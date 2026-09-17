@@ -2,295 +2,128 @@
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import '../../styles/product.css';
 ---
-<BaseLayout title="PolyMesh FEA" description="PolyMesh is an adaptive hybrid polyhedral mesher and linear-elastostatics solver co-designed to choose element shape, size, and order, solve, estimate error, and refine in one loop.">
+<BaseLayout title="PolyMesh FEA" description="The open-source PolyMesh meshing and linear-elastostatics project, how its adaptive loop works, and the pinned integration boundary inside Chudware.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Product / PolyMesh FEA</p>
-      <h1>The mesh and the solver should be allowed to talk.</h1>
-      <p class="lede">PolyMesh is an adaptive hybrid polyhedral mesher and the linear-elastostatics solver it was co-designed with. Geometry, element choice, solution error, and refinement stay inside one loop instead of crossing a file boundary and forgetting what the other side learned.</p>
+      <h1>Mesh generation, solution, error estimation, and refinement in one project.</h1>
+      <p class="lede">PolyMesh is the BSD-3-Clause project published as <strong>Polyhedral-FEA</strong>. It combines CAD-aware hybrid meshing, FE/VEM assembly, a linear-elastostatics solver, recovery-based error estimation, and adaptive refinement.</p>
       <ul class="product-hero-meta">
-        <li>Hybrid FE and VEM assembly in one global system</li>
-        <li>Error-driven hp-adaptivity with a stated ZZ indicator</li>
-        <li>C++20 &middot; OpenCASCADE &middot; Eigen &middot; BSD-3-Clause</li>
+        <li>C++20 with OpenCASCADE and Eigen</li>
+        <li>Standard FE cells and polyhedral VEM in one system</li>
+        <li>Public source, tests, validation reports, and benchmark artifacts</li>
       </ul>
     </div>
   </header>
 
-  <section class="section" aria-labelledby="system-title">
-    <div class="wrap">
-      <header class="section-heading">
-        <p class="eyebrow" id="system-title">One mechanical system</p>
-        <h2>Different cells. One assembly. One answer.</h2>
-        <p class="lede">Tetrahedra, hexahedra, prisms, pyramids, and arbitrary polyhedra can meet in the same volume. Their contributions scatter into the same stiffness matrix and proceed through the same solve.</p>
-      </header>
-      <figure class="product-diagram">
-        <svg class="product-svg" viewBox="0 0 640 280" role="img" aria-labelledby="system-diagram-title">
-          <title id="system-diagram-title">Tet, hex, prism, pyramid, and polyhedral cells enter one shared FE and VEM stiffness assembly, then one linear solve produces displacement, stress, and an error estimate.</title>
-          <defs>
-            <marker id="polymesh-system-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-              <path class="product-svg-arrow-accent" d="M0,0 L10,5 L0,10 Z" />
-            </marker>
-          </defs>
-
-          <text class="product-svg-label-faint" x="30" y="22">STANDARD ELEMENTS AND GENERAL POLYHEDRA SHARE THE SAME GLOBAL SYSTEM</text>
-
-          <rect class="product-svg-node" x="30" y="54" width="102" height="48" rx="3" />
-          <rect class="product-svg-node" x="30" y="116" width="102" height="48" rx="3" />
-          <rect class="product-svg-node" x="30" y="178" width="102" height="48" rx="3" />
-          <text class="product-svg-title" x="81" y="75" text-anchor="middle">TET / HEX</text>
-          <text class="product-svg-label" x="81" y="91" text-anchor="middle">FE</text>
-          <text class="product-svg-title" x="81" y="137" text-anchor="middle">PRISM / PYRAMID</text>
-          <text class="product-svg-label" x="81" y="153" text-anchor="middle">FE</text>
-          <text class="product-svg-title" x="81" y="199" text-anchor="middle">POLYHEDRON</text>
-          <text class="product-svg-label" x="81" y="215" text-anchor="middle">VEM</text>
-
-          <rect class="product-svg-node-accent" x="205" y="104" width="148" height="72" rx="3" />
-          <text class="product-svg-title" x="279" y="132" text-anchor="middle">ASSEMBLE_STIFFNESS</text>
-          <text class="product-svg-label" x="279" y="152" text-anchor="middle">one global K</text>
-
-          <rect class="product-svg-node" x="424" y="104" width="92" height="72" rx="3" />
-          <text class="product-svg-title" x="470" y="132" text-anchor="middle">SOLVE</text>
-          <text class="product-svg-label" x="470" y="152" text-anchor="middle">once</text>
-
-          <rect class="product-svg-node" x="556" y="76" width="58" height="48" rx="3" />
-          <rect class="product-svg-node" x="556" y="156" width="58" height="48" rx="3" />
-          <text class="product-svg-title" x="585" y="97" text-anchor="middle">FIELD</text>
-          <text class="product-svg-label" x="585" y="113" text-anchor="middle">u, &#963;</text>
-          <text class="product-svg-title" x="585" y="177" text-anchor="middle">ERROR</text>
-          <text class="product-svg-label" x="585" y="193" text-anchor="middle">ZZ &#951;</text>
-
-          <line class="product-svg-flow" x1="132" y1="78" x2="205" y2="122" marker-end="url(#polymesh-system-arrow)" />
-          <line class="product-svg-flow" x1="132" y1="140" x2="205" y2="140" marker-end="url(#polymesh-system-arrow)" />
-          <line class="product-svg-flow" x1="132" y1="202" x2="205" y2="158" marker-end="url(#polymesh-system-arrow)" />
-          <line class="product-svg-flow" x1="353" y1="140" x2="424" y2="140" marker-end="url(#polymesh-system-arrow)" />
-          <line class="product-svg-flow" x1="516" y1="124" x2="556" y2="106" marker-end="url(#polymesh-system-arrow)" />
-          <line class="product-svg-flow" x1="516" y1="156" x2="556" y2="174" marker-end="url(#polymesh-system-arrow)" />
-
-          <text class="product-svg-label-faint" x="30" y="248">NO SECOND SOLVE &middot; NO MORTAR COUPLING</text>
-          <text class="product-svg-label-dim" x="30" y="266">CONSTANT-STRAIN PATCH TEST u = Gx: EXACT TO 1e-9 m ACROSS FE / VEM INTERFACES</text>
-        </svg>
-        <figcaption>One assembly path for standard finite elements and the Virtual Element Method.</figcaption>
-      </figure>
-    </div>
-  </section>
-
-  <section class="section" aria-labelledby="rationale-title">
-    <div class="wrap split">
-      <header class="section-heading">
-        <p class="eyebrow" id="rationale-title">Why co-design matters</p>
-        <h2>A mesh is not finished when the solver first sees it.</h2>
-        <p class="lede">Most FEA toolchains split meshing from solving. The mesher emits elements, the solver takes what it gets, and neither side can tell the other what it needs. The costly regions are discovered only after the irreversible handoff.</p>
-        <p class="supporting-copy">PolyMesh closes the loop: classify geometry by criticality, choose element shape, size, and polynomial order per region, solve, estimate the error, refine, and iterate toward a target accuracy at minimum cost. Because the solver consumes general polyhedra, an awkward cell does not have to be shattered into slivers merely to satisfy the solver.</p>
-      </header>
-      <div class="product-note">
-        <p class="eyebrow">One interface, measured</p>
-        <p>Standard tet4, tet10, hex8, hex20, prism, and pyramid elements and VEM cells for arbitrary polyhedra all scatter into the same <code>assemble_stiffness</code> path.</p>
-        <p>There is no second solve and no mortar coupling. The constant-strain patch test <code>u = Gx</code> is exact to <strong>1e-9&nbsp;m</strong> across FE/VEM interfaces.</p>
-      </div>
-    </div>
-  </section>
-
   <section class="section" aria-labelledby="loop-title">
     <div class="wrap">
       <header class="section-heading">
-        <p class="eyebrow" id="loop-title">The closed loop</p>
-        <h2>Geometry demand goes in. Measured solution error comes back.</h2>
-        <p class="lede">The first mesh is a proposal. Zienkiewicz&ndash;Zhu recovery compares the solved stress field with its recovered field, then hp-adaptivity spends the next pass where that indicator says it matters.</p>
+        <p class="eyebrow" id="loop-title">Adaptive loop</p>
+        <h2>Use the solved field to decide where the next mesh spends work.</h2>
+        <p class="lede">Geometry and boundary-condition features drive an initial size field. The project meshes, solves, recovers stress, estimates discretization error, and can refine toward an explicit target or resource limit.</p>
       </header>
       <figure class="product-diagram">
-        <svg class="product-svg" viewBox="0 0 640 330" role="img" aria-labelledby="loop-diagram-title">
-          <title id="loop-diagram-title">STEP and B-rep geometry is classified, a DOF-budget-gated advisor scores mesh actions, a hybrid mesher builds cells, FE and VEM assemble one system, the solver produces a field, and a Zienkiewicz-Zhu error estimate drives hp refinement until the target or resource budget is reached.</title>
+        <svg class="product-svg" viewBox="0 0 640 260" role="img" aria-labelledby="polymesh-diagram-title">
+          <title id="polymesh-diagram-title">PolyMesh imports a CAD boundary representation, analyzes features, creates a hybrid mesh, assembles and solves it, estimates error, and either exports the result or adapts the mesh.</title>
           <defs>
-            <marker id="polymesh-loop-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <marker id="polymesh-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
               <path class="product-svg-arrow-accent" d="M0,0 L10,5 L0,10 Z" />
             </marker>
           </defs>
-
-          <text class="product-svg-label-faint" x="30" y="20">ONE ADAPTIVE PASS &middot; THE EXIT CONDITION IS REPORTED, NOT IMPLIED</text>
-
-          <rect class="product-svg-node" x="30" y="56" width="105" height="58" rx="3" />
-          <rect class="product-svg-node" x="166" y="56" width="105" height="58" rx="3" />
-          <rect class="product-svg-node-accent" x="302" y="56" width="105" height="58" rx="3" />
-          <rect class="product-svg-node" x="438" y="56" width="105" height="58" rx="3" />
-          <text class="product-svg-title" x="82" y="79" text-anchor="middle">CLASSIFY</text>
-          <text class="product-svg-title" x="218" y="79" text-anchor="middle">ADVISE</text>
-          <text class="product-svg-title" x="354" y="79" text-anchor="middle">MESH</text>
-          <text class="product-svg-title" x="490" y="79" text-anchor="middle">ASSEMBLE</text>
-          <text class="product-svg-label" x="82" y="98" text-anchor="middle">CAD criticality</text>
-          <text class="product-svg-label" x="218" y="98" text-anchor="middle">DOF-gated</text>
-          <text class="product-svg-label" x="354" y="98" text-anchor="middle">hybrid cells</text>
-          <text class="product-svg-label" x="490" y="98" text-anchor="middle">FE + VEM</text>
-
-          <line class="product-svg-flow" x1="135" y1="85" x2="166" y2="85" marker-end="url(#polymesh-loop-arrow)" />
-          <line class="product-svg-flow" x1="271" y1="85" x2="302" y2="85" marker-end="url(#polymesh-loop-arrow)" />
-          <line class="product-svg-flow" x1="407" y1="85" x2="438" y2="85" marker-end="url(#polymesh-loop-arrow)" />
-
-          <rect class="product-svg-node" x="438" y="164" width="105" height="58" rx="3" />
-          <rect class="product-svg-node" x="302" y="164" width="105" height="58" rx="3" />
-          <rect class="product-svg-node-accent" x="166" y="164" width="105" height="58" rx="3" />
-          <text class="product-svg-title" x="490" y="187" text-anchor="middle">SOLVE</text>
-          <text class="product-svg-title" x="354" y="187" text-anchor="middle">RECOVER</text>
-          <text class="product-svg-title" x="218" y="187" text-anchor="middle">ESTIMATE</text>
-          <text class="product-svg-label" x="490" y="206" text-anchor="middle">linear elastic</text>
-          <text class="product-svg-label" x="354" y="206" text-anchor="middle">stress field</text>
-          <text class="product-svg-label" x="218" y="206" text-anchor="middle">ZZ &#951;</text>
-
-          <line class="product-svg-flow" x1="490" y1="114" x2="490" y2="164" marker-end="url(#polymesh-loop-arrow)" />
-          <line class="product-svg-flow" x1="438" y1="193" x2="407" y2="193" marker-end="url(#polymesh-loop-arrow)" />
-          <line class="product-svg-flow" x1="302" y1="193" x2="271" y2="193" marker-end="url(#polymesh-loop-arrow)" />
-
-          <rect class="product-svg-node" x="30" y="164" width="105" height="58" rx="3" />
-          <text class="product-svg-title" x="82" y="187" text-anchor="middle">REFINE</text>
-          <text class="product-svg-label" x="82" y="206" text-anchor="middle">h and p</text>
-          <line class="product-svg-flow" x1="166" y1="193" x2="135" y2="193" marker-end="url(#polymesh-loop-arrow)" />
-          <path class="product-svg-con" d="M82,164 L82,140 L354,140 L354,122" marker-end="url(#polymesh-loop-arrow)" />
-
-          <rect class="product-svg-node-accent" x="438" y="266" width="105" height="42" rx="3" />
-          <text class="product-svg-title" x="490" y="292" text-anchor="middle">RESULT</text>
-          <path class="product-svg-flow" d="M218,222 L218,287 L430,287" marker-end="url(#polymesh-loop-arrow)" />
-          <text class="product-svg-label-dim" x="224" y="274">&#951; &le; TARGET OR BUDGET REACHED</text>
-          <text class="product-svg-label-faint" x="30" y="322">THE RESULT CARRIES THE ACHIEVED INDICATOR, EVEN WHEN IT MISSES THE TARGET</text>
+          <rect class="product-svg-node" x="20" y="80" width="100" height="64" rx="4" />
+          <rect class="product-svg-node" x="150" y="80" width="100" height="64" rx="4" />
+          <rect class="product-svg-node" x="280" y="80" width="100" height="64" rx="4" />
+          <rect class="product-svg-node" x="410" y="80" width="100" height="64" rx="4" />
+          <rect class="product-svg-node-accent" x="540" y="80" width="80" height="64" rx="4" />
+          <text class="product-svg-title" x="70" y="106" text-anchor="middle">CAD</text>
+          <text class="product-svg-label" x="70" y="128" text-anchor="middle">STEP / B-rep</text>
+          <text class="product-svg-title" x="200" y="106" text-anchor="middle">MESH</text>
+          <text class="product-svg-label" x="200" y="128" text-anchor="middle">hybrid cells</text>
+          <text class="product-svg-title" x="330" y="106" text-anchor="middle">SOLVE</text>
+          <text class="product-svg-label" x="330" y="128" text-anchor="middle">one system</text>
+          <text class="product-svg-title" x="460" y="106" text-anchor="middle">ESTIMATE</text>
+          <text class="product-svg-label" x="460" y="128" text-anchor="middle">ZZ recovery</text>
+          <text class="product-svg-title" x="580" y="106" text-anchor="middle">RESULT</text>
+          <text class="product-svg-label" x="580" y="128" text-anchor="middle">VTU</text>
+          <line class="product-svg-flow" x1="120" y1="112" x2="142" y2="112" marker-end="url(#polymesh-arrow)" />
+          <line class="product-svg-flow" x1="250" y1="112" x2="272" y2="112" marker-end="url(#polymesh-arrow)" />
+          <line class="product-svg-flow" x1="380" y1="112" x2="402" y2="112" marker-end="url(#polymesh-arrow)" />
+          <line class="product-svg-flow" x1="510" y1="112" x2="532" y2="112" marker-end="url(#polymesh-arrow)" />
+          <path class="product-svg-con" d="M460,152 L460,210 L200,210 L200,152" marker-end="url(#polymesh-arrow)" />
+          <text class="product-svg-label-faint" x="330" y="232" text-anchor="middle">ADAPT SIZE / ORDER / LOCAL REFINEMENT</text>
         </svg>
-        <figcaption>Classify, choose, mesh, solve, recover, estimate, and refine &mdash; one feedback loop.</figcaption>
+        <figcaption>The estimator is a refinement signal, not a guarantee that the physical model is correct.</figcaption>
       </figure>
-      <div class="product-columns product-stack">
-        <div>
-          <p class="product-body">The learned mesh advisor is a deployed ONNX graph. It scores candidate combinations of mesher, element size, adaptivity, and polynomial order under a degree-of-freedom budget. A gate can refuse the choice; it does not manufacture a prediction when the case falls outside its calibrated envelope.</p>
-          <p class="product-body">The desktop studio and self-hosted web app can show the network's actual input, hidden-layer, and output activations from the same forward passes that produced the decision. The animation is an inspection surface for the real graph, not a second model built for presentation.</p>
-        </div>
-        <div class="product-note">
-          <p class="eyebrow">Error, not confidence</p>
-          <p>The global ZZ value is a recovery-based discretization-error indicator. It is not a probability that the answer is correct, and PolyMesh does not relabel it as one.</p>
-          <p>When a pass stops above its target, the achieved value remains the headline fact.</p>
-        </div>
-      </div>
     </div>
   </section>
 
-  <section class="section" aria-labelledby="worked-title">
+  <section class="section" aria-labelledby="project-title">
     <div class="wrap product-columns">
       <div>
         <header class="section-heading product-subhead">
-          <p class="eyebrow" id="worked-title">Published showcase run</p>
-          <h2>A wishbone, a real solve, and 29.77% stated plainly.</h2>
+          <p class="eyebrow" id="project-title">Standalone project</p>
+          <h2>A mesher and solver with inspectable boundaries.</h2>
         </header>
-        <p class="product-body">The recorded suspension-wishbone run carried a conserved 4.717&nbsp;kN distributed load into a 40,170-cell tet4 mesh with 29,388 unknowns. It returned a 202.49&nbsp;MPa peak von Mises stress and 1.198&nbsp;mm peak displacement.</p>
-        <p class="product-body">Its global Zienkiewicz&ndash;Zhu indicator was <strong>29.77%</strong>. That is the number the project publishes. It is not laundered into a confidence score, hidden behind the stress picture, or omitted because it complicates the result. The run is useful precisely because the shortfall remains visible.</p>
-        <p class="product-body">The advisor enumerated 108 candidates and made 109 forward passes. Candidate 29 won the score sweep; the wishbone lay outside the calibrated descriptor envelope, so the gate withheld that action and the configured baseline remained authoritative.</p>
+        <p class="product-body">The public project accepts STEP and B-rep geometry, produces hybrid meshes, solves linear elastostatics, writes VTU fields, and includes CLI, desktop-study, and self-hosted browser applications.</p>
+        <p class="product-body">Standard tetrahedral, hexahedral, prism, and pyramid elements share a global assembly with arbitrary polyhedral cells handled through the Virtual Element Method. The public documentation identifies which experimental paths remain gated instead of treating every implemented path as a default.</p>
+        <p class="product-body">A learned advisor can rank measured candidate mesh actions under a degrees-of-freedom budget. It can select or refuse a candidate; it does not guarantee a requested error tolerance.</p>
       </div>
       <div class="product-spec-wrap">
         <table class="product-spec">
-          <caption>Suspension wishbone &middot; published cinema manifest</caption>
+          <caption>Project scope</caption>
           <tbody>
-            <tr><th scope="row">Mesh</th><td>40,170 tet4 cells</td></tr>
-            <tr><th scope="row">System</th><td>29,388 unknowns</td></tr>
-            <tr><th scope="row">Distributed load</th><td>4.717 kN</td></tr>
-            <tr><th scope="row">Peak von Mises</th><td>202.49 MPa</td></tr>
-            <tr><th scope="row">Peak displacement</th><td>1.198 mm</td></tr>
-            <tr><th scope="row">Global ZZ indicator</th><td>29.77%</td></tr>
-            <tr><th scope="row">Advisor sweep</th><td>108 candidates &middot; 109 forward passes</td></tr>
-            <tr><th scope="row">Scored winner</th><td>Candidate 29; gated, not applied</td></tr>
+            <tr><th scope="row">Geometry input</th><td>STEP and B-rep for CAD-aware commands; Gmsh volume mesh accepted by the solve path</td></tr>
+            <tr><th scope="row">Elements</th><td>tet4/tet10, hex8/hex20, prism, pyramid, and polyhedral VEM</td></tr>
+            <tr><th scope="row">Analysis</th><td>Small-strain linear elastostatics</td></tr>
+            <tr><th scope="row">Adaptivity</th><td>Geometry sizing, recovery-based error estimation, h/p refinement controls</td></tr>
+            <tr><th scope="row">Output</th><td>VTU fields with displacement, stress, error, and mesh-quality data</td></tr>
+            <tr><th scope="row">License</th><td>BSD 3-Clause</td></tr>
           </tbody>
         </table>
       </div>
     </div>
   </section>
 
-  <section class="section" aria-labelledby="define-title">
-    <div class="wrap">
+  <section class="section" aria-labelledby="integration-title">
+    <div class="wrap split">
       <header class="section-heading">
-        <p class="eyebrow" id="define-title">Defining a run</p>
-        <h2>Five steps, with the feedback path left intact.</h2>
-        <p class="lede">The same headless pipeline serves the command line, desktop studio, and web app. Each surface starts from the same geometry and ends with the same mesh, fields, notes, and export.</p>
+        <p class="eyebrow" id="integration-title">Inside Chudware</p>
+        <h2>A pinned in-process meshing dependency, not a remote black box.</h2>
+        <p class="lede">Chudware builds a specific public PolyMesh commit into its FEA stack and records that commit in result provenance. The pinned revision does not move when the standalone project's default branch advances.</p>
+        <p class="supporting-copy">Chudware uses the meshing pipeline for its volume mesh and adaptive path. Chudware's engine owns study setup, face selection, per-body material and interface policies, resource admission, static/contact/thermal/modal/buckling solvers, evidence fields, and document persistence.</p>
       </header>
-      <ol class="product-steps">
-        <li>
-          <div>
-            <h3>Load the exact part</h3>
-            <p>Import STEP or BRep geometry through OpenCASCADE. The CAD topology supplies the surfaces, curvature, thin-wall cues, and feature criticality that a faceted handoff would discard.</p>
-          </div>
-        </li>
-        <li>
-          <div>
-            <h3>State the mechanics</h3>
-            <p>Set the isotropic linear-elastic material, fixtures, loads, target element size, mesher, polynomial order, adaptive-pass budget, and ZZ target. Resource ceilings are explicit inputs to the run rather than an operating-system surprise.</p>
-          </div>
-        </li>
-        <li>
-          <div>
-            <h3>Choose and build the mesh</h3>
-            <p>The advisor can score measured candidate actions under the DOF budget, while geometry and boundary conditions drive the sizing field. The mesher emits the element mix the region calls for; the desktop and web surfaces can reveal those real cells as they arrive.</p>
-          </div>
-        </li>
-        <li>
-          <div>
-            <h3>Assemble once and solve</h3>
-            <p>Standard FE cells and arbitrary polyhedral VEM cells scatter into one global stiffness system. Linear elastostatics produces displacement, reactions, von Mises stress, and the fields used by recovery.</p>
-          </div>
-        </li>
-        <li>
-          <div>
-            <h3>Estimate, refine, and report</h3>
-            <p>ZZ recovery marks where the discretization needs work; hp-adaptivity changes local size or order and runs the loop again. The result reports the achieved indicator and termination reason, then exports its available fields to VTU.</p>
-          </div>
-        </li>
-      </ol>
-    </div>
-  </section>
-
-  <section class="section" aria-labelledby="delivery-title">
-    <div class="wrap product-columns">
-      <div>
-        <header class="section-heading product-subhead">
-          <p class="eyebrow" id="delivery-title">Interfaces and implementation</p>
-          <h2>One pipeline, shipped three ways.</h2>
-        </header>
-        <p class="product-body">The <code>polymesh</code> CLI exposes <code>check</code>, <code>mesh</code>, <code>solve</code>, <code>diag</code>, <code>render</code>, and <code>calibrate</code>. <code>polymesh-gui</code> is the local desktop studio. The self-hosted web app keeps model loading, meshing, solving, live progress, advisor activations, and result export in the browser while the C++ server runs the same pipeline.</p>
-        <p class="product-body">PolyMesh is C++20. OpenCASCADE supplies CAD exchange and topology, Eigen supplies the algebra, and the project is released under BSD-3-Clause.</p>
-      </div>
-      <div class="product-spec-wrap">
-        <table class="product-spec">
-          <caption>PolyMesh product surface</caption>
-          <tbody>
-            <tr><th scope="row">CAD kernel</th><td>OpenCASCADE &middot; STEP / BRep</td></tr>
-            <tr><th scope="row">Element family</th><td>tet4, tet10, hex8, hex20, prism, pyramid, arbitrary polyhedron</td></tr>
-            <tr><th scope="row">Assembly</th><td>Standard FE and VEM in one <code>assemble_stiffness</code></td></tr>
-            <tr><th scope="row">Physics</th><td>Linear elastostatics &middot; isotropic linear elasticity</td></tr>
-            <tr><th scope="row">Adaptivity</th><td>Error-driven h and p &middot; Zienkiewicz&ndash;Zhu recovery indicator</td></tr>
-            <tr><th scope="row">Advisor</th><td>Deployed ONNX graph &middot; DOF-budget-gated candidate scoring</td></tr>
-            <tr><th scope="row">Applications</th><td><code>polymesh</code> CLI &middot; <code>polymesh-gui</code> &middot; self-hosted web app</td></tr>
-            <tr><th scope="row">Implementation</th><td>C++20 &middot; OpenCASCADE &middot; Eigen</td></tr>
-            <tr><th scope="row">License</th><td>BSD-3-Clause</td></tr>
-          </tbody>
-        </table>
+      <div class="product-note">
+        <p class="eyebrow">Why the boundary matters</p>
+        <p>A result names the engine build, PolyMesh commit, solver, and mesher. That makes the meshing input to a released result traceable even when both projects continue changing.</p>
+        <p><a class="text-link" href="/open-source/">Source, validation, and limits</a></p>
       </div>
     </div>
   </section>
 
   <section class="section" aria-labelledby="limits-title">
-    <div class="wrap">
-      <header class="section-heading">
-        <p class="eyebrow" id="limits-title">Where the line is</p>
-        <h2>The limitations travel with the product.</h2>
-        <p class="lede">These are current engineering boundaries, not footnotes that disappear after the first run.</p>
-      </header>
+    <div class="wrap product-columns">
+      <div>
+        <header class="section-heading product-subhead">
+          <p class="eyebrow" id="limits-title">Limits</p>
+          <h2>The public project publishes the failure modes with the validation.</h2>
+        </header>
+        <p class="product-body">The default product mesher is a graded tetrahedral path. Polyhedral VEM transitions and the learned advisor remain separately gated where the public evidence does not justify making them the default.</p>
+        <p class="product-body">Geometry fidelity, extreme slivers, iterative-solver scaling, feature resolution, and advisor out-of-distribution behavior are documented limits. A mesh or solve can refuse rather than return an answer outside its configured resource and validity gates.</p>
+      </div>
       <div class="product-note product-note-warning">
-        <p class="eyebrow">Current limitations &mdash; permanent</p>
-        <p>PolyMesh solves <strong>linear elastostatics only</strong>, with an <strong>isotropic linear-elastic material only</strong>.</p>
-        <p>The CAD commands accept <strong>STEP/BRep</strong>. STL is internal and legacy, not a product CAD input; the solve path also accepts an already-generated Gmsh <code>.msh</code> volume mesh.</p>
-        <p>VTU result export currently carries displacement, von Mises stress, ZZ &#951;, and element quality, but <strong>not the full stress tensor or reactions</strong>.</p>
-        <p>The default resource ceilings are <strong>589,824 elements</strong> and <strong>1,769,472 degrees of freedom</strong>. They are enforced rather than advisory.</p>
-        <p>At the extreme graded setting <code>h=0.005</code> on a cylinder, the mesher can produce a closed, non-inverted mesh containing a sliver chain that the current CG policy cannot solve.</p>
+        <p class="eyebrow">No tolerance guarantee</p>
+        <p>The recovery indicator measures behavior of the discretized solution. It does not validate material properties, boundary conditions, load cases, contact assumptions, or the geometry itself.</p>
       </div>
     </div>
   </section>
 
   <section class="section cta-band">
     <div class="wrap section-heading">
-      <p class="eyebrow">Next</p>
-      <h2>Inspect the loop, then inspect its answer.</h2>
-      <p class="lede">Run PolyMesh from the CLI, desktop studio, or self-hosted web app &mdash; and keep the achieved error indicator beside the field it qualifies.</p>
-      <div class="actions"><a class="button" href="/open-source/">Explore the open-source project</a><a class="button button-secondary" href="/product/simulation/">Chudware Simulation</a></div>
+      <p class="eyebrow">Inspect the implementation</p>
+      <h2>Read the source and the committed evidence.</h2>
+      <p class="lede">The public repository includes build instructions, validation reports, benchmark artifacts, limits, and runnable applications.</p>
+      <div class="actions"><a class="button" href="https://github.com/Hunter-124/Polyhedral-FEA">PolyMesh on GitHub</a><a class="button button-secondary" href="/product/simulation/">Chudware Simulation</a></div>
       <ul class="product-jump">
         <li><a href="/product/">All capabilities</a></li>
         <li><a href="/product/modeling/">Modeling</a></li>

@@ -1,141 +1,98 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
-import TesseractHero from '../components/TesseractHero.astro';
-import Showcase from '../components/Showcase.astro';
-import Icon from '../components/Icon.astro';
-import { HERO_STAGES } from '../scripts/hero-timeline';
-import { MACHINING_OPS } from '../scripts/machining-timeline';
 ---
-<BaseLayout title="Parametric CAD from sketch to shop floor" description="Chudware is a parametric CAD system for mechanical engineers: exact solid geometry, an editable feature tree, assemblies, CAM, PLM, and simulation, in a browser or as a native Windows, Linux, and macOS desktop application.">
-  <TesseractHero>
-    <p class="eyebrow">Parametric CAD · Browser or native</p>
-    <h1>Parametric CAD, <span class="text-gradient">from sketch to shop floor.</span></h1>
-    <p class="lede">Chudware is built for mechanical engineers and product teams who want modeling, assemblies, CAM, PLM, simulation, reverse engineering, and an AI copilot in the same workspace.</p>
-    <p class="hero-note">In a browser you get the real application, not a video stream of a machine in a data centre. Signed native builds for Windows, Linux, and macOS are ready to download.</p>
-    <div class="actions">
-      <a class="button" href="https://app.chudware.com/signup">Create an account</a>
-      <a class="button button-secondary" href="/product/">Tour the product</a>
+<BaseLayout
+  title="Engineering CAD from design through production"
+  description="Chudware is built for engineers: parametric modeling, assemblies, simulation, CAM, electronics, PLM, and AI-assisted workflows in one browser or desktop workspace."
+>
+  <header class="home-hero">
+    <div class="wrap home-hero-grid">
+      <div class="home-hero-copy">
+        <p class="eyebrow">Engineering CAD · Browser and desktop</p>
+        <h1>Chudware is built for engineers.</h1>
+        <p class="lede">Model parts, assemble systems, run simulation, prepare toolpaths, develop electronics, manage product data, and use AI tools in one workspace.</p>
+        <div class="actions">
+          <a class="button" href="/gallery/">See product work</a>
+          <a class="button button-secondary" href="/product/">Explore the product</a>
+        </div>
+        <ul class="home-hero-facts" aria-label="Product fundamentals">
+          <li>Exact B-rep solids</li>
+          <li>Editable feature history</li>
+          <li>STEP, IGES, BREP, and mesh exchange</li>
+        </ul>
+      </div>
+      <figure class="home-hero-media">
+        <a href="/gallery/#modeling" aria-label="View the modeling workspace in the gallery">
+          <img src="/images/modeling.png" width="1600" height="900" alt="Chudware modeling workspace showing a parametric enclosure and its editable feature tree" fetchpriority="high" />
+        </a>
+        <figcaption><span>Modeling workspace</span><a href="/gallery/#modeling">View full image</a></figcaption>
+      </figure>
     </div>
-    <dl class="architecture-strip" slot="strip" aria-label="Chudware at a glance">
-      <div><dt>Geometry</dt><dd>Exact B-rep solids, not meshes</dd></div>
-      <div><dt>Interoperability</dt><dd>STEP, IGES, and BREP in and out</dd></div>
-      <div><dt>Isolation</dt><dd>Per-account roots at the gateway</dd></div>
-      <div><dt>Native</dt><dd>Windows, Linux, macOS</dd></div>
-    </dl>
-  </TesseractHero>
+  </header>
 
-  <section class="capability-index" aria-labelledby="capabilities-title">
+  <section class="section home-capabilities" aria-labelledby="capabilities-title">
     <div class="wrap">
-      <p class="eyebrow" id="capabilities-title">The engineering loop</p>
-      <ul>
-        <li>Parametric modeling</li>
-        <li>Constraint sketching</li>
-        <li>Assemblies</li>
-        <li>CAM</li>
-        <li>Simulation</li>
-        <li>Reverse engineering</li>
-        <li>PLM</li>
-      </ul>
-    </div>
-  </section>
-
-  <section class="section" id="architecture">
-    <div class="wrap architecture-layout">
-      <header class="section-heading architecture-copy">
-        <p class="eyebrow">The real application, in a tab</p>
-        <h2>Full CAD in a browser tab, without turning CAD into a web toy.</h2>
-        <p class="lede">The browser runs the same application as the desktop build. Model state and tool calls go over the wire — never a video stream of a machine in a data centre — so the geometry kernel and the full engineering toolchain stay intact instead of being reduced to fit a web page.</p>
-        <p class="supporting-copy">Prefer local execution? <a class="text-link" href="/download/">Native builds for Windows, Linux, and macOS</a> run the same product surface on an engineering workstation.</p>
+      <header class="section-heading">
+        <p class="eyebrow">One engineering environment</p>
+        <h2 id="capabilities-title">Move from geometry to a documented result.</h2>
+        <p class="lede">Each workspace stays connected to the same project, model, and revision history.</p>
       </header>
-      <div class="pricing-note">
-        <p class="eyebrow">Open a supplier's file, not only your own</p>
-        <p>Chudware opens STEP, IGES, and BREP solids, STL, OBJ, PLY, and glTF meshes, and DXF for 2D profiles. It writes STEP, IGES, BREP, STL, OBJ, PLY, and glTF back out.</p>
-        <p>The native <code>.step+</code> document is a container: a neutral STEP body stored alongside the parametric tree. Any CAD system can open the STEP inside it, so an editable design is never trapped in a format only Chudware can read.</p>
+      <div class="capability-grid">
+        <article><p class="capability-index">01</p><h3><a href="/product/modeling/">Modeling</a></h3><p>Constrained sketches and ordered features produce editable exact solids.</p></article>
+        <article><p class="capability-index">02</p><h3><a href="/product/assemblies/">Assemblies</a></h3><p>Locate components with mates, then inspect motion, clearance, and interference.</p></article>
+        <article><p class="capability-index">03</p><h3><a href="/product/simulation/">Simulation</a></h3><p>Set up structural, modal, and thermal studies against the active design.</p></article>
+        <article><p class="capability-index">04</p><h3><a href="/product/cam/">CAM</a></h3><p>Define stock, tools, and operations, simulate removal, and post G-code.</p></article>
+        <article><p class="capability-index">05</p><h3>Electronics</h3><p>Keep electronics and firmware workspaces alongside the mechanical project.</p></article>
+        <article><p class="capability-index">06</p><h3><a href="/product/plm/">PLM</a></h3><p>Keep revisions, project files, manufacturing artifacts, and decisions together.</p></article>
+        <article><p class="capability-index">07</p><h3><a href="/docs/ai-copilot/">AI</a></h3><p>Give an agent the open model as context and inspect the features it creates.</p></article>
       </div>
     </div>
   </section>
 
-  <Showcase
-    kind="hero"
-    panelTitle="FeatureManager"
-    panelDoc="bracket_v4.chud"
-    rows={HERO_STAGES}
-    kernel="Exact solids"
-    activeVerb="Rebuilding"
-    doneText="Rebuild complete"
-    image={{ src: '/images/modeling.png', width: 1340, height: 838, alt: 'The Chudware modeling workspace showing a shelled parametric enclosure beside its feature tree' }}
-    caption="Live render · the same ordered feature history the product replays, solved here as exact geometry rather than a stored picture of it."
-  >
-    <p class="eyebrow">Live from the feature tree</p>
-    <h2>A parametric rebuild, replayed in front of you.</h2>
-    <p class="lede">Every Chudware model is an ordered feature history — sketches, extrusions, fillets, holes — that can be edited and rebuilt deterministically. Watch one re-execute: the same operation stream the FeatureManager drives in the product, rendered here as an exact boolean field.</p>
-    <div class="actions"><a class="button button-secondary" href="/product/modeling/">How modeling works</a></div>
-  </Showcase>
-
-  <Showcase
-    kind="machining"
-    flip
-    panelTitle="Operations"
-    panelDoc="bracket_v4 · Setup1"
-    rows={MACHINING_OPS}
-    kernel="Dexel stock · 384 × 262"
-    activeVerb="Running"
-    doneText="Simulation complete"
-    image={{ src: '/images/cam.png', width: 1340, height: 838, alt: 'Chudware manufacturing workspace showing a CAM job, stock, tools, operations, and toolpath simulation' }}
-    caption="Live render · toolpaths generated on the fly and swept through a dexel stock model, the way the product's simulation checks a job before it posts."
-  >
-    <p class="eyebrow">Live from the CAM job</p>
-    <h2>Stock in, part out — simulated before a spindle turns.</h2>
-    <p class="lede">Every operation in the Manufacture workspace produces a real toolpath, and the stock simulation sweeps the cutter through a model of the billet to show exactly what remains. Watch a facing pass, a pocket, three contour stepdowns, and four drilled holes turn a block of 6061 into a bracket, with the programmed path and the cutter's trail drawn on the surface as it goes.</p>
-    <div class="actions"><a class="button button-secondary" href="/product/cam/">How CAM works</a></div>
-  </Showcase>
-
-  <section class="section workbench-section">
+  <section class="section home-work" aria-labelledby="work-title">
     <div class="wrap">
-      <header class="section-heading">
-        <p class="eyebrow">One project, not a relay race</p>
-        <h2>Keep design intent attached as the work moves downstream.</h2>
-        <p class="lede">The feature tree, manufacturing plan, product data, artifacts, and copilot activity live in one engineering environment instead of being handed between disconnected tools.</p>
+      <header class="section-heading home-work-heading">
+        <div>
+          <p class="eyebrow">Product gallery</p>
+          <h2 id="work-title">Modeling, CAM, and simulation in view.</h2>
+        </div>
+        <a class="text-link" href="/gallery/">Open the gallery</a>
       </header>
-      <ol class="workflow-grid">
-        <li><span><Icon name="overview" /></span><div><h3>Model with intent</h3><p>Constrained sketches and ordered features keep dimensions, references, and revisions explicit.</p></div></li>
-        <li><span><Icon name="package" /></span><div><h3>Carry geometry into production</h3><p>Build CAM operations and inspect simulation alongside the source design.</p></div></li>
-        <li><span><Icon name="archive" /></span><div><h3>Trace the product</h3><p>PLM connects project history and artifacts to the engineering work that produced them.</p></div></li>
-      </ol>
+      <div class="home-work-grid">
+        <figure>
+          <a href="/gallery/#cam"><img src="/images/cam.png" width="1600" height="900" loading="lazy" alt="Chudware manufacturing workspace with a CAM job, operations, and toolpath simulation" /></a>
+          <figcaption><span><strong>CAM</strong> · Operations and toolpath simulation</span><a href="/gallery/#cam">View full image</a></figcaption>
+        </figure>
+        <figure>
+          <a href="/gallery/#simulation"><img src="/images/fea.png" width="1600" height="900" loading="lazy" alt="Chudware simulation workspace with a static stress result, legend, and result summary" /></a>
+          <figcaption><span><strong>Simulation</strong> · Static stress result</span><a href="/gallery/#simulation">View full image</a></figcaption>
+        </figure>
+      </div>
     </div>
   </section>
 
-  <section class="section copilot-section">
+  <section class="section home-ai" aria-labelledby="ai-title">
     <div class="wrap split">
       <header class="section-heading">
-        <p class="eyebrow">AI that operates the tools</p>
-        <h2>The copilot works inside the model, not in a disconnected chat window.</h2>
-        <p class="lede">Describe the engineering intent in plain language. The copilot drives Chudware's modeling tools, and the result remains a normal, inspectable model with sketches and features.</p>
-        <div class="actions"><a class="button button-secondary" href="/docs/ai-copilot/">Read the copilot guide</a></div>
+        <p class="eyebrow">AI in the engineering loop</p>
+        <h2 id="ai-title">Use your own AI provider account.</h2>
+        <p class="lede">Connect a supported provider, give the copilot the open design as context, and review normal sketches, features, measurements, and files after it works.</p>
+        <div class="actions"><a class="button button-secondary" href="/docs/ai-copilot/">Read the AI copilot guide</a></div>
       </header>
-      <ol class="tool-loop" aria-label="Copilot modeling loop">
-        <li><span>Intent</span><strong>Describe the part and its constraints</strong></li>
-        <li><span>Context</span><strong>Work against the open model</strong></li>
-        <li><span>Tools</span><strong>Drive the same modeling operations</strong></li>
-        <li><span>Result</span><strong>Inspect sketches, features, and geometry</strong></li>
+      <ol class="home-ai-steps" aria-label="AI copilot workflow">
+        <li><span>1</span><div><strong>Connect</strong><p>Use your provider key or provider account.</p></div></li>
+        <li><span>2</span><div><strong>Describe</strong><p>State the engineering outcome and constraints.</p></div></li>
+        <li><span>3</span><div><strong>Inspect</strong><p>Review the resulting model, analysis, or project artifact.</p></div></li>
       </ol>
-    </div>
-  </section>
-
-  <section class="section source-section">
-    <div class="wrap source-band">
-      <div><p class="eyebrow">Verify before you cut metal</p><h2>Analysis attached to the model that produced it.</h2></div>
-      <p>Run linear static stress, modal, and thermal studies against the same feature tree you modeled, with error-driven adaptive mesh refinement and a second, independent mesher available to check whether a result is a property of the part or of the mesh.</p>
-      <a class="text-link" href="/product/simulation/">How simulation works <Icon name="arrow-right" /></a>
     </div>
   </section>
 
   <section class="section cta-band">
     <div class="wrap section-heading">
-      <p class="eyebrow">Start in the browser</p>
-      <h2>Open a full engineering workspace from a tab.</h2>
-      <p class="lede">Create an account for browser access, or download the desktop app for Windows, Linux, or macOS.</p>
-      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/download/">Download the desktop app</a></div>
+      <p class="eyebrow">Start with the product</p>
+      <h2>Open Chudware in your browser.</h2>
+      <p class="lede">Create an account for the browser workspace, or review the documentation first.</p>
+      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/docs/">Read the docs</a></div>
     </div>
   </section>
 </BaseLayout>

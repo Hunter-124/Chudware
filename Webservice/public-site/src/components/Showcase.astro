@@ -1,12 +1,9 @@
 ---
 /**
- * A live showcase: a raymarched render docked above the instrument panel that
- * drives it, beside a copy column that arrives through the default slot.
- *
- * `kind` selects the renderer in `scripts/showcase.ts`; `rows` is the same
- * timeline table that renderer reads, so the panel and the animation cannot
- * drift. The server renders the real product screenshot; only once WebGL2
- * hands back a live context does the script swap it for the canvas.
+ * Progressive product showcase. The static frame is a product screenshot;
+ * when WebGL2 is available, it is replaced by an illustrative animation and
+ * timeline panel. The animation explains the operation sequence but is not
+ * output captured from Chudware's geometry or CAM engines.
  */
 interface Row { readonly label: string; readonly detail: string }
 
@@ -43,7 +40,7 @@ const { kind, panelTitle, panelDoc, rows, kernel, activeVerb, doneText, image, c
           <canvas class="showcase-canvas" data-show-canvas aria-hidden="true" hidden></canvas>
         </div>
 
-        <figure class="showcase-panel" data-show-panel hidden>
+        <figure class="showcase-panel" data-show-panel hidden aria-hidden="true">
           <figcaption class="showcase-panel-head">
             <span class="showcase-panel-title">{panelTitle}</span>
             <span class="showcase-panel-doc">{panelDoc}</span>
@@ -65,7 +62,7 @@ const { kind, panelTitle, panelDoc, rows, kernel, activeVerb, doneText, image, c
           </div>
         </figure>
       </div>
-      <p class="showcase-caption">{caption}</p>
+      <p class="showcase-caption"><strong>Product screenshot; optional WebGL animation is illustrative.</strong> {caption}</p>
     </div>
   </div>
 </section>

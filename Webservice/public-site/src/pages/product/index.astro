@@ -12,7 +12,7 @@ import Icon from '../../components/Icon.astro';
       <ul class="product-hero-meta">
         <li>Exact solids, not mesh approximations</li>
         <li>Editable native <code>.step+</code> files</li>
-        <li>Browser workspace or native Windows and Linux builds</li>
+        <li>Browser workspace or native Windows, Linux, and macOS builds</li>
       </ul>
     </div>
   </header>
@@ -48,21 +48,21 @@ import Icon from '../../components/Icon.astro';
         <article class="product-card">
           <p class="product-card-index">03 / Simulate</p>
           <h2><a href="/product/simulation/">Simulation</a></h2>
-          <p>Stress studies live inside the part, and a static result reports how far its own error indicator got instead of asking you to trust a fineness slider.</p>
+          <p>Studies remain attached to the design and report the mesh, reactions, convergence, and engine provenance needed to review the result.</p>
           <ul class="fact-list">
-            <li>Fixtures and loads picked in the viewport and previewed before the solve</li>
-            <li>Two independent mesh generators for the same geometry, so a number can be checked</li>
-            <li>Error-driven refinement with a per-pass convergence table</li>
+            <li>Static, adaptive, convergence, modal, fatigue, thermal, buckling, and contact workflows</li>
+            <li>Per-body materials plus bonded, contact, and free interface policies</li>
+            <li>Mesh-quality, equilibrium, plausibility, and provenance fields beside the engineering result</li>
           </ul>
         </article>
         <article class="product-card">
           <p class="product-card-index">04 / Mesh + solve</p>
           <h2><a href="/product/polymesh/">PolyMesh FEA</a></h2>
-          <p>An adaptive hybrid polyhedral mesher and linear-elastostatics solver close the loop between geometry, element choice, solution error, and refinement.</p>
+          <p>The public PolyMesh project combines CAD-aware volume meshing, a linear-elastostatics solver, recovery-based error estimation, and adaptive refinement.</p>
           <ul class="fact-list">
-            <li>Standard FE and arbitrary polyhedral VEM cells in one global assembly</li>
-            <li>DOF-budget-gated ONNX advisor with its real activations visible</li>
-            <li>Achieved Zienkiewicz&ndash;Zhu error indicator reported without a confidence claim</li>
+            <li>Public C++20 source and validation evidence under BSD 3-Clause</li>
+            <li>Standard finite elements and polyhedral VEM in one global assembly</li>
+            <li>Pinned commit recorded in Chudware simulation provenance</li>
           </ul>
         </article>
         <article class="product-card">
@@ -91,7 +91,7 @@ import Icon from '../../components/Icon.astro';
           <p>Describe the engineering outcome; the copilot drives the same modeling operations you use by hand.</p>
           <ul class="fact-list">
             <li>Inspects geometry, creates and edits features, renders views, measures results</li>
-            <li>Chudware-managed capacity or your own provider key, chosen per account</li>
+            <li>Connect a supported provider account or your own API key</li>
             <li>Machine-affecting actions still require explicit operator review</li>
           </ul>
         </article>
@@ -112,15 +112,15 @@ import Icon from '../../components/Icon.astro';
   <section class="section" aria-labelledby="scope-title">
     <div class="wrap split">
       <header class="section-heading">
-        <p class="eyebrow" id="scope-title">Scope, stated plainly</p>
-        <h2>What is shipping, and what is still preview.</h2>
-        <p class="lede">The modeling, assembly, simulation, manufacturing, product data, copilot, and Reverse Engineering workspaces exist in the product today and are documented. Delivery is where the qualifiers belong.</p>
-        <p class="supporting-copy">Signed native builds for Windows, Linux, and macOS are downloaded from your account, and the commercial rate card is not published yet.</p>
+        <p class="eyebrow" id="scope-title">Commercial preview</p>
+        <h2>Use the trial against the work you need to ship.</h2>
+        <p class="lede">The modeling, assembly, simulation, manufacturing, product data, copilot, and Reverse Engineering workspaces are available today. Advanced workflows continue to change during commercial preview, so representative project testing matters.</p>
+        <p class="supporting-copy">The account release catalog publishes native x86-64 builds for Windows, Linux, and macOS. Desktop and Studio subscriptions are available through authenticated checkout; the pricing page explains plan scope.</p>
       </header>
       <div class="product-note">
-        <p class="eyebrow">No invented numbers</p>
-        <p>These pages avoid published benchmarks, customer counts, and certifications that do not exist. Every capability claim traces to the documentation, and the pricing page states outright that public rates are still being finalized.</p>
-        <p><a class="text-link" href="/pricing/">Read the pricing position <Icon name="arrow-right" /></a></p>
+        <p class="eyebrow">Reviewable output</p>
+        <p>Feature history, study evidence, manufacturing setup, and project revisions remain visible so an engineer can inspect what the product produced instead of relying on a summary sentence.</p>
+        <p><a class="text-link" href="/pricing/">Compare plans <Icon name="arrow-right" /></a></p>
       </div>
     </div>
   </section>
@@ -134,7 +134,7 @@ import Icon from '../../components/Icon.astro';
       <ul class="product-crosslinks">
         <li class="product-crosslink">
           <h3><a href="/gallery/">Gallery</a></h3>
-          <p>Images captured from Chudware itself: the modeling workspace, the manufacturing workspace, and workspace onboarding. No concept renders.</p>
+          <p>Product captures and worked examples with the request, resulting model, engineering context, and image provenance kept together.</p>
         </li>
         <li class="product-crosslink">
           <h3><a href="/docs/">Documentation</a></h3>
@@ -142,7 +142,7 @@ import Icon from '../../components/Icon.astro';
         </li>
         <li class="product-crosslink">
           <h3><a href="/pricing/">Access and pricing</a></h3>
-          <p>Browser workspace, native desktop downloads, and organization contact while the commercial catalog is finalized.</p>
+          <p>Current Desktop and Studio subscriptions, education rates, trial scope, storage, and enterprise contact.</p>
         </li>
       </ul>
     </div>

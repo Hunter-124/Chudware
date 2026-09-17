@@ -29,7 +29,7 @@ import { MACHINING_OPS } from '../../scripts/machining-timeline';
         <div class="actions"><a class="button button-secondary" href="/docs/cam/">CAM guide</a></div>
       </header>
       <figure class="product-figure">
-        <img src="/images/cam.png" width="1340" height="838" loading="lazy" alt="Chudware manufacturing workspace showing a CAM job with stock, tools, an operation list, and toolpath simulation controls" />
+        <img src="/images/cam.png" width="1600" height="900" loading="lazy" alt="Chudware manufacturing workspace showing a CAM job with stock, tools, an operation list, and toolpath simulation controls" />
         <figcaption><span>Chudware manufacturing workspace</span><span>Job &middot; stock &middot; operations</span></figcaption>
       </figure>
     </div>
@@ -44,13 +44,12 @@ import { MACHINING_OPS } from '../../scripts/machining-timeline';
     kernel="Dexel stock · 384 × 262"
     activeVerb="Running"
     doneText="Simulation complete"
-    image={{ src: '/images/cam.png', width: 1340, height: 838, alt: 'Chudware manufacturing workspace showing a CAM job, stock, tools, operations, and toolpath simulation' }}
-    caption="Live render · toolpaths generated on the fly and swept through a dexel stock model, the way the product's simulation checks a job before it posts."
+    image={{ src: '/images/cam.png', width: 1600, height: 900, alt: 'Chudware manufacturing workspace showing a CAM job, stock, tools, operations, and toolpath simulation' }}
+    caption="Illustrated stock-removal sequence · explains operation order; this page does not run a toolpath simulation."
   >
-    <p class="eyebrow">Stock simulation</p>
-    <h2>See what the job leaves behind before the post runs.</h2>
-    <p class="lede">Simulation sweeps every cutting move through a dexel model of the stock and reports what was removed, what remains, and where a tool, holder, or rapid met material it should not have. Scrub the playback to any point in the cycle and the remaining stock is rebuilt for that moment.</p>
-    <p class="supporting-copy">Here the same idea runs in your browser: facing, a two-stepdown pocket, three contour stepdowns, and four through holes, with the programmed path and the cutter's trail drawn on the surface.</p>
+    <p class="eyebrow">Stock-removal illustration</p>
+    <h2>Review what the job leaves behind before posting code.</h2>
+    <p class="lede">In the product, simulation sweeps cutting moves through a stock model, shows the programmed path, and supports playback review before posting. The animation above illustrates a facing pass, pocketing, contour passes, and drilling; it is not engine output from this website.</p>
   </Showcase>
 
   <section class="section" aria-labelledby="setup-title">

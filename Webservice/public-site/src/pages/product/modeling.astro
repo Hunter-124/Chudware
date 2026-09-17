@@ -28,7 +28,7 @@ import { HERO_STAGES } from '../../scripts/hero-timeline';
         <div class="actions"><a class="button button-secondary" href="/docs/first-part/">Read the first-part guide</a></div>
       </header>
       <figure class="product-figure">
-        <img src="/images/modeling.png" width="1340" height="838" loading="lazy" alt="Chudware parametric modeling workspace: a solid part in the 3D view with its ordered construction history in the Feature Manager" />
+        <img src="/images/modeling.png" width="1600" height="900" loading="lazy" alt="Chudware parametric modeling workspace: a solid part in the 3D view with its ordered construction history in the Feature Manager" />
         <figcaption><span>Chudware modeling workspace</span><span>Ordered features &middot; exact solids</span></figcaption>
       </figure>
     </div>
@@ -42,12 +42,12 @@ import { HERO_STAGES } from '../../scripts/hero-timeline';
     kernel="Exact solids"
     activeVerb="Rebuilding"
     doneText="Rebuild complete"
-    image={{ src: '/images/modeling.png', width: 1340, height: 838, alt: 'The Chudware modeling workspace showing a shelled parametric enclosure beside its feature tree' }}
-    caption="Live render · the same ordered feature history the product replays, solved here as exact geometry rather than a stored picture of it."
+    image={{ src: '/images/modeling.png', width: 1600, height: 900, alt: 'The Chudware modeling workspace showing a shelled parametric enclosure beside its feature tree' }}
+    caption="Illustrated rebuild sequence · shows feature-order behavior; the animation is not engine output."
   >
-    <p class="eyebrow">Rebuild, replayed</p>
-    <h2>Every feature re-executes in order, every time.</h2>
-    <p class="lede">Edit a sketch dimension and the extrude, the boss, the fillet, the holes and the pockets after it are recomputed from that change, in that order. The FeatureManager is not a list of what happened; it is the program that produces the part.</p>
+    <p class="eyebrow">Feature-order illustration</p>
+    <h2>A rebuild follows the feature tree from top to bottom.</h2>
+    <p class="lede">In the product, editing a sketch dimension recomputes the downstream extrude, boss, fillet, holes, and pockets in order. The animation above illustrates that dependency chain; it does not execute the geometry engine on this page.</p>
   </Showcase>
 
   <section class="section" aria-labelledby="sketch-title">
@@ -183,10 +183,10 @@ import { HERO_STAGES } from '../../scripts/hero-timeline';
           <p class="eyebrow" id="spec-title">Specifics</p>
           <h2>What the modeling workspace gives you.</h2>
         </header>
-        <p class="product-body">Chudware models on exact solid geometry, so a fillet is a real surface and a hole is a real cylinder &mdash; not a facet count that has to be turned up before the part measures correctly. A 2D constraint solver drives the sketches, and the feature tree keeps the construction order editable. The browser workspace and the native Windows and Linux builds present the same modeling surface.</p>
+        <p class="product-body">Chudware models on exact solid geometry: fillets, holes, and reference faces remain analytic geometry rather than display triangles. A 2D constraint solver drives sketches, and the feature tree keeps construction order editable. The browser workspace and native Windows, Linux, and macOS builds present the same modeling surface.</p>
         <p class="product-body">View control stays out of the way: <code>F</code> fits the model, <code>0</code> returns to isometric, and the numbered keys jump to standard views while a command is running.</p>
       </div>
-      <div class="product-spec-wrap">
+      <div class="product-spec-wrap" id="formats">
         <table class="product-spec">
           <caption>Modeling reference</caption>
           <tbody>
@@ -204,8 +204,6 @@ import { HERO_STAGES } from '../../scripts/hero-timeline';
             <tr><th scope="row">Weldments</th><td>Structural members swept along a path sketch, gussets, end caps</td></tr>
             <tr><th scope="row">Drawings</th><td>Multi-view sheets with dimensions, ASME Y14.5 geometric tolerancing, title block, and BOM; DXF and PDF output</td></tr>
             <tr><th scope="row">Units</th><td>Millimeter or inch per document; geometry is stored in millimeters either way, so switching units never rescales a part</td></tr>
-            <tr><th scope="row">Modeling tolerance</th><td>0.0000001 mm coincidence tolerance; boolean operations run at a 0.0001 mm fuzzy tolerance</td></tr>
-            <tr><th scope="row">Mesh export quality</th><td>0.05 mm chord deviation and 0.35 rad normal deviation by default, adjustable per export</td></tr>
             <tr><th scope="row">History</th><td>Ordered Feature Manager tree, editable after the fact</td></tr>
             <tr><th scope="row">Native format</th><td><code>.step+</code> &mdash; tree, dimensions, materials, studies, drawings</td></tr>
             <tr><th scope="row">Import</th><td>STEP, IGES, and BREP solids; STL, OBJ, PLY, and glTF meshes; DXF for 2D profiles</td></tr>

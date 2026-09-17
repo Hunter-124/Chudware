@@ -1,3 +1,6 @@
+/* Keep responsive rules above components even when this bundle loads first. */
+@layer reset, tokens, base, components, pages, responsive, motion;
+
 @layer pages {
   .product-hero-meta { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s5); list-style: none; color: var(--faint); font: var(--step--1)/1.5 var(--mono); }
   .product-hero-meta li { position: relative; padding-left: var(--s4); }

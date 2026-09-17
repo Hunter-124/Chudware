@@ -12,8 +12,6 @@ const REPO_ROOT = path.resolve(SITE_ROOT, '../..');
 const PRODUCT_BINARY_PATH = path.join(REPO_ROOT, 'host', 'build-linux', 'bin', 'chudware');
 const PRODUCT_VERSION_PATH = path.join(REPO_ROOT, 'host', 'build-linux', 'generated', 'api', 'chudware_version.h');
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-const REQUIRED_WIDTH = 1340;
-const REQUIRED_HEIGHT = 838;
 const TOP_LEVEL_KEYS = ['images', 'schemaVersion'];
 const IMAGE_KEYS = [
   'captureCommand',
@@ -131,11 +129,11 @@ function parseRawCapturePng(bytes, filename, errors) {
 // A published capture is either written straight to its marketed path by the scenario, or —
 // when the scenario mirrors a DIFFERENT step to --ui-screenshot than the one we publish — copied
 // byte-for-byte out of that scenario's own scratch output. Both forms name the scenario, the
-// current built binary, every extra CHUDWARE_* knob the frame depended on, and the exact
+// current built binary, every environment knob the frame depended on, and the exact
 // published path, so the command in the manifest is the command that reproduces the file.
 const REPO_RELATIVE_IMAGE_DIR = 'Webservice/public-site/public/images';
 const CAPTURE_RUN_PATTERN =
-  /^((?:CHUDWARE_[A-Z0-9_]+=[^\s'"]+ )+)\.\/host\/build-linux\/bin\/chudware --ui-screenshot ([^\s'"]+)$/;
+  /^((?:(?:CHUDWARE_[A-Z0-9_]+|XDG_DATA_HOME)=[^\s'"]+ )+)\.\/host\/build-linux\/bin\/chudware --ui-screenshot ([^\s'"]+)$/;
 const CAPTURE_COPY_PATTERN = /^cp (scratch\/[A-Za-z0-9._/-]+\.png) ([^\s'"]+)$/;
 
 function parseCaptureCommand(command) {
@@ -172,12 +170,9 @@ function validSourceRevision(value) {
 }
 
 function validProductRevision(value, sourceRevision) {
-  return (
-    typeof value === 'string' &&
-    /^\d+\.\d+\.\d+\+[0-9a-f]{8}(?:\.dirty)?$/.test(value) &&
-    validSourceRevision(sourceRevision) &&
-    value.includes(sourceRevision.slice(0, 8))
-  );
+  if (typeof value !== 'string' || !validSourceRevision(sourceRevision)) return false;
+  const match = /^\d+\.\d+\.\d+\+([0-9a-f]{8,12})(?:\.dirty)?$/.exec(value);
+  return Boolean(match && sourceRevision.startsWith(match[1]));
 }
 
 async function readBuiltProductRevision() {
@@ -196,7 +191,7 @@ async function readBuiltProductRevision() {
   }
 
   const version = header.match(/^#define\s+CHUDWARE_VERSION\s+"([^"]+)"/m)?.[1];
-  const sourcePrefix = header.match(/^#define\s+CHUDWARE_GIT_SHA\s+"([0-9a-f]{8})"/m)?.[1];
+  const sourcePrefix = header.match(/^#define\s+CHUDWARE_GIT_SHA\s+"([0-9a-f]{8,12})"/m)?.[1];
   const dirty = header.match(/^#define\s+CHUDWARE_BUILD_DIRTY\s+([01])/m)?.[1];
   if (!version || !sourcePrefix || dirty === undefined) {
     throw new Error('current built Chudware binary has incomplete revision metadata');
@@ -253,8 +248,13 @@ async function main() {
       manifestHashes.set(entry.sha256, entry.filename);
     }
 
-    if (entry.width !== REQUIRED_WIDTH || entry.height !== REQUIRED_HEIGHT) {
-      errors.push(`${entry.filename} must declare ${REQUIRED_WIDTH}x${REQUIRED_HEIGHT}`);
+    if (
+      !Number.isInteger(entry.width) ||
+      entry.width <= 0 ||
+      !Number.isInteger(entry.height) ||
+      entry.height <= 0
+    ) {
+      errors.push(`${entry.filename} must declare positive integer width and height`);
     }
     if (typeof entry.chudwareShot !== 'string' || !/^[a-z0-9][a-z0-9_-]*$/.test(entry.chudwareShot)) {
       errors.push(`${entry.filename} has an invalid CHUDWARE_SHOT scenario`);
@@ -275,7 +275,7 @@ async function main() {
     const capture = parseCaptureCommand(entry.captureCommand);
     if (!capture) {
       errors.push(
-        `${entry.filename} captureCommand must be CHUDWARE_SHOT=… [CHUDWARE_*=… …] ` +
+        `${entry.filename} captureCommand must be CHUDWARE_SHOT=… [CHUDWARE_*=… …] [XDG_DATA_HOME=…] ` +
           './host/build-linux/bin/chudware --ui-screenshot <path>, optionally followed by ' +
           '"&& cp scratch/<step>.png <published image>"',
       );
@@ -353,8 +353,11 @@ async function main() {
 
     const bytes = await readFile(path.join(IMAGE_DIR, entry.filename));
     const dimensions = parseRawCapturePng(bytes, entry.filename, errors);
-    if (dimensions && (dimensions.width !== REQUIRED_WIDTH || dimensions.height !== REQUIRED_HEIGHT)) {
-      errors.push(`${entry.filename} is ${dimensions.width}x${dimensions.height}; expected ${REQUIRED_WIDTH}x${REQUIRED_HEIGHT}`);
+    if (dimensions && (dimensions.width !== entry.width || dimensions.height !== entry.height)) {
+      errors.push(
+        `${entry.filename} is ${dimensions.width}x${dimensions.height}; ` +
+          `manifest declares ${entry.width}x${entry.height}`,
+      );
     }
     const digest = createHash('sha256').update(bytes).digest('hex');
     if (digest !== entry.sha256) {

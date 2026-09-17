@@ -1,29 +1,23 @@
 ---
 title: Install on Linux
-description: Install Chudware on Linux with one command, a .deb or .rpm package, an AppImage, or a plain archive.
+description: Install the published x86-64 Chudware build on Linux from your authenticated download page.
 section: Installation
 order: 20
 ---
-## One-line install
+## Get the current build
 
-The quickest route detects your package manager, installs the signed package, and registers the desktop entry:
+Sign in at [app.chudware.com](https://app.chudware.com/#downloads) and open the download page. It shows the published Linux x86-64 package, version, size, and SHA-256 digest for your account.
+
+The current stable catalog publishes an **AppImage**. Download it, mark it executable, and run it:
 
 ```sh
-curl -fsSL https://app.chudware.com/install.sh | sh -s -- --token <token>
+chmod +x Chudware-*.AppImage
+./Chudware-*.AppImage
 ```
 
-The token is personal and expires after 15 minutes. Sign in at [app.chudware.com](https://app.chudware.com/#downloads), open the download page, and it issues one alongside this same command, ready to paste.
+## Account-generated terminal command
 
-## Packages and archives
-
-Every format is issued from the same download page:
-
-- **`.deb`** — Debian and Ubuntu; installs with `apt` and removes cleanly.
-- **`.rpm`** — Fedora, RHEL, and openSUSE; installs with `dnf` or `zypper`.
-- **AppImage** — one portable file with nothing to install; make it executable and run it.
-- **`.tar.zst`** — plain archive for any distribution; unpack and run from anywhere.
-
-The `.deb` and `.rpm` packages install to `/opt/chudware`, put a `chudware` command on your `PATH`, and register the desktop entry and icons.
+The same page can generate a complete install command containing a personal, account-bound download token. The token expires after 15 minutes. Copy the ready-to-run command from the authenticated page rather than constructing one or sharing its token.
 
 The build is 64-bit and needs a graphics driver capable of a modern hardware-accelerated 3D context; without one the application does not start.
 

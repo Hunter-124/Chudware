@@ -4648,3 +4648,30 @@ test after rehashing; browser smoke with isolated account/API fixtures exercised
 Billing → AI setup, the visible API-key form, hidden grant card, and absence of
 purchase controls. Production rollout requires a gateway restart and leaving the
 new checkout switch unset or off; no provider credentials or runtime changed.
+
+## 2026-09-17 — product-first public site and gallery
+
+`Webservice/public-site` now leads with the engineering workspace rather than
+the oversized animated brand mark; the unused hero component and renderer were
+removed. Homepage, navigation, gallery, product pages, pricing, FAQ, download
+guidance, AI documentation, security claims, and legal copy were reviewed.
+Three new 1600×900 native captures retain the full Copilot panel and intrinsic
+aspect ratio. Modeling shows a genuine public demo response beside a disclosed
+scenario reproduction; CAM and FEA requests are labeled scripted examples, not
+invented transcripts. Capture hashes, build identity, and commands are recorded
+in `public/images/provenance.json`; the verifier now checks declared dimensions
+against PNG dimensions instead of forcing the obsolete capture size.
+
+The built-site browser sweep exposed an Astro CSS-order bug that dev mode had
+hidden: page bundles could register `responsive` before `components`, allowing
+desktop navigation to override the mobile menu. Every CSS entrypoint now
+declares the same layer order. The corrected production build passed browser
+checks on all 37 routed pages at 1440px and 390px: no horizontal document
+overflow, missing images, duplicate/missing primary headings, hidden mobile
+menus, or JavaScript errors. A static audit resolved 1,804 internal links,
+assets, and anchors across all 38 HTML outputs. Gallery full-size navigation,
+mobile menu interaction, documentation search, image aspect ratios, and the
+real account-generated Linux command were exercised. No private session
+history, provider credential, or scratch capture profile was published.
+Portal commit `1745f2afa` was deployed separately; the live authenticated credit
+checkout probe returned 503, with no purchase attempt, and gateway health passed.

@@ -3,51 +3,39 @@
   "images": [
     {
       "filename": "cam.png",
-      "sha256": "777622883236af58b004677541f427ffe1b0e82551f20550052dfd977b32793f",
-      "width": 1340,
-      "height": 838,
+      "sha256": "49f47494714b09ad5440b894aed492dcb1056ddcc1531617deea8d2f5ea2bf02",
+      "width": 1600,
+      "height": 900,
       "chudwareShot": "cam",
-      "scenarioStep": "adopted CAM job \"Part1 CAM (rev 3)\" with the toolpath simulation paused mid-cycle at 0:47 of 1:35; the copilot rail is collapsed by CHUDWARE_COPILOT_COLLAPSED=1, the product's existing collapse-state knob",
+      "scenarioStep": "isolated 1600x900 CAM scenario: an 80x60x15 mm plate with four 5 mm through-holes is programmed for a Fanuc post, with face, contour2d, and drill operations plus T1/T2 toolpaths; the native-viewport simulation is paused at 50% (0:47 of 1:35) and remains visibly UNVERIFIED. The empty isolated session store leaves the full Copilot composer visible without implying a saved conversation",
       "rawCapture": true,
-      "captureCommand": "CHUDWARE_SHOT=cam CHUDWARE_COPILOT_COLLAPSED=1 ./host/build-linux/bin/chudware --ui-screenshot Webservice/public-site/public/images/cam.png",
-      "productRevision": "0.1.0+0d08f436.dirty",
-      "sourceRevision": "0d08f436cb4432ce185e53c3b602d5dac79dc76d"
+      "captureCommand": "CHUDWARE_SHOT=cam CHUDWARE_WIN_SIZE=1600x900 CHUDWARE_ENGINE_DAEMON=0 CHUDWARE_SESSIONS_DIR=$PWD/scratch/gallery_empty_sessions XDG_DATA_HOME=$PWD/scratch/gallery_capture_data ./host/build-linux/bin/chudware --ui-screenshot Webservice/public-site/public/images/cam.png",
+      "productRevision": "0.0.0+9ab0d3a56.dirty",
+      "sourceRevision": "9ab0d3a562415904eb8c5fb1edb1fa6cdc93e1ee"
     },
     {
       "filename": "fea.png",
-      "sha256": "72d74cb40d9cc910e6c2e7e898c0dc4d7b44b99397100c7190f3b2b029c7f887",
-      "width": 1340,
-      "height": 838,
+      "sha256": "40d7a4a161558c8b139c44644c18bab452487cb930daa793acde4bb40bb503ab",
+      "width": 1600,
+      "height": 900,
       "chudwareShot": "fea",
-      "scenarioStep": "completed \"Static 1 - Results\" frame with the von Mises plot; the copilot rail is collapsed by CHUDWARE_COPILOT_COLLAPSED=1, which restores the product's persisted collapse state that the scenario's own startup would otherwise reset",
+      "scenarioStep": "isolated 1600x900 completed Static 1 result: a 60x40x10 mm steel block fixed on the -X face and loaded with 100 N in -Z on the +X face, captured only after the real result enabled the von Mises colormap and legend. The result panel reports stress, displacement, factor of safety, nodes, elements, and equations; the empty isolated session store leaves the full Copilot composer visible without implying a saved conversation",
       "rawCapture": true,
-      "captureCommand": "CHUDWARE_SHOT=fea CHUDWARE_COPILOT_COLLAPSED=1 ./host/build-linux/bin/chudware --ui-screenshot Webservice/public-site/public/images/fea.png",
-      "productRevision": "0.1.0+0d08f436.dirty",
-      "sourceRevision": "0d08f436cb4432ce185e53c3b602d5dac79dc76d"
+      "captureCommand": "CHUDWARE_SHOT=fea CHUDWARE_WIN_SIZE=1600x900 CHUDWARE_ENGINE_DAEMON=0 CHUDWARE_SESSIONS_DIR=$PWD/scratch/gallery_empty_sessions XDG_DATA_HOME=$PWD/scratch/gallery_capture_data ./host/build-linux/bin/chudware --ui-screenshot Webservice/public-site/public/images/fea.png",
+      "productRevision": "0.0.0+9ab0d3a56.dirty",
+      "sourceRevision": "9ab0d3a562415904eb8c5fb1edb1fa6cdc93e1ee"
     },
     {
       "filename": "modeling.png",
-      "sha256": "980f140ac0f6cb844586f4d7f70bbbb5613b3c77994910dac1b25cd7dce95acd",
-      "width": 1340,
-      "height": 838,
+      "sha256": "4cdca0c8fcb6f80adb623e4f96f3f3c7d529bcd83e53c0fc4fde1b7aa0cb2b6d",
+      "width": 1600,
+      "height": 900,
       "chudwareShot": "m1",
-      "scenarioStep": "scratch/m1_shots/m1_04_shell.png - step 4 of the six-step m1 run (Box1 + Fillet1 + Shell1). The scenario mirrors only its final step, m1_06_reopen.png, to --ui-screenshot, so this file is a byte-for-byte copy of the step-4 capture rather than the mirrored frame; the copilot rail is collapsed by CHUDWARE_COPILOT_COLLAPSED=1, the product's existing collapse-state knob",
+      "scenarioStep": "scratch/m1_shots/m1_04_shell.png, step 4 of the six-step m1 scenario (60x40x10 mm Box1, two R4 mm vertical-edge fillets, and a 2 mm Shell1 with the top removed). The expanded Copilot rail auto-adopts only a fresh public-safe OpenAI demo session that independently created the same requested tray and shows its genuine assistant response; the viewport is the deterministic scenario reproduction, not a composited chat image",
       "rawCapture": true,
-      "captureCommand": "CHUDWARE_SHOT=m1 CHUDWARE_COPILOT_COLLAPSED=1 ./host/build-linux/bin/chudware --ui-screenshot scratch/m1_shots/m1_06_reopen.png && cp scratch/m1_shots/m1_04_shell.png Webservice/public-site/public/images/modeling.png",
-      "productRevision": "0.1.0+0d08f436.dirty",
-      "sourceRevision": "0d08f436cb4432ce185e53c3b602d5dac79dc76d"
-    },
-    {
-      "filename": "onboarding.png",
-      "sha256": "d93a0715b7a1881c9e57ae6d6bde19c6ed240e908e95e62464542e9388d6b956",
-      "width": 1340,
-      "height": 838,
-      "chudwareShot": "onboarding",
-      "scenarioStep": "step 4 of 4, the \"Pick a starting workspace\" wizard page, which the scenario writes to scratch/onboarding_shots/onboarding_04_workspace.png and mirrors to --ui-screenshot; the copilot rail behind the modal is collapsed by CHUDWARE_COPILOT_COLLAPSED=1, the product's existing collapse-state knob",
-      "rawCapture": true,
-      "captureCommand": "CHUDWARE_SHOT=onboarding CHUDWARE_COPILOT_COLLAPSED=1 ./host/build-linux/bin/chudware --ui-screenshot Webservice/public-site/public/images/onboarding.png",
-      "productRevision": "0.1.0+0d08f436.dirty",
-      "sourceRevision": "0d08f436cb4432ce185e53c3b602d5dac79dc76d"
+      "captureCommand": "CHUDWARE_SHOT=m1 CHUDWARE_WIN_SIZE=1600x900 CHUDWARE_ENGINE_DAEMON=0 CHUDWARE_SESSIONS_DIR=$PWD/scratch/gallery_capture_sessions XDG_DATA_HOME=$PWD/scratch/gallery_capture_data ./host/build-linux/bin/chudware --ui-screenshot scratch/m1_shots/m1_06_reopen.png && cp scratch/m1_shots/m1_04_shell.png Webservice/public-site/public/images/modeling.png",
+      "productRevision": "0.0.0+9ab0d3a56.dirty",
+      "sourceRevision": "9ab0d3a562415904eb8c5fb1edb1fa6cdc93e1ee"
     }
   ]
 }

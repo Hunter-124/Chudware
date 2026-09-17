@@ -1,7 +1,6 @@
-/* Company + trust pages: /security/, /about/, /faq/, /contact/.
-   Every class is co-* prefixed so nothing here can collide with global.css
-   or with another page slice. Ordering is preserved by joining the cascade
-   layers global.css already declares. */
+/* Declare the shared layer order in every CSS entrypoint: Astro may emit this
+   stylesheet before global.css in a production build. */
+@layer reset, tokens, base, components, pages, responsive, motion;
 
 @layer pages {
   /* ---- shared -------------------------------------------------------- */

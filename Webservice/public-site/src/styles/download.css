@@ -1,6 +1,5 @@
-/* /download/ only. Every class is dl-* prefixed so nothing here can collide
-   with global.css or another page slice. Joins the cascade layers global.css
-   declares, exactly like company.css does. */
+/* Keep the shared cascade order independent of Astro's stylesheet ordering. */
+@layer reset, tokens, base, components, pages, responsive, motion;
 
 @layer pages {
   .dl-primary { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: var(--s6); align-items: center; padding: var(--s6); }
@@ -33,12 +32,7 @@
   .dl-card .text-link { margin-top: auto; font-size: var(--step--1); }
   .dl-sysnote { margin-top: var(--s5); font-size: var(--step--1); }
 
-  /* min-width: 0 at every level, or the nowrap command widens the whole
-     .split column and paints under the formats list beside it. */
-  .dl-command-row { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: stretch; min-width: 0; max-width: var(--measure); }
-  .dl-command { flex: 1 1 24rem; min-width: 0; overflow-x: auto; padding: var(--s4); border: var(--border) solid var(--line-hi); border-radius: var(--radius-sm); background: var(--bg-deep); white-space: nowrap; }
   .dl-token-note { margin-top: var(--s4); font-size: var(--step--1); }
-  .dl-copy-status { min-height: 1.5em; margin-top: var(--s2); color: var(--faint); font: var(--step--1)/1.5 var(--mono); }
 
   .dl-formats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--s7); align-content: start; margin-top: var(--s6); border-top: var(--border) solid var(--line); }
   .dl-formats > div { display: grid; grid-template-columns: minmax(8rem, .4fr) minmax(0, 1fr); gap: var(--s4); padding-block: var(--s4); border-bottom: var(--border) solid var(--line); }

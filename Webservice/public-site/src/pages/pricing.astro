@@ -2,12 +2,12 @@
 import BaseLayout from '../layouts/BaseLayout.astro';
 import Icon from '../components/Icon.astro';
 ---
-<BaseLayout title="Pricing" description="Chudware pricing: 14-day free trial, Desktop $30/month, Studio $150/month with the browser workspace, 50% off with a .edu address, and AI credit packs from $10.">
+<BaseLayout title="Pricing" description="Chudware subscription plans: a 14-day trial, native Desktop, Studio with hosted browser access, education pricing, and organization deployment.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Pricing</p>
-      <h1>Two plans, one price each, no seats to count.</h1>
-      <p class="lede">Every plan is billed monthly per account, cancels at the end of the period from your own account page, and includes the same modeling, assembly, CAM, PLM, simulation, and reverse-engineering workspaces. Verified <strong>.edu</strong> addresses pay half.</p>
+      <h1>Choose native desktop or desktop plus browser access.</h1>
+      <p class="lede">Subscriptions are monthly per account. Both paid plans include the same engineering workspaces; Studio adds the hosted browser workspace and a larger storage quota. Eligible verified <strong>.edu</strong> accounts see the education rate at checkout.</p>
     </div>
   </header>
 
@@ -15,40 +15,36 @@ import Icon from '../components/Icon.astro';
     <div class="wrap access-grid">
       <article class="access-option">
         <p class="eyebrow">Trial</p>
-        <h2>Free for 14 days.</h2>
-        <p class="price"><span class="price-amount">$0</span> <span class="price-period">for 14 days from email verification</span></p>
-        <p>The full product in the browser and on the desktop, so you evaluate the real thing rather than a demo build.</p>
-        <ul class="fact-list"><li>Browser workspace and native desktop app</li><li>5 GB of account storage</li><li>Opens STEP, IGES, and BREP; exports STEP, IGES, BREP, STL, OBJ, PLY, and glTF</li><li>No card required</li></ul>
+        <h2>Evaluate the complete product for 14 days.</h2>
+        <p class="price"><span class="price-amount">$0</span> <span class="price-period">for 14 days after email verification</span></p>
+        <ul class="fact-list"><li>Browser workspace and native desktop app</li><li>5 GB of account storage</li><li>Modeling, assemblies, CAM, PLM, simulation, reverse engineering, and copilot</li><li>No payment card required</li></ul>
         <a class="button button-secondary" href="https://app.chudware.com/signup">Start a trial</a>
       </article>
       <article class="access-option access-primary">
         <p class="eyebrow">Desktop</p>
-        <h2>The native app on your workstation.</h2>
-        <p class="price"><span class="price-amount">$30</span> <span class="price-period">per month · $15 with a .edu address</span></p>
-        <p>Signed Windows, Linux, and macOS builds downloaded from your account and updated from the same signed release manifests.</p>
-        <ul class="fact-list"><li>Native desktop app with a per-account licence and a device entitlement you revoke yourself</li><li>5 GB of account storage</li><li>AI copilot inside the product, metered by credits</li><li>Cancel at period end from your account page</li></ul>
+        <h2>Run Chudware on your workstation.</h2>
+        <p class="price"><span class="price-amount">Monthly</span> <span class="price-period">current rate confirmed at checkout</span></p>
+        <ul class="fact-list"><li>Native Windows, Linux, and macOS application</li><li>Per-account licence with self-service device revocation</li><li>5 GB of account storage</li><li>Eligible verified .edu accounts see the education rate at checkout</li><li>Cancel at the end of the current billing period</li></ul>
         <a class="button" href="https://app.chudware.com/signup">Choose Desktop</a>
       </article>
       <article class="access-option access-primary">
         <p class="eyebrow">Studio</p>
-        <h2>Desktop plus the browser workspace.</h2>
-        <p class="price"><span class="price-amount">$150</span> <span class="price-period">per month · $75 with a .edu address</span></p>
-        <p>Everything in Desktop, plus the full application running in a tab on any machine with nothing to install, backed by twenty times the storage.</p>
-        <ul class="fact-list"><li>Browser workspace on any machine</li><li>Native desktop app on every platform</li><li>100 GB of account storage</li><li>AI copilot inside the product, metered by credits</li></ul>
+        <h2>Add the hosted browser workspace.</h2>
+        <p class="price"><span class="price-amount">Monthly</span> <span class="price-period">current rate confirmed at checkout</span></p>
+        <ul class="fact-list"><li>Everything in Desktop</li><li>Hosted browser workspace with no local installation</li><li>100 GB of account storage</li><li>Eligible verified .edu accounts see the education rate at checkout</li><li>Access from any supported desktop browser</li></ul>
         <a class="button" href="https://app.chudware.com/signup">Choose Studio</a>
       </article>
       <article class="access-option">
-        <p class="eyebrow">AI credits</p>
-        <h2>Pay for the copilot as you use it.</h2>
-        <p class="price"><span class="price-amount">$10</span> <span class="price-period">for 8,000 credits</span></p>
-        <p>Credits are bought in packs from your account page, never expire, and are spent only when the copilot does work for you. Larger packs cost less per credit.</p>
-        <ul class="fact-list"><li>Starter — $10 for 8,000 credits</li><li>Standard — $25 for 20,000 credits</li><li>Bulk — $100 for 80,000 credits</li><li>Available on every paid plan and during the trial</li></ul>
-        <a class="button button-secondary" href="https://app.chudware.com/">Buy credits in your account</a>
+        <p class="eyebrow">AI provider</p>
+        <h2>Use your own provider account or API key.</h2>
+        <p>The copilot uses a provider connection you configure. Provider subscriptions, usage limits, and API charges remain between you and that provider.</p>
+        <ul class="fact-list"><li>Connect a supported provider account or enter an API key in Provider settings</li><li>Never paste provider credentials into chat or a project note</li><li>Chudware does not currently sell AI token packs or managed model capacity</li></ul>
+        <a class="button button-secondary" href="/docs/ai-copilot/">Configure the copilot</a>
       </article>
       <article class="access-option access-contact">
         <p class="eyebrow">Enterprise</p>
-        <h2>Many seats, one invoice.</h2>
-        <p>Organizations get 1 TB of storage, invoicing instead of card billing, and a direct line for deployment and support requirements. Priced per organization.</p>
+        <h2>Organization deployment and billing.</h2>
+        <p>Enterprise accounts include the desktop and browser workspaces, a 1 TB storage quota, and organization billing. Contact Chudware for deployment and access requirements.</p>
         <a class="text-link" href="mailto:sales@chudware.com">Contact sales <Icon name="arrow-right" /></a>
       </article>
     </div>
@@ -57,23 +53,23 @@ import Icon from '../components/Icon.astro';
   <section class="section pricing-principles">
     <div class="wrap split">
       <header class="section-heading">
-        <p class="eyebrow">How billing works</p>
-        <h2>Stripe handles the card. Your account page handles everything else.</h2>
-        <p class="lede">Payment is processed by Stripe; Chudware never sees or stores card numbers. Changing plan, updating a card, downloading invoices, and cancelling all happen from the billing section of your account, and cancellation takes effect at the end of the period you already paid for.</p>
+        <p class="eyebrow">Billing</p>
+        <h2>Subscriptions are managed from your account.</h2>
+        <p class="lede">Stripe processes card payments. Use the billing section of your account to change plan, update a payment method, download invoices, or cancel. Cancellation takes effect at the end of the period already paid for.</p>
       </header>
       <div class="pricing-note">
-        <p class="eyebrow">The fine print, briefly</p>
-        <p>All prices are in US dollars, exclusive of any tax Stripe is required to collect for your location.</p>
-        <p>The .edu rate is applied automatically to accounts whose verified email address ends in <code>.edu</code>; it is not a code you enter, and it cannot be selected for any other address.</p>
-        <p>Licensing is per account: the desktop licence is not transferable, activation stores a device entitlement you can revoke from your own account, and sharing one account instead of buying access is not permitted. The <a class="text-link" href="/legal/eula/">EULA</a> states it in full.</p>
+        <p class="eyebrow">Terms at a glance</p>
+        <p>Prices are in US dollars and exclude taxes Stripe must collect for your location.</p>
+        <p>Eligible verified <code>.edu</code> accounts see the education rate in authenticated checkout.</p>
+        <p>Licensing is per account. Desktop device entitlements can be revoked from that account and are not transferable. See the <a class="text-link" href="/legal/eula/">EULA</a>.</p>
       </div>
     </div>
   </section>
 
   <section class="section cta-band">
     <div class="wrap section-heading">
-      <p class="eyebrow">Choose a route</p>
-      <h2>Start the free trial or inspect the native build.</h2>
+      <p class="eyebrow">Get started</p>
+      <h2>Use the trial before choosing a plan.</h2>
       <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/download/">Download the desktop app</a></div>
     </div>
   </section>

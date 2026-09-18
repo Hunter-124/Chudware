@@ -42,6 +42,7 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
           {nav.map((item) => <a class="tap" href={item.href} aria-current={active(item.href) ? 'page' : undefined}>{item.label}</a>)}
         </nav>
         <div class="header-actions">
+          <a class="sign-in tap" href="https://www.linkedin.com/in/hunter-edmonds/" rel="me">LinkedIn</a>
           <a class="sign-in tap" href="https://app.chudware.com/signin">Sign in</a>
           <a class="button button-small" href="https://app.chudware.com/signup">Create an account</a>
         </div>
@@ -49,6 +50,7 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
           <summary class="tap"><Icon name="menu" /><span>Menu</span></summary>
           <nav aria-label="Mobile primary">
             {nav.map((item) => <a class="tap" href={item.href} aria-current={active(item.href) ? 'page' : undefined}>{item.label}</a>)}
+            <a class="tap" href="https://www.linkedin.com/in/hunter-edmonds/" rel="me">LinkedIn</a>
             <a class="tap" href="https://app.chudware.com/signin">Sign in</a>
             <a class="tap mobile-download" href="https://app.chudware.com/signup">Create an account</a>
           </nav>

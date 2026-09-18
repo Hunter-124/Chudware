@@ -4,15 +4,15 @@ import '../../styles/product.css';
 import Showcase from '../../components/Showcase.astro';
 import { HERO_STAGES } from '../../scripts/hero-timeline';
 ---
-<BaseLayout title="Parametric modeling" description="Constraint sketching, driving dimensions, ordered features, and the Feature Manager, working on exact solid geometry rather than a mesh approximation.">
+<BaseLayout title="Parametric modeling" description="Constraint sketching, driving dimensions, ordered features, drawings, and the Feature Manager — on exact solid geometry, not a mesh.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Product / Model</p>
-      <h1>Sketches that explain how the part may move.</h1>
-      <p class="lede">Chudware modeling is feature-based and history-driven. A constrained 2D sketch defines intent, a feature turns it into solid geometry, and the Feature Manager keeps that sequence editable for as long as the design lives.</p>
+      <h1>Sketches that carry intent. Features that stay editable.</h1>
+      <p class="lede">Chudware modeling is feature-based and history-driven. A constrained 2D sketch defines the intent, a feature turns it into an exact solid, and the Feature Manager keeps that sequence editable for the life of the design.</p>
       <ul class="product-hero-meta">
         <li>Exact solids, not a mesh approximation</li>
-        <li>2D constraint solver with degrees-of-freedom reporting</li>
+        <li>2D constraint solver that reports remaining degrees of freedom</li>
         <li>Native <code>.step+</code> documents</li>
       </ul>
     </div>
@@ -22,8 +22,8 @@ import { HERO_STAGES } from '../../scripts/hero-timeline';
     <div class="wrap split">
       <header class="section-heading">
         <p class="eyebrow" id="workspace-title">The workspace</p>
-        <h2>Geometry on the left, construction history on the right.</h2>
-        <p class="lede">Features are not baked away when they are created. A box, a fillet, and a shell stay listed in order beside the model, and each one can be reopened, re-dimensioned, or reordered.</p>
+        <h2>The model and its history, side by side.</h2>
+        <p class="lede">Features are never baked away. A box, a fillet, and a shell stay listed in order next to the model, and any of them can be reopened, re-dimensioned, or reordered.</p>
         <p class="supporting-copy">Saving as <code>.step+</code> keeps the feature tree, dimensions, materials, studies, and drawings in one editable document. Neutral exports exist for handing a flattened result to another tool, not for storing your design.</p>
         <div class="actions"><a class="button button-secondary" href="/docs/first-part/">Read the first-part guide</a></div>
       </header>
@@ -181,9 +181,9 @@ import { HERO_STAGES } from '../../scripts/hero-timeline';
       <div>
         <header class="section-heading product-subhead">
           <p class="eyebrow" id="spec-title">Specifics</p>
-          <h2>What the modeling workspace gives you.</h2>
+          <h2>What's in the modeling workspace.</h2>
         </header>
-        <p class="product-body">Chudware models on exact solid geometry: fillets, holes, and reference faces remain analytic geometry rather than display triangles. A 2D constraint solver drives sketches, and the feature tree keeps construction order editable. The browser workspace and native Windows, Linux, and macOS builds present the same modeling surface.</p>
+        <p class="product-body">Chudware models on exact solid geometry: fillets, holes, and reference faces are analytic surfaces, not display triangles. A 2D constraint solver drives sketches, and the feature tree keeps construction order editable. The browser workspace and the desktop app share the same modeling tools.</p>
         <p class="product-body">View control stays out of the way: <code>F</code> fits the model, <code>0</code> returns to isometric, and the numbered keys jump to standard views while a command is running.</p>
       </div>
       <div class="product-spec-wrap" id="formats">
@@ -218,12 +218,12 @@ import { HERO_STAGES } from '../../scripts/hero-timeline';
     <div class="wrap section-heading">
       <p class="eyebrow">Next</p>
       <h2>Model it, then take it downstream.</h2>
-      <p class="lede">Open a workspace in the browser, or see how the same document carries into assemblies and manufacturing.</p>
+      <p class="lede">Open a workspace in the browser, or see how the same document carries into assemblies and CAM.</p>
       <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/product/assemblies/">Assemblies</a></div>
       <ul class="product-jump">
         <li><a href="/product/">All capabilities</a></li>
         <li><a href="/product/cam/">CAM</a></li>
-        <li><a href="/product/plm/">Product data</a></li>
+        <li><a href="/product/plm/">PLM</a></li>
         <li><a href="/product/copilot/">AI copilot</a></li>
         <li><a href="/gallery/">Gallery</a></li>
       </ul>

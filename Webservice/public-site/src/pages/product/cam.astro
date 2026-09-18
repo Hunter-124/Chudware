@@ -14,7 +14,7 @@ import { MACHINING_OPS } from '../../scripts/machining-timeline';
       <ul class="product-hero-meta">
         <li>Job created from the active part</li>
         <li>Simulation with tool, holder, stock, and rapid moves</li>
-        <li>Post output targeted at one machine and controller</li>
+        <li>G-code posted for one specific machine and controller</li>
       </ul>
     </div>
   </header>
@@ -49,7 +49,7 @@ import { MACHINING_OPS } from '../../scripts/machining-timeline';
   >
     <p class="eyebrow">Stock removal</p>
     <h2>Review what the job leaves behind before posting code.</h2>
-    <p class="lede">Simulation sweeps cutting moves through a stock model, shows the programmed path, and supports playback review before posting.</p>
+    <p class="lede">Simulation sweeps every cutting move through a stock model, draws the programmed path, and lets you scrub back and forth before you post.</p>
   </Showcase>
 
   <section class="section" aria-labelledby="setup-title">
@@ -102,7 +102,7 @@ import { MACHINING_OPS } from '../../scripts/machining-timeline';
         <figcaption>Section through a setup. Stock is dashed, the finished part is solid, and the cut depth is the difference between them.</figcaption>
       </figure>
       <ul class="product-tiles product-stack">
-        <li class="product-tile"><strong>Facing</strong><span>Establish a reference surface on raw stock.</span></li>
+        <li class="product-tile"><strong>Facing</strong><span>Establish a reference face on raw stock.</span></li>
         <li class="product-tile"><strong>Pocketing</strong><span>Clear enclosed material to depth.</span></li>
         <li class="product-tile"><strong>Contouring</strong><span>Finish profiles and outside walls.</span></li>
         <li class="product-tile"><strong>Drilling</strong><span>Hole patterns from the model's own features.</span></li>
@@ -159,7 +159,7 @@ import { MACHINING_OPS } from '../../scripts/machining-timeline';
           <p class="eyebrow" id="responsibility-title">Where the line is</p>
           <h2>Chudware prepares and inspects the work.</h2>
         </header>
-        <p class="product-body">Simulation, collision inspection, and remaining-stock review exist so problems surface before a spindle turns. They are preparation tools. They do not certify a program.</p>
+        <p class="product-body">Simulation, collision inspection, and remaining-stock review exist so problems appear before a spindle turns. They are preparation tools. They do not certify a program.</p>
         <p class="product-body">Dry-run and single-block procedures at the machine still apply, according to your shop's safety process.</p>
       </div>
       <div class="product-note product-note-warning">
@@ -175,8 +175,8 @@ import { MACHINING_OPS } from '../../scripts/machining-timeline';
     <div class="wrap section-heading">
       <p class="eyebrow">Next</p>
       <h2>Keep the program, the part, and the decision trail together.</h2>
-      <p class="lede">Manufacturing output is one of the artifacts a project revision carries.</p>
-      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/product/plm/">Product data and revisions</a></div>
+      <p class="lede">Posted G-code is one more artifact a project revision carries.</p>
+      <div class="actions"><a class="button" href="https://app.chudware.com/signup">Create an account</a><a class="button button-secondary" href="/product/plm/">PLM and revisions</a></div>
       <ul class="product-jump">
         <li><a href="/product/">All capabilities</a></li>
         <li><a href="/product/modeling/">Modeling</a></li>

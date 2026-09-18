@@ -5,7 +5,7 @@ import '../styles/download.css';
 
 const DOWNLOADS = 'https://app.chudware.com/#downloads';
 ---
-<BaseLayout title="Download Chudware" description="Open the live Chudware release catalog for signed Windows, Linux, and macOS x86-64 desktop builds, or use the hosted browser workspace.">
+<BaseLayout title="Download Chudware" description="Download the Chudware desktop app for Windows, Linux, and macOS, or open the browser workspace.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Native desktop</p>
@@ -26,7 +26,7 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
         <div class="dl-primary-body">
           <p class="eyebrow" id="dl-primary-eyebrow">Signed release</p>
           <h2 id="dl-primary-title">Chudware desktop</h2>
-          <p class="dl-note" id="dl-primary-note">Builds for Windows, Linux, and macOS, published from the download page in your workspace.</p>
+          <p class="dl-note" id="dl-primary-note">Sign in to your account to download the current build for Windows, Linux, or macOS.</p>
           <p class="release-meta" id="dl-primary-meta"></p>
         </div>
         <a class="button" id="dl-primary-action" href={DOWNLOADS}>Go to the download page</a>
@@ -43,7 +43,7 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
             <span class="dl-mark" aria-hidden="true"><span data-os="windows"><Icon name="windows" /></span></span>
             <h3>Windows</h3>
           </header>
-          <p>The live catalog below shows the Windows package currently published for x86-64 systems.</p>
+          <p>x86-64 package. Version, size, and checksum are shown on the account download page.</p>
           <ul class="dl-builds" data-dl-platform="windows"></ul>
           <a class="text-link" href={DOWNLOADS}>Download for Windows <Icon name="arrow-right" /></a>
         </article>
@@ -52,7 +52,7 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
             <span class="dl-mark" aria-hidden="true"><span data-os="linux"><Icon name="linux" /></span></span>
             <h3>Linux</h3>
           </header>
-          <p>The live catalog below shows the Linux package currently published for x86-64 systems.</p>
+          <p>x86-64 package. Version, size, and checksum are shown on the account download page.</p>
           <ul class="dl-builds" data-dl-platform="linux"></ul>
           <a class="text-link" href={DOWNLOADS}>Download for Linux <Icon name="arrow-right" /></a>
         </article>
@@ -61,12 +61,12 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
             <span class="dl-mark" aria-hidden="true"><span data-os="macos"><Icon name="apple" /></span></span>
             <h3>macOS</h3>
           </header>
-          <p>The published x86-64 zip archive runs on Intel Macs and through Rosetta 2 on Apple silicon.</p>
+          <p>x86-64 zip archive. Runs on Intel Macs, and on Apple silicon through Rosetta 2.</p>
           <ul class="dl-builds" data-dl-platform="macos"></ul>
           <a class="text-link" href={DOWNLOADS}>Download for macOS <Icon name="arrow-right" /></a>
         </article>
       </div>
-      <p class="supporting-copy dl-sysnote">All native builds are 64-bit and need a graphics driver capable of a modern hardware-accelerated 3D context; without one the application does not start.</p>
+      <p class="supporting-copy dl-sysnote">All desktop builds are 64-bit and need a GPU driver with hardware-accelerated 3D. Without one the app won't start.</p>
     </div>
   </section>
 
@@ -74,11 +74,11 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
     <div class="wrap">
       <header class="section-heading">
         <p class="eyebrow">Linux terminal install</p>
-        <h2 id="dl-terminal-title">Use the command generated for your account.</h2>
-        <p class="lede">The authenticated download page generates a complete command with a personal download token for the currently published Linux package. The token is account-bound and expires after 15 minutes.</p>
+        <h2 id="dl-terminal-title">Install from the terminal.</h2>
+        <p class="lede">The account download page generates a ready-to-run install command for the current Linux package. The command carries a personal download token tied to your account that expires after 15 minutes.</p>
       </header>
       <div class="actions"><a class="button button-secondary" href={DOWNLOADS}>Open account downloads <Icon name="arrow-right" /></a></div>
-      <p class="supporting-copy dl-token-note">Copy the ready-to-run command from that page. Do not share the command or its token.</p>
+      <p class="supporting-copy dl-token-note">Don't share the command — it contains your token.</p>
       {/* Every row is hidden until the release API confirms that format exists
           for linux/x86_64. If the fetch fails, the whole format list remains
           hidden rather than naming a package that may not be published. */}
@@ -94,13 +94,13 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
   <section class="section">
     <div class="wrap split">
       <header class="section-heading">
-        <p class="eyebrow">Hosted workspace</p>
-        <h2>Use Chudware without installing the desktop application.</h2>
-        <p class="lede">The browser workspace exposes the same engineering workspaces through your account and is the quickest route from a machine where you cannot install software.</p>
+        <p class="eyebrow">Browser workspace</p>
+        <h2>Or skip the install.</h2>
+        <p class="lede">The browser workspace is the same product, in a tab. It's the quickest route on a machine where you can't install software.</p>
       </header>
       <div class="pricing-note">
         <p class="eyebrow">One account, both routes</p>
-        <p>Use parametric modeling, assemblies, CAM, PLM, <a class="text-link" href="/product/simulation/">simulation</a>, reverse engineering, and the AI copilot straight from the tab. The account that signs in to the browser workspace is the account the desktop app activates with.</p>
+        <p>Modeling, assemblies, CAM, PLM, <a class="text-link" href="/product/simulation/">simulation</a>, reverse engineering, and the copilot, straight from the tab. The account you sign in with is the same one the desktop app activates with.</p>
         <a class="text-link" href="https://app.chudware.com/signup">Create an account <Icon name="arrow-right" /></a>
       </div>
     </div>
@@ -110,7 +110,7 @@ const DOWNLOADS = 'https://app.chudware.com/#downloads';
     <div class="wrap section-heading">
       <p class="eyebrow">Get started</p>
       <h2>Install it, or open it in a tab.</h2>
-      <p class="lede">Both routes run the same product against the same account.</p>
+      <p class="lede">Same product, same account, either way.</p>
       <div class="actions"><a class="button" href={DOWNLOADS}>Go to the download page</a><a class="button button-secondary" href="/docs/">Read the install guides</a></div>
     </div>
   </section>

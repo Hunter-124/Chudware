@@ -8,11 +8,11 @@ import Icon from '../../components/Icon.astro';
     <div class="wrap">
       <p class="eyebrow">Product / Reverse engineer</p>
       <h1>A rebuild that keeps the evidence attached.</h1>
-      <p class="lede">A Reverse Engineering session keeps source evidence, reconstruction, dimensions, and delivery in one record. A photo set or scan can seed an editable feature tree, but the result remains evidence-dependent: a person confirms scale, fit-critical dimensions are reviewed, and unexplained shape can remain a named mesh fallback.</p>
+      <p class="lede">A reverse engineering session keeps the source evidence, the reconstruction, the dimensions, and the delivered part in one record. A photo set or a scan can seed an editable feature tree, but the result is only as good as its evidence: you confirm the scale, you review the fit-critical dimensions, and any shape the build can't explain stays flagged as a mesh fallback instead of being quietly smoothed over.</p>
       <ul class="product-hero-meta">
         <li>Source, Scale, Reconstruct, Model, Review, Deliver</li>
         <li>Photos, video, webcam, scan mesh, datasheet, or library record</li>
-        <li>Honesty tags, dimension evidence, deviation, and provenance</li>
+        <li>Confidence tags, dimension evidence, deviation, and provenance</li>
       </ul>
     </div>
   </header>
@@ -45,7 +45,7 @@ import Icon from '../../components/Icon.astro';
         <li><div><h3>Scale</h3><p>Use a printed ArUco mat, two picked points, or one known dimension. The computed ratio and residual stay unconfirmed until a person accepts them.</p></div></li>
         <li><div><h3>Reconstruct</h3><p>The available reconstruction path registers views and produces sparse, dense, splat, or mesh artifacts as supported. Progress, selected backend, failures, and resulting artifacts remain in the session record.</p></div></li>
         <li><div><h3>Model</h3><p>Fit planes, cylinders, spheres, cones, and sections, then build sketches and features where the evidence supports them. Shape the build cannot explain remains an explicit mesh-body fallback.</p></div></li>
-        <li><div><h3>Review</h3><p>Read dimension sources and honesty tiers, confirm fit-critical values, and inspect geometric deviation. Fix the worst regions and compare again before treating the rebuild as finished.</p></div></li>
+        <li><div><h3>Review</h3><p>Read dimension sources and confidence tiers, confirm fit-critical values, and inspect geometric deviation. Fix the worst regions and compare again before treating the rebuild as finished.</p></div></li>
         <li><div><h3>Deliver</h3><p>Attach the reviewed geometry to its Parts record or export the full session bundle, including the artifacts and manifest that explain how the result was produced.</p></div></li>
       </ol>
       <div class="product-note product-stack">
@@ -59,11 +59,11 @@ import Icon from '../../components/Icon.astro';
     <div class="wrap product-columns">
       <div>
         <header class="section-heading product-subhead">
-          <p class="eyebrow" id="honesty-title">Photo-derived honesty</p>
+          <p class="eyebrow" id="honesty-title">What a photo can and can't tell you</p>
           <h2>A shape estimate and a fit dimension are different evidence.</h2>
         </header>
         <p class="product-body">Single-photo results are tagged <code>approximate</code>. They have no metric scale and are suitable as reference or preview shape, not as a dimensionally usable replacement part.</p>
-        <p class="product-body">Measurements inferred from photos carry an honesty tier: high is ±2%, medium is ±5%, and low is ±10%. A fit-critical bore, shaft, or mating face still needs a typed confirmation from a caliper or another defensible source.</p>
+        <p class="product-body">Measurements inferred from photos carry a confidence tier: high is ±2%, medium is ±5%, low is ±10%. A fit-critical bore, shaft, or mating face still needs a value you typed in from a caliper or another source you'd defend.</p>
       </div>
       <div class="product-spec-wrap">
         <table class="product-spec">
@@ -72,7 +72,7 @@ import Icon from '../../components/Icon.astro';
           <tbody>
             <tr><th scope="row">Caliper or known dimension</th><td>Typed by a person, preserved as the scale or dimension source</td></tr>
             <tr><th scope="row">Datasheet</th><td>Kept as a sourced candidate and confirmed where fit depends on it</td></tr>
-            <tr><th scope="row">Photo measurement</th><td>Shown with its honesty tier and original photo-derived value</td></tr>
+            <tr><th scope="row">Photo measurement</th><td>Shown with its confidence tier and the original photo-derived value</td></tr>
             <tr><th scope="row">Primitive fit</th><td>Marked as fitted evidence from a scaled mesh, or approximate when scale is absent</td></tr>
             <tr><th scope="row">Single photo</th><td>Reference shape only; no metric scale</td></tr>
           </tbody>
@@ -111,7 +111,7 @@ import Icon from '../../components/Icon.astro';
       <ul class="product-jump">
         <li><a href="/product/">All capabilities</a></li>
         <li><a href="/product/modeling/">Modeling</a></li>
-        <li><a href="/product/plm/">Product data</a></li>
+        <li><a href="/product/plm/">PLM</a></li>
         <li><a href="/product/copilot/">AI copilot</a></li>
         <li><a href="/docs/reverse-engineering/">Docs</a></li>
       </ul>

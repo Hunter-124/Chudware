@@ -4697,3 +4697,18 @@ teardown/remount, and pixel-stable reduced motion were exercised in Chromium.
 The original website deployment succeeded; its live download catalog returned
 0.1.1 on Windows, Linux, and macOS. The personal LinkedIn link remains pending
 an exact URL from the owner; no profile URL or personal tagline was invented.
+
+## 2026-09-18 — homepage motion and About attribution
+
+Restored the bounded tesseract to the homepage hero and the existing modeling
+feature-sequence and CAM stock-removal animations below the AI workflow.
+The product gallery retains all three authentic captures at native aspect
+ratios, with modeling full-width above CAM and simulation. LinkedIn now appears
+only in About content, not either header menu.
+
+Chromium checks exercised all three live homepage animations, static fallbacks
+with JavaScript disabled, blocked scripts, missing WebGL, and throwing context
+initialization; all retained loaded fallback images. Context loss/restoration
+and pixel-stable reduced-motion frames passed for all three renderers.
+Responsive homepage checks found one H1, no horizontal overflow, and no header
+LinkedIn link; About links to the owner-provided profile.

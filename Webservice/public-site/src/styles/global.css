@@ -171,6 +171,7 @@
   .home-work-heading > div { display: grid; gap: var(--s4); }
   .home-work-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s6); }
   .home-work-grid figure { min-width: 0; margin: 0; }
+  .home-work-grid figure:first-child { grid-column: 1 / -1; }
   .home-work-grid figure > a { display: block; border: var(--border) solid var(--line-hi); border-radius: var(--radius); background: var(--bg-deep); overflow: hidden; }
   .home-work-grid img { width: 100%; height: auto; object-fit: contain; }
   .home-ai { background: var(--bg-deep); }

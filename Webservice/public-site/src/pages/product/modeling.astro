@@ -4,16 +4,16 @@ import '../../styles/product.css';
 import Showcase from '../../components/Showcase.astro';
 import { HERO_STAGES } from '../../scripts/hero-timeline';
 ---
-<BaseLayout title="Parametric modeling" description="Constraint sketching, driving dimensions, ordered features, drawings, and the Feature Manager — on exact solid geometry, not a mesh.">
+<BaseLayout title="Parametric modeling" description="Dimension-driven models on exact solid geometry: fully defined sketches, named relations, driving dimensions, ordered features, drawings, and a human-editable Feature Manager.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Product / Model</p>
-      <h1>Sketches that carry intent. Features that stay editable.</h1>
-      <p class="lede">Chudware modeling is feature-based and history-driven. A constrained 2D sketch defines the intent, a feature turns it into an exact solid, and the Feature Manager keeps that sequence editable for the life of the design.</p>
+      <h1>Dimension-driven models. Human-editable history.</h1>
+      <p class="lede">Chudware models are dimension-driven. A fully defined sketch — relations first, then driving dimensions — becomes an exact solid through a feature, and the Feature Manager keeps every step human-editable for the life of the design. Change a dimension and the part rebuilds in order.</p>
       <ul class="product-hero-meta">
         <li>Exact solids, not a mesh approximation</li>
-        <li>2D constraint solver that reports remaining degrees of freedom</li>
-        <li>Native <code>.step+</code> documents</li>
+        <li>Dimension-driven: change a value and the part rebuilds</li>
+        <li>2D constraint solver with degrees-of-freedom reporting</li>
       </ul>
     </div>
   </header>
@@ -46,7 +46,7 @@ import { HERO_STAGES } from '../../scripts/hero-timeline';
     caption="Feature sequence · illustration"
   >
     <p class="eyebrow">Feature history</p>
-    <h2>A rebuild follows the feature tree from top to bottom.</h2>
+    <h2>Change one dimension. The whole part rebuilds in order.</h2>
     <p class="lede">Editing a sketch dimension recomputes the downstream extrude, boss, fillet, holes, and pockets in order.</p>
   </Showcase>
 
@@ -183,7 +183,7 @@ import { HERO_STAGES } from '../../scripts/hero-timeline';
           <p class="eyebrow" id="spec-title">Specifics</p>
           <h2>What's in the modeling workspace.</h2>
         </header>
-        <p class="product-body">Chudware models on exact solid geometry: fillets, holes, and reference faces are analytic surfaces, not display triangles. A 2D constraint solver drives sketches, and the feature tree keeps construction order editable. The browser workspace and the desktop app share the same modeling tools.</p>
+        <p class="product-body">Chudware models are dimension-driven on exact solid geometry: fillets, holes, and reference faces are analytic surfaces, not display triangles. A 2D constraint solver fully defines sketches, and the feature tree keeps construction order human-editable. The browser workspace and the desktop app share the same modeling tools.</p>
         <p class="product-body">View control stays out of the way: <code>F</code> fits the model, <code>0</code> returns to isometric, and the numbered keys jump to standard views while a command is running.</p>
       </div>
       <div class="product-spec-wrap" id="formats">
@@ -204,7 +204,7 @@ import { HERO_STAGES } from '../../scripts/hero-timeline';
             <tr><th scope="row">Weldments</th><td>Structural members swept along a path sketch, gussets, end caps</td></tr>
             <tr><th scope="row">Drawings</th><td>Multi-view sheets with dimensions, ASME Y14.5 geometric tolerancing, title block, and BOM; DXF and PDF output</td></tr>
             <tr><th scope="row">Units</th><td>Millimeter or inch per document; geometry is stored in millimeters either way, so switching units never rescales a part</td></tr>
-            <tr><th scope="row">History</th><td>Ordered Feature Manager tree, editable after the fact</td></tr>
+            <tr><th scope="row">History</th><td>Ordered Feature Manager tree, human-editable after the fact</td></tr>
             <tr><th scope="row">Native format</th><td><code>.step+</code> &mdash; tree, dimensions, materials, studies, drawings</td></tr>
             <tr><th scope="row">Import</th><td>STEP, IGES, and BREP solids; STL, OBJ, PLY, and glTF meshes; DXF for 2D profiles</td></tr>
             <tr><th scope="row">Neutral export</th><td>STEP, IGES, BREP, STL, OBJ, PLY, glTF for downstream handoff</td></tr>

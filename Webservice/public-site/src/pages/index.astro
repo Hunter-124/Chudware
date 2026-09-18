@@ -7,22 +7,22 @@ import { MACHINING_OPS } from '../scripts/machining-timeline';
 ---
 <BaseLayout
   title="AI-first CAD for engineers"
-  description="AI-first CAD for engineers. Tell the copilot what to change; it works in your open model with real, editable features. Modeling, assemblies, simulation, CAM, and PLM in one document."
+  description="AI-first CAD for engineers. Describe the change you want; a team of agents works across your workspace and leaves behind a dimension-driven, human-editable feature history. Modeling, assemblies, simulation, CAM, and PLM in one document."
 >
   <header class="home-hero">
     <div class="wrap home-hero-grid">
       <div class="home-hero-copy">
         <p class="eyebrow">Parametric CAD · Browser and desktop</p>
         <h1>AI-first CAD for engineers.</h1>
-        <p class="lede">Tell the copilot what to change. It works in your open model with real sketches and features, and you review every one of them before saving a revision.</p>
+        <p class="lede">Describe the change you want. A team of agents works across your workspace — sketching, features, measurement, simulation, CAM — and leaves behind a human-editable feature history: fully defined sketches, named relations, and the critical dimensions you specified.</p>
         <div class="actions">
           <a class="button" href="https://app.chudware.com/signup">Create an account</a>
           <a class="button button-secondary" href="/product/">See the product</a>
         </div>
         <ul class="home-hero-facts" aria-label="Product fundamentals">
           <li>Exact B-rep solids</li>
-          <li>Editable feature history</li>
-          <li>Modeling, assemblies, simulation, CAM, PLM</li>
+          <li>Dimension-driven models</li>
+          <li>A team of agents, not a chat window</li>
         </ul>
       </div>
       <TesseractHero />
@@ -33,14 +33,14 @@ import { MACHINING_OPS } from '../scripts/machining-timeline';
     <div class="wrap split">
       <header class="section-heading">
         <p class="eyebrow">AI in the engineering loop</p>
-        <h2 id="ai-title">Describe the change. Review the features.</h2>
-        <p class="lede">Brief the copilot like you would brief another engineer. It uses the same modeling tools you do, in the document you have open, and everything it builds lands in the feature tree where you can edit it.</p>
+        <h2 id="ai-title">Describe the change. A team of agents does the work.</h2>
+        <p class="lede">Brief the copilot like you'd brief a group of engineers. The agents split the job — one sketches, one builds features, one measures and checks — using the same tools you use by hand, in the document you have open. Everything they build lands in your feature tree, fully defined and yours to edit.</p>
         <div class="actions"><a class="button button-secondary" href="/docs/ai-copilot/">Read the AI copilot guide</a></div>
       </header>
       <ol class="home-ai-steps" aria-label="AI copilot workflow">
         <li><span>1</span><div><strong>Connect</strong><p>Sign in with your AI provider account, or paste an API key. Your provider, your billing.</p></div></li>
         <li><span>2</span><div><strong>Describe</strong><p>Name the part, the change, the critical dimensions, and what must not move.</p></div></li>
-        <li><span>3</span><div><strong>Review</strong><p>Open the features it made, measure what matters, then save a revision — or send it back.</p></div></li>
+        <li><span>3</span><div><strong>Review</strong><p>Open the feature tree. Every sketch is fully defined, every relation is named, every critical dimension is the one you asked for. Save a revision, or send it back.</p></div></li>
       </ol>
     </div>
   </section>
@@ -56,9 +56,9 @@ import { MACHINING_OPS } from '../scripts/machining-timeline';
     image={{ src: '/images/modeling.png', width: 1600, height: 900, alt: 'Chudware modeling workspace with a parametric enclosure and editable feature tree' }}
     caption="Feature sequence · illustration"
   >
-    <p class="eyebrow">Editable geometry</p>
-    <h2>Follow the part from sketch to finished features.</h2>
-    <p class="lede">Dimensions drive the model. Extrudes, fillets, holes, and pockets stay in the feature tree as ordered, editable steps — nothing gets baked into dead geometry.</p>
+    <p class="eyebrow">Dimension-driven models</p>
+    <h2>Change a dimension. The part rebuilds.</h2>
+    <p class="lede">Every model is dimension-driven: fully defined sketches, named relations, and driving dimensions feed an ordered feature tree. Change one value and the extrudes, fillets, holes, and pockets downstream rebuild in order — nothing gets baked into dead geometry.</p>
     <div class="actions"><a class="button button-secondary" href="/product/modeling/">Explore modeling</a></div>
   </Showcase>
 
@@ -88,13 +88,13 @@ import { MACHINING_OPS } from '../scripts/machining-timeline';
         <p class="lede">Every workspace works on the same document and the same revision history. Nothing is exported into a side file that drifts.</p>
       </header>
       <div class="capability-grid">
-        <article><p class="capability-index">01</p><h3><a href="/product/modeling/">Modeling</a></h3><p>Constrained sketches, ordered features, exact solids. All of it stays editable.</p></article>
+        <article><p class="capability-index">01</p><h3><a href="/product/modeling/">Modeling</a></h3><p>Dimension-driven models on exact B-rep solids. Fully defined sketches, ordered features, all human-editable.</p></article>
         <article><p class="capability-index">02</p><h3><a href="/product/assemblies/">Assemblies</a></h3><p>Locate components with mates, then inspect motion, clearance, and interference.</p></article>
         <article><p class="capability-index">03</p><h3><a href="/product/simulation/">Simulation</a></h3><p>Static, contact, modal, thermal, buckling, and fatigue studies on the live design — with mesh and equilibrium evidence in the result.</p></article>
         <article><p class="capability-index">04</p><h3><a href="/product/cam/">CAM</a></h3><p>Stock, tools, operations, stock-removal simulation, and posted G-code.</p></article>
         <article><p class="capability-index">05</p><h3>Electronics</h3><p>ECAD and firmware live in the same project as the mechanical design.</p></article>
         <article><p class="capability-index">06</p><h3><a href="/product/plm/">PLM</a></h3><p>Revisions with notes, project files, manufacturing output, and the decision trail in one place.</p></article>
-        <article><p class="capability-index">07</p><h3><a href="/docs/ai-copilot/">AI</a></h3><p>The copilot reads the open model, builds real features, and shows you what it did.</p></article>
+        <article><p class="capability-index">07</p><h3><a href="/docs/ai-copilot/">AI</a></h3><p>A team of agents reads your model, builds real features across the workspace, and hands you a human-editable feature tree.</p></article>
       </div>
     </div>
   </section>

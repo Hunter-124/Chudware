@@ -892,7 +892,6 @@ struct AppState {
     // prevents opening, viewing, orbiting, measuring, or exporting existing work.
     bool entitlementReadOnly = true;
     bool entitlementSignedIn = false;
-    bool entitlementGraceExpiring = false;
     std::string entitlementPlan;
     std::string entitlementEmail;
     std::string entitlementStatus;

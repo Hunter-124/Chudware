@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -71,6 +72,12 @@ constexpr const char* kSubjectAccount = "entitlement-subject-v1";
 // the guessability of a hostname.
 constexpr const char* kSealKeyAccount = "entitlement-seal-key-v1";
 constexpr double kRefreshIntervalSeconds = 12.0 * 60.0 * 60.0;
+// After a failed check the next attempt comes much sooner — 5 min, doubling to the normal
+// interval — so a machine that comes back online recovers on its own within minutes.
+constexpr double kRetryBaseSeconds = 5.0 * 60.0;
+constexpr const char* kUnconfirmedStatus =
+    "Your subscription couldn't be confirmed — check your connection or sign in again";
+constexpr const char* kReauthorizeStatus = "Sign in again to keep editing on this device";
 struct PendingResult {
     enum class Kind { None, Fresh, Refused, Unreachable, Invalid } kind = Kind::None;
     std::string token;
@@ -96,6 +103,7 @@ struct Controller {
     bool loginRunning = false;
     std::string securityPolicyId;
     bool authoritativeRefused = false;
+    int failedAttempts = 0;  // consecutive unreachable checks; drives the retry backoff
     std::uint64_t generation = 0;
 
     ~Controller() {
@@ -390,6 +398,7 @@ std::string securityEventsUrl() {
 
 struct SecurityBatchResult {
     bool accepted = false;
+    bool reauthorize = false;  // signed gateway verdict: this device must sign in again
     json customerReceipt = nullptr;
 };
 
@@ -430,9 +439,10 @@ SecurityBatchResult sendSecurityBatch(std::string_view subject,
             return result;
         } catch (...) { return result; }
     }
-    std::string enforcement;
+    std::string enforcement, status;
     if(response.status!=200||!chudware::security::verifySecurityAcknowledgement(
-            response.body,batch.batchId,subject,policy.id,batch.sequence,&enforcement))return result;
+            response.body,batch.batchId,subject,policy.id,batch.sequence,&enforcement,&status))return result;
+    if(status=="reauthorize"){result.reauthorize=true;return result;}
     const auto decision=chudware::security::verifyEmbeddedEnforcementState(enforcement,subject,wallNow());
     if(decision.status==chudware::security::EnforcementStatus::Malformed||
        decision.status==chudware::security::EnforcementStatus::InvalidSignature||
@@ -452,17 +462,13 @@ void evaluateOffline(AppState& state) {
     Controller& c = controller();
     const auto decision = chudware::entitlement::offlineAccess(
         c.payload, c.stamp, wallNow(), monotonicNow(), bootIdentifier());
-    state.entitlementGraceExpiring =
-        decision.access == chudware::entitlement::OfflineAccess::Expiring;
     state.entitlementReadOnly =
         decision.access == chudware::entitlement::OfflineAccess::Expired ||
         decision.access == chudware::entitlement::OfflineAccess::ClockRollback;
-    if (decision.access == chudware::entitlement::OfflineAccess::ClockRollback)
-        state.entitlementStatus = "Clock changed; reconnect to verify your subscription";
-    else if (decision.access == chudware::entitlement::OfflineAccess::Expired)
-        state.entitlementStatus = "Offline entitlement expired";
-    else if (decision.access == chudware::entitlement::OfflineAccess::Expiring)
-        state.entitlementStatus = "Subscription check unavailable — reconnect within 3 days";
+    // Customer-facing wording stays generic on purpose: no countdowns, windows or clock
+    // checks — naming them only tells someone probing the binary what to look for.
+    if (state.entitlementReadOnly)
+        state.entitlementStatus = kUnconfirmedStatus;
     else
         state.entitlementStatus.clear();
 }
@@ -526,45 +532,52 @@ void startRefresh(const std::string& token) {
     }
     c.refreshRunning = true;
     c.lastAttemptMonotonic = monotonicNow();
-    std::string securitySubject;
-    json signedPolicy;
-    chudware::entitlement::SecurityPolicy securityPolicy;
-    const bool havePolicy = loadSecurityPolicy(securitySubject, signedPolicy, securityPolicy);
-    chudware::security::EventQueue securityQueue(appdataAppDir());
-    const std::string challenge = randomState();
-    const std::uint64_t sequence = chudware::device_identity::nextRefreshSequence(appdataAppDir());
-    json envelope = {
-        {"token", token},
-        {"request_nonce", challenge},
-        {"sequence", sequence},
-        {"app_version", CHUDWARE_VERSION},
-        {"platform", platformName()},
-        {"integrity_digest", integrityDigest()},
-        {"last_acked_event_sequence", securityQueue.acceptedThrough()},
-        {"customer_receipt", nullptr},
-    };
-    if (havePolicy) {
-        const SecurityBatchResult batch = sendSecurityBatch(
-            securitySubject, securityPolicy, sequence, challenge);
-        if (securityPolicy.id == "customer_endpoint") {
-            if (!batch.accepted || batch.customerReceipt.is_null()) {
-                c.refreshRunning = false;
-                setPending({PendingResult::Kind::Unreachable, {},
-                            "Customer security endpoint did not return a valid signed receipt"});
+    // Everything below does file and network I/O (two HTTPS round trips of up to 8 s each),
+    // so it runs on the worker, never the GUI thread.
+    c.worker = std::thread([token]() {
+        std::string securitySubject;
+        json signedPolicy;
+        chudware::entitlement::SecurityPolicy securityPolicy;
+        const bool havePolicy = loadSecurityPolicy(securitySubject, signedPolicy, securityPolicy);
+        const std::string challenge = randomState();
+        const std::uint64_t sequence = chudware::device_identity::nextRefreshSequence(appdataAppDir());
+        json customerReceipt = nullptr;
+        if (havePolicy) {
+            const SecurityBatchResult batch = sendSecurityBatch(
+                securitySubject, securityPolicy, sequence, challenge);
+            if (batch.reauthorize) {
+                setPending({PendingResult::Kind::Refused, {}, kReauthorizeStatus});
                 return;
             }
-            envelope["customer_receipt"] = batch.customerReceipt;
+            if (securityPolicy.id == "customer_endpoint") {
+                if (!batch.accepted || batch.customerReceipt.is_null()) {
+                    setPending({PendingResult::Kind::Unreachable, {}, {}});
+                    return;
+                }
+                customerReceipt = batch.customerReceipt;
+            }
         }
-    }
-    std::string signingError;
-    if (sequence == 0 ||
-        !chudware::device_identity::signRefreshEnvelope(envelope, appdataAppDir(), &signingError)) {
-        c.refreshRunning = false;
-        setPending({PendingResult::Kind::Invalid, {},
-                    "Device identity could not sign the refresh; sign in again to reauthorize this device"});
-        return;
-    }
-    c.worker = std::thread([envelope = std::move(envelope), challenge]() {
+        // The acknowledgement is read AFTER the batch: the gateway compares it with the
+        // sequence it just accepted. Reading it first sent the previous batch's number, so
+        // every refresh that followed an accepted batch was rejected.
+        json envelope = {
+            {"token", token},
+            {"request_nonce", challenge},
+            {"sequence", sequence},
+            {"app_version", CHUDWARE_VERSION},
+            {"platform", platformName()},
+            {"integrity_digest", integrityDigest()},
+            {"last_acked_event_sequence",
+             chudware::security::EventQueue(appdataAppDir()).acceptedThrough(securitySubject)},
+            {"customer_receipt", std::move(customerReceipt)},
+        };
+        std::string signingError;
+        if (sequence == 0 ||
+            !chudware::device_identity::signRefreshEnvelope(envelope, appdataAppDir(), &signingError)) {
+            setPending({PendingResult::Kind::Invalid, {},
+                        "Device identity could not sign the refresh; sign in again to reauthorize this device"});
+            return;
+        }
         const auto response = chudware::agent::http_post(
             refreshUrl(), {{"Content-Type", "application/json"},
                            {"X-Chudware-Refresh-Nonce", challenge}}, envelope.dump(), 8000);
@@ -616,14 +629,10 @@ void startRefresh(const std::string& token) {
                 setPending({PendingResult::Kind::Refused, {}, reason});
                 return;
             }
-            setPending({PendingResult::Kind::Unreachable, {}, "Subscription check returned an untrusted response"});
-            return;
         }
-        if (response.status == 0 || response.status >= 500) {
-            setPending({PendingResult::Kind::Unreachable, {}, response.error});
-            return;
-        }
-        setPending({PendingResult::Kind::Unreachable, {}, "Subscription check could not be authenticated"});
+        // No verified answer (offline, 5xx, or an unsigned 4xx that cannot be trusted as a
+        // refusal): keep the current state and retry on the backoff.
+        setPending({PendingResult::Kind::Unreachable, {}, {}});
     });
 }
 
@@ -942,19 +951,20 @@ void tickAccountPanel(AppState& state) {
                 return;
             }
             c.authoritativeRefused = false;
+            c.failedAttempts = 0;
             state.entitlementReadOnly = false;
-            state.entitlementGraceExpiring = false;
             state.entitlementStatus.clear();
             if (!persist(result.token, c.stamp))
                 state.entitlementStatus = "Entitlement is active but could not be stored securely";
         } else if (result.kind == PendingResult::Kind::Refused) {
             c.authoritativeRefused = true;
+            c.failedAttempts = 0;
             state.entitlementReadOnly = true;
-            state.entitlementGraceExpiring = false;
             state.entitlementStatus = result.detail.empty()
                 ? "Desktop entitlement refused" : result.detail;
         } else if (result.kind == PendingResult::Kind::Invalid) {
             c.authoritativeRefused = false;
+            c.failedAttempts = 0;
             state.entitlementReadOnly = true;
             state.entitlementSignedIn = false;
             state.entitlementToken.clear();
@@ -963,7 +973,8 @@ void tickAccountPanel(AppState& state) {
             state.entitlementStatus = result.detail;
             chudware::secret_store::erase(kService, kAccount, appdataAppDir());
         } else if (state.entitlementSignedIn) {
-            evaluateOffline(state);  // unreachable: grace, including last-three-days chip
+            ++c.failedAttempts;      // unreachable: keep offline access, retry on the backoff
+            evaluateOffline(state);
         } else {
             state.entitlementStatus = result.detail.empty()
                 ? "Sign-in service is unreachable" : result.detail;
@@ -978,7 +989,11 @@ void tickAccountPanel(AppState& state) {
         forceClockCheck =
             decision.access == chudware::entitlement::OfflineAccess::ClockRollback;
     }
-    const double retryAfter = forceClockCheck ? 60.0 : kRefreshIntervalSeconds;
+    double retryAfter = kRefreshIntervalSeconds;
+    if (forceClockCheck) retryAfter = 60.0;
+    else if (c.failedAttempts > 0)
+        retryAfter = std::min(kRefreshIntervalSeconds,
+                              kRetryBaseSeconds * std::ldexp(1.0, std::min(c.failedAttempts - 1, 16)));
     if (state.entitlementSignedIn && !c.refreshRunning && !c.loginRunning &&
         !c.worker.joinable() &&
         (c.lastAttemptMonotonic < 0.0 ||
@@ -1010,7 +1025,6 @@ void signOutDesktopAccount(AppState& state) {
     state.entitlementEmail.clear();
     state.entitlementSignedIn = false;
     state.entitlementReadOnly = true;
-    state.entitlementGraceExpiring = false;
     state.entitlementMutationVerified = false;
     state.entitlementAiVerified = false;
     state.entitlementStatus = "Signed out — sign in to activate desktop editing";
@@ -1135,29 +1149,6 @@ void drawEntitlementBanner(AppState& state, float x, float y, float w, float h) 
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
-}
-
-void drawEntitlementGraceChip(AppState& state) {
-    if (!state.entitlementGraceExpiring || state.entitlementReadOnly) return;
-    // Transient, corner-anchored, and small enough that the band's bottom-right is genuinely
-    // free — the one entitlement surface an overlay is still the right shape for.
-    const OverlayBand& band = overlayBand();
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    float maxX = band.valid ? band.maxX : vp->WorkPos.x + vp->WorkSize.x;
-    // The band spans the pinned glass columns; anchoring at its right edge put the chip UNDER
-    // the Copilot column, which painted over it. Sit left of that column when it is drawn.
-    const float copilotEdge = overlayColumnEdge(1);
-    if (copilotEdge >= 0.0f && copilotEdge < maxX) maxX = copilotEdge;
-    const float maxY = band.valid ? band.maxY : vp->WorkPos.y + vp->WorkSize.y;
-    ImGui::SetNextWindowPos(ImVec2(maxX - 12.0f * uiScale, maxY - 12.0f * uiScale),
-                            ImGuiCond_Always, ImVec2(1.0f, 1.0f));
-    ImGui::SetNextWindowBgAlpha(0.88f);
-    if (ImGui::Begin("##entitlement_grace_chip", nullptr,
-                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
-                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav)) {
-        ImGui::TextUnformatted("Subscription check unavailable — reconnect within 3 days");
-    }
-    ImGui::End();
 }
 
 }  // namespace ui

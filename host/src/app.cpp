@@ -7107,9 +7107,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 #ifndef __EMSCRIPTEN__
     ui::tickAccountPanel(st);
     chudware::update::globalUpdater().setEntitlementToken(st.entitlementToken);
-    // The read-only strip is chrome now (drawn above, before the dockspace);
-    // only the transient grace chip is still a corner overlay.
-    ui::drawEntitlementGraceChip(st);
+    // The read-only strip is chrome (drawn above, before the dockspace).
 #endif
 
     // ---------- panels (pinned glass columns + floating dialogs over the

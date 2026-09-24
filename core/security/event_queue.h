@@ -35,12 +35,16 @@ public:
 
     // Returns false rather than losing nonzero integrity evidence.
     bool append(const SecurityEvent& event, std::string* error = nullptr);
+    // Sequence state is bound to the device subject it was issued under. A new subject (a
+    // fresh device authorization, which the gateway starts at sequence 0) restarts the
+    // sequence; queued evidence rows are kept and ride the next batch.
     SecurityBatch prepareBatch(std::string_view subject, std::string_view policyId,
                                std::string_view appVersion, std::string_view platform,
                                std::int64_t now, std::string* error = nullptr);
     bool accept(std::string_view batchId, std::uint64_t acceptedThrough,
                 std::string* error = nullptr);
-    std::uint64_t acceptedThrough() const;
+    // 0 when the stored sequence state belongs to a different subject.
+    std::uint64_t acceptedThrough(std::string_view subject) const;
     std::size_t size() const;
 
 private:
@@ -57,10 +61,14 @@ public:
 private:
     EventQueue queue_;
 };
+// Verifies a signed gateway acknowledgement bound to this batch. `status` receives
+// "acknowledged", "contained" or "reauthorize". A reauthorize answer carries the gateway's
+// current sequence (never below ours) instead of echoing the batch sequence.
 bool verifySecurityAcknowledgement(std::string_view body, std::string_view batchId,
                                    std::string_view subject, std::string_view policyId,
                                    std::uint64_t sequence,
-                                   std::string* enforcementState = nullptr);
+                                   std::string* enforcementState = nullptr,
+                                   std::string* status = nullptr);
 bool gzipSecurityPayload(std::string_view input, std::string& output);
 
 unsigned securityEventScore(std::string_view reason) noexcept;

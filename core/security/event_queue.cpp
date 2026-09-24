@@ -76,7 +76,7 @@ private:
 #endif
 };
 
-struct Counters { std::uint64_t next = 1, ack = 0; std::string pendingId; std::uint64_t pendingSequence = 0; std::size_t pendingCount = 0; std::string pendingBody; };
+struct Counters { std::uint64_t next = 1, ack = 0; std::string pendingId; std::uint64_t pendingSequence = 0; std::size_t pendingCount = 0; std::string pendingBody; std::string subject; };
 
 bool loadCounters(std::string_view dir, Counters& out) {
     std::vector<unsigned char> bytes;
@@ -89,15 +89,21 @@ bool loadCounters(std::string_view dir, Counters& out) {
         out.pendingSequence = j.value("pending_sequence", 0ULL);
         out.pendingCount = j.value("pending_count", std::size_t{0});
         out.pendingBody = j.value("pending_body", "");
+        out.subject = j.value("subject", "");
         return out.next > 0 && out.ack < out.next;
     } catch (...) { return false; }
 }
 bool storeCounters(std::string_view dir, const Counters& c) {
     const std::string text = json{{"next_sequence",c.next},{"accepted_through",c.ack},
       {"pending_batch_id",c.pendingId},{"pending_sequence",c.pendingSequence},
-      {"pending_count",c.pendingCount},{"pending_body",c.pendingBody}}.dump();
+      {"pending_count",c.pendingCount},{"pending_body",c.pendingBody},{"subject",c.subject}}.dump();
     return secret_store::store(device_identity::kService, kStateAccount,
         std::vector<unsigned char>(text.begin(), text.end()), dir);
+}
+// State written before subjects were recorded: a pending batch still names its subject.
+void adoptLegacySubject(Counters& c) {
+    if (!c.subject.empty() || c.pendingBody.empty()) return;
+    try { c.subject = json::parse(c.pendingBody).value("subject", ""); } catch (...) {}
 }
 
 bool readRows(const fs::path& path, std::vector<json>& rows, bool& corrupt) {
@@ -159,7 +165,7 @@ std::string rfc3339Utc(std::int64_t seconds) {
 }
 
 
-bool verifySecurityAcknowledgement(std::string_view body,std::string_view batchId,std::string_view subject,std::string_view policy,std::uint64_t sequence,std::string* enforcementState){
+bool verifySecurityAcknowledgement(std::string_view body,std::string_view batchId,std::string_view subject,std::string_view policy,std::uint64_t sequence,std::string* enforcementState,std::string* statusOut){
     try {
         json value=json::parse(body);
         static const std::array<std::string_view,8> fields={"status","batch_id","subject","sequence","policy_id","signature","issued_at","enforcement_state"};
@@ -169,10 +175,11 @@ bool verifySecurityAcknowledgement(std::string_view body,std::string_view batchI
         if(status!="acknowledged"&&status!="contained"&&status!="reauthorize")return false;
         // Typed gets: MSVC (C2666) rejects the implicit-conversion soup of
         // nlohmann::json::operator!= against string_view/uint64_t.
+        const std::uint64_t acked=value.at("sequence").get<std::uint64_t>();
         if(value.at("batch_id").get<std::string>()!=batchId||
            value.at("subject").get<std::string>()!=subject||
            value.at("policy_id").get<std::string>()!=policy||
-           value.at("sequence").get<std::uint64_t>()!=sequence||
+           (status=="reauthorize"?acked<sequence:acked!=sequence)||
            !value.at("enforcement_state").is_object())return false;
         const std::string issuedAt=value.at("issued_at").get<std::string>();
         if(issuedAt.size()!=20||issuedAt[4]!='-'||issuedAt[7]!='-'||issuedAt[10]!='T'||issuedAt[13]!=':'||issuedAt[16]!=':'||issuedAt[19]!='Z')return false;
@@ -184,6 +191,7 @@ bool verifySecurityAcknowledgement(std::string_view body,std::string_view batchI
         std::vector<unsigned char> signedMessage(signature);signedMessage.insert(signedMessage.end(),canonical.begin(),canonical.end());std::vector<unsigned char> opened(signedMessage.size());unsigned long long n=0;
         if(crypto_sign_open(opened.data(),&n,signedMessage.data(),signedMessage.size(),entitlement::kEmbeddedPublicKey.data())!=0||n!=canonical.size())return false;
         if(enforcementState)*enforcementState=value.at("enforcement_state").dump();
+        if(statusOut)*statusOut=status;
         return true;
     }catch(...){return false;}
 }
@@ -237,6 +245,15 @@ SecurityBatch EventQueue::prepareBatch(std::string_view subject,std::string_view
     FileLock lock(lockPath(dataDir_)); if(!lock){if(error)*error="queue lock failed";return{};}
     std::vector<json> rows;bool corrupt=false;readRows(queuePath(dataDir_),rows,corrupt);
     Counters c;if(!loadCounters(dataDir_,c)){if(error)*error="counter state corrupt";return{};}
+    adoptLegacySubject(c);
+    if(c.subject!=subject){
+        // Legacy state with nothing pending adopts the current subject as-is: it is in step
+        // with the gateway. A DIFFERENT subject is a new authorization the gateway numbers
+        // from zero, so a sequence carried over from the old one would never be accepted.
+        if(!c.subject.empty())c=Counters{};
+        c.subject=std::string(subject);
+        if(!storeCounters(dataDir_,c)){if(error)*error="counter state write failed";return{};}
+    }
     if(c.pendingSequence && !c.pendingBody.empty()) return {c.pendingId,c.pendingSequence,c.pendingBody,c.pendingCount,c.pendingCount==0};
     std::vector<json> selected; std::size_t bytes=0;
     for(const auto&r:rows){json wire=wireEvent(r);const auto n=wire.dump().size();if(selected.size()==kSecurityBatchMaxEvents||bytes+n>kSecurityBatchMaxBytes/2)break;selected.push_back(std::move(wire));bytes+=n;}
@@ -260,7 +277,7 @@ bool EventQueue::accept(std::string_view id,std::uint64_t through,std::string* e
     if(through==c.pendingSequence){const std::size_t count=std::min(c.pendingCount,rows.size()); rows.erase(rows.begin(),rows.begin()+count); c.ack=through;c.next=through==UINT64_MAX?UINT64_MAX:through+1;c.pendingId.clear();c.pendingSequence=0;c.pendingCount=0;c.pendingBody.clear();}
     if(!writeRows(queuePath(dataDir_),rows)||!storeCounters(dataDir_,c)){if(error)*error="ack persistence failed";return false;}return true;
 }
-std::uint64_t EventQueue::acceptedThrough()const{FileLock lock(lockPath(dataDir_));Counters c;return lock&&loadCounters(dataDir_,c)?c.ack:0;}
+std::uint64_t EventQueue::acceptedThrough(std::string_view subject)const{FileLock lock(lockPath(dataDir_));Counters c;if(!lock||!loadCounters(dataDir_,c))return 0;adoptLegacySubject(c);return c.subject.empty()||c.subject==subject?c.ack:0;}
 std::size_t EventQueue::size()const{FileLock lock(lockPath(dataDir_));std::vector<json>r;bool c=false;if(lock)readRows(queuePath(dataDir_),r,c);return r.size();}
 bool SecurityReporter::report(std::string_view reason,std::int64_t at,std::string* error){return queue_.append({std::string(reason),at,securityEventScore(reason)},error);}
 bool SecurityReporter::heartbeat(std::int64_t at,std::string* error){return report("heartbeat",at,error);}

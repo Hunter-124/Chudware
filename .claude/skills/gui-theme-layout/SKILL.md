@@ -119,8 +119,9 @@ duplication**, and it is why the product read differently tab to tab.
   `dockTopY` before `setOverlayBand`, and `ui::drawEntitlementBanner(st, x, y, w, h)` paints the
   strip — `app.cpp:5994-6027`, `ui/account_panel.h:14-28`. Every earlier refinement of the floating
   version just moved which panel it covered next: an overlay cannot be positioned correctly for
-  nine workspaces that disagree about what lives at the top-left. Only the transient grace chip is
-  still a corner overlay (`ui::drawEntitlementGraceChip`, `app.cpp:6094`).
+  nine workspaces that disagree about what lives at the top-left. There is deliberately NO
+  offline-grace notice: customer-facing entitlement text never names grace windows, countdowns or
+  clock checks (it tells a cracker where to look); only the read-only strip shows, with generic wording.
 - **Workspace crossfade.** A workspace change fades the central BODY in over `anim::kBase` while
   the chrome (title bar, ribbon, status bar) stays fixed, so the chrome reads as a frame around
   content that changed — `app.cpp:6228-6265`. It is a `PushStyleVar(ImGuiStyleVar_Alpha)` around

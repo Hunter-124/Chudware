@@ -23,9 +23,6 @@ void drawAccountSettings(AppState& state);
 // before any panel has drawn. drawEntitlementBanner() paints the strip at the given rect.
 float entitlementBannerHeight(const AppState& state);
 void  drawEntitlementBanner(AppState& state, float x, float y, float w, float h);
-// The "subscription check unavailable" grace chip stays a bottom-right overlay: it is transient,
-// small, and anchored to a corner nothing else claims. Call once per frame after the panels.
-void  drawEntitlementGraceChip(AppState& state);
 // System-browser loopback login. Non-blocking after the listener is armed.
 bool beginDesktopAccountLogin(AppState& state);
 // Forgets this device's stored subscription session (sealed token, subject, signed security

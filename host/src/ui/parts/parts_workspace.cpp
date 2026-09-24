@@ -763,8 +763,71 @@ void queueDownload(AppState& st, const PartsItem& item) {
 }
 
 void insertItem(AppState& st, const PartsItem& item) {
+    if (S().insertBusy) return;
+    const bool intoAssembly = st.activeTab >= 0 &&
+        st.activeTab < static_cast<int>(st.docTabs.size()) &&
+        st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly;
+    const std::string assemblyDoc = intoAssembly ? st.docTabs[st.activeTab].docId : "";
+    const std::string projectDir = intoAssembly ? st.plmProjectPath() : "";
+    if (intoAssembly && (assemblyDoc.empty() || projectDir.empty() || !st.asmPanels)) {
+        S().insertNote = "Cannot insert: the assembly or its project folder is unavailable.";
+        S().insertError = true;
+        st.toast(ui::ToastLevel::Error, S().insertNote);
+        return;
+    }
+    S().insertBusy = true;
+    S().insertError = false;
+    S().insertNote = intoAssembly ? "Preparing " + item.name + " for the assembly…"
+                                  : "Creating " + item.name + " as a new part…";
+    st.toast(ui::ToastLevel::Info, S().insertNote);
     nlohmann::json p;
     p["item_id"] = item.id;
+    if (intoAssembly) {
+        p["project_dir"] = projectDir;
+        st.rpc.call("parts_prepare_for_assembly", p,
+            [&st, name = item.name, assemblyDoc](const core::RpcResult& r) {
+                if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+                    const std::string why = r.ok && r.result.is_object()
+                        ? r.result.value("reason", std::string("could not save part"))
+                        : r.err;
+                    S().insertBusy = false;
+                    S().insertError = true;
+                    S().insertNote = "Insert failed: " + why;
+                    st.toast(ui::ToastLevel::Error, S().insertNote);
+                    return;
+                }
+                const std::string path = r.result.value("path", std::string());
+                if (path.empty()) {
+                    S().insertBusy = false;
+                    S().insertError = true;
+                    S().insertNote = "Insert failed: saved part path was not returned.";
+                    st.toast(ui::ToastLevel::Error, S().insertNote);
+                    return;
+                }
+                S().insertNote = "Saved " + name + "; inserting into assembly…";
+                st.toast(ui::ToastLevel::Info, S().insertNote);
+                st.asmPanels->insertComponentWhenReady(
+                    st, path, assemblyDoc,
+                    [&st, name, assemblyDoc](bool inserted, const std::string& error) {
+                        S().insertBusy = false;
+                        S().insertError = !inserted;
+                        if (!inserted) {
+                            S().insertNote = "Insert failed: " + error;
+                            st.toast(ui::ToastLevel::Error, S().insertNote);
+                            return;
+                        }
+                        for (int i = 0; i < static_cast<int>(st.docTabs.size()); ++i)
+                            if (st.docTabs[i].docId == assemblyDoc) {
+                                st.switchToTab(i);
+                                break;
+                            }
+                        st.activeWorkspace = AppState::Workspace::Model;
+                        S().insertNote = "Inserted " + name + " into the assembly";
+                        st.toast(ui::ToastLevel::Success, S().insertNote);
+                    });
+            });
+        return;
+    }
     st.rpc.call("parts_insert_into_doc", p, [&st, name = item.name](const core::RpcResult& r) {
         bool ok = r.ok && r.result.is_object() && r.result.value("ok", false);
         if (ok) {
@@ -774,49 +837,64 @@ void insertItem(AppState& st, const PartsItem& item) {
             if (!doc.empty()) {
                 // Mechanical placement creates a separate editable document, not an
                 // assembly component. Open that document so the result cannot be lost.
-                if (st.asmPanels) st.asmPanels->closeAllToolForms(st);
-                std::string aicm, err;
-                const bool wasSuppressing = st.suppressTabDirty;
-                st.suppressTabDirty = true;
-                const bool activated = st.docMirror.activate(st.worker, doc, aicm, err);
-                st.suppressTabDirty = wasSuppressing;
-                if (!activated) {
-                    st.toast(ui::ToastLevel::Warn,
-                             "Created " + name + " as a new part (" + doc +
-                             "), but could not open it: " + err);
-                    return;
-                }
-                int existing = -1;
-                for (int i = 0; i < static_cast<int>(st.docTabs.size()); ++i)
-                    if (st.docTabs[i].docId == doc) { existing = i; break; }
-                if (existing >= 0) {
-                    st.docTabs[existing].userAdopted = true;
-                    if (st.activeTab == existing) {
-                        st.clearViewportForNewDoc();
-                        st.applyDocDrivenVisibility(st.docMirror.tree());
-                        if (!aicm.empty()) st.loadDocMeshAsync(aicm);
-                    } else {
-                        st.switchToTab(existing);
-                    }
-                } else {
-                    st.clearViewportForNewDoc();
-                    st.applyDocDrivenVisibility(st.docMirror.tree());
-                    st.addDocTab(false);
-                    if (!aicm.empty()) st.loadDocMeshAsync(aicm);
-                }
-                st.activeWorkspace = AppState::Workspace::Model;
-                st.toast(ui::ToastLevel::Success, "Created " + name + " as a new part");
+                // Activation may compile the new part; do it off the GL thread.
+                st.rpc.call("doc_activate", {{"doc_id", doc}},
+                    [&st, name, doc](const core::RpcResult& activatedResult) {
+                        S().insertBusy = false;
+                        if (st.asmPanels) st.asmPanels->closeAllToolForms(st);
+                        std::string aicm, err;
+                        const bool wasSuppressing = st.suppressTabDirty;
+                        st.suppressTabDirty = true;
+                        const bool activated = activatedResult.ok &&
+                            activatedResult.result.is_object() &&
+                            st.docMirror.adoptActivateResponse(
+                                doc, activatedResult.result, aicm, err);
+                        st.suppressTabDirty = wasSuppressing;
+                        if (!activated) {
+                            if (!activatedResult.ok) err = activatedResult.err;
+                            S().insertNote = "Created " + name + " as a new part (" + doc +
+                                             "), but could not open it: " + err;
+                            S().insertError = true;
+                            st.toast(ui::ToastLevel::Warn, S().insertNote);
+                            return;
+                        }
+                        int existing = -1;
+                        for (int i = 0; i < static_cast<int>(st.docTabs.size()); ++i)
+                            if (st.docTabs[i].docId == doc) { existing = i; break; }
+                        if (existing >= 0) {
+                            st.docTabs[existing].userAdopted = true;
+                            if (st.activeTab == existing) {
+                                st.clearViewportForNewDoc();
+                                st.applyDocDrivenVisibility(st.docMirror.tree());
+                                if (!aicm.empty()) st.loadDocMeshAsync(aicm);
+                            } else {
+                                st.switchToTab(existing);
+                            }
+                        } else {
+                            st.clearViewportForNewDoc();
+                            st.applyDocDrivenVisibility(st.docMirror.tree());
+                            st.addDocTab(false);
+                            if (!aicm.empty()) st.loadDocMeshAsync(aicm);
+                        }
+                        st.activeWorkspace = AppState::Workspace::Model;
+                        S().insertNote = "Created " + name + " as a new part";
+                        st.toast(ui::ToastLevel::Success, S().insertNote);
+                    });
             } else {
-                st.toast(ui::ToastLevel::Info,
-                         "Prepared " + name + "; no new part document was created");
+                S().insertBusy = false;
+                S().insertNote = "Prepared " + name + "; no new part document was created";
+                st.toast(ui::ToastLevel::Info, S().insertNote);
             }
         } else {
+            S().insertBusy = false;
             std::string why = r.ok
                 ? r.result.value("reason", std::string("insert failed"))
                 : r.err;
             std::string hint = r.ok ? r.result.value("hint", "") : "";
-            st.toast(ui::ToastLevel::Error,
-                     "Insert failed: " + why + (hint.empty() ? "" : ("  (" + hint + ")")));
+            S().insertError = true;
+            S().insertNote = "Insert failed: " + why +
+                             (hint.empty() ? "" : ("  (" + hint + ")"));
+            st.toast(ui::ToastLevel::Error, S().insertNote);
         }
     });
 }
@@ -1390,6 +1468,12 @@ void drawPartsLibraryWorkspace(AppState& st) {
                 }
                 ImGui::SetTooltip("%s", tip.c_str());
             }
+        }
+        if (!S().insertNote.empty()) {
+            const float* tone = S().insertError ? palette.statusErr : palette.textDim;
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(tone[0], tone[1], tone[2], 1.0f));
+            ImGui::TextWrapped("%s", S().insertNote.c_str());
+            ImGui::PopStyleColor();
         }
         if (S().gridView) drawResultsGrid(st);
         else              drawResultsList(st);

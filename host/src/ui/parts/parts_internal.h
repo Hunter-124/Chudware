@@ -203,6 +203,9 @@ struct PartsState {
     std::vector<QueueJob> queue;
     bool   queuePolling  = false;
     double lastQueuePoll = 0.0;
+    bool insertBusy = false;
+    std::string insertNote;  // in-flight phase or last insert outcome, also shown as a toast
+    bool insertError = false;
     bool   queueActive   = false;  // any pending/running job → keep polling
 
     // ---- thumbnails ----

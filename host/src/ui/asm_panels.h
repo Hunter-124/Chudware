@@ -25,6 +25,7 @@
 // on mouse release (the simplest correct path; see asm_panels.cpp Move-Component note).
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -80,9 +81,17 @@ public:
     // is unknown; the mate form must already be open.
     void presetMateTypeForShot(const std::string& type);
     void openInterference(AppState& st) { handleCommand(st, "asm_interference"); }
-    // Insert a component by path directly (scenario / programmatic). Returns the new aicm path.
+    // Async completion reports the actual engine outcome; targetDocId overrides the
+    // insert dialog's sticky target for callers such as the Parts Library.
     bool insertComponent(AppState& st, const std::string& path,
-                         const nlohmann::json& transform, std::string& aicmOut);
+                         const nlohmann::json& transform, std::string& aicmOut,
+                         std::function<void(bool, const std::string&)> onComplete = {},
+                         const std::string& targetDocId = {});
+    // The Parts Library may finish saving while another tab is active. Queue until the
+    // target tab's async activation has bound its mirror, then use insertComponent.
+    void insertComponentWhenReady(AppState& st, const std::string& path,
+                                  const std::string& targetDocId,
+                                  std::function<void(bool, const std::string&)> onComplete);
     // Add a mate directly (scenario). type/align per doc_schema; refs already shaped
     // [{component, selector}, ...]. Solves after. Returns the solved aicm path.
     bool addMate(AppState& st, const std::string& type, const std::string& align,
@@ -123,6 +132,13 @@ private:
     // ---- Insert ----
     bool insertOpen_ = false, insertFocus_ = false;
     int  insertSel_ = -1;                 // selected row in the open/recent chooser (-1 = none)
+    struct PendingLibraryInsert {
+        std::string path, targetDocId;
+        std::function<void(bool, const std::string&)> onComplete;
+        double deadline = 0.0;
+        bool activationRequested = false;
+    };
+    PendingLibraryInsert pendingLibraryInsert_;
     std::string insertChosenPath_;        // absolute path of the selected open/recent/browse part
     std::string insertNote_;              // last insert status / error line
     std::string insertTargetDocId_;       // assembly doc_id captured when the dialog opened / last insert

@@ -601,6 +601,64 @@ class TestPartPlace:
         assert "ok" in r
 
 
+class TestPrepareAssemblyComponent:
+    def test_saves_native_part_and_returns_path_without_overwriting_existing_file(
+            self, tmp_path, monkeypatch):
+        from services.parts import gui_rpc
+        from services.mcp import core_bridge as cb
+
+        made = []
+        closed = []
+
+        def place(params, _emit):
+            made.append(params["item_id"])
+            return {"ok": True, "doc_id": f"generated-{len(made)}",
+                    "detail": {"name": "Socket screw"}}
+
+        def call(method, params):
+            if method == "doc_save":
+                from pathlib import Path
+                Path(params["path"]).write_bytes(b"editable native part")
+                return {"path": params["path"]}
+            assert method == "doc_close"
+            closed.append(params["doc_id"])
+            return {}
+
+        monkeypatch.setattr(gui_rpc, "_parts_insert_into_doc", place)
+        monkeypatch.setattr(cb, "call", call)
+        first = gui_rpc.GUI_WORKER_METHODS["parts_prepare_for_assembly"](
+            {"item_id": "fastener:example", "project_dir": str(tmp_path)}, _noop_emit)
+        second = gui_rpc.GUI_WORKER_METHODS["parts_prepare_for_assembly"](
+            {"item_id": "fastener:example", "project_dir": str(tmp_path)}, _noop_emit)
+        assert first == {"ok": True, "path": str(tmp_path / "Socket_screw.step+")}
+        assert second == {"ok": True, "path": str(tmp_path / "Socket_screw_generated-2.step+")}
+        assert made == ["fastener:example", "fastener:example"]
+        assert closed == ["generated-1", "generated-2"]
+        assert (tmp_path / "Socket_screw.step+").read_bytes() == b"editable native part"
+
+    def test_save_failure_is_not_reported_as_insertable(self, tmp_path, monkeypatch):
+        from services.parts import gui_rpc
+        from services.mcp import core_bridge as cb
+
+        monkeypatch.setattr(gui_rpc, "_parts_insert_into_doc",
+                            lambda params, emit: {"ok": True, "doc_id": "generated",
+                                                  "detail": {"name": "Bearing"}})
+        closed = []
+
+        def call(method, params):
+            if method == "doc_close":
+                closed.append(params["doc_id"])
+                return {}
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(cb, "call", call)
+        result = gui_rpc._parts_prepare_for_assembly(
+            {"item_id": "bearing:example", "project_dir": str(tmp_path)}, _noop_emit)
+        assert result["ok"] is False and "disk full" in result["reason"]
+        assert closed == ["generated"]
+        assert not list(tmp_path.glob("*.step+"))
+
+
 class TestPartsThumbnail:
     """Parts Library V2: parts_thumbnail must RENDER a standard part's own 3D model.
 

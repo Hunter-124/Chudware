@@ -87,8 +87,7 @@ const char* kReverseEngineerHint =
 // ── placers (one per geometry_ref kind) ─────────────────────────────────────
 
 // core_family: parts_make RPC → new editable mech part doc.
-json place_core_family(const json& gref, const json& /*doc*/, const json& params,
-                       const PlaceSeams& seams) {
+json place_core_family(const json& gref, const json& params, const PlaceSeams& seams) {
     const std::string domain = "core_family";
     const std::string family = get_str(gref, "family");
     const std::string size = get_str(gref, "size");
@@ -427,7 +426,7 @@ const char* kSupportedKinds =
 json route(const std::string& kind, const json& gref, const json& doc, const json& params,
            const PlaceSeams& seams, bool& known) {
     known = true;
-    if (kind == "core_family") return place_core_family(gref, doc, params, seams);
+    if (kind == "core_family") return place_core_family(gref, params, seams);
     if (kind == "generate_model") return place_generate_model(gref, doc, params, seams);
     if (kind == "symbol_footprint") return place_symbol_footprint(gref, doc, params);
     if (kind == "section_profile") return place_section_profile(gref, doc, params);

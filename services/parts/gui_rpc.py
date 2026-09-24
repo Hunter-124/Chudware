@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout, as_completed
+from pathlib import Path
 from typing import Any, Callable
 
 # ---- vocabulary ------------------------------------------------------------------
@@ -872,6 +873,54 @@ def _parts_insert_into_doc(params: dict, _emit: Callable) -> dict:
                                       "params": (params or {}).get("params") or None})
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_insert_into_doc failed: {exc}"}
+
+
+def _parts_prepare_for_assembly(params: dict, emit: Callable) -> dict:
+    """Create a library part, save an editable .step+ in the selected project, and return its path.
+
+    The host applies asm_insert_component itself so it uses the same mirror, undo and
+    tessellation path as Insert Component. Do not leave an unadopted part doc open.
+    """
+    project_dir = str((params or {}).get("project_dir") or
+                      os.environ.get("CHUDWARE_PROJECT_SAVE_DIR") or "").strip()
+    if not project_dir:
+        return {"ok": False, "reason": "No project folder is available for the component."}
+    directory = Path(os.path.abspath(os.path.expanduser(project_dir)))
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        if not directory.is_dir():
+            return {"ok": False, "reason": f"Project folder is not a directory: {directory}"}
+    except OSError as exc:
+        return {"ok": False, "reason": f"Could not create project folder: {exc}"}
+
+    placed = _parts_insert_into_doc({"item_id": (params or {}).get("item_id")}, emit)
+    if not placed.get("ok"):
+        return placed
+    doc_id = placed.get("doc_id")
+    if not isinstance(doc_id, str) or not doc_id:
+        return {"ok": False, "reason": "Part placement returned no document to save."}
+
+    from services.mcp import core_bridge as cb
+    from services.mcp.cad_common import _project_save_stem
+    try:
+        name = (placed.get("detail") or {}).get("name")
+        stem = _project_save_stem(name if isinstance(name, str) else None, doc_id)
+        path = directory / f"{stem}.step+"
+        # A second placement must not overwrite a component another assembly already uses.
+        if path.exists():
+            path = directory / f"{stem}_{doc_id}.step+"
+        saved = cb.call("doc_save", {"doc_id": doc_id, "path": str(path)})
+        written = saved.get("path", str(path)) if isinstance(saved, dict) else str(path)
+        if not Path(written).is_file():
+            return {"ok": False, "reason": f"Part was not saved to the project: {written}"}
+        return {"ok": True, "path": written}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"Could not save library part to the project: {exc}"}
+    finally:
+        try:
+            cb.call("doc_close", {"doc_id": doc_id})
+        except Exception:  # noqa: BLE001 — saved artifact remains usable
+            pass
 
 
 # ---- vendor status / login ----------------------------------------------------------
@@ -1759,6 +1808,7 @@ GUI_WORKER_METHODS: dict[str, Callable] = {
     "parts_download":        _parts_download,
     "parts_queue_status":    _parts_queue_status,
     "parts_insert_into_doc": _parts_insert_into_doc,
+    "parts_prepare_for_assembly": _parts_prepare_for_assembly,
     "parts_import_artifact": _parts_import_artifact,
     "vendor_status":         _vendor_status,
     "vendor_login":          _vendor_login,

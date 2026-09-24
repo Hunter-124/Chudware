@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <system_error>
+#include <utility>
 
 
 #include <map>
@@ -197,6 +198,8 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
     return false;
 }
 
+namespace { bool mirrorIsAssembly(AppState& st); }
+
 void AsmPanels::draw(AppState& st) {
     // Feature-tree "Edit" on a component → open + focus the Mate form for it.
     if (!st.requestEditComponentMates.empty()) {
@@ -207,9 +210,44 @@ void AsmPanels::draw(AppState& st) {
         openPmGuest(st, "mate");
         st.addLog("[asm] edit mates for component " + cid);
     }
+    if (!pendingLibraryInsert_.targetDocId.empty()) {
+        auto& pending = pendingLibraryInsert_;
+        int targetTab = -1;
+        for (int i = 0; i < static_cast<int>(st.docTabs.size()); ++i)
+            if (st.docTabs[i].docId == pending.targetDocId &&
+                st.docTabs[i].kind == AppState::DocTab::TabKind::Assembly) {
+                targetTab = i;
+                break;
+            }
+        if (targetTab < 0 || ImGui::GetTime() > pending.deadline) {
+            auto done = std::move(pending.onComplete);
+            pending = {};
+            if (done) done(false, targetTab < 0 ? "Target assembly was closed"
+                                               : "Timed out opening the target assembly");
+        } else if (st.activeTab != targetTab ||
+                   (!pending.activationRequested && st.docMirror.docId() != pending.targetDocId)) {
+            pending.activationRequested = true;
+            st.switchToTab(targetTab);  // async activation when the target is not already bound
+        } else if (st.docMirror.docId() == pending.targetDocId && mirrorIsAssembly(st)) {
+            auto ready = std::move(pending);
+            pending = {};
+            std::string aicm;
+            if (!insertComponent(st, ready.path, nullptr, aicm,
+                                 ready.onComplete, ready.targetDocId) && ready.onComplete)
+                ready.onComplete(false, insertNote_);
+        }
+    }
     // Mate/Insert/Pattern/Explode/Interference draw via PropertyManager::drawBody guest callback.
     // BOM stays a floating glass window.
     drawBom(st);
+}
+
+void AsmPanels::insertComponentWhenReady(
+    AppState& st, const std::string& path, const std::string& targetDocId,
+    std::function<void(bool, const std::string&)> onComplete) {
+    pendingLibraryInsert_ = {path, targetDocId, std::move(onComplete),
+                             ImGui::GetTime() + 45.0, false};
+    st.addLog("[asm] queued library component: " + path);
 }
 
 void AsmPanels::closeAllToolForms(AppState& st) {
@@ -459,8 +497,10 @@ static const char* kInsertFilter =
     "All files (*.*)\0*.*\0";
 }  // namespace
 
-bool AsmPanels::insertComponent(AppState& st, const std::string& path,
-                                const nlohmann::json& transform, std::string& aicmOut) {
+bool AsmPanels::insertComponent(
+    AppState& st, const std::string& path, const nlohmann::json& transform,
+    std::string& aicmOut, std::function<void(bool, const std::string&)> onComplete,
+    const std::string& targetDocId) {
     aicmOut.clear();
     if (path.empty()) {
         insertNote_ = "No part selected.";
@@ -469,7 +509,7 @@ bool AsmPanels::insertComponent(AppState& st, const std::string& path,
 
     // Resolve the intended assembly document. Prefer the explicit target captured when
     // Insert opened / New Assembly ran; fall back to the active assembly tab / live mirror.
-    std::string targetDoc = insertTargetDocId_;
+    std::string targetDoc = targetDocId.empty() ? insertTargetDocId_ : targetDocId;
     if (targetDoc.empty() && st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
         st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly &&
         !st.docTabs[st.activeTab].docId.empty()) {
@@ -512,8 +552,8 @@ bool AsmPanels::insertComponent(AppState& st, const std::string& path,
         return false;
     }
 
-    // Keep the target sticky for subsequent Inserts from the same dialog.
-    insertTargetDocId_ = targetDoc;
+    // Only the insert dialog owns its sticky target; external callers pin their own doc.
+    if (targetDocId.empty()) insertTargetDocId_ = targetDoc;
 
     nlohmann::json op = {{"op", "asm_insert_component"}, {"source", {{"path", path}}}};
     if (!transform.is_null()) op["transform"] = transform;
@@ -524,17 +564,28 @@ bool AsmPanels::insertComponent(AppState& st, const std::string& path,
     aicmOut.clear();
     ++st.rebuildsInFlight;
     st.docMirror.applyOpsAsync(st.rpc, st.worker, nlohmann::json::array({op}),
-        [&st, targetDoc](const core::OpsResponse& r, bool applied) {
+        [&st, targetDoc, onComplete = std::move(onComplete)](
+            const core::OpsResponse& r, bool applied) {
             --st.rebuildsInFlight;
-            if (!applied) return;
-            if (!r.ok) { st.addLog("[err] insert: " + r.error_message); return; }
-            // Only load mesh if the mirror is still on the target assembly.
-            if (st.docMirror.docId() != targetDoc) {
-                st.addLog("[asm] insert completed on " + targetDoc +
-                          " (active doc changed — mesh not reloaded here)");
+            if (!r.ok) {
+                const std::string error = r.error_message.empty() ? "component insert failed"
+                                                                    : r.error_message;
+                st.addLog("[err] insert: " + error);
+                if (onComplete) onComplete(false, error);
                 return;
             }
-            if (!r.aicm_path.empty()) st.loadDocMeshAsync(r.aicm_path);  // T-PERF3
+            if (!applied) {
+                // The engine may have accepted the op while another tab superseded this mirror.
+                st.addLog("[asm] insert completed on " + targetDoc +
+                          " (active doc changed — mesh not reloaded here)");
+                for (auto& tab : st.docTabs)
+                    if (tab.docId == targetDoc) tab.meshCacheInvalidated = true;
+                if (onComplete) onComplete(true, {});
+                return;
+            }
+            if (st.docMirror.docId() == targetDoc && !r.aicm_path.empty())
+                st.loadDocMeshAsync(r.aicm_path);  // T-PERF3
+            if (onComplete) onComplete(true, {});
         });
     return true;
 }

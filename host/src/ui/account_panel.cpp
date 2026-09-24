@@ -1143,7 +1143,11 @@ void drawEntitlementGraceChip(AppState& state) {
     // free — the one entitlement surface an overlay is still the right shape for.
     const OverlayBand& band = overlayBand();
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float maxX = band.valid ? band.maxX : vp->WorkPos.x + vp->WorkSize.x;
+    float maxX = band.valid ? band.maxX : vp->WorkPos.x + vp->WorkSize.x;
+    // The band spans the pinned glass columns; anchoring at its right edge put the chip UNDER
+    // the Copilot column, which painted over it. Sit left of that column when it is drawn.
+    const float copilotEdge = overlayColumnEdge(1);
+    if (copilotEdge >= 0.0f && copilotEdge < maxX) maxX = copilotEdge;
     const float maxY = band.valid ? band.maxY : vp->WorkPos.y + vp->WorkSize.y;
     ImGui::SetNextWindowPos(ImVec2(maxX - 12.0f * uiScale, maxY - 12.0f * uiScale),
                             ImGuiCond_Always, ImVec2(1.0f, 1.0f));

@@ -1169,17 +1169,40 @@ static void applySlashInsert(std::vector<char>& buf, const std::string& text) {
     std::memcpy(buf.data(), text.c_str(), text.size() + 1);
 }
 
+// Each row is two text lines (command, then its description) plus padding. Rows used to be one
+// frame tall while drawing two lines, so the lines overlapped each other and the last row's
+// description ran out of the list.
+static float slashRowHeight() {
+    return ImGui::GetTextLineHeight() * 2.0f + 8.0f * ui::uiScale;
+}
+
+// Trim `s` (UTF-8) with a trailing ellipsis so it fits `maxW` pixels. Shrinks by whole
+// codepoints; the ellipsis is appended once (an earlier loop re-appended it every pass and
+// never converged, hanging the UI thread).
+static std::string slashFitText(const char* text, float maxW) {
+    std::string s = text ? text : "";
+    if (maxW <= 1.0f || ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
+    const std::string ell = "\xe2\x80\xa6";
+    while (!s.empty() && ImGui::CalcTextSize((s + ell).c_str()).x > maxW) {
+        do s.pop_back();
+        while (!s.empty() && (static_cast<unsigned char>(s.back()) & 0xC0) == 0x80);
+    }
+    while (!s.empty() && s.back() == ' ') s.pop_back();
+    return s + ell;
+}
+
 static bool slashMenuRow(const char* iconName, const char* label, const char* detail,
                          bool selected, int uid) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
-    const float rowH = ImGui::GetFrameHeight() + 6.0f * sc;
+    const float rowH = slashRowHeight();
     const float fh = ImGui::GetFontSize();
+    const float lineH = ImGui::GetTextLineHeight();
     ImGui::PushID(uid);
     const bool clicked = ImGui::Selectable("##slashrow", selected,
                                            ImGuiSelectableFlags_AllowItemOverlap |
                                                ImGuiSelectableFlags_DontClosePopups,
-                                           ImVec2(-1, rowH));
+                                           ImVec2(ImGui::GetContentRegionAvail().x, rowH));
     const bool hov = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
@@ -1191,35 +1214,26 @@ static bool slashMenuRow(const char* iconName, const char* label, const char* de
         ui::coloredRowWash(dl, mn, mx, rnd, pal.accent,
                            selected ? 0.34f : 0.18f, /*selected=*/selected);
     }
-    const float midY = (mn.y + mx.y) * 0.5f;
     const float pad = 8.0f * sc;
+    const float labelY = mn.y + (rowH - 2.0f * lineH) * 0.5f;
     const float isz = fh * 1.02f;
     const ImU32 ink = ui::Palette::toU32(selected ? pal.text : pal.textDim);
     float textX = mn.x + pad;
     IconUV ic = ui::getIcon(iconName, 20);
     if (ic.valid) {
-        const ImVec2 i0(mn.x + pad, midY - isz * 0.5f);
+        const ImVec2 i0(mn.x + pad, labelY + (lineH - isz) * 0.5f);
         dl->AddImage(ic.texId, i0, ImVec2(i0.x + isz, i0.y + isz), ic.uv0, ic.uv1, ink);
         textX = i0.x + isz + 7.0f * sc;
     }
-    dl->AddText(ImVec2(textX, midY - fh * 0.55f), ui::Palette::toU32(pal.text), label);
+    // Measure against what is actually visible: the list's clip rect excludes its scrollbar
+    // and the popup padding, which the item rect does not.
+    const float textMaxX = ImMin(mx.x, dl->GetClipRectMax().x) - pad;
+    const float textW = textMaxX - textX;
+    dl->AddText(ImVec2(textX, labelY), ui::Palette::toU32(pal.text),
+                slashFitText(label, textW).c_str());
     if (detail && detail[0]) {
-        std::string d = detail;
-        const float maxDetailW = (mx.x - textX) - 10.0f * sc;
-        // Trim-to-fit. The previous loop appended the ellipsis EVERY pass
-        // (`substr(size-2) + "…"` → net +1 byte/iteration), so a detail wider
-        // than the row never converged — an infinite loop that froze the UI
-        // thread the first frame the menu drew (the "type / and the app
-        // crashes" hang). Shrink the raw text first, append the ellipsis once.
-        if (maxDetailW > 1.0f && ImGui::CalcTextSize(d.c_str()).x > maxDetailW) {
-            const std::string ell = "\xe2\x80\xa6";
-            while (d.size() > 4 &&
-                   ImGui::CalcTextSize((d + ell).c_str()).x > maxDetailW)
-                d.resize(d.size() - 2);
-            d += ell;
-        }
-        dl->AddText(ImVec2(textX, midY + fh * 0.15f),
-                    ui::Palette::toU32(pal.textDim), d.c_str());
+        dl->AddText(ImVec2(textX, labelY + lineH), ui::Palette::toU32(pal.textDim),
+                    slashFitText(detail, textW).c_str());
     }
     ImGui::PopID();
     return clicked;
@@ -1285,12 +1299,19 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
     const ui::AdaptiveSurface& surf = chatSurf();
     const auto& pal = ui::palette;
     const float popW = ImMax(inputMax.x - inputMin.x, 280.0f * sc);
-    const float rowH = ImGui::GetFrameHeight() + 6.0f * sc;
+    const float rowH = slashRowHeight();
+    const float rowGap = 2.0f * sc;  // ItemSpacing.y pushed below
     const float headerH = ImGui::GetTextLineHeight() + 10.0f * sc;
-    const int visible = (int)std::min<size_t>(8, std::max<size_t>(1, s_slash.matches.size()));
-    const float listH = rowH * (float)visible + 6.0f * sc;
-    const float popH = headerH + listH + 8.0f * sc;
     const float gap = 4.0f * sc;
+    // Up to 8 rows, but never taller than the space above the composer: the menu drops UP
+    // and must not run off the top of the window. The list scrolls for the rest.
+    const float roomAbove = (inputMin.y - gap) - ImGui::GetMainViewport()->WorkPos.y -
+                            headerH - 20.0f * sc;
+    const int fitRows = std::max(1, (int)((roomAbove + rowGap) / (rowH + rowGap)));
+    const int visible = std::min(
+        fitRows, (int)std::min<size_t>(8, std::max<size_t>(1, s_slash.matches.size())));
+    const float listH = (rowH + rowGap) * (float)visible - rowGap + 6.0f * sc;
+    const float popH = headerH + listH + 8.0f * sc;
 
     ImGui::SetNextWindowPos(ImVec2(inputMin.x, inputMin.y - gap), ImGuiCond_Always,
                             ImVec2(0.0f, 1.0f));

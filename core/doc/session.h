@@ -361,6 +361,11 @@ nlohmann::json doc_bbox(const std::string& doc_id);
 // 1-based; <= 0 selects the LAST body. Throws OpError on no bodies / a bad body_id.
 nlohmann::json doc_eval_check(const std::string& doc_id, int body_id);
 
+// Per-body selectable face/edge findings; omitted size thresholds scale with each
+// body's bounds. IDs are the AICM picker TopExp::MapShapes indices (1-based).
+nlohmann::json doc_eval_geometry_analysis(const std::string& doc_id,
+                                          const nlohmann::json& options);
+
 // Evaluate — SOLID HEALTH census of one or every body: the counts that justify a watertight
 // verdict, with the stable sid of every offender. Returns {bodies:[{body_id, watertight,
 // is_watertight, sound, faces, edges, vertices, shells, solids, free_edges:{count,sids},

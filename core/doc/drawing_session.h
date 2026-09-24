@@ -233,6 +233,18 @@ nlohmann::json drawing_get(const std::string& doc_id);
 // source_doc_id}. Port of engine/doc/drawing.py::drawing_bom.
 nlohmann::json drawing_bom(const std::string& doc_id);
 
+// Place one ordinary, editable balloon per distinct assembly BOM item. Without view_id,
+// prefer the view covering most items and use other views for any remaining visible items.
+// Component projection runs only on this operation; placements describe the
+// visible component outline anchor/bounds in sheet mm. Part drawings and items
+// with no visible component refuse by name. Returns
+// {added, view_ids, placements:[{item,view_id,component,source,anchor,bbox}], drawing}.
+// Per-view projections are cached in view-local coordinates by source revision,
+// view id/orientation/scale; moving a view reuses the mapping.
+// Repeated runs replace only prior auto balloons.
+nlohmann::json drawing_auto_balloon(const std::string& doc_id,
+                                    const std::string& view_id = "");
+
 // drawing_close: drop the session. Returns true if it existed.
 bool drawing_close(const std::string& doc_id);
 

@@ -12,11 +12,14 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
+#include <set>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -1492,4 +1495,112 @@ TEST_CASE("Back and iso views occupy different drawing cells") {
     CHECK(views[1]["position"] != views[2]["position"]);
     doc::drawing_close(made["doc_id"].get<std::string>());
     doc::doc_close(src);
+}
+
+TEST_CASE("Auto Balloon attaches each assembly BOM item to its visible component") {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() /
+                         ("chudware_auto_balloon_" +
+                          std::to_string(std::chrono::steady_clock::now()
+                                             .time_since_epoch().count()));
+    fs::create_directories(dir);
+    struct Cleanup {
+        fs::path dir;
+        ~Cleanup() { std::error_code ec; fs::remove_all(dir, ec); }
+    } cleanup{dir};
+
+    json components = json::array();
+    for (int i = 0; i < 3; ++i) {
+        const std::string source = make_cube(10.0 + 4.0 * i);
+        const fs::path path = dir / ("component" + std::to_string(i) + ".step+");
+        doc::doc_save(source, path.string());
+        doc::doc_close(source);
+        const double x = 55.0 * i;
+        components.push_back({
+            {"id", "part" + std::to_string(i)}, {"source", {{"path", path.string()}}},
+            {"fixed", true},
+            {"transform", {1, 0, 0, x, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}},
+        });
+    }
+    const fs::path asm_path = dir / "assembly.step+";
+    doc::stepplus_save(json{{"schema", "aicad.asm/1"}, {"name", "ThreeParts"},
+                            {"components", components}, {"mates", json::array()}},
+                       asm_path.string(), {});
+    const std::string asm_id = doc::doc_open(asm_path.string())["doc_id"].get<std::string>();
+    const std::string did =
+        doc::drawing_new(json::object(), json::object(), "", asm_id)["doc_id"].get<std::string>();
+    const std::string vid =
+        doc::drawing_add_view(did, "base", "front", "s1", 1.0,
+                              json::array({100.0, 150.0}), false)["view_id"].get<std::string>();
+
+    const json bom = doc::drawing_bom(did)["rows"];
+    const json before = doc::drawing_get(did)["sheets"][0]["views"][0];
+    REQUIRE_MESSAGE(before["visible"].size() > 0, before.dump());
+    CHECK_FALSE(before.contains("components"));  // no per-component HLR on ordinary fetch
+    REQUIRE(bom.size() == 3);
+    const json generated = doc::drawing_auto_balloon(did);
+    CHECK(generated["added"] == 3);
+    CHECK(generated["view_ids"] == json::array({vid}));
+    const json& projected = generated["drawing"]["sheets"][0]["views"][0];
+    CHECK_FALSE(projected.contains("components"));
+    REQUIRE(generated["placements"].size() == 3);
+    std::map<int, json> placements;
+    for (const json& placement : generated["placements"])
+        placements[placement["item"].get<int>()] = placement;
+    std::set<int> items;
+    const json& balloons = projected["annotations"];
+    REQUIRE(balloons.size() == 3);
+    for (const json& annotation : balloons) {
+        CHECK(annotation["kind"] == "balloon");
+        CHECK(annotation["auto"] == true);
+        CHECK(draw_count(annotation) > 0);
+        const int item = annotation["item"].get<int>();
+        CHECK(items.insert(item).second);
+        const json& placement = placements.at(item);
+        CHECK(placement["source"] == bom[item - 1]["source"]);
+        CHECK(placement["anchor"] == annotation["a"]);
+        const json& bbox = placement["bbox"];
+        const json& anchor = annotation["a"];
+        CHECK(anchor[0].get<double>() >= bbox[0].get<double>() - 0.05);
+        CHECK(anchor[0].get<double>() <= bbox[2].get<double>() + 0.05);
+        CHECK(anchor[1].get<double>() >= bbox[1].get<double>() - 0.05);
+        CHECK(anchor[1].get<double>() <= bbox[3].get<double>() + 0.05);
+    }
+    CHECK(items.size() == 3);
+    CHECK(items.count(1) == 1);
+    CHECK(items.count(2) == 1);
+    CHECK(items.count(3) == 1);
+    CHECK(balloons[0]["pos"] != balloons[1]["pos"]);
+    CHECK(doc::drawing_auto_balloon(did)["added"] == 3);
+    CHECK(doc::drawing_get(did)["sheets"][0]["views"][0]["annotations"].size() == 3);
+    const double old_x = balloons[0]["a"][0].get<double>();
+    const json moved = doc::drawing_set_view(did, vid, nullptr,
+                                              json::array({120.0, 150.0}),
+                                              nullptr, nullptr);
+    CHECK(moved["view"]["annotations"][0]["a"][0].get<double>() ==
+          doctest::Approx(old_x + 20.0));
+    const json relocated = doc::drawing_auto_balloon(did);
+    CHECK(relocated["added"] == 3);
+    for (const json& placement : relocated["placements"])
+        CHECK(placement["anchor"][0].get<double>() ==
+              doctest::Approx(placements.at(placement["item"].get<int>())["anchor"][0]
+                                  .get<double>() + 20.0));
+    const fs::path dxf_path = dir / "balloons.dxf";
+    const json exported = doc::export_drawing(did, dxf_path.string(), "dxf");
+    CHECK(exported["entities"].get<int>() > 0);
+    CHECK(exported["annotations"].get<int>() >= 3);
+
+    const std::string part = make_cube(12.0);
+    const std::string part_drawing =
+        doc::drawing_new(json::object(), json::object(), "", part)["doc_id"].get<std::string>();
+    try {
+        doc::drawing_auto_balloon(part_drawing);
+        FAIL("part drawing must refuse Auto Balloon");
+    } catch (const doc::OpError& error) {
+        CHECK(error.detail.value("reason", std::string()) == "not_assembly");
+    }
+    doc::drawing_close(part_drawing);
+    doc::doc_close(part);
+    doc::drawing_close(did);
+    doc::doc_close(asm_id);
 }

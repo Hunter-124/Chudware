@@ -90,6 +90,20 @@ std::string scale_text(double scale) {
     return std::string(buf);
 }
 
+struct ComponentShape {
+    std::string id;
+    std::string name;
+    std::string source;
+    TopoDS_Shape shape;
+};
+struct ComponentViewCache {
+    long source_revision = -1;
+    std::string orientation;
+    double scale = 0.0;
+    json local_components;
+};
+
+
 // ----------------------------------------------------------------- session store
 struct DrawingSession {
     std::string doc_id;
@@ -99,6 +113,9 @@ struct DrawingSession {
     json source_env;      // equation env for the source compile
     long revision = 0;
     long source_revision = 0;
+    // Per-view HLR is expensive: only Auto Balloon fills this cache. Geometry is
+    // stored relative to the view origin so moving the view never invalidates it.
+    std::map<std::string, ComponentViewCache> component_views;
     std::string standalone_path;
     std::map<std::string, std::string> standalone_extra;
     std::string source_state = "live";
@@ -178,7 +195,8 @@ json blank_drawing(const std::string& name, const std::string& source_doc_id) {
 // ignore its components and project nothing — so it is resolved through compile_assembly
 // and each component world-placed (placed_world_shape), the same geometry the viewport
 // tessellates. Component-load failures degrade gracefully (fewer bodies), never throw.
-std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s) {
+std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s,
+                                       std::vector<ComponentShape>* components = nullptr) {
     json tree = s.source_doc;
     json env = s.source_env;
     if (!s.source_ref_id.empty()) {
@@ -195,11 +213,24 @@ std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s) {
         try {
             AssemblyResult ares = compile_assembly(tree);
             out.reserve(ares.bodies.size());
+            std::map<std::string, std::string> sources;
+            if (components) {
+                components->clear();
+                components->reserve(ares.bodies.size());
+                for (const json& c : tree.value("components", json::array()))
+                    sources[c.value("id", std::string())] =
+                        c.value("source", json::object()).value("path", std::string());
+            }
             for (const AsmBodyOut& b : ares.bodies) {
                 TopoDS_Shape world = placed_world_shape(b);
-                if (!world.IsNull()) out.push_back(world);
+                if (world.IsNull()) continue;
+                out.push_back(world);
+                if (components) {
+                    const std::string seed = b.component_id.substr(0, b.component_id.find('#'));
+                    components->push_back({b.component_id, b.name, sources[seed], world});
+                }
             }
-        } catch (...) { /* unloadable assembly -> empty -> "no bodies to project" per view */ }
+        } catch (...) { /* unresolved source projects as an empty view */ }
         return out;
     }
     CompileResult res = compile_document(tree, env.is_null() ? json::object() : env);
@@ -829,6 +860,18 @@ json live_source_tree(const DrawingSession& s) {
 json bom_rows_locked(const DrawingSession& s) {
     const std::string src_id = s.source_ref_id;
     json comps = src_id.empty() ? json::array() : doc_asm_bom_components(src_id);
+    if (src_id.empty() && live_source_tree(s).value("schema", std::string()) == "aicad.asm/1") {
+        std::vector<ComponentShape> bodies;
+        source_shapes(s, &bodies);
+        std::map<std::string, int> counts;
+        for (const auto& body : bodies)
+            ++counts[body.id.substr(0, body.id.find('#'))];
+        for (const auto& body : bodies) {
+            if (body.id.find('#') != std::string::npos) continue;
+            comps.push_back({{"component", body.id}, {"name", body.name},
+                             {"source", body.source}, {"quantity", counts[body.id]}});
+        }
+    }
     if (!comps.is_array() || comps.empty()) return json::array();
     std::vector<std::string> order;
     std::map<std::string, json> groups;
@@ -1101,9 +1144,67 @@ json compile_title_extension_draw(const json& sheet) {
     return draw;
 }
 
-// drawing_get without taking g_mtx (the caller already holds it). The full drawing
-// doc + every view's re-projected geometry (drawing.py::get_drawing_full).
-json drawing_get_locked_unsafe(const std::string& doc_id) {
+// Component-to-view mapping is computed against the same complete HLR projection.
+// Associate each visible assembly component with its own projected outline. An
+// individual HLR alone also exposes edges hidden by OTHER components: only keep an
+// anchor when a point on that outline survives in the combined view's visible edges.
+bool on_visible_edge(const json& visible, double x, double y) {
+    for (const json& poly : visible) {
+        if (!poly.is_array()) continue;
+        for (std::size_t i = 1; i < poly.size(); ++i) {
+            if (!is_xy(poly[i - 1]) || !is_xy(poly[i])) continue;
+            const double ax = poly[i - 1][0].get<double>(), ay = poly[i - 1][1].get<double>();
+            const double dx = poly[i][0].get<double>() - ax;
+            const double dy = poly[i][1].get<double>() - ay;
+            const double len2 = dx * dx + dy * dy;
+            if (len2 < 1e-12) continue;
+            const double t = std::clamp(((x - ax) * dx + (y - ay) * dy) / len2, 0.0, 1.0);
+            if (std::hypot(x - ax - t * dx, y - ay - t * dy) < 0.05) return true;
+        }
+    }
+    return false;
+}
+
+json projected_components(const json& view, const json& combined,
+                          const std::vector<ComponentShape>& components) {
+    json result = json::array();
+    const std::string kind = view.value("type", std::string());
+    if (kind == "section" || kind == "detail" || !combined.contains("visible")) return result;
+    const auto pos = get_pos(view.value("position", json::array({0.0, 0.0})));
+    const std::string orientation = view.value("orientation", std::string("front"));
+    const double scale = view.value("scale", 1.0);
+    for (const auto& component : components) {
+        json projection = project_view({component.shape}, orientation, scale, pos, false,
+                                       view.value("id", std::string()));
+        const json& bbox = projection.value("bbox", json(nullptr));
+        if (!bbox.is_array() || bbox.size() != 4) continue;
+        json anchor;
+        for (const json& poly : projection.value("visible", json::array())) {
+            if (!poly.is_array()) continue;
+            for (std::size_t i = 1; i < poly.size() && anchor.is_null(); ++i) {
+                if (!is_xy(poly[i - 1]) || !is_xy(poly[i])) continue;
+                const double ax = poly[i - 1][0].get<double>(), ay = poly[i - 1][1].get<double>();
+                const double bx = poly[i][0].get<double>(), by = poly[i][1].get<double>();
+                for (double t : {0.5, 0.25, 0.75}) {
+                    const double x = ax + (bx - ax) * t, y = ay + (by - ay) * t;
+                    if (on_visible_edge(combined["visible"], x, y)) {
+                        anchor = json::array({x, y});
+                        break;
+                    }
+                }
+            }
+            if (!anchor.is_null()) break;
+        }
+        if (!anchor.is_null())
+            result.push_back({{"component", component.id}, {"name", component.name},
+                              {"source", component.source}, {"bbox", bbox},
+                              {"anchor", anchor}});
+    }
+    return result;
+}
+
+json drawing_get_locked_unsafe(const std::string& doc_id,
+                               std::vector<ComponentShape>* components = nullptr) {
     DrawingSession& s = require_session(doc_id);
     if (s.source_missing) {
         json frozen = s.cached_views.is_object() ? s.cached_views : json::object();
@@ -1163,7 +1264,7 @@ json drawing_get_locked_unsafe(const std::string& doc_id) {
         }
         return frozen;
     }
-    auto shapes = source_shapes(s);
+    auto shapes = source_shapes(s, components);
     json sheets_out = json::array();
     double total_ms = 0.0;
     if (s.doc.contains("sheets") && s.doc["sheets"].is_array())
@@ -1302,6 +1403,7 @@ json drawing_set_source(const std::string& doc_id, const json& source_doc, const
     s.source_missing = false;
     s.source_state = "live";
     s.cached_views = json();
+    s.component_views.clear();
     s.source_revision += 1;
     return json{{"doc_id", doc_id}, {"revision", s.revision}, {"source_revision", s.source_revision}};
 }
@@ -1536,6 +1638,7 @@ json drawing_remove_view(const std::string& doc_id, const std::string& view_id) 
         }
     if (!removed)
         throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
+    s.component_views.erase(view_id);
     s.revision += 1;
     return json{{"removed", true}, {"revision", s.revision}};
 }
@@ -1937,6 +2040,180 @@ json drawing_bom(const std::string& doc_id) {
         out["note"] = s.source_ref_id.empty() ? "inline-source drawing has no BOM"
                                                : "part drawings have no BOM";
     return out;
+}
+
+json drawing_auto_balloon(const std::string& doc_id, const std::string& view_id) {
+    DrawingLock lk;
+    DrawingSession& s = require_session(doc_id);
+    json live = s.source_ref_id.empty() ? json() : doc_live_source(s.source_ref_id);
+    const json& tree = live.is_object() && live.contains("tree") ? live["tree"] : s.source_doc;
+    if (!tree.is_object() || tree.value("schema", std::string()) != "aicad.asm/1")
+        throw OpError("invalid_op", "auto balloon requires an assembly drawing",
+                      {{"reason", "not_assembly"}});
+    if (s.source_missing)
+        throw OpError("invalid_op", "auto balloon requires an available assembly source",
+                      {{"reason", "source_missing"}});
+    const json rows = bom_rows_locked(s);
+    if (rows.empty())
+        throw OpError("invalid_op", "auto balloon: assembly has no BOM components",
+                      {{"reason", "empty_bom"}});
+    if (!view_id.empty() && !find_view(s.doc, view_id))
+        throw OpError("invalid_op", "no view '" + view_id + "'",
+                      {{"reason", "unknown view"}});
+
+    const long source_revision = live.is_object()
+                                     ? live.value("revision", s.source_revision)
+                                     : s.source_revision;
+    auto supported = [](const json& v) {
+        const std::string type = v.value("type", std::string());
+        return type == "base" || type == "projected" || type == "iso";
+    };
+    auto cache_matches = [&](const json& v) {
+        const auto it = s.component_views.find(v.value("id", std::string()));
+        return it != s.component_views.end() &&
+               it->second.source_revision == source_revision &&
+               it->second.orientation == v.value("orientation", std::string("front")) &&
+               it->second.scale == v.value("scale", 1.0);
+    };
+    bool need_shapes = false;
+    for (const json* v : all_views(s.doc))
+        if (supported(*v) && (view_id.empty() || v->value("id", std::string()) == view_id) &&
+            !cache_matches(*v)) {
+            need_shapes = true;
+            break;
+        }
+
+    // The ordinary drawing fetch projects only the combined assembly. Only a cache
+    // miss on THIS command asks for the placed component bodies and their own HLR.
+    std::vector<ComponentShape> shapes;
+    json full = drawing_get_locked_unsafe(doc_id, need_shapes ? &shapes : nullptr);
+    struct Candidate { const json* view; json components; };
+    std::vector<Candidate> candidates;
+    for (const json& sheet : full["sheets"])
+        for (const json& projected : sheet["views"]) {
+            const std::string id = projected.value("view_id", std::string());
+            if (!view_id.empty() && id != view_id) continue;
+            const json* stored = find_view_c(s.doc, id);
+            if (!stored || !supported(*stored)) continue;
+            const auto pos = get_pos(stored->value("position", json::array({0.0, 0.0})));
+            if (!cache_matches(*stored)) {
+                json local = projected_components(*stored, projected, shapes);
+                for (json& c : local)
+                    for (int axis = 0; axis < 2; ++axis) {
+                        c["anchor"][axis] = c["anchor"][axis].get<double>() - pos[axis];
+                        c["bbox"][axis] = c["bbox"][axis].get<double>() - pos[axis];
+                        c["bbox"][axis + 2] = c["bbox"][axis + 2].get<double>() - pos[axis];
+                    }
+                s.component_views[id] = {source_revision,
+                                         stored->value("orientation", std::string("front")),
+                                         stored->value("scale", 1.0), std::move(local)};
+            }
+            json components = s.component_views.at(id).local_components;
+            for (json& c : components)
+                for (int axis = 0; axis < 2; ++axis) {
+                    c["anchor"][axis] = c["anchor"][axis].get<double>() + pos[axis];
+                    c["bbox"][axis] = c["bbox"][axis].get<double>() + pos[axis];
+                    c["bbox"][axis + 2] = c["bbox"][axis + 2].get<double>() + pos[axis];
+                }
+            candidates.push_back({&projected, std::move(components)});
+        }
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [&](const Candidate& lhs, const Candidate& rhs) {
+        auto coverage = [&](const Candidate& candidate) {
+            int count = 0;
+            for (const json& row : rows) {
+                const std::string source = row.value("source", std::string());
+                const std::string name = row.value("name", std::string());
+                for (const json& c : candidate.components)
+                    if ((!source.empty() && c.value("source", std::string()) == source) ||
+                        (source.empty() && c.value("source", std::string()).empty() &&
+                         c.value("name", std::string()) == name)) {
+                        ++count;
+                        break;
+                    }
+            }
+            return count;
+        };
+        return coverage(lhs) > coverage(rhs);
+    });
+    struct Choice {
+        std::string view;
+        std::string component;
+        std::string source;
+        json anchor;
+        json component_bounds;
+        json view_bounds;
+        int item;
+    };
+    std::vector<Choice> choices;
+    for (const json& row : rows) {
+        const std::string source = row.value("source", std::string());
+        const std::string name = row.value("name", std::string());
+        bool found = false;
+        for (const Candidate& candidate : candidates) {
+            for (const json& c : candidate.components) {
+                if ((!source.empty() && c.value("source", std::string()) != source) ||
+                    (source.empty() && (c.value("source", std::string()) != "" ||
+                                        c.value("name", std::string()) != name)))
+                    continue;
+                choices.push_back({candidate.view->at("view_id").get<std::string>(),
+                                   c.value("component", std::string()), source, c["anchor"],
+                                   c["bbox"], candidate.view->at("bbox"),
+                                   row.at("item").get<int>()});
+                found = true;
+                break;
+            }
+            if (found) break;
+        }
+        if (!found)
+            throw OpError("invalid_op",
+                          "auto balloon: no visible component for BOM item " +
+                              std::to_string(row.at("item").get<int>()),
+                          {{"reason", "component_not_visible"}, {"item", row.at("item")}});
+    }
+
+    // Idempotent regeneration affects only our own annotations, never manually placed
+    // balloons. All edits happen under one drawing lock and one revision increment.
+    for (json* view : all_views(s.doc)) {
+        json kept = json::array();
+        for (const json& ann : view->value("annotations", json::array()))
+            if (!(ann.value("kind", std::string()) == "balloon" &&
+                  ann.value("auto", false)))
+                kept.push_back(ann);
+        (*view)["annotations"] = std::move(kept);
+    }
+    std::map<std::string, int> column;
+    json used_views = json::array();
+    json placements = json::array();
+    for (const Choice& choice : choices) {
+        json& view = *find_view(s.doc, choice.view);
+        const int index = column[choice.view]++;
+        if (index == 0) used_views.push_back(choice.view);
+        const double x = choice.view_bounds[2].get<double>() + 18.0;
+        const double y = choice.view_bounds[3].get<double>() - 6.0 - 12.0 * index;
+        view["annotations"].push_back({
+            {"id", next_ann_id(view)}, {"type", "note"}, {"kind", "balloon"},
+            {"a", choice.anchor}, {"pos", json::array({x, y})},
+            {"value", static_cast<double>(choice.item)}, {"item", choice.item},
+            {"text", std::to_string(choice.item)}, {"auto", true},
+        });
+        placements.push_back({{"item", choice.item}, {"view_id", choice.view},
+                              {"component", choice.component}, {"source", choice.source},
+                              {"anchor", choice.anchor}, {"bbox", choice.component_bounds}});
+    }
+    ++s.revision;
+    full["revision"] = s.revision;
+    full["tree"] = s.doc;
+    for (json& sheet : full["sheets"])
+        for (json& projected : sheet["views"]) {
+            const json* stored = find_view_c(s.doc, projected.value("view_id", std::string()));
+            if (!stored) continue;
+            projected["annotations"] = stored->value("annotations", json::array());
+            for (json& ann : projected["annotations"])
+                ann["draw"] = compile_annotation(ann, doc_units(s.doc));
+        }
+    return json{{"added", choices.size()}, {"view_ids", used_views},
+                {"placements", std::move(placements)}, {"drawing", std::move(full)}};
 }
 
 std::map<std::string, std::string> drawings_for_source(const std::string& source_doc_id) {

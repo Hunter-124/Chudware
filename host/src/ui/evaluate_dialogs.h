@@ -143,6 +143,8 @@ private:
     void drawExclusiveWindow(AppState& st);
     void syncDocument(AppState& st);
     void drawMeasure(AppState& st);
+    void runGeometryAnalysis(AppState& st);
+    void drawGeometryAnalysis(AppState& st);
 
     // Exclusive tools (measure/check/interference/draft/thickness/curvature/zebra/symmetry).
     // Mass and Section are independent so both can be open at once.
@@ -207,6 +209,10 @@ private:
     nlohmann::json sectionResults_ = nlohmann::json::array({nullptr, nullptr, nullptr});
 
     // Symmetry plane: 0 front, 1 top, 2 right.
+    // Zero in a control means use the engine's per-body, size-scaled default.
+    float geometryMinArea_ = 0.f, geometryMinEdge_ = 0.f;
+    float geometrySliverRatio_ = 0.f, geometryGapTol_ = 0.f;
+    bool geometryDiscontinuities_ = false;
     int symmetryPlane_ = 0;
 
     // Field-analysis dock params (draft / thickness / curvature).

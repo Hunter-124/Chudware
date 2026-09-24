@@ -6,6 +6,7 @@
 
 #include "doc/session.h"
 #include "doc/op_registry.h"
+#include "geom/geometry_analysis.h"
 
 #include "util/aicm_handoff.h"
 
@@ -10207,6 +10208,25 @@ json doc_eval_check(const std::string& doc_id, int body_id) {
 
     return json{{"issues", issues}, {"body_id", shapes.body_ids[index]},
                 {"complete", shapes.complete}, {"source_failures", shapes.source_failures}};
+}
+
+json doc_eval_geometry_analysis(const std::string& doc_id, const json& options) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    const EvalShapeSet shapes = gather_eval_shapes(s);
+    if (shapes.compiled.shapes.empty())
+        throw_no_bodies(doc_id, shapes.compiled, "geometry analysis");
+    try {
+        json result = chudware::geom::geometry_analysis(
+            shapes.compiled.shapes, shapes.body_ids, options);
+        result["complete"] = shapes.complete;
+        result["source_failures"] = shapes.source_failures;
+        result["doc_id"] = doc_id;
+        result["revision"] = s.revision;
+        return result;
+    } catch (const std::invalid_argument& e) {
+        throw OpError("invalid_op", e.what());
+    }
 }
 
 // ── eval_solid_health (T-GH1) ────────────────────────────────────────────────────────────

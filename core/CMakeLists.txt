@@ -1246,6 +1246,7 @@ if(CHUDWARE_WITH_OCCT)
   # chudware_geom (SketchPlane/Eigen) and nlohmann_json.
   add_library(chudware_geom_occt STATIC
     geom/tessellate.cpp
+    geom/geometry_analysis.cpp
     geom/features.cpp
     geom/profile.cpp
     geom/profile3d.cpp
@@ -1712,6 +1713,15 @@ if(CHUDWARE_WITH_OCCT)
   add_test(NAME document COMMAND test_document)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(document PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  add_executable(test_geometry_analysis tests/test_geometry_analysis.cpp)
+  target_include_directories(test_geometry_analysis PRIVATE
+    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_geometry_analysis PRIVATE chudware_doc chudware_geom_occt)
+  set_target_properties(test_geometry_analysis PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME geometry_analysis COMMAND test_geometry_analysis)
+  set_tests_properties(geometry_analysis PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- Op vocabulary registry lockstep (mega-8 OpVocab) -----------------------
   # Fails if someone adds an apply_one handler without updating op_registry, or

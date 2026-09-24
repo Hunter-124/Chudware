@@ -381,14 +381,16 @@ static void fetchBom(AppState& st, AppState::DocTab& tab) {
 
 // Update the cached drawing from an RPC result (a {drawing:...} envelope, a full {sheets:...} doc,
 // or neither -> re-fetch), and mark the tab unsaved.
-static void absorbDrawingResult(AppState& st, AppState::DocTab& tab, const nlohmann::json& res) {
+static void absorbDrawingResult(AppState& st, AppState::DocTab& tab,
+                                const nlohmann::json& res, int tabIdx = -1) {
+    const int target = tabIdx >= 0 ? tabIdx : st.activeTab;
     if (res.is_object() && res.contains("drawing") && res["drawing"].is_object())
         tab.drawingDoc = res["drawing"];
     else if (res.is_object() && res.contains("sheets") && res["sheets"].is_array())
         tab.drawingDoc = res;
     else
-        st.refreshDrawingTab(st.activeTab);
-    st.markDrawingTabDirty(st.activeTab);
+        st.refreshDrawingTab(target);
+    st.markDrawingTabDirty(target);
 }
 
 // Call a drawing RPC; on failure log + toast and return false. `label` is the user-facing verb.
@@ -442,8 +444,16 @@ static void drawCallAsync(AppState& st, const char* method, nlohmann::json param
                                  labelS + " failed: " + (msg.empty() ? "engine error" : msg));
                         return;
                     }
-                    absorbDrawingResult(st, tab, r.result);
+                    absorbDrawingResult(st, tab, r.result, tabIdx);
                     if (needFit) tab.drawNeedFit = true;
+                    if (methodS == "drawing_auto_balloon") {
+                        const int added = r.result.value("added", 0);
+                        st.toast(ui::ToastLevel::Info,
+                                 "Auto Balloon: " + std::to_string(added) + " BOM items");
+                        st.addLog("[draw] auto balloon placed " + std::to_string(added) +
+                                  " BOM items");
+                        return;
+                    }
                     st.addLog("[draw] " + methodS + " ok");
                 },
                 120000);
@@ -626,6 +636,12 @@ bool drawingHandleCommand(AppState& st, const std::string& cmd) {
     if (cmd == "dwg_center_line")  { disarmDrawTools(tab); tab.centerLineActive = true; tab.centerLineStage = 0; return true; }
     if (cmd == "dwg_note")         { disarmDrawTools(tab); tab.noteActive = true; return true; }
     if (cmd == "dwg_balloon") { disarmDrawTools(tab); tab.balloonActive = true; return true; }
+    if (cmd == "dwg_auto_balloon") {
+        disarmDrawTools(tab);
+        drawCallAsync(st, "drawing_auto_balloon", {{"doc_id", tab.drawingDocId}},
+                      "Auto Balloon");
+        return true;
+    }
     if (cmd == "dwg_bom_table") {
         tab.bomVisible = !tab.bomVisible;
         if (tab.bomVisible && !tab.bomFetched) fetchBom(st, tab);

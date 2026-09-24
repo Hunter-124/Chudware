@@ -1748,3 +1748,111 @@ standalone source retains its existing `source_state:"missing"` warning. The
 warning distinguishes a frozen view from a live associative projection.
 DXF/PDF ASCII labels preserve hole-callout ⌴, ⌵ and ↧ as `CBORE`, `CSK`
 and `DEPTH` respectively.
+
+## hostd services-worker lanes (2026-09-24)
+
+Hostd lazily owns two independent serialized services-worker processes. Each has its
+own stdio mutex, process lifetime, response IDs and streamed-event channel. An
+`agent_admin_turn` may occupy the agent channel for hours without blocking any
+general-lane request. The manufacturing lane's injected worker callback always
+uses the general process. Shutdown stops each process only if it was created.
+`agent_cancel`/`agent_steer` for an active worker run use the agent worker's
+private authenticated control socket, never its busy stdio channel.
+
+The explicit hostd dispatch classification (worker_main registration tables):
+
+| Lane | Registered method families and exceptions |
+| --- | --- |
+| Agent | `agent_*`, `chudcode_*`, `session_*`, `subscription_*`, `skills_*`, `triggers_*`, `packs_*`, `ai_roles_*`, `model_rankings_*`, `bench_*`, `memory_*`, `subagent_*`, `dag_*`, `ai_prompt_*`, `ai_tool_*`; exact `rule_create`, `worker_control_info`. This retains Chudcode session/process ownership, OAuth login progress, benchmark child/status, prompt-cache invalidation and warm state, and agent/subagent/DAG control with their owning worker. |
+| General | All other registrations: `ping`, `run_model`, `list_editable_prompts`, `office_extract`; `plm_*`, `mfg_printer_adapter_*`, `part_*`, `parts_*`, `vendor_part_*`, `reveng_*`, `sim_*`, `em_*`, `ecad_*`, deliverables (`render_document`, `list_artifacts`) and other ordinary methods. Unknown methods also use general and retain the worker's ordinary unknown-method response. |
+
+Prefixes above describe reviewed registered method families, not a blanket
+classification of any `ai_*` name. The general process must not initialize or
+reconcile the agent-owned Chudcode service/bench lifecycle; stateful agent APIs
+stay on the agent worker even when a specific handler persists some data in files.
+
+## Drawing Auto Balloon (2026-09-24)
+
+`drawing_auto_balloon {doc_id, view_id?}` → `{added, view_ids, drawing}`.
+The source must be an assembly (`invalid_op`, `reason:"not_assembly"` for parts).
+It uses the drawing BOM's distinct item numbers and places one ordinary balloon
+annotation per item, selecting the view with the most visible components first
+and using additional views only for remaining items. An explicit `view_id` limits
+placement to that view; unknown views refuse with `reason:"unknown view"` and a
+BOM item not visible there (or in any available view) refuses atomically with
+`reason:"component_not_visible", item`. Repeating the call replaces only earlier
+automatically placed balloons. Each balloon stores `kind:"balloon"`, `item`, its
+sheet-mm leader `a` and label `pos`, and `auto:true`; it participates in ordinary
+annotation edit, view movement and DXF/PDF export. Assembly base/projected/iso
+views from `drawing_get` additionally carry
+`components:[{component,name,source,bbox,anchor}]` for visible component
+instances; `bbox:[minx,miny,maxx,maxy]` and `anchor:[x,y]` are in sheet mm.
+
+## Evaluate Geometry Analysis (2026-09-24)
+
+`eval_geometry_analysis {doc_id, min_face_area?, min_edge_length?,
+sliver_ratio?, gap_tol?, include_discontinuities?}` is read-only and distinct
+from the legacy `eval_check`. The first two thresholds are mm² and mm; gap
+tolerance is mm, while sliver ratio is face area / perimeter². Omitted size
+thresholds scale with each body's bounding-box diagonal (respectively
+`max(1e-6, diag² × 1e-4)`, `max(1e-4, diag × 1e-3)`, and
+`max(1e-4, diag × 1e-4)` mm); omitted sliver ratio is 0.001. Explicit zero
+disables that size/ratio check. Tangency inspection is opt-in because sharp
+design corners are normal, not default defects; a sampled outward-normal
+deviation above 5° along a two-face shared edge is `non_g1_edge`.
+
+Result: `{doc_id,revision,complete,source_failures,bodies:[{body_id,
+brep_valid,face_count,edge_count,thresholds,gap_scan_complete,findings:[{
+kind,body_id,face_id,edge_id,value,threshold,other_face_id?,
+other_edge_id?}]}]}`. Findings are `small_face`, `short_edge`,
+`sliver_face`, `open_edge`, `gap`, `non_g1_edge`, or `brep_invalid`.
+`face_id`/`edge_id` are 1-based *body-local* topology IDs from the same
+`TopExp::MapShapes` traversal as AICM viewport picking, zero when a finding
+does not identify that topology kind. Assembly `body_id` retains its AICM
+identity even if component patterns leave ordinal gaps. Near-gap detection
+compares endpoints of distinct open edges (not whole-edge proximity), and
+`gap_scan_complete:false` denotes the bounded >1024-endpoint case. A clean
+body is one with an empty findings list for enabled checks; an incomplete
+source is never presented as a complete clean document.
+
+## Web actor credential isolation (2026-09-24)
+
+For a web-origin `agent_admin_turn`, gateway-injected `_chudware_actor` carries
+`email`, `plan`, `credits_remaining`, and `key_source=byok|subscription|pool`.
+The gateway strips client secret/actor fields. `byok` supplies the user's key
+as `api_key` and actor `_byok_key_sha256`; `subscription` supplies actor
+`_subscription:{provider,access_token}` and `_subscription_token_sha256`;
+`pool` supplies actor `_pool:{provider,api_key}` and `_pool_key_sha256`.
+Each proof is lowercase SHA-256 hex over the exact UTF-8 credential bytes.
+Provider and model are explicit on every web turn. Pool provider is gateway
+configured (`CHUDWARE_WEB_POOL_PROVIDER`, default `openrouter`) and optional
+`CHUDWARE_WEB_POOL_MODEL` overrides the web model before credit reservation;
+`CHUDWARE_WEB_POOL_API_KEY` is gateway-only, never loaded from hostd ambient auth.
+
+The worker checks the digest, source, provider, and credential before calling
+Chudcode, then passes `web_actor`, `web_key_source`, `web_provider`,
+`web_tenant`, and `web_credential` to the host. The host creates a scoped
+mode-0700 session directory and a temporary mode-0700 HOME, XDG and
+`CHUDCODE_CODING_AGENT_DIR` for that credential; it blanks inherited environment
+variables and injects only the selected provider key/token. Credential identity
+includes source, tenant, provider, and credential fingerprint; a live session
+cannot change identity, and a resumed file cannot cross scope. Anthropic OAuth
+uses `ANTHROPIC_OAUTH_TOKEN`; Chudcode 0.3.0 has no isolated Codex bearer
+injection, so Codex subscription turns refuse `subscription_isolation_unsupported`.
+Missing pool key refuses `pool_credential_unconfigured` with a user-facing hint
+before reservation, missing/mismatched proofs refuse by source, and missing or
+unknown web source refuses `web_credential_source_invalid`. No web turn falls
+back to ambient auth. A desktop turn without `_chudware_actor` retains normal
+Chudcode ambient auth.
+
+## Drawing Auto Balloon projection cost addendum (2026-09-24)
+
+Supersedes the component-field claim in Drawing Auto Balloon above: ordinary
+`drawing_get` view geometry does **not** expose or compute per-component HLR.
+Only `drawing_auto_balloon` projects components on demand. Its result also has
+`placements:[{item,view_id,component,source,anchor,bbox}]`, with the chosen
+component's `anchor` and `bbox` in sheet mm. The drawing session caches each
+view's component projection relative to its view origin by view id, source
+revision, orientation and scale. Moving a view translates cached anchors/bounds
+without another component HLR pass; source edits or orientation/scale changes
+invalidate them. Regular drawing fetches retain only combined-view projection.

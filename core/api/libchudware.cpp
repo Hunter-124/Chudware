@@ -3499,6 +3499,10 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.contains("body") && params["body"].is_number()
                                     ? params["body"].get<int>() : 0),
                             out_json, 0);
+            if (m == "eval_geometry_analysis")
+                return emit(chudware::doc::doc_eval_geometry_analysis(
+                                params.value("doc_id", std::string()), params),
+                            out_json, 0);
             if (m == "eval_solid_health")
                 return emit(chudware::doc::doc_eval_solid_health(
                                 params.value("doc_id", std::string()),
@@ -3900,6 +3904,11 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                             out_json, 0);
             if (m == "drawing_bom")
                 return emit(chudware::doc::drawing_bom(params.value("doc_id", std::string())),
+                            out_json, 0);
+            if (m == "drawing_auto_balloon")
+                return emit(chudware::doc::drawing_auto_balloon(
+                                params.value("doc_id", std::string()),
+                                params.value("view_id", std::string())),
                             out_json, 0);
             if (m == "drawing_close")
                 return emit(json{{"closed", chudware::doc::drawing_close(

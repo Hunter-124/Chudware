@@ -783,6 +783,7 @@ static const char* ribbon_tipFor(const char* cmd_id) {
         {"eval_zebra",        "Show zebra stripes to inspect surface continuity."},
         {"eval_symmetry",     "Check the model for symmetry."},
         {"eval_check",        "Check geometry for errors and bad faces."},
+        {"eval_geometry",     "Find small faces, short edges, slivers, gaps and tangency breaks."},
         {"eval_interference", "Detect interference between bodies."},
         {"sim_new_static",    "Create a linear static stress study."},
         {"sim_new_modal",     "Create a frequency / modal study."},
@@ -901,6 +902,7 @@ static const char* ribbon_tipFor(const char* cmd_id) {
         {"dwg_center_line",   "Add a center line between two edges."},
         {"dwg_note",          "Add a text note, optionally with a leader."},
         {"dwg_balloon",       "Add a BOM balloon to a component."},
+        {"dwg_auto_balloon",  "Auto-place numbered BOM balloons on every visible component."},
         {"dwg_title_block",   "Edit the sheet's title block fields."},
         {"dwg_bom_table",     "Insert a bill of materials table."},
         // --- Appearance: material / clear + display styles ---

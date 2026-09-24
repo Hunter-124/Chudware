@@ -1,10 +1,14 @@
 # Commands Reference
 
-Every ribbon command (357 total), grouped by tab and ribbon group.
+Every ribbon command (359 total), grouped by tab and ribbon group.
 
 ## Annotation
 
 ### Annotations
+
+#### Auto Balloon
+
+_Available from the Annotation ▸ Annotations ribbon group._
 
 #### Balloon
 
@@ -213,6 +217,10 @@ _Available from the Evaluate ▸ Geometry ribbon group._
 ### Geometry Check
 
 #### Check
+
+_Available from the Evaluate ▸ Geometry Check ribbon group._
+
+#### Geometry Anlys.
 
 _Available from the Evaluate ▸ Geometry Check ribbon group._
 

@@ -351,6 +351,107 @@ void EvaluateDialogs::runEval(AppState& st, const std::string& method,
     }, 60000);
 }
 
+void EvaluateDialogs::runGeometryAnalysis(AppState& st) {
+    nlohmann::json options = {{"include_discontinuities", geometryDiscontinuities_}};
+    if (geometryMinArea_ > 0) options["min_face_area"] = geometryMinArea_;
+    if (geometryMinEdge_ > 0) options["min_edge_length"] = geometryMinEdge_;
+    if (geometrySliverRatio_ > 0) options["sliver_ratio"] = geometrySliverRatio_;
+    if (geometryGapTol_ > 0) options["gap_tol"] = geometryGapTol_;
+    runEval(st, "eval_geometry_analysis", options);
+}
+
+void EvaluateDialogs::drawGeometryAnalysis(AppState& st) {
+    kit::dimText("Zero uses a size-scaled default for each body. All dimensions are model mm.");
+    ImGui::InputFloat("Min face area (mm²)", &geometryMinArea_, 0, 0, "%.6g");
+    ImGui::InputFloat("Min edge length (mm)", &geometryMinEdge_, 0, 0, "%.6g");
+    ImGui::InputFloat("Sliver area / perimeter²", &geometrySliverRatio_, 0, 0, "%.6g");
+    ImGui::InputFloat("Gap tolerance (mm)", &geometryGapTol_, 0, 0, "%.6g");
+    ImGui::Checkbox("Inspect tangent discontinuities", &geometryDiscontinuities_);
+    if (kit::primaryButton("Run", !pending_)) {
+        geometryMinArea_ = std::max(0.f, geometryMinArea_);
+        geometryMinEdge_ = std::max(0.f, geometryMinEdge_);
+        geometrySliverRatio_ = std::max(0.f, geometrySliverRatio_);
+        geometryGapTol_ = std::max(0.f, geometryGapTol_);
+        runGeometryAnalysis(st);
+    }
+    if (pending_) {
+        kit::spinner("Analyzing geometry...");
+        return;
+    }
+    if (!errorText_.empty()) {
+        kit::blockedState("Geometry analysis unavailable", errorText_.c_str());
+        return;
+    }
+    if (!result_.contains("bodies") || !result_["bodies"].is_array()) return;
+    if (!result_.value("complete", false))
+        kit::blockedState("Incomplete source geometry",
+                          "Some source features or assembly components did not compile. Findings below cover surviving bodies only.");
+    for (const auto& body : result_["bodies"]) {
+        if (!body.contains("thresholds") || !body["thresholds"].is_object()) continue;
+        const auto& t = body["thresholds"];
+        ImGui::TextWrapped("Body %d limits: face %.4g mm², edge %.4g mm, "
+                           "sliver %.4g, gap %.4g mm",
+                           body.value("body_id", 0),
+                           t.value("min_face_area", 0.0), t.value("min_edge_length", 0.0),
+                           t.value("sliver_ratio", 0.0), t.value("gap_tol", 0.0));
+    }
+    static constexpr const char* kinds[] = {
+        "brep_invalid", "small_face", "short_edge", "sliver_face",
+        "open_edge", "gap", "non_g1_edge"
+    };
+    static constexpr const char* labels[] = {
+        "Invalid B-rep", "Small faces", "Short edges", "Sliver faces",
+        "Open edges", "Near gaps", "Non-tangent edges"
+    };
+    bool any = false;
+    for (int k = 0; k < 7; ++k) {
+        int count = 0;
+        for (const auto& body : result_["bodies"])
+            if (body.contains("findings") && body["findings"].is_array())
+                for (const auto& row : body["findings"])
+                    if (row.value("kind", std::string()) == kinds[k]) ++count;
+        if (!count) continue;
+        any = true;
+        kit::sectionHeader(labels[k], nullptr, nullptr, count, true);
+        if (!ImGui::BeginTable(kinds[k], 3, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg))
+            continue;
+        ImGui::TableSetupColumn("Entity");
+        ImGui::TableSetupColumn("Measured");
+        ImGui::TableSetupColumn("Limit");
+        ImGui::TableHeadersRow();
+        for (const auto& body : result_["bodies"]) {
+            if (!body.contains("findings") || !body["findings"].is_array()) continue;
+            for (const auto& row : body["findings"]) {
+                if (row.value("kind", std::string()) != kinds[k]) continue;
+                const int bid = row.value("body_id", 0);
+                const int fid = row.value("face_id", 0);
+                const int eid = row.value("edge_id", 0);
+                const std::string entity = "Body " + std::to_string(bid) +
+                    (fid ? " / Face " + std::to_string(fid) : "") +
+                    (eid ? " / Edge " + std::to_string(eid) : "");
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::PushID(&row);
+                if (ImGui::Selectable(entity.c_str(), false, ImGuiSelectableFlags_SpanAllColumns) &&
+                    bid > 0 && (fid > 0 || eid > 0))
+                    st.selection.selectOne({static_cast<uint32_t>(bid),
+                                            fid ? render::PickKind::Face : render::PickKind::Edge,
+                                            static_cast<uint32_t>(fid ? fid : eid)});
+                ImGui::PopID();
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%.5g", row.value("value", 0.0));
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("%.5g", row.value("threshold", 0.0));
+            }
+        }
+        ImGui::EndTable();
+    }
+    if (!any) kit::dimText("No findings for the enabled checks.");
+    for (const auto& body : result_["bodies"])
+        if (!body.value("gap_scan_complete", true))
+            kit::dimText("Gap scan skipped: too many open edge endpoints on a body.");
+}
+
 // Dedicated mass eval slot so Mass Properties can stay open while exclusive tools use result_.
 void EvaluateDialogs::runMassEval(AppState& st, const nlohmann::json& extra) {
     const int gen = ++massGen_;
@@ -1264,6 +1365,7 @@ void EvaluateDialogs::tickSectionDrag(AppState& st) {
 bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
     syncDocument(st);
     const bool exclusive = cmdId == "eval_measure" || cmdId == "eval_check" ||
+        cmdId == "eval_geometry" ||
         cmdId == "eval_interference" || cmdId == "eval_symmetry" ||
         cmdId == "eval_draft" || cmdId == "eval_thickness" || cmdId == "eval_curvature" ||
         cmdId == "eval_zebra";
@@ -1306,6 +1408,12 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
         runEval(st, "eval_check", nlohmann::json::object());
         openWindow_ = "check";
         title_ = "Geometry Check";
+        return true;
+    }
+    if (cmdId == "eval_geometry") {
+        openWindow_ = "geometry";
+        title_ = "Geometry Analysis";
+        runGeometryAnalysis(st);
         return true;
     }
     if (cmdId == "eval_interference") {
@@ -1409,6 +1517,7 @@ void EvaluateDialogs::syncDocument(AppState& st) {
         fireAllSectionEvals(st);
     }
     if (openWindow_ == "check") runEval(st, "eval_check", nlohmann::json::object());
+    else if (openWindow_ == "geometry") runGeometryAnalysis(st);
     else if (openWindow_ == "interference") {
         interferencePartNames_.clear();
         interferencePartChecked_.clear();
@@ -1869,12 +1978,14 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
 
         const bool interactivePending =
             openWindow_ == "measure" || openWindow_ == "draft" || openWindow_ == "thickness" ||
-            openWindow_ == "curvature" || openWindow_ == "zebra" || openWindow_ == "symmetry";
+            openWindow_ == "curvature" || openWindow_ == "zebra" || openWindow_ == "symmetry" ||
+            openWindow_ == "geometry";
         if (pending_ && !interactivePending) {
             kit::spinner("Computing analysis...");
         } else if (!errorText_.empty() && openWindow_ != "measure" && openWindow_ != "draft" &&
                    openWindow_ != "thickness" && openWindow_ != "curvature" &&
-                   openWindow_ != "field_err" && openWindow_ != "interference") {
+                   openWindow_ != "field_err" && openWindow_ != "interference" &&
+                   openWindow_ != "geometry") {
             ImGui::PushStyleColor(
                 ImGuiCol_Text,
                 ImVec4(gpal.statusErr[0], gpal.statusErr[1], gpal.statusErr[2], gpal.statusErr[3]));
@@ -1882,6 +1993,8 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
             ImGui::PopStyleColor();
         } else if (openWindow_ == "measure") {
             drawMeasure(st);
+        } else if (openWindow_ == "geometry") {
+            drawGeometryAnalysis(st);
         } else if (openWindow_ == "check") {
             if (result_.contains("issues") && result_["issues"].is_array()) {
                 const auto& issues = result_["issues"];

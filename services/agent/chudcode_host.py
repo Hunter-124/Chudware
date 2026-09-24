@@ -1888,19 +1888,31 @@ def _safe_client_state(client: Any) -> dict[str, Any]:
 
 
 _RETRY_FAILED_FRAMES = frozenset({"auto_retry_end", "retry_end", "retry_failed"})
-_ASSISTANT_OUTPUT_FRAMES = frozenset({"message_end", "message_complete", "tool_execution_end"})
+_MESSAGE_FRAMES = frozenset({"message_end", "message_complete"})
+_ASSISTANT_OUTPUT_FRAMES = _MESSAGE_FRAMES | {"tool_execution_end"}
 
 
 def _unrecovered_provider_failure(frames: Reversible[dict[str, Any]]) -> str | None:
-    """Return the provider error when a failed retry was the turn's last real event.
+    """Return the provider error when a provider failure was the turn's last real event.
 
-    A retry that fails and is then followed by assistant output (a later message or
+    Two shapes end a turn on a provider failure: a failed retry (429 past the retry
+    budget, …) and a non-retryable rejection, which Chudcode records as an assistant
+    message with ``stopReason: "error"`` (a 400 such as a model the credential's client
+    version may not use). Either one followed by assistant output (a later message or
     tool result) was recovered — a model fallback or a manual continue — and is not a
-    turn failure. Only a failed retry with nothing but lifecycle frames after it means
-    the turn produced no work past that point.
+    turn failure. Only lifecycle frames after it mean the turn produced no work past
+    that point.
     """
     for frame in reversed(frames):
         kind = frame.get("type")
+        if kind in _MESSAGE_FRAMES:
+            message = frame.get("message")
+            if not isinstance(message, Mapping) or message.get("role") != "assistant":
+                continue  # user/custom/tool-result records are not assistant output
+            if message.get("stopReason") != "error":
+                return None
+            detail = _provider_error_detail(message.get("errorMessage"))
+            return f"provider error: {detail or 'no error detail'}"[:1200]
         if kind in _ASSISTANT_OUTPUT_FRAMES:
             return None
         if kind not in _RETRY_FAILED_FRAMES:
@@ -1917,6 +1929,23 @@ def _unrecovered_provider_failure(frames: Reversible[dict[str, Any]]) -> str | N
                 break
         return f"provider retry exhausted: {message or 'no error detail'}"[:1200]
     return None
+
+
+def _provider_error_detail(raw: Any) -> str:
+    """Reduce Chudcode's ``"<status> <json body>\\n<diagnostic lines>"`` to one sentence."""
+    if not isinstance(raw, str):
+        return ""
+    head = raw.strip().split("\n", 1)[0]
+    status, _, body = head.partition(" ")
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return head
+    error = parsed.get("error") if isinstance(parsed, Mapping) else None
+    text = error.get("message") if isinstance(error, Mapping) else None
+    if isinstance(text, str) and text.strip():
+        return f"{status} {text.strip()}" if status.isdigit() else text.strip()
+    return head
 
 
 def _safe_last_assistant_text(client: Any) -> str | None:

@@ -523,6 +523,73 @@ def test_failed_provider_retry_survives_long_lifecycle_tail():
     assert result["terminal"]["isTerminal"] is True
 
 
+def _scripted_turn(events):
+    class Scripted(FakeClient):
+        def wait_for_idle(self, timeout=None):
+            self.idle_timeouts.append(timeout)
+            for event in events:
+                for listener in tuple(self.listeners):
+                    listener(event)
+            return ()
+
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(
+        client_factory=lambda **kw: factory.clients.append(Scripted(factory, **kw))
+        or factory.clients[-1]
+    )
+    return host.run_turn(
+        {"request": "Do the work", "session_id": "scripted", "run_id": "r-scripted"},
+        lambda _frame: None,
+    )
+
+
+_REJECTED = {
+    "role": "assistant",
+    "content": [],
+    "stopReason": "error",
+    "errorMessage": (
+        '400 {"type":"error","error":{"type":"invalid_request_error",'
+        '"message":"Claude Code 2.1.246 does not support this model"}}\n'
+        "raw-http-request=/tmp/req.json"
+    ),
+}
+
+
+def test_non_retryable_provider_rejection_fails_the_turn():
+    # Live 2026-09-24: a 400 is not retried, so Chudcode records it only as an
+    # assistant message with stopReason "error" and then emits a normal agent_end.
+    # The GUI rendered "The agent finished without reporting what it did".
+    result = _scripted_turn(
+        [
+            {"type": "message_end", "message": {"role": "user", "content": []}},
+            {"type": "message_end", "message": _REJECTED},
+            {"type": "agent_end", "messages": [], "isTerminal": True},
+        ]
+    )
+
+    assert result["ok"] is False
+    assert result["stop_reason"] == "provider_error"
+    assert result["reason"] == (
+        "provider error: 400 Claude Code 2.1.246 does not support this model"
+    )
+
+
+def test_provider_rejection_followed_by_assistant_output_is_recovered():
+    result = _scripted_turn(
+        [
+            {"type": "message_end", "message": _REJECTED},
+            {
+                "type": "message_end",
+                "message": {"role": "assistant", "content": [], "stopReason": "stop"},
+            },
+            {"type": "agent_end", "messages": [], "isTerminal": True},
+        ]
+    )
+
+    assert result["ok"] is True
+    assert "stop_reason" not in result
+
+
 def test_rejects_a_runtime_that_did_not_negotiate_protocol_v2():
     factory = FakeFactory(protocol_version=1)
     host = ChudcodeSessionHost(client_factory=factory)

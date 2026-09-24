@@ -2164,12 +2164,25 @@ def _sanitize_model(item: Any) -> dict[str, Any] | None:
     provider = _bounded_text(item.get("provider"), 128)
     if model_id is None or provider is None:
         return None
-    inputs = item.get("input")
+    # Chudcode's catalog names the modality list `inputModalities`; `input` is the older spelling.
+    inputs = item.get("inputModalities")
+    if not isinstance(inputs, list):
+        inputs = item.get("input")
     clean_inputs = (
         [text for value in inputs[:8] if (text := _bounded_text(value, 32)) is not None]
         if isinstance(inputs, list)
         else []
     )
+    # The per-model effort ladder (`thinking.efforts`) is the only source that knows a new
+    # release's rungs; dropping it left the composer on a hardcoded low/medium/high fallback.
+    thinking = item.get("thinking")
+    raw_efforts = thinking.get("efforts") if isinstance(thinking, Mapping) else None
+    efforts: list[str] = []
+    if isinstance(raw_efforts, list):
+        for value in raw_efforts[:8]:
+            text = _bounded_text(value, 32)
+            if text is not None and text not in efforts:
+                efforts.append(text)
     raw_cost = item.get("cost")
     cost = raw_cost if isinstance(raw_cost, Mapping) else {}
     clean_cost = {
@@ -2192,6 +2205,8 @@ def _sanitize_model(item: Any) -> dict[str, Any] | None:
             1_000_000_000, max(0, int(_finite_number(item.get("maxTokens"))))
         ),
         "reasoning": bool(item.get("reasoning")),
+        "reasoningEfforts": efforts,
+        "vision": "image" in clean_inputs,
         "input": clean_inputs,
         "cost": clean_cost,
     }

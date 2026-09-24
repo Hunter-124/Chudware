@@ -127,7 +127,11 @@ class _FakeHost:
                         "contextWindow": 200_000,
                         "maxTokens": 8_192,
                         "reasoning": index % 2 == 0,
-                        "input": ["text", "image"],
+                        "inputModalities": ["text", "image"],
+                        "thinking": {
+                            "mode": "anthropic-adaptive",
+                            "efforts": ["low", "medium", "high", "xhigh", "max"],
+                        },
                         "cost": {
                             "input": 1.0,
                             "output": 2.0,
@@ -773,9 +777,15 @@ def test_provider_auth_model_and_login_results_are_bounded_and_secret_free(onlin
         "contextWindow",
         "maxTokens",
         "reasoning",
+        "reasoningEfforts",
+        "vision",
         "input",
         "cost",
     }
+    # Chudcode's per-model ladder drives the composer's effort menu; without it a new
+    # release fell back to a hardcoded low/medium/high and hid xhigh/max.
+    assert models["models"][0]["reasoningEfforts"] == ["low", "medium", "high", "xhigh", "max"]
+    assert models["models"][0]["vision"] is True
     assert login["state"] == "oauth_connected"
     assert emit == [
         {

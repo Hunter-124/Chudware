@@ -76,6 +76,12 @@ log the token or move control back onto the serialized stdio lane.
   idempotent. Pre-start steering queues until immediately after `prompt()`.
 - A turn must observe terminal `agent_end` after `wait_for_idle`; idle without it is a protocol
   error. Event-forwarding errors fail the result rather than hiding a broken UI boundary.
+- `agent_end` is not success. `chudcode_host._unrecovered_provider_failure` returns
+  `ok:false, stop_reason:"provider_error"` when the turn's last assistant record is a failure:
+  a failed retry (`auto_retry_end success:false`) or a non-retryable rejection, which Chudcode
+  records only as an assistant `message_end` with `stopReason:"error"` + `errorMessage` (e.g.
+  a 400). Missing the second shape made a rejected Opus 5.5 turn render as "The agent
+  finished without reporting what it did" (2026-09-24).
 - `chudcode_close_session {session_id}` is idempotent: mark active runs cancelled, abort live
   work, dispose the process, and preserve persisted history.
 - On worker exit, stop the control server before disposing all saved-session and transient
@@ -178,6 +184,13 @@ STT. A status/settings request must not silently create or resume a conversation
 Secrets stay in typed `chudcode_rpc` wrappers. UI responses may expose state, account labels,
 usage, and model metadata, never credential bytes. Login UI requests are bounded and allow only
 safe web URLs before they enter Chudware's `extension_ui_request` event.
+
+`chudcode_models_list` rows carry `reasoningEfforts` (from the catalog's `thinking.efforts`)
+and `vision` (from `inputModalities`). The composer's effort menu reads that ladder; without
+it an id missing from `model_registry.h`'s static table fell back to Low/Medium/High.
+Anthropic OAuth requests present Chudcode's Claude Code fingerprint
+(`packages/ai/src/providers/claude-code-fingerprint.ts`). A `400 claude_code_version_too_old`
+on a new model means that version must be bumped and `chud` rebuilt.
 
 ## Binary and release workflow
 

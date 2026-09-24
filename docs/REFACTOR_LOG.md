@@ -4776,3 +4776,21 @@ then runs the normal `insertComponent`. **Host:** GL-thread EngineClient calls a
 mingw `-fsyntax-only` check and links shell32/ole32 (still unexercised at runtime). Known,
 pre-existing: `CHUDWARE_SHOT=flow` logs "numeric result did not arrive within 180 s" while
 exiting 0.
+
+## 2026-09-24 — Opus 5.5: effort ladder and silent provider rejections
+
+Two defects surfaced by one Opus 5.5 chat turn. **Effort menu:** `worker_rpc._sanitize_model`
+dropped Chudcode's per-model `thinking.efforts`, so the composer (`composerEffortLadder`) had no
+catalog ladder for an id missing from `model_registry.h`'s static table and fell back to
+Low/Medium/High; rows now carry `reasoningEfforts` and `vision` (from `inputModalities`, the
+old `input` key never existed in the live catalog). **Silent failure:** Anthropic rejected every
+Opus 5.5 request with `400 claude_code_version_too_old` (Chudcode presented Claude Code
+2.1.246; 2.1.280+ required). A 400 is not retried, so Chudcode recorded it only as an assistant
+`message_end` with `stopReason:"error"` and emitted a normal `agent_end`;
+`chudcode_host._unrecovered_provider_failure` only knew the failed-retry shape and returned
+`ok:true`, which the GUI rendered as "The agent finished without reporting what it did".
+Both shapes now return `ok:false, stop_reason:"provider_error"` with the provider's sentence.
+Chudcode `7f104b4558` bumps the fingerprint to 2.1.281; the local `~/.local/bin/chud` was
+rebuilt from the working tree (previous binary kept as `chud.2026-09-01.bak`). Deferred: the
+`vendor/chudcode/CHUDCODE_ARTIFACT.lock` release pin still names v0.3.0 artifacts carrying
+2.1.246 — a packaged build needs a new Chudcode release and a re-pin of all five targets.

@@ -1,18 +1,7 @@
-// Lazily-spawned services worker bridge for chudware-hostd.
-//
-// On web the browser talks only to hostd (via the gateway websocket). Methods the
-// C++ engine does not implement (plm_*, git_*, ai_roles_*, provider accounts, …)
-// live in the services worker. This bridge owns ONE long-lived subprocess and
-// forwards those engine-unknown RPCs over stdio JSON-RPC — the same protocol
-// services/worker/worker_client.cpp uses on desktop.
-//
-// Desktop GUI behaviour is unchanged: it still owns its own WorkerClient. This
-// path is the hostd fallback only.
-//
-// Threading: call() is safe from any client-dispatch thread; a single mutex
-// serialises the one stdio channel. Callers must NOT hold a global/server lock
-// across call() — a slow plm_overview (~10–30 s) must only block the requesting
-// connection's thread.
+// Lazily-spawned, independent services-worker stdio lanes for hostd.
+// Each lane owns a child, stdio channel, and mutex. A long Chudcode turn
+// cannot serialize unrelated PLM/manufacturing/parts requests.
+// Desktop GUI keeps its own WorkerClient; these lanes serve hostd only.
 #pragma once
 
 #include <atomic>
@@ -30,7 +19,10 @@ namespace hostd {
 
 class WorkerBridge {
 public:
-    static WorkerBridge& instance();
+    static WorkerBridge& agent();
+    static WorkerBridge& general();
+    // Explicitly classify worker methods. Unknown methods use the general lane.
+    static WorkerBridge& forMethod(const std::string& method);
     // Called synchronously for each matching streamed worker notification's
     // "data" payload while call() waits for the terminal response.
     using EventFn = std::function<void(const nlohmann::json&)>;
@@ -58,13 +50,11 @@ public:
     // Best-effort shutdown of the child (idempotent). Called from ~WorkerBridge.
     void stop();
 
-    // Stops the singleton's child WITHOUT constructing it if instance() was never called —
-    // safe to call unconditionally from hostd's clean-shutdown tail after server.run()
-    // returns (does NOT lazily spin up a worker process just to shut it down).
+    // Stop both lazily-created children without constructing an unused lane.
     static void shutdownIfCreated();
 
 private:
-    WorkerBridge() = default;
+    explicit WorkerBridge(bool agentLane) : agentLane_(agentLane) {}
     ~WorkerBridge();
     WorkerBridge(const WorkerBridge&) = delete;
     WorkerBridge& operator=(const WorkerBridge&) = delete;
@@ -108,11 +98,10 @@ private:
     ControlInfo control_;
     std::string activeWorkerRunId_;
 
+    const bool agentLane_;
     std::mutex mtx_;
-
-    // Set true the first time instance() runs; lets shutdownIfCreated() avoid constructing
-    // the function-local static singleton just to no-op stop() on it.
-    static std::atomic<bool> created_;
+    static std::atomic<bool> agentCreated_;
+    static std::atomic<bool> generalCreated_;
 };
 
 }  // namespace hostd

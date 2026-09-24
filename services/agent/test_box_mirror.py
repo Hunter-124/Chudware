@@ -8,6 +8,8 @@ monkeypatch pattern test_effort.py uses.
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
 import socket
 import threading
 import time
@@ -119,6 +121,46 @@ def env(tmp_path, monkeypatch):
     (project / ".hidden.txt").write_bytes(b"nope")
     (project / ".aicadvault" / "blob").write_bytes(b"vault-internal")
     return fake, project, tmp_path
+
+def _drain_in_process(config_path, mirror_dir, barrier, uploads, results):
+    engine_paths.CONFIG = config_path
+    os.environ["CHUDWARE_BOX_MIRROR_DIR"] = mirror_dir
+    fake = FakeBox()
+
+    def record_upload(method, url, **kwargs):
+        if url.startswith(box_mirror._UPLOAD) and url.endswith("/content"):
+            uploads.append(url)
+            time.sleep(0.05)
+        return fake(method, url, **kwargs)
+
+    box_mirror._http = record_upload
+    barrier.wait(timeout=10)
+    results.append(box_mirror.drain(block=True))
+
+
+def test_two_process_drainers_upload_each_spooled_file_once(env):
+    _fake, project, tmp = env
+    _write_config(tmp, _enabled_cfg())
+    box_mirror.enqueue_project(str(project))
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Manager() as manager:
+        barrier = ctx.Barrier(2)
+        uploads = manager.list()
+        results = manager.list()
+        args = (engine_paths.CONFIG, os.environ["CHUDWARE_BOX_MIRROR_DIR"],
+                barrier, uploads, results)
+        workers = [ctx.Process(target=_drain_in_process, args=args) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=20)
+            if worker.is_alive():
+                worker.terminate()
+                worker.join()
+            assert worker.exitcode == 0
+        assert sorted(result.get("reason", "ok") for result in results) == ["busy", "ok"]
+        assert len(uploads) == 2
+        assert list(box_mirror._spool_dir().glob("*.json")) == []
 
 
 def _write_config(tmp_path, box: dict) -> None:

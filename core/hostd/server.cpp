@@ -99,7 +99,7 @@ Server::Server(chudware_ipc::IpcListener listener, std::string buildId)
             [](const std::string& method, const nlohmann::json& params) {
                 nlohmann::json result;
                 std::string err;
-                if (!WorkerBridge::instance().call(method, params, result, err))
+                if (!WorkerBridge::general().call(method, params, result, err))
                     throw std::runtime_error(err.empty() ? "worker call failed" : err);
                 return result;
             });
@@ -956,9 +956,9 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         // Engine-unknown only: forward to the lazily-spawned Python worker
         // (plm_*, git_*, ai_roles_*, provider accounts, …). Known-method
         // failures stay on the engine error path byte-identical — never mask
-        // a real engine error behind a worker round-trip. Bridge call holds
-        // only WorkerBridge's own mutex (one stdio channel); this dispatch
-        // thread alone blocks, so other clients keep serving engine RPCs.
+        // a real engine error behind a worker round-trip. Each worker lane
+        // holds only its own stdio mutex; a slow agent turn cannot block
+        // unrelated worker calls from other clients.
         const bool unknown =
             err.rfind("unknown method:", 0) == 0 ||
             (result.is_object() && result.contains("error") && result["error"].is_string() &&
@@ -980,8 +980,8 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
             const int workerTimeoutMs =
                 method == "agent_admin_turn" ? 900000 : 120000;
             const bool workerOk =
-                WorkerBridge::instance().call(method, p, wresult, werr,
-                                              workerTimeoutMs, workerEvent);
+                WorkerBridge::forMethod(method).call(method, p, wresult, werr,
+                                                      workerTimeoutMs, workerEvent);
             if (workerOk) {
                 // Worker success: return result verbatim except any legacy
                 // batched event copy; matching progress already streamed live.

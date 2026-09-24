@@ -9,25 +9,57 @@
 #include "security/runtime_guard.h"
 #include "util/platform_paths.h"
 
+namespace hostd {
+
+std::atomic<bool> WorkerBridge::agentCreated_{false};
+std::atomic<bool> WorkerBridge::generalCreated_{false};
+
+WorkerBridge& WorkerBridge::agent() {
+    static WorkerBridge bridge(true);
+    agentCreated_.store(true, std::memory_order_release);
+    return bridge;
+}
+
+WorkerBridge& WorkerBridge::general() {
+    static WorkerBridge bridge(false);
+    generalCreated_.store(true, std::memory_order_release);
+    return bridge;
+}
+
+WorkerBridge& WorkerBridge::forMethod(const std::string& method) {
+    // Reviewed against worker_main._METHODS registrations. These families share
+    // Chudcode sessions, the agent prompt cache, subscription login progress,
+    // benchmark subprocesses, or agent/subagent/DAG control state. The only
+    // non-family exceptions are the control endpoint and trigger rule creation.
+    // office_extract and all other registered worker families (PLM, printer,
+    // parts, reveng, sim, deliverables, run_model, prompts) use general.
+    static constexpr const char* agentPrefixes[] = {
+        "agent_", "chudcode_", "session_", "subscription_", "skills_",
+        "triggers_", "packs_", "ai_roles_", "model_rankings_", "bench_",
+        "memory_", "subagent_", "dag_", "ai_prompt_", "ai_tool_",
+    };
+    if (method == "worker_control_info" || method == "rule_create")
+        return agent();
+    for (const char* prefix : agentPrefixes)
+        if (method.compare(0, std::strlen(prefix), prefix) == 0)
+            return agent();
+    return general();
+}
+
+void WorkerBridge::shutdownIfCreated() {
+    if (agentCreated_.load(std::memory_order_acquire)) agent().stop();
+    if (generalCreated_.load(std::memory_order_acquire)) general().stop();
+}
+
+}  // namespace hostd
+
 #ifdef _WIN32
 
 namespace hostd {
 
-std::atomic<bool> WorkerBridge::created_{false};
-
-WorkerBridge& WorkerBridge::instance() {
-    static WorkerBridge inst;
-    created_.store(true, std::memory_order_release);
-    return inst;
-}
-
 WorkerBridge::~WorkerBridge() = default;
 
 void WorkerBridge::stop() {}
-
-void WorkerBridge::shutdownIfCreated() {
-    if (created_.load(std::memory_order_relaxed)) instance().stop();
-}
 
 bool WorkerBridge::call(const std::string& /*method*/, const nlohmann::json& /*params*/,
                         nlohmann::json& /*result*/, std::string& err, int /*timeoutMs*/,
@@ -332,18 +364,6 @@ bool sendControlRequest(const std::string& transport, const std::string& endpoin
 }
 }  // namespace
 
-std::atomic<bool> WorkerBridge::created_{false};
-
-WorkerBridge& WorkerBridge::instance() {
-    static WorkerBridge inst;
-    created_.store(true, std::memory_order_release);
-    return inst;
-}
-
-void WorkerBridge::shutdownIfCreated() {
-    if (created_.load(std::memory_order_relaxed)) instance().stop();
-}
-
 WorkerBridge::~WorkerBridge() { stop(); }
 
 void WorkerBridge::clearActiveRun() {
@@ -362,11 +382,11 @@ void WorkerBridge::clearControlState() {
 bool WorkerBridge::controlActiveRun(const std::string& action, const json& params,
                                     bool& matched, json& result, std::string& err) {
     matched = false;
-    if (!created_.load(std::memory_order_acquire)) {
+    if (!agentCreated_.load(std::memory_order_acquire)) {
         err.clear();
         return false;
     }
-    return instance().controlActiveRunImpl(action, params, matched, result, err);
+    return agent().controlActiveRunImpl(action, params, matched, result, err);
 }
 
 bool WorkerBridge::controlActiveRunImpl(const std::string& action, const json& params,
@@ -583,6 +603,11 @@ bool WorkerBridge::spawn(std::string& err) {
         if (!repo_.empty() && chdir(repo_.c_str()) != 0) {
             // Fall through; imports or resource lookup will fail clearly.
         }
+        // This role belongs to the spawned child, not the hostd environment:
+        // desktop/standalone workers continue to start with their full lifecycle.
+        if (::setenv("CHUDWARE_HOSTD_WORKER_LANE",
+                     agentLane_ ? "agent" : "general", 1) != 0)
+            _exit(127);
         if (compiledWorker_)
             execlp(workerBin_.c_str(), workerBin_.c_str(), "--module", "worker", (char*)nullptr);
         else
@@ -602,7 +627,8 @@ bool WorkerBridge::spawn(std::string& err) {
     childStdinWr_ = inPipe[1];
     readBuf_.clear();
     running_ = true;
-    log().line("worker_bridge: spawned services.worker_main pid=%d launcher=%s repo=%s", (int)pid,
+    log().line("worker_bridge: spawned %s services.worker_main pid=%d launcher=%s repo=%s",
+               agentLane_ ? "agent" : "general", (int)pid,
                workerBin_.c_str(), repo_.c_str());
     return true;
 }
@@ -821,8 +847,8 @@ bool WorkerBridge::callOnce(const std::string& method, const json& params, json&
 
 bool WorkerBridge::call(const std::string& method, const json& params, json& result,
                         std::string& err, int timeoutMs, const EventFn& onEvent) {
-    // Serialize the single stdio channel. Only this mutex is held — never a
-    // Server-wide lock — so other client threads keep dispatching engine RPCs.
+    // Only this lane's stdio mutex is held; an agent turn cannot serialize
+    // clients using the independent general-worker channel.
     std::lock_guard<std::mutex> lk(mtx_);
     result = json::object();
     err.clear();

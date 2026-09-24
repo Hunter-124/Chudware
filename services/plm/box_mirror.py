@@ -653,6 +653,37 @@ def _mirror_project(project: str, box: dict, deadline: float) -> dict:
 # --------------------------------------------------------------------------- drain
 
 _drain_lock = threading.Lock()
+
+@contextlib.contextmanager
+def _process_drain_lock():
+    """Claim the shared spool and state across independent worker processes."""
+    root = _mirror_root()
+    root.mkdir(parents=True, exist_ok=True)
+    with open(root / "drain.lock", "a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 _drain_activity_lock = threading.Lock()
 _drain_activity: dict[str, Any] = {
     "running": False,
@@ -688,72 +719,77 @@ def _drain_once(budget_s: float) -> dict:
         return {"ok": False, "reason": "busy",
                 "hint": "another Box drain is already running; the spool keeps the work"}
     try:
-        box = get_box_config()
-        if not box["enabled"]:
-            return {"ok": True, "skipped": "disabled"}
-        deadline = time.time() + budget_s
-        out: dict = {"ok": True, "projects": [], "retired": [], "errors": []}
-        # Cheap (one stat per file) and self-limiting: once swept, nothing regrows
-        # unless a project is deleted again.
-        out["retired"].extend(_sweep_orphan_states())
-        for ent in sorted(_spool_dir().glob("*.json")):
-            if time.time() > deadline:
-                out["ok"] = False
-                out["errors"].append("budget_exhausted: remaining projects stay spooled")
-                break
-            try:
-                stamp = ent.stat().st_mtime_ns
-                raw = ent.read_bytes()
-                record = json.loads(raw.decode("utf-8"))
-                if not isinstance(record, dict):
-                    raise ValueError("entry must be a JSON object")
-                project = record.get("project")
-                if not isinstance(project, str) or not project:
-                    raise ValueError("entry has no project path")
-            except Exception as e:  # noqa: BLE001 — quarantine and report corrupt input
-                out["ok"] = False
-                detail = f"{type(e).__name__}: {e}"
-                try:
-                    quarantined = _quarantine_spool_entry(ent)
-                    detail += f"; quarantined as {quarantined.name}"
-                except Exception as quarantine_error:  # noqa: BLE001
-                    detail += (f"; quarantine failed: {type(quarantine_error).__name__}: "
-                               f"{quarantine_error}")
-                out["errors"].append(f"spool_corrupt: {ent.name}: {detail}")
-                continue
-            # A project directory that is gone can NEVER be mirrored, so retire its entry
-            # instead of failing it forever. Without this a drain spent its whole budget
-            # re-reading dead entries and writing a `last_error` state file for each, so
-            # real pending work was never reached and the spool only grew (2646 entries
-            # observed, 2633 of them deleted test directories).
-            if not Path(project).is_dir():
-                with contextlib.suppress(OSError):
-                    if ent.stat().st_mtime_ns == stamp:
-                        ent.unlink()
-                with contextlib.suppress(OSError):
-                    _state_path(project).unlink()
-                out["retired"].append(project)
-                continue
-            try:
-                summary = _mirror_project(project, box, deadline)
-                out["projects"].append({"project": project, **summary})
-                with contextlib.suppress(OSError):
-                    # A save that landed DURING the mirror re-wrote the entry;
-                    # only consume it if it is still the one we drained.
-                    if ent.stat().st_mtime_ns == stamp:
-                        ent.unlink()
-            except BoxError as e:
-                out["ok"] = False
-                out["errors"].append(f"{project}: {e.reason}: {e.hint}")
-                _note_error(project, f"{e.reason}: {e.hint}")
-            except Exception as e:  # noqa: BLE001 — one project never kills the drain
-                out["ok"] = False
-                out["errors"].append(f"{project}: {type(e).__name__}: {e}")
-                _note_error(project, f"{type(e).__name__}: {e}")
-        return out
+        with _process_drain_lock() as acquired:
+            if not acquired:
+                return {"ok": False, "reason": "busy",
+                        "hint": "another Box drain is already running; the spool keeps the work"}
+            return _drain_locked(budget_s)
     finally:
         _drain_lock.release()
 
+
+def _drain_locked(budget_s: float) -> dict:
+    box = get_box_config()
+    if not box["enabled"]:
+        return {"ok": True, "skipped": "disabled"}
+    deadline = time.time() + budget_s
+    out: dict = {"ok": True, "projects": [], "retired": [], "errors": []}
+    out["retired"].extend(_sweep_orphan_states())
+    for ent in sorted(_spool_dir().glob("*.json")):
+        if time.time() > deadline:
+            out["ok"] = False
+            out["errors"].append("budget_exhausted: remaining projects stay spooled")
+            break
+        try:
+            stamp = ent.stat().st_mtime_ns
+            raw = ent.read_bytes()
+            record = json.loads(raw.decode("utf-8"))
+            if not isinstance(record, dict):
+                raise ValueError("entry must be a JSON object")
+            project = record.get("project")
+            if not isinstance(project, str) or not project:
+                raise ValueError("entry has no project path")
+        except Exception as e:  # noqa: BLE001 — quarantine and report corrupt input
+            out["ok"] = False
+            detail = f"{type(e).__name__}: {e}"
+            try:
+                quarantined = _quarantine_spool_entry(ent)
+                detail += f"; quarantined as {quarantined.name}"
+            except Exception as quarantine_error:  # noqa: BLE001
+                detail += (f"; quarantine failed: {type(quarantine_error).__name__}: "
+                           f"{quarantine_error}")
+            out["errors"].append(f"spool_corrupt: {ent.name}: {detail}")
+            continue
+        # A project directory that is gone can NEVER be mirrored, so retire its entry
+        # instead of failing it forever. Without this a drain spent its whole budget
+        # re-reading dead entries and writing a `last_error` state file for each, so
+        # real pending work was never reached and the spool only grew (2646 entries
+        # observed, 2633 of them deleted test directories).
+        if not Path(project).is_dir():
+            with contextlib.suppress(OSError):
+                if ent.stat().st_mtime_ns == stamp:
+                    ent.unlink()
+            with contextlib.suppress(OSError):
+                _state_path(project).unlink()
+            out["retired"].append(project)
+            continue
+        try:
+            summary = _mirror_project(project, box, deadline)
+            out["projects"].append({"project": project, **summary})
+            with contextlib.suppress(OSError):
+                # A save that landed DURING the mirror re-wrote the entry;
+                # only consume it if it is still the one we drained.
+                if ent.stat().st_mtime_ns == stamp:
+                    ent.unlink()
+        except BoxError as e:
+            out["ok"] = False
+            out["errors"].append(f"{project}: {e.reason}: {e.hint}")
+            _note_error(project, f"{e.reason}: {e.hint}")
+        except Exception as e:  # noqa: BLE001 — one project never kills the drain
+            out["ok"] = False
+            out["errors"].append(f"{project}: {type(e).__name__}: {e}")
+            _note_error(project, f"{type(e).__name__}: {e}")
+    return out
 
 def drain(*, block: bool = False, budget_s: float = 300.0) -> dict:
     """Mirror every spooled project up to Box.

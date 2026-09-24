@@ -159,6 +159,19 @@ for raw in sys.stdin:
             "events": [{"kind": "must_not_replay"}],
         }})
         continue
+    if method in {
+        "subscription_status", "bench_status", "triggers_list", "packs_get",
+        "skills_list", "ai_roles_get", "model_rankings_get", "rule_create",
+        "subagent_list", "dag_status", "memory_recall", "session_btw",
+        "chudcode_session_stats", "ai_prompt_warm", "ai_tool_catalog",
+        "plm_status", "mfg_printer_adapter_snapshot", "part_search",
+        "reveng_start_from_product", "ecad_thermal_handoff", "office_extract",
+        "unregistered_probe",
+    }:
+        send(sys.stdout.buffer, {"id": rid, "ok": True, "result": {
+            "pid": os.getpid(), "method": method,
+            "lane": os.environ.get("CHUDWARE_HOSTD_WORKER_LANE")}})
+        continue
     if method == "worker_probe":
         send(sys.stdout.buffer, {"id": rid, "ok": True, "result": {
             "worker": "reached", "value": params.get("value")}})
@@ -309,6 +322,72 @@ def test_worker_progress_is_request_scoped_and_live_control_lands(
     log_path = worker_daemon["log_path"]
     if log_path.exists():
         assert TOKEN not in log_path.read_text(encoding="utf-8", errors="replace")
+
+
+def test_blocked_agent_lane_does_not_block_general_worker(worker_daemon):
+    requester, general, controller = DaemonClient(), DaemonClient(), DaemonClient()
+    requester.connect()
+    worker_daemon["pids"].append(_pid(requester))
+    general.connect()
+    controller.connect()
+    outcome: dict = {}
+    thread = threading.Thread(
+        target=lambda: outcome.update(
+            result=requester.call(
+                "agent_admin_turn", {"run_id": "lane-blocked", "request": "work"}
+            )
+        ),
+        daemon=True,
+    )
+    thread.start()
+    _wait_for(worker_daemon["active"])
+    started = time.monotonic()
+    general_response = general.call("plm_status")
+    general_pid = general_response["pid"]
+    assert general_response["lane"] == "general"
+    assert time.monotonic() - started < 3.0
+    assert thread.is_alive()
+    assert worker_daemon["active"].exists()
+    assert controller.call("agent_cancel", {"run_id": "lane-blocked"})["cancelled"]
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    assert outcome["result"]["control"] == "cancel"
+    assert _worker_count(worker_daemon["counter"]) == 2
+    assert _worker_count(worker_daemon["info_counter"]) == 1
+
+    for method in (
+        "subscription_status", "bench_status", "triggers_list", "packs_get",
+        "skills_list", "ai_roles_get", "model_rankings_get", "rule_create",
+        "subagent_list", "dag_status", "memory_recall", "session_btw",
+        "chudcode_session_stats", "ai_prompt_warm", "ai_tool_catalog",
+    ):
+        response = controller.call(method)
+        assert response["pid"] != general_pid, method
+        assert response["lane"] == "agent", method
+    for method in (
+        "part_search",
+        "reveng_start_from_product", "ecad_thermal_handoff",
+        "office_extract", "unregistered_probe",
+    ):
+        response = general.call(method)
+        assert response.get("pid") == general_pid, (method, response)
+        assert response["lane"] == "general", method
+    assert _worker_count(worker_daemon["counter"]) == 2
+
+    # Clean daemon shutdown reaps BOTH children rather than only the lane
+    # last used; neither lane is permitted to outlive its owner.
+    worker_pids = [
+        int(line) for line in worker_daemon["counter"].read_text().splitlines()
+    ]
+    assert controller.call("daemon_drain")["ok"]
+    requester.close()
+    general.close()
+    controller.close()
+    deadline = time.monotonic() + 8.0
+    while any(Path(f"/proc/{pid}").exists() for pid in worker_pids):
+        assert time.monotonic() < deadline, "worker child outlived hostd shutdown"
+        time.sleep(0.02)
+    assert all(not Path(f"/proc/{pid}").exists() for pid in worker_pids)
 
 
 def test_unknown_method_worker_fallback_contract_is_unchanged(worker_daemon):

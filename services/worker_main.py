@@ -22,6 +22,7 @@ Imports are services.* throughout (the engine_oracle fallback is gone with the o
 from __future__ import annotations
 
 import json
+import os
 import logging
 import signal
 import sys
@@ -248,10 +249,19 @@ def _reconcile_bench() -> None:
 
 
 def serve() -> None:
-    from services.agent.chudcode_control import ControlServer
-
+    # Hostd gives each worker one process-local role. Unflagged desktop,
+    # standalone and compiled launches retain the original full lifecycle.
+    lane = os.environ.get("CHUDWARE_HOSTD_WORKER_LANE", "")
+    if lane not in ("", "agent", "general"):
+        raise ValueError("invalid hostd worker lane")
+    agent_services = lane != "general"
     global _CONTROL_SERVER
-    control = ControlServer(_invoke_chudcode_control, paths.RUNTIME).start()
+    if agent_services:
+        from services.agent.chudcode_control import ControlServer
+
+        control = ControlServer(_invoke_chudcode_control, paths.RUNTIME).start()
+    else:
+        control = None
     _CONTROL_SERVER = control
     shutdown_lock = threading.RLock()
     shutdown_complete = False
@@ -263,9 +273,11 @@ def serve() -> None:
                 return
             shutdown_complete = True
         try:
-            control.stop()
+            if control is not None:
+                control.stop()
         finally:
-            _shutdown_bench()
+            if agent_services:
+                _shutdown_bench()
             try:
                 from services.reveng.gaussian_jobs import shutdown as shutdown_gaussian_jobs
                 shutdown_gaussian_jobs()
@@ -273,7 +285,8 @@ def serve() -> None:
                 log.error("Gaussian shutdown failed: %s", type(exc).__name__)
             finally:
                 try:
-                    _shutdown_chudcode()
+                    if agent_services:
+                        _shutdown_chudcode()
                 finally:
                     _drain_box_mirror_on_exit()
 
@@ -292,10 +305,11 @@ def serve() -> None:
             signal.signal(signum, on_signal)
 
     try:
-        log.info("worker ready (runtime=%s)", paths.RUNTIME)
-        _reconcile_bench()
-        _warm_prompt_cache()
-        _warm_chudcode_service()
+        log.info("worker ready (runtime=%s, lane=%s)", paths.RUNTIME, lane or "standalone")
+        if agent_services:
+            _reconcile_bench()
+            _warm_prompt_cache()
+            _warm_chudcode_service()
         for line in sys.stdin:
             line = line.strip()
             if not line:

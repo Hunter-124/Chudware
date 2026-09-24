@@ -2835,15 +2835,18 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     if raw_actor is None:
         credit_actor = None
     else:
+        if not isinstance(raw_actor, dict):
+            return {"ok": False, "reason": "invalid_chudware_actor"}
+        if str(raw_actor.get("key_source") or "").strip().lower() not in {
+            "byok", "subscription", "pool"
+        }:
+            return {"ok": False, "reason": "web_credential_source_invalid"}
         try:
             credit_actor = agent_config.Actor.from_mapping(raw_actor)
         except ValueError:
             return {"ok": False, "reason": "invalid_chudware_actor"}
-    if credit_actor is not None and credit_actor.key_source == "subscription":
-        try:
-            agent_config.bind_subscription_grant(raw_actor.get("_subscription"))
-        except (AttributeError, ValueError):
-            return {"ok": False, "reason": "invalid_subscription_grant"}
+    if credit_actor is not None and credit_actor.key_source != "byok" and raw_params.get("api_key") is not None:
+        return {"ok": False, "reason": "web_credential_source_invalid"}
 
     cfg = dict(agent_config.load_config() or {})
     from services.agent.preferences import resolve_turn_preferences
@@ -2854,11 +2857,47 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         if not isinstance(byok_key, str) or not byok_key.strip():
             agent_config.clear_pooled_credentials()
             return {"ok": False, "reason": "BYOK provider credential unavailable"}
-        declared = raw_actor.get("_byok_key_sha256")
-        actual = hashlib.sha256(byok_key.encode("utf-8")).hexdigest()
-        if not isinstance(declared, str) or not hmac.compare_digest(declared, actual):
-            agent_config.clear_pooled_credentials()
-            return {"ok": False, "reason": "byok_credential_mismatch"}
+    web_credential = None
+    web_provider = ""
+    if credit_actor is not None:
+        source = credit_actor.key_source
+        if source == "subscription":
+            grant = raw_actor.get("_subscription")
+            if not isinstance(grant, dict):
+                return {"ok": False, "reason": "invalid_subscription_grant"}
+            web_provider = str(grant.get("provider") or "").strip().lower()
+            web_credential = grant.get("access_token")
+            if web_provider != "anthropic-sub":
+                return {"ok": False, "reason": "subscription_isolation_unsupported"}
+            proof = raw_actor.get("_subscription_token_sha256")
+            failure = "subscription_credential_mismatch"
+        elif source == "pool":
+            pool = raw_actor.get("_pool")
+            if not isinstance(pool, dict) or not str(pool.get("api_key") or "").strip():
+                return {
+                    "ok": False, "reason": "pool_credential_unconfigured",
+                    "hint": "The managed AI pool is not configured. Contact the site operator or connect your own provider.",
+                }
+            web_provider = str(pool.get("provider") or "").strip().lower()
+            web_credential = pool.get("api_key")
+            proof = raw_actor.get("_pool_key_sha256")
+            failure = "pool_credential_mismatch"
+        else:
+            web_provider, web_credential = param_str("provider").lower(), byok_key
+            proof = raw_actor.get("_byok_key_sha256")
+            failure = "byok_credential_mismatch"
+        if not param_str("provider") or not param_str("model"):
+            return {"ok": False, "reason": "web_model_required"}
+        if source == "subscription":
+            if param_str("provider").lower() not in {"anthropic", "anthropic-sub", "claude"}:
+                return {"ok": False, "reason": "subscription_credential_mismatch"}
+        elif param_str("provider").lower() != web_provider:
+            return {"ok": False, "reason": failure}
+        if not isinstance(web_credential, str) or not web_credential.strip():
+            return {"ok": False, "reason": failure}
+        actual = hashlib.sha256(web_credential.encode("utf-8")).hexdigest()
+        if not isinstance(proof, str) or not hmac.compare_digest(proof, actual):
+            return {"ok": False, "reason": failure}
     if byok_key is not None and (
         not isinstance(byok_key, str) or not byok_key.strip()
         or (credit_actor is not None and not (param_str("provider") and param_str("model")))
@@ -2904,6 +2943,8 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         else:
             provider_name = provider_name or str(cfg.get("provider") or "")
             model_name = model_name or str(cfg.get("model") or "")
+        if credit_actor is not None and credit_actor.key_source == "subscription":
+            provider_name = "anthropic"
         if turn_preferences.local_only and not _auto_local_provider(provider_name, cfg):
             raise ValueError("This computer only requires a loopback model. Configure a local model in Accounts.")
         if byok_key is not None and byok_provider_env(provider_name) is None:
@@ -3108,11 +3149,19 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         "attachments": attachments,
         "register_callbacks": register_callbacks,
     }
-    if byok_key is not None:
+    if credit_actor is not None:
+        host_params.update(
+            web_actor=True,
+            web_key_source=credit_actor.key_source,
+            web_credential=web_credential,
+            web_provider=web_provider,
+            web_tenant=credit_actor.email,
+        )
+    elif byok_key is not None:
         host_params.update(
             byok_key=byok_key,
             byok_provider=provider_name,
-            byok_tenant=credit_actor.email if credit_actor is not None else "desktop",
+            byok_tenant="desktop",
         )
     if project_root:
         host_params["workspace_dir"] = project_root

@@ -56,51 +56,79 @@ _BYOK_PROVIDER_ENV = {
 def byok_provider_env(provider: str) -> str | None:
     return _BYOK_PROVIDER_ENV.get(provider.strip().lower())
 
-
-def _byok_identity(params: Mapping[str, Any]) -> str | None:
+def _credential_scope(params: Mapping[str, Any]) -> tuple[str, str, str, str, str] | None:
+    """Return source, tenant, provider, secret, and Chudcode's credential env name."""
+    source = _nonempty_string(params.get("web_key_source"))
+    if source is not None:
+        if source not in {"byok", "subscription", "pool"}:
+            raise ValueError("web_credential_source_invalid")
+        tenant = _nonempty_string(params.get("web_tenant"))
+        provider = _nonempty_string(params.get("web_provider"))
+        secret = _nonempty_string(params.get("web_credential"))
+        if not tenant or not provider or not secret:
+            raise ValueError("web_credential_missing")
+        provider = provider.lower()
+        if source == "subscription":
+            env_name = {"anthropic-sub": "ANTHROPIC_OAUTH_TOKEN"}.get(provider)
+            if env_name is None:
+                raise ValueError("subscription_isolation_unsupported")
+        else:
+            env_name = byok_provider_env(provider)
+            if env_name is None:
+                raise ValueError(f"{source}_unsupported_online")
+        return source, tenant, provider, secret, env_name
+    if params.get("web_actor"):
+        raise ValueError("web_credential_source_invalid")
     key = _nonempty_string(params.get("byok_key"))
     if key is None:
         if params.get("byok_key") is not None:
             raise ValueError("byok_unsupported_online")
         return None
     tenant = _nonempty_string(params.get("byok_tenant")) or "desktop"
-    provider = _nonempty_string(params.get("byok_provider")) or ""
-    if byok_provider_env(provider) is None:
+    provider = (_nonempty_string(params.get("byok_provider")) or "").lower()
+    env_name = byok_provider_env(provider)
+    if env_name is None:
         raise ValueError("byok_unsupported_online")
+    return "byok", tenant, provider, key, env_name
+
+
+def _credential_identity(params: Mapping[str, Any]) -> str | None:
+    scope = _credential_scope(params)
+    if scope is None:
+        return None
+    source, tenant, provider, secret, _ = scope
     return hashlib.sha256(
-        json.dumps([tenant, provider.lower(), key], separators=(",", ":")).encode()
+        json.dumps([source, tenant, provider, secret], separators=(",", ":")).encode()
     ).hexdigest()
 
-def _byok_client_scope(
+
+def _credential_client_scope(
     params: Mapping[str, Any], session_dir: str | None, resume_file: str | None
 ) -> tuple[tempfile.TemporaryDirectory[str], str, dict[str, str]]:
     from services import paths
 
-    identity = _byok_identity(params)
-    if identity is None:
-        raise ValueError("byok_unsupported_online")
-    provider = _nonempty_string(params.get("byok_provider")) or ""
-    env_name = byok_provider_env(provider)
-    if env_name is None:
-        raise ValueError("byok_unsupported_online")
+    scope = _credential_scope(params)
+    if scope is None:
+        raise ValueError("web_credential_missing")
+    source, _, _, secret, env_name = scope
+    identity = _credential_identity(params)
     root = Path(session_dir) if session_dir else paths.ROOT / "Sessions"
     if resume_file and session_dir is None:
         root = Path(resume_file).expanduser().parent.parent
-    scoped = root.expanduser() / f"byok-{identity}"
+    scoped = root.expanduser() / f"{source}-{identity}"
     if scoped.is_symlink():
-        raise RuntimeError("BYOK session directory cannot be a symlink")
+        raise RuntimeError("credential session directory cannot be a symlink")
     if resume_file and Path(resume_file).expanduser().resolve().parent != scoped.resolve():
-        raise RuntimeError("BYOK session file belongs to another credential scope")
+        raise RuntimeError("session file belongs to another credential scope")
     scoped.mkdir(mode=0o700, parents=True, exist_ok=True)
     scoped.chmod(0o700)
-    tempdir = tempfile.TemporaryDirectory(prefix="chudware-byok-")
+    tempdir = tempfile.TemporaryDirectory(prefix=f"chudware-{source}-")
     home = Path(tempdir.name)
-    agent = home / "agent"
-    xdg = home / "xdg"
+    agent, xdg = home / "agent", home / "xdg"
     agent.mkdir(mode=0o700)
     xdg.mkdir(mode=0o700)
-    # RpcClient merges its env into os.environ; blank every inherited variable
-    # before restoring only process essentials and the selected provider key.
+    # RpcClient merges env into os.environ: blank inherited credentials/config
+    # before restoring process essentials and the one selected provider secret.
     clean = {name: "" for name in os.environ}
     for name in ("PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "CHUDCODE_PACKAGE_DIR"):
         if name in os.environ:
@@ -111,9 +139,13 @@ def _byok_client_scope(
         "XDG_DATA_HOME": str(home / "data"),
         "XDG_CACHE_HOME": str(home / "cache"),
         "CHUDCODE_CODING_AGENT_DIR": str(agent),
-        env_name: _nonempty_string(params.get("byok_key")) or "",
+        env_name: secret,
     })
     return tempdir, str(scoped), clean
+
+
+
+
 
 
 
@@ -903,7 +935,7 @@ class ChudcodeSessionHost:
             if workspace is not None
             else None
         )
-        credential_identity = _byok_identity(params)
+        credential_identity = _credential_identity(params)
         with self._lock:
             if self._shutdown:
                 raise RuntimeError("chudcode session host is shut down")
@@ -1036,8 +1068,8 @@ class ChudcodeSessionHost:
         session_dir = _nonempty_string(params.get("chudcode_session_dir"))
         tempdir = None
         clean_env = None
-        if params.get("byok_key") is not None:
-            tempdir, session_dir, clean_env = _byok_client_scope(
+        if _credential_scope(params) is not None:
+            tempdir, session_dir, clean_env = _credential_client_scope(
                 params, session_dir, resume_file
             )
         elif session_dir is None and resume_file:

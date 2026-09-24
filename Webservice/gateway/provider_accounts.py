@@ -1,17 +1,17 @@
 """Browser-driven AI subscription sign-in, scoped per account.
 
-`provider_keys.py` stores a metered API key. This module stores an OAuth grant
-against a subscription the account already pays for — Claude Pro/Max and
-ChatGPT Plus/Pro — so those turns run on the customer's own plan instead of
-drawing Chudware credits.
+`provider_keys.py` stores a customer's own API key. This module stores OAuth
+grants against subscriptions the account already pays for — Claude Pro/Max and
+ChatGPT Plus/Pro. Only personal grants can authenticate a customer turn;
+unsupported provider injection is refused downstream, never sent to ambient auth.
 
 Two scopes share one table:
 
 * ``personal`` — the linking account's own subscription, used only for its own
   turns.
-* ``shared``   — an operator-owned account backing the managed pool. Only an
-  admin can create one; the row keeps the linking admin's email for
-  attribution, not for entitlement.
+* ``shared``   — a legacy operator-owned connection managed by an admin. Its
+  row keeps attribution, but it is never used for a customer's turn: managed
+  pool turns use a dedicated operator API key with metered credits instead.
 
 Why these flows remain web-service-local rather than using the packaged desktop
 Chudcode credential store: every login and grant is tenant-scoped here, while a
@@ -754,11 +754,10 @@ def _usable_access_token(row: Any, owner_email: str) -> str | None:
 
 
 def resolve_subscription_token(email: str, wire_provider: str) -> dict[str, Any] | None:
-    """A usable subscription grant for this turn, personal before shared.
+    """A usable personal subscription grant for this turn, or None.
 
-    Returns ``{"provider", "account_key", "scope", "access_token"}`` or None.
-    Never raises for an unusable link: a dead grant simply means this turn falls
-    through to whatever the caller's next credential source is.
+    Operator-owned shared OAuth accounts never authenticate customer turns:
+    the managed pool uses its dedicated API key and credit reservation.
     """
     provider = _WIRE_TO_SUBSCRIPTION.get(str(wire_provider or "").strip().lower())
     if provider is None:
@@ -771,8 +770,8 @@ def resolve_subscription_token(email: str, wire_provider: str) -> dict[str, Any]
             SELECT email, provider, account_key, scope, encrypted_tokens
               FROM provider_accounts
              WHERE provider = %s
-               AND ((email = %s AND scope = 'personal') OR scope = 'shared')
-             ORDER BY scope = 'personal' DESC, last_used_at NULLS FIRST
+               AND email = %s AND scope = 'personal'
+             ORDER BY last_used_at NULLS FIRST
             """,
             (provider, normalized_email),
         )

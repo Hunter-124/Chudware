@@ -806,6 +806,31 @@ provider-matching endpoint. Client-supplied `api_key`, `base_url`, and
 `auth_mode` fields are stripped. `agent_provider_*` remains admin-only. Do not
 set `CHUDWARE_WEB_SHARE_PROVIDER_KEYS=1` in a public environment.
 
+Configure the managed credit pool in the **gateway's mode-600 environment**, not
+in a customer's settings or the hostd account:
+
+| Variable | Meaning |
+| --- | --- |
+| `CHUDWARE_WEB_POOL_API_KEY` | Dedicated operator API key for metered pool turns; absent/blank refuses `pool_credential_unconfigured` before reserving credits. |
+| `CHUDWARE_WEB_POOL_PROVIDER` | Provider for that key, defaults to `openrouter`; must be a supported Chudcode API-key provider. |
+| `CHUDWARE_WEB_POOL_MODEL` | Optional model override for pool turns; if unset, the web client must select a model supported by the pool provider. Billing rates apply to the effective model. |
+
+The gateway injects only its decrypted BYOK key, a **personal** subscription
+OAuth token, or this dedicated pool key into the private actor payload with a
+SHA-256 proof. The worker verifies the proof and runs each web actor in a
+credential-scoped Chudcode process with temporary private HOME/XDG/agent state;
+an absent/unknown source cannot use ambient host auth. Claude Pro/Max links use
+`ANTHROPIC_OAUTH_TOKEN` only inside that process. Chudcode 0.3.0 has no isolated
+Codex OAuth-token injection surface; linked Codex turns refuse
+`subscription_isolation_unsupported` rather than spending the operator's login.
+The desktop (no web actor) continues to use its normal Chudcode login.
+
+`GET /api/providers` is likewise account-scoped: it advertises only validated
+BYOK, usable personal Claude subscription, and the configured credit-pool
+provider/model for an entitled account. It does not list operator config or
+hostd OAuth accounts (even to admins), shared operator OAuth links, or linked
+Codex subscriptions that cannot yet run in isolation.
+
 ## University of Alabama Box workspace
 
 Production remains `livingroom-pc`, user `liveuser`, gateway port 8300; do not

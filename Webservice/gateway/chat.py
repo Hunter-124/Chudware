@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -177,36 +178,97 @@ async def load_history(scope_key: str, limit: int = 100) -> list[dict[str, Any]]
 # ---------------------------------------------------------------------------
 
 
+@dataclass(slots=True)
+class _Connection:
+    scope: str
+    email: str
+    display: str
+    loop: asyncio.AbstractEventLoop
+    revoked: bool = False
+
+
 class Hub:
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self._clients: dict[WebSocket, str] = {}
+        # Org/account mutations can run in a different TestClient loop or a
+        # sync worker thread. Never touch a WebSocket from that other thread.
+        self._lock = threading.Lock()
+        self._clients: dict[WebSocket, _Connection] = {}
 
-    async def add(self, ws: WebSocket, scope_key: str) -> None:
-        async with self._lock:
-            self._clients[ws] = scope_key
+    async def add(self, ws: WebSocket, scope_key: str, email: str, display: str) -> None:
+        with self._lock:
+            self._clients[ws] = _Connection(scope_key, email, display, asyncio.get_running_loop())
 
-    async def remove(self, ws: WebSocket) -> None:
-        async with self._lock:
-            self._clients.pop(ws, None)
+    def is_active(self, ws: WebSocket) -> bool:
+        with self._lock:
+            entry = self._clients.get(ws)
+            return entry is not None and not entry.revoked
+
+    async def remove(self, ws: WebSocket) -> tuple[str, str, str] | None:
+        with self._lock:
+            entry = self._clients.pop(ws, None)
+        return (entry.scope, entry.email, entry.display) if entry else None
+
+    def revoke(self, email: str, team_id: str | None = None) -> None:
+        """Immediately exclude matching sockets; close them on their own loops."""
+        email = email.strip().lower()
+        scope = "team:" + team_id if team_id is not None else None
+        with self._lock:
+            targets = []
+            for ws, entry in self._clients.items():
+                if entry.email != email or (scope is not None and entry.scope != scope) or entry.revoked:
+                    continue
+                entry.revoked = True
+                targets.append((ws, entry.loop))
+        for ws, loop in targets:
+            loop.call_soon_threadsafe(lambda socket=ws: asyncio.create_task(self._close_revoked(socket)))
+
+    def revoke_team(self, team_id: str) -> None:
+        """Close every live socket scoped to a deleted team."""
+        scope = "team:" + team_id
+        with self._lock:
+            users = {entry.email for entry in self._clients.values()
+                     if entry.scope == scope and not entry.revoked}
+        for email in users:
+            self.revoke(email, team_id)
+
+    async def _close_revoked(self, ws: WebSocket) -> None:
+        try:
+            await ws.close(code=4403, reason="chat access revoked")
+        except Exception:
+            pass  # The peer may already have disconnected.
+        finally:
+            await _leave(ws)
 
     async def broadcast(
         self, scope_key: str, payload: dict[str, Any], *, skip: WebSocket | None = None
     ) -> None:
         data = json.dumps(payload, separators=(",", ":"))
-        async with self._lock:
-            targets = [ws for ws, scope in self._clients.items() if scope == scope_key]
+        with self._lock:
+            targets = [ws for ws, entry in self._clients.items()
+                       if entry.scope == scope_key and not entry.revoked]
         dead: list[WebSocket] = []
         for ws in targets:
             if skip is not None and ws is skip:
                 continue
+            with self._lock:
+                entry = self._clients.get(ws)
+                if entry is None or entry.revoked:
+                    continue
             try:
                 await ws.send_text(data)
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            await self.remove(ws)
+            await _leave(ws)
 
+
+async def _leave(ws: WebSocket) -> None:
+    entry = await hub.remove(ws)
+    if entry is None:
+        return
+    scope_key, email, display = entry
+    if await presence.leave(scope_key, email):
+        await hub.broadcast(scope_key, _event("leave", email, display))
 
 hub = Hub()
 
@@ -278,7 +340,7 @@ async def ws_chat(websocket: WebSocket) -> None:
 
     await websocket.accept()
 
-    await hub.add(websocket, scope_key)
+    await hub.add(websocket, scope_key, email, display)
     first = await presence.join(scope_key, email, display)
     try:
         # Snapshot presence to the joining client.
@@ -293,6 +355,9 @@ async def ws_chat(websocket: WebSocket) -> None:
 
         while True:
             raw = await websocket.receive_text()
+            if not hub.is_active(websocket):
+                await websocket.close(code=4403, reason="chat access revoked")
+                return
             try:
                 revalidate_websocket_user(websocket.scope)
             except AuthError as exc:
@@ -342,13 +407,7 @@ async def ws_chat(websocket: WebSocket) -> None:
     except Exception:
         log.exception("chat ws error for %s", email)
     finally:
-        await hub.remove(websocket)
-        left = await presence.leave(scope_key, email)
-        if left:
-            try:
-                await hub.broadcast(scope_key, _event("leave", email, display))
-            except Exception:
-                pass
+        await _leave(websocket)
 
 
 @router.get("/api/chat/history")

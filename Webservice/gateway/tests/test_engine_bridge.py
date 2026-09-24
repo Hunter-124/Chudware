@@ -522,6 +522,7 @@ class TestEngineBridge:
         self, daemon, client, monkeypatch
     ):
         monkeypatch.setattr(settings, "share_provider_keys", False)
+        monkeypatch.setenv("CHUDWARE_WEB_POOL_API_KEY", "operator-pool-test-key")
         with db.tx() as cur:
             cur.execute(
                 """
@@ -543,7 +544,7 @@ class TestEngineBridge:
         )
         params = {
             "question": "cheap turn",
-            "provider": "mock",
+            "provider": "openrouter",
             "model": "vendor/cheap",
             "max_tokens": 8,
             "_test_emit_usage": True,
@@ -563,6 +564,7 @@ class TestEngineBridge:
         actor = forwarded[0]["params"]["options"]["_chudware_actor"]
         assert actor["plan"] == "studio"
         assert actor["key_source"] == "pool"
+        assert actor["_pool"]["api_key"] == "operator-pool-test-key"
         assert actor["_reservation_credits"] == 1
         with db.tx() as cur:
             cur.execute(

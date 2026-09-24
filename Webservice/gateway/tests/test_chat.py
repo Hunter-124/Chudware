@@ -73,6 +73,8 @@ def _make_app(chat, user: _User | None = None):
 
     app = FastAPI()
     app.include_router(chat.router)
+    from orgs import router as orgs_router  # type: ignore
+    app.include_router(orgs_router)
 
     if user is not None:
 
@@ -255,6 +257,132 @@ def test_chat_teams_never_expose_messages_or_presence_to_unrelated_accounts(chat
                     assert charlie.get(
                         "/api/chat/history", params={"team": team_id}
                     ).status_code == 404
+
+
+@pytest.mark.parametrize("remove_from_org", [False, True])
+def test_membership_removal_revokes_idle_socket_without_affecting_others(
+    chat_env, remove_from_org
+):
+    chat, _, _ = chat_env
+    import db  # type: ignore
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    team_id = _team("alice@example.com", "bob@example.com")
+    with db.tx() as cur:
+        cur.execute("SELECT org_id FROM teams WHERE id = %s", (team_id,))
+        org_id = str(cur.fetchone()["org_id"])
+
+    with TestClient(_make_app(chat, _User("alice@example.com", "Alice"))) as admin, \
+         TestClient(_make_app(chat, _User("bob@example.com", "Bob"))) as member:
+        with admin.websocket_connect(f"/ws/chat?team={team_id}") as ws_a:
+            assert ws_a.receive_json()["type"] == "presence"
+            with member.websocket_connect(f"/ws/chat?team={team_id}") as ws_b:
+                assert {u["email"] for u in ws_b.receive_json()["users"]} == {
+                    "alice@example.com", "bob@example.com"
+                }
+                assert ws_a.receive_json()["type"] == "join"
+                endpoint = (
+                    f"/api/orgs/{org_id}/members/bob@example.com"
+                    if remove_from_org
+                    else f"/api/orgs/{org_id}/teams/{team_id}/members/bob@example.com"
+                )
+                response = admin.delete(endpoint)
+                assert response.status_code == 200
+                with pytest.raises(WebSocketDisconnect) as exc:
+                    ws_b.receive_json()
+                assert exc.value.code == 4403
+                assert ws_a.receive_json()["type"] == "leave"
+                assert asyncio.run(chat.presence.list("team:" + team_id)) == [
+                    {"email": "alice@example.com", "display": "Alice"}
+                ]
+                ws_a.send_json({"text": "remaining team message"})
+                assert ws_a.receive_json()["text"] == "remaining team message"
+
+
+def test_account_suspension_revokes_idle_team_and_personal_sockets(chat_env):
+    chat, _, _ = chat_env
+    import accounts  # type: ignore
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    team_id = _team("alice@example.com", "bob@example.com")
+    with TestClient(_make_app(chat, _User("bob@example.com", "Bob"))) as client:
+        with client.websocket_connect(f"/ws/chat?team={team_id}") as team_ws, \
+             client.websocket_connect("/ws/chat") as personal_ws:
+            assert team_ws.receive_json()["type"] == "presence"
+            assert personal_ws.receive_json()["type"] == "presence"
+            accounts.set_status("bob@example.com", "suspended", decided_by="test")
+            for ws in (team_ws, personal_ws):
+                with pytest.raises(WebSocketDisconnect) as exc:
+                    ws.receive_json()
+                assert exc.value.code == 4403
+            assert asyncio.run(chat.presence.list()) == []
+
+
+@pytest.mark.parametrize("delete_org", [False, True])
+def test_deleting_team_or_organization_revokes_all_team_sockets(chat_env, delete_org):
+    chat, _, _ = chat_env
+    import db  # type: ignore
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    general_id = _team("alice@example.com", "bob@example.com")
+    with db.tx() as cur:
+        cur.execute("SELECT org_id FROM teams WHERE id = %s", (general_id,))
+        org_id = str(cur.fetchone()["org_id"])
+    with TestClient(_make_app(chat, _User("alice@example.com", "Alice"))) as alice, \
+         TestClient(_make_app(chat, _User("bob@example.com", "Bob"))) as bob:
+        team_id = general_id
+        if not delete_org:
+            response = alice.post(f"/api/orgs/{org_id}/teams", json={"name": "Design"})
+            assert response.status_code == 201
+            team_id = response.json()["team"]["id"]
+            response = alice.post(
+                f"/api/orgs/{org_id}/teams/{team_id}/members",
+                json={"email": "bob@example.com"},
+            )
+            assert response.status_code == 201
+        with alice.websocket_connect(f"/ws/chat?team={team_id}") as ws_a:
+            assert ws_a.receive_json()["type"] == "presence"
+            with bob.websocket_connect(f"/ws/chat?team={team_id}") as ws_b:
+                assert ws_b.receive_json()["type"] == "presence"
+                assert ws_a.receive_json()["type"] == "join"
+                endpoint = f"/api/orgs/{org_id}" if delete_org else f"/api/orgs/{org_id}/teams/{team_id}"
+                assert alice.delete(endpoint).status_code == 200
+                for ws in (ws_a, ws_b):
+                    with pytest.raises(WebSocketDisconnect) as exc:
+                        ws.receive_json()
+                    assert exc.value.code == 4403
+                assert asyncio.run(chat.presence.list("team:" + team_id)) == []
+
+
+def test_org_admin_demotion_revokes_implicit_team_access(chat_env):
+    chat, _, _ = chat_env
+    import db  # type: ignore
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    team_id = _team("alice@example.com")
+    with db.tx() as cur:
+        cur.execute("SELECT org_id FROM teams WHERE id = %s", (team_id,))
+        org_id = str(cur.fetchone()["org_id"])
+        cur.execute(
+            "INSERT INTO org_members (org_id, email, role) VALUES (%s, %s, 'admin')",
+            (org_id, "bob@example.com"),
+        )
+    with TestClient(_make_app(chat, _User("alice@example.com", "Alice"))) as owner, \
+         TestClient(_make_app(chat, _User("bob@example.com", "Bob"))) as admin:
+        with admin.websocket_connect(f"/ws/chat?team={team_id}") as ws:
+            assert ws.receive_json()["type"] == "presence"
+            response = owner.patch(
+                f"/api/orgs/{org_id}/members/bob@example.com", json={"role": "member"}
+            )
+            assert response.status_code == 200
+            with pytest.raises(WebSocketDisconnect) as exc:
+                ws.receive_json()
+            assert exc.value.code == 4403
+            assert asyncio.run(chat.presence.list("team:" + team_id)) == []
 
 
 def test_ws_suspension_closes_before_next_message_is_saved(chat_env):

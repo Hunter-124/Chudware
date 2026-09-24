@@ -16,6 +16,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.types import ASGIApp, Receive, Scope, Send
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from gateway import accounts, app as app_mod, credits, db, engine_bridge, provider_keys
 from gateway.config import settings
@@ -286,7 +287,7 @@ def test_worker_clears_byok_key_between_tenants(
         lambda _event: None,
     )
     assert first["ok"] is True
-    assert [(p["byok_tenant"], p["byok_key"]) for p in host.turns] == [(A, SECRET)]
+    assert [(p["web_tenant"], p["web_credential"]) for p in host.turns] == [(A, SECRET)]
     mismatch = worker_rpc._agent_admin_turn(
         {
             "request": "forged credential",
@@ -343,7 +344,7 @@ def test_worker_clears_byok_key_between_tenants(
         lambda _event: None,
     )
     assert third["ok"] is True
-    assert [(p["byok_tenant"], p["byok_key"]) for p in host.turns] == [
+    assert [(p["web_tenant"], p["web_credential"]) for p in host.turns] == [
         (A, SECRET), (B, "sk-bob-only"),
     ]
 
@@ -384,8 +385,9 @@ def test_desktop_turn_never_imports_gateway(
 
 
 def test_byok_precedes_credits_for_x_and_y_still_pools(
-    daemon: FakeDaemon, accept_validation: None
+    daemon: FakeDaemon, accept_validation: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("CHUDWARE_WEB_POOL_API_KEY", "shared-pool-test-key")
     email = "demo@example.com"
     _seed(email, ai_grant=True)
     client = _client_for(email)
@@ -449,3 +451,71 @@ def test_byok_precedes_credits_for_x_and_y_still_pools(
     assert reservation["state"] == "reconciled"
     pool_call = [c for c in daemon.calls if c.get("method") == "agent_ask_v2"][-1]
     assert pool_call["params"]["options"]["_chudware_actor"]["key_source"] == "pool"
+    pool_actor = pool_call["params"]["options"]["_chudware_actor"]
+    assert pool_actor["_pool"] == {
+        "provider": "openrouter", "api_key": "shared-pool-test-key",
+    }
+    assert pool_actor["_pool_key_sha256"] == hashlib.sha256(
+        b"shared-pool-test-key"
+    ).hexdigest()
+
+
+def test_pool_without_operator_key_refuses_before_credit_reservation(
+    daemon: FakeDaemon, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CHUDWARE_WEB_POOL_API_KEY", raising=False)
+    _seed(A, ai_grant=True)
+    before = _balance_and_ledger(A)
+    with TestClient(app_mod.app).websocket_connect(
+        "/engine", headers={"X-Dev-User": A}
+    ) as ws:
+        _rpc(ws, 1, "hello")
+        denied = _rpc(ws, 2, "agent_ask_v2", {
+            "question": "pool without key", "provider": "openrouter",
+            "model": "vendor/cheap",
+        })
+    assert denied["result"]["reason"] == "pool_credential_unconfigured"
+    assert denied["result"]["hint"]
+    assert _balance_and_ledger(A) == before
+    assert not [call for call in daemon.calls if call.get("method") == "agent_ask_v2"]
+
+
+def test_subscription_digest_and_pool_model_injection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(engine_bridge, "actor_for", lambda email: {
+        "email": email, "plan": "studio", "credits_remaining": 10, "key_source": "pool",
+    })
+    monkeypatch.setattr(engine_bridge, "resolve_validated_key", lambda *_: None)
+    monkeypatch.setattr(engine_bridge, "resolve_subscription_token", lambda *_: {
+        "provider": "anthropic-sub", "access_token": "customer-oauth",
+    })
+    actor = engine_bridge._actor_for_turn(A, json.dumps({
+        "params": {"provider": "anthropic", "model": "claude-sonnet-4"},
+    }))
+    line = engine_bridge._sanitize_agent_rpc(json.dumps({
+        "method": "agent_ask_v2", "params": {
+            "provider": "anthropic", "model": "claude-sonnet-4",
+            "api_key": "browser-forgery",
+            "options": {"api_key": "nested-forgery", "_chudware_actor": {"email": "forged"}},
+        },
+    }), actor)
+    params = json.loads(line)["params"]
+    injected = params["options"]["_chudware_actor"]
+    assert "api_key" not in params and "api_key" not in params["options"]
+    assert injected["_subscription"]["access_token"] == "customer-oauth"
+    assert injected["_subscription_token_sha256"] == hashlib.sha256(b"customer-oauth").hexdigest()
+    monkeypatch.setattr(engine_bridge, "resolve_subscription_token", lambda *_: None)
+    monkeypatch.setenv("CHUDWARE_WEB_POOL_API_KEY", "operator-pool")
+    monkeypatch.setenv("CHUDWARE_WEB_POOL_MODEL", "vendor/pool-model")
+    pool = engine_bridge._actor_for_turn(A, json.dumps({
+        "params": {"provider": "anthropic", "model": "browser-model"},
+    }))
+    pooled = json.loads(engine_bridge._sanitize_agent_rpc(json.dumps({
+        "method": "agent_ask_v2", "params": {
+            "provider": "anthropic", "model": "browser-model",
+            "options": {"provider": "openai", "model": "forged-option"},
+        },
+    }), pool))["params"]
+    assert pooled["provider"] == "openrouter"
+    assert pooled["model"] == "vendor/pool-model"
+    assert "model" not in pooled["options"] and "provider" not in pooled["options"]
+    assert pooled["options"]["_chudware_actor"]["_pool"]["api_key"] == "operator-pool"

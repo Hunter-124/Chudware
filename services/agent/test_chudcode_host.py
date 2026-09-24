@@ -404,6 +404,37 @@ def test_byok_process_isolated_and_live_session_rejects_credential_switch(
     assert factory.clients[1].kwargs["session_dir"] != client.kwargs["session_dir"]
     host.shutdown()
 
+def test_web_subscription_pool_and_desktop_process_boundaries(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "operator-key")
+    monkeypatch.setenv("ANTHROPIC_OAUTH_TOKEN", "operator-oauth")
+    monkeypatch.setenv("OPENAI_API_KEY", "operator-openai")
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    shared = {"chudcode_session_dir": str(tmp_path), "web_actor": True,
+              "web_tenant": "tenant@example.test"}
+    subscription = {**shared, "web_key_source": "subscription",
+                    "web_provider": "anthropic-sub", "web_credential": "tenant-oauth"}
+    assert run(host, "sub", "sub-1", **subscription)[0]["ok"]
+    sub_env = factory.clients[0].kwargs["env"]
+    assert sub_env["ANTHROPIC_OAUTH_TOKEN"] == "tenant-oauth"
+    assert sub_env["ANTHROPIC_API_KEY"] == ""
+    assert sub_env["OPENAI_API_KEY"] == ""
+    assert factory.clients[0].kwargs["session_dir"].startswith(str(tmp_path / "subscription-"))
+    assert not run(host, "sub", "sub-switch", **{**subscription, "web_credential": "different"})[0]["ok"]
+    assert not run(host, "codex", "codex-1", **{**subscription, "web_provider": "openai-codex"})[0]["ok"]
+    assert not run(host, "invalid", "invalid-1", web_actor=True)[0]["ok"]
+    pool = {**shared, "web_key_source": "pool", "web_provider": "openrouter",
+            "web_credential": "operator-pool"}
+    assert run(host, "pool", "pool-1", **pool)[0]["ok"]
+    pool_env = factory.clients[1].kwargs["env"]
+    assert pool_env["OPENROUTER_API_KEY"] == "operator-pool"
+    assert pool_env["ANTHROPIC_API_KEY"] == ""
+    assert pool_env["ANTHROPIC_OAUTH_TOKEN"] == ""
+    assert factory.clients[1].kwargs["session_dir"].startswith(str(tmp_path / "pool-"))
+    assert run(host, "desktop", "desktop-1")[0]["ok"]
+    assert "env" not in factory.clients[2].kwargs
+    host.shutdown()
+
 
 def test_reuses_one_live_client_per_session_and_isolates_other_sessions():
     factory = FakeFactory()

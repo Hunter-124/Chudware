@@ -155,6 +155,14 @@ def _body(body: Any) -> dict[str, Any]:
     return body if isinstance(body, dict) else {}
 
 
+def _chat_hub():
+    # chat imports orgs for team authorization; defer the reverse import.
+    try:
+        from .chat import hub
+    except ImportError:
+        from chat import hub  # type: ignore
+    return hub
+
 # ---------------------------------------------------------------------------
 # Authorization primitives (cursor-level: they run inside the caller's own
 # transaction, so nothing they assert can go stale before the write lands)
@@ -841,7 +849,11 @@ async def delete_organization(org_id: str, request: Request) -> dict[str, bool]:
     api_writes.enforce(email, "organization changes")
     with tx() as cur:
         _require_org(cur, org_uuid, email, owner=True)
+        cur.execute("SELECT id FROM teams WHERE org_id = %s", (org_uuid,))
+        team_ids = [str(row["id"]) for row in cur.fetchall()]
         cur.execute("DELETE FROM organizations WHERE id = %s", (org_uuid,))
+    for team_id in team_ids:
+        _chat_hub().revoke_team(team_id)
     log.warning(
         "org deleted: %s by %s — shared files under %s were left in place",
         org_uuid,
@@ -1040,10 +1052,18 @@ async def set_member_role(
                 status_code=400,
                 detail="the owner's role cannot be changed; transfer ownership instead",
             )
+        if role == "member" and current["role"] == "admin":
+            cur.execute("SELECT id FROM teams WHERE org_id = %s", (org_uuid,))
+            team_ids = [str(row["id"]) for row in cur.fetchall()]
         cur.execute(
             "UPDATE org_members SET role = %s WHERE org_id = %s AND email = %s",
             (role, org_uuid, target),
         )
+    if role == "member" and current["role"] == "admin":
+        # A former org admin may have been on teams without explicit membership.
+        # Snapshot the affected teams in the same transaction as the demotion.
+        for team_id in team_ids:
+            _chat_hub().revoke(target, team_id)
     log.info("org member role: %s %s -> %s by %s", org_uuid, target, role, email)
     return {"ok": True, "email": target, "role": role}
 
@@ -1085,6 +1105,8 @@ async def remove_member(org_id: str, member_email: str, request: Request) -> dic
                     status_code=403,
                     detail="only the organization owner can remove an administrator",
                 )
+        cur.execute("SELECT id FROM teams WHERE org_id = %s", (org_uuid,))
+        team_ids = [str(row["id"]) for row in cur.fetchall()]
         cur.execute(
             "DELETE FROM team_members USING teams"
             " WHERE team_members.team_id = teams.id"
@@ -1095,6 +1117,8 @@ async def remove_member(org_id: str, member_email: str, request: Request) -> dic
             "DELETE FROM org_members WHERE org_id = %s AND email = %s",
             (org_uuid, target),
         )
+    for team_id in team_ids:
+        _chat_hub().revoke(target, team_id)
     log.info("org member removed: %s %s by %s", org_uuid, target, email)
     return {"ok": True}
 
@@ -1240,6 +1264,7 @@ async def delete_team(org_id: str, team_id: str, request: Request) -> dict[str, 
         if row["is_general"]:
             raise HTTPException(status_code=400, detail="the General team cannot be deleted")
         cur.execute("DELETE FROM teams WHERE id = %s AND org_id = %s", (team_uuid, org_uuid))
+    _chat_hub().revoke_team(team_uuid)
     log.warning(
         "team deleted: %s in org %s by %s — shared files under %s were left in place",
         team_uuid,
@@ -1340,6 +1365,7 @@ async def remove_team_member(
         )
         if cur.fetchone() is None:
             raise HTTPException(status_code=404, detail="team member not found")
+    _chat_hub().revoke(target, team_uuid)
     log.info("team member removed: %s %s by %s", team_uuid, target, email)
     return {"ok": True}
 

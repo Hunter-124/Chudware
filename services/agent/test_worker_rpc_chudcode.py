@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import hashlib
 
 import pytest
 
@@ -566,6 +567,8 @@ def test_credit_denial_never_reaches_chudcode(online_lane, monkeypatch):
         "plan": "metered",
         "credits_remaining": 0,
         "key_source": "pool",
+        "_pool": {"provider": "openai", "api_key": "pool-test-key"},
+        "_pool_key_sha256": hashlib.sha256(b"pool-test-key").hexdigest(),
         "_rate": {
             "model": "gpt-test",
             "prompt_usd_per_mtok": "1",
@@ -581,57 +584,58 @@ def test_credit_denial_never_reaches_chudcode(online_lane, monkeypatch):
     assert online_lane.host.turns == []
 
 
-def test_subscription_grant_is_bound_for_one_chudcode_turn_only(
-    online_lane, monkeypatch
-):
-    clears: list[str] = []
-    bound: list[dict] = []
-
-    monkeypatch.setattr(
-        config, "clear_pooled_credentials", lambda: clears.append("clear")
-    )
-
-    def bind(grant):
-        if not isinstance(grant, dict) or not grant.get("access_token"):
-            raise ValueError("invalid grant")
-        bound.append(dict(grant))
-
-    monkeypatch.setattr(config, "bind_subscription_grant", bind)
+def test_subscription_requires_digest_and_only_passes_supported_token_to_host(online_lane):
     actor = {
-        "email": "tenant-a@example.test",
-        "plan": "studio",
-        "credits_remaining": 0,
-        "key_source": "subscription",
-        "_subscription": {
-            "provider": "anthropic-sub",
-            "access_token": "tenant-a-bearer",
-        },
+        "email": "tenant-a@example.test", "plan": "studio",
+        "credits_remaining": 0, "key_source": "subscription",
+        "_subscription": {"provider": "anthropic-sub", "access_token": "tenant-a-bearer"},
+        "_subscription_token_sha256": hashlib.sha256(b"tenant-a-bearer").hexdigest(),
     }
+    params = _params(online_lane, run_id="tenant-a", provider="anthropic",
+                     model="claude-sonnet-4", _chudware_actor=actor)
+    assert worker_rpc._agent_admin_turn(params, lambda event: None)["ok"]
+    host_turn = online_lane.host.turns[-1]
+    assert (host_turn["web_key_source"], host_turn["web_provider"],
+            host_turn["web_tenant"], host_turn["web_credential"]) == (
+                "subscription", "anthropic-sub", actor["email"], "tenant-a-bearer")
+    assert "byok_key" not in host_turn
 
-    first = worker_rpc._agent_admin_turn(
-        _params(online_lane, run_id="tenant-a", _chudware_actor=actor),
-        lambda event: None,
-    )
-    assert first["ok"] is True
-    assert bound == [actor["_subscription"]]
-    assert clears == ["clear", "clear"]
+    for changed, reason in [
+        ({**actor, "_subscription_token_sha256": "0" * 64}, "subscription_credential_mismatch"),
+        ({**actor, "_subscription": None}, "invalid_subscription_grant"),
+        ({**actor, "_subscription": {"provider": "openai-codex", "access_token": "codex"}},
+         "subscription_isolation_unsupported"),
+    ]:
+        denied = worker_rpc._agent_admin_turn(
+            {**params, "_chudware_actor": changed, "run_id": reason}, lambda event: None)
+        assert denied["reason"] == reason
     assert len(online_lane.host.turns) == 1
 
-    second = worker_rpc._agent_admin_turn(
-        _params(
-            online_lane,
-            run_id="tenant-b",
-            _chudware_actor={
-                **actor,
-                "email": "tenant-b@example.test",
-                "_subscription": None,
-            },
-        ),
-        lambda event: None,
-    )
-    assert second == {"ok": False, "reason": "invalid_subscription_grant"}
-    assert bound == [actor["_subscription"]]
-    assert clears == ["clear", "clear", "clear"]
+
+def test_pool_requires_proven_credential_and_preserves_credit_preflight(online_lane, monkeypatch):
+    monkeypatch.setattr(config, "pooled_credit_preflight",
+                        lambda *_args, **_kw: {"ok": True, "max_output_tokens": 8192})
+    actor = {
+        "email": "tenant@example.test", "plan": "studio",
+        "credits_remaining": 100, "key_source": "pool",
+        "_pool": {"provider": "openrouter", "api_key": "pool-secret"},
+        "_pool_key_sha256": hashlib.sha256(b"pool-secret").hexdigest(),
+    }
+    params = _params(online_lane, run_id="pool", provider="openrouter",
+                     model="vendor/cheap", _chudware_actor=actor)
+    assert worker_rpc._agent_admin_turn(params, lambda event: None)["ok"]
+    host_turn = online_lane.host.turns[-1]
+    assert (host_turn["web_key_source"], host_turn["web_provider"],
+            host_turn["web_credential"]) == ("pool", "openrouter", "pool-secret")
+    for changed, reason in [
+        ({**actor, "_pool": None}, "pool_credential_unconfigured"),
+        ({**actor, "_pool_key_sha256": "0" * 64}, "pool_credential_mismatch"),
+        ({**actor, "key_source": ""}, "web_credential_source_invalid"),
+        ({**actor, "key_source": "unknown"}, "web_credential_source_invalid"),
+    ]:
+        denied = worker_rpc._agent_admin_turn(
+            {**params, "run_id": reason, "_chudware_actor": changed}, lambda event: None)
+        assert denied["reason"] == reason
     assert len(online_lane.host.turns) == 1
 
 

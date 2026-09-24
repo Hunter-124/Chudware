@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import sys
+import hashlib
 import asyncio
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from gateway import accounts, billing, credits, db, plans
 from gateway.db import tx
@@ -41,6 +44,8 @@ def _account(email: str = "buyer@example.com", *, balance: int = 0, ai_grant: bo
 def _rated_actor(model: str) -> dict:
     actor = credits.actor_for("buyer@example.com")
     prompt_rate, completion_rate = credits.model_rate(model, refresh=False)
+    actor["_pool"] = {"provider": "openrouter", "api_key": "operator-pool-test-key"}
+    actor["_pool_key_sha256"] = hashlib.sha256(b"operator-pool-test-key").hexdigest()
     actor["_rate"] = {
         "model": model,
         "prompt_usd_per_mtok": str(prompt_rate),
@@ -206,7 +211,7 @@ def test_worker_refusal_happens_before_chudcode_host_call(monkeypatch):
     out = worker_rpc._agent_admin_turn(
         {
             "request": "make a bracket",
-            "provider": "mock",
+            "provider": "openrouter",
             "model": "vendor/expensive",
             "_chudware_actor": _rated_actor("vendor/expensive"),
         },
@@ -227,7 +232,7 @@ def test_ample_pooled_turn_records_reported_actuals(monkeypatch):
             self.turns.append(params)
             emit({
                 "type": "usage",
-                "provider": "mock",
+                "provider": "openrouter",
                 "model": "vendor/cheap",
                 "promptTokens": 100,
                 "completionTokens": 100,
@@ -250,7 +255,7 @@ def test_ample_pooled_turn_records_reported_actuals(monkeypatch):
     out = worker_rpc._agent_admin_turn(
         {
             "request": "cheap turn",
-            "provider": "mock",
+            "provider": "openrouter",
             "model": "vendor/cheap",
             "_chudware_actor": _rated_actor("vendor/cheap"),
         },

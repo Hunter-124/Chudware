@@ -225,6 +225,14 @@ def set_status(
             (status, time.time(), decided_by.strip(), notes, email),
         )
         row = cur.fetchone()
+    if row is not None and status != "active":
+        # Status changes also remove live chat access, even for idle sockets.
+        # Import locally: chat -> orgs -> accounts is the normal import path.
+        try:
+            from .chat import hub
+        except ImportError:
+            from chat import hub  # type: ignore
+        hub.revoke(email)
     return _row_to_account(row)
 
 

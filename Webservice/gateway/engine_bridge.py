@@ -693,21 +693,24 @@ def _actor_for_turn(email: str, line: str) -> dict[str, Any]:
     """
     actor = actor_for(email)
     provider = _agent_provider(line)
-    if not provider:
-        actor["_byok_validated"] = False
-        return actor
-    key = resolve_validated_key(email, provider)
+    key = resolve_validated_key(email, provider) if provider else None
     actor["_byok_validated"] = key is not None
     if key is not None:
         actor["key_source"] = "byok"
         actor["_byok_api_key"] = key
         return actor
-    grant = resolve_subscription_token(email, provider)
+    grant = resolve_subscription_token(email, provider) if provider else None
     if grant is not None:
         actor["key_source"] = "subscription"
         actor["_subscription"] = {
             "provider": grant["provider"],
             "access_token": grant["access_token"],
+        }
+    if actor["key_source"] == "pool":
+        actor["_pool"] = {
+            "provider": os.environ.get("CHUDWARE_WEB_POOL_PROVIDER", "openrouter").strip().lower(),
+            "api_key": os.environ.get("CHUDWARE_WEB_POOL_API_KEY", "").strip(),
+            "model": os.environ.get("CHUDWARE_WEB_POOL_MODEL", "").strip(),
         }
     return actor
 
@@ -794,6 +797,18 @@ def _sanitize_agent_rpc(line: str, actor: Mapping[str, Any]) -> str:
     if not isinstance(options, dict):
         options = {}
         params["options"] = options
+    options.pop("_chudware_actor", None)
+    if method in _AGENT_TURN_PROVIDER_METHODS:
+        for key in _STRIP_SECRET_FIELDS:
+            options.pop(key, None)
+    pool = actor.get("_pool")
+    if method in _AGENT_TURN_PROVIDER_METHODS and isinstance(pool, Mapping):
+        params["provider"] = str(pool["provider"])
+        if pool.get("model"):
+            params["model"] = str(pool["model"])
+        options.pop("provider", None)
+        options.pop("model", None)
+    params["options"] = options
     injected = {
         "email": str(actor["email"]),
         "plan": str(actor["plan"]),
@@ -803,6 +818,14 @@ def _sanitize_agent_rpc(line: str, actor: Mapping[str, Any]) -> str:
     if injected["key_source"] == "byok" and actor.get("_byok_validated"):
         injected["_byok_key_sha256"] = hashlib.sha256(
             str(actor["_byok_api_key"]).encode("utf-8")
+        ).hexdigest()
+    if injected["key_source"] == "pool" and isinstance(pool, Mapping):
+        injected["_pool"] = {
+            "provider": str(pool["provider"]),
+            "api_key": str(pool["api_key"]),
+        }
+        injected["_pool_key_sha256"] = hashlib.sha256(
+            str(pool["api_key"]).encode("utf-8")
         ).hexdigest()
     rate = actor.get("_rate")
     if isinstance(rate, Mapping):
@@ -828,6 +851,9 @@ def _sanitize_agent_rpc(line: str, actor: Mapping[str, Any]) -> str:
             "provider": str(grant["provider"]),
             "access_token": str(grant["access_token"]),
         }
+        injected["_subscription_token_sha256"] = hashlib.sha256(
+            str(grant["access_token"]).encode("utf-8")
+        ).hexdigest()
     options["_chudware_actor"] = injected
     return json.dumps(msg, separators=(",", ":"))
 
@@ -1040,6 +1066,17 @@ async def engine_ws(ws: WebSocket) -> None:
                     if (
                         actor.get("key_source") == "pool"
                         and method in _AGENT_TURN_PROVIDER_METHODS
+                        and not actor.get("_pool", {}).get("api_key")
+                    ):
+                        await ws.send_text(_rpc_result(line, {
+                            "ok": False,
+                            "reason": "pool_credential_unconfigured",
+                            "hint": "The managed AI pool is not configured. Contact the site operator or connect your own provider.",
+                        }))
+                        continue
+                    if (
+                        actor.get("key_source") == "pool"
+                        and method in _AGENT_TURN_PROVIDER_METHODS
                     ):
                         if int(actor.get("credits_remaining") or 0) <= 0:
                             # Absolute stop: a zero-balance pool actor never
@@ -1051,6 +1088,8 @@ async def engine_ws(ws: WebSocket) -> None:
                             ))
                             continue
                         model, prompt_estimate, max_output = _agent_cost_inputs(line)
+                        if actor.get("_pool", {}).get("model"):
+                            model = str(actor["_pool"]["model"])
                         reservation = await asyncio.to_thread(
                             reserve_turn,
                             actor,

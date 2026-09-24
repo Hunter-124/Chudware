@@ -429,15 +429,20 @@ def test_only_an_admin_can_connect_or_see_a_shared_account(vendor: VendorStub) -
     assert user_view["accounts"] == []
 
 
-def test_a_customer_turn_falls_through_to_the_shared_pool(vendor: VendorStub) -> None:
+def test_customer_without_personal_grant_uses_dedicated_pool_not_operator_oauth(
+    vendor: VendorStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _seed(A)
     _seed(OPERATOR)
     _connect_claude(OPERATOR, role="admin", scope="shared")
+    monkeypatch.setenv("CHUDWARE_WEB_POOL_API_KEY", "dedicated-pool-key")
 
-    grant = provider_accounts.resolve_subscription_token(A, "anthropic")
-    assert grant is not None
-    assert grant["scope"] == "shared"
-    assert grant["access_token"] == CLAUDE_ACCESS
+    assert provider_accounts.resolve_subscription_token(A, "anthropic") is None
+    params = _sanitized_params(A, _turn_line())
+    actor = params["options"]["_chudware_actor"]
+    assert actor["key_source"] == "pool"
+    assert "_subscription" not in actor
+    assert actor["_pool"] == {"provider": "openrouter", "api_key": "dedicated-pool-key"}
 
 
 def test_a_personal_link_wins_over_the_shared_pool(vendor: VendorStub) -> None:
@@ -612,6 +617,9 @@ def test_a_connected_subscription_reaches_the_worker_inside_the_actor(
         "provider": "anthropic-sub",
         "access_token": CLAUDE_ACCESS,
     }
+    assert injected["_subscription_token_sha256"] == hashlib.sha256(
+        CLAUDE_ACCESS.encode("utf-8")
+    ).hexdigest()
     # A bearer must never ride the API-key slot: it is not an API key.
     assert "api_key" not in params
 

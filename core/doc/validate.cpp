@@ -190,13 +190,10 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
     // required; height/depth/mode/font/align are optional (compiler defaults). target_face
     // = the planar face to mark.
     {"text", {{"text"}, {{"target_face", RefForm::Sel, true}}}},
-    {"fillet", {{}, {{"edges", RefForm::SelList, false},
-                     {"middle_face", RefForm::SelOrDatum, false},
-                     {"face_set_a", RefForm::SelList, false},
-                     {"face_set_b", RefForm::SelList, false}}}},
-    {"chamfer", {{"length"}, {{"edges", RefForm::SelList, false},
-                              {"vertices", RefForm::SelList, false},
-                              {"reference_face", RefForm::SelOrDatum, false}}}},
+    {"fillet", {{}, {{"edges", RefForm::SelList, false}}}},
+    {"chamfer", {{}, {{"edges", RefForm::SelList, false},
+                       {"vertices", RefForm::SelList, false},
+                       {"reference_face", RefForm::Sel, false}}}},
     {"shell", {{"thickness"}, {{"remove", RefForm::SelList, false}}}},
     {"draft", {{"angle"}, {{"neutral", RefForm::SelOrDatum, true},
                            {"pull", RefForm::SelOrDatum, false},
@@ -1484,35 +1481,39 @@ vector<string> validate_feature(const json& f, const string& where,
         errs.insert(errs.end(), se.begin(), se.end());
     }
 
-    if (ftype == "fillet") {
-        if (truthy(get(params, "full_round"))) {
-            if (!truthy(get(refs, "middle_face"))) {
-                errs.push_back(where + ".refs.middle_face: required for full_round fillet");
-            }
-        } else if (truthy(get(params, "face_fillet"))) {
-            if (!truthy(get(refs, "face_set_a")) || !truthy(get(refs, "face_set_b"))) {
-                errs.push_back(where + ".refs.face_set_a/face_set_b: required for face fillet");
-            }
-            if (!params.contains("radius")) {
-                errs.push_back(where + ".params.radius: required for fillet");
-            }
+    if (ftype == "fillet" || ftype == "chamfer") {
+        const json& typej = get(params, "type");
+        if (!typej.is_null() && !typej.is_string()) {
+            errs.push_back(where + ".params.type: must be a string");
         } else {
-            if (!params.contains("radius")) {
-                errs.push_back(where + ".params.radius: required for fillet");
+            const string subtype = typej.is_string() ? typej.get<string>() : "";
+            const bool supported = subtype.empty() ||
+                (ftype == "fillet"
+                    ? (subtype == "constant" || subtype == "variable")
+                    : (subtype == "symmetric" || subtype == "asymmetric" ||
+                       subtype == "distance_angle" || subtype == "vertex"));
+            if (!supported) {
+                errs.push_back(where + ".params.type: " + ftype + " type '" +
+                               subtype + "' is not supported");
+            } else if (ftype == "fillet") {
+                if (!params.contains("radius"))
+                    errs.push_back(where + ".params.radius: required for fillet");
+                if (subtype == "variable" && !params.contains("radius2"))
+                    errs.push_back(where + ".params.radius2: required for variable fillet");
+                if (!subtype.empty() && !truthy(get(refs, "edges")))
+                    errs.push_back(where + ".refs.edges: required for " + subtype + " fillet");
+            } else {
+                if (!params.contains("length") && !params.contains("distance"))
+                    errs.push_back(where + ".params.length: required for chamfer");
+                if (subtype == "asymmetric" && !params.contains("length2"))
+                    errs.push_back(where + ".params.length2: required for asymmetric chamfer");
+                const string& slot = subtype == "vertex" ? "vertices" : "edges";
+                if (!subtype.empty() && !truthy(get(refs, slot)))
+                    errs.push_back(where + ".refs." + slot + ": required for " +
+                                   subtype + " chamfer");
+                if (subtype == "distance_angle" && !params.contains("angle"))
+                    errs.push_back(where + ".params.angle: required for distance_angle chamfer");
             }
-            if (!truthy(get(refs, "edges"))) {
-                errs.push_back(where + ".refs.edges: required for fillet");
-            }
-        }
-    }
-
-    if (ftype == "chamfer") {
-        if (truthy(get(params, "vertex_chamfer"))) {
-            if (!truthy(get(refs, "vertices"))) {
-                errs.push_back(where + ".refs.vertices: required for vertex chamfer");
-            }
-        } else if (!truthy(get(refs, "edges"))) {
-            errs.push_back(where + ".refs.edges: required for chamfer");
         }
     }
 

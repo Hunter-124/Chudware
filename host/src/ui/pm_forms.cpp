@@ -294,42 +294,21 @@ static const std::vector<PMFormDef>& forms() {
             Check     ("ruled",   "Ruled (straight transitions)", "Options", false),
             Check     ("merge",   "Merge result", "Options", true),
         }},
-        // --- fillet ---  radius / [radius2] ; edges[]  OR  full_round + middle_face
-        //   C30-A: variable-size fillet. A ComboL "type" (constant|variable) gates radius2 via the
-        //   existing DimIf/enableKey mechanism — mirrors the chamfer Symmetric|Asymmetric gating.
-        //   "type" is UI-only; the engine keys off radius2 (absent/equal => constant path).
-        //   C33-B: extend "type" with "full_round" (Check has no gating constructor, so the proven
-        //   Combo-gating path is the clean fit). full_round swaps the edge/radius rows for a single
-        //   "Middle Face" face well; the type combo also emits params.full_round=true (the engine
-        //   reads params.full_round + refs.middle_face, ignoring edges/radius on that path).
-        //   tangent_prop remains disabled "(coming soon)" for discoverability.
-        //   Face fillet (type=="face"): a rolling-ball blend between two face sets
-        //   (refs.face_set_a / face_set_b); the engine dispatches on type=="face". Tangent
-        //   propagation (params.tangent_propagation) auto-includes G1-continuous edges.
+        // --- fillet --- constant or variable radius on picked edges.
+        // The engine selects the variable path when radius2 differs from radius.
         { "fillet", "Fillet", "fillet", {
             WellIf    ("edges",      "Edges",              "Items to Fillet",    K_EDGE, true,
                        "type", "constant|variable"),
-            WellIf    ("middle_face","Middle Face",        "Items to Fillet",    K_FACE, false,
-                       "type", "full_round"),
-            WellIf    ("face_set_a", "Face Set 1",         "Items to Fillet",    K_FACE, true,
-                       "type", "face"),
-            WellIf    ("face_set_b", "Face Set 2",         "Items to Fillet",    K_FACE, true,
-                       "type", "face"),
             ComboL    ("type",       "Fillet Type",        "Fillet Parameters",
-                       "constant|variable|full_round|face",
-                       "Constant Size|Variable Size|Full Round|Face Fillet"),
+                       "constant|variable", "Constant Size|Variable Size"),
             DimIf     ("radius",     "Radius",             "Fillet Parameters",  2.0,
-                       "type", "constant|variable|face"),
+                       "type", "constant|variable"),
             DimIf     ("radius2",    "End Radius",         "Fillet Parameters",  2.0,
                        "type", "variable"),
-            Check     ("tangent_propagation","Tangent propagation","Fillet Parameters", false),
         }},
-        // --- chamfer ---  length / [length2 | angle] ; edges[] | vertices[]
-        //   A single "type" combo (symmetric|asymmetric|distance_angle|vertex) drives which
-        //   fields show AND which dress.py path runs: type=="vertex" -> vertex chamfer
-        //   (refs.vertices); angle>0 -> distance-angle (refs.reference_face optional); length2>0
-        //   -> asymmetric; else symmetric. The path-selecting params (length2/angle) are
-        //   omitWhenDisabled so a stale value can't force the wrong path.
+        // --- chamfer --- distance / [second distance | angle] on edges or vertices.
+        // The selected type determines whether to bevel the picked edges or edges
+        // incident to picked vertices, and which leg definition applies.
         { "chamfer", "Chamfer", "chamfer", {
             WellIf  ("edges",    "Edges",            "Items to Chamfer", K_EDGE, true,
                      "type", "symmetric|asymmetric|distance_angle"),
@@ -477,15 +456,10 @@ static const std::vector<PMFormDef>& forms() {
             Text     ("skip",     "Instances to skip", "Instances to Skip",
                       "ring indices (0=seed), e.g. 1, 3, 5"),
         }},
-        // --- draft ---  angle + neutral plane + faces[]
-        //   Engine (draft.py): tapers each selected face about the line where it meets the neutral
-        //   plane (OCCT DraftAngle). Pull direction defaults to the neutral plane normal.
-        //   mode (neutral_plane|parting_line|step): parting/step split each drafted face along a
-        //   parting line (refs.parting edges, gated on those modes) and taper the halves oppositely.
+        // --- draft --- neutral-plane taper on the selected faces.
         { "draft", "Draft", "draft", {
             ComboL   ("mode",    "Draft Type",    "Draft",
-                      "neutral_plane|parting_line|step",
-                      "Neutral Plane|Parting Line|Step"),
+                      "neutral_plane", "Neutral Plane"),
             Range    (Angle("angle",   "Draft Angle",   "Draft", 3.0), 0.0, 89.0),
             DatumRef ("neutral", "Neutral Plane", "Draft",
                       "plane.top|plane.front|plane.right",
@@ -495,8 +469,6 @@ static const std::vector<PMFormDef>& forms() {
             // (normalize_feature neutral slot: datum->plane_point/normal, face passes through).
             Well     ("neutral", "…or click a face/plane", "Draft", K_PLANE, false),
             Well     ("faces",   "Faces to Draft", "Draft", K_FACE, true),
-            WellIf   ("parting", "Parting Line (edges)", "Draft", K_EDGE, true,
-                      "mode", "parting_line|step"),
         }},
         // --- helix (Curve) --- engine features/curves.py. Produces a sweep PATH (a Sweep can then
         //   reference this helix feature). v1 is "Height & Pitch"-defined; the engine derives turns

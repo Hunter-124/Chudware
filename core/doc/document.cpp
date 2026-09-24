@@ -3919,12 +3919,15 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     std::string ifmt = str_field(feat, "format", "");
                     if (ifmt.empty()) ifmt = detect_format(src_path);
                     std::vector<std::pair<std::string, TopoDS_Shape>> imported;
+                    std::vector<std::string> import_warnings;
                     try {
-                        imported = import_bodies(src_path, ifmt);
+                        imported = import_bodies(src_path, ifmt, &import_warnings);
                     } catch (const OpError& oe) {
                         throw std::runtime_error("import failed for '" + src_path +
                                                  "': " + oe.what());
                     }
+                    for (const std::string& warning : import_warnings)
+                        st.warning = st.warning.empty() ? warning : st.warning + "; " + warning;
                     for (auto& [name, shp] : imported)
                         if (!shp.IsNull()) {
                             solids.push_back(shp);
@@ -5215,6 +5218,22 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 st.ok = true;
 
             } else if (type == "fillet" || type == "chamfer") {
+                // normalize_feature stores params.type in hem_type to preserve the
+                // feature's top-level type. An absent subtype is the legacy path.
+                const std::string blend_type = feat.value("hem_type", std::string());
+                if (type == "fillet" && !blend_type.empty() &&
+                    blend_type != "constant" && blend_type != "variable")
+                    throw std::runtime_error("fillet type '" + blend_type + "' is not supported");
+                if (type == "chamfer" && !blend_type.empty() &&
+                    blend_type != "symmetric" && blend_type != "asymmetric" &&
+                    blend_type != "distance_angle" && blend_type != "vertex")
+                    throw std::runtime_error("chamfer type '" + blend_type + "' is not supported");
+                if (type == "fillet" && blend_type == "variable" &&
+                    (!feat.contains("radius2") || feat.at("radius2").is_null()))
+                    throw std::runtime_error("fillet: radius2 is required for variable type");
+                if (type == "chamfer" && blend_type == "asymmetric" &&
+                    (!feat.contains("length2") || feat.at("length2").is_null()))
+                    throw std::runtime_error("chamfer: length2 is required for asymmetric type");
                 const std::string body_id = body_ref(feat);
                 if (body_id.empty())
                     throw std::runtime_error(type + ": no body ref and no current body");
@@ -5232,6 +5251,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     edges_it != feat.end() &&
                     (edges_it->is_object() ||
                      (edges_it->is_array() && !edges_it->empty()));
+                if (!blend_type.empty() && blend_type != "vertex" && !has_edge_sel)
+                    throw std::runtime_error(type + ": refs.edges required for type '" +
+                                             blend_type + "'");
                 // Reject a selector that names a non-existent feature (Bug K4) before any
                 // resolution — a stale owner/feature ref would otherwise score against the
                 // wrong edge and silently mutilate the body (an open shell that reports ok).
@@ -5297,6 +5319,43 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     }
                     picked = std::move(picks.edges);
                 }
+                std::vector<TopoDS_Vertex> picked_vertices;
+                if (type == "chamfer" && blend_type == "vertex") {
+                    auto vit = feat.find("vertices");
+                    if (vit == feat.end() ||
+                        !(vit->is_object() || (vit->is_array() && !vit->empty())))
+                        throw std::runtime_error("chamfer: refs.vertices required for type 'vertex'");
+                    validate_selector_refs(*vit, "chamfer");
+                    TopTools_IndexedMapOfShape vertices;
+                    TopExp::MapShapes(body, TopAbs_VERTEX, vertices);
+                    std::vector<chudware::doc::TopoInfo> infos;
+                    infos.reserve(vertices.Extent());
+                    for (int vi = 1; vi <= vertices.Extent(); ++vi) {
+                        const gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(vertices(vi)));
+                        chudware::doc::TopoInfo info;
+                        info.kind = "vertex";
+                        info.index = vi - 1;
+                        info.hint_index = vi - 1;
+                        info.centroid = Eigen::Vector3d(p.X(), p.Y(), p.Z());
+                        infos.push_back(std::move(info));
+                    }
+                    const double diag = chudware::doc::bbox_diag(body);
+                    TopTools_IndexedMapOfShape selected_vertices;
+                    auto add_vertex = [&](const json& sel) {
+                        auto idx = chudware::doc::resolve_with_hint_fallback(sel, infos, diag);
+                        if (!idx)
+                            throw std::runtime_error("chamfer: vertex selector dangling");
+                        selected_vertices.Add(vertices(*idx + 1));
+                    };
+                    if (vit->is_array()) {
+                        for (const json& sel : *vit) add_vertex(sel);
+                    } else {
+                        add_vertex(*vit);
+                    }
+                    picked_vertices.reserve(selected_vertices.Extent());
+                    for (int vi = 1; vi <= selected_vertices.Extent(); ++vi)
+                        picked_vertices.push_back(TopoDS::Vertex(selected_vertices(vi)));
+                }
 
                 // EMPTY-QUERY guard (Bug A4): if an edge selector/query was given but
                 // resolved to NO edges, fail with a distinct "no edges matched" message
@@ -5315,12 +5374,57 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // tolerance (1e-7) removes no detectable material — OCCT no-ops it or hands
                 // back the body unchanged, which used to report a silent success. Warn,
                 // pass the body through unchanged, and skip the (pointless) kernel call.
-                blend_size = type == "fillet"
-                    ? num_or_expr(feat.at("radius"), env)
-                    : num_or_expr(feat.at("distance"), env);
+                const char* size_key = type == "fillet" ? "radius" : "distance";
+                if (!feat.contains(size_key) || feat.at(size_key).is_null())
+                    throw std::runtime_error(type + ": missing required " +
+                                             (type == "fillet" ? std::string("radius")
+                                                               : std::string("distance/length")));
+                blend_size = num_or_expr(feat.at(size_key), env);
                 if (!(blend_size > 0.0))
                     throw std::runtime_error(
                         type + (type == "fillet" ? " radius must be > 0" : " distance must be > 0"));
+                double chamfer_angle = 0.0;
+                std::optional<TopoDS_Face> chamfer_reference_face;
+                if (type == "chamfer" && blend_type == "distance_angle") {
+                    if (!feat.contains("angle") || feat.at("angle").is_null())
+                        throw std::runtime_error("chamfer: angle is required for distance_angle");
+                    const double angle_degrees = num_or_expr(feat.at("angle"), env);
+                    if (!(angle_degrees > 0.0 && angle_degrees < 90.0))
+                        throw std::runtime_error("chamfer: angle must be between 0 and 90 degrees");
+                    chamfer_angle = radians(angle_degrees);
+                    auto ref_it = feat.find("reference_face");
+                    if (ref_it != feat.end() && !ref_it->is_null()) {
+                        validate_selector_refs(*ref_it, "reference_face");
+                        TopoDS_Face face;
+                        if (chudware::doc::is_geom_query(*ref_it)) {
+                            chudware::doc::QueryPicks qp =
+                                chudware::doc::resolve_geom_query(body, *ref_it);
+                            if (!qp.error.empty() || qp.faces.size() != 1)
+                                throw std::runtime_error("chamfer: reference_face must resolve to one face");
+                            face = qp.faces.front();
+                        } else {
+                            chudware::doc::FacePicks fp =
+                                chudware::doc::resolve_face_picks(body, *ref_it, "reference_face");
+                            if (!fp.dangling.empty() || fp.faces.size() != 1)
+                                throw std::runtime_error("chamfer: reference_face must resolve to one face");
+                            face = fp.faces.front();
+                        }
+                        TopTools_IndexedDataMapOfShapeListOfShape adjacent;
+                        TopExp::MapShapesAndAncestors(body, TopAbs_EDGE, TopAbs_FACE, adjacent);
+                        for (const TopoDS_Edge& edge : *picked) {
+                            bool found = false;
+                            if (adjacent.Contains(edge)) {
+                                const TopTools_ListOfShape& faces = adjacent.FindFromKey(edge);
+                                for (TopTools_ListIteratorOfListOfShape it(faces); it.More(); it.Next())
+                                    if (it.Value().IsSame(face)) { found = true; break; }
+                            }
+                            if (!found)
+                                throw std::runtime_error(
+                                    "chamfer: reference_face must be adjacent to every selected edge");
+                        }
+                        chamfer_reference_face = face;
+                    }
+                }
                 bool sub_tolerance = blend_size < 1e-7;
                 if (sub_tolerance) {
                     char buf[160];
@@ -5333,9 +5437,11 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     // Variable-radius fillet (dress.py): a linear law r1->r2 along the edge,
                     // active when radius2 > 0 and differs from radius. Requires picked edges
                     // (the variable law is per-edge; the dir-filter path stays uniform).
-                    double radius2 = feat.contains("radius2")
+                    double radius2 = ((blend_type.empty() || blend_type == "variable") &&
+                                      feat.contains("radius2"))
                         ? num_or_expr(feat.at("radius2"), env) : 0.0;
-                    const bool variable = picked && radius2 > 0.0 &&
+                    const bool variable = (blend_type.empty() || blend_type == "variable") &&
+                                          picked && radius2 > 0.0 &&
                                           std::abs(radius2 - radius) > 1e-9;
                     if (variable)
                         out = ::geom::fillet_edges_variable(body, radius, radius2, *picked, &n_dropped);
@@ -5347,11 +5453,24 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     // Two-distance (asymmetric) chamfer (dress.py): leg d1 on one face, d2
                     // on the other, active when length2 > 0 and differs from length. Needs
                     // picked edges (the asymmetric Add references a specific incident face).
-                    double length2 = feat.contains("length2")
+                    double length2 = ((blend_type.empty() || blend_type == "asymmetric") &&
+                                      feat.contains("length2"))
                         ? num_or_expr(feat.at("length2"), env) : 0.0;
-                    const bool asym = picked && length2 > 0.0 &&
+                    const bool asym = (blend_type.empty() || blend_type == "asymmetric") &&
+                                      picked && length2 > 0.0 &&
                                       std::abs(length2 - distance) > 1e-9;
-                    if (asym)
+                    if (blend_type == "vertex") {
+                        std::string vertex_diag;
+                        out = ::geom::chamfer_vertices(body, distance, picked_vertices, &vertex_diag);
+                        if (out.IsNull())
+                            throw std::runtime_error("chamfer: " +
+                                (vertex_diag.empty() ? std::string("vertex corner cut failed")
+                                                     : vertex_diag));
+                    } else if (blend_type == "distance_angle")
+                        out = ::geom::chamfer_edges_distance_angle(body, distance, chamfer_angle,
+                                                                    *picked, chamfer_reference_face,
+                                                                    &n_dropped);
+                    else if (asym)
                         out = ::geom::chamfer_edges_two_distance(body, distance, length2, *picked,
                                                                  &n_dropped);
                     else
@@ -6929,6 +7048,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 st.ok = true;
 
             } else if (type == "draft") {
+                const std::string draft_mode = feat.value("mode", std::string());
+                if (!draft_mode.empty() && draft_mode != "neutral_plane")
+                    throw std::runtime_error("draft mode '" + draft_mode + "' is not supported");
                 // Taper the selected faces about a neutral plane (datum or face) by an
                 // angle (degrees). Port of engine/doc/features/draft.py neutral_plane mode.
                 const std::string body_id = body_ref(feat);

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
@@ -372,7 +373,14 @@ def _import_iges(path: Path) -> list[tuple[str, Any]]:
     status = reader.ReadFile(str(path))
     if status != IFSelect_RetDone:
         raise RuntimeError(f"IGES reader failed with status {status}")
-    reader.TransferRoots()
+    roots = reader.NbRootsForTransfer()
+    transferred = reader.TransferRoots()
+    if transferred != roots:
+        if transferred == 0:
+            raise RuntimeError(f"IGES reader transferred 0 of {roots} roots from '{path}'")
+        warnings.warn(
+            f"{transferred} of {roots} IGES roots translated from '{path}'",
+            RuntimeWarning, stacklevel=2)
 
     result: list[tuple[str, Any]] = []
     for i in range(1, reader.NbShapes() + 1):
@@ -423,6 +431,16 @@ def _import_3mf(path: Path) -> list[tuple[str, Any]]:
     model = wrapper.CreateModel()
     reader = model.QueryReader("3mf")
     reader.ReadFromFile(str(path))
+    unit_to_mm = {
+        lib3mf.ModelUnit.MicroMeter: 0.001,
+        lib3mf.ModelUnit.MilliMeter: 1.0,
+        lib3mf.ModelUnit.CentiMeter: 10.0,
+        lib3mf.ModelUnit.Inch: 25.4,
+        lib3mf.ModelUnit.Foot: 304.8,
+        lib3mf.ModelUnit.Meter: 1000.0,
+    }.get(model.GetUnit())
+    if unit_to_mm is None:
+        raise ValueError(f"3MF '{path}' has an unsupported model length unit")
 
     result: list[tuple[str, Any]] = []
     mesh_iter = model.GetMeshObjects()
@@ -435,7 +453,10 @@ def _import_3mf(path: Path) -> list[tuple[str, Any]]:
         gv = mesh.GetVertices()
         gi = mesh.GetTriangleIndices()
         verts = np.array([[v.Coordinates[0], v.Coordinates[1], v.Coordinates[2]] for v in gv],
-                         dtype=np.float32)
+                         dtype=np.float64)
+        if unit_to_mm != 1.0:
+            verts *= unit_to_mm
+        verts = verts.astype(np.float32)
         tris = np.array([[t.Indices[0], t.Indices[1], t.Indices[2]] for t in gi], dtype=np.uint32)
         name = mesh.GetName() or f"{Path(path).stem}_{idx}"
         result.append((name, MeshBody(verts=verts, tris=tris, name=name)))

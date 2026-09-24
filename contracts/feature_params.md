@@ -646,3 +646,36 @@ this world-space delta with its current placement, without adding a part feature
 referenced by an active mate refuses with `component_is_mated`; a missing component
 refuses with `component_not_found`. Authored poses use the existing assembly warm
 start invalidation and grounded-island transport path.
+
+## Dress-up modes (append-only, 2026-09-23)
+
+### `chamfer` — selectable edge, vertex, and distance-angle variants (append-only, 2026-09-23)
+
+`params.type` selects `"symmetric"`, `"asymmetric"`, `"distance_angle"`, or `"vertex"`.
+`params.length` is the primary distance (the legacy `distance` alias remains accepted).
+`refs.edges` selects the edges for the first three variants; `refs.vertices` selects
+corners for `"vertex"`. On each convex three-edge corner, a planar triangular face
+through points at `length` along its incident straight edges cuts off the corner
+(a right-angle box corner loses `length³/6` volume). Non-linear, short, or non-trihedral
+corners refuse rather than beveling full edges. `"asymmetric"` uses `params.length2`
+for the second face setback.
+`"distance_angle"` uses `params.angle` in degrees (strictly between 0 and 90) and
+optionally `refs.reference_face: sel(face)`, which must touch every selected edge.
+The distance is measured on that face; without it, each edge uses its first
+adjacent face in stable topology order. An omitted `params.type` preserves the
+legacy distance/length2 and whole-body edge-selection behavior.
+
+### `fillet` and `draft` — unsupported variants (append-only, 2026-09-23)
+
+`fillet` supports `params.type: "constant"|"variable"`; `"full_round"` and
+`"face"` fail by name rather than silently rounding other edges. No fillet type
+keeps the legacy whole-body/selected-edge path. `draft` supports
+`params.mode: "neutral_plane"` (or omitted mode); `"parting_line"` and `"step"`
+fail by name rather than applying neutral-plane draft.
+
+### `import` — partial STEP/IGES transfer warnings (append-only, 2026-09-23)
+
+`doc_import_file` responses may carry `warnings: [str]`. A STEP or IGES file whose
+translator transfers fewer roots than it contains still imports the translated bodies,
+and the response names the shortfall (for example `"2 of 5 STEP roots translated"`).
+Absent `warnings` means every root translated.

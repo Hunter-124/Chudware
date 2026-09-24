@@ -17,7 +17,7 @@ from services.formats import formats_dwg  # noqa: E402
 
 def _square_circle_doc():
     """An in-memory ezdxf Drawing standing in for a converted DWG: square (area 100) + circle r2."""
-    doc = ezdxf.new()
+    doc = ezdxf.new(units=4)  # fixture coordinates describe millimetres
     msp = doc.modelspace()
     msp.add_lwpolyline([(0, 0), (10, 0), (10, 10), (0, 10)], close=True)
     msp.add_circle((5, 5), 2.0)

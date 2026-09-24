@@ -36,6 +36,7 @@
 #include <Eigen/Dense>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
+#include <TopoDS_Vertex.hxx>
 #include <TopoDS_Shape.hxx>
 
 namespace geom {
@@ -78,6 +79,21 @@ TopoDS_Shape fillet_edges_variable(const TopoDS_Shape& shape, double r1, double 
 TopoDS_Shape chamfer_edges_two_distance(const TopoDS_Shape& shape, double d1, double d2,
                                         const std::vector<TopoDS_Edge>& edges,
                                         int* n_dropped = nullptr);
+
+// Distance-angle chamfer: setback `d` is measured on the reference face and
+// `angle_rad` is the angle to that face. If no face is given, each edge uses
+// its first adjacent face in OCCT's stable topology traversal order.
+TopoDS_Shape chamfer_edges_distance_angle(const TopoDS_Shape& shape, double d,
+                                          double angle_rad,
+                                          const std::vector<TopoDS_Edge>& edges,
+                                          const std::optional<TopoDS_Face>& reference_face = std::nullopt,
+                                          int* n_dropped = nullptr);
+
+// Cut off each selected three-edge convex corner with a triangular face at a
+// setback `d` along its incident straight edges. Failure details go to `diag`.
+TopoDS_Shape chamfer_vertices(const TopoDS_Shape& shape, double d,
+                              const std::vector<TopoDS_Vertex>& vertices,
+                              std::string* diag = nullptr);
 
 // --- shell (hollow to a wall) + draft (taper faces) — port of dress.py/draft.py ---
 

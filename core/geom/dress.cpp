@@ -2,6 +2,7 @@
 #include "util/process_isolation.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <functional>
 #include <chrono>
@@ -13,11 +14,16 @@
 #include <BRep_Tool.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepBuilderAPI_MakePolygon.hxx>
+#include <BRepBuilderAPI_MakeSolid.hxx>
+#include <BRepBuilderAPI_Sewing.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepOffsetAPI_DraftAngle.hxx>
 #include <BRepOffsetAPI_MakeOffsetShape.hxx>
 #include <BRepOffsetAPI_MakeThickSolid.hxx>
 #include <BRepOffset_Mode.hxx>
+#include <BRepLib.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAbs_CurveType.hxx>
@@ -32,11 +38,15 @@
 #include <TopTools_ListOfShape.hxx>
 #include <Standard_Failure.hxx>
 #include <TopoDS.hxx>
+#include <TopoDS_Shell.hxx>
+#include <TopoDS_Solid.hxx>
+#include <TopoDS_Vertex.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Vec.hxx>
 
 namespace geom {
 
@@ -319,6 +329,145 @@ TopoDS_Shape chamfer_edges_two_distance(const TopoDS_Shape& shape, double d1, do
                 mk.Add(d1, d2, e, TopoDS::Face(ef.FindFromKey(e).First()));
         },
         n_dropped);
+}
+
+TopoDS_Shape chamfer_edges_distance_angle(const TopoDS_Shape& shape, double d,
+                                          double angle_rad,
+                                          const std::vector<TopoDS_Edge>& edges,
+                                          const std::optional<TopoDS_Face>& reference_face,
+                                          int* n_dropped) {
+    if (edges.empty()) return TopoDS_Shape();
+    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+    return blend_drop_failing<BRepFilletAPI_MakeChamfer>(
+        shape, blendable_only(shape, edges),
+        [d, angle_rad, &edge_faces, &reference_face](BRepFilletAPI_MakeChamfer& mk,
+                                                     const TopoDS_Edge& edge) {
+            if (!edge_faces.Contains(edge) || edge_faces.FindFromKey(edge).IsEmpty()) return;
+            const TopoDS_Face& face = reference_face
+                ? *reference_face : TopoDS::Face(edge_faces.FindFromKey(edge).First());
+            mk.AddDA(d, angle_rad, edge, face);
+        },
+        n_dropped);
+}
+
+TopoDS_Shape chamfer_vertices(const TopoDS_Shape& shape, double d,
+                              const std::vector<TopoDS_Vertex>& vertices,
+                              std::string* diag) {
+    if (diag) diag->clear();
+    if (vertices.empty()) {
+        if (diag) *diag = "vertex type requires selected vertices";
+        return {};
+    }
+    struct Corner {
+        std::array<gp_Pnt, 4> points;
+        double volume;
+    };
+    std::vector<Corner> corners;
+    corners.reserve(vertices.size());
+    try {
+        TopTools_IndexedDataMapOfShapeListOfShape vertex_edges;
+        TopExp::MapShapesAndAncestors(shape, TopAbs_VERTEX, TopAbs_EDGE, vertex_edges);
+        for (const TopoDS_Vertex& vertex : vertices) {
+            if (!vertex_edges.Contains(vertex)) {
+                if (diag) *diag = "vertex type requires three incident straight edges";
+                return {};
+            }
+            TopTools_IndexedMapOfShape incident;
+            for (TopTools_ListIteratorOfListOfShape it(vertex_edges.FindFromKey(vertex));
+                 it.More(); it.Next())
+                incident.Add(it.Value());
+            if (incident.Extent() != 3) {
+                if (diag) *diag = "vertex type requires exactly three incident edges";
+                return {};
+            }
+            const gp_Pnt origin = BRep_Tool::Pnt(vertex);
+            Corner corner{{origin, gp_Pnt(), gp_Pnt(), gp_Pnt()}, 0.0};
+            for (int i = 1; i <= 3; ++i) {
+                const TopoDS_Edge edge = TopoDS::Edge(incident(i));
+                if (BRep_Tool::Degenerated(edge) ||
+                    BRepAdaptor_Curve(edge).GetType() != GeomAbs_Line) {
+                    if (diag) *diag = "vertex type requires straight non-degenerate edges";
+                    return {};
+                }
+                TopoDS_Vertex first, last;
+                TopExp::Vertices(edge, first, last);
+                const TopoDS_Vertex& other = first.IsSame(vertex) ? last : first;
+                const gp_Vec ray(origin, BRep_Tool::Pnt(other));
+                if (!(ray.Magnitude() > d + 1e-7)) {
+                    if (diag) *diag = "vertex chamfer distance must be shorter than every incident edge";
+                    return {};
+                }
+                corner.points[i] = origin.Translated(ray.Multiplied(d / ray.Magnitude()));
+            }
+            const gp_Vec a(origin, corner.points[1]);
+            const gp_Vec b(origin, corner.points[2]);
+            const gp_Vec c(origin, corner.points[3]);
+            const double determinant = a.Dot(b.Crossed(c));
+            if (std::abs(determinant) <= 1e-9) {
+                if (diag) *diag = "vertex corner has coplanar incident edges";
+                return {};
+            }
+            if (determinant < 0.0) std::swap(corner.points[2], corner.points[3]);
+            corner.volume = std::abs(determinant) / 6.0;
+            corners.push_back(corner);
+        }
+    } catch (const Standard_Failure&) {
+        if (diag) *diag = "vertex corner topology could not be resolved";
+        return {};
+    }
+
+    auto built = chudware::util::isolate_shape_build([&]() -> TopoDS_Shape {
+        try {
+            TopoDS_Shape current = shape;
+            for (const Corner& corner : corners) {
+                const auto& p = corner.points;
+                BRepBuilderAPI_Sewing sew;
+                const int triangles[4][3] = {{1, 2, 3}, {0, 2, 1},
+                                             {0, 3, 2}, {0, 1, 3}};
+                for (const auto& tri : triangles) {
+                    BRepBuilderAPI_MakePolygon poly;
+                    for (int index : tri) poly.Add(p[index]);
+                    poly.Close();
+                    if (!poly.IsDone()) return {};
+                    BRepBuilderAPI_MakeFace face(poly.Wire());
+                    if (!face.IsDone()) return {};
+                    sew.Add(face.Face());
+                }
+                sew.Perform();
+                TopExp_Explorer shells(sew.SewedShape(), TopAbs_SHELL);
+                if (!shells.More()) return {};
+                const TopoDS_Shell shell = TopoDS::Shell(shells.Current());
+                shells.Next();
+                if (shells.More()) return {};
+                BRepBuilderAPI_MakeSolid solid_builder(shell);
+                if (!solid_builder.IsDone()) return {};
+                TopoDS_Solid cutter = solid_builder.Solid();
+                if (!BRepLib::OrientClosedSolid(cutter)) return {};
+                GProp_GProps before;
+                BRepGProp::VolumeProperties(current, before);
+                BRepAlgoAPI_Cut cut(current, cutter);
+                cut.Build();
+                if (!cut.IsDone() || cut.Shape().IsNull()) return {};
+                TopoDS_Shape next = cut.Shape();
+                GProp_GProps after;
+                BRepGProp::VolumeProperties(next, after);
+                const double removed = before.Mass() - after.Mass();
+                if (std::abs(removed - corner.volume) >
+                    std::max(1e-6, corner.volume * 1e-4) || !blend_is_watertight(next))
+                    return {};
+                current = next;
+            }
+            return current;
+        } catch (const Standard_Failure&) {
+            return {};
+        }
+    }, kBlendTimeout);
+    if (!built.ok || built.shape.IsNull()) {
+        if (diag) *diag = "vertex corner cut failed; select a convex three-edge corner and reduce the distance";
+        return {};
+    }
+    return built.shape;
 }
 
 // --- shell ----------------------------------------------------------------------

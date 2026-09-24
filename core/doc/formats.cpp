@@ -291,14 +291,11 @@ std::string abs_path(const std::string& path) {
 
 #ifdef CHUDWARE_WITH_LIB3MF
 // A named mesh extracted from a 3MF mesh object — the C++ analogue of the
-// oracle's (name, MeshBody(verts, tris)) tuple. Vertices are float32 (Lib3MF
-// sPosition.m_Coordinates is Lib3MF_single == float), triangle indices uint32
-// (sTriangle.m_Indices is Lib3MF_uint32) — IDENTICAL element types to the Python
-// _import_3mf path, which builds np.float32 verts + np.uint32 tris from the very
-// same lib3mf structs.
+// oracle's (name, MeshBody(verts, tris)) tuple. Source vertices are float32
+// and triangle indices uint32; non-mm model units are scaled to document mm.
 struct NamedMesh {
     std::string name;
-    MeshData mesh;  // verts stored as doubles, but the source floats round-trip exactly
+    MeshData mesh;  // vertices widened to double for unit conversion
 };
 
 // Load lib3mf.dll. The CppDynamic binding LoadLibraryW's the given filename; we
@@ -349,14 +346,25 @@ Lib3MF::PWrapper load_lib3mf() {
     }
 }
 
-// Read every mesh object out of a .3mf, BIT-IDENTICAL to engine/doc/formats.py
-// ::_import_3mf: iterate the model's mesh objects in file order, skip empty ones,
-// pull GetVertices()/GetTriangleIndices(), name = GetName() or "<stem>_<idx>".
+// Read every mesh object out of a .3mf like formats.py::_import_3mf: iterate
+// the model's mesh objects in file order, skip empty ones, convert model units
+// to mm, pull triangles, name = GetName() or "<stem>_<idx>".
 std::vector<NamedMesh> read_3mf_objects(const std::string& path) {
     Lib3MF::PWrapper wrapper = load_lib3mf();
     Lib3MF::PModel model = wrapper->CreateModel();
     Lib3MF::PReader reader = model->QueryReader("3mf");
     reader->ReadFromFile(path);
+    double unit_to_mm = 1.0;
+    switch (model->GetUnit()) {
+        case Lib3MF::eModelUnit::MicroMeter: unit_to_mm = 0.001; break;
+        case Lib3MF::eModelUnit::MilliMeter: break;
+        case Lib3MF::eModelUnit::CentiMeter: unit_to_mm = 10.0; break;
+        case Lib3MF::eModelUnit::Inch: unit_to_mm = 25.4; break;
+        case Lib3MF::eModelUnit::Foot: unit_to_mm = 304.8; break;
+        case Lib3MF::eModelUnit::Meter: unit_to_mm = 1000.0; break;
+        default:
+            throw OpError("import_failed", "3MF: unsupported model length unit", {{"path", path}});
+    }
 
     const std::string stem = std::filesystem::path(path).stem().string();
     std::vector<NamedMesh> out;
@@ -375,12 +383,8 @@ std::vector<NamedMesh> read_3mf_objects(const std::string& path) {
         nm.name = nm_name.empty() ? (stem + "_" + std::to_string(idx)) : nm_name;
         nm.mesh.verts.reserve(gv.size() * 3);
         for (const Lib3MF::sPosition& v : gv) {
-            // m_Coordinates is float32; widen to double for MeshData — the value is
-            // preserved exactly (every float is representable as a double), so a
-            // float32 reconstruction on the gate side is bit-identical to numpy's.
-            nm.mesh.verts.push_back(static_cast<double>(v.m_Coordinates[0]));
-            nm.mesh.verts.push_back(static_cast<double>(v.m_Coordinates[1]));
-            nm.mesh.verts.push_back(static_cast<double>(v.m_Coordinates[2]));
+            for (float coordinate : v.m_Coordinates)
+                nm.mesh.verts.push_back(static_cast<double>(coordinate) * unit_to_mm);
         }
         nm.mesh.tris.reserve(gi.size() * 3);
         for (const Lib3MF::sTriangle& t : gi) {
@@ -501,7 +505,7 @@ std::vector<Tag> read_tags(const std::string& path) {
 
 // Pull every ENTITIES-section entity out of the tag stream. Only code-0 tags whose value
 // names a known/unknown entity type start a new entity; everything up to the next code-0
-// (or ENDSEC) belongs to it. Sections other than ENTITIES are skipped entirely.
+// (or ENDSEC) belongs to it. HEADER variables are handled separately by insunits_scale().
 std::vector<Entity> parse_entities(const std::vector<Tag>& tags) {
     std::vector<Entity> out;
     bool in_entities = false;
@@ -542,6 +546,69 @@ std::vector<Entity> parse_entities(const std::vector<Tag>& tags) {
         if (cur != nullptr) cur->tags.push_back(t);
     }
     return out;
+}
+
+// HEADER $INSUNITS is a code-9 variable followed by a code-70 integer. Zero (or
+// absence) means unitless, so coordinates already have the caller's intended scale.
+double insunits_scale(const std::vector<Tag>& tags, const std::string& path) {
+    bool in_header = false, expect_section_name = false, expect_units = false;
+    int units = 0;
+    for (const Tag& t : tags) {
+        if (t.code == 0) {
+            if (t.value == "SECTION") {
+                expect_section_name = true;
+                in_header = false;
+            } else if (t.value == "ENDSEC") {
+                in_header = false;
+                expect_units = false;
+            }
+            continue;
+        }
+        if (expect_section_name && t.code == 2) {
+            in_header = t.value == "HEADER";
+            expect_section_name = false;
+            continue;
+        }
+        if (!in_header) continue;
+        if (t.code == 9) {
+            expect_units = t.value == "$INSUNITS";
+        } else if (expect_units && t.code == 70) {
+            try { units = std::stoi(t.value); }
+            catch (const std::exception&) {
+                throw OpError("import_failed", "DXF: invalid $INSUNITS", {{"path", path}});
+            }
+            expect_units = false;
+        }
+    }
+    switch (units) {
+        case 0: case 4: return 1.0;
+        case 1: return 25.4;           // inches
+        case 2: return 304.8;          // feet
+        case 3: return 1609344.0;      // miles
+        case 5: return 10.0;           // centimeters
+        case 6: return 1000.0;         // meters
+        case 7: return 1000000.0;      // kilometers
+        case 8: return 0.0000254;      // microinches
+        case 9: return 0.0254;         // mils
+        case 10: return 914.4;         // yards
+        case 11: return 1e-7;          // angstroms
+        case 12: return 1e-6;          // nanometers
+        case 13: return 0.001;         // microns
+        case 14: return 100.0;         // decimeters
+        case 15: return 10000.0;       // decameters
+        case 16: return 100000.0;      // hectometers
+        case 17: return 1e12;          // gigameters
+        case 18: return 149597870700000.0; // astronomical units
+        case 19: return 9.4607304725808e18; // light years
+        case 20: return 3.085677581491367e19; // parsecs
+        case 21: return 1200.0 / 3937.0 * 1000.0; // US survey feet
+        case 22: return 100.0 / 3937.0 * 1000.0;  // US survey inches
+        case 23: return 3600.0 / 3937.0 * 1000.0; // US survey yards
+        case 24: return 6336000.0 / 3937.0 * 1000.0; // US survey miles
+        default:
+            throw OpError("import_failed", "DXF: unsupported $INSUNITS " +
+                          std::to_string(units), {{"path", path}, {"units", units}});
+    }
 }
 
 // Fetch the first value for `code`, or `def_val` when absent.
@@ -835,6 +902,7 @@ void dxf_assemble_wires(const std::vector<TopoDS_Edge>& edges, TopoDS_Compound& 
 // themselves imported yet.
 TopoDS_Shape read_dxf_shape(const std::string& path) {
     std::vector<dxf::Tag> tags = dxf::read_tags(path);
+    const double unit_to_mm = dxf::insunits_scale(tags, path);
     std::vector<dxf::Entity> entities = dxf::parse_entities(tags);
     int skipped = 0;
     std::vector<TopoDS_Edge> edges = dxf_entities_to_edges(entities, skipped);
@@ -848,7 +916,10 @@ TopoDS_Shape read_dxf_shape(const std::string& path) {
                       {{"path", path}, {"format", "dxf"}});
     TopoDS_Compound comp;
     dxf_assemble_wires(edges, comp);
-    return comp;
+    if (unit_to_mm == 1.0) return comp;
+    gp_Trsf scale;
+    scale.SetScale(gp_Pnt(0, 0, 0), unit_to_mm);
+    return BRepBuilderAPI_Transform(comp, scale, Standard_True).Shape();
 }
 
 // --------------------------------------------------------------------------- DWG import
@@ -1648,17 +1719,17 @@ Handle(TDocStd_Document) new_xcaf_doc() {
     return doc;
 }
 
-void write_gltf(const std::vector<TopoDS_Shape>& bodies, const std::string& path, bool binary,
-                const TessOptions& tess = TessOptions{}) {
+void write_gltf(const std::vector<TopoDS_Shape>& bodies, const std::string& path, bool binary) {
     Handle(TDocStd_Document) doc = new_xcaf_doc();
     Handle(XCAFDoc_ShapeTool) tool = XCAFDoc_DocumentTool::ShapeTool(doc->Main());
-    for (const TopoDS_Shape& s : bodies) {
-        if (s.IsNull()) continue;
-        mesh_shape(s, tess);  // glTF writer needs precomputed triangulation
-        tool->AddShape(s, /*makeAssembly=*/Standard_False);
-    }
+    for (const TopoDS_Shape& s : bodies)
+        tool->AddShape(s, /*makeAssembly=*/Standard_False);  // premeshed by export_bodies
     TColStd_IndexedDataMapOfStringString file_info;
     RWGltf_CafWriter writer(path.c_str(), binary);
+    // OCCT's converter describes source/destination units as metres per unit.
+    // Document coordinates are mm; glTF coordinates are necessarily metres.
+    writer.ChangeCoordinateSystemConverter().SetInputLengthUnit(0.001);
+    writer.ChangeCoordinateSystemConverter().SetOutputLengthUnit(1.0);
     if (!writer.Perform(doc, file_info, Message_ProgressRange()))
         throw OpError("export_failed", "glTF writer returned failure", {{"path", path}});
 }
@@ -1667,6 +1738,7 @@ MeshData read_gltf(const std::string& path) {
     RWGltf_CafReader reader;
     Handle(TDocStd_Document) doc = new_xcaf_doc();
     reader.SetDocument(doc);
+    reader.SetSystemLengthUnit(0.001);  // glTF metres -> document millimetres
     reader.SetParallel(Standard_False);
     if (!reader.Perform(path.c_str(), Message_ProgressRange()))
         throw OpError("import_failed", "glTF reader returned failure", {{"path", path}});
@@ -2210,20 +2282,30 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
                 throw OpError("export_failed", "STL writer returned failure", {{"path", out}});
             return out;
         }
-        if (fmt == "obj") {
-            write_obj(shape_to_mesh(shape, tess), out);
+        if (fmt == "obj" || fmt == "ply") {
+            MeshData mesh;
+            for (const TopoDS_Shape& body : bodies) {
+                MeshData part = shape_to_mesh(body, tess);
+                if (part.triangle_count() == 0) continue;
+                const uint32_t base = static_cast<uint32_t>(mesh.vertex_count());
+                mesh.verts.insert(mesh.verts.end(), part.verts.begin(), part.verts.end());
+                for (uint32_t index : part.tris) mesh.tris.push_back(base + index);
+            }
+            if (mesh.triangle_count() == 0)
+                throw OpError("export_failed", "export: no triangles to write as " + fmt,
+                              {{"path", out}, {"format", fmt}});
+            if (fmt == "obj") write_obj(mesh, out);
+            else write_ply(mesh, out);
             return out;
         }
-        if (fmt == "ply") {
-            write_ply(shape_to_mesh(shape, tess), out);
-            return out;
-        }
-        if (fmt == "gltf") {
-            write_gltf(bodies, out, /*binary=*/false, tess);
-            return out;
-        }
-        if (fmt == "glb") {
-            write_gltf(bodies, out, /*binary=*/true, tess);
+        if (fmt == "gltf" || fmt == "glb") {
+            std::vector<TopoDS_Shape> meshed;
+            for (const TopoDS_Shape& body : bodies)
+                if (shape_to_mesh(body, tess).triangle_count() != 0) meshed.push_back(body);
+            if (meshed.empty())
+                throw OpError("export_failed", "export: no triangles to write as " + fmt,
+                              {{"path", out}, {"format", fmt}});
+            write_gltf(meshed, out, fmt == "glb");
             return out;
         }
         if (fmt == "3mf") {
@@ -2338,8 +2420,8 @@ TopoDS_Shape place_solidworks_body(const TopoDS_Shape& shape,
 
 }  // namespace
 
-std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::string& path,
-                                                                const std::string& fmt) {
+std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(
+    const std::string& path, const std::string& fmt, std::vector<std::string>* warnings) {
     if (!std::filesystem::exists(path))
         throw OpError("import_failed", "import: file not found: " + path, {{"path", path}});
     try {
@@ -2347,7 +2429,15 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
             STEPControl_Reader r;
             if (r.ReadFile(path.c_str()) != IFSelect_RetDone)
                 throw OpError("import_failed", "STEP reader: ReadFile failed", {{"path", path}});
-            r.TransferRoots();
+            const int roots = r.NbRootsForTransfer();
+            const int transferred = r.TransferRoots();
+            if (transferred != roots) {
+                const std::string message = std::to_string(transferred) + " of " +
+                                            std::to_string(roots) + " STEP roots translated";
+                if (warnings && transferred > 0) warnings->push_back(message);
+                else throw OpError("import_failed", "STEP reader: " + message,
+                                   {{"path", path}, {"transferred", transferred}, {"roots", roots}});
+            }
             TopoDS_Shape shape = r.OneShape();
             if (shape.IsNull())
                 throw OpError("import_failed", "STEP reader: no shape transferred", {{"path", path}});
@@ -2357,7 +2447,15 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
             IGESControl_Reader r;
             if (r.ReadFile(path.c_str()) != IFSelect_RetDone)
                 throw OpError("import_failed", "IGES reader: ReadFile failed", {{"path", path}});
-            r.TransferRoots();
+            const int roots = r.NbRootsForTransfer();
+            const int transferred = r.TransferRoots();
+            if (transferred != roots) {
+                const std::string message = std::to_string(transferred) + " of " +
+                                            std::to_string(roots) + " IGES roots translated";
+                if (warnings && transferred > 0) warnings->push_back(message);
+                else throw OpError("import_failed", "IGES reader: " + message,
+                                   {{"path", path}, {"transferred", transferred}, {"roots", roots}});
+            }
             TopoDS_Shape raw = r.OneShape();
             if (raw.IsNull())
                 throw OpError("import_failed", "IGES reader: no shape transferred", {{"path", path}});
@@ -2458,8 +2556,8 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
             // 3MF via lib3mf: one body per mesh object (matching _import_3mf), each
             // sewn into a shell/solid (the same as_solid path as the other mesh
             // formats). Body names follow the oracle: the 3MF object name, else
-            // "<stem>_<idx>". The raw vertex/triangle extraction is BIT-IDENTICAL to
-            // the Python lib3mf path (both wrap lib3mf 2.5.0).
+            // "<stem>_<idx>". Both the C++ and Python lib3mf paths convert the
+            // model's declared length unit into Chudware millimetres.
             std::vector<NamedMesh> objs = read_3mf_objects(path);
             if (objs.empty())
                 throw OpError("import_failed", "no mesh objects found in 3MF '" + path + "'",
@@ -2520,9 +2618,14 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
             // DWG has no in-process reader here (proprietary binary) — run LibreDWG's
             // dwg2dxf with literal argv, then reuse the DXF lane above.
             std::string tmp_dxf = dwg_to_temp_dxf(path);
+            struct TempDxfCleanup {
+                const std::string& path;
+                ~TempDxfCleanup() {
+                    std::error_code ec;
+                    std::filesystem::remove(path, ec);
+                }
+            } cleanup{tmp_dxf};
             TopoDS_Shape shape = read_dxf_shape(tmp_dxf);
-            std::error_code ec;
-            std::filesystem::remove(tmp_dxf, ec);
             std::string stem = std::filesystem::path(path).stem().string();
             return {{stem.empty() ? std::string("dwg") : stem, shape}};
         }

@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -2994,6 +2995,138 @@ static double total_shape_volume(const CompileResult& r) {
         v += g.Mass();
     }
     return v;
+}
+
+TEST_CASE("vertex chamfer cuts only the selected box corner") {
+    const double side = 20.0, setback = 2.0;
+    const json base_feature{{"id", "blk"}, {"type", "box"},
+                            {"length", side}, {"width", side}, {"height", side}};
+    json doc{{"features", json::array({base_feature})}};
+    CompileResult base = compile_document(doc, json::object());
+    REQUIRE(base.ok);
+    REQUIRE(base.shapes.size() == 1);
+    TopTools_IndexedMapOfShape base_faces;
+    TopExp::MapShapes(base.shapes.front(), TopAbs_FACE, base_faces);
+
+    const json vertex = chudware::doc::make_pick_selector(
+        base.shapes.front(), "vertex", 1, std::nullopt);
+    REQUIRE(vertex.is_object());
+    doc["features"].push_back(
+        json{{"id", "ch"}, {"type", "chamfer"},
+             {"params", {{"type", "vertex"}, {"length", setback}}},
+             {"refs", {{"vertices", json::array({vertex})}}}});
+    CompileResult cut = compile_document(doc, json::object());
+    const auto* status = status_of(cut, "ch");
+    REQUIRE(status != nullptr);
+    REQUIRE_MESSAGE(status->ok, status->error);
+    REQUIRE(cut.shapes.size() == 1);
+    TopTools_IndexedMapOfShape cut_faces;
+    TopExp::MapShapes(cut.shapes.front(), TopAbs_FACE, cut_faces);
+    CHECK(cut_faces.Extent() == base_faces.Extent() + 1);
+    CHECK(total_shape_volume(base) - total_shape_volume(cut) ==
+          doctest::Approx(setback * setback * setback / 6.0).epsilon(1e-4));
+    CHECK(BRepCheck_Analyzer(cut.shapes.front()).IsValid());
+
+    const json second = chudware::doc::make_pick_selector(
+        base.shapes.front(), "vertex", 2, std::nullopt);
+    REQUIRE(second.is_object());
+    doc["features"][1]["refs"]["vertices"].push_back(second);
+    CompileResult two_corners = compile_document(doc, json::object());
+    const auto* two_status = status_of(two_corners, "ch");
+    REQUIRE(two_status != nullptr);
+    REQUIRE_MESSAGE(two_status->ok, two_status->error);
+    REQUIRE(two_corners.shapes.size() == 1);
+    TopTools_IndexedMapOfShape two_faces;
+    TopExp::MapShapes(two_corners.shapes.front(), TopAbs_FACE, two_faces);
+    CHECK(two_faces.Extent() == base_faces.Extent() + 2);
+    CHECK(total_shape_volume(base) - total_shape_volume(two_corners) ==
+          doctest::Approx(2.0 * setback * setback * setback / 6.0).epsilon(1e-4));
+
+    doc["features"][1]["params"]["length"] = side;
+    CompileResult too_long = compile_document(doc, json::object());
+    const auto* too_long_status = status_of(too_long, "ch");
+    REQUIRE(too_long_status != nullptr);
+    CHECK_FALSE(too_long_status->ok);
+    CHECK(too_long_status->error.find("shorter than every incident edge") !=
+          std::string::npos);
+}
+
+TEST_CASE("distance-angle chamfer measures its leg on the selected face") {
+    const json base_feature{{"id", "blk"}, {"type", "box"},
+                            {"length", 20.0}, {"width", 20.0}, {"height", 20.0}};
+    json doc{{"features", json::array({base_feature})}};
+    CompileResult base = compile_document(doc, json::object());
+    REQUIRE(base.ok);
+    REQUIRE(base.shapes.size() == 1);
+    const TopoDS_Shape& shape = base.shapes.front();
+    TopTools_IndexedMapOfShape edges, faces;
+    TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+    TopExp::MapShapes(shape, TopAbs_FACE, faces);
+    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+    REQUIRE(edge_faces.Contains(edges(1)));
+    REQUIRE_FALSE(edge_faces.FindFromKey(edges(1)).IsEmpty());
+    const int face_index = faces.FindIndex(edge_faces.FindFromKey(edges(1)).First());
+    REQUIRE(face_index > 0);
+    const json edge_sel = chudware::doc::make_pick_selector(shape, "edge", 1, std::nullopt);
+    const json face_sel =
+        chudware::doc::make_pick_selector(shape, "face", face_index, std::nullopt);
+    REQUIRE(edge_sel.is_object());
+    REQUIRE(face_sel.is_object());
+    auto run = [&](const char* subtype, double angle, bool with_face) {
+        json params{{"type", subtype}, {"length", 2.0}};
+        if (angle > 0.0) params["angle"] = angle;
+        json refs{{"edges", json::array({edge_sel})}};
+        if (with_face) refs["reference_face"] = face_sel;
+        doc["features"].push_back(
+            json{{"id", "ch"}, {"type", "chamfer"}, {"params", params}, {"refs", refs}});
+        CompileResult result = compile_document(doc, json::object());
+        doc["features"].erase(doc["features"].size() - 1);
+        return result;
+    };
+    CompileResult symmetric = run("symmetric", 0.0, false);
+    CompileResult forty_five = run("distance_angle", 45.0, true);
+    CompileResult thirty = run("distance_angle", 30.0, true);
+    CompileResult default_face = run("distance_angle", 45.0, false);
+    for (const CompileResult* result : {&symmetric, &forty_five, &thirty, &default_face}) {
+        const auto* status = status_of(*result, "ch");
+        REQUIRE(status != nullptr);
+        REQUIRE_MESSAGE(status->ok, status->error);
+        REQUIRE(result->shapes.size() == 1);
+    }
+    CHECK(total_shape_volume(forty_five) ==
+          doctest::Approx(total_shape_volume(symmetric)).epsilon(1e-5));
+    CHECK(total_shape_volume(default_face) ==
+          doctest::Approx(total_shape_volume(forty_five)).epsilon(1e-5));
+    CHECK(std::abs(total_shape_volume(thirty) - total_shape_volume(forty_five)) > 1.0);
+}
+
+TEST_CASE("unsupported dress variants and missing sizes refuse by name") {
+    const json base{{"id", "blk"}, {"type", "box"},
+                    {"length", 20.0}, {"width", 20.0}, {"height", 20.0}};
+    auto refusal = [&](json feature, const std::string& expected) {
+        json doc{{"features", json::array({base, feature})}};
+        CompileResult r = compile_document(doc, json::object());
+        const auto* status = status_of(r, "bad");
+        REQUIRE(status != nullptr);
+        CHECK_FALSE(status->ok);
+        CHECK(status->error.find(expected) != std::string::npos);
+        CHECK(r.body_count == 1);
+    };
+    refusal(json{{"id", "bad"}, {"type", "fillet"},
+                 {"params", {{"type", "full_round"}}}},
+            "fillet type 'full_round' is not supported");
+    refusal(json{{"id", "bad"}, {"type", "fillet"},
+                 {"params", {{"type", "face"}}}},
+            "fillet type 'face' is not supported");
+    refusal(json{{"id", "bad"}, {"type", "draft"},
+                 {"params", {{"mode", "parting_line"}}}},
+            "draft mode 'parting_line' is not supported");
+    refusal(json{{"id", "bad"}, {"type", "draft"},
+                 {"params", {{"mode", "step"}}}},
+            "draft mode 'step' is not supported");
+    refusal(json{{"id", "bad"}, {"type", "fillet"}}, "missing required radius");
+    refusal(json{{"id", "bad"}, {"type", "chamfer"}}, "missing required distance/length");
 }
 
 TEST_CASE("thread: M8 external cut reduces a Ø8x20 cylinder's volume to a valid solid") {

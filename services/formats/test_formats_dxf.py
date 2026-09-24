@@ -14,7 +14,7 @@ from services.formats.formats import import_path, list_formats  # noqa: E402
 
 
 def _write(tmp_path, build) -> str:
-    doc = ezdxf.new()
+    doc = ezdxf.new(units=4)  # fixture coordinates describe millimetres
     build(doc.modelspace())
     p = os.path.join(str(tmp_path), "case.dxf")
     doc.saveas(p)
@@ -43,6 +43,21 @@ def test_dxf_square_and_circle_become_faces(tmp_path):
     areas = sorted(round(f.area, 3) for f in shape.faces())
     assert areas[0] == pytest.approx(math.pi * 4.0, abs=0.05)   # circle r=2
     assert areas[1] == pytest.approx(100.0, abs=0.01)           # square 10x10
+
+@pytest.mark.parametrize("insunits, expected", [
+    (0, 2.0),     # unitless geometry remains untouched
+    (1, 50.8),    # inches -> mm
+    (6, 2000.0),  # metres -> mm
+])
+def test_dxf_insunits_scales_geometry_to_mm(tmp_path, insunits, expected):
+    def build(msp):
+        msp.doc.header["$INSUNITS"] = insunits
+        msp.add_line((3, 0), (5, 0))
+
+    _, shape = import_path(_write(tmp_path, build))[0]
+    assert len(shape.edges()) == 1
+    assert shape.edges()[0].length == pytest.approx(expected)
+    assert shape.edges()[0].center().X == pytest.approx(expected * 2)
 
 
 def test_dxf_open_geometry_stays_as_wire(tmp_path):

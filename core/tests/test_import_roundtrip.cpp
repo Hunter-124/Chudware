@@ -46,6 +46,7 @@
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Shell.hxx>
 #include <gp_Dir.hxx>
+#include <TopoDS_Vertex.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Vec.hxx>
@@ -681,3 +682,134 @@ TEST_CASE("mesh_to_shape re-orients an inverted soup and smooths its curved wall
     CHECK(static_cast<int>(wall_normal.size()) == 2 * kSides);
     CHECK(max_tilt > 0.1 * pitch);
 }
+
+TEST_CASE("DXF HEADER units scale imported geometry into millimetres") {
+    for (const auto [units, expected] : std::vector<std::pair<int, double>>{
+             {0, 2.0}, {1, 50.8}, {6, 2000.0}}) {
+        const fs::path path = tmp("units_" + std::to_string(units) + ".dxf");
+        {
+            std::ofstream dxf(path);
+            dxf << "0\nSECTION\n2\nHEADER\n9\n$INSUNITS\n70\n" << units
+                << "\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n"
+                   "0\nLINE\n10\n3\n20\n0\n11\n5\n21\n0\n"
+                   "0\nENDSEC\n0\nEOF\n";
+        }
+        const auto bodies = chudware::doc::import_bodies(path.string(), "dxf");
+        REQUIRE(bodies.size() == 1);
+        const auto edges = TopExp_Explorer(bodies.front().second, TopAbs_EDGE);
+        REQUIRE(edges.More());
+        TopoDS_Vertex a, b;
+        TopExp::Vertices(TopoDS::Edge(edges.Current()), a, b);
+        CHECK(BRep_Tool::Pnt(a).Distance(BRep_Tool::Pnt(b)) ==
+              doctest::Approx(expected).epsilon(1e-6));
+        fs::remove(path);
+    }
+}
+
+TEST_CASE("mesh exports refuse only wholly empty triangle sets") {
+    const TopoDS_Shape wire =
+        BRepBuilderAPI_MakeEdge(gp_Pnt(0, 0, 0), gp_Pnt(10, 0, 0)).Shape();
+    const TopoDS_Shape box = BRepPrimAPI_MakeBox(10, 10, 10).Shape();
+    for (const std::string& fmt : {"obj", "ply", "gltf", "glb"}) {
+        const fs::path path = tmp("wire_export." + fmt);
+        fs::remove(path);
+        try {
+            chudware::doc::export_bodies({wire}, path.string(), fmt);
+            FAIL("zero-triangle export succeeded");
+        } catch (const chudware::doc::OpError& e) {
+            CHECK(e.code == "export_failed");
+            CHECK_FALSE(fs::exists(path));
+        }
+        chudware::doc::export_bodies({box, wire}, path.string(), fmt);
+        const auto mesh = chudware::doc::read_mesh(path.string(), fmt);
+        CHECK(mesh.triangle_count() > 0);
+        fs::remove(path);
+        if (fmt == "gltf") {
+            fs::path bin = path;
+            fs::remove(bin.replace_extension(".bin"));
+        }
+    }
+}
+
+TEST_CASE("glTF reader converts metres to mm and writer converts mm to metres") {
+    const fs::path external = tmp("external_meters.gltf");
+    {
+        std::ofstream os(external);
+        os << R"GLTF({"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],
+            "nodes":[{"mesh":0}],"meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1}]}],
+            "buffers":[{"byteLength":42,"uri":"data:application/octet-stream;base64,AAAAAAAAAAAAAAAAzczMPQAAAAAAAAAAAAAAAM3MzD0AAAAAAAABAAIA"}],
+            "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36,"target":34962},
+                           {"buffer":0,"byteOffset":36,"byteLength":6,"target":34963}],
+            "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3",
+                          "min":[0,0,0],"max":[0.1,0.1,0]},
+                         {"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"}]})GLTF";
+    }
+    const auto external_mesh = chudware::doc::read_mesh(external.string(), "gltf");
+    REQUIRE(external_mesh.triangle_count() == 1);
+    CHECK(*std::max_element(external_mesh.verts.begin(), external_mesh.verts.end()) ==
+          doctest::Approx(100.0).epsilon(1e-5));
+    fs::remove(external);
+
+    const TopoDS_Shape box = BRepPrimAPI_MakeBox(100.0, 40.0, 20.0).Shape();
+    for (const std::string& fmt : {"gltf", "glb"}) {
+        const fs::path path = tmp("meters_export." + fmt);
+        chudware::doc::export_bodies({box}, path.string(), fmt);
+        const auto mesh = chudware::doc::read_mesh(path.string(), fmt);
+        REQUIRE(mesh.triangle_count() > 0);
+        CHECK(*std::max_element(mesh.verts.begin(), mesh.verts.end()) ==
+              doctest::Approx(100.0).epsilon(1e-5));
+        fs::remove(path);
+        if (fmt == "gltf") {
+            fs::path bin = path;
+            fs::remove(bin.replace_extension(".bin"));
+        }
+}
+}
+
+#ifdef CHUDWARE_WITH_LIB3MF
+TEST_CASE("3MF model units scale the raw mesh to document millimetres") {
+    const fs::path path = tmp("inch_model.3mf");
+    const std::string model =
+        R"XML(<?xml version="1.0" encoding="UTF-8"?>
+<model unit="inch" xml:lang="en-US"
+ xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+ <resources><object id="1" type="model" name="Inch tetra"><mesh>
+  <vertices><vertex x="0" y="0" z="0"/><vertex x="2" y="0" z="0"/>
+    <vertex x="0" y="2" z="0"/><vertex x="0" y="0" z="2"/></vertices>
+  <triangles><triangle v1="0" v2="2" v3="1"/><triangle v1="0" v2="1" v3="3"/>
+    <triangle v1="0" v2="3" v3="2"/><triangle v1="1" v2="2" v3="3"/></triangles>
+ </mesh></object></resources><build><item objectid="1"/></build>
+</model>)XML";
+    const std::string types =
+        R"XML(<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+ <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
+</Types>)XML";
+    const std::string rels =
+        R"XML(<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+ <Relationship Target="/3D/3dmodel.model" Id="rel0"
+  Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
+</Relationships>)XML";
+    mz_zip_archive zip{};
+    REQUIRE(mz_zip_writer_init_file(&zip, path.string().c_str(), 0));
+    for (const auto& [name, data] :
+         std::vector<std::pair<std::string, std::string>>{
+             {"[Content_Types].xml", types},
+             {"_rels/.rels", rels},
+             {"3D/3dmodel.model", model}}) {
+        REQUIRE(mz_zip_writer_add_mem(
+            &zip, name.c_str(), data.data(), data.size(), MZ_DEFAULT_COMPRESSION));
+    }
+    REQUIRE(mz_zip_writer_finalize_archive(&zip));
+    REQUIRE(mz_zip_writer_end(&zip));
+    const auto meshes = chudware::doc::read_mesh_raw(path.string(), "3mf");
+    REQUIRE(meshes.size() == 1);
+    CHECK(meshes[0].second.triangle_count() == 4);
+    CHECK(*std::max_element(meshes[0].second.verts.begin(),
+                            meshes[0].second.verts.end()) ==
+          doctest::Approx(50.8).epsilon(1e-6));
+    fs::remove(path);
+}
+#endif

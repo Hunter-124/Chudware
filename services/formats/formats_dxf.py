@@ -23,8 +23,9 @@ Pipeline
    body, mirroring the mesh importers).
 
 Scope (v1): **import only** — DXF is not written back (2D-projection-from-3D export is a separate
-follow-up). Curves are flattened, not preserved as exact NURBS. Drawing units are taken as-is
-(no ``$INSUNITS`` scaling). rhino3dm/OCCT NURBS fidelity is out of scope here.
+follow-up). Curves are flattened, not preserved as exact NURBS. ``$INSUNITS`` scales geometry
+into millimetres; unset/unitless drawings retain their coordinates. rhino3dm/OCCT NURBS fidelity
+is out of scope here.
 
 License: ezdxf is MIT — in-process use is inside the CONTRIBUTING.md guardrails (no debt row).
 """
@@ -41,6 +42,18 @@ _FLATTEN_DEV = 0.05
 _CONNECT_TOL = 1e-6
 # Below this a polyline segment / curve span is treated as degenerate and dropped.
 _EPS = 1e-9
+
+# AutoCAD $INSUNITS codes: millimetres per drawing unit (0 = unitless, unchanged).
+_MM_PER_INSUNIT = {
+    0: 1.0, 1: 25.4, 2: 304.8, 3: 1609344.0, 4: 1.0,
+    5: 10.0, 6: 1000.0, 7: 1000000.0, 8: 0.0000254,
+    9: 0.0254, 10: 914.4, 11: 1e-7, 12: 1e-6, 13: 0.001,
+    14: 100.0, 15: 10000.0, 16: 100000.0, 17: 1e12,
+    18: 149597870700000.0, 19: 9.4607304725808e18,
+    20: 3.085677581491367e19, 21: 1200.0 / 3937.0 * 1000.0,
+    22: 100.0 / 3937.0 * 1000.0, 23: 3600.0 / 3937.0 * 1000.0,
+    24: 6336000.0 / 3937.0 * 1000.0,
+}
 
 
 def import_dxf(path: str | Path) -> list[tuple[str, Any]]:
@@ -68,16 +81,21 @@ def bodies_from_doc(doc, stem: str, source: str = "") -> list[tuple[str, Any]]:
     """
     from build123d import Compound
 
+    unit = int(doc.header.get("$INSUNITS", 0) or 0)
+    if unit not in _MM_PER_INSUNIT:
+        raise ValueError(f"'{source or stem}' has unsupported $INSUNITS {unit}")
     edges, skipped = _entities_to_edges(doc.modelspace())
     if not edges:
         raise ValueError(
             f"'{source or stem}' has no importable 2D geometry "
             f"({skipped} unsupported/empty entity(ies) skipped — text, dimensions, hatches and "
             "3D mesh entities are not imported).")
-
     faces, wires = _assemble_wires(edges)
     shapes: list[Any] = [*faces, *wires]
     body = shapes[0] if len(shapes) == 1 else Compound(children=shapes)
+    scale = _MM_PER_INSUNIT[unit]
+    if scale != 1.0:
+        body = body.scale(scale)
     return [(stem, body)]
 
 

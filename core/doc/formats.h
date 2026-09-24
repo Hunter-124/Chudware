@@ -133,10 +133,13 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies,
 // brep, mesh formats stl/obj/ply/gltf/glb/3mf/3dm (sewn into a shell/solid), and
 // modern sldprt/sldasm saved-display tessellations. Returns (name, shape) pairs in file
 // order; SolidWorks assemblies retain flattened hierarchy/instance path names and world
-// transforms. Throws OpError("import_failed") on an unsupported format, malformed stream,
+// transforms. Partial STEP/IGES transfer returns surviving bodies only when `warnings`
+// is supplied; otherwise it refuses rather than silently losing source roots.
+// Throws OpError("import_failed") on an unsupported format, malformed stream,
 // unavailable optional dependency, or empty result. x_t/x_b must route through COM -> STEP.
-std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::string& path,
-                                                                const std::string& fmt);
+std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(
+    const std::string& path, const std::string& fmt,
+    std::vector<std::string>* warnings = nullptr);
 
 // Keep solid body ordinals stable, then append uncovered non-solid remnants.
 // Shapes without solids retain their existing whole-shape grouping.

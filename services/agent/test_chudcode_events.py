@@ -353,6 +353,7 @@ class ChudcodeEventMapperTests(unittest.TestCase):
         )
         self.assertEqual(mapped[0][1]["total_tokens"], 14)
         self.assertEqual(mapped[1][1]["cache_read"], 15)
+        self.assertEqual(mapped[1][1]["used"], 25)
 
         kind, injected = one(
             {
@@ -369,7 +370,28 @@ class ChudcodeEventMapperTests(unittest.TestCase):
             {"type": "context_window", "contextTokens": 100, "contextWindow": 200}
         )
         self.assertEqual(kind, "agent.context")
-        self.assertEqual(window["context_window"], 200)
+        self.assertEqual((window["used"], window["window"]), (100, 200))
+
+        kind, window_only = one({"type": "context_window", "contextWindow": 200})
+        self.assertNotIn("used", window_only)
+
+    def test_assistant_message_end_reports_measured_context(self):
+        usage = {"input": 2, "output": 8, "cacheRead": 287_415, "cacheWrite": 9_159}
+
+        def context_of(message, **frame):
+            mapped = map_rpc_frame({"type": "message_end", "message": message, **frame}, CTX)
+            return [p for kind, p in mapped if kind == "agent.context"]
+
+        [measured] = context_of({"role": "assistant", "stopReason": "stop", "usage": usage})
+        self.assertEqual((measured["used"], measured["cache_read"]), (296_584, 287_415))
+        [occupancy] = context_of({"role": "assistant", "usage": {**usage, "contextTokens": 5}})
+        self.assertEqual(occupancy["used"], 5)
+        # Partial usage, a nested agent's window, and user envelopes never move the meter.
+        self.assertEqual(context_of({"role": "assistant", "stopReason": "error", "usage": usage}), [])
+        self.assertEqual(
+            context_of({"role": "assistant", "usage": usage}, subagentId="child-1"), []
+        )
+        self.assertEqual(context_of({"role": "user", "usage": usage}), [])
 
     def test_extension_ui_command_output_and_errors(self):
         kind, request = one(

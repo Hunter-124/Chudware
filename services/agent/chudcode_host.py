@@ -350,6 +350,10 @@ class ChudcodeSessionHost:
                     run.client = session.client
                     self._sessions.move_to_end(session_id)
 
+                # get_state's contextUsage before the prompt: the resumed session's
+                # real fill, re-sent once the GUI has reset its meter on run_started.
+                opening: list[dict[str, Any]] = []
+
                 def forward(event: Any) -> None:
                     nonlocal terminal
                     # Keep distinct notifications when the RPC client reuses a frame's
@@ -366,10 +370,15 @@ class ChudcodeSessionHost:
                         provider_frames.append(frame)
                     try:
                         emit(frame)
+                        if kind == "agent_start" and opening:
+                            emit(opening.pop())
                     except Exception as exc:  # noqa: BLE001 - emit is an injected boundary
                         emit_errors.append(str(exc))
                 unsubscribe = _register_listener(session.client, forward)
                 self._configure_turn(session, params)
+                opening_frame = _context_frame(_safe_client_state(session.client))
+                if opening_frame is not None:
+                    opening.append(opening_frame)
                 message, images = _prompt_payload(
                     prompt, params.get("attachments"), params.get("images")
                 )
@@ -417,6 +426,14 @@ class ChudcodeSessionHost:
                     )
 
                 state = _safe_client_state(session.client)
+                # Chudcode's own figure (anchored provider usage + unbilled tail), the
+                # same number its footer shows; the per-message usage was provisional.
+                closing_frame = _context_frame(state)
+                if closing_frame is not None:
+                    try:
+                        emit(closing_frame)
+                    except Exception as exc:  # noqa: BLE001 - emit is an injected boundary
+                        emit_errors.append(str(exc))
                 provider_failure = _unrecovered_provider_failure(provider_frames)
                 result = {
                     "ok": not emit_errors and provider_failure is None,
@@ -1885,6 +1902,23 @@ def _safe_client_state(client: Any) -> dict[str, Any]:
             type(exc).__name__,
         )
         return {}
+
+
+def _context_frame(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Turn ``get_state().contextUsage`` into a ``context_update`` RPC-shaped frame."""
+    usage = state.get("contextUsage")
+    if not isinstance(usage, Mapping):
+        return None
+    frame: dict[str, Any] = {"type": "context_update"}
+    tokens = usage.get("tokens")
+    # null right after compaction, until the next response anchors it.
+    if isinstance(tokens, (int, float)) and not isinstance(tokens, bool) and tokens >= 0:
+        frame["contextTokens"] = int(tokens)
+    window = usage.get("contextWindow")
+    if isinstance(window, (int, float)) and not isinstance(window, bool) and window > 0:
+        frame["contextWindow"] = int(window)
+        frame["windowSource"] = "catalog"
+    return frame if len(frame) > 1 else None
 
 
 _RETRY_FAILED_FRAMES = frozenset({"auto_retry_end", "retry_end", "retry_failed"})

@@ -550,16 +550,72 @@ def _terminal(
         return explicit
     if _name(_str(data, "scope")) in {"run", "session", "root"}:
         return True
+    if not _is_root(data, context):
+        return False
+    return default
+
+
+def _is_root(data: Mapping[str, Any], context: Mapping[str, Any]) -> bool:
+    """False for frames a nested agent produced inside the top-level stream."""
     subagent = _str(data, "subagentId", "subagent_id")
     agent = _str(data, "agentId", "agent_id")
     root = _str(context, "rootAgentId", "root_agent_id", "agentId", "agent_id")
-    if (
+    return not (
         subagent
         or (agent and root and agent != root)
         or _bool(context, "isSubagent", "is_subagent") is True
-    ):
-        return False
-    return default
+    )
+
+
+def _context_tokens(usage: Mapping[str, Any]) -> int:
+    """Chudcode's ``calculateContextTokens``: the prefix the next request resends.
+
+    Provider-reported occupancy wins; otherwise the completion total (the reply
+    joins the prefix) minus provider orchestration tokens that never replay.
+    """
+    explicit = usage.get("contextTokens", usage.get("context_tokens"))
+    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
+        return max(0, int(explicit))
+    orchestration = usage.get("orchestration")
+    replayless = (
+        _int(orchestration, "input") + _int(orchestration, "output")
+        + _int(orchestration, "cacheRead")
+        if isinstance(orchestration, Mapping)
+        else 0
+    )
+    total = _int(usage, "totalTokens", "total_tokens") or sum(
+        _int(usage, key) for key in ("input", "output", "cacheRead", "cacheWrite")
+    )
+    return max(0, total - replayless)
+
+
+def _assistant_context(
+    data: Mapping[str, Any], context: Mapping[str, Any], link: Mapping[str, Any]
+) -> tuple[str, dict[str, Any]] | None:
+    """Measured occupancy from a finished top-level assistant message, if any."""
+    message = data.get("message")
+    if not isinstance(message, Mapping) or message.get("role") != "assistant":
+        return None
+    usage = message.get("usage")
+    # Chudcode's own anchor skips aborted/error completions: their usage is partial.
+    if not isinstance(usage, Mapping) or not _is_root(data, context) or _name(
+        _str(message, "stopReason", "stop_reason")
+    ) in {"error", "aborted"}:
+        return None
+    used = _context_tokens(usage)
+    if used <= 0:
+        return None
+    return (
+        "agent.context",
+        _linked(
+            link,
+            used=used,
+            cache_read=_int(usage, "cacheRead", "cache_read"),
+            source="api",
+            model=_str(message, "model", limit=200),
+            provider=_str(message, "provider", limit=120),
+        ),
+    )
 
 
 def _finished(
@@ -754,13 +810,19 @@ def map_rpc_frame(
     if event in lifecycle:
         phase, fallback = lifecycle[event]
         # Never copy message/prompt-result final content into assistant_delta.
-        return [
+        mapped = [
             _status(
                 link,
                 phase,
                 _str(data, "statusText", "message", limit=_MAX_LABEL) or fallback,
             )
         ]
+        # Chudcode reports provider usage ONLY on the assistant message envelope.
+        if phase == "message_end":
+            measured = _assistant_context(data, ctx, link)
+            if measured is not None:
+                mapped.append(measured)
+        return mapped
 
     tool_start = {
         "tool_start",
@@ -933,27 +995,32 @@ def map_rpc_frame(
             provider["total_tokens"] = (
                 provider["prompt_tokens"] + provider["completion_tokens"]
             )
+        # agent.context is the frozen meter contract (`used`/`window`, see
+        # agent_turn); `cache_read` feeds the bubble's per-turn cache figure.
         context_payload = {
+            "used": provider["context_tokens"] or provider["prompt_tokens"],
             "cache_read": _int(
                 usage, "cacheRead", "cache_read", "cacheReadTokens", "cache_read_tokens"
             ),
-            "prompt_tokens": provider["prompt_tokens"],
-            "completion_tokens": provider["completion_tokens"],
-            "context_tokens": provider["context_tokens"],
-            "total_tokens": provider["total_tokens"],
+            "source": provider["source"],
         }
         return [
             ("agent.provider_usage", _linked(link, **provider)),
             ("agent.context", _linked(link, **context_payload)),
         ]
     if event in {"context_update", "context_changed", "context_window"}:
-        payload = {
+        payload: dict[str, Any] = {
             "cache_read": _int(
                 data, "cacheRead", "cache_read", "cacheReadTokens", "cache_read_tokens"
             ),
-            "context_tokens": _int(data, "contextTokens", "context_tokens", "tokens"),
-            "context_window": _int(data, "contextWindow", "context_window", "window"),
         }
+        # Absent is not zero: a window-only update must not blank the measured fill.
+        if any(key in data for key in ("contextTokens", "context_tokens", "tokens")):
+            payload["used"] = _int(data, "contextTokens", "context_tokens", "tokens")
+        window = _int(data, "contextWindow", "context_window", "window")
+        if window > 0:
+            payload["window"] = window
+            payload["window_source"] = _str(data, "windowSource", "window_source", limit=40)
         return [("agent.context", _linked(link, **payload))]
 
     compaction = {

@@ -173,6 +173,14 @@ runtime's doctor command.
   guess a stronger semantic event.
 - Provider usage maps to both `agent.provider_usage` and `agent.context`; todos, retry,
   compaction, fallback, spawn/subagent, and terminal events retain their existing feed shapes.
+- **The context meter (`agent.context`) speaks the frozen `{used, window, window_source}`
+  contract (`host/src/app.cpp` reads nothing else).** Chudcode 0.3.0 emits no usage frame:
+  usage exists only on the assistant `message_end` envelope, mapped to `used` with
+  Chudcode's `calculateContextTokens` (skipping error/aborted and nested-agent messages).
+  `run_turn` also emits `get_state().contextUsage` — Chudcode's own footer figure — once
+  right after `agent_start` (the GUI zeroes the meter on `run_started`) and once after
+  `agent_end`. Before 2026-09-24 the keys were `context_tokens`/`context_window`, so the
+  GUI only ever showed its transcript estimate ("~22k" for a 296k session).
 
 ## Auth, memory, and settings
 

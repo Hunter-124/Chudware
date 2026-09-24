@@ -590,6 +590,54 @@ def test_provider_rejection_followed_by_assistant_output_is_recovered():
     assert "stop_reason" not in result
 
 
+def test_meter_is_seeded_after_run_started_and_closed_with_chudcode_state():
+    """2026-09-24: the meter read "~22k/1.0M" on a session holding ~296k tokens.
+
+    No Chudcode frame carried the contract's `used`, so the GUI only ever showed its
+    own transcript estimate. The host now reports Chudcode's contextUsage (the figure
+    its footer shows) after the GUI's run_started reset and again at agent_end.
+    """
+    from services.agent.chudcode_events import map_rpc_frame
+
+    fills = iter([(296_000, 1_000_000), (301_500, 1_000_000)])
+
+    class Measured(FakeClient):
+        def get_state(self):
+            tokens, window = next(fills)
+            return {**super().get_state(),
+                    "contextUsage": {"tokens": tokens, "contextWindow": window}}
+
+        def wait_for_idle(self, timeout=None):
+            for event in (
+                {"type": "agent_start"},
+                {"type": "message_end", "message": {
+                    "role": "assistant", "stopReason": "stop", "model": "m",
+                    "usage": {"input": 2, "output": 8, "cacheRead": 287_415,
+                              "cacheWrite": 9_159, "totalTokens": 296_584}}},
+                {"type": "agent_end", "messages": [], "isTerminal": True},
+            ):
+                for listener in tuple(self.listeners):
+                    listener(event)
+            return ()
+
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(
+        client_factory=lambda **kw: factory.clients.append(Measured(factory, **kw))
+        or factory.clients[-1]
+    )
+    feed = []
+    result = host.run_turn(
+        {"request": "Do the work", "session_id": "meter", "run_id": "r-meter"},
+        lambda frame: feed.extend(map_rpc_frame(frame)),
+    )
+
+    assert result["ok"] is True
+    kinds = [kind for kind, _ in feed]
+    meter = [(p.get("used"), p.get("window")) for kind, p in feed if kind == "agent.context"]
+    assert kinds.index("run_started") < kinds.index("agent.context")
+    assert meter == [(296_000, 1_000_000), (296_584, None), (301_500, 1_000_000)]
+
+
 def test_rejects_a_runtime_that_did_not_negotiate_protocol_v2():
     factory = FakeFactory(protocol_version=1)
     host = ChudcodeSessionHost(client_factory=factory)

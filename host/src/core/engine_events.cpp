@@ -29,6 +29,10 @@ namespace core {
 using nlohmann::json;
 
 namespace {
+// Bounded synchronous calls made by the GL thread. EngineClient closes the
+// connection on timeout; the next frame's maintainConnection restores it.
+constexpr int kMetadataCallTimeoutMs = 5000;
+constexpr int kAttachCallTimeoutMs = 10000;
 
 // The user is mid-edit on the ACTIVE doc (open sketch or PM form) — the same
 // safety gate pollAiCadHandoff used: never yank geometry out from under them.
@@ -89,6 +93,8 @@ bool bootstrapped = false;
 // A failed/deferred bootstrap (engine still "loading") used to retry EVERY frame — two sync
 // RPCs per frame on the GL thread. Back off: retry at most every 500ms until it succeeds.
 std::chrono::steady_clock::time_point lastBootstrapTry{};
+std::chrono::steady_clock::time_point lastMirrorRetry{};
+std::chrono::steady_clock::time_point lastBootstrapFailureToast{};
 // Last reconnect generation we bootstrapped against. When EngineClient silently
 // reconnects (daemon drain-replace, transient EOF), it lands on a fresh daemon
 // clientId with NO event subscriptions — the one-time `bootstrapped` latch would
@@ -153,31 +159,44 @@ std::string eventDocName(const json& d) {
 // Open a read-only mirror tab for a doc another client minted. Mirrors the
 // poller's focus rules: the FIRST mirror ever opened may take focus; later
 // parts open in the background with the aiPulse glow.
-void openMirrorTab(AppState& st, const std::string& docId, const std::string& name = {}) {
-    if (docId.rfind("doc-cpp", 0) != 0) return;  // parts/assemblies only (no dwg/ecad mirror yet)
+bool openMirrorTab(AppState& st, const std::string& docId, const std::string& name = {}) {
+    if (docId.rfind("doc-cpp", 0) != 0) return true;  // parts/assemblies only
     if (tabIndexForDoc(st, docId) >= 0) {        // already visible (ours or a prior mirror)
         pendingOpen.erase(docId);  // a deferred reveal is satisfied — don't retry every frame
-        return;
+        return true;
     }
     // The user closed this mirror by hand. The agent keeps building (hostd degraded
     // that close to a detach), but re-revealing the tab on its next edit made the
     // close look broken. Stay closed until the user opens it again from Artifacts.
     if (st.dismissedMirrorDocs.count(docId)) {
         pendingOpen.erase(docId);
-        return;
+        return true;
     }
     if (userMidEdit(st)) {                       // defer the reveal, never disrupt
         // Keep a name we already know if this retry arrived without one.
         if (!name.empty() || !pendingOpen.count(docId)) pendingOpen[docId] = name;
-        return;
+        return true;
     }
     auto* c = engine::client();
-    if (!c) return;
+    if (!c) return false;
     json r;
     std::string e;
     // Viewer semantics: attach read-only. The user's first edit attempt on this
     // tab auto-upgrades to rw (engine_backend.cpp read_only retry) — no new UI.
-    c->call("attach_doc", json{{"doc_id", docId}, {"mode", "ro"}}, r, e);
+    if (!c->call("attach_doc", json{{"doc_id", docId}, {"mode", "ro"}}, r, e,
+                 kAttachCallTimeoutMs)) {
+        st.addLog("[daemon] attach_doc failed for " + docId + ": " + e);
+        if (r.is_null()) {
+            // Transport failure (including timeout): no view was confirmed. Retry
+            // after reconnect instead of inventing a live mirror tab.
+            if (pendingOpen.emplace(docId, name).second)
+                st.toast(ui::ToastLevel::Warn, "Couldn't attach live document — retrying");
+            return false;
+        }
+        st.toast(ui::ToastLevel::Warn, "Couldn't attach live document: " + e);
+        pendingOpen.erase(docId);
+        return true;  // RPC refusal: retrying this doc would only spam the daemon
+    }
 
     bool anyMirror = false;
     for (const auto& t : st.docTabs)
@@ -258,6 +277,7 @@ void openMirrorTab(AppState& st, const std::string& docId, const std::string& na
         }
     }
     pendingOpen.erase(docId);
+    return true;
 }
 
 // Apply a pushed foreign revision to the active live view without a blocking worker round-trip.
@@ -313,8 +333,15 @@ void handleOwnHoldExpired(AppState& st, const std::string& docId) {
     if (c) {
         json tr;
         std::string te;
-        if (c->call("doc_tree", json{{"doc_id", docId}}, tr, te) && tr.is_object() &&
-            tr.contains("revision") && tr["revision"].is_number())
+        if (!c->call("doc_tree", json{{"doc_id", docId}}, tr, te,
+                     kMetadataCallTimeoutMs)) {
+            st.addLog("[daemon] doc_tree revision check failed for " + docId + ": " + te);
+            st.propertyManager->closeIfActive();  // cannot safely undo an unverified revision
+            st.toast(ui::ToastLevel::Warn,
+                     "Edit hold expired — revision unavailable; edit form closed without undo");
+            return;
+        }
+        if (tr.is_object() && tr.contains("revision") && tr["revision"].is_number())
             engRev = tr["revision"].get<long>();
     }
     if (engRev >= 0 && engRev == (long)st.docMirror.revision()) {
@@ -592,28 +619,55 @@ void handleEvent(AppState& st, const json& evt) {
 // orphan-recovery protocol): count them and raise the AppState prompt flag — the
 // modal itself renders in app.cpp alongside the other app-scope confirmations.
 // Best-effort: an old daemon without recovery_list just fails the call quietly.
-void checkOrphanRecovery(AppState& st, chudware_ipc::EngineClient& c) {
+void reportBootstrapTransportFailure(AppState& st, const std::string& detail) {
+    st.addLog("[daemon] " + detail);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastBootstrapFailureToast >= std::chrono::seconds(15)) {
+        lastBootstrapFailureToast = now;
+        st.toast(ui::ToastLevel::Warn, "Engine document sync interrupted — retrying");
+    }
+}
+
+bool checkOrphanRecovery(AppState& st, chudware_ipc::EngineClient& c) {
     json rl;
     std::string e;
-    if (!c.call("recovery_list", json::object(), rl, e)) return;
-    if (!rl.is_object() || !rl.contains("entries") || !rl["entries"].is_array()) return;
+    if (!c.call("recovery_list", json::object(), rl, e, kMetadataCallTimeoutMs)) {
+        if (!c.connected()) {
+            reportBootstrapTransportFailure(st, "recovery_list transport failure: " + e);
+            return false;  // reconnect dropped the subscription; bootstrap anew
+        }
+        st.addLog("[daemon] recovery_list unavailable: " + e);
+        return true;  // older daemons do not support orphan recovery
+    }
+    if (!rl.is_object() || !rl.contains("entries") || !rl["entries"].is_array()) return true;
     const int n = (int)rl["entries"].size();
-    if (n <= 0) return;
+    if (n <= 0) return true;
     st.addLog("[daemon] " + std::to_string(n) +
               " retired doc(s) from a previous session awaiting recovery");
     st.recoveryPromptCount = n;
+    return true;
 }
 
 bool tryBootstrap(AppState& st, chudware_ipc::EngineClient& c) {
     json r;
     std::string e;
-    if (!c.call("subscribe", json{{"doc_ids", "*"}}, r, e)) return false;
+    if (!c.call("subscribe", json{{"doc_ids", "*"}}, r, e,
+                kMetadataCallTimeoutMs)) {
+        if (!c.connected()) reportBootstrapTransportFailure(st, "subscribe failed: " + e);
+        else st.addLog("[daemon] subscribe failed: " + e);
+        return false;
+    }
     // Docs already open in the shared engine (an agent working before the GUI
     // attached): mirror them. "loading" here just means no docs yet — retry.
     json dl;
-    if (!c.call("doc_list", json::object(), dl, e)) {
+    if (!c.call("doc_list", json::object(), dl, e, kMetadataCallTimeoutMs)) {
         if (dl.is_object() && dl.value("code", std::string()) == "loading") return false;
-        return true;  // subscribed; doc listing best-effort
+        if (!c.connected()) {
+            reportBootstrapTransportFailure(st, "doc_list failed: " + e);
+            return false;  // never reconcile tabs against an unconfirmed list
+        }
+        st.addLog("[daemon] doc_list failed: " + e);
+        return checkOrphanRecovery(st, c);  // subscribed; list unavailable, no reconciliation
     }
     if (dl.is_object() && dl.contains("docs") && dl["docs"].is_array()) {
         std::set<std::string> liveIds;
@@ -622,7 +676,7 @@ bool tryBootstrap(AppState& st, chudware_ipc::EngineClient& c) {
                 doc.is_object() ? doc.value("doc_id", std::string()) : std::string();
             if (!id.empty()) {
                 liveIds.insert(id);
-                openMirrorTab(st, id, eventDocName(doc));
+                if (!openMirrorTab(st, id, eventDocName(doc))) return false;
                 // origin_kind (daemon-annotated): a doc minted by a GUI client is user-owned,
                 // so if we mirrored it after (re)connecting, mark it adopted — it must be
                 // quit-warned and never auto-closed. Unknown/mcp/agent origin stays AI-owned.
@@ -657,8 +711,7 @@ bool tryBootstrap(AppState& st, chudware_ipc::EngineClient& c) {
             st.closeDocTab(i);
         }
     }
-    checkOrphanRecovery(st, c);
-    return true;
+    return checkOrphanRecovery(st, c);
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,10 +1068,12 @@ void engineEventsTick(AppState& st) {
         const auto now = std::chrono::steady_clock::now();
         if (now - lastBootstrapTry >= std::chrono::milliseconds(500)) {
             lastBootstrapTry = now;
-            bootstrapped = tryBootstrap(st, *c);
-            // First successful bootstrap = daemon connected, doc list mirrored, and the
-            // orphan-recovery check has run. This is the safe point to let boot-time daemon
-            // actions (the starter part) fire on web (see ensureStarterDoc).
+            const uint64_t before = c->reconnectGeneration();
+            const bool ok = tryBootstrap(st, *c);
+            // A timed-out call invalidates its socket. Any inline reconnect
+            // during bootstrap also loses the earlier subscription.
+            bootstrapped = ok && c->connected() &&
+                           before == c->reconnectGeneration();
             if (bootstrapped) st.daemonEverConnected = true;
         }
     }
@@ -1026,9 +1081,12 @@ void engineEventsTick(AppState& st) {
     for (const json& evt : c->drainEvents()) handleEvent(st, evt);
 
     // Deferred work queued while the user was mid-edit / away: apply when safe.
-    if (!pendingOpen.empty() && !userMidEdit(st)) {
+    if (bootstrapped && c->connected() && !pendingOpen.empty() && !userMidEdit(st) &&
+        std::chrono::steady_clock::now() - lastMirrorRetry >= std::chrono::milliseconds(500)) {
+        lastMirrorRetry = std::chrono::steady_clock::now();
         const std::map<std::string, std::string> retry = pendingOpen;
-        for (const auto& [id, nm] : retry) openMirrorTab(st, id, nm);
+        for (const auto& [id, nm] : retry)
+            if (!openMirrorTab(st, id, nm) && !c->connected()) break;
     }
     if (!pendingChanged.empty() && !userMidEdit(st)) {
         // Only the ACTIVE tab applies immediately; background ones stay pulsed

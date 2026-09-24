@@ -29,6 +29,9 @@
 #include "../ui/ecad/ecad_panel.h"    // Wave 2: point the ECAD editor at the active Schematic/PCB tab
 #include "../ui/ecad/ecad_mirror.h"   // Wave 2: complete EcadMirror type for setDocId on switch
 
+// Closing a daemon mirror is a GL-thread round trip, never an unbounded wait.
+// A timeout leaves the server-side outcome unknown; do not record a confirmed detach.
+static constexpr int kMirrorCloseTimeoutMs = 10000;
 // ---- DocSession (multi-document per-tab editing/display state) -------------------------------
 // Defined here (not in app_state.h) so the unique_ptr members see the COMPLETE PropertyManager /
 // SketchMode / EvaluateDialogs types pulled in above — app_state.h only forward-declares them.
@@ -774,9 +777,16 @@ void AppState::closeDocTab(int idx, bool detachOnly) {
         if (auto* c = engine::client()) {
             nlohmann::json res;
             std::string err;
-            c->call(detachOnly ? "detach_doc" : "doc_discard",
-                    {{"doc_id", closing.docId}}, res, err);
-            noteSurvivingClose(closing, res);
+            const char* method = detachOnly ? "detach_doc" : "doc_discard";
+            if (c->call(method, {{"doc_id", closing.docId}}, res, err,
+                        kMirrorCloseTimeoutMs)) {
+                noteSurvivingClose(closing, res);
+            } else {
+                addLog("[tabs] " + std::string(method) + " failed for " +
+                       closing.docId + ": " + err);
+                toast(ui::ToastLevel::Warn,
+                      "Document close not confirmed — check Agent Documents");
+            }
         }
     } else {
         nlohmann::json res;

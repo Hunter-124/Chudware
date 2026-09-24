@@ -221,8 +221,12 @@ void revealInFileManager(const std::string& /*path*/) {
 // ---------------------------------------------------------------------------
 // Windows common dialogs.
 // ---------------------------------------------------------------------------
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <commdlg.h>   // not pulled in by lean-and-mean windows.h
 #include <shlobj.h>    // SHGetKnownFolderPath (FOLDERID_Documents)
@@ -238,10 +242,13 @@ namespace ui {
 
 static std::wstring widen(const std::string& s) {
     if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(),
+                                (int)s.size(), nullptr, 0);
     if (n <= 0) return {};
     std::wstring w(n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(),
+                             (int)s.size(), w.data(), n))
+        return {};
     return w;
 }
 
@@ -249,8 +256,10 @@ static std::string narrow(const wchar_t* w) {
     if (!w || !*w) return {};
     int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
     if (n <= 1) return {};
-    std::string s(n - 1, '\0');  // n includes the terminating NUL
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
+    std::string s(n, '\0');  // include space for the terminator written by Win32
+    if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr))
+        return {};
+    s.pop_back();
     return s;
 }
 
@@ -379,12 +388,13 @@ void revealInFileManager(const std::string& path) {
     if (path.empty()) return;
     const std::wstring wide = widen(path);
     if (wide.empty()) return;
-    // SHOpenFolderAndSelectItems requires COM on the calling thread; S_FALSE = already on.
+    // SHOpenFolderAndSelectItems requires COM on the calling thread. S_FALSE
+    // still requires a matching CoUninitialize; a failed init owns nothing.
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    const bool ownsCom = SUCCEEDED(com);
+    if (FAILED(com)) return;
     PIDLIST_ABSOLUTE item = ILCreateFromPathW(wide.c_str());
     if (!item) {
-        if (ownsCom) CoUninitialize();
+        CoUninitialize();
         return;
     }
     PIDLIST_ABSOLUTE folder = ILClone(item);
@@ -392,9 +402,9 @@ void revealInFileManager(const std::string& path) {
         PCUITEMID_CHILD child = ILFindLastID(item);
         (void)SHOpenFolderAndSelectItems(folder, 1, &child, 0);
     }
-    if (folder) CoTaskMemFree(folder);
-    CoTaskMemFree(item);
-    if (ownsCom) CoUninitialize();
+    if (folder) ILFree(folder);
+    ILFree(item);
+    CoUninitialize();
 }
 
 }  // namespace ui

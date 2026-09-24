@@ -564,7 +564,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU
   target_link_options(Chudware PRIVATE $<$<CONFIG:Release>:-Wl,--gc-sections>)
 endif()
 if(WIN32)
-  target_link_libraries(Chudware PRIVATE dwmapi comdlg32 dbghelp)  # comdlg32: C41 file dialogs; dbghelp: crash stack/minidump
+  target_link_libraries(Chudware PRIVATE dwmapi comdlg32 dbghelp shell32 ole32)  # comdlg32: C41 file dialogs; dbghelp: crash stack/minidump; shell32/ole32: reveal-in-Explorer
   # windows.h min/max macros break CEF headers (std::numeric_limits<>::max()) and
   # any other code that uses std::min/std::max — always define NOMINMAX on the host.
   target_compile_definitions(Chudware PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

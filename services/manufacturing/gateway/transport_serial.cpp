@@ -560,23 +560,32 @@ device::PollResult SerialTransport::poll(device::Deadline deadline) {
             event.raw = bytesToString(event.data);
             return {{std::move(event)}};
         }
-        if (std::chrono::steady_clock::now() >= deadline) return {};
+        if (deadline == device::Deadline::max() ||
+            std::chrono::steady_clock::now() >= deadline) return {};
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 #else
     const int fd = static_cast<int>(handle_);
     for (;;) {
         const auto now = std::chrono::steady_clock::now();
-        const auto remaining = deadline > now ? deadline - now : device::Deadline::duration::zero();
+        const auto remaining = deadline == device::Deadline::max()
+            ? device::Deadline::duration::zero()
+            : deadline > now ? deadline - now : device::Deadline::duration::zero();
         const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
-        const int timeout = deadline <= now ? 0 : static_cast<int>(std::clamp<std::int64_t>(
-            remaining_ms.count() + (remaining > remaining_ms ? 1 : 0), 1,
-            std::numeric_limits<int>::max()));
+        const int timeout = deadline == device::Deadline::max() || deadline <= now
+            ? 0 : static_cast<int>(std::clamp<std::int64_t>(
+                remaining_ms.count() + (remaining > remaining_ms ? 1 : 0), 1,
+                std::numeric_limits<int>::max()));
         pollfd ready{fd, POLLIN, 0};
-        int status;
-        do status = ::poll(&ready, 1, timeout); while (status < 0 && errno == EINTR);
+        const int status = ::poll(&ready, 1, timeout);
         if (status == 0) return {};
-        if (status < 0) return deviceLost("serial poll failed: " + std::string(std::strerror(errno)));
+        if (status < 0 && errno == EINTR) {
+            if (deadline == device::Deadline::max() ||
+                std::chrono::steady_clock::now() >= deadline) return {};
+            continue;
+        }
+        if (status < 0)
+            return deviceLost("serial poll failed: " + std::string(std::strerror(errno)));
         if (ready.revents & POLLNVAL) return deviceLost("serial descriptor became invalid");
 
         if (ready.revents & (POLLIN | POLLHUP | POLLERR)) {
@@ -590,10 +599,16 @@ device::PollResult SerialTransport::poll(device::Deadline deadline) {
                 event.raw = bytesToString(event.data);
                 return {{std::move(event)}};
             }
-            if (count < 0 && errno == EINTR) continue;
+            if (count < 0 && errno == EINTR) {
+                if (deadline == device::Deadline::max() ||
+                    std::chrono::steady_clock::now() >= deadline) return {};
+                continue;
+            }
             if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 if (ready.revents & (POLLHUP | POLLERR))
                     return deviceLost("serial peer disconnected");
+                if (deadline == device::Deadline::max() ||
+                    std::chrono::steady_clock::now() >= deadline) return {};
                 continue;
             }
             if (count == 0 || (count < 0 && (errno == ENXIO || errno == EIO)))
@@ -601,6 +616,8 @@ device::PollResult SerialTransport::poll(device::Deadline deadline) {
             if (count < 0)
                 return deviceLost("serial read failed: " + std::string(std::strerror(errno)));
         }
+        if (deadline == device::Deadline::max() ||
+            std::chrono::steady_clock::now() >= deadline) return {};
     }
 #endif
 }

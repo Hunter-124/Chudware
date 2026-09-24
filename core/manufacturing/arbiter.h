@@ -74,6 +74,10 @@ public:
     StartOutcome start(std::string_view run_id, std::string_view approval_id,
                        const Initiator& initiator);
     RunOutcome hold(std::string_view run_id, const Initiator& initiator, HoldKind kind);
+    // Device observations and post-command failures must update the arbiter's
+    // authorization state through the canonical, journaled state machine.
+    RunOutcome observe_state(std::string_view run_id, device::RunState state,
+                             std::string_view cause);
     RunOutcome abort(std::string_view run_id, const Initiator& initiator);
     RunOutcome resume(std::string_view run_id, const Initiator& initiator);
     bool record_discontinuity(std::string_view run_id, device::RunDiscontinuity discontinuity);

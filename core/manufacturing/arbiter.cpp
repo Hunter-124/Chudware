@@ -214,8 +214,13 @@ bool Arbiter::transition(RunAuthorization& run, device::RunState to,
     if (!validation.allowed) return false;
     const auto from = run.state;
     run.state = to;
+    const bool terminal = to == device::RunState::Completed ||
+                          to == device::RunState::Aborted ||
+                          to == device::RunState::Faulted ||
+                          to == device::RunState::Abandoned;
     const auto seq = journal_.append("mfg.run.state", run.run_id,
-        {{"from", device::to_string(from)}, {"state", device::to_string(to)}, {"cause", cause}});
+        {{"run_id", run.run_id}, {"from", device::to_string(from)},
+         {"state", device::to_string(to)}, {"cause", cause}, {"terminal", terminal}});
     if (at_seq) *at_seq = seq;
     return true;
 }
@@ -370,12 +375,25 @@ RunOutcome Arbiter::hold(std::string_view run_id, const Initiator& initiator, Ho
                 run.state, std::nullopt};
     }
     device::Seq seq = 0;
-    if (!transition(run, device::RunState::Holding, hold_kind_name(kind), &seq) ||
-        !transition(run, device::RunState::Held, "hold_acknowledged", &seq))
+    if (!transition(run, device::RunState::Holding, hold_kind_name(kind), &seq))
         return {false, "run.transition_refused", "canonical hold transition refused",
                 run.state, std::nullopt};
     journal_attempt("hold", run_id, initiator, "accepted", hold_kind_name(kind));
     return {true, {}, {}, run.state, seq};
+}
+
+RunOutcome Arbiter::observe_state(std::string_view run_id, device::RunState state,
+                                  std::string_view cause) {
+    std::lock_guard lock(mutex_);
+    const auto it = runs_.find(run_id);
+    if (it == runs_.end())
+        return {false, "run.not_found", "run is not registered",
+                device::RunState::Draft, std::nullopt};
+    device::Seq seq = 0;
+    if (!transition(it->second, state, cause, &seq))
+        return {false, "run.transition_refused", "canonical run transition refused",
+                it->second.state, std::nullopt};
+    return {true, {}, {}, state, seq};
 }
 
 RunOutcome Arbiter::abort(std::string_view run_id, const Initiator& initiator) {
@@ -385,9 +403,11 @@ RunOutcome Arbiter::abort(std::string_view run_id, const Initiator& initiator) {
         return {false, "run.not_found", "run is not registered",
                 device::RunState::Draft, std::nullopt};
     auto& run = it->second;
-    if (run.state != device::RunState::Running && run.state != device::RunState::Held) {
+    if (run.state != device::RunState::Running &&
+        run.state != device::RunState::Holding &&
+        run.state != device::RunState::Held) {
         journal_attempt("abort", run_id, initiator, "refused", "run.not_abortable");
-        return {false, "run.not_abortable", "abort requires a running or held run",
+        return {false, "run.not_abortable", "abort requires an active run",
                 run.state, std::nullopt};
     }
     device::Seq seq = 0;

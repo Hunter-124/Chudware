@@ -144,7 +144,10 @@ inline TransitionValidation validate_run_transition(
             allowed = to == RunState::Holding || to == RunState::Completing ||
                       to == RunState::Aborting || to == RunState::Faulted;
             break;
-        case RunState::Holding: allowed = to == RunState::Held || to == RunState::Faulted; break;
+        case RunState::Holding:
+            allowed = to == RunState::Held || to == RunState::Aborting ||
+                      to == RunState::Faulted;
+            break;
         case RunState::Held:
             allowed = to == RunState::Resuming || to == RunState::Abandoned ||
                       to == RunState::Aborting || to == RunState::Faulted;

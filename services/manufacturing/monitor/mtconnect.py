@@ -7,7 +7,7 @@ network client and exposes no machine command surface.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-import json
+import math
 import re
 from typing import Any, Iterable, Mapping
 import xml.etree.ElementTree as ET
@@ -367,9 +367,11 @@ def _convert_number(text: str, conversion: Mapping[str, Any] | None) -> float | 
         number = float(text)
     except ValueError:
         return None
+    if not math.isfinite(number):
+        return None
     if conversion is not None:
         number = number * float(conversion["factor"]) + float(conversion["offset"])
-    return number
+    return number if math.isfinite(number) else None
 
 
 def parse_streams(
@@ -488,6 +490,13 @@ def parse_streams(
                         why = "missing or invalid source timestamp"
                         quality_src = "MISSING_OR_INVALID_TIMESTAMP"
                     number = None if quality != "good" else _convert_number(text.strip(), conversion)
+                    numeric = value_kind == "sample" or unit_src is not None or canonical_kind in {
+                        "part_count", "tool_life"
+                    }
+                    if quality == "good" and numeric and number is None:
+                        quality = "unavailable"
+                        quality_src = "INVALID_NUMERIC_VALUE"
+                        why = "numeric sample is non-finite or unparseable"
                     value_text = None if quality != "good" or number is not None else text
                     observations.append(
                         ObservationRow(

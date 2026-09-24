@@ -83,15 +83,6 @@ bool printerClass(device::MachineClass machine_class) {
     return machine_class == device::MachineClass::FdmPrinterOpen ||
            machine_class == device::MachineClass::FdmPrinterEnclosed;
 }
-bool workerVirtualPrinter(const json& capability) {
-    if (!capability.is_object() || !capability.contains("levels") ||
-        !capability["levels"].is_array()) return false;
-    for (const auto& level : capability["levels"]) {
-        if (level.is_object() && level.value("level", std::string{}) == "execute" &&
-            level.value("truth", std::string{}) == "verified") return true;
-    }
-    return false;
-}
 
 std::string base64Encode(std::string_view input) {
     static constexpr char alphabet[] =
@@ -489,10 +480,7 @@ void ManufacturingLane::failExpiredClaimSafely() {
         if (!active) continue;
         arbiter_.record_discontinuity(run_id, device::RunDiscontinuity::Disconnect);
         run.discontinuity = device::RunDiscontinuity::Disconnect;
-        run.state = device::RunState::Faulted;
-        appendEvent("mfg.run.state", run_id,
-                    {{"run_id", run_id}, {"state", "faulted"},
-                     {"cause", "commander_lease_expired"}, {"terminal", true}});
+        transitionRun(run, device::RunState::Faulted, "commander_lease_expired");
         affected.push_back(run_id);
     }
     InvalidationNotice notice;
@@ -720,11 +708,41 @@ device::Seq ManufacturingLane::appendEvent(std::string kind, std::string subject
     return seq;
 }
 
+void ManufacturingLane::transitionRun(RunRecord& run, device::RunState state,
+                                      std::string_view cause) {
+    const auto outcome = arbiter_.observe_state(run.run_id, state, cause);
+    if (!outcome.ok)
+        throw std::logic_error("run/arbiter state diverged: " + outcome.why);
+    run.state = state;
+    const auto records = journal_.replay(*outcome.at_seq);
+    for (const auto& record : records)
+        publishEvent(record.kind, record.subject, record.seq, record.body);
+}
+
+void ManufacturingLane::raiseRunAttention(std::string_view run_id,
+                                          std::string_view reason,
+                                          std::string_view why) {
+    const std::string id = "attention:" + device::detail::mint_ulid();
+    json attention{{"action", "raised"}, {"id", id}, {"severity", "critical"},
+                   {"device", device_id_.str()}, {"run", run_id},
+                   {"reason", reason}, {"why", why},
+                   {"raised_seq", journal_.head() + 1},
+                   {"occurrence_count", 1}, {"deliveries", json::array()}};
+    const auto seq = appendEvent("mfg.attention", id, attention);
+    JournalRecord record;
+    record.seq = seq;
+    record.kind = "mfg.attention";
+    record.subject = id;
+    record.body = std::move(attention);
+    applyAttention(record);
+}
+
 void ManufacturingLane::serviceDevice() {
     if (!connected_ || !adapter_) return;
     adapter_->service(journal_.head());
     const auto discontinuity = adapter_->discontinuity();
     const auto progress = adapter_->streamProgress();
+    const auto observed = adapter_->snapshot();
     if (discontinuity != device::RunDiscontinuity::None) {
         terminal_claim_ = true;
         if (discontinuity == device::RunDiscontinuity::Disconnect)
@@ -739,30 +757,26 @@ void ManufacturingLane::serviceDevice() {
         if (discontinuity != device::RunDiscontinuity::None) {
             run.discontinuity = discontinuity;
             arbiter_.record_discontinuity(run_id, discontinuity);
-            run.state = run.state == device::RunState::Aborting &&
-                                discontinuity == device::RunDiscontinuity::Reset
-                            ? device::RunState::Aborted
-                            : device::RunState::Faulted;
-            appendEvent("mfg.run.state", run_id,
-                        {{"run_id", run_id}, {"state", device::to_string(run.state)},
-                         {"cause", discontinuityName(discontinuity)},
-                         {"terminal", true}});
+            const auto state = run.state == device::RunState::Aborting &&
+                                       discontinuity == device::RunDiscontinuity::Reset
+                                   ? device::RunState::Aborted
+                                   : device::RunState::Faulted;
+            transitionRun(run, state, discontinuityName(discontinuity));
             continue;
         }
+        if (run.state == device::RunState::Holding &&
+            observed.state == FreshState::Ok && observed.v &&
+            observed.v->state == device::DeviceState::Hold &&
+            observed.v->substate == "0" &&
+            observed.t_mono_ns > run.hold_requested_at_ns)
+            transitionRun(run, device::RunState::Held, "hold_observed");
         if (run.state == device::RunState::Running && progress.complete) {
             if (!run.completion_observed) {
                 run.completion_observed = true;
                 continue;
             }
-            run.state = device::RunState::Completing;
-            appendEvent("mfg.run.state", run_id,
-                        {{"run_id", run_id}, {"state", "completing"},
-                         {"cause", "program_stream_complete"}});
-            run.state = device::RunState::Completed;
-            appendEvent("mfg.run.state", run_id,
-                        {{"run_id", run_id}, {"state", "completed"},
-                         {"cause", "controller_acknowledged_program"},
-                         {"terminal", true}});
+            transitionRun(run, device::RunState::Completing, "program_stream_complete");
+            transitionRun(run, device::RunState::Completed, "controller_acknowledged_program");
         }
     }
 }
@@ -1060,7 +1074,6 @@ gates::GateReport ManufacturingLane::computePreflight(RunRecord& run,
 RunAuthorization ManufacturingLane::authorizationFor(const RunRecord& run,
                                                        const ArtifactRecord& artifact,
                                                        const ApprovalBinding& approval) const {
-    const bool virtual_printer = isPrinter() && workerVirtualPrinter(printer_capability_);
     RunAuthorization auth;
     auth.run_id = run.run_id;
     auth.approval_id = approval.approval_id;
@@ -1074,35 +1087,32 @@ RunAuthorization ManufacturingLane::authorizationFor(const RunRecord& run,
     auto& context = auth.tier0_context;
     context.action = tier0::Action::RunStart;
     context.artifact_kind = artifact.kind;
-    context.machine_class = endpoint_.endpoint_is_physical && !virtual_printer
+    context.machine_class = endpoint_.endpoint_is_physical
         ? machine_class_ : device::MachineClass::Emulated;
     context.policy = lanePolicy();
     context.policy.revision = approval.policy_revision;
     context.execute_capability = {
         device::CapabilityLevel::Execute,
-        endpoint_.endpoint_is_physical && !virtual_printer
+        endpoint_.endpoint_is_physical
             ? device::CapabilityTruthValue::Assumed
             : device::CapabilityTruthValue::Verified,
-        endpoint_.endpoint_is_physical && !virtual_printer
+        endpoint_.endpoint_is_physical
             ? std::vector<std::string>{}
-            : std::vector<std::string>{virtual_printer
-                  ? "res:virtual_printer_worker"
-                  : transport_kind_ == device::TransportKind::Emulator
-                      ? "res:emulator_e3:built_in"
-                      : "res:virtual_qualification"},
+            : std::vector<std::string>{transport_kind_ == device::TransportKind::Emulator
+                  ? "res:emulator_e3:built_in" : "res:virtual_qualification"},
         device::EmulatorStage::E3,
-        endpoint_.endpoint_is_physical && !virtual_printer
+        endpoint_.endpoint_is_physical
             ? std::optional<device::CapabilityLevel>(device::CapabilityLevel::Execute)
             : std::nullopt,
-        endpoint_.endpoint_is_physical && !virtual_printer
+        endpoint_.endpoint_is_physical
             ? "physical execute requires an attended hardware pilot" : ""};
     context.emulator_stage_passed = device::EmulatorStage::E3;
     context.commander_lease_held_by_caller = true;
-    context.wcs_established_this_setup = !endpoint_.endpoint_is_physical || virtual_printer;
-    context.bed_origin_declared_by_firmware = !endpoint_.endpoint_is_physical || virtual_printer;
+    context.wcs_established_this_setup = !endpoint_.endpoint_is_physical;
+    context.bed_origin_declared_by_firmware = !endpoint_.endpoint_is_physical;
 
     auto& input = auth.gate_input;
-    const auto authorization_machine_class = endpoint_.endpoint_is_physical && !virtual_printer
+    const auto authorization_machine_class = endpoint_.endpoint_is_physical
         ? machine_class_ : device::MachineClass::Emulated;
     input.machine_class = authorization_machine_class;
     input.artifact_kind = artifact.kind;
@@ -1123,7 +1133,7 @@ RunAuthorization ManufacturingLane::authorizationFor(const RunRecord& run,
         snapshot.state = FreshState::Ok;
         snapshot.normalize();
     }
-    const auto execute_truth = endpoint_.endpoint_is_physical && !virtual_printer
+    const auto execute_truth = endpoint_.endpoint_is_physical
         ? device::CapabilityTruthValue::Assumed
         : device::CapabilityTruthValue::Verified;
     gates::Stage1Check controller;
@@ -1138,7 +1148,7 @@ RunAuthorization ManufacturingLane::authorizationFor(const RunRecord& run,
     controller.accepts = {{"dev"}, {gates::Admission::ProbedEvidence}};
     input.stage1.push_back(std::move(controller));
     auto& facts = input.facts;
-    const bool simulated_qualification = !endpoint_.endpoint_is_physical || virtual_printer;
+    const bool simulated_qualification = !endpoint_.endpoint_is_physical;
     facts.artifact_hash = artifact.hash_sha256;
     facts.approved_artifact_hash = approval.artifact.hash_sha256;
     facts.machine_fingerprint =
@@ -1333,6 +1343,28 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
     if (method == "mfg_device_release") {
         if (!requireLease(params, caller, failure)) return failure;
         const auto active = leases_.describe(device_id_.str(), clock_.mono_ns());
+        // An explicit release has a live commander; require that commander
+        // to finish or abort, rather than orphaning an active machine.
+        for (const auto& [id, run] : runs_) {
+            if (run.device_id == device_id_.str() &&
+                (run.state == device::RunState::Running ||
+                 run.state == device::RunState::Holding ||
+                 run.state == device::RunState::Held ||
+                 run.state == device::RunState::Aborting))
+                return refuse("mfg_device_release_active_run",
+                              "abort or finish the active run before releasing its commander lease",
+                              {{"run_id", id}, {"state", device::to_string(run.state)}});
+        }
+        if (connected_ && isPrinter()) {
+            if (!callWorker("mfg_printer_adapter_close", workerParams(), failure))
+                return failure;
+            connected_ = false;
+            appendEvent("mfg.device.state", device_id_.str(),
+                        {{"device_id", device_id_.str()}, {"state", deviceState()},
+                         {"raw", "commander released device"}});
+        } else if (connected_) {
+            closeActiveDevice("commander released device");
+        }
         const auto released = leases_.release(active->lease_id, caller, clock_.mono_ns());
         if (!released.ok) return refuse(released.code, released.why);
         active_claim_.reset();
@@ -1418,6 +1450,16 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
     }
     if (method == "mfg_device_disconnect") {
         if (!requireLease(params, caller, failure)) return failure;
+        for (const auto& [id, run] : runs_) {
+            if (run.device_id == device_id_.str() &&
+                (run.state == device::RunState::Running ||
+                 run.state == device::RunState::Holding ||
+                 run.state == device::RunState::Held ||
+                 run.state == device::RunState::Aborting))
+                return refuse("mfg_device_disconnect_active_run",
+                              "abort or finish the active run before disconnecting its device",
+                              {{"run_id", id}, {"state", device::to_string(run.state)}});
+        }
         if (isPrinter() && connected_) {
             auto closed = callWorker("mfg_printer_adapter_close",
                                      {{"adapter_id", device_id_.str()}}, failure);
@@ -1446,16 +1488,40 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
             stripWorkerAuthority(rows);
             std::optional<device::RunDiscontinuity> terminal;
             std::string terminal_state;
+            std::string job_state;
+            uint64_t job_observed_ns = 0;
+            uint64_t hold_observed_ns = 0;
             for (const auto& row : rows) {
-                if (!row.is_object() || row.value("field", std::string{}) != "device_state" ||
-                    !row.contains("v") || !row.at("v").is_string()) continue;
+                if (!row.is_object() || !row.contains("v") || !row.at("v").is_string())
+                    continue;
+                const std::string field = row.value("field", std::string{});
                 const std::string state = row.at("v").get<std::string>();
-                if (state == "disconnected") {
-                    terminal = device::RunDiscontinuity::Disconnect;
-                    terminal_state = state;
-                } else if (state == "alarm" || state == "fault") {
-                    terminal = device::RunDiscontinuity::Alarm;
-                    terminal_state = state;
+                if (field == "device_state") {
+                    if (state == "disconnected") {
+                        terminal = device::RunDiscontinuity::Disconnect;
+                        terminal_state = state;
+                    } else if (state == "alarm" || state == "fault") {
+                        terminal = device::RunDiscontinuity::Alarm;
+                        terminal_state = state;
+                    } else if (state == "hold" &&
+                               row.value("state", std::string{}) == "ok") {
+                        const uint64_t observed = row.value("t_mono_ns", uint64_t{0});
+                        const uint64_t now = clock_.mono_ns();
+                        const uint64_t ttl_ms = row.value("ttl_ms", uint64_t{0});
+                        if (observed && observed <= now && ttl_ms &&
+                            (now - observed) / 1000000ULL <= ttl_ms)
+                            hold_observed_ns = observed;
+                    }
+                } else if (field == "job_state" &&
+                           row.value("state", std::string{}) == "ok") {
+                    const uint64_t observed = row.value("t_mono_ns", uint64_t{0});
+                    const uint64_t now = clock_.mono_ns();
+                    const uint64_t ttl_ms = row.value("ttl_ms", uint64_t{0});
+                    if (observed && observed <= now && ttl_ms &&
+                        (now - observed) / 1000000ULL <= ttl_ms) {
+                        job_state = state;
+                        job_observed_ns = observed;
+                    }
                 }
             }
             if (terminal) {
@@ -1470,12 +1536,9 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
                     if (!active) continue;
                     affected_run = id;
                     run.discontinuity = *terminal;
-                    run.state = device::RunState::Faulted;
                     arbiter_.record_discontinuity(id, *terminal);
-                    appendEvent("mfg.run.state", id,
-                                {{"run_id", id}, {"state", "faulted"},
-                                 {"cause", discontinuityName(*terminal)},
-                                 {"terminal", true}});
+                    transitionRun(run, device::RunState::Faulted,
+                                  discontinuityName(*terminal));
                 }
                 try {
                     worker_call_("mfg_printer_adapter_close",
@@ -1509,6 +1572,39 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
                 projected.subject = attention_id;
                 projected.body = std::move(attention);
                 applyAttention(projected);
+            }
+            if (!terminal) {
+                for (auto& [id, run] : runs_) {
+                    if (run.device_id != device_id_.str()) continue;
+                    const bool active = run.state == device::RunState::Running ||
+                                        run.state == device::RunState::Holding ||
+                                        run.state == device::RunState::Held ||
+                                        run.state == device::RunState::Aborting;
+                    if (!active) continue;
+                    if (run.state == device::RunState::Holding &&
+                        ((job_state == "held" &&
+                          job_observed_ns > run.hold_requested_at_ns) ||
+                         hold_observed_ns > run.hold_requested_at_ns))
+                        transitionRun(run, device::RunState::Held, "hold_observed");
+                    if (job_state == "completed" && run.state == device::RunState::Running) {
+                        transitionRun(run, device::RunState::Completing, "print_completed_observed");
+                        transitionRun(run, device::RunState::Completed, "print_completed_observed");
+                    } else if (job_state == "aborted" || job_state == "cancelled") {
+                        if (run.state == device::RunState::Running ||
+                            run.state == device::RunState::Holding ||
+                            run.state == device::RunState::Held)
+                            transitionRun(run, device::RunState::Aborting,
+                                          "print_cancelled_observed");
+                        if (run.state == device::RunState::Aborting)
+                            transitionRun(run, device::RunState::Aborted,
+                                          "print_cancelled_observed");
+                    } else if (job_state == "faulted" || job_state == "error" ||
+                               (job_state == "completed" &&
+                                run.state != device::RunState::Completed)) {
+                        transitionRun(run, device::RunState::Faulted,
+                                      "print_job_" + job_state + "_observed");
+                    }
+                }
             }
             const auto snapshot_seq = journal_.head() + 1;
             for (auto& row : rows)
@@ -1810,8 +1906,7 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
             return refuse("mfg_run_device_mismatch",
                           "run is bound to a different selected device");
         const auto artifact = artifacts_.find(run->second.artifact_id);
-        if (endpoint_.endpoint_is_physical &&
-            !(isPrinter() && workerVirtualPrinter(printer_capability_)))
+        if (endpoint_.endpoint_is_physical)
             return refuse("mfg_physical_execute_not_qualified",
                           "physical execute is not advertised or enabled");
         if (artifact == artifacts_.end() ||
@@ -1860,6 +1955,20 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
             if (outcome.gate_report) detail["gate_report"] = gateReportJson(*outcome.gate_report);
             return refuse(outcome.code, outcome.why, std::move(detail));
         }
+        run->second.state = outcome.state;
+        const auto described = arbiter_.describe_run(run_id);
+        if (described && described->initiator) run->second.initiator = described->initiator;
+        approval->second.nonce.state = NonceState::Burned;
+        approval->second.nonce.burned_at_seq = outcome.nonce_burned_at_seq;
+        approval->second.initiator = run->second.initiator;
+        const auto commandUnknown = [&](std::string code, std::string why,
+                                        json detail = json::object()) {
+            transitionRun(run->second, device::RunState::Faulted, "command_outcome_unknown");
+            raiseRunAttention(run_id, "command_outcome_unknown",
+                              "start command outcome is unknown after nonce burn: " + why);
+            detail["nonce_burned_at_seq"] = *outcome.nonce_burned_at_seq;
+            return refuse(std::move(code), std::move(why), std::move(detail));
+        };
         if (isPrinter()) {
             const auto& artifact = artifacts_.at(run->second.artifact_id);
             std::string content;
@@ -1871,9 +1980,8 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
                  {"sha256", artifact.hash_sha256}},
                 failure);
             if (!uploaded)
-                return refuse("mfg_printer_upload_refused_after_nonce_burn",
-                              failure.body.value("message", "printer upload refused"),
-                              {{"nonce_burned_at_seq", *outcome.nonce_burned_at_seq}});
+                return commandUnknown("mfg_printer_upload_refused_after_nonce_burn",
+                                      failure.body.value("message", "printer upload refused"));
             json remote = uploaded->value(
                 "remote_artifact",
                 json{{"artifact_id", artifact.artifact_id}, {"sha256", artifact.hash_sha256}});
@@ -1884,23 +1992,15 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
                  {"authorization_token", token}},
                 failure);
             if (!started)
-                return refuse("mfg_program_start_refused_after_nonce_burn",
-                              failure.body.value("message", "printer start refused"),
-                              {{"nonce_burned_at_seq", *outcome.nonce_burned_at_seq}});
+                return commandUnknown("mfg_program_start_refused_after_nonce_burn",
+                                      failure.body.value("message", "printer start refused"));
         } else {
             auto started = adapter_->startProgram(
                 artifacts_.at(run->second.artifact_id).program_lines);
             if (!started.ok)
-                return refuse("mfg_program_start_refused_after_nonce_burn", started.why,
-                              {{"nonce_burned_at_seq", *outcome.nonce_burned_at_seq},
-                               {"snapshot", adapter_->snapshot()}});
+                return commandUnknown("mfg_program_start_refused_after_nonce_burn",
+                                      started.why, {{"snapshot", adapter_->snapshot()}});
         }
-        run->second.state = outcome.state;
-        const auto described = arbiter_.describe_run(run_id);
-        if (described && described->initiator) run->second.initiator = described->initiator;
-        approval->second.nonce.state = NonceState::Burned;
-        approval->second.nonce.burned_at_seq = outcome.nonce_burned_at_seq;
-        approval->second.initiator = run->second.initiator;
         return ok({{"state", device::to_string(outcome.state)},
                    {"nonce_burned_at_seq", *outcome.nonce_burned_at_seq},
                    {"gate_report_ref", outcome.gate_report ? outcome.gate_report->ref : run->second.gate_report_ref}});
@@ -1935,16 +2035,24 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         const auto outcome = arbiter_.hold(run_id, initiator, kind);
         for (const auto& record : journal_.replay(before + 1)) publishEvent(record.kind, record.subject, record.seq, record.body);
         if (!outcome.ok) return refuse(outcome.code, outcome.why);
+        runs_.at(run_id).state = outcome.state;
+        runs_.at(run_id).hold_requested_at_ns = clock_.mono_ns();
         if (isPrinter()) {
             auto paused = callWorker("mfg_printer_adapter_pause",
                                      {{"adapter_id", device_id_.str()}}, failure);
-            if (!paused) return failure;
+            if (!paused) {
+                raiseRunAttention(run_id, "hold_command_outcome_unknown",
+                                  "printer pause was not confirmed by the worker");
+                return failure;
+            }
         } else {
             const auto device_outcome = adapter_->requestHold();
-            if (!device_outcome.ok)
+            if (!device_outcome.ok) {
+                raiseRunAttention(run_id, "hold_command_outcome_unknown",
+                                  "controller feed hold write failed: " + device_outcome.why);
                 return refuse("mfg_device_hold_refused", device_outcome.why);
+            }
         }
-        runs_.at(run_id).state = outcome.state;
         return ok({{"state", device::to_string(outcome.state)}, {"at_seq", *outcome.at_seq}});
     }
     if (method == "mfg_run_resume") {
@@ -1980,8 +2088,9 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
                 code = "resume_forbidden_after_power_loss"; break;
         }
         if (observed_discontinuity == device::RunDiscontinuity::None &&
-            arbiter_run->state != device::RunState::Held)
-            return refuse("run.not_held", "resume refusal applies only to a held run");
+            arbiter_run->state != device::RunState::Held &&
+            arbiter_run->state != device::RunState::Holding)
+            return refuse("run.not_held", "resume refusal applies only to a held or holding run");
         const auto seq = appendEvent("mfg.arbiter.attempt", run_id,
             {{"action", "resume"},
              {"initiator", {{"kind", initiator.kind == gates::InitiatorKind::Human ? "human" : "agent"},

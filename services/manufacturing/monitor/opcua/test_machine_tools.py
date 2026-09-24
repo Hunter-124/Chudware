@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from services.manufacturing.monitor.mtconnect import parse_current, parse_probe
 from services.manufacturing.monitor.normalize import EndpointContext
 
-from .codec import BOOLEAN, STRING, UINT32, DataValue, NodeId, Variant
+from .codec import BOOLEAN, NULL, STRING, UINT32, DataValue, NodeId, Variant
 from .machine_tools import (
     MachineToolShape,
     NodeReading,
@@ -147,3 +149,89 @@ def test_supported_emergency_stop_shape_maps_to_condition_row() -> None:
     assert row.quality == "bad"
     assert row.why == "source reported active emergency-stop condition"
     assert row.raw["value"]["value"] is True
+
+
+@pytest.mark.parametrize("variant", [None, Variant(), Variant(NULL, "ACTIVE"), Variant(STRING)])
+def test_missing_or_typeless_value_is_never_good_observation(variant: Variant | None) -> None:
+    path = "/MachineTool/Monitoring/ExecutionState"
+    row = map_machine_tools(
+        {path: DataValue(variant, 0, STAMP, STAMP)},
+        REMOTE,
+        device_name="mill-one",
+        shapes=(_shape(path),),
+    ).observations[0]
+
+    assert row.quality == "unavailable"
+    assert row.quality_src == "MISSING_TYPED_VALUE"
+    assert row.state == "unknown"
+    assert row.why == "missing typed value"
+    assert row.v_num is row.v_text is row.v_json is None
+    assert row.evidence_eligible is False
+
+
+@pytest.mark.parametrize(
+    ("variant", "reason_code", "reason"),
+    [
+        (None, "MISSING_TYPED_VALUE", "missing typed value"),
+        (Variant(), "MISSING_TYPED_VALUE", "missing typed value"),
+        (Variant(BOOLEAN, None), "MISSING_TYPED_VALUE", "missing typed value"),
+        (Variant(NULL, False), "MISSING_TYPED_VALUE", "missing typed value"),
+        (
+            Variant(STRING, ""),
+            "INVALID_EMERGENCY_STOP_TYPE",
+            "EmergencyStop requires a Boolean scalar",
+        ),
+        (
+            Variant(STRING, "false"),
+            "INVALID_EMERGENCY_STOP_TYPE",
+            "EmergencyStop requires a Boolean scalar",
+        ),
+        (
+            Variant(BOOLEAN, 0),
+            "INVALID_EMERGENCY_STOP_TYPE",
+            "EmergencyStop requires a Boolean scalar",
+        ),
+        (
+            Variant(BOOLEAN, "false"),
+            "INVALID_EMERGENCY_STOP_TYPE",
+            "EmergencyStop requires a Boolean scalar",
+        ),
+        (
+            Variant(BOOLEAN, [False], True),
+            "INVALID_EMERGENCY_STOP_TYPE",
+            "EmergencyStop requires a Boolean scalar",
+        ),
+    ],
+)
+def test_invalid_emergency_stop_value_cannot_clear_condition(
+    variant: Variant | None, reason_code: str, reason: str
+) -> None:
+    path = "/MachineTool/Monitoring/EmergencyStop"
+    row = map_machine_tools(
+        {path: DataValue(variant, 0, STAMP, STAMP)},
+        REMOTE,
+        device_name="mill-one",
+        shapes=(_shape(path),),
+    ).conditions[0]
+
+    assert row.quality == "unavailable"
+    assert row.state == "unknown"
+    assert row.severity == "unavailable"
+    assert row.transition == "unavailable"
+    assert row.text is None
+    assert row.why == reason
+    assert row.quality_src == reason_code
+
+
+def test_boolean_false_emergency_stop_can_clear_condition() -> None:
+    path = "/MachineTool/Monitoring/EmergencyStop"
+    row = map_machine_tools(
+        {path: DataValue(Variant(BOOLEAN, False), 0, STAMP, STAMP)},
+        REMOTE,
+        device_name="mill-one",
+        shapes=(_shape(path),),
+    ).conditions[0]
+    assert row.quality == "good"
+    assert row.state == "ok"
+    assert row.transition == "cleared"
+    assert row.text == "Emergency stop clear"

@@ -138,42 +138,6 @@ struct LaneRig {
 };
 
 
-struct StartedPrinterRun {
-    std::string run_id;
-    std::string approval_id;
-};
-
-StartedPrinterRun startPrinterRun(ManufacturingLane& lane,
-                                  const std::string& device_id,
-                                  const std::string& lease_id) {
-    const auto artifact = call(
-        lane, "mfg_artifact_register",
-        {{"device_id", device_id}, {"lease_id", lease_id},
-         {"artifact", {{"kind", "print_job"}, {"lines", json::array({"G28", "G1 X1"})},
-                       {"slicer_profile_hash", "slicer:terminal"}}}});
-    const auto preflight = call(
-        lane, "mfg_preflight_run",
-        {{"device_id", device_id}, {"lease_id", lease_id},
-         {"artifact_id", artifact.at("artifact").at("artifact_id")},
-         {"job", {{"job_id", "job:terminal"}, {"setup_revision", 1}, {"quantity", 1}}}});
-    const std::string run_id = preflight.at("run_id");
-    const auto proposal = call(
-        lane, "mfg_approval_propose",
-        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
-         {"exercisable_by", "human_only"}, {"expiry_ttl_ms", 60000},
-         {"attendance", {{"mode", "physical_attended"}, {"attested_by", "operator"}}}});
-    const auto approval = call(
-        lane, "mfg_approval_create",
-        {{"device_id", device_id}, {"lease_id", lease_id},
-         {"proposal_id", proposal.at("proposal").at("proposal_id")}});
-    const std::string approval_id = approval.at("approval").at("approval_id");
-    const auto started = call(
-        lane, "mfg_run_start",
-        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
-         {"approval_id", approval_id}});
-    REQUIRE(started.at("state") == "running");
-    return {run_id, approval_id};
-}
 
 }  // namespace
 
@@ -384,6 +348,64 @@ TEST_CASE("request-asserted initiator is refused and authenticated nonce is sing
     CHECK(replay.at("code") == "mfg_run_authorization_refresh_refused");
 }
 
+TEST_CASE("post-burn stream refusal faults the run and requires operator attention") {
+    LaneRig rig;
+    rig.claim();
+    rig.connect();
+    const auto artifact = call(
+        rig.lane, "mfg_artifact_register",
+        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+         {"artifact", {{"kind", "nc"},
+                       {"lines", json::array({"G1 X" + std::string(200, '9')})},
+                       {"post_profile_id", "emulator"}}}});
+    const std::string run_id = rig.preflight(artifact.at("artifact").at("artifact_id")).at("run_id");
+    const std::string approval_id = rig.approval(run_id, "human_only");
+    const auto refused = rig.start(run_id, approval_id, "human", true);
+    CHECK(refused.at("code") == "mfg_program_start_refused_after_nonce_burn");
+    CHECK(refused.at("detail").at("nonce_burned_at_seq").get<uint64_t>() > 0);
+    CHECK(call(rig.lane, "mfg_run_describe", {{"run_id", run_id}})
+              .at("run").at("state") == "faulted");
+    CHECK(call(rig.lane, "mfg_approval_inspect", {{"approval_id", approval_id}})
+              .at("approval").at("status") == "burned");
+    const auto attention = call(rig.lane, "mfg_attention_list");
+    REQUIRE(attention.at("attention").size() == 1);
+    CHECK(attention.at("attention").at(0).at("reason") == "command_outcome_unknown");
+    const auto transitions = call(rig.lane, "mfg_journal_query",
+        {{"subject", run_id}, {"kinds", json::array({"mfg.run.state"})}});
+    CHECK(std::any_of(transitions.at("records").begin(),
+                      transitions.at("records").end(), [](const json& record) {
+        return record.at("body").value("state", std::string{}) == "faulted" &&
+               record.at("body").value("cause", std::string{}) == "command_outcome_unknown";
+    }));
+}
+
+TEST_CASE("a commander cannot release while a run is active or holding") {
+    LaneRig rig;
+    rig.claim();
+    rig.connect();
+    const auto artifact_id = rig.registerArtifact();
+    const std::string run_id = rig.preflight(artifact_id).at("run_id");
+    const auto approval_id = rig.approval(run_id, "human_only");
+    REQUIRE(rig.start(run_id, approval_id, "human").at("state") == "running");
+    const json lease{{"device_id", rig.device_id}, {"lease_id", rig.lease_id}};
+    CHECK(call(rig.lane, "mfg_device_release", lease, true).at("code") ==
+          "mfg_device_release_active_run");
+    CHECK(call(rig.lane, "mfg_run_hold",
+          {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+           {"run_id", run_id}}).at("state") == "holding");
+    const auto transitions = call(rig.lane, "mfg_journal_query",
+        {{"subject", run_id}, {"kinds", json::array({"mfg.run.state"})}});
+    CHECK(std::none_of(transitions.at("records").begin(),
+                       transitions.at("records").end(), [](const json& record) {
+        return record.at("body").value("state", std::string{}) == "held";
+    }));
+    CHECK(call(rig.lane, "mfg_device_release", lease, true).at("code") ==
+          "mfg_device_release_active_run");
+    CHECK(call(rig.lane, "mfg_run_abort",
+          {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
+           {"run_id", run_id}}).at("state") == "aborting");
+}
+
 TEST_CASE("hold and abort are accepted but alarm permanently forbids resume") {
     LaneRig rig;
     rig.claim();
@@ -397,7 +419,7 @@ TEST_CASE("hold and abort are accepted but alarm permanently forbids resume") {
     const auto held = call(rig.lane, "mfg_run_hold",
         {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
          {"run_id", run_id}, {"kind", "feed_hold"}});
-    CHECK(held.at("state") == "held");
+    CHECK(held.at("state") == "holding");
     const auto resume_without_discontinuity = call(rig.lane, "mfg_run_resume",
         {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
          {"run_id", run_id}}, true);
@@ -416,10 +438,6 @@ TEST_CASE("hold and abort are accepted but alarm permanently forbids resume") {
     CHECK(resume.at("code") == "no_alarm_since_hold");
     CHECK(resume.at("message").get<std::string>().find("author a new run") != std::string::npos);
 
-    const auto aborted = call(rig.lane, "mfg_run_abort",
-        {{"device_id", rig.device_id}, {"lease_id", rig.lease_id},
-         {"run_id", run_id}});
-    CHECK(aborted.at("state") == "aborting");
 }
 
 TEST_CASE("run describe deterministically advances a completed emulator stream") {
@@ -862,7 +880,7 @@ TEST_CASE("allowlist epoch change closes and falsifies an active claim") {
           "allowlist_epoch_changed");
 }
 
-TEST_CASE("printer adapters route through the injected worker after arbitration") {
+TEST_CASE("physical printer worker cannot promote execute authority") {
     TempDirectory temp;
     auto entry = commissioned(chudware::device::TransportKind::Tcp,
                               chudware::device::MachineClass::FdmPrinterEnclosed,
@@ -954,44 +972,20 @@ TEST_CASE("printer adapters route through the injected worker after arbitration"
     const auto refused = call(
         lane, "mfg_run_start",
         {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
-         {"approval_id", approval_id},
-         {"initiator", {{"kind", "agent"}, {"identity", "planner"},
-                        {"seat", "agent-seat"}, {"agent_run_id", "agent:test"}}}},
-        true);
-    CHECK(refused.at("code") == "mfg_initiator_identity_assertion_forbidden");
+         {"approval_id", approval_id}}, true);
+    CHECK(refused.at("code") == "mfg_physical_execute_not_qualified");
+    CHECK(std::find(methods.begin(), methods.end(), "mfg_printer_adapter_upload") ==
+          methods.end());
     CHECK(std::find(methods.begin(), methods.end(), "mfg_printer_adapter_start") ==
           methods.end());
-
-    const auto started = call(
-        lane, "mfg_run_start",
-        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id},
-         {"approval_id", approval_id}});
-    CHECK(started.at("state") == "running");
-    REQUIRE(arguments.count("mfg_printer_adapter_start") == 1);
-    const auto& token =
-        arguments.at("mfg_printer_adapter_start").at("authorization_token");
-    CHECK(token.is_string());
-    CHECK(token.get<std::string>().rfind("run-token:", 0) == 0);
-    CHECK_FALSE(arguments.at("mfg_printer_adapter_start").contains("approval_id"));
-    CHECK_FALSE(arguments.at("mfg_printer_adapter_start").contains("lease_id"));
-
-    const auto held = call(
-        lane, "mfg_run_hold",
-        {{"device_id", device_id}, {"lease_id", lease_id},
-         {"run_id", run_id}, {"kind", "feed_hold"}});
-    CHECK(held.at("state") == "held");
-    CHECK(methods.back() == "mfg_printer_adapter_pause");
-    const auto aborted = call(
-        lane, "mfg_run_abort",
-        {{"device_id", device_id}, {"lease_id", lease_id}, {"run_id", run_id}});
-    CHECK(aborted.at("state") == "aborting");
-    CHECK(methods.back() == "mfg_printer_adapter_cancel");
+    const auto inspected = call(lane, "mfg_approval_inspect", {{"approval_id", approval_id}});
+    CHECK(inspected.at("approval").at("status") == "active");
     call(lane, "mfg_device_disconnect",
          {{"device_id", device_id}, {"lease_id", lease_id}});
     CHECK(methods.back() == "mfg_printer_adapter_close");
 }
 
-TEST_CASE("printer terminal telemetry faults the run and raises attention") {
+TEST_CASE("printer terminal telemetry closes the claim and raises attention") {
     TempDirectory temp;
     auto entry = commissioned(chudware::device::TransportKind::Tcp,
                               chudware::device::MachineClass::FdmPrinterEnclosed,
@@ -1038,7 +1032,6 @@ TEST_CASE("printer terminal telemetry faults the run and raises attention") {
     const std::string lease_id = claimed.at("lease").at("lease_id");
     call(lane, "mfg_device_connect",
          {{"device_id", device_id}, {"lease_id", lease_id}});
-    const auto run = startPrinterRun(lane, device_id, lease_id);
 
     std::vector<json> events;
     lane.setEventSink([&](const std::string& line) {
@@ -1051,10 +1044,6 @@ TEST_CASE("printer terminal telemetry faults the run and raises attention") {
     CHECK(telemetry.at("snapshot").at("src") == "simulated");
     CHECK(row.at("seq") == telemetry.at("snapshot").at("seq"));
     CHECK(row.at("seq") != 999);
-    const auto described =
-        call(lane, "mfg_run_describe", {{"run_id", run.run_id}});
-    CHECK(described.at("run").at("state") == "faulted");
-    CHECK(described.at("run").at("discontinuity") == "alarm");
     const auto attention = call(lane, "mfg_attention_list");
     REQUIRE(attention.at("attention").size() == 1);
     CHECK(attention.at("attention").at(0).at("reason") ==
@@ -1063,18 +1052,6 @@ TEST_CASE("printer terminal telemetry faults the run and raises attention") {
         return event.at("event") == "mfg.attention" &&
                event.at("data").at("action") == "raised";
     }));
-    const auto resume = call(
-        lane, "mfg_run_resume",
-        {{"device_id", device_id}, {"lease_id", lease_id},
-         {"run_id", run.run_id}},
-        true);
-    CHECK(resume.at("code") == "no_alarm_since_hold");
-    const auto hold = call(
-        lane, "mfg_run_hold",
-        {{"device_id", device_id}, {"lease_id", lease_id},
-         {"run_id", run.run_id}, {"kind", "feed_hold"}},
-        true);
-    CHECK(hold.at("code") == "run.terminal");
     const auto reconnect = call(
         lane, "mfg_device_connect",
         {{"device_id", device_id}, {"lease_id", lease_id}}, true);

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 from pathlib import Path
 import re
 
@@ -83,6 +84,47 @@ def test_unavailable_is_unknown_and_never_exposes_last_good_as_current() -> None
     assert row.why == "source reported UNAVAILABLE"
     assert row.v_num is row.v_text is row.v_json is None
     assert row.last_ok is None
+    assert row.evidence_eligible is False
+
+
+@pytest.mark.parametrize("text", ["NaN", "Infinity", "-Infinity", "1e309", "garbage", ""])
+def test_invalid_numeric_sample_cannot_be_good_evidence(text: str) -> None:
+    probe = parse_probe(fixture("probe_v2.xml"), CONTEXT)
+    current_xml = fixture("current_running_v2.xml").replace(
+        ">12.5</Position>", f">{text}</Position>"
+    )
+    rows = {
+        row.source_item_id: row for row in parse_current(current_xml, CONTEXT, probe).observations
+    }
+    row = rows["x_pos"]
+
+    assert row.quality == "unavailable"
+    assert row.quality_src == "INVALID_NUMERIC_VALUE"
+    assert row.state == "unknown"
+    assert row.why == "numeric sample is non-finite or unparseable"
+    assert row.v_num is row.v_text is row.v_json is None
+    assert row.evidence_eligible is False
+    assert row.raw["text"] == text
+    assert rows["exec"].quality == "good"
+    assert rows["exec"].v_text == "ACTIVE"
+
+
+def test_numeric_unit_conversion_overflow_is_unavailable() -> None:
+    probe = parse_probe(fixture("probe_v2.xml"), CONTEXT)
+    position = probe.data_item_map()["x_pos"]
+    inch_position = replace(position, unit_src="INCH")
+    current_xml = fixture("current_running_v2.xml").replace(
+        ">12.5</Position>", ">1e308</Position>"
+    )
+    row = next(
+        row for row in parse_current(current_xml, CONTEXT, {"x_pos": inch_position}).observations
+        if row.source_item_id == "x_pos"
+    )
+
+    assert row.quality == "unavailable"
+    assert row.quality_src == "INVALID_NUMERIC_VALUE"
+    assert row.state == "unknown"
+    assert row.v_num is row.v_text is row.v_json is None
     assert row.evidence_eligible is False
 
 

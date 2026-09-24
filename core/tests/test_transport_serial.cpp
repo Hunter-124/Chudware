@@ -288,6 +288,28 @@ TEST_CASE("POSIX serial transport enforces allowlist and exclusive ownership") {
     second.close();
 }
 
+TEST_CASE("POSIX serial max deadline services silently without awaiting data") {
+    TempDirectory temporary;
+    DeviceAllowlist allowlist(temporary.path / "devices.allowlist");
+    PseudoTerminal pty;
+    const auto entry = serialEntry(pty.slave_path);
+    std::string why;
+    REQUIRE(allowlist.upsert(entry, &why));
+    SerialTransportOptions options;
+    options.operator_note = entry.operator_note;
+    SerialTransport transport(allowlist, MachineClass::Emulated, options);
+    REQUIRE(transport.open({"pty-grbl", pty.slave_path, false}).ok);
+
+    std::thread delayed_peer([&] {
+        std::this_thread::sleep_for(200ms);
+        const char byte = '?';
+        (void)::write(pty.master, &byte, 1);
+    });
+    const auto polled = transport.poll(chudware::device::Deadline::max());
+    delayed_peer.join();
+    CHECK(polled.events.empty());
+}
+
 TEST_CASE("POSIX serial handles partial writes and bounded chunked status reads") {
     TempDirectory temporary;
     DeviceAllowlist allowlist(temporary.path / "devices.allowlist");

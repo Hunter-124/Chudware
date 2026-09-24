@@ -461,9 +461,14 @@ TEST_CASE("human-or-agent starts once with provenance and alarm can never transp
     CHECK(replay.code == "tier0:approval.present_unexpired_unburned");
     CHECK(replay.why.find("burned") != std::string::npos);
 
-    REQUIRE(rig.arbiter.hold(run_id,
+    const auto holding = rig.arbiter.hold(run_id,
         {mfg::gates::InitiatorKind::Human, "operator", "seat", std::nullopt},
-        mfg::HoldKind::FeedHold).ok);
+        mfg::HoldKind::FeedHold);
+    REQUIRE(holding.ok);
+    CHECK(holding.state == device::RunState::Holding);
+    CHECK(rig.arbiter.describe_run(run_id)->state == device::RunState::Holding);
+    CHECK_FALSE(rig.arbiter.resume(run_id, agent).ok);
+    REQUIRE(rig.arbiter.observe_state(run_id, device::RunState::Held, "hold_observed").ok);
     REQUIRE(rig.arbiter.record_discontinuity(run_id, device::RunDiscontinuity::Alarm));
     const auto resume = rig.arbiter.resume(run_id, agent);
     CHECK_FALSE(resume.ok);
@@ -483,6 +488,8 @@ TEST_CASE("either initiator may request hold or abort") {
     const mfg::Initiator agent{mfg::gates::InitiatorKind::Agent, "planner", "agent-seat", "agent-run:2"};
     REQUIRE(rig.arbiter.start(run_id, approval_id, human).ok);
     REQUIRE(rig.arbiter.hold(run_id, agent, mfg::HoldKind::ControlledStop).ok);
+    CHECK(rig.arbiter.describe_run(run_id)->state == device::RunState::Holding);
+    REQUIRE(rig.arbiter.observe_state(run_id, device::RunState::Held, "hold_observed").ok);
     REQUIRE(rig.arbiter.resume(run_id, human).ok);
     const auto aborted = rig.arbiter.abort(run_id, agent);
     CHECK(aborted.ok);

@@ -220,5 +220,6 @@ TEST_CASE("run state validator rejects transparent resume after alarm") {
     CHECK_FALSE(illegal.allowed);
     CHECK(illegal.why.find("resume forbidden") != std::string::npos);
     CHECK(validate_run_transition(RunState::Held, RunState::Resuming).allowed);
+    CHECK(validate_run_transition(RunState::Holding, RunState::Aborting).allowed);
     CHECK_FALSE(validate_run_transition(RunState::Faulted, RunState::Running).allowed);
 }

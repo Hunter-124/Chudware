@@ -83,6 +83,7 @@ private:
         std::optional<InitiatorProvenance> initiator;
         device::RunDiscontinuity discontinuity = device::RunDiscontinuity::None;
         bool completion_observed = false;
+        uint64_t hold_requested_at_ns = 0;
         device::Seq created_at_seq = 0;
     };
 
@@ -140,6 +141,9 @@ private:
                       device::Seq seq, const nlohmann::json& body);
     void serviceDevice();
     device::CapabilityReport capabilityReport() const;
+    void transitionRun(RunRecord& run, device::RunState state, std::string_view cause);
+    void raiseRunAttention(std::string_view run_id, std::string_view reason,
+                           std::string_view why);
     FreshValue<device::DeviceState> deviceState() const;
     nlohmann::json artifactJson(const ArtifactRecord& artifact) const;
     nlohmann::json runJson(const RunRecord& run) const;

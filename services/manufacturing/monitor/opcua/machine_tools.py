@@ -24,7 +24,7 @@ from ..normalize import (
     device_key,
     item_key,
 )
-from .codec import DataValue, NodeId, Variant
+from .codec import BOOLEAN, NULL, DataValue, NodeId, Variant
 
 MACHINE_TOOLS_NAMESPACE = "http://opcfoundation.org/UA/MachineTool/"
 PROFILE_NAME = "OPC UA for Machine Tools 1.01 closed read-only subset"
@@ -260,16 +260,23 @@ def map_machine_tools(
                 quality_src = "MISSING_SOURCE_TIMESTAMP"
                 why = "missing source timestamp"
         usable = quality == "good" and source_ns is not None
+        if usable:
+            variant = data_value.value
+            if variant is None or variant.type_id == NULL or variant.value is None:
+                quality = "unavailable"
+                quality_src = "MISSING_TYPED_VALUE"
+                why = "missing typed value"
+                usable = False
+            elif shape.condition and (
+                variant.type_id != BOOLEAN or variant.is_array or type(variant.value) is not bool
+            ):
+                quality = "unavailable"
+                quality_src = "INVALID_EMERGENCY_STOP_TYPE"
+                why = "EmergencyStop requires a Boolean scalar"
+                usable = False
 
         if shape.condition:
-            active = (
-                bool(data_value.value.value)
-                if usable
-                and data_value is not None
-                and data_value.value is not None
-                and not data_value.value.is_array
-                else None
-            )
+            active = data_value.value.value if usable else None
             if active is None:
                 severity = "unavailable"
                 transition = "unavailable"

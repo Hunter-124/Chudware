@@ -104,7 +104,7 @@ void GrblAdapter::service(Seq journal_seq) {
                             : now + config_.poll_interval_ns;
     }
 
-    const PollResult result = transport_.poll(std::chrono::steady_clock::time_point::max());
+    const PollResult result = transport_.poll(std::chrono::steady_clock::now());
     for (const auto& event : result.events) {
         processEvent(event, journal_seq);
         if (!open_) break;

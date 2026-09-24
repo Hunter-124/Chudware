@@ -4712,3 +4712,35 @@ initialization; all retained loaded fallback images. Context loss/restoration
 and pixel-stable reduced-motion frames passed for all three renderers.
 Responsive homepage checks found one H1, no horizontal overflow, and no header
 LinkedIn link; About links to the owner-provided profile.
+
+## 2026-09-23 — ship-readiness sweep: 19 subsystem audits, ~95 defects fixed
+
+Read-only scouts audited host shell/tabs, ribbon/PM, sketcher, viewport, workspaces, core
+doc/geom, hostd/agent run, sim/mate/CAM, services/agent, MCP, PLM/parts/installer, the web
+gateway, build/packaging, then ECAD, drawing, sim GUI, manufacturing, settings/recovery and
+import/export; fix agents repaired disjoint slices, each commit gated by core+host builds,
+core ctest (108/108), host ctest (25/25), the touched pytest units, the gateway suite and
+headless `CHUDWARE_SHOT` smokes (m1/sketch/asm/fea/drawing/flow). Highlights: picking ids
+now carry 12-bit body ordinals (assemblies >255 bodies used to alias) and `parseAicm`
+refuses out-of-range face/edge/index data; fillet Full Round/Face and draft Parting
+Line/Step (never compiled) are removed from the forms and refuse by name, while chamfer
+Vertex (SolidWorks corner cut, d³/6) and Distance-Angle are real; CAM post/sim/audit
+surface dropped operations (`incomplete` + `warnings`, GUI export gated), G95 F words are
+mm/rev, spindle-off cutting is an audit error; manufacturing hold/start only claim
+Held/Running after the device accepts, a post-nonce-burn failure journals
+`command_outcome_unknown`→Faulted, serial polls are bounded, releases with an active run
+refuse, and endpoint physicality alone governs execute authorization; hostd no longer
+self-kills multi-hour agent turns at the 60-min watchdog; MCP CAD writes honor the
+credential denylist and realpath containment; PLM item paths are contained and sync
+refuses to clobber unsaved work; web mesh handoffs need a per-account doc grant, chat is
+team-scoped, and web BYOK turns run in a credential-isolated `chud` process (temp
+HOME/XDG/`CHUDCODE_CODING_AGENT_DIR`, scrubbed env, key-digest proof from the gateway).
+glTF/3MF/DXF imports now scale to mm; partial STEP/IGES transfers keep bodies and warn.
+Deferred: WorkerBridge is still one serialized worker for all tenants (hostd finding 2);
+keyless pooled/subscription web turns still use the host's ambient Chudcode auth; Parts
+Library "Insert" creates a new part (says so) rather than inserting into the open
+assembly; Auto Balloon / Geometry Analysis ribbon rows were removed, not implemented; an
+idle chat socket removed from a team keeps receiving until reconnect; the Windows-only
+`revealInFileManager` rewrite is uncompiled here. Gotcha: `./build.sh core` after a
+local-polymesh configure used to strand `POLYMESH_ROOT` at the private checkout
+(`<checkout>/src` has no CMakeLists) — `reconfigure_core_tree` now restores the managed root.

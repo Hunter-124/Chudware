@@ -15,7 +15,7 @@
 #  The ui/imgui / ui/abstract (AI-CAD2) app is retired. host/ is the single
 #  cross-platform GUI target (builds on Linux with GCC/Clang, macOS with
 #  AppleClang, and Windows with MSVC). Binary:
-#  host/build-$PLATFORM_SUFFIX/bin/chudware (plus Chudware and Chudware compat symlinks)
+#  host/build-$PLATFORM_SUFFIX/bin/chudware
 #
 #  Usage:
 #    ./build.sh            Default: build the host GUI.
@@ -237,7 +237,14 @@ reconfigure_core_tree() {
         return 0
     fi
     # An empty value CLEARS the cache entry, which is exactly how a tree returns to the pin.
-    cmake -S "$ROOT/core" -B "$tree" -DPOLYMESH_SOURCE_DIR="${CHUDWARE_POLYMESH_ROOT:-}"
+    # The local-source configure FORCE-cached POLYMESH_ROOT to that checkout, so returning to
+    # the pin must also restore the managed root or configure looks for <checkout>/src.
+    if [ -n "$POLYMESH_SOURCE_ARG" ]; then
+        cmake -S "$ROOT/core" -B "$tree" "$POLYMESH_SOURCE_ARG"
+    else
+        cmake -S "$ROOT/core" -B "$tree" -DPOLYMESH_SOURCE_DIR= \
+              -DPOLYMESH_ROOT="$ROOT/third_party/polymesh"
+    fi
 }
 
 # `./build.sh core` means every consumed native engine is current. Rebuild each configured

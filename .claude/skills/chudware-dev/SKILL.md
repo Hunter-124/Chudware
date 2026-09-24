@@ -143,6 +143,15 @@ judgment).
   docs use floor `CHUDWARE_DOC_GC_AGENT_GRACE_S` (default 1800 s) so mission-built parts stay
   openable from the GUI after the agent detaches; `CHUDWARE_DOC_GC=0` disables
   (`core/hostd/doc_registry.*`).
+- **Two worker lanes (2026-09-24).** hostd runs an agent-lane and a general-lane services
+  worker (`WorkerBridge::forMethod`, `core/hostd/worker_bridge.cpp`). A new stateful agent
+  RPC family MUST be added to the agent prefix list or it lands on the general lane (a
+  different process, blind to Chudcode sessions). Worker-side files shared across processes
+  need flocks (vault config and Box mirror drain already have them), not threading locks.
+- **Web actors never use ambient `chud` auth (2026-09-24).** BYOK, personal Claude OAuth and
+  the pool (`CHUDWARE_WEB_POOL_API_KEY`/`_PROVIDER`/`_MODEL`) each run in a credential-scoped
+  Chudcode process with a gateway digest proof; a web actor without a servable credential
+  refuses by name. Desktop turns keep the host login.
 - **What keeps hostd alive is WORK, not sockets** (2026-08-27). `Server::idleExpired` and the
   drain both gate on `pinningClients()`, never `status_.clients`: a `gui` client always pins
   (the app being open IS the reason the daemon exists), any other client pins only while it

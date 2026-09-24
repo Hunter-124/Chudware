@@ -4744,3 +4744,35 @@ idle chat socket removed from a team keeps receiving until reconnect; the Window
 `revealInFileManager` rewrite is uncompiled here. Gotcha: `./build.sh core` after a
 local-polymesh configure used to strand `POLYMESH_ROOT` at the private checkout
 (`<checkout>/src` has no CMakeLists) — `reconfigure_core_tree` now restores the managed root.
+
+## 2026-09-24 — closing the sweep's deferred items
+
+Everything the 2026-09-23 entry deferred is now real. **Worker lanes:** hostd owns two
+services workers (`WorkerBridge::agent()` / `general()`, `forMethod` in
+`core/hostd/worker_bridge.cpp`): agent_/chudcode_/session_/subscription_/skills_/triggers_/
+packs_/ai_roles_/model_rankings_/bench_/memory_/subagent_/dag_/ai_prompt_/ai_tool_ plus
+`worker_control_info`/`rule_create` go to the agent lane; everything else (PLM, mfg, parts,
+ECAD, sim, unknown) goes to general. The child learns its lane from
+`CHUDWARE_HOSTD_WORKER_LANE`; a general worker skips Chudcode/control/bench startup, an
+unflagged worker keeps the old all-in-one behavior. Because two processes now share files,
+PLM vault config and the Box mirror drain take sibling-file flocks. Pinned by
+`services/mcp/test_hostd_worker_bridge.py` (a blocked agent call does not block a general
+call). **Web credentials:** no web actor ever reaches the host's ambient `chud` auth. BYOK,
+personal Claude OAuth (`ANTHROPIC_OAUTH_TOKEN` in a temp HOME) and the pool (dedicated
+`CHUDWARE_WEB_POOL_API_KEY`/`_PROVIDER` default openrouter/`_MODEL`, injected by the gateway
+with a digest proof) all run in credential-scoped processes; an unset pool key refuses
+`pool_credential_unconfigured`; Codex subscriptions refuse `subscription_isolation_unsupported`
+(Chudcode 0.3.0 has no isolated Codex bearer injection); the model catalogue lists only what
+the resolver can serve that caller. RUNBOOK documents the env. **Chat:** team/org removal,
+admin demotion, deletion and suspension close affected sockets (4403) on their own loop.
+**Auto Balloon** (`drawing_auto_balloon`): one balloon per BOM item anchored on that
+component's visible outline, projection computed only on demand and cached per
+view+source revision (ordinary `drawing_get` pays nothing). **Geometry Analysis**
+(`eval_geometry_analysis`, `core/geom/geometry_analysis.*`): BRepCheck validity, small/sliver
+faces, short/open edges, free-end gaps, opt-in G1 breaks; its own Evaluate dialog. Both
+ribbon rows are back. **Parts Insert** into an open assembly saves a `.step+` to the project
+then runs the normal `insertComponent`. **Host:** GL-thread EngineClient calls are bounded
+(5–10 s) and a timeout never reads as an empty list; Windows `revealInFileManager` passes a
+mingw `-fsyntax-only` check and links shell32/ole32 (still unexercised at runtime). Known,
+pre-existing: `CHUDWARE_SHOT=flow` logs "numeric result did not arrive within 180 s" while
+exiting 0.

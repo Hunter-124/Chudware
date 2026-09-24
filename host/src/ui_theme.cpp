@@ -940,12 +940,23 @@ const ViewportBackdropInfo& viewportBackdrop() { return gViewportBackdrop; }
 
 void setLuminanceSampler(LuminanceSampler fn) { gLuminanceSampler = fn; }
 float sampleLuminance(ImVec2 mn, ImVec2 mx) {
-    return gLuminanceSampler ? gLuminanceSampler(mn, mx) : -1.f;
+    const float lum = gLuminanceSampler ? gLuminanceSampler(mn, mx) : -1.f;
+    return std::isfinite(lum) && lum >= 0.f && lum <= 1.f ? lum : -1.f;
 }
 
 void setBackdropStatsSampler(BackdropStatsSampler fn) { gBackdropStatsSampler = fn; }
 bool sampleBackdropStats(ImVec2 mn, ImVec2 mx, BackdropStats& out) {
-    return gBackdropStatsSampler ? gBackdropStatsSampler(mn, mx, out) : false;
+    BackdropStats stats;
+    if (!gBackdropStatsSampler || !gBackdropStatsSampler(mn, mx, stats) ||
+        !std::isfinite(stats.lum) || stats.lum < 0.f || stats.lum > 1.f ||
+        !std::isfinite(stats.variance) || stats.variance < 0.f || stats.variance > 0.25f ||
+        !std::isfinite(stats.hue) || stats.hue < 0.f || stats.hue > 360.f ||
+        !std::isfinite(stats.sat) || stats.sat < 0.f || stats.sat > 1.f) {
+        out = BackdropStats{};
+        return false;
+    }
+    out = stats;
+    return true;
 }
 
 // ---- v2.1 colored glass config (see ui_theme.h GlassStyle for sentinel semantics) ----------
@@ -1008,7 +1019,7 @@ static AdaptiveSurface adaptiveSurfaceStyled(float avgLuminance, GlassGroup grou
     AdaptiveSurface out{};
     out.group = group;
     out.contrastBoost = rs.textContrastBoost;
-    if (avgLuminance < 0.f) {
+    if (!std::isfinite(avgLuminance) || avgLuminance < 0.f || avgLuminance > 1.f) {
         // No live backdrop: theme-dependent palette fallback (chrome). Dark theme's `text` role
         // is LIGHT (darkText=false); light theme's `text` role is dark (darkText=true) — keeps
         // glassText()'s halo tone correct for palette-fallback surfaces.
@@ -1074,26 +1085,31 @@ const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect, GlassGroup 
         float           dynHue = -1.f, dynSat = 0.f, dynVar = 0.f;
     };
     static std::unordered_map<ImGuiID, State> states;
-    static AdaptiveSurface stateless;
-
-    const float sampled = sampleLuminance(rect.Min, rect.Max);
-    if (sampled < 0.f) {
-        // Stateless palette fallback — no persistent id lookup, recomputed fresh (cheap).
-        // Pass the group through so fallback surfaces still get tint/opacity knobs.
-        stateless = adaptiveSurface(-1.f, group);
-        return stateless;
-    }
 
     State& st = states[id];
     const int frame = ImGui::GetFrameCount();
-    if (st.lastFrame == frame) return st.cur;   // idempotent per frame
+    if (st.lastFrame == frame) return st.cur;   // cache fallback as well as live surfaces
     st.lastFrame = frame;
 
+    const float sampled = sampleLuminance(rect.Min, rect.Max);
+    if (sampled < 0.f) {
+        // A live texture can temporarily lack a grid (resize, pending/failed readback).
+        // Keep its last contrast pair rather than switching only the ink to palette white.
+        if (viewportBackdrop().valid() && st.lum >= 0.f) return st.cur;
+        st.lum = -1.f;
+        st.dynHue = -1.f;
+        st.dynSat = st.dynVar = 0.f;
+        st.cur = adaptiveSurface(-1.f, group);
+        return st.cur;
+    }
+
     const float dt = ImGui::GetIO().DeltaTime;
-    if (st.lum < 0.f)
+    if (st.lum < 0.f) {
         st.lum = sampled;   // snap on first sample for this id
-    else
+        st.dark = sampled > 0.50f;
+    } else {
         st.lum = approach(st.lum, sampled, dt, kAdaptiveTau);
+    }
 
     // Hysteresis: only flip tone once the smoothed luminance clears the far threshold.
     st.dark = st.lum > 0.58f ? true : (st.lum < 0.42f ? false : st.dark);

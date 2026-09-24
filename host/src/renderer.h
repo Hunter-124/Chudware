@@ -529,6 +529,7 @@ private:
     mutable int lumaPboH_[kLumaPboCount] = {0, 0, 0};  // (detects a mid-flight blur resize)
     mutable int lumaPboNext_ = 0;              // next ring slot to issue into
     mutable int lumaSrcW_ = 0, lumaSrcH_ = 0;  // readback source size as of the last (re)spec
+    mutable unsigned int lumaSrcFbo_ = 0;     // source generation (also invalidated on realloc)
     mutable unsigned int lumaFallbackCounter_ = 0;  // every-8th-frame direct-read fallback cadence
     mutable std::vector<float> lumaGrid_;     // published grid, top-left row order, lumaW_*lumaH_
     mutable std::vector<float> lumaStaging_;  // built off to the side, then swapped in (no tearing)

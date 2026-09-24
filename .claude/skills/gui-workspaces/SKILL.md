@@ -189,6 +189,12 @@ tabs re-bootstrap via `engine_events` after hostd reconnect) · `title_bar.cpp` 
 (notifications) · `scenarios.cpp` (scripted test harness — add a scenario if your workspace
 gains a major new flow).
 
+Explorer rendering uses `FsBackend::pollDirectory/pollStat/pollDefaultRoot`, never
+blocking `list/stat/defaultRoot` or `mkdir` on the web. Snapshot state distinguishes
+loading, errors, and confirmed absence. Directory requests coalesce; mutation and
+workspace invalidation fence old callbacks. Keep filtered rows alive across nested
+mutations, which can invalidate the browser cache during tree traversal.
+
 ## Shared patterns
 
 - Panel shape: `class XxxPanel { void draw(AppState&); void drawBody(AppState&); }`; global

@@ -863,6 +863,8 @@ void Renderer::allocTargets() {
     resolvedDirty_ = true;
     backdropDirty_ = true;
     blurW_ = blurH_ = 0;
+    // Existing grids/fences describe the old render targets, even if GL reuses their names.
+    lumaSrcFbo_ = 0;
 }
 
 void Renderer::resize(int width, int height) {
@@ -2616,6 +2618,7 @@ GlassTimings Renderer::glassTimings() const {
 }
 
 void Renderer::setBackdropEnabled(bool on) {
+    if (on && !backdropEnabled_) lumaSrcFbo_ = 0;  // refresh after a hidden/drawing workspace
     backdropEnabled_ = on;
 }
 
@@ -2624,28 +2627,40 @@ void Renderer::setBackdropEnabled(bool on) {
 void Renderer::issueLumaReadback() const {
     if (!backdropEnabled_) return;  // disabled means no readback at all.
 
-    // Always drain the ring first so slots free up even on a frame that skips issuing below.
-    pollLumaPbos();
-
+    // Select the source before polling: old-generation fences must never publish into a
+    // resized viewport or a different quality step's blur output.
     const bool blurAvailable = blurW_ > 0 && blurH_ > 0 && downsampleProg_ && kawaseProg_;
     unsigned int srcFbo = 0;
     int srcW = 0, srcH = 0;
     if (blurAvailable) {
-        srcFbo = blurPingFbo_[(kBlurPasses - 1) & 1];
+        // Match backdrop()'s final texture, including LOW's single (odd) blur pass.
+        srcFbo = blurPingFbo_[(blurPasses_ - 1) & 1];
         srcW = blurW_;
         srcH = blurH_;
     } else {
         // Blur chain permanently unavailable (link failure / never sized) -> fall back to a
         // direct small read of the full resolved color buffer, throttled to every 8th frame so it
         // never becomes a per-frame full-res stall source; still async via the same PBO ring.
-        if (!resolveFbo_ || w_ <= 0 || h_ <= 0) return;
+        if (!resolveFbo_ || rw_ <= 0 || rh_ <= 0) return;
         ++lumaFallbackCounter_;
         if ((lumaFallbackCounter_ % 8) != 0) return;
         srcFbo = resolveFbo_;
-        srcW = w_;
-        srcH = h_;
+        srcW = rw_;
+        srcH = rh_;
     }
     if (!srcFbo || srcW <= 0 || srcH <= 0) return;
+    if (srcFbo != lumaSrcFbo_ || srcW != lumaSrcW_ || srcH != lumaSrcH_) {
+        for (int i = 0; i < kLumaPboCount; ++i) {
+            if (lumaFence_[i]) {
+                glDeleteSync(static_cast<GLsync>(lumaFence_[i]));
+                lumaFence_[i] = nullptr;
+            }
+            lumaPboPending_[i] = false;
+        }
+        lumaEverRead_ = false;
+        lumaSrcFbo_ = srcFbo;
+    }
+    pollLumaPbos();
     issueLumaPboRead(srcFbo, srcW, srcH);
 }
 
@@ -2655,24 +2670,33 @@ void Renderer::issueLumaReadback() const {
 // them first (their data no longer matches the new dimensions).
 void Renderer::issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const {
 #ifdef __EMSCRIPTEN__
-    // WebGL2 cannot map a PBO for read-back, so bypass the async PBO ring entirely: do a
-    // SYNCHRONOUS glReadPixels of the (small, quarter-res blur) source and reduce on the CPU.
-    // This feeds the liquid-glass backdrop luminance so panels pick DARK text over the bright
-    // studio backdrop — without it the grid stays at 0.5 (hysteresis dead-zone) and glass text
-    // washes out light-on-light. srcFbo is normally the quarter-res blur target, so this read
-    // is tiny; issueLumaReadback already throttles the full-res fallback to every 8th frame.
+    // WebGL2 cannot map a PBO for readback. Read the active blur output into CPU scratch;
+    // unavailable/failed reads must never be reduced as black pixels or a previous image.
     if (srcW <= 0 || srcH <= 0) return;
     // A synchronous glReadPixels forces a GPU pipeline flush (measurable jank on weak iGPUs),
-    // so throttle to every 32nd frame — the backdrop luma changes slowly (camera/panel motion)
-    // and the tone hysteresis smooths it, so ~1 read/sec is ample. Always read the FIRST time
-    // (lumaEverRead_ guard) so glass text isn't washed for the first frames after boot.
+    // so throttle unchanged-source reads. A resize/quality/source transition invalidates
+    // lumaEverRead_ above and MUST refresh immediately instead of reusing the old grid.
     if (lumaEverRead_ && (++lumaWebCounter_ % 32) != 0) return;
+    lumaSrcW_ = srcW;
+    lumaSrcH_ = srcH;
     const size_t need = (size_t)srcW * (size_t)srcH * 4;
     if (lumaCpuBuf_.size() < need) lumaCpuBuf_.resize(need);
     glBindFramebuffer(GL_FRAMEBUFFER, srcFbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        lumaEverRead_ = false;
+        return;
+    }
     glReadPixels(0, 0, srcW, srcH, GL_RGBA, GL_UNSIGNED_BYTE, lumaCpuBuf_.data());
+    const GLenum readError = glGetError();
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (readError != GL_NO_ERROR) {
+        lumaEverRead_ = false;
+        std::fprintf(stderr, "[glass] backdrop readback failed: GL error 0x%x\n",
+                     static_cast<unsigned int>(readError));
+        return;
+    }
     const unsigned char* px = lumaCpuBuf_.data();
     const int stepX = std::max(1, (srcW + kLumaGridMaxW - 1) / kLumaGridMaxW);
     const int stepY = std::max(1, (srcH + kLumaGridMaxH - 1) / kLumaGridMaxH);
@@ -2741,7 +2765,10 @@ void Renderer::issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const {
 
 // Non-blocking poll of every ring slot; a signaled slot is mapped, reduced, and freed.
 void Renderer::pollLumaPbos() const {
-    for (int i = 0; i < kLumaPboCount; ++i) {
+    // Oldest first: numeric slot order can publish an older frame after a newer one
+    // when the ring wraps and several fences become ready together.
+    for (int n = 0; n < kLumaPboCount; ++n) {
+        const int i = (lumaPboNext_ + n) % kLumaPboCount;
         if (!lumaPboPending_[i] || !lumaFence_[i]) continue;
         const GLenum res = glClientWaitSync(static_cast<GLsync>(lumaFence_[i]), 0, /*timeout=*/0);
         if (res == GL_ALREADY_SIGNALED || res == GL_CONDITION_SATISFIED) {

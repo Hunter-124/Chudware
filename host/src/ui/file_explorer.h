@@ -16,9 +16,9 @@ struct AppState;
 
 namespace ui {
 
-// Ensure AppState::workspaceDir is set + the directory exists. Idempotent; safe to call every
-// frame. Defaults workspaceDir to <Documents>/Chudware (creating it) when empty, falling back to
-// the app data dir if Documents can't be resolved. Never throws.
+// Resolve AppState::workspaceDir. Desktop creates it once per root change.
+// Web discovers the gateway-owned root asynchronously: workspaceDir stays empty
+// while pending, and no network write/yield occurs. Safe to call every frame.
 void ensureWorkspaceDir(AppState& st);
 
 // Draw the Explorer tab body (no Begin/End). Call every frame from drawLeftPane's Explorer case.

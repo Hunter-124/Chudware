@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -31,9 +32,25 @@ struct FsStat {
     int64_t  mtime  = 0;
 };
 
-// Abstract FS. Thread affinity: call from the GL/UI thread. Web gateway calls use
-// async emscripten_fetch + ASYNCIFY yields (emscripten_sleep) — never EMSCRIPTEN_FETCH_SYNCHRONOUS
-// on the main thread (this build is main-thread ImGui + ASYNCIFY, no PROXY_TO_PTHREAD).
+enum class FsReadState { Loading, Ready, Missing, Error };
+
+struct FsDirectorySnapshot {
+    FsReadState state = FsReadState::Loading;
+    bool pending = false;
+    uint64_t revision = 0;
+    std::vector<FsEntry> entries;
+    std::string error;
+};
+
+struct FsStatSnapshot {
+    FsReadState state = FsReadState::Loading;
+    FsStat value;
+    std::string error;
+};
+
+// Abstract FS. Thread affinity: call from the GL/UI thread. The command APIs below
+// await confirmed results (web uses ASYNCIFY). Rendering MUST use the poll APIs:
+// web polling starts asynchronous reads and returns immediately, without yielding.
 class FsBackend {
 public:
     virtual ~FsBackend() = default;
@@ -57,6 +74,19 @@ public:
     // Workspace root. Desktop: Documents/Chudware or Documents/Chudware.
     // Web: server abs workspace root (from gateway list).
     virtual std::string defaultRoot() = 0;
+
+    // Render-time reads. Snapshots refresh after two seconds, coalesce requests,
+    // and distinguish pending/error from confirmed absence. A snapshot reference
+    // is valid only until invalidation; do not retain it across a mutation/yield.
+    virtual const FsDirectorySnapshot& pollDirectory(const std::string& dir);
+    virtual FsStatSnapshot pollStat(const std::string& path);
+    // Empty while discovering the web root; error is not a placeholder path.
+    virtual std::string pollDefaultRoot(std::string& err) {
+        err.clear();
+        return defaultRoot();
+    }
+    // Workspace changes additionally retire the discovered server root.
+    virtual void invalidateBrowseCache(bool workspaceChanged = false);
 
     // ---- convenience (implemented in terms of the above where possible) ----
 
@@ -89,7 +119,15 @@ public:
         std::string e;
         return stat(path, e).isFile;
     }
+private:
+    struct DirectoryCache {
+        FsDirectorySnapshot snapshot;
+        double checkedAt = -1e9;
+    };
+    std::map<std::string, DirectoryCache> browseCache_;
+    uint64_t browseRevision_ = 0;
 };
+
 
 // Process-wide backend (desktop or web, selected at compile time).
 FsBackend& fsBackend();

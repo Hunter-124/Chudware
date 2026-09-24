@@ -526,6 +526,10 @@ void forceOnboardingForScenario(int step) {
 }
 
 void drawOnboarding(AppState& st, bool appBusy) {
+    // The gateway already authenticates web users. This wizard provisions desktop
+    // account/provider access; it must never open while browser state is loading.
+    if (webBuild()) return;
+
     if (!s_wizard.gateRead) {
         s_wizard.gateRead = true;
         s_wizard.completedVersion = readCompletedVersion();

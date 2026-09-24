@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -96,24 +97,23 @@ static bool        s_renameFocus = false;
 static std::string s_pendingDelete;    // path queued for the delete-confirm modal ("" = none)
 static std::string s_clipboardPath;    // Explorer copy/paste stash (a file path)
 static std::string s_pendingNewFolder; // a just-created folder to auto-enter inline-rename next frame
-// Recent-row existence cache: fs exists per entry per frame is real filesystem traffic while the
-// Recent list is visible. Refresh at most every ~2s; a path not yet cached (a just-added recent)
-// is probed once on first sight, so a list change still paints correctly the same frame.
-static std::map<std::string, bool> s_recentExists;
-static double s_recentExistsAt = -1e9;
-// Directory listing cache: drawDirNode used to call fsb.list() every frame for every open
-// folder. Cache the filtered/sorted children for a short TTL (and bust on mutations / Refresh)
-// so mtime-sorted files don't imply per-frame FS traffic. mtime comes from FsEntry (filled once
-// per list()) — never a separate last_write_time per row.
+// UI caches hold filtered/sorted rows; backend snapshots own refresh scheduling.
+// Shared ownership keeps a tree walk valid when a child mutation invalidates the
+// cache while its parent's rows are still being iterated.
 struct DirListCache {
-    double scannedAt = -1e9;
+    uint64_t revision = UINT64_MAX;
+    chudware::FsReadState state = chudware::FsReadState::Loading;
+    std::string error;
     std::vector<std::string> dirs;   // full paths, name-sorted (case-insensitive)
     std::vector<std::string> files;  // full paths, mtime-desc (unknown mtime = oldest)
 };
-static std::map<std::string, DirListCache> s_dirListCache;
-static constexpr double kDirListCacheTtlSec = 2.0;
+static std::map<std::string, std::shared_ptr<DirListCache>> s_dirListCache;
+static std::string s_workspaceError;
 
-static void invalidateDirListCache() { s_dirListCache.clear(); }
+static void invalidateDirListCache(bool workspaceChanged = false) {
+    s_dirListCache.clear();
+    chudware::fsBackend().invalidateBrowseCache(workspaceChanged);
+}
 
 // Hover tooltip: full file/dir name, plus absolute path on a second line when it adds context.
 static void itemPathTooltip(const std::string& name, const std::string& fullPath) {
@@ -182,25 +182,29 @@ static const char* fileIconFallback(const std::string& ext) {
 // ---- workspace resolution ------------------------------------------------
 void ensureWorkspaceDir(AppState& st) {
     auto& fsb = chudware::fsBackend();
-    if (st.workspaceDir.empty()) {
-        // Prefer the persisted setting, else the backend default (desktop Documents/Chudware
-        // or Documents/Chudware; web = server workspace abs root).
-        if (!st.settings.workspaceDir.empty()) {
-            st.workspaceDir = st.settings.workspaceDir;
-        } else {
-            st.workspaceDir = fsb.defaultRoot();
-        }
-    }
-    std::string err;
-    fsb.mkdir(st.workspaceDir, err);   // idempotent; ignore "already exists"
-    if (s_currentFolder.empty()) s_currentFolder = st.workspaceDir;
-    // Root-change detection: Settings -> General's "Workspace folder" Apply resets st.workspaceDir
-    // (possibly to empty = re-resolve default, handled above) while the app is live. Re-root the
-    // browser to the new workspace — without this, s_currentFolder keeps showing the old tree.
+    if (st.workspaceDir.empty()) st.workspaceDir = st.settings.workspaceDir;
+#ifdef __EMSCRIPTEN__
+    // The gateway creates its authorized root. Never mkdir from a draw call.
+    // Do not publish "/" as a temporary daemon path while discovery is pending.
+    if (st.workspaceDir.empty() || st.workspaceDir == "/" || st.workspaceDir == "/workspace")
+        st.workspaceDir = fsb.pollDefaultRoot(s_workspaceError);
+#else
+    if (st.workspaceDir.empty()) st.workspaceDir = fsb.defaultRoot();
+#endif
     static std::string s_lastRoot;
     if (st.workspaceDir != s_lastRoot) {
+        invalidateDirListCache(/*workspaceChanged=*/!s_lastRoot.empty());
         s_lastRoot = st.workspaceDir;
         s_currentFolder = st.workspaceDir;
+        s_selectedPath.clear();
+        s_renameId.clear();
+        s_pendingDelete.clear();
+        s_pendingNewFolder.clear();
+        s_clipboardPath.clear();
+#ifndef __EMSCRIPTEN__
+        // Desktop setup is idempotent once per workspace, not once per frame.
+        fsb.mkdir(st.workspaceDir, s_workspaceError);
+#endif
     }
 }
 
@@ -225,7 +229,9 @@ static void commitRename(AppState& st, const std::string& root) {
         return;
     }
     std::string err;
-    if (fsb.exists(newP)) { st.toast(ui::ToastLevel::Warn, "A file with that name exists"); return; }
+    const auto destination = fsb.stat(newP, err);
+    if (!err.empty()) { st.toast(ui::ToastLevel::Error, "Rename failed: " + err); return; }
+    if (destination.exists) { st.toast(ui::ToastLevel::Warn, "A file with that name exists"); return; }
     if (!fsb.rename(oldP, newP, err)) {
         st.toast(ui::ToastLevel::Error, "Rename failed: " + err);
     } else {
@@ -238,31 +244,34 @@ static void commitRename(AppState& st, const std::string& root) {
 // ---- copy / paste (filesystem) -------------------------------------------
 // Build a collision-free destination by appending " (copy)" (then " (copy 2)", ...) before the
 // extension until the name is free.
-static std::string uniqueDest(const std::string& dir, const std::string& src) {
+static std::string uniqueDest(const std::string& dir, const std::string& src, std::string& err) {
     auto& fsb = chudware::fsBackend();
     std::string fname = pathFilename(src);
     std::string stem = pathStem(fname);
     std::string ext  = pathExtension(fname);
     std::string cand = pathJoin(dir, fname);
-    if (!fsb.exists(cand)) return cand;
+    if (!fsb.stat(cand, err).exists) return err.empty() ? cand : std::string();
     for (int n = 1; n < 1000; ++n) {
         std::string suffix = (n == 1) ? " (copy)" : (" (copy " + std::to_string(n) + ")");
         cand = pathJoin(dir, stem + suffix + ext);
-        if (!fsb.exists(cand)) return cand;
+        if (!fsb.stat(cand, err).exists) return err.empty() ? cand : std::string();
     }
-    return cand;
+    err = "No unused copy name available";
+    return {};
 }
 
 static bool doPaste(AppState& st, const std::string& root, const std::string& destDir) {
     auto& fsb = chudware::fsBackend();
     if (s_clipboardPath.empty()) { st.toast(ui::ToastLevel::Info, "Nothing copied"); return false; }
     std::string src = s_clipboardPath;
-    if (!fsb.exists(src)) { st.toast(ui::ToastLevel::Warn, "Copied file no longer exists"); return false; }
-    if (!withinWorkspace(root, destDir)) { st.toast(ui::ToastLevel::Warn, "Paste blocked outside the workspace"); return false; }
-    std::string dest = uniqueDest(destDir, src);
     std::string err;
-    const bool isDir = fsb.isDirectory(src);
-    if (!fsb.copy(src, dest, /*recursive=*/isDir, err)) {
+    const auto source = fsb.stat(src, err);
+    if (!err.empty()) { st.toast(ui::ToastLevel::Error, "Paste failed: " + err); return false; }
+    if (!source.exists) { st.toast(ui::ToastLevel::Warn, "Copied file no longer exists"); return false; }
+    if (!withinWorkspace(root, destDir)) { st.toast(ui::ToastLevel::Warn, "Paste blocked outside the workspace"); return false; }
+    std::string dest = uniqueDest(destDir, src, err);
+    if (!err.empty()) { st.toast(ui::ToastLevel::Error, "Paste failed: " + err); return false; }
+    if (!fsb.copy(src, dest, /*recursive=*/source.isDir, err)) {
         st.toast(ui::ToastLevel::Error, "Paste failed: " + err);
         return false;
     }
@@ -282,8 +291,10 @@ static void createNewFolder(AppState& st, const std::string& root, const std::st
     }
     int n = 1;
     std::string cand = pathJoin(dir, "New Folder");
-    while (fsb.exists(cand)) cand = pathJoin(dir, "New Folder " + std::to_string(++n));
     std::string err;
+    while (fsb.stat(cand, err).exists && err.empty())
+        cand = pathJoin(dir, "New Folder " + std::to_string(++n));
+    if (!err.empty()) { st.toast(ui::ToastLevel::Error, "New Folder failed: " + err); return; }
     if (fsb.mkdir(cand, err)) {
         s_pendingNewFolder = cand;
         s_currentFolder = dir;
@@ -443,21 +454,20 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
     }
 
     if (open) {
-        // Cache-aware gather + sort: dirs by name, files by mtime desc (FsEntry.mtime from list()).
-        const double now = ImGui::GetTime();
-        auto cacheIt = s_dirListCache.find(dir);
-        if (cacheIt == s_dirListCache.end() ||
-            (now - cacheIt->second.scannedAt) > kDirListCacheTtlSec) {
-            DirListCache fresh;
-            fresh.scannedAt = now;
-            std::string listErr;
-            auto entries = fsb.list(dir, listErr);
+        const auto& snapshot = fsb.pollDirectory(dir);
+        auto& cached = s_dirListCache[dir];
+        if (!cached || cached->revision != snapshot.revision || cached->state != snapshot.state) {
+            auto fresh = std::make_shared<DirListCache>();
+            fresh->revision = snapshot.revision;
+            fresh->state = snapshot.state;
+            fresh->error = snapshot.error;
+            const auto& entries = snapshot.entries;
             std::vector<std::pair<std::string, int64_t>> filePairs;  // path, mtime
             for (const auto& e : entries) {
                 if (e.name.empty() || e.name[0] == '.') continue;
                 std::string full = pathJoin(dir, e.name);
                 if (e.isDir) {
-                    fresh.dirs.push_back(std::move(full));
+                    fresh->dirs.push_back(std::move(full));
                 } else if (isKnownExt(lowerExt(e.name))) {
                     // mtime==0 (unknown/error) sorts as oldest per contract.
                     filePairs.emplace_back(std::move(full), e.mtime);
@@ -469,7 +479,7 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
                 std::transform(bn.begin(), bn.end(), bn.begin(), ::tolower);
                 return an < bn;
             };
-            std::sort(fresh.dirs.begin(), fresh.dirs.end(), byName);
+            std::sort(fresh->dirs.begin(), fresh->dirs.end(), byName);
             // Newest first; tie-break by name for stable order when mtimes match.
             std::sort(filePairs.begin(), filePairs.end(),
                       [&](const std::pair<std::string, int64_t>& a,
@@ -477,15 +487,20 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
                           if (a.second != b.second) return a.second > b.second;
                           return byName(a.first, b.first);
                       });
-            fresh.files.reserve(filePairs.size());
-            for (auto& fp : filePairs) fresh.files.push_back(std::move(fp.first));
-            cacheIt = s_dirListCache.insert_or_assign(dir, std::move(fresh)).first;
+            fresh->files.reserve(filePairs.size());
+            for (auto& fp : filePairs) fresh->files.push_back(std::move(fp.first));
+            cached = std::move(fresh);
         }
-        const auto& dirs = cacheIt->second.dirs;
-        const auto& files = cacheIt->second.files;
-        for (const auto& d : dirs) drawDirNode(st, root, d, /*isRoot=*/false);
-        for (const auto& f : files) drawFileRow(st, root, f, lowerExt(f));
-        if (dirs.empty() && files.empty())
+        const auto rows = cached;
+        for (const auto& d : rows->dirs) drawDirNode(st, root, d, /*isRoot=*/false);
+        for (const auto& f : rows->files) drawFileRow(st, root, f, lowerExt(f));
+        if (rows->state == chudware::FsReadState::Error)
+            ImGui::TextWrapped("Unable to read folder: %s", rows->error.c_str());
+        else if (rows->state == chudware::FsReadState::Missing)
+            ImGui::TextDisabled("  Folder missing");
+        else if (rows->state == chudware::FsReadState::Loading)
+            ImGui::TextDisabled("  Loading...");
+        else if (rows->dirs.empty() && rows->files.empty())
             ImGui::TextDisabled("  (empty)");
         ImGui::TreePop();
     }
@@ -498,18 +513,28 @@ static void drawRecentSection(AppState& st) {
     auto& fsb = chudware::fsBackend();
     // FM-style section rule (the "Reference"/"Features" treatment) instead of a CollapsingHeader.
     ui::fmSectionDivider("Recent");
-    if (ImGui::GetTime() - s_recentExistsAt > 2.0) {
-        s_recentExists.clear();
-        s_recentExistsAt = ImGui::GetTime();
+#ifndef __EMSCRIPTEN__
+    static std::map<std::string, chudware::FsStatSnapshot> recentStats;
+    static double checkedAt = -1e9;
+    if (ImGui::GetTime() - checkedAt > 2.0) {
+        recentStats.clear();
+        checkedAt = ImGui::GetTime();
     }
+#endif
     int idx = 0;
     for (const std::string& rp : st.recentFiles) {
         ImGui::PushID(idx++);
-        auto exIt = s_recentExists.find(rp);
-        if (exIt == s_recentExists.end()) {
-            exIt = s_recentExists.emplace(rp, fsb.exists(rp)).first;
-        }
-        const bool exists = exIt->second;
+#ifdef __EMSCRIPTEN__
+        const auto probe = fsb.pollStat(rp);
+#else
+        auto found = recentStats.find(rp);
+        if (found == recentStats.end())
+            found = recentStats.emplace(rp, fsb.pollStat(rp)).first;
+        const auto& probe = found->second;
+#endif
+        // Unknown/network errors are not evidence of deletion. Keep opening
+        // available; doc_open reports authoritative failures without a preflight.
+        const bool exists = probe.state != chudware::FsReadState::Ready || probe.value.exists;
         const std::string ext = lowerExt(rp);
         const std::string fname = pathFilename(rp);
         // Same FM leaf-row pattern as the tree's file rows; a missing file keeps a readable dim
@@ -547,7 +572,9 @@ static void drawDeleteModal(AppState& st, const std::string& root) {
     if (ImGui::BeginPopupModal("Delete?", &open, ImGuiWindowFlags_AlwaysAutoResize)) {
         std::string p = s_pendingDelete;
         ImGui::Text("Delete \"%s\"?", pathFilename(p).c_str());
-        if (fsb.isDirectory(p)) ImGui::TextDisabled("This folder and its contents.");
+        const auto probe = fsb.pollStat(p);
+        if (probe.state == chudware::FsReadState::Ready && probe.value.isDir)
+            ImGui::TextDisabled("This folder and its contents.");
         ImGui::Spacing();
         if (ImGui::Button("Delete", ImVec2(110 * ui::uiScale, 0))) {
             if (!withinWorkspace(root, p)) {
@@ -589,6 +616,10 @@ void drawFileExplorerBody(AppState& st) {
 
     ensureWorkspaceDir(st);
     const std::string root = st.workspaceDir;
+    if (root.empty()) {
+        ImGui::TextWrapped("%s", s_workspaceError.empty() ? "Loading workspace..." : s_workspaceError.c_str());
+        return;
+    }
 
     // A just-created folder enters inline rename on the next frame (after the tree expands it).
     if (!s_pendingNewFolder.empty()) {
@@ -601,12 +632,14 @@ void drawFileExplorerBody(AppState& st) {
     }
 
     std::string current = s_currentFolder.empty() ? root : s_currentFolder;
-    if (!fsb.isDirectory(current)) current = pathParent(current);
+    const auto currentStat = fsb.pollStat(current);
+    if (currentStat.state == chudware::FsReadState::Ready && !currentStat.value.isDir)
+        current = pathParent(current);
     if (current.empty() || !withinWorkspace(root, current)) current = root;
 
-    const bool selectedFile = !s_selectedPath.empty() &&
-        fsb.isRegularFile(s_selectedPath) &&
-        isKnownExt(lowerExt(s_selectedPath));
+    const auto selectedStat = s_selectedPath.empty() ? chudware::FsStatSnapshot{} : fsb.pollStat(s_selectedPath);
+    const bool selectedFile = !s_selectedPath.empty() && isKnownExt(lowerExt(s_selectedPath)) &&
+        selectedStat.state == chudware::FsReadState::Ready && selectedStat.value.isFile;
 
     // Toolbar: the exact FeatureManager top-strip layout — a centered row of 24px glass icon
     // buttons (4dp gaps), the row reserved with a Dummy (glass/icons are draw-list only), the
@@ -675,10 +708,7 @@ void drawFileExplorerBody(AppState& st) {
 
     ui::fmSectionDivider("Workspace");
     ImGui::BeginChild("##fx_tree", ImVec2(0, 0), ImGuiChildFlags_None);
-    if (fsb.exists(root))
-        drawDirNode(st, root, root, /*isRoot=*/true);
-    else
-        ImGui::TextDisabled("Workspace folder missing");
+    drawDirNode(st, root, root, /*isRoot=*/true);
     ImGui::EndChild();
 
     drawDeleteModal(st, root);

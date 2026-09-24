@@ -20,6 +20,11 @@ attribution.
 - The streamed-container portal (`sessions.py`, `proxy.py`, `image/`) was **removed**
   on 2026-08-10. `/app` is the only client. `deploy/monitor.py` survives as a host
   RAM/disk/GPU sampler and disk-pressure flag.
+- Browser startup never opens the desktop account/provider onboarding wizard;
+  the gateway sign-in remains authoritative. Explorer directory/stat reads are
+  asynchronous snapshots: pending reads keep the UI responsive, refresh failures
+  retain existing rows with an error, and workspace switches/mutations retire
+  stale responses. Merely displaying Explorer does not create directories.
 
 ## Phone and tablet controls
 

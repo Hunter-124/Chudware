@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <system_error>
+#include <stdexcept>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -20,6 +21,11 @@ namespace chudware {
 namespace {
 
 namespace fs = std::filesystem;
+
+double browseNow() {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 // ---- path helpers (shared, pure string) ------------------------------------
 
@@ -59,8 +65,12 @@ public:
         err.clear();
         std::vector<FsEntry> out;
         std::error_code ec;
-        for (fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
-             it != end; it.increment(ec)) {
+        fs::directory_iterator it(dir, fs::directory_options::none, ec), end;
+        if (ec) {
+            err = ec.message();
+            return {};
+        }
+        for (; it != end; it.increment(ec)) {
             if (ec) {
                 err = ec.message();
                 break;
@@ -219,6 +229,176 @@ public:
     std::string rootAbs_;   // cached from last list() {"root": ...}
     bool        rootKnown_ = false;
 
+    struct BrowseEntry {
+        FsDirectorySnapshot snapshot;
+        double checkedAt = -1e9;
+    };
+    std::map<std::string, BrowseEntry> directories_;
+    uint64_t browseEpoch_ = 0;
+    uint64_t snapshotRevision_ = 0;
+
+    struct BrowseRequest {
+        WebFsBackend* backend;
+        std::string relative;
+        uint64_t epoch;
+    };
+
+    void invalidateBrowseCache(bool workspaceChanged = false) override {
+        ++browseEpoch_;
+        directories_.clear();
+        if (workspaceChanged) {
+            rootAbs_.clear();
+            rootKnown_ = false;
+        }
+    }
+
+    static void browseComplete(emscripten_fetch_t* fetch) {
+        auto* request = static_cast<BrowseRequest*>(fetch->userData);
+        auto& backend = *request->backend;
+        // No map references/pointers survive a request. Mutations and workspace
+        // switches retire the entire epoch, including responses still in flight.
+        if (request->epoch == backend.browseEpoch_) {
+            auto it = backend.directories_.find(request->relative);
+            if (it != backend.directories_.end()) {
+                auto& cache = it->second;
+                auto& snapshot = cache.snapshot;
+                snapshot.pending = false;
+                snapshot.revision = ++backend.snapshotRevision_;
+                cache.checkedAt = browseNow();
+                snapshot.error.clear();
+                if (fetch->status < 200 || fetch->status >= 300) {
+                    snapshot.state = fetch->status == 404 ? FsReadState::Missing : FsReadState::Error;
+                    snapshot.error = fetch->status ? "HTTP " + std::to_string(fetch->status)
+                                                   : "Workspace network error";
+                    if (snapshot.state == FsReadState::Missing) snapshot.entries.clear();
+                } else {
+                    try {
+                        if (!fetch->data || fetch->numBytes == 0)
+                            throw std::runtime_error("Empty workspace listing");
+                        auto json = nlohmann::json::parse(fetch->data, fetch->data + fetch->numBytes);
+                        const auto root = json.at("root").get<std::string>();
+                        if (root.empty() || !json.at("dirs").is_array() || !json.at("files").is_array())
+                            throw std::runtime_error("Invalid workspace listing");
+                        if (backend.rootKnown_ && backend.rootAbs_ != root)
+                            throw std::runtime_error("Workspace changed; reload the workspace");
+                        std::vector<FsEntry> entries;
+                        auto take = [&](const nlohmann::json& array, bool isDir) {
+                            for (const auto& item : array) {
+                                FsEntry entry;
+                                entry.name = item.at("name").get<std::string>();
+                                entry.isDir = isDir;
+                                entry.size = item.value("size", uint64_t{0});
+                                entry.mtime = item.value("mtime", int64_t{0});
+                                if (entry.name.empty() || entry.name == "." || entry.name == ".." ||
+                                    entry.name.find_first_of("/\\") != std::string::npos)
+                                    throw std::runtime_error("Invalid workspace entry name");
+                                entries.push_back(std::move(entry));
+                            }
+                        };
+                        take(json.at("dirs"), true);
+                        take(json.at("files"), false);
+                        backend.rootAbs_ = root;
+                        backend.rootKnown_ = true;
+                        snapshot.entries = std::move(entries);
+                        snapshot.state = FsReadState::Ready;
+                    } catch (const std::exception& e) {
+                        snapshot.state = FsReadState::Error;
+                        snapshot.error = std::string("Workspace listing: ") + e.what();
+                    }
+                }
+            }
+        }
+        delete request;
+        emscripten_fetch_close(fetch);
+    }
+
+    const FsDirectorySnapshot& pollRelative(const std::string& relative) {
+        auto& cache = directories_[relative];
+        auto& snapshot = cache.snapshot;
+        if (!snapshot.pending && browseNow() - cache.checkedAt >= 2.0) {
+            snapshot.pending = true;
+            auto* request = new BrowseRequest{this, relative, browseEpoch_};
+            emscripten_fetch_attr_t attr;
+            emscripten_fetch_attr_init(&attr);
+            std::strcpy(attr.requestMethod, "GET");
+            attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;
+            attr.timeoutMSecs = 15000;
+            attr.userData = request;
+            attr.onsuccess = browseComplete;
+            attr.onerror = browseComplete;
+            const auto url = "/workspace/list?dir=" + urlEncode(relative);
+            if (!emscripten_fetch(&attr, url.c_str())) {
+                delete request;
+                snapshot.pending = false;
+                snapshot.state = FsReadState::Error;
+                snapshot.error = "Could not start workspace request";
+                snapshot.revision = ++snapshotRevision_;
+                cache.checkedAt = browseNow();
+            }
+        }
+        return snapshot;
+    }
+
+    bool isWorkspacePath(const std::string& path) const {
+        return path.empty() || path == "/" || path.front() != '/' ||
+               path == rootAbs_ || path.compare(0, rootAbs_.size() + 1, rootAbs_ + "/") == 0;
+    }
+
+    const FsDirectorySnapshot& pollDirectory(const std::string& dir) override {
+        if (!rootKnown_) return pollRelative("");
+        // Do not turn a recent absolute path from another team into a relative
+        // path under this team's root (nor probe it every frame).
+        if (!isWorkspacePath(dir)) {
+            static const FsDirectorySnapshot outside{
+                FsReadState::Error, false, 0, {}, "Path is outside the current workspace"};
+            return outside;
+        }
+        return pollRelative(toRel(dir));
+    }
+
+    std::string pollDefaultRoot(std::string& err) override {
+        err.clear();
+        if (!rootKnown_) {
+            const auto& root = pollRelative("");
+            err = root.error;
+        }
+        return rootKnown_ ? rootAbs_ : std::string();
+    }
+
+    FsStatSnapshot pollStat(const std::string& path) override {
+        FsStatSnapshot result;
+        if (!rootKnown_) {
+            const auto& root = pollRelative("");
+            result.state = root.state == FsReadState::Error ? FsReadState::Error : FsReadState::Loading;
+            result.error = root.error;
+            return result;
+        }
+        if (!isWorkspacePath(path)) {
+            result.state = FsReadState::Error;
+            result.error = "Path is outside the current workspace";
+            return result;
+        }
+        const bool isRoot = path.empty() || path == rootAbs_ || path == rootAbs_ + "/" || path == "/";
+        const auto& directory = pollDirectory(isRoot ? rootAbs_ : pathParent(path));
+        result.state = directory.state;
+        result.error = directory.error;
+        if (directory.state == FsReadState::Missing) {
+            result.state = FsReadState::Ready;
+        } else if (directory.state == FsReadState::Ready) {
+            if (isRoot) {
+                result.value.exists = result.value.isDir = true;
+            } else {
+                const auto name = pathFilename(path);
+                for (const auto& entry : directory.entries) {
+                    if (entry.name != name) continue;
+                    result.value = {true, entry.isDir, !entry.isDir, entry.size, entry.mtime};
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
     // Ensure we know the server workspace abs root (one list of "").
     bool ensureRoot(std::string& err) {
         if (rootKnown_ && !rootAbs_.empty()) return true;
@@ -325,8 +505,10 @@ public:
     }
 
     // Blocking GET with ASYNCIFY yield. Returns body bytes; sets err on failure.
-    static std::string fetchGetBlocking(const std::string& url, std::string& err) {
+    static std::string fetchGetBlocking(const std::string& url, std::string& err,
+                                        int* status = nullptr) {
         err.clear();
+        if (status) *status = 0;
         FetchWait wait;
         auto* own = new OwnedPayload(nullptr, 0, &wait);
         emscripten_fetch_attr_t attr;
@@ -344,6 +526,7 @@ public:
             return {};
         }
         while (wait.done == 0) emscripten_sleep(5);
+        if (status) *status = wait.status;
         if (wait.done < 0) {
             err = wait.err.empty() ? ("fetch failed: " + url) : (wait.err + " for " + url);
             return {};
@@ -406,6 +589,13 @@ public:
                   std::string& err) {
         err.clear();
         const std::string payload = body.dump();
+        invalidateBrowseCache();
+        // Also retire reads completed while ASYNCIFY yielded for this mutation,
+        // even on ambiguous network failure: the server may have committed it.
+        struct MutationFence {
+            WebFsBackend& backend;
+            ~MutationFence() { backend.invalidateBrowseCache(); }
+        } fence{*this};
         std::string text;
         if (!fetchWriteBlocking("POST", url, payload.data(), payload.size(),
                                "application/json", text, err)) {
@@ -420,11 +610,12 @@ public:
         return true;
     }
 
-    std::vector<FsEntry> listImpl(const std::string& dirRel, bool wantRoot, std::string& err) {
+    std::vector<FsEntry> listImpl(const std::string& dirRel, bool wantRoot, std::string& err,
+                                  int* status = nullptr) {
         err.clear();
         const std::string url = std::string("/workspace/list?dir=") + urlEncode(dirRel);
         std::string fetchErr;
-        auto text = fetchGetBlocking(url, fetchErr);
+        auto text = fetchGetBlocking(url, fetchErr, status);
         if (!fetchErr.empty() && text.empty()) {
             err = fetchErr;
             return {};
@@ -465,28 +656,26 @@ public:
     }
 
     std::vector<FsEntry> list(const std::string& dir, std::string& err) override {
-        if (!ensureRoot(err) && rootAbs_.empty()) {
-            // ensureRoot may set err; still try listing with toRel best-effort
-        }
+        if (!ensureRoot(err)) return {};
         return listImpl(toRel(dir), /*wantRoot=*/false, err);
     }
 
     bool mkdir(const std::string& path, std::string& err) override {
-        ensureRoot(err);
+        if (!ensureRoot(err)) return false;
         nlohmann::json out;
         return postJson("/workspace/mkdir",
                         nlohmann::json{{"path", toRel(path)}}, out, err);
     }
 
     bool rename(const std::string& src, const std::string& dst, std::string& err) override {
-        ensureRoot(err);
+        if (!ensureRoot(err)) return false;
         nlohmann::json out;
         return postJson("/workspace/rename",
                         nlohmann::json{{"src", toRel(src)}, {"dst", toRel(dst)}}, out, err);
     }
 
     bool remove(const std::string& path, std::string& err) override {
-        ensureRoot(err);
+        if (!ensureRoot(err)) return false;
         nlohmann::json out;
         return postJson("/workspace/delete",
                         nlohmann::json{{"path", toRel(path)}}, out, err);
@@ -495,10 +684,7 @@ public:
     FsStat stat(const std::string& path, std::string& err) override {
         err.clear();
         FsStat s;
-        if (!ensureRoot(err) && rootAbs_.empty()) {
-            // fall through — may still work with relative listing
-            err.clear();
-        }
+        if (!ensureRoot(err)) return s;
         const std::string rel = toRel(path);
         if (rel.empty()) {
             // Workspace root always exists as a directory once known (or by convention).
@@ -510,13 +696,10 @@ public:
         const std::string parent = pathParent(rel);
         const std::string name   = pathFilename(rel);
         std::string listErr;
-        auto entries = listImpl(parent, /*wantRoot=*/false, listErr);
-        if (!listErr.empty() && entries.empty()) {
-            // Treat list failure of parent as "does not exist" only if 404-ish; else surface.
-            if (listErr.find("404") != std::string::npos ||
-                listErr.find("not found") != std::string::npos) {
-                return s;
-            }
+        int listStatus = 0;
+        auto entries = listImpl(parent, /*wantRoot=*/false, listErr, &listStatus);
+        if (listStatus == 404) return s;
+        if (!listErr.empty()) {
             err = listErr;
             return s;
         }
@@ -546,48 +729,18 @@ public:
 
     bool copy(const std::string& src, const std::string& dst, bool recursive,
               std::string& err) override {
-        ensureRoot(err);
+        if (!ensureRoot(err)) return false;
         nlohmann::json out;
-        // Prefer a single server-side copy (handles dirs recursively).
-        if (postJson("/workspace/copy",
-                     nlohmann::json{{"src", toRel(src)},
-                                    {"dst", toRel(dst)},
-                                    {"recursive", recursive}},
-                     out, err)) {
-            return true;
-        }
-        // Fallback for older gateways: single-file download+upload only.
-        if (recursive) {
-            // Directory copy without /workspace/copy is not supported by this fallback.
-            return false;
-        }
-        std::string fallbackErr;
-        const std::string srcRel = toRel(src);
-        const std::string url = std::string("/workspace/download?path=") + urlEncode(srcRel);
-        auto text = fetchGetBlocking(url, fallbackErr);
-        if (text.empty() && !fallbackErr.empty()) {
-            err = fallbackErr;
-            return false;
-        }
-        const std::string destName = pathFilename(dst);
-        const std::string destParent = pathParent(toRel(dst));
-        std::string upErr;
-        std::string abs = fsUpload(destParent, destName,
-                                  reinterpret_cast<const uint8_t*>(text.data()),
-                                  text.size(), upErr);
-        if (abs.empty()) {
-            err = upErr.empty() ? "upload failed" : upErr;
-            return false;
-        }
-        err.clear();
-        return true;
+        // Never retry a failed mutation with download/upload: an ambiguous
+        // response may already have copied it, and upload could overwrite dst.
+        return postJson("/workspace/copy",
+                        nlohmann::json{{"src", toRel(src)},
+                                       {"dst", toRel(dst)},
+                                       {"recursive", recursive}}, out, err);
     }
 
     std::vector<std::string> loadRecents(std::string& err) override {
-        // Fully async: fire-and-forget GET. Startup callers (loadSettings) treat empty as
-        // "no durable recents yet"; a later open can still refresh from IDBFS config.
-        // Returning {} immediately keeps boot non-blocking; results are not applied
-        // retroactively (config.json/IDBFS is the primary store after first save).
+        // Startup-only durable load; render-time recents use pollStat instead.
         err.clear();
         // Best-effort blocking GET via ASYNCIFY — loadSettings runs once at boot on the
         // main thread where a short yield is acceptable and keeps the API sync for callers.
@@ -657,6 +810,38 @@ WebFsBackend& webInstance() {
 
 // ---- public entry points ---------------------------------------------------
 
+const FsDirectorySnapshot& FsBackend::pollDirectory(const std::string& dir) {
+    auto& cache = browseCache_[dir];
+    if (browseNow() - cache.checkedAt >= 2.0) {
+        cache.checkedAt = browseNow();
+        auto& snapshot = cache.snapshot;
+        auto entries = list(dir, snapshot.error);
+        snapshot.state = snapshot.error.empty() ? FsReadState::Ready : FsReadState::Error;
+        snapshot.revision = ++browseRevision_;
+        if (snapshot.error.empty()) snapshot.entries = std::move(entries);
+        else {
+            std::string statError;
+            const auto directory = stat(dir, statError);
+            if (statError.empty() && !directory.exists) {
+                snapshot.state = FsReadState::Missing;
+                snapshot.entries.clear();
+            }
+        }
+    }
+    return cache.snapshot;
+}
+
+FsStatSnapshot FsBackend::pollStat(const std::string& path) {
+    FsStatSnapshot result;
+    result.value = stat(path, result.error);
+    result.state = result.error.empty() ? FsReadState::Ready : FsReadState::Error;
+    return result;
+}
+
+void FsBackend::invalidateBrowseCache(bool /*workspaceChanged*/) {
+    browseCache_.clear();
+}
+
 FsBackend& fsBackend() {
 #ifdef __EMSCRIPTEN__
     return webInstance();
@@ -669,6 +854,10 @@ std::string fsUpload(const std::string& dir, const std::string& filename,
                      const uint8_t* data, size_t len, std::string& err) {
     err.clear();
 #ifdef __EMSCRIPTEN__
+    webInstance().invalidateBrowseCache();
+    struct UploadFence {
+        ~UploadFence() { webInstance().invalidateBrowseCache(); }
+    } fence;
     // Multipart form: dir (form field) + file (file field).
     // ASYNCIFY-yielding upload — never EMSCRIPTEN_FETCH_SYNCHRONOUS on main thread.
     const std::string boundary = "----ChudwareBoundary7MA4YWxkTrZu0gW";

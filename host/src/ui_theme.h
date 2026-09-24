@@ -448,7 +448,7 @@ const ViewportBackdropInfo& viewportBackdrop();
 // 0..1 luminance out; negative => no live backdrop under that rect.
 using LuminanceSampler = float (*)(ImVec2 mn, ImVec2 mx);
 void  setLuminanceSampler(LuminanceSampler fn);
-float sampleLuminance(ImVec2 mn, ImVec2 mx);   // -1 when unavailable
+float sampleLuminance(ImVec2 mn, ImVec2 mx);   // -1 when unavailable or non-finite/out of range
 
 // v2.1 dynamic color: aggregate backdrop statistics under a rect. hue/sat are the HSV of the
 // MEAN RGB (hue of the mean, not mean of hues — circular-safe and cheap); variance is the
@@ -464,8 +464,8 @@ struct BackdropStats {
 };
 using BackdropStatsSampler = bool (*)(ImVec2 mn, ImVec2 mx, BackdropStats& out);
 void setBackdropStatsSampler(BackdropStatsSampler fn);
-// false => unavailable (no live backdrop / sampler unregistered); callers then behave exactly
-// as if dynamicColor were off.
+// false => unavailable or invalid statistics; callers then behave exactly as if dynamicColor
+// were off. On failure `out` is reset to its unavailable defaults.
 bool sampleBackdropStats(ImVec2 mn, ImVec2 mx, BackdropStats& out);
 
 // Stable, window-independent panel-surface id (ImHashStr) — the same id resolves to the same
@@ -480,8 +480,9 @@ AdaptiveSurface adaptiveSurface(float avgLuminance, GlassGroup group = GlassGrou
 
 // Hysteretic (.42/.58) + temporally smoothed (tau 0.24s) per-panel adapter. Samples luminance
 // under `rect` via the registered sampler. `id` = any stable ImGuiID (use panelId()). Safe to
-// call every frame; idempotent within a frame; GUI thread only. `group` selects the user
-// GlassStyle (tint / dynamic color / contrast); pass the SAME group every frame for a given id.
+// call every frame; live AND fallback results are idempotent within a frame, GUI thread only.
+// Missing readbacks retain the last live contrast pair while the backdrop remains live.
+// `group` selects GlassStyle; pass the SAME group every frame for a given id.
 const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect,
                                      GlassGroup group = GlassGroup::Global);
 

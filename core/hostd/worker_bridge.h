@@ -47,7 +47,9 @@ public:
                                  const nlohmann::json& params, bool& matched,
                                  nlohmann::json& result, std::string& err);
 
-    // Best-effort shutdown of the child (idempotent). Called from ~WorkerBridge.
+    // Shutdown of the child (idempotent). Called from ~WorkerBridge and daemon exit. Never
+    // waits behind an in-flight call: a live agent turn is cancelled through the control lane,
+    // then the child is terminated if it has not returned within a short grace.
     void stop();
 
     // Stop both lazily-created children without constructing an unused lane.
@@ -79,6 +81,9 @@ private:
     int childStdinWr_ = -1;   // write -> child stdin
     int childStdoutRd_ = -1;  // read  <- child stdout
     pid_t process_ = -1;
+    // Mirror of process_ readable WITHOUT mtx_: stop() must be able to end a child whose
+    // in-flight call holds the lane for hours. Updated at every process_ assignment.
+    std::atomic<pid_t> livePid_{-1};
     std::string readBuf_;
     int nextId_ = 1;
     bool running_ = false;
@@ -100,6 +105,8 @@ private:
 
     const bool agentLane_;
     std::mutex mtx_;
+    // Set once stop() begins: an in-flight call that loses its child must not respawn one.
+    std::atomic<bool> stopping_{false};
     static std::atomic<bool> agentCreated_;
     static std::atomic<bool> generalCreated_;
 };

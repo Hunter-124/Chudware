@@ -148,6 +148,11 @@ judgment).
   RPC family MUST be added to the agent prefix list or it lands on the general lane (a
   different process, blind to Chudcode sessions). Worker-side files shared across processes
   need flocks (vault config and Box mirror drain already have them), not threading locks.
+  `WorkerBridge::stop()` never waits behind an in-flight call (a turn holds the lane for
+  hours): it cancels the active run over the control lane, waits ≤10 s, then SIGTERMs the
+  child, and a stopping bridge never respawns. Before this a tray Quit mid-turn wedged hostd
+  with its accept loop gone and the agent's next CAD call blocked forever
+  (`test_sigterm_mid_turn_ends_the_turn_and_the_daemon`).
 - **Web actors never use ambient `chud` auth (2026-09-24).** BYOK, personal Claude OAuth and
   the pool (`CHUDWARE_WEB_POOL_API_KEY`/`_PROVIDER`/`_MODEL`) each run in a credential-scoped
   Chudcode process with a gateway digest proof; a web actor without a servable credential

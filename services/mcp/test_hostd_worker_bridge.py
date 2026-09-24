@@ -140,6 +140,8 @@ for raw in sys.stdin:
             "kind": "agent.tool_call", "run_id": run_id, "tool_name": "fake_tool"}})
         if mode == "die":
             os._exit(23)
+        if mode == "hang":
+            time.sleep(600)  # a wedged turn: ignores cancel entirely
         with condition:
             condition.wait_for(
                 lambda: active.get("cancelled") or "steer" in active,
@@ -439,3 +441,49 @@ def test_inactive_control_does_not_construct_worker(worker_daemon):
     assert cancelled.get("cancelled") is False
     assert steered.get("steered") is False
     assert _worker_count(worker_daemon["counter"]) == 0
+
+
+@pytest.mark.parametrize("mode", ["normal", "hang"])
+def test_sigterm_mid_turn_ends_the_turn_and_the_daemon(
+    worker_daemon, monkeypatch: pytest.MonkeyPatch, mode
+):
+    # Live 2026-09-24: hostd was stopped (tray Quit / SIGTERM) while an agent turn held the
+    # worker lane. WorkerBridge::stop() waited on that lane forever: the accept loop was
+    # gone, the worker's engine socket hung, and the turn's next CAD call blocked for good.
+    # Stop must cancel the live run (and end a child that ignores the cancel) instead.
+    monkeypatch.setenv("CHUDWARE_TEST_WORKER_MODE", mode)
+    requester = DaemonClient()
+    requester.connect()
+    daemon_pid = _pid(requester)
+    worker_daemon["pids"].append(daemon_pid)
+    outcome: dict = {}
+
+    def run() -> None:
+        try:
+            outcome["result"] = requester.call(
+                "agent_admin_turn", {"run_id": "stopped-mid-turn", "request": "work"}
+            )
+        except Exception as exc:  # noqa: BLE001 — a dropped connection is an acceptable end
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    _wait_for(worker_daemon["active"])
+    worker_pids = [
+        int(line) for line in worker_daemon["counter"].read_text().splitlines()
+    ]
+    os.kill(daemon_pid, signal.SIGTERM)
+
+    deadline = time.monotonic() + 20.0
+    while Path(f"/proc/{daemon_pid}").exists():
+        status = Path(f"/proc/{daemon_pid}/stat").read_text().split()[2] if Path(
+            f"/proc/{daemon_pid}/stat").exists() else "X"
+        if status == "Z":
+            break
+        assert time.monotonic() < deadline, "hostd wedged behind the in-flight turn"
+        time.sleep(0.05)
+    thread.join(timeout=5.0)
+    assert not thread.is_alive(), "the requester never learned its turn ended"
+    assert all(not Path(f"/proc/{pid}").exists() for pid in worker_pids)
+    if mode == "normal":
+        assert outcome.get("result", {}).get("control") == "cancel"

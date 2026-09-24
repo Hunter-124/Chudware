@@ -420,7 +420,38 @@ bool WorkerBridge::controlActiveRunImpl(const std::string& action, const json& p
 }
 
 void WorkerBridge::stop() {
-    std::lock_guard<std::mutex> lk(mtx_);
+    stopping_.store(true, std::memory_order_release);
+    std::unique_lock<std::mutex> lk(mtx_, std::try_to_lock);
+    if (!lk.owns_lock()) {
+        // A call holds the lane — an agent turn holds it for hours. Waiting here wedged the
+        // daemon on tray Quit / SIGTERM mid-turn (2026-09-24): the accept loop was gone, the
+        // worker's engine socket hung, and the turn's next CAD call blocked forever. Ask the
+        // active run to cancel, give it a bounded moment to return, then end the child so
+        // the blocked readLine sees EOF and releases the lane.
+        std::string runId;
+        {
+            std::lock_guard<std::mutex> controlLock(controlMtx_);
+            runId = activeWorkerRunId_;
+        }
+        if (!runId.empty()) {
+            bool matched = false;
+            json ignored;
+            std::string cancelErr;
+            controlActiveRunImpl("cancel", json{{"run_id", runId}}, matched, ignored, cancelErr);
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!lk.try_lock() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (!lk.owns_lock()) {
+            const pid_t pid = livePid_.load(std::memory_order_acquire);
+            if (pid > 0) {
+                log().line("worker_bridge: stopping with a call in flight; terminating pid %d",
+                           (int)pid);
+                ::kill(pid, SIGTERM);
+            }
+            lk.lock();
+        }
+    }
     clearControlState();
     if (!running_ && process_ < 0 && childStdinWr_ < 0 && childStdoutRd_ < 0) return;
     // Soft shutdown request, then reap (mirrors worker_client.cpp stop()).
@@ -447,6 +478,7 @@ void WorkerBridge::stop() {
             waitpid(process_, nullptr, 0);
         }
         process_ = -1;
+        livePid_.store(-1, std::memory_order_release);
     }
     if (childStdoutRd_ >= 0) {
         ::close(childStdoutRd_);
@@ -479,6 +511,7 @@ void WorkerBridge::reap() {
             waitpid(process_, nullptr, 0);
         }
         process_ = -1;
+        livePid_.store(-1, std::memory_order_release);
     }
     readBuf_.clear();
     running_ = false;
@@ -623,6 +656,7 @@ bool WorkerBridge::spawn(std::string& err) {
     ::close(outPipe[1]);
     fcntl(outPipe[0], F_SETFL, O_NONBLOCK);
     process_ = pid;
+    livePid_.store(pid, std::memory_order_release);
     childStdoutRd_ = outPipe[0];
     childStdinWr_ = inPipe[1];
     readBuf_.clear();
@@ -684,6 +718,7 @@ bool WorkerBridge::readLine(std::string& line, int timeoutMs) {
             pid_t r = (process_ >= 0) ? waitpid(process_, &status, WNOHANG) : -1;
             if (r == process_ || (r < 0 && errno == ECHILD)) {
                 process_ = -1;
+                livePid_.store(-1, std::memory_order_release);
                 char chunk[4096];
                 ssize_t got = ::read(childStdoutRd_, chunk, sizeof(chunk));
                 if (got > 0) {
@@ -788,6 +823,7 @@ bool WorkerBridge::callOnce(const std::string& method, const json& params, json&
                 pid_t r = waitpid(process_, &status, WNOHANG);
                 if (r == process_ || (r < 0 && errno == ECHILD)) {
                     process_ = -1;
+                    livePid_.store(-1, std::memory_order_release);
                     err = "closed waiting for response";
                 } else {
                     err = "timeout waiting for response";
@@ -853,6 +889,10 @@ bool WorkerBridge::call(const std::string& method, const json& params, json& res
     result = json::object();
     err.clear();
     if (timeoutMs <= 0) timeoutMs = 120000;
+    if (stopping_.load(std::memory_order_acquire)) {
+        err = "worker bridge stopping";
+        return false;
+    }
 
     const bool longAgentTurn = method == "agent_admin_turn";
     std::string runId;
@@ -884,7 +924,7 @@ bool WorkerBridge::call(const std::string& method, const json& params, json& res
                        attempt == 0 ? "respawning once" : "giving up");
             reap();
             err = std::move(attemptErr);
-            if (attempt == 1) return false;
+            if (attempt == 1 || stopping_.load(std::memory_order_acquire)) return false;
             continue;
         }
 
@@ -908,7 +948,7 @@ bool WorkerBridge::call(const std::string& method, const json& params, json& res
                    attemptErr.c_str(), attempt == 0 ? "respawning once" : "giving up");
         reap();
         err = std::move(attemptErr);
-        if (attempt == 1) return false;
+        if (attempt == 1 || stopping_.load(std::memory_order_acquire)) return false;
         // loop: respawn inside fetchControlInfo/callOnce
     }
     return false;

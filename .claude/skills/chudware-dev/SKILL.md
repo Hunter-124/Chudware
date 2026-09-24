@@ -225,7 +225,13 @@ judgment).
 - **The turn budget is the caller's (2026-09-07).** `agent_admin_turn` forwards `timeout`
   to `chudcode_host.wait_for_idle`; without it the host's 2-hour absolute cap kills a long
   turn with `Timed out waiting for agent_end` regardless of `run_mission.py --timeout-s`
-  (the driver now sends it and waits `--timeout-s + 60`). OAuth account balancing is
+  (the driver now sends it and waits `--timeout-s + 60`). The GUI does the same since
+  2026-09-24: `buildAgentJobRpcRoute` stamps `timeout` (default 7200 s), `jobs.cpp` waits
+  budget + 120 s and hostd's bridge budget + 60 s; the old fixed 900 000 ms client deadline
+  killed a healthy 15-minute turn mid-tool-call and labelled it `provider_error` (a client
+  wait expiring is now `client_timeout`). An agent-opened doc never takes viewport focus
+  from a user's own tab (`openMirrorTab`); the error card lists only tool failures the turn
+  never got past, parsed through `splitToolRowDetail`. OAuth account balancing is
   sticky on the **Chudware session id**, not the resumed Chudcode history: a session id
   pinned to an exhausted account keeps 429-ing after `chud usage` shows a fresh account —
   resume the same `.jsonl` under a new `--session-id` (`chud dry-balance <model>` shows
@@ -315,7 +321,9 @@ judgment).
   (`resume=True` opts in) with a real import feature; nested path-backed assemblies load
   recursively; `validated: true` requires every component to contribute solids and an
   exact round-trip count (`components:[{name,solids,source}]`). The MCP mass tool is
-  `measure_part(density_g_cm3=)`; `eval_mass` is engine-internal.
+  `measure_part(density_g_cm3=)`; `eval_mass` is engine-internal. A `doc_solve_mates` that
+  moves nothing beyond solver tolerance is not an edit (2026-09-24): revision, dirty and
+  undo stay put, so `describe_assembly` never dirties a user's solved assembly.
 - **Refuse before you mesh; never go silent (2026-09-10).** Contact geometry preflights
   (interface classification, selector span, normal cone from CAD face normals) run before
   any fill — the open-saddle refusal takes ~1 s with 0 elements where it used to burn 45
@@ -376,7 +384,9 @@ judgment).
   (`path.empty() || dirty || autosave path`) into `CHUDWARE_PROJECT_SAVE_DIR`. It NEVER
   touches `origin_kind=gui` and never writes a file for an empty doc. Only `new_part` and
   `add_features` project-save on their own — every assembly and every `edit_feature` /
-  `set_material` / `asm_*` mutation depends on this sweep.
+  `set_material` / `asm_*` mutation depends on this sweep. Since 2026-09-24 a pristine
+  import of a file still on disk (engine `doc_list.reproducible_from`) is neither swept
+  (`skipped: reproducible_import`) nor autosaved/retired by hostd — GC just closes it.
 - **In daemon mode hostd is the ONLY autosave authority** (2026-08-27). The daemon-mode
   early-return lives in `cad_common._autosave()` — the single write — not at its callers.
   It used to sit on the two aggregate entry points (`_autosave_all_open`,

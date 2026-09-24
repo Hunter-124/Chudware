@@ -120,9 +120,11 @@ nlohmann::json doc_open_embedded(const nlohmann::json& document);
 
 // C20 assembly RPCs (port of engine/doc/session.py solve_mates / set_explode_state /
 // asm_world_bodies). doc_solve_mates re-solves the mates (optional drag {component,
-// target[3]} soft-target), persists the solved transforms, bumps the revision, and
-// returns the ops-response carrying doc_status (dof/over_defined/mate_status). Throws
-// OpError("invalid_op") on a non-assembly doc.
+// target[3]} soft-target) and returns the ops-response carrying doc_status
+// (dof/over_defined/mate_status). Only a solve that changes the document (a component
+// moves beyond the solver tolerance, reference frames bind, or component geometry
+// differs) persists the solved transforms and bumps revision/dirty/undo; a no-op solve
+// leaves all three untouched. Throws OpError("invalid_op") on a non-assembly doc.
 nlohmann::json doc_solve_mates(const std::string& doc_id,
                                const nlohmann::json& drag = nlohmann::json(nullptr));
 // Toggle the exploded-view state and re-tessellate (no revision bump — view-only).

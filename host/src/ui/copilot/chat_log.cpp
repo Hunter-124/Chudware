@@ -840,19 +840,35 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         // Nothing to show if the turn has no un-shown prose, no stop fields and no
         // humanized line. (Prose the timeline already drew inline is not repeated here.)
         if (!(bodyText.empty() && stopReason.empty() && errorDetail.empty() && m.errorHuman.empty())) {
-        // Also surface any failed activity reason strings (phase errors) that aren't already
-        // folded into the meta row — keeps "budget exhausted (1)" from being the only line.
+        // Also surface failed activity reasons (phase errors) that aren't already folded into
+        // the meta row — keeps "budget exhausted (1)" from being the only line. Only failures
+        // the turn never got past: a row that fails and is followed by later successful work
+        // was recovered from and is not why the turn stopped (a `read local://PLAN.md`
+        // miss 14 minutes before a timeout was painted as the cause, 2026-09-24). Tool rows
+        // carry a packed detail (args + \x1eERR\x1e + \x1eMETA\x1e trailers): show only its
+        // error text, never the raw marker bytes.
         std::string phaseErr;
+        std::vector<std::string> unrecovered;
         for (const auto& a : m.activity) {
             if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
+            if (a.status == "done") {
+                unrecovered.clear();
+                continue;
+            }
             if (a.status != "fail" && a.status != "error") continue;
             std::string bit;
             if (!a.reason.empty()) bit = a.reason;
-            else if (!a.detail.empty()) bit = a.detail;
-            else if (!a.title.empty()) bit = a.title;
+            else if (a.stage.rfind("tool:", 0) == 0) {
+                const std::string err = splitToolRowDetail(a.detail).err;
+                if (!err.empty()) bit = a.title.empty() ? err : (a.title + ": " + err);
+            } else if (!a.detail.empty()) bit = a.detail;
+            if (bit.empty()) bit = a.title;
             if (bit.empty()) continue;
             if (errorDetail.find(bit) != std::string::npos) continue;
             if (m.text.find(bit) != std::string::npos) continue;
+            unrecovered.push_back(std::move(bit));
+        }
+        for (const auto& bit : unrecovered) {
             if (!phaseErr.empty()) phaseErr += "\n";
             phaseErr += bit;
         }

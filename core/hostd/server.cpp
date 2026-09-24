@@ -974,11 +974,20 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     sendAgentEvent(requester, encoded.c_str());
                 };
             }
-            // jobs.cpp gives online turns a 15-minute ceiling. The daemon
-            // transport cannot carry that client-side timeout through, so keep
-            // the same bound here instead of truncating a live turn at 120 s.
-            const int workerTimeoutMs =
-                method == "agent_admin_turn" ? 900000 : 120000;
+            // An online turn's budget is the caller's `timeout` (seconds; the GUI's jobs.cpp
+            // always sends it). The bridge wait is an IDLE bound (each streamed
+            // line restarts WorkerBridge::readLine), sized past that budget so the worker's
+            // structured "turn timed out" reply always arrives first. Everything else keeps
+            // the ordinary 120 s bound.
+            int workerTimeoutMs = 120000;
+            if (method == "agent_admin_turn") {
+                double budgetS = 7200.0;
+                const auto t = p.find("timeout");
+                if (t != p.end() && t->is_number() && t->get<double>() > 0)
+                    budgetS = t->get<double>();
+                const double ms = (budgetS + 60.0) * 1000.0;
+                workerTimeoutMs = ms >= 2147483647.0 ? 2147483647 : (int)ms;
+            }
             const bool workerOk =
                 WorkerBridge::forMethod(method).call(method, p, wresult, werr,
                                                       workerTimeoutMs, workerEvent);

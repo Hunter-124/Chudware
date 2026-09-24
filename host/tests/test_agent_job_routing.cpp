@@ -88,6 +88,22 @@ void testRunAndSessionIds() {
           "conversation id supplies missing session id");
 }
 
+// Every online turn carries an explicit budget the worker enforces, so a long healthy turn is
+// bounded by the worker's structured timeout rather than a silent client socket deadline.
+void testOnlineTurnBudget() {
+    const AgentJobRpcRoute route =
+        buildAgentJobRpcRoute("fix the brakes", "doc", "conv", false, nlohmann::json::object(), false);
+    check(route.params.contains("timeout") && route.params["timeout"].is_number() &&
+              route.params["timeout"].get<double>() >= 3600.0,
+          "online turn gets an hours-scale budget, not the old 15-minute ceiling");
+    const AgentJobRpcRoute explicitBudget = buildAgentJobRpcRoute(
+        "fix the brakes", "doc", "conv", false, {{"timeout", 14400}}, true);
+    check(explicitBudget.params.value("timeout", 0.0) == 14400.0, "explicit budget preserved");
+    const AgentJobRpcRoute offline = buildAgentJobRpcRoute(
+        "local build", "doc", "conv", false, {{"options", {{"offline", true}}}}, false);
+    check(!offline.params.contains("timeout"), "offline native route gets no worker budget");
+}
+
 // The composer's user-picked mode is authoritative for a normal (non-mission) turn: the route
 // must never re-derive it, and an absent/blank mode falls back to "agent".
 void testComposerModePreserved() {
@@ -243,6 +259,7 @@ void testEventConsumption() {
 int main() {
     testOnlineNormalRoute();
     testRunAndSessionIds();
+    testOnlineTurnBudget();
     testComposerModePreserved();
     testOnlineMissionRoute();
     testExplicitOfflineFallbacks();

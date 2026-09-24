@@ -63,6 +63,29 @@ std::string jsonString(const nlohmann::json& value, const char* key) {
     return value[key].get<std::string>();
 }
 
+// The online turn budget is the caller's (chudware-dev SKILL.md, 2026-09-07): it rides to
+// agent_admin_turn as `timeout` (seconds) and bounds chudcode_host.wait_for_idle, so the
+// worker reports a structured timeout first. The client wait is the same budget plus slack.
+// The old fixed 900 000 ms client deadline predated Chudcode and killed a healthy turn at
+// 15:00 mid-tool-call, then "auto-cancelled the orphan" and blamed the provider (2026-09-24).
+constexpr double kOnlineTurnBudgetS = 7200.0;
+constexpr int kOnlineTurnSlackS = 120;
+constexpr int kOfflineRunWaitMs = 900000;
+
+int agentJobWaitMs(const AgentJobRpcRoute& route) {
+    if (!route.online) return kOfflineRunWaitMs;
+    double budget = kOnlineTurnBudgetS;
+    const auto it = route.params.find("timeout");
+    if (it != route.params.end() && it->is_number()) budget = it->get<double>();
+    const double ms = (budget + kOnlineTurnSlackS) * 1000.0;
+    return ms >= 2147483647.0 ? 2147483647 : (int)ms;
+}
+
+// A client-side wait expiring is not a provider failure: name it for what it is.
+std::string transportStopReason(const std::string& err) {
+    return err.rfind("engine call timed out", 0) == 0 ? "client_timeout" : "provider_error";
+}
+
 }  // namespace
 
 AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::string& docId,
@@ -112,6 +135,9 @@ AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::st
     if (sessionId.empty()) sessionId = convId;
     if (sessionId.empty()) sessionId = runId;
     route.params["session_id"] = sessionId;
+    const auto timeout = route.params.find("timeout");
+    if (timeout == route.params.end() || !timeout->is_number() || timeout->get<double>() <= 0)
+        route.params["timeout"] = kOnlineTurnBudgetS;
     return route;
 }
 
@@ -282,7 +308,7 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
             consumeAgentJobEvent(job, data, /*mission=*/false);
         };
         const bool ok =
-            w.call(route.method, route.params, result, err, 900000, onEvent);
+            w.call(route.method, route.params, result, err, agentJobWaitMs(route), onEvent);
         if (ok && route.online) result = normalizeAgentAdminTurnResult(result, /*mission=*/false);
         // Transport loss (timeout/closed) orphans the daemon-side run: hostd keeps
         // executing — and billing — with no client attached. A user resubmit then
@@ -306,7 +332,7 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
             job->error = err;
             job->errorIsCad = false;
             job->converged = false;
-            if (job->stopReason.empty()) job->stopReason = "provider_error";
+            if (job->stopReason.empty()) job->stopReason = transportStopReason(err);
             if (job->errorDetail.empty()) job->errorDetail = err;
             if (orphanCancelled)
                 job->errorDetail += " (orphaned run auto-cancelled after transport loss)";
@@ -490,14 +516,14 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
             consumeAgentJobEvent(job, data, /*mission=*/true);
         };
         const bool ok =
-            w.call(route.method, route.params, result, err, 900000, onEvent);
+            w.call(route.method, route.params, result, err, agentJobWaitMs(route), onEvent);
         if (ok && route.online) result = normalizeAgentAdminTurnResult(result, /*mission=*/true);
         std::lock_guard<std::mutex> lk(job->mtx);
         if (!ok) {
             job->error = err;
             job->errorIsCad = false;
             job->converged = false;
-            if (job->stopReason.empty()) job->stopReason = "provider_error";
+            if (job->stopReason.empty()) job->stopReason = transportStopReason(err);
             if (job->errorDetail.empty()) job->errorDetail = err;
         } else {
             // Online agent_admin_turn results are normalized above to the legacy mission shape;

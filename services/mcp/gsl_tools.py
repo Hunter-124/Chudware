@@ -1144,13 +1144,14 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
 
 
 def _describe_assembly_text(doc_id: str) -> str:
-    """Narrate world placement, a live mate solve, and collision-only fit.
+    """Narrate world placement, the mate-solve verdict, and collision-only fit.
 
-    Calls asm_world_bodies, then doc_solve_mates (which can update placements),
-    then eval_interference in zero-clearance threshold mode. The native fit check
+    Calls asm_world_bodies, then doc_solve_mates for the verdict (status, dof), then
+    eval_interference in zero-clearance threshold mode. A re-solve that moves nothing
+    is not an edit (core/doc/session.cpp::doc_solve_mates), so describing a solved
+    assembly never bumps its revision or marks it dirty. The native fit check
     evaluates geometry and exact overlap volumes, not minimum measured gaps.
-    Placement rows describe the pre-solve snapshot; solve_mates first when those
-    rows must reflect the solved pose. Preserve the raw fit evidence in the reply.
+    Preserve the raw fit evidence in the reply.
     """
     # 1. World-placed bodies
     try:
@@ -2292,13 +2293,14 @@ def register_gsl_tools(mcp: FastMCP) -> None:
         """Compact narrative of an assembly (or multi-body part) — world placement, fit/clearance,
         and mate solve summary. Use INSTEAD of dumping asm_world_bodies JSON.
 
-        Queries world-frame bounding boxes/origins, runs doc_solve_mates, then evaluates
-        collision-only fit with clearance_mode='threshold', min_clearance_mm=0 and
-        include_coincident=False. Overlap volumes remain exact; clearance lower bounds
-        are not measured gaps and no tightest measured gap is reported. Returns raw fit
-        completeness, pair coverage and failures; no-pair or incomplete results cannot
-        qualify collision-free. Works on assembly docs and multi-body parts.
-        Call solve_mates first if the pre-solve placement rows must show the solved pose.
+        Read-only on a solved assembly: queries world-frame bounding boxes/origins, reads
+        the mate-solve verdict (status, dof) without editing, dirtying or re-revisioning
+        the document, then evaluates collision-only fit with clearance_mode='threshold',
+        min_clearance_mm=0 and include_coincident=False. Overlap volumes remain exact;
+        clearance lower bounds are not measured gaps and no tightest measured gap is
+        reported. Returns raw fit completeness, pair coverage and failures; no-pair or
+        incomplete results cannot qualify collision-free. Works on assembly docs and
+        multi-body parts. To re-seat components after edits, use solve_mates.
         """
         try:
             return _describe_assembly_text(_doc(doc_id))

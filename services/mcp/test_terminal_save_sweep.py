@@ -260,6 +260,42 @@ def test_an_assembly_is_swept_on_its_component_count(sweep):
     assert out["saved"][0]["name"] == "motor_mount"
 
 
+def test_a_pristine_import_of_an_existing_file_is_not_written_to_the_project(
+    sweep, tmp_path
+):
+    """An agent's body-roster probe (`import_part(..., keep_bodies=[...])`) was written
+    into the project root as `_frame624_2026-09-07.step+` beside the STEP it came from
+    (2026-09-24). A doc that is only an unmodified import of a file still on disk is
+    reproducible scratch; hostd closes it at GC without a recovery row for the same
+    reason. Authored content after the import, or a vanished source, is real work."""
+    source = tmp_path / "depricated" / "_frame624_2026-09-07.step"
+    source.parent.mkdir(parents=True)
+    source.write_text("ISO-10303-21;\n")
+    row = {"kind": "part", "dirty": True, "path": "", "origin_kind": "mcp"}
+    fake = sweep(
+        [
+            {**row, "doc_id": "d-probe", "name": "_frame624_2026-09-07",
+             "feature_count": 1, "revision": 1, "reproducible_from": [str(source)]},
+            # Engine empties reproducible_from once anything is authored after the import.
+            {**row, "doc_id": "d-placed", "name": "frame_placed",
+             "feature_count": 2, "revision": 2, "reproducible_from": []},
+            {**row, "doc_id": "d-orphaned", "name": "frame_orphaned",
+             "feature_count": 1, "revision": 1,
+             "reproducible_from": [str(tmp_path / "gone" / "frame.step")]},
+        ],
+        touched=["d-probe", "d-placed", "d-orphaned"],
+    )
+    out = C.save_touched_docs()
+
+    assert [s[0] for s in fake.saves] == ["d-placed", "d-orphaned"]
+    assert out["skipped"] == [
+        {"doc_id": "d-probe", "name": "_frame624_2026-09-07",
+         "reason": "reproducible_import", "source_paths": [str(source)]}
+    ]
+    assert out["persistence_failure"] is None
+
+
+
 def test_an_agent_origin_doc_this_process_never_touched_is_still_swept(sweep):
     """The worker is forked per turn, so a doc built by an earlier turn's worker is not
     in this process's registry. origin_kind is the engine's own attribution and covers

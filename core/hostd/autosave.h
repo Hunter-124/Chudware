@@ -50,6 +50,13 @@
 //  clone whose owning worker died mid-run used to be retired to the orphan tier and
 //  then accepted from the "Recover?" prompt, giving the user a tab strip of
 //  `AI: <part>_pf`, `_pf2`, `_pf3` shadow copies of their real part.
+//
+//  PRISTINE IMPORTS ARE NEVER RECOVERED (2026-09-24): a doc whose engine doc_list row
+//  carries a non-empty `reproducible_from` (every feature an unmodified import) whose
+//  source files all still exist is skipped by autosave and by retireDoc, so doc-GC just
+//  closes it. An agent's body-roster probe import used to become a recovery row once
+//  the terminal save sweep (services/mcp/cad_common.py) stopped writing it to the
+//  project; re-importing the source rebuilds it exactly.
 #pragma once
 
 #include <atomic>

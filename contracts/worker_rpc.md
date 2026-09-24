@@ -33,6 +33,7 @@ for, and shows the repair-runtime flow. Workers tolerate unknown OPTIONAL params
 | `doc_save` | `{doc_id, path?}` → `{path}` (`.step+` writer; path omitted = current) |
 | `doc_close` | `{doc_id}` → `{closed: true}` (discards unsaved state) |
 | `doc_list` | `{}` → `{docs:[{doc_id, name, kind, path, revision, dirty, feature_count, component_count, empty}]}` — `empty` is true when the doc has no authored content (part: zero features; assembly: zero features+components+mates). Appended 2026-07-16 (empty recovery auto-discard) |
+| `doc_list` (appended 2026-09-24) | each row also carries `reproducible_from: [abs source_path…]` — non-empty only for a never-saved part (no `path`) whose every feature is an `import` with an absolute `source_path` and whose `revision <= feature_count` (nothing authored after the imports: any edit/material/undo op empties it). Consumers treat the doc as reproducible scratch only while every listed file still exists: hostd autosave skips it and `retireDoc` closes it without an orphan; `cad_common.save_touched_docs` reports it `skipped` `reproducible_import` instead of writing it to the project |
 | `doc_apply_ops` | doc_ops §1 envelope → ops-response (incl. `owner_map`) |
 | `doc_undo` / `doc_redo` | `{doc_id}` → ops-response |
 | `doc_tree` | `{doc_id}` → `{revision, tree, owner_map}` (no rebuild; uses the last build) |

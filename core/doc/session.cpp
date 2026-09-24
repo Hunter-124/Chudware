@@ -5968,10 +5968,45 @@ json doc_rebuild(const std::string& doc_id) {
 }
 
 // ============================================================ C20 assembly RPCs
-// doc_solve_mates: re-solve the assembly mates (optionally with a drag soft-target),
-// persist the solved transforms, bump the revision (one undoable step), and return the
-// ops-response (port of session.py::solve_mates). doc_set_explode_state toggles the
-// explode view and re-tessellates without a revision bump.
+// doc_solve_mates: re-solve the assembly mates (optionally with a drag soft-target) and
+// return the ops-response (port of session.py::solve_mates). A solve that CHANGES the
+// document — moves a component beyond the solver's own convergence threshold, binds new
+// reference frames, or places different component geometry — persists the solved
+// transforms and bumps the revision (one undoable step). A solve that lands everything
+// where it already is is not an edit: revision, dirty and the undo stack stay put and
+// only the verdict is returned. Live 2026-09-24: describe_assembly re-solved a user's
+// clean, already-solved assembly and dirtied it (revision 0->1) with nothing moved.
+// doc_set_explode_state toggles the explode view and re-tessellates without a revision bump.
+
+// Does the stored 16-float row-major `transform` equal the solved one within `eps`? The
+// solver judges its positional (mm) and direction (dimensionless) residual rows against
+// the same threshold, so every entry is compared against it. A missing or malformed
+// stored transform never matches: writing one is a document change.
+static bool solved_pose_matches(const json& stored, const std::vector<double>& solved,
+                                double eps) {
+    if (!stored.is_array() || stored.size() != 16 || solved.size() != 16) return false;
+    for (std::size_t i = 0; i < 16; ++i) {
+        if (!stored[i].is_number()) return false;
+        if (std::abs(stored[i].get<double>() - solved[i]) > eps) return false;
+    }
+    return true;
+}
+
+// Did this compile place different component geometry than the result it replaces?
+// Component loads are cached per source stamp with one stable compound TShape, so an
+// unchanged source yields the identical TShape. No prior result means nobody has been
+// served geometry this compile could contradict.
+static bool assembly_geometry_changed(const AssemblyResult* prior, const AssemblyResult& next) {
+    if (!prior) return false;
+    if (prior->bodies.size() != next.bodies.size()) return true;
+    for (std::size_t i = 0; i < next.bodies.size(); ++i) {
+        const AsmBodyOut& a = prior->bodies[i];
+        const AsmBodyOut& b = next.bodies[i];
+        if (a.component_id != b.component_id || !a.shape_local.IsPartner(b.shape_local))
+            return true;
+    }
+    return false;
+}
 
 json doc_solve_mates(const std::string& doc_id, const json& drag) {
     DocLock lk;
@@ -5981,7 +6016,7 @@ json doc_solve_mates(const std::string& doc_id, const json& drag) {
                       {{"reason", "not an assembly"}});
     std::string base_dir;
     if (!s.path.empty()) base_dir = std::filesystem::path(s.path).parent_path().string();
-    push_undo(s);
+    const json before = s.doc;  // the undo entry, iff this solve changes the document
 
     std::optional<chudware::mate::WarmMap> warm;
     if (!s.asm_warm.empty()) warm = s.asm_warm;
@@ -6000,15 +6035,32 @@ json doc_solve_mates(const std::string& doc_id, const json& drag) {
     }
     bind_assembly_reference_frames(s.doc);
     AssemblyResult ares = compile_assembly(s.doc, base_dir, warm, drag_opt);
+    const double pose_eps = std::max(ares.tolerance, 1e-9);
+    bool moved = false;
     if (s.doc.contains("components") && s.doc["components"].is_array())
+        for (const json& comp : s.doc["components"]) {
+            auto it = ares.transforms.find(comp.value("id", std::string()));
+            if (it == ares.transforms.end()) continue;
+            const auto stored = comp.find("transform");
+            if (stored == comp.end() || !solved_pose_matches(*stored, it->second, pose_eps)) {
+                moved = true;
+                break;
+            }
+        }
+    if (moved)
         for (json& comp : s.doc["components"]) {
             auto it = ares.transforms.find(comp.value("id", std::string()));
             if (it != ares.transforms.end()) comp["transform"] = it->second;
         }
+    const bool changed =
+        moved || s.doc != before || assembly_geometry_changed(s.asm_result.get(), ares);
     s.asm_warm = ares.warm;
     s.asm_result = std::make_shared<AssemblyResult>(std::move(ares));
-    s.revision += 1;
-    s.dirty = true;
+    if (changed) {
+        push_undo_document(s, before);
+        s.revision += 1;
+        s.dirty = true;
+    }
     return ops_response_assembly(s, json::object());
 }
 
@@ -6364,6 +6416,33 @@ json doc_list() {
                 mate_count = (int)sp->doc["mates"].size();
             empty = feature_count == 0 && component_count == 0 && mate_count == 0;
         }
+        // Pristine import (2026-09-24): every feature is an `import` of an absolute
+        // source_path and nothing was authored since. Each import commits exactly one
+        // revision, so any later edit_feature / material / undo / other op pushes the
+        // revision past the feature count and the list goes empty. Consumers (hostd
+        // doc-GC + autosave, the agent terminal save sweep) treat the doc as reproducible
+        // scratch — not saved, not retired — while those source files still exist. Only a
+        // never-saved doc qualifies: opening a file resets the revision to 0, so the
+        // revision count proves nothing about edits made before it was saved.
+        json reproducible_from = json::array();
+        if (!isAsm && sp->path.empty() && feature_count > 0 && sp->revision <= feature_count) {
+            for (const json& f : sp->doc["features"]) {
+                if (!f.is_object() || f.value("type", std::string()) != "import") {
+                    reproducible_from.clear();
+                    break;
+                }
+                // Params may be nested (canonical {params}) or flat.
+                const json& p = f.contains("params") && f["params"].is_object() ? f["params"] : f;
+                const std::string src = p.contains("source_path") && p["source_path"].is_string()
+                                            ? p["source_path"].get<std::string>()
+                                            : std::string();
+                if (src.empty() || !std::filesystem::path(src).is_absolute()) {
+                    reproducible_from.clear();
+                    break;
+                }
+                reproducible_from.push_back(src);
+            }
+        }
         docs.push_back({
             {"doc_id", sp->doc_id},
             {"name", sp->doc.is_object() ? sp->doc.value("name", sp->doc_id) : sp->doc_id},
@@ -6374,6 +6453,7 @@ json doc_list() {
             {"feature_count", feature_count},
             {"component_count", component_count},
             {"empty", empty},
+            {"reproducible_from", std::move(reproducible_from)},
         });
     }
     return json{{"docs", docs}};

@@ -572,6 +572,63 @@ def test_describe_assembly_connection_loss_remains_structured(monkeypatch, faile
     assert not result.get("collision_free"), result
 
 
+def _doc_state(doc: str) -> tuple:
+    row, = [d for d in cb.call("doc_list", {})["docs"] if d["doc_id"] == doc]
+    return row["revision"], row["dirty"]
+
+
+def test_describe_assembly_leaves_a_solved_assembly_unedited(tmp_path):
+    """Live 2026-09-24: describe_assembly on the user's clean, already-solved assembly
+    bumped it revision 0->1 and dirty:true with nothing moved. A solve that lands every
+    component where it already is must not be an edit; one that moves a component is."""
+    plate = _new_plate_with_hole()
+    plate_path = str(tmp_path / "ro_plate.step+")
+    r, _ = _call("save_part", {"doc_id": plate, "path": plate_path})
+    assert r["ok"], r
+    r, _ = _call("new_part", {"name": "ro_pin", "fresh": True})
+    pin = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": pin, "ops": [
+        cb.feat("cylinder", "Pin", {"radius": cb.dim(4), "height": cb.dim(20)})]})
+    assert r["ok"], r
+    pin_path = str(tmp_path / "ro_pin.step+")
+    r, _ = _call("save_part", {"doc_id": pin, "path": pin_path})
+    assert r["ok"], r
+
+    r, _ = _call("new_assembly", {"name": "ro_asm"})
+    asm = r["doc_id"]
+    r, _ = _call("asm_add_component", {"doc_id": asm, "path": plate_path, "fixed": True})
+    assert r["ok"], r
+    r, _ = _call("asm_add_component", {"doc_id": asm, "path": pin_path, "at": [30, 20, 30]})
+    assert r["ok"] and r["component"] == "k2", r
+    r, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric",
+                              "a": {"component": "k1", "query": {"of": "face", "surf": "round"}},
+                              "b": {"component": "k2", "query": {"of": "face", "surf": "round"}}})
+    assert r["ok"] and r["converged"], r
+    saved = str(tmp_path / "ro_asm.step+")
+    cb.call("doc_save", {"doc_id": asm, "path": saved})
+    cb.call("doc_close", {"doc_id": asm})
+    # The user's document: opened from disk, clean, mates already solved.
+    user_doc = cb.call("doc_open", {"path": saved})["doc_id"]
+    try:
+        before = _doc_state(user_doc)
+        assert before[1] is False, before
+        out, _ = _call("describe_assembly", {"doc_id": user_doc})
+        assert out["ok"], out
+        assert "Mate solve:" in out["text"], out
+        assert _doc_state(user_doc) == before
+
+        # The pin is free to slide along the bore: a drag that really moves it is an edit.
+        moved = cb.call("doc_solve_mates", {"doc_id": user_doc,
+                                            "drag": {"component": "k2",
+                                                     "target": [30, 20, 60]}})
+        assert moved["revision"] == before[0] + 1, moved
+        assert _doc_state(user_doc) == (before[0] + 1, True)
+    finally:
+        cb.call("doc_close", {"doc_id": user_doc})
+        _call("close_part", {"doc_id": pin})
+        _call("close_part", {"doc_id": plate})
+
+
 # ---------------------------------------------------------------- describe_board (T-F8)
 
 

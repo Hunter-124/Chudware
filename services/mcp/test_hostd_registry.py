@@ -775,6 +775,49 @@ def test_gc_purges_internal_docs_instead_of_retiring_them(scratch_daemon, monkey
     assert not any((n or "").endswith("_pf") for n in names), names
 
 
+def test_gc_closes_a_pristine_import_without_a_recovery_row(
+    scratch_daemon, monkeypatch, tmp_path
+):
+    """A doc that is only an unmodified import of a file still on disk is reproducible
+    scratch — an agent's body-roster probe import. The terminal save sweep no longer
+    writes it into the project (2026-09-24), so hostd must not retire it either, or the
+    litter just moves into the "Recover unsaved parts?" prompt. The same import with an
+    authored feature on top is the control: still retired."""
+    monkeypatch.setenv("CHUDWARE_DOC_GC_GRACE_S", "1")
+    monkeypatch.setenv("CHUDWARE_DOC_GC_AGENT_GRACE_S", "1")
+    keep = DaemonClient()
+    keep.connect()
+    scratch_daemon.append(_pid(keep))
+    a = DaemonClient()
+    a.connect()
+
+    src_doc = a.call("doc_new", {"name": "frame_src"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": src_doc, "ops": BOX_OPS})
+    source = str(tmp_path / "frame.step")
+    a.call("export_file", {"doc_id": src_doc, "path": source, "format": "step"})
+    assert os.path.isfile(source)
+    a.call("doc_close", {"doc_id": src_doc})
+
+    probe = a.call("import_file", {"path": source})["doc_id"]
+    placed = a.call("import_file", {"path": source})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": placed, "ops": _box_ops("authored")})
+
+    a.close()
+
+    deadline = time.time() + 8
+    ids: set = set()
+    open_ids: set = {probe}
+    while time.time() < deadline:
+        time.sleep(0.5)
+        ids = {e.get("doc_id") for e in keep.call("recovery_list").get("entries", [])}
+        open_ids = {d.get("doc_id") for d in keep.call("doc_list", {}).get("docs", [])}
+        if placed in ids and probe not in open_ids:
+            break
+    assert placed in ids, "control: an import with authored work MUST still be retired"
+    assert probe not in open_ids, "GC must still close the reproducible doc"
+    assert probe not in ids, "a pristine import of an existing file must not be recovered"
+
+
 # ------------------------------------------------------------ foreign edits
 
 

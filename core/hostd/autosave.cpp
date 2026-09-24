@@ -44,6 +44,23 @@ static bool documentJsonIsEmpty(const json& doc) {
     return features == 0;
 }
 
+// A doc_list row whose whole content is an unmodified import of source files that all
+// still exist on disk (engine `reproducible_from`, core/doc/session.cpp doc_list) is
+// reproducible scratch, not user work: re-importing the source rebuilds it. An agent's
+// body-roster probe (`import_part(..., keep_bodies=[...])`) used to reach the recovery
+// prompt this way (2026-09-24). Any authored change empties the list engine-side, and a
+// missing source keeps the doc recovery-worthy.
+static bool docListRowIsReproducible(const json& d) {
+    if (!d.contains("reproducible_from") || !d["reproducible_from"].is_array() ||
+        d["reproducible_from"].empty())
+        return false;
+    for (const auto& src : d["reproducible_from"]) {
+        std::error_code ec;
+        if (!src.is_string() || !fs::is_regular_file(src.get<std::string>(), ec)) return false;
+    }
+    return true;
+}
+
 // Peek document.json inside a .step+ ZIP without opening it in the engine.
 // Returns true when the file is missing/unreadable/corrupt OR the doc is empty.
 // Prefer false only when we can prove the part has content (fail-closed for recovery).
@@ -239,8 +256,9 @@ void Autosave::saveDirtyDocs() {
     for (const auto& d : docs["docs"]) {
         if (!d.is_object() || !d.value("dirty", false)) continue;
         // Never autosave a blank/default doc — that is what filled the recovery
-        // tier with dozens of empty "AI part" tabs.
-        if (d.value("empty", false)) continue;
+        // tier with dozens of empty "AI part" tabs — nor a pristine import of a file
+        // that still exists (docListRowIsReproducible): the source IS its backup.
+        if (d.value("empty", false) || docListRowIsReproducible(d)) continue;
         const std::string id = d.value("doc_id", std::string());
         if (id.empty()) continue;
         // Internal throwaway (the agent preflight shadow clone): not user work, so it
@@ -318,7 +336,8 @@ bool Autosave::retireDoc(const std::string& docId, const std::string& name) {
         { std::lock_guard<std::mutex> lk(revMtx_); lastSavedRev_.erase(docId); }
         return true;
     }
-    // Peek live doc_list for the empty flag before writing an orphan artifact.
+    // Peek live doc_list for the empty / reproducible flags before writing an orphan
+    // artifact.
     {
         json docs;
         std::string err;
@@ -326,8 +345,10 @@ bool Autosave::retireDoc(const std::string& docId, const std::string& name) {
             docs.is_object() && docs.contains("docs")) {
             for (const auto& d : docs["docs"]) {
                 if (!d.is_object() || d.value("doc_id", std::string()) != docId) continue;
-                if (d.value("empty", false)) {
-                    log().line("doc-gc: not retiring empty doc %s ('%s')", docId.c_str(),
+                const bool empty = d.value("empty", false);
+                if (empty || docListRowIsReproducible(d)) {
+                    log().line("doc-gc: not retiring %s doc %s ('%s')",
+                               empty ? "empty" : "reproducible import", docId.c_str(),
                                name.c_str());
                     // Still purge any prior session autosave for this id.
                     std::error_code ec2;

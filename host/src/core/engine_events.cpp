@@ -157,8 +157,9 @@ std::string eventDocName(const json& d) {
 }
 
 // Open a read-only mirror tab for a doc another client minted. Mirrors the
-// poller's focus rules: the FIRST mirror ever opened may take focus; later
-// parts open in the background with the aiPulse glow.
+// poller's focus rules: the FIRST mirror ever opened may take focus, but only
+// when the user is not already looking at a document of their own; every other
+// reveal opens in the background with the aiPulse glow.
 bool openMirrorTab(AppState& st, const std::string& docId, const std::string& name = {}) {
     if (docId.rfind("doc-cpp", 0) != 0) return true;  // parts/assemblies only
     if (tabIndexForDoc(st, docId) >= 0) {        // already visible (ours or a prior mirror)
@@ -201,7 +202,15 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     bool anyMirror = false;
     for (const auto& t : st.docTabs)
         if (t.aiHandoff) anyMirror = true;
-    const bool takeFocus = !anyMirror;
+    // The user's own document on screen is never swapped out from under them. An agent
+    // opening a component file just to READ it (import_part resume:true of the frame part
+    // while the user viewed the Rover assembly) used to take focus here, and the frame
+    // part's legacy rotors-without-wheels looked like "the agent took the wheels off"
+    // (2026-09-24). A user-adopted mirror counts as the user's own.
+    const bool userDocOnScreen =
+        st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+        (!st.docTabs[st.activeTab].aiHandoff || st.docTabs[st.activeTab].userAdopted);
+    const bool takeFocus = !anyMirror && !userDocOnScreen;
 
     // Fallback ONLY when the event carried no name (older daemon): read it off the
     // doc tree. ASYNC via st.rpc — doc_tree takes the doc's engine lock, and with an

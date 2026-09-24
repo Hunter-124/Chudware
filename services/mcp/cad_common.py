@@ -1894,6 +1894,26 @@ def _needs_project_save(entry: dict) -> bool:
         return False
 
 
+def _reproducible_import_sources(entry: dict) -> Optional[list]:
+    """Source files that rebuild this doc exactly, or None when it holds authored work.
+
+    The engine lists them in `reproducible_from` only while every feature is an
+    unmodified import (core/doc/session.cpp doc_list: any later edit, material change or
+    undo empties it). Such a doc is scratch — an agent's body-roster probe import — and
+    writing it into the project root duplicated a source file the user already has
+    (2026-09-24, `_frame624_2026-09-07.step+`). hostd applies the same test and simply
+    closes it at GC instead of retiring it to the recovery tier (hostd/autosave.cpp
+    docListRowIsReproducible). A missing source leaves it authored-equivalent: saved.
+    """
+    sources = entry.get("reproducible_from")
+    if not isinstance(sources, list) or not sources:
+        return None
+    for src in sources:
+        if not (isinstance(src, str) and os.path.isabs(src) and os.path.isfile(src)):
+            return None
+    return list(sources)
+
+
 def save_touched_docs() -> dict:
     """Save every doc this run built that has no real user file yet. Never raises.
 
@@ -1930,6 +1950,12 @@ def save_touched_docs() -> dict:
         if not _needs_project_save(e):
             out["skipped"].append({"doc_id": did, "name": e.get("name"),
                                    "reason": "already_saved"})
+            continue
+        sources = _reproducible_import_sources(e)
+        if sources:
+            out["skipped"].append({"doc_id": did, "name": e.get("name"),
+                                   "reason": "reproducible_import",
+                                   "source_paths": sources})
             continue
         pending.append(e)
 

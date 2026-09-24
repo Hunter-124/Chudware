@@ -1918,6 +1918,28 @@ def note_touched_doc(doc_id: Optional[str]) -> None:
         _TOUCHED_DOCS.append(doc_id)
 
 
+# doc_id -> the doc's path when this process discarded it with close_part(discard=True) but
+# hostd kept it alive (detached: an agent run or another client still holds it). The
+# terminal sweep must honour the discard instead of saving the dropped state over the file
+# (live 2026-09-24: the stale "Wheel End" doc the agent discarded was swept over the
+# rebuilt Wheel End it had just saved to the same path). Keyed with the path because doc
+# ids are reused across engine restarts.
+_DISCARDED_DOCS: dict = {}
+
+
+def note_discarded_doc(doc_id: Optional[str]) -> None:
+    if not doc_id:
+        return
+    path = None
+    try:
+        path = next((e.get("path") for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                     if isinstance(e, dict) and e.get("doc_id") == doc_id), None)
+    except Exception:  # noqa: BLE001 — an unknown path still records the discard intent
+        pass
+    _DISCARDED_DOCS[doc_id] = path
+
+
+
 def _needs_project_save(entry: dict) -> bool:
     """True when this doc holds content that is NOT yet in a real user file.
 
@@ -1992,6 +2014,10 @@ def save_touched_docs() -> dict:
         origin = e.get("origin_kind")
         ours = did in _TOUCHED_DOCS or origin in ("mcp", "agent")
         if not ours or origin == "gui":
+            continue
+        if did in _DISCARDED_DOCS and _DISCARDED_DOCS[did] == e.get("path"):
+            out["skipped"].append({"doc_id": did, "name": e.get("name"),
+                                   "reason": "discarded"})
             continue
         if not _needs_project_save(e):
             out["skipped"].append({"doc_id": did, "name": e.get("name"),

@@ -473,3 +473,43 @@ def test_crash_save_runs_and_surfaces_all_finalization_faults(monkeypatch):
     assert "turn crashed" in out["reason"]
     assert "reset crashed" in out["reason"]
     assert "doc_save wrote nothing" in out["reason"]
+
+
+def test_a_discarded_doc_the_daemon_kept_alive_is_not_swept_over_its_file(
+        sweep, monkeypatch, tmp_path):
+    """Live 2026-09-24: the agent rebuilt Wheel End in a fresh doc, saved it over the file,
+    then close_part(discard=True) on the stale doc — hostd only DETACHED it (the run still
+    held it) and the terminal sweep wrote the stale state back over the rebuilt file."""
+    target = tmp_path / "CAD" / "Wheels" / "Wheel End.step+"
+    target.parent.mkdir(parents=True)
+    target.write_text("rebuilt")
+    fake = sweep(
+        [
+            {"doc_id": "doc-stale", "name": "Wheel End", "kind": "assembly",
+             "component_count": 21, "revision": 9, "dirty": True,
+             "path": str(target), "origin_kind": "mcp"},
+            {"doc_id": "doc-rebuilt", "name": "Wheel End", "kind": "assembly",
+             "component_count": 25, "revision": 4, "dirty": False,
+             "path": str(target), "origin_kind": "mcp"},
+        ],
+        touched=["doc-stale", "doc-rebuilt"],
+    )
+    engine_call = fake.call
+
+    def call(method, params=None):
+        if method == "doc_close":
+            return {"detached": True, "note": "an agent run still owns this doc"}
+        return engine_call(method, params)
+
+    monkeypatch.setattr(C.cb, "call", call)
+    monkeypatch.setattr(C, "_DISCARDED_DOCS", {})
+    from services.agent.agent_turn import _bind_tool
+
+    closed = _bind_tool("close_part")(doc_id="doc-stale", discard=True)
+    assert '"detached": true' in closed
+
+    out = C.save_touched_docs()
+
+    assert fake.saves == []
+    assert target.read_text() == "rebuilt"
+    assert {"doc_id": "doc-stale", "name": "Wheel End", "reason": "discarded"} in out["skipped"]

@@ -392,6 +392,9 @@ judgment).
   `set_material` / `asm_*` mutation depends on this sweep. Since 2026-09-24 a pristine
   import of a file still on disk (engine `doc_list.reproducible_from`) is neither swept
   (`skipped: reproducible_import`) nor autosaved/retired by hostd — GC just closes it.
+  A `close_part(discard=True)` that hostd degraded to a detach is recorded
+  (`_DISCARDED_DOCS`, keyed with the doc's path) and the sweep skips it (`discarded`);
+  it once wrote a discarded stale Wheel End back over the rebuilt file.
 - **In daemon mode hostd is the ONLY autosave authority** (2026-08-27). The daemon-mode
   early-return lives in `cad_common._autosave()` — the single write — not at its callers.
   It used to sit on the two aggregate entry points (`_autosave_all_open`,

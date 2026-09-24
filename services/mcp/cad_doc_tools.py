@@ -54,6 +54,7 @@ from .cad_common import (
     _write_diff,
     is_geom_query,
     normalize_geom_query,
+    note_discarded_doc,
     note_harness_saved_path,
     note_touched_doc,
     placement_warnings,
@@ -8183,7 +8184,12 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             if d in _TOUCHED_DOCS:
                 _TOUCHED_DOCS.remove(d)
             if r.get("detached"):
-                # Another client is editing it: our view detached, the doc lives on.
+                # Another client (or this agent run itself) keeps it alive: our view
+                # detached, the doc lives on. An explicit discard must survive that — the
+                # terminal save sweep would otherwise write the dropped state back over its
+                # file (live 2026-09-24: a stale Wheel End overwrote the rebuilt one).
+                if discard:
+                    note_discarded_doc(d)
                 _unpublish(d)
                 if _CUR["doc_id"] == d:
                     _CUR["doc_id"] = None

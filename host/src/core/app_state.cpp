@@ -184,6 +184,22 @@ void appstateInitPersist() {
                 // Already mounted on a hot restart — keep going and re-populate.
                 console.warn('[chudware] IDBFS mount:', e);
             }
+            // Flush a queued debounce as soon as the page leaves the foreground.
+            // IndexedDB remains asynchronous, but it must at least start before unload.
+            if (!Module.__chudwarePersistHideHook) {
+                Module.__chudwarePersistHideHook = true;
+                var flushPending = function() {
+                    if (Module.__chudwarePersistSyncTimer) {
+                        clearTimeout(Module.__chudwarePersistSyncTimer);
+                        Module.__chudwarePersistSyncTimer = null;
+                        if (Module.__chudwarePersistFlush) Module.__chudwarePersistFlush();
+                    }
+                };
+                window.addEventListener('pagehide', flushPending);
+                document.addEventListener('visibilitychange', function() {
+                    if (document.visibilityState === 'hidden') flushPending();
+                });
+            }
             FS.syncfs(true, function(err) {
                 if (err) console.warn('[chudware] IDBFS populate failed:', err);
                 else console.log('[chudware] IDBFS populated at /persist');
@@ -213,30 +229,37 @@ void appstatePersistSync() {
     // Debounce idle writes, but mark a single trailing flush immediately when a
     // write arrives during syncfs. Every flush therefore completes before the next starts.
     EM_ASM({
+        if (!Module.__chudwarePersistFlush) {
+            Module.__chudwarePersistFlush = function() {
+                if (Module.__chudwarePersistSyncInFlight) {
+                    Module.__chudwarePersistSyncPending = true;
+                    return;
+                }
+                Module.__chudwarePersistSyncInFlight = true;
+                FS.syncfs(false, function(err) {
+                    Module.__chudwarePersistSyncInFlight = false;
+                    if (err) console.warn('[chudware] IDBFS flush failed:', err);
+                    if (Module.__chudwarePersistSyncPending) {
+                        Module.__chudwarePersistSyncPending = false;
+                        Module.__chudwarePersistFlush();
+                    }
+                });
+            };
+        }
         if (Module.__chudwarePersistSyncInFlight) {
             Module.__chudwarePersistSyncPending = true;
         } else {
             if (Module.__chudwarePersistSyncTimer)
                 clearTimeout(Module.__chudwarePersistSyncTimer);
-            Module.__chudwarePersistSyncTimer = setTimeout(function() {
-                Module.__chudwarePersistSyncTimer = null;
-                var flush = function() {
-                    if (Module.__chudwarePersistSyncInFlight) {
-                        Module.__chudwarePersistSyncPending = true;
-                        return;
-                    }
-                    Module.__chudwarePersistSyncInFlight = true;
-                    FS.syncfs(false, function(err) {
-                        Module.__chudwarePersistSyncInFlight = false;
-                        if (err) console.warn('[chudware] IDBFS flush failed:', err);
-                        if (Module.__chudwarePersistSyncPending) {
-                            Module.__chudwarePersistSyncPending = false;
-                            flush();
-                        }
-                    });
-                };
-                flush();
-            }, 50);
+            Module.__chudwarePersistSyncTimer = null;
+            if (document.visibilityState === 'hidden') {
+                Module.__chudwarePersistFlush();
+            } else {
+                Module.__chudwarePersistSyncTimer = setTimeout(function() {
+                    Module.__chudwarePersistSyncTimer = null;
+                    Module.__chudwarePersistFlush();
+                }, 50);
+            }
         }
     });
 }
@@ -783,7 +806,17 @@ std::mutex& configWriteMutex() {
     static std::mutex m;
     return m;
 }
+// The writer has no AppState reference (and may run on a worker thread). The UI
+// consumes this once on its frame thread rather than coupling config I/O to ImGui.
+std::string g_configCorruptionWarning;
 }  // namespace
+std::string takeConfigCorruptionWarning() {
+    std::lock_guard<std::mutex> guard(configWriteMutex());
+    std::string warning;
+    warning.swap(g_configCorruptionWarning);
+    return warning;
+}
+
 
 bool updateConfigJson(const std::function<void(nlohmann::json&)>& patch) {
     if (!patch) return false;
@@ -797,22 +830,57 @@ bool updateConfigJson(const std::function<void(nlohmann::json&)>& patch) {
     ConfigFileLock lock(path + ".lock");
     // Re-read INSIDE the lock: anything we parsed earlier may be stale by now.
     nlohmann::json j = nlohmann::json::object();
+    bool corrupt = false;
     {
         std::ifstream in(path);
         if (in) {
-            nlohmann::json old;
             try {
+                nlohmann::json old;
                 in >> old;
+                if (in.bad()) return false;  // I/O failure is not a parse failure.
                 if (old.is_object()) j = std::move(old);
+                else corrupt = true;  // a config root must be an object
+            } catch (const nlohmann::json::parse_error&) {
+                corrupt = true;
             } catch (...) {
-                j = nlohmann::json::object();  // corrupt file: start clean rather than abort
+                return false;
             }
+        } else {
+            // Missing config is a first run; an existing but unreadable one must
+            // never be treated as empty and replaced by a partial settings patch.
+            if (std::filesystem::exists(path, ec) || ec) return false;
         }
     }
     try {
         patch(j);
     } catch (...) {
         return false;  // a throwing patch must not leave a partial write behind
+    }
+    if (corrupt) {
+        // Preserve unknown (possibly recoverable) credentials and other keys before
+        // publishing a fresh config. Never overwrite a previous corruption backup.
+        const std::string stem = path + ".corrupt-" + std::to_string(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        std::string backup = stem;
+        for (unsigned i = 1; std::filesystem::exists(backup, ec); ++i) {
+            if (ec) break;
+            backup = stem + "-" + std::to_string(i);
+        }
+        if (ec) {
+            std::fprintf(stderr, "[chudware] cannot check config backup: %s\n", ec.message().c_str());
+            return false;
+        }
+        std::filesystem::rename(path, backup, ec);
+        if (ec) {
+            std::fprintf(stderr, "[chudware] cannot back up corrupt config: %s\n", ec.message().c_str());
+            return false;  // fail closed; do not overwrite the only copy
+        }
+        std::fprintf(stderr, "[chudware] corrupt settings file moved to %s\n", backup.c_str());
+        if (g_configCorruptionWarning.empty())
+            g_configCorruptionWarning = "Settings file was corrupt; backup saved at " +
+                                        backup + ". Review your settings.";
+        appstatePersistSync();  // persist the backup itself if a subsequent write fails (IDBFS)
     }
     try {
         // Per-process tmp name: the lock already serializes well-behaved writers, but a

@@ -55,6 +55,8 @@ public:
         return mateOpen_ || insertOpen_ || patternOpen_ || explodeOpen_ || interferenceOpen_;
     }
 
+    // Disarm document-bound assembly tools before switching or closing their tab.
+    void closeAllToolForms(AppState& st);
     // Feed a resolved assembly pick into the active mate well. Called from the selection observer
     // when the Mate form is open. Returns true if a well consumed the pick.
     bool routeAsmPick(const nlohmann::json& selector, const std::string& component, int pickKind);
@@ -101,7 +103,6 @@ private:
     void beginPatternForm();
     // Open/replace the left-pane PM guest for the named tool (mutual-excludes other asm tools).
     void openPmGuest(AppState& st, const char* which);
-    void closeAllToolForms(AppState& st);  // closes Mate/Insert/Pattern/Explode/Interference + PM guest
     void drawInsertBody(AppState& st);
     void drawMateFormBody(AppState& st);
     void drawPatternFormBody(AppState& st);
@@ -189,6 +190,8 @@ private:
     std::string interferenceError_;
     bool interferencePending_ = false;  // C39: eval_interference in flight (async)
     int  interferenceGen_ = 0;          // C39: bumped per refresh; stale callbacks ignored
+    std::string interferenceDocId_;
+    std::string interferenceDocName_;
 
     // ---- BOM ----
     bool bomOpen_ = false, bomFocus_ = false;
@@ -198,6 +201,8 @@ private:
     std::string bomNote_;
     int bomPending_ = 0;                // C39: eval_mass calls still in flight (async)
     int bomGen_ = 0;                    // C39: bumped per refresh; stale callbacks ignored
+    std::string bomDocId_;
+    std::string bomDocName_;
 };
 
 }  // namespace ui

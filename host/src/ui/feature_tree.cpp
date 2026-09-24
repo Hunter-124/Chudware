@@ -3779,6 +3779,8 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     // Only enable when the active tab is the CAD doc currently bound in DocMirror — Drawing/ECAD
     // tabs leave the previous part loaded behind the sheet, and async tab rebind can lag activeTab.
     const bool canHistory = canDoc && st.docMirror.hasDoc() &&
+        !(st.propertyManager && st.propertyManager->active()) &&
+        !(st.sketch3dMode && st.sketch3dMode->active()) &&
         !st.activeTabIsDrawing() && !st.activeTabIsEcad() &&
         st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
         st.docTabs[st.activeTab].docId == st.docMirror.docId() &&

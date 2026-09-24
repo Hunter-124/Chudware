@@ -1264,7 +1264,7 @@ void EvaluateDialogs::tickSectionDrag(AppState& st) {
 bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
     syncDocument(st);
     const bool exclusive = cmdId == "eval_measure" || cmdId == "eval_check" ||
-        cmdId == "eval_geometry" || cmdId == "eval_interference" || cmdId == "eval_symmetry" ||
+        cmdId == "eval_interference" || cmdId == "eval_symmetry" ||
         cmdId == "eval_draft" || cmdId == "eval_thickness" || cmdId == "eval_curvature" ||
         cmdId == "eval_zebra";
     if (exclusive) {
@@ -1302,7 +1302,7 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
         fireAllSectionEvals(st);
         return true;
     }
-    if (cmdId == "eval_check" || cmdId == "eval_geometry") {
+    if (cmdId == "eval_check") {
         runEval(st, "eval_check", nlohmann::json::object());
         openWindow_ = "check";
         title_ = "Geometry Check";

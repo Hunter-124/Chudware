@@ -25,6 +25,7 @@
 #include "imgui.h"
 
 #include "core/app_state.h"
+#include "ui/asm_panels.h"
 #include "ui/icons.h"      // drawIconGlass — the in-field search-clear glyph
 #include "ui_theme.h"
 
@@ -767,9 +768,48 @@ void insertItem(AppState& st, const PartsItem& item) {
     st.rpc.call("parts_insert_into_doc", p, [&st, name = item.name](const core::RpcResult& r) {
         bool ok = r.ok && r.result.is_object() && r.result.value("ok", false);
         if (ok) {
-            std::string doc = r.result.value("doc_id", "");
-            st.toast(ui::ToastLevel::Success,
-                     "Inserted " + name + (doc.empty() ? "" : (" into " + doc)));
+            const std::string doc = r.result.contains("doc_id") &&
+                                    r.result["doc_id"].is_string()
+                ? r.result["doc_id"].get<std::string>() : std::string();
+            if (!doc.empty()) {
+                // Mechanical placement creates a separate editable document, not an
+                // assembly component. Open that document so the result cannot be lost.
+                if (st.asmPanels) st.asmPanels->closeAllToolForms(st);
+                std::string aicm, err;
+                const bool wasSuppressing = st.suppressTabDirty;
+                st.suppressTabDirty = true;
+                const bool activated = st.docMirror.activate(st.worker, doc, aicm, err);
+                st.suppressTabDirty = wasSuppressing;
+                if (!activated) {
+                    st.toast(ui::ToastLevel::Warn,
+                             "Created " + name + " as a new part (" + doc +
+                             "), but could not open it: " + err);
+                    return;
+                }
+                int existing = -1;
+                for (int i = 0; i < static_cast<int>(st.docTabs.size()); ++i)
+                    if (st.docTabs[i].docId == doc) { existing = i; break; }
+                if (existing >= 0) {
+                    st.docTabs[existing].userAdopted = true;
+                    if (st.activeTab == existing) {
+                        st.clearViewportForNewDoc();
+                        st.applyDocDrivenVisibility(st.docMirror.tree());
+                        if (!aicm.empty()) st.loadDocMeshAsync(aicm);
+                    } else {
+                        st.switchToTab(existing);
+                    }
+                } else {
+                    st.clearViewportForNewDoc();
+                    st.applyDocDrivenVisibility(st.docMirror.tree());
+                    st.addDocTab(false);
+                    if (!aicm.empty()) st.loadDocMeshAsync(aicm);
+                }
+                st.activeWorkspace = AppState::Workspace::Model;
+                st.toast(ui::ToastLevel::Success, "Created " + name + " as a new part");
+            } else {
+                st.toast(ui::ToastLevel::Info,
+                         "Prepared " + name + "; no new part document was created");
+            }
         } else {
             std::string why = r.ok
                 ? r.result.value("reason", std::string("insert failed"))

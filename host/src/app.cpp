@@ -6580,7 +6580,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       const bool canDoc =
           st.workerStarted && !st.anyRunActive() && !st.agentV2Running;
       const bool textFocus = io.WantTextInput;
-      const bool inSketchNow = st.sketchMode->active();
+      const bool inSketchNow = st.sketchMode->active() ||
+                               (st.sketch3dMode && st.sketch3dMode->active());
       bool ecadFocused = false;
       if (ImGuiContext *g = ImGui::GetCurrentContext()) {
         for (ImGuiWindow *w = g->NavWindow; w; w = w->ParentWindow)
@@ -6595,6 +6596,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           st.docTabs[st.activeTab].docId == st.docMirror.docId() &&
           st.docMirror.hasDoc();
       if (canDoc && !textFocus && !st.showWeb && !inSketchNow && !ecadFocused &&
+          !(st.propertyManager && st.propertyManager->active()) &&
           activeCad && (io.KeyCtrl || io.KeySuper)) {
         if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
           st.docRedo();
@@ -7355,8 +7357,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // Attention live in the pinned left column (layout.cpp) and the Offline/Live
     // mode strip is chrome under the ribbon (above). This call only bootstraps
     // the mirror's list RPCs and hosts the approval dialog.
-    if (!webActive && ws == WS::Manufacture)
+    if (!webActive && ws == WS::Manufacture) {
       ui::drawManufacturePanel(st);
+      ui::camDrawPostConfirm(st);
+    }
 
     if (!wsFullBody) {
       // ---- ECAD editor (Electronics workspace or when an ECAD doc is open)
@@ -7722,6 +7726,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // path); Discard drops them daemon-side; Later just dismisses — the daemon
     // keeps the entries, so the prompt returns on the next app start.
     {
+      if (std::string configWarning = takeConfigCorruptionWarning();
+          !configWarning.empty())
+        st.toast(ui::ToastLevel::Warn, std::move(configWarning));
       static int s_recoveryCount = 0;
       // Never raise it during a headless capture: this modal is centred and app-modal, so it
       // covered the very panel every CHUDWARE_SHOT scenario exists to photograph (the reveng_*
@@ -7768,9 +7775,17 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                     ids.push_back(o["doc_id"].get<std::string>());
               }
               core::mirrorRecoveredDocs(st, ids);
-              const int n = ids.empty() ? s_recoveryCount : (int)ids.size();
-              st.toast(ui::ToastLevel::Info, "Recovered " + std::to_string(n) +
-                                                 " part" + (n == 1 ? "" : "s"));
+              const int n = static_cast<int>(ids.size());
+              if (n < s_recoveryCount) {
+                st.toast(ui::ToastLevel::Warn,
+                         "Recovered " + std::to_string(n) + " of " +
+                             std::to_string(s_recoveryCount) + " parts — " +
+                             std::to_string(s_recoveryCount - n) +
+                             " could not be reopened (they remain recoverable next launch)");
+              } else {
+                st.toast(ui::ToastLevel::Info, "Recovered " + std::to_string(n) +
+                                                   " part" + (n == 1 ? "" : "s"));
+              }
             } else {
               st.toast(ui::ToastLevel::Error, "Recovery failed: " + e);
             }
@@ -8291,6 +8306,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 #endif
   }
 
+  // Release any in-flight RPC before quit cleanup takes the daemon client's lock.
+  if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
+    std::fprintf(stderr, "[td] rpc.shutdown\n");
+  st.rpc.shutdown(); // Abort the in-flight one before bounded cleanup.
+
   // Clean-exit signal (daemon mode): closing the app normally is a DELIBERATE
   // exit. In-flight agent runs are NOT cancelled here — they execute
   // daemon-side and survive by design; the quit modal already gave the user
@@ -8312,15 +8332,25 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   //    Screenshot/headless runs skip it.
   if (!shot && engine::daemonMode()) {
     if (auto *c = engine::client()) {
+      const auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(10);
       for (const auto &t : st.docTabs) {
         if (t.docId.empty() || (t.kind != AppState::DocTab::TabKind::Part &&
                                 t.kind != AppState::DocTab::TabKind::Assembly))
           continue;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0)
+          break;
         const bool userOwned = !t.aiHandoff || t.userAdopted;
         nlohmann::json res;
         std::string err;
-        c->call(userOwned ? "doc_discard" : "detach_doc", {{"doc_id", t.docId}},
-                res, err);
+        const int timeoutMs = remaining > 3000 ? 3000 : static_cast<int>(remaining);
+        if (!c->call(userOwned ? "doc_discard" : "detach_doc", {{"doc_id", t.docId}},
+                     res, err, timeoutMs)) {
+          st.addLog("[tabs] quit cleanup stopped: " + err);
+          break; // A timed-out call would reconnect before the next one.
+        }
       }
     }
   }
@@ -8331,9 +8361,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                              // context is still live
   ui::freeIcons(); // C14: release atlas textures while GL context is still live
   ui::destroyCursors(); // W1-B: free the GLFW standard cursors
-  if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
-    std::fprintf(stderr, "[td] rpc.shutdown\n");
-  st.rpc.shutdown(); // C39: drop pending async calls + abort the in-flight one
   if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
     std::fprintf(stderr, "[td] stopMeshLoader\n");
   st.stopMeshLoader(); // T-PERF3: join mesh thread before static dtors (avoid

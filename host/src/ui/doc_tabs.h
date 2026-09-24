@@ -47,8 +47,8 @@ enum class TabSaveResult {
 // Save one document tab to disk, dispatching by kind:
 //   Part/Assembly → DocMirror .step+ (re-saves to its path, or Save-As when never saved / forceDialog)
 //   Schematic/PCB → ecad_save .ecad+ (to its path, or Save-As when never saved / forceDialog)
-//   Drawing       → saves its SOURCE part (drawings embed in the part's .step+; persisting the part
-//                   persists the drawing). No-op if the source part tab is gone.
+//   Drawing       → standalone .draw+ when available, otherwise saves its source part's .step+.
+//                   A dirty embedded drawing without an open source fails rather than closing.
 // Clears the saved tab's dirty marker (and, for a part, every drawing embedded in it). Records the
 // path in Recent. NOTE: CAD/Drawing saves switch the active document as a side effect (DocMirror must
 // point at the doc being saved); callers that must preserve the active tab restore it afterward.

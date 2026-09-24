@@ -4520,7 +4520,6 @@ static void saveAgentConfigNestedBool(const char* obj, const char* key, bool val
 // 2-col grid like the session knobs above. Backend/learning/cache knobs persist to
 // config.json agent.* via the recipe above; visibility knobs persist via ui/ai/ai_prefs.
 static void drawMemoryLearningSection(AppState& st, float sc) {
-    Settings& settings = st.settings;
 
     static bool s_loaded = false;
     // Unified compaction control maps only to agent.compaction_strategy.
@@ -4559,12 +4558,8 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
 
 
     // ---- Basic mode ----
-    // Of the 14 controls in this section the inventory found exactly three everyday, and
-    // one of those ("Project memory (per-folder)", settings.memoryEnabled) is a DUPLICATE
-    // of the session-knobs grid rendered directly above on this same page — showing it
-    // twice on one screen is pure confusion, so Basic drops the second copy rather than
-    // the capability. Everything else here is a storage-backend, compaction-algorithm,
-    // extraction-model or render-density knob whose default is already right.
+    // Project memory and its token budget already live in the persisted Session knobs
+    // grid above. Keep a single control for each in both Basic and Advanced modes.
     if (!st.settings.showAdvanced) {
         if (ImGui::Checkbox("Remember decisions & notes", &s_learn))
             saveAgentConfigValue("memory_learn", s_learn);
@@ -4615,27 +4610,12 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         }
 
         ImGui::TableNextColumn();
-        ImGui::Checkbox("Project memory (per-folder)", &settings.memoryEnabled);
-        helpMarker("Remembers decisions and notes under the PLM project "
-                   "(.plm/memory.db). Auto-created; recall is token-budgeted.");
-        ImGui::TableNextColumn();
         if (ImGui::Checkbox("Remember decisions & notes", &s_learn))
             saveAgentConfigValue("memory_learn", s_learn);
         helpMarker("Learning switch: when on, the agent writes decisions and notes it "
                    "judges worth keeping into project memory (agent.memory_learn, "
                    "default on). Recall still works when off; nothing new is learned.");
 
-        ImGui::TableNextColumn();
-        if (settings.memoryEnabled) {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Memory token budget");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-1.0f);
-            ImGui::SliderInt("##mem_budget_ml", &settings.memoryTokenBudget, 100, 2000,
-                             "%d tokens");
-        } else {
-            ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
-        }
         ImGui::TableNextColumn();
         if (ImGui::Checkbox("Supersede stale reads", &s_supersedeReads))
             saveAgentConfigNestedBool("compaction", "supersede_reads", s_supersedeReads);

@@ -153,7 +153,8 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
     }
     if (cmdId == "asm_parts_library") {
         st.activeWorkspace = AppState::Workspace::PartsLibrary;
-        st.toast(ui::ToastLevel::Info, "Parts Library — pick a standard part to insert.");
+        st.toast(ui::ToastLevel::Info,
+                 "Parts Library creates an editable part; save it, then use Insert Component.");
         st.addLog("[asm] Std. Parts → Parts Library workspace");
         return true;
     }
@@ -212,12 +213,16 @@ void AsmPanels::draw(AppState& st) {
 }
 
 void AsmPanels::closeAllToolForms(AppState& st) {
+    const bool ownedGuest = pmFormActive();
     mateOpen_ = false; editComponentTarget_.clear();
+    for (auto& pick : picks_) pick = MatePick{};
+    activeWell_ = 0;
     insertOpen_ = false; insertSel_ = -1; insertChosenPath_.clear(); insertNote_.clear();
-    patternOpen_ = false;
+    insertTargetDocId_.clear();
+    patternOpen_ = false; patternComps_.clear();
     explodeOpen_ = false;
     interferenceOpen_ = false;
-    if (st.propertyManager && st.propertyManager->guestActive())
+    if (ownedGuest && st.propertyManager && st.propertyManager->guestActive())
         st.propertyManager->closeGuest();
 }
 
@@ -237,11 +242,15 @@ void AsmPanels::openPmGuest(AppState& st, const char* which) {
 
     const char* title = "Assembly";
     const char* icon = "mate";
+    std::string interferenceTitle;
     if (wantMate)        { title = "Mate";                  icon = "mate"; }
     else if (wantInsert) { title = "Insert Component";      icon = "insert_component"; }
     else if (wantPattern){ title = "Component Pattern";     icon = "pattern_component"; }
     else if (wantExplode){ title = "Exploded View";         icon = "exploded_view"; }
-    else if (wantInterf) { title = "Interference Detection"; icon = "interference"; }
+    else if (wantInterf) {
+        interferenceTitle = "Interference Detection — " + interferenceDocName_;
+        title = interferenceTitle.c_str(); icon = "interference";
+    }
 
     // Capture `this` + which tool; body draws only while the matching flag is still open.
     st.propertyManager->openGuest(
@@ -1337,6 +1346,24 @@ void AsmPanels::drawExplodeBody(AppState& st) {
 // Interference Detection
 // ===========================================================================
 
+static bool assemblyResultIsActive(const AppState& st, const std::string& docId) {
+    return !docId.empty() && st.activeTab >= 0 &&
+        st.activeTab < static_cast<int>(st.docTabs.size()) &&
+        st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly &&
+        st.docTabs[st.activeTab].docId == docId;
+}
+
+static void staleAssemblyResultNotice(const AppState& st, const std::string& docId,
+                                      const std::string& docName) {
+    bool open = false;
+    for (const auto& tab : st.docTabs)
+        if (tab.docId == docId) { open = true; break; }
+    const std::string label = docName.empty() ? docId : docName;
+    ImGui::TextWrapped("Results are for %s, not the active document%s. "
+                       "Select that assembly or refresh for the active assembly.",
+                       label.c_str(), open ? "" : " (source document is closed)");
+}
+
 // C39: async — pairwise boolean intersections scale with component count and used to freeze
 // the window for up to 60s. The window opens immediately showing "Computing..."; the result
 // fills in when the call drains (GL thread). A re-refresh while pending supersedes (gen).
@@ -1344,9 +1371,17 @@ void AsmPanels::refreshInterference(AppState& st) {
     interferenceError_.clear();
     interferenceResult_ = nlohmann::json::object();
     interferencePending_ = false;
+    interferenceDocId_ = st.docMirror.hasDoc() ? st.docMirror.docId() : std::string();
+    interferenceDocName_ = interferenceDocId_;
+    for (const auto& tab : st.docTabs)
+        if (tab.docId == interferenceDocId_) {
+            interferenceDocName_ = tab.displayTitle();
+            break;
+        }
+    ++interferenceGen_;
     if (!st.docMirror.hasDoc()) { interferenceError_ = "No assembly open."; return; }
     interferencePending_ = true;
-    const int gen = ++interferenceGen_;
+    const int gen = interferenceGen_;
     ++st.rebuildsInFlight;
     st.rpc.call("eval_interference", {{"doc_id", st.docMirror.docId()}},
         [this, &st, gen](const core::RpcResult& r) {
@@ -1378,9 +1413,20 @@ void AsmPanels::drawInterferenceBody(AppState& st) {
     const auto& pal = ui::palette;
     interferenceFocus_ = false;
 
+    ImGui::Text("Interference Detection — %s", interferenceDocName_.c_str());
+    const bool activeAssembly = st.activeTab >= 0 &&
+        st.activeTab < static_cast<int>(st.docTabs.size()) &&
+        st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly &&
+        st.docMirror.docId() == st.docTabs[st.activeTab].docId;
+    ImGui::BeginDisabled(!activeAssembly);
     if (ImGui::Button("Refresh", ImVec2(ui::metrics::asmBtnW(), 0)))
         refreshInterference(st);
+    ImGui::EndDisabled();
     ImGui::Spacing();
+    if (!assemblyResultIsActive(st, interferenceDocId_)) {
+        staleAssemblyResultNotice(st, interferenceDocId_, interferenceDocName_);
+        return;
+    }
 
     if (interferencePending_) {
         pushText(pal.textDim);
@@ -1452,6 +1498,13 @@ void AsmPanels::refreshBom(AppState& st) {
     bomRows_.clear();
     bomNote_.clear();
     bomPending_ = 0;
+    bomDocId_ = st.docMirror.hasDoc() ? st.docMirror.docId() : std::string();
+    bomDocName_ = bomDocId_;
+    for (const auto& tab : st.docTabs)
+        if (tab.docId == bomDocId_) {
+            bomDocName_ = tab.displayTitle();
+            break;
+        }
     const int gen = ++bomGen_;  // C39: invalidates eval_mass callbacks of an older refresh
     const auto& tree = st.docMirror.tree();
     if (!tree.is_object() || !tree.contains("components") || !tree["components"].is_array()) {
@@ -1502,16 +1555,29 @@ void AsmPanels::refreshBom(AppState& st) {
 void AsmPanels::drawBom(AppState& st) {
     if (!bomOpen_) return;
     bool open = true;
+    const std::string title = "Bill of Materials — " + bomDocName_ + "###Bill of Materials";
     ui::setNextCommandDialogPlacement("Bill of Materials",
         ImVec2(ui::metrics::px(700), ui::metrics::px(480)),
         ImVec2(ui::metrics::px(340), ui::metrics::px(300)));
     if (bomFocus_) { ImGui::SetNextWindowFocus(); bomFocus_ = false; }
     ImGui::SetNextWindowBgAlpha(1.0f);
-    const bool bomWin = ImGui::Begin("Bill of Materials", &open, ImGuiWindowFlags_NoDocking);
+    const bool bomWin = ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoDocking);
     if (bomWin) {
         ui::kit::sectionHeader("Components", "bom", nullptr, (int)bomRows_.size(), true);
+        const bool activeAssembly = st.activeTab >= 0 &&
+            st.activeTab < static_cast<int>(st.docTabs.size()) &&
+            st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly &&
+            st.docMirror.docId() == st.docTabs[st.activeTab].docId;
+        ImGui::BeginDisabled(!activeAssembly);
         if (ui::kit::secondaryButton("Refresh")) refreshBom(st);
+        ImGui::EndDisabled();
         ImGui::Separator();
+        if (!assemblyResultIsActive(st, bomDocId_)) {
+            staleAssemblyResultNotice(st, bomDocId_, bomDocName_);
+            ImGui::End();
+            if (!open) bomOpen_ = false;
+            return;
+        }
 
         if (!bomNote_.empty()) ui::kit::dimText(bomNote_.c_str());
         const float footerHeight = ImGui::GetTextLineHeightWithSpacing() +

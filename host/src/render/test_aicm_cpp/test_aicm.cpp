@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "../aicm_loader.h"
 #include "../id_pass.h"  // encode/decode id helpers (no GL in these inline functions)
@@ -68,14 +69,76 @@ int main(int argc, char** argv) {
     render::PickHit h = render::decodeId(enc);
     CHECK(h.body_id == 1 && h.kind == PickKind::Face && h.topo_id == 5,
           "encode/decode round-trips body=1 face id=5");
-    render::PickHit hv = render::decodeId(render::encodeId(3, PickKind::Vertex, 0x3FFFFF));
-    CHECK(hv.body_id == 3 && hv.kind == PickKind::Vertex && hv.topo_id == 0x3FFFFF,
-          "encode/decode round-trips max 22-bit topo id");
+    render::PickHit hv = render::decodeId(
+        render::encodeId(render::kMaxPickBodyId, PickKind::Vertex, render::kMaxPickTopoId));
+    CHECK(hv.body_id == render::kMaxPickBodyId && hv.kind == PickKind::Vertex &&
+              hv.topo_id == render::kMaxPickTopoId,
+          "max body and topology ids round-trip");
     CHECK(!render::decodeId(0).valid(), "id 0 decodes to invalid (background)");
-    // body_id is 8-bit in the packed id — values above 255 truncate (documented contract limit).
     render::PickHit hi = render::decodeId(render::encodeId(300, PickKind::Face, 1));
-    CHECK(hi.body_id == 44 && hi.kind == PickKind::Face && hi.topo_id == 1,
-          "body_id truncates to 8 bits (300 -> 44)");
+    CHECK(hi.body_id == 300 && hi.kind == PickKind::Face && hi.topo_id == 1,
+          "body 300 does not alias body 44");
+    render::DocMesh oversized;
+    oversized.bodies.emplace_back();
+    oversized.bodies.back().body_id = render::kMaxPickBodyId + 1;
+    CHECK(render::pickIdOverflow(oversized) != nullptr, "oversized body id is refused");
+    oversized.bodies.back().body_id = 1;
+    oversized.bodies.back().faces.push_back(
+        {render::kMaxPickTopoId + 1, 0, 1, 0});
+    CHECK(render::pickIdOverflow(oversized) != nullptr, "oversized face id is refused");
+    oversized.bodies.back().faces.clear();
+    CHECK(render::pickIdOverflow(oversized) == nullptr, "valid pick ids fit the attachment");
+
+    // A small valid AICM blob with one triangle and one two-point edge; mutate each
+    // referenced span independently so the parser must reject it before GPU upload.
+    std::vector<uint8_t> bytes;
+    auto put32 = [&](uint32_t value) {
+        for (int i = 0; i < 4; ++i) bytes.push_back(uint8_t(value >> (8 * i)));
+    };
+    auto put64 = [&](uint64_t value) {
+        for (int i = 0; i < 8; ++i) bytes.push_back(uint8_t(value >> (8 * i)));
+    };
+    auto chunk = [&](const char* tag, uint64_t size) {
+        bytes.insert(bytes.end(), tag, tag + 4);
+        put64(size);
+    };
+    bytes.insert(bytes.end(), {'A', 'I', 'C', 'M'});
+    put32(1); put32(3);
+    chunk("BODY", 110);
+    put32(1); bytes.push_back(0); bytes.push_back(0); // empty name
+    for (int i = 0; i < 3; ++i) put32(0); // color
+    put32(3); put32(1); // vertices, triangles
+    for (int i = 0; i < 18; ++i) put32(0); // positions, normals
+    const size_t idxPos = bytes.size();
+    put32(0); put32(1); put32(2);
+    chunk("FACE", 17);
+    put32(1); put32(1); // count, face id
+    const size_t firstTriPos = bytes.size();
+    put32(0); put32(1); bytes.push_back(0); // first triangle, count, type
+    chunk("EDGE", 45);
+    put32(1); put32(1); // count, edge id
+    const size_t firstPtPos = bytes.size();
+    put32(0); put32(2); bytes.push_back(0); // first point, count, type
+    put32(2);
+    for (int i = 0; i < 6; ++i) put32(0); // edge positions
+    render::DocMesh parsed;
+    CHECK(render::parseAicm(bytes.data(), bytes.size(), parsed, err),
+          "minimal AICM geometry parses");
+    auto overwrite32 = [](std::vector<uint8_t>& blob, size_t pos, uint32_t value) {
+        for (int i = 0; i < 4; ++i) blob[pos + i] = uint8_t(value >> (8 * i));
+    };
+    auto malformed = bytes;
+    overwrite32(malformed, idxPos, 3);
+    CHECK(!render::parseAicm(malformed.data(), malformed.size(), parsed, err) &&
+              err == "invalid BODY vertex index", "out-of-range triangle index is refused");
+    malformed = bytes;
+    overwrite32(malformed, firstTriPos, 0xFFFFFFFFu);
+    CHECK(!render::parseAicm(malformed.data(), malformed.size(), parsed, err) &&
+              err == "invalid FACE triangle range", "overflowing face range is refused");
+    malformed = bytes;
+    overwrite32(malformed, firstPtPos, 0xFFFFFFFFu);
+    CHECK(!render::parseAicm(malformed.data(), malformed.size(), parsed, err) &&
+              err == "invalid EDGE point range", "overflowing edge range is refused");
 
     // ---- id-pass frame cache key (task 01: selection lag) ----
     // The whole point of the cache is: identical inputs => render() is skipped; ANY change to the

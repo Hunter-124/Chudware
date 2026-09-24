@@ -53,11 +53,34 @@ static NewDocKind s_newDoc = NewDocKind::None;
 // after the strip is drawn so they never mutate docTabs mid-iteration. -1 / false = nothing asked.
 static int  s_closeOthersIdx = -1;
 static bool s_closeAll = false;
-// Unsaved-changes prompt: the tab the user asked to close while it had unsaved edits.
-static int  s_confirmCloseIdx = -1;
-// Save-then-close: the tab to save and then close (the "Save" choice on the unsaved-changes prompt).
-// Applied after the strip is drawn (like s_closeIdx), so it never mutates docTabs mid-iteration.
-static int  s_saveCloseIdx = -1;
+// A modal can outlive tab-vector reordering; keep the requested document's identity.
+struct CloseTabIdentity {
+    AppState::DocTab::TabKind kind = AppState::DocTab::TabKind::Part;
+    std::string id;
+};
+static CloseTabIdentity s_confirmClose;
+static CloseTabIdentity s_saveClose;
+static CloseTabIdentity s_closeConfirmed;
+
+static const std::string& closeTabId(const AppState::DocTab& tab) {
+    using K = AppState::DocTab::TabKind;
+    if (tab.kind == K::Drawing) return tab.drawingDocId;
+    if (tab.kind == K::Schematic || tab.kind == K::PCB) return tab.ecadDocId;
+    return tab.docId;
+}
+
+static CloseTabIdentity closeTabIdentity(const AppState::DocTab& tab) {
+    return {tab.kind, closeTabId(tab)};
+}
+
+static int resolveCloseTab(const AppState& st, const CloseTabIdentity& identity) {
+    if (identity.id.empty()) return -1;
+    for (int i = 0; i < (int)st.docTabs.size(); ++i) {
+        const auto& tab = st.docTabs[i];
+        if (tab.kind == identity.kind && closeTabId(tab) == identity.id) return i;
+    }
+    return -1;
+}
 // Wave 2: set true to request the New-Document chooser popup open this frame (the "+" button click,
 // or a Ctrl+N hook from app.cpp via openNewDocChooser()). Consumed inside drawDocTabs.
 static bool s_openChooser = false;
@@ -166,7 +189,7 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
         const int n = (int)st.docTabs.size();
         if (ImGui::MenuItem("Close")) {
             const bool aiSilent = t.aiHandoff && !t.userAdopted;
-            if (t.dirty && !aiSilent) s_confirmCloseIdx = idx; else s_closeIdx = idx;
+            if (t.dirty && !aiSilent) s_confirmClose = closeTabIdentity(t); else s_closeIdx = idx;
         }
         if (ImGui::MenuItem("Close Others", nullptr, false, n > 1)) s_closeOthersIdx = idx;
         ImGui::Separator();
@@ -296,7 +319,7 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
         // Pure AI-authored docs (un-adopted handoff mirrors) never raise a save prompt —
         // AI-VC auto-checkpoints handle their history; close silently even if dirty.
         const bool aiSilent = t.aiHandoff && !t.userAdopted;
-        if (t.dirty && !aiSilent) s_confirmCloseIdx = idx;   // ask first
+        if (t.dirty && !aiSilent) s_confirmClose = closeTabIdentity(t);   // ask first
         else                      s_closeIdx = idx;
     } else if (switchClicked && !active) {
         s_switchTo = idx;
@@ -591,10 +614,12 @@ TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
         }
         const int src = partTabIndexForDoc(st, t.sourceDocId);
         if (src < 0) {
-            // An embedded drawing without its source cannot be persisted independently.
-            st.addLog("[tabs] drawing '" + t.displayTitle() +
-                      "' has no open source part — cannot save embedded drawing");
-            return TabSaveResult::Nothing;
+            if (!t.dirty) return TabSaveResult::Nothing;
+            const std::string reason = "Drawing '" + t.displayTitle() +
+                "' has no open source part; reopen it to save the embedded drawing";
+            st.addLog("[tabs] " + reason);
+            st.toast(ui::ToastLevel::Error, reason);
+            return TabSaveResult::Failed;
         }
         return saveDocTab(st, src, forceDialog);
     }
@@ -618,7 +643,8 @@ float drawDocTabs(AppState& st, float availW) {
 
     s_switchTo = -1;
     s_closeIdx = -1;
-    s_saveCloseIdx = -1;
+    s_saveClose = {};
+    s_closeConfirmed = {};
     s_newDoc = NewDocKind::None;
 
     // ---- pinned floating overlay window (visual-overhaul fix 2) ------------------------------------
@@ -913,40 +939,41 @@ float drawDocTabs(AppState& st, float availW) {
     if (floatingWindow) ImGui::End();
 
     // ---- unsaved-changes confirmation prompt ----
-    if (s_confirmCloseIdx >= 0) {
-        ImGui::OpenPopup("Close document?##doctab");
-    }
+    const int confirmIdx = resolveCloseTab(st, s_confirmClose);
+    if (!s_confirmClose.id.empty() && confirmIdx < 0) s_confirmClose = {};
+    if (!s_confirmClose.id.empty()) ImGui::OpenPopup("Close document?##doctab");
     bool open = true;
-    // Center the modal.
     ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f),
                             ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Close document?##doctab", &open,
                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
-        int idx = s_confirmCloseIdx;
-        std::string name = (idx >= 0 && idx < (int)st.docTabs.size())
-                               ? st.docTabs[idx].displayTitle() : std::string("this document");
-        ImGui::Text("\"%s\" has unsaved changes.", name.c_str());
-        ImGui::TextUnformatted("Save your edits before closing?");
-        ImGui::Spacing();
-        if (ImGui::Button("Save", ImVec2(ui::metrics::px(120), 0))) {
-            s_saveCloseIdx = s_confirmCloseIdx;
-            s_confirmCloseIdx = -1;
+        if (confirmIdx < 0) {
             ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Don't Save", ImVec2(ui::metrics::px(120), 0))) {
-            s_closeIdx = s_confirmCloseIdx;
-            s_confirmCloseIdx = -1;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(ui::metrics::px(90), 0))) {
-            s_confirmCloseIdx = -1;
-            ImGui::CloseCurrentPopup();
+        } else {
+            const std::string name = st.docTabs[confirmIdx].displayTitle();
+            ImGui::Text("\"%s\" has unsaved changes.", name.c_str());
+            ImGui::TextUnformatted("Save your edits before closing?");
+            ImGui::Spacing();
+            if (ImGui::Button("Save", ImVec2(ui::metrics::px(120), 0))) {
+                s_saveClose = s_confirmClose;
+                s_confirmClose = {};
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Don't Save", ImVec2(ui::metrics::px(120), 0))) {
+                s_closeConfirmed = s_confirmClose;
+                s_confirmClose = {};
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(ui::metrics::px(90), 0))) {
+                s_confirmClose = {};
+                ImGui::CloseCurrentPopup();
+            }
         }
         ImGui::EndPopup();
     }
-    if (!open) s_confirmCloseIdx = -1;   // modal dismissed via the title-bar X
+    if (!open) s_confirmClose = {};
 
     // No height reservation any more — the strip is a pinned floating overlay (fix 2), so the central
     // window's content cursor stays at the top and the viewport chrome (toolbar + 3D) sits flush under
@@ -955,13 +982,21 @@ float drawDocTabs(AppState& st, float availW) {
     // ---- apply deferred actions (after all tabs were drawn) ----
     // A close that targets the active tab leaves the mirror on a neighbor, so handle close before
     // switch; only one of these fires per frame in practice.
-    if (s_saveCloseIdx >= 0) {
-        // Save the tab, then close it — unless the user cancels the Save-As or it fails (keep it open
-        // so nothing is lost). Saved/Nothing both proceed to close.
-        const int idx = s_saveCloseIdx;
-        s_saveCloseIdx = -1;
-        TabSaveResult r = saveDocTab(st, idx, /*forceDialog=*/false);
-        if (r != TabSaveResult::Cancelled && r != TabSaveResult::Failed) st.closeDocTab(idx);
+    if (!s_saveClose.id.empty()) {
+        // Save the chosen document, not whichever tab now occupies its old index.
+        const CloseTabIdentity chosen = s_saveClose;
+        const int idx = resolveCloseTab(st, chosen);
+        s_saveClose = {};
+        if (idx >= 0) {
+            TabSaveResult r = saveDocTab(st, idx, /*forceDialog=*/false);
+            const int currentIdx = resolveCloseTab(st, chosen);
+            if (currentIdx >= 0 && r != TabSaveResult::Cancelled && r != TabSaveResult::Failed)
+                st.closeDocTab(currentIdx);
+        }
+    } else if (!s_closeConfirmed.id.empty()) {
+        const int idx = resolveCloseTab(st, s_closeConfirmed);
+        s_closeConfirmed = {};
+        if (idx >= 0) st.closeDocTab(idx);
     } else if (s_closeOthersIdx >= 0) {
         // Keep the clicked tab, close the rest. Make it active first so the close-index bookkeeping
         // keeps it selected; skip dirty tabs so unsaved work is never silently discarded. Iterate

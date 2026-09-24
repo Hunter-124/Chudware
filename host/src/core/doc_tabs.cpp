@@ -22,6 +22,7 @@
 #include "ipc_client.h"               // services/ipc EngineClient (daemon detach_doc)
 #include "../ui/sketch_mode.h"        // per-document SketchMode owned by each DocSession
 #include "../ui/property_manager.h"   // per-document PropertyManager owned by each DocSession
+#include "../ui/asm_panels.h"        // disarm assembly pick routes before changing the active PM
 #include "../ui/evaluate_dialogs.h"   // per-document EvaluateDialogs (Measure/Mass/Section) owned by DocSession
 #include "../ui/sim_manager.h"        // per-document SimManager (simulation studies) owned by DocSession
 #include "../ui/feature_tree.h"       // featureTreeResetTransient — clear tree statics on a tab switch
@@ -270,6 +271,7 @@ void AppState::switchToTab(int idx) {
         if (docMirror.docId() == docTabs[idx].docId) return;
     }
 
+    if (asmPanels) asmPanels->closeAllToolForms(*this);
     // 1) Park the LEAVING CAD tab's per-doc value state into its session (its PM form / sketch /
     //    measure live on the session and are preserved — switching no longer cancels them).
     parkActiveCadSession(*this);
@@ -670,7 +672,7 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                         loadDocMeshAsync(aicm);
                      } else {
                          unloadDocMesh();
-                         renderer->setActiveMeshIdentity(docId, docMirror.revision());
+                         if (renderer) renderer->setActiveMeshIdentity(docId, docMirror.revision());
                          d.session->cachedDocMesh = std::make_shared<render::DocMesh>();
                      }
                      // Park snapshot + path now so a mid-load switch-away/back can take the
@@ -714,6 +716,7 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
 
 void AppState::closeDocTab(int idx, bool detachOnly) {
     if (idx < 0 || idx >= (int)docTabs.size()) return;
+    if (idx == activeTab && asmPanels) asmPanels->closeAllToolForms(*this);
     DocTab closing = docTabs[idx];
     // Multi-document: keep the closing tab's session alive past this erase until any async RPC its
     // PM / sketch / evaluate has in flight has drained (their completion lambdas capture `this`).

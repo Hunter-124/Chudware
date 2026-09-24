@@ -60,6 +60,18 @@ bool loadBinarySTL(const std::string& path, Mesh& out, std::string& err) {
         return false;
     }
 
+    // Check the declared record count against the file before allocating triangle-sized arrays.
+    // A uint32 count times the 50-byte record size fits in uint64 even on 32-bit hosts.
+    const uint64_t expectedSize = 84ull + uint64_t(nTris) * 50ull;
+    const bool seeked = std::fseek(f, 0, SEEK_END) == 0;
+    const long actualSize = seeked ? std::ftell(f) : -1;
+    if (actualSize < 0 || uint64_t(actualSize) < expectedSize ||
+        std::fseek(f, 84, SEEK_SET) != 0) {
+        err = "truncated triangle data";
+        std::fclose(f);
+        return false;
+    }
+
     out = Mesh{};
 
     // ------------------------------------------------------------------

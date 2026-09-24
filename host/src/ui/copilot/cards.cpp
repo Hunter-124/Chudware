@@ -7,6 +7,8 @@
 // timeline that hosts them lives in activity_timeline.cpp.
 
 #include "copilot_internal.h"
+#include <algorithm>
+#include <iterator>
 #include "util/time_local.h"
 
 // ============================ Plan / Objectives section ============================
@@ -2044,7 +2046,17 @@ static bool aiVcOk(const core::RpcResult& r, std::string& hint) {
     return true;
 }
 
-static void aiVcRefreshMirror(AppState& st, const nlohmann::json& res) {
+static bool aiVcDocStillActive(const AppState& st, const std::string& docId) {
+    if (docId.empty() || !st.docMirror.hasDoc() ||
+        st.docMirror.docId() != docId) return false;
+    if (st.activeTab < 0) return true;
+    return st.activeTab < (int)st.docTabs.size() &&
+           st.docTabs[st.activeTab].docId == docId;
+}
+
+static void aiVcRefreshMirror(AppState& st, const nlohmann::json& res,
+                              const std::string& docId) {
+    if (!aiVcDocStillActive(st, docId)) return;
     // Prefer an ops-shaped envelope (revision/tree/tess); otherwise resync + rebuild mesh.
     if (res.is_object() && (res.contains("revision") || res.contains("tree") ||
                             res.contains("ops"))) {
@@ -2061,11 +2073,12 @@ static void aiVcRefreshMirror(AppState& st, const nlohmann::json& res) {
         return;
     }
     if (!st.docMirror.hasDoc()) return;
-    const std::string docId = st.docMirror.docId();
+    const std::string activeDocId = docId;
     st.docMirror.resync(st.worker);
     nlohmann::json p;
     p["doc_id"] = docId;
-    st.rpc.call("doc_activate", p, [&st](const core::RpcResult& r) {
+    st.rpc.call("doc_activate", p, [&st, activeDocId](const core::RpcResult& r) {
+        if (!aiVcDocStillActive(st, activeDocId)) return;
         if (!r.ok || !r.result.is_object()) return;
         std::string aicm = r.result.value("aicm_path", std::string());
         if (aicm.empty() && r.result.contains("tess") && r.result["tess"].is_object())
@@ -2075,7 +2088,8 @@ static void aiVcRefreshMirror(AppState& st, const nlohmann::json& res) {
     });
 }
 
-static void aiVcApplyChatTruncate(AppState& st, const nlohmann::json& res) {
+static bool aiVcApplyChatTruncate(AppState& st, const std::string& convId,
+                                  const nlohmann::json& res) {
     // Prefer explicit chat_truncate_to (msg index); fall back to msg:N targets only.
     int truncateTo = -1;
     if (res.is_object() && res.contains("chat_truncate_to") &&
@@ -2085,35 +2099,30 @@ static void aiVcApplyChatTruncate(AppState& st, const nlohmann::json& res) {
         else if (res["chat_truncate_to"].is_number())
             truncateTo = (int)res["chat_truncate_to"].get<double>();
     }
-    if (truncateTo < 0) return;
-    if (truncateTo > (int)st.chat.size()) truncateTo = (int)st.chat.size();
-    if (truncateTo < (int)st.chat.size()) {
-        // ARCHIVE, never destroy. The discarded tail moves into a branch on this session
-        // so a revert aimed at the wrong message can be undone — reverting must not be the
-        // operation that loses work. Textures are GPU handles owned by the live view, so
-        // they are released here; the branch keeps the message data only.
-        if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size()) {
-            ChatBranch br;
-            br.id = "b" + std::to_string(
-                st.conversations[st.activeConv].branches.size() + 1);
-            br.when = (double)std::time(nullptr);
-            br.fromMsgIdx = truncateTo;
-            br.label = "reverted to message " + std::to_string(truncateTo) + " — " +
-                       std::to_string((int)st.chat.size() - truncateTo) + " message(s) parked";
-            br.msgs.assign(st.chat.begin() + truncateTo, st.chat.end());
-            for (auto& m : br.msgs) {
-                m.uiCachedH = -1.0f;   // heights are view state, not content
-            }
-            st.conversations[st.activeConv].branches.push_back(std::move(br));
-        }
-        // Free textures on the tail before erase (GL-safe via freeChatTextures).
-        std::vector<ChatMsg> tail(st.chat.begin() + truncateTo, st.chat.end());
-        freeChatTextures(tail);
-        st.chat.erase(st.chat.begin() + truncateTo, st.chat.end());
-        // Invalidate height caches for remaining messages (layout may shift).
-        for (auto& m : st.chat) m.uiCachedH = -1.0f;
-        markChatHistoryDirty();  // the branch must reach disk, not just RAM
+    if (truncateTo < 0) return false;
+    std::vector<ChatMsg>* msgs = conversationMsgs(st, convId);
+    if (!msgs) return false;
+    if (truncateTo > (int)msgs->size()) truncateTo = (int)msgs->size();
+    if (truncateTo < (int)msgs->size()) {
+        auto conv = std::find_if(st.conversations.begin(), st.conversations.end(),
+                                 [&convId](const Conversation& c) { return c.id == convId; });
+        if (conv == st.conversations.end()) return false;
+        ChatBranch br;
+        br.id = "b" + std::to_string(conv->branches.size() + 1);
+        br.when = (double)std::time(nullptr);
+        br.fromMsgIdx = truncateTo;
+        br.label = "reverted to message " + std::to_string(truncateTo) + " — " +
+                   std::to_string((int)msgs->size() - truncateTo) + " message(s) parked";
+        br.msgs.assign(std::make_move_iterator(msgs->begin() + truncateTo),
+                       std::make_move_iterator(msgs->end()));
+        freeChatTextures(br.msgs);
+        for (auto& m : br.msgs) m.uiCachedH = -1.0f;
+        conv->branches.push_back(std::move(br));
+        msgs->erase(msgs->begin() + truncateTo, msgs->end());
+        for (auto& m : *msgs) m.uiCachedH = -1.0f;
+        markChatHistoryDirty();
     }
+    return true;
 }
 
 void aiVcRollback(AppState& st, const std::string& to, const std::string& okToast) {
@@ -2132,7 +2141,9 @@ void aiVcRollback(AppState& st, const std::string& to, const std::string& okToas
     if (to.rfind("msg:", 0) == 0) {
         try { msgTruncateTo = std::stoi(to.substr(4)); } catch (...) { msgTruncateTo = -1; }
     }
-    st.rpc.call("plm_rollback", p, [&st, okToast, msgTruncateTo](const core::RpcResult& r) {
+    const std::string convId = st.activeConvId();
+    st.rpc.call("plm_rollback", p,
+                [&st, okToast, msgTruncateTo, convId, docId](const core::RpcResult& r) {
         s_aiVc.busy = false;
         std::string hint;
         if (!aiVcOk(r, hint)) {
@@ -2142,30 +2153,42 @@ void aiVcRollback(AppState& st, const std::string& to, const std::string& okToas
             // locally and say plainly that no geometry was rolled back.
             if (s_aiVc.available && msgTruncateTo >= 0 && aiVcIsNoCheckpoint(r)) {
                 nlohmann::json synth = {{"chat_truncate_to", msgTruncateTo}};
-                aiVcApplyChatTruncate(st, synth);
-                st.toast(ui::ToastLevel::Info,
-                         "No geometry checkpoint at that point — rewound the chat only; "
-                         "the part was left unchanged.");
+                const bool chatFound = aiVcApplyChatTruncate(st, convId, synth);
+                st.toast(chatFound ? ui::ToastLevel::Info : ui::ToastLevel::Error,
+                         chatFound ? "No geometry checkpoint at that point — rewound the "
+                                     "original chat only; the part was left unchanged."
+                                   : "No geometry checkpoint; original chat no longer exists.");
                 s_aiVc.lastFetch = 0.0;
                 return;
             }
             if (s_aiVc.available) st.toast(ui::ToastLevel::Error, hint);
             return;
         }
-        aiVcRefreshMirror(st, r.result);
+        aiVcRefreshMirror(st, r.result, docId);
         // Prefer backend chat_truncate_to; if absent and this was a msg:N rewind, synthesize.
-        bool hadTruncate = r.result.is_object() && r.result.contains("chat_truncate_to") &&
-                           !r.result["chat_truncate_to"].is_null();
+        const bool hadTruncate = r.result.is_object() &&
+                                 r.result.contains("chat_truncate_to") &&
+                                 !r.result["chat_truncate_to"].is_null();
+        bool chatFound;
         if (hadTruncate) {
-            aiVcApplyChatTruncate(st, r.result);
+            chatFound = aiVcApplyChatTruncate(st, convId, r.result);
         } else if (msgTruncateTo >= 0) {
             nlohmann::json synth = {{"chat_truncate_to", msgTruncateTo}};
-            aiVcApplyChatTruncate(st, synth);
+            chatFound = aiVcApplyChatTruncate(st, convId, synth);
         } else {
-            aiVcApplyChatTruncate(st, r.result);
+            chatFound = conversationMsgs(st, convId) != nullptr;
         }
-        st.toast(ui::ToastLevel::Success,
-                 okToast.empty() ? std::string("Restored checkpoint") : okToast);
+        if (chatFound) {
+            const std::string label = okToast.empty() ? "Restored checkpoint" : okToast;
+            const bool sameConversation = st.activeConvId() == convId;
+            const bool sameDocument = docId.empty() || aiVcDocStillActive(st, docId);
+            st.toast(ui::ToastLevel::Success,
+                     sameConversation && sameDocument
+                         ? label : label + " for the original conversation/document");
+        } else {
+            st.toast(ui::ToastLevel::Warn,
+                     "Checkpoint restored; original conversation no longer exists.");
+        }
         s_aiVc.lastFetch = 0.0;  // force timeline refresh next open
     });
 }
@@ -2202,11 +2225,22 @@ void aiVcRequestRollback(AppState& st, const std::string& to, const std::string&
     p["to"] = to;
     const std::string fp = aiVcActiveDocFilePath(st);
     if (!fp.empty()) p["file_path"] = fp;
-    p["chat_size"] = (int)st.chat.size();
-    st.rpc.call("plm_rollback_check", p, [&st, to](const core::RpcResult& r) {
+    const int chatSize = (int)st.chat.size();
+    const std::string convId = st.activeConvId();
+    p["chat_size"] = chatSize;
+    st.rpc.call("plm_rollback_check", p,
+                [&st, to, convId, docId, chatSize](const core::RpcResult& r) {
         auto& c = s_aiVc.confirm;
-        c.busy = false;
         if (c.to != to) return;   // user armed a different target meanwhile
+        c.busy = false;
+        if (st.activeConvId() != convId ||
+            (docId.empty() ? !aiVcActiveDocId(st).empty()
+                           : !aiVcDocStillActive(st, docId))) {
+            c = AiVcUi::Confirm{};
+            st.toast(ui::ToastLevel::Info,
+                     "Restore check cancelled after switching conversation or document.");
+            return;
+        }
         // Chat-only rewind: no geometry checkpoint at that point. Still confirm,
         // with wording that never claims geometry was restored.
         if (aiVcIsNoCheckpoint(r) && to.rfind("msg:", 0) == 0) {
@@ -2214,7 +2248,7 @@ void aiVcRequestRollback(AppState& st, const std::string& to, const std::string&
             c.notFound = true;
             // Chat-only rewind discards the tail after the target message.
             try { c.discardedMessages =
-                    std::max(0, (int)st.chat.size() - std::stoi(to.substr(4))); }
+                    std::max(0, chatSize - std::stoi(to.substr(4))); }
             catch (...) { c.discardedMessages = -1; }
             c.geometryRollback = false;
             c.open = true;

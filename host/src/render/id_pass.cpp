@@ -37,9 +37,8 @@ void main(){
     frag = vId;
 })";
 
-// RGBA8 fallback: same vertex shader, pack the 32-bit id into RGBA bytes (little-endian-ish:
-// r = low byte ... a = high byte). Readback reassembles. Only the low 24 bits carry topo data
-// and 8 bits body, so all 32 bits are meaningful — we use all four channels.
+// RGBA8 fallback: same vertex shader, pack the full 32-bit id into RGBA bytes (little-endian-ish:
+// r = low byte ... a = high byte). Readback reassembles all body/kind/topology bits.
 const char* kFragRGBA = R"(#version 330 core
 flat in uint vId;
 uniform int uClipCount;
@@ -161,6 +160,21 @@ void IdPass::allocTargets(int w, int h) {
 }
 
 bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
+    destroy();  // drop old per-body buffers (keep prog_ + targets)
+    built_ = false;
+    ++docGen_;
+    haveCachedFrame_ = false;
+    // The RGBA8 WebGL2 path has the same 32-bit budget as R32UI. Reject oversized IDs
+    // before encoding so picking never silently aliases a different body or topology item.
+    if (const char* reason = pickIdOverflow(doc)) {
+        err = reason;
+        static bool logged = false;
+        if (!logged) {
+            std::fprintf(stderr, "id_pass: %s\n", reason);
+            logged = true;
+        }
+        return false;
+    }
     // Decide encoding once (env-gated fallback) and build the matching program.
     const char* mode = std::getenv("CHUDWARE_IDBUF");
 #ifdef __EMSCRIPTEN__
@@ -175,10 +189,6 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
     int linked = 0;
     glGetProgramiv(prog_, GL_LINK_STATUS, &linked);
     if (!linked) { err = "id_pass program link failed"; return false; }
-
-    destroy();  // drop old per-body buffers (keep prog_ + targets)
-    ++docGen_;  // every topology upload produces a distinct render input generation
-    haveCachedFrame_ = false;
 
     // Bind pos (location 0, float3) + id (location 1, uint) attribute buffers into a fresh VAO and
     // optionally an element buffer. Returns the BodyDraw (count set by caller). Integer ids MUST go
@@ -440,7 +450,7 @@ PickHit IdPass::pickFinalPreferEdge(int px, int py, int finalW, int finalH, int 
         for (int i = 0; i < bw; ++i) {
             uint32_t v = block[(size_t)j * bw + i];
             if (v == 0 || bodyHidden(v)) continue;
-            PickKind k = PickKind((v >> 22) & 0x3u);
+            PickKind k = PickKind((v >> 18) & 0x3u);
             if (k != PickKind::Edge && k != PickKind::Vertex) continue;
             long dx = (long)(x0 + i) - cx, dy = (long)(y0 + j) - cy;
             long d2 = dx * dx + dy * dy;

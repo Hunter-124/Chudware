@@ -1101,12 +1101,12 @@ std::string simPathSegment(std::string value) {
   return value.empty() ? std::string("unknown") : value;
 }
 
-std::string staticModalStepPath(const std::string &docId,
-                                const std::string &studyId,
-                                std::uint64_t reservationToken) {
+std::string simExportPath(const std::string &docId,
+                          const std::string &studyId,
+                          std::uint64_t reservationToken, bool flow) {
   const std::string leaf =
       "sim_" + simPathSegment(docId) + "_" + simPathSegment(studyId) + "_" +
-      std::to_string(reservationToken) + ".step";
+      std::to_string(reservationToken) + (flow ? ".stl" : ".step");
   // Relative paths are intentionally server-owned in daemon/WASM mode.
   return engine::daemonMode() ? leaf : appdataAppDir() + "/cache/" + leaf;
 }
@@ -1117,6 +1117,8 @@ struct SimManager::StaticModalPrep {
     bool pressure = false;
     float vec[3] = {0.0f, 0.0f, -100.0f};
     float pressureMpa = 0.1f;
+    int thermalKind = 0;
+    float hWm2k = 0.0f, tAmbC = 0.0f, fluxWm2 = 0.0f;
     std::vector<nlohmann::json> selectors;
     std::vector<nlohmann::json> resolved;
   };
@@ -1134,6 +1136,11 @@ struct SimManager::StaticModalPrep {
   std::vector<nlohmann::json> fixtureSelectors;
   std::vector<nlohmann::json> fixtures;
   std::vector<Load> loads;
+  nlohmann::json flowParams;
+  nlohmann::json fatigue;
+  nlohmann::json thermalMaterial;
+  nlohmann::json thermalTransient;
+  float thermFixTempC = 0.0f;
   std::size_t facesRemaining = 0;
 };
 
@@ -4215,23 +4222,6 @@ void SimManager::collectFlowResultLines(AppState &st,
 // ---------------------------------------------------------------- run (ported
 // from SimPanel)
 
-nlohmann::json SimManager::facePointsFor(AppState &st,
-                                         const nlohmann::json &selector,
-                                         std::string &err) {
-  nlohmann::json result;
-  // Strip the host-only "_pick" hint before sending to the engine.
-  nlohmann::json sel = selector;
-  if (sel.is_object())
-    sel.erase("_pick");
-  nlohmann::json params = {{"doc_id", st.docMirror.docId()}, {"selector", sel}};
-  if (!st.worker.call("doc_face_points", params, result, err, 30000))
-    return {};
-  if (result.contains("code")) {
-    err = result.value("message", std::string("face_points error"));
-    return {};
-  }
-  return result;
-}
 
 void SimManager::run(AppState &st, Study &s) {
   // Always re-seed material from the part so a FeatureManager / Mass Props
@@ -4341,61 +4331,23 @@ void SimManager::run(AppState &st, Study &s) {
 }
 
 void SimManager::runFatigue(AppState &st, Study &s) {
-  if (!st.simClient)
+  if (!st.simClient || !st.docMirror.hasDoc())
     return;
-  auto *sim = st.simClient;
-  if (!st.docMirror.hasDoc()) {
-    st.addLog("[sim] no document to analyse");
-    return;
-  }
-
-  const std::string stepPath =
-      engine::daemonMode() ? std::string()
-                           : (appdataAppDir() + "/cache/sim_fatigue.step");
-  {
-    nlohmann::json r,
-        p = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
-    std::string e;
-    if (!st.worker.call("doc_export_step", p, r, e, 60000) ||
-        !r.is_object() || r.contains("code") || !r.value("ok", true)) {
-      st.addLog("[sim] export STEP failed: " +
-                (r.is_object()
-                     ? r.value("message", r.value("error", e))
-                     : e));
-      st.toast(ui::ToastLevel::Error, "Simulation: export failed");
-      return;
-    }
-    lastStepPath_ = r.value("path", stepPath);
-  }
-
-  nlohmann::json fixtures = nlohmann::json::array();
-  for (const auto &p : s.fixtures.picks) {
-    std::string e;
-    auto fp = facePointsFor(st, p.selector, e);
-    if (!fp.is_null() && fp.contains("points") && fp["points"].is_array() &&
-        !fp["points"].empty())
-      fixtures.push_back(fp);
-  }
-  if (fixtures.size() != s.fixtures.picks.size()) {
-    st.toast(ui::ToastLevel::Warn,
-             "One or more fixture faces no longer resolve; reselect them");
-    return;
-  }
-
-  int mi = materialIndexByKey(s.materialKey);
+  auto prep = std::make_shared<StaticModalPrep>();
+  prep->type = s.type;
+  const int mi = materialIndexByKey(s.materialKey);
   double matSut = 0, matSe = 0, matSy = 0;
-  nlohmann::json material = nlohmann::json::object();
   if (mi >= 0) {
     const auto &m = materials()[mi];
     matSut = m.ultimate_mpa;
     matSe = m.endurance_mpa;
     matSy = m.yield_mpa;
-    material = {{"E_mpa", m.E_mpa},
-                {"nu", m.nu},
-                {"density_g_cm3", m.density_g_cm3},
-                {"yield_mpa", m.yield_mpa},
-                {"ultimate_mpa", m.ultimate_mpa},
-                {"endurance_mpa", m.endurance_mpa}};
+    prep->material = {{"E_mpa", m.E_mpa},
+                      {"nu", m.nu},
+                      {"density_g_cm3", m.density_g_cm3},
+                      {"yield_mpa", m.yield_mpa},
+                      {"ultimate_mpa", m.ultimate_mpa},
+                      {"endurance_mpa", m.endurance_mpa}};
   }
   const double sutUsed = s.fatigueSut > 0 ? s.fatigueSut : matSut;
   if (sutUsed <= 0) {
@@ -4404,78 +4356,35 @@ void SimManager::runFatigue(AppState &st, Study &s) {
     st.addLog("[sim] fatigue: material has no ultimate strength (Sut)");
     return;
   }
-  // Marin-corrected endurance limit (host owns the correction; engine just uses
-  // Se_corrected).
   const double seBaseV = seBase(s, matSe, sutUsed);
   const double ka = marin_ka(sutUsed, s.fatigueSurface),
                kb = marin_kb(s.fatigueSizeMm, s.fatigueLoadCase),
                kc = marin_kc(s.fatigueLoadCase), kd = marin_kd(s.fatigueTempC);
-  const double seCorr = ka * kb * kc * kd * seBaseV;
   float lmin, lmax;
   fatigueLoadFactors(s, lmin, lmax);
-
-  nlohmann::json loads = nlohmann::json::array();
-  for (const auto &ld : s.loads) {
-    nlohmann::json faces = nlohmann::json::array();
-    int resolvedFaces = 0;
-    for (const auto &p : ld.faces.picks) {
-      std::string e;
-      auto fp = facePointsFor(st, p.selector, e);
-      if (!fp.is_null() && fp.contains("points") && fp["points"].is_array() &&
-          !fp["points"].empty()) {
-        ++resolvedFaces;
-        if (faces.empty())
-          faces = fp;
-        else
-          for (auto &pt : fp["points"])
-            faces["points"].push_back(pt);
-      }
-    }
-    if (resolvedFaces != (int)ld.faces.picks.size()) {
-      st.toast(ui::ToastLevel::Warn,
-               "One or more load faces no longer resolve; reselect them");
-      return;
-    }
-    nlohmann::json l = {{"faces", faces}};
-    if (ld.pressure) {
-      l["type"] = "pressure";
-      l["magnitude"] = ld.pressureMpa;
-    } else {
-      l["type"] = "force";
-      l["vector"] = {ld.vec[0], ld.vec[1], ld.vec[2]};
-    }
-    loads.push_back(l);
+  prep->fatigue = {{"lmin", lmin},
+                   {"lmax", lmax},
+                   {"se_corrected_mpa", ka * kb * kc * kd * seBaseV},
+                   {"se_base_mpa", seBaseV},
+                   {"ultimate_mpa", sutUsed},
+                   {"yield_mpa", matSy},
+                   {"marin", {{"ka", ka}, {"kb", kb}, {"kc", kc}, {"kd", kd}}}};
+  for (const auto &pick : s.fixtures.picks)
+    prep->fixtureSelectors.push_back(pick.selector);
+  prep->fixtures.resize(prep->fixtureSelectors.size());
+  for (const auto &load : s.loads) {
+    StaticModalPrep::Load snap;
+    snap.pressure = load.pressure;
+    snap.vec[0] = load.vec[0];
+    snap.vec[1] = load.vec[1];
+    snap.vec[2] = load.vec[2];
+    snap.pressureMpa = load.pressureMpa;
+    for (const auto &pick : load.faces.picks)
+      snap.selectors.push_back(pick.selector);
+    snap.resolved.resize(snap.selectors.size());
+    prep->loads.push_back(std::move(snap));
   }
-
-  nlohmann::json study = {
-      {"step_path", lastStepPath_},
-      {"material", material},
-      {"fixtures", fixtures},
-      {"loads", loads},
-      {"fatigue",
-       {{"lmin", lmin},
-        {"lmax", lmax},
-        {"se_corrected_mpa", seCorr},
-        {"se_base_mpa", seBaseV},
-        {"ultimate_mpa", sutUsed},
-        {"yield_mpa", matSy},
-        {"marin", {{"ka", ka}, {"kb", kb}, {"kc", kc}, {"kd", kd}}}}},
-  };
-  addMeshParams(study, s, s.meshOrder); // 2nd-order elements keep the fatigue
-                                        // stress field accurate.
-  std::string note;
-  if (sim->launch("sim_run_fatigue", {{"study", study}}, note,
-                  st.docMirror.docId())) {
-    clearTransientResult(s);
-    persist(st, s);
-    clearMeshPreview();
-    resultShown_ = false;
-    shownStudyId_.clear();
-    running_ = true;
-    runningStudy_ = sel_;
-    runningStudyId_ = s.id;
-  }
-  st.addLog(note);
+  beginExportPrep(st, s, prep);
 }
 
 void SimManager::runStaticOrModal(AppState &st, Study &s) {
@@ -4486,33 +4395,9 @@ void SimManager::runStaticOrModal(AppState &st, Study &s) {
     return;
   }
 
-  const std::string docId = st.docMirror.docId();
-  lastDocId_ = docId;
-  std::uint64_t reservationToken = 0;
-  if (prepInFlight_ ||
-      !st.simClient->tryReserve(docId, reservationToken)) {
-    st.toast(ui::ToastLevel::Info, "A simulation is already in progress");
-    return;
-  }
-
   auto prep = std::make_shared<StaticModalPrep>();
-  prep->sim = st.simClient;
-  prep->reservationToken = reservationToken;
-  prep->docId = docId;
-  prep->studyId = s.id;
   prep->type = s.type;
   prep->nModes = s.nModes;
-  prep->requestedStepPath =
-      staticModalStepPath(docId, s.id, reservationToken);
-  prep->meshOptions.meshFineness = s.meshFineness;
-  prep->meshOptions.meshTargetMm = s.meshTargetMm;
-  prep->meshOptions.meshMinMm = s.meshMinMm;
-  prep->meshOptions.learnedAdvisor = s.learnedAdvisor;
-  prep->meshOptions.advisorMaxDof = s.advisorMaxDof;
-  prep->meshOptions.adaptEnabled = s.adaptEnabled;
-  prep->meshOptions.adaptMaxPasses = s.adaptMaxPasses;
-  prep->meshOptions.adaptEtaTarget = s.adaptEtaTarget;
-  prep->meshOptions.meshOrder = s.meshOrder;
 
   for (const auto &pick : s.fixtures.picks)
     prep->fixtureSelectors.push_back(pick.selector);
@@ -4542,6 +4427,34 @@ void SimManager::runStaticOrModal(AppState &st, Study &s) {
                       {"yield_mpa", material.yield_mpa}};
   }
 
+  beginExportPrep(st, s, prep);
+}
+
+void SimManager::beginExportPrep(
+    AppState &st, Study &s, const std::shared_ptr<StaticModalPrep> &prep) {
+  const std::string docId = st.docMirror.docId();
+  std::uint64_t reservationToken = 0;
+  if (prepInFlight_ ||
+      !st.simClient->tryReserve(docId, reservationToken)) {
+    st.toast(ui::ToastLevel::Info, "A simulation is already in progress");
+    return;
+  }
+  lastDocId_ = docId;
+  prep->sim = st.simClient;
+  prep->reservationToken = reservationToken;
+  prep->docId = docId;
+  prep->studyId = s.id;
+  prep->requestedStepPath =
+      simExportPath(docId, s.id, reservationToken, isFlowFamily(s.type));
+  prep->meshOptions.meshFineness = s.meshFineness;
+  prep->meshOptions.meshTargetMm = s.meshTargetMm;
+  prep->meshOptions.meshMinMm = s.meshMinMm;
+  prep->meshOptions.learnedAdvisor = s.learnedAdvisor;
+  prep->meshOptions.advisorMaxDof = s.advisorMaxDof;
+  prep->meshOptions.adaptEnabled = s.adaptEnabled;
+  prep->meshOptions.adaptMaxPasses = s.adaptMaxPasses;
+  prep->meshOptions.adaptEtaTarget = s.adaptEtaTarget;
+  prep->meshOptions.meshOrder = s.meshOrder;
   staticModalPrep_ = prep;
   prepInFlight_ = true;
   clearTransientResult(s);
@@ -4575,7 +4488,7 @@ void SimManager::runStaticOrModal(AppState &st, Study &s) {
         const auto pathIt = result.result.find("path");
         if (pathIt != result.result.end() && !pathIt->is_string()) {
           failStaticModalPrep(st, prep,
-                              "Simulation: export returned an invalid STEP path");
+                              "Simulation: export returned an invalid path");
           return;
         }
         prep->resolvedStepPath =
@@ -4584,10 +4497,9 @@ void SimManager::runStaticOrModal(AppState &st, Study &s) {
                 : pathIt->get<std::string>();
         if (prep->resolvedStepPath.empty()) {
           failStaticModalPrep(st, prep,
-                              "Simulation: export returned no STEP path");
+                              "Simulation: export returned no path");
           return;
         }
-        lastStepPath_ = prep->resolvedStepPath;
 
         prep->facesRemaining = prep->fixtureSelectors.size();
         for (const auto &load : prep->loads)
@@ -4697,17 +4609,29 @@ void SimManager::finishStaticModalPrep(
   for (const auto &face : prep->fixtures)
     fixtures.push_back(face);
   nlohmann::json study = {{"step_path", prep->resolvedStepPath},
-                          {"material", prep->material},
+                          {"material", prep->type == StudyType::ThermalFea
+                                           ? prep->thermalMaterial : prep->material},
                           {"fixtures", std::move(fixtures)}};
-  addMeshParams(study, prep->meshOptions,
-                (prep->type == StudyType::Static || prep->type == StudyType::Buckling)
-                    ? prep->meshOptions.meshOrder : 1,
-                supportsLearnedAdvisor(prep->type));
+  if (prep->type == StudyType::ThermalFea) {
+    for (auto &face : study["fixtures"])
+      face["temp_c"] = prep->thermFixTempC;
+    if (!prep->thermalTransient.is_null())
+      study["transient"] = prep->thermalTransient;
+  }
+  if (!isFlowFamily(prep->type))
+    addMeshParams(study, prep->meshOptions,
+                  (prep->type == StudyType::Static ||
+                   prep->type == StudyType::Buckling ||
+                   prep->type == StudyType::Fatigue)
+                      ? prep->meshOptions.meshOrder : 1,
+                  prep->type == StudyType::ThermalFea ||
+                      supportsLearnedAdvisor(prep->type));
 
   std::string note;
   bool launched = false;
   const std::uint64_t token = prep->reservationToken;
-  if (prep->type == StudyType::Static || prep->type == StudyType::Buckling) {
+  if (prep->type == StudyType::Static || prep->type == StudyType::Buckling ||
+      prep->type == StudyType::Fatigue || prep->type == StudyType::ThermalFea) {
     nlohmann::json loads = nlohmann::json::array();
     for (const auto &load : prep->loads) {
       nlohmann::json points = nlohmann::json::array();
@@ -4719,7 +4643,21 @@ void SimManager::finishStaticModalPrep(
             points["points"].push_back(point);
       }
       nlohmann::json item = {{"faces", std::move(points)}};
-      if (load.pressure) {
+      if (prep->type == StudyType::ThermalFea) {
+        if (load.resolved.empty() || item["faces"].empty()) {
+          failStaticModalPrep(st, prep,
+                              "Every thermal load needs at least one resolved face");
+          return;
+        }
+        if (load.thermalKind == 1) {
+          item["type"] = "convection";
+          item["h"] = load.hWm2k;
+          item["t_amb_c"] = load.tAmbC;
+        } else {
+          item["type"] = "flux";
+          item["magnitude"] = load.fluxWm2;
+        }
+      } else if (load.pressure) {
         item["type"] = "pressure";
         item["magnitude"] = load.pressureMpa;
       } else {
@@ -4729,14 +4667,24 @@ void SimManager::finishStaticModalPrep(
       loads.push_back(std::move(item));
     }
     study["loads"] = std::move(loads);
+    if (prep->type == StudyType::Fatigue)
+      study["fatigue"] = prep->fatigue;
     const char *method = prep->type == StudyType::Buckling
                              ? "sim_run_buckling"
-                             : (prep->meshOptions.adaptEnabled
-                                    ? "sim_run_adaptive" : "sim_run_static");
+                             : prep->type == StudyType::Fatigue
+                                   ? "sim_run_fatigue"
+                                   : prep->type == StudyType::ThermalFea
+                                         ? "sim_run_thermal"
+                                         : (prep->meshOptions.adaptEnabled
+                                                ? "sim_run_adaptive" : "sim_run_static");
     nlohmann::json params{{"study", std::move(study)}};
     if (prep->type == StudyType::Buckling)
       params["n_modes"] = prep->nModes;
     launched = prep->sim->launch(method, std::move(params), note, prep->docId, token);
+  } else if (isFlowFamily(prep->type)) {
+    prep->flowParams["stl_path"] = prep->resolvedStepPath;
+    launched = prep->sim->launch("sim_run_flow", std::move(prep->flowParams),
+                                note, prep->docId, token);
   } else {
     launched = prep->sim->launch(
         "sim_run_modal", {{"study", study}, {"n_modes", prep->nModes}}, note,
@@ -4760,26 +4708,10 @@ void SimManager::finishStaticModalPrep(
 }
 
 void SimManager::runFlow(AppState &st, Study &s) {
-  if (!st.simClient)
+  if (!st.simClient || !st.docMirror.hasDoc())
     return;
-  auto *sim = st.simClient;
-  if (!st.docMirror.hasDoc()) {
-    st.addLog("[sim] no document to analyse");
-    return;
-  }
-  const std::string stlPath = engine::daemonMode()
-                                  ? std::string("sim_flow.stl")
-                                  : (appdataAppDir() + "/cache/sim_flow.stl");
-  nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"path", stlPath}};
-  std::string e;
-  if (!st.worker.call("doc_export_step", p, r, e, 60000) ||
-      !r.is_object() || r.contains("code") || !r.value("ok", true)) {
-    st.addLog("[sim] export STL failed: " +
-              (r.is_object() ? r.value("message", r.value("error", e)) : e));
-    st.toast(ui::ToastLevel::Error, "Simulation: STL export failed");
-    return;
-  }
-  lastStepPath_ = r.value("path", stlPath);
+  auto prep = std::make_shared<StaticModalPrep>();
+  prep->type = s.type;
   static const int dirs[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
                                  {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
   static const char *presets[4] = {"coarse", "medium", "fine", "xfine"};
@@ -4790,8 +4722,8 @@ void SimManager::runFlow(AppState &st, Study &s) {
   const char *fluidName = (s.flowFluid == 1)   ? "water"
                           : (s.flowFluid == 2) ? "custom"
                                                : "air";
-  nlohmann::json params = {
-      {"stl_path", lastStepPath_},
+  prep->flowParams = {
+      {"stl_path", ""},
       {"direction", {dirs[di][0], dirs[di][1], dirs[di][2]}},
       {"speed_mps", s.flowSpeed},
       {"preset", presets[pi]},
@@ -4810,7 +4742,7 @@ void SimManager::runFlow(AppState &st, Study &s) {
     if (s.flowThermalType == 1) {
       // Conjugate heat transfer: solid part conducts an internal power
       // dissipation.
-      params["thermal"] = {
+      prep->flowParams["thermal"] = {
           {"enabled", true},
           {"mode", "conjugate"},
           {"inlet_temp_c", s.flowInletTempC},
@@ -4822,7 +4754,7 @@ void SimManager::runFlow(AppState &st, Study &s) {
       const char *wallMode = (s.flowWallMode == 0)   ? "temp"
                              : (s.flowWallMode == 1) ? "flux"
                                                      : "power";
-      params["thermal"] = {
+      prep->flowParams["thermal"] = {
           {"enabled", true},
           {"mode", "fluid"},
           {"inlet_temp_c", s.flowInletTempC},
@@ -4833,18 +4765,7 @@ void SimManager::runFlow(AppState &st, Study &s) {
       };
     }
   }
-  std::string note;
-  if (sim->launch("sim_run_flow", params, note, st.docMirror.docId())) {
-    clearTransientResult(s);
-    persist(st, s);
-    clearMeshPreview();
-    resultShown_ = false;
-    shownStudyId_.clear();
-    running_ = true;
-    runningStudy_ = sel_;
-    runningStudyId_ = s.id;
-  }
-  st.addLog(note);
+  beginExportPrep(st, s, prep);
 }
 
 // ---------------------------------------------------------------- tick (drain,
@@ -4868,7 +4789,29 @@ void SimManager::clearResultOverlay(AppState &st) {
   shownStudyId_.clear();
 }
 
+void SimManager::restoreMotionHighlight(AppState &st) {
+  if (!motionHighlightPose_)
+    return;
+  st.featureHighlightFaces.clear();
+  motionHighlightPose_ = false;
+  motionHighlightStudyId_.clear();
+  const auto *session = st.activeSession();
+  const render::DocMesh *base =
+      st.docMirror.hasDoc() && session && session->cachedDocMesh &&
+              session->cachedRevision == st.docMirror.revision()
+          ? session->cachedDocMesh.get()
+          : (st.docMirror.hasDoc() &&
+                     motionCacheDocId_ == st.docMirror.docId()
+                 ? motionDocMesh_.get() : nullptr);
+  if (st.overlays && base) {
+    std::string err;
+    if (!st.overlays->setDoc(*base, err))
+      st.addLog("[motion] restore selection geometry: " + err);
+  }
+}
+
 void SimManager::restoreModelMesh(AppState &st) {
+  restoreMotionHighlight(st);
   clearResultOverlay(st);
   if (!st.docMirror.hasDoc())
     return;
@@ -4876,15 +4819,9 @@ void SimManager::restoreModelMesh(AppState &st) {
   const auto generation = ++modelRestoreGeneration_;
   const std::string docId = st.docMirror.docId();
   const int revision = st.docMirror.revision();
+  const auto *session = st.activeSession();
   // Motion parks the immutable base GPU mesh before uploading its first pose. Switching back
   // needs neither a worker request nor another mesh upload when that cache is still available.
-  const auto *session = st.activeSession();
-  if (motionHighlightPose_ && st.overlays && session && session->cachedDocMesh) {
-    std::string err;
-    if (!st.overlays->setDoc(*session->cachedDocMesh, err))
-      st.addLog("[motion] restore selection geometry: " + err);
-    motionHighlightPose_ = false;
-  }
   if (st.renderer && session && session->cachedRevision == revision &&
       st.renderer->bindCachedMeshes(docId, revision))
     return;
@@ -4924,6 +4861,10 @@ void SimManager::syncResultView(AppState &st) {
   // actually set, so it hides/restores correctly on every workspace switch.
   const bool valid = sel_ >= 0 && sel_ < (int)studies_.size();
   const bool onSimWs = st.activeWorkspace == AppState::Workspace::Simulate;
+  if (motionHighlightPose_ &&
+      (!valid || studies_[sel_].id != motionHighlightStudyId_ ||
+       !onSimWs || node_ != SimNode::Results))
+    restoreMotionHighlight(st);
   if (valid && studies_[sel_].type == StudyType::Motion &&
       studies_[sel_].motionHasResult &&
       studies_[sel_].motionSourceRevision != st.docMirror.revision()) {
@@ -8541,9 +8482,8 @@ void SimManager::drawForm(AppState &st, Study &s) {
       for (int i = 0; i < 3; ++i)
         if (ImGui::Selectable(kUnitItems[i], ui_ == i)) {
           st.simUnits = i;
-          // Re-label the legend in the new units if a result is on screen
-          // (cheap; no reload).
-          if (s.hasResult && st.colormapOn && st.renderer) {
+          // Keep cached legend labels current even while the colormap is hidden.
+          if (s.hasResult && st.renderer) {
             std::string label, unit;
             double fromSI = 1.0;
             fieldMeta(st, st.activeScalarField, label, unit, fromSI);
@@ -8786,12 +8726,16 @@ void SimManager::drawForm(AppState &st, Study &s) {
                 .c_str());
       }
       ImGui::SeparatorText("Contact pressure");
+      const UnitSys u = unitSys(st);
+      float displayPressure = s.contactPressureMpa * (float)u.pressFromMpa;
+      char fmt[32];
+      std::snprintf(fmt, sizeof(fmt), "p = %%.4g %s", u.press);
       ImGui::SetNextItemWidth(-FLT_MIN);
-      if (ImGui::InputFloat("##ctpress", &s.contactPressureMpa, 0, 0,
-                            "p = %.2f MPa")) {
-      }
-      if (ImGui::IsItemDeactivatedAfterEdit())
+      ImGui::InputFloat("##ctpress", &displayPressure, 0, 0, fmt);
+      if (ImGui::IsItemDeactivatedAfterEdit()) {
+        s.contactPressureMpa = displayPressure / (float)u.pressFromMpa;
         persist(st, s);
+      }
       simTip("Downward pressure on the upper block's top face.");
     } else if (s.type == StudyType::FreqResponse) {
       drawStudyTypeBanner(
@@ -8854,7 +8798,26 @@ void SimManager::drawForm(AppState &st, Study &s) {
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-    bool busy =
+    const bool jobRunning = st.simClient && st.simClient->job().running.load();
+    const bool ownsJob = jobRunning &&
+        ((st.simClient->job().ownerDocId.empty() && running_) ||
+         st.simClient->job().ownerDocId == lastDocId_);
+    const bool otherDocJob = jobRunning && !ownsJob;
+    const bool otherDocBusy = otherDocJob ||
+        (st.simClient && st.simClient->busy() && !ownsJob &&
+         !running_ && !prepInFlight_);
+    std::string otherDocName;
+    if (otherDocJob) {
+      otherDocName = st.simClient->job().ownerDocId;
+      for (const auto &tab : st.docTabs)
+        if (tab.docId == otherDocName) {
+          otherDocName = tab.title;
+          break;
+        }
+      if (otherDocName.empty())
+        otherDocName = "another document";
+    }
+    const bool busy =
         (st.simClient && st.simClient->busy()) || advRunning_ || prepInFlight_ ||
         motionRun_ || (s.type != StudyType::Motion && st.rpc.busy());
     std::string blocker;
@@ -8912,17 +8875,26 @@ void SimManager::drawForm(AppState &st, Study &s) {
     if (!canRun)
       ImGui::BeginDisabled();
     const ImVec2 runSize(ImGui::GetContentRegionAvail().x, runButtonHeight);
-    if (ImGui::Button(busy ? "Running\xe2\x80\xa6" : "Run", runSize))
+    const std::string runLabel =
+        otherDocJob ? ("Running in " + otherDocName + "\xe2\x80\xa6")
+                    : otherDocBusy ? "Another document preparing\xe2\x80\xa6"
+                                   : busy ? "Running\xe2\x80\xa6" : "Run";
+    if (ImGui::Button(runLabel.c_str(), runSize))
       run(st, s);
     if (!canRun)
       ImGui::EndDisabled();
     // Tooltip: blocker reason (when unmet) or generic hint (when ready).
-    if (!busy && !ready)
+    if (otherDocBusy) {
+      const std::string why = otherDocJob
+          ? "Simulation is running in " + otherDocName + "; switch to that document to cancel."
+          : "Another document is preparing a simulation.";
+      simTip(why.c_str());
+    } else if (!busy && !ready)
       simTip(blocker.c_str());
     else
       simTip("Mesh the part and solve. Results color the model and appear "
              "under Results.");
-    if (st.simClient && st.simClient->job().running.load()) {
+    if (ownsJob) {
       if (st.simClient->cancelRequested()) {
         ImGui::BeginDisabled();
         ImGui::SmallButton("Cancel requested");
@@ -9566,6 +9538,8 @@ bool SimManager::applyMotionFrame(AppState &st, Study &s, int frame) {
     if (!st.overlays->setDoc(*motionDocMesh_, err))
       return failPlayback("could not restore selection geometry: " + err);
     motionHighlightPose_ = false;
+    st.featureHighlightFaces.clear();
+    motionHighlightStudyId_.clear();
   }
 
   const auto &frameJ = s.motionTrajectory[frame];
@@ -10122,10 +10096,12 @@ void SimManager::highlightMotionCollisions(AppState &st, const Study &s,
       highlighted.insert(component->second);
   }
   std::string error;
-  motionHighlightPose_ = true;
   if (!st.overlays->setDoc(highlights, error)) {
     st.featureHighlightFaces.clear();
     st.toast(ui::ToastLevel::Warn, "Could not highlight the collision pose: " + error);
+  } else {
+    motionHighlightPose_ = true;
+    motionHighlightStudyId_ = s.id;
   }
   if (highlighted.size() < components.size() || components.empty())
     st.toast(ui::ToastLevel::Warn, "Some collision components have no viewport mapping; see pair details.");
@@ -10431,89 +10407,13 @@ void SimManager::drawProvenance(const nlohmann::json &result) {
 // run (conduction)
 
 void SimManager::runThermalFea(AppState &st, Study &s) {
-  if (!st.simClient)
+  if (!st.simClient || !st.docMirror.hasDoc())
     return;
-  auto *sim = st.simClient;
-  if (!st.docMirror.hasDoc()) {
-    st.addLog("[sim] no document to analyse");
-    return;
-  }
-
-  const std::string stepPath =
-      engine::daemonMode() ? std::string()
-                           : (appdataAppDir() + "/cache/sim_thermal.step");
-  {
-    nlohmann::json r,
-        p = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
-    std::string e;
-    if (!st.worker.call("doc_export_step", p, r, e, 60000) ||
-        !r.is_object() || r.contains("code") || !r.value("ok", true)) {
-      st.addLog("[sim] export STEP failed: " +
-                (r.is_object()
-                     ? r.value("message", r.value("error", e))
-                     : e));
-      st.toast(ui::ToastLevel::Error, "Simulation: export failed");
-      return;
-    }
-    lastStepPath_ = r.value("path", stepPath);
-  }
-
-  // Fixed-temperature (Dirichlet) faces. Refuse stale selectors instead of
-  // silently solving a different boundary-value problem.
-  nlohmann::json fixtures = nlohmann::json::array();
-  for (const auto &pck : s.fixtures.picks) {
-    std::string e;
-    auto fp = facePointsFor(st, pck.selector, e);
-    if (fp.is_null() || !fp.contains("points") || fp["points"].empty()) {
-      st.toast(ui::ToastLevel::Error,
-               "A fixed-temperature face no longer resolves; reselect it");
-      st.addLog("[sim] thermal fixture resolution failed: " + e);
-      return;
-    }
-    fp["temp_c"] = s.thermFixTempC;
-    fixtures.push_back(fp);
-  }
-  // Flux / convection loads.
-  nlohmann::json loads = nlohmann::json::array();
-  for (const auto &ld : s.loads) {
-    nlohmann::json faces;
-    for (const auto &pck : ld.faces.picks) {
-      std::string e;
-      auto fp = facePointsFor(st, pck.selector, e);
-      if (fp.is_null() || !fp.contains("points") || fp["points"].empty()) {
-        st.toast(ui::ToastLevel::Error,
-                 "A thermal load face no longer resolves; reselect it");
-        st.addLog("[sim] thermal load resolution failed: " + e);
-        return;
-      }
-      if (faces.is_null())
-        faces = fp;
-      else
-        for (auto &pt : fp["points"])
-          faces["points"].push_back(pt);
-    }
-    if (faces.is_null() || faces["points"].empty()) {
-      st.toast(ui::ToastLevel::Error,
-               "Every thermal load needs at least one resolved face");
-      return;
-    }
-    nlohmann::json l = {{"faces", faces}};
-    if (ld.thermalKind == 1) {
-      l["type"] = "convection";
-      l["h"] = ld.hWm2k;
-      l["t_amb_c"] = ld.tAmbC;
-    } else {
-      l["type"] = "flux";
-      l["magnitude"] = ld.fluxWm2;
-    }
-    loads.push_back(l);
-  }
-  if (fixtures.empty() && loads.empty()) {
+  if (s.fixtures.picks.empty() && s.loads.empty()) {
     st.toast(ui::ToastLevel::Warn,
              "Add a thermal boundary condition before running");
     return;
   }
-
   // studyReady guarantees a library-resolved material with a positive density
   // for transient conduction; never substitute an arbitrary material.
   const int mi = materialIndexByKey(s.materialKey);
@@ -10522,38 +10422,38 @@ void SimManager::runThermalFea(AppState &st, Study &s) {
              "Thermal material is missing required density data");
     return;
   }
-  const double density = materials()[mi].density_g_cm3;
-  nlohmann::json study = {
-      {"step_path", lastStepPath_},
-      {"material",
-       {{"k_w_mk", s.thermK},
-        {"cp_j_kgk", s.thermCp},
-        {"density_g_cm3", density}}},
-      {"fixtures", fixtures},
-      {"loads", loads},
-  };
+  auto prep = std::make_shared<StaticModalPrep>();
+  prep->type = s.type;
+  prep->thermalMaterial = {{"k_w_mk", s.thermK},
+                           {"cp_j_kgk", s.thermCp},
+                           {"density_g_cm3", materials()[mi].density_g_cm3}};
+  prep->thermFixTempC = s.thermFixTempC;
   if (s.thermTransient && s.thermTEndS > 0) {
-    nlohmann::json tr = {{"t_end_s", s.thermTEndS},
-                         {"t_init_c", s.thermTInitC}};
+    prep->thermalTransient = {{"t_end_s", s.thermTEndS},
+                              {"t_init_c", s.thermTInitC}};
     if (s.thermDtS > 0)
-      tr["dt_s"] = s.thermDtS;
-    study["transient"] = tr;
+      prep->thermalTransient["dt_s"] = s.thermDtS;
   }
-  addMeshParams(study, s, /*order=*/1, /*allowAdvisor=*/true);
-
-  std::string note;
-  if (sim->launch("sim_run_thermal", {{"study", study}}, note,
-                  st.docMirror.docId())) {
-    clearTransientResult(s);
-    persist(st, s);
-    clearMeshPreview();
-    resultShown_ = false;
-    shownStudyId_.clear();
-    running_ = true;
-    runningStudy_ = sel_;
-    runningStudyId_ = s.id;
+  for (const auto &pick : s.fixtures.picks)
+    prep->fixtureSelectors.push_back(pick.selector);
+  prep->fixtures.resize(prep->fixtureSelectors.size());
+  for (const auto &load : s.loads) {
+    if (load.faces.picks.empty()) {
+      st.toast(ui::ToastLevel::Error,
+               "Every thermal load needs at least one resolved face");
+      return;
+    }
+    StaticModalPrep::Load snap;
+    snap.thermalKind = load.thermalKind;
+    snap.hWm2k = load.hWm2k;
+    snap.tAmbC = load.tAmbC;
+    snap.fluxWm2 = load.fluxWm2;
+    for (const auto &pick : load.faces.picks)
+      snap.selectors.push_back(pick.selector);
+    snap.resolved.resize(snap.selectors.size());
+    prep->loads.push_back(std::move(snap));
   }
-  st.addLog(note);
+  beginExportPrep(st, s, prep);
 }
 
 // ---------------------------------------------------------------- ccx proxy

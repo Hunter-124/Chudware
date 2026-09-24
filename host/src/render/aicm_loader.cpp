@@ -128,6 +128,12 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
             c.floats(current->pos, 3ull * current->n_verts);
             c.floats(current->nrm, 3ull * current->n_verts);
             c.uints(current->idx, 3ull * current->n_tris);
+            if (!c.ok) { err = "truncated BODY payload"; return false; }
+            if (std::any_of(current->idx.begin(), current->idx.end(),
+                            [&](uint32_t index) { return index >= current->n_verts; })) {
+                err = "invalid BODY vertex index";
+                return false;
+            }
             // C32-A material trailer: present iff the chunk has >=8 bytes left after idx. Old AICM
             // files (no trailer) keep the dielectric defaults; the boundary re-sync below skips any
             // bytes either way, so this stays forward-compatible.
@@ -175,6 +181,10 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
                 f.first_tri = c.u32();
                 f.tri_count = c.u32();
                 f.surf_type = c.u8();
+                if (current && uint64_t(f.first_tri) + f.tri_count > current->n_tris) {
+                    err = "invalid FACE triangle range";
+                    return false;
+                }
                 faces.push_back(f);
             }
             if (current) current->faces = std::move(faces);
@@ -194,6 +204,14 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
             uint32_t total_pts = c.u32();
             std::vector<float> pts;
             c.floats(pts, 3ull * total_pts);
+            if (!c.ok) { err = "truncated EDGE payload"; return false; }
+            if (current && std::any_of(edges.begin(), edges.end(),
+                                       [&](const EdgeSegment& e) {
+                                           return uint64_t(e.first_pt) + e.pt_count > total_pts;
+                                       })) {
+                err = "invalid EDGE point range";
+                return false;
+            }
             if (current) {
                 current->edges = std::move(edges);
                 current->edge_pts = std::move(pts);

@@ -274,6 +274,9 @@ std::string configPath();
 // serialize. ALWAYS use this instead of hand-rolling ifstream/ofstream on configPath().
 // Returns false if the file could not be written (the patch is then a no-op on disk).
 bool updateConfigJson(const std::function<void(nlohmann::json&)>& patch);
+// Consume the one-time warning emitted when updateConfigJson backs up a corrupt config.
+// The writer may run on a background thread; the GUI displays this on its frame thread.
+std::string takeConfigCorruptionWarning();
 void loadSettings(Settings& s);
 void saveSettings(const Settings& s);
 // WASM IDBFS: mount /persist early, populate before first config/chat load, flush after writes.

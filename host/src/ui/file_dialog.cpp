@@ -377,8 +377,24 @@ void afterFileWritten(const std::string& /*path*/) {
 
 void revealInFileManager(const std::string& path) {
     if (path.empty()) return;
-    // explorer /select,"C:\path\file" highlights the item in its folder.
-    (void)std::system(("explorer /select,\"" + path + "\"").c_str());
+    const std::wstring wide = widen(path);
+    if (wide.empty()) return;
+    // SHOpenFolderAndSelectItems requires COM on the calling thread; S_FALSE = already on.
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool ownsCom = SUCCEEDED(com);
+    PIDLIST_ABSOLUTE item = ILCreateFromPathW(wide.c_str());
+    if (!item) {
+        if (ownsCom) CoUninitialize();
+        return;
+    }
+    PIDLIST_ABSOLUTE folder = ILClone(item);
+    if (folder && ILRemoveLastID(folder)) {
+        PCUITEMID_CHILD child = ILFindLastID(item);
+        (void)SHOpenFolderAndSelectItems(folder, 1, &child, 0);
+    }
+    if (folder) CoTaskMemFree(folder);
+    CoTaskMemFree(item);
+    if (ownsCom) CoUninitialize();
 }
 
 }  // namespace ui

@@ -34,17 +34,35 @@ struct PickHit {
     bool operator!=(const PickHit& o) const { return !(*this == o); }
 };
 
-// ---- packed id encoding: [31:24] body (8b) | [23:22] kind (2b) | [21:0] topo id (22b) ----
+// ---- packed id encoding: [31:20] body (12b) | [19:18] kind (2b) | [17:0] topo id (18b) ----
+// setDoc refuses bodies/topology that cannot be represented before any pick buffers are built.
+constexpr uint32_t kMaxPickBodyId = 0xFFFu;
+constexpr uint32_t kMaxPickTopoId = 0x3FFFFu;
 inline uint32_t encodeId(uint32_t body_id, PickKind kind, uint32_t topo_id) {
-    return ((body_id & 0xFFu) << 24) | ((uint32_t(kind) & 0x3u) << 22) | (topo_id & 0x3FFFFFu);
+    return (body_id << 20) | (uint32_t(kind) << 18) | topo_id;
 }
 inline PickHit decodeId(uint32_t v) {
     PickHit h;
     if (v == 0) return h;  // background
-    h.body_id = (v >> 24) & 0xFFu;
-    h.kind = PickKind((v >> 22) & 0x3u);
-    h.topo_id = v & 0x3FFFFFu;
+    h.body_id = v >> 20;
+    h.kind = PickKind((v >> 18) & 0x3u);
+    h.topo_id = v & kMaxPickTopoId;
     return h;
+}
+
+// Return the reason a document cannot fit in the 32-bit pick attachment, or nullptr.
+inline const char* pickIdOverflow(const DocMesh& doc) {
+    for (const auto& b : doc.bodies) {
+        if (b.body_id == 0 || b.body_id > kMaxPickBodyId)
+            return "body id exceeds 12-bit picking range (1..4095)";
+        for (const auto& f : b.faces)
+            if (f.face_id > kMaxPickTopoId) return "face id exceeds 18-bit picking range";
+        for (const auto& e : b.edges)
+            if (e.edge_id > kMaxPickTopoId) return "edge id exceeds 18-bit picking range";
+        for (const auto& v : b.brep_verts)
+            if (v.vertex_id > kMaxPickTopoId) return "vertex id exceeds 18-bit picking range";
+    }
+    return nullptr;
 }
 
 // ---- id-pass frame caching ----
@@ -138,9 +156,9 @@ public:
     void setSectionClip(int count, const float normals[3][3], const float offsets[3]);
 
 private:
-    // True when the encoded id belongs to a hidden body (body id lives in bits [31:24]).
+    // True when the encoded id belongs to a hidden body.
     bool bodyHidden(uint32_t encoded) const {
-        return !hidden_.empty() && hidden_.count((encoded >> 24) & 0xFFu) != 0;
+        return !hidden_.empty() && hidden_.count(encoded >> 20) != 0;
     }
     // True when this AICM body id is hidden (batched draws carry the raw body id).
     bool bodyHiddenId(uint32_t body_id) const {
@@ -160,10 +178,9 @@ private:
     // id travels as a per-vertex INTEGER attribute (location 1) so a whole body draws in one call.
     unsigned int prog_ = 0;
 
-    // One batched draw covering ALL of a body's faces (indexed tris), edges (line list), or verts
-    // (points). Each vertex carries its own encoded id in vboId, so the entire body draws in a
-    // single glDraw* — and a hidden body is skipped wholesale (its body_id is in bits [31:24] of
-    // every id, but we keep it explicit for the skip test). faces use the EBO; edges/verts don't.
+    // One batched draw covering all of a body's faces (indexed tris), edges (line list), or verts
+    // (points). Each vertex carries its encoded id in vboId.
+    // A hidden body is skipped wholesale; faces use the EBO, edges and vertices do not.
     struct BodyDraw {
         unsigned int vao = 0, vboPos = 0, vboId = 0, ebo = 0;
         int count = 0;         // index count (faces) or vertex count (edges/verts)

@@ -169,7 +169,6 @@ static const RibbonCmd kCmds[] = {
     // --- Group: Check ---
     { "eval_check",        "Check",          "check",           "Evaluate", "Geometry Check",  true,  nullptr,          false, CommandCapability::Inspect },
     { "eval_interference", "Interference",   "interference_eval","Evaluate","Geometry Check",  true,  nullptr,          false, CommandCapability::Inspect },
-    { "eval_geometry",     "Geometry Anlys.","geometry_analysis","Evaluate","Geometry Check",  false, nullptr,          false, CommandCapability::Inspect },
 
     // =========================================================================
     // Tab: Simulation
@@ -422,7 +421,6 @@ static const RibbonCmd kCmds[] = {
     { "dwg_center_line",  "Center Line",   "construction",  "Annotation", "Annotations", true,  nullptr, false },
     { "dwg_note",         "Note",          "text_ent",      "Annotation", "Annotations", true,  nullptr, false },
     { "dwg_balloon",      "Balloon",       "circle",        "Annotation", "Annotations", false, nullptr, false },
-    { "dwg_auto_balloon", "Auto Balloon",  "circular_pattern", "Annotation", "Annotations", false, nullptr, false },
     // --- Group: Tables --- title block + BOM.
     { "dwg_title_block",  "Title Block",   "new_doc",       "Annotation", "Tables", true,  nullptr, false },
     { "dwg_bom_table",    "Bill of Mat.",  "bom",           "Annotation", "Tables", true,  nullptr, false },

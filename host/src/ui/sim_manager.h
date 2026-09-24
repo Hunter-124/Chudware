@@ -509,7 +509,6 @@ private:
     void drawMotionResults(AppState& st, Study& s);
     // Advance the playback frame on the main thread (called from tick()).
     void tickMotion(AppState& st);
-    nlohmann::json facePointsFor(AppState& st, const nlohmann::json& selector, std::string& err);
 
     // pick capture: append every currently-selected face into `well`.
     void captureSelectionInto(AppState& st, SimWell& well);
@@ -712,13 +711,13 @@ private:
     // Armed well for viewport picking: -1 none, 0 = fixtures, >=1 = loads[armId-1]. Tied to sel_.
     int armedWell_ = -1;
 
-    std::string lastStepPath_;      // temp STEP from the last export
     bool running_ = false;          // a run launched by THIS manager is in flight
     int  runningStudy_ = -1;        // index of the study that launched the in-flight run
     std::string runningStudyId_;    // stable id of the launched study (survives refresh/reorder)
-    // Export + selector resolution run through AsyncRpc. Its callbacks are drained on the UI
-    // thread, and closed DocSessions remain retired until that queue drains.
+    // Export and selector resolution are AsyncRpc continuations pinned to the
+    // source document and a SimClient reservation (also covering flow/thermal/fatigue).
     struct StaticModalPrep;
+    void beginExportPrep(AppState& st, Study& s, const std::shared_ptr<StaticModalPrep>& prep);
     void failStaticModalPrep(AppState& st, const std::shared_ptr<StaticModalPrep>& prep,
                              const std::string& message);
     void finishStaticModalPrep(AppState& st, const std::shared_ptr<StaticModalPrep>& prep);
@@ -737,8 +736,10 @@ private:
     // actual transition (not every frame). See syncResultView.
     bool resultShown_ = false;
     std::string shownStudyId_;
-    // Re-tessellate the current document and reload its (editable, face-bearing) model mesh, replacing
-    // a result overlay. Turns the colormap/deformation off first.
+    // Restore a collision pose's selection overlay before switching studies or model views.
+    void restoreMotionHighlight(AppState& st);
+    // Re-tessellate the current document and reload its (editable, face-bearing) model mesh,
+    // replacing a result overlay. Turns colormap/deformation off first.
     void restoreModelMesh(AppState& st);
     // Finish legend/deform after an overlay mesh commit (sync path or async drain).
     void finishResultOverlay(AppState& st, Study& s);
@@ -793,6 +794,7 @@ private:
     std::map<std::string, std::array<double, 16>> motionInverseBaseWorldByComponentId_;
     uint64_t modelRestoreGeneration_ = 0;
     bool motionHighlightPose_ = false; // shared selection overlay temporarily carries a sampled pose
+    std::string motionHighlightStudyId_; // identity of the pose currently held by the selection overlay
 
     // Custom-material editor scratch (filled by the "+ New material…" popup).
     char cmName_[64] = "";

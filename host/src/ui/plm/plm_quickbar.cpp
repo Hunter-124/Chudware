@@ -4,6 +4,7 @@
 
 #include <cstring>
 #include <string>
+#include <utility>
 
 #include "imgui.h"
 
@@ -97,10 +98,9 @@ void refetch() {  // force a re-resolve next frame (after a mutation)
     plmInvalidate(); // the quickbar and hub must observe the same post-mutation list
 }
 
-void discardDraft(AppState& st, std::string itemId) {
-    nlohmann::json p = pathParam(st);
-    p["item_id"] = itemId;
-    st.rpc.call("plm_discard_draft", p, [&st](const core::RpcResult& r) {
+void discardDraft(AppState& st, nlohmann::json path, std::string itemId) {
+    path["item_id"] = itemId;
+    st.rpc.call("plm_discard_draft", path, [&st](const core::RpcResult& r) {
         std::string h;
         if (!plmOk(r, h)) { st.toast(ui::ToastLevel::Error, h); return; }
         st.toast(ui::ToastLevel::Info, "Draft discarded — back to the released version");
@@ -109,46 +109,55 @@ void discardDraft(AppState& st, std::string itemId) {
 }
 
 // Cut the checkpoint; if this was an auto-branch, offer a Discard-draft action.
-void chainCheckpoint(AppState& st, bool branched, const std::string& newRev) {
-    nlohmann::json p = pathParam(st);
-    p["message"] = q.msg;
-    std::string itemId = q.itemId;
-    st.rpc.call("plm_checkpoint", p, [&st, branched, newRev, itemId](const core::RpcResult& r) {
+void chainCheckpoint(AppState& st, nlohmann::json path, bool branched,
+                     const std::string& newRev, std::string itemId, std::string message) {
+    nlohmann::json p = path;
+    p["message"] = message;
+    st.rpc.call("plm_checkpoint", p,
+                [&st, path = std::move(path), branched, newRev,
+                 itemId = std::move(itemId), message = std::move(message)](const core::RpcResult& r) {
         q.busy = false;
         std::string h;
         if (!plmOk(r, h)) { st.toast(ui::ToastLevel::Error, h); return; }
-        q.msg[0] = '\0';
+        if (st.plmProjectPath() == path.value("path", std::string()) &&
+            message == q.msg) q.msg[0] = '\0';
         refetch();
         if (branched) {
-            std::string m = "Now editing a new draft" +
+            std::string m = "New draft in " + path.value("path", std::string()) +
                             (newRev.empty() ? std::string() : " (revision " + newRev + ")") +
                             " — the released version is safe.";
             ui::toastWithAction(st, ui::ToastLevel::Info, m, "Discard draft",
-                                [itemId](AppState& s) { discardDraft(s, itemId); });
+                                [path, itemId](AppState& s) { discardDraft(s, path, itemId); });
         } else {
-            st.toast(ui::ToastLevel::Success, "Checkpoint saved");
+            st.toast(ui::ToastLevel::Success,
+                     st.plmProjectPath() == path.value("path", std::string())
+                         ? "Checkpoint saved"
+                         : "Checkpoint saved in " + path.value("path", std::string()));
         }
     });
 }
 
 void doCheckpoint(AppState& st) {
     if (q.busy) return;
+    nlohmann::json path = pathParam(st);
+    const std::string itemId = q.itemId;
+    const std::string message = q.msg;
     q.busy = true;
-    // Silent auto-branch: editing a Released document starts a new-revision draft
-    // first (Hunter's locked decision — never edit a released design in place).
+    // Editing a Released document starts a new-revision draft first.
     if (q.haveItem && q.lifecycle == "Released") {
-        nlohmann::json p = pathParam(st);
-        p["item_id"] = q.itemId;
+        nlohmann::json p = path;
+        p["item_id"] = itemId;
         p["start_new_rev"] = true;
-        st.rpc.call("plm_item_set", p, [&st](const core::RpcResult& r) {
+        st.rpc.call("plm_item_set", p,
+                    [&st, path = std::move(path), itemId, message](const core::RpcResult& r) {
             std::string h;
             if (!plmOk(r, h)) { q.busy = false; st.toast(ui::ToastLevel::Error, h); return; }
             std::string newRev = r.result.value("working_rev", "");
-            chainCheckpoint(st, /*branched=*/true, newRev);
+            chainCheckpoint(st, path, /*branched=*/true, newRev, itemId, message);
         });
         return;
     }
-    chainCheckpoint(st, /*branched=*/false, "");
+    chainCheckpoint(st, std::move(path), /*branched=*/false, "", itemId, message);
 }
 
 void doRelease(AppState& st) {

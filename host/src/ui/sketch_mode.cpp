@@ -850,7 +850,11 @@ void SketchMode::addEntity(AppState& st, const nlohmann::json& entity,
         op["constraints"] = constraints;
     nlohmann::json ops = nlohmann::json::array({op});
     auto r = st.docMirror.applyOps(st.worker, ops);
-    if (!r.ok) { st.addLog("[sketch] add_entity failed: " + r.error_message); return; }
+    if (!r.ok) {
+        st.addLog("[sketch] add_entity failed: " + r.error_message);
+        st.toast(ui::ToastLevel::Warn, r.error_message);
+        return;
+    }
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     resolve(st);
 }
@@ -994,178 +998,198 @@ void SketchMode::addPlaneDimRef(AppState& st, int planeIdx) {
                        std::string("datum:") + kDatum[planeIdx]);
 }
 
+// A rejected compile returns an ops envelope with the original revision, not an RPC error.
+static bool compoundBatchFailed(AppState& st, const core::OpsResponse& r, int beforeRevision,
+                                const char* name) {
+    if (r.ok && r.revision != beforeRevision) return false;
+    std::string msg = r.error_message;
+    if (msg.empty() && r.feature_status.is_array()) {
+        for (const auto& status : r.feature_status) {
+            if (status.is_object() && !status.value("ok", true)) {
+                msg = status.value("error", std::string());
+                if (!msg.empty()) break;
+            }
+        }
+    }
+    if (msg.empty()) msg = std::string(name) + " could not be built";
+    st.addLog("[sketch] " + std::string(name) + " failed: " + msg);
+    st.toast(ui::ToastLevel::Warn, msg);
+    return true;
+}
+
 // Emit 4 lines as a closed loop (corners A,B,C,D). Each edge i (corners[i]->corners[(i+1)%4]) gets
 // a chained coincident to the previous edge's p2, plus the per-edge relation in relations[i] (one
-// of "horizontal"/"vertical"/"parallel"/"perpendicular"/"equal"/"", referencing $self, or for the
-// two-ref relations referencing the opposite edge's id via the {prefix}). Mirrors the corner-rect
-// op pattern (successive applyOps so coincidents reference real ids).
+// of "horizontal"/"vertical"/"parallel"/"perpendicular"/"equal"/"". Batch placeholders
+// keep the entities and every relation in one atomic document mutation.
 std::vector<std::string> SketchMode::addQuadLoop(AppState& st, const ImVec2 corners[4],
-                             const char* relations[4], const std::string* cornerSnaps) {
-    std::string ids[4];
-    std::string prevId, firstId;
+                             const char* relations[4], const std::string* cornerSnaps,
+                             const ImVec2* center, const std::string& centerSnap) {
+    nlohmann::json ops = nlohmann::json::array();
+    auto ref = [](int i) { return "$" + std::to_string(i); };
     for (int i = 0; i < 4; ++i) {
         int j = (i + 1) % 4;
         nlohmann::json cs = nlohmann::json::array();
         const char* rel = relations[i];
-        // Single-ref auto relations (h/v) reference $self; pair relations (parallel/equal/perp) are
-        // applied in a second pass below once all four ids exist.
         if (rel && (std::strcmp(rel, "horizontal") == 0 || std::strcmp(rel, "vertical") == 0))
             cs.push_back({{"type", rel}, {"refs", {"$self"}}});
-        if (!prevId.empty())
-            cs.push_back({{"type", "coincident"}, {"refs", {prevId + ".p2", "$self.p1"}}});
-        // Corner pick snapped onto a vertex/origin -> keep that coincident on this edge's p1.
+        if (i)
+            cs.push_back({{"type", "coincident"}, {"refs", {ref(i - 1) + ".p2", "$self.p1"}}});
+        if (i == 3)
+            cs.push_back({{"type", "coincident"}, {"refs", {"$self.p2", "$0.p1"}}});
         if (cornerSnaps) pushSnapConstraint(cornerSnaps[i], "$self.p1", cs);
         nlohmann::json ent = {{"type", "line"},
             {"p1", nlohmann::json::array({corners[i].x, corners[i].y})},
             {"p2", nlohmann::json::array({corners[j].x, corners[j].y})}};
-        nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_},
-                             {"entity", ent}, {"constraints", cs}};
-        // C50: one undo step for the whole rectangle — only the first batch pushes an undo snapshot.
-        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/i != 0);
-        if (!r.ok) { st.addLog("[sketch] quad line failed: " + r.error_message); break; }
-        std::string nid = (r.id_map.is_object() && r.id_map.contains("$0"))
-                        ? r.id_map["$0"].get<std::string>() : std::string();
-        ids[i] = nid;
-        if (i == 0) firstId = nid;
-        prevId = nid;
-        if (i == 3 && !firstId.empty() && !nid.empty()) {
-            nlohmann::json clop = {{"op", "sketch_add_constraint"}, {"sketch", fid_},
-                {"constraint", {{"type", "coincident"}, {"refs", {nid + ".p2", firstId + ".p1"}}}}};
-            st.docMirror.applyOps(st.worker, nlohmann::json::array({clop}), /*coalesce=*/true);
-        }
-        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        ops.push_back({{"op", "sketch_add_entity"}, {"sketch", fid_},
+                       {"entity", ent}, {"constraints", cs}});
     }
-    // Second pass: pair relations on the two OPPOSITE-edge pairs (0<->2, 1<->3). The relation token
-    // may combine "parallel"/"equal"/"perpendicular" (space-separated); we apply each once per pair
-    // (only for i<2 so the 0/2 and 1/3 pairs aren't double-emitted). "perpendicular" relates the
-    // pair's first edge to the adjacent edge i+1.
-    auto pair = [&](const char* type, const std::string& a, const std::string& b) {
-        if (a.empty() || b.empty()) return;
-        nlohmann::json op = {{"op", "sketch_add_constraint"}, {"sketch", fid_},
-            {"constraint", {{"type", type}, {"refs", {a, b}}}}};
-        st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/true);
+    // Opposite-edge relations are applied after all referenced edges have been minted.
+    auto pair = [&](const char* type, int a, int b) {
+        ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                       {"constraint", {{"type", type}, {"refs", {ref(a), ref(b)}}}}});
     };
     for (int i = 0; i < 2; ++i) {
         const char* rel = relations[i];
         if (!rel) continue;
         std::string tok(rel);
-        if (tok.find("parallel") != std::string::npos) pair("parallel", ids[i], ids[i + 2]);
-        if (tok.find("equal") != std::string::npos)    pair("equal",    ids[i], ids[i + 2]);
-        if (tok.find("perpendicular") != std::string::npos) pair("perpendicular", ids[i], ids[i + 1]);
+        if (tok.find("parallel") != std::string::npos) pair("parallel", i, i + 2);
+        if (tok.find("equal") != std::string::npos) pair("equal", i, i + 2);
+        if (tok.find("perpendicular") != std::string::npos) pair("perpendicular", i, i + 1);
     }
+    if (center) {
+        // Center rectangle's construction point and diagonal belong to the same transaction.
+        const std::string pointRef = ref(static_cast<int>(ops.size()));
+        nlohmann::json pcs = nlohmann::json::array();
+        pushSnapConstraint(centerSnap, "$self.p", pcs);
+        ops.push_back({{"op", "sketch_add_entity"}, {"sketch", fid_},
+                       {"entity", {{"type", "point"}, {"construction", true},
+                                   {"p", {center->x, center->y}}}}, {"constraints", pcs}});
+        nlohmann::json dcs = nlohmann::json::array({
+            {{"type", "coincident"}, {"refs", {"$self.p1", "$0.p1"}}},
+            {{"type", "coincident"}, {"refs", {"$self.p2", "$2.p1"}}},
+            {{"type", "midpoint"}, {"refs", {pointRef + ".p", "$self"}}}});
+        ops.push_back({{"op", "sketch_add_entity"}, {"sketch", fid_},
+                       {"entity", {{"type", "line"}, {"construction", true},
+                                   {"p1", {corners[0].x, corners[0].y}},
+                                   {"p2", {corners[2].x, corners[2].y}}}},
+                       {"constraints", dcs}});
+    }
+    const int beforeRevision = st.docMirror.revision();
+    auto r = st.docMirror.applyOps(st.worker, ops);
+    if (compoundBatchFailed(st, r, beforeRevision, "Rectangle")) return {};
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     resolve(st);
-    return {ids[0], ids[1], ids[2], ids[3]};
+    std::vector<std::string> ids;
+    ids.reserve(4);
+    for (int i = 0; i < 4; ++i) ids.push_back(r.id_map[ref(i)].get<std::string>());
+    return ids;
 }
 
 // C42: N-line closed loop (generalized addQuadLoop without the per-edge h/v relations). Each edge
 // gets a chained coincident to its predecessor's p2 (+ loop-closing coincident); equalEdges adds
 // "equal" between consecutive edges so a Polygon stays regular-ish under drag.
 std::vector<std::string> SketchMode::addPolyLoop(AppState& st, const std::vector<ImVec2>& corners,
-                                                 bool equalEdges) {
+                                                 bool equalEdges, const ImVec2* center,
+                                                 const std::string& centerSnap,
+                                                 const std::string& vertexSnap) {
     const size_t n = corners.size();
     if (n < 3) return {};
-    std::vector<std::string> ids(n);
-    std::string prevId, firstId;
+    nlohmann::json ops = nlohmann::json::array();
+    auto ref = [](size_t i) { return "$" + std::to_string(i); };
     for (size_t i = 0; i < n; ++i) {
         size_t j = (i + 1) % n;
         nlohmann::json cs = nlohmann::json::array();
-        if (!prevId.empty())
-            cs.push_back({{"type", "coincident"}, {"refs", {prevId + ".p2", "$self.p1"}}});
+        if (i)
+            cs.push_back({{"type", "coincident"}, {"refs", {ref(i - 1) + ".p2", "$self.p1"}}});
+        if (i == n - 1)
+            cs.push_back({{"type", "coincident"}, {"refs", {"$self.p2", "$0.p1"}}});
+        if (i == 0 && center) pushSnapConstraint(vertexSnap, "$self.p1", cs);
         nlohmann::json ent = {{"type", "line"},
             {"p1", nlohmann::json::array({corners[i].x, corners[i].y})},
             {"p2", nlohmann::json::array({corners[j].x, corners[j].y})}};
-        nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_},
-                             {"entity", ent}, {"constraints", cs}};
-        // C50: one undo step for the whole polygon — only the first batch pushes an undo snapshot.
-        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/i != 0);
-        if (!r.ok) { st.addLog("[sketch] poly line failed: " + r.error_message); break; }
-        std::string nid = (r.id_map.is_object() && r.id_map.contains("$0"))
-                        ? r.id_map["$0"].get<std::string>() : std::string();
-        ids[i] = nid;
-        if (i == 0) firstId = nid;
-        prevId = nid;
-        if (i == n - 1 && !firstId.empty() && !nid.empty()) {
-            nlohmann::json clop = {{"op", "sketch_add_constraint"}, {"sketch", fid_},
-                {"constraint", {{"type", "coincident"}, {"refs", {nid + ".p2", firstId + ".p1"}}}}};
-            st.docMirror.applyOps(st.worker, nlohmann::json::array({clop}), /*coalesce=*/true);
-        }
-        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        ops.push_back({{"op", "sketch_add_entity"}, {"sketch", fid_},
+                       {"entity", ent}, {"constraints", cs}});
     }
     if (equalEdges) {
-        for (size_t i = 0; i + 1 < n; ++i) {
-            if (ids[i].empty() || ids[i + 1].empty()) continue;
-            nlohmann::json op = {{"op", "sketch_add_constraint"}, {"sketch", fid_},
-                {"constraint", {{"type", "equal"}, {"refs", {ids[i], ids[i + 1]}}}}};
-            st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/true);
-        }
+        for (size_t i = 0; i + 1 < n; ++i)
+            ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                           {"constraint", {{"type", "equal"}, {"refs", {ref(i), ref(i + 1)}}}}});
     }
+    if (center) {
+        const std::string circleRef = ref(ops.size());
+        const float radius = std::hypot(corners[0].x - center->x, corners[0].y - center->y);
+        nlohmann::json cs = nlohmann::json::array();
+        pushSnapConstraint(centerSnap, "$self.center", cs);
+        ops.push_back({{"op", "sketch_add_entity"}, {"sketch", fid_},
+                       {"entity", {{"type", "circle"}, {"construction", true},
+                                   {"center", {center->x, center->y}}, {"radius", radius}}},
+                       {"constraints", cs}});
+        for (size_t i = 0; i < n; ++i)
+            ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                           {"constraint", {{"type", "point_on"},
+                                           {"refs", {ref(i) + ".p1", circleRef}}}}});
+    }
+    const int beforeRevision = st.docMirror.revision();
+    auto r = st.docMirror.applyOps(st.worker, ops);
+    if (compoundBatchFailed(st, r, beforeRevision, "Polygon")) return {};
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     resolve(st);
+    std::vector<std::string> ids;
+    ids.reserve(n);
+    for (size_t i = 0; i < n; ++i) ids.push_back(r.id_map[ref(i)].get<std::string>());
     return ids;
 }
 
 // C51: straight slot as real geometry (see header). Builds the capsule from the spine endpoints
 // p1/p2 (the arc centers) and the full width: 2 side lines tangent-offset by half-width, 2 cap
 // arcs (the outer semicircles), and a construction centerline. Endpoints are chained by coincident
-// closure; the centerline ends pin to the arc centers; the cap radii are equal. All five batches
-// coalesce into ONE undo step.
+// closure; the centerline ends pin to the arc centers; the cap radii are equal. One atomic batch
+// commits all entities and relations as a single undo step.
 void SketchMode::addDecomposedSlot(AppState& st, const ImVec2& p1, const ImVec2& p2, float width,
                                    const std::string& snap1, const std::string& snap2) {
     const float R2D = 57.29577951f, D2R = 1.0f / 57.29577951f;
     float hw = width * 0.5f;
     float axisDeg = std::atan2(p2.y - p1.y, p2.x - p1.x) * R2D;
-    float nx = -std::sin(axisDeg * D2R), ny = std::cos(axisDeg * D2R);   // unit +normal
-    ImVec2 A1(p1.x + nx * hw, p1.y + ny * hw), B1(p2.x + nx * hw, p2.y + ny * hw);   // l1: A1->B1
-    ImVec2 A2(p1.x - nx * hw, p1.y - ny * hw), B2(p2.x - nx * hw, p2.y - ny * hw);   // l2: A2->B2
+    float nx = -std::sin(axisDeg * D2R), ny = std::cos(axisDeg * D2R);
+    ImVec2 A1(p1.x + nx * hw, p1.y + ny * hw), B1(p2.x + nx * hw, p2.y + ny * hw);
+    ImVec2 A2(p1.x - nx * hw, p1.y - ny * hw), B2(p2.x - nx * hw, p2.y - ny * hw);
 
-    bool first = true;
-    auto add = [&](const nlohmann::json& entity) -> std::string {
-        nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_}, {"entity", entity}};
-        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/!first);
-        first = false;
-        if (!r.ok) { st.addLog("[sketch] slot part failed: " + r.error_message); return std::string(); }
-        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
-        return (r.id_map.is_object() && r.id_map.contains("$0"))
-             ? r.id_map["$0"].get<std::string>() : std::string();
+    nlohmann::json ops = nlohmann::json::array();
+    auto add = [&](const nlohmann::json& entity) {
+        ops.push_back({{"op", "sketch_add_entity"}, {"sketch", fid_}, {"entity", entity}});
     };
-    std::string l1 = add({{"type", "line"}, {"p1", {A1.x, A1.y}}, {"p2", {B1.x, B1.y}}});
-    std::string l2 = add({{"type", "line"}, {"p1", {A2.x, A2.y}}, {"p2", {B2.x, B2.y}}});
-    // c1 at p1: start=axis+90 (=A1) -> end=axis-90 (=A2), CCW (outer bulge away from p2).
-    std::string c1 = add({{"type", "arc"}, {"center", {p1.x, p1.y}}, {"radius", hw},
-                          {"start", axisDeg + 90.0f}, {"end", axisDeg - 90.0f}, {"ccw", true}});
-    // c2 at p2: start=axis-90 (=B2) -> end=axis+90 (=B1), CCW (outer bulge away from p1).
-    std::string c2 = add({{"type", "arc"}, {"center", {p2.x, p2.y}}, {"radius", hw},
-                          {"start", axisDeg - 90.0f}, {"end", axisDeg + 90.0f}, {"ccw", true}});
-    std::string sp = add({{"type", "line"}, {"construction", true},
-                          {"p1", {p1.x, p1.y}}, {"p2", {p2.x, p2.y}}});
-    if (l1.empty() || l2.empty() || c1.empty() || c2.empty() || sp.empty()) { resolve(st); return; }
-
+    add({{"type", "line"}, {"p1", {A1.x, A1.y}}, {"p2", {B1.x, B1.y}}}); // $0
+    add({{"type", "line"}, {"p1", {A2.x, A2.y}}, {"p2", {B2.x, B2.y}}}); // $1
+    add({{"type", "arc"}, {"center", {p1.x, p1.y}}, {"radius", hw},
+         {"start", axisDeg + 90.0f}, {"end", axisDeg - 90.0f}, {"ccw", true}}); // $2
+    add({{"type", "arc"}, {"center", {p2.x, p2.y}}, {"radius", hw},
+         {"start", axisDeg - 90.0f}, {"end", axisDeg + 90.0f}, {"ccw", true}}); // $3
+    add({{"type", "line"}, {"construction", true},
+         {"p1", {p1.x, p1.y}}, {"p2", {p2.x, p2.y}}}); // $4
     auto con = [&](const nlohmann::json& c) {
-        nlohmann::json op = {{"op", "sketch_add_constraint"}, {"sketch", fid_}, {"constraint", c}};
-        st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/true);
+        ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_}, {"constraint", c}});
     };
-    con({{"type", "coincident"}, {"refs", {l1 + ".p1", c1 + ".start"}}});   // A1
-    con({{"type", "coincident"}, {"refs", {l1 + ".p2", c2 + ".end"}}});     // B1
-    con({{"type", "coincident"}, {"refs", {l2 + ".p1", c1 + ".end"}}});     // A2
-    con({{"type", "coincident"}, {"refs", {l2 + ".p2", c2 + ".start"}}});   // B2
-    con({{"type", "coincident"}, {"refs", {sp + ".p1", c1 + ".center"}}});  // centerline -> centers
-    con({{"type", "coincident"}, {"refs", {sp + ".p2", c2 + ".center"}}});
-    con({{"type", "equal"}, {"refs", {c1, c2}}});                           // uniform cap radius
-    // SolidWorks-style slot: each side line is tangent to BOTH end caps so the capsule shape
-    // holds under drag (and the sides stay parallel — implied by the 4 tangents + equal radii,
-    // so no explicit parallel is emitted). These were previously omitted because our solver's
-    // linearized rank test reports a tangent whose contact point coincides with the shared
-    // endpoint as "redundant", and the session then flagged the slot falsely Over Defined. That
-    // is fixed (engine/doc/session.py: a redundant geometric relation no longer over-defines —
-    // only a redundant driving dimension does), so the real tangency relations are restored.
-    con({{"type", "tangent"}, {"refs", {l1, c1}}});
-    con({{"type", "tangent"}, {"refs", {l1, c2}}});
-    con({{"type", "tangent"}, {"refs", {l2, c1}}});
-    con({{"type", "tangent"}, {"refs", {l2, c2}}});
-    // Placement snaps on the two spine endpoints -> constraints on the cap-arc centers.
+    con({{"type", "coincident"}, {"refs", {"$0.p1", "$2.start"}}});
+    con({{"type", "coincident"}, {"refs", {"$0.p2", "$3.end"}}});
+    con({{"type", "coincident"}, {"refs", {"$1.p1", "$2.end"}}});
+    con({{"type", "coincident"}, {"refs", {"$1.p2", "$3.start"}}});
+    con({{"type", "coincident"}, {"refs", {"$4.p1", "$2.center"}}});
+    con({{"type", "coincident"}, {"refs", {"$4.p2", "$3.center"}}});
+    con({{"type", "equal"}, {"refs", {"$2", "$3"}}});
+    // Tangency at both caps holds each side tangent while the slot is dragged.
+    con({{"type", "tangent"}, {"refs", {"$0", "$2"}}});
+    con({{"type", "tangent"}, {"refs", {"$0", "$3"}}});
+    con({{"type", "tangent"}, {"refs", {"$1", "$2"}}});
+    con({{"type", "tangent"}, {"refs", {"$1", "$3"}}});
     nlohmann::json endCs = nlohmann::json::array();
-    pushSnapConstraint(snap1, c1 + ".center", endCs);
-    pushSnapConstraint(snap2, c2 + ".center", endCs);
+    pushSnapConstraint(snap1, "$2.center", endCs);
+    pushSnapConstraint(snap2, "$3.center", endCs);
     for (const auto& c : endCs) con(c);
+
+    const int beforeRevision = st.docMirror.revision();
+    auto r = st.docMirror.applyOps(st.worker, ops);
+    if (compoundBatchFailed(st, r, beforeRevision, "Slot")) return;
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     resolve(st);
 }
 
@@ -1355,10 +1379,9 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
     }
     // Resync the mirror revision (sketch_exit bumps it server-side).
     resyncMirror(st);
-    // Empty-sketch cleanup: cascade-delete only when NOTHING depends on this sketch
-    // (brand-new empty cancel). If dependents exist, KEEP the empty sketch so they
-    // remain in the tree with rebuild errors; warn the user to re-add a profile.
-    if (ents_.empty()) {
+    // Empty-sketch cleanup: Finish removes empty sketches; Cancel removes only a new empty sketch.
+    // If dependents exist, keep the feature and warn rather than cascading their deletion.
+    if (ents_.empty() && (keep || isNewEmpty_)) {
         std::vector<std::string> deps;
         collectSketchDependents(st, fid_, deps);
         if (deps.empty()) {
@@ -7428,7 +7451,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     {"entity", e.id}, {"point", nlohmann::json::array({mu, mv})},
                     {"keep_construction", trimKeepConstruction_}};
                 auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
-                if (!r.ok) { st.addLog("[sketch] trim failed: " + r.error_message); return false; }
+                if (!r.ok) {
+                    st.addLog("[sketch] trim failed: " + r.error_message);
+                    st.toast(ui::ToastLevel::Warn, r.error_message);
+                    return false;
+                }
                 if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
                 resolve(st);   // refresh entities/statuses (same path as add_entity)
                 return true;
@@ -7489,7 +7516,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     nlohmann::json op = {{"op", "sketch_extend"}, {"sketch", fid_},
                         {"entity", e.id}, {"end", whichEnd}};
                     auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
-                    if (!r.ok) st.addLog("[sketch] extend failed: " + r.error_message);
+                    if (!r.ok) {
+                        st.addLog("[sketch] extend failed: " + r.error_message);
+                        st.toast(ui::ToastLevel::Warn, r.error_message);
+                    }
                     else {
                         if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
                         resolve(st);
@@ -7563,7 +7593,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         {"entities", eids}, {"distance", offsetDist_},
                         {"side", nlohmann::json::array({mu, mv})}};
                     auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
-                    if (!r.ok) st.addLog("[sketch] offset failed: " + r.error_message);
+                    if (!r.ok) {
+                        st.addLog("[sketch] offset failed: " + r.error_message);
+                        st.toast(ui::ToastLevel::Warn, r.error_message);
+                    }
                     else {
                         if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
                         resolve(st);
@@ -8786,8 +8819,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             } else if (tool_ == SketchTool::RectCorner && toolUV_.size() == 2) {
                 ImVec2 a = toolUV_[0], b = toolUV_[1];
                 // Axis-aligned rect: 4 coincident-chained lines with per-edge h/v relations.
-                // C50: route through addQuadLoop so the 4 line batches COALESCE into one undo step
-                // (was an inline loop with 4 separate undo steps -> "vanishes one corner at a time").
+                // The complete loop, snaps, and relations commit atomically in one undo step.
                 ImVec2 quad[4] = {{a.x, a.y}, {b.x, a.y}, {b.x, b.y}, {a.x, b.y}};
                 const char* rel[4] = {"horizontal", "vertical", "horizontal", "vertical"};
                 // The two clicked corners are quad[0] (first pick) and quad[2] (opposite); keep their
@@ -9053,28 +9085,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         float a = a0 + 6.2831853f * i / (float)polySides_;
                         corners.push_back(ImVec2(ctr.x + R * std::cos(a), ctr.y + R * std::sin(a)));
                     }
-                    auto ids = addPolyLoop(st, corners, /*equalEdges=*/true);
-                    // SolidWorks-style inscribed CONSTRUCTION circle: anchors the polygon's center
-                    // (the center pick's snap lands on the circle center) and holds every vertex on
-                    // it, so a polygon dropped on the origin stays centered + dimensionable.
-                    nlohmann::json ccs = nlohmann::json::array();
-                    pushSnapConstraint(toolSnaps_[0], "$self.center", ccs);
-                    std::string cid = emitConstructionEntity(st,
-                        {{"type", "circle"}, {"construction", true},
-                         {"center", nlohmann::json::array({ctr.x, ctr.y})}, {"radius", R}}, ccs);
-                    if (!cid.empty()) {
-                        for (const auto& lid : ids)
-                            if (!lid.empty())
-                                emitConstructionConstraint(st, {{"type", "point_on"},
-                                    {"refs", {lid + ".p1", cid}}});
-                        // The picked vertex (corners[0] == ids[0].p1) keeps its own snap too.
-                        if (!ids.empty() && !ids[0].empty()) {
-                            nlohmann::json vcs = nlohmann::json::array();
-                            pushSnapConstraint(toolSnaps_[1], ids[0] + ".p1", vcs);
-                            for (const auto& c : vcs) emitConstructionConstraint(st, c);
-                        }
-                    }
-                    resolve(st);
+                    // The construction circle and its center/vertex relations commit with the loop.
+                    addPolyLoop(st, corners, /*equalEdges=*/true, &ctr,
+                                toolSnaps_[0], toolSnaps_[1]);
                     resetTool();
                 }
             } else if (tool_ == SketchTool::Star && toolUV_.size() == 2) {
@@ -9096,7 +9109,6 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         corners.push_back(ImVec2(ctr.x + r * std::cos(a), ctr.y + r * std::sin(a)));
                     }
                     addPolyLoop(st, corners, /*equalEdges=*/false);
-                    resolve(st);
                     resetTool();
                 }
             } else if (tool_ == SketchTool::RectCenter && toolUV_.size() == 2) {
@@ -9110,31 +9122,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     ImVec2 quad[4] = {ImVec2(ctr.x - dx, ctr.y - dy), ImVec2(ctr.x + dx, ctr.y - dy),
                                       ImVec2(ctr.x + dx, ctr.y + dy), ImVec2(ctr.x - dx, ctr.y + dy)};
                     const char* rel[4] = {"horizontal", "vertical", "horizontal", "vertical"};
-                    auto ids = addQuadLoop(st, quad, rel);
-                    // SolidWorks-style center rectangle: a construction diagonal (corner 0 -> corner
-                    // 2) plus a center CONSTRUCTION point pinned to the diagonal's midpoint. The
-                    // center pick's snap lands on that point, so the rect stays centered on it.
-                    if (ids.size() == 4 && !ids[0].empty() && !ids[2].empty()) {
-                        nlohmann::json pcs = nlohmann::json::array();
-                        pushSnapConstraint(toolSnaps_[0], "$self.p", pcs);
-                        std::string pc = emitConstructionEntity(st,
-                            {{"type", "point"}, {"construction", true},
-                             {"p", nlohmann::json::array({ctr.x, ctr.y})}}, pcs);
-                        std::string diag = emitConstructionEntity(st,
-                            {{"type", "line"}, {"construction", true},
-                             {"p1", nlohmann::json::array({quad[0].x, quad[0].y})},
-                             {"p2", nlohmann::json::array({quad[2].x, quad[2].y})}},
-                            nlohmann::json::array());
-                        if (!pc.empty() && !diag.empty()) {
-                            emitConstructionConstraint(st, {{"type", "coincident"},
-                                {"refs", {diag + ".p1", ids[0] + ".p1"}}});
-                            emitConstructionConstraint(st, {{"type", "coincident"},
-                                {"refs", {diag + ".p2", ids[2] + ".p1"}}});
-                            emitConstructionConstraint(st, {{"type", "midpoint"},
-                                {"refs", {pc + ".p", diag}}});
-                        }
-                        resolve(st);
-                    }
+                    // Include the center point and construction diagonal with the four edges.
+                    addQuadLoop(st, quad, rel, nullptr, &ctr, toolSnaps_[0]);
                     resetTool();
                 }
             } else if (tool_ == SketchTool::Point && toolUV_.size() == 1) {

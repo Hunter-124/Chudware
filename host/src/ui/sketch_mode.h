@@ -130,7 +130,7 @@ public:
     // here; the scripted scenarios in app.cpp keep using enterForFeature/enterNewOnSelection
     // unchanged. Returns the new feature id (empty on failure) so callers can re-enter it.
     std::string createSketchOnPlane(AppState& st, const nlohmann::json& planeRef);
-    void exitSketch(AppState& st, bool keep = true);   // keep=false also deletes an empty new sketch
+    void exitSketch(AppState& st, bool keep = true);   // Cancel deletes only a new empty sketch
 
     // Tree "Edit Sketch Plane": arm a plane pick that RE-PARENTS an existing sketch onto the picked
     // plane/face (rebuilds the sketch and every feature downstream). Exits the active sketch first if
@@ -526,20 +526,18 @@ private:
     std::string chainPrevId_;
     float conicRho_ = 0.5f;          // Conic tool: live shoulder weight 0..1 during the rho pick
 
-    // Emit the 4 lines of a quad (corners A,B,C,D in order) as one chained loop with the given
-    // relation kinds (mirrors the corner-rect op pattern; relations[i] applies to edge i->i+1,
-    // "" = none). Used by the 3pt/center/parallelogram rectangle variants.
-    // cornerSnaps (optional, length 4) carries the toolSnaps_ record for each corner pick so a
-    // corner dropped on a vertex/origin keeps its coincident; "" / nullptr = unconstrained corner.
-    // Returns the 4 created line ids (in corner order), so a caller can attach center construction
-    // geometry (e.g. Center Rectangle's diagonal + center point). Empty entries on failure.
+    // Emit a quad loop in one atomic batch with the given per-edge relations and placement snaps.
+    // If center is set, include the center rectangle's construction point and diagonal in that
+    // same batch. Returns the four line ids in corner order, or empty on failure.
     std::vector<std::string> addQuadLoop(AppState& st, const ImVec2 corners[4],
-                     const char* relations[4], const std::string* cornerSnaps = nullptr);
-    // C42: emit N lines as a closed coincident-chained loop (generalized addQuadLoop, no per-edge
-    // h/v). equalEdges adds "equal" relations between consecutive edges (Polygon regularity).
-    // Returns the N created line ids (corner order) for attaching the inscribed construction circle.
+                     const char* relations[4], const std::string* cornerSnaps = nullptr,
+                     const ImVec2* center = nullptr, const std::string& centerSnap = "");
+    // Emit a closed N-line loop in one atomic batch. With center, include the inscribed
+    // construction circle and placement snaps. Returns the line ids, or empty on failure.
     std::vector<std::string> addPolyLoop(AppState& st, const std::vector<ImVec2>& corners,
-                                         bool equalEdges);
+                                         bool equalEdges, const ImVec2* center = nullptr,
+                                         const std::string& centerSnap = "",
+                                         const std::string& vertexSnap = "");
     // C51: emit a straight slot as REAL geometry — 2 side lines + 2 cap arcs + 1 construction
     // centerline — joined by coincident endpoints (closure), the centerline ends coincident with
     // the arc centers, equal cap radii, and each side tangent to both caps. SolidWorks-style:

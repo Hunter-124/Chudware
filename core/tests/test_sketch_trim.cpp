@@ -296,3 +296,107 @@ TEST_CASE("op: arc trimmed past a construction cutter keeps tangent+start relati
     int dof_after = doc_sketch_overview(doc_id, fid).at("dof").get<int>();
     CHECK(dof_after == dof_before);
 }
+
+TEST_CASE("op: rectangle batch resolves edge handles and rejects partial geometry") {
+    std::string fid;
+    const std::string doc_id = make_sketch("AtomicRectangle", json::array(), json::array(), fid);
+    chudware::doc::doc_set_meta(doc_id, "sketch.auto_coincident", false);
+    json ops = json::array();
+    const double corners[4][2] = {{0, 0}, {20, 0}, {20, 10}, {0, 10}};
+    const char* hv[4] = {"horizontal", "vertical", "horizontal", "vertical"};
+    for (int i = 0; i < 4; ++i) {
+        json cs = json::array({json{{"type", hv[i]}, {"refs", {"$self"}}}});
+        if (i) cs.push_back({{"type", "coincident"},
+                             {"refs", {"$" + std::to_string(i - 1) + ".p2", "$self.p1"}}});
+        if (i == 3) cs.push_back({{"type", "coincident"}, {"refs", {"$self.p2", "$0.p1"}}});
+        const int j = (i + 1) % 4;
+        ops.push_back({{"op", "sketch_add_entity"}, {"sketch", fid},
+                       {"entity", {{"type", "line"}, {"p1", {corners[i][0], corners[i][1]}},
+                                   {"p2", {corners[j][0], corners[j][1]}}}},
+                       {"constraints", cs}});
+    }
+    ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid},
+                   {"constraint", {{"type", "equal"}, {"refs", {"$0", "$2"}}}}});
+    const json r = doc_apply_ops(doc_id, -1, ops, false, false);
+    const json& ids = r.at("id_map");
+    const json skf = feature_of(r.at("tree"), fid);
+    REQUIRE_MESSAGE(skf.is_object(), r.dump().substr(0, 900));
+    const json& params = skf.at("params");
+    REQUIRE(params.at("entities").size() == 4);
+    REQUIRE(params.at("constraints").size() == 9);
+    for (int i = 0; i < 4; ++i)
+        CHECK(find_ent(params, ids.at("$" + std::to_string(i)).get<std::string>()) != nullptr);
+    CHECK(has_ref(params, ids.at("$3").get<std::string>() + ".p2"));
+    CHECK(has_ref(params, ids.at("$0").get<std::string>() + ".p1"));
+    for (const auto& c : params.at("constraints"))
+        for (const auto& h : c.at("refs"))
+            CHECK(h.get<std::string>().find('$') == std::string::npos);
+
+    const int revision = r.at("revision").get<int>();
+    json bad = json::array({
+        json{{"op", "sketch_add_entity"}, {"sketch", fid},
+             {"entity", {{"type", "line"}, {"p1", {30, 0}}, {"p2", {40, 0}}}}},
+        json{{"op", "sketch_add_entity"}, {"sketch", fid},
+             {"entity", {{"type", "line"}, {"p1", {40, 0}}, {"p2", "invalid"}}}}});
+    CHECK_THROWS_AS(doc_apply_ops(doc_id, -1, bad, false, false), chudware::doc::OpError);
+    const json after = chudware::doc::doc_tree(doc_id);
+    CHECK(after.at("revision").get<int>() == revision);
+    CHECK(feature_of(after.at("tree"), fid).at("params").at("entities").size() == 4);
+}
+
+TEST_CASE("op: straight slot batch resolves arc center and endpoint handles") {
+    std::string fid;
+    const std::string doc_id = make_sketch("AtomicSlot", json::array(), json::array(), fid);
+    chudware::doc::doc_set_meta(doc_id, "sketch.auto_coincident", false);
+    json ops = json::array({
+        json{{"op", "sketch_add_entity"}, {"sketch", fid},
+             {"entity", {{"type", "line"}, {"p1", {0, 2}}, {"p2", {20, 2}}}}},
+        json{{"op", "sketch_add_entity"}, {"sketch", fid},
+             {"entity", {{"type", "line"}, {"p1", {0, -2}}, {"p2", {20, -2}}}}},
+        json{{"op", "sketch_add_entity"}, {"sketch", fid},
+             {"entity", {{"type", "arc"}, {"center", {0, 0}}, {"radius", 2},
+                         {"start", 90}, {"end", -90}, {"ccw", true}}}},
+        json{{"op", "sketch_add_entity"}, {"sketch", fid},
+             {"entity", {{"type", "arc"}, {"center", {20, 0}}, {"radius", 2},
+                         {"start", -90}, {"end", 90}, {"ccw", true}}}},
+        json{{"op", "sketch_add_entity"}, {"sketch", fid},
+             {"entity", {{"type", "line"}, {"construction", true},
+                         {"p1", {0, 0}}, {"p2", {20, 0}}}}}
+    });
+    auto con = [&](const char* type, const char* a, const char* b) {
+        ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid},
+                       {"constraint", {{"type", type}, {"refs", {a, b}}}}});
+    };
+    con("coincident", "$0.p1", "$2.start");
+    con("coincident", "$0.p2", "$3.end");
+    con("coincident", "$1.p1", "$2.end");
+    con("coincident", "$1.p2", "$3.start");
+    con("coincident", "$4.p1", "$2.center");
+    con("coincident", "$4.p2", "$3.center");
+    con("equal", "$2", "$3");
+    con("tangent", "$0", "$2");
+    con("tangent", "$0", "$3");
+    con("tangent", "$1", "$2");
+    con("tangent", "$1", "$3");
+    const json r = doc_apply_ops(doc_id, -1, ops, false, false);
+    const json& ids = r.at("id_map");
+    const json skf = feature_of(r.at("tree"), fid);
+    REQUIRE_MESSAGE(skf.is_object(), r.dump().substr(0, 900));
+    const json& params = skf.at("params");
+    REQUIRE(params.at("entities").size() == 5);
+    REQUIRE(params.at("constraints").size() == 11);
+    CHECK(has_ref(params, ids.at("$2").get<std::string>() + ".center"));
+    CHECK(has_ref(params, ids.at("$3").get<std::string>() + ".end"));
+    CHECK(has_ref(params, ids.at("$4").get<std::string>() + ".p1"));
+    for (const auto& c : params.at("constraints"))
+        for (const auto& h : c.at("refs"))
+            CHECK(h.get<std::string>().find('$') == std::string::npos);
+}
+
+TEST_CASE("geom: offset inside a circle cannot exceed its radius") {
+    const json c = {{"type", "circle"}, {"center", {0, 0}}, {"radius", 5.0}};
+    CHECK_THROWS_AS(sg::offset_chain({c}, 6.0, 0.0, 0.0), sg::GeomError);
+    const auto valid = sg::offset_chain({c}, 2.0, 0.0, 0.0);
+    REQUIRE(valid.size() == 1);
+    CHECK(valid[0].at("radius").get<double>() == doctest::Approx(3.0));
+}

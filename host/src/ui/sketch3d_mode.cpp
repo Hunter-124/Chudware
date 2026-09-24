@@ -364,10 +364,11 @@ bool Sketch3DMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
         clearSel();
         return true;
     }
-    // sk3d_relations has no single well-defined relation without knowing the selection shape — the
-    // contextual buttons (drawConstraintButtons) already cover that from the viewport status strip;
-    // treat the ribbon button as a no-op tool-swallow so it doesn't fall through to "unhandled".
-    if (cmdId == "sk3d_relations") { return true; }
+    // Relation kinds depend on the selection; the viewport status strip offers contextual buttons.
+    if (cmdId == "sk3d_relations") {
+        st.toast(ui::ToastLevel::Info, "Add Relation: use the contextual relation buttons in the viewport status strip");
+        return true;
+    }
     return false;
 }
 

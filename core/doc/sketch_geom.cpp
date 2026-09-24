@@ -362,7 +362,8 @@ json offset_one(const json& e, double distance, double side) {
     }
     auto [c, r] = circle_params(e);
     double ccw_sign = arc_ccw(e) ? 1.0 : -1.0;
-    double new_r = std::max(r - side * ccw_sign * distance, TOL);
+    double new_r = r - side * ccw_sign * distance;
+    if (new_r <= TOL) throw GeomError("offset distance exceeds the circle/arc radius");
     json out = e;
     out["radius"] = new_r;
     out["center"] = {c[0], c[1]};

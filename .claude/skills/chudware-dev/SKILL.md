@@ -246,6 +246,12 @@ judgment).
   `agent.prewalk_target`, `effort.resolve_effort`, `TierProfile.deliberation` and the council
   threshold env readers — the Auto resolver (`preferences.py` §3.1 rules + bundled
   classifier with keyword fallback) replaces the seat lookups; the per-role table stays.
+- **Auto's task kind never changes the mode (2026-09-24).** `TurnPreferences.mode` (the
+  user's work style / composer pick) is the only mode source; a `chat`-classified prompt
+  gets a cheap model, low thinking, depth 0 and no advisor, but NOT a read-only roster.
+  The removed `roster_mode` forced `ask` on every chat-kind turn, so "what's wrong with
+  the brakes?" in Agent mode ran as Ask and refused every edit
+  (`test_chat_classified_question_keeps_the_agent_mode_the_user_picked`).
 - **Buckling and steady thermal are engine-native (2026-09-07).** `run_fea_buckling` = static
   prestress → geometric stiffness → reciprocal pencil `K_G φ = μ K φ` (Spectra Cholesky on
   the shared modal factor); `max_load_factor` (default 1e4) is an engineering ceiling: the

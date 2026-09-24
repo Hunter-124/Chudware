@@ -468,6 +468,24 @@ def test_delegation_is_available_for_missions_not_single_part_work():
     assert "new_part" in part_tools
 
 
+def test_chat_classified_question_keeps_the_agent_mode_the_user_picked():
+    """2026-09-24: Agent mode + "what's wrong with the brakes?" became Ask."""
+    from services.agent.mission_dispatch import _apply_session_preferences
+    from services.agent.preferences import resolve_turn_preferences
+
+    preferences = resolve_turn_preferences(
+        "", cfg={"copilot": {"work_style": "do_it"}}, task_kind="chat",
+    )
+    assert preferences.mode == "agent"
+    allowed, _ = _apply_session_preferences(
+        "general_agent", ["describe_part", "new_part", "fs_write", "delegate"],
+        "BASE", preferences=preferences,
+    )
+    assert {"describe_part", "new_part", "fs_write"} <= set(allowed)
+    assert "delegate" not in allowed
+
+
+
 def test_curated_roles_keep_their_execution_permissions():
     from services.agent.mission_dispatch import _apply_session_preferences
     from services.agent.preferences import resolve_turn_preferences

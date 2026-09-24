@@ -2588,7 +2588,7 @@ def _apply_session_preferences(
     preferences = preferences or resolve_turn_preferences("", task_kind="modelling")
     if preferences.task_list:
         allowed = sorted(set(allowed) | {"task_list"})
-    allowed = apply_mode_tools(preferences.roster_mode, allowed,
+    allowed = apply_mode_tools(preferences.mode, allowed,
                                preferences=preferences) or []
     system_prompt = system_prompt.rstrip() + "\n\n" + preferences.prompt_guidance()
     menu = render_tool_menu(allowed)

@@ -144,9 +144,9 @@ def apply_mode_tools(
     :data:`AGENT_DEFAULT_TOOLS`.
     """
     if preferences is not None:
-        chosen_mode = mode or preferences.mode
-        if preferences.task_kind == "chat" or preferences.mode == "ask":
-            chosen_mode = "ask"
+        # Auto's task kind tunes model/thinking/delegation only; the mode is
+        # the user's work style and is never downgraded by classification.
+        chosen_mode = "ask" if preferences.mode == "ask" else (mode or preferences.mode)
         allowed = apply_mode_tools(chosen_mode, role_tools, plan_only=plan_only,
                                    subagent=subagent)
         return apply_preference_tools(allowed, preferences, mode=chosen_mode)
@@ -214,7 +214,7 @@ def apply_preference_tools(allowed, preferences, *, mode=None):
     from services.agent.guardrails import MUTATING_TOOLS
 
     tools = set(allowed) if allowed is not None else None
-    readonly = (mode or preferences.roster_mode) in ("ask", "plan")
+    readonly = (mode or preferences.mode) in ("ask", "plan")
     if tools is None:
         if not readonly and preferences.delegation_depth and preferences.advisor:
             return None

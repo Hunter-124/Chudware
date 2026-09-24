@@ -132,10 +132,6 @@ class TurnPreferences:
     def local_only(self) -> bool:
         return self.preferences.local_only
 
-    @property
-    def roster_mode(self) -> str:
-        return "ask" if self.task_kind == "chat" or self.mode == "ask" else self.mode
-
     def prompt_guidance(self) -> str:
         lines = [f"Work style: {self.preferences.work_style}. Priority: {self.priority}."]
         if self.mode == "plan":

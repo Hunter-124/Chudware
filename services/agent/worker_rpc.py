@@ -3041,13 +3041,13 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         )
 
     options = {"project_dir": project_root} if project_root else {}
-    options.update({"mode": turn_preferences.roster_mode,
+    options.update({"mode": turn_preferences.mode,
                     "advisor": turn_preferences.advisor,
                     "max_subagent_depth": turn_preferences.delegation_depth})
     for key in ("mode", "plan_only", "advisor", "autonomy"):
         if key in raw_params:
             options[key] = raw_params[key]
-    if turn_preferences.task_kind == "chat" or turn_preferences.mode == "ask":
+    if turn_preferences.mode == "ask":
         options["mode"] = "ask"
     try:
         mission_dispatch = MissionDispatch(

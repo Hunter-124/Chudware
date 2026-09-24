@@ -117,7 +117,7 @@ The classifier runs on the bundled local model (P9; `model_manager.model_for_rol
 
 | Signal | Rule | Grounded in |
 |---|---|---|
-| **Chat question** (no geometry verb, no mutation intent) | cheapest capable model, `thinking=low`, read-only roster, no subagents, no advisor | `_TASK_CLASS_MIN_RANK["simple"]=1` `role_models.py:161-172` |
+| **Chat question** (no geometry verb, no mutation intent) | cheapest capable model, `thinking=low`, no subagents, no advisor; the roster follows the user's work style (a chat question in Agent mode can still edit) | `_TASK_CLASS_MIN_RANK["simple"]=1` `role_models.py:161-172` |
 | **Modelling** (features on one doc) | mid tier, `thinking=medium`, verify-battery floor, no delegation | `min_rank multi_feature_part=3` (same table) |
 | **Simulation / analysis** | strongest available for setup, `thinking=high`, sim precheck hard-block on | `min_rank["analysis"]=4`; `CHUDWARE_SIM_PRECHECK_BLOCK=1` `services/agent/advisor/sim_advisor.py:1078` |
 | **Long mission** (multi-deliverable or ≥2 docs) | strong planner + cheap leaves, delegation depth 2, task list on, council when features ≥5 | `_DEFAULT_FEATURE_THRESHOLD=5` `councils.py:73`; depth 2 `config.py:301-319` |

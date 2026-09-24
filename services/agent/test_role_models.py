@@ -59,8 +59,9 @@ def test_auto_rules_table(monkeypatch, signal, prompt, inputs, expected):
     tools = apply_mode_tools(None, ["describe_part", "new_part", "add_features", "delegate",
                                    "mission_start", "advise", "task_list"], preferences=policy)
     if signal == "chat":
-        assert "describe_part" in tools
-        assert not {"new_part", "add_features", "delegate", "mission_start", "advise"} & set(tools)
+        # Classification never downgrades the user's work style (do_it keeps edits).
+        assert {"describe_part", "new_part", "add_features"} <= set(tools)
+        assert not {"delegate", "mission_start", "advise"} & set(tools)
     if signal == "modelling":
         assert "add_features" in tools and "delegate" not in tools and policy.verify_battery
         for priority, model, thinking in (

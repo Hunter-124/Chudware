@@ -1065,6 +1065,7 @@ def dispatch_host_tool(
                 "result": safe_result,
             }
         )
+        del records[:-64]
     return safe_result
 
 

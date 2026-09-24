@@ -25,6 +25,7 @@ def bench_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     with br._state_lock:
         br._active_proc = None
         br._active_thread = None
+        br._bench_stopping = False
     status = reports / "bench_status.json"
     if status.exists():
         status.unlink()
@@ -76,25 +77,16 @@ def bench_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 }),
                 encoding="utf-8",
             )
+        if "tools.flywheel.bench.gym.leaderboard" in cmd:
+            lb = repo / "benchmarks" / "leaderboard" / "leaderboard.json"
+            lb.write_text(
+                json.dumps({"schema": "aicad.leaderboard/1", "models": []}),
+                encoding="utf-8",
+            )
+            rc = int(getattr(br, "_TEST_LB_RC", 0))
         return FakeProc(rc=rc, delay=getattr(br, "_TEST_DELAY", 0.05))
 
-    def fake_run(cmd, **kwargs):
-        calls.append({"kind": "run", "cmd": list(cmd), "kwargs": kwargs})
-        # Write a minimal leaderboard so last_result_path resolves.
-        lb = repo / "benchmarks" / "leaderboard" / "leaderboard.json"
-        lb.write_text(
-            json.dumps({"schema": "aicad.leaderboard/1", "models": []}),
-            encoding="utf-8",
-        )
-        rc = int(getattr(br, "_TEST_LB_RC", 0))
-
-        class R:
-            returncode = rc
-
-        return R()
-
     monkeypatch.setattr(br.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(br.subprocess, "run", fake_run)
     br._TEST_FORCE_RC = 0
     br._TEST_LB_RC = 0
     br._TEST_DELAY = 0.05
@@ -140,6 +132,64 @@ def test_bench_status_idle_when_never_run(bench_env):
     assert st["stage"] == "idle"
 
 
+def test_stale_bench_status_is_reconciled_on_restart(bench_env, monkeypatch):
+    br, _repo, _reports, _calls = bench_env
+    br._write_status({
+        "running": True, "stage": "running", "pid": 4242,
+        "cmd": ["python", "-m", "tools.flywheel.bench.gym.cli", "diag"],
+    })
+    def missing_process(_pid, _sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(br.os, "kill", missing_process)
+    status = br._read_status()
+    assert status["running"] is False
+    assert status["stage"] == "error"
+    assert br._read_status()["running"] is False
+
+
+def test_restart_terminates_verified_orphan_group(bench_env, monkeypatch):
+    br, _repo, _reports, _calls = bench_env
+    br._write_status({
+        "running": True, "stage": "running", "pid": 4242,
+        "cmd": ["python", "-m", "tools.flywheel.bench.categories", "run", "modeling"],
+    })
+    killed = []
+    monkeypatch.setattr(br, "_bench_pid_alive", lambda pid, cmd: True)
+    monkeypatch.setattr(br, "_terminate_bench_group", lambda pid, proc=None: killed.append(pid))
+    assert br._read_status()["stage"] == "error"
+    assert killed == [4242]
+
+def test_reused_pid_does_not_kill_unrelated_process(bench_env, monkeypatch):
+    import os
+    if not Path("/proc").is_dir():
+        pytest.skip("cmdline verification requires /proc")
+
+    br, _repo, _reports, _calls = bench_env
+    br._write_status({
+        "running": True, "stage": "running", "pid": os.getpid(),
+        "cmd": ["python", "-m", "tools.flywheel.bench.gym.cli", "diag"],
+    })
+    killed = []
+    monkeypatch.setattr(br, "_terminate_bench_group", lambda pid, proc=None: killed.append(pid))
+    assert br._read_status()["stage"] == "error"
+    assert killed == []
+
+
+def test_worker_shutdown_terminates_active_bench(bench_env, monkeypatch):
+    br, _repo, _reports, _calls = bench_env
+    br._write_status({"running": True, "stage": "running", "pid": 4242})
+    proc = type("Process", (), {"pid": 4242})()
+    with br._state_lock:
+        br._active_proc = proc
+    killed = []
+    monkeypatch.setattr(br, "_terminate_bench_group", lambda pid, target=None: killed.append((pid, target)))
+    br._shutdown_bench()
+    assert killed == [(4242, proc)]
+    assert br._read_status()["running"] is False
+    assert br._read_status()["stage"] == "error"
+
+
 def test_bench_run_diag_cmd_and_leaderboard(bench_env):
     br, repo, reports, calls = bench_env
     br._TEST_DELAY = 0.02
@@ -154,17 +204,15 @@ def test_bench_run_diag_cmd_and_leaderboard(bench_env):
     assert Path(st["last_result_path"]).exists()
 
     popens = [c for c in calls if c["kind"] == "popen"]
-    runs = [c for c in calls if c["kind"] == "run"]
-    assert len(popens) == 1
+    assert len(popens) == 2
     cmd = popens[0]["cmd"]
     assert "tools.flywheel.bench.gym.cli" in cmd
     assert "diag" in cmd
     assert "--tiers" in cmd
     assert "xai:grok-4-5,local-24k" in cmd
     assert popens[0]["kwargs"].get("start_new_session") is True
-    assert len(runs) == 1
-    assert "tools.flywheel.bench.gym.leaderboard" in runs[0]["cmd"]
-    assert "build" in runs[0]["cmd"]
+    assert "tools.flywheel.bench.gym.leaderboard" in popens[1]["cmd"]
+    assert "build" in popens[1]["cmd"]
 
 
 def test_bench_run_smoke_cmd(bench_env):
@@ -174,13 +222,14 @@ def test_bench_run_smoke_cmd(bench_env):
     assert out["ok"] is True
     _wait_idle(br)
     popens = [c for c in calls if c["kind"] == "popen"]
-    assert len(popens) == 1
+    assert len(popens) == 2
     cmd = popens[0]["cmd"]
     assert "run" in cmd
     assert "--real" in cmd
     assert "--challenges" in cmd
     assert "C1" in cmd
     assert "--no-adjust" in cmd
+    assert "tools.flywheel.bench.gym.leaderboard" in popens[1]["cmd"]
 
 
 def test_bench_run_rejects_bad_mode(bench_env):

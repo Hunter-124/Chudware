@@ -229,6 +229,24 @@ def _shutdown_chudcode() -> None:
         log.error("Chudcode shutdown failed: %s", type(exc).__name__)
 
 
+def _shutdown_bench() -> None:
+    try:
+        from services.agent.worker_rpc import _shutdown_bench as stop_bench
+
+        stop_bench()
+    except Exception as exc:  # noqa: BLE001 — shutdown must continue
+        log.error("Bench shutdown failed: %s", type(exc).__name__)
+
+
+def _reconcile_bench() -> None:
+    try:
+        from services.agent.worker_rpc import _read_status
+
+        _read_status()
+    except Exception as exc:  # noqa: BLE001 — worker still serves without bench
+        log.error("Bench recovery failed: %s", type(exc).__name__)
+
+
 def serve() -> None:
     from services.agent.chudcode_control import ControlServer
 
@@ -247,6 +265,7 @@ def serve() -> None:
         try:
             control.stop()
         finally:
+            _shutdown_bench()
             try:
                 from services.reveng.gaussian_jobs import shutdown as shutdown_gaussian_jobs
                 shutdown_gaussian_jobs()
@@ -274,6 +293,7 @@ def serve() -> None:
 
     try:
         log.info("worker ready (runtime=%s)", paths.RUNTIME)
+        _reconcile_bench()
         _warm_prompt_cache()
         _warm_chudcode_service()
         for line in sys.stdin:

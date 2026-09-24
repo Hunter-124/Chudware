@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -1003,9 +1004,114 @@ def _category_status_path(cat_id: str) -> Path:
     return _reports_dir() / "categories" / f"{cat_id}_status.json"
 
 
-_state_lock = threading.Lock()
+_state_lock = threading.RLock()
 _active_proc: subprocess.Popen | None = None
 _active_thread: threading.Thread | None = None
+_bench_stopping = False
+
+
+def _bench_pid_alive(pid: Any, cmd: Any) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, OverflowError, ValueError):
+        return False
+    except PermissionError:
+        pass
+    if Path("/proc").is_dir():
+        try:
+            argv = (Path("/proc") / str(pid) / "cmdline").read_bytes().split(b"\0")
+        except (OSError, ValueError):
+            return False
+        expected = (
+            "tools.flywheel.bench.gym.cli",
+            "tools.flywheel.bench.categories",
+            "tools.flywheel.bench.gym.leaderboard",
+        )
+        module = next(
+            (cmd[i + 1] for i, arg in enumerate(cmd[:-1]) if arg == "-m"),
+            None,
+        ) if isinstance(cmd, list) else None
+        if module not in expected or module.encode() not in argv:
+            return False
+    return True
+
+
+def _terminate_bench_group(pid: int, proc: subprocess.Popen | None = None) -> None:
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if proc is not None and proc.poll() is not None:
+                break
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    elif proc is not None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _shutdown_bench() -> None:
+    """Stop the benchmark process group before the owning worker exits."""
+    global _bench_stopping
+    with _state_lock:
+        _bench_stopping = True
+        proc = _active_proc
+        active = _active_thread is not None and _active_thread.is_alive()
+    if proc is not None:
+        _terminate_bench_group(proc.pid, proc)
+    if active or proc is not None:
+        status = _write_status({
+            "running": False, "stage": "error", "finished": _utc_now(),
+            "last_error": "bench worker shut down", "pid": None,
+        })
+        _mark_category_stopped(status)
+
+
+def _spawn_bench(cmd: list[str], root: Path, env: dict, logf: Any) -> subprocess.Popen:
+    global _active_proc
+    with _state_lock:
+        if _bench_stopping:
+            raise RuntimeError("bench worker is shutting down")
+        proc = subprocess.Popen(
+            cmd, cwd=str(root), env=env, stdout=logf,
+            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _active_proc = proc
+        return proc
+
+def _mark_category_stopped(status: dict) -> None:
+    category = status.get("category")
+    if not isinstance(category, str) or not category.isidentifier():
+        return
+    path = _category_status_path(category)
+    if not path.is_file():
+        return
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(current, dict) and current.get("running"):
+            current.update({
+                "running": False, "stage": "error",
+                "finished": status["finished"], "last_error": status["last_error"],
+            })
+            path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+    except (OSError, ValueError):
+        _LOG.exception("Could not reconcile bench category status")
 
 
 def _utc_now() -> str:
@@ -1057,26 +1163,29 @@ def _read_status() -> dict:
                 return _default_status()
             out = _default_status()
             out.update(loaded)
-            # Live process check — if the status says running but the process is gone
-            # and no thread is finishing it up, mark error.
-            global _active_proc, _active_thread
-            if out.get("running") and _active_proc is not None:
-                rc = _active_proc.poll()
-                if rc is not None and (
-                    _active_thread is None or not _active_thread.is_alive()
-                ):
-                    # Thread should have written final status; heal if it crashed.
-                    if out.get("stage") not in (
-                        "done",
-                        "error",
-                        "building_leaderboard",
-                    ):
-                        out["running"] = False
-                        out["stage"] = "error" if rc != 0 else "done"
+            if out.get("running") and (
+                _active_thread is None or not _active_thread.is_alive()
+            ):
+                proc = _active_proc
+                rc = proc.poll() if proc is not None else None
+                if proc is None or rc is not None:
+                    pid = out.get("pid")
+                    if proc is None and _bench_pid_alive(pid, out.get("cmd")):
+                        # The prior worker died while its detached process survived.
+                        _terminate_bench_group(pid)
+                    out.update({
+                        "running": False,
+                        "stage": "error",
+                        "finished": out.get("finished") or _utc_now(),
+                        "last_error": (
+                            f"bench process exited with code {rc}"
+                            if rc is not None else "bench worker exited before completion"
+                        ),
+                    })
+                    if rc is not None:
                         out["exit_code"] = rc
-                        out["finished"] = out.get("finished") or _utc_now()
-                        if rc != 0 and not out.get("last_error"):
-                            out["last_error"] = f"bench process exited with code {rc}"
+                    path.write_text(json.dumps(out, indent=2), encoding="utf-8")
+                    _mark_category_stopped(out)
             return out
         except Exception as exc:  # noqa: BLE001
             st = _default_status()
@@ -1162,17 +1271,7 @@ def _run_pipeline(mode: str, tiers: list[str], cycle: str) -> None:
             logf.write(f"# bench_run mode={mode} tiers={tiers} cycle={cycle}\n")
             logf.write(f"# cwd={root}\n# cmd={' '.join(cmd)}\n\n")
             logf.flush()
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(root),
-                env=env,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,  # detach from worker process group
-            )
-            with _state_lock:
-                _active_proc = proc
+            proc = _spawn_bench(cmd, root, env, logf)
             _write_status({"pid": proc.pid, "stage": "running"})
             rc = proc.wait()
     except Exception as exc:  # noqa: BLE001
@@ -1186,6 +1285,15 @@ def _run_pipeline(mode: str, tiers: list[str], cycle: str) -> None:
                 "exit_code": None,
             }
         )
+        with _state_lock:
+            _active_proc = None
+            _active_thread = None
+        return
+    if _bench_stopping:
+        _write_status({
+            "running": False, "stage": "error", "finished": _utc_now(),
+            "last_error": "bench worker shut down", "exit_code": rc,
+        })
         with _state_lock:
             _active_proc = None
             _active_thread = None
@@ -1208,7 +1316,7 @@ def _run_pipeline(mode: str, tiers: list[str], cycle: str) -> None:
         return
 
     # Rebuild leaderboard so the GUI table picks up the new cells.
-    _write_status({"stage": "building_leaderboard", "exit_code": rc})
+    _write_status({"stage": "building_leaderboard", "exit_code": rc, "pid": None})
     lb_cmd = [
         sys.executable or "python3",
         "-m",
@@ -1220,16 +1328,9 @@ def _run_pipeline(mode: str, tiers: list[str], cycle: str) -> None:
         with open(log_path, "a", encoding="utf-8") as logf:
             logf.write(f"\n# leaderboard build\n# cmd={' '.join(lb_cmd)}\n")
             logf.flush()
-            lb = subprocess.run(
-                lb_cmd,
-                cwd=str(root),
-                env=env,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                check=False,
-            )
-            lb_rc = int(lb.returncode)
+            lb = _spawn_bench(lb_cmd, root, env, logf)
+            _write_status({"pid": lb.pid, "cmd": lb_cmd})
+            lb_rc = lb.wait()
     except Exception as exc:  # noqa: BLE001
         _write_status(
             {
@@ -1241,6 +1342,15 @@ def _run_pipeline(mode: str, tiers: list[str], cycle: str) -> None:
                 "last_result_path": str(log_path),
             }
         )
+        with _state_lock:
+            _active_proc = None
+            _active_thread = None
+        return
+    if _bench_stopping:
+        _write_status({
+            "running": False, "stage": "error", "finished": _utc_now(),
+            "last_error": "bench worker shut down", "exit_code": lb_rc,
+        })
         with _state_lock:
             _active_proc = None
             _active_thread = None
@@ -1344,17 +1454,7 @@ def _run_category_pipeline(category: str, cycle: str, mode: str | None = None) -
             logf.write(f"# bench_run category={category} cycle={cycle}\n")
             logf.write(f"# cwd={root}\n# cmd={' '.join(cmd)}\n\n")
             logf.flush()
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(root),
-                env=env,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            with _state_lock:
-                _active_proc = proc
+            proc = _spawn_bench(cmd, root, env, logf)
             _write_status({"pid": proc.pid, "stage": "running"})
             rc = proc.wait()
     except Exception as exc:  # noqa: BLE001
@@ -1369,6 +1469,15 @@ def _run_category_pipeline(category: str, cycle: str, mode: str | None = None) -
                 "category": category,
             }
         )
+        with _state_lock:
+            _active_proc = None
+            _active_thread = None
+        return
+    if _bench_stopping:
+        _write_status({
+            "running": False, "stage": "error", "finished": _utc_now(),
+            "last_error": "bench worker shut down", "exit_code": rc,
+        })
         with _state_lock:
             _active_proc = None
             _active_thread = None
@@ -1443,6 +1552,10 @@ def _bench_run(params: dict, _emit: Callable) -> dict:
     """Start a gym CLI or category run on a daemon thread; return immediately."""
     global _active_thread, _active_proc
     try:
+        with _state_lock:
+            if _bench_stopping:
+                return {"ok": False, "reason": "bench worker is shutting down"}
+        _read_status()
         params = params or {}
         category_raw = params.get("category")
         category = str(category_raw).strip().lower() if category_raw else ""
@@ -1458,8 +1571,7 @@ def _bench_run(params: dict, _emit: Callable) -> dict:
                 "hint": "Pass only category:<id>, or only mode+tiers for the gym path.",
             }
 
-        # Refuse a second concurrent run (do NOT call _read_status under the lock —
-        # _read_status itself takes _state_lock → deadlock).
+        # Refuse a second concurrent run.
         with _state_lock:
             already = _active_thread is not None and _active_thread.is_alive()
         if already:
@@ -2516,15 +2628,15 @@ def _bounded_history_seed(raw_history: Any) -> str:
     return prefix + "\n".join(rows) + suffix
 
 
-def _claim_history_seed(session_id: str, raw_history: Any, *, resumed: bool) -> str:
-    """Return a migration block only on the first turn seen for a session."""
+def _claim_history_seed(
+    session_id: str, raw_history: Any, *, resumed: bool
+) -> tuple[str, bool]:
+    """Reserve the first migration attempt; caller releases it on failure."""
     with _HISTORY_SEED_LOCK:
         if session_id in _HISTORY_SEEDED_SESSIONS:
-            return ""
+            return "", False
         _HISTORY_SEEDED_SESSIONS.add(session_id)
-    if resumed:
-        return ""
-    return _bounded_history_seed(raw_history)
+    return ("" if resumed else _bounded_history_seed(raw_history)), True
 
 
 _SCOPE_MAX_FEATURES = 32
@@ -2957,7 +3069,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         if key in raw_params:
             settings[key] = raw_params[key]
 
-    migration = _claim_history_seed(
+    migration, claimed_history_seed = _claim_history_seed(
         session_id,
         raw_params.get("history"),
         resumed=resumed_session,
@@ -3040,6 +3152,9 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     except Exception as exc:  # noqa: BLE001
         agent_config.clear_pooled_credentials()
         _restore_process_workspace(previous_cwd, previous_env)
+        if claimed_history_seed:
+            with _HISTORY_SEED_LOCK:
+                _HISTORY_SEEDED_SESSIONS.discard(session_id)
         return {
             "ok": False,
             "reason": f"agent_admin_turn: workspace activation failed: "
@@ -3067,6 +3182,9 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     except Exception as exc:  # noqa: BLE001
         agent_config.clear_pooled_credentials()
         _restore_process_workspace(previous_cwd, previous_env)
+        if claimed_history_seed:
+            with _HISTORY_SEED_LOCK:
+                _HISTORY_SEEDED_SESSIONS.discard(session_id)
         return {
             "ok": False,
             "reason": f"agent_admin_turn: usage setup failed: "
@@ -3204,6 +3322,11 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             else:
                 prior = str(response.get("reason") or "agent_admin_turn failed")
                 response["reason"] = f"{prior}; {joined}"
+        if claimed_history_seed and (
+            not response.get("ok") or response.get("turn", {}).get("cancelled")
+        ):
+            with _HISTORY_SEED_LOCK:
+                _HISTORY_SEEDED_SESSIONS.discard(session_id)
 
     return response
 

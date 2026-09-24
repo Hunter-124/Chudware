@@ -351,6 +351,23 @@ class HostToolDispatchTests(unittest.TestCase):
         self.assertEqual(list(result), ["ok", "path"])
         self.assertEqual(result["path"], "part.step")
 
+    def test_tool_records_keep_latest_64_calls(self):
+        records = []
+        counts = {}
+        for index in range(70):
+            binding = self._binding(
+                name=f"tool_{index}",
+                handler=lambda value: {"ok": True, "value": value},
+                tool_calls=records,
+                tool_call_counts=counts,
+            )
+            dispatch_host_tool(binding, {"value": index}, None, None)
+        self.assertEqual(len(records), 64)
+        self.assertEqual(
+            [record["result"]["value"] for record in records],
+            list(range(6, 70)),
+        )
+
     def test_host_tool_execute_wraps_every_result_in_the_content_envelope(self):
         """A `host_tool_result` whose result lacks `content` never resolves inside
         Chudcode (write xd://<tool> hangs until the turn cap), and CAD tools return

@@ -408,6 +408,73 @@ def _params(lane, *, run_id, request="Do the work", **extra):
     }
 
 
+@pytest.mark.parametrize("failure", ["error", "crash"])
+def test_failed_first_turn_retries_legacy_history_seed(online_lane, failure):
+    history = [{"role": "user", "text": "Earlier question"}]
+    online_lane.host.mode = failure
+    first = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="run-failed", history=history),
+        lambda _event: None,
+    )
+    assert first["ok"] is False
+    assert "Earlier question" in online_lane.host.turns[0]["request"]
+
+    online_lane.host.mode = "success"
+    retry = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="run-retry", history=history),
+        lambda _event: None,
+    )
+    assert retry["ok"] is True
+    assert "Earlier question" in online_lane.host.turns[1]["request"]
+
+    followup = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="run-followup", history=history),
+        lambda _event: None,
+    )
+    assert followup["ok"] is True
+    assert online_lane.host.turns[2]["request"] == "Do the work"
+
+
+def test_failed_followup_does_not_reseed_successful_session(online_lane):
+    history = [{"role": "user", "text": "Earlier question"}]
+    first = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="run-first", history=history),
+        lambda _event: None,
+    )
+    online_lane.host.mode = "error"
+    failed = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="run-failed-followup", history=history),
+        lambda _event: None,
+    )
+    online_lane.host.mode = "success"
+    retry = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="run-next", history=history),
+        lambda _event: None,
+    )
+    assert first["ok"] is True
+    assert failed["ok"] is False
+    assert retry["ok"] is True
+    assert online_lane.host.turns[2]["request"] == "Do the work"
+
+
+def test_cancelled_first_turn_retries_legacy_history_seed(online_lane):
+    history = [{"role": "user", "text": "Earlier question"}]
+    online_lane.host.mode = "cancel"
+    cancelled = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="run-cancel", history=history),
+        lambda _event: None,
+    )
+    online_lane.host.mode = "success"
+    retry = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="run-retry", history=history),
+        lambda _event: None,
+    )
+    assert cancelled["ok"] is True
+    assert cancelled["turn"]["cancelled"] is True
+    assert retry["ok"] is True
+    assert "Earlier question" in online_lane.host.turns[1]["request"]
+
+
 def test_persistent_reuse_one_time_history_seed_and_mapped_streaming(online_lane):
     emitted: list[dict] = []
     history = [

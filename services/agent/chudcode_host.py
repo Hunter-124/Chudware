@@ -18,8 +18,8 @@ import re
 import threading
 import uuid
 from urllib.parse import urlsplit
-from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections import OrderedDict, deque
+from collections.abc import Callable, Mapping, Reversible, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -147,7 +147,14 @@ class _Session:
     turn_lock: threading.Lock = field(default_factory=threading.Lock)
     active_turns: int = 0
     closed: bool = False
+    dispose_started: bool = False
     host_tool_names: set[str] = field(default_factory=set)
+
+
+@dataclass
+class _CreationGuard:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    users: int = 0
 
 
 @dataclass
@@ -159,6 +166,7 @@ class _Run:
     cancel_requested: bool = False
     cancel_sent: bool = False
     steers: set[str] = field(default_factory=set)
+    control_lock: threading.Lock = field(default_factory=threading.Lock)
     pending_steers: list[str] = field(default_factory=list)
 
 
@@ -175,6 +183,8 @@ class ChudcodeSessionHost:
         self._binary_hint = os.fspath(binary) if binary is not None else None
         self._max_sessions = _session_limit_from_env()
         self._sessions: OrderedDict[str, _Session] = OrderedDict()
+        self._creating: dict[str, _CreationGuard] = {}
+        self._reserved_creations = 0
         self._runs: dict[str, _Run] = {}
         self._completed_runs: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._lock = threading.RLock()
@@ -218,7 +228,8 @@ class ChudcodeSessionHost:
         session: _Session | None = None
         unsubscribe: Callable[[], None] | None = None
         emit_errors: list[str] = []
-        frames: list[dict[str, Any]] = []
+        provider_frames: deque[dict[str, Any]] = deque(maxlen=256)
+        terminal: dict[str, Any] | None = None
         try:
             session = self._get_or_create_session(session_id, params, resume_file)
             with session.turn_lock:
@@ -229,22 +240,23 @@ class ChudcodeSessionHost:
                     self._sessions.move_to_end(session_id)
 
                 def forward(event: Any) -> None:
-                    # Exactly one listener family is registered (see _register_listener),
-                    # so every delivered frame is distinct and is forwarded as-is. An
-                    # earlier identity dedupe keyed on id(event) dropped REAL frames:
-                    # the RPC client hands each notification as a short-lived dataclass,
-                    # CPython reuses the freed address, and any later frame landing on
-                    # a recycled id() vanished — in practice the 2nd..Nth tool call of a
-                    # parallel batch never reached the feed.
+                    nonlocal terminal
+                    # Keep distinct notifications when the RPC client reuses a frame's
+                    # object identity.
                     frame = _json_value(event)
                     if not isinstance(frame, dict):
                         frame = {"type": "unknown", "value": frame}
-                    frames.append(frame)
+                    kind = frame.get("type")
+                    if kind == "agent_end" and frame.get(
+                        "isTerminal", frame.get("is_terminal")
+                    ) is not False:
+                        terminal = frame
+                    if kind in _RETRY_FAILED_FRAMES or kind in _ASSISTANT_OUTPUT_FRAMES:
+                        provider_frames.append(frame)
                     try:
                         emit(frame)
                     except Exception as exc:  # noqa: BLE001 - emit is an injected boundary
                         emit_errors.append(str(exc))
-
                 unsubscribe = _register_listener(session.client, forward)
                 self._configure_turn(session, params)
                 message, images = _prompt_payload(
@@ -264,10 +276,13 @@ class ChudcodeSessionHost:
                     session.client.prompt(message, images=images or None)
                     run.started = True
                     pending_steers = tuple(run.pending_steers)
-                    run.pending_steers.clear()
 
                 for text in pending_steers:
-                    session.client.steer(text)
+                    with run.control_lock:
+                        session.client.steer(text)
+                        with self._lock:
+                            run.steers.add(text)
+                            run.pending_steers.remove(text)
                 # `wait_for_idle(timeout=None)` inherits the RPC client's own 60s default,
                 # which is a short-wait default and not a turn budget: nothing in CAD ever
                 # set `timeout`, so EVERY online turn was killed at 60 seconds with
@@ -285,23 +300,13 @@ class ChudcodeSessionHost:
                     else _TURN_ABSOLUTE_CAP_SECONDS
                 )
 
-                terminal = next(
-                    (
-                        frame
-                        for frame in reversed(frames)
-                        if frame.get("type") == "agent_end"
-                        and frame.get("isTerminal", frame.get("is_terminal"))
-                        is not False
-                    ),
-                    None,
-                )
                 if terminal is None:
                     raise RuntimeError(
                         "chudcode RPC turn ended without a terminal agent_end"
                     )
 
                 state = _safe_client_state(session.client)
-                provider_failure = _unrecovered_provider_failure(frames)
+                provider_failure = _unrecovered_provider_failure(provider_frames)
                 result = {
                     "ok": not emit_errors and provider_failure is None,
                     "run_id": run_id,
@@ -346,9 +351,10 @@ class ChudcodeSessionHost:
                         "Chudcode event unsubscription failed (%s)",
                         type(exc).__name__,
                     )
+            dispose = False
             with self._lock:
-                if session is not None and session.active_turns:
-                    session.active_turns -= 1
+                if session is not None:
+                    dispose = self._release_session_locked(session)
                 self._runs.pop(run_id, None)
                 completed = {
                     "run_id": run_id,
@@ -359,6 +365,8 @@ class ChudcodeSessionHost:
                 self._completed_runs[run_id] = completed
                 while len(self._completed_runs) > self._max_sessions * 8:
                     self._completed_runs.popitem(last=False)
+            if dispose:
+                _stop_client(session.client)
 
     def cancel(self, run_id) -> dict:
         run_key = _nonempty_string(run_id)
@@ -374,29 +382,28 @@ class ChudcodeSessionHost:
                     "cancelled": bool(completed and completed.get("cancelled")),
                     "active": False,
                 }
-            if run.cancel_requested:
-                return {
-                    "ok": True,
-                    "run_id": run_key,
-                    "cancelled": True,
-                    "active": True,
-                }
-            run.cancel_requested = True
-            client = run.client
-            should_abort = client is not None and run.started and not run.cancel_sent
+        return self._cancel_run(run)
+
+    def _cancel_run(self, run: _Run) -> dict:
+        run_key = run.run_id
+        with run.control_lock:
+            with self._lock:
+                run.cancel_requested = True
+                client = run.client
+                should_abort = client is not None and run.started and not run.cancel_sent
             if should_abort:
-                run.cancel_sent = True
-        if should_abort:
-            try:
-                client.abort()
-            except RuntimeError as exc:
-                return {
-                    "ok": False,
-                    "run_id": run_key,
-                    "cancelled": True,
-                    "active": True,
-                    "reason": str(exc),
-                }
+                try:
+                    client.abort()
+                except Exception as exc:  # noqa: BLE001 - RPC transport failures are retryable
+                    return {
+                        "ok": False,
+                        "run_id": run_key,
+                        "cancelled": True,
+                        "active": True,
+                        "reason": str(exc),
+                    }
+                with self._lock:
+                    run.cancel_sent = True
         return {"ok": True, "run_id": run_key, "cancelled": True, "active": True}
 
     def steer(self, run_id, text) -> dict:
@@ -416,30 +423,33 @@ class ChudcodeSessionHost:
                     "steered": False,
                     "active": False,
                 }
-            if message in run.steers:
-                return {
-                    "ok": True,
-                    "run_id": run_key,
-                    "steered": True,
-                    "active": True,
-                    "duplicate": True,
-                }
-            run.steers.add(message)
-            client = run.client
-            send_now = client is not None and run.started and not run.cancel_requested
-            if not send_now:
-                run.pending_steers.append(message)
-        if send_now:
-            try:
-                client.steer(message)
-            except RuntimeError as exc:
-                return {
-                    "ok": False,
-                    "run_id": run_key,
-                    "steered": False,
-                    "active": True,
-                    "reason": str(exc),
-                }
+        with run.control_lock:
+            with self._lock:
+                if message in run.steers or message in run.pending_steers:
+                    return {
+                        "ok": True,
+                        "run_id": run_key,
+                        "steered": True,
+                        "active": True,
+                        "duplicate": True,
+                    }
+                client = run.client
+                send_now = client is not None and run.started and not run.cancel_requested
+                if not send_now:
+                    run.pending_steers.append(message)
+            if send_now:
+                try:
+                    client.steer(message)
+                except Exception as exc:  # noqa: BLE001 - RPC transport failures are retryable
+                    return {
+                        "ok": False,
+                        "run_id": run_key,
+                        "steered": False,
+                        "active": True,
+                        "reason": str(exc),
+                    }
+                with self._lock:
+                    run.steers.add(message)
         return {
             "ok": True,
             "run_id": run_key,
@@ -508,24 +518,20 @@ class ChudcodeSessionHost:
         if key is None:
             return {"ok": True}
         with self._lock:
-            session = self._sessions.pop(key, None)
+            session = self._sessions.get(key)
             if session is None or session.closed:
                 return {"ok": True}
             session.closed = True
             runs = [run for run in self._runs.values() if run.session_id == key]
             for run in runs:
                 run.cancel_requested = True
+            dispose = self._dispose_if_idle_locked(session)
         for run in runs:
-            if run.client is not None and run.started and not run.cancel_sent:
-                run.cancel_sent = True
-                try:
-                    run.client.abort()
-                except Exception as exc:  # noqa: BLE001 - disposal must continue
-                    _LOG.warning(
-                        "Chudcode abort during session disposal failed (%s)",
-                        type(exc).__name__,
-                    )
-        _stop_client(session.client)
+            result = self._cancel_run(run)
+            if not result["ok"]:
+                _LOG.warning("Chudcode abort during session disposal failed")
+        if dispose:
+            _stop_client(session.client)
         return {"ok": True}
 
     def export_session(self, session_id, output_path=None) -> dict[str, Any]:
@@ -680,6 +686,7 @@ class ChudcodeSessionHost:
             self._service_client = None
             for session in sessions:
                 session.closed = True
+                session.dispose_started = True
             for run in self._runs.values():
                 run.cancel_requested = True
         for session in sessions:
@@ -790,10 +797,23 @@ class ChudcodeSessionHost:
             self._sessions.move_to_end(key)
             return session
 
+    def _release_session_locked(self, session: _Session) -> bool:
+        session.active_turns -= 1
+        return self._dispose_if_idle_locked(session)
+
+    def _dispose_if_idle_locked(self, session: _Session) -> bool:
+        if session.closed and session.active_turns == 0 and not session.dispose_started:
+            session.dispose_started = True
+            if self._sessions.get(session.session_id) is session:
+                self._sessions.pop(session.session_id)
+            return True
+        return False
+
     def _release_live_session(self, session: _Session) -> None:
         with self._lock:
-            if session.active_turns:
-                session.active_turns -= 1
+            dispose = self._release_session_locked(session)
+        if dispose:
+            _stop_client(session.client)
 
     def _get_or_create_session(
         self, session_id: str, params: Mapping[str, Any], resume_file: str | None
@@ -805,65 +825,110 @@ class ChudcodeSessionHost:
             else None
         )
         with self._lock:
-            existing = self._sessions.get(session_id)
+            if self._shutdown:
+                raise RuntimeError("chudcode session host is shut down")
+            existing = self._claim_existing_session_locked(
+                session_id, resume_file, workspace_dir
+            )
             if existing is not None:
-                if (
-                    resume_file
-                    and existing.resume_file
-                    and resume_file != existing.resume_file
-                ):
-                    raise RuntimeError(
-                        "cannot change chudcode_session_file on a live Chudware session"
-                    )
-                if existing.workspace_dir is None and workspace_dir is not None:
-                    existing.workspace_dir = workspace_dir
-                self._sessions.move_to_end(session_id)
-                existing.active_turns += 1
                 return existing
-
-            self._evict_for_new_session()
-            client = self._make_client(
-                params, no_session=False, resume_file=resume_file
-            )
-            try:
-                _start_client(client)
-                if resume_file:
-                    resume_path = Path(resume_file).expanduser()
-                    if not resume_path.is_file():
-                        raise RuntimeError(
-                            f"persisted Chudcode session file does not exist: {resume_path}"
+            guard = self._creating.setdefault(session_id, _CreationGuard())
+            guard.users += 1
+        try:
+            with guard.lock:
+                reserved = False
+                try:
+                    with self._lock:
+                        if self._shutdown:
+                            raise RuntimeError("chudcode session host is shut down")
+                        existing = self._claim_existing_session_locked(
+                            session_id, resume_file, workspace_dir
                         )
-                    client.switch_session(str(resume_path))
-            except (OSError, RuntimeError, ValueError):
-                _stop_client(client)
-                raise
-            session = _Session(
-                session_id,
-                client,
-                resume_file,
-                workspace_dir,
-                active_turns=1,
-            )
-            self._sessions[session_id] = session
-            return session
+                        if existing is not None:
+                            return existing
+                        victim = self._evict_for_new_session()
+                        self._reserved_creations += 1
+                        reserved = True
+                    if victim is not None:
+                        _stop_client(victim.client)
+                    client = self._make_client(
+                        params, no_session=False, resume_file=resume_file
+                    )
+                    try:
+                        _start_client(client)
+                        if resume_file:
+                            resume_path = Path(resume_file).expanduser()
+                            if not resume_path.is_file():
+                                raise RuntimeError(
+                                    f"persisted Chudcode session file does not exist: {resume_path}"
+                                )
+                            client.switch_session(str(resume_path))
+                        with self._lock:
+                            if self._shutdown:
+                                raise RuntimeError("chudcode session host is shut down")
+                            session = _Session(
+                                session_id,
+                                client,
+                                resume_file,
+                                workspace_dir,
+                                active_turns=1,
+                            )
+                            self._sessions[session_id] = session
+                            self._reserved_creations -= 1
+                            reserved = False
+                        return session
+                    except Exception:  # noqa: BLE001 - even RPC-specific errors need teardown
+                        _stop_client(client)
+                        raise
+                finally:
+                    if reserved:
+                        with self._lock:
+                            self._reserved_creations -= 1
+        finally:
+            with self._lock:
+                guard.users -= 1
+                if not guard.users:
+                    self._creating.pop(session_id, None)
 
-    def _evict_for_new_session(self) -> None:
-        while len(self._sessions) >= self._max_sessions:
-            victim_key = next(
-                (
-                    key
-                    for key, value in self._sessions.items()
-                    if value.active_turns == 0 and not value.closed
-                ),
-                None,
+    def _claim_existing_session_locked(
+        self, session_id: str, resume_file: str | None, workspace_dir: str | None
+    ) -> _Session | None:
+        existing = self._sessions.get(session_id)
+        if existing is None:
+            return None
+        if existing.closed:
+            raise RuntimeError("chudcode RPC session is closing")
+        if (
+            resume_file
+            and existing.resume_file
+            and resume_file != existing.resume_file
+        ):
+            raise RuntimeError(
+                "cannot change chudcode_session_file on a live Chudware session"
             )
-            if victim_key is None:
-                raise RuntimeError(
-                    "all bounded Chudcode RPC sessions are currently active"
-                )
-            victim = self._sessions.pop(victim_key)
-            victim.closed = True
-            _stop_client(victim.client)
+        if existing.workspace_dir is None and workspace_dir is not None:
+            existing.workspace_dir = workspace_dir
+        self._sessions.move_to_end(session_id)
+        existing.active_turns += 1
+        return existing
+
+    def _evict_for_new_session(self) -> _Session | None:
+        if len(self._sessions) + self._reserved_creations < self._max_sessions:
+            return None
+        victim_key = next(
+            (
+                key
+                for key, value in self._sessions.items()
+                if value.active_turns == 0 and not value.closed
+            ),
+            None,
+        )
+        if victim_key is None:
+            raise RuntimeError("all bounded Chudcode RPC sessions are currently active")
+        victim = self._sessions.pop(victim_key)
+        victim.closed = True
+        victim.dispose_started = True
+        return victim
 
     def _make_client(
         self,
@@ -890,12 +955,9 @@ class ChudcodeSessionHost:
         kwargs: dict[str, Any] = {
             "no_session": no_session,
             "rpc_defaults": True,
-            # RpcClient defaults to 10_000 retained frames and raises "Event history
-            # limit was exceeded while waiting for agent_end" once a turn streams more
-            # than that — a 65-minute ME490 mission turn hit it and was killed mid-write.
-            # run_turn already keeps every frame of the turn in its own list, so the
-            # client's ring only needs to outlast the longest turn; a mission runs for
-            # hours and streams every text delta, so bound it generously.
+            # RpcClient's default 10_000-frame history raises during long missions;
+            # this transport limit must outlast a turn even though run_turn only
+            # retains terminal and provider-recovery frames.
             "max_event_history": _event_history_limit_from_env(),
         }
         if binary is not None:
@@ -1693,7 +1755,7 @@ _RETRY_FAILED_FRAMES = frozenset({"auto_retry_end", "retry_end", "retry_failed"}
 _ASSISTANT_OUTPUT_FRAMES = frozenset({"message_end", "message_complete", "tool_execution_end"})
 
 
-def _unrecovered_provider_failure(frames: list[dict[str, Any]]) -> str | None:
+def _unrecovered_provider_failure(frames: Reversible[dict[str, Any]]) -> str | None:
     """Return the provider error when a failed retry was the turn's last real event.
 
     A retry that fails and is then followed by assistant output (a later message or

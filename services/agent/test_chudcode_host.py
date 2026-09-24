@@ -411,6 +411,36 @@ def test_frames_sharing_an_object_identity_are_all_forwarded():
     assert [f["toolCallId"] for f in ends] == [f"toolu_{name}" for name in calls]
 
 
+def test_failed_provider_retry_survives_long_lifecycle_tail():
+    class LongStream(FakeClient):
+        def wait_for_idle(self, timeout=None):
+            self.idle_timeouts.append(timeout)
+            events = [
+                {"type": "auto_retry_end", "success": False, "error": "quota"}
+            ]
+            events.extend({"type": "agent_start"} for _ in range(1_000))
+            events.append({"type": "agent_end", "messages": [], "isTerminal": True})
+            for event in events:
+                for listener in tuple(self.listeners):
+                    listener(event)
+            return ()
+
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(
+        client_factory=lambda **kw: factory.clients.append(LongStream(factory, **kw))
+        or factory.clients[-1]
+    )
+    result = host.run_turn(
+        {"request": "Do the work", "session_id": "long", "run_id": "r-long"},
+        lambda _frame: None,
+    )
+
+    assert result["ok"] is False
+    assert result["stop_reason"] == "provider_error"
+    assert "quota" in result["reason"]
+    assert result["terminal"]["isTerminal"] is True
+
+
 def test_rejects_a_runtime_that_did_not_negotiate_protocol_v2():
     factory = FakeFactory(protocol_version=1)
     host = ChudcodeSessionHost(client_factory=factory)
@@ -438,6 +468,60 @@ def test_lru_disposes_only_the_least_recent_idle_session(monkeypatch):
     assert factory.clients[2].stop_count == 0
 
 
+def test_spawning_another_session_does_not_block_control_or_duplicate_creators():
+    start_entered = threading.Event()
+    finish_start = threading.Event()
+
+    class SlowStart(FakeClient):
+        def start(self):
+            start_entered.set()
+            assert finish_start.wait(2)
+            return super().start()
+
+    factory = FakeFactory(block=True)
+
+    def make_client(**kwargs):
+        client_type = FakeClient if not factory.clients else SlowStart
+        client = client_type(factory, **kwargs)
+        factory.clients.append(client)
+        return client
+
+    host = ChudcodeSessionHost(client_factory=make_client)
+    first = threading.Thread(target=lambda: run(host, "first", "r-first"), daemon=True)
+    first.start()
+    while not factory.clients:
+        time.sleep(0.001)
+    assert factory.clients[0].prompted.wait(1)
+
+    second = threading.Thread(target=lambda: run(host, "second", "r-second"), daemon=True)
+    also_second = threading.Thread(
+        target=lambda: run(host, "second", "r-second-2"), daemon=True
+    )
+    second.start()
+    assert start_entered.wait(1)
+    also_second.start()
+    control_done = threading.Event()
+
+    def control_first():
+        assert host.status(run_id="r-first")["active"]
+        assert host.steer("r-first", "continue")["ok"]
+        assert host.cancel("r-first")["ok"]
+        control_done.set()
+
+    control = threading.Thread(target=control_first, daemon=True)
+    control.start()
+    try:
+        assert control_done.wait(0.5)
+        assert len(factory.clients) == 2
+    finally:
+        finish_start.set()
+    factory.clients[1].release.set()
+    for thread in (first, second, also_second, control):
+        thread.join(1)
+        assert not thread.is_alive()
+    assert len(factory.clients) == 2
+
+
 def test_resumes_explicit_persisted_chudcode_session_file(tmp_path):
     persisted = tmp_path / "persisted.jsonl"
     persisted.write_text("{}\n", encoding="utf-8")
@@ -456,6 +540,33 @@ def test_resumes_explicit_persisted_chudcode_session_file(tmp_path):
         0
     ].calls
     assert factory.clients[0].kwargs["session_dir"] == str(tmp_path)
+
+
+def test_failed_session_switch_stops_spawned_client_before_retry(tmp_path):
+    persisted = tmp_path / "persisted.jsonl"
+    persisted.write_text("{}\n", encoding="utf-8")
+
+    class FailingSwitch(FakeClient):
+        def switch_session(self, session_path):
+            self.calls.append(("switch_session", {"sessionPath": session_path}))
+            raise LookupError("transient session switch failure")
+
+    factory = FakeFactory()
+    def make_client(**kwargs):
+        client_type = FailingSwitch if not factory.clients else FakeClient
+        client = client_type(factory, **kwargs)
+        factory.clients.append(client)
+        return client
+
+    host = ChudcodeSessionHost(client_factory=make_client)
+    failed, _ = run(host, "resume", "r1", chudcode_session_file=str(persisted))
+    retried, _ = run(host, "resume", "r2", chudcode_session_file=str(persisted))
+
+    assert failed["ok"] is False
+    assert "transient session switch failure" in failed["reason"]
+    assert factory.clients[0].stop_count == 1
+    assert retried["ok"] is True
+    assert factory.clients[1].stop_count == 0
 
 
 def test_waits_past_nonterminal_agent_end_until_terminal_frame():
@@ -544,6 +655,59 @@ def test_cancel_and_steer_are_immediate_and_idempotent_during_terminal_wait():
     }
     assert host.cancel("run-race")["active"] is False
     assert host.steer("run-race", "too late")["steered"] is False
+
+
+def test_failed_abort_and_steer_retry_transport_instead_of_claiming_success():
+    class FlakyControl(FakeClient):
+        def __init__(self, factory, **kwargs):
+            super().__init__(factory, **kwargs)
+            self.fail_abort = True
+            self.fail_steer = True
+
+        def abort(self):
+            if self.fail_abort:
+                self.fail_abort = False
+                self.calls.append(("abort", {}))
+                raise LookupError("abort connection interrupted")
+            super().abort()
+
+        def steer(self, message):
+            if self.fail_steer:
+                self.fail_steer = False
+                self.calls.append(("steer", {"message": message}))
+                raise LookupError("steer connection interrupted")
+            super().steer(message)
+
+    factory = FakeFactory(block=True)
+    def make_client(**kwargs):
+        client = FlakyControl(factory, **kwargs)
+        factory.clients.append(client)
+        return client
+
+    host = ChudcodeSessionHost(client_factory=make_client)
+    outcome = {}
+    thread = threading.Thread(
+        target=lambda: outcome.setdefault("turn", run(host, "flaky", "r-flaky")),
+        daemon=True,
+    )
+    thread.start()
+    while not factory.clients:
+        time.sleep(0.001)
+    client = factory.clients[0]
+    assert client.prompted.wait(1)
+
+    assert host.steer("r-flaky", "Try another approach")["ok"] is False
+    assert host.steer("r-flaky", "Try another approach")["steered"] is True
+    assert host.steer("r-flaky", "Try another approach")["duplicate"] is True
+    assert host.cancel("r-flaky")["ok"] is False
+    assert host.cancel("r-flaky")["ok"] is True
+    assert host.cancel("r-flaky")["ok"] is True
+    thread.join(1)
+
+    assert not thread.is_alive()
+    assert outcome["turn"][0]["cancelled"] is True
+    assert call_names(client).count("steer") == 2
+    assert call_names(client).count("abort") == 2
 
 
 def test_forwards_events_attachments_callbacks_and_all_turn_settings(tmp_path):
@@ -721,6 +885,43 @@ def test_close_and_shutdown_stop_each_process_once_and_reject_new_work():
     assert [client.stop_count for client in factory.clients] == [1, 1]
     result, _ = run(host, "c", "c1")
     assert result == {"ok": False, "reason": "chudcode session host is shut down"}
+
+
+def test_close_defers_disposal_until_inflight_export_finishes(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowExport(FakeClient):
+        def export_html(self, output_path=None):
+            entered.set()
+            assert release.wait(2)
+            return super().export_html(output_path)
+
+    factory = FakeFactory()
+    def make_client(**kwargs):
+        client = SlowExport(factory, **kwargs)
+        factory.clients.append(client)
+        return client
+
+    host = ChudcodeSessionHost(client_factory=make_client)
+    assert run(host, "export", workspace_dir=str(project))[0]["ok"]
+    outcome = {}
+    thread = threading.Thread(
+        target=lambda: outcome.setdefault("export", host.export_session("export")),
+        daemon=True,
+    )
+    thread.start()
+    assert entered.wait(1)
+    assert host.close_session("export") == {"ok": True}
+    assert factory.clients[0].stop_count == 0
+    release.set()
+    thread.join(1)
+
+    assert not thread.is_alive()
+    assert outcome["export"]["ok"] is True
+    assert factory.clients[0].stop_count == 1
 
 
 def test_generic_transient_calls_bound_oauth_ui_and_cancel_interactive_requests():

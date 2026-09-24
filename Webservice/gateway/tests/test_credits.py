@@ -1,6 +1,7 @@
 """Commercial credit invariants: idempotency, refusal, actuals, and BYOK."""
 from __future__ import annotations
 
+import sys
 import asyncio
 from types import SimpleNamespace
 
@@ -192,99 +193,77 @@ def test_zero_ceiling_is_unlimited_but_one_credit_ceiling_throttles():
     }
 
 
-def test_worker_refusal_happens_before_mock_provider_call(monkeypatch):
+def test_worker_refusal_happens_before_chudcode_host_call(monkeypatch):
     _account(balance=100)
     _rates(("vendor/expensive", "0.000100", "0.000100"))
 
-    class Provider:
-        name = "mock"
-        model = "vendor/expensive"
 
-        def __init__(self):
-            self.calls = 0
+    class RefusingHost:
+        def run_turn(self, *_args):
+            raise AssertionError("unaffordable turn reached Chudcode")
 
-        def complete(self, *_args, **_kwargs):
-            self.calls += 1
-            return "should not run"
-
-    provider = Provider()
-    from services.agent import config as agent_config
-    from services.agent import mission_dispatch
-
-    monkeypatch.setattr(agent_config, "get_provider", lambda *a, **k: provider)
-    monkeypatch.setattr(
-        mission_dispatch,
-        "run_linear_role_turn",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("turn dispatched")),
-    )
+    monkeypatch.setattr(worker_rpc, "get_default_chudcode_host", lambda: RefusingHost())
     out = worker_rpc._agent_admin_turn(
         {
             "request": "make a bracket",
             "provider": "mock",
-            "model": provider.model,
-            "api_key": "operator-key",
-            "_chudware_actor": _rated_actor(provider.model),
+            "model": "vendor/expensive",
+            "_chudware_actor": _rated_actor("vendor/expensive"),
         },
         lambda _event: None,
     )
     assert out == {"ok": False, "reason": "insufficient_credits"}
-    assert provider.calls == 0
 
 
 def test_ample_pooled_turn_records_reported_actuals(monkeypatch):
     _account(balance=100)
     _rates(("vendor/cheap", "0.000001", "0.000002"))
 
-    class Provider:
-        name = "mock"
-        model = "vendor/cheap"
-
+    class UsageHost:
         def __init__(self):
-            self.calls = 0
+            self.turns = []
 
-        def complete(self, *_args, **_kwargs):
-            self.calls += 1
-            token_usage.record_usage(
-                provider=self.name,
-                model=self.model,
-                prompt_tokens=100,
-                completion_tokens=100,
-            )
-            return "done"
+        def run_turn(self, params, emit):
+            self.turns.append(params)
+            emit({
+                "type": "usage",
+                "provider": "mock",
+                "model": "vendor/cheap",
+                "promptTokens": 100,
+                "completionTokens": 100,
+                "totalTokens": 200,
+            })
+            terminal = {"type": "agent_end", "isTerminal": True}
+            emit(terminal)
+            return {"ok": True, "result": "done", "terminal": terminal}
 
-    provider = Provider()
-    from services.agent import config as agent_config
-    from services.agent import mission_dispatch
+    monkeypatch.setitem(
+        sys.modules, "services.mcp.cad_common",
+        SimpleNamespace(save_touched_docs=lambda: {
+            "saved": [], "errors": [], "persistence_failure": None,
+        }),
+    )
 
-    def get_provider(*_args, **_kwargs):
-        return provider
-
-    def one_turn(_request, _role, bound, **_kwargs):
-        bound.complete("", [], max_tokens=8)
-        return {"success": True, "stop_reason": "confirmed", "result": {}}
-
-    monkeypatch.setattr(agent_config, "get_provider", get_provider)
-    monkeypatch.setattr(mission_dispatch, "run_linear_role_turn", one_turn)
+    host = UsageHost()
+    monkeypatch.setattr(worker_rpc, "get_default_chudcode_host", lambda: host)
     events = []
     out = worker_rpc._agent_admin_turn(
         {
             "request": "cheap turn",
             "provider": "mock",
-            "model": provider.model,
-            "api_key": "operator-key",
-            "_chudware_actor": _rated_actor(provider.model),
+            "model": "vendor/cheap",
+            "_chudware_actor": _rated_actor("vendor/cheap"),
         },
         events.append,
     )
     assert out["ok"] is True
-    assert provider.calls == 1
+    assert len(host.turns) == 1
     usage = next(event for event in events if event.get("kind") == "agent.provider_usage")
-    assert set(usage) == {
-        "kind", "provider", "model", "prompt_tokens", "completion_tokens",
-        "total_tokens", "context_tokens", "source",
-    }
+    assert usage["model"] == "vendor/cheap"
+    assert usage["prompt_tokens"] == 100
+    assert usage["completion_tokens"] == 100
     credits.record_spend(
-        _rated_actor(provider.model),
+        _rated_actor("vendor/cheap"),
         model=usage["model"],
         prompt_tokens=usage["prompt_tokens"],
         completion_tokens=usage["completion_tokens"],

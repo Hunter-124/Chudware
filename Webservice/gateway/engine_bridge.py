@@ -10,10 +10,14 @@ Backpressure is natural: each side awaits the other's write.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import threading
+import time
+from collections import OrderedDict
 from collections.abc import Mapping
 from pathlib import PurePosixPath
 from typing import Any
@@ -57,6 +61,71 @@ _active_bridges = 0
 # ASGI test runners; production never awaits inside either mutation.
 _bridge_owners: dict[str, int] = {}
 _bridge_lock = threading.Lock()
+
+# HTTP mesh fetches outlive their WS bridge. Only daemon-confirmed document
+# grants enter this process-local, bounded capability table.
+_mesh_grants: OrderedDict[tuple[str, str], float] = OrderedDict()
+_mesh_generation: tuple[int, int, int] | None = None
+_mesh_grants_lock = threading.Lock()
+_MESH_GRANT_TTL = 24 * 60 * 60
+_MESH_GRANT_LIMIT = 8192
+_FILE_MESH_RE = re.compile(r"^(?P<doc>[A-Za-z0-9_.-]{1,180})_r\d+\.aicm$")
+_SHM_MESH_RE = re.compile(r"^chudware_(?P<doc>[A-Za-z0-9_.-]{1,180})_r\d+$")
+_FILE_MESH_DIR = PurePosixPath("/tmp/chudware_cpp_docs")
+_SHM_MESH_DIR = PurePosixPath("/dev/shm")
+
+
+def mesh_doc_id(name: str, *, shm: bool = False) -> str | None:
+    match = (_SHM_MESH_RE if shm else _FILE_MESH_RE).fullmatch(name)
+    return match.group("doc") if match else None
+
+
+def _mesh_socket_generation() -> tuple[int, int, int] | None:
+    try:
+        stat = os.stat(settings.webd_socket)
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino, stat.st_ctime_ns
+
+
+def grant_mesh_document(email: str, doc_id: str) -> None:
+    global _mesh_generation
+    generation = _mesh_socket_generation()
+    if generation is None:
+        return
+    now = time.monotonic()
+    key = (email.strip().lower(), doc_id)
+    with _mesh_grants_lock:
+        if generation != _mesh_generation:
+            _mesh_grants.clear()
+            _mesh_generation = generation
+        for old_key, expires in list(_mesh_grants.items()):
+            if expires <= now:
+                del _mesh_grants[old_key]
+        _mesh_grants.pop(key, None)
+        _mesh_grants[key] = now + _MESH_GRANT_TTL
+        while len(_mesh_grants) > _MESH_GRANT_LIMIT:
+            _mesh_grants.popitem(last=False)
+
+
+def mesh_document_authorized(email: str, doc_id: str) -> bool:
+    global _mesh_generation
+    generation = _mesh_socket_generation()
+    if generation is None:
+        return False
+    key = (email.strip().lower(), doc_id)
+    now = time.monotonic()
+    with _mesh_grants_lock:
+        if generation != _mesh_generation:
+            _mesh_grants.clear()
+            _mesh_generation = generation
+            return False
+        expiry = _mesh_grants.get(key, 0)
+        if expiry <= now:
+            _mesh_grants.pop(key, None)
+            return False
+        _mesh_grants.move_to_end(key)
+        return True
 
 
 def active_bridge_count() -> int:
@@ -141,7 +210,10 @@ def _collect_paths(node: Any, found: list[str]) -> None:
             _collect_paths(item, found)
 
 
-def path_violation(line: str, allowed_roots: list[PurePosixPath]) -> str | None:
+def path_violation(
+    line: str, allowed_roots: list[PurePosixPath],
+    document_capabilities: set[str] | frozenset[str] = frozenset(),
+) -> str | None:
     """Return a path value that is relative or outside the caller's roots.
 
     Daemon path-bearing RPC fields must always carry canonical absolute paths:
@@ -162,7 +234,19 @@ def path_violation(line: str, allowed_roots: list[PurePosixPath]) -> str | None:
         # may legitimately not exist yet (doc_save), and resolving would do
         # filesystem I/O plus symlink following on the event loop.
         candidate = PurePosixPath(os.path.normpath(raw))
-        if not any(candidate == root or root in candidate.parents for root in allowed_roots):
+        # Broad /tmp and /dev/shm roots must never grant access to arbitrary
+        # daemon-host files. Personal workspace roots may themselves live in
+        # /tmp (development and tests), and remain authorized.
+        if any(candidate == root or root in candidate.parents for root in allowed_roots
+               if root not in {PurePosixPath("/tmp"), _SHM_MESH_DIR}):
+            continue
+        if candidate.parent == _FILE_MESH_DIR:
+            doc_id = mesh_doc_id(candidate.name)
+        elif candidate.parent == _SHM_MESH_DIR:
+            doc_id = mesh_doc_id(candidate.name, shm=True)
+        else:
+            return raw
+        if doc_id is None or doc_id not in document_capabilities:
             return raw
     return None
 
@@ -531,6 +615,7 @@ def _authorize_daemon_response(
     pending: dict[Any, tuple[str, set[str]]],
     capabilities: set[str],
     allowed_roots: list[PurePosixPath],
+    account_email: str = "",
 ) -> str | None:
     """Update capabilities and filter registry output; None drops an unsafe reply."""
     try:
@@ -564,6 +649,8 @@ def _authorize_daemon_response(
                 continue
             if doc_id in capabilities or _owned_doc_entry(entry, allowed_roots):
                 capabilities.add(doc_id)
+                if account_email:
+                    grant_mesh_document(account_email, doc_id)
                 kept.append(entry)
         result["docs"] = kept
         return json.dumps(message, separators=(",", ":"))
@@ -574,6 +661,8 @@ def _authorize_daemon_response(
         if not isinstance(doc_id, str) or not doc_id:
             return None
         capabilities.add(doc_id)
+        if account_email:
+            grant_mesh_document(account_email, doc_id)
     elif method == "doc_close":
         capabilities.difference_update(request_ids)
     return line
@@ -711,6 +800,10 @@ def _sanitize_agent_rpc(line: str, actor: Mapping[str, Any]) -> str:
         "credits_remaining": max(0, int(actor["credits_remaining"])),
         "key_source": str(actor["key_source"]),
     }
+    if injected["key_source"] == "byok" and actor.get("_byok_validated"):
+        injected["_byok_key_sha256"] = hashlib.sha256(
+            str(actor["_byok_api_key"]).encode("utf-8")
+        ).hexdigest()
     rate = actor.get("_rate")
     if isinstance(rate, Mapping):
         injected["_rate"] = {
@@ -794,15 +887,13 @@ async def engine_ws(ws: WebSocket) -> None:
             return
         log.info("engine bridge open: %s -> %s", user.email, sock)
 
-        # The absolute paths this caller may name in a daemon RPC: their own
-        # workspace + bucket trees, plus the shared scratch dirs the client uses
-        # for mesh/tess payloads (those carry no other account's data).
+        # Per-account roots are the only general-purpose path capabilities.
+        # Scratch handoffs are admitted separately by exact document/revision
+        # naming and a bridge-granted document capability.
         slug = user_slug(user.email)
         personal_roots = [
             PurePosixPath(os.path.normpath(str(settings.user_workspace_root(slug)))),
             PurePosixPath(os.path.normpath(str(settings.user_bucket_root(slug)))),
-            PurePosixPath("/dev/shm"),
-            PurePosixPath("/tmp"),
         ]
         allowed_roots = personal_roots
         active_actor: dict[str, Any] | None = None
@@ -900,7 +991,7 @@ async def engine_ws(ws: WebSocket) -> None:
                         params["options"] = options
                     options["workspace_dir"] = str(workspace_root)
                     line = json.dumps(message, separators=(",", ":"))
-                offender = path_violation(line, allowed_roots)
+                offender = path_violation(line, allowed_roots, document_capabilities)
                 if offender is not None:
                     log.warning(
                         "engine bridge %s: rejected out-of-jail path %r",
@@ -1021,7 +1112,8 @@ async def engine_ws(ws: WebSocket) -> None:
                     break
                 line = raw.decode("utf-8", errors="replace").rstrip("\n")
                 authorized = _authorize_daemon_response(
-                    line, pending_requests, document_capabilities, allowed_roots
+                    line, pending_requests, document_capabilities, allowed_roots,
+                    user.email,
                 )
                 if authorized is None:
                     log.warning(

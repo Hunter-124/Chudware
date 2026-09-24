@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 import sys
 from pathlib import Path
 
@@ -51,6 +52,8 @@ def chat_env(pg, tmp_path, monkeypatch, reload_settings):
     accounts.ensure_account("alice@example.com", display="Alice")
     accounts.set_status("alice@example.com", "active", decided_by="test")
     accounts.ensure_account("bob@example.com", display="Bob")
+    accounts.ensure_account("charlie@example.com", display="Charlie")
+    accounts.set_status("charlie@example.com", "active", decided_by="test")
     accounts.set_status("bob@example.com", "active", decided_by="test")
     monkeypatch.setattr(
         chat,
@@ -91,6 +94,35 @@ def _make_app(chat, user: _User | None = None):
     return app
 
 
+def _team(owner: str, member: str | None = None) -> str:
+    import db  # type: ignore
+
+    org_id, team_id = str(uuid.uuid4()), str(uuid.uuid4())
+    with db.tx() as cur:
+        cur.execute(
+            "INSERT INTO organizations (id, name, created_by) VALUES (%s, %s, %s)",
+            (org_id, "Test team", owner),
+        )
+        cur.execute(
+            "INSERT INTO org_members (org_id, email, role) VALUES (%s, %s, 'owner')",
+            (org_id, owner),
+        )
+        cur.execute(
+            "INSERT INTO teams (id, org_id, name, is_general) VALUES (%s, %s, 'General', TRUE)",
+            (team_id, org_id),
+        )
+        if member:
+            cur.execute(
+                "INSERT INTO org_members (org_id, email, role) VALUES (%s, %s, 'member')",
+                (org_id, member),
+            )
+            cur.execute(
+                "INSERT INTO team_members (team_id, email, role) VALUES (%s, %s, 'member')",
+                (team_id, member),
+            )
+    return team_id
+
+
 def test_history_roundtrip(chat_env):
     chat, config, data = chat_env
     from fastapi.testclient import TestClient
@@ -102,20 +134,20 @@ def test_history_roundtrip(chat_env):
         assert r.json()["messages"] == []
 
         async def seed():
-            await chat.save_message("alice@example.com", "Alice", "hello history")
-            await chat.save_message("bob@example.com", "Bob", "second")
+            await chat.save_message("personal:alice@example.com", "alice@example.com", "Alice", "hello history")
+            await chat.save_message("personal:bob@example.com", "bob@example.com", "Bob", "second")
 
         asyncio.run(seed())
 
         r = client.get("/api/chat/history?limit=10")
         assert r.status_code == 200
         msgs = r.json()["messages"]
-        assert len(msgs) == 2
+        assert len(msgs) == 1
         assert msgs[0]["text"] == "hello history"
         assert msgs[0]["user"] == "alice@example.com"
         assert msgs[0]["display"] == "Alice"
-        assert msgs[1]["text"] == "second"
-        assert msgs[1]["user"] == "bob@example.com"
+        with TestClient(_make_app(chat, _User("bob@example.com", "Bob"))) as bob:
+            assert [m["text"] for m in bob.get("/api/chat/history").json()["messages"]] == ["second"]
         # Persisted, not merely fanned out in memory.
         import db  # type: ignore
 
@@ -130,15 +162,16 @@ def test_ws_broadcast_and_presence(chat_env):
 
     # Identity comes from middleware-attached state.user only — chat.py has
     # no unauthenticated query-param fallback (impersonation primitive).
+    team_id = _team("alice@example.com", "bob@example.com")
     app_a = _make_app(chat, user=_User("alice@example.com", "Alice"))
     app_b = _make_app(chat, user=_User("bob@example.com", "Bob"))
     with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
-        with client_a.websocket_connect("/ws/chat") as ws_a:
+        with client_a.websocket_connect(f"/ws/chat?team={team_id}") as ws_a:
             snap = ws_a.receive_json()
             assert snap["type"] == "presence"
             assert any(u["email"] == "alice@example.com" for u in snap["users"])
 
-            with client_b.websocket_connect("/ws/chat") as ws_b:
+            with client_b.websocket_connect(f"/ws/chat?team={team_id}") as ws_b:
                 snap_b = ws_b.receive_json()
                 assert snap_b["type"] == "presence"
                 emails = {u["email"] for u in snap_b["users"]}
@@ -179,10 +212,49 @@ def test_ws_broadcast_and_presence(chat_env):
             assert leave["type"] == "leave"
             assert leave["user"] == "bob@example.com"
 
-        r = client_a.get("/api/chat/history")
+        r = client_a.get("/api/chat/history", params={"team": team_id})
         assert r.status_code == 200
         texts = [m["text"] for m in r.json()["messages"]]
         assert "hello lab" in texts
+
+
+def test_chat_teams_never_expose_messages_or_presence_to_unrelated_accounts(chat_env):
+    chat, _, _ = chat_env
+    from fastapi.testclient import TestClient
+
+    team_id = _team("alice@example.com", "bob@example.com")
+    other_team = _team("charlie@example.com")
+    app_a = _make_app(chat, _User("alice@example.com", "Alice"))
+    app_b = _make_app(chat, _User("bob@example.com", "Bob"))
+    app_c = _make_app(chat, _User("charlie@example.com", "Charlie"))
+    with TestClient(app_a) as alice, TestClient(app_b) as bob, TestClient(app_c) as charlie:
+        with alice.websocket_connect(f"/ws/chat?team={team_id}") as a:
+            assert [u["email"] for u in a.receive_json()["users"]] == ["alice@example.com"]
+            with bob.websocket_connect(f"/ws/chat?team={team_id}") as b:
+                assert {u["email"] for u in b.receive_json()["users"]} == {
+                    "alice@example.com", "bob@example.com"
+                }
+                assert a.receive_json()["type"] == "join"
+                with charlie.websocket_connect(f"/ws/chat?team={other_team}") as c:
+                    assert [u["email"] for u in c.receive_json()["users"]] == ["charlie@example.com"]
+                    a.send_json({"text": "private team design"})
+                    assert a.receive_json()["text"] == "private team design"
+                    assert b.receive_json()["text"] == "private team design"
+                    c.send_json({"text": "other team note"})
+                    assert c.receive_json()["text"] == "other team note"
+                    assert [
+                        m["text"] for m in charlie.get(
+                            "/api/chat/history", params={"team": other_team}
+                        ).json()["messages"]
+                    ] == ["other team note"]
+                    assert [
+                        m["text"] for m in bob.get(
+                            "/api/chat/history", params={"team": team_id}
+                        ).json()["messages"]
+                    ] == ["private team design"]
+                    assert charlie.get(
+                        "/api/chat/history", params={"team": team_id}
+                    ).status_code == 404
 
 
 def test_ws_suspension_closes_before_next_message_is_saved(chat_env):
@@ -202,7 +274,7 @@ def test_ws_suspension_closes_before_next_message_is_saved(chat_env):
             with pytest.raises(WebSocketDisconnect) as exc:
                 ws.receive_json()
             assert exc.value.code == 4403
-    assert asyncio.run(chat.load_history()) == []
+    assert asyncio.run(chat.load_history("personal:alice@example.com")) == []
 
 
 def test_presence_refcount(chat_env):
@@ -210,12 +282,13 @@ def test_presence_refcount(chat_env):
 
     async def run():
         p = chat.Presence()
-        assert await p.join("a@x.com", "A") is True
-        assert await p.join("a@x.com", "A") is False
-        assert await p.list() == [{"email": "a@x.com", "display": "A"}]
-        assert await p.leave("a@x.com") is False
-        assert await p.list() == [{"email": "a@x.com", "display": "A"}]
-        assert await p.leave("a@x.com") is True
-        assert await p.list() == []
+        assert await p.join("personal:a@x.com", "a@x.com", "A") is True
+        assert await p.join("personal:b@x.com", "b@x.com", "B") is True
+        assert await p.join("personal:a@x.com", "a@x.com", "A") is False
+        assert await p.list("personal:a@x.com") == [{"email": "a@x.com", "display": "A"}]
+        assert await p.leave("personal:a@x.com", "a@x.com") is False
+        assert await p.list("personal:a@x.com") == [{"email": "a@x.com", "display": "A"}]
+        assert await p.leave("personal:a@x.com", "a@x.com") is True
+        assert await p.list("personal:a@x.com") == []
 
     asyncio.run(run())

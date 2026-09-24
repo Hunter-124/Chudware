@@ -24,7 +24,7 @@ from engine_bridge import path_violation  # noqa: E402
 
 ALICE = PurePosixPath("/srv/ws/users/alice~40ua.edu")
 BOB = PurePosixPath("/srv/ws/users/bob~40ua.edu")
-ROOTS = [ALICE, PurePosixPath("/srv/bucket/users/alice~40ua.edu"), PurePosixPath("/tmp")]
+ROOTS = [ALICE, PurePosixPath("/srv/bucket/users/alice~40ua.edu")]
 
 
 def rpc(method: str, params: object, call_id: int = 1) -> str:
@@ -44,6 +44,10 @@ def rpc(method: str, params: object, call_id: int = 1) -> str:
         rpc("doc_open", {"path": "/etc/passwd"}),
         rpc("doc_open", {"path": "/home/liveuser/.ssh/id_ed25519"}),
         rpc("export_file", {"out_path": "/home/liveuser/chudware-web-data/gateway.env"}),
+        # Shared scratch paths are never general-purpose file roots.
+        rpc("doc_open", {"path": "/tmp/other-account.step+"}),
+        rpc("doc_render", {"aicm_path": "/tmp/mesh-1234.aicm"}),
+        rpc("doc_render", {"aicm_path": "/dev/shm/chudware_doc-cpp0000002a_r1"}),
         # Nested inside a params sub-object / list — the walk must be recursive.
         rpc("batch", {"ops": [{"op": "open", "src": f"{BOB}/x.step+"}]}),
         rpc("agent_run_v2", {"ctx": {"project_dir": "/home/liveuser"}}),
@@ -66,8 +70,6 @@ def test_cross_tenant_paths_are_rejected(line: str) -> None:
         rpc("doc_open", {"path": f"{ALICE}/part.step+"}),
         rpc("doc_open", {"path": f"{ALICE}/nested/deep/part.step+"}),
         rpc("doc_save", {"path": "/srv/bucket/users/alice~40ua.edu/out.step+"}),
-        # Scratch space used for mesh/tess payloads.
-        rpc("doc_render", {"aicm_path": "/tmp/mesh-1234.aicm"}),
         # Canonical absolute paths are required for every path-bearing field.
         # Non-path payloads must pass through untouched.
         rpc("hello", {"client": "gui"}),
@@ -89,3 +91,17 @@ def test_root_itself_is_allowed_but_its_prefix_sibling_is_not() -> None:
     assert path_violation(rpc("doc_open", {"path": str(ALICE)}), ROOTS) is None
     sibling = rpc("doc_open", {"path": "/srv/ws/users/alice~40ua.edu-evil/x.step+"})
     assert path_violation(sibling, ROOTS) is not None
+
+
+def test_mesh_handoffs_need_this_connections_document_capability() -> None:
+    file = rpc("doc_render", {"aicm_path": "/tmp/chudware_cpp_docs/doc-cpp0000002a_r1.aicm"})
+    shm = rpc("doc_render", {"aicm_path": "/dev/shm/chudware_doc-cpp0000002a_r1"})
+    caps = {"doc-cpp0000002a"}
+    assert path_violation(file, ROOTS) is not None
+    assert path_violation(shm, ROOTS) is not None
+    assert path_violation(file, ROOTS, caps) is None
+    assert path_violation(shm, ROOTS, caps) is None
+    for bad in ("/tmp/chudware_cpp_docs/doc-cpp0000002a_r1.step+",
+                "/tmp/chudware_cpp_docs/sub/doc-cpp0000002a_r1.aicm",
+                "/dev/shm/chudware_doc-cpp0000002b_r1"):
+        assert path_violation(rpc("doc_open", {"path": bad}), ROOTS, caps) is not None

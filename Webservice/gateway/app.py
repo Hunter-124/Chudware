@@ -19,13 +19,13 @@ try:
     from . import db
     from .auth import AuthMiddleware, User, get_current_user
     from .config import settings
-    from .chat import Presence, presence, router as chat_router  # noqa: F401
+    from .chat import Presence, presence, router as chat_router, _scope_key  # noqa: F401
     from .bucket import router as bucket_router
 except ImportError:  # uvicorn app:app from package dir
     import db  # type: ignore
     from auth import AuthMiddleware, User, get_current_user
     from config import settings
-    from chat import Presence, presence, router as chat_router  # noqa: F401
+    from chat import Presence, presence, router as chat_router, _scope_key  # noqa: F401
     from bucket import router as bucket_router
 
 log = logging.getLogger("chudware-web")
@@ -462,7 +462,9 @@ async def healthz(request: Request) -> dict[str, Any]:
     mem_b = mem_available_bytes()
     mem_g = mem_available_gib()
     try:
-        online = await presence.list()
+        user = get_current_user(request)
+        scope_key = None if user.role == "admin" else _scope_key(request, user.email.lower())
+        online = await presence.list(scope_key)
         presence_n = len(online) if online is not None else 0
     except Exception:  # noqa: BLE001
         presence_n = None

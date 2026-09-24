@@ -9,10 +9,13 @@ the legacy shared tree is reachable only by an explicit admin opt-in.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 import json
 import os
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
@@ -27,7 +30,7 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway import accounts, app as app_mod, db, mailer, orgs, plans  # noqa: E402
+from gateway import accounts, app as app_mod, db, engine_bridge, mailer, orgs, plans  # noqa: E402
 from gateway.config import settings  # noqa: E402
 from gateway.limits import RateLimiter, user_slug  # noqa: E402
 import gateway.workspace as workspace_mod  # noqa: E402
@@ -403,6 +406,67 @@ def test_files_aicm_cannot_read_across_tenants(client):
     # The owner can still fetch their own published payloads.
     r = client.get("/files/aicm", params={"path": str(victim)}, headers=A)
     assert r.status_code == 200
+
+
+def test_mesh_handoffs_require_the_accounts_daemon_grant(client, monkeypatch):
+    generation = [(1, 2, 3)]
+    monkeypatch.setattr(engine_bridge, "_mesh_socket_generation", lambda: generation[0])
+    doc_id = "doc-cpp" + uuid.uuid4().hex
+    filename = f"{doc_id}_r2.aicm"
+    scratch = Path(tempfile.gettempdir()) / "chudware_cpp_docs"
+    scratch.mkdir(exist_ok=True)
+    file = scratch / filename
+    shm_name = f"chudware_{doc_id}_r2"
+    shm = Path("/dev/shm") / shm_name
+    file.write_bytes(b"alice file mesh")
+    shm.write_bytes(b"alice shm mesh")
+    try:
+        for headers in (A, B):
+            for params in ({"path": str(file)}, {"shm": shm_name},
+                           {"path": "aicm-shm://" + shm_name}):
+                assert client.get("/files/aicm", params=params, headers=headers).status_code == 403
+
+        pending = {1: ("doc_new", set())}
+        capabilities: set[str] = set()
+        engine_bridge._authorize_daemon_response(
+            json.dumps({"id": 1, "result": {"doc_id": doc_id}}),
+            pending, capabilities, [], "alice@crimson.ua.edu",
+        )
+        assert doc_id in capabilities
+        for params, expected in (
+            ({"path": str(file)}, b"alice file mesh"),
+            ({"path": "aicm-shm://" + shm_name}, b"alice shm mesh"),
+            ({"shm": shm_name}, b"alice shm mesh"),
+        ):
+            assert client.get("/files/aicm", params=params, headers=B).status_code == 403
+            response = client.get("/files/aicm", params=params, headers=A)
+            assert response.status_code == 200
+            assert response.content == expected
+        # A daemon restart may reuse its sequential document IDs; old grants
+        # must not authorize the new process's mesh.
+        generation[0] = (1, 2, 4)
+        assert client.get("/files/aicm", params={"shm": shm_name}, headers=A).status_code == 403
+        # A grant for one document never covers the neighboring sequential id.
+        other = scratch / f"{doc_id}extra_r2.aicm"
+        other.write_bytes(b"other")
+        try:
+            assert client.get("/files/aicm", params={"path": str(other)}, headers=A).status_code == 403
+        finally:
+            other.unlink()
+    finally:
+        file.unlink()
+        shm.unlink()
+
+
+def test_healthz_presence_is_account_scoped_except_for_admin(client, monkeypatch):
+    live = app_mod.Presence()
+    monkeypatch.setattr(app_mod, "presence", live)
+    asyncio.run(live.join("personal:alice@crimson.ua.edu", "alice@crimson.ua.edu", "Alice"))
+    asyncio.run(live.join("personal:bob@crimson.ua.edu", "bob@crimson.ua.edu", "Bob"))
+    assert client.get("/healthz", headers=A).json()["presence"] == 1
+    assert client.get("/healthz", headers=B).json()["presence"] == 1
+    assert client.get("/healthz", headers=ADMIN).json()["presence"] == 2
+    assert client.get("/healthz").json() == {"ok": True}
 
 
 # ---------------------------------------------------------------------------

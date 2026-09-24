@@ -13,11 +13,10 @@ server-side paths) — bytes only cross the wire for import/export.
 Blocking filesystem handlers are synchronous FastAPI routes so mounted I/O and
 recursive quota checks run in the threadpool, never on the ASGI event loop.
 
-/files/aicm serves tessellation payloads the daemon publishes for its clients:
-either plain files (tmp chudware_cpp_docs / state dir / the caller's own
-workspace root) or POSIX shm objects (aicm-shm://name -> /dev/shm/<name>).
-Enforcement is server-side; the allowlist is the security boundary, the client
-clamp is only UX.
+/files/aicm serves daemon-published tessellation from document-scoped scratch
+handoffs or the caller's own workspace; shared scratch is never a general file
+allowlist.
+Enforcement is server-side; the client clamp is only UX.
 """
 
 from __future__ import annotations
@@ -25,7 +24,6 @@ import json
 
 import logging
 import re
-import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -35,6 +33,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 try:
     from . import orgs
+    from .engine_bridge import mesh_doc_id, mesh_document_authorized
     from .auth import User, get_current_user
     from .accounts import get_account
     from .config import settings
@@ -50,6 +49,7 @@ try:
 except ImportError:  # uvicorn app:app from package dir
     import orgs
     from auth import User, get_current_user
+    from engine_bridge import mesh_doc_id, mesh_document_authorized
     from accounts import get_account
     from config import settings
     from limits import (
@@ -541,47 +541,40 @@ async def workspace_chat_put(request: Request, scope: str = "") -> dict[str, Any
     )
     return {"ok": True, "sessions": len(store["sessions"])}
 
-
-def _aicm_allowlist(caller_root: Path | None) -> list[Path]:
-    dirs = [
-        Path(tempfile.gettempdir()) / "chudware_cpp_docs",  # aicm_handoff publish_file
-        Path.home() / ".local" / "share" / "Chudware",     # hostd state dir (autosave etc.)
-    ]
-    if caller_root is not None:
-        # Only the caller's OWN tree — the legacy root also contains every
-        # other account's users/<slug>/ subtree, so it is never allowlisted
-        # for anyone but an admin who explicitly passed scope=shared.
-        dirs.append(caller_root)
-    return [d.resolve() for d in dirs if d.exists()]
-
-
 @router.get("/files/aicm")
 def files_aicm(request: Request, path: str = "", shm: str = "", scope: str = "") -> FileResponse:
-    """Serve one daemon-published tessellation payload (file or shm object)."""
+    """Serve a caller-owned file or an authorized document's mesh handoff."""
+    user = get_current_user(request)
+    try:
+        _, caller_root = _caller_root(request, scope)
+    except HTTPException as exc:
+        if exc.status_code != 503:
+            raise
+        caller_root = None  # daemon handoffs remain available without a workspace mount
     if path.startswith(_SHM_URI_PREFIX):
         shm, path = path[len(_SHM_URI_PREFIX):], ""
     if shm:
-        if not _SHM_NAME_RE.match(shm):
+        if not _SHM_NAME_RE.fullmatch(shm):
             raise HTTPException(status_code=400, detail="bad shm name")
+        doc_id = mesh_doc_id(shm, shm=True)
+        if doc_id is None or not mesh_document_authorized(user.email, doc_id):
+            raise HTTPException(status_code=403, detail="document not authorized")
         target = Path("/dev/shm") / shm
-        if not target.is_file():
+        if target.is_symlink() or not target.is_file():
             raise HTTPException(status_code=404, detail="shm object gone")
         return FileResponse(str(target), media_type="application/octet-stream",
                             headers=_aicm_cache_headers(shm))
     if not path:
         raise HTTPException(status_code=400, detail="path or shm required")
     try:
-        _, caller_root = _caller_root(request, scope)
-    except HTTPException as exc:
-        if exc.status_code != 503:
-            raise
-        caller_root = None  # workspace unconfigured — shm/tmp payloads still work
-    try:
         target = Path(path).resolve(strict=True)
     except OSError:
         raise HTTPException(status_code=404, detail="not found")
-    if not any(target == d or d in target.parents for d in _aicm_allowlist(caller_root)):
-        raise HTTPException(status_code=403, detail="path not allowlisted")
+    if caller_root is None or (target != caller_root and caller_root not in target.parents):
+        scratch = Path(tempfile.gettempdir()).resolve() / "chudware_cpp_docs"
+        doc_id = mesh_doc_id(target.name) if target.parent == scratch else None
+        if doc_id is None or not mesh_document_authorized(user.email, doc_id):
+            raise HTTPException(status_code=403, detail="document not authorized")
     if not target.is_file():
         raise HTTPException(status_code=400, detail="not a file")
     return FileResponse(str(target), media_type="application/octet-stream",

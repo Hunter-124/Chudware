@@ -9,11 +9,13 @@ from __future__ import annotations
 import base64
 import dataclasses
 import json
+import hashlib
 import logging
 import mimetypes
 import os
 import shutil
 import sys
+import tempfile
 import re
 import threading
 import uuid
@@ -38,6 +40,82 @@ _MAX_DOCTOR_MESSAGE_CHARS = 4_096
 _TURN_ABSOLUTE_CAP_SECONDS = 2 * 60 * 60.0
 
 _LOG = logging.getLogger(__name__)
+_BYOK_PROVIDER_ENV = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "xai": "XAI_API_KEY",
+    "google": "GEMINI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "cerebras": "CEREBRAS_API_KEY",
+}
+
+
+def byok_provider_env(provider: str) -> str | None:
+    return _BYOK_PROVIDER_ENV.get(provider.strip().lower())
+
+
+def _byok_identity(params: Mapping[str, Any]) -> str | None:
+    key = _nonempty_string(params.get("byok_key"))
+    if key is None:
+        if params.get("byok_key") is not None:
+            raise ValueError("byok_unsupported_online")
+        return None
+    tenant = _nonempty_string(params.get("byok_tenant")) or "desktop"
+    provider = _nonempty_string(params.get("byok_provider")) or ""
+    if byok_provider_env(provider) is None:
+        raise ValueError("byok_unsupported_online")
+    return hashlib.sha256(
+        json.dumps([tenant, provider.lower(), key], separators=(",", ":")).encode()
+    ).hexdigest()
+
+def _byok_client_scope(
+    params: Mapping[str, Any], session_dir: str | None, resume_file: str | None
+) -> tuple[tempfile.TemporaryDirectory[str], str, dict[str, str]]:
+    from services import paths
+
+    identity = _byok_identity(params)
+    if identity is None:
+        raise ValueError("byok_unsupported_online")
+    provider = _nonempty_string(params.get("byok_provider")) or ""
+    env_name = byok_provider_env(provider)
+    if env_name is None:
+        raise ValueError("byok_unsupported_online")
+    root = Path(session_dir) if session_dir else paths.ROOT / "Sessions"
+    if resume_file and session_dir is None:
+        root = Path(resume_file).expanduser().parent.parent
+    scoped = root.expanduser() / f"byok-{identity}"
+    if scoped.is_symlink():
+        raise RuntimeError("BYOK session directory cannot be a symlink")
+    if resume_file and Path(resume_file).expanduser().resolve().parent != scoped.resolve():
+        raise RuntimeError("BYOK session file belongs to another credential scope")
+    scoped.mkdir(mode=0o700, parents=True, exist_ok=True)
+    scoped.chmod(0o700)
+    tempdir = tempfile.TemporaryDirectory(prefix="chudware-byok-")
+    home = Path(tempdir.name)
+    agent = home / "agent"
+    xdg = home / "xdg"
+    agent.mkdir(mode=0o700)
+    xdg.mkdir(mode=0o700)
+    # RpcClient merges its env into os.environ; blank every inherited variable
+    # before restoring only process essentials and the selected provider key.
+    clean = {name: "" for name in os.environ}
+    for name in ("PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "CHUDCODE_PACKAGE_DIR"):
+        if name in os.environ:
+            clean[name] = os.environ[name]
+    clean.update({
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(xdg),
+        "XDG_DATA_HOME": str(home / "data"),
+        "XDG_CACHE_HOME": str(home / "cache"),
+        "CHUDCODE_CODING_AGENT_DIR": str(agent),
+        env_name: _nonempty_string(params.get("byok_key")) or "",
+    })
+    return tempdir, str(scoped), clean
+
+
 
 _AUTH_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "get_auth_state": (frozenset(), frozenset({"providerId"})),
@@ -145,6 +223,7 @@ class _Session:
     resume_file: str | None
     workspace_dir: str | None
     turn_lock: threading.Lock = field(default_factory=threading.Lock)
+    credential_identity: str | None = None
     active_turns: int = 0
     closed: bool = False
     dispose_started: bool = False
@@ -824,11 +903,12 @@ class ChudcodeSessionHost:
             if workspace is not None
             else None
         )
+        credential_identity = _byok_identity(params)
         with self._lock:
             if self._shutdown:
                 raise RuntimeError("chudcode session host is shut down")
             existing = self._claim_existing_session_locked(
-                session_id, resume_file, workspace_dir
+                session_id, resume_file, workspace_dir, credential_identity
             )
             if existing is not None:
                 return existing
@@ -842,7 +922,7 @@ class ChudcodeSessionHost:
                         if self._shutdown:
                             raise RuntimeError("chudcode session host is shut down")
                         existing = self._claim_existing_session_locked(
-                            session_id, resume_file, workspace_dir
+                            session_id, resume_file, workspace_dir, credential_identity
                         )
                         if existing is not None:
                             return existing
@@ -871,6 +951,7 @@ class ChudcodeSessionHost:
                                 client,
                                 resume_file,
                                 workspace_dir,
+                                credential_identity=credential_identity,
                                 active_turns=1,
                             )
                             self._sessions[session_id] = session
@@ -891,13 +972,16 @@ class ChudcodeSessionHost:
                     self._creating.pop(session_id, None)
 
     def _claim_existing_session_locked(
-        self, session_id: str, resume_file: str | None, workspace_dir: str | None
+        self, session_id: str, resume_file: str | None, workspace_dir: str | None,
+        credential_identity: str | None,
     ) -> _Session | None:
         existing = self._sessions.get(session_id)
         if existing is None:
             return None
         if existing.closed:
             raise RuntimeError("chudcode RPC session is closing")
+        if existing.credential_identity != credential_identity:
+            raise RuntimeError("cannot change Chudcode credential identity on a live session")
         if (
             resume_file
             and existing.resume_file
@@ -950,7 +1034,13 @@ class ChudcodeSessionHost:
 
         binary = self._resolve_binary(required=self._client_factory is None)
         session_dir = _nonempty_string(params.get("chudcode_session_dir"))
-        if session_dir is None and resume_file:
+        tempdir = None
+        clean_env = None
+        if params.get("byok_key") is not None:
+            tempdir, session_dir, clean_env = _byok_client_scope(
+                params, session_dir, resume_file
+            )
+        elif session_dir is None and resume_file:
             session_dir = str(Path(resume_file).expanduser().parent)
         kwargs: dict[str, Any] = {
             "no_session": no_session,
@@ -960,6 +1050,8 @@ class ChudcodeSessionHost:
             # retains terminal and provider-recovery frames.
             "max_event_history": _event_history_limit_from_env(),
         }
+        if clean_env is not None:
+            kwargs["env"] = clean_env
         if binary is not None:
             kwargs["executable"] = binary
         if session_dir is not None:
@@ -970,7 +1062,15 @@ class ChudcodeSessionHost:
         system_prompt = _nonempty_string(params.get("system_prompt"))
         if system_prompt is not None:
             kwargs["append_system_prompt"] = system_prompt
-        return factory(**kwargs)
+        try:
+            client = factory(**kwargs)
+            if tempdir is not None:
+                client._chudware_tempdir = tempdir
+            return client
+        except Exception:
+            if tempdir is not None:
+                tempdir.cleanup()
+            raise
 
     def _resolve_binary(self, *, required: bool) -> str | None:
         if self._binary_hint:
@@ -1587,6 +1687,10 @@ def _stop_client(client: Any) -> None:
                 "Chudcode RPC client teardown failed (%s)",
                 type(exc).__name__,
             )
+    tempdir = getattr(client, "_chudware_tempdir", None)
+    if tempdir is not None:
+        tempdir.cleanup()
+        client._chudware_tempdir = None
 
 
 def _nonempty_string(value: Any) -> str | None:

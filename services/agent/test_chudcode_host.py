@@ -354,6 +354,57 @@ def call_names(client):
     return [name for name, _payload in client.calls]
 
 
+def test_byok_process_isolated_and_live_session_rejects_credential_switch(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "operator-secret")
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    scoped = {
+        "byok_provider": "openai",
+        "byok_tenant": "alice@example.com",
+        "byok_key": "sk-alice-only",
+        "chudcode_session_dir": str(tmp_path),
+    }
+    first, _ = run(host, "shared-id", "alice-1", **scoped)
+    assert first["ok"] is True
+    client = factory.clients[0]
+    child_env = client.kwargs["env"]
+    assert child_env["OPENAI_API_KEY"] == "sk-alice-only"
+    assert child_env["ANTHROPIC_API_KEY"] == ""
+    assert client.kwargs["session_dir"].startswith(str(tmp_path / "byok-"))
+    assert Path(client.kwargs["session_dir"]).stat().st_mode & 0o777 == 0o700
+    home = Path(child_env["HOME"])
+    assert home.is_dir()
+    assert child_env["CHUDCODE_CODING_AGENT_DIR"].startswith(str(home))
+
+    repeat, _ = run(host, "shared-id", "alice-2", **scoped)
+    other, _ = run(host, "shared-id", "bob-1", **{**scoped, "byok_tenant": "bob@example.com"})
+    changed, _ = run(host, "shared-id", "new-key", **{**scoped, "byok_key": "sk-new-key"})
+    keyless, _ = run(host, "shared-id", "keyless")
+    assert repeat["ok"] is True
+    assert all(not row["ok"] for row in (other, changed, keyless))
+    assert call_names(client).count("prompt") == 2
+    assert len(factory.clients) == 1
+    foreign = tmp_path / "foreign.jsonl"
+    foreign.write_text("{}", encoding="utf-8")
+    mismatched, _ = run(
+        host, "foreign", "foreign-1", **scoped,
+        chudcode_session_file=str(foreign),
+    )
+    assert mismatched["ok"] is False
+    assert len(factory.clients) == 1
+
+    host.close_session("shared-id")
+    assert client.stop_count == 1
+    assert not home.exists()
+    next_turn, _ = run(host, "shared-id", "bob-2", **{**scoped, "byok_tenant": "bob@example.com"})
+    assert next_turn["ok"] is True
+    assert len(factory.clients) == 2
+    assert factory.clients[1].kwargs["session_dir"] != client.kwargs["session_dir"]
+    host.shutdown()
+
+
 def test_reuses_one_live_client_per_session_and_isolates_other_sessions():
     factory = FakeFactory()
     host = ChudcodeSessionHost(client_factory=factory)

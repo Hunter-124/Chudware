@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import base64
 import builtins
+import hashlib
 import json
 import logging
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import httpx
@@ -24,6 +26,26 @@ from services.agent import config as agent_config, worker_rpc
 SECRET = "sk-account-secret-never-leak-1234"
 A = "alice@example.com"
 B = "bob@example.com"
+
+
+class _FakeOnlineHost:
+    def __init__(self):
+        self.turns: list[dict] = []
+
+    def run_turn(self, params, emit):
+        self.turns.append(params)
+        terminal = {"type": "agent_end", "isTerminal": True}
+        emit(terminal)
+        return {"ok": True, "result": "done", "terminal": terminal}
+
+
+def _isolate_online_persistence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        sys.modules, "services.mcp.cad_common",
+        SimpleNamespace(save_touched_docs=lambda: {
+            "saved": [], "errors": [], "persistence_failure": None,
+        }),
+    )
 
 
 def _seed(email: str, *, plan: str = "studio", ai_grant: bool = True) -> None:
@@ -237,93 +259,105 @@ def test_validation_endpoint_is_rate_limited(
 def test_worker_clears_byok_key_between_tenants(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from services.agent import mission_dispatch
-
-    captured: list[str] = []
-
-    class Provider:
-        name = "openai"
-        model = "test"
-
-    def resolve(_name, cfg, role=None):
-        captured.append(str(cfg.get("api_key") or ""))
-        return Provider()
-
-    monkeypatch.setattr(agent_config, "_resolve_provider", resolve)
+    host = _FakeOnlineHost()
+    monkeypatch.setattr(worker_rpc, "get_default_chudcode_host", lambda: host)
+    _isolate_online_persistence(monkeypatch)
     monkeypatch.setattr(agent_config, "load_config", lambda: {
         "provider": "openai",
+        "model": "gpt-5",
         "api_key": "ambient-desktop-key-must-not-win",
     })
-    monkeypatch.setattr(
-        mission_dispatch,
-        "run_linear_role_turn",
-        lambda *_args, **_kwargs: {
-            "success": True,
-            "stop_reason": "confirmed",
-            "result": {},
-        },
-    )
     actor_a = {
         "email": A,
         "plan": "studio",
         "credits_remaining": 100,
         "key_source": "byok",
+        "_byok_key_sha256": hashlib.sha256(SECRET.encode()).hexdigest(),
     }
     first = worker_rpc._agent_admin_turn(
         {
             "request": "first tenant",
+            "session_id": "tenant-a",
             "provider": "openai",
+            "model": "gpt-5",
             "api_key": SECRET,
             "_chudware_actor": actor_a,
         },
         lambda _event: None,
     )
     assert first["ok"] is True
-    assert captured == [SECRET]
+    assert [(p["byok_tenant"], p["byok_key"]) for p in host.turns] == [(A, SECRET)]
+    mismatch = worker_rpc._agent_admin_turn(
+        {
+            "request": "forged credential",
+            "session_id": "tenant-a",
+            "provider": "openai",
+            "model": "gpt-5",
+            "api_key": "sk-other",
+            "_chudware_actor": actor_a,
+        },
+        lambda _event: None,
+    )
+    assert mismatch == {"ok": False, "reason": "byok_credential_mismatch"}
+    assert len(host.turns) == 1
+    missing_proof = worker_rpc._agent_admin_turn(
+        {
+            "request": "unproven credential",
+            "session_id": "tenant-a",
+            "provider": "openai",
+            "model": "gpt-5",
+            "api_key": SECRET,
+            "_chudware_actor": {k: v for k, v in actor_a.items() if k != "_byok_key_sha256"},
+        },
+        lambda _event: None,
+    )
+    assert missing_proof == {"ok": False, "reason": "byok_credential_mismatch"}
+    assert len(host.turns) == 1
 
     actor_b = {**actor_a, "email": B}
     second = worker_rpc._agent_admin_turn(
         {
             "request": "unrelated next tenant",
+            "session_id": "tenant-b",
             "provider": "openai",
+            "model": "gpt-5",
             "_chudware_actor": actor_b,
         },
         lambda _event: None,
     )
     assert second["ok"] is False
     assert "BYOK provider credential unavailable" in second["reason"]
-    assert captured == [SECRET]
+    assert len(host.turns) == 1
+    third = worker_rpc._agent_admin_turn(
+        {
+            "session_id": "tenant-b",
+            "request": "second tenant's own key",
+            "provider": "openai",
+            "model": "gpt-5",
+            "api_key": "sk-bob-only",
+            "_chudware_actor": {
+                **actor_b,
+                "_byok_key_sha256": hashlib.sha256(b"sk-bob-only").hexdigest(),
+            },
+        },
+        lambda _event: None,
+    )
+    assert third["ok"] is True
+    assert [(p["byok_tenant"], p["byok_key"]) for p in host.turns] == [
+        (A, SECRET), (B, "sk-bob-only"),
+    ]
 
 
 def test_desktop_turn_never_imports_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from services.agent import mission_dispatch
-
-    captured: dict = {}
-
-    class Provider:
-        name = "openai"
-        model = "desktop-model"
-
-    def resolve(_name, cfg, role=None):
-        captured.update(cfg)
-        return Provider()
-
-    monkeypatch.setattr(agent_config, "_resolve_provider", resolve)
+    host = _FakeOnlineHost()
+    monkeypatch.setattr(worker_rpc, "get_default_chudcode_host", lambda: host)
+    _isolate_online_persistence(monkeypatch)
     monkeypatch.setattr(
         agent_config,
         "load_config",
-        lambda: {"provider": "openai", "api_key": "desktop-owned-key"},
-    )
-    monkeypatch.setattr(
-        mission_dispatch,
-        "run_linear_role_turn",
-        lambda *_args, **_kwargs: {
-            "success": True,
-            "stop_reason": "confirmed",
-            "result": {},
-        },
+        lambda: {"provider": "openai", "model": "desktop-model", "api_key": "desktop-owned-key"},
     )
     real_import = builtins.__import__
 
@@ -337,12 +371,16 @@ def test_desktop_turn_never_imports_gateway(
         {
             "request": "desktop-shaped turn",
             "provider": "openai",
+            "model": "desktop-model",
             "api_key": "desktop-owned-key",
         },
         lambda _event: None,
     )
     assert result["ok"] is True
-    assert captured["api_key"] == "desktop-owned-key"
+    assert len(host.turns) == 1
+    assert host.turns[0]["byok_key"] == "desktop-owned-key"
+    assert host.turns[0]["byok_tenant"] == "desktop"
+    assert host.turns[0]["settings"]["provider"] == "openai"
 
 
 def test_byok_precedes_credits_for_x_and_y_still_pools(
@@ -385,6 +423,7 @@ def test_byok_precedes_credits_for_x_and_y_still_pools(
     assert byok_actor["key_source"] == "byok"
     assert "_reservation_credits" not in byok_actor
     assert byok_call["params"]["api_key"] == SECRET
+    assert byok_actor["_byok_key_sha256"] == hashlib.sha256(SECRET.encode()).hexdigest()
     assert byok_call["params"]["api_key"] != "browser-forgery-must-be-stripped"
 
     # The same account has no OpenRouter key. Provider Y deliberately falls

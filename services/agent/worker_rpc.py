@@ -20,6 +20,8 @@ when an RPC reports ``unknown_method``.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import math
@@ -35,7 +37,7 @@ from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
 
-from services.agent.chudcode_host import get_default_chudcode_host
+from services.agent.chudcode_host import byok_provider_env, get_default_chudcode_host
 
 
 _LOG = logging.getLogger(__name__)
@@ -2847,6 +2849,22 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     from services.agent.preferences import resolve_turn_preferences
     from services.agent.role_models import resolve_role_model, _auto_local_provider
 
+    byok_key = raw_params.get("api_key")
+    if credit_actor is not None and credit_actor.key_source == "byok":
+        if not isinstance(byok_key, str) or not byok_key.strip():
+            agent_config.clear_pooled_credentials()
+            return {"ok": False, "reason": "BYOK provider credential unavailable"}
+        declared = raw_actor.get("_byok_key_sha256")
+        actual = hashlib.sha256(byok_key.encode("utf-8")).hexdigest()
+        if not isinstance(declared, str) or not hmac.compare_digest(declared, actual):
+            agent_config.clear_pooled_credentials()
+            return {"ok": False, "reason": "byok_credential_mismatch"}
+    if byok_key is not None and (
+        not isinstance(byok_key, str) or not byok_key.strip()
+        or (credit_actor is not None and not (param_str("provider") and param_str("model")))
+    ):
+        agent_config.clear_pooled_credentials()
+        return {"ok": False, "reason": "byok_unsupported_online"}
     try:
         # An explicit composer/CLI choice is the user's turn override, not Auto.
         requested_mode = param_str("mode")
@@ -2888,6 +2906,8 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             model_name = model_name or str(cfg.get("model") or "")
         if turn_preferences.local_only and not _auto_local_provider(provider_name, cfg):
             raise ValueError("This computer only requires a loopback model. Configure a local model in Accounts.")
+        if byok_key is not None and byok_provider_env(provider_name) is None:
+            raise ValueError("byok_unsupported_online")
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         agent_config.clear_pooled_credentials()
         return {"ok": False, "reason": str(exc)}
@@ -3088,6 +3108,12 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         "attachments": attachments,
         "register_callbacks": register_callbacks,
     }
+    if byok_key is not None:
+        host_params.update(
+            byok_key=byok_key,
+            byok_provider=provider_name,
+            byok_tenant=credit_actor.email if credit_actor is not None else "desktop",
+        )
     if project_root:
         host_params["workspace_dir"] = project_root
     session_dir = param_str("chudcode_session_dir") or param_str("sessions_dir")

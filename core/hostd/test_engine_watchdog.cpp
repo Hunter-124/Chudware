@@ -20,8 +20,8 @@ int main() {
     // activation. Surviving the short deadline must not make these unbounded.
     for (const char* method : {"doc_apply_ops", "doc_rebuild", "doc_undo", "doc_redo",
                                "doc_activate", "doc_regen", "run_fea_static",
-                               "run_cfd_flow", "agent_run", "cam_generate",
-                               "doc_save", "doc_open", "export_part", "import_part"}) {
+                               "run_cfd_flow", "cam_generate", "doc_save", "doc_open",
+                               "export_part", "import_part"}) {
         assert(!overdue(method, shortCeiling + 1));
         assert(!overdue(method, 600000));  // ten-minute valid long operation
         assert(!overdue(method, longCeiling));
@@ -29,6 +29,14 @@ int main() {
         assert(!engineCallOverdue(method, longCeiling + 1, shortCeiling));
         assert(!engineCallOverdueLong(method, longCeiling + 1, 0));
         assert(!engineCallOverdueLong(method, longCeiling + 1, -1));
+    }
+
+    // An agent turn can stream progress well past the engine wall-clock tier;
+    // its worker transport, not this watchdog, owns silence/absolute limits.
+    for (const char* method : {"agent_run", "agent_admin_turn", "agent_step",
+                               "chudcode_export_session"}) {
+        assert(!overdue(method, longCeiling + 1));
+        assert(!overdue(method, 4 * longCeiling));
     }
 
     // Truly bounded calls retain the short deadline, not the generous ceiling.

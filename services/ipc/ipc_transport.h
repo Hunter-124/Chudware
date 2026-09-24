@@ -54,10 +54,10 @@ public:
     bool valid() const { return fd_ >= 0; }
 #endif
 
-    // Read one \n-terminated line (without the \n). timeoutMs < 0 blocks forever;
-    // timeoutMs == 0 is a non-blocking poll (returns false immediately if no full
-    // line is buffered/readable). Returns false on timeout, EOF, or error — use
-    // eof() to distinguish a dead peer from a timeout.
+    // Read one \n-terminated line (without the \n). Lines longer than 64 MiB
+    // fail closed. timeoutMs < 0 blocks forever; timeoutMs == 0 is a
+    // non-blocking poll. Returns false on timeout, EOF, or error — use eof()
+    // to distinguish a dead peer from a timeout.
     bool readLine(std::string& line, int timeoutMs);
 
     // Write `line` + '\n' fully. Serialized by the CALLER (per-conn write mutex

@@ -693,16 +693,22 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
                                  ? std::filesystem::path(worker_bin).parent_path().string()
                                  : admin_worker_repo_root();
 
-    int out_pipe[2], in_pipe[2], err_pipe[2];
+    int out_pipe[2] = {-1, -1}, in_pipe[2] = {-1, -1}, err_pipe[2] = {-1, -1};
+    auto close_pipes = [&] {
+        for (int fd : out_pipe) if (fd >= 0) ::close(fd);
+        for (int fd : in_pipe) if (fd >= 0) ::close(fd);
+        for (int fd : err_pipe) if (fd >= 0) ::close(fd);
+    };
     if (::pipe(out_pipe) != 0 || ::pipe(in_pipe) != 0 || ::pipe(err_pipe) != 0) {
         err = std::string("pipe() failed: ") + std::strerror(errno);
+        close_pipes();
         return false;
     }
     const pid_t parent_pid = ::getpid();
     pid_t pid = ::fork();
     if (pid < 0) {
         err = std::string("fork() failed: ") + std::strerror(errno);
-        ::close(out_pipe[0]); ::close(out_pipe[1]); ::close(in_pipe[0]); ::close(in_pipe[1]);
+        close_pipes();
         return false;
     }
     if (pid == 0) {
@@ -733,6 +739,7 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     const int rd = out_pipe[0];
     const int ed = err_pipe[0];
     const int wr = in_pipe[1];
+    bool child_reaped = false;
 
     // Rolling tail of the worker's stderr. It MUST be drained even when nothing
     // goes wrong: an unread 64 KiB pipe would block a chatty worker forever.
@@ -756,7 +763,9 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
         int status = 0;
         std::string what = prefix;
         for (int i = 0; i < 100; ++i) {
+            if (child_reaped) break;
             pid_t r = ::waitpid(pid, &status, WNOHANG);
+            if (r == pid || (r < 0 && errno == ECHILD)) child_reaped = true;
             if (r == pid) {
                 if (WIFSIGNALED(status)) {
                     const int sig = WTERMSIG(status);
@@ -790,11 +799,15 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     };
 
     auto reap = [&](bool graceful) {
+        if (child_reaped) return;
         if (graceful) {
             for (int i = 0; i < 100; ++i) {
                 int status = 0;
                 pid_t r = ::waitpid(pid, &status, WNOHANG);
-                if (r == pid || (r < 0 && errno == ECHILD)) return;
+                if (r == pid || (r < 0 && errno == ECHILD)) {
+                    child_reaped = true;
+                    return;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
         }
@@ -802,7 +815,7 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
         // (both sides setpgid the child into its own group).
         ::kill(-pid, SIGKILL);
         ::kill(pid, SIGKILL);
-        ::waitpid(pid, nullptr, 0);
+        if (::waitpid(pid, nullptr, 0) == pid) child_reaped = true;
     };
 
     // C4: the provider the user picked in the composer is ALREADY resolved into
@@ -863,6 +876,7 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
         err = "write to admin worker failed";
         ::close(rd);
         reap(false);
+        ::close(ed);
         return false;
     }
 
@@ -882,7 +896,9 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     const auto hard_deadline = std::chrono::steady_clock::now() + kAbsoluteCap;
     auto idle_deadline = std::chrono::steady_clock::now() + kIdleTimeout;
     std::string read_buf;
+    constexpr size_t kMaxWorkerLine = 64u * 1024u * 1024u;
     bool got_final = false;
+    size_t scan_from = 0;
     bool ok_final = false;
     // Stop button: run_design registered this run's RunControl and pointed the
     // provider cancel flag at it before entering the pre-flight branch, but the
@@ -898,7 +914,13 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
             err = "cancelled";
             break;
         }
-        size_t nl = read_buf.find('\n');
+        size_t nl = read_buf.find('\n', scan_from);
+        if ((nl != std::string::npos && nl > kMaxWorkerLine) ||
+            (nl == std::string::npos && read_buf.size() > kMaxWorkerLine)) {
+            err = "admin worker response line exceeds 64 MiB";
+            break;
+        }
+        scan_from = read_buf.size();
         if (nl == std::string::npos) {
             const auto now = std::chrono::steady_clock::now();
             if (now >= idle_deadline || now >= hard_deadline) {
@@ -916,6 +938,7 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
                 int status = 0;
                 pid_t r = ::waitpid(pid, &status, WNOHANG);
                 if (r == pid || (r < 0 && errno == ECHILD)) {
+                    child_reaped = true;
                     // Reap already consumed the status when r == pid; re-derive from it
                     // directly rather than waiting again on a gone child.
                     drain_stderr();
@@ -958,6 +981,7 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
             err = std::string("read() failed: ") + std::strerror(errno);
             break;
         }
+        scan_from = 0;
         const std::string resp_line = read_buf.substr(0, nl);
         read_buf.erase(0, nl + 1);
         if (resp_line.empty()) continue;

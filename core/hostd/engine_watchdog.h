@@ -8,16 +8,12 @@
 // Restart=on-failure) and docs recover from autosave (explicit, user-gated, so no auto-replay
 // loop).
 //
-// TWO TIERS, because "overdue" means wildly different things per RPC. Every call the daemon
-// tracks (Server::beginInflight — engine passthrough only) falls in exactly one of them:
-//   * FAST (engineMethodWatchdogged): bounded, non-modeling calls such as ping.
-//     Ceiling ~90 s, CHUDWARE_HOSTD_ENGINE_WATCHDOG_S.
-//   * LONG (everything else, including modeling/rebuild mutations): work scales with
-//     document/input size and may legitimately take minutes. This also covers shadow
-//     preflight doc_apply_ops and cold doc_activate rebuilds without caller hints.
-//     CHUDWARE_HOSTD_ENGINE_WATCHDOG_LONG_S bounds these calls so a genuine hang cannot
-//     hold inflight above zero and prevent idle exit forever.
-// The tiers are disjoint: a method is judged by exactly one ceiling, never both.
+// Two disjoint engine-call tiers. Agent/chudcode calls have their own transport
+// silence/absolute limits, so elapsed wall time cannot diagnose a stuck turn.
+//   * FAST: bounded non-modeling engine calls (~90 s).
+//   * LONG: modeling/rebuild mutations (~60 min), including shadow preflight
+//     doc_apply_ops and cold doc_activate rebuilds.
+// An engine method is judged by at most one ceiling.
 #pragma once
 
 #include <string_view>
@@ -30,18 +26,21 @@ inline bool engineMethodWatchdogged(std::string_view m) {
            m == "__hostd_test_stall";  // test-only probe (server.cpp), never a real client RPC
 }
 
+inline bool engineMethodTurn(std::string_view m) {
+    return m.substr(0, 6) == "agent_" || m.substr(0, 9) == "chudcode_";
+}
+
 // True when a watchdogged call has run past the ceiling. ceilingMs <= 0 disables the watchdog.
 inline bool engineCallOverdue(std::string_view method, long long elapsedMs, long long ceilingMs) {
     return ceilingMs > 0 && engineMethodWatchdogged(method) && elapsedMs > ceilingMs;
 }
 
-// True when a LONG-tier (non-interactive) call has blown the generous ceiling. Kept separate
-// from engineCallOverdue rather than folded into it so the two tiers can never be confused: an
-// interactive RPC is judged ONLY by the fast ceiling and a long-running one ONLY by this, which
-// is exactly why the fast tier's semantics are unchanged. ceilingMs <= 0 disables this tier.
+// The generous wall-clock ceiling applies only to engine calls, not agent turns
+// whose streamed progress can continue for hours.
 inline bool engineCallOverdueLong(std::string_view method, long long elapsedMs,
                                   long long ceilingMs) {
-    return ceilingMs > 0 && !engineMethodWatchdogged(method) && elapsedMs > ceilingMs;
+    return ceilingMs > 0 && !engineMethodWatchdogged(method) &&
+           !engineMethodTurn(method) && elapsedMs > ceilingMs;
 }
 
 }  // namespace hostd

@@ -94,9 +94,18 @@ void IpcConn::shutdown() {
 
 bool IpcConn::readLine(std::string& line, int timeoutMs) {
     if (fd_ < 0) return false;
+    constexpr size_t kMaxLine = 64u * 1024u * 1024u;
     const auto start = std::chrono::steady_clock::now();
+    size_t scanFrom = 0;
     for (;;) {
-        size_t nl = readBuf_.find('\n');
+        size_t nl = readBuf_.find('\n', scanFrom);
+        if ((nl != std::string::npos && nl > kMaxLine) ||
+            (nl == std::string::npos && readBuf_.size() > kMaxLine)) {
+            readBuf_.clear();
+            eof_.store(true, std::memory_order_release);
+            return false;
+        }
+        scanFrom = readBuf_.size();
         if (nl != std::string::npos) {
             line = readBuf_.substr(0, nl);
             readBuf_.erase(0, nl + 1);

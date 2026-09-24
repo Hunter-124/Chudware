@@ -67,17 +67,10 @@ static long long monoMs() {
         .count();
 }
 
-// LONG-tier engine-call ceiling: the one that applies to the deliberately slow RPCs the fast
-// watchdog exempts (doc_open/doc_save, import_*/export_*, cam_*, run_fea/run_cfd, agent_*).
-// 60 min — the top of the sane range, chosen because the two error costs are wildly asymmetric:
-// tripping this mid-solve or mid-agent-run destroys live work, while a genuinely wedged call
-// only needs to be reclaimed EVENTUALLY, not promptly. agent_run in particular is a synchronous
-// dispatch-thread call whose length is mission-driven with no in-tree bound, so the ceiling is
-// set well past anything we expect to finish rather than tuned to a workload. It is still
-// exactly 40x the interactive ceiling and, crucially, FINITE: without it a hung call holds
-// status_.inflight above 0 forever and idleExpired() can never fire again — the daemon becomes
-// unkillable by its own self-healing. 0 disables the tier (for a deployment that really does
-// run >1 h solves on a dispatch thread). Env: CHUDWARE_HOSTD_ENGINE_WATCHDOG_LONG_S.
+// LONG-tier engine-call ceiling for modeling/rebuilds, sims and I/O. Agent turns
+// are excluded: their transport monitors silence and a turn can take hours.
+// 0 disables this tier for deployments with longer engine solves.
+// Env: CHUDWARE_HOSTD_ENGINE_WATCHDOG_LONG_S.
 static long long engineWatchdogLongMs() {
     static const long long ms = [] {
         if (const char* w = std::getenv("CHUDWARE_HOSTD_ENGINE_WATCHDOG_LONG_S"); w && *w)
@@ -410,12 +403,31 @@ bool Server::gcCloseDoc(const std::string& docId, const char* reason) {
     const bool discard = std::string_view(reason) == "discarded" || registry_.isInternal(docId);
     json result;
     std::string err;
+    json docs;
+    const bool listed = core::cpp_core().call("doc_list", json::object(), docs, err) &&
+                        docs.is_object() && docs.contains("docs") && docs["docs"].is_array();
+    bool found = false;
+    if (listed) {
+        for (const auto& d : docs["docs"]) {
+            if (d.is_object() && d.value("doc_id", std::string()) == docId) {
+                found = true;
+                break;
+            }
+        }
+    }
+    if (listed && !found) {
+        // Recheck abandonment after the engine lookup: an attach may have arrived
+        // while doc_list ran. There is no engine doc to retire or close.
+        if (!registry_.reapUnderLock(docId, [] {})) return false;
+        registry_.onDaemonClosedDoc(docId, reason);
+        log().line("doc-gc: removed absent doc %s from registry", docId.c_str());
+        return true;
+    }
     if (!discard && autosave_) {
-        json docs;
+        // A failed listing is not evidence that the document is absent.
         std::string name = docId;
         bool needRetire = true;
-        if (core::cpp_core().call("doc_list", json::object(), docs, err) &&
-            docs.is_object() && docs.contains("docs")) {
+        if (listed) {
             for (const auto& d : docs["docs"]) {
                 if (!d.is_object() || d.value("doc_id", std::string()) != docId) continue;
                 name = d.value("name", docId);
@@ -438,7 +450,7 @@ bool Server::gcCloseDoc(const std::string& docId, const char* reason) {
             return false;  // never close a doc we could not preserve
         }
     }
-    // WHY: the isReapable() check above (and needRetire's doc_list + retireDoc I/O just
+    // WHY: the isReapable() check above (and doc_list + retireDoc I/O just
     // above, both unlocked) can go stale — a client's attach_doc / implicit-attach
     // (Server::dispatch -> DocRegistry::preCall) races in during that gap and starts a
     // legitimate op on a doc this function is about to destroy. reapUnderLock() re-verifies
@@ -913,6 +925,11 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     json result;
     std::string err;
     beginInflight(c.id, method);
+    struct InflightGuard {
+        Server& server;
+        int clientId;
+        ~InflightGuard() { server.endInflight(clientId); }
+    } inflightGuard{*this, c.id};
     // Live streaming (transparency): agent events go back to the requesting client while nested
     // document commits enter the shared registry and fan out to every subscribed GUI. Both
     // thread-local sinks fire synchronously on this dispatch thread and are cleared by RAII.
@@ -965,7 +982,6 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
             const bool workerOk =
                 WorkerBridge::instance().call(method, p, wresult, werr,
                                               workerTimeoutMs, workerEvent);
-            endInflight(c.id);
             if (workerOk) {
                 // Worker success: return result verbatim except any legacy
                 // batched event copy; matching progress already streamed live.
@@ -985,7 +1001,6 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
             return json{{"code", "worker_error"},
                         {"message", !werr.empty() ? werr : std::string("worker bridge failed")}};
         }
-        endInflight(c.id);
         isError = true;
         // Normalize: clients (CoreError mapping) rely on a "message" field. Keep
         // whatever in-band payload the engine produced ({"error":...}, OpError
@@ -999,7 +1014,6 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
         if (!e.contains("code")) e["code"] = "engine_error";
         return e;
     }
-    endInflight(c.id);
     // Live-streamed above (streamThis) -> the batched result["events"] copy is now redundant.
     // Drop it so a streaming client (which renders the live agent.event push) never double-
     // renders the run. (Same-build deploy: every client understands the push.)
@@ -1059,13 +1073,8 @@ bool Server::agentWorkInFlight() const {
     return false;
 }
 
-// Background watchdog: force-restart the daemon when a tracked engine call blows its tier's
-// ceiling (engine_watchdog.h). An OCCT call cannot be interrupted in-process, so a genuine hang
-// is only recoverable by ending the process; systemd (Restart=on-failure) respawns and docs
-// recover from autosave (explicit/user-gated — no auto-replay loop). Bounded non-modeling calls
-// use the fast ceiling; modeling/rebuilds, sims, agents and I/O use the long ceiling. Rebuild
-// cost scales with document size, including shadow preflight and cold activation. Both tiers
-// remain bounded so a hung call cannot prevent idle exit permanently.
+// Background watchdog bounds engine calls that cannot be interrupted in-process.
+// Agent turns use their own streaming silence/absolute caps, not this wall-clock tier.
 void Server::watchdogLoop() {
     const long long longCeilingMs = engineWatchdogLongMs();
     while (!stopping_.load()) {

@@ -545,9 +545,11 @@ bool WorkerBridge::spawn(std::string& err) {
         return false;
     }
 
-    int outPipe[2], inPipe[2];
+    int outPipe[2] = {-1, -1}, inPipe[2] = {-1, -1};
     if (pipe(outPipe) != 0 || pipe(inPipe) != 0) {
         err = std::string("pipe() failed: ") + std::strerror(errno);
+        for (int fd : outPipe) if (fd >= 0) ::close(fd);
+        for (int fd : inPipe) if (fd >= 0) ::close(fd);
         return false;
     }
 
@@ -624,8 +626,14 @@ bool WorkerBridge::writeLine(const std::string& line) {
 
 bool WorkerBridge::readLine(std::string& line, int timeoutMs) {
     auto start = std::chrono::steady_clock::now();
+    constexpr size_t kMaxWorkerLine = 64u * 1024u * 1024u;
+    size_t scanFrom = 0;
     for (;;) {
-        size_t nl = readBuf_.find('\n');
+        size_t nl = readBuf_.find('\n', scanFrom);
+        if ((nl != std::string::npos && nl > kMaxWorkerLine) ||
+            (nl == std::string::npos && readBuf_.size() > kMaxWorkerLine))
+            return false;
+        scanFrom = readBuf_.size();
         if (nl != std::string::npos) {
             line = readBuf_.substr(0, nl);
             readBuf_.erase(0, nl + 1);
@@ -740,6 +748,11 @@ bool WorkerBridge::callOnce(const std::string& method, const json& params, json&
     for (;;) {
         std::string resp;
         if (!readLine(resp, timeoutMs)) {
+            if (readBuf_.size() > 64u * 1024u * 1024u) {
+                err = "worker response line exceeds 64 MiB";
+                reap();  // framing is lost; next call must spawn a fresh worker
+                return false;
+            }
             // Distinguish child death (EOF / reaped) from a live slow call so
             // the outer retry only respawns on a dead child.
             if (process_ < 0 || childStdoutRd_ < 0) {

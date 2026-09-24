@@ -96,10 +96,27 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
 
 
 
-    def _asm_component_doc(path: str) -> str:
+    def _component_source_path(path: str, asm_doc: Optional[str]) -> str:
+        """Absolute path of a component's source file.
+
+        A relative component source is stored relative to the ASSEMBLY file's folder
+        (`Parts/…`, `../Frame/…`) — the engine's compile_assembly resolves it that way. It
+        was resolved against the worker's cwd here, so asm_mate on a saved assembly failed
+        with "no such file" for every relative component (2026-09-24)."""
+        p = path
+        if not os.path.isabs(p) and asm_doc:
+            asm_path = next((e.get("path") for e in (cb.call("doc_list", {}) or {})
+                             .get("docs", []) if isinstance(e, dict)
+                             and e.get("doc_id") == asm_doc), None)
+            if isinstance(asm_path, str) and asm_path:
+                p = os.path.join(os.path.dirname(asm_path), p)
+        return os.path.abspath(p)
+
+
+
+    def _asm_component_doc(path: str, asm_doc: Optional[str] = None) -> str:
         """doc_id of the component's source part, opened (once) for geometry queries."""
-        import os as _os
-        p = _os.path.abspath(path)
+        p = _component_source_path(path, asm_doc)
         d = _ASM_QUERY_DOCS.get(p)
         if d:
             try:  # still open?
@@ -380,7 +397,7 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                 q = ref.get("query", "top")
                 if isinstance(q, str):
                     q = {"of": "face", "side": q}
-                part_doc = _asm_component_doc(src)
+                part_doc = _asm_component_doc(src, d)
                 matches = (cb.call("doc_query", {"doc_id": part_doc, "query": q})
                            .get("matches") or [])
                 if len(matches) != 1:
@@ -857,6 +874,8 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                 raise ValueError(
                     "motion_fea_handoff: the isolated component must be moving, not fixed.")
             src_path = (comp.get("source") or {}).get("path") or ""
+            if src_path:
+                src_path = _component_source_path(src_path, d)
             if not src_path or not os.path.exists(src_path):
                 raise ValueError(f"motion_fea_handoff: component '{cid}' has no readable "
                                  f"source file ({src_path!r}) to run FEA on.")

@@ -3113,6 +3113,66 @@ def test_assembly_tools_end_to_end(tmp_path):
     _call("close_part", {"doc_id": pin})
     _call("close_part", {"doc_id": plate})
 
+def test_asm_mate_on_a_saved_assembly_resolves_relative_component_sources(
+        tmp_path, monkeypatch):
+    """Live 2026-09-24: asm_mate on the saved Rover Review failed "no such file" for every
+    component whose stored source is relative to the assembly file (`Parts/…`,
+    `../Frame/…`) — the tool resolved it against the worker's cwd instead."""
+    parts = tmp_path / "Frame"
+    asm_dir = tmp_path / "Assembly"
+    parts.mkdir()
+    asm_dir.mkdir()
+    r, _ = _call("new_part", {"name": "rel_plate"})
+    plate = r["doc_id"]
+    _call("add_features", {"doc_id": plate, "ops": [
+        cb.feat("box", "Plate", {"length": cb.dim(60), "width": cb.dim(40),
+                                 "height": cb.dim(10)}),
+        cb.feat("hole", "Bore", {"style": "simple", "end": "through_all",
+                                 "diameter": cb.dim(8), "positions": [[15, 5]]},
+                {"face": {"of": "face", "side": "top"}})]})
+    plate_path = str(parts / "rel_plate.step+")
+    assert _call("save_part", {"doc_id": plate, "path": plate_path})[0]["ok"]
+    r, _ = _call("new_part", {"name": "rel_pin"})
+    pin = r["doc_id"]
+    _call("add_features", {"doc_id": pin, "ops": [
+        cb.feat("cylinder", "Pin", {"radius": cb.dim(4), "height": cb.dim(20)})]})
+    pin_path = str(parts / "rel_pin.step+")
+    assert _call("save_part", {"doc_id": pin, "path": pin_path})[0]["ok"]
+
+    # Rover Review's components are stored relative to the assembly file; build that shape
+    # directly (asm_add_component itself records absolute paths).
+    asm = _call("new_assembly", {"name": "rel_asm"})[0]["doc_id"]
+    saved = str(asm_dir / "rel_asm.step+")
+    cb.call("doc_save", {"doc_id": asm, "path": saved})
+    rev = cb.call("doc_tree", {"doc_id": asm})["revision"]
+    ident = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    pin_pose = [1, 0, 0, 15, 0, 1, 0, 5, 0, 0, 1, 30, 0, 0, 0, 1]
+    cb.call("doc_apply_ops", {"doc_id": asm, "base_revision": rev, "with_tess": False, "ops": [
+        {"op": "asm_insert_component", "source": {"path": "../Frame/rel_plate.step+"},
+         "name": "Plate", "fixed": True, "transform": ident},
+        {"op": "asm_insert_component", "source": {"path": "../Frame/rel_pin.step+"},
+         "name": "Pin", "fixed": False, "transform": pin_pose}]})
+    cb.call("doc_save", {"doc_id": asm, "path": saved})
+    cb.call("doc_close", {"doc_id": asm})
+    reopened = cb.call("doc_open", {"path": saved})["doc_id"]
+    elsewhere = tmp_path / "worker" / "cwd"  # ../Frame from here is NOT the parts folder
+    elsewhere.mkdir(parents=True)
+    monkeypatch.chdir(elsewhere)
+    try:
+        comps = cb.call("doc_tree", {"doc_id": reopened})["tree"]["components"]
+        sources = [(c.get("source") or {}).get("path") for c in comps]
+        assert all(s and not os.path.isabs(s) for s in sources), sources
+        ids = [c["id"] for c in comps]
+        r, _ = _call("asm_mate", {"doc_id": reopened, "mate_type": "concentric",
+                                  "a": {"component": ids[0],
+                                        "query": {"of": "face", "surf": "round"}},
+                                  "b": {"component": ids[1],
+                                        "query": {"of": "face", "surf": "round"}}})
+        assert r["ok"], r
+    finally:
+        cb.call("doc_close", {"doc_id": reopened})
+        _call("close_part", {"doc_id": pin})
+        _call("close_part", {"doc_id": plate})
 
 def test_asm_mate_operand_shapes(tmp_path):
     """Class-2/4 selector-shape gaps in asm_mate `a`/`b` — hunted alongside cad_doc_tools'

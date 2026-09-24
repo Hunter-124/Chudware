@@ -43,6 +43,9 @@ GenResult gen_face(const Operation& opIn, const OpContext& ctx) {
     double stepover = op.stepover > 0 ? op.stepover : r;
     PathBuilder pb = make_builder(op);
     pb.set_spindle((int)std::lround(op.rpm));
+    if (!valid_depth_levels(op.heights.top, op.heights.bottom, op.stock_to_leave_axial)) {
+        res.ok = false; res.error = "depth_levels: final depth must be below top"; return res;
+    }
     auto levels = depth_levels(op.heights.top, op.heights.bottom, op.stepdown, op.stock_to_leave_axial);
     for (double z : levels) {
         auto strokes = geo::raster_fill(area, stepover, op.angle, op.pattern != CutPattern::OneWay);
@@ -85,6 +88,9 @@ GenResult gen_contour2d(const Operation& opIn, const OpContext& ctx) {
     double off = r + op.stock_to_leave;
     PathBuilder pb = make_builder(op);
     pb.set_spindle((int)std::lround(op.rpm));
+    if (!valid_depth_levels(op.heights.top, op.heights.bottom, op.stock_to_leave_axial)) {
+        res.ok = false; res.error = "depth_levels: final depth must be below top"; return res;
+    }
     auto levels = depth_levels(op.heights.top, op.heights.bottom, op.stepdown, op.stock_to_leave_axial);
 
     for (const Path2& loop : loops) {
@@ -137,6 +143,9 @@ GenResult gen_pocket2d(const Operation& opIn, const OpContext& ctx) {
     double stepover = op.stepover > 0 ? op.stepover : r * 0.8;
     PathBuilder pb = make_builder(op);
     pb.set_spindle((int)std::lround(op.rpm));
+    if (!valid_depth_levels(op.heights.top, op.heights.bottom, op.stock_to_leave_axial)) {
+        res.ok = false; res.error = "depth_levels: final depth must be below top"; return res;
+    }
     auto levels = depth_levels(op.heights.top, op.heights.bottom, op.stepdown, op.stock_to_leave_axial);
 
     for (const Region& reg : regs) {
@@ -187,6 +196,9 @@ GenResult gen_slot(const Operation& opIn, const OpContext& ctx) {
     double width = op_num(op, "width", dia);
     PathBuilder pb = make_builder(op);
     pb.set_spindle((int)std::lround(op.rpm));
+    if (!valid_depth_levels(op.heights.top, op.heights.bottom, op.stock_to_leave_axial)) {
+        res.ok = false; res.error = "depth_levels: final depth must be below top"; return res;
+    }
     auto levels = depth_levels(op.heights.top, op.heights.bottom, op.stepdown, op.stock_to_leave_axial);
 
     if (width <= dia + 1e-6) {

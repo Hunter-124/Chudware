@@ -48,6 +48,17 @@ struct CamUI {
     double dialectsNextTry = 0.0;
     int postIdx = -1;
     bool flavorPopup = false;
+    bool postPending = false;          // partial NC stays inaccessible until explicit approval
+    bool postDialogOpen = false;
+    std::string pendingGcode;
+    std::string pendingDialect;
+    nlohmann::json pendingWarnings;
+    int pendingGen = 0;
+    int pendingRevision = -1;
+    std::string pendingDocId;
+    bool pendingDownloadOnWeb = false;
+    nlohmann::json exportedWarnings;
+    bool exportedIncomplete = false;
 
     int rpcInflight = 0;
     int rpcGen = 0;                    // drops callbacks after a job switch
@@ -88,7 +99,7 @@ struct CamUI {
 };
 CamUI g;
 
-bool camBusy() { return g.rpcInflight > 0 || g.auditInflight; }
+bool camBusy() { return g.rpcInflight > 0 || g.auditInflight || g.postPending; }
 void camBeginRpc() { ++g.rpcInflight; }
 void camEndRpc() { if (g.rpcInflight > 0) --g.rpcInflight; }
 
@@ -101,9 +112,21 @@ void resetOpBuffers() {
     g.loadedOpRevision = -1;
 }
 
+void clearPendingPost() {
+    g.postPending = false;
+    g.postDialogOpen = false;
+    g.pendingGcode.clear();
+    g.pendingDialect.clear();
+    g.pendingWarnings = nlohmann::json();
+    g.pendingDocId.clear();
+}
+
 void clearSimulationAndOutput() {
     g.gcode.clear();
     g.gcodePath.clear();
+    clearPendingPost();
+    g.exportedWarnings = nlohmann::json();
+    g.exportedIncomplete = false;
     g.sim = nlohmann::json();
     g.audit = nlohmann::json();
     ++g.simGen;
@@ -292,9 +315,94 @@ void writeGcodeFile(const std::string& dialect) {
     g.gcodePath.clear();
 #endif
 }
+void downloadGcode();
+
+// Core keeps CAM warnings as strings ("operation <id>: <error>"); accept structured
+// warnings too so the operation and failure remain visible if an RPC provides them.
+const nlohmann::json* camWarnings(const nlohmann::json& result) {
+    if (!result.is_object() || !result.contains("warnings") ||
+        !result["warnings"].is_array() || result["warnings"].empty()) return nullptr;
+    return &result["warnings"];
+}
+
+bool camIncomplete(const nlohmann::json& result) {
+    if (!result.is_object()) return false;
+    if (result.value("incomplete", false)) return true;
+    if (!result.contains("warnings")) return false;
+    const auto& warnings = result["warnings"];
+    return warnings.is_string() ? !warnings.get_ref<const std::string&>().empty()
+                                : !warnings.empty();
+}
+
+void drawCamWarning(const nlohmann::json& warning) {
+    if (warning.is_string()) {
+        ImGui::BulletText("%s", warning.get_ref<const std::string&>().c_str());
+    } else if (warning.is_object()) {
+        const std::string op = warning.value("op", std::string("unknown"));
+        const std::string error = warning.value(
+            "error", warning.value("warning", std::string("generation failed")));
+        ImGui::BulletText("operation %s: %s", op.c_str(), error.c_str());
+    } else {
+        ImGui::BulletText("%s", warning.dump().c_str());
+    }
+}
+
+void adoptPostResult(const nlohmann::json& result, const std::string& dialect,
+                     bool pipeline, bool downloadOnWeb, int gen, const std::string& docId) {
+    g.pipeStage = 0;
+    g.gcode.clear();
+    g.gcodePath.clear();
+    g.audit = nlohmann::json();
+    g.exportedWarnings = nlohmann::json();
+    g.exportedIncomplete = false;
+    if (!result.is_object() || !result.value("ok", true)) {
+        g.status = "cam_post: " + (result.is_object()
+                       ? result.value("error", std::string("post failed"))
+                       : std::string("bad response"));
+        return;
+    }
+    const std::string code = result.value("gcode", std::string());
+    if (camIncomplete(result)) {
+        g.postPending = true;
+        g.postDialogOpen = true;
+        g.pendingGcode = code;
+        g.pendingDialect = dialect;
+        if (result.contains("warnings") && result["warnings"].is_array())
+            g.pendingWarnings = result["warnings"];
+        else if (result.contains("warnings") && !result["warnings"].is_null() &&
+                 !(result["warnings"].is_string() &&
+                   result["warnings"].get_ref<const std::string&>().empty()))
+            g.pendingWarnings = nlohmann::json::array({result["warnings"]});
+        else
+            g.pendingWarnings = nlohmann::json::array();
+        g.pendingGen = gen;
+        g.pendingRevision = g.mirror.revision();
+        g.pendingDocId = docId;
+        g.pendingDownloadOnWeb = downloadOnWeb;
+        g.status = "INCOMPLETE post — review dropped operations before export";
+        return;
+    }
+    if (code.empty()) {
+        g.status = "cam_post: no G-code returned";
+        return;
+    }
+    g.gcode = code;
+    writeGcodeFile(dialect);
+    g.status = pipeline ? "pipeline done: generated + simulated + posted " + dialect
+                        : "posted " + dialect + " (" +
+                          std::to_string(result.value("line_count", 0)) + " lines)";
+#ifdef __EMSCRIPTEN__
+    if (downloadOnWeb) downloadGcode();
+#endif
+}
+
 
 // Browser Blob download of in-memory gcode (web) / ensure temp file exists (desktop).
 void downloadGcode() {
+    if (g.postPending) {
+        g.status = "Review incomplete post before downloading";
+        return;
+    }
     if (g.gcode.empty()) {
         g.status = "no G-code — Post first";
         return;
@@ -317,11 +425,12 @@ void downloadGcode() {
             URL.revokeObjectURL(url);
         }, 0);
     }, g.gcode.c_str(), fname.c_str());
-    g.status = "downloaded " + fname;
+    g.status = "downloaded " + fname + (g.exportedIncomplete ? " (INCOMPLETE)" : "");
 #else
     if (g.gcodePath.empty()) writeGcodeFile(dialect);
-    g.status = g.gcodePath.empty() ? ("G-code ready (" + fname + ")")
-                                   : ("saved " + g.gcodePath);
+    g.status = (g.gcodePath.empty() ? ("G-code ready (" + fname + ")")
+                                    : ("saved " + g.gcodePath)) +
+               (g.exportedIncomplete ? " (INCOMPLETE)" : "");
 #endif
 }
 
@@ -464,6 +573,22 @@ void doPipeline(AppState& st) {
     doGenerate(st);
 }
 
+int simulationWarningCount(const nlohmann::json& sim) {
+    int n = camWarnings(sim) ? (int)camWarnings(sim)->size() : 0;
+    if (sim.is_object() && sim.contains("results") && sim["results"].is_array())
+        for (const auto& result : sim["results"])
+            if (const auto* warnings = camWarnings(result)) n += (int)warnings->size();
+    return n;
+}
+
+bool simulationIncomplete(const nlohmann::json& sim) {
+    if (camIncomplete(sim)) return true;
+    if (sim.is_object() && sim.contains("results") && sim["results"].is_array())
+        for (const auto& result : sim["results"])
+            if (camIncomplete(result)) return true;
+    return false;
+}
+
 void doSimulate(AppState& st) {
     if (g.docId.empty()) { g.status = "no job"; return; }
     if (camBusy()) { g.status = "CAM busy"; return; }
@@ -487,14 +612,20 @@ void doSimulate(AppState& st) {
                 [gen, docId, stp](const core::RpcResult& r) {
         camEndRpc();
         if (gen != g.rpcGen || g.docId != docId) return;
-        if (!r.ok) {
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) {
             g.pipeStage = 0;
-            g.status = std::string("cam_simulate: ") +
-                       (r.err.empty() ? std::string("failed") : r.err);
+            g.status = "cam_simulate: " +
+                       (r.err.empty() && r.result.is_object()
+                            ? r.result.value("error", std::string("failed"))
+                            : r.err.empty() ? std::string("failed") : r.err);
             return;
         }
         camAdoptSimResult(r.result);
-        g.status = "simulated";
+        const int warnings = simulationWarningCount(r.result);
+        g.status = simulationIncomplete(r.result)
+                       ? "simulation INCOMPLETE — " + std::to_string(warnings) +
+                             " warning(s); review dropped operations"
+                       : "simulated";
         if (g.pipeStage == 2) {
             g.pipeStage = 3;
             doPost(*stp);
@@ -511,6 +642,11 @@ void doPost(AppState& st) {
         return;
     }
     const std::string dialect = currentDialect();
+    // A prior posted artifact cannot be downloaded while a new result is awaiting review.
+    g.gcode.clear();
+    g.gcodePath.clear();
+    g.exportedWarnings = nlohmann::json();
+    g.exportedIncomplete = false;
     camBeginRpc();
     g.status = "posting " + dialect + "...";
     const int gen = g.rpcGen;
@@ -525,19 +661,7 @@ void doPost(AppState& st) {
                        (r.err.empty() ? std::string("failed") : r.err);
             return;
         }
-        g.audit = nlohmann::json();
-        g.gcode = r.result.value("gcode", std::string());
-        writeGcodeFile(dialect);
-        if (g.pipeStage == 3) {
-            g.pipeStage = 0;
-            g.status = "pipeline done: generated + simulated + posted " + dialect;
-        } else {
-            g.status = "posted " + dialect + " (" +
-                       std::to_string(r.result.value("line_count", 0)) + " lines)";
-        }
-#ifdef __EMSCRIPTEN__
-        if (!g.gcode.empty()) downloadGcode();
-#endif
+        adoptPostResult(r.result, dialect, g.pipeStage == 3, true, gen, docId);
     });
 }
 
@@ -632,10 +756,13 @@ void drawSelectedSimEvidence() {
     const int gouges = result->value("gouges", 0);
     const int rapids = result->value("rapid_collisions", 0);
     const int holders = result->value("holder_collisions", 0);
+    const bool incomplete = camIncomplete(*result);
     const bool clean = gouges == 0 && rapids == 0 && holders == 0;
-    const float* color = clean ? ui::palette.statusOk : ui::palette.statusWarn;
+    const float* color = incomplete ? ui::palette.statusWarn
+                                    : clean ? ui::palette.statusOk : ui::palette.statusWarn;
     ImGui::TextColored(ImVec4(color[0], color[1], color[2], color[3]),
-                       clean ? "Verified clean" : "Verification findings");
+                       incomplete ? "Verification INCOMPLETE"
+                                  : clean ? "Verified clean" : "Verification findings");
     const double cycle = result->value("cycle_time_s", 0.0);
     ImGui::TextDisabled("%.0f%% removed  |  %dm %02ds",
                         100.0 * result->value("machined_fraction", 0.0),
@@ -974,9 +1101,11 @@ void camDrawViewportHud(AppState& /*st*/, const ImVec2& vpMin, const ImVec2& vpS
             const bool clean = evidence->value("gouges", 0) == 0 &&
                                evidence->value("rapid_collisions", 0) == 0 &&
                                evidence->value("holder_collisions", 0) == 0;
-            const float* color = clean ? ui::palette.statusOk : ui::palette.statusErr;
+            const bool incomplete = simulationIncomplete(g.sim);
+            const float* color = incomplete ? ui::palette.statusWarn
+                                            : clean ? ui::palette.statusOk : ui::palette.statusErr;
             ImGui::TextColored(ImVec4(color[0], color[1], color[2], color[3]),
-                               clean ? "VERIFIED" : "FINDINGS");
+                               incomplete ? "INCOMPLETE" : clean ? "VERIFIED" : "FINDINGS");
         }
 
         auto legend = [](const char* label, const float color[4]) {
@@ -1057,10 +1186,6 @@ void camLoadJob(AppState& st, const std::string& docId) {
     if (!camCall(st, "cam_tree", {{"doc_id", docId}}, tree)) return;
     loadTree(tree);
     g.status = "loaded CAM job from copilot";
-    if (tree.contains("gcode") && tree["gcode"].is_string()) {
-        g.gcode = tree["gcode"].get<std::string>();
-        if (!g.gcode.empty()) writeGcodeFile(currentDialect());
-    }
 
     AppState* stp = &st;
     camBeginRpc();
@@ -1079,22 +1204,81 @@ void camLoadJob(AppState& st, const std::string& docId) {
         g.genWarnings =
             (generated.result.contains("warnings") && generated.result["warnings"].is_array())
                 ? (int)generated.result["warnings"].size() : 0;
-        if (g.gcode.empty() && generated.result.contains("gcode") &&
-            generated.result["gcode"].is_string()) {
-            g.gcode = generated.result["gcode"].get<std::string>();
-            if (!g.gcode.empty()) writeGcodeFile(currentDialect());
-        }
-        if (!g.gcode.empty()) return;
         const std::string dialect = currentDialect();
         camBeginRpc();
         stp->rpc.call("cam_post", {{"doc_id", docId}, {"dialect", dialect}},
                       [gen, docId, dialect](const core::RpcResult& posted) {
             camEndRpc();
-            if (gen != g.rpcGen || g.docId != docId || !posted.ok) return;
-            g.gcode = posted.result.value("gcode", std::string());
-            if (!g.gcode.empty()) writeGcodeFile(dialect);
+            if (gen != g.rpcGen || g.docId != docId) return;
+            if (!posted.ok) {
+                g.status = "cam_post: " +
+                           (posted.err.empty() ? std::string("failed") : posted.err);
+                return;
+            }
+            adoptPostResult(posted.result, dialect, false, false, gen, docId);
         });
     });
+}
+
+void camDrawPostConfirm(AppState& /*st*/) {
+    if (g.postDialogOpen) {
+        ImGui::OpenPopup("Incomplete CAM post##cam_export_confirm");
+        g.postDialogOpen = false;
+    }
+    if (!ImGui::BeginPopupModal("Incomplete CAM post##cam_export_confirm", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) return;
+    if (!g.postPending) {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    const float* warn = ui::palette.statusWarn;
+    ImGui::TextColored(ImVec4(warn[0], warn[1], warn[2], warn[3]),
+                       "INCOMPLETE — some operations were not posted");
+    ImGui::TextWrapped("The G-code omits these operations. This post has not been exported.");
+    if (g.pendingWarnings.is_array() && !g.pendingWarnings.empty()) {
+        const float listHeight = std::min(
+            ui::metrics::camBtnH() * (float)(g.pendingWarnings.size() + 1),
+            ImGui::GetIO().DisplaySize.y * 0.45f);
+        ImGui::BeginChild("##cam_post_warnings",
+                          ImVec2(ui::metrics::camFieldW() * 3.0f, listHeight), true);
+        ImGui::PushTextWrapPos();
+        for (const auto& warning : g.pendingWarnings) drawCamWarning(warning);
+        ImGui::PopTextWrapPos();
+        ImGui::EndChild();
+    } else {
+        ImGui::TextWrapped("The post reported missing operations without details.");
+    }
+    ImGui::Spacing();
+    if (ImGui::Button("Cancel", ImVec2(0.0f, ui::metrics::camBtnH()))) {
+        clearPendingPost();
+        g.status = "incomplete post canceled — nothing exported";
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SetItemDefaultFocus();  // Enter/Escape must not implicitly approve export.
+    ImGui::SameLine(0.0f, ui::metrics::camBtnGap());
+    const bool valid = !g.pendingGcode.empty() && g.pendingGen == g.rpcGen &&
+                       g.pendingDocId == g.docId &&
+                       g.pendingRevision == g.mirror.revision();
+    if (!valid) ImGui::BeginDisabled();
+    if (ImGui::Button("Export anyway", ImVec2(0.0f, ui::metrics::camBtnH())) && valid) {
+        const std::string dialect = g.pendingDialect;
+        const bool downloadOnWeb = g.pendingDownloadOnWeb;
+        g.gcode = std::move(g.pendingGcode);
+        g.exportedWarnings = std::move(g.pendingWarnings);
+        g.exportedIncomplete = true;
+        clearPendingPost();
+        writeGcodeFile(dialect);
+        g.status = "exported INCOMPLETE " + dialect + " — see dropped operations";
+#ifdef __EMSCRIPTEN__
+        if (downloadOnWeb) downloadGcode();
+#else
+        (void)downloadOnWeb;
+#endif
+        ImGui::CloseCurrentPopup();
+    }
+    if (!valid) ImGui::EndDisabled();
+    ImGui::EndPopup();
 }
 
 void drawCamOutputBody(AppState& st) {
@@ -1133,6 +1317,15 @@ void drawCamOutputBody(AppState& st) {
     if (!g.status.empty()) {
         ImGui::PushTextWrapPos();
         ImGui::TextDisabled("%s", g.status.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    if (g.exportedIncomplete) {
+        const float* warn = ui::palette.statusWarn;
+        ImGui::TextColored(ImVec4(warn[0], warn[1], warn[2], warn[3]),
+                           "INCOMPLETE NC output — exported by explicit confirmation");
+        ImGui::PushTextWrapPos();
+        if (g.exportedWarnings.is_array())
+            for (const auto& warning : g.exportedWarnings) drawCamWarning(warning);
         ImGui::PopTextWrapPos();
     }
     if (!g.audit.empty()) {
@@ -1317,6 +1510,21 @@ void drawSimulationOptions() {
     ImGui::SliderFloat("##cam_sim_resolution", &g.optRes, 0.2f, 2.0f,
                        "Resolution %.1f mm");
     drawSelectedSimEvidence();
+    if (simulationIncomplete(g.sim)) {
+        const float* warn = ui::palette.statusWarn;
+        ImGui::TextColored(ImVec4(warn[0], warn[1], warn[2], warn[3]),
+                           "Simulation INCOMPLETE — operations omitted:");
+        ImGui::PushTextWrapPos();
+        if (const auto* warnings = camWarnings(g.sim))
+            for (const auto& warning : *warnings) drawCamWarning(warning);
+        if (g.sim.is_object() && g.sim.contains("results") && g.sim["results"].is_array())
+            for (const auto& result : g.sim["results"])
+                if (const auto* warnings = camWarnings(result))
+                    for (const auto& warning : *warnings) drawCamWarning(warning);
+        if (simulationWarningCount(g.sim) == 0)
+            ImGui::TextWrapped("The simulation reported missing operations without details.");
+        ImGui::PopTextWrapPos();
+    }
 }
 
 }  // namespace

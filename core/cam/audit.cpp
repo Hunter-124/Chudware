@@ -25,7 +25,8 @@ struct ModalState {
     int work_offset = 54;
     int work_offset_sub = 0;
     int tool = 0;
-    double feed = 0;         // mm/min
+    double feed = 0;         // F in mm/min (G94) or mm/rev (G95)
+    int feed_mode = 94;
     double rpm = 0;
     int spindle = 0;         // 0=off, 3=CW, 4=CCW
     Vec3 pos{0, 0, 0};
@@ -204,7 +205,7 @@ json audit_program(const Job& job,
     double feed_hi = 0;
     double rpm_lo = std::numeric_limits<double>::infinity();
     double rpm_hi = 0;
-    bool saw_feed = false, saw_rpm = false;
+    bool saw_feed = false, saw_rpm = false, saw_effective_feed = false;
     int line_count = 0;
 
     // Stock / envelope from first setup (multi-setup posts still share one envelope check).
@@ -242,6 +243,8 @@ json audit_program(const Job& job,
         bool has_dwell = false;
         bool m6 = false;
         int t_word = -1;
+        bool has_feed_word = false;
+        bool has_rpm_word = false;
 
         for (const Word& w : words) {
             int gi = static_cast<int>(std::lround(w.value));
@@ -261,6 +264,8 @@ json audit_program(const Job& job,
                     errors.push_back("G20 inch mode is not supported (jobs are mm)");
                 } else if (g == 21) {
                     st.units = 21;
+                } else if (g == 94 || g == 95) {
+                    st.feed_mode = g;
                 } else if (g == 90) {
                     st.distance = 90;
                 } else if (g == 91) {
@@ -274,7 +279,7 @@ json audit_program(const Job& job,
                 } else if (g == 28 || g == 30 || g == 40 || g == 41 || g == 42 ||
                            g == 43 || g == 49 || g == 53 || g == 80 || g == 81 ||
                            g == 82 || g == 83 || g == 84 || g == 85 || g == 98 ||
-                           g == 99 || g == 94 || g == 95 || g == 64 || g == 61 ||
+                           g == 99 || g == 64 || g == 61 ||
                            g == 10 || g == 50 || g == 92 || g == 96 || g == 97) {
                     // known, ignored for audit modal subset
                 } else {
@@ -312,6 +317,8 @@ json audit_program(const Job& job,
             }
             if (w.letter == 'S') {
                 st.rpm = w.value;
+                has_rpm_word = true;
+                if (w.value < 0) errors.push_back("spindle S must be non-negative");
                 saw_rpm = true;
                 rpm_lo = std::min(rpm_lo, w.value);
                 rpm_hi = std::max(rpm_hi, w.value);
@@ -332,18 +339,7 @@ json audit_program(const Job& job,
             if (w.letter == 'F') {
                 st.feed = w.value;
                 saw_feed = true;
-                feed_lo = std::min(feed_lo, w.value);
-                feed_hi = std::max(feed_hi, w.value);
-                if (w.value <= 0) {
-                    errors.push_back("feed F must be > 0");
-                } else if (profile.max_feed > 0 && w.value - 1e-9 > profile.max_feed) {
-                    char buf[128];
-                    std::snprintf(buf, sizeof(buf),
-                                  "feed F%.3f exceeds machine max_feed %.3f mm/min",
-                                  w.value, profile.max_feed);
-                    errors.push_back(buf);
-                }
-                // chipload check deferred until we have tool flutes + S
+                has_feed_word = true;
                 continue;
             }
             if (w.letter == 'X') { X = w.value; has_xyz = true; continue; }
@@ -364,6 +360,30 @@ json audit_program(const Job& job,
             // Other letters (N, H, D, L, Q, A, B, C, …) ignored.
             (void)has_I; (void)has_J; (void)has_R; (void)R; (void)I; (void)J;
         }
+        if (has_feed_word) {
+            if (st.feed <= 0) {
+                errors.push_back("feed F must be > 0");
+            } else if (st.feed_mode == 95 &&
+                       (st.feed < 0.001 - 1e-9 || st.feed > 2.0 + 1e-9)) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf), "G95 feed F%.4f outside [0.001, 2.0] mm/rev",
+                              st.feed);
+                errors.push_back(buf);
+            }
+        }
+        if ((has_feed_word || has_rpm_word) && st.feed > 0 &&
+            (st.feed_mode == 94 || st.rpm > 0)) {
+            double feed_mm_min = st.feed * (st.feed_mode == 95 ? st.rpm : 1.0);
+            saw_effective_feed = true;
+            feed_lo = std::min(feed_lo, feed_mm_min);
+            feed_hi = std::max(feed_hi, feed_mm_min);
+            if (profile.max_feed > 0 && feed_mm_min - 1e-9 > profile.max_feed) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf), "feed F%.3f exceeds machine max_feed %.3f mm/min",
+                              feed_mm_min, profile.max_feed);
+                errors.push_back(buf);
+            }
+        }
 
         if (t_word >= 0) {
             if (known_tools.find(t_word) == known_tools.end()) {
@@ -382,7 +402,8 @@ json audit_program(const Job& job,
         if (saw_feed && saw_rpm && st.feed > 0 && st.rpm > 0 && st.tool > 0 && mat) {
             const Tool* tl = job.tools.find(st.tool);
             if (tl && tl->flutes > 0) {
-                double fz = st.feed / (st.rpm * std::max(1, tl->flutes));
+                double feed_mm_min = st.feed * (st.feed_mode == 95 ? st.rpm : 1.0);
+                double fz = feed_mm_min / (st.rpm * std::max(1, tl->flutes));
                 double ref = ref_chipload(*mat, std::max(0.1, tl->diameter));
                 double lo = 0.25 * ref;
                 double hi = 4.0 * ref;
@@ -404,7 +425,9 @@ json audit_program(const Job& job,
             est_time += dwell;
         }
 
-        if (!has_xyz) continue;
+        // A full-circle G2/G3 can have only centre/radius words and no XYZ endpoint.
+        if (!has_xyz && !((st.motion == 2 || st.motion == 3) && (has_I || has_J || has_R)))
+            continue;
 
         Vec3 target = st.pos;
         if (st.distance == 90) {
@@ -426,8 +449,20 @@ json audit_program(const Job& job,
         bool rapid = (st.motion == 0);
         bool cut = (st.motion == 1 || st.motion == 2 || st.motion == 3);
 
+        if (cut && st.feed_mode == 95 && st.rpm <= 0)
+            errors.push_back("G95 cutting move requires positive spindle rpm");
+        if (cut && st.feed_mode == 95 &&
+            (st.feed < 0.001 - 1e-9 || st.feed > 2.0 + 1e-9))
+            errors.push_back("G95 cutting feed outside [0.001, 2.0] mm/rev");
+        const Tool* active_tool = job.tools.find(st.tool);
+        bool probe = active_tool && active_tool->type == ToolType::Probe;
+        bool head = profile.kind == MachineKind::Laser || profile.kind == MachineKind::Plasma ||
+                    profile.kind == MachineKind::Waterjet;
+        if (cut && !head && !probe && (st.spindle == 0 || st.rpm <= 0))
+            errors.push_back("G1/G2/G3 cutting move while spindle is off or S is zero");
         if (st.have_pos) {
-            est_time += segment_time_s(rapid, from, target, st.feed, profile);
+            double feed_mm_min = st.feed * (st.feed_mode == 95 ? st.rpm : 1.0);
+            est_time += segment_time_s(rapid, from, target, feed_mm_min, profile);
         }
 
         // Envelope checks on target.
@@ -534,8 +569,8 @@ json audit_program(const Job& job,
     }
 
     json feed_range = json::array({
-        saw_feed ? feed_lo : 0.0,
-        saw_feed ? feed_hi : 0.0,
+        saw_effective_feed ? feed_lo : 0.0,
+        saw_effective_feed ? feed_hi : 0.0,
     });
     json rpm_range = json::array({
         saw_rpm ? rpm_lo : 0.0,

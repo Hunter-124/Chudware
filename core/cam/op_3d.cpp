@@ -237,6 +237,9 @@ GenResult gen_contour3d(const Operation& opIn, const OpContext& ctx) {
                                         : std::fabs(op.heights.top - op.heights.bottom);
     if (stepdown <= 0.0) stepdown = 1.0;
 
+    if (!valid_depth_levels(op.heights.top, op.heights.bottom, op.stock_to_leave_axial)) {
+        res.ok = false; res.error = "depth_levels: final depth must be below top"; return res;
+    }
     auto levels   = depth_levels(op.heights.top, op.heights.bottom, stepdown,
                                  op.stock_to_leave_axial);
     auto sections = waterline_sections(mesh, levels, op.tolerance);
@@ -284,6 +287,9 @@ GenResult gen_pocket3d(const Operation& opIn, const OpContext& ctx) {
     double stepdown = op.stepdown > 0.0 ? op.stepdown : tool_r;
     if (stepdown <= 0.0) stepdown = 1.0;
 
+    if (!valid_depth_levels(op.heights.top, op.heights.bottom, op.stock_to_leave_axial)) {
+        res.ok = false; res.error = "depth_levels: final depth must be below top"; return res;
+    }
     auto levels   = depth_levels(op.heights.top, op.heights.bottom, stepdown,
                                  op.stock_to_leave_axial);
     auto sections = waterline_sections(mesh, levels, op.tolerance);
@@ -320,6 +326,9 @@ GenResult gen_adaptive_clear3d(const Operation& opIn, const OpContext& ctx) {
     double stepdown = op.stepdown > 0.0 ? op.stepdown : tool_r * 0.5;
     if (stepdown <= 0.0) stepdown = 0.5;
 
+    if (!valid_depth_levels(op.heights.top, op.heights.bottom, op.stock_to_leave_axial)) {
+        res.ok = false; res.error = "depth_levels: final depth must be below top"; return res;
+    }
     auto levels   = depth_levels(op.heights.top, op.heights.bottom, stepdown,
                                  op.stock_to_leave_axial);
     auto sections = waterline_sections(mesh, levels, op.tolerance);

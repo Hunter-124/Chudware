@@ -273,7 +273,8 @@ Feeds compute_feeds(const Machine& mach, const Tool& tool, const Operation& op,
         double ref_dia = op.geometry.contains("max_dia") ? num(op.geometry["max_dia"], 50.0) : 50.0;
         f.rpm = clampd(sfm_to_rpm(sfm, std::max(1.0, ref_dia)), mach.min_rpm, op.max_turn_rpm > 0 ? op.max_turn_rpm : mach.max_rpm);
         double fpr = (op.type == OpType::TurnFinish) ? 0.12 : 0.25;  // mm/rev
-        f.feed = f.rpm * fpr;
+        // Keep the programmed mm/rev chipload when the operation overrides RPM.
+        f.feed = (op.rpm > 0 ? op.rpm : f.rpm) * fpr;
         f.plunge = f.feed * 0.5;
         f.fz = fpr;
         f.notes.push_back("turning: feed/rev " + std::to_string(fpr) + "mm");

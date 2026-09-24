@@ -203,6 +203,8 @@ struct NcGen {
     bool beam_on = false;
     bool lathe = false;
     bool diameter = false;
+    bool per_rev = false;
+    int feed_rpm = 0;
 
     NcGen(const PostConfig& cfg, const PostOptions& o) : c(cfg), opt(o), seq(cfg.seq_start) {
         lathe = c.lathe;
@@ -225,6 +227,13 @@ struct NcGen {
         blk(c.comment_open + s + c.comment_close);
     }
     std::string axis(const char* a, double v, const NumFmt& f) { return std::string(a) + fmt_num(v, f); }
+    double nc_feed(double feed_mm_min) const {
+        return per_rev ? feed_mm_min / feed_rpm : feed_mm_min;
+    }
+    std::string feed_word(double feed_mm_min) const {
+        const NumFmt per_rev_fmt{4, false, true, false};
+        return "F" + fmt_num(nc_feed(feed_mm_min), per_rev ? per_rev_fmt : c.feed);
+    }
 
     // emit one linear/rapid move word-set with modal suppression
     void motion(const std::string& g, const Vec3& to, double feed, bool with_feed) {
@@ -241,9 +250,10 @@ struct NcGen {
             if (std::fabs(to.y - pos.y) > 5e-7 || pos.y > 1e8) word(axis("Y", to.y, c.xyz));
             if (std::fabs(to.z - pos.z) > 5e-7 || pos.z > 1e8) word(axis("Z", to.z, c.xyz));
         }
-        if (with_feed && feed > 0 && (!c.modal_feed || std::fabs(feed - last_feed) > 1e-6)) {
-            word(axis("F", feed, c.feed));
-            last_feed = feed;
+        double output_feed = with_feed && feed > 0 ? nc_feed(feed) : 0;
+        if (output_feed > 0 && (!c.modal_feed || std::fabs(output_feed - last_feed) > 1e-6)) {
+            word(feed_word(feed));
+            last_feed = output_feed;
         }
         std::string line = b.str();
         if (!line.empty() && !(line == g)) blk(line);
@@ -272,9 +282,10 @@ struct NcGen {
                   << " " << axis("J", m.center.y - pos.y, c.arc);
             }
         }
-        if (m.feed > 0 && (!c.modal_feed || std::fabs(m.feed - last_feed) > 1e-6)) {
-            b << " " << axis("F", m.feed, c.feed);
-            last_feed = m.feed;
+        double output_feed = m.feed > 0 ? nc_feed(m.feed) : 0;
+        if (output_feed > 0 && (!c.modal_feed || std::fabs(output_feed - last_feed) > 1e-6)) {
+            b << " " << feed_word(m.feed);
+            last_feed = output_feed;
         }
         blk(b.str());
         pos = m.to;
@@ -397,7 +408,32 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
         for (auto& o : setup.operations) if (o.id == tp.op_id) { op = &o; break; }
         int rpm; double cutF, plungeF;
         path_speeds(tp, rpm, cutF, plungeF);
-
+        bool per_rev = op &&
+                       op->extra.value("feed_mode", std::string("per_min")) == "per_rev";
+        if (per_rev && !g.lathe) {
+            res.ok = false;
+            res.error = "operation " + tp.op_id + ": G95 requires a lathe post";
+            return res;
+        }
+        if (per_rev && rpm <= 0) {
+            res.ok = false;
+            res.error = "operation " + tp.op_id + ": G95 requires positive spindle rpm";
+            return res;
+        }
+        if (per_rev) {
+            for (const Move& m : tp.moves) {
+                if (m.feed <= 0) continue;
+                double fpr = m.feed / rpm;
+                if (fpr < 0.001 || fpr > 2.0) {
+                    res.ok = false;
+                    res.error = "operation " + tp.op_id + ": G95 feed outside [0.001, 2.0] mm/rev";
+                    return res;
+                }
+            }
+        }
+        if (g.per_rev != per_rev) g.last_feed = -1;
+        g.per_rev = per_rev;
+        g.feed_rpm = rpm;
         // tool change
         if (tp.tool_number != last_tool) {
             const Tool* t = tools.find(tp.tool_number);
@@ -424,8 +460,7 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
             }
         }
         if (g.lathe && op)
-            g.blk(op->extra.value("feed_mode", std::string("per_min")) == "per_rev"
-                      ? c.feed_per_rev : c.feed_per_min);
+            g.blk(per_rev ? c.feed_per_rev : c.feed_per_min);
         bool head = (setup.machine.kind == MachineKind::Laser || setup.machine.kind == MachineKind::Plasma ||
                      setup.machine.kind == MachineKind::Waterjet);
         if (g.lathe && op && op->surface_speed_mode == "css") {
@@ -440,6 +475,8 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
             css << c.css_on << " S" << fmt_num(op->css, g.c.rpm);
             if (c.css_clamp.empty()) css << " D" << fmt_num(op->max_turn_rpm, g.c.rpm);
             g.blk(css.str());
+            // G96 selects surface-speed control but does not start the spindle.
+            g.blk(op->spindle_dir < 0 ? c.spindle_ccw : c.spindle_cw);
             g.last_rpm = rpm;
         }
         if (!head && rpm > 0 && rpm != g.last_rpm) g.spindle(rpm, op ? op->spindle_dir : 1);
@@ -451,7 +488,7 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
             std::string code = drill_cycle_code(c, op->cycle);
             double Rp = op->heights.retract;
             double Zb = op->heights.bottom - op->tip_through;
-            double F = plungeF;
+            double F = g.nc_feed(plungeF);
             g.blk(c.cycle_retract_g99);
             bool first = true;
             for (auto& pj : op->geometry["points"]) {
@@ -467,7 +504,7 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
                         b << " Q" << fmt_num(op->peck > 0 ? op->peck : 1.0, c.xyz);
                     if (op->cycle == "spot" && op->dwell > 0)
                         b << " P" << fmt_num(c.dwell_seconds ? op->dwell : op->dwell * 1000, c.feed);
-                    b << " F" << fmt_num(F, c.feed);
+                    b << " F" << fmt_num(F, per_rev ? NumFmt{4, false, true, false} : c.feed);
                     first = false;
                 } else {
                     b << "X" << fmt_num(p.x, c.xyz) << " Y" << fmt_num(p.y, c.xyz);

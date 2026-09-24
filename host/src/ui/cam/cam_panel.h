@@ -22,6 +22,8 @@ void camHandleCommand(AppState& st, const std::string& cmd);
 // Integrated left-rail bodies. They draw inside their caller's surface (no Begin/End).
 void drawCamTreeBody(AppState& st);
 void drawCamOutputBody(AppState& st);
+// Global Manufacture modal: incomplete posts remain unexported until explicitly approved.
+void camDrawPostConfirm(AppState& st);
 
 // Active classified toolpath geometry for the native viewport overlay.
 const CamBackplot* camActiveBackplot();

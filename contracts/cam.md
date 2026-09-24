@@ -158,3 +158,28 @@ Result of MCP `cam_job_diff`:
 | `cam_feeds` | CuttingDB lookup for GUI autofill |
 | `cam_tree` | each setup may include `machine_detail` (full `Machine::to_json`) alongside kind string `machine` |
 | `cam_job_diff` | MCP-only |
+
+## 8. CAM operation-generation completeness (additive)
+
+`cam_post`, `cam_setup_sheet`, and each `cam_simulate.results[]` entry carry
+`incomplete: boolean`. It is `true` if any unsuppressed operation in the
+corresponding setup scope failed to generate a toolpath. Their `warnings` arrays
+contain a readable `"operation <id>: <reason>"` string for each refusal; post
+and simulation preserve any existing warnings and partial results. Consumers
+MUST NOT export an incomplete posted program as a complete machining job.
+`cam_setup_sheet` now includes a `warnings: string[]` field. `cam_audit`
+also adds each generation refusal to both `warnings` and `errors`, making
+`ok: false` even when the remaining G-code passes its modal checks.
+
+All generated toolpath feeds remain mm/min internally. A turning operation's
+explicit `feed` in `extra.feed_mode: "per_rev"` is entered in mm/rev and resolved
+to mm/min before toolpath generation; the post converts emitted F words back
+to mm/rev under G95. `cam_audit.stats.feed_range_mm_min` continues to report
+effective mm/min, including G95 moves.
+For a selected turning operation in G95 mode, `cam_feeds.feed` is returned in
+mm/rev (with an additive `feed_mode: "per_rev"`); its other rate fields remain
+mm/min. Without that mode, `cam_feeds.feed` remains mm/min.
+`cam_audit` tracks G94/G95 modally, checks G95 F words against
+0.001–2.0 mm/rev, and rejects cutting motion with the spindle off or without
+a positive programmed S on spindle-based machines. Laser, plasma, and
+waterjet machine profiles are exempt from the spindle requirement.

@@ -11,11 +11,17 @@ namespace chudware {
 namespace cam {
 
 // ───────────────────────────────────────────────────────── depth stepping ──
+bool valid_depth_levels(double top, double bottom, double stock_to_leave_axial) {
+    return std::isfinite(top) && std::isfinite(bottom) &&
+           std::isfinite(stock_to_leave_axial) &&
+           top - (bottom + stock_to_leave_axial) > 1e-9;
+}
+
 std::vector<double> depth_levels(double top, double bottom, double stepdown,
                                  double stock_to_leave_axial) {
     std::vector<double> levels;
     double final_z = bottom + stock_to_leave_axial;
-    if (final_z >= top - 1e-9) { levels.push_back(final_z); return levels; }
+    if (!valid_depth_levels(top, bottom, stock_to_leave_axial)) return levels;
     if (stepdown <= 1e-9) { levels.push_back(final_z); return levels; }
     double z = top - stepdown;
     while (z > final_z + 1e-6) {

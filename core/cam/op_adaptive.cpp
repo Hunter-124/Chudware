@@ -26,6 +26,9 @@ GenResult gen_adaptive2d(const Operation& opIn, const OpContext& ctx) {
     double stepdown = op.stepdown > 0 ? op.stepdown : (op.heights.top - op.heights.bottom);
     PathBuilder pb = PathBuilder(op.heights, op.feed, op.plunge, std::max(ctx.machine.rapid_xy, 1000.0));
     pb.set_spindle((int)std::lround(op.rpm));
+    if (!valid_depth_levels(op.heights.top, op.heights.bottom, op.stock_to_leave_axial)) {
+        res.ok = false; res.error = "depth_levels: final depth must be below top"; return res;
+    }
     auto levels = depth_levels(op.heights.top, op.heights.bottom, stepdown, op.stock_to_leave_axial);
 
     // Largest ring-to-ring link distance seen across the whole op, for the

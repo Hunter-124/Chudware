@@ -1,12 +1,16 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include "cam/audit.h"
+#include "cam/op_common.h"
 #include "cam/cut/process.h"
+#include "cam/session.h"
 #include "cam/post.h"
 #include "cam/stock_sim.h"
 #include "cam/turn/process.h"
@@ -111,7 +115,7 @@ TEST_CASE("lathe post emits G18, feed per rev, CSS, diameter X, G76, and shared 
     finish_path.tool_number = 1;
     finish_path.moves = {
         {MoveKind::Rapid, {15, 0, 0}, false, {}, 0, 1200, 0},
-        {MoveKind::Cut, {12, 0, -20}, false, {}, 0.2, 0, 0},
+        {MoveKind::Cut, {12, 0, -20}, false, {}, 240, 0, 0},
     };
     PostOptions lathe_options;
     lathe_options.overrides = {{"lathe", true}, {"css_clamp", ""}};
@@ -157,7 +161,138 @@ TEST_CASE("lathe post emits G18, feed per rev, CSS, diameter X, G76, and shared 
     CHECK(posted.gcode.find("G1 X18.200") == std::string::npos);
 }
 
+TEST_CASE("G95 converts internal mm/min feeds at post and audits mm/rev words") {
+    Setup setup;
+    setup.machine.kind = MachineKind::Lathe;
+    setup.stock.type = StockType::Box;
+    setup.stock.min = {0, 0, -10};
+    setup.stock.max = {20, 10, 0};
+    Operation op;
+    op.id = "turn";
+    op.type = OpType::TurnFinish;
+    op.tool_number = 1;
+    op.extra = {{"feed_mode", "per_rev"}};
+    setup.operations.push_back(op);
+    Job job;
+    job.setups = {setup};
+    job.tools = one_turn_tool();
+    OpContext ctx;
+    ctx.machine = setup.machine;
+    ctx.tool = job.tools.tools.front();
+    ctx.material_id = "aluminum";
+
+    Operation automatic = resolved_op(op, ctx);
+    REQUIRE(automatic.rpm > 0);
+    Toolpath path;
+    path.op_id = op.id;
+    path.tool_number = 1;
+    path.moves = {
+        {MoveKind::Rapid, {15, 0, 0}, false, {}, 0, (int)std::lround(automatic.rpm), 0},
+        {MoveKind::Cut, {12, 0, -2}, false, {}, automatic.feed, 0, 0},
+    };
+    PostOptions options;
+    options.overrides = {{"lathe", true}};
+    PostResult posted = post_setup(setup, job.tools, "linuxcnc", {path}, options);
+    REQUIRE(posted.ok);
+    json audit = audit_program(job, posted.gcode, "linuxcnc", setup.machine, {}, "cam_post");
+    CHECK(audit["ok"] == true);
+    Toolpath stopped = path;
+    stopped.moves.front().spindle_rpm = 0;
+    CHECK_FALSE(post_setup(setup, job.tools, "linuxcnc", {stopped}, options).ok);
+
+    op.rpm = 1000;
+    op.feed = 0.2; // explicit G95 feed in mm/rev
+    CHECK(resolved_op(op, ctx).feed == doctest::Approx(200.0));
+    const std::string bad = "G21\nG95\nS1000 M3\nF120\nG1 X12 Z-2\n";
+    audit = audit_program(job, bad, "linuxcnc", setup.machine, {}, "supplied");
+    CHECK(audit["ok"] == false);
+    bool bad_per_rev = false;
+    for (const auto& error : audit["errors"])
+        bad_per_rev |= error.get<std::string>().find("G95 feed") != std::string::npos;
+    CHECK(bad_per_rev);
+    const std::string doc = cam_new(json{{"name", "lathe feeds"}}).at("doc_id").get<std::string>();
+    cam_apply_ops(doc, -1, json::array({
+        {{"op", "add_setup"}, {"setup", setup.to_json()}},
+        {{"op", "add_tool"}, {"tool", job.tools.tools.front().to_json()}},
+    }));
+    json autofill = cam_feeds(doc, {{"tool_number", 1}});
+    CHECK(autofill["feed_mode"] == "per_rev");
+    CHECK(autofill["feed"].get<double>() == doctest::Approx(0.12));
+    CHECK(cam_close(doc));
+}
+
+TEST_CASE("CAM consumers keep refused operation diagnostics after toolpath caching") {
+    const std::string doc = cam_new(json{{"name", "incomplete"}}).at("doc_id").get<std::string>();
+    const json setup = {{"id", "setup"}, {"name", "S"},
+                        {"stock", {{"type", "box"}, {"min", {-20, -20, -5}},
+                                   {"max", {20, 20, 0}}}}};
+    const json face = {{"id", "face"}, {"type", "face"}, {"tool_number", 1},
+                       {"heights", {{"top", 0}, {"bottom", -1}}}};
+    const json no_regions = {{"id", "missing"}, {"type", "pocket2d"}, {"tool_number", 1}};
+    const json inverted = {{"id", "inverted"}, {"type", "contour2d"}, {"tool_number", 1},
+                           {"heights", {{"top", 0}, {"bottom", 2}}},
+                           {"geometry", {{"contours", {{{0, 0}, {10, 0}, {10, 10}, {0, 10}}}}}}};
+    cam_apply_ops(doc, -1, json::array({
+        {{"op", "add_setup"}, {"setup", setup}},
+        {{"op", "add_tool"}, {"tool", {{"number", 1}, {"diameter", 6}}}},
+        {{"op", "add_operation"}, {"setup_id", "setup"}, {"operation", face}},
+        {{"op", "add_operation"}, {"setup_id", "setup"}, {"operation", no_regions}},
+        {{"op", "add_operation"}, {"setup_id", "setup"}, {"operation", inverted}},
+    }));
+    const json fresh_post = cam_post(doc, json::object());
+    CHECK(fresh_post["incomplete"] == true);
+    CHECK(fresh_post["warnings"].size() == 2);
+    const json generated = cam_generate(doc, json::object());
+    CHECK(generated["toolpaths"].size() == 1);
+    CHECK(generated["warnings"].size() == 2);
+    const json post = cam_post(doc, json::object());
+    CHECK(post["incomplete"] == true);
+    CHECK(post["warnings"].size() == 2);
+    const json sim = cam_simulate(doc, json::object());
+    REQUIRE(sim["results"].size() == 1);
+    CHECK(sim["results"][0]["incomplete"] == true);
+    CHECK(sim["results"][0]["warnings"].size() >= 2);
+    const json sheet = cam_setup_sheet(doc, json::object());
+    CHECK(sheet["incomplete"] == true);
+    CHECK(sheet["warnings"].size() == 2);
+    const json audit = cam_audit(doc, json::object());
+    CHECK(audit["ok"] == false);
+    CHECK(audit["errors"].size() >= 2);
+    CHECK(cam_close(doc));
+}
+
+TEST_CASE("audit rejects spindle-off cutting but not head-based cutting") {
+    Job job;
+    Setup setup;
+    setup.stock.type = StockType::Box;
+    setup.stock.min = {0, 0, -5};
+    setup.stock.max = {20, 20, 0};
+    job.setups = {setup};
+    const std::string gcode = "G21\nG94\nF100\nG0 X0 Y0 Z0\nG1 X10 Y0 Z-1\n";
+    json result = audit_program(job, gcode, "grbl", setup.machine, {}, "supplied");
+    CHECK(result["ok"] == false);
+    bool spindle_off = false;
+    for (const auto& error : result["errors"])
+        spindle_off |= error.get<std::string>().find("spindle is off") != std::string::npos;
+    CHECK(spindle_off);
+    setup.machine.kind = MachineKind::Laser;
+    job.setups.front().machine = setup.machine;
+    result = audit_program(job, gcode, "marlin", setup.machine, {}, "supplied");
+    CHECK(result["ok"] == true);
+}
+
+TEST_CASE("negative operation rpm is rejected instead of suppressing spindle start") {
+    bool rejected = false;
+    try {
+        Operation::from_json({{"id", "negative"}, {"rpm", -1000}});
+    } catch (const OpError& error) {
+        rejected = error.code == "invalid_op" &&
+                   std::string(error.what()).find("rpm") != std::string::npos;
+    }
+    CHECK(rejected);
+}
 TEST_CASE("threading produces bounded degressive pass geometry") {
+
     const json j = read_json("turn/constructed_part.json").at("thread");
     turn::ThreadSpec spec;
     spec.major_radius_mm = j.at("major_radius_mm");

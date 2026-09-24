@@ -1,5 +1,6 @@
 // core/cam/model.cpp — CAM data-model serialization + enum tables.
 #include "cam/model.h"
+#include "cam/session.h"
 
 #include <algorithm>
 #include <cstring>
@@ -416,6 +417,9 @@ Operation Operation::from_json(const json& j) {
     if (j.contains("lead_out")) o.lead_out = Lead::from_json(j["lead_out"]);
     if (j.contains("ramp")) o.ramp = Ramp::from_json(j["ramp"]);
     o.rpm = num(j.value("rpm", json(0.0)));
+    if (o.rpm < 0)
+        throw OpError("invalid_op", "operation rpm must be non-negative; use spindle_dir for direction",
+                      json{{"rpm", o.rpm}});
     o.feed = num(j.value("feed", json(0.0)));
     o.plunge = num(j.value("plunge", json(0.0)));
     o.lead_feed = num(j.value("lead_feed", json(0.0)));

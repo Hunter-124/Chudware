@@ -55,8 +55,9 @@ private:
     bool at_clear_ = false;
 };
 
-// Stepped depths from top to bottom: returns the list of cut Z levels honoring
-// stepdown (>0) and the axial finish allowance. Always includes the final depth.
+// Stepped depths from top to bottom, in the operation WCS. An inverted or
+// degenerate final height is invalid and must be refused by the generator.
+bool valid_depth_levels(double top, double bottom, double stock_to_leave_axial);
 std::vector<double> depth_levels(double top, double bottom, double stepdown,
                                  double stock_to_leave_axial);
 

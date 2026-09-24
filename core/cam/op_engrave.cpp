@@ -28,6 +28,9 @@ GenResult gen_engrave(const Operation& opIn, const OpContext& ctx) {
         double d = (width * 0.5) / std::tan(half);
         z = op.heights.top - d;
     }
+    if (!valid_depth_levels(op.heights.top, z, 0.0)) {
+        res.ok = false; res.error = "depth_levels: final depth must be below top"; return res;
+    }
     auto levels = depth_levels(op.heights.top, z, op.stepdown, 0.0);
 
     PathBuilder pb(op.heights, op.feed, op.plunge, std::max(ctx.machine.rapid_xy, 1000.0));

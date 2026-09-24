@@ -35,6 +35,8 @@ struct CamSession {
     std::vector<json> undo, redo;
     // cached generated toolpaths per setup id; invalidated on edit.
     std::unordered_map<std::string, std::vector<Toolpath>> cache;
+    // Generation diagnostics must survive alongside cached paths, including refused ops.
+    std::unordered_map<std::string, json> generation_warnings;
     // last simulate_setup remaining heightfield per setup id (rest stock / from_sim).
     std::unordered_map<std::string, HeightField> lastRemaining;
     bool stale = true;
@@ -143,14 +145,43 @@ std::vector<Toolpath> generate_setup(const Job& job, const Setup& su, json* warn
         if (op.suppressed) continue;
         OpContext ctx = make_ctx(su, job.tools, op.tool_number);
         GenResult r = generate(op, ctx);
-        if (!r.ok) {
-            if (warnings) warnings->push_back(json{{"op", op.id}, {"error", r.error}});
+        if (!r.ok || r.path.moves.empty()) {
+            if (warnings) warnings->push_back(json{{"op", op.id},
+                                                   {"error", r.ok ? "no toolpath moves generated" : r.error}});
             continue;
         }
         for (auto& w : r.warnings) if (warnings) warnings->push_back(json{{"op", op.id}, {"warning", w}});
         out.push_back(std::move(r.path));
     }
     return out;
+}
+
+const std::vector<Toolpath>& ensure_setup(CamSession& s, const Setup& su) {
+    auto it = s.cache.find(su.id);
+    if (it == s.cache.end() || s.stale) {
+        json warnings = json::array();
+        s.cache[su.id] = generate_setup(s.job, su, &warnings);
+        s.generation_warnings[su.id] = std::move(warnings);
+    }
+    return s.cache.at(su.id);
+}
+
+bool append_generation_warnings(json& warnings, const json& generated,
+                                json* errors = nullptr) {
+    bool incomplete = false;
+    for (const auto& entry : generated) {
+        if (entry.contains("error")) {
+            std::string note = "operation " + entry.value("op", std::string()) +
+                               ": " + entry["error"].get<std::string>();
+            warnings.push_back(note);
+            if (errors) errors->push_back(note);
+            incomplete = true;
+        } else if (entry.contains("warning")) {
+            warnings.push_back("operation " + entry.value("op", std::string()) +
+                               ": " + entry["warning"].get<std::string>());
+        }
+    }
+    return incomplete;
 }
 
 // ── ops vocabulary ──
@@ -311,6 +342,7 @@ json cam_apply_ops(const std::string& doc_id, long base_revision, const json& op
     s.revision += 1;
     s.stale = true;
     s.cache.clear();
+    s.generation_warnings.clear();
     return json{{"revision", s.revision}, {"id_map", id_map}, {"tree", tree_of(s.job)}};
 }
 
@@ -322,7 +354,7 @@ json cam_undo(const std::string& doc_id) {
     s.job = Job::from_json(s.undo.back());
     s.undo.pop_back();
     s.revision += 1;
-    s.cache.clear(); s.stale = true;
+    s.cache.clear(); s.generation_warnings.clear(); s.stale = true;
     return json{{"revision", s.revision}, {"tree", tree_of(s.job)}};
 }
 json cam_redo(const std::string& doc_id) {
@@ -332,8 +364,7 @@ json cam_redo(const std::string& doc_id) {
     s.undo.push_back(s.job.to_json());
     s.job = Job::from_json(s.redo.back());
     s.redo.pop_back();
-    s.revision += 1;
-    s.cache.clear(); s.stale = true;
+    s.cache.clear(); s.generation_warnings.clear(); s.stale = true;
     return json{{"revision", s.revision}, {"tree", tree_of(s.job)}};
 }
 json cam_tree(const std::string& doc_id) {
@@ -364,6 +395,7 @@ json cam_generate(const std::string& doc_id, const json& params) {
     json warnings = json::array();
     json out = json::array();
     s.cache.clear();
+    s.generation_warnings.clear();
     for (Setup& su : s.job.setups) {
         if (!setup_id.empty() && su.id != setup_id) continue;
         std::vector<Toolpath> tps;
@@ -372,16 +404,20 @@ json cam_generate(const std::string& doc_id, const json& params) {
                 if (op.id == op_id && !op.suppressed) {
                     OpContext ctx = make_ctx(su, s.job.tools, op.tool_number);
                     GenResult r = generate(op, ctx);
-                    if (r.ok) tps.push_back(std::move(r.path));
-                    else warnings.push_back(json{{"op", op.id}, {"error", r.error}});
+                    if (r.ok && !r.path.moves.empty()) tps.push_back(std::move(r.path));
+                    else warnings.push_back(json{{"op", op.id},
+                                                 {"error", r.ok ? "no toolpath moves generated" : r.error}});
                 }
         } else {
-            tps = generate_setup(s.job, su, &warnings);
+            json per_setup = json::array();
+            tps = generate_setup(s.job, su, &per_setup);
+            for (const auto& entry : per_setup) warnings.push_back(entry);
+            s.generation_warnings[su.id] = std::move(per_setup);
         }
         for (auto& tp : tps) out.push_back(tp.to_json());
-        s.cache[su.id] = std::move(tps);
+        if (op_id.empty()) s.cache[su.id] = std::move(tps);
     }
-    s.stale = false;
+    s.stale = !op_id.empty();
     return json{{"toolpaths", out}, {"warnings", warnings},
                 {"stats", json{{"count", out.size()}}}};
 }
@@ -404,18 +440,18 @@ json cam_simulate(const std::string& doc_id, const json& params) {
     json results = json::array();
     for (Setup& su : s.job.setups) {
         if (!setup_id.empty() && su.id != setup_id) continue;
-        auto it = s.cache.find(su.id);
-        std::vector<Toolpath> tps;
-        if (it != s.cache.end() && !s.stale) tps = it->second;
-        else { json w = json::array(); tps = generate_setup(s.job, su, &w); }
+        const auto& tps = ensure_setup(s, su);
         TriMesh part;  // optional part mesh for gouge (supplied via params or empty)
         if (params.contains("part_mesh")) part = trimesh_from_json(params["part_mesh"]);
         SimResult r = simulate_setup(su, s.job.tools, tps, part, so);
         s.lastRemaining[su.id] = r.remaining;
         json rj = r.to_json(include_field);
         rj["setup_id"] = su.id;
-        results.push_back(rj);
+        json& notes = rj["warnings"];
+        rj["incomplete"] = append_generation_warnings(notes, s.generation_warnings.at(su.id));
+        results.push_back(std::move(rj));
     }
+    s.stale = false;
     return json{{"results", results}};
 }
 
@@ -434,43 +470,50 @@ json cam_post(const std::string& doc_id, const json& params) {
         po.program_number = o.value("program_number", po.program_number);
         if (o.contains("overrides")) po.overrides = o["overrides"];
     }
-    // ensure generated
-    for (Setup& su : s.job.setups) {
-        if (s.cache.find(su.id) == s.cache.end() || s.stale) {
-            json w = json::array();
-            s.cache[su.id] = generate_setup(s.job, su, &w);
-        }
-    }
+    // Keep diagnostics paired with cached toolpaths even after an earlier generate/simulate.
+    for (Setup& su : s.job.setups) ensure_setup(s, su);
     s.stale = false;
+    json generated = json::array();
     if (!setup_id.empty()) {
         Setup* su = find_setup(s.job, setup_id);
         if (!su) throw OpError("unknown_setup", "no such setup", params);
-        PostResult r = post_setup(*su, s.job.tools, dialect, s.cache[su->id], po);
-        return r.to_json();
+        PostResult r = post_setup(*su, s.job.tools, dialect, s.cache.at(su->id), po);
+        json result = r.to_json();
+        result["incomplete"] = append_generation_warnings(result["warnings"],
+                                                            s.generation_warnings.at(su->id));
+        return result;
     }
     std::vector<std::vector<Toolpath>> per;
-    for (auto& su : s.job.setups) per.push_back(s.cache[su.id]);
+    for (auto& su : s.job.setups) {
+        per.push_back(s.cache.at(su.id));
+        for (const auto& entry : s.generation_warnings.at(su.id)) generated.push_back(entry);
+    }
     // post_job posts with job.post; honor the per-call `dialect` override by posting against
     // a copy whose default dialect is the requested one.
     Job jd = s.job;
     jd.post = dialect;
     PostResult r = post_job(jd, per, po);
-    return r.to_json();
+    json result = r.to_json();
+    result["incomplete"] = append_generation_warnings(result["warnings"], generated);
+    return result;
 }
 
 json cam_setup_sheet(const std::string& doc_id, const json& params) {
     std::lock_guard<std::mutex> lk(g_mtx);
     CamSession& s = must(doc_id);
     std::string dialect = params.value("dialect", s.job.post);
-    for (Setup& su : s.job.setups)
-        if (s.cache.find(su.id) == s.cache.end() || s.stale) {
-            json w = json::array();
-            s.cache[su.id] = generate_setup(s.job, su, &w);
-        }
+    json generated = json::array();
+    for (Setup& su : s.job.setups) ensure_setup(s, su);
     s.stale = false;
     std::vector<std::vector<Toolpath>> per;
-    for (auto& su : s.job.setups) per.push_back(s.cache[su.id]);
-    return setup_sheet(s.job, per, dialect).to_json();
+    for (auto& su : s.job.setups) {
+        per.push_back(s.cache.at(su.id));
+        for (const auto& entry : s.generation_warnings.at(su.id)) generated.push_back(entry);
+    }
+    json result = setup_sheet(s.job, per, dialect).to_json();
+    result["warnings"] = json::array();
+    result["incomplete"] = append_generation_warnings(result["warnings"], generated);
+    return result;
 }
 
 // ── stateless inline helpers (parity harness / MCP) ──
@@ -488,8 +531,9 @@ json cam_generate_inline(const json& params) {
         if (!op_id.empty() && op.id != op_id) continue;
         OpContext ctx = make_ctx(su, job.tools, op.tool_number);
         GenResult r = generate(op, ctx);
-        if (r.ok) out.push_back(r.path.to_json());
-        else warnings.push_back(json{{"op", op.id}, {"error", r.error}});
+        if (r.ok && !r.path.moves.empty()) out.push_back(r.path.to_json());
+        else warnings.push_back(json{{"op", op.id},
+                                     {"error", r.ok ? "no toolpath moves generated" : r.error}});
     }
     return json{{"toolpaths", out}, {"warnings", warnings}};
 }
@@ -578,8 +622,19 @@ json cam_feeds(const std::string& doc_id, const json& params) {
         }
     }
 
+    if (op.extra.value("feed_mode", std::string("per_min")) == "per_rev" &&
+        mach.kind != MachineKind::Lathe)
+        throw OpError("invalid_op", "G95 feed requires a lathe machine", params);
     Feeds f = compute_feeds(mach, *tool, op, material, db);
-    return f.to_json();
+    json result = f.to_json();
+    if (op.extra.value("feed_mode", std::string("per_min")) == "per_rev") {
+        double rpm = op.rpm > 0 ? op.rpm : f.rpm;
+        if (rpm <= 0)
+            throw OpError("invalid_op", "G95 feed requires positive spindle rpm", params);
+        result["feed"] = f.feed / rpm;
+        result["feed_mode"] = "per_rev";
+    }
+    return result;
 }
 
 json cam_audit(const std::string& doc_id, const json& params) {
@@ -603,37 +658,27 @@ json cam_audit(const std::string& doc_id, const json& params) {
             dialect = rec->post_dialect;
     }
 
-    // Ensure toolpaths (same as cam_simulate / cam_post).
+    // Ensure toolpaths and their diagnostics are drawn from the same generation.
     std::vector<Toolpath> tps;
+    json generated = json::array();
     if (!setup_id.empty()) {
         Setup* su = find_setup(s.job, setup_id);
         if (!su) throw OpError("unknown_setup", "no such setup", params);
-        auto it = s.cache.find(su->id);
-        if (it != s.cache.end() && !s.stale) tps = it->second;
-        else {
-            json w = json::array();
-            tps = generate_setup(s.job, *su, &w);
-            s.cache[su->id] = tps;
-            s.stale = false;
-        }
+        tps = ensure_setup(s, *su);
+        generated = s.generation_warnings.at(su->id);
+        s.stale = false;
         // When no explicit machine profile, use setup machine limits as envelope.
         if (!rec) {
             profile = su->machine;
-            // Keep profile_id as fallback id for provenance when not a named preset.
             profile_id = "setup";
         }
     } else {
-        for (Setup& su : s.job.setups) {
-            if (s.cache.find(su.id) == s.cache.end() || s.stale) {
-                json w = json::array();
-                s.cache[su.id] = generate_setup(s.job, su, &w);
-            }
-        }
+        for (Setup& su : s.job.setups) ensure_setup(s, su);
         s.stale = false;
         for (auto& su : s.job.setups) {
-            auto it = s.cache.find(su.id);
-            if (it != s.cache.end())
-                tps.insert(tps.end(), it->second.begin(), it->second.end());
+            const auto& paths = s.cache.at(su.id);
+            tps.insert(tps.end(), paths.begin(), paths.end());
+            for (const auto& entry : s.generation_warnings.at(su.id)) generated.push_back(entry);
         }
         if (!rec && !s.job.setups.empty()) {
             profile = s.job.setups.front().machine;
@@ -641,6 +686,7 @@ json cam_audit(const std::string& doc_id, const json& params) {
         }
     }
 
+    std::string post_error;
     // Empty gcode → run the same post path as cam_post in-memory.
     if (gcode.empty()) {
         PostOptions po;
@@ -658,8 +704,8 @@ json cam_audit(const std::string& doc_id, const json& params) {
             if (!su) throw OpError("unknown_setup", "no such setup", params);
             PostResult r = post_setup(*su, s.job.tools, dialect, s.cache[su->id], po);
             gcode = r.gcode;
-            if (!r.ok && gcode.empty())
-                throw OpError("post_failed", r.error.empty() ? "post failed" : r.error, params);
+            if (!r.ok)
+                post_error = r.error.empty() ? "post failed" : r.error;
         } else {
             std::vector<std::vector<Toolpath>> per;
             for (auto& su : s.job.setups) per.push_back(s.cache[su.id]);
@@ -667,8 +713,8 @@ json cam_audit(const std::string& doc_id, const json& params) {
             jd.post = dialect;
             PostResult r = post_job(jd, per, po);
             gcode = r.gcode;
-            if (!r.ok && gcode.empty())
-                throw OpError("post_failed", r.error.empty() ? "post failed" : r.error, params);
+            if (!r.ok)
+                post_error = r.error.empty() ? "post failed" : r.error;
         }
     }
 
@@ -682,7 +728,14 @@ json cam_audit(const std::string& doc_id, const json& params) {
         }
     }
 
-    return audit_program(audit_job, gcode, dialect, profile, tps, source, profile_id);
+    json result = audit_program(audit_job, gcode, dialect, profile, tps, source, profile_id);
+    if (!post_error.empty()) {
+        result["errors"].push_back("post: " + post_error);
+        result["ok"] = false;
+    }
+    if (append_generation_warnings(result["warnings"], generated, &result["errors"]))
+        result["ok"] = false;
+    return result;
 }
 
 // ── save / open (.cam+ ZIP via miniz) ──

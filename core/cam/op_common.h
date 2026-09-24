@@ -56,6 +56,12 @@ inline Operation resolved_op(const Operation& op, const OpContext& ctx) {
     Operation r = op;
     Feeds f = compute_feeds(ctx.machine, ctx.tool, r, ctx.material_id);
     apply_feeds(r, f);
+    // Toolpaths and simulation always use mm/min; an explicit turning G95 feed
+    // is entered in mm/rev and converted after the resolved spindle speed is known.
+    if (ctx.machine.kind == MachineKind::Lathe && op.feed > 0 &&
+        op.extra.value("feed_mode", std::string("per_min")) == "per_rev" &&
+        r.rpm > 0)
+        r.feed = op.feed * r.rpm;
     return r;
 }
 

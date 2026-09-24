@@ -281,7 +281,7 @@ struct Operation {
 
     // Feeds & speeds (0 -> resolved from the cutting-data DB at generate time).
     double rpm = 0;
-    double feed = 0;       // cutting feed (mm/min)
+    double feed = 0;       // cutting feed (mm/min; explicit G95 input is mm/rev)
     double plunge = 0;     // Z plunge feed (mm/min)
     double lead_feed = 0;  // lead-in/out feed (mm/min)
     double ramp_feed = 0;  // ramp/helix feed (mm/min)

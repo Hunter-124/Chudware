@@ -10,6 +10,7 @@
 #define _USE_MATH_DEFINES
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -81,7 +82,41 @@ struct LoadedComponent {
 // Shared futures single-flight top-level loads; recursive loads never wait on an
 // unfinished future, since its owner may itself be waiting on this branch.
 std::mutex g_cache_mtx;
-std::map<std::string, std::shared_future<std::shared_ptr<const LoadedComponent>>> g_load_cache;
+struct LoadCacheEntry {
+    std::string path;
+    std::shared_future<std::shared_ptr<const LoadedComponent>> body;
+    std::uint64_t inserted_at;
+    std::uint64_t last_used;
+};
+std::map<std::string, LoadCacheEntry> g_load_cache;
+std::uint64_t g_load_cache_clock = 0;  // protected by g_cache_mtx
+constexpr std::size_t kComponentCacheLimit = 128;
+
+// Caller holds g_cache_mtx. Keep pending single-flight loads until their
+// promises settle, even if a newer file stamp has replaced their path.
+void trim_load_cache(const std::string& path) {
+    std::uint64_t newest = 0;
+    for (const auto& item : g_load_cache)
+        if (item.second.path == path) newest = std::max(newest, item.second.inserted_at);
+    for (auto it = g_load_cache.begin(); it != g_load_cache.end();) {
+        if (it->second.path == path && it->second.inserted_at != newest &&
+            it->second.body.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            it = g_load_cache.erase(it);
+        else
+            ++it;
+    }
+    while (g_load_cache.size() > kComponentCacheLimit) {
+        auto oldest = g_load_cache.end();
+        for (auto it = g_load_cache.begin(); it != g_load_cache.end(); ++it) {
+            if (it->second.body.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                continue;
+            if (oldest == g_load_cache.end() || it->second.last_used < oldest->second.last_used)
+                oldest = it;
+        }
+        if (oldest == g_load_cache.end()) break;
+        g_load_cache.erase(oldest);
+    }
+}
 
 std::string resolve_source_path(const std::string& path, const std::string& base_dir) {
     std::filesystem::path p(path);
@@ -400,18 +435,29 @@ std::string component_file_stamp(const std::string& abspath) {
 // Cache only the parsed source, never a traversal result: every fingerprint request
 // still stats every descendant, so edits below an unchanged assembly invalidate it.
 std::shared_ptr<const json> component_document(const std::string& path) {
-    struct Entry { std::string stamp; std::shared_ptr<const json> doc; };
+    struct Entry { std::string stamp; std::shared_ptr<const json> doc; std::uint64_t last_used; };
     static std::map<std::string, Entry> cache;
+    static std::uint64_t clock = 0;  // protected by g_cache_mtx
     const std::string stamp = component_file_stamp(path);
     {
         std::lock_guard<std::mutex> lock(g_cache_mtx);
         auto it = cache.find(path);
-        if (it != cache.end() && it->second.stamp == stamp) return it->second.doc;
+        if (it != cache.end() && it->second.stamp == stamp) {
+            it->second.last_used = ++clock;
+            return it->second.doc;
+        }
     }
     auto doc = std::make_shared<const json>(stepplus_read_document(path));
     if (component_file_stamp(path) == stamp) {
         std::lock_guard<std::mutex> lock(g_cache_mtx);
-        cache[path] = {stamp, doc};
+        cache[path] = {stamp, doc, ++clock};  // replaces the superseded stamp
+        if (cache.size() > kComponentCacheLimit) {
+            auto oldest = std::min_element(cache.begin(), cache.end(),
+                [](const auto& a, const auto& b) {
+                    return a.second.last_used < b.second.last_used;
+                });
+            cache.erase(oldest);
+        }
     }
     return doc;
 }
@@ -442,14 +488,19 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
     const std::string key = component_cache_key(abspath);
     std::shared_future<std::shared_ptr<const LoadedComponent>> fut;
     std::shared_ptr<std::promise<std::shared_ptr<const LoadedComponent>>> mine;
+    std::uint64_t mine_age = 0;
     {
         std::lock_guard<std::mutex> lk(g_cache_mtx);
         auto it = g_load_cache.find(key);
         if (it != g_load_cache.end()) {
-            fut = it->second;
+            fut = it->second.body;
+            it->second.last_used = ++g_load_cache_clock;
         } else {
             mine = std::make_shared<std::promise<std::shared_ptr<const LoadedComponent>>>();
-            fut = g_load_cache[key] = mine->get_future().share();
+            fut = mine->get_future().share();
+            mine_age = ++g_load_cache_clock;
+            g_load_cache.emplace(key, LoadCacheEntry{abspath, fut, mine_age, mine_age});
+            trim_load_cache(abspath);
         }
     }
     auto load = [&] {
@@ -469,14 +520,20 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
             auto lc = load();
             const bool cacheable = lc->error.empty() && component_cache_key(abspath) == key;
             mine->set_value(lc);
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
             if (!cacheable) {
-                std::lock_guard<std::mutex> lk(g_cache_mtx);
-                g_load_cache.erase(key);
+                auto it = g_load_cache.find(key);
+                if (it != g_load_cache.end() && it->second.inserted_at == mine_age)
+                    g_load_cache.erase(it);
             }
+            trim_load_cache(abspath);
         } catch (...) {
             mine->set_exception(std::current_exception());
             std::lock_guard<std::mutex> lk(g_cache_mtx);
-            g_load_cache.erase(key);
+            auto it = g_load_cache.find(key);
+            if (it != g_load_cache.end() && it->second.inserted_at == mine_age)
+                g_load_cache.erase(it);
+            trim_load_cache(abspath);
         }
     }
     return fut.get();

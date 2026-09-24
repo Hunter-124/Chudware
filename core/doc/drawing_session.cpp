@@ -873,6 +873,21 @@ std::string scalar_text(const json& v) {
     if (v.is_object() && v.contains("value")) return scalar_text(v["value"]);
     return "";
 }
+std::string compose_chamfer(const json& ann, const std::string& units) {
+    const json& length = ann.value("length", json(nullptr));
+    const json& angle = ann.value("angle", json(nullptr));
+    const int precision = ann.contains("precision") && ann["precision"].is_number_integer()
+                              ? ann["precision"].get<int>() : -1;
+    const std::string distance = length.is_number()
+                                     ? fmt_len(length.get<double>(), units == "IPS", precision)
+                                     : scalar_text(length);
+    std::string text = distance + " \xC3\x97 " + scalar_text(angle) + "\xC2\xB0";
+    if (ann.value("count", 0) > 1)
+        text = std::to_string(ann.value("count", 0)) + "X " + text;
+    return ann.value("prefix", std::string()) + text +
+           ann.value("suffix", std::string());
+}
+
 
 void collect_hole_features(const json& node, json& rows) {
     if (node.is_array()) {
@@ -1099,11 +1114,12 @@ json drawing_get_locked_unsafe(const std::string& doc_id) {
         frozen["tree"] = s.doc;
         frozen["active_sheet_id"] =
             s.doc.value("active_sheet", std::string("s1"));
-        frozen["source_state"] = "missing";
+        frozen["source_state"] = s.source_state;
         frozen["source_missing"] = true;
         frozen["views_stale"] = true;
-        frozen["warning"] =
-            "source missing — views frozen from last projection";
+        frozen["warning"] = s.source_state == "closed"
+                                ? "source closed — views frozen from last projection"
+                                : "source missing — views frozen from last projection";
         if (!frozen.contains("sheets") || !frozen["sheets"].is_array())
             frozen["sheets"] = json::array();
         // Geometry stays frozen, but non-geometric drawing data remains editable:
@@ -1268,6 +1284,7 @@ json drawing_new(const json& source_doc, const json& env, const std::string& nam
     // The drawing's "source" field records the part it projects (the live ref id when
     // present, else its own id for the inline probe — matches drawing.py's source ref).
     s.doc = blank_drawing(nm, source_doc_id.empty() ? doc_id : source_doc_id);
+    s.doc["units"]["system"] = doc_units(src);
     s.revision = 0;
     s.source_revision = src_rev;
     g_drawings[doc_id] = std::move(s);
@@ -1282,6 +1299,9 @@ json drawing_set_source(const std::string& doc_id, const json& source_doc, const
     s.source_ref_id.clear();
     s.source_doc = source_doc;
     s.source_env = env.is_null() ? json::object() : env;
+    s.source_missing = false;
+    s.source_state = "live";
+    s.cached_views = json();
     s.source_revision += 1;
     return json{{"doc_id", doc_id}, {"revision", s.revision}, {"source_revision", s.source_revision}};
 }
@@ -1520,6 +1540,33 @@ json drawing_remove_view(const std::string& doc_id, const std::string& view_id) 
     return json{{"removed", true}, {"revision", s.revision}};
 }
 
+// Annotation anchors and derived-view picks are stored in absolute sheet mm. Move them
+// through the same model-space origin as the projected geometry, never through a
+// translation alone (which leaves dimensions detached after a scale change).
+void remap_sheet_point(json& point, const std::array<double, 2>& before,
+                       const std::array<double, 2>& after, double ratio,
+                       const std::array<double, 4>& axes) {
+    if (!is_xy(point)) return;
+    const double u = (point[0].get<double>() - before[0]) * ratio;
+    const double v = (point[1].get<double>() - before[1]) * ratio;
+    point[0] = after[0] + axes[0] * u + axes[1] * v;
+    point[1] = after[1] + axes[2] * u + axes[3] * v;
+}
+
+void remap_annotation(json& ann, const std::array<double, 2>& before,
+                      const std::array<double, 2>& after, double ratio,
+                      const std::array<double, 4>& axes) {
+    if (!ann.is_object()) return;
+    for (const char* key : {"a", "b", "c", "d", "pos", "center", "vertex", "origin"})
+        if (ann.contains(key)) remap_sheet_point(ann[key], before, after, ratio, axes);
+    for (const char* key : {"line2", "points"})
+        if (ann.contains(key) && ann[key].is_array())
+            for (json& point : ann[key])
+                remap_sheet_point(point, before, after, ratio, axes);
+    if (ann.contains("radius") && ann["radius"].is_number())
+        ann["radius"] = ann["radius"].get<double>() * ratio;
+}
+
 json drawing_set_view(const std::string& doc_id, const std::string& view_id, const json& scale,
                       const json& position, const json& orientation, const json& show_hidden) {
     DrawingLock lk;
@@ -1527,8 +1574,12 @@ json drawing_set_view(const std::string& doc_id, const std::string& view_id, con
     json* view = find_view(s.doc, view_id);
     if (!view)
         throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
+    const double old_scale = view->value("scale", 1.0);
+    const std::array<double, 2> old_pos =
+        get_pos(view->value("position", json::array({0.0, 0.0})));
+    const std::string old_orient = view->value("orientation", std::string());
     if (scale.is_number()) {
-        if (scale.get<double>() <= 0.0)
+        if (!std::isfinite(scale.get<double>()) || scale.get<double>() <= 0.0)
             throw OpError("invalid_op", "scale must be positive", {{"reason", "bad scale"}});
         (*view)["scale"] = scale.get<double>();
     }
@@ -1537,9 +1588,50 @@ json drawing_set_view(const std::string& doc_id, const std::string& view_id, con
     if (orientation.is_string() && view->value("type", std::string()) != "iso")
         (*view)["orientation"] = orientation.get<std::string>();
     if (show_hidden.is_boolean()) (*view)["show_hidden"] = show_hidden.get<bool>();
+    const double new_scale = view->value("scale", 1.0);
+    const std::array<double, 2> new_pos =
+        get_pos(view->value("position", json::array({0.0, 0.0})));
+    std::array<double, 4> axes{1.0, 0.0, 0.0, 1.0};
+    const std::string new_orient = view->value("orientation", std::string());
+    if (old_orient != new_orient &&
+        (view->value("type", std::string()) == "base" ||
+         view->value("type", std::string()) == "projected")) {
+        Vec3 old_d, old_x, old_y, new_d, new_x, new_y;
+        orient_frame(old_orient, old_d, old_x, old_y);
+        orient_frame(new_orient, new_d, new_x, new_y);
+        // Only opposite/same-plane views admit a lossless sheet-plane remap.
+        // Orthogonal changes discard depth: sheet anchors cannot reconstruct 3D picks.
+        if (std::fabs(v_dot(old_d, new_d)) > 1.0 - 1e-9)
+            axes = {v_dot(new_x, old_x), v_dot(new_x, old_y),
+                    v_dot(new_y, old_x), v_dot(new_y, old_y)};
+    }
+    if (old_scale > 0.0 &&
+        (old_scale != new_scale || old_pos != new_pos ||
+         axes != std::array<double, 4>{1.0, 0.0, 0.0, 1.0})) {
+        const double ratio = new_scale / old_scale;
+        if (view->contains("annotations") && (*view)["annotations"].is_array())
+            for (json& ann : (*view)["annotations"])
+                remap_annotation(ann, old_pos, new_pos, ratio, axes);
+        for (json* child : all_views(s.doc)) {
+            if (child->value("parent", std::string()) != view_id) continue;
+            if (child->value("type", std::string()) == "section" &&
+                child->contains("cut_line") && (*child)["cut_line"].is_array())
+                for (json& point : (*child)["cut_line"])
+                    remap_sheet_point(point, old_pos, new_pos, ratio, axes);
+            if (child->value("type", std::string()) == "detail") {
+                if (child->contains("center"))
+                    remap_sheet_point((*child)["center"], old_pos, new_pos, ratio, axes);
+                if (child->contains("radius") && (*child)["radius"].is_number())
+                    (*child)["radius"] = (*child)["radius"].get<double>() * ratio;
+            }
+        }
+    }
     s.revision += 1;
     auto shapes = source_shapes(s);
     json geom = project_one(s, *view, shapes);
+    if (geom.contains("annotations") && geom["annotations"].is_array())
+        for (json& ann : geom["annotations"])
+            if (ann.is_object()) ann["draw"] = compile_annotation(ann, doc_units(s.doc));
     return json{{"view_id", view_id}, {"revision", s.revision}, {"view", geom}};
 }
 
@@ -1645,6 +1737,8 @@ json drawing_add_dim(const std::string& doc_id, const std::string& view_id, cons
 
     if (kExt.count(type)) {
         json ann = build_ext_annotation(s, *view, type, a, b_in, c, d, pos, text, units, scale);
+        if (text.is_string() && !text.get<std::string>().empty())
+            ann["text_override"] = text;
         (*view)["annotations"].push_back(ann);
         s.revision += 1;
         return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
@@ -1690,6 +1784,8 @@ json drawing_add_dim(const std::string& doc_id, const std::string& view_id, cons
                      ? text.get<std::string>()
                      : format_dim_value(value, units, type)},
     };
+    if (text.is_string() && !text.get<std::string>().empty())
+        ann["text_override"] = text;
     (*view)["annotations"].push_back(ann);
     s.revision += 1;
     return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
@@ -1727,14 +1823,9 @@ json drawing_add_chamfer_dimension(const std::string& doc_id,
     if (spec.contains("text") && spec["text"].is_string() &&
         !spec["text"].get<std::string>().empty()) {
         ann["text"] = spec["text"];
+        ann["text_override"] = spec["text"];
     } else {
-        std::string composed = scalar_text(ann["length"]) + " \xC3\x97 " +
-                               scalar_text(ann["angle"]) + "\xC2\xB0";
-        const int count = ann.value("count", 0);
-        if (count > 1) composed = std::to_string(count) + "X " + composed;
-        composed = ann.value("prefix", std::string()) + composed +
-                   ann.value("suffix", std::string());
-        ann["text"] = composed;
+        ann["text"] = compose_chamfer(ann, doc_units(s.doc));
     }
     (*view)["annotations"].push_back(ann);
     ++s.revision;
@@ -1794,6 +1885,11 @@ json drawing_add_ordinate_dimensions(const std::string& doc_id,
         if (entry.is_object() && entry.contains("text")) ann["text"] = entry["text"];
         else if (spec.contains("text") && points.size() == 1) ann["text"] = spec["text"];
         else ann["text"] = format_dim_value(value, units, "linear_dim");
+        if (ann.contains("text") &&
+            ((entry.is_object() && entry.contains("text")) ||
+             (spec.contains("text") && points.size() == 1)) &&
+            ann["text"].is_string())
+            ann["text_override"] = ann["text"];
         (*view)["annotations"].push_back(ann);
         annotations.push_back(ann);
     }
@@ -1851,6 +1947,32 @@ std::map<std::string, std::string> drawings_for_source(const std::string& source
             out["drawings/" + id + ".json"] = s.doc.dump();
     return out;
 }
+// doc_close calls this only AFTER dropping both its registry and per-doc locks.
+// The drawing lock must never be nested under either: drawing_get takes it before
+// doc_live_source acquires those locks, and the opposite order would deadlock.
+void drawings_source_closed(const std::string& source_doc_id, const json& source_doc,
+                            const json& source_env, long source_revision) {
+    DrawingLock lk;
+    for (auto& [id, s] : g_drawings) {
+        if (s.source_ref_id != source_doc_id || s.source_missing) continue;
+        s.source_doc = source_doc;
+        s.source_env = source_env;
+        s.source_revision = source_revision;
+        // The registry no longer exposes the source. Project its final captured tree
+        // once, then freeze it as the existing stale-view path does for a missing file.
+        try {
+            s.cached_views = drawing_get_locked_unsafe(id);
+        } catch (const std::exception&) {
+            // Even an unprojectable final tree must be identified as stale, not silently
+            // served from the drawing's creation-time snapshot.
+            s.cached_views = json::object();
+        }
+        s.source_state = "closed";
+        s.source_missing = true;
+        ++s.revision;
+    }
+}
+
 
 json register_restored_drawing(const json& drawing_doc, const std::string& source_doc_id) {
     DrawingLock lk;
@@ -2033,7 +2155,36 @@ json drawing_open_standalone(const std::string& path) {
 static bool is_numeric_dim(const std::string& type, const std::string& kind) {
     const std::string& dk = kind.empty() ? type : kind;
     return dk == "linear_dim" || dk == "aligned_dim" || dk == "radial_dim" ||
-           dk == "diameter_dim" || dk == "angular_dim" || dk == "hole_callout";
+           dk == "diameter_dim" || dk == "angular_dim" || dk == "hole_callout" ||
+           dk == "ordinate_dim";
+}
+
+json drawing_set_units(const std::string& doc_id, const std::string& system) {
+    if (system != "MMGS" && system != "IPS")
+        throw OpError("invalid_op", "drawing units must be MMGS|IPS",
+                      {{"reason", "bad units"}, {"system", system}});
+    DrawingLock lk;
+    DrawingSession& s = require_session(doc_id);
+    if (doc_units(s.doc) != system) {
+        s.doc["units"]["system"] = system;
+        for (json* view : all_views(s.doc)) {
+            if (!view->contains("annotations") || !(*view)["annotations"].is_array())
+                continue;
+            for (json& ann : (*view)["annotations"]) {
+                if (!ann.is_object()) continue;
+                const std::string kind = ann.value("kind", std::string());
+                const std::string override = ann.value("text_override", std::string());
+                if (!override.empty()) continue;
+                if (is_numeric_dim(ann.value("type", std::string()), kind))
+                    ann["text"] = compose_disp(ann, system);
+                else if (kind == "chamfer")
+                    ann["text"] = compose_chamfer(ann, system);
+            }
+        }
+        ++s.revision;
+    }
+    return json{{"doc_id", doc_id}, {"system", system},
+                {"revision", s.revision}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
 }
 
 json drawing_set_annotation(const std::string& doc_id, const std::string& view_id,
@@ -2626,7 +2777,7 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
     static const Slot kSlots[] = {
         {"front", "base", 1, 1},      {"top", "projected", 1, 0},
         {"right", "projected", 2, 1}, {"bottom", "projected", 1, 2},
-        {"left", "projected", 0, 1},  {"back", "projected", 2, 0},
+        {"left", "projected", 0, 1},  {"back", "projected", 0, 0},
         {"iso", "iso", 2, 0},
     };
     struct Placed { std::string vid; int col, row; };

@@ -1,7 +1,6 @@
 #include "geom/tessellate.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -37,27 +36,28 @@
 
 namespace geom {
 
-// --- tessellation micro-profiling accumulators (see tessellate.h) ---------------
+// The document's tessellation phase runs on its compiling thread; different
+// documents can compile concurrently on different threads.
 namespace {
-std::atomic<long long> g_tess_mesh_ns{0};
-std::atomic<long long> g_tess_extract_ns{0};
-std::atomic<long> g_tess_bodies{0};
-std::atomic<long> g_tess_faces{0};
+thread_local long long g_tess_mesh_ns = 0;
+thread_local long long g_tess_extract_ns = 0;
+thread_local long g_tess_bodies = 0;
+thread_local long g_tess_faces = 0;
 }  // namespace
 
 void tess_timing_reset() {
-    g_tess_mesh_ns.store(0, std::memory_order_relaxed);
-    g_tess_extract_ns.store(0, std::memory_order_relaxed);
-    g_tess_bodies.store(0, std::memory_order_relaxed);
-    g_tess_faces.store(0, std::memory_order_relaxed);
+    g_tess_mesh_ns = 0;
+    g_tess_extract_ns = 0;
+    g_tess_bodies = 0;
+    g_tess_faces = 0;
 }
 
 TessTiming tess_timing_read() {
     TessTiming t;
-    t.mesh_ms = g_tess_mesh_ns.load(std::memory_order_relaxed) / 1e6;
-    t.extract_ms = g_tess_extract_ns.load(std::memory_order_relaxed) / 1e6;
-    t.bodies = g_tess_bodies.load(std::memory_order_relaxed);
-    t.faces = g_tess_faces.load(std::memory_order_relaxed);
+    t.mesh_ms = g_tess_mesh_ns / 1e6;
+    t.extract_ms = g_tess_extract_ns / 1e6;
+    t.bodies = g_tess_bodies;
+    t.faces = g_tess_faces;
     return t;
 }
 
@@ -204,10 +204,9 @@ DisplayDeflections mesh_body(const TopoDS_Shape& shape, double lin_deflection, d
     const auto start = std::chrono::steady_clock::now();
     BRepMesh_IncrementalMesh mesher(shape, eff_lin, Standard_False,
                                     eff_ang, Standard_True);
-    g_tess_mesh_ns.fetch_add(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - start).count(), std::memory_order_relaxed);
-    g_tess_bodies.fetch_add(1, std::memory_order_relaxed);
+    g_tess_mesh_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    ++g_tess_bodies;
     return {eff_lin, eff_ang};
 }
 
@@ -239,7 +238,7 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
     TopTools_IndexedDataMapOfShapeListOfShape anc_map;
     TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc_map);
 
-    g_tess_faces.fetch_add(face_map.Extent(), std::memory_order_relaxed);
+    g_tess_faces += face_map.Extent();
 
     // ----- Per-face geometry: triangles grouped per face (contiguous ranges) -----
     for (int fi = 1; fi <= face_map.Extent(); ++fi) {
@@ -382,10 +381,8 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
         body.verts.push_back(vr);
     }
 
-    g_tess_extract_ns.fetch_add(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - _extract_t0).count(),
-        std::memory_order_relaxed);
+    g_tess_extract_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - _extract_t0).count();
     return body;
 }
 

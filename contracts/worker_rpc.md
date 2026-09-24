@@ -1721,3 +1721,30 @@ Near-half-turn rotation log/exp preserves the signed off-axis direction and uses
 the antisymmetric sine with `atan2`, avoiding trace-only precision loss near pi.
 These changes retain residual tolerances and do not turn sampled kinematics into
 interference or continuous-clearance evidence.
+
+## Drawing association, units, and export addendum (2026-09-23)
+
+`drawing_new` and `drawing_make` initialize the drawing's `tree.units.system` from
+the current source document (`MMGS` or `IPS`; absent/unsupported source units
+default to `MMGS`). The drawing then owns its display units independently of
+later changes to the source.
+
+`drawing_set_units` takes `{doc_id, system:"MMGS"|"IPS"}` and returns
+`{doc_id, system, revision, drawing}`. An unsupported system is `invalid_op`
+(`reason:"bad units"`). Changing units recomposes stored numeric dimensions and
+hole-callout text from their model-mm values (respecting explicit text overrides)
+and returns the full updated drawing; free notes and GD&T text remain literal.
+
+`drawing_set_view` remaps that view's sheet-mm annotation anchors and any child
+section cut line/detail crop by the old-to-new position/scale transform. A
+detail crop radius scales with its parent. Projected annotation primitives
+are recomposed from the remapped anchors, not reused from the old view.
+
+`doc_close` captures the source's final committed tree and equation environment
+for referencing open drawings before the source is destroyed. Subsequent
+`drawing_get` returns the final projected views with `source_state:"closed"`,
+`source_missing:true`, `views_stale:true` and a closed-source warning; a missing
+standalone source retains its existing `source_state:"missing"` warning. The
+warning distinguishes a frozen view from a live associative projection.
+DXF/PDF ASCII labels preserve hole-callout ⌴, ⌵ and ↧ as `CBORE`, `CSK`
+and `DEPTH` respectively.

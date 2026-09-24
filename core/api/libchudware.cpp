@@ -590,14 +590,18 @@ CHUDWARE_API void chudware_free(char* s) { std::free(s); }
 // Live event streaming: one thread-local C hook for agent events and simulation phases.
 // Armed on the dispatch/solver thread before chudware_call; cleared immediately after.
 CHUDWARE_API void chudware_set_event_sink(void (*cb)(const char* event_json, void* ud), void* ud) {
-    chudware::sim::set_progress_sink(cb, ud);
-    if (cb) {
-        chudware::agent::set_stream_event_sink([cb, ud](const nlohmann::json& ev) {
-            const std::string s = ev.dump();
-            cb(s.c_str(), ud);
-        });
-    } else {
-        chudware::agent::set_stream_event_sink({});
+    try {
+        chudware::sim::set_progress_sink(cb, ud);
+        if (cb) {
+            chudware::agent::set_stream_event_sink([cb, ud](const nlohmann::json& ev) {
+                const std::string s = ev.dump();
+                cb(s.c_str(), ud);
+            });
+        } else {
+            chudware::agent::set_stream_event_sink({});
+        }
+    } catch (...) {
+        // A void C setter cannot report allocation failures across the ABI.
     }
 }
 
@@ -608,16 +612,20 @@ CHUDWARE_API void chudware_set_event_sink(void (*cb)(const char* event_json, voi
 CHUDWARE_API void chudware_set_doc_publish_sink(
     void (*cb)(const char* method, const char* params_json, const char* result_json, void* ud),
     void* ud) {
-    if (cb) {
-        chudware::agent::set_doc_publish_sink(
-            [cb, ud](const std::string& method, const nlohmann::json& params,
-                     const nlohmann::json& result) {
-                const std::string p = params.dump();
-                const std::string r = result.dump();
-                cb(method.c_str(), p.c_str(), r.c_str(), ud);
-            });
-    } else {
-        chudware::agent::set_doc_publish_sink({});
+    try {
+        if (cb) {
+            chudware::agent::set_doc_publish_sink(
+                [cb, ud](const std::string& method, const nlohmann::json& params,
+                         const nlohmann::json& result) {
+                    const std::string p = params.dump();
+                    const std::string r = result.dump();
+                    cb(method.c_str(), p.c_str(), r.c_str(), ud);
+                });
+        } else {
+            chudware::agent::set_doc_publish_sink({});
+        }
+    } catch (...) {
+        // A void C setter cannot report allocation failures across the ABI.
     }
 }
 
@@ -3828,6 +3836,11 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(chudware::doc::drawing_model_items(
                                 params.value("doc_id", std::string()),
                                 params.value("view_id", std::string())),
+                            out_json, 0);
+            if (m == "drawing_set_units")
+                return emit(chudware::doc::drawing_set_units(
+                                params.value("doc_id", std::string()),
+                                params.value("system", std::string())),
                             out_json, 0);
             if (m == "drawing_set_titleblock") {
                 json fields = params.contains("fields") && params["fields"].is_object()

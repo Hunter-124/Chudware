@@ -1304,3 +1304,192 @@ TEST_CASE("Standalone draw+ embeds its source and falls back to stale cached vie
     fs::remove(stripped_path, ec);
     fs::remove(source_path, ec);
 }
+
+TEST_CASE("Moving and rescaling a parent carries dimensions and derived cuts") {
+    const std::string src = make_block();
+    const std::string did =
+        doc::drawing_new(json::object(), json::object(), "Attached", src)["doc_id"].get<std::string>();
+    const std::string parent =
+        doc::drawing_add_view(did, "base", "top", "s1", 1.0,
+                              json::array({130.0, 175.0}), nullptr)["view_id"].get<std::string>();
+    doc::drawing_add_dim(did, parent, "linear_dim",
+                         json::array({110.0, 155.0}), json::array({150.0, 155.0}),
+                         nullptr, nullptr, json::array({130.0, 145.0}), nullptr);
+    doc::drawing_add_dim(did, parent, "angular_dim",
+                         json::array({120.0, 175.0}), json::array({140.0, 175.0}),
+                         json::array({130.0, 165.0}), json::array({130.0, 185.0}),
+                         json::array({140.0, 185.0}), nullptr);
+    doc::drawing_add_ordinate_dimensions(
+        did, parent, json{{"origin", json::array({110.0, 155.0})},
+                          {"points", json::array({json::array({150.0, 155.0})})}});
+    doc::drawing_add_dim(did, parent, "diameter_dim",
+                         json::array({135.0, 175.0}), nullptr, nullptr, nullptr,
+                         json::array({145.0, 190.0}), nullptr);
+    const std::string section =
+        doc::drawing_add_section(
+            did, parent, nullptr,
+            json::array({json::array({130.0, 155.0}), json::array({130.0, 195.0})}),
+            nullptr, nullptr, json::array({320.0, 175.0}), "s1", false)["view_id"].get<std::string>();
+    const std::string detail =
+        doc::drawing_add_detail(did, parent, json::array({130.0, 175.0}), 12.0,
+                                2.0, nullptr, json::array({320.0, 230.0}), "s1", false)["view_id"].get<std::string>();
+
+    json moved = doc::drawing_set_view(did, parent, 2.0, json::array({170.0, 195.0}),
+                                       nullptr, nullptr);
+    REQUIRE(moved["view"]["annotations"].size() == 4);
+    CHECK(moved["view"]["annotations"][0]["a"] == json::array({130.0, 155.0}));
+    CHECK(moved["view"]["annotations"][0]["b"] == json::array({210.0, 155.0}));
+    CHECK(moved["view"]["annotations"][0]["pos"] == json::array({170.0, 135.0}));
+    CHECK(draw_count(moved["view"]["annotations"][0]) > 0);
+    CHECK(moved["view"]["annotations"][1]["line2"] ==
+          json::array({json::array({170.0, 175.0}), json::array({170.0, 215.0})}));
+    CHECK(moved["view"]["annotations"][1]["vertex"] == json::array({170.0, 195.0}));
+    CHECK(moved["view"]["annotations"][2]["origin"] == json::array({130.0, 155.0}));
+    CHECK(moved["view"]["annotations"][3]["center"] == json::array({170.0, 195.0}));
+    CHECK(moved["view"]["annotations"][3]["radius"].get<double>() ==
+          doctest::Approx(10.0));
+    json full = doc::drawing_get(did);
+    const json& views = full["sheets"][0]["views"];
+    const json* cut = nullptr;
+    const json* crop = nullptr;
+    for (const json& v : views) {
+        if (v.value("view_id", std::string()) == section) cut = &v;
+        if (v.value("view_id", std::string()) == detail) crop = &v;
+    }
+    REQUIRE(cut != nullptr);
+    REQUIRE(crop != nullptr);
+    CHECK((*cut)["cut_line"] ==
+          json::array({json::array({170.0, 155.0}), json::array({170.0, 235.0})}));
+    const bool cut_error = cut->contains("error") && (*cut)["error"].is_string();
+    CHECK_FALSE(cut_error);
+    CHECK((*crop)["center"] == json::array({170.0, 195.0}));
+    CHECK((*crop)["radius"].get<double>() == doctest::Approx(24.0));
+    const bool crop_error = crop->contains("error") && (*crop)["error"].is_string();
+    CHECK_FALSE(crop_error);
+    // Opposite-facing projections have a lossless planar frame change.
+    json flipped = doc::drawing_set_view(did, parent, nullptr, nullptr, "bottom", nullptr);
+    CHECK(flipped["view"]["annotations"][0]["a"] == json::array({130.0, 235.0}));
+    json flipped_full = doc::drawing_get(did);
+    for (const json& v : flipped_full["sheets"][0]["views"])
+        if (v.value("view_id", std::string()) == section)
+            CHECK(v["cut_line"] ==
+                  json::array({json::array({170.0, 235.0}),
+                               json::array({170.0, 155.0})}));
+    doc::drawing_close(did);
+    doc::doc_close(src);
+}
+
+TEST_CASE("Drawing units inherit source, switch numeric text, and preserve overrides") {
+    const std::string src = make_cube(25.4);
+    doc::doc_apply_ops(src, -1,
+                       json::array({json{{"op", "set_units"}, {"system", "IPS"}}}), false);
+    const json created = doc::drawing_new(json::object(), json::object(), "", src);
+    CHECK(created["drawing"]["units"]["system"] == "IPS");
+    const std::string did = created["doc_id"].get<std::string>();
+    const std::string vid =
+        doc::drawing_add_view(did, "base", "front", "s1", 1.0,
+                              json::array({150.0, 170.0}), nullptr)["view_id"].get<std::string>();
+    doc::drawing_add_dim(did, vid, "linear_dim",
+                         json::array({100.0, 170.0}), json::array({125.4, 170.0}),
+                         nullptr, nullptr, json::array({115.0, 155.0}), nullptr);
+    doc::drawing_add_dim(did, vid, "linear_dim",
+                         json::array({130.0, 170.0}), json::array({155.4, 170.0}),
+                         nullptr, nullptr, json::array({145.0, 155.0}), "REF");
+    doc::drawing_add_chamfer_dimension(
+        did, vid, json{{"a", json::array({140.0, 170.0})},
+                       {"length", 25.4}, {"angle", 45.0}});
+    doc::drawing_add_ordinate_dimensions(
+        did, vid, json{{"origin", json::array({100.0, 170.0})},
+                       {"points", json::array({json::array({125.4, 170.0})})}});
+    json initial = doc::drawing_get(did);
+    CHECK(initial["tree"]["sheets"][0]["views"][0]["annotations"][0]["text"] == "1 in");
+    json metric = doc::drawing_set_units(did, "MMGS");
+    CHECK(metric["drawing"]["tree"]["units"]["system"] == "MMGS");
+    CHECK(metric["drawing"]["sheets"][0]["views"][0]["annotations"][0]["text"] == "25.4");
+    CHECK(metric["drawing"]["sheets"][0]["views"][0]["annotations"][1]["text"] == "REF");
+    CHECK(metric["drawing"]["sheets"][0]["views"][0]["annotations"][2]["text"] ==
+          "25.4 \xC3\x97 45\xC2\xB0");
+    CHECK(metric["drawing"]["sheets"][0]["views"][0]["annotations"][3]["text"] == "25.4");
+    json imperial = doc::drawing_set_units(did, "IPS");
+    CHECK(imperial["drawing"]["sheets"][0]["views"][0]["annotations"][0]["text"] == "1 in");
+    CHECK(imperial["drawing"]["sheets"][0]["views"][0]["annotations"][2]["text"] ==
+          "1 \xC3\x97 45\xC2\xB0");
+    CHECK(imperial["drawing"]["sheets"][0]["views"][0]["annotations"][3]["text"] == "1 in");
+    CHECK_THROWS_AS(doc::drawing_set_units(did, "UNKNOWN"), doc::OpError);
+    doc::drawing_close(did);
+    const json made = doc::drawing_make(
+        src, json{{"views", json::array({"front"})}, {"model_items", false}});
+    CHECK(made["drawing"]["tree"]["units"]["system"] == "IPS");
+    doc::drawing_close(made["doc_id"].get<std::string>());
+    doc::doc_close(src);
+}
+
+TEST_CASE("Closing an edited source freezes its final geometry and warns") {
+    const std::string src = make_cube(20.0);
+    const std::string did =
+        doc::drawing_new(json::object(), json::object(), "", src)["doc_id"].get<std::string>();
+    doc::drawing_add_view(did, "base", "front", "s1", 1.0,
+                          json::array({150.0, 170.0}), nullptr);
+    const json initial = doc::drawing_get(did);
+    doc::doc_apply_ops(
+        src, -1,
+        json::array({json{{"op", "add_feature"},
+                          {"feature", {{"type", "box"}, {"name", "Far"},
+                                       {"params", {{"length", dimv(20)}, {"width", dimv(20)},
+                                                   {"height", dimv(20)},
+                                                   {"at", json::array({100.0, 0.0, 0.0})}}}}}}}),
+        false);
+    const json latest = doc::drawing_get(did);
+    REQUIRE(latest["sheets"][0]["views"][0]["bbox"].is_array());
+    CHECK(latest["sheets"][0]["views"][0]["bbox"][2].get<double>() >
+          initial["sheets"][0]["views"][0]["bbox"][2].get<double>() + 50.0);
+    REQUIRE(doc::doc_close(src));
+    const json frozen = doc::drawing_get(did);
+    CHECK(frozen["source_state"] == "closed");
+    CHECK(frozen["source_missing"] == true);
+    CHECK(frozen["views_stale"] == true);
+    CHECK(frozen["warning"] == "source closed — views frozen from last projection");
+    CHECK(frozen["sheets"][0]["views"][0]["bbox"] ==
+          latest["sheets"][0]["views"][0]["bbox"]);
+    doc::drawing_close(did);
+}
+
+TEST_CASE("ASCII DXF labels retain manufacturing callout meanings") {
+    namespace fs = std::filesystem;
+    const std::string src = make_cube(30.0);
+    const std::string did =
+        doc::drawing_new(json::object(), json::object(), "", src)["doc_id"].get<std::string>();
+    const std::string vid =
+        doc::drawing_add_view(did, "base", "front", "s1", 1.0,
+                              json::array({150.0, 170.0}), nullptr)["view_id"].get<std::string>();
+    doc::drawing_add_dim(did, vid, "note", json::array({150.0, 170.0}), nullptr,
+                         nullptr, nullptr, json::array({180.0, 190.0}),
+                         "\xE2\x8C\xB4 \xE2\x8C\xB5 \xE2\x86\xA7");
+    const fs::path path = fs::temp_directory_path() / "chudware_callout_symbols.dxf";
+    doc::export_drawing(did, path.string(), "dxf");
+    std::ifstream stream(path, std::ios::binary);
+    REQUIRE(stream.good());
+    const std::string text((std::istreambuf_iterator<char>(stream)),
+                           std::istreambuf_iterator<char>());
+    CHECK(text.find("CBORE") != std::string::npos);
+    CHECK(text.find("CSK") != std::string::npos);
+    CHECK(text.find("DEPTH") != std::string::npos);
+    std::error_code ec;
+    fs::remove(path, ec);
+    doc::drawing_close(did);
+    doc::doc_close(src);
+}
+
+TEST_CASE("Back and iso views occupy different drawing cells") {
+    const std::string src = make_cube(20.0);
+    const json made = doc::drawing_make(
+        src, json{{"views", json::array({"front", "back", "iso"})},
+                  {"model_items", false}});
+    const json& views = made["drawing"]["tree"]["sheets"][0]["views"];
+    REQUIRE(views.size() == 3);
+    CHECK(views[1]["orientation"] == "back");
+    CHECK(views[2]["orientation"] == "iso");
+    CHECK(views[1]["position"] != views[2]["position"]);
+    doc::drawing_close(made["doc_id"].get<std::string>());
+    doc::doc_close(src);
+}

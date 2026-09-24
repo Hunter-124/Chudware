@@ -63,9 +63,8 @@ void pool_polylines(const json& jpls, std::vector<Polyline>& out) {
     }
 }
 
-// Map an annotation string onto plain ASCII for DXF R12 / PDF Helvetica (the engine
-// composes ⌀/×/°/± which neither target draws cleanly): ⌀->DIA, ×->X, °->DEG, ±->+-,
-// other non-ASCII dropped. Mirrors session.cpp::sanitize_label for the export side (N-7).
+// Map annotation text onto ASCII for DXF R12 / PDF Helvetica. Manufacturing
+// callout glyphs must retain their meaning even when the target font lacks them.
 std::string ascii_label(const std::string& in) {
     std::string out;
     out.reserve(in.size());
@@ -84,11 +83,14 @@ std::string ascii_label(const std::string& in) {
             else if (d == 0xB1) out += "+-";
             i += 2; continue;
         }
-        if (c == 0xE2 && i + 2 < in.size() &&
-            static_cast<unsigned char>(in[i + 1]) == 0x8C &&
-            static_cast<unsigned char>(in[i + 2]) == 0x80) {
-            out += "DIA ";
-            i += 3; continue;
+        if (c == 0xE2 && i + 2 < in.size()) {
+            const unsigned char d = static_cast<unsigned char>(in[i + 1]);
+            const unsigned char e = static_cast<unsigned char>(in[i + 2]);
+            const char* replacement = d == 0x8C && e == 0x80 ? "DIA " :
+                                      d == 0x8C && e == 0xB4 ? " CBORE " :
+                                      d == 0x8C && e == 0xB5 ? " CSK " :
+                                      d == 0x86 && e == 0xA7 ? " DEPTH " : nullptr;
+            if (replacement) { out += replacement; i += 3; continue; }
         }
         ++i;
         while (i < in.size() && (static_cast<unsigned char>(in[i]) & 0xC0) == 0x80) ++i;

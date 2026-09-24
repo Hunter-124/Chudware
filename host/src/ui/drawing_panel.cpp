@@ -485,31 +485,15 @@ static void commitGdt(AppState& st, AppState::DocTab& tab, const std::string& vi
     }
 }
 
-// Move a view to a new sheet position (drawing_set_view {position}) — position-only, so the
-// engine re-projects nothing; cheap + smooth. Absorbs the returned drawing.
+// Moving a parent also repositions derived-view cuts and detail crops; refresh the
+// assembled sheet so their markers and geometry move together with its annotations.
 static void commitViewMove(AppState& st, AppState::DocTab& tab, const std::string& viewId,
                            double px, double py) {
     nlohmann::json res;
     nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"view_id", viewId},
                              {"position", nlohmann::json::array({px, py})}};
     if (!drawCall(st, "drawing_set_view", params, res, "Move view")) return;
-    st.markDrawingTabDirty(st.activeTab);
-    // Splice ONLY the moved view's returned geometry into the cache — no full drawing_get
-    // (which would re-HLR every view). Parent-view markers (section/detail) the moved view
-    // owns are recomputed on the next Rebuild; the move itself is instant.
-    if (res.contains("view") && res["view"].is_object() && tab.drawingDoc.contains("sheets") &&
-        tab.drawingDoc["sheets"].is_array()) {
-        const std::string rid = res["view"].value("view_id", viewId);
-        for (auto& sh : tab.drawingDoc["sheets"]) {
-            if (!sh.contains("views") || !sh["views"].is_array()) continue;
-            for (auto& vv : sh["views"]) {
-                std::string vid = vv.value("view_id", vv.value("id", std::string()));
-                if (vid == rid) { vv = res["view"]; break; }
-            }
-        }
-    } else {
-        st.refreshDrawingTab(st.activeTab);
-    }
+    absorbDrawingResult(st, tab, res);
     st.addLog("[draw] moved view " + viewId);
 }
 
@@ -641,7 +625,7 @@ bool drawingHandleCommand(AppState& st, const std::string& cmd) {
     if (cmd == "dwg_center_mark")  { disarmDrawTools(tab); tab.centerMarkActive = true; return true; }
     if (cmd == "dwg_center_line")  { disarmDrawTools(tab); tab.centerLineActive = true; tab.centerLineStage = 0; return true; }
     if (cmd == "dwg_note")         { disarmDrawTools(tab); tab.noteActive = true; return true; }
-    if (cmd == "dwg_balloon" || cmd == "dwg_auto_balloon") { disarmDrawTools(tab); tab.balloonActive = true; return true; }
+    if (cmd == "dwg_balloon") { disarmDrawTools(tab); tab.balloonActive = true; return true; }
     if (cmd == "dwg_bom_table") {
         tab.bomVisible = !tab.bomVisible;
         if (tab.bomVisible && !tab.bomFetched) fetchBom(st, tab);
@@ -1311,9 +1295,11 @@ static void renderTitleBlockPopup(AppState& st, AppState::DocTab& tab, const nlo
     static char tbTitle[96] = {0}, tbDrawn[48] = {0}, tbDate[32] = {0}, tbMatl[48] = {0},
                 tbFinish[48] = {0}, tbRev[16] = {0}, tbScale[16] = {0}, tbSheetNo[16] = {0},
                 tbCompany[64] = {0};
-    static int  tbSizeIdx = 1;          // A3 default
+    static int tbSizeIdx = 1;          // A3 default
+    static int tbUnitsIdx = 0;
     static bool tbLoaded = false;
     static const char* kSizes[] = {"A4", "A3", "A2", "A1", "A0", "A", "B", "C", "D", "E"};
+    static const char* kUnits[] = {"MMGS", "IPS"};
 
     if (tab.titleBlockOpen) {
         ImGui::OpenPopup("Sheet Properties##sheetprops");
@@ -1341,6 +1327,9 @@ static void renderTitleBlockPopup(AppState& st, AppState::DocTab& tab, const nlo
         tbSizeIdx = 1;
         for (int i = 0; i < IM_ARRAYSIZE(kSizes); ++i)
             if (sz == kSizes[i]) { tbSizeIdx = i; break; }
+        const nlohmann::json& tree = tab.drawingDoc.value("tree", nlohmann::json::object());
+        tbUnitsIdx = tree.contains("units") && tree["units"].is_object() &&
+                             djstr(tree["units"], "system") == "IPS" ? 1 : 0;
         tbLoaded = true;
     }
 
@@ -1350,6 +1339,8 @@ static void renderTitleBlockPopup(AppState& st, AppState::DocTab& tab, const nlo
         GlassPopupScope glass = beginGlassPopup("drw_sheetprops_popup");
         ImGui::SetNextItemWidth(120 * ui::uiScale);
         ImGui::Combo("Sheet size", &tbSizeIdx, kSizes, IM_ARRAYSIZE(kSizes));
+        ImGui::SetNextItemWidth(120 * ui::uiScale);
+        ImGui::Combo("Units", &tbUnitsIdx, kUnits, IM_ARRAYSIZE(kUnits));
         ImGui::Separator();
         // Short fields share rows (kills the dead vertical space of nine full-width inputs in a
         // 360px popup); Title/Company stay full width.
@@ -1390,6 +1381,16 @@ static void renderTitleBlockPopup(AppState& st, AppState::DocTab& tab, const nlo
                           {"size", kSizes[tbSizeIdx]}}, res, "Sheet size");
                 absorbDrawingResult(st, tab, res);
                 tab.drawNeedFit = true;
+            }
+            const nlohmann::json& tree = tab.drawingDoc.value("tree", nlohmann::json::object());
+            const std::string curUnits = tree.contains("units") && tree["units"].is_object()
+                                              ? djstr(tree["units"], "system") : "MMGS";
+            if (curUnits != kUnits[tbUnitsIdx]) {
+                nlohmann::json res;
+                if (drawCall(st, "drawing_set_units",
+                             {{"doc_id", tab.drawingDocId}, {"system", kUnits[tbUnitsIdx]}},
+                             res, "Drawing units"))
+                    absorbDrawingResult(st, tab, res);
             }
             nlohmann::json fields = {
                 {"title", tbTitle}, {"drawn_by", tbDrawn}, {"date", tbDate}, {"material", tbMatl},
@@ -1477,6 +1478,17 @@ void drawDrawingSheet(AppState& st) {
             ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetTextLineHeight()));
             ImGui::PopStyleColor();
         }
+    }
+
+    if (tab.drawingDoc.is_object() &&
+        tab.drawingDoc.value("views_stale", false)) {
+        const std::string warning = djstr(tab.drawingDoc, "warning");
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              ImVec4(pal.statusWarn[0], pal.statusWarn[1],
+                                     pal.statusWarn[2], pal.statusWarn[3]));
+        ImGui::TextUnformatted(warning.empty() ? "Source unavailable — views are stale"
+                                               : warning.c_str());
+        ImGui::PopStyleColor();
     }
 
     // ---- canvas child ----

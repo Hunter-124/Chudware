@@ -1073,7 +1073,8 @@ std::vector<TopoDS_Shape> brep_cache_decode(const std::string& blob) {
     };
     std::size_t pos = 0;
     auto get_u64 = [&](const char* what) -> uint64_t {
-        if (pos + 8 > blob.size()) throw bad(std::string("truncated ") + what);
+        if (pos > blob.size() || blob.size() - pos < 8)
+            throw bad(std::string("truncated ") + what);
         uint64_t v = 0;
         for (int i = 0; i < 8; ++i)
             v |= static_cast<uint64_t>(static_cast<unsigned char>(blob[pos + i])) << (8 * i);
@@ -1088,7 +1089,7 @@ std::vector<TopoDS_Shape> brep_cache_decode(const std::string& blob) {
     bodies.reserve(static_cast<std::size_t>(count));
     for (uint64_t i = 0; i < count; ++i) {
         const uint64_t len = get_u64("length");
-        if (pos + len > blob.size()) throw bad("truncated body");
+        if (pos > blob.size() || len > blob.size() - pos) throw bad("truncated body");
         std::istringstream is(blob.substr(pos, static_cast<std::size_t>(len)), std::ios::binary);
         pos += static_cast<std::size_t>(len);
         TopoDS_Shape sh;

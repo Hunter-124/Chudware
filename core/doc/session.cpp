@@ -4455,8 +4455,10 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
         // FaceChecker) — measured >50% of warm assembly opens before this cache.
         static std::mutex s_asm_tess_mtx;
         struct AsmTessEntry {
-            TopoDS_Shape shape;  // pins the TShape so the pointer key can't be recycled (ABA)
+            TopoDS_Shape shape;  // pins the TShape while the pointer key lives (ABA)
             std::shared_future<std::shared_ptr<const aicm::AicmBody>> body;
+            std::uint64_t last_used;
+            bool in_flight;
         };
         // WHY: lookup-or-install-placeholder happens under ONE s_asm_tess_mtx acquisition
         // below (no unlock/relock gap) so two threads racing the SAME uncached TShape key
@@ -4467,6 +4469,33 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
         // reason to flush the cache.
         using AsmTessKey = std::pair<const void*, int>;
         static std::map<AsmTessKey, AsmTessEntry> s_asm_tess_cache;
+        static std::uint64_t s_asm_tess_clock = 0;  // protected by s_asm_tess_mtx
+        constexpr std::size_t kAsmTessCacheLimit = 128;
+        // Caller holds s_asm_tess_mtx. Never discard a placeholder while another
+        // thread may be waiting for its shared future.
+        auto trim_tess_cache = [&]() {
+            for (auto it = s_asm_tess_cache.begin(); it != s_asm_tess_cache.end();) {
+                if (it->second.in_flight) { ++it; continue; }
+                const void* tshape = it->first.first;
+                const auto pins = std::count_if(
+                    s_asm_tess_cache.begin(), s_asm_tess_cache.end(),
+                    [tshape](const auto& entry) { return entry.first.first == tshape; });
+                if (it->second.shape.TShape()->GetRefCount() <= pins)
+                    it = s_asm_tess_cache.erase(it);
+                else
+                    ++it;
+            }
+            while (s_asm_tess_cache.size() > kAsmTessCacheLimit) {
+                auto oldest = s_asm_tess_cache.end();
+                for (auto it = s_asm_tess_cache.begin(); it != s_asm_tess_cache.end(); ++it) {
+                    if (it->second.in_flight) continue;
+                    if (oldest == s_asm_tess_cache.end() ||
+                        it->second.last_used < oldest->second.last_used) oldest = it;
+                }
+                if (oldest == s_asm_tess_cache.end()) break;
+                s_asm_tess_cache.erase(oldest);
+            }
+        };
         const int qkey = static_cast<int>(s.display_quality);
         for (const AsmBodyOut& body : ares->bodies) {
             std::optional<Eigen::Vector3d> off;
@@ -4485,10 +4514,13 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
                     auto it = s_asm_tess_cache.find(key);
                     if (it != s_asm_tess_cache.end()) {
                         fut = it->second.body;
+                        it->second.last_used = ++s_asm_tess_clock;
                     } else {
                         mine = std::make_shared<std::promise<std::shared_ptr<const aicm::AicmBody>>>();
                         fut = mine->get_future().share();
-                        s_asm_tess_cache[key] = AsmTessEntry{body.shape_local, fut};
+                        s_asm_tess_cache.emplace(key, AsmTessEntry{
+                            body.shape_local, fut, ++s_asm_tess_clock, true});
+                        trim_tess_cache();
                     }
                 }
                 if (mine) {
@@ -4502,11 +4534,18 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
                         mine->set_value(std::make_shared<const aicm::AicmBody>(
                             ::geom::tessellate_body(local_shape, 0, std::string(), color,
                                                     d.lin, d.ang)));
+                        {
+                            std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
+                            auto it = s_asm_tess_cache.find(key);
+                            if (it != s_asm_tess_cache.end()) it->second.in_flight = false;
+                            trim_tess_cache();
+                        }
                     } catch (...) {
                         mine->set_exception(std::current_exception());
                         // A failed tessellation is NOT cached — the next caller for this key retries.
                         std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
                         s_asm_tess_cache.erase(key);
+                        trim_tess_cache();
                     }
                 }
                 std::shared_ptr<const aicm::AicmBody> local = fut.get();  // rethrows for every waiter
@@ -6263,6 +6302,11 @@ bool doc_close(const std::string& doc_id) {
     if (!doc.owns_lock())
         throw OpError("doc_busy", "document " + doc_id + " has an operation in flight",
                       {{"doc_id", doc_id}});
+    // Capture the final committed source while it is pinned. Never acquire DrawingLock
+    // here: drawing_get holds it while acquiring a source DocLock (opposite order).
+    json source_tree = pin->doc;
+    json source_env = env_from_doc(pin->doc);
+    const long source_revision = pin->revision;
     {
         std::lock_guard<std::mutex> reg(g_registry_mtx);
         auto it = g_sessions.find(doc_id);
@@ -6275,6 +6319,9 @@ bool doc_close(const std::string& doc_id) {
     pin->undo_stack.clear();
     pin->redo_stack.clear();
     doc.unlock();
+    // With neither the doc nor registry lock held, drawings can safely project the
+    // final snapshot and flag their views stale before this close returns.
+    drawings_source_closed(doc_id, source_tree, source_env, source_revision);
     // Session teardown happens when `pin` goes out of scope below.
     wipe_undo_journal(doc_id);
     // T-PERF10: free AICM shared-memory objects for this doc (all revisions).
@@ -13243,8 +13290,9 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
     // feature params. The compiler prefers this embedded geometry; source_path stays as
     // provenance and a rebuild fallback. Fail-soft: if the read throws, we leave the
     // feature path-only (the compiler will then read the source as before).
+    std::vector<std::string> import_warnings;
     try {
-        auto bodies = import_bodies(import_path_, f);
+        auto bodies = import_bodies(import_path_, f, &import_warnings);
         TopoDS_Compound comp;
         BRep_Builder bb;
         bb.MakeCompound(comp);
@@ -13282,6 +13330,7 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
 
     json resp = apply_ops_locked(*s, -1, ops, /*coalesce=*/false);
     resp["doc_id"] = s->doc_id;
+    if (!import_warnings.empty()) resp["warnings"] = import_warnings;
     if (solidworks_tessellation) {
         resp["import_fidelity"] = "saved_display_tessellation";
         resp["feature_resolved"] = false;

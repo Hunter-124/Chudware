@@ -87,8 +87,8 @@ void transform_body_rigid(aicm::AicmBody& body, const gp_Trsf& t);
 // triangle/edge extraction that builds the AicmBody, so the compile profiler can
 // tell whether an incremental edit's tessellation cost is meshing (geometry truly
 // changed) or extraction (re-walking unchanged faces — the reuse opportunity).
-// Process-wide accumulators; reset before a timed region, read after. Cheap: two
-// steady_clock reads per tessellate_body call.
+// Per-compiling-thread accumulators; reset before the document's sequential
+// tessellation phase, read after it.
 struct TessTiming {
     double mesh_ms = 0.0;
     double extract_ms = 0.0;

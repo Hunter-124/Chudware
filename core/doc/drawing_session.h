@@ -12,14 +12,11 @@
 // mirrors doc/session.cpp / ecad/session.cpp: a process-global map keyed by an opaque
 // doc id, a revision bumped on every mutation, require_session(doc_id) lookup.
 //
-// SOURCE MODEL (vs. the Python oracle): the oracle references an OPEN source
-// DocSession by id and pulls its last good bodies on fetch. The C++ core's drawing
-// session stores the source document TREE (+ its equation env) supplied at
-// drawing_new and recompiles it on fetch — the same associative re-projection, with
-// the source carried inline (matching the stateless drawing probe in export2d.cpp).
-// `source_revision` is bumped whenever the caller updates the stored source via
-// drawing_set_source, so the per-(rev,orient,scale,hidden) projection cache stays
-// valid exactly as in the oracle.
+// A drawing with a live source id re-pulls its current tree and equation environment
+// for associative projection. doc_close captures the final committed source and
+// freezes the resulting views with an explicit stale warning. An inline drawing
+// instead projects its fixed tree. source_revision tracks the source snapshot;
+// the compiled HLR geometry is recomputed from it on fetch.
 #pragma once
 
 #include <map>
@@ -34,6 +31,11 @@ namespace chudware::doc {
 // to {"drawings/<drawing_id>.json": <drawing doc JSON string>} for .step+ embedding on
 // save (port of engine/doc/stepplus.py::_collect_drawing_entries). Empty when none.
 std::map<std::string, std::string> drawings_for_source(const std::string& source_doc_id);
+// Called after a source session has been removed from the document registry.
+// Freeze every associated drawing on its final source tree/env and flag it stale.
+void drawings_source_closed(const std::string& source_doc_id,
+                            const nlohmann::json& source_doc,
+                            const nlohmann::json& source_env, long source_revision);
 
 // register_restored_drawing: re-register a saved drawing (its serialized aicad.drawing/1
 // doc) as a FRESH session whose live source is re-pointed to `source_doc_id` (the just-
@@ -54,9 +56,9 @@ nlohmann::json drawing_open_standalone(const std::string& path);
 // drawing_new: create a drawing referencing a source part. Two source models:
 //   - LIVE (host path): pass `source_doc_id` = an OPEN C++ DocSession id ("doc-cpp...").
 //     The drawing re-pulls that session's CURRENT tree on every fetch (associative,
-//     matching engine/doc/drawing.py which references the open source session). The
-//     inline `source_doc`/`env` then act only as the initial name + a fallback snapshot
-//     if the source is later closed.
+//     matching engine/doc/drawing.py which references the open source session). On
+//     close the inline source is refreshed to the FINAL tree/env and its views are
+//     frozen with a stale warning, never reverted to the creation-time snapshot.
 //   - INLINE (stateless probe / parity): leave `source_doc_id` empty and pass the source
 //     part tree in `source_doc` (+ `env`); the drawing recompiles that fixed tree.
 // `name` defaults to "<source name> - Drawing". Returns {doc_id, drawing:<tree>}.
@@ -68,6 +70,11 @@ nlohmann::json drawing_new(const nlohmann::json& source_doc, const nlohmann::jso
 // open source in the oracle). Returns {doc_id, revision, source_revision}.
 nlohmann::json drawing_set_source(const std::string& doc_id, const nlohmann::json& source_doc,
                                   const nlohmann::json& env);
+
+// Drawing display units are independent of the source after creation. Recompose
+// existing numeric annotation text and return {doc_id, system, revision, drawing}.
+nlohmann::json drawing_set_units(const std::string& doc_id, const std::string& system);
+
 // Sheet lifecycle. A newly-created drawing starts with s1 active; callers may add
 // further sheets and direct sheet-less view/table operations to the active sheet.
 nlohmann::json drawing_add_sheet(const std::string& doc_id, const std::string& size,

@@ -480,7 +480,11 @@ judgment).
 - **`save_part`/`export_part` with no path go to `CHUDWARE_PROJECT_SAVE_DIR`.** The temp
   fallback survives ONLY for headless external MCP clients with no project. A
   `chudware_mcp_*` basename is also dropped by the artifact allowlist as internal scratch,
-  so a scratch save is invisible in the GUI as well as misplaced.
+  so a scratch save is invisible in the GUI as well as misplaced. Since 2026-09-24 a bare
+  `save_part` of a doc that already lives in a real `.step+` saves IN PLACE, and an explicit
+  `save_part(path=…)` deletes the root copy the harness itself placed for that doc
+  (`cad_common._HARNESS_SAVED_PATHS`, only when it is the doc's current file) and reports
+  `removed_stale_copy` — a live run left five `<Stem>.step+` duplicates in the project root.
 - **Nested agents remain inside Chudcode.** CAD owns the role/council/mission/governance
   context and the host-tool surface, but does not run a nested provider loop. Session,
   subagent, retry, compaction, todo, and usage events are mapped back into the existing

@@ -295,3 +295,42 @@ def test_metadata_failure_never_guesses_a_new_destination(
     else:
         assert C._project_save(_DOC, "supplied name") is None
     assert engine.saves == []
+
+
+def test_bare_save_of_an_opened_file_saves_in_place(engine, monkeypatch, tmp_path):
+    """Live 2026-09-24: a bare save_part of `CAD/Wheels/Wheel Hub ….step+` wrote a
+    duplicate `Wheel_Hub_….step+` into the project root."""
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    home = tmp_path / "CAD" / "Wheels"
+    home.mkdir(parents=True)
+    opened = home / "Wheel Hub 2026-09-24.step+"
+    opened.write_text("original")
+    engine.names[_DOC] = "Wheel Hub 2026-09-24"
+    engine.paths[_DOC] = str(opened)
+
+    saved = json.loads(_tool("save_part")(doc_id=_DOC))
+
+    assert saved["path"] == str(opened)
+    assert sorted(p.name for p in tmp_path.glob("*.step+")) == []
+
+
+def test_explicit_save_retires_only_the_copy_the_harness_placed(engine, monkeypatch,
+                                                                  tmp_path):
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    r = _new_part("Brake Rotor Hat")
+    harness_copy = Path(r["saved_path"])
+    assert harness_copy.parent == tmp_path and harness_copy.is_file()
+    destination = tmp_path / "CAD" / "Wheels" / "Brake Rotor Hat.step+"
+    destination.parent.mkdir(parents=True)
+
+    saved = json.loads(_tool("save_part")(doc_id=_DOC, path=str(destination)))
+
+    assert saved["path"] == str(destination) and destination.is_file()
+    assert not harness_copy.exists()
+    assert saved["removed_stale_copy"] == str(harness_copy)
+
+    # A later explicit save somewhere else must not touch a file the USER chose.
+    elsewhere = tmp_path / "Brake Rotor Hat backup.step+"
+    again = json.loads(_tool("save_part")(doc_id=_DOC, path=str(elsewhere)))
+    assert destination.is_file() and elsewhere.is_file()
+    assert "removed_stale_copy" not in again

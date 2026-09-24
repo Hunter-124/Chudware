@@ -54,11 +54,13 @@ from .cad_common import (
     _write_diff,
     is_geom_query,
     normalize_geom_query,
+    note_harness_saved_path,
     note_touched_doc,
     placement_warnings,
     pose_to_transform16,
     cb,
     recover_autosaved,
+    retire_harness_copy,
     recover_skipped,
 )
 
@@ -8350,6 +8352,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # exactly where the file will be written (no hidden navigation).
             out = (_sanitize_output_path(path) if path
                    else _default_deliverable_path(d, ".step+"))
+            prior_path = next((e.get("path") for e in (cb.call("doc_list", {}) or {})
+                               .get("docs", []) if isinstance(e, dict)
+                               and e.get("doc_id") == d), None)
             note = None
             if not out.lower().endswith(".step+"):
                 # A caller who wrote "bracket.step" asked for a CAD file by name and gets the
@@ -8370,14 +8375,24 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             r = cb.call("doc_save", {"doc_id": d, "path": out})
             written = r.get("path", out)
             ok = os.path.exists(written)
+            retired = None
             if ok:
                 # Delivered: record the revision so close_part won't warn until further edits.
                 rev = _doc_revision(d)
                 if rev is not None:
                     _LAST_DELIVER_REV[d] = rev
+                if path:
+                    # An explicit destination supersedes a copy the harness placed itself —
+                    # only the file THIS doc lived in until now (doc ids are reused across
+                    # engine restarts, so the record alone never authorizes a delete).
+                    retired = retire_harness_copy(d, written, prior_path)
+                elif prior_path != written:
+                    note_harness_saved_path(d, written)
             res = {"ok": ok, "format": "step+", "native": True, "doc_id": d,
                    "path": written,
                    "bytes": (os.path.getsize(written) if ok else 0)}
+            if retired:
+                res["removed_stale_copy"] = retired
             if note:
                 res["note"] = note
             # Non-blocking placement provenance (assembly-merge discipline): a

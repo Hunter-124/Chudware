@@ -1755,6 +1755,39 @@ def _project_save_stem(name: Optional[str], doc_id: str) -> str:
     return stem or doc_id
 
 
+# doc_id -> the .step+ file the HARNESS chose and wrote for it (new_part / add_features
+# auto project-save, bare save_part into CHUDWARE_PROJECT_SAVE_DIR). Nobody asked for that
+# location, so when the same document is later saved to an explicit path the old file is a
+# stale duplicate the harness itself created. Live 2026-09-24: five `<Stem>.step+` copies
+# were left in the ME-490 project root beside the real files the agent saved under CAD/.
+_HARNESS_SAVED_PATHS: dict = {}
+
+
+def note_harness_saved_path(doc_id: Optional[str], path: Optional[str]) -> None:
+    if doc_id and path:
+        _HARNESS_SAVED_PATHS[doc_id] = os.path.abspath(path)
+
+
+def retire_harness_copy(doc_id: Optional[str], new_path: Optional[str],
+                        prior_path: Optional[str]) -> Optional[str]:
+    """After `doc_id` was saved to an explicit `new_path`, delete the harness-chosen copy it
+    moved away from — only when that copy is the file the doc lived in until this save.
+    Returns the removed path, or None. Never raises."""
+    if not doc_id or not new_path:
+        return None
+    old = _HARNESS_SAVED_PATHS.pop(doc_id, None)
+    if (not old or not prior_path or old != os.path.abspath(prior_path)
+            or old == os.path.abspath(new_path)):
+        return None
+    try:
+        if os.path.isfile(old):
+            os.remove(old)
+            return old
+    except OSError:
+        pass
+    return None
+
+
 def _default_deliverable_path(doc_id: str, suffix: str) -> str:
     """Choose the destination for a save/export whose caller omitted ``path``.
 
@@ -1764,21 +1797,30 @@ def _default_deliverable_path(doc_id: str, suffix: str) -> str:
     ``chudware_mcp_`` basename is deliberately classified as internal scratch. External
     headless MCP clients do not configure a project folder, so only that case keeps the
     historical temp-file fallback.
+
+    A native save of a document that already lives in a real ``.step+`` file saves IN
+    PLACE (the same rule `_project_save` follows). Writing `<root>/<Stem>.step+` instead
+    duplicated an opened `CAD/Wheels/Wheel Hub ….step+` into the project root (2026-09-24).
     """
     root = os.environ.get("CHUDWARE_PROJECT_SAVE_DIR")
     if not root:
         return _tmp(suffix)
 
-    directory = Path(os.path.abspath(os.path.expanduser(root)))
-    directory.mkdir(parents=True, exist_ok=True)
     name = None
+    current = None
     try:
         for entry in (cb.call("doc_list", {}) or {}).get("docs", []):
             if isinstance(entry, dict) and entry.get("doc_id") == doc_id:
                 name = entry.get("name") or ""
+                current = entry.get("path")
                 break
     except Exception:  # noqa: BLE001 — the doc_id remains a stable filename fallback
         pass
+    if (suffix == ".step+" and isinstance(current, str)
+            and current.lower().endswith(".step+") and not _is_recovery_path(current)):
+        return current
+    directory = Path(os.path.abspath(os.path.expanduser(root)))
+    directory.mkdir(parents=True, exist_ok=True)
     return str(directory / f"{_project_save_stem(name, doc_id)}{suffix}")
 
 
@@ -1816,6 +1858,7 @@ def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional
         entry = next((e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
                       if isinstance(e, dict) and e.get("doc_id") == doc_id), {})
         current = entry.get("path")
+        chosen_by_harness = False
         if (isinstance(current, str) and current.lower().endswith(".step+")
                 and not _is_recovery_path(current)):
             path = Path(current)
@@ -1825,10 +1868,13 @@ def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional
             if not d.is_dir():
                 return None
             path = d / f"{_project_save_stem(name or entry.get('name'), doc_id)}.step+"
+            chosen_by_harness = True
         r = cb.call("doc_save", {"doc_id": doc_id, "path": str(path)})
         written = r.get("path", str(path)) if isinstance(r, dict) else str(path)
         if not os.path.exists(written):
             return None
+        if chosen_by_harness:
+            note_harness_saved_path(doc_id, written)
         try:  # optional Box cloud mirror — spools the project only; uploads drain later
             from services.plm import box_mirror
             box_mirror.notify_saved_path(written)

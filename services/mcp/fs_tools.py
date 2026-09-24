@@ -74,6 +74,13 @@ _SENSITIVE_FILE_NAMES = (
 )
 
 
+def _is_sensitive_path(resolved: Path) -> bool:
+    """Check the credential denylist on a fully resolved path, without a workspace jail."""
+    return resolved.name in _SENSITIVE_FILE_NAMES or any(
+        part in _SENSITIVE_DIR_NAMES for part in resolved.parts
+    )
+
+
 def _workspace_root() -> Optional[Path]:
     """Return the canonical mandatory filesystem jail, or ``None`` to fail closed."""
     raw = os.environ.get("CHUDWARE_FS_ROOT", "").strip()
@@ -164,9 +171,7 @@ def _canonical_target(raw_path: str, *, allow_missing: bool = False,
             return None, _err("use_fw_sources", firmware)
         return None, _err("outside_workspace_root",
                           f"{raw_path} resolves outside the active project root ({root})")
-    if resolved.name in _SENSITIVE_FILE_NAMES or any(
-        part in _SENSITIVE_DIR_NAMES for part in resolved.parts
-    ):
+    if _is_sensitive_path(resolved):
         return None, _err("blocked_sensitive_path",
                           f"{raw_path} resolves into a credential/key location")
     return resolved, None
@@ -365,7 +370,14 @@ def _reader_for(name: str) -> str:
 # Destructive shell shapes refused outright (ported/trimmed from the oh-my-pi bash tool's
 # CRITICAL_BASH_PATTERNS). Intentionally tight — the cost of a false negative is a wiped host.
 _CRITICAL_SHELL_PATTERNS = [
-    re.compile(r"\brm\s+-[a-z]*[rf][a-z]*\s+(?:/|~|\$HOME|\*)(?:\s|$)", re.I),  # rm -rf / ~ * $HOME
+    re.compile(
+        r"\brm\s+(?=(?:--?[a-z-]+\s+)*(?:-[a-z]*[rf][a-z]*|--(?:recursive|force))\s+)"
+        r"(?:--?[a-z-]+\s+)*(?:--\s+)?(?:[^\s;|&<>]+\s+)*"
+        r"(?:/(?:\*|(?:bin|boot|dev|etc|home|lib|lib64|media|mnt|opt|proc|root|run|"
+        r"sbin|srv|sys|tmp|usr|var)(?:/\*?)?)?|~(?:/\*?)?|"
+        r"\$HOME(?:/\*?)?|\$\{HOME\}(?:/\*?)?)(?=$|[\s;|&<>])",
+        re.I,
+    ),
     re.compile(r"\bsudo\s+rm\b", re.I),
     re.compile(r"\bmkfs(?:\.\w+)?\b", re.I),
     re.compile(r"\bdd\b[^\n]*\bof=/dev/", re.I),

@@ -65,6 +65,26 @@ def test_fs_tools_fail_closed_without_root(monkeypatch):
 
 
 
+def test_code_check_jails_doc_path_and_blocks_credentials(tmp_path, monkeypatch):
+    from services.mcp.code_compliance_tools import register_code_compliance_tools
+
+    mcp = _FakeMCP()
+    register_code_compliance_tools(mcp)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(workspace))
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"elements": []}')
+    assert json.loads(mcp.tools["code_check"](doc_path=str(outside)))["reason"] == (
+        "outside_workspace_root")
+
+    credentials = workspace / ".aws"
+    credentials.mkdir()
+    (credentials / "credentials.json").write_text('{"elements": []}')
+    assert json.loads(mcp.tools["code_check"](
+        doc_path=str(credentials / "credentials.json")))["reason"] == "blocked_sensitive_path"
+
+
 class _FakeMCP:
     """Captures @mcp.tool()-decorated fns by name (what FastMCP does under the hood)."""
 
@@ -412,9 +432,25 @@ def test_run_shell_captures_output_and_exit_code():
 
 def test_run_shell_blocks_destructive():
     t = _tools()
-    for bad in ("rm -rf /", "sudo rm x", "dd if=/dev/zero of=/dev/sda", ":(){ :|:& };:"):
+    bad_commands = (
+        "rm -rf /", "rm -rf /*", "rm -r /etc", "rm -f /home/",
+        "rm -rf ~", "rm -rf ~/", "rm -rf ~/*",
+        "rm -rf $HOME", "rm -rf $HOME/", "rm -rf $HOME/*",
+        "rm -rf ${HOME}", "rm -rf ${HOME}/", "rm -rf ${HOME}/*",
+        "rm -r -f -- /usr", "rm -rf harmless /var/*",
+        "sudo rm x", "dd if=/dev/zero of=/dev/sda", ":(){ :|:& };:",
+    )
+    for bad in bad_commands:
         r = t["run_shell"](bad)
         assert not r["ok"] and r["reason"] == "blocked", bad
+
+
+def test_run_shell_keeps_project_relative_cleanup_usable(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    (tmp_path / "scratch").mkdir()
+    result = _tools()["run_shell"]("rm -rf scratch")
+    assert result["ok"] and result["exit_code"] == 0
+    assert not (tmp_path / "scratch").exists()
 
 
 def test_run_shell_timeout_preserves_json_safe_partial_output(tmp_path):

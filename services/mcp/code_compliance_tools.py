@@ -22,6 +22,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import core_bridge as cb
 from .core_bridge import CoreError
+from .fs_tools import _canonical_target
 
 from services.mcp.cad_tools import _dumps, _err
 
@@ -85,6 +86,12 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
             * ``disclaimer`` — byte-exact: "Preliminary check — not sealed engineering.
               Verify with a licensed structural engineer before construction."
         """
+        if doc_path and doc_path.strip():
+            target, blocked = _canonical_target(doc_path)
+            if blocked:
+                return _dumps(blocked)
+            doc_path = str(target)
+
         try:
             from services.structural.code_check import (
                 DISCLAIMER,

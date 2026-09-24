@@ -50,9 +50,9 @@
       "inputs": {
         "request": "Profile import, mesh, setup, solve, and repeat-run behavior on deterministic small, medium, and large STEP+ assets under the resource governor. Capture exact cache hit/miss behavior and skip the large case only with an explicit governor reason.",
         "assets": {
-          "small": "/home/hunter/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build/CAD_Model/CD-400_Steering/CD-403_Upright_R.step+",
-          "medium": "/home/hunter/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build/CAD_Model/CD-103_Hinge/CD-103_Hinge_Leaf_A.step+",
-          "large": "/home/hunter/Documents/ME489/Crimson_Crankers_Program/01_Design_Package/CAD_Build/CAD_Model/CD-000_GA/CD-000_GA_Deployed_v6.step+"
+          "small": "assets/<small-part>.step+",
+          "medium": "assets/<medium-part>.step+",
+          "large": "assets/<large-assembly>.step+"
         }
       },
       "tools": ["engine_profile", "import_part"],

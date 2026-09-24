@@ -43,7 +43,7 @@ from dulwich import porcelain
 from dulwich.objects import Blob, Commit, Tree
 from dulwich.repo import Repo
 
-from services.plm import gitbind, history as hist, manifest, snapshot
+from services.plm import generic_snapshot, gitbind, history as hist, manifest, snapshot
 from services.plm.vault import Vault, VaultError, _user_author
 
 _LOG = logging.getLogger(__name__)
@@ -260,6 +260,10 @@ def _materialize_working_tree(project_dir: Path, repo: Repo, commit_id: bytes) -
     if not m_raw:
         return
     m = manifest.loads(m_raw)
+    # Reject the entire incoming manifest before touching any working file.
+    for it in m.get("items", []):
+        if it.get("path"):
+            generic_snapshot.contained_path(project_dir, it["path"])
     for it in m.get("items", []):
         iid = it["item_id"]
         path = it.get("path") or ""
@@ -270,7 +274,7 @@ def _materialize_working_tree(project_dir: Path, repo: Repo, commit_id: bytes) -
             exploded = snapshot.read_item_from_tree(files, iid)
         except KeyError:
             continue
-        dest = project_dir / path
+        dest = generic_snapshot.contained_path(project_dir, path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(snapshot.reassemble_container(exploded))
 
@@ -903,6 +907,19 @@ def _sync_once(project_dir: Path, remote_url: str, remote_name: str) -> dict[str
         pushed = False
         conflicts: list[dict[str, Any]] = []
 
+        def refuse_dirty_work() -> dict[str, Any] | None:
+            vault = Vault.open(project_dir)
+            try:
+                dirty = vault._dirty_items(vault.manifest())
+            finally:
+                vault.close()
+            if dirty:
+                return _err(
+                    "unsaved_changes",
+                    "Save or checkpoint local changes before pulling shared changes.",
+                )
+            return None
+
         # empty remote, local has history → just push
         if remote_head is None and local_head is not None:
             ok = _cas_push(repo, remote_url, local_head, expected_old=None)
@@ -912,9 +929,12 @@ def _sync_once(project_dir: Path, remote_url: str, remote_name: str) -> dict[str
 
         # empty local, remote has history → FF
         if local_head is None and remote_head is not None:
+            refusal = refuse_dirty_work()
+            if refusal is not None:
+                return refusal
             # ensure objects present (fetch already did)
-            _ensure_branch_and_head(repo, remote_head)
             _materialize_working_tree(project_dir, repo, remote_head)
+            _ensure_branch_and_head(repo, remote_head)
             return _ok(pulled=True, pushed=False, conflicts_copied=[])
 
         if local_head is None and remote_head is None:
@@ -926,9 +946,12 @@ def _sync_once(project_dir: Path, remote_url: str, remote_name: str) -> dict[str
             return _ok(pulled=False, pushed=False, conflicts_copied=[])
 
         if _is_ancestor(repo, local_head, remote_head):
+            refusal = refuse_dirty_work()
+            if refusal is not None:
+                return refusal
             # behind: fast-forward local to remote
-            _ensure_branch_and_head(repo, remote_head)
             _materialize_working_tree(project_dir, repo, remote_head)
+            _ensure_branch_and_head(repo, remote_head)
             pulled = True
             return _ok(pulled=pulled, pushed=False, conflicts_copied=[])
 
@@ -940,6 +963,9 @@ def _sync_once(project_dir: Path, remote_url: str, remote_name: str) -> dict[str
             return _ok(pulled=False, pushed=True, conflicts_copied=[])
 
         # diverged: replay local tip onto remote with copy-as-variant (§6.4)
+        refusal = refuse_dirty_work()
+        if refusal is not None:
+            return refusal
         base = _merge_base(repo, local_head, remote_head)
         new_files, conflicts = _replay_divergent(
             repo, base=base, local_head=local_head, remote_head=remote_head
@@ -953,8 +979,8 @@ def _sync_once(project_dir: Path, remote_url: str, remote_name: str) -> dict[str
             author=author,
             kind=hist.KIND_AUTO,
         )
-        _ensure_branch_and_head(repo, new_sha)
         _materialize_working_tree(project_dir, repo, new_sha)
+        _ensure_branch_and_head(repo, new_sha)
         ok = _cas_push(repo, remote_url, new_sha, expected_old=remote_head)
         if not ok:
             return _err("contended", "someone else published changes during sync; try again")

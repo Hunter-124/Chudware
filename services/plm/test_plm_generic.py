@@ -18,9 +18,11 @@ import io
 import json
 import zipfile
 
-from services.plm import doctypes, manifest, snapshot
-from services.plm.vault import Vault, VaultError
+import pytest
+
+from services.plm import doctypes, generic_snapshot, gitbind, history as hist, manifest, snapshot
 from services.plm import worker_rpc
+from services.plm.vault import Vault, VaultError
 
 _GIT_VOCAB = {
     "git", "commit", "repository", "repo", "branch", "merge", "rebase",
@@ -112,6 +114,80 @@ def test_add_item_already_tracked_is_idempotent(tmp_path):
     assert second["already_tracked"] is True
     assert len(v.manifest()["items"]) == 1
     v.close()
+
+
+def test_item_paths_cannot_escape_project_on_add_or_snapshot(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "secret.txt"
+    outside.write_text("private")
+    (project / "shortcut.txt").symlink_to(outside)
+    v = Vault.open(project)
+    try:
+        for rel in ("../secret.txt", "shortcut.txt", str(outside)):
+            with pytest.raises(VaultError, match="outside the project") as exc:
+                v.add_item(rel)
+            assert exc.value.reason == "invalid_mode"
+        assert v.manifest()["items"] == []
+
+        # An old or peer-supplied manifest cannot cause a content read either.
+        item = {"item_id": "forged", "path": "../secret.txt", "doc_type": "document"}
+        with pytest.raises(VaultError) as exc:
+            generic_snapshot.content_paths(item, project, {})
+        assert exc.value.reason == "invalid_mode"
+    finally:
+        v.close()
+
+
+def test_forged_manifest_cannot_restore_outside_project(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "secret.txt"
+    outside.write_text("untouched")
+    (project / "spec.md").write_text("stored")
+    v = Vault.open(project)
+    try:
+        item = v.add_item("spec.md")
+        m = v.manifest()
+        m["items"][0]["path"] = "../secret.txt"
+        files = v._bind.read_tree(v._bind.head_commit())
+        files["manifest.json"] = manifest.dumps(m)
+        crafted = v._bind.commit_tree(
+            files, gitbind.EntryMeta(
+                kind=hist.KIND_CHECKPOINT, message="crafted",
+                author_name="Test", author_email="test@example.org",
+            ),
+        )
+        with pytest.raises(VaultError) as exc:
+            v.restore(crafted, item["item_id"])
+        assert exc.value.reason == "invalid_mode"
+        assert outside.read_text() == "untouched"
+    finally:
+        v.close()
+
+
+def test_tree_symlink_members_cannot_read_or_restore_outside_project(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "secret.txt"
+    outside.write_text("untouched")
+    tree = project / "tree"
+    tree.mkdir()
+    (tree / "link.txt").symlink_to(outside)
+    v = Vault.open(project)
+    try:
+        with pytest.raises(VaultError) as exc:
+            v.add_item("tree", doc_type="software")
+        assert exc.value.reason == "invalid_mode"
+        assert outside.read_text() == "untouched"
+        item = {"item_id": "forged", "path": "tree", "doc_type": "software"}
+        content = {snapshot.item_prefix("forged") + "tree/link.txt": b"overwritten"}
+        with pytest.raises(VaultError) as exc:
+            generic_snapshot.materialize(item, content, project)
+        assert exc.value.reason == "invalid_mode"
+        assert outside.read_text() == "untouched"
+    finally:
+        v.close()
 
 
 def test_file_item_byte_exact_restore(tmp_path):

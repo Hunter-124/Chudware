@@ -1076,25 +1076,20 @@ def _captioned_render(png: str, doc_id: str, views: list,
 
 
 def _sanitize_output_path(path: str) -> str:
-    """K3: Normalize an output path so callers see (and the engine writes to) the real,
-    resolved absolute path.
+    """Resolve an output destination and refuse credential/key locations.
 
-    We canonicalise via os.path.abspath (which resolves '..' components and symlinks so
-    path-traversal sequences like '../../etc/passwd' are fully collapsed).  We do NOT
-    impose an allowlist root here — the MCP server runs under the user's own account so
-    writing anywhere they have permission is intentional.  What we DO guarantee is that
-    the returned path is fully resolved (no '..' components remain) so the caller always
-    knows exactly where the file will land, and the engine can't be fooled by a crafted
-    relative sequence that navigates outside an expected directory.
-
-    ``~`` is expanded first: without it a model-written ``~/parts/x.step+`` became a
-    LITERAL ``~`` directory under the daemon's cwd, so the file landed somewhere the
-    user could never find.
-
-    Raises ValueError for obviously invalid inputs (empty string, non-string)."""
+    Relative paths resolve against this process's cwd; ``~``, ``..``, and symlinks
+    are resolved before the denylist check. CAD deliverables deliberately have no
+    workspace-root jail, unlike fs_* tools.
+    """
     if not isinstance(path, str) or not path.strip():
         raise ValueError("output path must be a non-empty string")
-    return os.path.abspath(os.path.expanduser(path))
+    from .fs_tools import _is_sensitive_path
+
+    resolved = Path(os.path.realpath(os.path.expanduser(path)))
+    if _is_sensitive_path(resolved):
+        raise ValueError(f"output path {path!r} resolves into a credential/key location")
+    return str(resolved)
 
 
 # --- never overwrite an artifact: archive the old set first -----------------------------

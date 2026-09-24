@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -200,12 +201,12 @@ def _tree_working_stamp(root: Path) -> tuple[tuple[str, int, int, int, int], ...
             for fn in sorted(filenames):
                 if fn in _EXCLUDE_DIRS:
                     continue
-                abs_path = Path(dirpath) / fn
+                rel = (Path(dirpath) / fn).relative_to(root).as_posix()
+                abs_path = generic_snapshot.contained_path(root, rel)
                 try:
                     st = abs_path.stat()
                 except OSError:
                     continue
-                rel = abs_path.relative_to(root).as_posix()
                 out.append((rel, int(st.st_mtime_ns), int(st.st_ctime_ns),
                             int(st.st_size), int(st.st_ino)))
     except OSError:
@@ -282,7 +283,51 @@ class Vault:
         raw = self._bind.read_blob_at(head, "manifest.json")
         if raw is None:  # corrupted/empty — degrade gracefully (DoD)
             return manifest.new_manifest(self.project_dir.name, _now_iso())
-        return manifest.loads(raw)
+        m = manifest.loads(raw)
+        missing = {
+            (it["item_id"], rr["rev"])
+            for it in m["items"]
+            for rr in it.get("released_revs", [])
+            if not rr.get("commit")
+        }
+        if missing:
+            # The release entry can be HEAD after a crash before its pin commit.
+            # Walk back to the first entry containing each revision; later
+            # checkpoints may have carried the null pin forward.
+            for commit, meta in self._bind.iter_log():
+                current_raw = self._bind.read_blob_at(commit, "manifest.json")
+                if current_raw is None:
+                    continue
+                current = manifest.loads(current_raw)
+                present = {
+                    (it["item_id"], rr["rev"])
+                    for it in current["items"]
+                    for rr in it.get("released_revs", [])
+                }
+                parent = meta["parents"][0] if meta["parents"] else None
+                parent_raw = self._bind.read_blob_at(parent, "manifest.json") if parent else None
+                previous = manifest.loads(parent_raw) if parent_raw else {"items": []}
+                prior = {
+                    (it["item_id"], rr["rev"])
+                    for it in previous["items"]
+                    for rr in it.get("released_revs", [])
+                }
+                introduced = missing & (present - prior)
+                for it in m["items"]:
+                    for rr in it.get("released_revs", []):
+                        if (it["item_id"], rr["rev"]) in introduced:
+                            rr["commit"] = commit
+                for freeze in m.get("bom_freezes", []):
+                    if not freeze.get("commit") and (
+                        freeze.get("assembly_item"), freeze.get("rev")
+                    ) in introduced:
+                        freeze["commit"] = commit
+                missing -= introduced
+                if not missing:
+                    break
+            if missing:
+                raise VaultError("corrupt_item", "a released revision has no release entry")
+        return m
 
     def status(self) -> dict[str, Any]:
         """Project state for the Hub/badges (contract §7 plm_status shape).
@@ -585,8 +630,8 @@ class Vault:
         ``doc_type`` is auto-detected (:mod:`doctypes`) when omitted and is
         always user-retaggable. Returns the item view.
         """
-        rel = str(rel_path).replace("\\", "/").lstrip("/")
-        abs_path = self.project_dir / rel
+        rel = str(rel_path).replace("\\", "/")
+        abs_path = generic_snapshot.contained_path(self.project_dir, rel)
         detected_type = doctypes.detect_doc_type(str(abs_path))
         dt = doc_type or detected_type
         if (detected_type in doctypes.CONTAINER_DOC_TYPES
@@ -681,7 +726,20 @@ class Vault:
             else:
                 cfg[k] = v
         cfg_path = self._bind.vault_dir / "config.json"
-        cfg_path.write_text(_json.dumps(cfg, indent=2, sort_keys=True), "utf-8")
+        tmp: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=cfg_path.parent,
+                prefix=f".{cfg_path.name}.", suffix=".tmp", delete=False,
+            ) as handle:
+                tmp = Path(handle.name)
+                handle.write(_json.dumps(cfg, indent=2, sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, cfg_path)
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
         return cfg
 
     # -- planning store: tasks / issues / milestones (aicad.planning/1) ------
@@ -854,6 +912,9 @@ class Vault:
         if item_id is not None and not targets:
             raise VaultError("invalid_item", f"no such item: {item_id}")
         for it in targets:
+            if it.get("path"):
+                generic_snapshot.contained_path(self.project_dir, it["path"])
+        for it in targets:
             dt = it.get("doc_type")
             if dt and dt in doctypes.GENERIC_DOC_TYPES:
                 generic_snapshot.materialize(it, src_tree, self.project_dir)
@@ -863,7 +924,7 @@ class Vault:
             except KeyError:
                 continue  # item not present at that point (e.g. added later)
             container = snapshot.reassemble_container(exploded)
-            dst = self.project_dir / it["path"]
+            dst = generic_snapshot.contained_path(self.project_dir, it["path"])
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(container)
 
@@ -1125,6 +1186,8 @@ class Vault:
                     continue
                 if not any(fn.endswith(s) for s in _CONTAINER_SUFFIXES):
                     continue
+                rel = (Path(dirpath) / fn).relative_to(self.project_dir).as_posix()
+                generic_snapshot.contained_path(self.project_dir, rel)
                 p = Path(dirpath) / fn
                 if p.is_file():  # skip dangling symlinks / non-regular entries
                     out.append(p)
@@ -1176,11 +1239,13 @@ class Vault:
             dt = tracked_item.get("doc_type")
             if (rel and (not dt or dt in doctypes.CONTAINER_DOC_TYPES)
                     and any(rel.endswith(s) for s in _CONTAINER_SUFFIXES)):
-                container_paths.setdefault(rel, self.project_dir / rel)
+                container_paths.setdefault(
+                    rel, generic_snapshot.contained_path(self.project_dir, rel))
 
         import json as _json
         root_key = _vault_cache_key(self.project_dir)
         for rel, path in sorted(container_paths.items()):
+            path = generic_snapshot.contained_path(self.project_dir, rel)
             item = manifest.find_item_by_path(m, rel)
             # Stat first: an unchanged container is reused from the process
             # explode cache instead of being re-read and re-exploded. Any
@@ -1313,7 +1378,7 @@ class Vault:
 
     def _working_exploded(self, item: dict[str, Any]) -> snapshot.ExplodedItem | None:
         """Explode an item's current working container (None when unreadable)."""
-        path = self.project_dir / item["path"]
+        path = generic_snapshot.contained_path(self.project_dir, item["path"])
         if not path.is_file():
             return None
         try:
@@ -1352,7 +1417,7 @@ class Vault:
             store = doctypes.storage_form(dt)
             if store == "link":
                 return ("link",)
-            path = self.project_dir / it["path"]
+            path = generic_snapshot.contained_path(self.project_dir, it["path"])
             if store == "tree":
                 if not path.is_dir():
                     return ("missing",)
@@ -1366,7 +1431,7 @@ class Vault:
                         int(st.st_size), int(st.st_ino))
             except OSError:
                 return ("missing",)
-        path = self.project_dir / it["path"]
+        path = generic_snapshot.contained_path(self.project_dir, it["path"])
         try:
             if not path.is_file():
                 return None
@@ -1405,7 +1470,7 @@ class Vault:
             live_ids.add(iid)
             stamp = self._working_stamp(it)
             if stamp is None:
-                path = self.project_dir / it["path"]
+                path = generic_snapshot.contained_path(self.project_dir, it["path"])
                 try:
                     path.stat()
                 except FileNotFoundError:
@@ -1434,7 +1499,7 @@ class Vault:
                 item_tree = self._bind.read_subtree(head, snapshot.item_prefix(iid))
                 is_dirty = generic_snapshot.is_dirty(it, self.project_dir, item_tree)
             else:
-                path = self.project_dir / it["path"]
+                path = generic_snapshot.contained_path(self.project_dir, it["path"])
                 head_path = snapshot.item_prefix(iid) + "document.json"
                 entry = self._bind.entry_at(head, head_path)
                 head_oid = entry[1] if entry is not None and entry[0] != 0o040000 else None

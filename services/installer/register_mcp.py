@@ -27,7 +27,9 @@ SERVER_NAME_LEGACY = "ai-cad"  # left in place on register; removed on --unregis
 
 
 def default_python() -> Path:
-    return paths.RUNTIME / "venv" / "Scripts" / "python.exe"
+    if sys.platform == "win32":
+        return paths.RUNTIME / "venv" / "Scripts" / "python.exe"
+    return paths.RUNTIME / "venv" / "bin" / "python"
 
 
 def default_mcp_bin() -> Path | None:
@@ -77,12 +79,12 @@ def server_entry(python_exe: Path, cwd: Path, hostd_bin: Path | None = None,
     }
 
 
-def _load(path: Path) -> dict:
+def _load(path: Path) -> dict | None:
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            return {}
+        except Exception:  # noqa: BLE001 -- leave unreadable or unparseable configs alone
+            return None
     return {}
 
 
@@ -95,6 +97,10 @@ def apply(python_exe: Path, cwd: Path, targets: list[str], dry_run: bool,
         if name not in targets:
             continue
         cfg = _load(path)
+        if cfg is None:
+            out[name] = {"path": str(path), "exists": path.exists(),
+                         "changed": False, "wrote": False, "reason": "unparseable"}
+            continue
         servers = cfg.get("mcpServers") or {}
         if unregister:
             changed = SERVER_NAME in servers or SERVER_NAME_LEGACY in servers

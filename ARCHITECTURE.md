@@ -20,7 +20,7 @@ clients (desktop GUI, WASM-side bridge, tools). Lifecycle, env vars, and trouble
 ### `host/` — the sole GUI target (native + WASM)
 ~110k LOC under `host/src/ui/`: ribbon UI, FeatureManager tree, PropertyManager,
 constraint-solver sketcher UX, copilot chat (`host/src/ui/copilot/`). Own OpenGL pipeline
-under `host/src/render/`. Binary: `host/build-linux/bin/Chudware` (+ `Chudware` compat symlink).
+under `host/src/render/`. Binary: `host/build-linux/bin/chudware`.
 The **same `host/src/ui` tree compiles to WASM** under Emscripten for the web app
 ([Webservice/README.md](Webservice/README.md)); desktop/web parity is by construction and
 enforced by `contracts/web_parity.md` + `scripts/web_parity_probe.py` (a gate stage that
@@ -83,7 +83,7 @@ on the work board ([work/](work)).
 
 ## Build & test
 
-- `./build.sh` — core → `libchudware.so`, then host GUI → `host/build-linux/bin/Chudware`.
+- `./build.sh` — core → `libchudware.so`, then host GUI → `host/build-linux/bin/chudware`.
 - `bash scripts/gate.sh` — full Linux gate: `scripts/check.py` (6 stdlib gates incl.
   `oracle_import_audit`), core build + ctest, host build + WASM smoke, hostd lifecycle +
   web-parity probe, Python suites, headless `CHUDWARE_SHOT=m1` screenshot smoke.

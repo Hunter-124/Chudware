@@ -22,6 +22,7 @@ import pytest
 
 import services.paths as paths
 from services.mcp import cad_common
+from services.mcp import cad_render_tools, tool_registry
 
 
 class _FakeImage:
@@ -172,3 +173,61 @@ def test_prune_render_cache_never_raises(cache):
         assert victim.exists()
     finally:
         locked.chmod(0o700)
+
+
+def test_cad_output_paths_resolve_symlinks_and_block_credentials(tmp_path):
+    secret = tmp_path / ".ssh"
+    secret.mkdir()
+    alias = tmp_path / "exports"
+    alias.symlink_to(secret, target_is_directory=True)
+    with pytest.raises(ValueError, match="credential"):
+        cad_common._sanitize_output_path(str(alias / "part.step+"))
+    with pytest.raises(ValueError, match="credential"):
+        cad_common._sanitize_output_path(str(tmp_path / ".netrc"))
+    ordinary = tmp_path / "parts" / ".." / "part.step+"
+    assert cad_common._sanitize_output_path(str(ordinary)) == str(tmp_path / "part.step+")
+
+
+def test_render_destination_rejects_symlink_escape_and_final_suffix(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(project))
+    monkeypatch.delenv("CHUDWARE_PROJECT_SAVE_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_RENDER_SAVE_ANYWHERE", raising=False)
+    (project / "figures").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="outside"):
+        cad_render_tools._render_save_target(str(project / "figures" / "figure.png"))
+    (project / "poster.png").symlink_to(outside / "poster.png")
+    with pytest.raises(ValueError, match="outside"):
+        cad_render_tools._render_save_target(str(project / "poster"))
+    (project / "movie.gif").symlink_to(outside / "movie.gif")
+    with pytest.raises(ValueError, match="outside"):
+        cad_render_tools._render_save_target(str(project / "movie.gif"), film=True)
+    (project / "frames").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="outside"):
+        cad_render_tools._render_save_target(str(project / "frames"), directory=True)
+    secret = project / ".ssh"
+    secret.mkdir()
+    (project / "secret.png").symlink_to(secret / "id_rsa")
+    with pytest.raises(ValueError, match="credential"):
+        cad_render_tools._render_save_target(str(project / "secret.png"))
+    assert cad_render_tools._render_save_target(str(project / "good")) == str(
+        project / "good.png")
+
+
+def test_render_policy_only_blocks_explicit_saves(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    monkeypatch.delenv("CHUDWARE_PROJECT_SAVE_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    assert tool_registry.classify_risk("render_animation") == tool_registry.RISK_WRITE
+    assert tool_registry.classify_risk("render_part") == tool_registry.RISK_READ
+    tool_registry.set_policy(deny_risk=["write"])
+    try:
+        assert cad_render_tools._render_save_target(None) is None
+        with pytest.raises(ValueError, match="write-risk policy"):
+            cad_render_tools._render_save_target(str(tmp_path / "figure.png"))
+    finally:
+        tool_registry.reset_policy()

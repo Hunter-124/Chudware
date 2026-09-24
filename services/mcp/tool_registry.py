@@ -91,6 +91,8 @@ _RISK_OVERRIDES: dict[str, str] = {
     # browser_profiles is a mixed list/refresh/delete surface. Keep the whole
     # tool behind write policy even though action="list" alone is read-only.
     "browser_profiles": RISK_WRITE,
+    # Every successful animation writes a film and poster; it is never observation-only.
+    "render_animation": RISK_WRITE,
 }
 
 # Motion and safety classifications are explicit membership only. A newly added
@@ -329,6 +331,12 @@ def _current_deny_risk() -> set[str] | None:
     if _POLICY_SET and _ACTIVE_DENY_RISK is None:
         return None
     return _env_deny_risk()
+
+
+def is_risk_denied(risk: str) -> bool:
+    """Whether the active explicit or environment policy denies a risk class."""
+    denied = _current_deny_risk()
+    return denied is not None and risk in denied
 
 
 def is_allowed(name: str) -> bool:

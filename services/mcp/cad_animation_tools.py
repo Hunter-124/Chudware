@@ -941,9 +941,12 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
             if ext not in (".gif", ".mp4"):
                 raise ValueError("save_path must end in .gif or .mp4; got "
                                  f"{ext or 'no extension'!r}.")
-            target = _render_save_target(save_path)          # absolute + containment + '..'
-            if target.lower().endswith(ext + ".png"):
-                target = target[: -len(".png")]
+            target = _render_save_target(save_path, film=True)
+            poster = _render_save_target(os.path.join(
+                os.path.dirname(target),
+                f"poster_{os.path.splitext(os.path.basename(target))[0]}.png"))
+            frame_root = (_render_save_target(frames_dir, directory=True)
+                          if frames_dir else None)
             frames = max(2, int(frames))
             fps = max(1, min(60, int(fps)))
             W, H = (int(size[0]), int(size[1])) if (isinstance(size, (list, tuple))
@@ -1341,14 +1344,14 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
             pattern = os.path.join(seq, "f%05d.png")
             total = len(ordered)
             exported = None
-            if frames_dir:
-                if not os.path.isabs(str(frames_dir)):
-                    raise ValueError("frames_dir must be an ABSOLUTE directory path.")
-                os.makedirs(str(frames_dir), exist_ok=True)
+            if frame_root:
+                os.makedirs(frame_root, exist_ok=True)
                 for k in range(total):
+                    destination = _render_save_target(
+                        os.path.join(frame_root, f"f{k:05d}.png"))
                     shutil.copyfile(os.path.join(work, "seq", f"f{k:05d}.png"),
-                                    os.path.join(str(frames_dir), f"f{k:05d}.png"))
-                exported = str(frames_dir)
+                                    destination)
+                exported = frame_root
 
             os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
             enc = _encode(pattern, target, fps, int(max_bytes), W)
@@ -1356,7 +1359,6 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
             with open(target, "rb") as fh:
                 sha = hashlib.sha256(fh.read()).hexdigest()
             poster_src = paths[min(len(paths) - 1, int(len(paths) * 0.62))]
-            poster = os.path.join(os.path.dirname(target), f"poster_{stem}.png")
             shutil.copyfile(poster_src, poster)
             inline = render_output_path(_render_stem(doc_name or stem, "poster"), ".png")
             shutil.copyfile(poster_src, inline)

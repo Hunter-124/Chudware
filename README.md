@@ -57,8 +57,8 @@ under [services/](services): the MCP server, the built-in agent loop, the stdio 
 ## Quickstart
 
 ```bash
-./build.sh                     # core → libchudware.so, then host GUI → host/build-linux/bin/Chudware
-./host/build-linux/bin/Chudware  # run
+./build.sh                     # core → libchudware.so, then host GUI → host/build-linux/bin/chudware
+./host/build-linux/bin/chudware  # run
 bash scripts/gate.sh           # full Linux gate (check.py + builds + ctest + smokes)
 python3 scripts/check.py       # fast stdlib-only gate
 ```

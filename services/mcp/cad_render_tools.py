@@ -56,6 +56,7 @@ from .cad_sim_tools import (
     _reject_fully_constrained_loads,
     _sim_face_points,
 )
+from .tool_registry import RISK_WRITE, is_risk_denied
 
 
 def _render_stem(doc_id: str, label: str = "") -> str:
@@ -225,38 +226,39 @@ _RENDER_SAVE_ROOT_VARS = ("CHUDWARE_PROJECT_SAVE_DIR", "CHUDWARE_PROJECT_DIR",
 
 
 def _render_save_roots() -> list:
-    """[(env var, absolute root)] for every configured workspace/project directory."""
+    """[(env var, real root)] for every configured workspace/project directory."""
     out: list = []
     for var in _RENDER_SAVE_ROOT_VARS:
         raw = (os.environ.get(var) or "").strip()
         if raw:
-            out.append((var, os.path.abspath(os.path.expanduser(raw))))
+            out.append((var, os.path.realpath(os.path.expanduser(raw))))
     return out
 
 
-def _render_save_target(save_path) -> Optional[str]:
-    """Validate `save_path` BEFORE any engine work and return the absolute file to write.
+def _render_save_target(save_path, *, directory: bool = False,
+                        film: bool = False) -> Optional[str]:
+    """Validate a file or frame directory before rendering and resolve its destination.
 
-    Returns None when the caller passed nothing. Refuses a relative path (the MCP server's
-    cwd is the daemon's, not the caller's, so a relative destination lands somewhere nobody
-    can point a report at) and any path outside a configured workspace/project root unless
-    CHUDWARE_RENDER_SAVE_ANYWHERE=1. Canonicalisation goes through the same
-    _sanitize_output_path every export_part / save_part destination uses, so '..' sequences
-    are collapsed before the containment test rather than after."""
+    A supplied path needs write permission under the active tool policy. The destination
+    and configured roots are resolved through symlinks before containment is checked.
+    PNG files gain a .png suffix when omitted; films and directories retain theirs.
+    """
     if save_path is None:
         return None
     if not isinstance(save_path, str) or not save_path.strip():
         raise ValueError("save_path must be a non-empty absolute path, e.g. "
                          "'/home/you/project/figures/fixture-setup.png'")
+    if is_risk_denied(RISK_WRITE):
+        raise ValueError("save_path is denied by the active write-risk policy")
     expanded = os.path.expanduser(save_path.strip())
     if not os.path.isabs(expanded):
         raise ValueError(
             f"save_path must be ABSOLUTE; got {save_path!r}. This server runs in its own "
             "process (its cwd is the engine daemon's), so a relative path lands somewhere "
             "you cannot reference. Pass the full path under your project folder.")
+    if not directory and not film and not expanded.lower().endswith(".png"):
+        expanded += ".png"
     out = _sanitize_output_path(expanded)
-    if not out.lower().endswith(".png"):
-        out += ".png"
     if (os.environ.get(_RENDER_SAVE_ANYWHERE) or "").strip().lower() in (
             "1", "true", "yes", "on"):
         return out
@@ -267,8 +269,11 @@ def _render_save_target(save_path) -> Optional[str]:
             f"configured ({' / '.join(_RENDER_SAVE_ROOT_VARS)} are all unset). Set one for "
             f"this session, or set {_RENDER_SAVE_ANYWHERE}=1 to allow any absolute path.")
     for _var, root in roots:
-        if out == root or out.startswith(root.rstrip(os.sep) + os.sep):
-            return out
+        try:
+            if os.path.commonpath((out, root)) == root:
+                return out
+        except ValueError:  # different drives on Windows
+            continue
     raise ValueError(
         f"save_path {out!r} is outside this session's project/workspace directory "
         f"({', '.join(r for _v, r in roots)}). Save the figure under the project root so it "

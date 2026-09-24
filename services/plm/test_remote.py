@@ -167,6 +167,91 @@ def test_two_clones_linear_alternating_sync(tmp_path):
         vb.close()
 
 
+@pytest.mark.parametrize("divergent", [False, True])
+def test_sync_refuses_unsaved_work_before_pull(tmp_path, divergent):
+    src = tmp_path / "seed"
+    src.mkdir()
+    _write_part(src, "Bracket.step+", wall=3.0)
+    v = Vault.open(src)
+    v.save()
+    v.close()
+    bare = tmp_path / "team.git"
+    assert remote.seed_remote(src, bare)["ok"]
+    alice, bob = tmp_path / "alice", tmp_path / "bob"
+    assert remote.clone_from_remote(bare, alice)["ok"]
+    assert remote.clone_from_remote(bare, bob)["ok"]
+
+    _write_part(alice, "Bracket.step+", wall=5.0)
+    va = Vault.open(alice)
+    va.checkpoint("alice change")
+    va.close()
+    assert remote.sync(alice)["ok"]
+
+    if divergent:
+        _write_part(bob, "Bracket.step+", wall=7.0)
+        vb = Vault.open(bob)
+        vb.checkpoint("bob saved change")
+        vb.close()
+    _write_part(bob, "Bracket.step+", wall=9.0)
+    before = (bob / "Bracket.step+").read_bytes()
+    vb = Vault.open(bob)
+    head = vb._bind.head_commit()
+    vb.close()
+
+    result = remote.sync(bob)
+    assert result["ok"] is False
+    assert result["reason"] == "unsaved_changes"
+    assert (bob / "Bracket.step+").read_bytes() == before
+    vb = Vault.open(bob)
+    try:
+        assert vb._bind.head_commit() == head
+        assert vb._dirty_items(vb.manifest())
+    finally:
+        vb.close()
+
+
+def test_sync_rejects_peer_manifest_with_escape_before_overwrite(tmp_path):
+    src = tmp_path / "seed"
+    src.mkdir()
+    _write_part(src, "Bracket.step+")
+    v = Vault.open(src)
+    v.save()
+    v.close()
+    bare = tmp_path / "team.git"
+    assert remote.seed_remote(src, bare)["ok"]
+    alice, bob = tmp_path / "alice", tmp_path / "bob"
+    assert remote.clone_from_remote(bare, alice)["ok"]
+    assert remote.clone_from_remote(bare, bob)["ok"]
+    outside = tmp_path / "secret.txt"
+    outside.write_text("untouched")
+
+    va = Vault.open(alice)
+    try:
+        m = va.manifest()
+        m["items"][0]["path"] = "../secret.txt"
+        files = va._bind.read_tree(va._bind.head_commit())
+        files["manifest.json"] = remote.manifest.dumps(m)
+        va._bind.commit_tree(files, remote.gitbind.EntryMeta(
+            kind=remote.hist.KIND_CHECKPOINT, message="crafted peer history",
+            author_name="Test", author_email="test@example.org",
+        ))
+    finally:
+        va.close()
+    assert remote.sync(alice)["ok"]
+    vb = Vault.open(bob)
+    before = vb._bind.head_commit()
+    vb.close()
+    result = remote.sync(bob)
+    assert result["ok"] is False
+    assert result["reason"] == "invalid_mode"
+    assert outside.read_text() == "untouched"
+    vb = Vault.open(bob)
+    try:
+        assert vb._bind.head_commit() == before
+    finally:
+        vb.close()
+
+
 # ---------------------------------------------------------------------------
 # diverge → copy-as-variant
 # ---------------------------------------------------------------------------

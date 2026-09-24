@@ -58,6 +58,18 @@ def _sha(data: bytes) -> str:
 def _raise_walk_error(error: OSError) -> None:
     raise error
 
+def contained_path(root: Path, rel: str) -> Path:
+    """Resolve a manifest path without allowing traversal or symlink escape."""
+    from services.plm.vault import VaultError
+
+    root = root.resolve()
+    if not rel or Path(rel).is_absolute():
+        raise VaultError("invalid_mode", f"item path is outside the project: {rel}")
+    candidate = (root / rel).resolve()
+    if candidate == root or not candidate.is_relative_to(root):
+        raise VaultError("invalid_mode", f"item path is outside the project: {rel}")
+    return candidate
+
 
 # ---------------------------------------------------------------------------
 # working-file → shadow-tree content
@@ -74,7 +86,7 @@ def content_paths(item: dict[str, Any], project_dir: Path,
     per-item ``meta.json`` / ``summary.txt`` around this.
     """
     store = doctypes.storage_form(item.get("doc_type"))
-    working = project_dir / item["path"]
+    working = contained_path(project_dir, item["path"])
     if store == "link":
         # link.json is written by the link operation; between edits it is simply
         # carried forward from HEAD.
@@ -106,8 +118,9 @@ def _snapshot_tree(item_id: str, root: Path, max_file_bytes: int) -> dict[str, b
         for fn in sorted(filenames):
             if fn in _EXCLUDE_DIRS:
                 continue
-            abs_path = Path(dirpath) / fn
-            rel = abs_path.relative_to(root).as_posix()
+            # A symlinked tree member must not read outside the tracked tree.
+            rel = (Path(dirpath) / fn).relative_to(root).as_posix()
+            abs_path = contained_path(root, rel)
             size = abs_path.stat().st_size
             if size > max_file_bytes:
                 index[rel] = {"size": size, "skipped": True}
@@ -173,12 +186,12 @@ def materialize(item: dict[str, Any], src_tree: dict[str, bytes],
         return
     if store == "tree":
         prefix = snapshot.item_prefix(iid) + "tree/"
-        root = project_dir / item["path"]
+        root = contained_path(project_dir, item["path"])
         for path, data in src_tree.items():
             if not path.startswith(prefix):
                 continue
             rel = path[len(prefix):]
-            dest = root / rel
+            dest = contained_path(root, rel)
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
         return
@@ -186,7 +199,7 @@ def materialize(item: dict[str, Any], src_tree: dict[str, bytes],
     blob = src_tree.get(_file_path(iid, item["path"]))
     if blob is None:
         return
-    dest = project_dir / item["path"]
+    dest = contained_path(project_dir, item["path"])
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(blob)
 

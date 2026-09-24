@@ -297,6 +297,80 @@ def test_release_pin_is_persisted_not_null(tmp_path):
         v2.close()
 
 
+@pytest.mark.parametrize("later_commit", [False, True])
+def test_release_interrupted_before_pin_recovers_from_release_entry(
+        tmp_path, monkeypatch, later_commit):
+    _write(tmp_path, "Bracket.step+", _part())
+    v = Vault.open(tmp_path)
+    try:
+        iid = v.status()["items"][0]["item_id"]
+        commit_tree = v._bind.commit_tree
+        calls = 0
+
+        def fail_second_commit(files, meta):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("interrupted before pin commit")
+            return commit_tree(files, meta)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(v._bind, "commit_tree", fail_second_commit)
+            with pytest.raises(OSError, match="interrupted before pin"):
+                v.release(iid, "rev A", bom_pins=[])
+
+        release_head = v._bind.head_commit()
+        stored = manifest.loads(v._bind.read_blob_at(release_head, "manifest.json"))
+        assert manifest.find_item(stored, iid)["released_revs"][-1]["commit"] is None
+        if later_commit:
+            v._bind.commit_tree(
+                v._bind.read_tree(release_head),
+                gitbind.EntryMeta(
+                    kind="checkpoint", message="later entry",
+                    author_name="Test", author_email="test@example.org",
+                ),
+            )
+        assert manifest.find_item(v.manifest(), iid)["released_revs"][-1]["commit"] == release_head
+        assert v.manifest()["bom_freezes"][-1]["commit"] == release_head
+        v.start_new_rev(iid)
+        item = manifest.find_item(v.manifest(), iid)
+        assert item["released_revs"][-1]["commit"] == release_head
+        v.discard_working_rev(iid)
+        assert manifest.find_item(v.manifest(), iid)["lifecycle"] == manifest.LIFECYCLE_RELEASED
+    finally:
+        v.close()
+
+
+def test_local_config_replace_preserves_prior_file_until_new_file_is_ready(tmp_path, monkeypatch):
+    v = Vault.open(tmp_path)
+    try:
+        v.set_local_config({"link_checkouts": {"old": "old-location"}})
+        cfg_path = v._bind.vault_dir / "config.json"
+        replace = os.replace
+        observed = []
+
+        def observe_replace(src, dest):
+            observed.append((
+                json.loads(cfg_path.read_text()),
+                json.loads(src.read_text()),
+                dest,
+            ))
+            replace(src, dest)
+
+        monkeypatch.setattr(vault_mod.os, "replace", observe_replace)
+        v.set_local_config({"link_checkouts": {"new": "new-location"}})
+        assert len(observed) == 1
+        old, new, destination = observed[0]
+        assert old["link_checkouts"] == {"old": "old-location"}
+        assert new["link_checkouts"] == {
+            "old": "old-location", "new": "new-location",
+        }
+        assert destination == cfg_path
+        assert json.loads(cfg_path.read_text()) == new
+    finally:
+        v.close()
+
+
 def test_non_release_commits_have_no_geometry(tmp_path):
     _write(tmp_path, "Bracket.step+", _part())
     v = Vault.open(tmp_path)

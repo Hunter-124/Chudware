@@ -61,8 +61,8 @@ _HAS_RECON = bool(_CAPS.get("sparse") or _CAPS.get("dense"))
 _HAS_DENSE = bool(_CAPS.get("dense"))
 
 requires_backends = pytest.mark.skipif(
-    not _HAS_RECON,
-    reason="reconstruction backend (colmap/openmvs) not provisioned — full-recon asserts skipped",
+    not (_CAPS.get("sparse") and _CAPS.get("dense")),
+    reason="full reconstruction needs sparse AND dense backends (colmap + openmvs)",
 )
 requires_cv2 = pytest.mark.skipif(not HAVE_CV2, reason="cv2 not installed")
 

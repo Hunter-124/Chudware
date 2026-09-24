@@ -62,7 +62,7 @@ class VendorPart:
 
 
 def slug(value: str) -> str:
-    s = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(value).strip()).strip("-").lower()
+    s = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(value).strip()).strip("-.").lower()
     return s or "part"
 
 
@@ -103,7 +103,11 @@ def _detect_format(path: Path) -> str:
 
 
 def _part_dir(part: VendorPart) -> Path:
-    return paths.VENDOR_PARTS / slug(part.supplier) / slug(part.part_number)
+    root = paths.VENDOR_PARTS.resolve()
+    dest = (root / slug(part.supplier) / slug(part.part_number)).resolve()
+    if not dest.is_relative_to(root):
+        raise ValueError("vendor part path is outside the vendor library")
+    return dest
 
 
 def _prepare_local_cad(*, supplier: str, part_number: str, cad_path: str,

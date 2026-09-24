@@ -45,7 +45,8 @@ REM ---- 1. locate a usable Python -------------------------------------------
 set "PYEXE="
 
 call :try_python "%APPDATA%\Chudware\runtime\venv\Scripts\python.exe"
-if not defined PYEXE call :try_python "%APPDATA%\Chudware\runtime\venv\Scripts\python.exe"
+if not defined PYEXE call :try_python "%APPDATA%\Billet\runtime\venv\Scripts\python.exe"
+if not defined PYEXE call :try_python "%APPDATA%\AI-CAD\runtime\venv\Scripts\python.exe"
 if not defined PYEXE call :try_python "%REPO%\.venv\Scripts\python.exe"
 
 if not defined PYEXE (

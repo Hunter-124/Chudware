@@ -1,4 +1,4 @@
-"""ECAD → 3D bridge tests (fab_outputs.md §5). House style: main() + asserts.
+r"""ECAD → 3D bridge tests (fab_outputs.md §5). House style: main() + asserts.
 
 Run (from repo root):
     & "$env:APPDATA\Chudware\runtime\venv\Scripts\python.exe" -m engine.ecad.test_threed

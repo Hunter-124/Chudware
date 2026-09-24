@@ -21,6 +21,8 @@ import getpass
 import os
 import tempfile
 import time
+import threading
+from contextlib import contextmanager
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -60,6 +62,31 @@ _SCHEMA_KIND = {
     "aicad.cam": "cam",
     "aicad.req": "requirements",
 }
+
+_local_config_thread_lock = threading.Lock()
+
+
+@contextmanager
+def _local_config_lock(path: Path) -> Iterator[None]:
+    """Keep the read/merge/replace transaction exclusive across vault workers."""
+    with _local_config_thread_lock:
+        with open(path, "a+b") as lock:
+            if os.name == "nt":
+                import msvcrt
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------
@@ -719,28 +746,29 @@ class Vault:
     def set_local_config(self, patch: dict[str, Any]) -> dict[str, Any]:
         """Merge *patch* into the vault-local config (one level deep for dicts)."""
         import json as _json
-        cfg = self.get_local_config()
-        for k, v in (patch or {}).items():
-            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-                cfg[k].update(v)
-            else:
-                cfg[k] = v
         cfg_path = self._bind.vault_dir / "config.json"
-        tmp: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w", encoding="utf-8", dir=cfg_path.parent,
-                prefix=f".{cfg_path.name}.", suffix=".tmp", delete=False,
-            ) as handle:
-                tmp = Path(handle.name)
-                handle.write(_json.dumps(cfg, indent=2, sort_keys=True))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, cfg_path)
-        finally:
-            if tmp is not None:
-                tmp.unlink(missing_ok=True)
-        return cfg
+        with _local_config_lock(cfg_path.with_name(cfg_path.name + ".lock")):
+            cfg = self.get_local_config()
+            for k, v in (patch or {}).items():
+                if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                    cfg[k].update(v)
+                else:
+                    cfg[k] = v
+            tmp: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "w", encoding="utf-8", dir=cfg_path.parent,
+                    prefix=f".{cfg_path.name}.", suffix=".tmp", delete=False,
+                ) as handle:
+                    tmp = Path(handle.name)
+                    handle.write(_json.dumps(cfg, indent=2, sort_keys=True))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, cfg_path)
+            finally:
+                if tmp is not None:
+                    tmp.unlink(missing_ok=True)
+            return cfg
 
     # -- planning store: tasks / issues / milestones (aicad.planning/1) ------
 

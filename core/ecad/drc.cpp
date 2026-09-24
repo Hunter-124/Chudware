@@ -729,23 +729,43 @@ json ratsnest(const json& board) {
         return net.is_string() && !net.get<std::string>().empty();
     };
     if (board.contains("footprints") && board["footprints"].is_array()) {
+        size_t fp_index = 0;
         for (const auto& fp : board["footprints"]) {
-            if (!fp.contains("pads") || !fp["pads"].is_array()) continue;
+            if (!fp.contains("pads") || !fp["pads"].is_array()) {
+                ++fp_index;
+                continue;
+            }
+            std::string fp_key = fp.value("id", std::string());
+            if (fp_key.empty()) fp_key = fp.value("ref", std::string());
+            if (fp_key.empty()) fp_key = "fp" + std::to_string(fp_index);
+            size_t pad_index = 0;
             for (const auto& pad : fp["pads"]) {
                 json net = pad.contains("net") ? pad["net"] : json(nullptr);
-                if (!net_ok(net)) continue;
-                auto [wx, wy] = schema::pad_world(fp, pad);
-                terminals[net.get<std::string>()].push_back({pad.value("id", std::string()), {wx, wy}});
+                if (net_ok(net)) {
+                    auto [wx, wy] = schema::pad_world(fp, pad);
+                    std::string pad_key = pad.value("id", std::string());
+                    if (pad_key.empty()) pad_key = "pad" + std::to_string(pad_index);
+                    terminals[net.get<std::string>()].push_back(
+                        {"pad:" + fp_key + ":" + pad_key, {wx, wy}});
+                }
+                ++pad_index;
             }
+            ++fp_index;
         }
     }
     if (board.contains("vias") && board["vias"].is_array()) {
+        size_t via_index = 0;
         for (const auto& v : board["vias"]) {
             json net = v.contains("net") ? v["net"] : json(nullptr);
-            if (!net_ok(net)) continue;
-            Point at{0, 0};
-            if (v.contains("at") && v["at"].is_array()) at = {getf(v["at"][0]), getf(v["at"][1])};
-            terminals[net.get<std::string>()].push_back({v.value("id", std::string()), at});
+            if (net_ok(net)) {
+                Point at{0, 0};
+                if (v.contains("at") && v["at"].is_array())
+                    at = {getf(v["at"][0]), getf(v["at"][1])};
+                std::string via_key = v.value("id", std::string());
+                if (via_key.empty()) via_key = "via" + std::to_string(via_index);
+                terminals[net.get<std::string>()].push_back({"via:" + via_key, at});
+            }
+            ++via_index;
         }
     }
     for (auto& [net, terms] : terminals)

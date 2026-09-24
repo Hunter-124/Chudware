@@ -5,6 +5,7 @@
 #include <cmath>
 #include <map>
 #include <regex>
+#include <stdexcept>
 
 namespace chudware::ecad::schema {
 
@@ -170,6 +171,16 @@ std::set<std::string> valid_layers(int copper_layers) {
 
 // ----------------------------------------------------------------- geometry
 namespace {
+bool is_xy(const json& v) {
+    return v.is_array() && v.size() == 2 && v[0].is_number() && v[1].is_number();
+}
+
+const json& require_pos(const json& entity, const char* name) {
+    if (!entity.is_object() || !entity.contains("pos") || !is_xy(entity["pos"]))
+        throw std::invalid_argument(std::string(name) + ".pos: must be [x,y]");
+    return entity["pos"];
+}
+
 std::pair<double, double> rot(double x, double y, double deg) {
     double r = deg * 3.14159265358979323846 / 180.0;
     double c = std::cos(r), s = std::sin(r);
@@ -189,7 +200,8 @@ std::pair<double, double> local_to_world(double x, double y, const json& pos, do
 }  // namespace
 
 std::pair<double, double> pin_world(const json& symbol, const json& pin) {
-    double px = pin["pos"][0].get<double>(), py = pin["pos"][1].get<double>();
+    const json& pos = require_pos(pin, "pin");
+    double px = pos[0].get<double>(), py = pos[1].get<double>();
     double length = pin.contains("length") && pin["length"].is_number() ? pin["length"].get<double>()
                                                                         : 2.54;
     double a = (pin.contains("angle") && pin["angle"].is_number() ? pin["angle"].get<double>() : 0.0)
@@ -198,24 +210,22 @@ std::pair<double, double> pin_world(const json& symbol, const json& pin) {
     double sang = symbol.contains("angle") && symbol["angle"].is_number() ? symbol["angle"].get<double>()
                                                                           : 0.0;
     std::string mir = symbol.value("mirror", std::string("none"));
-    return local_to_world(tx, ty, symbol["pos"], sang, mir);
+    return local_to_world(tx, ty, require_pos(symbol, "symbol"), sang, mir);
 }
 
 std::pair<double, double> pad_world(const json& footprint, const json& pad) {
     std::string mirror =
         (footprint.value("side", std::string()) == "bottom") ? "x" : "none";
-    double px = pad["pos"][0].get<double>(), py = pad["pos"][1].get<double>();
+    const json& pos = require_pos(pad, "pad");
+    double px = pos[0].get<double>(), py = pos[1].get<double>();
     double angle = (footprint.contains("angle") && footprint["angle"].is_number())
                        ? footprint["angle"].get<double>()
                        : 0.0;
-    return local_to_world(px, py, footprint["pos"], angle, mirror);
+    return local_to_world(px, py, require_pos(footprint, "footprint"), angle, mirror);
 }
 
 // ----------------------------------------------------------------- validation
 namespace {
-bool is_xy(const json& v) {
-    return v.is_array() && v.size() == 2 && v[0].is_number() && v[1].is_number();
-}
 
 std::string string_value(const json& object, const char* key,
                          const std::string& fallback = std::string()) {
@@ -734,6 +744,8 @@ std::vector<std::string> validate_board(const json& doc) {
                 int k = 0;
                 for (const json& pad : fp["pads"]) {
                     std::string ploc = loc + ".pads[" + std::to_string(k) + "]";
+                    if (!is_xy(pad.contains("pos") ? pad["pos"] : json()))
+                        errs.push_back(ploc + ".pos: must be [x,y]");
                     std::string shape = pad.value("shape", std::string("rect"));
                     if (!pad_shapes().count(shape))
                         errs.push_back(ploc + ".shape: bad value '" + shape + "'");

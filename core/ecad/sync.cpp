@@ -146,6 +146,18 @@ json update_board_from_sch(const json& board_in, const json& netlist, const json
     json components = netlist.contains("components") && netlist["components"].is_array()
                           ? netlist["components"]
                           : json::array();
+    // Netlists supplied directly need the same lossless-sync guarantee as session
+    // schematic documents: one board footprint cannot represent two components.
+    std::set<std::string> component_refs;
+    for (const auto& component : components) {
+        if (!component.is_object() || !component.contains("ref") ||
+            !component["ref"].is_string()) continue;
+        const std::string ref = component["ref"].get<std::string>();
+        if (!ref.empty() && !component_refs.insert(ref).second)
+            throw OpError("schematic_ref_conflict",
+                          "ecad_update_from_sch refused: duplicate component ref '" + ref + "'",
+                          {{"rule", "duplicate_ref"}, {"ref", ref}});
+    }
 
     json report = {{"added", json::array()}, {"updated", json::array()}, {"removed", json::array()},
                    {"unresolved", json::array()}, {"nets_bound", 0}, {"linked_sch", nullptr}};

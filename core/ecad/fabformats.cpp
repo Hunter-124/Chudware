@@ -485,7 +485,8 @@ std::string write_gerber_layer(const json& board, const std::string& layer_id) {
 
 // ────────────────────────────────────────────────────────── write_gerbers
 std::map<std::string, std::string> write_gerbers(const json& board) {
-    int n_cu = board["stackup"].value("copper_layers", 2);
+    int n_cu = board.contains("stackup") && board["stackup"].is_object()
+                   ? board["stackup"].value("copper_layers", 2) : 2;
     std::vector<std::string> candidate = schema::copper_layer_ids(n_cu);
     for (const char* l : {"F.SilkS", "B.SilkS", "F.Mask", "B.Mask", "F.Paste", "B.Paste", "F.Fab",
                           "B.Fab", "Edge.Cuts"})

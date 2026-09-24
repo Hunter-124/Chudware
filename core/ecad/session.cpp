@@ -174,7 +174,7 @@ int fill_zones_into(json& doc, double resolution) {
 // DRC + ratsnest. `stats.ms` is omitted (non-deterministic); the harness compares
 // compile.netlist + compile.erc (sch) and compile.drc + compile.ratsnest +
 // zone.filled_polys (pcb).
-json compile_field(json& doc) {
+json compile_field(json& doc, bool refresh_zone_fill = true) {
     json out = {{"netlist", nullptr}, {"erc", json::array()}, {"drc", json::array()},
                 {"ratsnest", json::array()}, {"stats", json::object()}};
     if (schema::is_schematic(doc)) {
@@ -185,7 +185,9 @@ json compile_field(json& doc) {
                                    ? netlist["nets"].size()
                                    : 0;
     } else if (schema::is_board(doc)) {
-        int zfilled = fill_zones_into(doc, kInteractiveFillResolution);
+        int zfilled = refresh_zone_fill ? fill_zones_into(doc, kInteractiveFillResolution)
+                                        : (doc.contains("zones") && doc["zones"].is_array()
+                                               ? static_cast<int>(doc["zones"].size()) : -1);
         if (zfilled >= 0) out["stats"]["zones_filled"] = zfilled;
         out["drc"] = run_drc(doc);
         out["ratsnest"] = ratsnest(doc);
@@ -195,8 +197,9 @@ json compile_field(json& doc) {
     return out;
 }
 
-json ops_response(Session& s, const json& id_map, const json& warnings) {
-    json cf = compile_field(s.doc);
+json ops_response(Session& s, const json& id_map, const json& warnings,
+                  bool refresh_zone_fill = true) {
+    json cf = compile_field(s.doc, refresh_zone_fill);
     s.last_compile = cf;
     json resp = {{"revision", s.revision}, {"id_map", id_map}, {"kind", schema::doc_kind(s.doc)},
                  {"tree", s.doc}, {"compile", cf}};
@@ -810,7 +813,8 @@ json ecad_open(const std::string& path) {
 namespace {
 // swap_doc (engine/ecad/session.py::swap_doc): validate -> undo snapshot -> swap ->
 // rev+1 -> compile -> ops-response (empty id_map). Caller holds g_mtx.
-json swap_doc_locked(Session& s, const json& new_doc, long base_revision, const json& warnings) {
+json swap_doc_locked(Session& s, const json& new_doc, long base_revision, const json& warnings,
+                     bool refresh_zone_fill = true) {
     if (base_revision >= 0 && base_revision != s.revision)
         throw OpError("stale_revision",
                       "base_revision " + std::to_string(base_revision) + " != current " +
@@ -830,7 +834,7 @@ json swap_doc_locked(Session& s, const json& new_doc, long base_revision, const 
     s.doc = new_doc;  // deep copy (value semantics)
     s.revision += 1;
     s.dirty = true;
-    return ops_response(s, json::object(), warnings);
+    return ops_response(s, json::object(), warnings, refresh_zone_fill);
 }
 }  // namespace
 
@@ -856,6 +860,13 @@ json ecad_update_from_sch(const std::string& board_doc_id, const std::string& sc
                       {{"reason", "wrong doc kind"}, {"doc_id", sch_doc_id}});
 
     json netlist = build_netlist(sch_s.doc);
+    for (const json& violation : run_erc(sch_s.doc, netlist)) {
+        const std::string rule = violation.value("rule", std::string());
+        if (rule == "duplicate_ref" || rule == "unit_ref_conflict")
+            throw OpError("schematic_ref_conflict",
+                          "ecad_update_from_sch refused: " + violation.value("message", rule),
+                          {{"rule", rule}, {"violation", violation}, {"doc_id", sch_doc_id}});
+    }
     // Carry the schematic's id so sync records board.linked_sch = the source schematic.
     netlist["id"] = sch_s.doc.contains("id") ? sch_s.doc["id"] : json(nullptr);
 
@@ -1074,7 +1085,7 @@ json ecad_fill_zones(const std::string& doc_id, const json& resolution, long bas
     json summary = {{"zones", zones}, {"zones_filled", filled}, {"polygons", polys},
                     {"copper_area_mm2", rounded}};
 
-    json resp = swap_doc_locked(s, filled_board, base_revision, json::array());
+    json resp = swap_doc_locked(s, filled_board, base_revision, json::array(), false);
     resp["fill_summary"] = summary;
     resp["doc_id"] = doc_id;
     return resp;

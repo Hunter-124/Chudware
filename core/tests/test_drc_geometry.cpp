@@ -2,7 +2,10 @@
 // Pure JSON, OCCT-free; links chudware_ecad only.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "ecad/drc.h"
+#include "ecad/fabformats.h"
 #include "ecad/schema.h"
+#include "ecad/session.h"
+#include "ecad/zonefill.h"
 
 #include <algorithm>
 #include <cmath>
@@ -85,6 +88,87 @@ bool has_rule(const json& violations, const std::string& rule) {
 }
 
 }  // namespace
+
+TEST_CASE("footprint-local pad ids and via ids do not collapse disconnected terminals") {
+    json b = board();
+    add_pad(b, pad("p1", "GND", 0.0, 0.0), "fp1");
+    add_pad(b, pad("p1", "GND", 10.0, 0.0), "fp2");
+    const json air = ratsnest(b);
+    REQUIRE(air.size() == 1);
+    CHECK(air[0]["p1"] == json::array({0.0, 0.0}));
+    CHECK(air[0]["p2"] == json::array({10.0, 0.0}));
+    CHECK(has_rule(run_drc(b), "unrouted"));
+
+    // A via named like a pad must not electrically join that pad by identity.
+    b["vias"].push_back(json{{"id", "p1"}, {"net", "GND"},
+                              {"at", json::array({20.0, 0.0})}});
+    CHECK(ratsnest(b).size() == 2);
+}
+
+TEST_CASE("malformed pad positions fail validation and geometry refuses them safely") {
+    json b = board();
+    json missing = pad("p1", "GND", 0.0, 0.0);
+    missing.erase("pos");
+    add_pad(b, missing);
+    const auto errors = schema::validate_board(b);
+    REQUIRE(std::find(errors.begin(), errors.end(),
+                      "footprints[0].pads[0].pos: must be [x,y]") != errors.end());
+    CHECK_THROWS_WITH(schema::pad_world(b["footprints"][0], missing),
+                      "pad.pos: must be [x,y]");
+
+    const json symbol = {{"pos", json::array({0.0, 0.0})}};
+    CHECK_THROWS_WITH(schema::pin_world(symbol, json::object()),
+                      "pin.pos: must be [x,y]");
+    missing["pos"] = json::array({0.0});
+    CHECK_THROWS_WITH(schema::pad_world(b["footprints"][0], missing),
+                      "pad.pos: must be [x,y]");
+
+    const json created = ecad_new("pcb", "Bad pad");
+    b["id"] = created["doc_id"];
+    try {
+        ecad_swap_doc(created["doc_id"].get<std::string>(), b, 0, json::array());
+        FAIL("invalid pad accepted");
+    } catch (const OpError& error) {
+        CHECK(error.code == "invalid_op");
+        CHECK(std::string(error.what()).find("pads[0].pos") != std::string::npos);
+    }
+    ecad_close(created["doc_id"].get<std::string>());
+}
+
+TEST_CASE("Gerber export defaults absent or malformed stackup to two copper layers") {
+    json b = board();
+    b.erase("stackup");
+    const auto missing = fab::write_gerbers(b);
+    CHECK(missing.count("F.Cu") == 1);
+    CHECK(missing.count("B.Cu") == 1);
+    b["stackup"] = nullptr;
+    CHECK(fab::write_gerbers(b) == missing);
+}
+
+TEST_CASE("final zone fill survives response compilation, session state and Gerber export") {
+    const json created = ecad_new("pcb", "Fine fill");
+    const std::string id = created["doc_id"].get<std::string>();
+    json b = ecad_session_doc(id);
+    b["zones"].push_back(json{{"id", "z1"}, {"net", "GND"}, {"layer", "F.Cu"},
+                                {"polygon", json::array({json::array({0.0, 0.0}),
+                                                          json::array({3.0, 0.0}),
+                                                          json::array({3.0, 3.0})})},
+                                {"filled_polys", json::array()}});
+    const json expected = fill_zones(b, 0.1)["zones"][0]["filled_polys"];
+    const json coarse = fill_zones(b, 0.25)["zones"][0]["filled_polys"];
+    REQUIRE(!expected.empty());
+    REQUIRE(expected != coarse);
+    const json placed = ecad_swap_doc(id, b, created["revision"].get<long>(), json::array());
+    const json filled = ecad_fill_zones(id, nullptr, placed["revision"].get<long>());
+    CHECK(filled["tree"]["zones"][0]["filled_polys"] == expected);
+    CHECK(ecad_session_doc(id)["zones"][0]["filled_polys"] == expected);
+    const json exported = ecad_export(json{{"doc_id", id}, {"kind", "gerber"}});
+    CHECK(exported["files"]["F.Cu"] ==
+          fab::write_gerber_layer(filled["tree"], "F.Cu"));
+    CHECK(exported["files"]["F.Cu"] !=
+          fab::write_gerber_layer(fill_zones(b, 0.25), "F.Cu"));
+    ecad_close(id);
+}
 
 TEST_CASE("arc-track copper participates in clearance DRC") {
     json b = board();

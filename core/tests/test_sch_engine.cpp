@@ -17,6 +17,7 @@
 //
 // Pure JSON, OCCT-free; links chudware_ecad only.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "ecad/container.h"
 #include "ecad/erc.h"
 #include "ecad/kicad.h"
 #include "ecad/netlist.h"
@@ -85,6 +86,53 @@ std::string net_of(const json& netlist, const std::string& sym, const std::strin
 }  // namespace
 
 // ---------------------------------------------------------------- connectivity
+
+TEST_CASE("board sync refuses conflicting schematic refs without mutating the board") {
+    const json board_created = ecad_new("pcb", "Ref guard");
+    const std::string board_id = board_created["doc_id"].get<std::string>();
+    const fs::path path = fs::temp_directory_path() / "chudware_ecad_ref_guard.ecad+";
+    for (bool different_library : {true, false}) {
+        json doc = schema::new_schematic("Conflicting refs");
+        doc["lib_cache"]["Device:R"] = res_def();
+        if (different_library) {
+            doc["lib_cache"]["Device:R2"] = res_def();
+            doc["lib_cache"]["Device:R2"]["libid"] = "Device:R2";
+        }
+        for (int i = 0; i < 2; ++i)
+            doc["symbols"].push_back(json{{"id", "s" + std::to_string(i + 1)},
+                                           {"libid", i && different_library ? "Device:R2" : "Device:R"},
+                                           {"ref", "R1"}, {"value", "10k"}, {"sheet", "sh1"},
+                                           {"pos", json::array({20.0 * i, 0.0})},
+                                           {"angle", 0}, {"mirror", "none"}, {"unit", 1}});
+        const std::string rule = different_library ? "duplicate_ref" : "unit_ref_conflict";
+        REQUIRE(has_rule(run_erc(doc, build_netlist(doc)), rule));
+        ecad_container_save(doc, path.string(), {});
+        const json opened = ecad_open(path.string());
+        const std::string sch_id = opened["doc_id"].get<std::string>();
+        try {
+            ecad_update_from_sch(board_id, sch_id, false, nullptr, 0);
+            FAIL("lossy board sync accepted a conflicting schematic ref");
+        } catch (const OpError& error) {
+            CHECK(error.code == "schematic_ref_conflict");
+            CHECK(error.detail.value("rule", std::string()) == rule);
+        }
+        CHECK(ecad_session_doc(board_id)["footprints"].empty());
+        ecad_close(sch_id);
+    }
+    fs::remove(path);
+    ecad_close(board_id);
+
+    // Inline netlists do not include the source symbols/ERC; reject duplicate
+    // component entries at the sync boundary as well.
+    const json netlist = {{"components", json::array({json{{"ref", "R1"}},
+                                                      json{{"ref", "R1"}}})}};
+    try {
+        ecad_update_from_sch_inline(schema::new_board("B"), netlist, false, nullptr);
+        FAIL("duplicate netlist components accepted");
+    } catch (const OpError& error) {
+        CHECK(error.code == "schematic_ref_conflict");
+    }
+}
 
 TEST_CASE("coincident geometry on two sheets does not short") {
     json doc = schema::new_schematic("TwoSheets");

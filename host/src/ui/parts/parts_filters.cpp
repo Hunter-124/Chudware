@@ -161,11 +161,10 @@ void drawFiltersBlock(AppState& st, float paneW) {
     ImGui::BeginChild("##parts_filters", ImVec2(paneW, 0), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
 
-    // Scrollable filter body above the fixed vendor-strip footer.
-    // 118, not 108: the footer band is stripH - ItemSpacing.y, and the strip's four stacked
-    // rows measure ~98*sc even with drawVendorStrip's own tightened spacing — at 108 the last
-    // row hung out the bottom of the glass card. This leaves it a real ~9*sc bottom margin.
-    const float stripH = 118.0f * sc;   // dots row + health line + connect + half-width row
+    // Scrollable filter body above the fixed vendor-strip footer. The footer's height depends
+    // on the pane width (its secondary buttons stack in a narrow pane), so it is asked for
+    // rather than hard-coded; the width is measured here, where the strip will start.
+    const float stripH = vendorStripHeight(ImGui::GetContentRegionAvail().x);
     // WindowPadding 0: a nested child re-applies the DEFAULT style padding (15 px), which
     // pushed every filter widget 15 px right of the vendor-strip footer drawn below in the
     // OUTER child — one pane, two left edges. The scroll region must inherit the gutter,

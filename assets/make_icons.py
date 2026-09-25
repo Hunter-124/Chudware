@@ -617,18 +617,27 @@ def draw_body_folder(d, cell, p):
 
 @icon("history")
 def draw_history(d, cell, p):
-    """Vertical feature timeline with nodes."""
+    """Clock face wrapped in a counter-clockwise arrow — the universal "history" glyph.
+
+    Replaces a vertical node timeline whose half-width, alpha-120 spine and 1 px
+    nodes collapsed into a dotted hairline at 14-20 px. Everything here is a
+    full-opacity 2 px stroke on one bold ring, so it survives the @20 downsample:
+    the ring runs clockwise from 9 o'clock round to ~8 o'clock, leaving a gap at
+    lower-left where a solid arrowhead points DOWN (counter-clockwise travel);
+    two clock hands (12 and ~4 o'clock) sit inside."""
     s = cell * SS
     lw = stroke_width(cell)
-    x = s * 0.46
-    d.line([(x, s*0.14), (x, s*0.86)], fill=_rgba(p.stroke, 120), width=max(1, lw//2))
-    for i, yf in enumerate([0.22, 0.42, 0.62, 0.78]):
-        y = s * yf
-        r = s * (0.07 if i == 0 else 0.055)
-        col = p.accent if i == 0 else p.stroke
-        filled_circle(d, x, y, r, _rgba(col, 90 if i == 0 else 55))
-        circle(d, x, y, r, outline=col, lw=lw)
-    arc_segment(d, x, s*0.22, s*0.22, 270, 360, p.accent, lw)
+    cx, cy, r = s * 0.54, s * 0.52, s * 0.33
+    arc_segment(d, cx, cy, r, 180, 360, p.stroke, lw)
+    arc_segment(d, cx, cy, r, 0, 128, p.stroke, lw)
+    # Arrowhead on the ring's 9 o'clock end, pointing along the CCW tangent (down).
+    ax, ah, aw = cx - r, s * 0.17, s * 0.14
+    d.polygon([(ax - aw, cy - s * 0.02), (ax + aw, cy - s * 0.02), (ax, cy - s * 0.02 + ah)],
+              fill=p.accent)
+    # Hands: minute to 12, hour toward ~4 o'clock, meeting on a centre hub.
+    d.line([(cx, cy), (cx, cy - r * 0.58)], fill=p.stroke, width=lw)
+    d.line([(cx, cy), (cx + r * 0.42, cy + r * 0.30)], fill=p.stroke, width=lw)
+    filled_circle(d, cx, cy, lw * 0.6, p.stroke)
 
 @icon("rollback")
 def draw_rollback(d, cell, p):
@@ -1951,57 +1960,54 @@ def draw_view_cube(d, cell, p):
     lw = stroke_width(cell)
     iso_box(d, s/2, s/2, s*0.28, p.stroke, lw)
 
+def _display_cube(d, s, p, lw, shaded: bool, interior_edges: bool, hidden_edges: bool = False):
+    """Display-style cube family (shaded / shaded+edges / HLR / HLV): one true 2:1 iso
+    cube (brand-mark projection) spanning ~2/3 of the cell like the neighbouring toolbar
+    glyphs, all at a 1x stroke, so the view-toolbar button keeps one size and weight as
+    the display style changes. Replaces a full-bleed rounded square with a 2x outline
+    (shaded) and a flatter, smaller iso_box puck (HLR/HLV)."""
+    q = _iso_pts(s * 0.5, s * 0.5, s * 0.33)
+    if shaded:
+        # Alphas look high but build_atlas() pastes with the icon as its own mask, which
+        # squares alpha on the transparent atlas (200 -> ~157); these land as light tints.
+        d.polygon([q["lt"], q["top"], q["rt"], q["c"]], fill=_rgba(p.accent, 200))
+        d.polygon([q["lt"], q["c"], q["bot"], q["lb"]], fill=_rgba(p.accent, 150))
+        d.polygon([q["c"], q["rt"], q["rb"], q["bot"]], fill=_rgba(p.accent, 100))
+    if hidden_edges:
+        # The three edges meeting at the hidden back-bottom corner, which a true iso
+        # projection lands on the front-top corner `c`: dashed accent, drawn under the rim.
+        for end in ("top", "lb", "rb"):   # dash from the rim inward, clear of the solid hub
+            _dash(d, *q[end], *q["c"], p.accent, lw, dash=lw * 2.2, gap=lw * 1.5)
+    rim = [q["lt"], q["top"], q["rt"], q["rb"], q["bot"], q["lb"]]
+    d.line(rim + [rim[0]], fill=p.stroke, width=lw, joint="curve")
+    if interior_edges:
+        d.line([q["lt"], q["c"], q["rt"]], fill=p.stroke, width=lw, joint="curve")
+        d.line([q["c"], q["bot"]], fill=p.stroke, width=lw)
+
 @icon("display_shaded")
 def draw_display_shaded(d, cell, p):
-    """Filled rounded square."""
+    """Shaded iso cube, silhouette only (no interior edges)."""
     s = cell * SS
-    lw = stroke_width(cell)
-    d.rounded_rectangle([s*0.15, s*0.15, s*0.85, s*0.85], radius=int(s*0.12),
-                         fill=(*p.accent[:3], 120), outline=p.stroke, width=lw)
+    _display_cube(d, s, p, stroke_width(cell), shaded=True, interior_edges=False)
 
 @icon("display_shaded_edges")
 def draw_display_shaded_edges(d, cell, p):
-    """Filled cube with dark edges outline."""
+    """Shaded iso cube with every visible edge stroked."""
     s = cell * SS
-    lw = stroke_width(cell)
-    # filled cube
-    d.rounded_rectangle([s*0.15, s*0.15, s*0.85, s*0.85], radius=int(s*0.12),
-                         fill=(*p.accent[:3], 120), outline=None)
-    # dark outline for edges
-    d.rounded_rectangle([s*0.15, s*0.15, s*0.85, s*0.85], radius=int(s*0.12),
-                         fill=None, outline=p.stroke, width=lw*2)
+    _display_cube(d, s, p, stroke_width(cell), shaded=True, interior_edges=True)
 
 @icon("display_hlr")
 def draw_display_hlr(d, cell, p):
-    """Outline cube (hidden line removal - visible edges only)."""
+    """Unfilled iso cube, visible edges only (hidden line removal)."""
     s = cell * SS
-    lw = stroke_width(cell)
-    iso_box(d, s/2, s/2, s*0.28, p.stroke, lw)
+    _display_cube(d, s, p, stroke_width(cell), shaded=False, interior_edges=True)
 
 @icon("display_hlv")
 def draw_display_hlv(d, cell, p):
-    """Outline cube with dashed hidden edges (hidden line visible)."""
+    """Unfilled iso cube with its hidden edges dashed (hidden lines visible)."""
     s = cell * SS
-    lw = stroke_width(cell)
-    # solid visible edges
-    iso_box(d, s/2, s/2, s*0.28, p.stroke, lw)
-    # dashed hidden edges
-    c = s / 2
-    r = s * 0.28
-    t = (c, c - r * 0.7)
-    rt = (c + r, c - r * 0.35)
-    rm = (c + r, c + r * 0.15)
-    # dashed line from left to right back edge
-    segs = 3
-    for i in range(segs):
-        t0 = i / segs
-        t1 = (i + 0.6) / segs
-        x0 = t[0] + (rm[0] - t[0]) * t0
-        y0 = t[1] + (rm[1] - t[1]) * t0
-        x1 = t[0] + (rm[0] - t[0]) * t1
-        y1 = t[1] + (rm[1] - t[1]) * t1
-        col = p.accent if i % 2 == 0 else (p.accent[0], p.accent[1], p.accent[2], 80)
-        d.line([(x0, y0), (x1, y1)], fill=col, width=lw)
+    _display_cube(d, s, p, stroke_width(cell), shaded=False, interior_edges=True,
+                  hidden_edges=True)
 
 @icon("display_wireframe")
 def draw_display_wireframe(d, cell, p):

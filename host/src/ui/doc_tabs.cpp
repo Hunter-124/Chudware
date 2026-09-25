@@ -90,17 +90,14 @@ static bool s_openChooser = false;
 // and reserve a dedicated "+N" glass chip after the last visible tab (and before the first when
 // scrolled) so the count never paints over a filename. Boundary tab titles get a clean alpha fade.
 static float s_scrollX = 0.0f;   // px of content hidden past the LEFT edge (0 = flush left)
-// Last frame's overflow state, for docTabStripHeight(): layout queries the strip height BEFORE
-// drawDocTabs runs each frame, so it reports the previous frame's overflow. One frame of lag on
-// transitions; the published band bottom (publishDocTabBandBottom) covers the real edge either way.
-static bool  s_lastOverflow = false;
-// Height the band grows by while overflowing (logical dp, pre-scale): a scrollbar lane ABOVE the
-// tab pills, so tab titles keep their full height and never share space with the bar.
-static constexpr float kScrollLaneDp = 10.0f;
-// Drawn thickness of the scrollbar track + thumb (logical dp, pre-scale). Chunkier than the
-// app-wide 2px list-pane hairline — this strip's bar must stay legible over the busy viewport
-// backdrop behind the glass band.
-static constexpr float kScrollBarThickDp = 6.0f;
+// Overflow never changes the strip's height: there is no scrollbar lane. Scrolling is the wheel,
+// the "+N" chips, and click/hover-reveal of a clipped edge tab; position feedback is a hairline
+// thumb laid INSIDE the band's bottom edge while the strip is hovered (see drawDocTabs).
+// Trailing "+" button slot: lead gap (x2) + button + trailing inset (x1), in units of the
+// inter-tab gap. Reserved out of the tab lane up front in BOTH the window sizing and the layout,
+// so the button is never pushed past the window / Copilot column edge.
+static constexpr float kBtnLeadGaps = 2.0f;
+static constexpr float kBtnTrailGaps = 1.0f;
 
 // Forward decls (definitions below drawDocTabs, which calls them).
 void createNewDoc(AppState& st, int kindOrd);
@@ -472,7 +469,7 @@ float docTabStripHeight(const AppState& st) {
     // "+" New-Document button stays reachable — closing the last tab must not strand the user with
     // no way to start a new file. Only suppressed before the worker is up (nothing to host yet).
     (void)st;
-    return (26.0f + (s_lastOverflow ? kScrollLaneDp : 0.0f)) * ui::uiScale;
+    return 26.0f * ui::uiScale;
 }
 
 // Index of the Part/Assembly tab that owns worker doc `docId`, or -1. Used to resolve a Drawing's
@@ -630,7 +627,7 @@ TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
 // Draws the document tab strip at the top of the central dock area. In the app shell the strip
 // floats over the viewport in its own pinned borderless window (see the overlay block below); the
 // inline fallback draws it at the current cursor of the central document window. `availW` is the
-// content width to span. Returns the strip height (pill row + scrollbar lane while overflowing).
+// content width to span. Returns the strip height (the pill row; overflow never adds height).
 float drawDocTabs(AppState& st, float availW) {
     // The strip still draws with zero tabs (empty start state / all tabs closed) — just the band and
     // the "+" New-Document button, so the user can always start a new file. Suppressed only before
@@ -665,6 +662,8 @@ float drawDocTabs(AppState& st, float availW) {
     // measureTabW — the same formula drawOneTab uses — so band, pills, and window all agree.
     const float gap = 2.0f * s;               // inter-tab gap
     const float btn = barH;                   // trailing "+" button, always visible
+    // Full trailing slot (lead gap + button + trailing inset) — see kBtnLeadGaps.
+    const float btnSlot = btn + (kBtnLeadGaps + kBtnTrailGaps) * gap;
     const int nTabs = (int)st.docTabs.size();
     std::vector<float> tabWs((size_t)nTabs, 0.0f);
     std::vector<float> tabOff((size_t)nTabs, 0.0f);   // start x within the (unscrolled) content
@@ -674,7 +673,7 @@ float drawDocTabs(AppState& st, float availW) {
         tabWs[i] = measureTabW(st.docTabs[i], s);
         fullContentW += tabWs[i] + (i + 1 < nTabs ? gap : 0.0f);
     }
-    const float contentW = btn + fullContentW + gap;
+    const float contentW = fullContentW + btnSlot;
 
     ui::OverlayBand band = ui::overlayBand();
     bool floatingWindow = false;
@@ -690,13 +689,9 @@ float drawDocTabs(AppState& st, float availW) {
         if (rightBound < 0.0f) rightBound = band.maxX - margin;
         const float winW = std::max(80.0f * s,
                                     std::min(contentW + 6.0f * s, rightBound - docX));
-        // Overflow is decidable NOW (availW will BE winW — the lane formula below uses the same
-        // expression), so the window grows its scrollbar lane the same frame the strip starts or
-        // stops overflowing — no transition frame where the bar hangs outside the band.
-        const bool willOverflow = fullContentW > std::max(40.0f * s, winW - btn - gap * 2.0f) + 0.5f;
-        // Height hugs the band + a hair of slack so the rounded pills are not clipped: barH for the
-        // pill row, plus the scrollbar lane while overflowing (top of the band, above the pills).
-        const float winH = barH + (willOverflow ? kScrollLaneDp * s : 0.0f) + 2.0f * s;
+        // Height hugs the pill row + a hair of slack so the rounded pills are not clipped. Overflow
+        // never grows the strip (no stacked scrollbar lane), so tabs sit at the same y either way.
+        const float winH = barH + 2.0f * s;
         availW = winW;   // the strip lays out relative to this window's content width
         ImGui::SetNextWindowPos(ImVec2(docX, docY), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Always);
@@ -725,17 +720,13 @@ float drawDocTabs(AppState& st, float availW) {
     ImVec2 origin = ImGui::GetCursorScreenPos();
     // In the floating overlay window origin is already the strip's top-left.
     const float bandT = origin.y, bandL = origin.x;
-    // Scroll lane + overflow state: the tabs scroll in the window content minus the pinned trailing
-    // "+" button. Identical formula to the pre-Begin estimate above, so the overlay window's
-    // scrollbar-lane reservation always matches what is drawn here.
+    // Tab lane + overflow state: the tabs scroll in the window content minus the pinned trailing
+    // "+" button slot. Identical formula to the pre-Begin window sizing above.
     const float outerL = origin.x;
-    const float outerW = std::max(40.0f * s, availW - btn - gap * 2.0f);
+    const float outerW = std::max(40.0f * s, availW - btnSlot);
     const float outerR = outerL + outerW;
     const bool overflow = fullContentW > outerW + 0.5f;
-    s_lastOverflow = overflow;   // next frame's docTabStripHeight reports the grown strip
-    const float scrollLane = overflow ? kScrollLaneDp * s : 0.0f;
-    // Band spans the scrollbar lane (top) plus the pill row while overflowing.
-    const float bandB = origin.y + barH + scrollLane;
+    const float bandB = origin.y + barH;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     // The band hugs its CONTENT (contentW measured above the Begin) instead of spanning the full
     // window — a full-width glass slab with zero/few tabs read as a large dead strip (visual-review
@@ -758,8 +749,8 @@ float drawDocTabs(AppState& st, float availW) {
     // its left. When they overflow, each side that hides files gets a dedicated "+N" glass chip in
     // its OWN slot (the tab clip region shrinks so chips never paint over a filename). Boundary tab
     // titles fade out with a clean alpha ramp. When everything fits this collapses to the plain
-    // flush-left, no-chip layout. The tab row sits BELOW the scrollbar lane while overflowing.
-    const float y0 = origin.y + scrollLane;
+    // flush-left, no-chip layout. The tab row sits at the band top whether or not it overflows.
+    const float y0 = origin.y;
 
     // Two-pass layout: chip widths depend on hidden counts, and hidden counts depend on the
     // (shrunk) tab clip width after chips are reserved. One refine pass is enough for digit-width
@@ -883,42 +874,34 @@ float drawDocTabs(AppState& st, float availW) {
             s_scrollX = std::min(maxScroll, s_scrollX + tabsW * 0.8f);
     }
 
-    // Horizontal scrollbar in its own lane at the TOP of the band (the band grew by
-    // kScrollLaneDp while overflowing — see the window sizing above), so the bar never overlaps a
-    // tab title. ui::drawScrollPill with a 6dp track + thumb (kScrollBarThickDp): same pill idiom
-    // as every list pane, but thick enough to stay legible over the viewport backdrop. The drag
-    // strip covers the whole lane; while active the thumb centre follows the mouse x. Drawn on the
-    // window draw list like everything else in the strip, so modals still paint over it.
-    if (overflow && maxScroll > 0.5f) {
-        const float laneT = bandT;
-        const float laneB = laneT + scrollLane;
-        const float inset = 8.0f * s;   // keep the track clear of the band's rounded corners
-        const float trackL = bandL + inset;
-        const float trackR = bandR - inset;
-        const float trackW = std::max(1.0f, trackR - trackL);
-        const float thumbW = std::min(trackW, std::max(24.0f * s, trackW * (tabsW / fullContentW)));
-        const float thumbX = trackL + (s_scrollX / maxScroll) * (trackW - thumbW);
-        ImGui::SetCursorScreenPos(ImVec2(bandL, laneT));
-        ImGui::InvisibleButton("##hscroll", ImVec2(bandR - bandL, laneB - laneT));
-        const bool sbHov = ImGui::IsItemHovered() || ImGui::IsItemActive();
-        if (ImGui::IsItemActive()) {
-            const float t = (ImGui::GetIO().MousePos.x - trackL - thumbW * 0.5f) /
-                            std::max(1.0f, trackW - thumbW);
-            s_scrollX = std::min(std::max(t, 0.0f), 1.0f) * maxScroll;
+    // Scroll-position hint: an app-default 2dp hairline (ui::drawScrollPill idiom) laid INSIDE the
+    // band along its bottom edge under the tab lane, shown only while the strip is hovered. It adds
+    // no height and takes no input (the old 10dp lane above the pills stacked a chunky orange bar on
+    // the tabs and dropped the row out of line with a non-overflowing strip). Scrolling itself is
+    // the wheel, the "+N" chips, and click/hover-reveal of a clipped edge tab.
+    if (overflow && maxScroll > 0.5f && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+        ImGui::IsMouseHoveringRect(bandRect.Min, bandRect.Max)) {
+        const float trackL = tabsL + bandRdp;   // clear of the band's rounded bottom corners
+        const float trackR = tabsR - bandRdp;
+        const float trackW = trackR - trackL;
+        if (trackW > 16.0f * s) {
+            const float thumbW = std::min(trackW, std::max(16.0f * s, trackW * (tabsW / fullContentW)));
+            const float thumbX = trackL + (s_scrollX / maxScroll) * (trackW - thumbW);
+            const float lineY = bandB - 2.5f * s;   // hairline centre, just above the pill bottoms
+            ui::drawScrollPill(dl, ImVec2(trackL, lineY - 1.0f * s), ImVec2(trackR, lineY + 1.0f * s),
+                               thumbX, thumbX + thumbW, /*vertical=*/false, /*hovered=*/false, surf);
         }
-        ui::drawScrollPill(dl, ImVec2(trackL, laneT), ImVec2(trackR, laneB),
-                           thumbX, thumbX + thumbW,
-                           /*vertical=*/false, sbHov, surf, kScrollBarThickDp);
     }
 
     // "+" New-Document button, pinned at the far right of the strip — opens the chooser popup (Wave 2).
     // Clicking it (or Ctrl+N via openNewDocChooser()) sets wantNewDocChooser.
     {
         // Pinned at the far right, OUTSIDE the scroll lane — always visible, never scrolled and
-        // never painted over a tab. The 3×gap keeps a flush-scrolled last tab visually clear of the
-        // nub (its slot was already reserved out of outerW above). Otherwise it hugs the last tab
-        // so the band (which hugs its content) doesn't leave it stranded outside the glass.
-        const float btnX = overflow ? (outerR + 3.0f * gap) : (outerL + fullContentW + gap);
+        // never painted over a tab. Its whole slot (btnSlot: lead gap + button + trailing inset)
+        // was reserved out of outerW / contentW above, so in both states it ends one gap inside
+        // the band and the overlay window — never clipped by the Copilot column edge. Otherwise it
+        // hugs the last tab so the band (which hugs its content) doesn't strand it outside the glass.
+        const float btnX = (overflow ? outerR : outerL + fullContentW) + kBtnLeadGaps * gap;
         const float btnSide = barH;               // matches the pill row's height
         const ImVec2 p0(btnX, y0);
         ImGui::SetCursorScreenPos(p0);
@@ -928,8 +911,13 @@ float drawDocTabs(AppState& st, float availW) {
             const ImRect pill(p0, ImVec2(p0.x + btnSide, p0.y + btnSide));
             ui::glassPanel(dl, pill, ui::GlassLevel::UltraThin, 4.0f /*dp*/, surf);
         }
-        ui::drawIconGlass(dl, "new_doc", ImVec2(p0.x + btnSide * 0.5f, p0.y + btnSide * 0.5f), 9.f * s,
-                          ImGui::ColorConvertFloat4ToU32(surf.textSecondary), ui::glassIconHalo(surf));
+        // Same 16dp icon size as the tab kind icons (drawOneTab), tinted with the primary text tone
+        // (the tab labels' max-contrast role) so the always-available action never reads as a faint
+        // fleck next to the tabs.
+        const float iconSz = 16.0f * s;
+        ui::drawIconGlass(dl, "new_doc", ImVec2(p0.x + btnSide * 0.5f, p0.y + btnSide * 0.5f),
+                          iconSz, ImGui::ColorConvertFloat4ToU32(surf.textPrimary),
+                          ui::glassIconHalo(surf));
         if (hov) ImGui::SetTooltip("New document");
         if (clicked || s_openChooser) { st.wantNewDocChooser = true; s_openChooser = false; }
     }
@@ -1026,7 +1014,7 @@ float drawDocTabs(AppState& st, float availW) {
         createNewDoc(st, (int)kind);
     }
 
-    return barH + scrollLane;
+    return barH;
 }
 
 // Wave 2: New-Document chooser action — create the worker doc + open a matching tab. Part/Assembly

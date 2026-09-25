@@ -1,17 +1,20 @@
 // Parts Library — results (list table + grid cards) and per-item actions.
-// GUI V2 phase A: the list is a real ImGui table (Name | Vendor | Part# | Material | Price,
-// natural clipping instead of the old printf %-36.36s column hack) with an 18px domain icon
-// before the name; hover shows the border treatment + the item's actions.
+// GUI V2 phase A: the list is a real ImGui table (Name | Vendor | Part# | Material | Price)
+// with an 18px domain icon before the name; hover shows the border treatment + the item's
+// actions. Column widths are BUDGETED from the pane width every frame (see drawResultsList)
+// and every cell's text is ellipsized to its cell — a table cell only hard-clips.
 // Status ("downloaded", "live vendor result") is carried by drawn badges/glyphs — the ASCII
 // bracket tags they replace read as debug output and shoved the real text sideways.
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
 
 #include "imgui.h"
+#include "imgui_internal.h"   // TablePushBackgroundChannel — the row wash spans every column
 
 #include "core/app_state.h"
 #include "ui_theme.h"
@@ -275,6 +278,8 @@ static void itemTooltipAt(const PartsItem& item, bool hovered) {
         ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
     }
+    if (!item.vendor.empty())     ImGui::Text("Vendor: %s", item.vendor.c_str());
+    if (!item.partNumber.empty()) ImGui::Text("Part #: %s", item.partNumber.c_str());
     if (!item.material.empty()) ImGui::Text("Material: %s", item.material.c_str());
     if (!item.standard.empty()) ImGui::Text("Standard: %s", item.standard.c_str());
     if (!item.license.empty())  ImGui::TextDisabled("License: %s", item.license.c_str());
@@ -369,6 +374,68 @@ static void requestThumbWindow(AppState& st, int visibleStart, int visibleEnd, i
         requestThumb(st, S().results[i]);
 }
 
+// Price cell text. ONE formatter for the column measure pass and the draw, so a Price column
+// sized from it always fits exactly what is painted.
+static void priceLabel(const PartsItem& item, char* buf, size_t n) {
+    if (item.priceUsd > 0.0)
+        std::snprintf(buf, n, "$%.2f/%s", item.priceUsd, item.unit.c_str());
+    else
+        std::snprintf(buf, n, "%s", "\xe2\x80\x94");   // em dash: "no price"
+}
+
+// Natural width of each content-sized list column: the widest cell over the WHOLE result
+// set, header included, so a column does not breathe as rows scroll through the clipper.
+// Re-measured only when the set or the font changes — the budget reads it every frame. The
+// caps stop one pathological vendor/material/part string from starving Name; a capped
+// column ellipsizes its outliers instead.
+struct ListColumnWidths { float vendor = 0.0f, part = 0.0f, material = 0.0f, price = 0.0f; };
+
+static const ListColumnWidths& listColumnWidths() {
+    static ListColumnWidths w;
+    static size_t      n      = SIZE_MAX;
+    static float       fontSz = -1.0f;
+    static std::string firstId, lastId;
+    const auto& rs = S().results;
+    const float fs = ImGui::GetFontSize();
+    if (rs.size() == n && fs == fontSz &&
+        (rs.empty() || (rs.front().id == firstId && rs.back().id == lastId)))
+        return w;
+    n      = rs.size();
+    fontSz = fs;
+    firstId.assign(rs.empty() ? std::string_view() : std::string_view(rs.front().id));
+    lastId.assign(rs.empty() ? std::string_view() : std::string_view(rs.back().id));
+
+    auto textW = [](const std::string& s) { return ImGui::CalcTextSize(s.c_str()).x; };
+    w.vendor   = ImGui::CalcTextSize("Vendor").x;
+    w.part     = ImGui::CalcTextSize("Part #").x;
+    w.material = ImGui::CalcTextSize("Material").x;
+    w.price    = ImGui::CalcTextSize("Price").x;
+    char buf[64];
+    for (const auto& it : rs) {
+        w.vendor   = std::max(w.vendor,   textW(it.vendor));
+        w.part     = std::max(w.part,     textW(it.partNumber));
+        w.material = std::max(w.material, textW(it.material));
+        priceLabel(it, buf, sizeof(buf));
+        w.price    = std::max(w.price, ImGui::CalcTextSize(buf).x);
+    }
+    const float sc = ui::uiScale;
+    w.vendor   = std::ceil(std::min(w.vendor,   130.0f * sc));
+    w.part     = std::ceil(std::min(w.part,     140.0f * sc));
+    w.material = std::ceil(std::min(w.material, 110.0f * sc));
+    w.price    = std::ceil(std::min(w.price,    110.0f * sc));
+    return w;
+}
+
+// A table cell only hard-clips ("Socket Head Cap Scre"); this ellipsizes `text` to what is
+// left of the current cell instead. Allocates only when the text actually overflows.
+static void cellText(const char* text) {
+    const float avail = ImGui::GetContentRegionAvail().x;
+    if (ImGui::CalcTextSize(text).x <= avail) {
+        ImGui::TextUnformatted(text);
+        return;
+    }
+    ImGui::TextUnformatted(ui::kit::elide(text, std::max(1.0f, avail)).c_str());
+}
 
 void drawResultsList(AppState& st) {
     const float sc = ui::uiScale;
@@ -393,24 +460,43 @@ void drawResultsList(AppState& st) {
     const float tableW = std::max(ImGui::GetContentRegionAvail().x - laneW,
                                   ui::metrics::U(12));
 
-    // Narrow-pane column budget: the fixed columns keep their full width no matter how
-    // little is left, which crushes the stretch "Name" column — the one telling you what the
-    // part actually is — to nothing when the pane is squeezed (AI Copilot docked alongside).
-    // Below the threshold the lowest-value columns yield, Material first then Vendor, so
-    // Name always keeps a readable minimum. No-op at any normal pane width.
-    const float wVendor = 110.0f * sc, wPart = 90.0f * sc, wMaterial = 90.0f * sc;
-    const float wPrice  =  80.0f * sc, wAct  = 140.0f * sc;
-    const float nameMin = 150.0f * sc;
-    // PadOuterX chrome is exactly 2*CellPadding.x per column (outer padding both ends +
-    // inner spacing between each pair), i.e. 2 per cell x 6 cells.
-    const float chrome  = 6.0f * ImGui::GetStyle().CellPadding.x * 2.0f;
-    const float budget  = tableW - chrome - nameMin;
-    const bool showMaterial = budget >= wVendor + wPart + wMaterial + wPrice + wAct;
-    const bool showVendor   = budget >= wVendor + wPart + wPrice + wAct;
-    const ImGuiTableColumnFlags colVendor = ImGuiTableColumnFlags_WidthFixed |
-        (showVendor   ? 0 : ImGuiTableColumnFlags_Disabled);
-    const ImGuiTableColumnFlags colMaterial = ImGuiTableColumnFlags_WidthFixed |
-        (showMaterial ? 0 : ImGuiTableColumnFlags_Disabled);
+    // Column budget, recomputed from the pane width every frame. Fixed pixel columns kept
+    // their full width however little was left, so the stretch Name column — the one that
+    // says what the part IS — was crushed to "Nar" at 1.5x. Columns are now granted in
+    // priority order out of what the pane actually has:
+    //   Name (readable minimum) + the actions' "…" button  →  Price  →  Part #
+    //   →  Name up to a comfortable width  →  the inline action buttons  →  Vendor → Material
+    // Part # / Price / Vendor / Material are sized to their content (listColumnWidths); Name
+    // stretches over everything left, so a wide pane widens the name, not the gutters. A
+    // column that does not fit is disabled outright; its value stays in the row tooltip.
+    const ListColumnWidths& cw = listColumnWidths();
+    // PadOuterX chrome is exactly 2*CellPadding.x per VISIBLE column (outer padding both
+    // ends + inner spacing between each pair).
+    const float colChrome   = 2.0f * ImGui::GetStyle().CellPadding.x;
+    const float nameMin     = 160.0f * sc;
+    const float nameComfort = 320.0f * sc;
+    // actionsLayout needs one square line-height "…" to reach every action from its popup;
+    // anything wider shows the first actions inline.
+    const float actMin  = std::ceil(ImGui::GetTextLineHeight()) + ui::metrics::px(1.0f);
+    const float actFull = 140.0f * sc;
+    float room = tableW - (nameMin + colChrome) - (actMin + colChrome);
+    auto grant = [&room, colChrome](float w) {
+        if (room < w + colChrome) return false;
+        room -= w + colChrome;
+        return true;
+    };
+    const bool showPrice = grant(cw.price);
+    const bool showPart  = grant(cw.part);
+    room -= std::min(std::max(room, 0.0f), nameComfort - nameMin);   // Name's comfort share
+    const float actGrow = std::clamp(room, 0.0f, actFull - actMin);
+    room -= actGrow;
+    const float wAct = actMin + actGrow;
+    const bool showVendor   = grant(cw.vendor);
+    const bool showMaterial = grant(cw.material);
+    auto fixedCol = [](bool shown) -> ImGuiTableColumnFlags {
+        return ImGuiTableColumnFlags_WidthFixed |
+               (shown ? ImGuiTableColumnFlags_None : ImGuiTableColumnFlags_Disabled);
+    };
 
     const ImGuiTableFlags tblFlags = ImGuiTableFlags_SizingFixedFit |
                                      ImGuiTableFlags_NoBordersInBody |
@@ -420,10 +506,10 @@ void drawResultsList(AppState& st) {
         return;
     }
     ImGui::TableSetupColumn("Name",     ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("Vendor",   colVendor,   wVendor);
-    ImGui::TableSetupColumn("Part #",   ImGuiTableColumnFlags_WidthFixed, wPart);
-    ImGui::TableSetupColumn("Material", colMaterial, wMaterial);
-    ImGui::TableSetupColumn("Price",    ImGuiTableColumnFlags_WidthFixed, wPrice);
+    ImGui::TableSetupColumn("Vendor",   fixedCol(showVendor),   cw.vendor);
+    ImGui::TableSetupColumn("Part #",   fixedCol(showPart),     cw.part);
+    ImGui::TableSetupColumn("Material", fixedCol(showMaterial), cw.material);
+    ImGui::TableSetupColumn("Price",    fixedCol(showPrice),    cw.price);
     ImGui::TableSetupColumn("##act",    ImGuiTableColumnFlags_WidthFixed, wAct);
 
     // Header row (textDim, no ugly TableHeadersRow chrome).
@@ -433,7 +519,7 @@ void drawResultsList(AppState& st) {
     const char* heads[5] = {"Name", "Vendor", "Part #", "Material", "Price"};
     for (int c = 0; c < 5; ++c) {
         ImGui::TableSetColumnIndex(c);
-        ImGui::TextUnformatted(heads[c]);
+        cellText(heads[c]);
     }
     ImGui::PopStyleColor();
 
@@ -477,9 +563,12 @@ void drawResultsList(AppState& st) {
         ImVec2 rMax = ImGui::GetItemRectMax();
         // Domain colour: the SAME hue the grid card and the category tree use, so a
         // fastener reads as a fastener in every view. Painted from the row-spanning
-        // Selectable's rect (SpanAllColumns → the item rect already covers every column)
-        // before any cell content draws, so the wash can never sit on top of the text.
+        // Selectable's rect (SpanAllColumns → the item rect covers every column) into the
+        // table's BACKGROUND channel: the cell-0 channel we are in is clipped to the Name
+        // column, which is what cut the wash off at the Name/Part # seam. The background
+        // channel sits under every column's content, so the wash never covers text either.
         const float* tint = categoryTint(item.domain);
+        ImGui::TablePushBackgroundChannel();
         ui::coloredRowWash(dl, rMin, rMax, 5.0f, tint, hovered ? 0.26f : 0.11f,
                            /*selected=*/false);
         if (hovered) {
@@ -489,6 +578,7 @@ void drawResultsList(AppState& st) {
                         ImVec2(rMax.x - 0.5f, rMax.y - 0.5f),
                         Palette::toU32(palette.accentMid), 4.0f * sc, 0, 1.0f * sc);
         }
+        ImGui::TablePopBackgroundChannel();
         itemTooltipAt(item, hovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal |
                                                             ImGuiHoveredFlags_AllowWhenOverlappedByItem));
 
@@ -545,24 +635,28 @@ void drawResultsList(AppState& st) {
             ImGui::SameLine();
         }
         // Source pill: the vendor's name (amber) for a live hit, "library" (accent) for a
-        // local one, carrying the vendor's favicon when one is already cached. Capped so a
-        // long vendor can never shove the part name out of the cell — the cap grows by the
-        // logo's advance so adding the icon does not eat the label.
+        // local one, carrying the vendor's favicon when one is already cached. Capped at
+        // 96dp AND at a share of what is left of the cell, so a long vendor can never shove
+        // the part name out of a narrow Name column; below one readable glyph it is dropped
+        // (the Vendor column / row tooltip still name the source).
         {
             const unsigned int logoTex = vendorLogoTex(item);
             const bool  hasLogo = logoTex != 0;
-            const float capW    = 96.0f * sc + badgeLogoAdvance(hasLogo);
-            badgeInline(fitBadgeLabel(sourceBadgeLabel(item), capW, hasLogo).c_str(),
-                        sourceBadgeRole(item), logoTex);
+            const float capW    = std::min(96.0f * sc + badgeLogoAdvance(hasLogo),
+                                           ImGui::GetContentRegionAvail().x * 0.45f);
+            if (capW >= badgeW("W\xe2\x80\xa6", hasLogo)) {
+                badgeInline(fitBadgeLabel(sourceBadgeLabel(item), capW, hasLogo).c_str(),
+                            sourceBadgeRole(item), logoTex);
+                ImGui::SameLine();
+            }
         }
-        ImGui::SameLine();
-        ImGui::TextUnformatted(item.name.c_str());   // table clipping ellipsizes naturally
+        cellText(item.name.c_str());
 
         auto dimCell = [&](int col, const char* text) {
             cellLine(col);
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-            ImGui::TextUnformatted(text);
+            cellText(text);
             ImGui::PopStyleColor();
         };
         dimCell(1, item.vendor.c_str());
@@ -570,15 +664,15 @@ void drawResultsList(AppState& st) {
         dimCell(3, item.material.empty() ? "-" : item.material.c_str());
 
         cellLine(4);
-        if (item.priceUsd > 0.0) {
+        {
             // The one number a buyer scans a results table for — it should not be the same
             // tone as the part number three columns to its left.
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
-            ImGui::Text("$%.2f/%s", item.priceUsd, item.unit.c_str());
+            const float* role = item.priceUsd > 0.0 ? palette.accent : palette.textDisabled;
+            char price[64];
+            priceLabel(item, price, sizeof(price));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(role[0], role[1], role[2], 1.0f));
+            cellText(price);
             ImGui::PopStyleColor();
-        } else {
-            ImGui::TextDisabled("—");
         }
 
         cellLine(5);

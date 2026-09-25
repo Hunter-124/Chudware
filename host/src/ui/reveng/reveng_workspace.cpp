@@ -34,6 +34,7 @@
 #include <cstring>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <memory>
 #include <unordered_map>
 #include <string>
@@ -46,6 +47,7 @@
 #include "core/engine_events.h"  // core::watchRevEngReconstruct — live Reconstruct progress feed
 #include "ui_theme.h"
 #include "../metrics.h"     // ui::metrics::re*() — the ONLY source of sizes in this TU
+#include "ui/widgets/kit.h"  // ui::kit::elide — ellipsize rail labels to their frames
 
 #include "reveng_internal.h"
 #include "reveng_widgets.h"  // RE-40 shared visual kit (cards / chips / previews / steps)
@@ -71,6 +73,10 @@ struct ShellState {
     // Column roll animation (T-G21). Negative = uninitialised, snaps on the first frame.
     float railW = -1.0f;
     float propW = -1.0f;
+    // Width the two side columns may share while the stage body keeps its minimum — published by
+    // the layout each frame so revealColumn() can tell whether a column is being auto-folded.
+    // +inf until the first layout pass: nothing is auto-folded before anything has been measured.
+    float sideBudget = std::numeric_limits<float>::infinity();
 
     // Rail card thumbnails. `path` is the session's first still, resolved once from the session
     // directory; the texture itself is owned by the img_tex LRU cache (never freed here).
@@ -123,10 +129,45 @@ ShellState& SH() {
     return s;
 }
 
+// The responsive fold: when the body cannot hold three columns at their minimum widths
+// (rail reRailW, properties rePropW, stage body rePreviewMinW), Auto columns roll to their strip —
+// Properties first, then Sessions. A user-Collapsed column already counts as a strip; an
+// Expanded one is never folded. Pure function of intent + budget, so it cannot oscillate.
+void foldColumns(const RevEngState& s, float sideBudget, bool& railFold, bool& propFold) {
+    const float stripW = M::reThumbSm();
+    railFold = s.railIntent  == ColumnIntent::Collapsed;
+    propFold = s.propsIntent == ColumnIntent::Collapsed;
+    auto fits = [&] {
+        return (railFold ? stripW : M::reRailW()) + (propFold ? stripW : M::rePropW()) <= sideBudget;
+    };
+    if (!fits() && s.propsIntent == ColumnIntent::Auto) propFold = true;
+    if (!fits() && s.railIntent  == ColumnIntent::Auto) railFold = true;
+}
+
+// An explicit "show me this column" (strip chevron, ribbon command, empty-state button). If the
+// layout would fold the column were it left on Auto, the request pins it Expanded so the next
+// frame's auto-fold cannot undo it; otherwise it goes back to Auto, so a column the user merely
+// re-opened on a wide body still folds if the window later narrows.
+void revealColumn(bool rail) {
+    RevEngState& s = S();
+    ColumnIntent& intent = rail ? s.railIntent : s.propsIntent;
+    intent = ColumnIntent::Auto;
+    bool railFold = false, propFold = false;
+    foldColumns(s, SH().sideBudget, railFold, propFold);
+    if (rail ? railFold : propFold) intent = ColumnIntent::Expanded;
+}
+
 bool selectedSession(const std::string& sid) {
     const auto& s = S();
     return s.selected >= 0 && s.selected < (int)s.sessions.size() &&
            s.sessions[s.selected].session_id == sid;
+}
+
+// A label ellipsized to a fixed-width frame (button / input hint) instead of hard-clipped by it.
+// The ### suffix keeps the ImGui id stable while the visible text changes with the width.
+std::string fitLabel(const char* label, const char* id, float frameW) {
+    const float room = frameW - ImGui::GetStyle().FramePadding.x * 2.0f;
+    return ui::kit::elide(label, room) + "###" + id;
 }
 
 bool gaussianRunning(const GaussianState& g) {
@@ -413,6 +454,22 @@ float sessionProgress(const RevEngState& s, int idx) {
 RevEngState& S() {
     static RevEngState s;
     return s;
+}
+
+// Chip geometry mirrors ui::kit (chipGeom: padX 1.5U, dot 2x0.75U + 1U gap; valueChip: padX 1.5U,
+// 1U label/value gap) so a flow layout can measure a chip before it is placed.
+float statusChipW(const char* label) {
+    return M::U(1.5f) * 2.0f + M::U(0.75f) * 2.0f + M::U(1.0f)
+         + ImGui::CalcTextSize(label ? label : "").x;
+}
+
+float valueChipW(const char* label, const char* value) {
+    return M::U(1.5f) * 2.0f + M::U(1.0f) + ImGui::CalcTextSize(label ? label : "").x
+         + ImGui::CalcTextSize(value ? value : "").x;
+}
+
+void flowSameLine(float rightX, float w, float gap) {
+    if (ImGui::GetItemRectMax().x + gap + w <= rightX) ImGui::SameLine(0.0f, gap);
 }
 
 // RE-21: Apply a reveng event to the singleton (GL-thread only, called from app.cpp drain).
@@ -1376,13 +1433,13 @@ bool handleRevEngCommand(AppState& st, const char* cmd) {
         toStage(Stage::Source);
         s.sourceMode  = SourceMode::Scan;
         s.sourceFocus = focus;
-        s.railCollapsed = false;
+        revealColumn(/*rail=*/true);
     };
 
     if (c == "reveng_new")          { toStage(Stage::Source); s.focusNewName = true;
-                                      s.railCollapsed = false; return true; }
+                                      revealColumn(/*rail=*/true); return true; }
     if (c == "reveng_open")         { st.activeWorkspace = AppState::Workspace::ReverseEng;
-                                      s.railCollapsed = false;
+                                      revealColumn(/*rail=*/true);
                                       loadSessions(st, /*force=*/true); return true; }
     if (c == "reveng_from_library") { st.activeWorkspace = AppState::Workspace::PartsLibrary;
                                       return true; }
@@ -1627,7 +1684,7 @@ void drawReconstructStage(AppState& st) {
                               "Re-check backends")) {
             loadCapabilities(st, /*force=*/true);
             S().propsTab = 1;
-            S().propsCollapsed = false;
+            revealColumn(/*rail=*/false);
         }
         return;
     }
@@ -1698,18 +1755,34 @@ void drawSessionCard(AppState& st, RevEngState& s, int i) {
         }
 
         ImGui::SameLine(0.0f, M::reCardPadX());
+        // Everything right of the thumbnail is ellipsized or flowed against the card's content
+        // edge, so a narrow rail shortens the name / wraps a chip instead of hard-clipping it.
+        const float rightX = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+        const float gap    = M::reCtlGap();
+        auto fitChip = [&](const std::string& label) {
+            return ui::kit::elide(label.c_str(),
+                                  rightX - ImGui::GetCursorScreenPos().x - statusChipW(""));
+        };
         ImGui::BeginGroup();
         {
-            if (ImGui::Selectable(ss.name.c_str(), selected)) pick = true;
-            if (ImGui::IsItemHovered() && !ss.session_id.empty())
-                ImGui::SetTooltip("%s", ss.session_id.c_str());
+            const float       nameW = ImGui::GetContentRegionAvail().x;
+            const std::string name  = ui::kit::elide(ss.name.c_str(), nameW);
+            if (ImGui::Selectable((name + "###re_sess_name").c_str(), selected, 0,
+                                  ImVec2(nameW, 0.0f)))
+                pick = true;
+            if (ImGui::IsItemHovered()) {
+                if (name != ss.name)
+                    ImGui::SetTooltip("%s\n%s", ss.name.c_str(), ss.session_id.c_str());
+                else if (!ss.session_id.empty())
+                    ImGui::SetTooltip("%s", ss.session_id.c_str());
+            }
 
             if (ss.hasGaussian) {
                 const kit::Level level = ss.gaussianStatus == "cancelled" ? kit::Level::Warn
                                         : badgeLevel(ss.gaussianStatus);
                 const std::string label = "Gaussian " +
                     (ss.gaussianStatus.empty() ? std::string("idle") : ss.gaussianStatus);
-                kit::StatusChip(label.c_str(), level,
+                kit::StatusChip(fitChip(label).c_str(), level,
                                 "Gaussian reference in reconstruction units, not completed CAD.");
                 char frameTxt[24];
                 std::snprintf(frameTxt, sizeof(frameTxt), "%d", ss.gaussianFrames);
@@ -1727,15 +1800,16 @@ void drawSessionCard(AppState& st, RevEngState& s, int i) {
                               std::clamp(ss.gaussianPct, 0, 100));
                 kit::ProgressBar(std::clamp(ss.gaussianPct, 0, 100) / 100.0f, progressTxt, level);
             } else {
-                kit::StatusChip(ss.status.empty() ? "new" : ss.status.c_str(), statusLevel(ss.status));
-                ImGui::SameLine(0.0f, M::reCtlGap());
+                kit::StatusChip(fitChip(ss.status.empty() ? "new" : ss.status).c_str(),
+                                statusLevel(ss.status));
                 char imgTxt[24];
                 std::snprintf(imgTxt, sizeof(imgTxt), "%d", ss.images);
+                flowSameLine(rightX, valueChipW("img", imgTxt), gap);
                 kit::ValueChip("img", imgTxt, ss.images > 0 ? kit::Level::Ok : kit::Level::Neutral,
                                "Images captured or imported into this session.");
             }
             if (ss.approximate) {
-                ImGui::SameLine(0.0f, M::reCtlGap());
+                flowSameLine(rightX, statusChipW("approximate"), gap);
                 kit::HonestyTag("approximate",
                                 "This session's pipeline is flagged approximate \xe2\x80\x94 reference/preview "
                                 "geometry only, not a measured model.");
@@ -1766,19 +1840,26 @@ void drawSessionCard(AppState& st, RevEngState& s, int i) {
 void drawNewSessionCard(AppState& st, RevEngState& s) {
     if (kit::CardBegin("##re_new_session", "New session", "folder_new")) {
         const bool canCreate = st.workerStarted && !s.newSessionPending;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+        const float fieldW = ImGui::GetContentRegionAvail().x;
+        const float textW  = fieldW - ImGui::GetStyle().FramePadding.x * 2.0f;
+        ImGui::SetNextItemWidth(fieldW);
         if (s.focusNewName) {
             ImGui::SetKeyboardFocusHere();
             s.focusNewName = false;
         }
-        ImGui::InputTextWithHint("##reveng_new_name", "Environment / object name (optional)",
-                                 s.newNameBuf, sizeof(s.newNameBuf));
+        const std::string hint = ui::kit::elide("Environment / object name (optional)", textW);
+        ImGui::InputTextWithHint("##reveng_new_name", hint.c_str(), s.newNameBuf,
+                                 sizeof(s.newNameBuf));
         kit::GapControl();
-        if (kit::PrimaryButton(s.newSessionPending ? "Creating\xe2\x80\xa6" : "Create session",
-                               canCreate,
+        const char* createLab = s.newSessionPending ? "Creating\xe2\x80\xa6" : "Create session";
+        const bool  create =
+            kit::PrimaryButton(fitLabel(createLab, "re_create_session", fieldW).c_str(), canCreate,
                                st.workerStarted ? "A session is already being created."
                                                 : "The Chudware worker is not running.",
-                               ImVec2(ImGui::GetContentRegionAvail().x, M::reBtnH()))) {
+                               ImVec2(fieldW, M::reBtnH()));
+        if (canCreate && ImGui::CalcTextSize(createLab).x > textW && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", createLab);
+        if (create) {
             s.newSessionPending = true;
             s.newSessionErr.clear();
             nlohmann::json params = nlohmann::json::object();
@@ -1821,14 +1902,24 @@ void drawSessionRailBody(AppState& st) {
     RevEngState& s = S();
 
     // The column header already names this column; the body opens with its controls.
-    const float refreshW = M::reBtnW();
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - refreshW -
-                            ImGui::GetStyle().ItemSpacing.x);
-    ImGui::InputTextWithHint("##re_rail_filter", "Filter by name or id",
-                             s.railFilterBuf, sizeof(s.railFilterBuf));
-    ImGui::SameLine(0.0f, ImGui::GetStyle().ItemSpacing.x);
-    if (kit::SecondaryButton(s.listPending ? "\xe2\x80\xa6" : "Refresh", !s.listPending,
-                             "A refresh is already in flight.", ImVec2(refreshW, 0.0f)))
+    // Filter + Refresh share a line while the filter keeps a usable reFieldW; a narrower rail
+    // stacks them rather than squeezing the field to nothing and clipping the button.
+    const ImGuiStyle& style    = ImGui::GetStyle();
+    const float       availW   = ImGui::GetContentRegionAvail().x;
+    const bool        oneLine  = availW >= M::reFieldW() + style.ItemSpacing.x + M::reBtnW();
+    const float       refreshW = oneLine ? M::reBtnW() : availW;
+    const float       filterW  = oneLine ? availW - refreshW - style.ItemSpacing.x : availW;
+    const std::string filterHint =
+        ui::kit::elide("Filter by name or id", filterW - style.FramePadding.x * 2.0f);
+    ImGui::SetNextItemWidth(filterW);
+    ImGui::InputTextWithHint("##re_rail_filter", filterHint.c_str(), s.railFilterBuf,
+                             sizeof(s.railFilterBuf));
+    if (oneLine) ImGui::SameLine(0.0f, style.ItemSpacing.x);
+    else         kit::GapControl();
+    if (kit::SecondaryButton(fitLabel(s.listPending ? "\xe2\x80\xa6" : "Refresh", "re_rail_refresh",
+                                      refreshW).c_str(),
+                             !s.listPending, "A refresh is already in flight.",
+                             ImVec2(refreshW, 0.0f)))
         loadSessions(st, /*force=*/true);
 
     kit::GapControl();
@@ -2135,8 +2226,9 @@ void drawPropertiesBody(AppState& st) {
 // a vertical caption, and the freed width goes to the stage body. This is the T-G21 affordance
 // (roll to the header strip, NEVER shrink to a floating pill) rotated to the horizontal axis the
 // three RE columns are laid out on — the pinned columns in layout.cpp roll UP because they stack
-// vertically; these roll SIDEWAYS because they stack horizontally.
-void drawCollapsedStrip(const char* id, const char* caption, bool* collapsed, float w) {
+// vertically; these roll SIDEWAYS because they stack horizontally. Returns true when the expand
+// chevron is clicked; the caller routes that through revealColumn() so an auto-fold is pinned open.
+bool drawCollapsedStrip(const char* id, const char* caption, bool autoFolded, float w) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(M::reCardPadY(), M::reCardPadY()));
     ui::pushGlassChildStyle();
     ImGui::BeginChild(id, ImVec2(w, 0.0f), ImGuiChildFlags_Border,
@@ -2145,8 +2237,11 @@ void drawCollapsedStrip(const char* id, const char* caption, bool* collapsed, fl
     ImGui::PopStyleVar();
 
     const float innerW = ImGui::GetContentRegionAvail().x;
-    if (ImGui::Button("\xc2\xbb", ImVec2(innerW, M::reBtnH()))) *collapsed = false;
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Expand %s", caption);
+    const bool expand = ImGui::Button("\xc2\xbb", ImVec2(innerW, M::reBtnH()));
+    if (ImGui::IsItemHovered()) {
+        if (autoFolded) ImGui::SetTooltip("Expand %s (folded to fit this window width)", caption);
+        else            ImGui::SetTooltip("Expand %s", caption);
+    }
 
     ImGui::Dummy(ImVec2(0.0f, M::reCtlGap()));
     for (const char* p = caption; *p; ++p) {
@@ -2156,18 +2251,21 @@ void drawCollapsedStrip(const char* id, const char* caption, bool* collapsed, fl
         ImGui::TextDisabled("%s", ch);
     }
     ImGui::EndChild();
+    return expand;
 }
 
 // Header row inside an expanded column: title on the left, collapse chevron on the right.
-void drawColumnHeader(const char* title, bool* collapsed) {
+// Returns true when the collapse chevron is clicked.
+bool drawColumnHeader(const char* title) {
     const float chevW  = ImGui::GetFrameHeight();
     const float startX = ImGui::GetCursorPosX();
     const float availW = ImGui::GetContentRegionAvail().x;
     ImGui::TextUnformatted(title);
     ImGui::SameLine(startX + availW - chevW);
-    if (ImGui::Button("\xc2\xab", ImVec2(chevW, chevW))) *collapsed = true;
+    const bool collapse = ImGui::Button("\xc2\xab", ImVec2(chevW, chevW));
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Collapse %s", title);
     kit::Rule();
+    return collapse;
 }
 
 // ================================================================================
@@ -2292,7 +2390,7 @@ void drawStageBody(AppState& st, RevEngState& s) {
                             "Select a session in the rail, or create one to begin.",
                             "New session")) {
             s.focusNewName = true;
-            s.railCollapsed = false;
+            revealColumn(/*rail=*/true);
         }
         return;
     }
@@ -2438,24 +2536,30 @@ void drawRevEngWorkspace(AppState& st) {
         webcamCaptureShutdown();
     }
 
-    const float gutter  = M::reGutter();
-    const float stripW  = M::reThumbSm();
-    const float railTgt = s.railCollapsed  ? stripW : M::reRailW();
-    const float propTgt = s.propsCollapsed ? stripW : M::rePropW();
-    const float railW   = approachPx(sh.railW, railTgt);
-    const float propW   = approachPx(sh.propW, propTgt);
-
-    // Column widths. When the window is too narrow for all three, the SIDE columns give way
-    // first — the stage body is the work surface and must never be the thing that vanishes.
+    // Column widths. Each column has a real minimum — rail reRailW, properties rePropW, stage body
+    // rePreviewMinW. A body too narrow for all three folds the Auto side columns to their strips
+    // (Properties first, then Sessions) instead of squeezing everything until it clips. The fold
+    // is recomputed every frame from the width alone and never written into the user's intent.
+    const float gutter = M::reGutter();
+    const float stripW = M::reThumbSm();
     const float totalW = ImGui::GetContentRegionAvail().x;
-    float drawRailW = railW;
-    float drawPropW = propW;
+    sh.sideBudget = totalW - 2.0f * gutter - M::rePreviewMinW();
+    bool railFold = false, propFold = false;
+    foldColumns(s, sh.sideBudget, railFold, propFold);
+    const bool railAutoFolded = railFold && s.railIntent  != ColumnIntent::Collapsed;
+    const bool propAutoFolded = propFold && s.propsIntent != ColumnIntent::Collapsed;
+
+    float drawRailW = approachPx(sh.railW, railFold ? stripW : M::reRailW());
+    float drawPropW = approachPx(sh.propW, propFold ? stripW : M::rePropW());
     float midW = totalW - drawRailW - drawPropW - 2.0f * gutter;
-    const float midMin = M::rePreviewMinW();
-    if (midW < midMin) {
+    // Only a column pinned Expanded (or a body narrower than two strips + the stage minimum) can
+    // still overflow. The stage body then gives up its preferred minimum, down to the hero-preview
+    // width; past that the side columns shrink too — the work surface must never vanish.
+    const float midFloor = M::reThumbLg();
+    if (midW < midFloor) {
         const float sideTotal = drawRailW + drawPropW;
         const float k = sideTotal > 0.0f
-                            ? std::clamp(1.0f - (midMin - midW) / sideTotal, 0.0f, 1.0f)
+                            ? std::clamp(1.0f - (midFloor - midW) / sideTotal, 0.0f, 1.0f)
                             : 0.0f;
         drawRailW *= k;
         drawPropW *= k;
@@ -2463,15 +2567,16 @@ void drawRevEngWorkspace(AppState& st) {
     }
 
     // ---- left: session rail --------------------------------------------------
-    if (s.railCollapsed && drawRailW <= stripW + M::reCardGap()) {
-        drawCollapsedStrip("##reveng_rail_strip", "SESSIONS", &s.railCollapsed, drawRailW);
+    if (railFold && drawRailW <= stripW + M::reCardGap()) {
+        if (drawCollapsedStrip("##reveng_rail_strip", "SESSIONS", railAutoFolded, drawRailW))
+            revealColumn(/*rail=*/true);
     } else {
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(M::reCardPadX(), M::reCardPadY()));
         ui::pushGlassChildStyle();
         ImGui::BeginChild("##reveng_rail", ImVec2(drawRailW, 0.0f), ImGuiChildFlags_Border);
         ui::popGlassChildStyle();
         ImGui::PopStyleVar();
-        drawColumnHeader("Sessions", &s.railCollapsed);
+        if (drawColumnHeader("Sessions")) s.railIntent = ColumnIntent::Collapsed;
         drawSessionRailBody(st);
         ImGui::EndChild();
     }
@@ -2498,15 +2603,16 @@ void drawRevEngWorkspace(AppState& st) {
 
     // ---- right: properties ---------------------------------------------------
     ImGui::SameLine(0.0f, gutter);
-    if (s.propsCollapsed && drawPropW <= stripW + M::reCardGap()) {
-        drawCollapsedStrip("##reveng_props_strip", "DETAILS", &s.propsCollapsed, drawPropW);
+    if (propFold && drawPropW <= stripW + M::reCardGap()) {
+        if (drawCollapsedStrip("##reveng_props_strip", "DETAILS", propAutoFolded, drawPropW))
+            revealColumn(/*rail=*/false);
     } else {
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(M::reCardPadX(), M::reCardPadY()));
         ui::pushGlassChildStyle();
         ImGui::BeginChild("##reveng_props", ImVec2(drawPropW, 0.0f), ImGuiChildFlags_Border);
         ui::popGlassChildStyle();
         ImGui::PopStyleVar();
-        drawColumnHeader("Properties", &s.propsCollapsed);
+        if (drawColumnHeader("Properties")) s.propsIntent = ColumnIntent::Collapsed;
         drawPropertiesBody(st);
         ImGui::EndChild();
     }

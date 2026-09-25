@@ -221,7 +221,7 @@ struct Palette {
     // glassBg:        main translucent fill — semi-opaque so the content behind bleeds through subtly.
     // glassBorder:    cooler/brighter border than the standard chrome border.
     // glassHighlight: white-tinted top-shine gradient + specular line (top inner edge).
-    // glassShadow:    soft simulated drop-shadow beneath the panel.
+    // glassShadow:    in-rect bottom hairline (glassPanel edge) and the shared dim-scrim black.
     float glassBg[4]        = {0.118f, 0.133f, 0.167f, 0.87f};
     float glassBorder[4]    = {0.230f, 0.275f, 0.365f, 0.80f};
     float glassHighlight[4] = {1.000f, 1.000f, 1.000f, 0.09f};
@@ -276,9 +276,10 @@ void setAccentColors(const float primary[3], const float secondary[3]);
 Fonts loadFonts(const std::string& assetsDir, float pxScale = 1.0f);
 
 // Draw a glassmorphism panel background onto 'dl' covering [mn, mx].
-// Layers (back to front): drop-shadow, translucent base fill, vertical inner-shine gradient,
-// border, top specular line. 'rounding' is a logical dp value (multiplied by ui::uiScale
-// internally, so 8.0f matches the PopupRounding set by applyTheme at any DPI).
+// Layers (back to front): translucent base fill, vertical inner-shine gradient, border, top
+// specular line. Deliberately NO offset drop shadow — controls at rest render flat. 'rounding' is
+// a logical dp value (multiplied by ui::uiScale internally, so 8.0f matches the PopupRounding set
+// by applyTheme at any DPI).
 void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 8.0f);
 // Alpha-scaled variant for animated widgets (e.g. toasts): `alpha` (0..1) multiplies every glass
 // role's alpha before drawing, so a fading card dims all five layers coherently.

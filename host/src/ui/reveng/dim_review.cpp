@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -707,12 +708,18 @@ void drawDimRow(AppState& st, DimReviewState& d, DimRow& row, int idx) {
 
     ImGui::BeginGroup();
 
+    // Flow layout: every item after the first on a line is measured before placement and only
+    // joins the current line when it fits inside the band's right padding; otherwise it starts
+    // a new line at the group's left edge (flowSameLine / statusChipW in reveng_internal.h).
+    const float rightX = mn.x + fullW - padX;
+    auto flow = [&](float w, float gap) { flowSameLine(rightX, w, gap); };
+
     // ---- line 1: label + provenance -------------------------------------------------------
     if (row.fitCritical) {
         ImGui::PushStyleColor(ImGuiCol_Text, role4(row.alarm() ? palette.statusErr : palette.text));
         ImGui::TextUnformatted(row.label.c_str());
         ImGui::PopStyleColor();
-        ImGui::SameLine(0.0f, M::reCtlGap());
+        flow(statusChipW("FIT-CRITICAL"), M::reCtlGap());
         kit::StatusChip("FIT-CRITICAL", row.alarm() ? Level::Error : Level::Warn,
                         "This dimension decides whether a printed replacement fits.\n"
                         "It must be confirmed individually with a typed caliper value -\n"
@@ -720,19 +727,19 @@ void drawDimRow(AppState& st, DimReviewState& d, DimRow& row, int idx) {
     } else {
         ImGui::TextUnformatted(row.label.c_str());
     }
-    ImGui::SameLine(0.0f, M::reCtlGap());
+    flow(statusChipW(row.tier.empty() ? "unknown" : row.tier.c_str()), M::reCtlGap());
     kit::HonestyTag(row.tier.c_str(), row.note.empty() ? nullptr : row.note.c_str());
-    ImGui::SameLine(0.0f, M::reCtlGap());
+    flow(statusChipW(row.source.c_str()), M::reCtlGap());
     kit::StatusChip(row.source.c_str(), methodLevel(row), methodTip(row));
     if (row.alarm()) {
-        ImGui::SameLine(0.0f, M::reCtlGap());
+        flow(statusChipW("GUESSED"), M::reCtlGap());
         kit::StatusChip("GUESSED", Level::Error,
                         "contracts/reveng.md section 0: no silent guessing on a fit-critical\n"
                         "dimension. Measure the part with calipers and type the value, or\n"
                         "read it off the datasheet - do not ship this number.");
     }
     if (row.settled()) {
-        ImGui::SameLine(0.0f, M::reCtlGap());
+        flow(statusChipW("confirmed"), M::reCtlGap());
         kit::StatusChip("confirmed", Level::Ok,
                         row.confirmed ? "Recorded in the intake ledger."
                                       : "Confirmed from this session.");
@@ -748,14 +755,14 @@ void drawDimRow(AppState& st, DimReviewState& d, DimRow& row, int idx) {
         ImGui::TextUnformatted(shown.c_str());
         ImGui::PopStyleColor();
         if (row.hasTol) {
-            ImGui::SameLine(0.0f, M::reCtlGap());
-            ImGui::PushStyleColor(ImGuiCol_Text, role4(palette.textDim));
             const std::string tol = "+/- " + kit::fmtMm(row.tol_mm, 3);
+            flow(ImGui::CalcTextSize(tol.c_str()).x, M::reCtlGap());
+            ImGui::PushStyleColor(ImGuiCol_Text, role4(palette.textDim));
             ImGui::TextUnformatted(tol.c_str());
             ImGui::PopStyleColor();
         }
 
-        ImGui::SameLine(0.0f, M::reSectionGap());
+        flow(M::reFieldW(), M::reSectionGap());
         ImGui::SetNextItemWidth(M::reFieldW());
         ImGui::InputTextWithHint("##caliper", "caliper mm", row.editBuf, sizeof(row.editBuf),
                                  ImGuiInputTextFlags_CharsDecimal);
@@ -763,7 +770,12 @@ void drawDimRow(AppState& st, DimReviewState& d, DimRow& row, int idx) {
             ImGui::SetTooltip("The typed caliper value submitted to confirm_dimensions.\n"
                               "This is the number the model is built from.");
 
-        ImGui::SameLine(0.0f, M::reCtlGap());
+        {
+            const char* ctl = row.busy ? "confirming" : row.settled() ? "Re-confirm" : "Confirm";
+            const float ctlW = row.busy ? statusChipW(ctl)
+                             : ImGui::CalcTextSize(ctl).x + M::U(1.75f) * 4.0f;
+            flow(ctlW, M::reCtlGap());
+        }
         double pending = 0.0;
         const bool canSend = rowSubmitValue(row, pending);
         if (row.busy) {
@@ -784,7 +796,7 @@ void drawDimRow(AppState& st, DimReviewState& d, DimRow& row, int idx) {
                 confirmKeys(st, {row.key});
         }
         if (row.justOk && !row.busy) {
-            ImGui::SameLine(0.0f, M::reCtlGap());
+            flow(statusChipW("recorded"), M::reCtlGap());
             kit::StatusChip("recorded", Level::Ok, nullptr);
         }
     }
@@ -953,6 +965,51 @@ void resumeCardBody(const ImVec2& bodyPos) {
     ImGui::SetCursorPos(ImVec2(bodyPos.x, std::max(bodyPos.y, bottomLocal)));
 }
 
+// A card title row carrying a status chip + one action button, placed so neither is ever
+// hard-clipped at the card edge. Both sit on the title row only when both fit; otherwise the chip
+// is shed to the first body line, and the button follows it only when not even the button fits
+// beside the title. Call right after kit::CardBegin() with its body cursor; returns the click.
+bool cardHeaderChipButton(const ImVec2& bodyPos, const char* chip, Level chipLevel,
+                          const char* chipTip, const char* button, bool enabled,
+                          const char* disabledReason) {
+    const float gap   = M::reCtlGap();
+    const float chipW = statusChipW(chip);
+    const float btnW  = ImGui::CalcTextSize(button).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    bool pressed = false;
+    auto drawButton = [&] {
+        pressed = kit::SecondaryButton(button, enabled, disabledReason, ImVec2(btnW, 0.0f));
+    };
+
+    // Free width on the title row, measured with the kit's own placement: CardHeaderRight(0)
+    // parks at the content edge, an oversized request clamps to the end of the title.
+    kit::CardHeaderRight(0.0f);
+    const float rowRight = ImGui::GetCursorScreenPos().x;
+    kit::CardHeaderRight(std::numeric_limits<float>::max());
+    const float rowFree      = rowRight - ImGui::GetCursorScreenPos().x;
+    const bool  chipOnHeader = rowFree >= chipW + gap + btnW;
+    const bool  btnOnHeader  = rowFree >= btnW;
+
+    if (btnOnHeader) {
+        kit::CardHeaderRight(chipOnHeader ? chipW + gap + btnW : btnW);
+        if (chipOnHeader) {
+            kit::StatusChip(chip, chipLevel, chipTip);
+            ImGui::SameLine(0.0f, gap);
+        }
+        drawButton();
+    }
+    resumeCardBody(bodyPos);
+    if (!chipOnHeader) {
+        const float rightX = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+        kit::StatusChip(chip, chipLevel, chipTip);
+        if (!btnOnHeader) {
+            flowSameLine(rightX, btnW, gap);
+            drawButton();
+        }
+        kit::GapControl();
+    }
+    return pressed;
+}
+
 }  // namespace
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
@@ -1062,18 +1119,14 @@ void drawDimReviewPanel(AppState& st) {
                        : criticalOpen > 0 ? Level::Warn
                        : total == 0       ? Level::Neutral
                                           : Level::Ok;
-        const float hrW = ImGui::CalcTextSize(gate).x + ImGui::CalcTextSize("Refresh").x
-                        + ImGui::GetStyle().FramePadding.x * 8.0f + M::reCtlGap();
-        kit::CardHeaderRight(hrW);
-        kit::StatusChip(gate, gl,
-                        "The fit-critical gate: every dimension that decides whether a printed\n"
-                        "replacement fits must carry a confirmed, non-guessed value.");
-        ImGui::SameLine(0.0f, M::reCtlGap());
-        if (kit::SecondaryButton("Refresh", sess != nullptr && st.workerStarted && !d.canned,
-                                 d.canned ? "Showing the CHUDWARE_SHOT fixture."
-                                          : (sess ? "Worker is not running." : "No session selected.")))
+        if (cardHeaderChipButton(
+                bodyPos, gate, gl,
+                "The fit-critical gate: every dimension that decides whether a printed\n"
+                "replacement fits must carry a confirmed, non-guessed value.",
+                "Refresh", sess != nullptr && st.workerStarted && !d.canned,
+                d.canned ? "Showing the CHUDWARE_SHOT fixture."
+                         : (sess ? "Worker is not running." : "No session selected.")))
             d.forceReload = true;
-        resumeCardBody(bodyPos);
     }
 
     if (d.canned) {
@@ -1163,6 +1216,9 @@ void drawDimReviewPanel(AppState& st) {
         kit::ProgressBar(total > 0 ? (float)settled / (float)total : 0.0f, cap, pl);
         kit::GapControl();
 
+        // Chips flow onto new lines when the card is narrower than the row (same as drawDimRow).
+        const float rightX = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+        const float gap    = M::reCtlGap();
         char critTxt[32];
         std::snprintf(critTxt, sizeof(critTxt), "%d of %d open", criticalOpen, critical);
         kit::ValueChip("fit-critical", critTxt,
@@ -1170,20 +1226,20 @@ void drawDimReviewPanel(AppState& st) {
                        "Fit-critical dimensions must each be confirmed with a typed caliper\n"
                        "value. Until they are, a printed replacement is a gamble.");
         if (alarms > 0) {
-            ImGui::SameLine(0.0f, M::reCtlGap());
             char alarmTxt[24];
             std::snprintf(alarmTxt, sizeof(alarmTxt), "%d", alarms);
+            flowSameLine(rightX, valueChipW("guessed & critical", alarmTxt), gap);
             kit::ValueChip("guessed & critical", alarmTxt, Level::Error,
                            "contracts/reveng.md section 0 forbids a guessed value on a\n"
                            "fit-critical dimension. Measure these before building.");
         }
         if (!d.scaleConfirmed) {
-            ImGui::SameLine(0.0f, M::reCtlGap());
+            flowSameLine(rightX, statusChipW("scale unconfirmed"), gap);
             kit::StatusChip("scale unconfirmed", Level::Warn,
                             "session.scale.confirmed is false: every millimetre below inherits\n"
                             "the uncertainty of the scale solve. Confirm it in the Scale stage.");
         }
-        ImGui::SameLine(0.0f, M::reCtlGap());
+        flowSameLine(rightX, ImGui::CalcTextSize("(?)").x, gap);
         kit::HelpMarker("Honesty tiers (contracts/reveng.md section 0):\n"
                         "  high        +/- 2 %  - datasheet or typed caliper\n"
                         "  medium      +/- 5 %  - good photo/fit evidence\n"
@@ -1303,19 +1359,15 @@ void drawDeviationPanel(AppState& st) {
                                    : verdictTier == 1 ? "within 0.5 mm" : "out of tolerance")
                                   : "not measured";
         const Level cl = dev.ok ? tierLevel(verdictTier) : Level::Neutral;
-        const float hrW = ImGui::CalcTextSize(chip).x + ImGui::CalcTextSize("Recompute").x
-                        + ImGui::GetStyle().FramePadding.x * 8.0f + M::reCtlGap();
-        kit::CardHeaderRight(hrW);
-        kit::StatusChip(chip, cl,
-                        "Worst-point deviation between the reconstructed scan and the rebuilt\n"
-                        "model. Tiers: under 0.1 mm tight, under 0.5 mm loose, above that the\n"
-                        "rebuild does not represent the part.");
-        ImGui::SameLine(0.0f, M::reCtlGap());
-        if (kit::SecondaryButton("Recompute", sess != nullptr && st.workerStarted && !d.canned,
-                                 d.canned ? "Showing the CHUDWARE_SHOT fixture."
-                                          : (sess ? "Worker is not running." : "No session selected.")))
+        if (cardHeaderChipButton(
+                bodyPos, chip, cl,
+                "Worst-point deviation between the reconstructed scan and the rebuilt\n"
+                "model. Tiers: under 0.1 mm tight, under 0.5 mm loose, above that the\n"
+                "rebuild does not represent the part.",
+                "Recompute", sess != nullptr && st.workerStarted && !d.canned,
+                d.canned ? "Showing the CHUDWARE_SHOT fixture."
+                         : (sess ? "Worker is not running." : "No session selected.")))
             d.devForce = true;
-        resumeCardBody(bodyPos);
     }
 
     if (!sess && !d.canned) {

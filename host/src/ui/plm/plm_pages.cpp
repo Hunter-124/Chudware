@@ -338,6 +338,7 @@ constexpr float kGlassAccentHovA   = 0.80f;
 constexpr float kGlassAccentHeldA  = 0.92f;
 constexpr float kGlassGhostHovA    = 0.06f;
 constexpr float kGlassGhostHeldA   = 0.10f;
+constexpr float kGlassBorderA      = 0.55f;   // matches ui::kit's chip/button hairline
 }  // namespace
 
 bool plmGlassButton(const char* id, const char* label, const char* icon, bool accent,
@@ -356,10 +357,11 @@ bool plmGlassButton(const char* id, const char* label, const char* icon, bool ac
     const bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    // glassBackground takes a LOGICAL dp radius; rowRound() is already scaled.
+    // Flat button face + hairline border, the same shadowless surface ui::kit's
+    // buttons use. (ui::glassBackground is a PANEL surface — its offset drop shadow
+    // made every PLM button look heavier than the rest of the app's controls.)
     const float rndPx = kit::rowRound();
-    const float rndDp = rndPx / ui::metrics::scale();
-    ui::glassBackground(dl, p0, p1, rndDp);
+    dl->AddRectFilled(p0, p1, Palette::toU32(palette.button), rndPx);
 
     ImVec4 fill(palette.accent[0], palette.accent[1], palette.accent[2],
                 held ? kGlassAccentHeldA : hov ? kGlassAccentHovA : kGlassAccentIdleA);
@@ -370,6 +372,9 @@ bool plmGlassButton(const char* id, const char* label, const char* icon, bool ac
             palette.text[0], palette.text[1], palette.text[2],
             held ? kGlassGhostHeldA : kGlassGhostHovA)), rndPx);
     }
+    float edge[4];
+    Palette::withAlpha(accent ? palette.accent : palette.border, edge, kGlassBorderA);
+    dl->AddRect(p0, p1, Palette::toU32(edge), rndPx, 0, ui::metrics::stroke(1.0f));
 
     // On the accent wash the ink is derived from that fill, not assumed white — the
     // light theme's accent is bright enough that white text vanishes on it.
@@ -2696,7 +2701,11 @@ void plmDrawGitPage(AppState& st) {
     const ImVec2 avail  = ImVec2(avail0.x - pageR, avail0.y - pageB);
     const float topH    = avail.y * 0.62f;                 // main band = top ~2/3
     const float bottomH = avail.y - topH - gap;            // changes + history
-    const float mainW   = avail.x * 0.72f;                 // code panel = left ~3/4; right column stays narrow
+    // Right (Repository / Pull requests) column: ~28% of the page, but never so
+    // narrow that each repository fact has to wrap mid-phrase (it only gets a DPI-
+    // scaled floor), and never more than 40% so the code browser keeps the lead.
+    const float sideW   = std::min(std::max(avail.x * 0.28f, 240.0f * S), avail.x * 0.40f);
+    const float mainW   = avail.x - sideW - gap;           // code panel = the rest
 
     // Fixed-height frosted-glass panel (unlike plmPanelBegin's AutoResizeY, so fill-
     // height scroll children inside — History, the code viewer — actually get height).
@@ -2724,33 +2733,19 @@ void plmDrawGitPage(AppState& st) {
         const float listW   = ImGui::GetContentRegionAvail().x * 0.36f;
         const ImVec2 panelTop = ImGui::GetCursorScreenPos();  // top of the file-explorer column
 
-        // Centered icon+"Code" header above the file tree (matches the icon+title
-        // treatment every other glass panel uses via plmSectionHeader).
-        float headerRowH;
-        {
-            const float hIconSz = ImGui::GetTextLineHeight();
-            const char* label = "Code";
-            const float textW = ImGui::CalcTextSize(label).x;
-            const float unitW = hIconSz + 6 * S + textW;
-            headerRowH = ImGui::GetFrameHeight();
-            ImVec2 p0 = ImGui::GetCursorScreenPos();
-            float startX = p0.x + (listW - unitW) * 0.5f;
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            const float cy = p0.y + headerRowH * 0.5f;
-            ui::drawIconGlass(dl, "body_folder", ImVec2(startX + hIconSz * 0.5f, cy),
-                              hIconSz, Palette::toU32(palette.accent), 0);
-            dl->AddText(ImVec2(startX + hIconSz + 6 * S,
-                       p0.y + (headerRowH - ImGui::GetTextLineHeight()) * 0.5f),
-                       Palette::toU32(palette.accent), label);
-            ImGui::Dummy(ImVec2(0, headerRowH));
-        }
-        ImGui::Dummy(ImVec2(0, 3 * S));
+        // Icon+"Code" header above the file tree — the same left-aligned
+        // plmSectionHeader every other Git panel (Repository, Pull requests,
+        // Changes, History) opens with, plus the same 1dp gap gpanel leaves.
+        plmSectionHeader("Code", "body_folder");
+        ImGui::Dummy(ImVec2(0, 1 * S));
 
         // File/folder tree: a real explorer with folder + file icons and glass row
-        // pills. Built fresh each frame from the flat tracked-file list.
-        const float headerH = headerRowH + 6 * S;  // icon+text row + spacing
+        // pills. Built fresh each frame from the flat tracked-file list. It takes
+        // whatever column height the header left.
+        const float headerH = ImGui::GetCursorScreenPos().y - panelTop.y;
         ui::pushGlassChildStyle(8.0f);
-        ImGui::BeginChild("##git_files", ImVec2(listW, innerH - headerH), ImGuiChildFlags_Borders);
+        ImGui::BeginChild("##git_files", ImVec2(listW, std::max(1.0f, innerH - headerH)),
+                          ImGuiChildFlags_Borders);
         ui::popGlassChildStyle();
         if (H.gitTree.empty()) {
             dimText(H.gitDetailsLoading ? "Loading\xe2\x80\xa6" : "No tracked files yet.");
@@ -2883,23 +2878,39 @@ void plmDrawGitPage(AppState& st) {
     gpanelEnd();
 
     // ---- right column: Repository / Pull requests ----------------------------
-    // Both panels are positioned directly in the page and anchored to the band's
-    // top-left (not nested inside a clipping child). That way the Pull-requests
-    // panel's bottom border lands exactly on the Code box's bottom border
-    // (bandTop.y + topH) instead of being clipped by a parent child's edge — which
-    // is what made it read as bleeding into the band below.
-    const float sideW  = avail.x - mainW - gap;
-    const float rightX = bandTop.x + mainW + gap;
+    // One column host, exactly the band's height, holding both panels. When they
+    // fit, Pull requests stretches so its bottom border lands on the Code box's
+    // bottom border; when the Repository facts are tall (narrow column, large UI
+    // scale) Pull requests keeps a floor of a header + a few rows and the column
+    // scrolls instead of shrinking that panel until its content is cut mid-line.
+    const float rightX  = bandTop.x + mainW + gap;
     const float repoPad = 4 * S;
 
-    // Repository — drawn inline (tighter padding + shorter header than gpanel), and
-    // AutoResizeY so it fits its content exactly. The narrow column wraps the info
-    // lines to varying heights, so a fixed line-count height clipped the sign-in
-    // button off the bottom; auto-height can't clip regardless of how text wraps.
     ImGui::SetCursorScreenPos(ImVec2(rightX, bandTop.y));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::BeginChild("##git_side", ImVec2(sideW, topH), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoBackground);
+    ImGui::PopStyleVar();
+    const float colTop = ImGui::GetCursorScreenPos().y;
+    const float colX   = ImGui::GetCursorScreenPos().x;
+
+    // Repository — drawn inline (tighter padding + shorter header than gpanel), and
+    // AutoResizeY so it fits its content exactly; auto-height can't clip regardless
+    // of how the facts wrap. Each fact is a pair shown on one line when it fits and
+    // split at its own seam otherwise, so nothing breaks mid-phrase ("7 in / the
+    // last 24h").
+    auto factLine = [&](const std::string& a, const std::string& b, const char* sep) {
+        const std::string joined = a + sep + b;
+        if (ImGui::CalcTextSize(joined.c_str()).x <= ImGui::GetContentRegionAvail().x) {
+            dimText("%s", joined.c_str());
+        } else {
+            dimText("%s", a.c_str());
+            dimText("%s", b.c_str());
+        }
+    };
     ui::pushGlassChildStyle(10.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(13 * S, repoPad));
-    ImGui::BeginChild("##git_repo", ImVec2(sideW, 0),
+    ImGui::BeginChild("##git_repo", ImVec2(0, 0),
                       ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     plmSectionHeader("Repository", "git");
@@ -2913,16 +2924,21 @@ void plmDrawGitPage(AppState& st) {
         ImGui::TextUnformatted(H.gitBranch.c_str());
         ImGui::PopStyleColor();
     }
+    const char* kDot = "  \xc2\xb7  ";
     if (!H.gitUpstream.empty())
-        dimText("%s  \xc2\xb7  %d ahead, %d behind", H.gitUpstream.c_str(),
-                H.gitAhead, H.gitBehind);
-    if (!H.ghRepoName.empty())
-        dimText("%s/%s  (%s)", H.ghRepoOwner.c_str(), H.ghRepoName.c_str(),
-                H.ghRepoVis.c_str());
-    dimText("%d commits  \xc2\xb7  %d in the last 24h", H.gitTotalCommits, H.gitCommits24h);
+        factLine(H.gitUpstream,
+                 std::to_string(H.gitAhead) + " ahead, " + std::to_string(H.gitBehind) + " behind",
+                 kDot);
+    if (!H.ghRepoName.empty()) {
+        const std::string repo = H.ghRepoOwner + "/" + H.ghRepoName;
+        if (H.ghRepoVis.empty()) dimText("%s", repo.c_str());
+        else                     factLine(repo, "(" + H.ghRepoVis + ")", "  ");
+    }
+    factLine(std::to_string(H.gitTotalCommits) + " commits",
+             std::to_string(H.gitCommits24h) + " in the last 24h", kDot);
     ImGui::Dummy(ImVec2(0, 3 * S));
     if (H.ghAuthed) {
-        dimText("Signed in as %s", H.ghUser.c_str());
+        factLine("Signed in as", H.ghUser, " ");
     } else {
         if (!H.busy && plmGlassButton("##ghsignin", "Sign in with GitHub", "team", true))
             st.rpc.call("git_gh_auth_login", pathParam(st),
@@ -2943,18 +2959,21 @@ void plmDrawGitPage(AppState& st) {
     ImGui::PopStyleVar();       // WindowPadding
     ui::popGlassChildStyle();
 
-    // Pull requests — sits directly under the auto-sized Repository box and fills
-    // the rest of the band, so its bottom edge is flush with the Code box bottom
-    // (bandTop.y + topH). (GitHub issues live on the Planning tab's Issues panel.)
+    // Pull requests — directly under the auto-sized Repository box, filling the
+    // rest of the band (flush with the Code box bottom) but never shorter than its
+    // header plus a few list rows. (GitHub issues live on the Planning tab.)
     const float prTop = repoBottom + gap;
-    const float prH   = (bandTop.y + topH) - prTop;
-    ImGui::SetCursorScreenPos(ImVec2(rightX, prTop));
-    gpanel("##git_prs", "Pull requests", "plan_board", ImVec2(sideW, prH));
+    const float prMin = ImGui::GetFrameHeightWithSpacing() * 2.0f +
+                        ImGui::GetTextLineHeightWithSpacing() * 3.0f;
+    const float prH   = std::max((colTop + topH) - prTop, prMin);
+    ImGui::SetCursorScreenPos(ImVec2(colX, prTop));
+    gpanel("##git_prs", "Pull requests", "plan_board", ImVec2(0, prH));
     ImGui::BeginChild("##git_prlist", ImVec2(0, 0), ImGuiChildFlags_None);
     if (H.gitPrs.empty()) dimText(H.ghAuthed ? "No open pull requests." : "Sign in to see pull requests.");
     for (const auto& pr : H.gitPrs) dimText("#%d  %s", pr.number, pr.title.c_str());
     ImGui::EndChild();
     gpanelEnd();
+    ImGui::EndChild();  // ##git_side
 
     // Return the cursor to the band's bottom-left so the bottom band flows below.
     ImGui::SetCursorScreenPos(ImVec2(bandTop.x, bandTop.y + topH));

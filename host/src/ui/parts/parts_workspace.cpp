@@ -28,6 +28,8 @@
 #include "ui/asm_panels.h"
 #include "ui/icons.h"      // drawIconGlass — the in-field search-clear glyph
 #include "ui_theme.h"
+#include "ui/metrics.h"      // ui::metrics::U — the search input's last-resort floor
+#include "ui/widgets/kit.h"  // ui::kit::elide — the sort preview and the search hint
 
 #include "parts_internal.h"
 #include "parts_widgets.h"
@@ -1218,25 +1220,38 @@ void drawPartsLibraryWorkspace(AppState& st) {
         // per-category hues belong to the panes, not to the toolbar.
         const float barTint[3] = {palette.accent[0], palette.accent[1], palette.accent[2]};
 
-        // Sort combo width = widest entry + frame padding + arrow button.
         static const char* kSortItems[] = {
             "Relevance", "Price: low to high", "Price: high to low", "Name"};
-        float sortW = 0.0f;
-        for (const char* it : kSortItems)
-            sortW = std::max(sortW, ImGui::CalcTextSize(it).x);
-        sortW += ImGui::GetStyle().FramePadding.x * 2.0f + ImGui::GetFrameHeight();
-
-        // The results column has a floor but the fixed items on this row can still eat the
-        // whole line — never hand the input a negative width. The reserve is MEASURED from
-        // the widgets that actually follow instead of a literal, so growing the view switch
-        // from one button to two segments cannot silently push them off the row.
+        const float fpX     = ImGui::GetStyle().FramePadding.x;
         const float frameH  = ImGui::GetFrameHeight();
         const float gapW    = ImGui::GetStyle().ItemSpacing.x;
-        const float searchW = ImGui::CalcTextSize("Search").x +
-                              ImGui::GetStyle().FramePadding.x * 2.0f;
+        const float searchW = ImGui::CalcTextSize("Search").x + fpX * 2.0f;
         const float segW    = frameH * 1.30f;    // one icon-only view-switch segment
-        const float inputW  = std::max(80.0f * sc,
-            ImGui::GetContentRegionAvail().x - (gapW * 3.0f + searchW + sortW + segW * 2.0f));
+        // Full sort combo = widest entry + frame padding + arrow button.
+        float sortFullW = 0.0f;
+        for (const char* it : kSortItems)
+            sortFullW = std::max(sortFullW, ImGui::CalcTextSize(it).x);
+        sortFullW += fpX * 2.0f + frameH;
+
+        // Row budget, MEASURED from the widgets that actually share the line. The input is
+        // the row's reason to exist, so it is served first: it keeps a readable minimum and
+        // the sort combo pays for it — full width, then an ellipsized preview, then just its
+        // arrow (the active sort moves into its tooltip). The old fixed-width combo let the input
+        // collapse to "search f" at 1.5x and pushed the view switch off the row entirely.
+        // Search and the view switch stay whole: each is one click the row cannot lose.
+        const float inputMin = 170.0f * sc;
+        const float room = ImGui::GetContentRegionAvail().x -
+                           (gapW * 3.0f + searchW + segW * 2.0f);
+        // Narrowest preview still worth a frame: a couple of glyphs + the ellipsis.
+        const float sortPreviewMinW =
+            fpX * 2.0f + frameH + ImGui::CalcTextSize("Rel\xe2\x80\xa6").x;
+        float sortW = sortFullW;
+        if (room - sortFullW < inputMin) {
+            sortW = room - inputMin;
+            if (sortW < sortPreviewMinW) sortW = frameH;   // arrow only
+        }
+        const bool  sortArrowOnly = sortW <= frameH;
+        const float inputW = std::max(ui::metrics::U(4), room - sortW);
 
         const ImVec2 qOrigin = ImGui::GetCursorScreenPos();
         const ImVec2 xCenter(qOrigin.x + inputW - 15.0f * sc, qOrigin.y + frameH * 0.5f);
@@ -1262,10 +1277,24 @@ void drawPartsLibraryWorkspace(AppState& st) {
         parts::glassFieldBegin();
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(26.0f * sc, 5 * sc));
         ImGui::SetNextItemWidth(inputW);
-        bool hit = ImGui::InputTextWithHint("##parts_q",
-                                    "search fasteners, bearings, sections, electronics, vendors…",
-                                    S().searchBuf, sizeof(S().searchBuf),
-                                    ImGuiInputTextFlags_EnterReturnsTrue);
+        // ImGui hard-clips a hint at the frame edge ("…electronics, ve"); hand it one that is
+        // already ellipsized to the text room between the magnifier inset and the frame's
+        // right padding. Re-elided only when that room (or the font) changes.
+        static constexpr const char* kSearchHint =
+            "search fasteners, bearings, sections, electronics, vendors\xe2\x80\xa6";
+        static std::string hintShown;
+        static float       hintRoom = -1.0f, hintFont = -1.0f;
+        const float room4Hint = inputW - 26.0f * sc - fpX;
+        if (room4Hint != hintRoom || ImGui::GetFontSize() != hintFont) {
+            hintRoom = room4Hint;
+            hintFont = ImGui::GetFontSize();
+            hintShown = ImGui::CalcTextSize(kSearchHint).x <= room4Hint
+                            ? std::string(kSearchHint)
+                            : ui::kit::elide(kSearchHint, std::max(1.0f, room4Hint));
+        }
+        bool hit = ImGui::InputTextWithHint("##parts_q", hintShown.c_str(),
+                                            S().searchBuf, sizeof(S().searchBuf),
+                                            ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::PopStyleVar();
         {
             ImDrawList*  dl  = ImGui::GetWindowDrawList();
@@ -1312,11 +1341,37 @@ void drawPartsLibraryWorkspace(AppState& st) {
                         Palette::toU32(palette.text), "Search");
         }
         ImGui::SameLine();
+        // BeginCombo, not Combo: the preview is ELLIPSIZED to whatever width the budget
+        // above granted (Combo hard-clips it), and at the arrow-only floor the combo drops
+        // its preview entirely and names the active sort in its tooltip instead.
+        const char* sortLabel = kSortItems[std::clamp(S().sortMode, 0,
+                                                      (int)IM_ARRAYSIZE(kSortItems) - 1)];
+        std::string sortPreview;
+        if (!sortArrowOnly) {
+            const float previewRoom = sortW - fpX * 2.0f - frameH;
+            if (ImGui::CalcTextSize(sortLabel).x > previewRoom)
+                sortPreview = ui::kit::elide(sortLabel, std::max(1.0f, previewRoom));
+        }
         ImGui::SetNextItemWidth(sortW);
         parts::glassFieldBegin();
-        const bool sortChanged =
-            ImGui::Combo("##sort", &S().sortMode, kSortItems, IM_ARRAYSIZE(kSortItems));
+        const bool sortOpen = ImGui::BeginCombo(
+            "##sort", sortPreview.empty() ? sortLabel : sortPreview.c_str(),
+            sortArrowOnly ? ImGuiComboFlags_NoPreview : ImGuiComboFlags_None);
         parts::glassFieldEnd(barTint);
+        if ((sortArrowOnly || !sortPreview.empty()) && !sortOpen && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Sort: %s", sortLabel);
+        bool sortChanged = false;
+        if (sortOpen) {
+            for (int i = 0; i < (int)IM_ARRAYSIZE(kSortItems); ++i) {
+                const bool sel = S().sortMode == i;
+                if (ImGui::Selectable(kSortItems[i], sel) && !sel) {
+                    S().sortMode = i;
+                    sortChanged  = true;
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
         if (sortChanged) {
             st.settings.partsSortMode = S().sortMode;
             saveSettings(st.settings);

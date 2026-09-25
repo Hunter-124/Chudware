@@ -14,6 +14,7 @@
 #include "imgui_internal.h"     // ImRect (ui::adaptivePanel / ui::glassPanel rect argument)
 
 #include "icons.h"
+#include "layout.h"             // setNextCommandDialogPlacement (floating dialog anchor)
 #include "metrics.h"
 
 #include "../core/app_state.h"
@@ -95,10 +96,9 @@ void drawEquationsDialog(AppState& st) {
     static std::vector<char> s_addExpr{std::vector<char>(256, 0)};
     static std::string s_addError;  // inline validation error under the Add row
 
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 80 * ui::uiScale,
-                                   vp->WorkPos.y + 110 * ui::uiScale), ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(ImVec2(420 * ui::uiScale, 320 * ui::uiScale), ImGuiCond_Appearing);
+    ui::setNextCommandDialogPlacement("Equations",
+        ImVec2(ui::metrics::px(460), ui::metrics::px(360)),
+        ImVec2(ui::metrics::px(320), ui::metrics::px(220)));
 
     bool open = st.showEquations;
     // Liquid-glass v2: transparent native WindowBg so the adaptive glassPanel (painted below,
@@ -106,7 +106,8 @@ void drawEquationsDialog(AppState& st) {
     // The title bar renders DURING Begin (before our glass paint), so give it its own opaque-ish
     // glassBg backing via a scoped TitleBg push (the theme sets it transparent globally); we then
     // frost only the CONTENT region so the title/X stay crisp instead of filmed over.
-    const ImVec4 titleTint(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], pal.glassBg[3]);
+    // Opaque title backing: a translucent tint let whatever sits behind (ribbon) ghost through.
+    const ImVec4 titleTint(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], 1.0f);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
     ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);

@@ -36,6 +36,7 @@
 #include "plm/plm_hub.h"       // g_plmHub, PlmPage, plmLifecycleBadge (FM PLM badge)
 #include "plm/plm_quickbar.h"  // ui::plmActiveDocPlmState
 #include "plm/graph_tab.h"     // ui::plmGraphFocus (jump to this part's links)
+#include "widgets/kit.h"       // ui::kit::elide — row labels elide against the right-edge eye
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
@@ -327,6 +328,28 @@ static void setBodyShown(AppState& st, int slot, bool shown) {
     st.applyBodyVisibility();
 }
 
+// ---- right-edge row adornments: label budget ----
+// Every visibility row draws its eye at nodeMax.x - 14dp - 6dp on the SpanFullWidth node rect, and
+// a status row appends an inline dot (featureBadge) right after its label. ImGui never clips a tree
+// node's label, so a long name ran straight under the eye. Rows elide their visible label against
+// these reserves instead, so the text always ends a clear gap left of the adornments at any scale.
+static float fmEyeColumnW() { return (14.0f + 6.0f + 6.0f) * ui::uiScale; }  // glyph + inset + gap
+// Horizontal footprint of featureBadge's dot as laid out after the label: SameLine() spacing plus
+// the dot's Dummy width (see featureBadge). Only reserve it when the row actually shows a badge.
+static float fmBadgeW() { return ImGui::GetStyle().ItemSpacing.x + (2.0f * 3.5f + 4.0f) * ui::uiScale; }
+static bool fmBadgeShown(bool ok, const std::vector<std::string>& danglingRefs, bool rolledBack,
+                         const std::string& warnText = "") {
+    return rolledBack || !ok || !danglingRefs.empty() || !warnText.empty();
+}
+// Elide `text` for a TreeNodeEx about to be submitted at the current cursor (FramePadding already
+// pushed — it sizes the arrow slot), keeping `rightReserve` px clear at the row's right edge.
+// `leadW` covers any extra label prefix (the expandable row's icon spacer).
+static std::string fmFitRowLabel(const std::string& text, float rightReserve, float leadW = 0.0f) {
+    const float maxW = ImGui::GetContentRegionAvail().x - ImGui::GetTreeNodeToLabelSpacing() -
+                       leadW - rightReserve;
+    return ui::kit::elide(text.c_str(), maxW);
+}
+
 // ---- per-feature eye (FeatureManager hide/show on every tree row) ----
 // Renderer slot index for an AICM body id (or -1 if that body isn't currently loaded).
 static int slotForBodyId(AppState& st, uint32_t bid) {
@@ -503,47 +526,58 @@ void fmSectionDivider(const char* label) { treeSectionDivider(label); }
 // Collapsible section header — the same centered-label + hairline look as treeSectionDivider, but the
 // WHOLE row is a toggle and an end-of-line chevron shows the open/closed state (mirrors the PCB
 // Manager "Add copper layer" affordance: a control pinned at the right edge with the right hairline
-// cut short to clear it). Toggles *open; returns *open. `rightClicked`, if given, reports a
-// right-click on the row so the caller can raise a context menu (e.g. the filename's Appearance...).
-bool fmSectionDividerCollapse(const char* label, bool* open, bool* rightClicked) {
+// cut short to clear it). This is the ONE body behind every FeatureManager section header (document
+// name / Reference / Features), so they share structure, rhythm and chevron placement exactly.
+// A header that carries a leading control reserves `leadW` px at the row's left edge (the left
+// hairline starts after it) and paints it in `lead(rowMin, rowH)`, submitted on top of the row
+// toggle (which allows overlap so the control receives its own clicks). The label stays centred on
+// the full row — every header's label shares one axis — and is clamped/elided so it never runs
+// into the lead control or the chevron at narrow widths (full text in a hover tooltip).
+template <class LeadFn>
+static bool fmSectionHeaderRow(const char* label, bool* open, bool* rightClicked, float leadW,
+                               LeadFn&& lead) {
     const auto& pal = fmPalette();
     const float S = ui::uiScale;
     const float chev = 18.0f * S;                     // end-of-line chevron hit box
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    float  w = ImGui::GetContentRegionAvail().x;
-    float  lineH = ImGui::GetTextLineHeight();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float lineH = ImGui::GetTextLineHeight();
     const float rowH = std::max(lineH + 4.0f * S, chev + 2.0f * S);
-    ImVec2 tsz = ImGui::CalcTextSize(label);
-    float  textX = p.x + (w - tsz.x) * 0.5f;
-    float  textY = p.y + (rowH - lineH) * 0.5f;
-    float  cy = p.y + rowH * 0.5f;
+    const float cy = p.y + rowH * 0.5f;
     const float chevX = p.x + w - chev;
+    const float leftLineStart = p.x + 4.0f * S + leadW;
     const float rightLineEnd = chevX - 8.0f * S;      // cut the right hairline short of the chevron
+    const std::string shown = ui::kit::elide(label, rightLineEnd - leftLineStart);
+    const ImVec2 tsz = ImGui::CalcTextSize(shown.c_str());
+    const float textX = std::max(leftLineStart,
+                                 std::min(p.x + (w - tsz.x) * 0.5f, rightLineEnd - tsz.x));
+    const float textY = p.y + (rowH - lineH) * 0.5f;
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    // Full-row invisible toggle FIRST so the label/hairlines/chevron paint on top of its hit rect.
+    // Full-row invisible toggle FIRST so the label/hairlines/chevron (and any lead control) paint
+    // on top of its hit rect.
     ImGui::PushID(label);
     ImGui::SetCursorScreenPos(p);
+    ImGui::SetNextItemAllowOverlap();
     const bool clicked = ImGui::InvisibleButton("##sec_toggle", ImVec2(w, rowH));
     const bool hov = ImGui::IsItemHovered();
     if (clicked) *open = !*open;
     if (rightClicked) *rightClicked = hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right);
-    if (hov)   // faint wash to signal the whole row is interactive
+    if (hov) {   // faint wash to signal the whole row is interactive
         ui::glassRowBackground(dl, p, ImVec2(p.x + w, p.y + rowH), 3.0f, false, false, 0.16f);
-
-    ImU32 lineCol = ui::Palette::toU32(pal.border);
-    if (textX > p.x + 4.0f * S) {
-        dl->AddLine(ImVec2(p.x + 4.0f * S, cy), ImVec2(textX - 6.0f * S, cy),
-                    lineCol, std::max(1.0f, 1.0f * S));
-        const float rStart = textX + tsz.x + 6.0f * S;
-        if (rStart < rightLineEnd)
-            dl->AddLine(ImVec2(rStart, cy), ImVec2(rightLineEnd, cy), lineCol,
-                        std::max(1.0f, 1.0f * S));
+        if (shown != label) ImGui::SetTooltip("%s", label);
     }
+
+    const ImU32 lineCol = ui::Palette::toU32(pal.border);
+    const float lineTh = std::max(1.0f, 1.0f * S);
+    const float lEnd = textX - 6.0f * S;
+    if (lEnd > leftLineStart) dl->AddLine(ImVec2(leftLineStart, cy), ImVec2(lEnd, cy), lineCol, lineTh);
+    const float rStart = textX + tsz.x + 6.0f * S;
+    if (rStart < rightLineEnd) dl->AddLine(ImVec2(rStart, cy), ImVec2(rightLineEnd, cy), lineCol, lineTh);
     dl->AddText(ImVec2(textX, textY),
                 ImGui::ColorConvertFloat4ToU32(ImVec4(pal.treeSection[0], pal.treeSection[1],
                                                       pal.treeSection[2], pal.treeSection[3])),
-                label);
+                shown.c_str());
 
     // Chevron: pointing down when open, right when closed. Hand-drawn filled triangle.
     const ImVec2 cc(chevX + chev * 0.5f, cy);
@@ -555,11 +589,19 @@ bool fmSectionDividerCollapse(const char* label, bool* open, bool* rightClicked)
     else
         dl->AddTriangleFilled(ImVec2(cc.x - a * 0.6f, cc.y - a), ImVec2(cc.x - a * 0.6f, cc.y + a),
                               ImVec2(cc.x + a * 0.7f, cc.y), ink);
+
+    lead(p, rowH);
     ImGui::PopID();
 
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y));
     ImGui::Dummy(ImVec2(w, rowH));
     return *open;
+}
+
+// Toggles *open; returns *open. `rightClicked`, if given, reports a right-click on the row so the
+// caller can raise a context menu (e.g. the filename's Appearance...).
+bool fmSectionDividerCollapse(const char* label, bool* open, bool* rightClicked) {
+    return fmSectionHeaderRow(label, open, rightClicked, 0.0f, [](ImVec2, float) {});
 }
 
 // Section divider carrying a small square "+" button pinned at the right edge. The right hairline is
@@ -1449,15 +1491,19 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     // Label: dimmed-icon suppressed cue handled via the tree icon; keep a compact [S] too. For an
     // expandable row the arrow occupies the leading slot, so we pad the label with leading spaces
     // sized to one icon width and paint the type icon into that gap (arrow → icon → text).
+    // The visible name is elided against the eye column (+ the status dot when this row shows one,
+    // measured at the ambient ItemSpacing featureBadge lays out with) so it never runs under them.
     const float iconPx = std::min(16.0f * ui::uiScale, ImGui::GetFontSize());
-    std::string label = c.name;
-    if (c.suppressed) label += " [S]";
+    const float rightReserve =
+        fmEyeColumnW() + (fmBadgeShown(c.fs.ok, c.fs.dangling, c.rolledBack) ? fmBadgeW() : 0.0f);
+    std::string fullName = c.name;
+    if (c.suppressed) fullName += " [S]";
+    std::string lead;
     if (c.expandable) {
         const float sw = ImGui::CalcTextSize(" ").x;
         const int nsp = sw > 0.0f ? (int)std::ceil((iconPx + 5.0f * ui::uiScale) / sw) : 2;
-        label = std::string(std::max(1, nsp), ' ') + label;
+        lead.assign(std::max(1, nsp), ' ');
     }
-    label += "##ft_" + fid;
 
     // polish(G2): match fmRowPill padding (6dp x, 4dp y) so featureRow height == pill height.
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
@@ -1465,6 +1511,10 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2.0f * ui::uiScale));
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0, 0, 0, 0));
+    const std::string shownName =
+        fmFitRowLabel(fullName, rightReserve, lead.empty() ? 0.0f : ImGui::CalcTextSize(lead.c_str()).x);
+    const bool labelClipped = shownName != fullName;
+    const std::string label = lead + shownName + "##ft_" + fid;
     ImVec2 rowPos = ImGui::GetCursorScreenPos();
     if (c.expandable) fmSeedCollapsed();
     const bool nodeOpen = ImGui::TreeNodeEx(label.c_str(), flags);
@@ -1778,10 +1828,14 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         }
     }
 
-    featureBadge(c.fs.ok, !c.fs.error.empty(), c.fs.error, c.fs.dangling, c.rolledBack);
-
     // The status badge owns detailed status/error hover text. Keeping the row itself quiet avoids
-    // tooltip cards covering selected rows while the user is trying to scan or drag the tree.
+    // tooltip cards covering selected rows while the user is trying to scan or drag the tree —
+    // except when the name was elided: then hovering the label reveals the full name. Emitted
+    // BEFORE the badge so the badge's own tooltip still wins while the dot is hovered.
+    if (labelClipped && res.hovered && !overEye && !ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+        ImGui::SetTooltip("%s", fullName.c_str());
+
+    featureBadge(c.fs.ok, !c.fs.error.empty(), c.fs.error, c.fs.dangling, c.rolledBack);
 
     // (nested indent is owned by drawOneRow now — no Unindent here)
     return res;
@@ -2004,23 +2058,6 @@ static bool s_fmCollapseSeed = false;
 static void fmSeedCollapsed() {
     if (s_fmCollapseSeed)
         ImGui::SetNextItemOpen(false, ImGuiCond_Always);
-}
-
-// Clip `text` to `maxW` with a trailing ellipsis. Empty maxW → unchanged.
-static std::string fmEllipsize(const std::string& text, float maxW) {
-    if (maxW <= 1.0f || text.empty()) return text;
-    if (ImGui::CalcTextSize(text.c_str()).x <= maxW) return text;
-    const char* ell = "...";
-    const float ew = ImGui::CalcTextSize(ell).x;
-    if (ew >= maxW) return std::string(ell);
-    // Shrink from the end until it fits.
-    std::string out = text;
-    while (!out.empty()) {
-        out.pop_back();
-        if (ImGui::CalcTextSize((out + ell).c_str()).x <= maxW)
-            return out + ell;
-    }
-    return std::string(ell);
 }
 
 // User-created datum features that belong under FM Reference (Planes/Axes/Points), not Features.
@@ -2470,7 +2507,7 @@ static void drawNestedInfoRow(const std::string& id, const std::string& label,
     // Clip the label to the row width so long names never overrun the pill.
     const float iconReserve = ImGui::GetTreeNodeToLabelSpacing() + 8.0f * ui::uiScale;
     const float maxW = std::max(8.0f, ImGui::GetContentRegionAvail().x - iconReserve);
-    const std::string clipped = fmEllipsize(label, maxW);
+    const std::string clipped = ui::kit::elide(label.c_str(), maxW);
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(fmPalette().textDim[0], fmPalette().textDim[1],
                fmPalette().textDim[2], 0.72f));
@@ -2513,7 +2550,7 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
         const ImVec2 rowPos = ImGui::GetCursorScreenPos();
         const float iconReserve = ImGui::GetTreeNodeToLabelSpacing() + 8.0f * ui::uiScale;
         const float maxW = std::max(8.0f, ImGui::GetContentRegionAvail().x - iconReserve);
-        const std::string clipped = fmEllipsize(mat, maxW);
+        const std::string clipped = ui::kit::elide(mat.c_str(), maxW);
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(fmPalette().textDim[0], fmPalette().textDim[1],
                    fmPalette().textDim[2], 0.72f));
@@ -2773,10 +2810,15 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                  hidden || unavailable ? 0.5f : 1.0f);
         ImGui::SameLine(0, 4 * ui::uiScale);
         ImVec2 compRowPos = ImGui::GetCursorScreenPos();
+        // Elide against the eye column (+ the status dot featureBadge appends below, if any) so a
+        // long component name never runs under the visibility toggle.
+        const std::string shownLabel = fmFitRowLabel(label,
+            fmEyeColumnW() + (fmBadgeShown(fs.ok, fs.dangling, false, fs.warning) ? fmBadgeW() : 0.0f));
         fmSeedCollapsed();
-        const bool compOpen = ImGui::TreeNodeEx((label + "##comp_" + cid).c_str(), lf);
+        const bool compOpen = ImGui::TreeNodeEx((shownLabel + "##comp_" + cid).c_str(), lf);
         if (hidden || unavailable) ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) {
+            if (shownLabel != label) ImGui::SetTooltip("%s", label.c_str());
             if (unavailable) {
                 const std::string why = absPath.empty()
                     ? "Component source path is unresolved"
@@ -3428,86 +3470,36 @@ static void doOpenDoc(AppState& st) {
                 }, 120000);
 }
 
-// Features section header — centered "Features" label + hairlines, the collapse chevron pinned at
-// the far right, and TWO small right-aligned icon buttons (Add Folder, then Name & group) sitting
-// just left of the chevron. They carry 2x a single button's right-indent (two buttons) mirroring the
-// chevron's own inset, per Hunter's spec. Returns the (possibly toggled) open state; sets
-// *addFolder on the frame its button is clicked. addEn grays the button out.
+// Features section header — the SAME centred-label + twin-hairline + far-right chevron row as the
+// document / Reference headers (fmSectionHeaderRow), plus the Add Folder glass button in the lead
+// slot at the far left (Hunter red-pen placement); the left hairline starts just right of it.
+// Returns the (possibly toggled) open state; sets *addFolder on the frame its button is clicked.
+// addEn grays the button out (it still swallows its own clicks so a miss never collapses the list).
 static bool fmFeaturesHeader(bool* open, bool addEn, bool* addFolder) {
-    const auto& pal = fmPalette();
     const float S = ui::uiScale;
-    const float chev = 18.0f * S;
     const float btn = 18.0f * S;
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    const float w = ImGui::GetContentRegionAvail().x;
-    const float lineH = ImGui::GetTextLineHeight();
-    const float rowH = std::max(lineH + 4.0f * S, chev + 2.0f * S);
-    const ImVec2 tsz = ImGui::CalcTextSize("Features");
-    const float cy = p.y + rowH * 0.5f;
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-
-    ImGui::PushID("fm_features_hdr");
-    // Whole-row collapse toggle FIRST; the two buttons + chevron are submitted on top and consume
-    // their own clicks (SetNextItemAllowOverlap lets the later items receive them).
-    ImGui::SetCursorScreenPos(p);
-    ImGui::SetNextItemAllowOverlap();
-    const bool rowClicked = ImGui::InvisibleButton("##feat_toggle", ImVec2(w, rowH));
-    const bool rowHov = ImGui::IsItemHovered();
-    if (rowClicked) *open = !*open;
-    if (rowHov) ui::glassRowBackground(dl, p, ImVec2(p.x + w, p.y + rowH), 3.0f, false, false, 0.16f);
-
-    // Layout: the two folder buttons sit at the far LEFT, then the "Features" label just to their
-    // right, a hairline filling the gap, and the collapse chevron pinned far right (Hunter red-pen).
-    const float chevX = p.x + w - chev;
-    const float addX = p.x + 4.0f * S;
-    const float textX = addX + btn + 8.0f * S;   // label starts right of the Add Folder button
-    const float textY = p.y + (rowH - lineH) * 0.5f;
-    const ImU32 lineCol = ui::Palette::toU32(pal.border);
-    dl->AddText(ImVec2(textX, textY),
-                ImGui::ColorConvertFloat4ToU32(ImVec4(pal.treeSection[0], pal.treeSection[1],
-                                                      pal.treeSection[2], pal.treeSection[3])),
-                "Features");
-    // Hairline from just right of the label to just left of the chevron.
-    const float rStart = textX + tsz.x + 6.0f * S;
-    const float rEnd = chevX - 8.0f * S;
-    if (rStart < rEnd) dl->AddLine(ImVec2(rStart, cy), ImVec2(rEnd, cy), lineCol, std::max(1.0f, 1.0f * S));
-
-    // Small glass-pill icon button helper (drawn atop the row toggle).
-    auto iconBtn = [&](float x, const char* iconName, bool enabled, const char* tip) -> bool {
-        const ImVec2 bMin(x, p.y + (rowH - btn) * 0.5f), bMax(bMin.x + btn, bMin.y + btn);
+    bool addClicked = false;
+    fmSectionHeaderRow("Features", open, nullptr, btn + 6.0f * S, [&](ImVec2 p, float rowH) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 bMin(p.x + 4.0f * S, p.y + (rowH - btn) * 0.5f);
+        const ImVec2 bMax(bMin.x + btn, bMin.y + btn);
         ImGui::SetCursorScreenPos(bMin);
-        ImGui::SetNextItemAllowOverlap();
-        const bool clicked = enabled && ImGui::InvisibleButton(iconName, ImVec2(btn, btn));
-        const bool hov = enabled && ImGui::IsItemHovered();
-        if (hov) ui::glassRowBackground(dl, bMin, bMax, 3.0f, false, false, 0.40f);
+        const bool clicked = ImGui::InvisibleButton("##add_folder", ImVec2(btn, btn));
+        const bool hov = addEn && ImGui::IsItemHovered();
+        addClicked = addEn && clicked;
+        // Resting glass pill (same language as fmSectionDividerAddButton's "+") so it reads as a
+        // control; the glyph is sized like the toolbar's (~0.7 of the chip), not a speck.
+        ui::glassRowBackground(dl, bMin, bMax, 3.0f, false, false, hov ? 0.40f : 0.22f);
         const ImVec2 bc((bMin.x + bMax.x) * 0.5f, (bMin.y + bMax.y) * 0.5f);
         const float* dis = ui::palette.textDisabled;
-        const ImU32 col = enabled ? ImGui::ColorConvertFloat4ToU32(fmSurf().textPrimary)
-                                  : ImGui::ColorConvertFloat4ToU32(
-                                        ImVec4(dis[0], dis[1], dis[2], 0.5f));
-        ui::drawIconGlass(dl, iconName, bc, btn * 0.42f, col, fmHalo(fmSurf()));
-        if (hov && tip) ImGui::SetTooltip("%s", tip);
-        return clicked;
-    };
-    if (addFolder)
-        *addFolder = iconBtn(addX, "folder_new", addEn,
-                             "Add Folder\n(groups the selected features, or drops an empty folder to "
-                             "drag features into)");
-
-    // Collapse chevron (down = open, right = closed).
-    const ImVec2 cc(chevX + chev * 0.5f, cy);
-    const float a = chev * 0.24f;
-    const ImU32 ink = ImGui::ColorConvertFloat4ToU32(fmSurf().textPrimary);
-    if (*open)
-        dl->AddTriangleFilled(ImVec2(cc.x - a, cc.y - a * 0.6f), ImVec2(cc.x + a, cc.y - a * 0.6f),
-                              ImVec2(cc.x, cc.y + a * 0.7f), ink);
-    else
-        dl->AddTriangleFilled(ImVec2(cc.x - a * 0.6f, cc.y - a), ImVec2(cc.x - a * 0.6f, cc.y + a),
-                              ImVec2(cc.x + a * 0.7f, cc.y), ink);
-    ImGui::PopID();
-
-    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y));
-    ImGui::Dummy(ImVec2(w, rowH));
+        const ImU32 col = addEn ? ImGui::ColorConvertFloat4ToU32(fmSurf().textPrimary)
+                                : ImGui::ColorConvertFloat4ToU32(ImVec4(dis[0], dis[1], dis[2], 0.5f));
+        ui::drawIconGlass(dl, "folder_new", bc, btn * 0.72f, col, fmHalo(fmSurf()));
+        if (hov)
+            ImGui::SetTooltip("Add Folder\n(groups the selected features, or drops an empty folder "
+                              "to drag features into)");
+    });
+    if (addFolder) *addFolder = addClicked;
     return *open;
 }
 
@@ -4265,7 +4257,7 @@ void drawFeatureTreeBody(AppState& st,
                         ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                 fmSeedCollapsed();
                 const bool originFldOpen = ImGui::TreeNodeEx(
-                    "Points##ref_points_folder",
+                    (fmFitRowLabel("Points", fmEyeColumnW()) + "##ref_points_folder").c_str(),
                     ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
                 if (!anyPointShown) ImGui::PopStyleColor();
                 {
@@ -4317,7 +4309,8 @@ void drawFeatureTreeBody(AppState& st,
                         ImGui::PushStyleColor(ImGuiCol_Text,
                             ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                     ImVec2 originRowPos = ImGui::GetCursorScreenPos();
-                    ImGui::TreeNodeEx("Origin##origin_pt", of);
+                    ImGui::TreeNodeEx(
+                        (fmFitRowLabel("Origin", fmEyeColumnW()) + "##origin_pt").c_str(), of);
                     treeIconInArrowSlot(originRowPos, "origin", "[O]",
                                         originShown ? 1.0f : 0.45f);
                     if (!originShown) ImGui::PopStyleColor();
@@ -4369,7 +4362,10 @@ void drawFeatureTreeBody(AppState& st,
                             ImGui::PushStyleColor(ImGuiCol_Text,
                                 ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                         ImVec2 uRowPos = ImGui::GetCursorScreenPos();
-                        ImGui::TreeNodeEx((up.name + "##refpt_" + up.id).c_str(), uf);
+                        const std::string upShown = fmFitRowLabel(up.name, fmEyeColumnW());
+                        ImGui::TreeNodeEx((upShown + "##refpt_" + up.id).c_str(), uf);
+                        if (upShown != up.name && ImGui::IsItemHovered())
+                            ImGui::SetTooltip("%s", up.name.c_str());
                         const char* icon = (up.type == "csys" || up.type == "coordinate_system" ||
                                             up.type == "ref_csys") ? "ref_csys" : "ref_point";
                         const char* fb = (up.type == "csys" || up.type == "coordinate_system" ||
@@ -4443,7 +4439,7 @@ void drawFeatureTreeBody(AppState& st,
                         ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                 fmSeedCollapsed();
                 const bool planesOpen = ImGui::TreeNodeEx(
-                    "Planes##ref_planes_folder",
+                    (fmFitRowLabel("Planes", fmEyeColumnW()) + "##ref_planes_folder").c_str(),
                     ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
                 if (!anyPlaneShown) ImGui::PopStyleColor();
                 // Folder cascade eye: any/all shown → hide all; all hidden → show all.
@@ -4496,7 +4492,8 @@ void drawFeatureTreeBody(AppState& st,
                             ImGui::PushStyleColor(ImGuiCol_Text,
                                 ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                         ImVec2 planeRowPos = ImGui::GetCursorScreenPos();
-                        ImGui::TreeNodeEx((std::string(kPlanes[pi]) + "##plane" + std::to_string(pi)).c_str(), pf);
+                        ImGui::TreeNodeEx((fmFitRowLabel(kPlanes[pi], fmEyeColumnW()) + "##plane" +
+                                           std::to_string(pi)).c_str(), pf);
                         treeIconInArrowSlot(planeRowPos, "ref_plane", "[P]",
                                             hidden ? 0.45f : 1.0f);
                         if (hidden) ImGui::PopStyleColor();
@@ -4564,7 +4561,10 @@ void drawFeatureTreeBody(AppState& st,
                             ImGui::PushStyleColor(ImGuiCol_Text,
                                 ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                         ImVec2 uRowPos = ImGui::GetCursorScreenPos();
-                        ImGui::TreeNodeEx((up.name + "##refpl_" + up.id).c_str(), uf);
+                        const std::string upShown = fmFitRowLabel(up.name, fmEyeColumnW());
+                        ImGui::TreeNodeEx((upShown + "##refpl_" + up.id).c_str(), uf);
+                        if (upShown != up.name && ImGui::IsItemHovered())
+                            ImGui::SetTooltip("%s", up.name.c_str());
                         treeIconInArrowSlot(uRowPos, "ref_plane", "[P]", pHidden ? 0.45f : 1.0f);
                         if (pHidden) ImGui::PopStyleColor();
                         fmRowPillEnd(urect, pSel);
@@ -4723,7 +4723,7 @@ void drawFeatureTreeBody(AppState& st,
                         ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                 fmSeedCollapsed();
                 const bool axesOpen = ImGui::TreeNodeEx(
-                    "Axes##ref_axes_folder",
+                    (fmFitRowLabel("Axes", fmEyeColumnW()) + "##ref_axes_folder").c_str(),
                     ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
                 if (!anyAxisShown) ImGui::PopStyleColor();
                 {
@@ -4775,7 +4775,9 @@ void drawFeatureTreeBody(AppState& st,
                             ImGui::PushStyleColor(ImGuiCol_Text,
                                 ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                         ImVec2 axisRowPos = ImGui::GetCursorScreenPos();
-                        ImGui::TreeNodeEx((ar.name + "##refaxis_" + ar.id).c_str(), af);
+                        // Full name already shows in this row's hover tooltip (below).
+                        ImGui::TreeNodeEx(
+                            (fmFitRowLabel(ar.name, fmEyeColumnW()) + "##refaxis_" + ar.id).c_str(), af);
                         treeIconInArrowSlot(axisRowPos, "ref_axis", "[A]",
                                             axisHidden ? 0.45f : 1.0f);
                         if (axisHidden) ImGui::PopStyleColor();

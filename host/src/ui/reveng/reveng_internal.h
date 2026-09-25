@@ -43,6 +43,10 @@ enum class SourceFocus { None, Photos, Video, Webcam };
 enum class Stage { Source, Scale, Reconstruct, Model, Review, Deliver };
 constexpr int kStageCount = 6;
 
+// User intent for a collapsible side column (see RevEngState::railIntent). Auto = the shell's
+// responsive layout decides; Collapsed / Expanded = the user said so explicitly this session.
+enum class ColumnIntent { Auto, Collapsed, Expanded };
+
 // Per-stage badge state mirrored from session.stages values ("idle"|"pending"|"done"|...).
 struct StageState {
     std::string badge = "idle";  // raw contract badge string
@@ -346,10 +350,13 @@ struct RevEngState {
     // Right column view: 0 = Session details, 1 = Capabilities, 2 = Provenance log.
     int propsTab = 0;
 
-    // Collapse states for the three top-level columns (rail / properties). The stage body always
-    // stays visible; collapsing rolls a column to a header strip + chevron (T-G21 affordance).
-    bool railCollapsed  = false;
-    bool propsCollapsed = false;
+    // User intent for the two side columns (rail / properties). The stage body always stays
+    // visible; collapsing rolls a column to a header strip + chevron (T-G21 affordance).
+    // Auto follows the layout, which folds Properties then Sessions when the body is too narrow
+    // for three columns at their minimum widths. That fold is a per-frame LAYOUT decision in the
+    // shell and never written here, so an explicit Expanded survives any window/scale change.
+    ColumnIntent railIntent  = ColumnIntent::Auto;
+    ColumnIntent propsIntent = ColumnIntent::Auto;
 
     // RE-40: per-stage badge mirror of session.stages (contracts/reveng.md §2), indexed by
     // (int)Stage. Stage::Source maps to the manifest's "capture" key; the other five match their
@@ -369,6 +376,14 @@ struct RevEngState {
 };
 
 RevEngState& S();
+
+// Flow layout for chip rows. statusChipW / valueChipW return the width kit::StatusChip /
+// kit::ValueChip will occupy (HonestyTag is never wider than statusChipW of its tier), measured
+// BEFORE placement. flowSameLine() keeps the next item on the current line when `w` still fits
+// before screen-x `rightX` after `gap`; otherwise the item starts a new line at the indent.
+float statusChipW(const char* label);
+float valueChipW(const char* label, const char* value);
+void  flowSameLine(float rightX, float w, float gap);
 
 Renderer::CameraXform gaussianPreviewCamera(int width, int height);
 

@@ -2850,58 +2850,13 @@ std::string selectedAuthoredLinkId(const GraphTabState &G) {
                             : std::string();
 }
 
-// Local glass action button — supports optional atlas icon (matches
-// plmGlassButton).
+// Graph-panel action button: the published plmGlassButton (one surface for every
+// PLM page), plus the Graph inspector's "fill the row" width (-1).
 bool graphGlassButton(const char *id, const char *label, bool accent = false,
                       float widthOverride = 0.0f, const char *icon = nullptr) {
-  const float S = ui::uiScale;
-  const float iconSz = (icon && icon[0]) ? 16.0f * S : 0.0f;
-  const float iconGap = iconSz > 0.0f ? 6.0f * S : 0.0f;
-  const float padX = 12.0f * S;
-  const float textW = (label && label[0]) ? ImGui::CalcTextSize(label).x : 0.0f;
-  const float content = iconSz + iconGap + textW;
-  const float w = widthOverride > 0
-                      ? widthOverride
-                      : (widthOverride < 0 ? ImGui::GetContentRegionAvail().x
-                                           : (padX * 2 + content));
-  const float h = ImGui::GetFrameHeight();
-  ImVec2 p0 = ImGui::GetCursorScreenPos();
-  ImVec2 p1(p0.x + w, p0.y + h);
-  bool clicked = ImGui::InvisibleButton(id, ImVec2(w, h));
-  bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
-  ImDrawList *dl = ImGui::GetWindowDrawList();
-  ui::glassBackground(dl, p0, p1, 9.0f);
-  if (accent) {
-    float a = held ? 0.92f : hov ? 0.80f : 0.66f;
-    dl->AddRectFilled(
-        p0, p1,
-        ImGui::GetColorU32(
-            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], a)),
-        9.0f * S);
-  } else if (hov) {
-    dl->AddRectFilled(
-        p0, p1,
-        ImGui::GetColorU32(ImVec4(palette.text[0], palette.text[1],
-                                  palette.text[2], held ? 0.10f : 0.06f)),
-        9.0f * S);
-  }
-  // Ink over the accent fill is DERIVED from that fill, not assumed white: the
-  // accent teal sits at luminance 0.686, where white is the low-contrast choice.
-  ImU32 tcol = accent
-                   ? ImGui::ColorConvertFloat4ToU32(ui::maxContrastTextOn(
-                         ImVec4(palette.accent[0], palette.accent[1],
-                                palette.accent[2], 1.0f)))
-                   : Palette::toU32(palette.text);
-  float x = p0.x + (w - content) * 0.5f;
-  if (iconSz > 0.0f) {
-    ui::drawIconGlass(dl, icon, ImVec2(x + iconSz * 0.5f, p0.y + h * 0.5f),
-                      iconSz, tcol, 0);
-    x += iconSz + iconGap;
-  }
-  if (textW > 0)
-    dl->AddText(ImVec2(x, p0.y + (h - ImGui::GetTextLineHeight()) * 0.5f), tcol,
-                label);
-  return clicked;
+  const float w = widthOverride < 0.0f ? ImGui::GetContentRegionAvail().x
+                                       : widthOverride;
+  return plmGlassButton(id, label, icon, accent, w);
 }
 
 // Resolve a graph node path to an absolute filesystem path under the project.

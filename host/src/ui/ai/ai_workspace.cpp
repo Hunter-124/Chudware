@@ -40,6 +40,7 @@
 #include "ui/copilot/copilot.h"
 #include "ui_theme.h"
 #include "ui/metrics.h"            // cpMenu* rhythm tokens (gutter / row pad / gap / corner)
+#include "ui/layout.h"             // ui::overlayBand — sub-agent popup windows stay inside the band
 #include "ui/widgets/kit.h"        // ui::kit — the app-wide section header / empty state
 #include "ui/ai/active_work.h"     // activeWorkPump (per-frame thumb queue)
 #include "ui/ai/plan_board.h"
@@ -766,12 +767,61 @@ static bool drawSubagentChatWindow(AppState& st, SubChatState& cs, int cascadeId
 
     std::string shortId = cs.cur.id.size() > 10 ? cs.cur.id.substr(0, 10) : cs.cur.id;
     std::string title = roleKey + "  ·  " + shortId + "###subchat_" + cs.cur.id;
-    const float step  = 28.0f * S;
-    ImGui::SetNextWindowPos(
-        ImVec2(s_popupAnchor.x + step * (float)(cascadeIdx % 6),
-               s_popupAnchor.y + step * (float)(cascadeIdx % 6)),
-        ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(ImVec2(470.0f * S, 540.0f * S), ImGuiCond_FirstUseEver);
+    // Placement: cascade from s_popupAnchor, but every window's rect (cascade offset included)
+    // must stay inside the overlay band (viewport work rect ∩ ribbon..status-bar band), like
+    // ui::setNextCommandDialogPlacement — that helper has one anchor per window name and cannot
+    // cascade, so the same band math is applied here with a wrapping cascade index.
+    {
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImVec2 lo = vp->WorkPos;
+        ImVec2 hi(lo.x + vp->WorkSize.x, lo.y + vp->WorkSize.y);
+        const ui::OverlayBand& band = ui::overlayBand();
+        if (band.valid) {
+            lo.x = std::max(lo.x, band.minX); lo.y = std::max(lo.y, band.minY);
+            hi.x = std::min(hi.x, band.maxX); hi.y = std::min(hi.y, band.maxY);
+        }
+        if (hi.x > lo.x && hi.y > lo.y) {
+            const float mX = std::min(ui::metrics::px(12.0f), (hi.x - lo.x) * 0.05f);
+            const float mY = std::min(ui::metrics::px(12.0f), (hi.y - lo.y) * 0.05f);
+            lo.x += mX; lo.y += mY; hi.x -= mX; hi.y -= mY;
+            const ImVec2 maxSz(hi.x - lo.x, hi.y - lo.y);
+            const ImVec2 minSz(std::min(ui::metrics::px(300.0f), maxSz.x),
+                               std::min(ui::metrics::px(240.0f), maxSz.y));
+            // The default size leaves room for 3 cascade steps so a band too short for the
+            // full 540 dp still shows a readable staircase instead of stacking every window.
+            const float step = ui::metrics::px(28.0f);
+            const float reserve = step * 3.0f;
+            const ImVec2 prefSz(
+                std::clamp(ui::metrics::px(470.0f), minSz.x, std::max(minSz.x, maxSz.x - reserve)),
+                std::clamp(ui::metrics::px(540.0f), minSz.y, std::max(minSz.y, maxSz.y - reserve)));
+            ImGui::SetNextWindowSizeConstraints(minSz, maxSz);
+            ImGui::SetNextWindowSize(prefSz, ImGuiCond_FirstUseEver);
+
+            const ImGuiWindow* win = ImGui::FindWindowByName(title.c_str());
+            ImVec2 sz = prefSz;
+            if (win) sz = ImVec2(std::clamp(win->SizeFull.x, minSz.x, maxSz.x),
+                                 std::clamp(win->SizeFull.y, minSz.y, maxSz.y));
+            if (!win || !win->WasActive) {
+                // (Re)appearing: cascade slot. The cascade wraps before any slot would push the
+                // window past the band's right/bottom edge (max 6 slots keeps it readable).
+                const float travel = std::min(maxSz.x - sz.x, maxSz.y - sz.y);
+                const int slots = std::clamp(1 + (int)std::floor(std::max(0.0f, travel) / step), 1, 6);
+                const float off = step * (float)(cascadeIdx % slots);
+                const float span = step * (float)(slots - 1);
+                const ImVec2 base(std::clamp(s_popupAnchor.x, lo.x, std::max(lo.x, hi.x - sz.x - span)),
+                                  std::clamp(s_popupAnchor.y, lo.y, std::max(lo.y, hi.y - sz.y - span)));
+                ImGui::SetNextWindowPos(
+                    ImVec2(std::clamp(base.x + off, lo.x, hi.x - sz.x),
+                           std::clamp(base.y + off, lo.y, hi.y - sz.y)),
+                    ImGuiCond_Appearing);
+            } else {
+                // Already open: recover bounds after a viewport/DPI/band change.
+                const ImVec2 p(std::clamp(win->Pos.x, lo.x, hi.x - sz.x),
+                               std::clamp(win->Pos.y, lo.y, hi.y - sz.y));
+                if (p.x != win->Pos.x || p.y != win->Pos.y) ImGui::SetNextWindowPos(p);
+            }
+        }
+    }
 
     bool open = true;
     if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {

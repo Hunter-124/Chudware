@@ -7,10 +7,12 @@
 //     credential editors, download queue and health-check results table.
 //   * startHealthCheck/pollHealthStatus — vendors_health_check/_status flow (single-flight,
 //     2 s backoff while running).
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 
 #include "imgui.h"
@@ -19,6 +21,7 @@
 #include "ui_theme.h"
 #include "ui/icons.h"      // hasIconSdf/getIcon/drawIconGlass — the CTA pill draws its own glyph
 #include "ui/metrics.h"    // ui::metrics::partsPadX — the ONE horizontal inset of this workspace
+#include "ui/widgets/kit.h" // ui::kit::elide — CTA / status lines fit a narrow filters pane
 
 #include "parts_internal.h"
 #include "parts_widgets.h"
@@ -139,13 +142,48 @@ void gatedRowFeedback(bool gated, const char* why) {
         ImGui::SetTooltip("%s", why);
 }
 
+// Footer geometry, shared by the strip and vendorStripHeight() so the height the filters pane
+// reserves is always the height the strip lays out.
+//
+// kBandInset pulls the band 2 px inside the pane gutter so it reads as a CARD sitting in the
+// pane instead of a full-bleed slab wedged against the pane border; kCtrlInset keeps the
+// full-width controls 4 px inside that card edge — the CTA pill used to be exactly as wide as
+// the band, so its border WAS the band's border.
+float stripBandInset() { return 2.0f * ui::uiScale; }
+float stripCtrlInset() { return stripBandInset() + 4.0f * ui::uiScale; }
+float stripRowGap()    { return 4.0f * ui::uiScale; }   // the footer's one vertical gap
+float stripPairGap()   { return 4.0f * ui::uiScale; }   // between the two secondary buttons
+float stripRowH()      { return 20.0f * ui::uiScale; }  // one secondary button row
+
+// Secondary actions ("Vendors…" / "Test vendors") share one row only while BOTH labels fit
+// their half; a narrow pane (1.5x, copilot docked) stacks them instead of centre-clipping
+// both ends of the words. Measured against the widest label either button can carry, so the
+// layout does not flip when "Test vendors" turns into "Testing…".
+bool stripPairStacked(float contentW) {
+    const float half = (contentW - 2.0f * stripCtrlInset() - stripPairGap()) * 0.5f;
+    float labelW = 0.0f;
+    for (const char* l : {"Vendors\xe2\x80\xa6", "Test vendors", "Testing\xe2\x80\xa6"})
+        labelW = std::max(labelW, ImGui::CalcTextSize(l).x);
+    return half < labelW + 2.0f * ui::metrics::partsPadX();
+}
+
 }  // namespace
+
+float vendorStripHeight(float contentW) {
+    // 118: the strip's four stacked rows measure ~98*sc under its own tightened spacing, and
+    // the footer band is this height minus ItemSpacing.y — the rest is a real ~9*sc bottom
+    // margin. A stacked secondary pair adds one button row and its gap.
+    return 118.0f * ui::uiScale +
+           (stripPairStacked(contentW) ? stripRowH() + stripRowGap() : 0.0f);
+}
 
 // ---- compact strip (fixed footer of the filters pane) --------------------------------
 
 void drawVendorStrip(AppState& st, float paneW) {
     const float sc = ui::uiScale;
     (void)paneW;
+    // Measured BEFORE anything indents: the same width vendorStripHeight() was given.
+    const float contentW = ImGui::GetContentRegionAvail().x;
 
     // -- background polling (always runs while the parts workspace is visible) --------
     bool anyLoginBusy = false;
@@ -173,13 +211,8 @@ void drawVendorStrip(AppState& st, float paneW) {
     // section, so it gets one tinted surface in the app's shared glass language (accent hue,
     // low alpha) closed by an accent hairline as its section edge. Painted before the footer's
     // widgets so it stays behind them.
-    //
-    // kBandInset pulls the band 2 px inside the pane gutter so it reads as a CARD sitting in
-    // the pane instead of a full-bleed slab wedged against the pane border; kCtrlInset keeps
-    // the full-width controls 4 px inside that card edge — the CTA pill used to be exactly as
-    // wide as the band, so its border WAS the band's border.
-    const float kBandInset = 2.0f * sc;
-    const float kCtrlInset = kBandInset + 4.0f * sc;
+    const float kBandInset = stripBandInset();
+    const float kCtrlInset = stripCtrlInset();
     {
         ImDrawList*  dl    = ImGui::GetWindowDrawList();
         const ImVec2 p0    = ImGui::GetCursorScreenPos();
@@ -199,7 +232,7 @@ void drawVendorStrip(AppState& st, float paneW) {
     // the card entirely. 4 px is this footer's one gap — and it is also the clearance above
     // and below the CTA pill. Popped at the very end (this function has no early returns).
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                        ImVec2(ImGui::GetStyle().ItemSpacing.x, 4.0f * sc));
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, stripRowGap()));
     ImGui::Dummy(ImVec2(0.0f, 2.0f * sc));   // 2 + 4 spacing = 6 px of band-top clearance
 
     // -- status logo/dot row + "N/M signed in" + health summary ------------------------
@@ -317,8 +350,17 @@ void drawVendorStrip(AppState& st, float paneW) {
             ImGui::TextDisabled("no vendors");
         }
 
+        // Every status line fits the band (kCtrlInset short of its right edge): a narrow
+        // filters pane at 1.5x used to run these straight off the card.
+        const float lineW = ImGui::GetContentRegionAvail().x - kCtrlInset;
         if (!S().healthSupported) {
-            ImGui::TextDisabled("Health check unavailable (update the worker)");
+            const char* const msg = "Health check unavailable (update the worker)";
+            if (ImGui::CalcTextSize(msg).x <= lineW) {
+                ImGui::TextDisabled("%s", msg);
+            } else {
+                ImGui::TextDisabled("%s", ui::kit::elide(msg, std::max(1.0f, lineW)).c_str());
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", msg);
+            }
         } else if (S().healthStarting || (S().healthRunning && S().healthResults.empty())) {
             spinner("Testing vendors");
         } else if (S().healthChecked && !S().healthResults.empty()) {
@@ -329,24 +371,41 @@ void drawVendorStrip(AppState& st, float paneW) {
                 else ++failing;
             }
             // Coloured tokens. The whole summary used to be one dim sentence, so a failing
-            // vendor read exactly like the inert labels around it.
-            auto token = [&](const float* numRole, int n, const char* word, bool lead) {
-                if (lead) {
-                    ImGui::SameLine(0.0f, 5.0f * sc);
+            // vendor read exactly like the inert labels around it. Degrades in two steps when
+            // the line is narrower than the full sentence: the "Health:" lead goes first, then
+            // the words shorten — the coloured counts always survive.
+            const float numGap = 5.0f * sc, wordGap = 4.0f * sc;
+            char nums[3][16];
+            std::snprintf(nums[0], sizeof(nums[0]), "%d", ok);
+            std::snprintf(nums[1], sizeof(nums[1]), "%d", needLogin);
+            std::snprintf(nums[2], sizeof(nums[2]), "%d", failing);
+            const int nTok = failing > 0 ? 3 : 2;
+            auto lineWidth = [&](bool lead, const char* const* words) {
+                float w = lead ? ImGui::CalcTextSize("Health:").x : -numGap;
+                for (int i = 0; i < nTok; ++i) {
+                    if (i > 0) w += numGap + ImGui::CalcTextSize("·").x;
+                    w += numGap + ImGui::CalcTextSize(nums[i]).x + wordGap +
+                         ImGui::CalcTextSize(words[i]).x;
+                }
+                return w;
+            };
+            static const char* const kLong[3]  = {"ok", "need sign-in", "failing"};
+            static const char* const kShort[3] = {"ok", "sign-in", "fail"};
+            const bool lead = lineWidth(true, kLong) <= lineW;
+            const char* const* words =
+                lead || lineWidth(false, kLong) <= lineW ? kLong : kShort;
+            const float* roles[3] = {palette.statusOk, palette.statusWarn, palette.statusErr};
+            if (lead) textRole(palette.textDim, "Health:");
+            for (int i = 0; i < nTok; ++i) {
+                if (i > 0) {
+                    ImGui::SameLine(0.0f, numGap);
                     textRole(palette.textDisabled, "·");
                 }
-                char b[16];
-                std::snprintf(b, sizeof(b), "%d", n);
-                ImGui::SameLine(0.0f, 5.0f * sc);
-                textRole(numRole, b);
-                ImGui::SameLine(0.0f, 4.0f * sc);
-                textRole(palette.textDim, word);
-            };
-            textRole(palette.textDim, "Health:");
-            token(palette.statusOk,   ok,        "ok",           false);
-            token(palette.statusWarn, needLogin, "need sign-in", true);
-            if (failing > 0)
-                token(palette.statusErr, failing, "failing", true);
+                if (lead || i > 0) ImGui::SameLine(0.0f, numGap);
+                textRole(roles[i], nums[i]);
+                ImGui::SameLine(0.0f, wordGap);
+                textRole(palette.textDim, words[i]);
+            }
         } else {
             ImGui::TextDisabled(" ");
         }
@@ -378,14 +437,32 @@ void drawVendorStrip(AppState& st, float paneW) {
         dl->AddRect(ImVec2(c0.x + 0.5f, c0.y + 0.5f), ImVec2(c1.x - 0.5f, c1.y - 0.5f),
                     Palette::toU32(brd), 7.0f * sc, 0, 1.0f * sc);
 
-        // Icon + centred label, laid out exactly like borderRow(centerText=true).
+        // Icon + centred label, laid out exactly like borderRow(centerText=true). The label
+        // steps down instead of clipping when the pane is narrow: full text + icon, then the
+        // short text + icon, then the short text alone, then that ellipsized. The icon used to
+        // be placed LEFT of the pill once the text outgrew it.
         const char*  icon     = "browser_panel";
-        const char*  label    = "Connect vendor accounts";
+        const char*  kFull    = "Connect vendor accounts";
+        const char*  kShort   = "Connect vendors";
         const float  iconSz   = 18.0f * sc;
         const float  iconGap  = 6.0f * sc;
-        const bool   haveIcon = ui::hasIconSdf(icon) || ui::getIcon(icon).valid;
-        const ImVec2 ts       = ImGui::CalcTextSize(label);
-        float x = c0.x + (w - (ts.x + (haveIcon ? iconSz + iconGap : 0.0f))) * 0.5f;
+        const float  textRoom = w - 2.0f * ui::metrics::partsPadX();
+        const float  iconAdv  = iconSz + iconGap;
+        bool haveIcon = ui::hasIconSdf(icon) || ui::getIcon(icon).valid;
+        const char*  label = kFull;
+        std::string  elided;
+        if (ImGui::CalcTextSize(kFull).x + (haveIcon ? iconAdv : 0.0f) > textRoom) {
+            label = kShort;
+            const float shortW = ImGui::CalcTextSize(kShort).x;
+            if (shortW + (haveIcon ? iconAdv : 0.0f) > textRoom) haveIcon = false;
+            if (shortW > textRoom) {
+                elided = ui::kit::elide(kShort, std::max(1.0f, textRoom));
+                label  = elided.c_str();
+            }
+        }
+        if (label != kFull && hovered) ImGui::SetTooltip("%s", kFull);
+        const ImVec2 ts = ImGui::CalcTextSize(label);
+        float x = c0.x + (w - (ts.x + (haveIcon ? iconAdv : 0.0f))) * 0.5f;
         if (haveIcon) {
             const ImU32 icol =
                 ui::hasIconSdf(icon)
@@ -393,7 +470,7 @@ void drawVendorStrip(AppState& st, float paneW) {
                     : IM_COL32(255, 255, 255, 255);  // gui-lint: allow identity tint, not a color — raster atlas glyphs keep their own pixels
             ui::drawIconGlass(dl, icon, ImVec2(x + iconSz * 0.5f, c0.y + h * 0.5f), iconSz,
                               icol, 0);
-            x += iconSz + iconGap;
+            x += iconAdv;
         }
         dl->PushClipRect(c0, c1, true);
         dl->AddText(ImVec2(x, c0.y + (h - ts.y) * 0.5f), Palette::toU32(palette.text), label);
@@ -404,21 +481,25 @@ void drawVendorStrip(AppState& st, float paneW) {
     }
     gatedRowFeedback(wizardOpen, "The sign-in wizard is already open.");
 
+    // Secondary pair: side by side while both labels fit their half, else one full-width
+    // row each (vendorStripHeight reserved the extra row for exactly this case).
     ImGui::Indent(kCtrlInset);
-    const float half = (ImGui::GetContentRegionAvail().x - kCtrlInset - 4.0f * sc) * 0.5f;
+    const bool  stacked = stripPairStacked(contentW);
+    const float fullW   = ImGui::GetContentRegionAvail().x - kCtrlInset;
+    const float pairW   = stacked ? fullW : (fullW - stripPairGap()) * 0.5f;
     ImGui::BeginDisabled(wizardOpen);
     if (borderRow("##vendors_popup", "Vendors…", nullptr, S().vendorsPopupOpen,
-                  ImVec2(half, 20.0f * sc), /*centerText=*/true))
+                  ImVec2(pairW, stripRowH()), /*centerText=*/true))
         S().vendorsPopupOpen = !S().vendorsPopupOpen;
     ImGui::EndDisabled();
     gatedRowFeedback(wizardOpen, "Vendor Accounts stays hidden while the sign-in "
                                  "wizard owns the results column.");
-    ImGui::SameLine(0.0f, 4.0f * sc);
+    if (!stacked) ImGui::SameLine(0.0f, stripPairGap());
     const bool healthBusy  = S().healthStarting || S().healthRunning;
     const bool healthGated = healthBusy || wizardOpen || !S().healthSupported;
     ImGui::BeginDisabled(healthGated);
     if (borderRow("##test_vendors", healthBusy ? "Testing…" : "Test vendors", nullptr,
-                  /*selected=*/false, ImVec2(half, 20.0f * sc), /*centerText=*/true))
+                  /*selected=*/false, ImVec2(pairW, stripRowH()), /*centerText=*/true))
         startHealthCheck(st);
     ImGui::EndDisabled();
     gatedRowFeedback(healthGated,

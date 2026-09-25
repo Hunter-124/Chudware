@@ -255,6 +255,10 @@ void drawResultsGrid(AppState& st);                 // parts_results.cpp
 // "Vendor Accounts" popup (sign-in list + API creds + download queue + health table), the
 // vendor health-check flow, and the phase-C wizard seam.
 void drawVendorStrip(AppState& st, float paneW);    // fixed footer inside the filters pane
+// Height the filters pane must reserve for drawVendorStrip, given the pane's content width
+// (GetContentRegionAvail().x where the strip will start): the secondary buttons stack onto a
+// second row when the pane is too narrow for them side by side.
+float vendorStripHeight(float contentW);
 void drawVendorsPopup(AppState& st);                // floating glass window; no-op when closed
 void startHealthCheck(AppState& st);
 void pollHealthStatus(AppState& st);

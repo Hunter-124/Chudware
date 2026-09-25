@@ -4440,10 +4440,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             float barH = btn + padY * 2;
             // Anchor LEFT of the pinned Copilot column — the raw cr1-relative anchor put the
             // toolbar underneath the floating glass column, unreachable (visual-review fix).
-            float hudRight = cr1.x;
+            // Right edge = min(viewport rect, draw-list clip rect, Copilot column edge). The
+            // viewport rect spans under the pinned columns while this window's clip rect ends at
+            // the visible viewport edge, so anchoring to cr1.x/column edge alone let the last pill
+            // be clipped (visual audit). Margin matches the left-side overlay margin (10*s).
+            float hudRight = std::min(cr1.x, hdl->GetClipRectMax().x);
             {
                 const float e = ui::overlayColumnEdge(1);
-                if (e > cr0.x + barW + 40.0f * s && e < cr1.x) hudRight = e;
+                if (e > cr0.x + barW + 40.0f * s && e < hudRight) hudRight = e;
             }
             float bx0  = hudRight - barW - 10.0f * s;
             // Never let the toolbar slide under the FeatureManager column either (left clamp), so its

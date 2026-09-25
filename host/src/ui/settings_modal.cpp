@@ -354,17 +354,27 @@ static void beginBoxSync(AppState& st, const std::string& projectRoot) {
 
 // A circled-"?" info chip that reveals a one-line explanation on hover — for discoverability
 // of the less-obvious settings (vision / plan mode / max iters / units). Drawn inline
-// (SameLine first); the chip goes accent on hover so it reads as interactive.
+// (it does its own SameLine); the chip goes accent on hover so it reads as interactive.
+//
+// The chip is centred on the item it annotates, not parked at the top of the line: after a
+// Checkbox or an AlignTextToFramePadding caption the line is a full frame tall, and a
+// line-top chip sat superscript-high beside the label. The hit box spans from the line top to
+// below the chip so the ImGui line height still covers it.
+static float helpMarkerGap() { return 4.0f * ui::uiScale; }
+static float helpMarkerWidth() { return ImGui::GetTextLineHeight(); }
 static void helpMarker(const char* desc) {
     const float sc = ui::uiScale;
-    ImGui::SameLine(0.0f, 4.0f * sc);
-    const float d = ImGui::GetTextLineHeight();
+    const ImVec2 prevMin = ImGui::GetItemRectMin();
+    const ImVec2 prevMax = ImGui::GetItemRectMax();
+    ImGui::SameLine(0.0f, helpMarkerGap());
+    const float d = helpMarkerWidth();
+    const ImVec2 lineTop = ImGui::GetCursorScreenPos();
+    const float cy = ImMax((prevMin.y + prevMax.y) * 0.5f, lineTop.y + d * 0.5f);
     ImGui::PushID(desc);
-    ImGui::InvisibleButton("##helpchip", ImVec2(d, d));
+    ImGui::InvisibleButton("##helpchip", ImVec2(d, cy + d * 0.5f - lineTop.y));
     const bool hov = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImVec2 mn = ImGui::GetItemRectMin();
-    const ImVec2 c(mn.x + d * 0.5f, mn.y + d * 0.5f);
+    const ImVec2 c(lineTop.x + d * 0.5f, cy);
     const float r = d * 0.5f - 1.0f * sc;
     const float* base = hov ? ui::palette.accent : ui::palette.textDim;
     float ring[4], glyph[4];
@@ -387,22 +397,43 @@ static void helpMarker(const char* desc) {
         ImGui::EndTooltip();
     }
 }
-// Match chatCopyContext's proven row treatment: Selectable owns input/focus/close semantics,
-// while its header colors stay transparent and the current window draw list paints the wash
-// after the item. Popup rows are sized only to the pinned popup interior so a long label can
-// never make the popup grow on its next auto-fit frame.
-static bool settingsManualRowSelectable(
-    const char* label, bool selected, float height, bool popupRow,
+
+// ---- label column for inline "caption [control]" rows ----
+// A group of caption-left rows (Plan preference / Subagent preference, the budget sliders, …)
+// shares ONE label column sized to its widest caption, so every control in the group starts at
+// the same x. Before this each control began right after its own caption and the column read
+// ragged. The column is capped so a narrow pane still leaves the control a usable width; a
+// caption wider than the cap simply pushes its own control right by the minimum gap.
+static float settingsLabelLeadWidth(const char* label, bool hasHelp) {
+    float w = ImGui::CalcTextSize(label).x;
+    if (hasHelp) w += helpMarkerGap() + helpMarkerWidth();
+    return w;
+}
+static void settingsLabelLead(const char* label, const char* help, float columnW) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float x0 = ImGui::GetCursorScreenPos().x;
+    const float cap = ImGui::GetContentRegionAvail().x * 0.55f;
+    const float colW = ImMin(columnW, cap);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    if (help && help[0]) helpMarker(help);
+    const float endX = ImGui::GetItemRectMax().x;
+    ImGui::SameLine(0.0f, ImMax(style.ItemSpacing.x, x0 + colW + style.ItemSpacing.x - endX));
+}
+
+// Popup rows (combo drop-downs): Selectable owns input/focus/close semantics, while its header
+// colors stay transparent and the current window draw list paints the wash after the item.
+// Rows are sized only to the pinned popup interior so a long label can never make the popup
+// grow on its next auto-fit frame.
+static bool settingsPopupRowSelectable(
+    const char* label, bool selected, float height = 0.0f,
     ImDrawFlags cornerRound = ImDrawFlags_RoundCornersNone) {
     const ImGuiStyle& style = ImGui::GetStyle();
     const ImVec2 windowPos = ImGui::GetWindowPos();
     const float windowWidth = ImGui::GetWindowWidth();
     const float border = style.WindowBorderSize;
     const ImVec2 rowPos = ImGui::GetCursorScreenPos();
-    float rowWidth = 0.0f;
-    if (popupRow) {
-        rowWidth = ImMax(0.0f, windowPos.x + windowWidth - border - rowPos.x);
-    }
+    const float rowWidth = ImMax(0.0f, windowPos.x + windowWidth - border - rowPos.x);
 
     ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
@@ -424,15 +455,33 @@ static bool settingsManualRowSelectable(
     return clicked;
 }
 
-static bool settingsPopupRowSelectable(
-    const char* label, bool selected, float height = 0.0f,
-    ImDrawFlags cornerRound = ImDrawFlags_RoundCornersNone) {
-    return settingsManualRowSelectable(label, selected, height, true, cornerRound);
-}
-
-static bool settingsChildRowSelectable(const char* label, bool selected,
-                                       float height = 0.0f) {
-    return settingsManualRowSelectable(label, selected, height, false);
+// Settings list/nav rows (AI rail, role list, Skills/Rules catalogs) use the app-wide kit row —
+// frosted pill, animated hover wash, selection glow — at Compact density, so a selected Settings
+// row reads like every other selected row in the app instead of a flat full-bleed wash.
+// `contentH` is the body height (0 = one text line); the kit adds its own padding. The hit item
+// is the last item on return, so IsItemHovered / SetItemDefaultFocus / GetItemRect* keep
+// working. `contentMin`/`contentW` (optional) receive the padded body origin and width for
+// callers that draw extra lines under the label.
+static bool settingsChildRowSelectable(const char* label, bool selected, float contentH = 0.0f,
+                                       ImVec2* contentMin = nullptr,
+                                       float* contentW = nullptr) {
+    ui::kit::pushDensity(ui::kit::Density::Compact);
+    const float padX = ui::kit::padX();
+    const float padY = ui::kit::padY();
+    const float bodyH = contentH > 0.0f ? contentH : ImGui::GetTextLineHeight();
+    const bool clicked = ui::kit::rowBegin(label, bodyH + padY * 2.0f, selected);
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const float bodyW = ImMax(ImGui::GetItemRectMax().x - padX - origin.x,
+                              ui::metrics::stroke(1.0f));
+    const std::string shown(label, ImGui::FindRenderedTextEnd(label));
+    const std::string fit = ui::kit::elide(shown.c_str(), bodyW);
+    ImGui::GetWindowDrawList()->AddText(origin, ui::Palette::toU32(ui::palette.text),
+                                        fit.c_str());
+    ui::kit::rowEnd();
+    ui::kit::popDensity();
+    if (contentMin) *contentMin = origin;
+    if (contentW) *contentW = bodyW;
+    return clicked;
 }
 
 static float settingsWidestComboLabel(const char* const* labels, int count) {
@@ -2377,19 +2426,22 @@ static void drawWebAccountProviderManager(AppState& st) {
         bool present = false;
         for (const ui::WebProviderKey& k : stored)
             if (k.provider == id) { present = true; hint = k.hint; break; }
-        char label[160];
-        std::snprintf(label, sizeof(label), "%s  \xe2\x80\xa2 %s##webprov_%s",
-                      ui::categoryLabel(id), present ? "key stored" : "no key", id);
-        if (ImGui::Selectable(label, selected)) {
+        // Same kit row as every other selectable Settings list; the stored-key hint rides in
+        // the row's right-aligned meta slot instead of a SameLine text that wrapped past it.
+        char title[160];
+        std::snprintf(title, sizeof(title), "%s  \xe2\x80\xa2 %s",
+                      ui::categoryLabel(id), present ? "key stored" : "no key");
+        const std::string meta = (present && !hint.empty()) ? "\xe2\x80\xa6" + hint : "";
+        ui::kit::RowStyle rs;
+        rs.selected = selected;
+        rs.meta = meta.empty() ? nullptr : meta.c_str();
+        ui::kit::pushDensity(ui::kit::Density::Compact);
+        const bool picked = ui::kit::row(id, title, rs);
+        ui::kit::popDensity();
+        if (picked) {
             s_selected = id;
             std::memset(s_keyBuf, 0, sizeof(s_keyBuf));
             s_keyFor = id;
-        }
-        if (present && !hint.empty()) {
-            ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusOk));
-            ImGui::Text("\xe2\x80\xa6%s", hint.c_str());
-            ImGui::PopStyleColor();
         }
     }
 
@@ -2523,7 +2575,9 @@ static void drawOmpProviderManager(AppState& st) {
                                   + ImGui::CalcTextSize(ompStateLabel(r)).x;
             textW = ImMax(textW, ImMax(ImGui::CalcTextSize(r.label.c_str()).x, statusW));
         }
-        const float need = 6.0f * sc + fh * 1.4f + 8.0f * sc + textW + 12.0f * sc;
+        // Row padding (kit Compact density) + badge + gap + text + the list child's padding.
+        const float need = ui::metrics::cpChatCardPadX() * 2.0f + fh * 1.4f + 8.0f * sc +
+                           textW + ui::metrics::px(10.0f) * 2.0f;
         listW = ImMin(ImMax(need, 180.0f * sc), ImMin(320.0f * sc, availW * 0.45f));
     }
 
@@ -2592,41 +2646,31 @@ static void drawOmpProviderManager(AppState& st) {
             const OmpProviderRow& r = *rp;
             ImGui::PushID(r.id.c_str());
             const bool sel = (r.id == s_omp.selectedId);
-            // ImGui's Selectable hard-codes a SQUARE frame (rounding 0.0f), so hide its
-            // header colors and paint the highlight ourselves with rounded corners below.
-            ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
-            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
-            ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
-            if (ImGui::Selectable("##row", sel, 0,
-                                  ImVec2(0, ImGui::GetTextLineHeight() * 2 + 8.0f * sc))) {
-                selectOmpProvider(r.id);
-            }
-            ImGui::PopStyleColor(3);
-            ImDrawList* dl = ImGui::GetWindowDrawList();
+            // Same kit row (rounded glass pill, hover wash, selection glow) as the AI rail and
+            // every other selectable list in the app; the badge and two text lines are drawn
+            // into its padded body.
+            const float fh = ImGui::GetFontSize();
+            ui::kit::pushDensity(ui::kit::Density::Compact);
+            const float bodyH = fh * 2.0f + 2.0f * sc;
+            const bool clicked = ui::kit::rowBegin("##row", bodyH + ui::kit::padY() * 2.0f, sel);
             const ImVec2 mn = ImGui::GetItemRectMin();
             const ImVec2 mx = ImGui::GetItemRectMax();
-            const bool hov = ImGui::IsItemHovered();
-            const bool act = ImGui::IsItemActive();
-            if (sel || hov || act) {
-                // The roles applyTheme installs into ImGuiCol_Header{,Hovered,Active} — read
-                // directly so a caller's PushStyleColor cannot shift the wash out from under us.
-                const float* hr = (hov || act) ? ui::palette.accentMid : ui::palette.accentSoft;
-                const ImVec4 hc(hr[0], hr[1], hr[2], hr[3]);
-                dl->AddRectFilled(mn, mx, ImGui::ColorConvertFloat4ToU32(hc),
-                                  ui::metrics::rounding(6.0f));
-            }
-            const float fh = ImGui::GetFontSize();
-            const float rowH = fh * 2.0f + 8.0f * sc;
+            const ImVec2 body = ImGui::GetCursorScreenPos();
+            const float bodyRight = mx.x - (body.x - mn.x);
+            ui::kit::rowEnd();
+            ui::kit::popDensity();
+            if (clicked) selectOmpProvider(r.id);
+            ImDrawList* dl = ImGui::GetWindowDrawList();
             const float badgeSide = fh * 1.4f;
             const float badgeGap = 8.0f * sc;
-            const float badgeX = mn.x + 6.0f * sc;
-            const float badgeY = mn.y + (rowH - badgeSide) * 0.5f;
-            // Center the two-line text block (name + status) on the same row-center as the
-            // badge so the badge, name and status read as one vertically-centered unit.
-            const float textTop = mn.y + (rowH - (fh * 2.0f + 2.0f * sc)) * 0.5f;
+            const float badgeX = body.x;
+            const float badgeY = mn.y + ((mx.y - mn.y) - badgeSide) * 0.5f;
+            // The two-line text block (name + status) fills the padded body, whose centre is
+            // the row centre, so badge, name and status read as one vertically-centred unit.
+            const float textTop = body.y;
             ui::drawProviderLogo(dl, ImVec2(badgeX, badgeY), badgeSide, r.id);
             const float textX = badgeX + badgeSide + badgeGap;
-            const float textMaxW = ImGui::GetItemRectMax().x - textX - 4.0f * sc;
+            const float textMaxW = ImMax(bodyRight - textX, ui::metrics::stroke(1.0f));
             const std::string labelFit = ellipsizeToFit(r.label, textMaxW);
             dl->AddText(ImVec2(textX, textTop),
                         ui::Palette::toU32(sel ? pal.text : pal.textDim), labelFit.c_str());
@@ -4041,16 +4085,24 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
     // in the modal.
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * sc, 1.5f * sc));
     static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
+    // The preference combos and the budget sliders form one two-column grid: each table
+    // column gets ONE label column sized to the widest caption stacked in it, so every combo
+    // and slider down a column starts at the same x.
+    const float harnessLeftColW =
+        ImMax(ImMax(settingsLabelLeadWidth("Plan preference", true),
+                    settingsLabelLeadWidth("Subagent preference", true)),
+              ImMax(settingsLabelLeadWidth("Subagent tool-call budget", true),
+                    settingsLabelLeadWidth("Memory token budget", false)));
+    const float harnessRightColW =
+        ImMax(ImMax(settingsLabelLeadWidth("Task list preference", true),
+                    settingsLabelLeadWidth("Advisor preference", true)),
+              settingsLabelLeadWidth("Max subagent nesting", true));
 
-    auto prefCombo = [&](const char* label, const char* id, int* pref, const char* help) {
+    auto prefCombo = [&](const char* label, const char* id, int* pref, const char* help,
+                         float labelColW) {
         // Caption inline-left of the widget: one row per knob instead of caption+widget rows.
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(label);
-        if (help && help[0]) {
-            ImGui::SameLine();
-            helpMarker(help);
-        }
-        ImGui::SameLine();
+        // Every combo in a table column starts at that column's shared label edge.
+        settingsLabelLead(label, help, labelColW);
         ImGui::SetNextItemWidth(-1.0f);
         int v = (*pref < 0 || *pref > 3) ? 0 : *pref;
         if (settingsPopupRowCombo(id, &v, kPrefLabels, 4)) {
@@ -4074,23 +4126,27 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                       "Off = never plan first (default — agent tools directly). "
                       "Option = model may plan. "
                       "Encourage = plan by default. "
-                      "Require = always draft a plan before building.");
+                      "Require = always draft a plan before building.",
+                      harnessLeftColW);
             ImGui::TableNextColumn();
             prefCombo("Task list preference", "##h_tasklist_pref",
                       &settings.taskListPreference,
                       "Whether the agent publishes a live task list (the Tasks panel "
                       "in the copilot). Off = never. Option = model's choice. "
                       "Encourage = publish for any multi-step job. "
-                      "Require = always publish before starting work.");
+                      "Require = always publish before starting work.",
+                      harnessRightColW);
             ImGui::TableNextColumn();
             prefCombo("Subagent preference", "##h_sub_pref", &settings.subagentPreference,
                       "How freely the main agent may spawn subagents. "
-                      "Off disables nesting; Require pushes multi-agent splits.");
+                      "Off disables nesting; Require pushes multi-agent splits.",
+                      harnessLeftColW);
             ImGui::TableNextColumn();
             prefCombo("Advisor preference", "##h_adv_pref", &settings.advisorPreference,
                       "Off = no advisor. Option = only when the model asks. "
                       "Encourage = stronger guidance tone when proactive fires. "
-                      "Require = more frequent checks when proactive is on.");
+                      "Require = more frequent checks when proactive is on.",
+                      harnessRightColW);
             ImGui::EndTable();
         }
     }
@@ -4204,12 +4260,11 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                               ImGuiTableFlags_NoPadOuterX)) {
             ImGui::TableNextColumn();
             {
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextUnformatted("Tool call detail");
-                helpMarker("Simplified: plain sentences only. Normal: sentences with an "
-                           "expandable raw drawer. Diagnostic: raw arguments, engine "
-                           "document ids and timings, drawers open by default.");
-                ImGui::SameLine();
+                settingsLabelLead("Tool call detail",
+                                  "Simplified: plain sentences only. Normal: sentences with an "
+                                  "expandable raw drawer. Diagnostic: raw arguments, engine "
+                                  "document ids and timings, drawers open by default.",
+                                  0.0f);
                 ImGui::SetNextItemWidth(-1.0f);
                 static const char* kChatDetail[] = {"Simplified", "Normal", "Diagnostic"};
                 int detail = ui::chatToolDetail();
@@ -4278,14 +4333,12 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             static int s_toolCallBudget = -1;
             if (s_toolCallBudget < 0)
                 s_toolCallBudget = ui::loadSubagentToolCallBudget();
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Subagent tool-call budget");
-            ImGui::SameLine();
-            helpMarker("A delegated subagent gets a soft warning to converge at this many "
-                       "tool calls. 0 = automatic based on its token grant. The main chat "
-                       "has no tool-call budget. Saved to config.json "
-                       "agent.subagent_tool_call_budget.");
-            ImGui::SameLine();
+            settingsLabelLead("Subagent tool-call budget",
+                              "A delegated subagent gets a soft warning to converge at this "
+                              "many tool calls. 0 = automatic based on its token grant. The "
+                              "main chat has no tool-call budget. Saved to config.json "
+                              "agent.subagent_tool_call_budget.",
+                              harnessLeftColW);
             ImGui::SetNextItemWidth(-1.0f);
             int budget = s_toolCallBudget;
             if (ImGui::SliderInt("##h_subagent_calls", &budget, 0, 64,
@@ -4301,12 +4354,11 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         {
             static int s_maxDepth = -1;
             if (s_maxDepth < 0) s_maxDepth = ui::loadMaxSubagentDepth();
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Max subagent nesting");
-            ImGui::SameLine();
-            helpMarker("Nesting levels of subagent-spawning-subagent (not concurrency). "
-                       "Root chat = depth 0. Saved to config.json agent.max_subagent_depth.");
-            ImGui::SameLine();
+            settingsLabelLead("Max subagent nesting",
+                              "Nesting levels of subagent-spawning-subagent (not concurrency). "
+                              "Root chat = depth 0. Saved to config.json "
+                              "agent.max_subagent_depth.",
+                              harnessRightColW);
             ImGui::SetNextItemWidth(-1.0f);
             int depth = s_maxDepth;
             if (ImGui::SliderInt("##h_depth", &depth, 0, 4, "%d")) {
@@ -4319,9 +4371,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
 
         ImGui::TableNextColumn();
         if (settings.memoryEnabled) {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Memory token budget");
-            ImGui::SameLine();
+            settingsLabelLead("Memory token budget", nullptr, harnessLeftColW);
             ImGui::SetNextItemWidth(-1.0f);
             if (ImGui::SliderInt("##h_membudget", &settings.memoryTokenBudget, 100, 2000,
                                  "%d tokens"))
@@ -4591,19 +4641,21 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         saveAgentConfigValue("compaction_strategy", strategy);
     };
 
+    // Compaction and Verbosity sit in the left column of two stacked tables; one shared label
+    // column keeps both combos on the same left edge.
+    const float memLabelColW = ImMax(settingsLabelLeadWidth("Compaction", true),
+                                     settingsLabelLeadWidth("Verbosity", true));
     if (ImGui::BeginTable("##memory_learning", 2,
                           ImGuiTableFlags_SizingStretchSame |
                           ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextColumn();
         {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Compaction");
-            ImGui::SameLine();
-            helpMarker("How long transcripts are compacted. Off = truncate only. "
-                       "Snapcompact = snapshot-style archive. Shake = drop low-value "
-                       "turns. Summary = model-written recap. Writes "
-                       "agent.compaction_strategy.");
-            ImGui::SameLine();
+            settingsLabelLead("Compaction",
+                              "How long transcripts are compacted. Off = truncate only. "
+                              "Snapcompact = snapshot-style archive. Shake = drop low-value "
+                              "turns. Summary = model-written recap. Writes "
+                              "agent.compaction_strategy.",
+                              memLabelColW);
             ImGui::SetNextItemWidth(-1.0f);
             if (settingsPopupRowCombo("##comp_mode", &s_compMode, kCompModes, 4))
                 saveCompMode(s_compMode);
@@ -4740,13 +4792,11 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
                           ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextColumn();
         {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Verbosity");
-            ImGui::SameLine();
-            helpMarker("How much the Agent Workflow / Active Work / Session Plan views "
-                       "render. Quiet = titles + status. Normal = last op. "
-                       "Full = op tickers, counts, token/latency detail (default).");
-            ImGui::SameLine();
+            settingsLabelLead("Verbosity",
+                              "How much the Agent Workflow / Active Work / Session Plan views "
+                              "render. Quiet = titles + status. Normal = last op. "
+                              "Full = op tickers, counts, token/latency detail (default).",
+                              memLabelColW);
             ImGui::SetNextItemWidth(-1.0f);
             if (settingsPopupRowCombo("##ws_verbosity", &s_verbosity, kVerbosity, 3))
                 ui::setAiUiVerbosity(s_verbosity);
@@ -5356,23 +5406,23 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
             ImGui::PopStyleColor();
         } else {
             const float lineH = ImGui::GetTextLineHeight();
-            const float rowH = lineH * 3.0f + 8.0f * S;
+            const float bodyH = lineH * 3.0f + 4.0f * S;
             for (size_t i = 0; i < s_ovSkills.skills.size(); ++i) {
                 const auto& sk = s_ovSkills.skills[i];
                 ImGui::PushID((int)i);
                 const bool sel = (!s_ovSkills.creating && s_ovSkills.selected == sk.name);
-                const ImVec2 textPos = ImGui::GetCursorScreenPos();
+                ImVec2 textPos;
+                float bodyW = 0.0f;
                 const std::string rowLabel =
                     ui::foldToAtlasGlyphs(sk.name) + "##skill_catalog_row";
-                if (settingsChildRowSelectable(rowLabel.c_str(), sel, rowH)) {
+                if (settingsChildRowSelectable(rowLabel.c_str(), sel, bodyH, &textPos, &bodyW)) {
                     s_ovSkills.creating = false;
                     s_ovSkills.selected = sk.name;
                     ovLoadSkillBody(st, sk.name);
                 }
                 if (sel) ImGui::SetItemDefaultFocus();
 
-                const ImVec2 rowMax = ImGui::GetItemRectMax();
-                const float textW = ImMax(40.0f * S, rowMax.x - textPos.x - 6.0f * S);
+                const float textW = ImMax(40.0f * S, bodyW);
                 const std::string description = sk.description.empty()
                     ? "No description provided."
                     : ui::foldToAtlasGlyphs(sk.description);
@@ -5646,23 +5696,23 @@ static void drawSettingsContextTab(AppState& st, float S) {
             ImGui::PopStyleColor();
         } else {
             const float lineH = ImGui::GetTextLineHeight();
-            const float rowH = lineH * 4.0f + 10.0f * S;
+            const float bodyH = lineH * 4.0f + 6.0f * S;
             for (size_t i = 0; i < s_ovTrig.rows.size(); ++i) {
                 const auto& tr = s_ovTrig.rows[i];
                 ImGui::PushID((int)i);
                 const bool sel = (!s_ovTrig.creating && s_ovTrig.selected == tr.id);
-                const ImVec2 textPos = ImGui::GetCursorScreenPos();
+                ImVec2 textPos;
+                float bodyW = 0.0f;
                 const std::string label = ovTriggerLabel(tr);
                 const std::string rowLabel = label + "##rule_catalog_row";
-                if (settingsChildRowSelectable(rowLabel.c_str(), sel, rowH)) {
+                if (settingsChildRowSelectable(rowLabel.c_str(), sel, bodyH, &textPos, &bodyW)) {
                     s_ovTrig.creating = false;
                     s_ovTrig.selected = tr.id;
                     ovLoadTriggerBody(st, tr.id);
                 }
                 if (sel) ImGui::SetItemDefaultFocus();
 
-                const ImVec2 rowMax = ImGui::GetItemRectMax();
-                const float textW = ImMax(40.0f * S, rowMax.x - textPos.x - 6.0f * S);
+                const float textW = ImMax(40.0f * S, bodyW);
                 const std::string source = tr.source.empty() ? "builtin" : tr.source;
                 std::string meta = ui::foldToAtlasGlyphs(tr.id);
                 meta += tr.enabled ? "  \xc2\xb7  enabled" : "  \xc2\xb7  disabled";
@@ -6142,18 +6192,34 @@ void drawSettingsModal(AppState& st, bool busy) {
     }
     float sc = ui::uiScale;
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float margin = 28.0f * sc;
-    const float maxW = std::max(360.0f * sc, vp->WorkSize.x - margin * 2.0f);
-    const float maxH = std::max(420.0f * sc, vp->WorkSize.y - margin * 2.0f);
+    // The dialog lives inside the overlay band (below the ribbon, above the status bar) — the
+    // same region every floating dialog anchors in. Sizing and centring against the whole
+    // viewport work area parked the title strip over the ribbon's tab row. Before app.cpp has
+    // published a band (first frame) the viewport work area is the fallback.
+    const ui::OverlayBand& band = ui::overlayBand();
+    const ImVec2 areaMin = band.valid ? ImVec2(band.minX, band.minY) : vp->WorkPos;
+    const ImVec2 areaMax = band.valid ? ImVec2(band.maxX, band.maxY)
+                                      : ImVec2(vp->WorkPos.x + vp->WorkSize.x,
+                                               vp->WorkPos.y + vp->WorkSize.y);
+    const ImVec2 areaSize(areaMax.x - areaMin.x, areaMax.y - areaMin.y);
+    const float marginX = 28.0f * sc;
+    const float marginY = 12.0f * sc;
+    const float maxW = std::max(1.0f, areaSize.x - marginX * 2.0f);
+    const float maxH = std::max(1.0f, areaSize.y - marginY * 2.0f);
     // Scale with the display instead of a flat 920x820: small screens keep the legacy size,
     // big ones get a wider modal — the Providers tab's two-column layouts only have room to
-    // engage when the detail pane clears ~640*sc, which 920px never gives it.
-    const float winW = std::min(std::max(920.0f * sc, vp->WorkSize.x * 0.60f),
+    // engage when the detail pane clears ~640*sc, which 920px never gives it. The band is a
+    // hard cap: a floor larger than the band would push the dialog back over the chrome.
+    const float winW = std::min(std::max(920.0f * sc, areaSize.x * 0.60f),
                                 std::min(1280.0f * sc, maxW));
-    const float winH = std::min(std::max(820.0f * sc, vp->WorkSize.y * 0.86f), maxH);
+    const float winH = std::min(std::max(820.0f * sc, areaSize.y * 0.86f), maxH);
     if (s_settingsOpen) {
-        ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Appearing);
-        ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        // Size tracks the band every frame (the dialog is NoResize), so a window/DPI change
+        // re-fits it; position centres in the band on open and is clamped back inside below.
+        ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2((areaMin.x + areaMax.x) * 0.5f,
+                                       (areaMin.y + areaMax.y) * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         // Opaque title strip — the global applyTheme sets TitleBg* to rgba(0,0,0,0) so floating
         // glass windows render transparently by default.  Override here so the Settings dialog
         // reads as a crisp native chrome dialog in both light and dark themes.
@@ -6180,6 +6246,16 @@ void drawSettingsModal(AppState& st, bool busy) {
         // widgets inside keep their normal frame borders.
         ImGui::PopStyleVar(2);    // FrameBorderSize, WindowBorderSize
         ImGui::PopStyleColor(3);  // TitleBg / TitleBgActive / TitleBgCollapsed
+        {
+            // Keep the title strip out of the chrome: a drag (or a band that shrank since the
+            // dialog opened) that leaves it past a band edge snaps it back inside.
+            const ImVec2 wp = ImGui::GetWindowPos();
+            const ImVec2 ws = ImGui::GetWindowSize();
+            const ImVec2 clamped(
+                std::max(areaMin.x, std::min(wp.x, areaMax.x - ws.x)),
+                std::max(areaMin.y, std::min(wp.y, areaMax.y - ws.y)));
+            if (clamped.x != wp.x || clamped.y != wp.y) ImGui::SetWindowPos(clamped);
+        }
         if (settingsBegun) {
         // C22b: if a pending prompt role was requested, load prompts and jump to the Prompts tab.
         bool jumpToPrompts = false;
@@ -6921,8 +6997,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                     if (settingsPopupRowCombo("##ai_sub_pick", &visSel, visLabels, visN))
                         s_aiSubSel = visIdx[visSel];
                 } else {
-                    // Borderless nav rail. Its rows paint against this child's own inner
-                    // borders, so the wash fills the rail without entering the content pane.
+                    // Borderless nav rail. Rows are the kit's rounded glass rows, inset by
+                    // this child's padding so the selection pill never touches the pane edge.
                     const ImVec2 railMn = ImGui::GetCursorScreenPos();
                     const float railAvailH = ImGui::GetContentRegionAvail().y;
                     const float railW = 148.0f * sc;
@@ -6934,12 +7010,11 @@ void drawSettingsModal(AppState& st, bool busy) {
                                       ImGuiChildFlags_AlwaysUseWindowPadding,
                                       ImGuiWindowFlags_NoScrollbar |
                                           ImGuiWindowFlags_NoScrollWithMouse);
-                    const float railRowH = ImGui::GetTextLineHeight() + 6.0f * sc;
                     for (int k = 0; k < visN; ++k) {
                         const int i = visIdx[k];
                         ImGui::PushID(i);
                         const bool selRow = (i == s_aiSubSel);
-                        if (settingsChildRowSelectable(kAiSubLabels[i], selRow, railRowH))
+                        if (settingsChildRowSelectable(kAiSubLabels[i], selRow))
                             s_aiSubSel = i;
                         if (selRow) ImGui::SetItemDefaultFocus();
                         ImGui::PopID();

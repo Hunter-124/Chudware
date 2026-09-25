@@ -82,7 +82,13 @@ Eight TUs behind one tab. Read `reveng_widgets.h` before touching any of them.
   (`app.cpp` `dispatchCmd` forwards every `reveng_` id here; Source entry points set a one-shot
   `SourceFocus`), and `ui::revengWorkspaceTeardown()` — closes the camera + rail thumbnails,
   called from app.cpp on leaving the tab and at shutdown (the workspace also self-heals on
-  re-entry after a frame gap).
+  re-entry after a frame gap). **Responsive columns:** minimums are `reRailW` / `rePropW` /
+  `rePreviewMinW`; a narrower body folds Auto side columns to their strips (Properties first,
+  then Sessions) via `foldColumns()` every frame. User intent is `RevEngState::railIntent` /
+  `propsIntent` (`ColumnIntent` Auto/Collapsed/Expanded) and is never written by the fold; any
+  "show the rail" action goes through `revealColumn()`, which pins Expanded only when the layout
+  is folding it. Chip rows flow with `statusChipW`/`valueChipW` + `flowSameLine`
+  (`reveng_internal.h`); rail labels ellipsize via `ui::kit::elide`.
 - `reveng_widgets.h` / `.cpp` — **the shared visual kit, namespace `ui::reveng::kit`. Every RE
   panel must draw with it**; this is the single most important convention in this workspace.
   It provides: `Level` + `levelColor`, `CardBegin`/`CardEnd`/`CardHeaderRight`/`SectionHeader`,

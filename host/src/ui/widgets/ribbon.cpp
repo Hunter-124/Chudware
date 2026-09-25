@@ -372,7 +372,8 @@ static float ribbon_contentH() {
     return h < minH ? minH : snap(h);
 }
 
-// How many small rows fit vertically in the body content zone.
+// How many small rows fit vertically in the body content zone (the fixed row grid — 3 at every
+// uiScale, since kBodyH / kCaptionH / kSmRowH all scale together).
 static int ribbon_rowsPerCol() {
     float smZoneH = ribbon_contentH();
     float rowH    = snap(kSmRowH * ui::uiScale);
@@ -380,36 +381,29 @@ static int ribbon_rowsPerCol() {
     return n < 1 ? 1 : n;
 }
 
-// Rows this particular group should stack into, given the height budget.
-//
-// A group of exactly TWO small rows lays out as a horizontal PAIR (one row, two columns)
-// rather than a two-high stack. A two-high stack in a three-row zone leaves a single empty
-// cell, which reads as a button that failed to load rather than as a deliberate short group;
-// side by side reads as intentional and costs only the narrower label's width.
-//
-// Three stays vertical on purpose: three rows fill the zone exactly, and a horizontal triple
-// is wide enough to push its neighbours into the overflow chevron on a narrow window. This is
-// the tight ribbon idiom and the reason the zone is three rows tall in the first place.
-static int ribbon_rowsForGroup(int nRows, int rowsPerCol) {
-    if (nRows == 2) return 1;
-    return rowsPerCol;
+// ONE height for every small-row button in the ribbon — plain small commands AND big commands
+// degraded to small rows. The content zone is split into ribbon_rowsPerCol() equal cells (floored
+// so the stack never overflows the zone), so small stacks read as thirds of the big-button height
+// (Office / SolidWorks). Previously plain rows used kSmRowH (22dp) while degraded rows used a
+// third of the zone (~28dp), so mixed columns (Features ▸ Reference) never lined up and every
+// plain stack was top-packed well short of the big button beside it.
+static float ribbon_smRowH() {
+    const int rows = ribbon_rowsPerCol();
+    float cell = std::floor(ribbon_contentH() / (float)rows);
+    return ImMax(cell, snap(kSmRowH * ui::uiScale));
 }
 
-// A one-row-tall stack is centred in the content zone instead of top-aligned. Top alignment
-// exists so a partially-filled column shares its top edge with the full stacks beside it, and
-// that is right for a 2-of-3 column -- but a single row pinned to the top of a three-row zone
-// just looks like it fell upwards. Only the one-row case is re-aligned; taller partial columns
-// keep the shared top edge.
-static float ribbon_smStackY(float contentY, int maxRows) {
-    if (maxRows != 1) return contentY;
-    float rowH = snap(kSmRowH * ui::uiScale);
-    return snap(contentY + (ribbon_contentH() - rowH) * 0.5f);
-}
-
-static int ribbon_maxColRows(const std::vector<SmColumn>& cols) {
-    int m = 0;
-    for (const auto& c : cols) m = ImMax(m, c.count);
-    return m;
+// Top edge (window-local px) of grid row `r`. Rows are distributed evenly over the full content
+// zone: row 0 flush with the big button's top, the last row flush with its bottom, the (at most
+// rows-1 px) floor remainder spread between them. EVERY column of every group uses this same grid,
+// so a short column (2 of 3) stays on rows 1-2 and aligns row-for-row with its neighbours.
+static float ribbon_smRowY(float contentY, int r) {
+    const int   rows  = ribbon_rowsPerCol();
+    const float rowH  = ribbon_smRowH();
+    const float zoneH = ribbon_contentH();
+    if (rows <= 1) return snap(contentY + (zoneH - rowH) * 0.5f);
+    const float pitch = rowH + (zoneH - rowH * (float)rows) / (float)(rows - 1);
+    return snap(contentY + pitch * (float)r);
 }
 
 // Group descriptor built each frame for the active tab
@@ -652,8 +646,7 @@ static float ribbon_smZoneW(const RibbonGroup& grp,
     for (const auto* cmd : grp.smCmds)
         widths.push_back(ribbon_smBtnW(cmd->label));
     if (widths.empty()) return 0.0f;
-    auto cols = ribbon_packColumns(
-        widths, ribbon_rowsForGroup((int)widths.size(), ribbon_rowsPerCol()));
+    auto cols = ribbon_packColumns(widths, ribbon_rowsPerCol());
     return ribbon_columnsTotalW(cols);
 }
 
@@ -1326,22 +1319,12 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     return clicked && enabled;
 }
 
-// §2.3: the height of a degraded "big-as-small" row (fit ~3 per content zone, floored at the
-// small row height). Layout MUST advance sy by this value, not kSmRowH*s, or these taller rows
-// overlap. Uses the same ribbon_contentH() the big button and group panel share; floor so
-// three stacked rows never exceed the content zone (snap-up would overflow by 1px).
-static float ribbon_bigBtnAsSmallRowH() {
-    float zone = ribbon_contentH();
-    float third = std::floor(zone / 3.0f);
-    return ImMax(third, snap(kSmRowH * ui::uiScale));
-}
-
 // Draw a big button degraded to small-row layout (icon + side label, one row height).
 static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
                                   const char* label, bool enabled, bool hasDrop,
                                   float wOverride = -1.0f) {
     float s      = ui::uiScale;
-    float rowH   = ribbon_bigBtnAsSmallRowH();  // fit ~3 per body zone, floored at kSmRowH
+    float rowH   = ribbon_smRowH();  // shared small-row grid height (same as ribbon_smBtn)
     float iconSz = snap(kSmIconSz * s);
     // §2.2 (same fix as ribbon_smBtn): drive the drawn/hit width from the SAME helper the column
     // packer measures with, so measure and draw never disagree.
@@ -1694,7 +1677,8 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
                           const char* label, bool enabled, float wOverride = -1.0f) {
     float s      = ui::uiScale;
     // ONE snapped geometry for hit / fill / content — same integer totalW and rowH at every scale.
-    float rowH   = snap(kSmRowH * s);
+    // rowH is the shared small-row grid height, identical to degraded big rows (ribbon_smRowH).
+    float rowH   = ribbon_smRowH();
     float iconSz = snap(kSmIconSz * s);
     // §2.2: drive the drawn/hit width from the SAME helper the packer measures with, so measure
     // and draw never disagree (previously the helper returned text+18*s but this drew text+10*s).
@@ -2093,6 +2077,27 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             }
         }
     }
+    // Pass 1b: give back big layout where it now fits. Pass 1 is greedy right-to-left and never
+    // undoes a step, so a group whose small layout saves only a few px (e.g. Hole: two bigs vs one
+    // two-row column) gets demoted even when the group degraded after it freed far more than was
+    // needed. Restore the CHEAPEST groups first (smallest big-minus-small width, leftmost on ties)
+    // so the leftover slack returns as many groups as possible to full big-button layout.
+    if (totalW <= availW) {
+        std::vector<int> demoted;
+        for (int gi = 0; gi < (int)groups.size(); ++gi)
+            if (groups[gi].collapse == COL_SMALL) demoted.push_back(gi);
+        std::vector<float> bigW(groups.size(), 0.0f);
+        for (int gi : demoted) bigW[gi] = ribbon_groupNaturalW(groups[gi], COL_BIG);
+        std::stable_sort(demoted.begin(), demoted.end(), [&](int a, int b) {
+            return bigW[a] - natW[a] < bigW[b] - natW[b];
+        });
+        for (int gi : demoted) {
+            if (totalW - natW[gi] + bigW[gi] > availW) continue;
+            totalW += bigW[gi] - natW[gi];
+            groups[gi].collapse = COL_BIG;
+            natW[gi] = bigW[gi];
+        }
+    }
     // Pass 2: hide rightmost groups into overflow
     if (totalW > availW) {
         for (int gi = (int)groups.size() - 1; gi >= 0 && totalW > availW; --gi) {
@@ -2267,21 +2272,16 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 if (!grp.bigCmds.empty()) bx += 2.0f * s;  // mid-gap between big and small zones
                 std::vector<float> widths;
                 for (const auto* cmd : grp.smCmds) widths.push_back(ribbon_smBtnW(cmd->label));
-                auto cols = ribbon_packColumns(
-                    widths, ribbon_rowsForGroup((int)widths.size(), rowsPerCol));
-                const float stackY = ribbon_smStackY(contentY, ribbon_maxColRows(cols));
+                auto cols = ribbon_packColumns(widths, rowsPerCol);
                 float sx = bx;
                 for (const auto& col : cols) {
-                    // Top-align a partially-filled small column (e.g. Reference's 2-of-3) so it
-                    // shares the same top edge as full 3-row stacks in neighboring groups;
-                    // ribbon_smStackY re-centres only the one-row-tall horizontal-pair case.
-                    float sy = stackY;
+                    // Every column sits on the shared row grid: a partially-filled column
+                    // (2 of 3) occupies rows 1-2 and aligns row-for-row with its neighbours.
                     for (int r = 0; r < col.count; ++r) {
                         const auto* cmd = grp.smCmds[col.first + r];
-                        ImGui::SetCursorPos(ImVec2(sx, sy));
+                        ImGui::SetCursorPos(ImVec2(sx, ribbon_smRowY(contentY, r)));
                         ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, ribbon_cmdEnabled(cmd),
                                      col.width);
-                        sy += snap(kSmRowH * s);
                     }
                     sx += col.width;
                 }
@@ -2303,17 +2303,15 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                     widths.push_back(ribbon_smBtnW(rows[i]->label));
                 }
             }
-            auto cols = ribbon_packColumns(
-                widths, ribbon_rowsForGroup((int)widths.size(), rowsPerCol));
-            const float stackY = ribbon_smStackY(contentY, ribbon_maxColRows(cols));
+            auto cols = ribbon_packColumns(widths, rowsPerCol);
             float sx = startX;
             for (const auto& col : cols) {
-                // Top-align partial columns (same rule as the big-layout small zone).
-                float sy = stackY;
+                // Same shared row grid as the big-layout small zone: degraded big rows and plain
+                // small rows have one height and one pitch, so mixed columns line up.
                 for (int r = 0; r < col.count; ++r) {
                     int idx = col.first + r;
                     const auto* cmd = rows[idx];
-                    ImGui::SetCursorPos(ImVec2(sx, sy));
+                    ImGui::SetCursorPos(ImVec2(sx, ribbon_smRowY(contentY, r)));
                     if (idx < nBig) {
                         // Finish Sketch degraded row: keep its Cancel dropdown (dedicated flyout,
                         // not runFlyout — see the big-layout branch above for why).
@@ -2322,7 +2320,6 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                             ribbon_bigBtnAsSmall(cmd->cmd_id, cmd->icon, cmd->label,
                                                  true, /*hasDrop=*/true, col.width);
                             ribbon_sketchFinishFlyout(cmd);
-                            sy += ribbon_bigBtnAsSmallRowH();
                             continue;
                         }
                         bool drop = ribbon_hasSubs(grp, cmd);
@@ -2336,8 +2333,6 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                         ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, ribbon_cmdEnabled(cmd),
                                      col.width);
                     }
-                    // §2.3: degraded big rows are taller than kSmRowH — advance by the actual height.
-                    sy += (idx < nBig) ? ribbon_bigBtnAsSmallRowH() : snap(kSmRowH * s);
                 }
                 sx += col.width;
             }

@@ -246,7 +246,7 @@ static void fillDark(Palette& p) {
     set4(p.glassBg,        0.118f, 0.133f, 0.167f, 0.87f);  // translucent dark-blue-gray
     set4(p.glassBorder,    0.230f, 0.275f, 0.365f, 0.80f);  // cool bright border
     set4(p.glassHighlight, 1.000f, 1.000f, 1.000f, 0.09f);  // subtle white top shine
-    set4(p.glassShadow,    0.000f, 0.000f, 0.000f, 0.40f);  // drop shadow
+    set4(p.glassShadow,    0.000f, 0.000f, 0.000f, 0.40f);  // in-rect bottom hairline / scrims
     // tree (feature-manager rows)
     set4(p.treeSection,    0.620f, 0.660f, 0.720f, 1.0f);   // muted section-header label
     // copilot blocks (chat action cards)
@@ -376,7 +376,7 @@ static void fillLight(Palette& p) {
     set4(p.glassBg,        0.970f, 0.975f, 0.988f, 0.92f);  // frosted near-white, slight blue tint
     set4(p.glassBorder,    0.620f, 0.650f, 0.730f, 0.72f);  // grey-blue border
     set4(p.glassHighlight, 1.000f, 1.000f, 1.000f, 0.35f);  // pronounced shine (2.2x => 0.77 for specular line, not blinding)
-    set4(p.glassShadow,    0.000f, 0.000f, 0.000f, 0.18f);  // lighter shadow on light bg
+    set4(p.glassShadow,    0.000f, 0.000f, 0.000f, 0.18f);  // lighter bottom hairline on light bg
     // tree (feature-manager rows)
     set4(p.treeSection,    0.357f, 0.384f, 0.439f, 1.0f);   // darker grey section-header label
     // copilot blocks (chat action cards)
@@ -517,24 +517,17 @@ void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, float
         float t[4]; Palette::withAlpha(c, t, mul * alpha); return Palette::toU32(t);
     };
 
-    // 1. Drop shadow: two stacked rects to fake a blurred shadow.
-    {
-        const float off  = 4.0f * s;
-        const float off2 = 2.5f * s;
-        dl->AddRectFilled(
-            ImVec2(mn.x + off2 * 0.4f, mn.y + off2),
-            ImVec2(mx.x + off,         mx.y + off),
-            A(p.glassShadow, 0.35f), r + off * 0.5f);
-        dl->AddRectFilled(
-            ImVec2(mn.x + 1.0f * s, mn.y + 2.0f * s),
-            ImVec2(mx.x + off2,     mx.y + off2),
-            A(p.glassShadow, 1.0f), r + 0.5f * s);
-    }
+    // No drop shadow. The old step 1 stacked two rects offset down-right by 2.5-4 dp: on every
+    // control-sized caller (PLM tab buttons, Firmware toolbar, Parts filter fields via
+    // glassCardWash, kit cards) it read as a dark embossed crescent that the backdrop path of
+    // glassPanel() never drew, so identical controls looked flat in one workspace and raised in
+    // the next. Depth comes from the in-rect edge treatment only (shine, border, specular) —
+    // the spec's non-offset treatment; glassPanel() adds its own inner rim + bottom hairline.
 
-    // 2. Base translucent fill.
+    // 1. Base translucent fill.
     dl->AddRectFilled(mn, mx, A(p.glassBg, 1.0f), r);
 
-    // 3. Inner vertical shine gradient — top 35% of height, glassHighlight -> transparent.
+    // 2. Inner vertical shine gradient — top 35% of height, glassHighlight -> transparent.
     {
         const float shineH = (mx.y - mn.y) * 0.35f;
         const ImVec2 shineMx(mx.x, mn.y + shineH);
@@ -543,10 +536,10 @@ void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, float
         dl->AddRectFilledMultiColor(mn, shineMx, top, top, btm, btm);
     }
 
-    // 4. Border.
+    // 3. Border.
     dl->AddRect(mn, mx, A(p.glassBorder, 1.0f), r, 0, 1.5f * s);
 
-    // 5. Top specular line — 1.5 px inside the top border arc.
+    // 4. Top specular line — 1.5 px inside the top border arc.
     {
         const float lineY = mn.y + 1.5f * s;
         const float inset = r * 0.6f;   // stay clear of the rounded corners

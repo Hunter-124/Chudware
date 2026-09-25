@@ -166,28 +166,35 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     const float markGap = 6.0f * sc;
     const float gearW = measureBtn("Settings", "settings", false);
     bool lChat = true, lTasks = true, lArts = true, lSess = true;
+    // Chat and Sessions read as one visual pair ONLY while they are in the same label state
+    // (both labelled or both icon-only): then both take the larger measurement. Once shedding
+    // drops one pill's label, each is sized by its own content — forcing an icon-only Sessions
+    // pill to Chat's labelled width painted a wide empty pill around a lone glyph. rowFits()
+    // and the placed hit boxes both come from this one function, so shedding decisions,
+    // submitted hit zones and painted pills can never disagree.
+    struct PillWidths { float chat, tasks, arts, sess; };
+    auto pillWidths = [&]() -> PillWidths {
+        PillWidths w{measureBtn("Chat", "ai_panel", lChat),
+                     measureBtn(tlLabel, "plan_board", lTasks),
+                     measureBtn("Artifacts", "artifacts", lArts),
+                     measureBtn("Sessions", "history", lSess)};
+        if (lChat == lSess) w.chat = w.sess = std::max(w.chat, w.sess);
+        return w;
+    };
     auto rowFits = [&]() -> bool {
-        const float chatMeasured = measureBtn("Chat", "ai_panel", lChat);
-        const float sessMeasured = measureBtn("Sessions", "history", lSess);
-        const float chatSessionsW = std::max(chatMeasured, sessMeasured);
-        const float w = chatSessionsW * 2.0f +
-                        measureBtn(tlLabel, "plan_board", lTasks) +
-                        measureBtn("Artifacts", "artifacts", lArts) +
-                        gearW + 4.0f * minGap;
+        const PillWidths pw = pillWidths();
+        const float w = pw.chat + pw.tasks + pw.arts + pw.sess + gearW + 4.0f * minGap;
         return w <= (colW - rightInset - contentLeftInset - markSz - markGap);
     };
     if (!rowFits()) { lArts = false;
     if (!rowFits()) { lSess = false;
     if (!rowFits()) { lTasks = false;
     if (!rowFits()) { lChat = false; } } } }
-    // Chat and Sessions are one visual pair: both use the larger of their current responsive
-    // measurements, so their submitted hit boxes and painted pills remain exactly equal.
-    const float chatSessionsW = std::max(measureBtn("Chat", "ai_panel", lChat),
-                                         measureBtn("Sessions", "history", lSess));
-    const float chatW = chatSessionsW;
-    const float tlW   = measureBtn(tlLabel, "plan_board", lTasks);
-    const float artW  = measureBtn("Artifacts", "artifacts", lArts);
-    const float sessW = chatSessionsW;
+    const PillWidths pw = pillWidths();
+    const float chatW = pw.chat;
+    const float tlW   = pw.tasks;
+    const float artW  = pw.arts;
+    const float sessW = pw.sess;
 
     // ---- Collapse chip: drawn INSIDE this window at an absolute screen position
     // (SetCursorScreenPos), exactly like the FeatureManager's ##lp_collapse — NOT a

@@ -947,13 +947,19 @@ static void drawProjectRail(AppState& st, float w) {
         ImGui::Spacing();
         fwSectionHeader(nullptr, "Sources");
         if (p.srcs.empty()) ImGui::TextDisabled("(none registered)");
-        if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
-        for (const std::string& src : p.srcs) ImGui::BulletText("%s", src.c_str());
-        if (st.fonts.mono) ImGui::PopFont();
+        for (const std::string& src : p.srcs) {
+            const float availW = ImGui::GetContentRegionAvail().x;
+            const std::string shown = ui::kit::elide(src.c_str(), availW);
+            ImGui::TextUnformatted(shown.c_str());
+            if (shown != src && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", src.c_str());
+        }
         if (!p.rootDir.empty()) {
             ImGui::Spacing();
             ImGui::TextDisabled("Root");
-            ImGui::TextWrapped("%s", p.rootDir.c_str());
+            const std::string shown =
+                ui::kit::elide(p.rootDir.c_str(), ImGui::GetContentRegionAvail().x);
+            ImGui::TextUnformatted(shown.c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", p.rootDir.c_str());
         }
     }
 
@@ -1008,6 +1014,9 @@ static void drawProjectRail(AppState& st, float w) {
             fwBanner(b.c_str(), palette.statusWarn);
         }
     }
+    // Reserve bottom breathing room so the final line scrolls fully into view instead of
+    // being cut mid-line by the rounded pane border.
+    ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));
 
     ImGui::EndChild();
     ui::popGlassChildStyle();
@@ -1034,10 +1043,14 @@ static void drawEditorTab(AppState& st) {
     } else {
         for (int i = 0; i < (int)p.srcs.size(); ++i) {
             ImGui::PushID(i);
-            if (ImGui::Selectable(p.srcs[i].c_str(), s.editorSelSrc == i)) {
+            const std::string shown =
+                ui::kit::elide(p.srcs[i].c_str(), ImGui::GetContentRegionAvail().x);
+            if (ImGui::Selectable(shown.c_str(), s.editorSelSrc == i)) {
                 s.editorSelSrc = i;
                 loadEditorFile(s, p, p.srcs[i]);
             }
+            if (shown != p.srcs[i] && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", p.srcs[i].c_str());
             ImGui::PopID();
         }
     }
@@ -1050,8 +1063,11 @@ static void drawEditorTab(AppState& st) {
     ImGui::BeginChild("##fw_editor_view", ImVec2(0, 0), ImGuiChildFlags_Border);
     ImGui::PopStyleVar();
     if (s.editorSelSrc < 0) {
-        ImGui::TextDisabled("Pick a source file on the left to preview it here.\n"
-                            "(Read-only preview for now — edit in your external editor.)");
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                                                    palette.textDisabled[2], 1.0f));
+        ImGui::TextWrapped("Pick a source file on the left to preview it here.\n"
+                           "(Read-only preview for now — edit in your external editor.)");
+        ImGui::PopStyleColor();
     } else if (!s.editorErr.empty()) {
         fwBanner(s.editorErr.c_str(), palette.statusErr);
     } else {

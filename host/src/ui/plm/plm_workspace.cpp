@@ -169,45 +169,63 @@ static const RailItem kRail[] = {
     {PlmPage::Settings, "Settings", "settings"},
 };
 
-// One horizontal PROJECT nav button: liquid-glass gradient fill (accent -> accentDim
-// top-to-bottom) when selected/hovered over the shared frosted base, icon + label,
-// and an optional count badge that sits in its OWN rounded pill inset from the
-// button's right edge. Drives g_plmHub.page on click.
-static void drawNavButton(const RailItem& r, int badge) {
+// One horizontal PROJECT nav button: flat button surface (the same palette.button /
+// palette.border face ui::kit's popover triggers use — no drop shadow, so the strip
+// matches every other workspace's controls) with a liquid-glass accent wash when
+// selected/hovered, icon + label, and an optional count badge in its OWN rounded pill
+// inset from the button's right edge. `compact` sheds the label (icon + badge only;
+// the label moves to a tooltip) so the strip degrades instead of clipping when the
+// pane is narrow. Drives g_plmHub.page on click.
+struct NavMetrics {
+    float h, iconSz, padX, iconGap, badgePadX, badgeGap, badgeInset;
+};
+
+static NavMetrics navMetrics() {
+    const float S = ui::uiScale;
+    return {ImGui::GetFrameHeight() * 1.16f, 15 * S, 10 * S, 7 * S, 7 * S, 9 * S, 11 * S};
+}
+
+static float navBadgePillW(int badge, const NavMetrics& m, char (&bbuf)[16]) {
+    bbuf[0] = '\0';
+    if (badge <= 0) return 0.0f;
+    std::snprintf(bbuf, sizeof(bbuf), "%d", badge);
+    return ImGui::CalcTextSize(bbuf).x + m.badgePadX * 2;
+}
+
+static float navButtonWidth(const RailItem& r, int badge, bool compact) {
+    const NavMetrics m = navMetrics();
+    char bbuf[16];
+    const float pillW = navBadgePillW(badge, m, bbuf);
+    const float body  = compact ? 0.0f : m.iconGap + ImGui::CalcTextSize(r.label).x;
+    return m.padX + m.iconSz + body +
+           (badge > 0 ? m.badgeGap + pillW + m.badgeInset : m.padX);
+}
+
+static void drawNavButton(const RailItem& r, int badge, bool compact) {
     const float S = ui::uiScale;
     ImGui::PushID((int)r.page);
     const bool sel = (g_plmHub.page == r.page);
 
-    const float h       = ImGui::GetFrameHeight() * 1.16f;
-    const float iconSz  = 15 * S;
-    const float padX    = 10 * S;
-    const float iconGap = 7 * S;
-    const float textW   = ImGui::CalcTextSize(r.label).x;
-
-    // Badge pill metrics — its own background + extra right padding from the edge.
-    char bbuf[16] = {};
-    float badgePillW = 0.0f;
-    const float badgePadX  = 7 * S;   // inside the pill
-    const float badgeGap   = 9 * S;   // between label and pill
-    const float badgeInset = 11 * S;  // pill -> button right edge ("more padding")
-    if (badge > 0) {
-        std::snprintf(bbuf, sizeof(bbuf), "%d", badge);
-        badgePillW = ImGui::CalcTextSize(bbuf).x + badgePadX * 2;
-    }
-
-    const float w = padX + iconSz + iconGap + textW +
-                    (badge > 0 ? badgeGap + badgePillW + badgeInset : padX);
+    const NavMetrics m = navMetrics();
+    const float h = m.h;
+    char bbuf[16];
+    const float badgePillW = navBadgePillW(badge, m, bbuf);
+    const float w = navButtonWidth(r, badge, compact);
 
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImVec2 p1(p0.x + w, p0.y + h);
     if (ImGui::InvisibleButton("##nav", ImVec2(w, h)))
         g_plmHub.page = r.page;
     const bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
+    if (compact && hov) {
+        if (badge > 0) ImGui::SetTooltip("%s (%d)", r.label, badge);
+        else           ImGui::SetTooltip("%s", r.label);
+    }
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float rnd = 9.0f * S;
 
-    // Frosted glass base for every button (translucent + specular + border).
-    ui::glassBackground(dl, p0, p1, 9.0f);
+    // Flat button face + hairline border — shadowless, like kit buttons.
+    dl->AddRectFilled(p0, p1, Palette::toU32(palette.button), rnd);
     // Liquid-glass gradient wash. The highlight must cover the FULL rounded button
     // (corners included): a rounded accent base, a rounded-top bright strip that
     // owns the top corners, then a full-width vertical sheen below the corner radius
@@ -226,20 +244,25 @@ static void drawNavButton(const RailItem& r, int badge) {
                                     ImVec2(p1.x, p0.y + h * 0.62f),
                                     cTop, cTop, cFade, cFade);
     }
+    float borderCol[4];
+    Palette::withAlpha(sel ? palette.accent : palette.border, borderCol, sel ? 0.90f : 0.55f);
+    dl->AddRect(p0, p1, Palette::toU32(borderCol), rnd, 0, ui::metrics::stroke(1.0f));
 
     const ImU32 tcu = sel ? Palette::toU32(palette.text)
         : ImGui::ColorConvertFloat4ToU32(ImVec4(palette.textDim[0], palette.textDim[1],
                                                 palette.textDim[2], 1.0f));
-    float x = p0.x + padX;
-    ui::drawIconGlass(dl, r.icon, ImVec2(x + iconSz * 0.5f, p0.y + h * 0.5f),
-                      iconSz, tcu, 0);
-    x += iconSz + iconGap;
-    ImVec2 ts = ImGui::CalcTextSize(r.label);
-    dl->AddText(ImVec2(x, p0.y + (h - ts.y) * 0.5f), tcu, r.label);
+    float x = p0.x + m.padX;
+    ui::drawIconGlass(dl, r.icon, ImVec2(x + m.iconSz * 0.5f, p0.y + h * 0.5f),
+                      m.iconSz, tcu, 0);
+    if (!compact) {
+        x += m.iconSz + m.iconGap;
+        ImVec2 ts = ImGui::CalcTextSize(r.label);
+        dl->AddText(ImVec2(x, p0.y + (h - ts.y) * 0.5f), tcu, r.label);
+    }
 
     if (badge > 0) {
         ImVec2 bs = ImGui::CalcTextSize(bbuf);
-        ImVec2 bp1(p1.x - badgeInset, p0.y + (h - bs.y) * 0.5f - 3 * S);
+        ImVec2 bp1(p1.x - m.badgeInset, p0.y + (h - bs.y) * 0.5f - 3 * S);
         ImVec2 bp0(bp1.x - badgePillW, bp1.y);
         bp1.y = bp0.y + bs.y + 6 * S;
         // The count sits ON the warn fill, so its ink is derived from that fill rather
@@ -247,7 +270,7 @@ static void drawNavButton(const RailItem& r, int badge) {
         const ImVec4 fill(palette.statusWarn[0], palette.statusWarn[1],
                           palette.statusWarn[2], 0.90f);
         dl->AddRectFilled(bp0, bp1, ImGui::GetColorU32(fill), (bs.y + 6 * S) * 0.5f);
-        dl->AddText(ImVec2(bp0.x + badgePadX, bp0.y + 3 * S),
+        dl->AddText(ImVec2(bp0.x + m.badgePadX, bp0.y + 3 * S),
                     ImGui::GetColorU32(ui::maxContrastTextOn(fill)), bbuf);
     }
     ImGui::PopID();
@@ -258,19 +281,54 @@ static void drawNavButton(const RailItem& r, int badge) {
 // as a right-aligned button on this strip; it now lives in the title bar (a
 // persistent, always-visible status control) — see ui::drawTitleBar /
 // drawActiveProjectControl in title_bar.cpp — so this strip is rail buttons only.
-static void drawTopNav(AppState& st) {
+//
+// The strip never clips: when the labelled buttons do not fit `availW`, labels are
+// shed right-to-left (the selected page keeps its label longest) until the row fits;
+// if even the all-icon row is too wide, buttons wrap onto further rows.
+static void drawTopNav(AppState& st, float availW) {
     (void)st;
     const float S = ui::uiScale;
     const float gap = 6 * S;
-    for (int i = 0; i < (int)(sizeof(kRail) / sizeof(kRail[0])); ++i) {
+    constexpr int kN = (int)(sizeof(kRail) / sizeof(kRail[0]));
+
+    int   idx[kN], badge[kN], n = 0;
+    bool  compact[kN] = {};
+    float fullW[kN], iconW[kN];
+    float total = 0.0f;
+    for (int i = 0; i < kN; ++i) {
         // Degrade: hide Graph when the worker lacks cad_graph_* RPCs.
         if (kRail[i].page == PlmPage::Graph && !plmGraphAvailable()) continue;
         if (kRail[i].page == PlmPage::Versions && !plmVersionsAvailable()) continue;
-        if (i) ImGui::SameLine(0, gap);
-        int badge = 0;
-        if (kRail[i].page == PlmPage::Files)    badge = g_plmHub.overview.dirtyCount;
-        if (kRail[i].page == PlmPage::Planning) badge = g_plmHub.overview.openIssues;
-        drawNavButton(kRail[i], badge);
+        int b = 0;
+        if (kRail[i].page == PlmPage::Files)    b = g_plmHub.overview.dirtyCount;
+        if (kRail[i].page == PlmPage::Planning) b = g_plmHub.overview.openIssues;
+        idx[n] = i; badge[n] = b;
+        fullW[n] = navButtonWidth(kRail[i], b, false);
+        iconW[n] = navButtonWidth(kRail[i], b, true);
+        total += fullW[n] + (n ? gap : 0.0f);
+        ++n;
+    }
+    // Shed labels from the right, sparing the selected page until last.
+    for (int pass = 0; pass < 2 && total > availW; ++pass) {
+        for (int k = n - 1; k >= 0 && total > availW; --k) {
+            if (compact[k]) continue;
+            const bool isSel = kRail[idx[k]].page == g_plmHub.page;
+            if (pass == 0 && isSel) continue;
+            compact[k] = true;
+            total -= fullW[k] - iconW[k];
+        }
+    }
+
+    const float left = ImGui::GetCursorScreenPos().x;
+    float x = left;
+    for (int k = 0; k < n; ++k) {
+        const float w = compact[k] ? iconW[k] : fullW[k];
+        if (k) {
+            if (x + gap + w - left <= availW) { ImGui::SameLine(0, gap); x += gap; }
+            else x = left;   // wrap: next row starts at the strip's left edge
+        }
+        drawNavButton(kRail[idx[k]], badge[k], compact[k]);
+        x += w;
     }
 }
 
@@ -509,8 +567,9 @@ void drawPlmWorkspace(AppState& st) {
     ImGui::Dummy(ImVec2(0, 3 * S));  // tighter top margin — nav sits closer to the box top
     ImGui::Indent(M);                // left margin
 
-    // Horizontal PROJECT nav above the page views (was a left side rail).
-    drawTopNav(st);
+    // Horizontal PROJECT nav above the page views (was a left side rail). It gets
+    // the same right margin the page body keeps (-M below) so it never runs past it.
+    drawTopNav(st, ImGui::GetContentRegionAvail().x - M);
     ImGui::Dummy(ImVec2(0, 2 * S));  // tighter gap between nav and page body
 
     // One generous, uniform content margin for every page body — so the Overview,

@@ -4794,3 +4794,31 @@ Chudcode `7f104b4558` bumps the fingerprint to 2.1.281; the local `~/.local/bin/
 rebuilt from the working tree (previous binary kept as `chud.2026-09-01.bak`). Deferred: the
 `vendor/chudcode/CHUDCODE_ARTIFACT.lock` release pin still names v0.3.0 artifacts carrying
 2.1.246 — a packaged build needs a new Chudcode release and a re-pin of all five targets.
+
+## 2026-09-24 — "the agent took the wheels off": harness fixes from one brake turn
+
+A GUI turn on the ME-490 Rover Review died at exactly 15:00 with "provider_error — engine
+call timed out after 900000ms (orphaned run auto-cancelled)" and the viewport showed the frame
+without wheels. Nothing was mutated: `openMirrorTab` auto-focused the first agent-opened doc
+(the frame part, opened with `import_part(resume:true)` to read its body roster) over the
+user's own tab, and a fixed 900 000 ms client deadline in `jobs.cpp` (plus the same bound in
+hostd's bridge) killed a healthy turn mid-tool-call. Fixed: online turns carry an explicit
+`timeout` budget (7200 s) that the GUI and hostd wait past, client expiry is `client_timeout`;
+mirror tabs never steal focus from a user tab; the error card parses tool rows through
+`splitToolRowDetail` and lists only failures the turn never got past (the raw `\x1eERR\x1e`
+bytes rendered as "?ERR?"); `doc_solve_mates` that moves nothing is not an edit (describe_assembly
+dirtied the user's assembly); a pristine import of an existing file (`doc_list.reproducible_from`)
+is neither project-saved nor retired (the cancel sweep had written a 36-body probe into the
+project root). Three live verification turns through an isolated hostd (bwrap overlay over the
+project, tray off, Box spool redirected) found four more: `WorkerBridge::stop()` wedged hostd
+behind an in-flight turn on tray Quit/SIGTERM; bare `save_part` duplicated an opened file into
+the project root and explicit saves left the harness's root copies behind; the terminal sweep
+wrote a `close_part(discard=True)`-ed stale Wheel End over the rebuilt file; `asm_mate` /
+`motion_fea_handoff` resolved relative component sources against the worker cwd. All fixed with
+failing-first regression tests. Run 3 completed in 39 min with every doc saved in place; its
+brake fix was applied to the real project (originals in
+`~/Backups/ME-490-before-brake-fix-2026-09-24/`). Deferred: the remaining Frame ↔ Upright
+Bracket overlap (spindle through an unbored bracket); calipers placed by measured pose, not
+mates. Test-env note: running several engine-backed test files in one pytest invocation with a
+non-default `CHUDWARE_HOSTD_BIN` leaves a daemon whose rendezvous breaks the next file — run
+them one file at a time.

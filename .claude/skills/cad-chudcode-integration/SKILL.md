@@ -76,6 +76,10 @@ log the token or move control back onto the serialized stdio lane.
   idempotent. Pre-start steering queues until immediately after `prompt()`.
 - A turn must observe terminal `agent_end` after `wait_for_idle`; idle without it is a protocol
   error. Event-forwarding errors fail the result rather than hiding a broken UI boundary.
+- The caller's `timeout` bounds the RUN, not just the wait: on `wait_for_idle` timeout
+  `run_turn` aborts the run once, waits `_BUDGET_ABORT_GRACE_SECONDS` (30 s, below hostd's
+  +60 s bridge slack) for its terminal frame, and returns `stop_reason:"turn_budget"` with
+  the session left live for "continue". Never return from a timed-out wait without aborting.
 - `agent_end` is not success. `chudcode_host._unrecovered_provider_failure` returns
   `ok:false, stop_reason:"provider_error"` when the turn's last assistant record is a failure:
   a failed retry (`auto_retry_end success:false`) or a non-retryable rejection, which Chudcode

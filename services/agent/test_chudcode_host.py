@@ -1476,6 +1476,53 @@ def test_turn_budget_is_explicit_and_not_the_rpc_client_short_wait_default():
         host.shutdown()
 
 
+def test_budget_expiry_stops_the_run_instead_of_orphaning_it():
+    """Live 2026-09-25: a GUI turn hit its 2 h budget, the caller gave up with
+    `Timed out waiting for agent_end`, and Chudcode kept running the SAME run for two
+    more hours — editing and saving the user's assembly with no UI attached. The host
+    must abort the run it stops waiting for, and name the stop instead of calling it a
+    provider error."""
+
+    class OutlivesBudget(FakeClient):
+        def wait_for_idle(self, timeout=None):
+            self.idle_timeouts.append(timeout)
+            if not any(name == "abort" for name, _ in self.calls):
+                raise TimeoutError("Timed out waiting for agent_end. Stderr: ")
+            return super().wait_for_idle(timeout)
+
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(
+        client_factory=lambda **kw: factory.clients.append(OutlivesBudget(factory, **kw))
+        or factory.clients[-1]
+    )
+    try:
+        result, emitted = run(host, "budget", run_id="r-budget", timeout=7200)
+        client = factory.clients[0]
+
+        assert result["ok"] is False
+        assert result["stop_reason"] == "turn_budget"
+        assert result["cancelled"] is False
+        assert "2 h" in result["reason"] and "continue" in result["reason"]
+        assert call_names(client).count("abort") == 1
+        # The aborted run's terminal frame still reaches the UI before the turn returns.
+        assert any(f.get("type") == "agent_end" and f.get("aborted") for f in emitted)
+        assert result["terminal"]["aborted"] is True
+        # A later Stop for the same run must not abort a second time.
+        assert host.cancel("r-budget")["active"] is False
+        assert call_names(client).count("abort") == 1
+
+        # The session survives: "continue" resumes in the same Chudcode process.
+        client.events = [
+            {"type": "agent_start"},
+            {"type": "agent_end", "messages": [], "isTerminal": True},
+        ]
+        again, _ = run(host, "budget", run_id="r-budget-2")
+        assert again["ok"] is True
+        assert len(factory.clients) == 1 and client.stop_count == 0
+    finally:
+        host.shutdown()
+
+
 def test_default_host_accessor_is_lazy_and_process_global():
     injected = ChudcodeSessionHost(client_factory=FakeFactory())
     previous = _set_default_chudcode_host_for_tests(injected)

@@ -5392,6 +5392,16 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                 "not an app problem. Try rephrasing or simplifying the request "
                 "(each iteration's Error details has the full trace).";
           }
+        } else if (!job.error.empty() && job.stopReason == "turn_budget") {
+          // The agent was still working when the turn's time budget ran out and the
+          // worker aborted the run (services/agent/chudcode_host.py). That is not an app
+          // failure: no red "System error", no error toast — say what happened and how
+          // to go on.
+          setStatus("Turn time limit reached", 1);
+          st.addLog("[agent] " + job.error);
+          assistantErr = ERR_CAD;
+          assistantErrFull = job.stopReason + " — " + job.error;
+          assistant = job.error;
         } else if (!job.error.empty()) {
           setStatus("System error", 2);
           // Prefer the structured provider detail when present (longer, more
@@ -5723,7 +5733,15 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             // if the job produced no summary (non-v2 / empty assistant). On
             // plan_ready: never dump raw JSON; only soft summary / existing
             // stream.
-            if (!assistant.empty()) {
+            if (!assistant.empty() && assistantErr != ERR_NONE &&
+                !active->text.empty()) {
+              // A failure after streamed prose: APPEND. The timeline already drew
+              // that prose inline and the error card renders only what m.text
+              // carries beyond it (timelineProseTail); replacing m.text broke that
+              // prefix, so the tail came back empty and the failure card was never
+              // drawn — a 2 h turn ended with nothing but a red status-bar word.
+              active->text += "\n\n" + assistant;
+            } else if (!assistant.empty()) {
               // If stream already equals or contains the final prose, still
               // replace with the authoritative final so partial streams
               // finalize cleanly.

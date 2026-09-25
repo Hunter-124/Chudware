@@ -34,10 +34,14 @@ _MAX_DOCTOR_OUTPUT_CHARS = 2_097_152
 _MAX_DOCTOR_FINDINGS = 128
 _MAX_DOCTOR_MESSAGE_CHARS = 4_096
 
-# Mirrors kAbsoluteCap in core/agent/run.cpp. The live per-turn controls are that file's
-# 5-minute idle timeout and the Stop button; this is only a backstop so a stream that dies
-# without a terminal agent_end cannot block a worker thread forever.
+# Default turn budget when the caller sends no `timeout` (the GUI and run_mission.py both
+# send one). When it expires the run is ABORTED, not abandoned: see
+# ChudcodeSessionHost._stop_budget_exhausted_run.
 _TURN_ABSOLUTE_CAP_SECONDS = 2 * 60 * 60.0
+# After the budget expires the host aborts the run and waits this long for its terminal
+# agent_end. It must stay under hostd's bridge slack (budget + 60 s) so the GUI still
+# receives this result instead of its own transport timeout.
+_BUDGET_ABORT_GRACE_SECONDS = 30.0
 
 _LOG = logging.getLogger(__name__)
 _BYOK_PROVIDER_ENV = {
@@ -407,18 +411,27 @@ class ChudcodeSessionHost:
                 # which is a short-wait default and not a turn budget: nothing in CAD ever
                 # set `timeout`, so EVERY online turn was killed at 60 seconds with
                 # `provider_error - Timed out waiting for agent_end` and an empty stderr,
-                # mid-build, while the agent was still healthy and working. Live policy
-                # belongs to the transport that owns cancellation: core/agent/run.cpp gives
-                # the worker a 5-minute idle timeout and a 2-hour absolute cap, and the Stop
-                # button is polled every 200ms. This bound only exists so a stream that
-                # stops without a terminal frame cannot wait forever, so it matches that
-                # absolute cap instead of pre-empting it.
+                # mid-build, while the agent was still healthy and working. The caller owns
+                # the budget (GUI 7200 s, run_mission.py --timeout-s); the default matches
+                # the old absolute cap. When it expires the run is aborted, because a
+                # Chudcode run nobody waits for keeps editing documents unseen.
                 timeout = params.get("timeout")
-                session.client.wait_for_idle(
-                    timeout=float(timeout)
-                    if timeout is not None
-                    else _TURN_ABSOLUTE_CAP_SECONDS
+                budget_s = (
+                    float(timeout) if timeout is not None else _TURN_ABSOLUTE_CAP_SECONDS
                 )
+                try:
+                    session.client.wait_for_idle(timeout=budget_s)
+                except Exception as exc:  # noqa: BLE001 - classified below
+                    if not _is_wait_timeout(exc):
+                        raise
+                    # The caller stopped waiting, but Chudcode would keep running this
+                    # run: every later CAD tool call mutates documents with the turn's
+                    # context torn down and no event reaching any UI. Live 2026-09-25: a
+                    # GUI turn hit its 2 h budget and the agent kept editing, saving and
+                    # checkpointing the user's assembly for two more unseen hours.
+                    return self._stop_budget_exhausted_run(
+                        run, session, budget_s, lambda: terminal
+                    )
 
                 if terminal is None:
                     raise RuntimeError(
@@ -495,6 +508,56 @@ class ChudcodeSessionHost:
                     self._completed_runs.popitem(last=False)
             if dispose:
                 _stop_client(session.client)
+
+    def _stop_budget_exhausted_run(
+        self,
+        run: _Run,
+        session: _Session,
+        budget_s: float,
+        terminal_seen: Callable[[], dict[str, Any] | None],
+    ) -> dict:
+        """Abort a run that outlived its budget and report it as ``turn_budget``."""
+        with run.control_lock:
+            with self._lock:
+                should_abort = not run.cancel_sent
+            if should_abort:
+                try:
+                    session.client.abort()
+                except Exception as exc:  # noqa: BLE001 - still report the budget stop
+                    _LOG.warning("Chudcode abort after turn budget failed (%s)", exc)
+                else:
+                    with self._lock:
+                        run.cancel_sent = True
+        try:
+            session.client.wait_for_idle(timeout=_BUDGET_ABORT_GRACE_SECONDS)
+        except Exception as exc:  # noqa: BLE001 - the abort is already on its way
+            _LOG.warning("Chudcode run did not settle after budget abort (%s)", exc)
+        minutes = max(1, round(budget_s / 60.0))
+        hours, mins = divmod(minutes, 60)
+        budget_text = (
+            f"{hours} h {mins} min" if hours and mins else f"{hours} h" if hours else f"{mins} min"
+        )
+        result: dict[str, Any] = {
+            "ok": False,
+            "run_id": run.run_id,
+            "session_id": run.session_id,
+            "cancelled": False,
+            "stop_reason": "turn_budget",
+            "reason": (
+                f"This turn used its whole {budget_text} time budget while the agent "
+                "was still working, so it was stopped. Everything it already saved is "
+                'kept; send "continue" to pick up where it left off.'
+            ),
+            "terminal": terminal_seen(),
+            "result": _safe_last_assistant_text(session.client),
+        }
+        state = _safe_client_state(session.client)
+        if state:
+            result["chudcode_session_id"] = state.get("sessionId") or state.get("session_id")
+            result["chudcode_session_file"] = state.get("sessionFile") or state.get(
+                "session_file"
+            )
+        return result
 
     def cancel(self, run_id) -> dict:
         run_key = _nonempty_string(run_id)
@@ -1980,6 +2043,17 @@ def _provider_error_detail(raw: Any) -> str:
     if isinstance(text, str) and text.strip():
         return f"{status} {text.strip()}" if status.isdigit() else text.strip()
     return head
+
+
+def _is_wait_timeout(exc: BaseException) -> bool:
+    """True when ``wait_for_idle`` gave up on its deadline (not a process/protocol failure)."""
+    if isinstance(exc, TimeoutError):
+        return True
+    try:
+        from chudcode_rpc import RpcTimeoutError  # type: ignore
+    except ImportError:
+        return False
+    return isinstance(exc, RpcTimeoutError)
 
 
 def _safe_last_assistant_text(client: Any) -> str | None:

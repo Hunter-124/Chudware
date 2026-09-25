@@ -311,6 +311,22 @@ void applyChangedActive(AppState& st, const std::string& docId, const json& d) {
     }
     if (mirror) st.suppressTabDirty = false;
 
+    // A revision published without a tessellation (asm_add_component / asm_mate and the
+    // animation pose writers call doc_apply_ops with with_tess:false) carries NO aicm_path
+    // key; an empty document carries an EMPTY one. Only the latter means "nothing to draw".
+    // For the former keep the displayed mesh — the next mesh-bearing revision replaces it —
+    // and drop the tab's cached mesh so a switch-in re-activates instead of binding a mesh
+    // older than its tree. Unloading here blanked the viewport after every agent mate.
+    if (!d.contains("aicm_path")) {
+        if (t.session) {
+            t.session->cachedAicmPath.clear();
+            t.session->cachedRevision = -1;
+            t.session->cachedMirror = {};
+            t.session->cachedDocMesh.reset();
+        }
+        pendingChanged.erase(docId);
+        return;
+    }
     const std::string aicm = d.value("aicm_path", std::string());
     if (t.session) {
         t.session->cachedAicmPath = aicm;
@@ -546,11 +562,14 @@ void handleEvent(AppState& st, const json& evt) {
             }
             return;
         }
-        // Adopted mirrors stay live: the user's edits are already committed to the shared
-        // engine (dirty = unsaved-to-disk, not un-pushed), so resyncing pulls the unified
-        // tree containing BOTH edit streams — nothing local to clobber. Only an open
-        // sketch/PM preview (userMidEdit) or a dirty tab the user owns outright defers.
-        if (userMidEdit(st) || (st.docTabs[idx].dirty && !st.docTabs[idx].userAdopted)) {
+        // Every tab stays live: in daemon mode the user's own edits are committed to the shared
+        // engine as they happen (dirty = unsaved-to-disk, never un-pushed), so the pushed
+        // snapshot already carries BOTH edit streams and there is nothing local to clobber. Only
+        // an open sketch/PM preview (userMidEdit) defers. Deferring a dirty user-owned tab froze
+        // the viewport for a whole agent turn: the first applied agent revision lights the tab's
+        // dirty marker, and from then on every later revision was parked until the user saved
+        // (2026-09-25, a 2 h steering rework on the user's open assembly showed nothing).
+        if (userMidEdit(st)) {
             pendingChanged[docId] = d;  // defer, retry when safe (poller semantics)
             st.docTabs[idx].aiPulse = true;
             st.docTabs[idx].lastAgentEditAt = std::chrono::steady_clock::now();
@@ -1105,8 +1124,7 @@ void engineEventsTick(AppState& st) {
                 ? st.docTabs[st.activeTab].docId
                 : std::string();
         auto it = pendingChanged.find(activeId);
-        if (it != pendingChanged.end() &&
-            (!st.docTabs[st.activeTab].dirty || st.docTabs[st.activeTab].userAdopted)) {
+        if (it != pendingChanged.end()) {
             const json d = it->second;
             applyChangedActive(st, activeId, d);
         }

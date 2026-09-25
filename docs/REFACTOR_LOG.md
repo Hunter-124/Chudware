@@ -4822,3 +4822,27 @@ Bracket overlap (spindle through an unbored bracket); calipers placed by measure
 mates. Test-env note: running several engine-backed test files in one pytest invocation with a
 non-default `CHUDWARE_HOSTD_BIN` leaves a daemon whose rendezvous breaks the next file — run
 them one file at a time.
+
+## 2026-09-25 — the 2 h steering turn: orphaned run, hidden error card, frozen viewport
+
+One "go bang it out" turn on the user's open `Rover Review` assembly exposed three defects.
+(1) `chudcode_host.run_turn` returned `Timed out waiting for agent_end` at the GUI's 7200 s
+budget but never aborted: Chudcode kept running the same run for two more hours (saves,
+PLM checkpoint, STATUS.md edits) with no UI attached and the run-scoped env already restored
+(`render_part save_path` refused with no project dir), until a 403 OAuth rejection ended it.
+Budget expiry now aborts once, waits ≤30 s for the terminal frame, and returns
+`stop_reason:"turn_budget"`; `worker_rpc` forwards failure `stop_reason`s (every failure used
+to become `provider_error`), and `app.cpp` shows an amber "Turn time limit reached" card.
+(2) The drain REPLACED `ChatMsg::text` with the failure message; the timeline had already
+drawn two streamed prose rows, so `timelineProseTail` found no matching prefix, returned empty,
+and the error card never drew — the only trace was a red "System error" status word. Failures
+now append (`timelineProseTail` trims the separator). (3) `engine_events.cpp` deferred every
+`doc.changed` for a dirty user-owned tab, and applying the first agent revision dirties that
+tab, so the viewport froze for the rest of the turn; mesh-less revisions (`with_tess:false`
+from `asm_add_component`/`asm_mate`) also unloaded the displayed mesh. Now only
+`userMidEdit` defers and a missing `aicm_path` keeps the current mesh. Files:
+`services/agent/chudcode_host.py`, `services/agent/worker_rpc.py`,
+`services/agent/test_chudcode_host.py`, `host/src/app.cpp`, `host/src/core/engine_events.cpp`,
+`host/src/ui/copilot/activity_timeline.cpp`. Deferred: the 7200 s default itself
+(`kOnlineTurnBudgetS`, hostd `server.cpp`) is unchanged; the asm writers still skip
+tessellation, so a newly added component appears at the next mesh-bearing revision.

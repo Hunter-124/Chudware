@@ -909,7 +909,10 @@ std::string timelineProseTail(const ChatMsg& m) {
     if (shown.empty()) return m.text;
     if (m.text.size() <= shown.size()) return {};
     if (m.text.compare(0, shown.size(), shown) != 0) return {};
-    return m.text.substr(shown.size());
+    // An appended note ("\n\n(Stopped by you.)", a failure message) starts with its separator;
+    // the tail renders as its own card, where those blank lines are just a gap at the top.
+    const size_t start = m.text.find_first_not_of("\n\r ", shown.size());
+    return start == std::string::npos ? std::string() : m.text.substr(start);
 }
 
 // The model's prose — the answer — as the HEAVIEST thing in the column: the only full glass

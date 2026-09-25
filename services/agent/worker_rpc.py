@@ -3320,6 +3320,10 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 "ok": False,
                 "reason": str(host_result.get("reason") or "Chudcode turn failed"),
             }
+            # provider_error / turn_budget: without it the GUI labels every failure
+            # provider_error (host/src/core/jobs.cpp normalizeAgentAdminTurnResult).
+            if host_result.get("stop_reason"):
+                response["stop_reason"] = str(host_result["stop_reason"])
         else:
             cancelled = bool(host_result.get("cancelled"))
             text = _terminal_text(host_result)

@@ -241,6 +241,21 @@ judgment).
   pinned to an exhausted account keeps 429-ing after `chud usage` shows a fresh account —
   resume the same `.jsonl` under a new `--session-id` (`chud dry-balance <model>` shows
   where fresh ids land).
+- **An expired turn budget STOPS the run (2026-09-25).** `chudcode_host.run_turn` used to
+  return `Timed out waiting for agent_end` and leave Chudcode running: a GUI turn hit 7200 s
+  and the agent kept editing, saving and checkpointing the user's assembly for two more
+  hours with no UI attached and the run-scoped env gone. On `wait_for_idle` timeout it now
+  sends `abort()` once, waits ≤30 s for the terminal frame (under hostd's +60 s slack) and
+  returns `ok:false, stop_reason:"turn_budget"`; `worker_rpc` forwards `stop_reason` on
+  failures, and the GUI shows an amber "Turn time limit reached" card, not "System error".
+  A failure after streamed prose is APPENDED to `ChatMsg::text` (the error card renders
+  only `timelineProseTail`; replacing the text hid the card entirely).
+- **Agent edits reach the user's active tab live (2026-09-25).** `engine_events.cpp`
+  defers a `doc.changed` only while `userMidEdit` (sketch/PM preview). It used to defer any
+  dirty user-owned tab, and the first applied agent revision itself dirties that tab, so the
+  viewport froze for the rest of the turn. A revision with no `aicm_path` key (the
+  `with_tess:false` writers: `asm_add_component`, `asm_mate`, animation poses) keeps the
+  displayed mesh; only an EMPTY `aicm_path` means an empty document.
 - **`render_study_setup` figures are load-vector-specific (2026-09-07).** One arrow per
   load entry through the engine frame, a bottom banner with resultant/direction/per-entry
   vectors; multi-body docs paint (AICM face ids are per-body 1-based — `_mesh_topo_index`

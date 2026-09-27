@@ -638,6 +638,35 @@ def test_meter_is_seeded_after_run_started_and_closed_with_chudcode_state():
     assert meter == [(296_000, 1_000_000), (296_584, None), (301_500, 1_000_000)]
 
 
+def test_resume_key_reaches_the_feed_when_the_turn_starts():
+    """2026-09-27 c217: hostd died mid-turn, the turn never returned, and the GUI only
+    learned a conversation's Chudcode session file from the finished turn — two hours of
+    agent history were left with no resume key. The key now rides right after agent_start.
+    """
+    from services.agent.chudcode_events import map_rpc_frame
+
+    class StartsThenDies(FakeClient):
+        def wait_for_idle(self, timeout=None):
+            for listener in tuple(self.listeners):
+                listener({"type": "agent_start"})
+            raise RuntimeError("daemon connection closed")
+
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(
+        client_factory=lambda **kw: factory.clients.append(StartsThenDies(factory, **kw))
+        or factory.clients[-1]
+    )
+    feed = []
+    host.run_turn(
+        {"request": "Do the work", "session_id": "resume", "run_id": "r-resume"},
+        lambda frame: feed.extend(map_rpc_frame(frame)),
+    )
+
+    bound = [payload for kind, payload in feed if kind == "agent.session"]
+    assert [p["chudcode_session_file"] for p in bound] == [factory.clients[0].session_file]
+    assert bound[0]["chudcode_session_id"] == factory.clients[0].session_id
+
+
 def test_rejects_a_runtime_that_did_not_negotiate_protocol_v2():
     factory = FakeFactory(protocol_version=1)
     host = ChudcodeSessionHost(client_factory=factory)

@@ -208,6 +208,11 @@ runtime's doctor command.
   ("Skipped due to queued user message" — Chudcode drops the rest of that tool batch and
   tells the model to retry), thrown tool errors. `_tool_end` carries it as `error_preview`;
   before 2026-09-27 every such card read "tool failed".
+- The resume key is bound when the turn STARTS (2026-09-27): right after `agent_start`,
+  `run_turn` emits a `session_bound` frame (`get_state` sessionId/sessionFile) that maps to
+  `agent.session {chudcode_session_id, chudcode_session_file}`; `app.cpp` stores it in the
+  conversation's `ChudcodeSessionLink` and persists immediately. The post-turn doctor capture
+  alone never ran when hostd died mid-turn, so a 2-hour session (c217) had no resume key.
 - Preserve correlation (`run_id`, `session_id`, node/span/parent/subagent ids), but synthesize
   only deterministic digest ids when the source omitted one.
 - Unknown frames remain visible as bounded deterministic `sub_run` rows. Never drop them or

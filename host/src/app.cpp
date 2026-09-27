@@ -124,6 +124,7 @@ inline void wasmBootReady() {
 #include "ui/cam/cam_panel.h" // CAM: manufacturing workspace (toolpaths / post / sim)
 #include "ui/config_panel.h" // Configurations (SolidWorks ConfigurationManager)
 #include "ui/console_panel.h"
+#include "ui/chudcode_session_actions.h" // agent.session -> conversation resume link
 #include "ui/copilot/copilot.h"
 #include "ui/cursors.h"       // W1-B: cursor manager
 #include "ui/cutlist_panel.h" // Weldment Cut List (SolidWorks Weldment Cut List)
@@ -4907,6 +4908,21 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                     ui::setContextWindowSource(
                         data.value("window_source", std::string()));
                   }
+                }
+              }
+            } else if (orchKind == "agent.session") {
+              // The Chudcode resume key, sent as the turn starts. Persist it now: the old
+              // post-turn doctor capture never ran when the daemon died mid-turn
+              // (2026-09-27, c217), leaving a 2-hour session unresumable.
+              const std::string file = data.value("chudcode_session_file", std::string());
+              if (!file.empty()) {
+                ui::ChudcodeSessionLink &link = ui::chudcodeSessionLinkEnsure(runConvId);
+                if (link.sessionFile != file) {
+                  link.sessionFile = file;
+                  const std::string sid = data.value("chudcode_session_id", std::string());
+                  if (!sid.empty())
+                    link.sessionId = sid;
+                  ui::persistChatHistory(st);
                 }
               }
             } else if (orchKind == "agent_call") {

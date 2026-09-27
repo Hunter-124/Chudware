@@ -1191,6 +1191,16 @@ def map_rpc_frame(
             ("agent.provider_usage", _linked(link, **provider)),
             ("agent.context", _linked(link, **context_payload)),
         ]
+    if event == "session_bound":
+        # Resume key for the GUI's conversation link, sent when the turn starts: a turn that
+        # never returns (daemon/worker death) must still leave its session resumable.
+        payload = {
+            "chudcode_session_id": _str(data, "sessionId", "session_id", limit=256),
+            "chudcode_session_file": _str(data, "sessionFile", "session_file", limit=4_096),
+        }
+        if not payload["chudcode_session_file"]:
+            return []
+        return [("agent.session", _linked(link, **payload))]
     if event in {"context_update", "context_changed", "context_window"}:
         payload: dict[str, Any] = {
             "cache_read": _int(

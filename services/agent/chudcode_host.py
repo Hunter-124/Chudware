@@ -435,8 +435,9 @@ class ChudcodeSessionHost:
                     run.client = session.client
                     self._sessions.move_to_end(session_id)
 
-                # get_state's contextUsage before the prompt: the resumed session's
-                # real fill, re-sent once the GUI has reset its meter on run_started.
+                # Emitted right after agent_start (the GUI resets its meter on run_started):
+                # the resume key first, then get_state's contextUsage — the resumed session's
+                # real fill.
                 opening: list[dict[str, Any]] = []
 
                 def forward(event: Any) -> None:
@@ -464,13 +465,27 @@ class ChudcodeSessionHost:
                             dispatch_progress_nudge(nudge)
                     try:
                         emit(frame)
-                        if kind == "agent_start" and opening:
-                            emit(opening.pop())
+                        if kind == "agent_start":
+                            while opening:
+                                emit(opening.pop(0))
                     except Exception as exc:  # noqa: BLE001 - emit is an injected boundary
                         emit_errors.append(str(exc))
                 unsubscribe = _register_listener(session.client, forward)
                 self._configure_turn(session, params)
-                opening_frame = _context_frame(_safe_client_state(session.client))
+                opening_state = _safe_client_state(session.client)
+                bound_file = opening_state.get("sessionFile") or opening_state.get(
+                    "session_file"
+                )
+                if isinstance(bound_file, str) and bound_file:
+                    opening.append(
+                        {
+                            "type": "session_bound",
+                            "sessionId": opening_state.get("sessionId")
+                            or opening_state.get("session_id"),
+                            "sessionFile": bound_file,
+                        }
+                    )
+                opening_frame = _context_frame(opening_state)
                 if opening_frame is not None:
                     opening.append(opening_frame)
                 message, images = _prompt_payload(

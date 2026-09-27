@@ -6,20 +6,24 @@
 // The panel calls back into C17's edit dispatcher via the optional EditCallback slot.
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <string>
+
+#include <nlohmann/json.hpp>
 
 #include "imgui.h"   // ImVec2 (FmRowRect) — shared FM row-styling API below
 
 struct AppState;
+namespace render { struct PickHit; }
 
 namespace ui {
 
 // ---- Shared FeatureManager row styling (the panel-wide ratified look) ----
 // Exported so sibling left-pane tabs (file_explorer.cpp Explorer) draw rows/icons/section rules
-// PIXEL-IDENTICAL to the FeatureManager reference: frosted row pill + soft-blue selection card +
-// accent-outline hover, 16px atlas icons vertically centered in the leaf-arrow slot, and the
-// centered hairline section dividers ("Reference"/"Features" style).
+// PIXEL-IDENTICAL to the FeatureManager reference: frosted row pill + accent selection (soft fill
+// + glow border) + accent-outline hover, 16px atlas icons vertically centered in the leaf-arrow
+// slot, and the centered hairline section dividers ("Reference"/"Features" style).
 //
 // Usage per row: fmRowPill(selected) BEFORE the row's widget (pushes FramePadding + transparent
 // Header colors), then the widget (TreeNodeEx/Selectable/InputText), then fmRowPillEnd(rect,
@@ -28,8 +32,8 @@ namespace ui {
 struct FmRowRect { ImVec2 mn, mx; };
 // `tint` (optional palette RGB, float[3]) dyes the row the "Layers"-style color wash (see
 // ui::coloredRowWash). Pass a section/element color for color-coded rows; leave null for the
-// neutral app-accent wash every row shares. Selection is a thin glow border in the tint color
-// (no blue vertical bar).
+// neutral app-accent wash every row shares. Selection (every row kind alike) is a soft accent fill
+// plus a crisp accent glow border, painted over the wash.
 FmRowRect fmRowPill(bool selected = false, const float* tint = nullptr);
 void      fmRowPillEnd(const FmRowRect& r, bool selected = false);
 void      fmRowStripeReset();
@@ -101,6 +105,24 @@ void featureClearTreeMultiSel();
 // applyOps/undo/redo/resync rebuild, so the cached highlight goes stale; call this after any such
 // rebuild (docUndo/docRedo in app_state.cpp, and the central DocMirror listener in app.cpp).
 void refreshFeatureHighlight(AppState& st);
+
+// Viewport -> FeatureManager sync. Call when a viewport pick is ADDED to the selection: selects the
+// tree row that owns it and requests the one-shot scroll (st.treeScrollToSelection), forcing open the
+// collapsed section/folder/parent row on the way. Part docs (incl. in-context component edit): the
+// owning feature from the mirror's owner map, else the body's latest owning feature. Assembly docs:
+// component rows light from the live selection (a pick's body -> its component), so this only asks
+// for the scroll. Local and synchronous — it never waits on the engine's doc_resolve_pick reply.
+void featureTreeRevealPick(AppState& st, const render::PickHit& hit);
+
+// The assembly component (a tree["components"] entry) that owns AICM body `bodyId`: the body id is
+// the 1-based ordinal among NON-suppressed components. nullptr for component-pattern instances
+// (synthetic ids) and out-of-range ids.
+const nlohmann::json* featureTreeAssemblyComponent(const nlohmann::json& tree, uint32_t bodyId);
+
+// Record the engine's doc_resolve_pick answer for an assembly pick (`componentId`, "<seed>#<k>" for
+// a pattern instance) so a pattern-instance body lights its seed component's row. Ordinary bodies
+// resolve locally and are ignored. Scoped to the active doc revision.
+void featureTreeNoteAssemblyPick(AppState& st, uint32_t bodyId, const std::string& componentId);
 
 // Wave 4C/4D: FeatureManager copy / cut / paste, driven by the global Ctrl+C/X/V routing and the
 // "edit_copy" / "edit_cut" / "edit_paste" dispatcher ids. Call from app.cpp's pre-draw key handler

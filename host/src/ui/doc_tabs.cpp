@@ -182,6 +182,7 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     // Right-click context menu (attaches to the ##tab item above). "Close Others" is the headline
     // request; Close / Close All round it out. Actions are deferred via the same statics the ×/middle
     // paths use so nothing mutates docTabs mid-draw.
+    ui::pushContextMenuStyle();
     if (ImGui::BeginPopupContextItem("##tabctx")) {
         const int n = (int)st.docTabs.size();
         if (ImGui::MenuItem("Close")) {
@@ -193,6 +194,7 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
         if (ImGui::MenuItem("Close All")) s_closeAll = true;
         ImGui::EndPopup();
     }
+    ui::popContextMenuStyle();
 
     // Shared pill geometry for fill + outline (same radius, same flags, same rect). Mismatched
     // inset/radius between glassPanel and a later AddRect was the source of the corner seam/step

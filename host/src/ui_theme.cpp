@@ -584,6 +584,26 @@ void popGlassTooltipStyle() {
     ImGui::PopStyleColor(1);
 }
 
+void pushContextMenuStyle() {
+    const Palette& p = palette;
+    const float s = uiScale;
+    ImGui::PushStyleColor(ImGuiCol_PopupBg,       fromRole(p.popupBg));
+    ImGui::PushStyleColor(ImGuiCol_Border,        fromRole(p.glassBorder));
+    ImGui::PushStyleColor(ImGuiCol_Header,        fromRole(p.accentSoft));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, fromRole(p.accentSoft));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive,  fromRole(p.accentMid));
+    // A MenuItem's hover band extends half of ItemSpacing past the content box on each side
+    // (Selectable pad-with-half-spacing), so band inset = WindowPadding - ItemSpacing/2:
+    // 12 - 8 = 4 dp horizontally, 8 - 4 = 4 dp vertically, labels 12 dp from the edge.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f * s, 8.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,   ImVec2(16.0f * s, 8.0f * s));
+}
+
+void popContextMenuStyle() {
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(5);
+}
+
 void pushGlassWindowStyle() {
     const Palette& p = palette;
     ImGui::PushStyleColor(ImGuiCol_WindowBg,

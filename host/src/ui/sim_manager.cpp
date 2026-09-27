@@ -6244,6 +6244,7 @@ void SimManager::drawStudyRow(AppState &st, int i) {
   }
   // Right-click: delete (deferred so we never mutate studies_ mid-row-draw).
   bool wantDelete = false;
+  ui::pushContextMenuStyle();
   if (ImGui::BeginPopupContextItem("##studyctx")) {
     if (ImGui::MenuItem("Open setup")) {
       sel_ = i;
@@ -6254,6 +6255,7 @@ void SimManager::drawStudyRow(AppState &st, int i) {
       wantDelete = true;
     ImGui::EndPopup();
   }
+  ui::popContextMenuStyle();
 
   if (open) {
     // One FM-grade leaf row: icon painted inside the leaf-arrow slot + label +

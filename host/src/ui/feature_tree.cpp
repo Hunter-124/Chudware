@@ -199,6 +199,21 @@ static void fmRowHoverPaint(ImVec2 rowMin, ImVec2 rowMax, bool hovered, bool sel
     dl->AddRectFilled(hovMin, hovMax, ui::Palette::toU32(pal.treeHover), 4.0f * S);
 }
 
+// ---- shared selected-row paint (every FeatureManager row kind) ----
+// A viewport pick lands the user's eye on the tree, so the selected row must read at a glance: a
+// soft accent fill plus the crisp accent glow border, painted OVER the row's category wash so part
+// features, assembly components and datum rows all select alike. accentSoft is translucent, so the
+// row text keeps its contrast. Same outer rect as the pill (both self-inset 2dp).
+static void fmRowSelectedPaint(ImDrawList* dl, ImVec2 rowMin, ImVec2 rowMax) {
+    const auto& pal = fmPalette();
+    const float S = ui::uiScale;
+    const float inset = 2.0f * S;
+    dl->AddRectFilled(ImVec2(rowMin.x + inset, rowMin.y + inset),
+                      ImVec2(rowMax.x - inset, rowMax.y - inset),
+                      ui::Palette::toU32(pal.accentSoft), 3.5f * S);
+    ui::glassSelectionGlow(dl, rowMin, rowMax, 3.5f, pal.accent);
+}
+
 // Frosted row pill at the current cursor (full content width). Stripe index advances per call.
 // Height is the FRAME height only (font + FramePadding), never WithSpacing — a pill that also
 // covered the inter-row spacing bled into the next row / the section dividers and read as
@@ -235,18 +250,17 @@ FmRowRect fmRowPill(bool selected, const float* tint) {
     float availW = ImGui::GetContentRegionAvail().x;
     ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    // Frosted glass base + alternating stripe ONLY — selection is now the glow border below (never
-    // the old blue accent card/vertical bar), so it composites correctly over the color wash too.
+    // Frosted glass base + alternating stripe, then the Layers-style color wash bounded to the inset
+    // pill: a section/element `tint` when supplied, else the neutral app accent so every row shares
+    // the same tinted-background language. Selection paints on top (fmRowSelectedPaint).
     const float wash = selected ? 0.42f : 0.26f;
     ui::glassRowBackground(dl, rowMin, rowMax, 3.5f, (s_fmStripeIdx++ % 2) == 0, false, wash);
-    // Layers-style color wash, bounded to the inset pill: a section/element `tint` when supplied,
-    // else the neutral app accent so every row shares the same tinted-background language. Glow
-    // border marks selection, dyed the same color.
     const float* eff = tint ? tint : ui::palette.accent;   // accent is float[4]; wash reads [0..2]
-    const float strength = tint ? (selected ? 0.40f : 0.28f) : (selected ? 0.22f : 0.11f);
+    const float strength = tint ? 0.28f : 0.11f;
     // Same outer rect as the frosted base — coloredRowWash self-insets by the identical 2dp
     // (and keeps MultiColor inside the rounded outline — see ui_theme.cpp).
-    ui::coloredRowWash(dl, rowMin, rowMax, 3.5f, eff, strength, selected);
+    ui::coloredRowWash(dl, rowMin, rowMax, 3.5f, eff, strength, false);
+    if (selected) fmRowSelectedPaint(dl, rowMin, rowMax);
     return {rowMin, rowMax};
 }
 void fmRowPillEnd(const FmRowRect& r, bool selected) {
@@ -456,26 +470,6 @@ static void featureBadge(bool ok, bool hasError, const std::string& errText,
     else        dl->AddCircleFilled(center, r, col);
     if (hasTip && ImGui::IsMouseHoveringRect(p, ImVec2(p.x + w, p.y + rowH)))
         ImGui::SetTooltip("%s", tip.c_str());
-}
-
-// ---- glass popover styling (shared by every FeatureManager popup) ----
-// A slightly lighter, blue-tinted, mostly-opaque popup bg (glass depth illusion), a teal accent
-// border, rounded corners and roomier padding. Push BEFORE the BeginPopup*/picker call and pop
-// AFTER EndPopup/the call: the styles must stay live for the popup's whole deferred draw. The
-// push/pop is balanced every frame regardless of whether the popup is actually open.
-static void pushTreePopupGlass() {
-    const auto& pal = fmPalette();
-    ImGui::PushStyleColor(ImGuiCol_PopupBg,
-        ImVec4(pal.panelBg[0] * 1.08f, pal.panelBg[1] * 1.08f, pal.panelBg[2] * 1.20f, 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_Border,
-        ImVec4(pal.accentMid[0], pal.accentMid[1], pal.accentMid[2], 0.60f));
-    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 8.0f * ui::uiScale);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-        ImVec2(10.0f * ui::uiScale, 7.0f * ui::uiScale));
-}
-static void popTreePopupGlass() {
-    ImGui::PopStyleVar(2);
-    ImGui::PopStyleColor(2);
 }
 
 // ---- styled section rule with a centered label ----
@@ -1321,6 +1315,89 @@ void refreshFeatureHighlight(AppState& st) {
     fillHighlightFaces(st, st.selectedFeatureId, st.featureHighlightFaces);
 }
 
+// ---- viewport -> FeatureManager sync (see feature_tree.h featureTreeRevealPick) ----
+// Assembly AICM bodies: body_id is the 1-based ordinal among NON-suppressed components (engine
+// assembly build: "counts ALL non-suppressed components"). Component-pattern instances carry
+// synthetic ids >= kAsmPatternBodyBase whose component ("<seed>#<k>") only the engine's
+// doc_resolve_pick reply knows; featureTreeNoteAssemblyPick caches those per doc revision.
+static constexpr uint32_t kAsmPatternBodyBase = 1000000;
+struct AsmPickComponents {
+    std::string docId;
+    int revision = -1;
+    std::unordered_map<uint32_t, std::string> byBody;   // pattern body id -> seed component id
+};
+static AsmPickComponents s_asmPickComponents;
+
+const nlohmann::json* featureTreeAssemblyComponent(const nlohmann::json& tree, uint32_t bodyId) {
+    if (bodyId < 1 || bodyId >= kAsmPatternBodyBase || !tree.is_object()) return nullptr;
+    auto comps = tree.find("components");
+    if (comps == tree.end() || !comps->is_array()) return nullptr;
+    uint32_t ordinal = 0;
+    for (const auto& c : *comps) {
+        if (!c.is_object() || jftbool(c, "suppressed")) continue;
+        if (++ordinal == bodyId) return &c;
+    }
+    return nullptr;
+}
+
+void featureTreeNoteAssemblyPick(AppState& st, uint32_t bodyId, const std::string& componentId) {
+    if (bodyId < kAsmPatternBodyBase || componentId.empty()) return;   // ordinals resolve locally
+    AsmPickComponents& cache = s_asmPickComponents;
+    if (cache.docId != st.docMirror.docId() || cache.revision != st.docMirror.revision()) {
+        cache.docId = st.docMirror.docId();
+        cache.revision = st.docMirror.revision();
+        cache.byBody.clear();
+    }
+    cache.byBody[bodyId] = componentId.substr(0, componentId.find('#'));   // instance -> its seed row
+    st.treeScrollToSelection = true;   // the row can light only now — bring it into view
+}
+
+// Component id (tree row) owning an assembly pick's body, or "" when unknown.
+static std::string asmPickComponentId(AppState& st, const nlohmann::json& tree, uint32_t bodyId) {
+    if (const nlohmann::json* c = featureTreeAssemblyComponent(tree, bodyId)) return jfld(*c, "id");
+    const AsmPickComponents& cache = s_asmPickComponents;
+    if (cache.docId != st.docMirror.docId() || cache.revision != st.docMirror.revision()) return {};
+    auto it = cache.byBody.find(bodyId);
+    return it == cache.byBody.end() ? std::string() : it->second;
+}
+
+// The LATEST feature (tree order) among a body's owners — the owner map's per-body list follows
+// json key order ("f10" < "f2"), not history order.
+static std::string latestBodyOwner(AppState& st, const nlohmann::json& tree, uint32_t bodyId) {
+    const std::vector<std::string> owners = st.docMirror.ownerOfBody(bodyId);
+    if (owners.empty()) return {};
+    auto feats = tree.find("features");
+    if (feats != tree.end() && feats->is_array()) {
+        for (auto it = feats->rbegin(); it != feats->rend(); ++it) {
+            if (!it->is_object()) continue;
+            const std::string id = jfld(*it, "id");
+            if (std::find(owners.begin(), owners.end(), id) != owners.end()) return id;
+        }
+    }
+    return owners.back();
+}
+
+void featureTreeRevealPick(AppState& st, const render::PickHit& hit) {
+    if (!hit.valid() || !st.docMirror.hasDoc()) return;
+    const nlohmann::json& tree = st.docMirror.tree();
+    if (!tree.is_object()) return;
+    if (jfld(tree, "schema") == "aicad.asm/1") {
+        // Component rows light from the live selection (drawAssemblyTree); only request the scroll.
+        st.treeScrollToSelection = true;
+        return;
+    }
+    std::string owner = hit.kind == render::PickKind::Face
+        ? st.docMirror.ownerOfFace(hit.body_id, hit.topo_id)
+        : hit.kind == render::PickKind::Edge
+            ? st.docMirror.ownerOfEdge(hit.body_id, hit.topo_id) : std::string();
+    if (owner.empty()) owner = latestBodyOwner(st, tree, hit.body_id);
+    if (owner.empty()) return;   // no owner map (e.g. dumb import) — leave the tree alone
+    s_multiSel.clear();          // the pick replaces any tree multi-selection
+    st.selectedFeatureId = owner;
+    st.featureHighlightFaces.clear();   // the pick owns the viewport highlight, not an old tree click
+    st.treeScrollToSelection = true;
+}
+
 // C37-E (item 3): "Zoom to Feature" — union the owned faces'/bodies' bboxes (from the host-side
 // bbox caches) and post a one-shot camera request. Toasts when nothing framable was found.
 static void zoomToFeature(AppState& st, const std::string& fid) {
@@ -1373,6 +1450,7 @@ struct RowCtx {
     std::vector<uint32_t> ownedBodies;  // AICM body ids this feature owns (per-row eye toggle)
     bool nested = false;            // a sketch child node (indented under its consumer)
     bool expandable = false;        // has nested children (sketch/refs) → real collapse arrow
+    bool forceOpen = false;         // expand now: a viewport pick revealed a row nested under it
     bool canDoc = true;            // gates every mutating menu item + drag-reorder
     bool barAtEnd = true;          // hides "Roll to End" when already at the end
     std::string firstOwnedBody;    // body key for the per-row Appearance item ("b<n>")
@@ -1516,7 +1594,10 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     const bool labelClipped = shownName != fullName;
     const std::string label = lead + shownName + "##ft_" + fid;
     ImVec2 rowPos = ImGui::GetCursorScreenPos();
-    if (c.expandable) fmSeedCollapsed();
+    if (c.expandable) {
+        fmSeedCollapsed();
+        if (c.forceOpen) ImGui::SetNextItemOpen(true);
+    }
     const bool nodeOpen = ImGui::TreeNodeEx(label.c_str(), flags);
     // Drag source: drag a feature onto a folder header to file it into that folder. The click/drag
     // threshold means a plain click still selects; only an actual drag starts this.
@@ -1597,7 +1678,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     // BeginPopupContextItem opens on right-click of the LAST item, and featureBadge() below
     // emits its own SameLine text item. With the old order the menu only opened when the user
     // right-clicked the tiny status dot, i.e. effectively never (C40 fix).
-    pushTreePopupGlass();
+    ui::pushContextMenuStyle();
     if (ImGui::BeginPopupContextItem(("##ctx_" + fid).c_str())) {
         const bool isSketch = (c.type == "sketch") ||
             (c.iconName && std::strcmp(c.iconName, "sketch_node") == 0);
@@ -1799,7 +1880,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         ImGui::EndPopup();
     }
 
-    popTreePopupGlass();
+    ui::popContextMenuStyle();
 
     // ---- per-feature eye toggle (every row, right edge) ----
     // Hidden body-owning features hide their bodies; hidden sketches/datums drop out of the ghost
@@ -2362,7 +2443,7 @@ static bool drawComponentFeatureRow(AppState& st, const std::string& idSuffix,
     fmRowPillEnd(rect);
     const bool activate = editable && ImGui::IsItemHovered() &&
                           ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
-    pushTreePopupGlass();
+    ui::pushContextMenuStyle();
     if (ImGui::BeginPopupContextItem(("##nested_feature_" + idSuffix).c_str())) {
         if (!editable) ImGui::BeginDisabled();
         if (ImGui::MenuItem("Edit in Assembly"))
@@ -2370,7 +2451,7 @@ static bool drawComponentFeatureRow(AppState& st, const std::string& idSuffix,
         if (!editable) ImGui::EndDisabled();
         ImGui::EndPopup();
     }
-    popTreePopupGlass();
+    ui::popContextMenuStyle();
     if (activate) beginNestedFeatureEdit(st, topComponentId, sourcePath, feature);
     if (nested) ImGui::Unindent(nestIndent);
     return expandable && open;
@@ -2564,7 +2645,7 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
         if (canAssign) {
             // Mirror the part Material node menu (feature_tree ~3703): curated keys + Remove.
             // Selection is deferred via queueNestedMaterial — flush after the tree walk.
-            pushTreePopupGlass();
+            ui::pushContextMenuStyle();
             if (ImGui::BeginPopupContextItem(("##nmat_ctx_" + rowId).c_str())) {
                 ImGui::TextDisabled("Assign Material");
                 ImGui::Separator();
@@ -2581,7 +2662,7 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
                 }
                 ImGui::EndPopup();
             }
-            popTreePopupGlass();
+            ui::popContextMenuStyle();
         }
 
         if (ImGui::IsItemHovered()) {
@@ -2644,7 +2725,7 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !unavailable)
                 openComponentPart(st, component.sourceAbsPath);
         }
-        pushTreePopupGlass();
+        ui::pushContextMenuStyle();
         if (ImGui::BeginPopupContextItem(("##nested_component_" + childId).c_str())) {
             if (unavailable) ImGui::BeginDisabled();
             if (ImGui::MenuItem("Open Part"))
@@ -2654,7 +2735,7 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
             if (unavailable) ImGui::EndDisabled();
             ImGui::EndPopup();
         }
-        popTreePopupGlass();
+        ui::popContextMenuStyle();
         if (open) {
             if (!resolved) {
                 ImGui::TextDisabled("(unresolved source)");
@@ -2670,6 +2751,25 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
         }
     }
     ImGui::Unindent(nestIndent);
+}
+
+// A pending viewport reveal (st.treeScrollToSelection) whose target row lives in the Features
+// section — so the section header is forced open for it. Datum picks also request a scroll, but
+// their rows live under Reference and must not pop Features open.
+static bool fmRevealTargetsFeatures(AppState& st, const nlohmann::json& tree) {
+    if (!st.treeScrollToSelection || !tree.is_object()) return false;
+    if (jfld(tree, "schema") == "aicad.asm/1") {
+        for (const auto& item : st.selection.items())
+            if (!asmPickComponentId(st, tree, item.hit.body_id).empty()) return true;
+        return false;
+    }
+    if (st.selectedFeatureId.empty()) return false;
+    auto feats = tree.find("features");
+    if (feats == tree.end() || !feats->is_array()) return false;
+    for (const auto& f : *feats)
+        if (f.is_object() && jfld(f, "id") == st.selectedFeatureId)
+            return !isUserRefGeomType(jfld(f, "type"));
+    return false;
 }
 
 // ---- C20b: assembly tree (components + Mates folder) ----
@@ -2756,6 +2856,18 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
         }
     }
 
+    // Viewport -> tree: every component under the live viewport selection lights its row; the
+    // latest pick's component is the one-shot reveal target (featureTreeRevealPick asked for it).
+    std::unordered_set<std::string> pickedComps;
+    std::string revealComp;
+    for (const auto& item : st.selection.items()) {
+        std::string pcid = asmPickComponentId(st, tree, item.hit.body_id);
+        if (pcid.empty()) continue;
+        revealComp = pcid;
+        pickedComps.insert(std::move(pcid));
+    }
+    if (!st.treeScrollToSelection) revealComp.clear();
+
     // Build ordered groups: first-seen key order; empty keys are unique per instance.
     struct AsmCompGroup {
         std::string key;                 // shared key, or empty for singleton
@@ -2795,7 +2907,8 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
         const bool isAsm = nestedDoc.schema == "aicad.asm/1";
         FStatus fs = getFeatureStatus(statusArr, cid);
 
-        FmRowRect compRect = fmRowPill(false, featureKindTint("import", false));
+        const bool compSel = pickedComps.count(cid) > 0;
+        FmRowRect compRect = fmRowPill(compSel, featureKindTint("import", false));
         // SolidWorks marks fixed components with a "(f)" prefix.
         std::string label = (fixed ? "(f) " : "") + cname;
         if (suppressed) label += " [S]";
@@ -2816,6 +2929,10 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             fmEyeColumnW() + (fmBadgeShown(fs.ok, fs.dangling, false, fs.warning) ? fmBadgeW() : 0.0f));
         fmSeedCollapsed();
         const bool compOpen = ImGui::TreeNodeEx((shownLabel + "##comp_" + cid).c_str(), lf);
+        if (compSel && cid == revealComp) {
+            ImGui::SetScrollHereY(0.5f);
+            st.treeScrollToSelection = false;
+        }
         if (hidden || unavailable) ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) {
             if (shownLabel != label) ImGui::SetTooltip("%s", label.c_str());
@@ -2866,7 +2983,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             ref.label = cname.empty() ? cid : cname;
             togglePendingContextRef(st, std::move(ref));
         }
-        pushTreePopupGlass();
+        ui::pushContextMenuStyle();
         if (ImGui::BeginPopupContextItem(("##cctx_" + cid).c_str())) {
             // "Edit" = edit this component's PLACEMENT / mates in the assembly (the common action):
             // route through the request seam AsmPanels::draw() consumes to open + focus the Mate
@@ -2901,9 +3018,9 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 toggleCompHidden(!hidden);
             ImGui::EndPopup();
         }
-        popTreePopupGlass();
+        ui::popContextMenuStyle();
 
-        fmRowPillEnd(compRect);
+        fmRowPillEnd(compRect, compSel);
         featureBadge(fs.ok, !fs.error.empty(), fs.error, fs.dangling, false, fs.warning);
 
         // Cached recursive document tree: metadata, editable feature history, and nested
@@ -2944,12 +3061,16 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
         treeIcon("body_folder", "[F]", 16.0f);
         ImGui::SameLine(0, 4 * ui::uiScale);
         fmSeedCollapsed();
+        if (!revealComp.empty() &&
+            std::any_of(group.indices.begin(), group.indices.end(),
+                        [&](size_t idx) { return insts[idx].cid == revealComp; }))
+            ImGui::SetNextItemOpen(true);   // the picked instance sits in this folder
         const bool groupOpen = ImGui::TreeNodeEx(
             (folderLabel + "##" + folderId).c_str(),
             ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding |
             ImGuiTreeNodeFlags_OpenOnArrow);
         // Group-folder context menu: Open Part once for the shared source.
-        pushTreePopupGlass();
+        ui::pushContextMenuStyle();
         if (ImGui::BeginPopupContextItem(("##gctx_" + folderId).c_str())) {
             const bool canOpen = !group.absPath.empty();
             if (!canOpen) ImGui::BeginDisabled();
@@ -2960,7 +3081,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             if (!canOpen) ImGui::EndDisabled();
             ImGui::EndPopup();
         }
-        popTreePopupGlass();
+        ui::popContextMenuStyle();
         if (ImGui::IsItemHovered() && !group.absPath.empty())
             ImGui::SetTooltip("%s", group.absPath.c_str());
         fmRowPillEnd(grpRect);
@@ -3024,7 +3145,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 if (msup) ImGui::PopStyleColor();
                 fmRowPillEnd(mateRect);
 
-                pushTreePopupGlass();
+                ui::pushContextMenuStyle();
                 if (ImGui::BeginPopupContextItem(("##mctx_" + mid).c_str())) {
                     // C25: deferred via applyTreeOps — applying here would invalidate the
                     // tree json this loop iterates (same UAF as feature reorder).
@@ -3039,7 +3160,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                     }
                     ImGui::EndPopup();
                 }
-                popTreePopupGlass();
+                ui::popContextMenuStyle();
                 ++mi;
             }
             if (tree["mates"].empty()) {
@@ -3903,6 +4024,9 @@ void drawFeatureTreeBody(AppState& st,
         bool& s_fileSecOpen = sec.fileOpen;
         bool& s_refSecOpen  = sec.refOpen;
         bool& s_featSecOpen = sec.featOpen;
+        // A viewport pick revealing a Features row opens the section it lives in.
+        const bool featuresReveal = fmRevealTargetsFeatures(st, tree);
+        if (featuresReveal) s_featSecOpen = true;
         bool fileRightClicked = false;
         const bool fileOpenBefore = s_fileSecOpen;
         fmSectionDividerCollapse(docName.c_str(), &s_fileSecOpen, &fileRightClicked);
@@ -3940,7 +4064,7 @@ void drawFeatureTreeBody(AppState& st,
             static bool  s_openRootPicker = false;
             if (!isAsmDoc && st.docMirror.hasDoc()) {
                 if (fileRightClicked) ImGui::OpenPopup("##root_ctx");
-                pushTreePopupGlass();
+                ui::pushContextMenuStyle();
                 if (ImGui::BeginPopup("##root_ctx")) {
                     if (ImGui::MenuItem("Appearance...")) {
                         s_rootColor[0] = 0.71f; s_rootColor[1] = 0.76f; s_rootColor[2] = 0.82f;
@@ -3954,11 +4078,10 @@ void drawFeatureTreeBody(AppState& st,
                     }
                     ImGui::EndPopup();
                 }
-                popTreePopupGlass();
+                ui::popContextMenuStyle();
                 // Picker popup lives OUTSIDE the context menu (a sibling) to avoid nested-popup
                 // ordering pitfalls; it is opened by the menu item via s_openRootPicker.
                 if (s_openRootPicker) { ImGui::OpenPopup("##appearance_root"); s_openRootPicker = false; }
-                pushTreePopupGlass();
                 if (appearanceColorPicker("##appearance_root", s_rootColor,
                                           &s_rootMetallic, &s_rootRoughness)) {
                     applyTreeOps(st, nlohmann::json::array({
@@ -3967,7 +4090,6 @@ void drawFeatureTreeBody(AppState& st,
                          {"metallic", s_rootMetallic}, {"roughness", s_rootRoughness}}}),
                         "set_appearance");
                 }
-                popTreePopupGlass();
             }
         }
 
@@ -4030,7 +4152,7 @@ void drawFeatureTreeBody(AppState& st,
                 {
                     bool matAsm = tree.is_object() && jfld(tree, "schema") == "aicad.asm/1";
                     if (!matAsm && st.docMirror.hasDoc()) {
-                        pushTreePopupGlass();
+                        ui::pushContextMenuStyle();
                         if (ImGui::BeginPopupContextItem("##mat_ctx")) {
                             ImGui::TextDisabled("Assign Material");
                             ImGui::Separator();
@@ -4065,7 +4187,7 @@ void drawFeatureTreeBody(AppState& st,
                             }
                             ImGui::EndPopup();
                         }
-                        popTreePopupGlass();
+                        ui::popContextMenuStyle();
                     }
                 }
                 // Show the friendly material name (kPhysicalMaterials) when the assigned key is one
@@ -4136,7 +4258,7 @@ void drawFeatureTreeBody(AppState& st,
                             bool rowHovered = ImGui::IsItemHovered();
                             char ctxId[32];
                             std::snprintf(ctxId, sizeof(ctxId), "##body_ctx%d", bi);
-                            pushTreePopupGlass();
+                            ui::pushContextMenuStyle();
                             if (ImGui::BeginPopupContextItem(ctxId)) {
                                 if (ImGui::MenuItem("Add to AI context")) {
                                     AppState::ContextRef ref;
@@ -4173,7 +4295,7 @@ void drawFeatureTreeBody(AppState& st,
                                 }
                                 ImGui::EndPopup();
                             }
-                            popTreePopupGlass();
+                            ui::popContextMenuStyle();
                             if (rowClicked) {
                                 if (st.contextPickActive) {
                                     AppState::ContextRef ref;
@@ -5128,6 +5250,23 @@ void drawFeatureTreeBody(AppState& st,
                         return it == ownerMap.end() ? std::vector<uint32_t>{} : it->second.bodies;
                     };
 
+                    // Viewport -> tree reveal: while a pick's scroll is pending, force open the user
+                    // folder / import-instance group / import row (Place_* transforms nest under it)
+                    // holding the selected feature so its row draws, lights and scrolls into view.
+                    std::string revealFolder, revealParent;
+                    if (st.treeScrollToSelection && !selectedFeatureId.empty()) {
+                        for (const auto& f : *feat)
+                            if (f.is_object() && jfld(f, "id") == selectedFeatureId) {
+                                revealFolder = jfld(f, "folder");
+                                break;
+                            }
+                        if (nestedPlacementIds.count(selectedFeatureId))
+                            for (const auto& kv : placeChildrenOf)
+                                for (const nlohmann::json* pf : kv.second)
+                                    if (pf && jfld(*pf, "id") == selectedFeatureId)
+                                        revealParent = kv.first;
+                    }
+
                     // ---- render one feature row (shared by flat + nested-sketch paths) ----
                     int rowIdx = 0;   // visual stripe index (stable across nesting)
                     // Returns whether the row is expanded (leaf/child rows always true) so the caller
@@ -5178,21 +5317,19 @@ void drawFeatureTreeBody(AppState& st,
                         ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
                         ImDrawList* rowDl = ImGui::GetWindowDrawList();
                         // Readable row pill via shared glass helper (panel stays transparent).
-                        // Frosted glass base + stripe only (no selection glow here — the colored
-                        // wash below owns selection, matching the ecad Layers style).
+                        // Frosted glass base + stripe only; selection paints last (below).
                         ui::glassRowBackground(rowDl, rowMin, rowMax, 3.5f, rowIdx % 2 == 0, false,
                                                sel ? 0.42f : 0.26f);
                         // Color-coded row wash dyed the feature's CATEGORY color (sketch=blue,
                         // solid-add=teal, cut=orange, dress-up=purple, pattern=cyan, datum=slate,
                         // ...) — the same Layers-style tinted background used across the app.
-                        // Replaces the old 3px left color bar; selection is a glow border in-color.
+                        // Replaces the old 3px left color bar.
                         {
                             const bool catIsCut = featureModeIsCut(&f);
                             const bool catIsErr = !fs.ok && (ftype == "sketch" || ftype == "sketch3d");
                             float catTint[3]; categoryColorRGB(ftype, catIsCut, catTint, catIsErr);
                             // Same outer rect as the base — coloredRowWash self-insets.
-                            ui::coloredRowWash(rowDl, rowMin, rowMax, 3.5f, catTint,
-                                               sel ? 0.40f : 0.28f, sel);
+                            ui::coloredRowWash(rowDl, rowMin, rowMax, 3.5f, catTint, 0.28f, false);
                         }
                         if (suppressed) {
                             // Inset + rounded to match the pill (square full-rect fill poked
@@ -5206,13 +5343,7 @@ void drawFeatureTreeBody(AppState& st,
                                          (int)(pal.statusWarn[2] * 255), 8),
                                 3.5f * S);
                         }
-                        if (sel) {
-                            // selection card drawn by glassRowBackground(selected=true)
-                            if (selectedFeatureId == fid && st.treeScrollToSelection) {
-                                ImGui::SetScrollHereY(0.5f);
-                                st.treeScrollToSelection = false;
-                            }
-                        }
+                        if (sel) fmRowSelectedPaint(rowDl, rowMin, rowMax);
                         ++rowIdx;
 
                         // C27-C: convert fillet↔chamfer (kept).
@@ -5268,6 +5399,7 @@ void drawFeatureTreeBody(AppState& st,
                         const bool importExpand = (ftype == "import") && !nested &&
                                                  importHasExpandableContent(f);
                         ctx.expandable = (!nested && childrenOf.count(fid) > 0) || importExpand;
+                        ctx.forceOpen = !revealParent.empty() && fid == revealParent;
 
                         ctx.canDoc = canDocTree;
                         ctx.barAtEnd = barAtEnd;
@@ -5277,6 +5409,12 @@ void drawFeatureTreeBody(AppState& st,
                         ctx.editCallback = &editCallback;
 
                         RowResult rr = featureRow(ctx, st);
+                        // Viewport -> tree reveal: centre the row just submitted (SetScrollHereY
+                        // targets the previous line, so it must follow the row, not precede it).
+                        if (sel && selectedFeatureId == fid && st.treeScrollToSelection) {
+                            ImGui::SetScrollHereY(0.5f);
+                            st.treeScrollToSelection = false;
+                        }
                         // T-G18: shared hover paint (identical to every meta/header row).
                         fmRowHoverPaint(rowMin, rowMax, rr.hovered, sel);
 
@@ -5473,6 +5611,8 @@ void drawFeatureTreeBody(AppState& st,
                                 treeIcon("body_folder", "[F]", 16.0f);   // #4.4: was "mates_folder"
                                 ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                                 fmSeedCollapsed();
+                                if (!revealFolder.empty() && folder == revealFolder)
+                                    ImGui::SetNextItemOpen(true);
                                 folderOpen = ImGui::TreeNodeEx(
                                     (folder + "##fld_" + folder).c_str(),
                                     ImGuiTreeNodeFlags_SpanFullWidth |
@@ -5510,13 +5650,22 @@ void drawFeatureTreeBody(AppState& st,
                             treeIcon("body_folder", "[F]", 16.0f);
                             ImGui::SameLine(0, 4 * ui::uiScale);
                             fmSeedCollapsed();
+                            if (st.treeScrollToSelection &&
+                                std::any_of(g.members.begin(), g.members.end(),
+                                    [&](const nlohmann::json* mf) {
+                                        if (!mf) return false;
+                                        const std::string mid = jfld(*mf, "id");
+                                        return mid == selectedFeatureId ||
+                                               (!revealParent.empty() && mid == revealParent);
+                                    }))
+                                ImGui::SetNextItemOpen(true);
                             const bool groupOpen = ImGui::TreeNodeEx(
                                 (folderLabel + "##" + folderId).c_str(),
                                 ImGuiTreeNodeFlags_SpanFullWidth |
                                 ImGuiTreeNodeFlags_FramePadding |
                                 ImGuiTreeNodeFlags_OpenOnArrow);
                             // Folder context: Open Part once for the shared source file.
-                            pushTreePopupGlass();
+                            ui::pushContextMenuStyle();
                             if (ImGui::BeginPopupContextItem(("##igctx_" + folderId).c_str())) {
                                 const bool canOpen = !g.absPath.empty();
                                 if (!canOpen) ImGui::BeginDisabled();
@@ -5527,7 +5676,7 @@ void drawFeatureTreeBody(AppState& st,
                                 if (!canOpen) ImGui::EndDisabled();
                                 ImGui::EndPopup();
                             }
-                            popTreePopupGlass();
+                            ui::popContextMenuStyle();
                             if (ImGui::IsItemHovered() && !g.absPath.empty())
                                 ImGui::SetTooltip("%s", g.absPath.c_str());
                             // Double-click folder → open the shared part (same as Open Part).
@@ -5694,6 +5843,9 @@ void drawFeatureTreeBody(AppState& st,
         // Always clear after the Features pass (even if header closed) so a one-shot seed
         // cannot leak into subsequent frames.
         s_fmCollapseSeed = false;
+        // Same for a viewport reveal: its forced-open folders get one frame. A target row that never
+        // drew (hidden by the name filter) must not pin its folders open or scroll a later frame.
+        if (featuresReveal) st.treeScrollToSelection = false;
     }
 
     if (!st.selectedFeatureId.empty() || !s_multiSel.empty()) {
@@ -5714,7 +5866,6 @@ void drawFeatureTreeBody(AppState& st,
     // node) and turn a commit into a set_appearance op on that body.
     if (s_apprOpen && !s_apprBody.empty()) { ImGui::OpenPopup("##appearance_feat"); s_apprOpen = false; }
     if (!s_apprBody.empty()) {
-        pushTreePopupGlass();
         if (appearanceColorPicker("##appearance_feat", s_apprColor,
                                   &s_apprMetallic, &s_apprRoughness)) {
             applyTreeOps(st, nlohmann::json::array({
@@ -5724,7 +5875,6 @@ void drawFeatureTreeBody(AppState& st,
                 "set_appearance");
             s_apprBody.clear();
         }
-        popTreePopupGlass();
     }
 
     // C25: apply ops queued during drawing — safe now, nothing reads the tree json below.

@@ -363,6 +363,7 @@ static void drawFileRow(AppState& st, const std::string& root, const std::string
             ImGui::EndDragDropSource();
         }
         // context menu
+        ui::pushContextMenuStyle();
         if (ImGui::BeginPopupContextItem("##fctx")) {
             s_selectedPath = pathStr;
             s_currentFolder = pathParent(p);
@@ -379,6 +380,7 @@ static void drawFileRow(AppState& st, const std::string& root, const std::string
             if (ImGui::MenuItem("Delete", "Del")) s_pendingDelete = pathStr;
             ImGui::EndPopup();
         }
+        ui::popContextMenuStyle();
         itemPathTooltip(fname, pathStr);
     }
     ImGui::PopID();
@@ -432,6 +434,7 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
     }
     itemPathTooltip(label, dir);
     // folder context menu (New Folder / Paste / Rename / Delete — root only allows New Folder/Paste)
+    ui::pushContextMenuStyle();
     if (ImGui::BeginPopupContextItem("##dctx")) {
         s_selectedPath = dir;
         s_currentFolder = dir;
@@ -452,6 +455,7 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
         }
         ImGui::EndPopup();
     }
+    ui::popContextMenuStyle();
 
     if (open) {
         const auto& snapshot = fsb.pollDirectory(dir);

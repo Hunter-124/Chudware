@@ -2899,6 +2899,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // Ordinary viewport/Measure picks resolve off the GL thread. Editing wells keep
   // their established routing, but never wait behind a busy async engine call.
   st.selection.setObserver([&st]() {
+    // Viewport -> FeatureManager: light + scroll to the newest pick's owning row NOW, from the
+    // mirror's owner map. This used to wait for the doc_resolve_pick round-trip and ran only on
+    // its success path, so a busy FIFO, a revision drift or a resolve error left the tree unsynced.
+    for (auto it = st.selection.items().rbegin(); it != st.selection.items().rend(); ++it) {
+      if (!it->pending_resolve || it->resolve_request != 0 || !it->hit.valid()) continue;
+      ui::featureTreeRevealPick(st, it->hit);
+      break;
+    }
     if (!st.docMirror.hasDoc() || !st.workerStarted) {
       for (auto &item : st.selection.mutableItems()) {
         if (!item.pending_resolve) continue;
@@ -2971,20 +2979,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                 } else {
                   selected.selector = reply.result["selector"].dump();
                   selected.resolution_error.clear();
-                  if (active) {
-                    std::string owner = hit.kind == render::PickKind::Face
-                        ? st.docMirror.ownerOfFace(hit.body_id, hit.topo_id)
-                        : hit.kind == render::PickKind::Edge
-                            ? st.docMirror.ownerOfEdge(hit.body_id, hit.topo_id) : std::string();
-                    if (owner.empty()) {
-                      const auto owners = st.docMirror.ownerOfBody(hit.body_id);
-                      if (!owners.empty()) owner = owners.back();
-                    }
-                    if (!owner.empty()) {
-                      st.selectedFeatureId = owner;
-                      st.treeScrollToSelection = true;
-                    }
-                  }
+                  // Assembly: a component-pattern instance's seed row is only known from here.
+                  if (active && reply.result.contains("component") &&
+                      reply.result["component"].is_string())
+                    ui::featureTreeNoteAssemblyPick(st, hit.body_id,
+                                                    reply.result["component"].get<std::string>());
                 }
                 if (!selected.resolution_error.empty())
                   st.addLog("[selection] " + selected.resolution_error);
@@ -3013,6 +3012,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           item.pending_resolve = false;
           item.resolution_error = asel.empty() ? err : std::string();
           if (!asel.empty()) {
+            ui::featureTreeNoteAssemblyPick(st, item.hit.body_id, comp);
             item.selector = asel;
             item.pending_resolve = false;
             try {
@@ -3031,8 +3031,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                                                       item.hit.topo_id, comp, err);
           item.pending_resolve = false;
           item.resolution_error = item.selector.empty() ? err : std::string();
-          if (!comp.empty())
+          if (!comp.empty()) {
+            ui::featureTreeNoteAssemblyPick(st, item.hit.body_id, comp);
             ap->routeAsmPatternPick(comp);
+          }
           continue; // handled — skip the part-doc resolve path
         }
       }
@@ -3083,30 +3085,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       if (!sel.empty()) {
         item.selector = sel;
         item.pending_resolve = false;
-        // W1-B (item 7): viewport->tree sync. Resolve the pick's owning feature
-        // via the DocMirror owner map and select it in the FeatureManager so
-        // its row highlights and (Wave-2) scrolls into view. Faces/edges use
-        // ownerOfFace/ownerOfEdge; a body pick (or a face whose owner is
-        // unknown) falls back to the body's first owner. TOLERANT of an empty
-        // owner map (engine hasn't shipped it) — then we leave the tree alone.
-        {
-          std::string owner;
-          if (item.hit.kind == render::PickKind::Face)
-            owner =
-                st.docMirror.ownerOfFace(item.hit.body_id, item.hit.topo_id);
-          else if (item.hit.kind == render::PickKind::Edge)
-            owner =
-                st.docMirror.ownerOfEdge(item.hit.body_id, item.hit.topo_id);
-          if (owner.empty()) {
-            auto owners = st.docMirror.ownerOfBody(item.hit.body_id);
-            if (!owners.empty())
-              owner = owners.back(); // most-recent feature on the body
-          }
-          if (!owner.empty()) {
-            st.selectedFeatureId = owner;
-            st.treeScrollToSelection = true;
-          }
-        }
         // C17: route the freshly resolved pick into the active PropertyManager
         // well (filtered by the well's allowed kinds). Consumed picks do not
         // affect the viewport highlight set beyond their normal selection role.

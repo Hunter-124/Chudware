@@ -1769,16 +1769,11 @@ static bool docIsAssembly(AppState& st) {
     return tree.is_object() && tree.value("schema", std::string()) == "aicad.asm/1";
 }
 
-// The component object at a 1-based body ordinal in an assembly tree (body_id == component
-// ordinal; see engine assembly.py AsmBodyOut.body_id). Returns nullptr if out of range.
+// The component object owning a 1-based AICM body id in an assembly: the ordinal among
+// NON-suppressed components (shared with the FeatureManager's viewport->tree sync, so both agree).
+// nullptr for component-pattern instances and out-of-range ids.
 static const nlohmann::json* asmComponentByOrdinal(AppState& st, uint32_t bodyId) {
-    const auto& tree = st.docMirror.tree();
-    if (!tree.is_object() || !tree.contains("components") || !tree["components"].is_array())
-        return nullptr;
-    const auto& comps = tree["components"];
-    if (bodyId < 1 || bodyId > comps.size()) return nullptr;
-    const auto& c = comps[bodyId - 1];
-    return c.is_object() ? &c : nullptr;
+    return ui::featureTreeAssemblyComponent(st.docMirror.tree(), bodyId);
 }
 
 // Component world origin (the translation of its row-major 16-float transform). Falls back to the
@@ -4150,6 +4145,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         const bool vpHasComp = vpComp && !vpCompId.empty();
         const bool vpHasBody = vpBodySlot >= 0 && !vpHasComp;
 
+        ui::pushContextMenuStyle();
         if (ImGui::BeginPopup("##vp_ctx")) {
             // ---- ITEM 8: selection-dependent entries ----
             if (vpHasComp) {
@@ -4353,6 +4349,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
             ImGui::EndPopup();
         }
+        ui::popContextMenuStyle();
 
         // C26: appearance picker — a SIBLING popup of vp_ctx (opened from its menu item) to avoid
         // nested-popup ordering issues. Direct-applies on commit (safe outside tree iteration).

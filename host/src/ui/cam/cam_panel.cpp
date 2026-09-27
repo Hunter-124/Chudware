@@ -1773,6 +1773,7 @@ void drawCamTreeBody(AppState& st) {
                     ImGui::AlignTextToFramePadding();
                     ImGui::TextColored(ImVec4(badgeCol[0], badgeCol[1], badgeCol[2], badgeCol[3]), "%s", badge);
                 }
+                ui::pushContextMenuStyle();
                 if (ImGui::BeginPopupContextItem("##cam_op_ctx")) {
                     if (ImGui::MenuItem(o.suppressed ? "Unsuppress" : "Suppress"))
                         pendingOps.push_back(nlohmann::json{
@@ -1783,6 +1784,7 @@ void drawCamTreeBody(AppState& st) {
                             {"op", "remove_operation"}, {"op_id", o.id}});
                     ImGui::EndPopup();
                 }
+                ui::popContextMenuStyle();
                 fmRowPillEnd(orr, opSel);
                 ImGui::PopID();
             }

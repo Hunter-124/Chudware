@@ -80,6 +80,14 @@ Python kernel executes → result drained per-frame by `host/src/core/engine_eve
   and **"Edit Model"** (in-context model edit → `AppState::enterComponentEdit(cid, absPath)`);
   double-click a component row also enters in-context edit. Ghost/edit-mode machinery is in
   gui-viewport.
+- **Viewport → tree sync** (`ui::featureTreeRevealPick`, called from app.cpp's selection
+  observer the moment a pick is added — never gated on the `doc_resolve_pick` reply): part docs
+  (and in-context edit) select the owner-map feature; assembly component rows light from the live
+  `st.selection` (body id = ordinal among non-suppressed components, `featureTreeAssemblyComponent`;
+  pattern instances via the resolve reply → `featureTreeNoteAssemblyPick`). A pending
+  `treeScrollToSelection` force-opens the Features section / folder / instance group and scrolls.
+  Assemblies have an empty engine `owner_map`, so nested component feature rows are not lit.
+  Selected rows (every kind) paint via `fmRowSelectedPaint` (accentSoft fill + accent glow).
 - The AI "Name & group" tree-header button was removed (sidelined); `nameAndGroupFeatures`
   is kept `[[maybe_unused]]` for later re-wiring.
 

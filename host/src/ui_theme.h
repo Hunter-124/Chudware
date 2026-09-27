@@ -302,6 +302,15 @@ void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, float
 void pushGlassTooltipStyle();
 void popGlassTooltipStyle();
 
+// Push/pop the chrome shared by every right-click context menu: opaque popupBg surface, glass
+// border, and padding/item spacing sized so a MenuItem's hover band sits evenly inset 4 dp from
+// every popup edge while labels sit 12 dp in. Hover/open rows use the soft accent wash, press
+// the mid wash. Push BEFORE BeginPopup*/BeginPopupContext* and pop AFTER the if-block — the
+// styles must stay live for the popup's whole draw, and the pair is balanced every frame
+// whether or not the menu is open. Submenus (BeginMenu) inherit it.
+void pushContextMenuStyle();
+void popContextMenuStyle();
+
 // Push/pop WindowBg=glassBg around a floating ImGui::Begin() window (translucent glass panel).
 // Pair the calls immediately around Begin()/End().
 void pushGlassWindowStyle();

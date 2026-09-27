@@ -7309,6 +7309,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !dimPopupOpen_)
             ImGui::OpenPopup("##SketchCtx");
     }
+    ui::pushContextMenuStyle();
     if (ImGui::BeginPopup("##SketchCtx")) {
         // Count deletable sketch entities in the selection (virtual origin/axes don't count).
         int nDelEnt = 0;
@@ -7383,9 +7384,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Exit Sketch")) { ImGui::CloseCurrentPopup(); ImGui::EndPopup();
+                                              ui::popContextMenuStyle();
                                               exitSketch(st, /*keep=*/true); dl->PopClipRect(); return; }
         ImGui::EndPopup();
     }
+    ui::popContextMenuStyle();
 
     // ---- C29-B sketch-editing tools (Trim / Extend / Offset) ----
     // These have bespoke pick semantics (whole-entity hover + ops), so they run BEFORE the generic

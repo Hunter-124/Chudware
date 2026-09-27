@@ -164,7 +164,8 @@ for raw in sys.stdin:
     if method in {
         "subscription_status", "bench_status", "triggers_list", "packs_get",
         "skills_list", "ai_roles_get", "model_rankings_get", "rule_create",
-        "subagent_list", "dag_status", "memory_recall", "session_btw",
+        "subagent_list", "subagent_transcript", "subagent_steer", "subagent_control",
+        "subagent_terminate", "dag_status", "memory_recall", "session_btw",
         "chudcode_session_stats", "ai_prompt_warm", "ai_tool_catalog",
         "plm_status", "mfg_printer_adapter_snapshot", "part_search",
         "reveng_start_from_product", "ecad_thermal_handoff", "office_extract",
@@ -360,7 +361,7 @@ def test_blocked_agent_lane_does_not_block_general_worker(worker_daemon):
     for method in (
         "subscription_status", "bench_status", "triggers_list", "packs_get",
         "skills_list", "ai_roles_get", "model_rankings_get", "rule_create",
-        "subagent_list", "dag_status", "memory_recall", "session_btw",
+        "dag_status", "memory_recall", "session_btw",
         "chudcode_session_stats", "ai_prompt_warm", "ai_tool_catalog",
     ):
         response = controller.call(method)
@@ -370,6 +371,8 @@ def test_blocked_agent_lane_does_not_block_general_worker(worker_daemon):
         "part_search",
         "reveng_start_from_product", "ecad_thermal_handoff",
         "office_extract", "unregistered_probe",
+        "subagent_list", "subagent_transcript", "subagent_steer", "subagent_control",
+        "subagent_terminate",
     ):
         response = general.call(method)
         assert response.get("pid") == general_pid, (method, response)
@@ -433,6 +436,47 @@ def test_agent_lane_call_behind_a_turn_fails_fast_and_hostd_survives(worker_daem
     served = gui.call("subscription_status")
     assert served.get("lane") == "agent", served
     assert _worker_count(worker_daemon["counter"]) == 1
+
+
+def test_subagent_roster_and_controls_are_served_while_a_turn_holds_the_agent_lane(
+    worker_daemon,
+):
+    # Registry sub-agents only exist while an agent turn runs, and that turn holds the agent
+    # lane for its whole length; the Current Run roster, transcript and Steer / Pause /
+    # Terminate must still answer instead of failing with worker_lane_busy.
+    requester, gui = DaemonClient(), DaemonClient()
+    requester.connect()
+    worker_daemon["pids"].append(_pid(requester))
+    gui.connect()
+    outcome: dict = {}
+    thread = threading.Thread(
+        target=lambda: outcome.update(
+            result=requester.call(
+                "agent_admin_turn", {"run_id": "roster-live", "request": "work"}
+            )
+        ),
+        daemon=True,
+    )
+    thread.start()
+    _wait_for(worker_daemon["active"])
+
+    started = time.monotonic()
+    for method in ("subagent_list", "subagent_transcript", "subagent_steer",
+                   "subagent_control", "subagent_terminate"):
+        response = gui.call(method, {"subagent_id": "dg_live"})
+        assert response.get("code") != "worker_lane_busy", (method, response)
+        assert response.get("method") == method, response
+        assert response.get("lane") == "general", (method, response)
+    assert time.monotonic() - started < 3.0  # the fake turn holds the agent lane for 10 s
+    assert thread.is_alive(), "the turn must still be running and holding the agent lane"
+    assert worker_daemon["active"].exists()
+    # A method that still belongs to the agent lane is refused, proving the lane was held.
+    assert gui.call("dag_status").get("code") == "worker_lane_busy"
+
+    assert gui.call("agent_cancel", {"run_id": "roster-live"})["cancelled"]
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    assert outcome["result"]["control"] == "cancel"
 
 
 def test_unknown_method_worker_fallback_contract_is_unchanged(worker_daemon):

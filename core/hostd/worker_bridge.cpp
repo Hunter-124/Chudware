@@ -40,6 +40,21 @@ WorkerBridge& WorkerBridge::forMethod(const std::string& method) {
     };
     if (method == "worker_control_info" || method == "rule_create")
         return agent();
+    // The sub-agent registry methods are served by the general lane so the GUI's Current Run
+    // roster, transcript and Steer/Pause/Resume/Terminate keep working while an agent turn holds
+    // the agent lane for hours (registry sub-agents only exist during such a turn). Invariant
+    // that makes this safe: services/agent/subagent_rpc.py serves all five purely from the
+    // on-disk registry (services/agent/subagent_registry.py) with no in-memory agent-lane state —
+    // metadata is replaced atomically and every read-modify-write of it holds the per-session
+    // cross-process lock (_update_meta), because the runners writing the same records live in
+    // the agent-lane worker; transcript/steer logs are O_APPEND with torn lines skipped. Keep
+    // this list explicit: a new subagent_* method goes here only if it keeps that invariant.
+    static constexpr const char* generalSubagentMethods[] = {
+        "subagent_list", "subagent_transcript", "subagent_steer", "subagent_control",
+        "subagent_terminate",
+    };
+    for (const char* name : generalSubagentMethods)
+        if (method == name) return general();
     for (const char* prefix : agentPrefixes)
         if (method.compare(0, std::strlen(prefix), prefix) == 0)
             return agent();

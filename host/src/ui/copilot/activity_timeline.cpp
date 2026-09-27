@@ -1449,6 +1449,149 @@ static void drawToolDetailBox(const char* id, const std::string& text, ImFont* f
     if (font) ImGui::PopFont();
 }
 
+// Tool arguments as the user reads them. NEVER through stripMdMarks: `**kwargs`, `x**2` and
+// backticks are code, not markdown. Producers ship args_preview as JSON capped at ~2 KB with a
+// trailing "…", so a long eval script is usually NOT parseable JSON — its code string is then
+// salvaged from the prefix. The right-click Copy keeps the raw preview.
+struct ToolArgsView {
+    std::string code;     // code/script/source/command string value, unescaped (verbatim)
+    std::string fields;   // every other key as "key: value" lines
+    std::string raw;      // fallback only: pretty JSON or the preview text, verbatim
+};
+
+static constexpr const char* kToolCodeKeys[] = {"code", "script", "source", "command", "cmd"};
+
+static void appendUtf8(std::string& out, uint32_t cp) {
+    if (cp < 0x80) {
+        out.push_back((char)cp);
+    } else if (cp < 0x800) {
+        out.push_back((char)(0xC0 | (cp >> 6)));
+        out.push_back((char)(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        out.push_back((char)(0xE0 | (cp >> 12)));
+        out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back((char)(0x80 | (cp & 0x3F)));
+    } else {
+        out.push_back((char)(0xF0 | (cp >> 18)));
+        out.push_back((char)(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back((char)(0x80 | (cp & 0x3F)));
+    }
+}
+
+// Decode a JSON string literal whose body starts at s[i] (just past the opening quote), up to
+// its closing quote or the end of a capped preview — whatever the cap left is still real code.
+static std::string decodeJsonStringPrefix(const std::string& s, size_t i) {
+    auto hex4 = [&s](size_t at, uint32_t& v) {
+        if (at + 4 > s.size()) return false;
+        v = 0;
+        for (size_t k = at; k < at + 4; ++k) {
+            const char c = s[k];
+            v <<= 4;
+            if (c >= '0' && c <= '9') v |= (uint32_t)(c - '0');
+            else if (c >= 'a' && c <= 'f') v |= (uint32_t)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') v |= (uint32_t)(c - 'A' + 10);
+            else return false;
+        }
+        return true;
+    };
+    std::string out;
+    while (i < s.size()) {
+        const char c = s[i];
+        if (c == '"') break;
+        if (c != '\\' || i + 1 >= s.size()) { out.push_back(c); ++i; continue; }
+        const char e = s[i + 1];
+        i += 2;
+        switch (e) {
+            case 'n': out.push_back('\n'); break;
+            case 't': out.push_back('\t'); break;
+            case 'r': out.push_back('\r'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'u': {
+                uint32_t cp = 0;
+                if (!hex4(i, cp)) { out += "\\u"; break; }
+                i += 4;
+                uint32_t lo = 0;
+                if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 <= s.size() && s[i] == '\\' &&
+                    s[i + 1] == 'u' && hex4(i + 2, lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    i += 6;
+                }
+                appendUtf8(out, cp);
+                break;
+            }
+            default: out.push_back(e); break;   // \" \\ \/ and anything unexpected, literally
+        }
+    }
+    return out;
+}
+
+static ToolArgsView toolArgsView(const std::string& args) {
+    ToolArgsView v;
+    const nlohmann::json j = nlohmann::json::parse(args, nullptr, /*allow_exceptions=*/false);
+    if (j.is_object()) {
+        const char* codeKey = nullptr;
+        for (const char* key : kToolCodeKeys) {
+            const auto it = j.find(key);
+            if (it != j.end() && it->is_string() && !it->get_ref<const std::string&>().empty()) {
+                v.code = it->get<std::string>();
+                codeKey = key;
+                break;
+            }
+        }
+        for (const auto& el : j.items()) {
+            if (el.key().rfind("_truncated", 0) == 0) continue;   // producer bookkeeping
+            if (codeKey && el.key() == codeKey) continue;
+            const nlohmann::json& val = el.value();
+            if (!v.fields.empty()) v.fields += "\n";
+            v.fields += el.key();
+            v.fields += ": ";
+            v.fields += val.is_string() ? val.get<std::string>() : val.dump();
+        }
+        if (v.code.empty() && v.fields.empty()) v.raw = args;
+        return v;
+    }
+    if (!j.is_discarded()) {
+        // Arrays / scalars: nothing better than readable JSON.
+        v.raw = j.is_string() ? j.get<std::string>() : j.dump(2);
+        return v;
+    }
+    // Not JSON — usually a capped object preview. Salvage the code string when one leads it.
+    if (!args.empty() && args[0] == '{') {
+        for (const char* key : kToolCodeKeys) {
+            const std::string quoted = std::string("\"") + key + "\"";
+            size_t at = args.find(quoted);
+            if (at == std::string::npos) continue;
+            at += quoted.size();
+            while (at < args.size() && std::isspace((unsigned char)args[at])) ++at;
+            if (at >= args.size() || args[at] != ':') continue;
+            ++at;
+            while (at < args.size() && std::isspace((unsigned char)args[at])) ++at;
+            if (at >= args.size() || args[at] != '"') continue;
+            v.code = decodeJsonStringPrefix(args, at + 1);
+            if (!v.code.empty()) return v;
+        }
+    }
+    v.raw = args;
+    return v;
+}
+
+// The Doing drawer's argument section: the code in the mono code box, the remaining arguments as
+// a key: value list, and raw text (verbatim, mono) only when neither exists.
+static void drawToolArgs(const std::string& args, const ui::Fonts& fonts) {
+    if (args.empty()) return;
+    const ToolArgsView v = toolArgsView(args);
+    if (!v.code.empty())
+        drawCodeBox("##toolcode", v.code, fonts.mono, ui::metrics::px(260.0f));
+    if (!v.fields.empty())
+        drawToolDetailBox("##toolfields", v.fields, nullptr, ui::metrics::copilotProseMaxH(),
+                          /*failure=*/false);
+    if (!v.raw.empty())
+        drawToolDetailBox("##tooldetail", v.raw, fonts.mono, ui::metrics::copilotProseMaxH(),
+                          /*failure=*/false);
+}
+
 // M14 — one tool call as ONE dense LOG LINE, not a card: [status mark in the gutter] wrench, the
 // HUMAN title (tool_phrase.h turns `add_features` into "Building geometry"), the target it acts on,
 // and a right-aligned latency/cache chip. It used to be a bordered glass card spending three lines
@@ -1655,16 +1798,21 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     bool toggleHit = hasDrawer && ImGui::IsItemClicked();
     if (titleHovered) {
         if (hasDrawer) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        // Everything the single line could not afford, in one place: the untruncated phrasing, the
-        // raw MCP symbol, and when the call ran.
+        // Everything the single line could not afford, in one place: the untruncated phrasing,
+        // when the call ran, and — only at the Full tool-detail level — the raw tool symbol.
         std::string tip;
-        if (titleFit != humanTitle) tip = humanTitle + "\n";
-        tip += a.title;
-        if (!clockS.empty()) tip += "\n" + clockS;
+        auto addLine = [&tip](const std::string& line) {
+            if (line.empty()) return;
+            if (!tip.empty()) tip += "\n";
+            tip += line;
+        };
+        if (titleFit != humanTitle) addLine(humanTitle);
+        if (diag) addLine(a.title);
+        addLine(clockS);
         if (metaCache > 0)
-            tip += "\n" + chatTokCount(metaCache) + " tokens read from the prompt cache by the "
-                   "completion that made this call.";
-        ImGui::SetTooltip("%s", tip.c_str());
+            addLine(chatTokCount(metaCache) + " tokens read from the prompt cache by the "
+                    "completion that made this call.");
+        if (!tip.empty()) ImGui::SetTooltip("%s", tip.c_str());
     }
     if (diag) {
         // Same ordering rule as the target below: SameLine, then measure.
@@ -1786,9 +1934,7 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
                 const ToolRowDetail mp = splitToolRowDetail(mi->detail);
                 const std::string t = ui::humanTarget(mi->reason);
                 if (!t.empty()) dimText(t.c_str());
-                if (!mp.args.empty())
-                    drawToolDetailBox("##tooldetail", stripMdMarks(mp.args), nullptr,
-                                      ui::metrics::copilotProseMaxH(), /*failure=*/false);
+                drawToolArgs(mp.args, fonts);
                 drawArtifacts(mp.arts);
                 ImGui::PopID();
             }
@@ -1809,8 +1955,7 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
             // Longer arguments still get their own box; right-click Copy retains the whole detail.
             if (!argsBody.empty() &&
                 !(declined && errBody.find(argsBody) != std::string::npos))
-                drawToolDetailBox("##tooldetail", stripMdMarks(argsBody), nullptr,
-                                  ui::metrics::copilotProseMaxH(), /*failure=*/false);
+                drawToolArgs(argsBody, fonts);
             drawArtifacts(artsBlob);
         }
         endCollapseBody(cb);

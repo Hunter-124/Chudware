@@ -133,6 +133,8 @@ class ProgressWatchdog:
         if not self.enabled:
             return None
         kind, data = _tool_frame(frame)
+        if kind == "subagent_event":
+            return self._observe_subagent(data, host_tools)
         if kind in {"assistant_delta", "text_delta", "output_text_delta", "output_delta"}:
             if data.get("channel", "text") == "text" and (
                 data.get("text") or data.get("delta")
@@ -190,8 +192,43 @@ class ProgressWatchdog:
         elif (host_uri or name in host_tools or name in catalog()
               or kind.startswith("host_tool_")) and (
                 classify_risk(name) != RISK_READ and _succeeded(data)):
-            self.research_calls = 0
-            self.first_research = None
-            self.last_progress = self.clock()
-            self._nudged_since_mutation = False
+            self._mark_progress()
+        return self.due()
+
+    def _mark_progress(self) -> None:
+        self.research_calls = 0
+        self.first_research = None
+        self.last_progress = self.clock()
+        self._nudged_since_mutation = False
+
+    def _observe_subagent(self, frame: Mapping[str, Any], host_tools: set[str]) -> str | None:
+        """A task sub-agent's successful CAD mutation is the turn's progress.
+
+        Chudcode forwards a sub-agent's own events inside ``subagent_event``
+        frames. Only its mutations count: its research is its own brief, and
+        eight researching sub-agents must not read as the parent stalling.
+        """
+        payload = frame.get("payload")
+        inner = payload.get("event") if isinstance(payload, Mapping) else None
+        if not isinstance(inner, Mapping):
+            return self.due()
+        kind = str(inner.get("type") or "")
+        call_id = str(inner.get("toolCallId") or "")
+        if not call_id or call_id in self._completed:
+            return self.due()
+        if kind == "tool_execution_start":
+            self._starts[call_id] = (str(inner.get("toolName") or ""), inner.get("args"))
+            return self.due()
+        if kind != "tool_execution_end":
+            return self.due()
+        started_name, started_args = self._starts.pop(call_id, ("", None))
+        self._completed.add(call_id)
+        self._recent_ids.append(call_id)
+        if len(self._recent_ids) > 512:
+            self._completed.remove(self._recent_ids.popleft())
+        args = inner.get("args", started_args)
+        name, host_uri = _resolved_name(str(inner.get("toolName") or started_name), args)
+        if (host_uri or name in host_tools or name in catalog()) and (
+                classify_risk(name) != RISK_READ and _succeeded(inner)):
+            self._mark_progress()
         return self.due()

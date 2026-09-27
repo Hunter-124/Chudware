@@ -29,17 +29,32 @@ the frame loop in `host/src/app.cpp`.
 | **Firmware** | `host/src/ui/firmware/fw_workspace.cpp/.h` | T-FIN5: project rail + sources, build console (parsed warnings), emulation + UART console, GPIO trace viewer (`contracts/firmware_rpc.md` §7/§8); fw_status-gated Flash/Debug; tab is progressively disclosed (`ui::firmwareTabVisible`); shot: `CHUDWARE_SHOT=firmware` |
 | **Manufacture** | `host/src/ui/manufacture/{manufacture_panel,device_panel,run_panel,approval_dialog,attention_panel,mfg_mirror}.cpp/.h` | Capability-truth chips, gate-report rendering. **No floating operator surface**: Devices / Run / Attention are rail tabs 3–5 of the pinned left column (`layout.cpp`), and the Offline/Live mode strip is chrome under the ribbon. All three bodies draw with `ui::kit` — cards, tone chips, `keyValueRow`, `emptyState`/`blockedState`, `inlineStatus` — never bespoke text dumps. **Tone convention: Offline Simulation is the SAFE state and reads calm (`Tone::Ok` dot chip on neutral glass); LIVE MACHINE is the hazardous one and is the only state that gets the `statusErr` wash + danger button.** Shot: `CHUDWARE_SHOT=manufacture` (the rail opens on Attention for that shot only — `layout.cpp` resolves the shot tab ONCE from `CHUDWARE_SHOT`, so `cam` keeps the Job Manager default) |
 
-### Agent Hub / project ownership (2026-09-26)
+### Agent Hub / project ownership (2026-09-26, reworked 2026-09-27)
 
-- `ai_workspace.cpp` draws the shell; `agent_dag.cpp` owns per-conversation execution
-  traces and node selection; `current_run_view.cpp` polls `subagent_list` with
-  `{project_dir:convProjectDir(st)}` and owns one **docked** inspector. Do not restore
-  floating sub-agent popups or auto-open an inspector when a subagent starts.
+- `ai_workspace.cpp` draws the shell (session header + New session above the chat; nav
+  view persisted as `agent.ui_ai_view`); `agent_dag.cpp` owns per-conversation traces:
+  an **agent tree** (main + one node per `subagent_id`, nested by spawn `parent_id`) and
+  each agent's **step timeline** (`drawAgentTrace`, ListClipper, 2000-step cap, saved as
+  `v:2`; rebuilt from persisted activity rows when a session has no live events). There is
+  no pan/zoom node canvas any more. `current_run_view.cpp` owns one **docked** inspector
+  (agent mode + step mode) and a roster that merges registry sub-agents (`subagent_list`,
+  routed to the GENERAL worker lane so it answers during a run) with Chudcode `task`
+  sub-agents from the trace (`agentTraceSubagents`; read-only, the main agent directs
+  them). Do not restore floating sub-agent popups or auto-open an inspector.
 - Activity (`active_work.cpp`, `docs_panel.cpp`) and Plan (`plan_board.cpp`) scope
-  artifacts/links to `convProjectDir(st)`. `insights_view.cpp` labels the global
-  model leaderboard "All projects"; `metrics_view.cpp` scopes token spend to the
-  current project by default with an opt-in All projects toggle. Keep Sessions
-  filtered by the stored conversation project key.
+  artifacts/links to `convProjectDir(st)`. Active Work cards render live previews offscreen
+  (`render/doc_thumbnail.*`) from each tab's prewarmed `cachedDocMesh`, keyed by
+  (docId, revision, aicm), ≤1 render/frame, 48-texture LRU; counts are only shown when known.
+  Documents "Attach to next message" feeds `st.pendingAttachments`; Save never clobbers a
+  file that changed on disk. `insights_view.cpp` header is "Model leaderboard · All
+  projects"; `metrics_view.cpp`'s chip is "Include all projects".
+- Sessions (`panel.cpp drawSessionsPanel`, shared by dock and workspace) list ONE project at
+  a time via the header switcher (active project by default; empty key = "Unassigned" only).
+  Titles come from `autoTitleConversation` (first prompt) unless renamed (`title_user`);
+  numbering uses the index's monotonic `session_seq`.
+- During a run every agent-lane worker call returns `worker_lane_busy`; UI detects it with
+  `core::workerLaneBusy` and phrases refusals via `ui::userFacingRpcError` /
+  `ui::kAvailableAfterRun`. Never show raw worker/lane/RPC text.
 - `conversations.cpp::bindActiveConversationProject` restamps `Conversation.projectDir`
   to the workspace sent on **each turn**, not only at creation. `engine_events.cpp`
   stamps agent `DocTab::projectDir` from the uniquely owning running conversation;

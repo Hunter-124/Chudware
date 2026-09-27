@@ -103,8 +103,8 @@ void drawMetricsView(AppState& st) {
     static bool allProjects = false;
     const std::string projectDir = convProjectDir(st);
     const std::string projectKey = convProjectKey(projectDir);
-    ui::kit::toggleChip("All projects", &allProjects, ui::kit::Tone::Accent,
-                        "Include token usage from conversations in every project");
+    ui::kit::toggleChip("Include all projects", &allProjects, ui::kit::Tone::Accent,
+                        "Include token usage from sessions in every project");
     ui::kit::gapRow();
 
     // Same adaptive surface the host pane (drawViewPane) resolves — idempotent per frame, and
@@ -137,7 +137,7 @@ void drawMetricsView(AppState& st) {
             convProjectKey(c.projectDir) != projectKey)) continue;
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
         SessionSpend ss;
-        ss.title = c.title.empty() ? ("Chat " + std::to_string(i + 1)) : c.title;
+        ss.title = c.title.empty() ? std::string("Untitled session") : c.title;
         ss.active = (i == st.activeConv);
         for (const auto& m : msgs) {
             if (m.fromUser || m.running || m.model.empty()) continue;
@@ -176,7 +176,7 @@ void drawMetricsView(AppState& st) {
         const std::string title = allProjects ? "No token usage yet"
                                               : "Nothing for " + name + " yet";
         ui::kit::emptyState(nullptr, title.c_str(),
-                            "Tokens and spend appear after an assistant turn completes.");
+                            "Tokens and spend appear after a run completes.");
         return;
     }
 
@@ -220,7 +220,7 @@ void drawMetricsView(AppState& st) {
         stat("Total spend", (incomplete ? ">= " : "") + fmtUsd(totalUsd), incomplete);
         stat("Total tokens", fmtTok(totalIn + totalOut), false);
         stat("Sessions tracked", std::to_string((int)sessions.size()), false);
-        stat("Turns counted", std::to_string(totalTurns), false);
+        stat("Runs counted", std::to_string(totalTurns), false);
         stat("Models priced",
              std::to_string(knownPriceModels) + " of " + std::to_string((int)models.size()),
              incomplete);
@@ -275,7 +275,7 @@ void drawMetricsView(AppState& st) {
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp |
                           ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableSetupColumn("Session", ImGuiTableColumnFlags_WidthStretch, 2.4f);
-        ImGui::TableSetupColumn("Turns", ImGuiTableColumnFlags_WidthStretch, 0.7f);
+        ImGui::TableSetupColumn("Runs", ImGuiTableColumnFlags_WidthStretch, 0.7f);
         ImGui::TableSetupColumn("Tokens (in / out)", ImGuiTableColumnFlags_WidthStretch, 1.6f);
         ImGui::TableSetupColumn("Spend", ImGuiTableColumnFlags_WidthStretch, 0.9f);
         ImGui::TableHeadersRow();
@@ -304,7 +304,7 @@ void drawMetricsView(AppState& st) {
                 ImGui::Text(">= %s", fmtUsd(srow.usd).c_str());
                 ImGui::PopStyleColor();
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%d of %d turns in this session ran on a model with no "
+                    ImGui::SetTooltip("%d of %d runs in this session used a model with no "
                                       "catalog price \xe2\x80\x94 their tokens are counted, "
                                       "their cost is unknown.", srow.unpricedTurns, srow.turns);
             } else {
@@ -320,15 +320,15 @@ void drawMetricsView(AppState& st) {
         ImVec4(palette.textDisabled[0], palette.textDisabled[1], palette.textDisabled[2], 1.0f));
     if (incomplete)
         ImGui::TextWrapped(
-            "Spend is catalog pricing \xc3\x97 tokens from completed turns \xe2\x80\x94 not a "
+            "Spend is catalog pricing \xc3\x97 tokens from completed runs \xe2\x80\x94 not a "
             "bill, and here not even a complete estimate: %d of %d models that spent tokens have "
             "no catalog price, so every \">=\" figure above is a floor. Those models' tokens "
             "are counted; their dollars are unknown, not zero.",
             (int)models.size() - knownPriceModels, (int)models.size());
     else
-        ImGui::TextWrapped("Spend is catalog pricing \xc3\x97 tokens from completed turns "
+        ImGui::TextWrapped("Spend is catalog pricing \xc3\x97 tokens from completed runs "
                            "\xe2\x80\x94 not a bill, but every model that spent tokens here has "
-                           "a catalog price. Turns with no token counts aren't listed.");
+                           "a catalog price. Runs with no token counts aren't listed.");
     ImGui::PopStyleColor();
 }
 

@@ -15,6 +15,7 @@
 #include "ui/chudcode_descriptors.h"      // ui::chudcodeCompactReplacement — compact-result guard
 #include "ui/chudcode_session_actions.h"  // per-conversation Chudcode session link (resume key)
 #include "ui/file_explorer.h"             // ui::ensureWorkspaceDir — the fs_* jail every turn rides
+#include "ui/ai/plan_board.h"             // planBoardTakeEditsForTurn — idle plan edits ride the turn
 #include <climits>                        // INT_MAX saturation in activityCharsOf()
 
 // ---- auto-growing, wrapping chat input -------------------------------------------------------
@@ -547,7 +548,7 @@ static void ensureAttachmentContent(AppState& st, const std::string& path) {
         if (officeExtractAbsent(r)) { d.state = AttachState::Unavailable; return; }
         if (!r.ok) {
             d.state = AttachState::Failed;
-            d.err = r.err.empty() ? "the document service did not respond" : r.err;
+            d.err = userFacingRpcError(r, "the document service did not respond");
             return;
         }
         if (!r.result.is_object() || !r.result.value("ok", true)) {
@@ -921,6 +922,7 @@ struct BtwPanelState {
     std::string question;
     std::string answer;
     std::string error;
+    bool        busy = false;   // refused only because a run holds the service: calm + retryable
 };
 static BtwPanelState s_btw;
 
@@ -1001,6 +1003,8 @@ struct SlashItem {
     std::string label;    // primary row text (usually same as insert, trimmed)
     std::string detail;   // muted description
     const char* icon = "ai_panel";
+    // Its service call shares the agent lane a running turn holds: unavailable during a run.
+    bool        needsIdle = false;
 };
 
 struct ComposerSkillRow {
@@ -1105,7 +1109,7 @@ static bool tryHandleSkillsListCommand(AppState& st) {
             s_composerSkills.inFlight
                 ? "Loading skills\xe2\x80\xa6 try /skills again in a moment."
                 : (s_composerSkills.rpcMissing
-                       ? "Skills RPC not available (worker missing skills_list)."
+                       ? "Skills aren't available in this version."
                        : "No skills discovered. Type / for the command menu."));
         return true;
     }
@@ -1127,22 +1131,30 @@ static bool tryHandleSkillsListCommand(AppState& st) {
 
 static const SlashItem kSessionSlashItems[] = {
     {SlashKind::Session, "/compact ", "/compact",
-     "Compact conversation [snapcompact|shake|summary]", "ai_panel"},
+     "Compact conversation [snapcompact|shake|summary]", "ai_panel", true},
     {SlashKind::Session, "/shake ", "/shake",
-     "Shake loose tokens [elide|images]", "ai_panel"},
+     "Shake loose tokens [elide|images]", "ai_panel", true},
     {SlashKind::Session, "/handoff ", "/handoff",
-     "New session seeded with a handoff document", "ai_panel"},
+     "New session seeded with a handoff document", "ai_panel", true},
     {SlashKind::Session, "/btw ", "/btw",
      "Side question (does not enter the transcript)", "ask"},
     {SlashKind::Session, "/prewalk", "/prewalk",
      "Arm agent prewalk for the next turn", "plan_board"},
     {SlashKind::Session, "/rule ", "/rule",
-     "New rule: /rule <trigger words> -> <context to inject>", "plan_board"},
+     "New rule: /rule <trigger words> -> <context to inject>", "plan_board", true},
     {SlashKind::Meta, "/skills", "/skills",
      "List available skills", "team"},
     {SlashKind::Meta, "/help", "/help",
      "Show slash-command help", "ask"},
 };
+
+// The built-in command `text` invokes (first token, case-insensitive), or nullptr.
+static const SlashItem* slashCommandFor(const std::string& text) {
+    const std::string cmd = slashLower(text.substr(0, text.find_first_of(" \t\n")));
+    for (const auto& it : kSessionSlashItems)
+        if (it.label == cmd) return &it;
+    return nullptr;
+}
 
 // True when the composer is still typing a single slash token (menu should stay open).
 static bool parseSlashQuery(const char* buf, std::string& outFilter) {
@@ -1222,8 +1234,10 @@ static std::string slashFitText(const char* text, float maxW) {
     return s + ell;
 }
 
+// `disabled` rows (a command that cannot run during a run) paint dimmed, never accept, and show
+// the reason as their detail line.
 static bool slashMenuRow(const char* iconName, const char* label, const char* detail,
-                         bool selected, int uid) {
+                         bool selected, int uid, bool disabled = false) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const float rowH = slashRowHeight();
@@ -1241,14 +1255,14 @@ static bool slashMenuRow(const char* iconName, const char* label, const char* de
     const float washA = selected ? 0.42f : (hov ? 0.36f : 0.28f);
     ui::glassRowBackground(dl, mn, mx, rnd, /*stripe=*/false, /*selected=*/false,
                            /*washAlpha=*/washA);
-    if (selected || hov) {
+    if (!disabled && (selected || hov)) {
         ui::coloredRowWash(dl, mn, mx, rnd, pal.accent,
                            selected ? 0.34f : 0.18f, /*selected=*/selected);
     }
     const float pad = 8.0f * sc;
     const float labelY = mn.y + (rowH - 2.0f * lineH) * 0.5f;
     const float isz = fh * 1.02f;
-    const ImU32 ink = ui::Palette::toU32(selected ? pal.text : pal.textDim);
+    const ImU32 ink = ui::Palette::toU32(selected && !disabled ? pal.text : pal.textDim);
     float textX = mn.x + pad;
     IconUV ic = ui::getIcon(iconName, 20);
     if (ic.valid) {
@@ -1260,14 +1274,14 @@ static bool slashMenuRow(const char* iconName, const char* label, const char* de
     // and the popup padding, which the item rect does not.
     const float textMaxX = ImMin(mx.x, dl->GetClipRectMax().x) - pad;
     const float textW = textMaxX - textX;
-    dl->AddText(ImVec2(textX, labelY), ui::Palette::toU32(pal.text),
+    dl->AddText(ImVec2(textX, labelY), ui::Palette::toU32(disabled ? pal.textDim : pal.text),
                 slashFitText(label, textW).c_str());
     if (detail && detail[0]) {
         dl->AddText(ImVec2(textX, labelY + lineH), ui::Palette::toU32(pal.textDim),
                     slashFitText(detail, textW).c_str());
     }
     ImGui::PopID();
-    return clicked;
+    return clicked && !disabled;
 }
 
 // Draw the drop-up slash menu above the composer input. Returns true when an item was
@@ -1358,6 +1372,9 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
 
     bool accepted = false;
     std::string acceptText;
+    // Any run (this session's or another's) holds the agent lane these commands need.
+    const bool runBusy = aiTurnActive(st) || st.anyRunActive();
+    auto rowDisabled = [runBusy](const SlashItem& it) { return runBusy && it.needsIdle; };
     ImGuiWindowFlags wflags =
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
@@ -1377,7 +1394,9 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
         for (int i = 0; i < (int)s_slash.matches.size(); ++i) {
             const auto& it = s_slash.matches[(size_t)i];
             const bool sel = (i == s_slash.selected);
-            if (slashMenuRow(it.icon, it.label.c_str(), it.detail.c_str(), sel, i)) {
+            const bool off = rowDisabled(it);
+            if (slashMenuRow(it.icon, it.label.c_str(),
+                             off ? kAvailableAfterRun : it.detail.c_str(), sel, i, off)) {
                 accepted = true;
                 acceptText = it.insert;
                 s_slash.selected = i;
@@ -1418,8 +1437,13 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
     if (!accepted && !s_slash.matches.empty() &&
         ((ImGui::IsKeyPressed(ImGuiKey_Enter, false) && !sio.KeyShift && !sio.KeyAlt) ||
          ImGui::IsKeyPressed(ImGuiKey_Tab, false))) {
-        accepted = true;
-        acceptText = s_slash.matches[(size_t)s_slash.selected].insert;
+        const SlashItem& pick = s_slash.matches[(size_t)s_slash.selected];
+        if (rowDisabled(pick)) {
+            st.toast(ui::ToastLevel::Info, std::string(pick.label) + ": " + kAvailableAfterRun);
+        } else {
+            accepted = true;
+            acceptText = pick.insert;
+        }
         ateEnter = true;
     }
 
@@ -1432,6 +1456,60 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
         return true;
     }
     return false;
+}
+
+// Shared failure path for the session slash commands: a run holding the service is a calm Info
+// note, anything else an error in user terms. Returns true when `r` failed (already reported).
+static bool slashRpcFailed(AppState& st, const core::RpcResult& r, const char* fallback) {
+    if (core::workerLaneBusy(r)) {
+        st.toast(ui::ToastLevel::Info, kAvailableAfterRun);
+        return true;
+    }
+    if (r.ok) return false;
+    st.toast(ui::ToastLevel::Error, userFacingRpcError(r, fallback));
+    return true;
+}
+
+// /btw: a side question answered from the transcript so far. It never enters the transcript and
+// never steers a running turn. A run holding the service is a calm, retryable panel state.
+static void askBtw(AppState& st, const std::string& q) {
+    s_btw.open = true;
+    s_btw.loading = true;
+    s_btw.busy = false;
+    s_btw.question = q;
+    s_btw.answer.clear();
+    s_btw.error.clear();
+    nlohmann::json params = nlohmann::json::object();
+    params["messages"] = chatMsgsToWireMessages(st.chat);
+    params["question"] = q;
+    nlohmann::json pov = agentProviderOverride(st.settings);
+    if (pov.contains("provider")) params["provider"] = pov["provider"];
+    if (pov.contains("model")) params["model"] = pov["model"];
+    else if (st.settings.model[0]) params["model"] = st.settings.model;
+    st.rpc.call("session_btw", params, [](const core::RpcResult& r) {
+        s_btw.loading = false;
+        if (core::workerLaneBusy(r)) {
+            s_btw.busy = true;
+            s_btw.error = kAvailableAfterRun;
+            return;
+        }
+        if (!r.ok) {
+            s_btw.error = userFacingRpcError(r, "Couldn't answer that right now.");
+            return;
+        }
+        if (r.result.is_object()) {
+            if (r.result.contains("answer") && r.result["answer"].is_string())
+                s_btw.answer = r.result["answer"].get<std::string>();
+            else if (r.result.contains("text") && r.result["text"].is_string())
+                s_btw.answer = r.result["text"].get<std::string>();
+            else
+                s_btw.error = userFacingRpcError(r, "No answer came back.");
+        } else if (r.result.is_string()) {
+            s_btw.answer = r.result.get<std::string>();
+        } else {
+            s_btw.error = "No answer came back.";
+        }
+    }, 180000);
 }
 
 // Returns true if `text` was a slash command (handled; do not run a normal turn).
@@ -1453,7 +1531,7 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
 
     auto needIdle = [&]() -> bool {
         if (aiTurnActive(st) || st.anyRunActive()) {
-            st.toast(ui::ToastLevel::Warn, "Wait for the current turn to finish.");
+            st.toast(ui::ToastLevel::Info, cmd + ": " + kAvailableAfterRun);
             return false;
         }
         return true;
@@ -1461,7 +1539,7 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
 
     if (cmd == "/prewalk") {
         ovSetAgentBool("prewalk", true);
-        st.toast(ui::ToastLevel::Success, "Prewalk armed (agent.prewalk = true)");
+        st.toast(ui::ToastLevel::Success, "Prewalk armed for the next run.");
         st.addLog("[..] /prewalk: agent.prewalk enabled");
         return true;
     }
@@ -1477,17 +1555,21 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
             st.toast(ui::ToastLevel::Warn, kRuleUsage);
             return true;
         }
+        if (!needIdle()) return true;
         nlohmann::json params = nlohmann::json::object();
         params["text"] = "/rule " + rest;
         st.rpc.call("rule_create", params, [&st](const core::RpcResult& r) {
+            if (core::workerLaneBusy(r)) {
+                st.toast(ui::ToastLevel::Info, std::string("/rule: ") + kAvailableAfterRun);
+                return;
+            }
             if (!r.ok || !r.result.is_object()) {
                 st.toast(ui::ToastLevel::Error,
-                         r.err.empty() ? "rule_create failed (worker missing rule_create?)"
-                                       : r.err);
+                         userFacingRpcError(r, "Couldn't create the rule."));
                 return;
             }
             if (!r.result.value("ok", false)) {
-                std::string why = r.result.value("reason", std::string("rule_create failed"));
+                std::string why = userFacingRpcError(r, "Couldn't create the rule.");
                 const std::string hint = r.result.value("hint", std::string());
                 if (!hint.empty()) why += "  \xc2\xb7  " + hint;
                 st.toast(ui::ToastLevel::Warn, why);
@@ -1510,38 +1592,7 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
             st.toast(ui::ToastLevel::Warn, "Usage: /btw <question>");
             return true;
         }
-        s_btw.open = true;
-        s_btw.loading = true;
-        s_btw.question = rest;
-        s_btw.answer.clear();
-        s_btw.error.clear();
-        nlohmann::json params = nlohmann::json::object();
-        params["messages"] = chatMsgsToWireMessages(st.chat);
-        params["question"] = rest;
-        nlohmann::json pov = agentProviderOverride(st.settings);
-        if (pov.contains("provider")) params["provider"] = pov["provider"];
-        if (pov.contains("model")) params["model"] = pov["model"];
-        else if (st.settings.model[0]) params["model"] = st.settings.model;
-        st.rpc.call("session_btw", params, [](const core::RpcResult& r) {
-            s_btw.loading = false;
-            if (!r.ok) {
-                s_btw.error = r.err.empty() ? "session_btw failed" : r.err;
-                return;
-            }
-            if (r.result.is_object()) {
-                if (r.result.contains("answer") && r.result["answer"].is_string())
-                    s_btw.answer = r.result["answer"].get<std::string>();
-                else if (r.result.contains("text") && r.result["text"].is_string())
-                    s_btw.answer = r.result["text"].get<std::string>();
-                else
-                    s_btw.answer = r.result.dump(2);
-            } else if (r.result.is_string()) {
-                s_btw.answer = r.result.get<std::string>();
-            } else {
-                s_btw.error = "empty answer";
-            }
-        }, 180000);
-        st.toast(ui::ToastLevel::Info, "Asking (side channel)...");
+        askBtw(st, rest);
         return true;
     }
 
@@ -1604,13 +1655,9 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
                 params["session_id"] = st.conversations[st.activeConv].id;
         }
         st.rpc.call("session_compact", params, [&st, strategy](const core::RpcResult& r) {
-            if (!r.ok) {
-                st.toast(ui::ToastLevel::Error,
-                         r.err.empty() ? "session_compact failed" : r.err);
-                return;
-            }
+            if (slashRpcFailed(st, r, "Couldn't compact this session.")) return;
             if (!r.result.is_object()) {
-                st.toast(ui::ToastLevel::Error, "session_compact: bad result");
+                st.toast(ui::ToastLevel::Error, "Couldn't compact this session.");
                 return;
             }
             // Replace the visible chat ONLY when the result carries an explicit nonempty
@@ -1648,13 +1695,9 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
         params["mode"] = mode;
         params["aggressive"] = aggressive;
         st.rpc.call("session_shake", params, [&st, mode](const core::RpcResult& r) {
-            if (!r.ok) {
-                st.toast(ui::ToastLevel::Error,
-                         r.err.empty() ? "session_shake failed" : r.err);
-                return;
-            }
+            if (slashRpcFailed(st, r, "Couldn't shake this session.")) return;
             if (!r.result.is_object()) {
-                st.toast(ui::ToastLevel::Error, "session_shake: bad result");
+                st.toast(ui::ToastLevel::Error, "Couldn't shake this session.");
                 return;
             }
             // Same replacement guard as /compact: only a nonempty explicit payload may
@@ -1693,11 +1736,7 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
         if (pov.contains("model")) params["model"] = pov["model"];
         else if (st.settings.model[0]) params["model"] = st.settings.model;
         st.rpc.call("session_handoff", params, [&st](const core::RpcResult& r) {
-            if (!r.ok) {
-                st.toast(ui::ToastLevel::Error,
-                         r.err.empty() ? "session_handoff failed" : r.err);
-                return;
-            }
+            if (slashRpcFailed(st, r, "Couldn't generate the handoff.")) return;
             std::string doc;
             if (r.result.is_object()) {
                 if (r.result.contains("document") && r.result["document"].is_string())
@@ -1772,6 +1811,12 @@ void drawBtwPanel(AppState& st) {
         ImGui::Separator();
         if (s_btw.loading) {
             ImGui::TextUnformatted("Thinking...");
+        } else if (s_btw.busy) {
+            // Refused only because a run holds the service: calm copy, and the question is
+            // kept so one click asks it again once the run finishes.
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+            ImGui::TextWrapped("%s", s_btw.error.c_str());
+            ImGui::PopStyleColor();
         } else if (!s_btw.error.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
             ImGui::TextWrapped("%s", s_btw.error.c_str());
@@ -1782,8 +1827,15 @@ void drawBtwPanel(AppState& st) {
                 s_btw.answer.empty() ? "(no answer)" : s_btw.answer.c_str());
             ImGui::PopStyleColor();
         }
+        if (!s_btw.loading && !s_btw.error.empty()) {
+            const bool runBusy = aiTurnActive(st) || st.anyRunActive();
+            if (ui::kit::secondaryButton("Ask again", !(s_btw.busy && runBusy),
+                                         kAvailableAfterRun, ImVec2(-1, 0))) {
+                const std::string q = s_btw.question;
+                askBtw(st, q);
+            }
+        }
         if (ImGui::Button("Close", ImVec2(-1, 0))) open = false;
-        (void)st;
     }
     ImGui::End();
     s_btw.open = open;
@@ -1829,6 +1881,10 @@ void submitTurn(AppState& st, const std::string& text) {
     std::string sendText = text;
     const nlohmann::json attachments = consumeAttachments(st, sendText);
     const nlohmann::json contextRefs = consumeContextRefs(st, sendText);
+    // Plan edits made while idle ride with the next turn (agent-facing only, never the bubble).
+    if (std::string planNote = planBoardTakeEditsForTurn(st, st.activeConvId());
+        !planNote.empty())
+        sendText += "\n\n" + planNote;
     nlohmann::json extra = nlohmann::json::object();
     if (!attachments.empty()) extra["attachments"] = attachments;
     if (!contextRefs.empty()) extra["context_refs"] = contextRefs;
@@ -1855,12 +1911,8 @@ void submitTurn(AppState& st, const std::string& text) {
     // chat surface even if the user had scrolled up into the history.
     chatLogResetStick();
 
-    // Name the conversation tab after its first prompt; persist so the turn survives a restart.
-    if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size()) {
-        std::string& title = st.conversations[st.activeConv].title;
-        bool isDefault = title.empty() || (title.rfind("Chat ", 0) == 0);
-        if (isDefault) title = text.size() > 28 ? (text.substr(0, 27) + "...") : text;
-    }
+    // Persist so the turn survives a restart; persistChatHistory also titles a session from its
+    // first prompt (autoTitleConversation) unless the user renamed it.
     ui::persistChatHistory(st);
 
     // The turn's "current editor context", sent in EVERY mode whenever a document is open (the
@@ -2814,17 +2866,6 @@ static nlohmann::json voiceSessionParams(const VoiceInputUi& v) {
     return nlohmann::json{{"session_id", v.sessionId}};
 }
 
-static std::string voiceRpcReason(const core::RpcResult& r, const char* fallback) {
-    if (!r.err.empty()) return r.err;
-    if (r.result.is_object()) {
-        for (const char* key : {"reason", "error"}) {
-            const auto it = r.result.find(key);
-            if (it != r.result.end() && it->is_string()) return it->get<std::string>();
-        }
-    }
-    return fallback;
-}
-
 static void voiceApplyPrompt(AppState& st, const std::string& base, const std::string& committed,
                              const std::string& partial) {
     const std::string out = ui::composeChudcodeTranscript(base, committed, partial);
@@ -2904,11 +2945,18 @@ static void voiceProbe(AppState& st) {
                     VoiceInputUi& vv = voiceUi();
                     if (vv.sessionId != sessionId || vv.requestGeneration != generation) return;
                     vv.rpcBusy = false;
+                    if (core::workerLaneBusy(r)) {
+                        // A run holds the speech service: keep the last-known mic state and
+                        // re-probe on the normal cadence. Before any answer, say when it opens.
+                        if (!vv.probed) vv.reason = kAvailableAfterRun;
+                        vv.probed = true;   // keeps the 5 s cadence instead of per-frame retries
+                        return;
+                    }
                     vv.probed = true;
                     if (!r.ok || !voiceApplyStatus(st, r.result)) {
                         vv.state = VoiceUiState::Unavailable;
-                        vv.reason = voiceRpcReason(
-                            r, "Speech-to-text unavailable in this Chudcode session.");
+                        vv.reason =
+                            userFacingRpcError(r, "Speech-to-text isn't available right now.");
                     }
                 },
                 15000);
@@ -2953,9 +3001,17 @@ static void voiceStart(AppState& st) {
                     VoiceInputUi& vv = voiceUi();
                     if (vv.sessionId != sessionId || vv.requestGeneration != generation) return;
                     vv.rpcBusy = false;
+                    if (core::workerLaneBusy(r)) {
+                        // Refused only because a run holds the speech service.
+                        vv.state = VoiceUiState::Idle;
+                        vv.reason.clear();
+                        st.toast(ui::ToastLevel::Info,
+                                 std::string("Voice input: ") + kAvailableAfterRun);
+                        return;
+                    }
                     if (!r.ok || !voiceApplyStatus(st, r.result)) {
                         vv.state = VoiceUiState::Error;
-                        vv.reason = voiceRpcReason(r, "Failed to start voice input.");
+                        vv.reason = userFacingRpcError(r, "Couldn't start voice input.");
                         st.toast(ui::ToastLevel::Warn, vv.reason.c_str());
                     }
                 },
@@ -2974,10 +3030,18 @@ static void voiceStop(AppState& st) {
                     VoiceInputUi& vv = voiceUi();
                     if (vv.sessionId != sessionId || vv.requestGeneration != generation) return;
                     vv.rpcBusy = false;
+                    if (core::workerLaneBusy(r)) {
+                        // The recording is still live on the service; keep listening and say
+                        // when stopping works again.
+                        vv.state = VoiceUiState::Listening;
+                        st.toast(ui::ToastLevel::Info,
+                                 std::string("Stop dictation: ") + kAvailableAfterRun);
+                        return;
+                    }
                     ui::ChudcodeSttResult result;
                     if (!r.ok || !ui::parseChudcodeSttResult(r.result, result)) {
                         vv.state = VoiceUiState::Error;
-                        vv.reason = voiceRpcReason(r, "Transcription failed.");
+                        vv.reason = userFacingRpcError(r, "Transcription failed.");
                         st.toast(ui::ToastLevel::Warn, vv.reason.c_str());
                         return;
                     }
@@ -3283,7 +3347,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
             if (unavailable) {
                 ImGui::SetTooltip("%s", v.reason.empty()
-                    ? "Voice input unavailable — ASR runtime or microphone capture missing."
+                    ? "Voice input unavailable — no microphone or speech model found."
                     : v.reason.c_str());
             } else if (listening) {
                 ImGui::SetTooltip("Listening — click to stop & insert text (Esc/right-click cancels).");
@@ -3537,8 +3601,8 @@ static void agentControlDrainLogs(AppState& st) {
     }
 }
 
-static void agentControlDispatch(AppState& st, const std::string& runId, const std::string& steer,
-                                 nlohmann::json attachments = nlohmann::json::array()) {
+void agentControlDispatch(AppState& st, const std::string& runId, const std::string& steer,
+                          nlohmann::json attachments) {
     g_agentCtl.st.store(&st, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lk(g_agentCtl.mtx);
@@ -4174,7 +4238,17 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     };
     if (submit || submitInput) {
         const std::string text = composerText(st);   // flattened + trimmed; empty = no message
-        if (active) {
+        const bool slash = !text.empty() && text[0] == '/';
+        const SlashItem* slashCmd = slash ? slashCommandFor(text) : nullptr;
+        if (active && slashCmd && slashCmd->needsIdle) {
+            // Commands that need the service a run holds are refused, never steered into the
+            // run; the text stays in the box so it can be sent once the run finishes.
+            st.toast(ui::ToastLevel::Info, slashCmd->label + ": " + kAvailableAfterRun);
+        } else if (active && slash && tryHandleSlashCommand(st, text)) {
+            // Slash commands run as commands (/btw side question, /prewalk, /skills, /help)
+            // rather than being steered into the live run as literal text.
+            clearComposerBox();
+        } else if (active) {
             // A turn is running — STEER it mid-run when the engine knows the run_id
             // (agent_steer: text is folded into the live turn at its next step). Fall
             // back to next-turn queueing only when no run_id is available (e.g. the

@@ -28,20 +28,26 @@ no controller remains alive that could ever resume it.
 ``consume_steers`` before each model completion, placing queued text into the
 next provider call.  A steer queued after completion remains pending.
 
-Metadata is atomically replaced.  Display, raw, and steer records use append
-writes; POSIX ``O_APPEND`` keeps complete raw records and concurrent steering
-writes from overwriting one another.
+Metadata is atomically replaced, and every read-modify-write of it runs under a
+per-session cross-process lock (``_update_meta``): the runners live inside the
+agent worker while the GUI's ``subagent_*`` RPCs are served by a different
+worker process, so an unlocked update could silently drop the other side's
+write.  Display, raw, and steer records use append writes; POSIX ``O_APPEND``
+keeps complete raw records and concurrent steering writes from overwriting one
+another.
 """
 from __future__ import annotations
 
 import json
 import os
 import platform
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from services.agent import raw_log
 
@@ -116,11 +122,12 @@ def resolve_project_dir(start: str | Path | None = None) -> str:
 
 def heartbeat(subagent_id: str) -> None:
     """Runner-only liveness write at turn boundaries, including pause holds."""
-    meta = get_session(subagent_id)
-    if meta is None or meta.get("status") not in LIVE_STATUSES:
-        return
-    meta["runner_heartbeat_ts"] = _now()
-    _write_meta(meta["id"], meta)
+    def touch(meta: dict) -> bool:
+        if meta.get("status") not in LIVE_STATUSES:
+            return False
+        meta["runner_heartbeat_ts"] = _now()
+        return True
+    _update_meta(subagent_id, touch)
 
 _CONTROL_DEFAULTS = {
     "paused": False,
@@ -203,11 +210,67 @@ def _safe_id(subagent_id: str) -> str:
 
 
 def _write_meta(subagent_id: str, meta: dict) -> None:
-    """Atomic rewrite (tmp + rename) so readers never see a torn file."""
+    """Atomic rewrite (tmp + rename) so readers never see a torn file.
+
+    Callers that derive *meta* from the stored record must hold ``_meta_lock``
+    (use ``_update_meta``); a bare call is only for a record nobody else writes.
+    """
     path = _meta_path(subagent_id)
     tmp = path.with_suffix(f".tmp{os.getpid()}")
     tmp.write_text(json.dumps(meta, indent=1, default=str), encoding="utf-8")
     tmp.replace(path)
+
+
+_META_THREAD_LOCK = threading.Lock()
+
+
+@contextmanager
+def _meta_lock(subagent_id: str) -> Iterator[None]:
+    """Hold one session's metadata exclusively across processes and threads.
+
+    Same lock shape as services/plm/vault.py ``_local_config_lock``: an
+    ``fcntl.flock`` (``msvcrt.locking`` on Windows) on a ``<id>.lock`` sidecar,
+    plus a process-local lock so this process's threads queue before the file.
+    Not re-entrant — never acquire it while already holding it.
+    """
+    path = subagents_dir() / f"{subagent_id}.lock"
+    with _META_THREAD_LOCK:
+        with open(path, "a+b") as lock:
+            if os.name == "nt":
+                import msvcrt  # noqa: PLC0415 — Windows only
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl  # noqa: PLC0415 — POSIX only
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _update_meta(subagent_id: str, mutate: Callable[[dict], Any]) -> Optional[dict]:
+    """Read, mutate in place, and rewrite one session record under ``_meta_lock``.
+
+    Returns the written record; ``None`` for an unknown or invalid id, or when
+    *mutate* returns ``False`` (nothing to write).  Exceptions from *mutate*
+    propagate with the record untouched.
+    """
+    try:
+        sid = _safe_id(subagent_id)
+    except ValueError:
+        return None
+    with _meta_lock(sid):
+        meta = get_session(sid)
+        if meta is None or mutate(meta) is False:
+            return None
+        _write_meta(sid, meta)
+        return meta
 
 
 def _append_line(path: Path, record: dict) -> None:
@@ -259,6 +322,19 @@ def register_session(
 ) -> dict:
     """Create (or refresh) a session record.  Returns the stored metadata dict."""
     sid = _safe_id(subagent_id)
+    with _meta_lock(sid):
+        return _register_locked(
+            sid, role=role, brief=brief, spawn_kind=spawn_kind,
+            parent_run_id=parent_run_id, parent_node_id=parent_node_id,
+            requested_by=requested_by, model=model, budget_tokens=budget_tokens,
+            status=status, session_id=session_id, transcript_dir=transcript_dir,
+            project_dir=project_dir,
+        )
+
+
+def _register_locked(sid: str, *, role, brief, spawn_kind, parent_run_id,
+                     parent_node_id, requested_by, model, budget_tokens, status,
+                     session_id, transcript_dir, project_dir) -> dict:
     existing = get_session(sid) or {}
     owner_session_id = str(session_id or _BOUND_SESSION_ID).strip()
     owner_dir = str(transcript_dir or _BOUND_TRANSCRIPT_DIR).strip()
@@ -317,15 +393,13 @@ def set_status(subagent_id: str, status: str, *, note: str = "") -> bool:
     """Update a session's status (mirrors delegation node transitions)."""
     if status not in STATUSES:
         return False
-    meta = get_session(subagent_id)
-    if meta is None:
-        return False
-    meta["status"] = status
-    meta["updated_ts"] = _now()
-    if note:
-        meta["status_note"] = str(note)[:300]
-    _write_meta(meta["id"], meta)
-    return True
+
+    def apply(meta: dict) -> None:
+        meta["status"] = status
+        meta["updated_ts"] = _now()
+        if note:
+            meta["status_note"] = str(note)[:300]
+    return _update_meta(subagent_id, apply) is not None
 
 
 def list_sessions(limit: int = 50, *, project_dir: str | None = None) -> list[dict]:
@@ -349,17 +423,19 @@ def list_sessions(limit: int = 50, *, project_dir: str | None = None) -> list[di
             _default_control_state(meta)
             reason = _runner_gone(meta)
             if reason:
-                # Re-read before replacing: another process may have completed it
-                # while this list request was reading the registry.
-                current = get_session(sid)
-                if current is not None and current.get("status") in LIVE_STATUSES:
-                    reason = _runner_gone(current)
-                    if reason:
-                        current["status"] = "abandoned"
-                        current["status_note"] = reason
-                        current["updated_ts"] = _now()
-                        _write_meta(sid, current)
-                        meta = current
+                # Re-read under the lock before replacing: another process may
+                # have completed it while this list request was reading.
+                def abandon(current: dict) -> bool:
+                    if current.get("status") not in LIVE_STATUSES:
+                        return False
+                    why = _runner_gone(current)
+                    if not why:
+                        return False
+                    current["status"] = "abandoned"
+                    current["status_note"] = why
+                    current["updated_ts"] = _now()
+                    return True
+                meta = _update_meta(sid, abandon) or meta
             if project_filter is not None and (
                 not meta.get("project_dir")
                 or meta["project_dir"] != project_filter
@@ -386,10 +462,7 @@ def append_transcript(subagent_id: str, who: str, text: str, **meta: Any) -> Non
         rec.update(meta)
     _append_line(_transcript_path(sid), rec)
     # Touch updated_ts so list_sessions sorts recently-active sessions first.
-    m = get_session(sid)
-    if m is not None:
-        m["updated_ts"] = _now()
-        _write_meta(sid, m)
+    _update_meta(sid, lambda m: m.__setitem__("updated_ts", _now()))
 
 
 def get_transcript(subagent_id: str, limit: int = 200) -> list[dict]:
@@ -559,13 +632,10 @@ def request_terminate(subagent_id: str) -> bool:
     interrupted mid-completion; the runner checks this flag before each model
     call and stops cleanly.  Returns False for an unknown session.
     """
-    meta = get_session(subagent_id)
-    if meta is None:
-        return False
-    meta["terminate_requested"] = True
-    meta["updated_ts"] = _now()
-    _write_meta(meta["id"], meta)
-    return True
+    def flag(meta: dict) -> None:
+        meta["terminate_requested"] = True
+        meta["updated_ts"] = _now()
+    return _update_meta(subagent_id, flag) is not None
 
 
 def terminate_requested(subagent_id: str) -> bool:
@@ -575,13 +645,10 @@ def terminate_requested(subagent_id: str) -> bool:
 
 def set_paused(subagent_id: str, paused: bool) -> bool:
     """Set or clear the turn-boundary pause flag."""
-    meta = get_session(subagent_id)
-    if meta is None:
-        return False
-    meta["paused"] = bool(paused)
-    meta["updated_ts"] = _now()
-    _write_meta(meta["id"], meta)
-    return True
+    def apply(meta: dict) -> None:
+        meta["paused"] = bool(paused)
+        meta["updated_ts"] = _now()
+    return _update_meta(subagent_id, apply) is not None
 
 
 def is_paused(subagent_id: str) -> bool:
@@ -597,29 +664,26 @@ def set_runtime_override(
     effort=None,
 ) -> bool:
     """Set runtime overrides; ``None`` leaves a value and ``""`` clears it."""
-    meta = get_session(subagent_id)
-    if meta is None:
-        return False
-    if model is not None:
-        meta["model_override"] = str(model).strip()
-    if provider is not None:
-        meta["provider_override"] = str(provider).strip()
-    if effort is not None:
-        raw_effort = str(effort).strip()
-        if raw_effort:
-            from services.agent.role_models import (  # noqa: PLC0415
-                clamp_subagent_effort,
-            )
-            clamped = clamp_subagent_effort(raw_effort)
-            if clamped not in ("low", "medium", "high"):
-                raise ValueError(
-                    "effort must be one of: low, medium, high, or empty")
-            meta["effort_override"] = clamped
-        else:
-            meta["effort_override"] = ""
-    meta["updated_ts"] = _now()
-    _write_meta(meta["id"], meta)
-    return True
+    def apply(meta: dict) -> None:
+        if model is not None:
+            meta["model_override"] = str(model).strip()
+        if provider is not None:
+            meta["provider_override"] = str(provider).strip()
+        if effort is not None:
+            raw_effort = str(effort).strip()
+            if raw_effort:
+                from services.agent.role_models import (  # noqa: PLC0415
+                    clamp_subagent_effort,
+                )
+                clamped = clamp_subagent_effort(raw_effort)
+                if clamped not in ("low", "medium", "high"):
+                    raise ValueError(
+                        "effort must be one of: low, medium, high, or empty")
+                meta["effort_override"] = clamped
+            else:
+                meta["effort_override"] = ""
+        meta["updated_ts"] = _now()
+    return _update_meta(subagent_id, apply) is not None
 
 
 def runtime_override(subagent_id: str) -> dict:

@@ -1,7 +1,7 @@
 // AI workspace UI preferences — config.json-backed knobs for the command-center views.
 // Persisted under agent.ui_* (same load-modify-write pattern as agent.max_subagent_depth).
-// Defaults favor full visibility while agent integrations are being validated; users can dial
-// them back via Settings or the workspace gear.
+// Every accessor is cached (one config.json read per process, invalidated by its setter), so
+// per-frame reads are cheap and AI > Options and Settings > AI always agree.
 #pragma once
 
 namespace ui {
@@ -11,20 +11,39 @@ namespace ui {
 int  aiUiVerbosity();
 void setAiUiVerbosity(int v);
 
-// Autopopulate: views follow the ACTIVE chat session / latest run instead of manual picking.
-// Default true.
+// Follow live runs: the AI workspace jumps to Current Run when the viewed session starts a new
+// run (never on a plain session switch). Default true.
 bool aiFollowActiveSession();
 void setAiFollowActiveSession(bool on);
 
-// Active Work: render iso preview textures for agent-touched docs (thumbnail worker jobs).
+// Active Work: render preview thumbnails for agent-touched docs.
 // Default true; when false the cards show the lightweight placeholder only.
 bool aiActiveWorkPreviews();
 void setAiActiveWorkPreviews(bool on);
 
+// The AI workspace's selected nav view (0 Current Run, 1 Plan, 2 Activity, 3 Sessions,
+// 4 Insights, 5 Options), restored across restarts. Default 0.
+int  aiWorkspaceView();
+void setAiWorkspaceView(int v);
+
+// One label set for the workspace-visibility knobs, shared by AI > Options and Settings > AI.
+namespace aiPrefCopy {
+inline constexpr const char* kDetailLabel   = "Detail level";
+inline constexpr const char* kDetailHelp    =
+    "How much detail the Current Run, Plan and Active Work views show. Quiet = titles and "
+    "status. Normal = the latest step. Full = every step, counts and timing.";
+inline constexpr const char* kDetailLevels[3] = {"Quiet", "Normal", "Full"};
+inline constexpr const char* kFollowLabel   = "Follow live runs";
+inline constexpr const char* kFollowHelp    =
+    "Switch to Current Run when the session you are viewing starts a new run.";
+inline constexpr const char* kPreviewsLabel = "Active Work previews";
+inline constexpr const char* kPreviewsHelp  =
+    "Show preview thumbnails of the documents agents are editing. Off = a lightweight "
+    "placeholder only.";
+}  // namespace aiPrefCopy
+
 // ---- chat transcript display (Settings -> AI -> Harness "Chat display") ---------------------
-// These are read from inside per-frame draw code for EVERY activity row, so they go through the
-// cached accessors below (one config.json read per process, invalidated by the setters) rather
-// than loadAgentInt's read-on-every-call path.
+// Read from per-frame draw code for EVERY activity row — the cached accessors make that cheap.
 
 // How much of a tool call the transcript shows.
 //   0 = simplified  — human sentence only; no raw JSON, no engine ids, no latency

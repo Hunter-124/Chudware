@@ -724,3 +724,60 @@ def test_removed_approval_ops_are_rejected():
         refused = _rpc("subagent_control", {"subagent_id": "dg_no_approval", "op": op})
         assert not refused["ok"]
         assert "pause, resume, set_runtime" in refused["reason"]
+
+
+_RACE_SCRIPT = r"""
+import sys, time
+from pathlib import Path
+from services.agent import subagent_registry as reg
+
+role, sid, go, rounds = sys.argv[1], sys.argv[2], Path(sys.argv[3]), int(sys.argv[4])
+while not go.exists():
+    time.sleep(0.001)
+
+def bump(meta):
+    meta["race_counter"] = int(meta.get("race_counter", 0)) + 1
+
+for i in range(rounds):
+    reg._update_meta(sid, bump)
+    if role == "runner":
+        reg.heartbeat(sid)
+        reg.set_status(sid, "running", note="turn %d" % i)
+        reg.append_transcript(sid, "subagent", "step %d" % i)
+    else:
+        reg.set_paused(sid, True)
+        reg.request_terminate(sid)
+        reg.set_runtime_override(sid, model="model-%d" % i)
+"""
+
+
+def test_concurrent_writers_in_two_processes_never_lose_an_update(tmp_path):
+    """The runner (agent worker) and the GUI's control RPCs (general worker) are
+    different processes rewriting the same record; neither may drop the other's write."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    sid, rounds = "dg_race", 150
+    reg.register_session(sid, role="worker", status="running")
+    go = tmp_path / "go"
+    repo = Path(__file__).resolve().parents[2]
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _RACE_SCRIPT, role, sid, str(go), str(rounds)],
+            cwd=repo, env=dict(os.environ),
+        )
+        for role in ("runner", "controller")
+    ]
+    go.write_text("go", encoding="utf-8")
+    for proc in procs:
+        assert proc.wait(timeout=120) == 0
+
+    meta = reg.get_session(sid)
+    assert meta["race_counter"] == 2 * rounds
+    assert meta["paused"] is True
+    assert meta["terminate_requested"] is True
+    assert meta["model_override"] == f"model-{rounds - 1}"
+    assert meta["status_note"] == f"turn {rounds - 1}"
+    assert len(reg.get_transcript(sid, limit=10_000)) == rounds

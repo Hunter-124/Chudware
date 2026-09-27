@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import math
+import threading
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -19,6 +20,9 @@ from typing import Any, Union, get_args, get_origin
 
 _MISSING = object()
 _LOG = logging.getLogger(__name__)
+# Run records (``tool_calls``) are shared by every agent in a turn, including
+# Chudcode task sub-agents calling concurrently on their own host-call threads.
+_RECORDS_LOCK = threading.Lock()
 
 
 def _debug_fallback(area: str, exc: BaseException) -> None:
@@ -96,10 +100,22 @@ class HostToolBinding:
                 else None
             )
             cancel = lambda: bool(getattr(host_context, "cancelled", False))
+            # A Chudcode task sub-agent inherits these bindings and calls them over
+            # the parent's client; chudcode_rpc names it on the context (None for
+            # the top-level agent, and on runtimes that predate the field).
             result = host_tool_result(
-                dispatch_host_tool(self, params, progress, cancel)
+                dispatch_host_tool(
+                    self,
+                    params,
+                    progress,
+                    cancel,
+                    agent_id=getattr(host_context, "agent_id", None),
+                    parent_agent_id=getattr(host_context, "parent_agent_id", None),
+                )
             )
-            return _with_skill_injection(self, result)
+            return _with_skill_injection(
+                self, result, agent_id=getattr(host_context, "agent_id", None)
+            )
 
         return factory(
             name=self.name,
@@ -136,7 +152,7 @@ def host_tool_result(result: Any) -> dict[str, Any]:
 
 
 def _with_skill_injection(
-    binding: HostToolBinding, envelope: dict[str, Any]
+    binding: HostToolBinding, envelope: dict[str, Any], *, agent_id: str | None = None
 ) -> dict[str, Any]:
     """Prefix a trigger-matched skill body to this tool's FIRST result text.
 
@@ -147,6 +163,8 @@ def _with_skill_injection(
     tool's own result — the first time that conversation touches the tool, once,
     within ``skills.SKILL_BODY_CHAR_LIMIT``. ``details`` is untouched, so the
     event mapper and every structured consumer see exactly the tool's own result.
+    A Chudcode task sub-agent (``agent_id``) has its own context window, so it
+    gets its own first-touch injection rather than inheriting the parent's.
     """
     content = envelope.get("content")
     if not isinstance(content, list) or not content:
@@ -154,17 +172,19 @@ def _with_skill_injection(
     first = content[0]
     if not isinstance(first, dict) or first.get("type") != "text":
         return envelope
+    conversation = str(
+        _ctx(binding.context, "session_id", None)
+        or _ctx(binding.context, "run_id", None)
+        or ""
+    )
+    if conversation and agent_id:
+        conversation = f"{conversation}:{agent_id}"
     try:
         from services.agent import skills
 
         bodies = skills.activate_for_prompt(
             "",
-            session_id=str(
-                _ctx(binding.context, "session_id", None)
-                or _ctx(binding.context, "run_id", None)
-                or ""
-            )
-            or None,
+            session_id=conversation or None,
             project_root=_ctx(binding.context, "project_dir", None),
             tools_about_to_run=[binding.name],
             role=_ctx(binding.context, "actor", None),
@@ -923,6 +943,9 @@ def _guardrail_block(binding: HostToolBinding, args: dict[str, Any]) -> str | No
     calls = _ctx(context, "tool_calls", _ctx(context, "calls", None))
     if calls is None:
         calls = binding.metadata.get("tool_calls", [])
+    # Parallel sub-agent calls append to the same run records; guards read a snapshot.
+    with _RECORDS_LOCK:
+        calls = list(calls)
 
     custom = _ctx(context, "pre_dispatch_guardrail", None)
     if callable(custom):
@@ -960,17 +983,83 @@ def _guardrail_block(binding: HostToolBinding, args: dict[str, Any]) -> str | No
     return str(block) if block is not None else None
 
 
+def _mode_refusal(name: str, context: Any) -> dict[str, Any] | None:
+    """Refuse a mutator under the user's read-only mode at dispatch time.
+
+    ``_effective_names`` already hides mutators from an Ask/Plan turn's
+    advertised set; this re-applies the same ``apply_mode_tools`` policy to the
+    call itself, so a stale binding or a sub-agent inheriting the parent's
+    bindings can never mutate under a mode the user chose to be read-only.
+    """
+    mode = _ctx(context, "mode", None)
+    plan_only = _ctx(context, "plan_only", None)
+    preferences = _ctx(context, "turn_preferences", None)
+    try:
+        from services.agent.copilot_mode_tools import (
+            META_TOOL_FLOOR,
+            apply_mode_tools,
+            normalize_mode,
+        )
+
+        effective = "plan" if plan_only else normalize_mode(mode)
+        if getattr(preferences, "mode", None) == "ask":
+            effective = "ask"
+        if effective not in {"ask", "plan"}:
+            return None
+        allowed = apply_mode_tools(
+            mode,
+            [name],
+            plan_only=plan_only,
+            subagent=bool(
+                _ctx(context, "subagent_id", None) or _ctx(context, "subagent", False)
+            ),
+            preferences=preferences,
+        )
+    except Exception as exc:  # noqa: BLE001 - mode helpers are optional at startup
+        _debug_fallback("dispatch mode policy", exc)
+        return None
+    if allowed is None or name in allowed or name in META_TOOL_FLOOR:
+        return None
+    try:
+        from services.agent.config import bugreport_floor
+
+        if name in bugreport_floor():
+            return None
+    except Exception as exc:  # noqa: BLE001 - optional config floor
+        _debug_fallback("dispatch bug-report floor", exc)
+    return {
+        "ok": False,
+        "status": "mode_refused",
+        "policy_refusal": True,
+        "executed": False,
+        "error": (
+            f"{name!r} is not available in {effective.title()} mode, which is "
+            "read-only. Describe the change instead, or ask the user to switch to "
+            "Agent mode."
+        ),
+    }
+
+
 def dispatch_host_tool(
     binding: HostToolBinding,
     args: Mapping[str, Any] | None,
     progress: Any,
     cancel: Any,
+    *,
+    agent_id: str | None = None,
+    parent_agent_id: str | None = None,
 ) -> Any:
     """Dispatch one host call through CAD's run-scoped dispatch chokepoint.
 
     Policy refusals are returned in their existing machine-readable shape.  Tool
     exceptions deliberately propagate so Chudcode records a tool error rather
     than a fabricated successful result.
+
+    ``agent_id``/``parent_agent_id`` name the Chudcode task sub-agent making the
+    call (None for the top-level agent). Sub-agents run concurrently on their own
+    RPC host-call threads against the same run context: per-tool call caps are
+    reserved atomically in ``_dispatch_tool`` and run records are appended under
+    ``_RECORDS_LOCK``; the CAD tool body itself runs unlocked.
     """
     if not isinstance(binding, HostToolBinding):
         raise TypeError("binding must be a HostToolBinding")
@@ -990,7 +1079,9 @@ def dispatch_host_tool(
             "executed": False,
         }
 
-    refusal = _policy_refusal(binding.name, binding.context)
+    refusal = _policy_refusal(binding.name, binding.context) or _mode_refusal(
+        binding.name, binding.context
+    )
     if refusal is not None:
         return refusal
 
@@ -1057,15 +1148,19 @@ def dispatch_host_tool(
         records = binding.metadata.get("tool_calls")
     if isinstance(records, list):
         ok = not (isinstance(safe_result, Mapping) and safe_result.get("ok") is False)
-        records.append(
-            {
-                "tool": binding.name,
-                "args": _json_safe(call_args),
-                "ok": ok,
-                "result": safe_result,
-            }
-        )
-        del records[:-64]
+        record = {
+            "tool": binding.name,
+            "args": _json_safe(call_args),
+            "ok": ok,
+            "result": safe_result,
+        }
+        if agent_id:
+            record["agent_id"] = agent_id
+            if parent_agent_id:
+                record["parent_agent_id"] = parent_agent_id
+        with _RECORDS_LOCK:
+            records.append(record)
+            del records[:-64]
     return safe_result
 
 

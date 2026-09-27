@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import queue
+import threading
 import unittest
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
+from unittest import mock
 
 from services.agent.chudcode_tools import (
     HostToolBinding,
@@ -582,6 +585,136 @@ class HostToolDispatchTests(unittest.TestCase):
         result = dispatch_host_tool(enabled, {"categories": ["measure"]}, None, None)
         self.assertEqual(enabled_calls, [["measure"]])
         self.assertIn("measure_part", result["added"])
+
+
+class _SubagentCall:
+    """The chudcode_rpc HostToolContext fields dispatch reads."""
+
+    cancelled = False
+
+    def __init__(self, agent_id=None, parent_agent_id=None):
+        self.agent_id = agent_id
+        self.parent_agent_id = parent_agent_id
+
+    def send_update(self, _payload):
+        pass
+
+
+class SubagentHostToolDispatchTests(unittest.TestCase):
+    """Chudcode task sub-agents call the parent's bindings concurrently."""
+
+    def _tool(self, name, handler, **context):
+        binding = HostToolBinding(
+            name=name,
+            description=name,
+            input_schema={"type": "object"},
+            handler=handler,
+            context={"policy_registry": _Policy(), **context},
+        )
+        return binding.to_host_tool(lambda **kw: kw)["execute"]
+
+    def test_parallel_subagent_calls_overlap_and_records_name_each_caller(self):
+        # Both bodies must be inside the tool at once: a dispatch lock around the
+        # CAD call would serialize them and break the barrier.
+        barrier = threading.Barrier(2, timeout=10)
+
+        def build(size: int):
+            if size > 1:  # the two sub-agent calls rendezvous; the last call does not
+                barrier.wait()
+            return {"ok": True, "size": size}
+
+        records = []
+        execute = self._tool("new_part", build, tool_calls=records, tool_call_counts={})
+        results = {}
+
+        def call(agent_id, size):
+            results[agent_id] = execute({"size": size}, _SubagentCall(agent_id, "Main"))
+
+        workers = [
+            threading.Thread(target=call, args=("CubeBuilder", 10)),
+            threading.Thread(target=call, args=("CylinderBuilder", 5)),
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=20)
+
+        self.assertEqual(results["CubeBuilder"]["details"], {"ok": True, "size": 10})
+        self.assertEqual(results["CylinderBuilder"]["details"], {"ok": True, "size": 5})
+        self.assertEqual(
+            sorted((r["agent_id"], r["parent_agent_id"], r["args"]["size"]) for r in records),
+            [("CubeBuilder", "Main", 10), ("CylinderBuilder", "Main", 5)],
+        )
+        # The top-level agent's own calls stay unattributed.
+        execute({"size": 1}, _SubagentCall())
+        self.assertNotIn("agent_id", records[-1])
+
+    def test_call_cap_holds_across_concurrent_subagent_calls(self):
+        release = threading.Event()
+        ran = []
+
+        def build():
+            ran.append(1)
+            release.wait(timeout=10)
+            return {"ok": True}
+
+        counts = {}
+        execute = self._tool("new_part", build, tool_call_counts=counts, tool_calls=[])
+        options = {
+            "enabled": True,
+            "timeout_s": None,
+            "max_calls_per_turn": 2,
+            "param_defaults": {},
+            "prompt_note": "",
+        }
+        refused = queue.Queue()
+        outcomes = []
+
+        def call(index):
+            out = execute({}, _SubagentCall(f"Builder{index}", "Main"))
+            outcomes.append(out)
+            if out["details"].get("ok") is False:
+                refused.put(out)
+
+        with mock.patch("services.agent.config.get_tool_options", return_value=options):
+            workers = [threading.Thread(target=call, args=(i,)) for i in range(6)]
+            for worker in workers:
+                worker.start()
+            # Four calls past the cap return at once while two bodies still hold.
+            for _ in range(4):
+                refused.get(timeout=10)
+            release.set()
+            for worker in workers:
+                worker.join(timeout=20)
+
+        self.assertEqual(len(ran), 2)
+        self.assertEqual(counts, {"new_part": 2})
+        self.assertEqual(
+            sum(1 for out in outcomes if out["details"].get("ok") is True), 2
+        )
+
+    def test_read_only_modes_refuse_subagent_mutations_at_dispatch(self):
+        ran = []
+
+        def add_features(ops=None):
+            ran.append(ops)
+            return {"ok": True}
+
+        for mode, plan_only in (("ask", None), ("plan", None), ("agent", True)):
+            execute = self._tool(
+                "add_features", add_features, mode=mode, plan_only=plan_only
+            )
+            out = execute({"ops": []}, _SubagentCall("Builder", "Main"))
+            self.assertEqual(out["details"]["status"], "mode_refused", mode)
+            self.assertIs(out["details"]["executed"], False)
+        self.assertEqual(ran, [])
+
+        # A read-only tool still runs under Plan; a mutator runs under Agent.
+        measured = self._tool("measure_part", lambda: {"ok": True}, mode="plan")
+        self.assertTrue(measured({}, _SubagentCall("Builder", "Main"))["details"]["ok"])
+        agent = self._tool("add_features", add_features, mode="agent")
+        self.assertTrue(agent({"ops": []}, _SubagentCall("Builder", "Main"))["details"]["ok"])
+        self.assertEqual(ran, [[]])
 
 
 if __name__ == "__main__":

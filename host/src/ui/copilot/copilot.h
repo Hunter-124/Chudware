@@ -166,10 +166,23 @@ bool chatLogAtBottom(const char* regionId);
 void chatLogJumpToBottom(const char* regionId);
 // Floating circular down-arrow "jump to latest" button, drawn OVER a chat viewport's
 // bottom-right corner. Call AFTER the scrolling child's EndChild() with the child's screen
-// rect (parent-window drawlist, so it never scrolls with the content). Hidden while
-// chatLogAtBottom(regionId); clicking re-engages stick-to-bottom.
+// rect: it submits its own tiny sibling child window, which sorts above the log so it owns
+// hover/clicks and never scrolls with the content. Hidden while chatLogAtBottom(regionId);
+// clicking re-engages stick-to-bottom.
 void chatDrawJumpToLatest(const char* regionId, const ImVec2& viewMin, const ImVec2& viewMax);
 void chatDrawComposer(AppState& st, bool busy, bool canRun);  // prelude + input + toolbar (real send path)
 void chatDrawSessionsList(AppState& st, bool busy);           // session rows + "+ New session"
+// The ONE empty-state for a session with no messages yet — both chat hosts (docked Copilot and
+// the AI workspace) draw it, so a blank session reads the same everywhere.
+void chatDrawEmptyState();
+
+// ---- session titles (conversations.cpp) -----------------------------------------------------
+// A session starts as "Session N" (monotonic N) and is named from its first typed prompt
+// (attachment/context markers stripped, ~40 chars). persistChatHistory applies this on every
+// write; call it directly where a first prompt lands to retitle in the same frame.
+void autoTitleConversation(AppState& st, int idx);
+// User rename. Persists (marks history dirty) and pins the name against auto-titling; an
+// empty/blank name hands the session back to its automatic title. Returns true on change.
+bool renameConversation(AppState& st, int idx, const std::string& title);
 
 }  // namespace ui

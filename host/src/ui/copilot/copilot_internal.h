@@ -444,11 +444,50 @@ bool&       chudcodeSessionServiceAvailable();
 void drawAISettingsBody(AppState& st, bool busy);
 void drawModelDropdown(AppState& st, bool busy);
 
+// ---- user-facing service errors (shared by every copilot / AI-workspace control) ----
+// A running agent turn holds the agent service lane; calls queued behind it fail fast with a
+// transient, internal code. Controls that refused a user action say when it comes back instead.
+inline constexpr const char* kAvailableAfterRun = "Available when the current run finishes.";
+// The ONE mapping from a failed service call to text a user may see: the busy lane becomes
+// kAvailableAfterRun; a message naming internals (worker, lane, RPC, raw method ids, tracebacks)
+// collapses to `fallback`, which callers write in user terms. Only the first line is kept.
+inline std::string userFacingRpcError(const core::RpcResult& r, const char* fallback) {
+    if (core::workerLaneBusy(r)) return kAvailableAfterRun;
+    std::string msg = r.err;
+    if (msg.empty() && r.result.is_object()) {
+        for (const char* key : {"reason", "message", "error"}) {
+            const auto it = r.result.find(key);
+            if (it != r.result.end() && it->is_string() &&
+                !it->get_ref<const std::string&>().empty()) {
+                msg = it->get<std::string>();
+                break;
+            }
+        }
+    }
+    if (const size_t nl = msg.find('\n'); nl != std::string::npos) msg.resize(nl);
+    if (msg.empty()) return fallback;
+    std::string low = msg;
+    for (char& c : low) c = (char)std::tolower((unsigned char)c);
+    for (const char* marker : {"worker", "lane", "rpc", "hostd", "method", "traceback",
+                               "exception", "config.json", "errno", "json"})
+        if (low.find(marker) != std::string::npos) return fallback;
+    // snake_case identifiers (session_btw, rule_create, ...) are wire names, not user copy.
+    for (size_t i = 1; i + 1 < low.size(); ++i)
+        if (low[i] == '_' && std::isalpha((unsigned char)low[i - 1]) &&
+            std::isalpha((unsigned char)low[i + 1]))
+            return fallback;
+    return msg;
+}
+
 // ---- composer + send path (composer) ----
 std::string composerText(const AppState& st);
 void drawBtwPanel(AppState& st);
 void submitTurn(AppState& st, const std::string& text);
 void drawRuntimeBanner(AppState& st);
+// Queue a steer (non-empty `steer`) or a cancel (empty) for the active run on the agent control
+// channel — the one path that reaches a running turn while it holds the agent lane.
+void agentControlDispatch(AppState& st, const std::string& runId, const std::string& steer,
+                          nlohmann::json attachments = nlohmann::json::array());
 bool aiTurnActive(AppState& st);
 void drawComposer(AppState& st, bool busy, bool canRun);
 

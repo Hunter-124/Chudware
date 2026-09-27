@@ -1027,40 +1027,21 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 }
 
 
-// Empty-state hero for a brand-new/blank conversation. Without it the composer's grey
-// placeholder is the only affordance — the log reads as a broken blank panel. One centered
-// title + one hint line; the hint left-aligns and wraps when the panel is too narrow to
-// center it on a single line.
-static void drawEmptyChatHero(const ui::Fonts& fonts, float logW) {
-    const float sc = ui::uiScale;
-    const ui::AdaptiveSurface& surf = chatSurf();
-    const char* title = "Start a new session";
-    const char* hint  = "Ask a question about this model, or describe what you want to build.";
-
-    ImGui::Dummy(ImVec2(0, 28.0f * sc));
-    ImGui::PushFont(fonts.h2 ? fonts.h2 : fonts.medium);
-    const float tw = ImGui::CalcTextSize(title).x;
-    if (tw < logW) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (logW - tw) * 0.5f);
-    ImGui::TextColored(surf.textPrimary, "%s", title);
-    ImGui::PopFont();
-
-    ImGui::Dummy(ImVec2(0, 4.0f * sc));
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    const float hw = ImGui::CalcTextSize(hint).x;
-    if (hw < logW) {
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (logW - hw) * 0.5f);
-        ImGui::TextUnformatted(hint);
-    } else {
-        ImGui::TextWrapped("%s", hint);
-    }
-    ImGui::PopStyleColor();
+// Empty state for a brand-new/blank session — the ONE empty state for st.chat, shared by the
+// docked Copilot and the AI workspace (copilot.h), so a blank session reads the same in both.
+// Without it the composer's grey placeholder is the only affordance and the log reads as a
+// broken blank panel. Forwards to the app-wide kit painter.
+void chatDrawEmptyState() {
+    ui::kit::emptyState("ai_panel", "Start a new session",
+                        "Ask about this model, or describe what to build \xe2\x80\x94 the agent "
+                        "plans, models and verifies it.");
 }
 
 void drawChatLogWindowed(AppState& st) {
     ui::Fonts& fonts = st.fonts;
     drawAiVcRollbackConfirm(st);   // pre-rollback confirmation modal (warning ladder)
     const float logW    = ImGui::GetContentRegionAvail().x;
-    if (st.chat.empty()) { drawEmptyChatHero(fonts, logW); return; }
+    if (st.chat.empty()) { chatDrawEmptyState(); return; }
     const float viewTop = ImGui::GetScrollY();
     const float viewBot = viewTop + ImGui::GetWindowSize().y;
     const float slack   = ImGui::GetWindowSize().y;   // one extra viewport of buffer each side
@@ -1165,25 +1146,34 @@ void chatLogJumpToBottom(const char* regionId) {
 void chatDrawJumpToLatest(const char* regionId, const ImVec2& viewMin, const ImVec2& viewMax) {
     (void)viewMin;
     if (chatLogAtBottom(regionId)) return;
-    const float sc = ui::uiScale;
-    const float r  = 13.0f * sc;
+    const float r = ui::metrics::px(13.0f);
     // 18dp x-inset keeps the disc clear of the pill-scrollbar lane on the child's right edge.
-    const ImVec2 c(viewMax.x - 18.0f * sc - r, viewMax.y - 10.0f * sc - r);
+    const ImVec2 c(viewMax.x - ui::metrics::px(18.0f) - r, viewMax.y - ui::metrics::px(10.0f) - r);
 
-    // The hit widget must live in the PARENT window (we are after EndChild) without disturbing
-    // its cursor layout — save/restore around the InvisibleButton.
+    // The button lives in its OWN tiny child window submitted after the log child. It used to be
+    // an InvisibleButton in the PARENT window, but the log child covers that rect, so ImGui's
+    // g.HoveredWindow was always the log child: the parent-window item could never be hovered or
+    // clicked (and its disc, on the parent drawlist, rendered UNDER the log). A later-submitted
+    // sibling child sorts above the log in display order, so it owns hover, the click, and
+    // paints on top. The margin keeps the anti-aliased rim inside the child's clip rect.
+    const float  pad = ui::metrics::px(2.0f);
+    const ImVec2 boxMin(c.x - r - pad, c.y - r - pad);
+    const ImVec2 boxSize(2.0f * (r + pad), 2.0f * (r + pad));
     const ImVec2 keep = ImGui::GetCursorPos();
-    ImGui::SetCursorScreenPos(ImVec2(c.x - r, c.y - r));
+    ImGui::SetCursorScreenPos(boxMin);
     ImGui::PushID(regionId ? regionId : "chat");
-    ImGui::InvisibleButton("##jump_latest", ImVec2(r * 2.0f, r * 2.0f));
-    ImGui::PopID();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::BeginChild("##jump_latest_host", boxSize, ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+                      ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoNav |
+                      ImGuiWindowFlags_NoSavedSettings);
+    ImGui::SetCursorScreenPos(ImVec2(c.x - r, c.y - r));
+    const bool clicked = ImGui::InvisibleButton("##jump_latest", ImVec2(r * 2.0f, r * 2.0f));
     const bool hov     = ImGui::IsItemHovered();
-    const bool clicked = ImGui::IsItemClicked();
     if (hov) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         ImGui::SetTooltip("Jump to the latest reply");
     }
-    ImGui::SetCursorPos(keep);
 
     const ui::AdaptiveSurface& surf = chatSurf();
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1200,6 +1190,10 @@ void chatDrawJumpToLatest(const char* regionId, const ImVec2& viewMin, const ImV
     const ImVec2 mid(c.x, c.y + hh * 0.6f);
     dl->AddLine(ImVec2(c.x - hw, c.y - hh), mid, ink, th);
     dl->AddLine(ImVec2(c.x + hw, c.y - hh), mid, ink, th);
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopID();
+    ImGui::SetCursorPos(keep);
 
     if (clicked) chatLogJumpToBottom(regionId);
 }

@@ -188,6 +188,30 @@ runtime's doctor command.
     for that project; missing project ownership never matches. Stale live records
     become terminal `abandoned` only from owner PID/start-time or heartbeat
     evidence, not age while the owner is alive.
+14. **Task sub-agents inherit the host tools (2026-09-27).** Before this, Chudcode's `task`
+    sub-agents got only MCP proxies: the RPC host tools lived solely in the top-level
+    session's registry (`rpc-mode.ts` `hostToolBridge.setTools` → `session.refreshRpcHostTools`),
+    so every spawned CAD worker reported "CAD tool devices are NOT mounted" and the main
+    agent built parts serially. Now `RpcHostToolBridge` is the session's `HostToolSource`;
+    `structured-subagent.ts` passes it as `inheritedHostTools`, and `createAgentSession`
+    registers agent-bound adapters (explicit agent `tools:` allowlists narrow them;
+    restricted/plan children get none), follows later `set_host_tools`, and hands the source
+    to grandchildren. Calls ride the SAME client as `host_tool_call` frames with additive
+    `agentId`/`parentAgentId` (= `subagent_lifecycle.payload.id` / spawner); chudcode_rpc
+    exposes them as `HostToolContext.agent_id/parent_agent_id`. Aborting a sub-agent sends
+    `host_tool_cancel` for its in-flight call.
+    CAD side: `dispatch_host_tool(..., agent_id=, parent_agent_id=)` runs every sub-agent
+    call concurrently (no dispatch lock around the tool body); `_dispatch_tool` RESERVES the
+    per-tool cap slot under `_CALL_ACCOUNTING_LOCK` and refunds calls that never ran;
+    `tool_calls` records (with `agent_id`) append under `_RECORDS_LOCK`; `enable_tools`
+    refreshes serialize; `_mode_refusal` re-applies Ask/Plan at dispatch (`mode_refused`);
+    skill injection dedupes per `session:agent_id`. `online_turn.resolve_settings` defaults
+    `subagent_subscription="events"`: `chudcode_events` maps `subagent_lifecycle/progress` to
+    one upserted `sub_run` per sub-agent (parent = the `task` call id) and `subagent_event`
+    tool frames to `agent.tool_call` with `subagent_id` + `parent_id`=task call, dropping the
+    child's text; `ProgressWatchdog` counts a sub-agent's successful CAD mutation as turn
+    progress but not its research. `general_agent.yaml` PARALLEL SUB-AGENTS: layout.md
+    contract first, one document per sub-agent, parent integrates and mates.
 
 ## Event rules
 

@@ -329,7 +329,13 @@ static void chudwareMergeSessionIndex(const std::filesystem::path& srcDir,
             if (j.is_string()) pushId(j.get<std::string>());
     std::string active = dstIdx.value("active", std::string());
     if (active.empty()) active = srcIdx.value("active", std::string());
-    const json::json merged = {{"version", 2}, {"active", active}, {"order", order}};
+    // Keep every other key the target index carries (v3 `active_by_project`, `session_seq`,
+    // `version`). This merge runs on EVERY launch while a legacy dir exists, and rebuilding a
+    // bare v2 envelope here silently dropped them each time (2026-09-27).
+    json::json merged = dstIdx.is_object() ? dstIdx : json::json::object();
+    if (!merged.contains("version")) merged["version"] = 2;
+    merged["active"] = active;
+    merged["order"] = order;
     std::error_code ec;
     fs::create_directories(dstDir, ec);
     std::ofstream out(dstDir / "index.json", std::ios::trunc);

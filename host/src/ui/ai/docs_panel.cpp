@@ -1,5 +1,8 @@
-// See docs_panel.h. Project-scoped conversation artifacts and agent-touched tabs on the
-// left, with extension-keyed preview/edit of the selected visible document on the right.
+// See docs_panel.h. Project-scoped conversation artifacts, agent-touched tabs and the next
+// message's attachments (st.pendingAttachments — the composer paperclip's list) on the left,
+// with extension-keyed preview/edit of the selected document on the right. Text previews track
+// the file on disk: a clean buffer reloads when the agent rewrites it, a dirty one is never
+// saved over a newer file without an explicit Overwrite.
 #include "docs_panel.h"
 
 #include <algorithm>
@@ -90,8 +93,6 @@ constexpr double kExistsTtl = 1.0;
 constexpr size_t kMaxExistsCache = 512;
 
 struct DocsState {
-    // Per-session user attachments, keyed by conversation id ("" -> "default").
-    std::unordered_map<std::string, std::vector<std::string>> attachedByConv;
     std::string selected;
 
     // Text edit buffer (loaded lazily when `selected` changes).
@@ -99,6 +100,17 @@ struct DocsState {
     std::string buf;
     bool        dirty = false, editMode = false, truncated = false;
     std::string loadErr;
+    // The file's last_write_time as of the last load/save. Agents rewrite files this pane is
+    // showing; a changed stamp reloads a clean buffer and flags a dirty one (diskChanged) so
+    // Save can never silently overwrite the newer file.
+    std::filesystem::file_time_type textMtime{};
+    bool        haveMtime = false;
+    bool        diskChanged = false;
+    double      mtimeCheckedAt = 0.0;
+    ImGuiID     editorId = 0;       // the multiline editor, to drop its stale focus on reload
+    // Selection requested while the buffer had unsaved edits: held until the inline
+    // Save / Discard / Keep editing prompt resolves it.
+    std::string pendingSelect, pendingSelectKind;
 
     // office_extract request/response for the selected office/pdf path.
     std::string    officePath;
@@ -322,38 +334,61 @@ void collectAgentDocs(const AppState& st, const std::string& projectDir,
     }
 }
 
-std::vector<std::string>* attachedFor(const AppState& st,
-                                      const std::string& projectDir) {
-    if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size())
-        return nullptr;
-    const auto& conv = st.conversations[(size_t)st.activeConv];
-    if (convProjectKey(conv.projectDir) != convProjectKey(projectDir) ||
-        conv.projectDir.empty()) return nullptr;
-    return &DS().attachedByConv[conv.id.empty() ? "default" : conv.id];
-}
-
-void attachPath(AppState& st, DocsState& D, std::vector<std::string>& attached,
-                const std::string& p, const std::string& projectDir) {
-    if (p.empty()) return;
-    if (!agentDocInProject(p, std::string(), projectDir)) {
-        st.toast(ToastLevel::Warn, "Choose a file inside the active project folder.");
+// Switch the previewed entry, but never over unsaved edits: the request is parked for the
+// inline Save / Discard / Keep editing prompt at the top of the preview pane.
+void requestSelect(DocsState& D, const std::string& key, const std::string& kind) {
+    if (key == D.selected) return;
+    if (D.dirty && !D.textPath.empty()) {
+        D.pendingSelect = key;
+        D.pendingSelectKind = kind;
         return;
     }
-    if (std::find(attached.begin(), attached.end(), p) == attached.end())
-        attached.push_back(p);
-    D.selected = p;
+    D.selected = key;
+    D.selectedKind = kind;
+}
+
+// "Attach to next message": the composer's own attachment list (the paperclip chips), so the
+// file really travels with the next prompt. A relative path resolves against the project.
+void attachPath(AppState& st, DocsState& D, const std::string& raw,
+                const std::string& projectDir) {
+    if (raw.empty()) return;
+    std::filesystem::path fp = lexicalPath(raw);
+    if (!fp.is_absolute() && !projectDir.empty())
+        fp = (lexicalPath(projectDir) / fp).lexically_normal();
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(fp, ec)) {
+        st.toast(ToastLevel::Warn, "No file at " + raw);
+        return;
+    }
+    const std::string p = fp.string();
+    if (std::find(st.pendingAttachments.begin(), st.pendingAttachments.end(), p) ==
+        st.pendingAttachments.end()) {
+        st.pendingAttachments.push_back(p);
+        savePromptDraft(st, /*force=*/true);
+    }
+    st.toast(ToastLevel::Info, "Attached " + baseName(p) + " to your next message");
+    requestSelect(D, p, "attached");
 }
 
 // ---------------------------------------------------------------- text load / save
 
-void ensureTextLoaded(DocsState& D, const std::string& path) {
-    if (D.textPath == path) return;
-    D.textPath  = path;
-    D.dirty     = false;
-    D.editMode  = false;
-    D.truncated = false;
+bool diskMtime(const std::string& path, std::filesystem::file_time_type& out) {
+    std::error_code ec;
+    out = std::filesystem::last_write_time(path, ec);
+    return !ec;
+}
+
+// (Re)read `path` into the buffer. The stamp is taken BEFORE the read, so a write landing
+// mid-read shows up as a newer stamp on the next poll instead of being missed.
+void loadTextFile(DocsState& D, const std::string& path) {
+    D.textPath    = path;
+    D.dirty       = false;
+    D.diskChanged = false;
+    D.truncated   = false;
     D.loadErr.clear();
     D.buf.clear();
+    D.haveMtime      = diskMtime(path, D.textMtime);
+    D.mtimeCheckedAt = ImGui::GetTime();
     std::ifstream in(path, std::ios::binary);
     if (!in) { D.loadErr = "could not open the file"; return; }
     D.buf.resize(kMaxEditBytes + 1);
@@ -362,18 +397,45 @@ void ensureTextLoaded(DocsState& D, const std::string& path) {
     if (D.buf.size() > kMaxEditBytes) {
         D.buf.resize(kMaxEditBytes);
         D.truncated = true;
+        D.editMode  = false;
     }
     // Headroom so the multiline editor can grow the text beyond the loaded size.
     D.buf.reserve(D.buf.size() + 8192);
 }
 
-void reloadText(DocsState& D) {
-    const std::string p = D.textPath;
-    D.textPath.clear();
-    ensureTextLoaded(D, p);
+void ensureTextLoaded(DocsState& D, const std::string& path) {
+    if (D.textPath == path) return;
+    D.editMode = false;
+    loadTextFile(D, path);
 }
 
-void saveText(AppState& st, DocsState& D) {
+// Re-read the current file in place, keeping edit mode. The editor's live ImGui state holds
+// the old text while focused, so drop its focus (only its own) to show the new contents.
+void reloadText(DocsState& D) {
+    if (D.editorId != 0 && ImGui::GetActiveID() == D.editorId) ImGui::ClearActiveID();
+    loadTextFile(D, D.textPath);
+}
+
+// About once a second: a newer stamp on disk reloads a clean buffer; a dirty one is flagged
+// so the toolbar offers Reload / Overwrite instead of a silent clobber.
+void pollDisk(DocsState& D) {
+    const double now = ImGui::GetTime();
+    if (D.textPath.empty() || now - D.mtimeCheckedAt < kExistsTtl) return;
+    D.mtimeCheckedAt = now;
+    std::filesystem::file_time_type mt;
+    if (!diskMtime(D.textPath, mt) || (D.haveMtime && mt == D.textMtime)) return;
+    if (!D.dirty) reloadText(D);
+    else D.diskChanged = true;
+}
+
+// Returns true when written. Without `overwrite`, a file changed on disk since it was loaded
+// is never written over: the conflict is flagged for the inline Reload / Overwrite choice.
+bool saveText(AppState& st, DocsState& D, bool overwrite) {
+    std::filesystem::file_time_type mt;
+    if (!overwrite && D.haveMtime && diskMtime(D.textPath, mt) && mt != D.textMtime) {
+        D.diskChanged = true;
+        return false;
+    }
     const size_t len = std::strlen(D.buf.c_str());
     try {
         const std::string tmp = D.textPath + ".tmp";
@@ -387,9 +449,14 @@ void saveText(AppState& st, DocsState& D) {
         D.buf.resize(len);
         D.buf.reserve(len + 8192);
         D.dirty = false;
+        D.diskChanged = false;
+        D.haveMtime = diskMtime(D.textPath, D.textMtime);
+        D.mtimeCheckedAt = ImGui::GetTime();
         st.toast(ToastLevel::Success, "Saved " + baseName(D.textPath));
+        return true;
     } catch (...) {
         st.toast(ToastLevel::Error, "Save failed: " + D.textPath);
+        return false;
     }
 }
 
@@ -587,6 +654,7 @@ void drawPreviewHeader(const std::string& path, const char* kindLabel,
 void drawTextPreview(AppState& st, DocsState& D, const std::string& path, bool isCsv,
                      const AdaptiveSurface& surf, float S) {
     ensureTextLoaded(D, path);
+    pollDisk(D);
     if (!D.loadErr.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 1.0f));
@@ -612,12 +680,20 @@ void drawTextPreview(AppState& st, DocsState& D, const std::string& path, bool i
         if (D.editMode) {
             ImGui::SameLine();
             ImGui::BeginDisabled(!D.dirty);
-            if (ImGui::SmallButton("Save")) saveText(st, D);
+            if (ImGui::SmallButton("Save")) saveText(st, D, /*overwrite=*/false);
             ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::SmallButton("Revert")) reloadText(D);
         }
     }
+    if (D.diskChanged) {
+        // The file changed on disk (typically the agent rewrote it) under unsaved edits.
+        ui::kit::inlineStatus("Changed on disk since you started editing.", ui::kit::Tone::Warn);
+        if (ui::kit::secondaryButton("Reload (discard my edits)")) reloadText(D);
+        ImGui::SameLine();
+        if (ui::kit::dangerButton("Overwrite with my edits")) saveText(st, D, /*overwrite=*/true);
+    }
+    D.editorId = 0;
     ImGui::Spacing();
     const float bodyH = ImGui::GetContentRegionAvail().y;
     if (D.editMode && !D.truncated) {
@@ -625,6 +701,7 @@ void drawTextPreview(AppState& st, DocsState& D, const std::string& path, bool i
         if (ImGui::InputTextMultiline("##docs_edit", D.buf.data(), D.buf.capacity(),
                                       ImVec2(-1.0f, bodyH)))
             D.dirty = true;
+        D.editorId = ImGui::GetItemID();
         if (st.fonts.mono) ImGui::PopFont();
     } else if (isCsv) {
         const char delim = lowerExt(path) == ".tsv" ? '\t' : ',';
@@ -711,10 +788,94 @@ void drawOfficePreview(AppState& st, DocsState& D, const std::string& path,
     drawOfficeResult(st, D.officeResult, surf, S);
 }
 
+// The open Part/Assembly tab an entry names: an unsaved agent part by its tab title, a saved
+// one by path. -1 when the entry is a plain file (or its doc is not open).
+int modelTabFor(const AppState& st, const std::string& key, const std::string& projectDir) {
+    const bool unsaved = key.rfind(kUnsavedKeyPrefix, 0) == 0;
+    const std::string name = unsaved ? key.substr(kUnsavedKeyPrefix.size()) : std::string();
+    const std::string fileKey = unsaved ? std::string() : comparablePath(lexicalPath(key));
+    for (int i = 0; i < (int)st.docTabs.size(); ++i) {
+        const AppState::DocTab& t = st.docTabs[(size_t)i];
+        if (t.kind != AppState::DocTab::TabKind::Part &&
+            t.kind != AppState::DocTab::TabKind::Assembly) continue;
+        if (!agentDocInProject(t.path, t.projectDir, projectDir)) continue;
+        if (unsaved ? (t.path.empty() && t.displayTitle() == name)
+                    : (!t.path.empty() && comparablePath(lexicalPath(t.path)) == fileKey))
+            return i;
+    }
+    return -1;
+}
+
+// A part/assembly the agent has open: its live shaded preview (same cache as the Active Work
+// cards, so it follows every agent revision) plus a way to open it.
+void drawLiveDocPreview(AppState& st, int tabIdx, const AdaptiveSurface& surf) {
+    const AppState::DocTab& t = st.docTabs[(size_t)tabIdx];
+    const std::string title = t.displayTitle();
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::TextUnformatted(title.c_str());
+    ImGui::PopStyleColor();
+    if (!t.path.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", t.path.c_str());
+    ImGui::SameLine(0, ui::metrics::cpMenuRowGap());
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+    ImGui::TextUnformatted(t.kind == AppState::DocTab::TabKind::Assembly ? "assembly" : "part");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float room = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 3.0f;
+    const float h = std::max(std::min(w * 0.62f, room), ImGui::GetFrameHeight() * 4.0f);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    drawAgentDocPreview(st, tabIdx, p0, ImVec2(p0.x + w, p0.y + h));
+    ImGui::Dummy(ImVec2(w, h));
+    ImGui::Spacing();
+
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+    ImGui::TextWrapped("%s", t.aiPulse
+        ? "An agent is editing this document; the preview follows each revision."
+        : t.path.empty() ? "Not saved to disk yet. The preview shows the live document."
+                         : "The preview shows the live document, including unsaved edits.");
+    ImGui::PopStyleColor();
+    if (ui::kit::secondaryButton("Open document")) openAgentDocTab(st, tabIdx);
+}
+
+// Another entry was picked while the text buffer has unsaved edits: ask inline, above the
+// editor, before anything is thrown away.
+void drawPendingSelectPrompt(AppState& st, DocsState& D) {
+    if (D.pendingSelect.empty()) return;
+    auto commit = [&D]() {
+        D.selected = D.pendingSelect;
+        D.selectedKind = D.pendingSelectKind;
+        D.pendingSelect.clear();
+        D.pendingSelectKind.clear();
+    };
+    if (!D.dirty) { commit(); return; }   // saved/reverted through the toolbar meanwhile
+    const std::string msg = "Unsaved edits to " + baseName(D.textPath) + ".";
+    ui::kit::inlineStatus(msg.c_str(), ui::kit::Tone::Warn);
+    if (ui::kit::primaryButton("Save and switch") && saveText(st, D, /*overwrite=*/false))
+        commit();
+    ImGui::SameLine();
+    if (ui::kit::dangerButton("Discard edits")) {
+        D.dirty = false;
+        D.textPath.clear();   // re-read from disk if the user comes back to this file
+        commit();
+    }
+    ImGui::SameLine();
+    if (ui::kit::secondaryButton("Keep editing")) {
+        D.pendingSelect.clear();
+        D.pendingSelectKind.clear();
+    }
+    ImGui::Spacing();
+}
+
 void drawPreview(AppState& st, DocsState& D, const AdaptiveSurface& surf, float S) {
+    drawPendingSelectPrompt(st, D);
     if (D.selected.empty()) {
         emptyState("Select a document",
-                   "Pick a file on the left, or attach one with the button or path entry.");
+                   "Pick a file on the left, or attach one to your next message.");
+        return;
+    }
+    if (const int tab = modelTabFor(st, D.selected, convProjectDir(st)); tab >= 0) {
+        drawLiveDocPreview(st, tab, surf);
         return;
     }
     // An agent part with no file yet: not a missing file, so say what it actually is.
@@ -862,6 +1023,11 @@ bool docRow(DocsState& D, const DocEntry& e, bool selected, const AdaptiveSurfac
             ImGui::TextUnformatted("not found on disk");
             ImGui::PopStyleColor();
         }
+        if (e.attached) {
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+            ImGui::TextUnformatted("attached to your next message");
+            ImGui::PopStyleColor();
+        }
         ImGui::PopTextWrapPos();
         ImGui::EndTooltip();
     }
@@ -870,7 +1036,7 @@ bool docRow(DocsState& D, const DocEntry& e, bool selected, const AdaptiveSurfac
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
         removeClicked = ImGui::SmallButton("(x)");
         ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove from this session's list");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove from your next message");
     }
     ImGui::PopID();
     return clicked;
@@ -878,52 +1044,58 @@ bool docRow(DocsState& D, const DocEntry& e, bool selected, const AdaptiveSurfac
 
 void drawDocList(AppState& st, DocsState& D, const AdaptiveSurface& surf, float S) {
     const std::string projectDir = convProjectDir(st);
-    std::vector<std::string>* attached = attachedFor(st, projectDir);
 
-    ImGui::BeginDisabled(attached == nullptr);
-    // ---- attach affordances ----
+    // ---- attach affordances: straight into the composer's attachments ----
     if (!dialogsDisabled()) {
-        if (ImGui::Button("Attach file...", ImVec2(-1.0f, 0.0f))) {
+        if (ImGui::Button("Attach to next message", ImVec2(-1.0f, 0.0f))) {
             const std::string p = ui::openFileDialog(kDocsFilter);
-            if (attached && !p.empty())
-                attachPath(st, D, *attached, p, projectDir);
+            if (!p.empty()) attachPath(st, D, p, projectDir);
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The file goes to the agent with your next chat message "
+                              "(same as the paperclip).");
     }
     {
-        const float addW = 40.0f * S;
-        ImGui::SetNextItemWidth(std::max(60.0f * S, ImGui::GetContentRegionAvail().x -
-                                                  addW - 4.0f * S));
+        const char* kAddLabel = "Attach";
+        const float gap  = ui::metrics::cpMenuLabelGap();
+        const float addW = ImGui::CalcTextSize(kAddLabel).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        ImGui::SetNextItemWidth(std::max(60.0f * S, ImGui::GetContentRegionAvail().x - addW - gap));
         const bool entered = ImGui::InputTextWithHint("##docs_path", "path/to/file",
                                                       D.pathBuf, sizeof(D.pathBuf),
                                                       ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::SameLine(0, 4.0f * S);
+        ImGui::SameLine(0, gap);
         ImGui::BeginDisabled(D.pathBuf[0] == '\0');
-        if (ImGui::SmallButton("Add") || (entered && D.pathBuf[0] != '\0')) {
-            if (attached) attachPath(st, D, *attached, D.pathBuf, projectDir);
+        if (ImGui::SmallButton(kAddLabel) || (entered && D.pathBuf[0] != '\0')) {
+            attachPath(st, D, D.pathBuf, projectDir);
             D.pathBuf[0] = '\0';
         }
         ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Attach this file to your next message. Relative paths start at "
+                              "the project folder.");
     }
     ImGui::Spacing();
-    ImGui::EndDisabled();
 
-    // ---- entries: everything the agent touched first, then the user's own attachments ----
+    // ---- entries: everything the agent touched first, then the next message's attachments ----
     std::vector<DocEntry> entries;
     std::unordered_set<std::string> seen;
     collectArtifacts(st, projectDir, entries, seen);
     collectAgentDocs(st, projectDir, entries, seen);
-    if (attached) {
-        for (const auto& p : *attached) {
-            if (!agentDocInProject(p, std::string(), projectDir) ||
-                !seen.insert(p).second) continue;
-            DocEntry e;
-            e.path = p;
-            e.name = baseName(p);
-            e.key  = p;
-            e.kind = "attached";
-            e.attached = true;
-            entries.push_back(std::move(e));
+    // The composer's pending attachments (paperclip or this pane) ride the next message, which
+    // binds to this project. One already listed as agent output is marked, not duplicated.
+    for (const auto& p : st.pendingAttachments) {
+        if (!seen.insert(p).second) {
+            for (auto& e : entries)
+                if (e.path == p) e.attached = true;
+            continue;
         }
+        DocEntry e;
+        e.path = p;
+        e.name = baseName(p);
+        e.key  = p;
+        e.kind = "attached";
+        e.attached = true;
+        entries.push_back(std::move(e));
     }
     // ONE flat vector — selection still addresses entries[i] directly; the two labelled
     // sections are only a header drawn before each run.
@@ -932,8 +1104,9 @@ void drawDocList(AppState& st, DocsState& D, const AdaptiveSurface& surf, float 
                               [](const DocEntry& e) { return e.agentTouched; }) -
         entries.begin());
     // Selection survives panel visits but cannot survive project changes or row removal:
-    // otherwise the right-hand preview exposes a document from another project.
-    if (!D.selected.empty() &&
+    // otherwise the right-hand preview exposes a document from another project. A file with
+    // unsaved edits stays open so the edits are never dropped silently.
+    if (!D.selected.empty() && !(D.dirty && D.textPath == D.selected) &&
         std::none_of(entries.begin(), entries.end(),
                      [&](const DocEntry& e) { return e.key == D.selected; }))
         D.selected.clear();
@@ -942,8 +1115,8 @@ void drawDocList(AppState& st, DocsState& D, const AdaptiveSurface& surf, float 
         const std::string title = "Nothing for " +
             (name.empty() ? std::string("this project") : name) + " yet";
         emptyState(title.c_str(),
-                   "Files agents create in this project show up here. Attach a project file "
-                   "to preview or edit it next to the chat.");
+                   "Files agents create in this project show up here. Attach a file to send "
+                   "it with your next message.");
         return;
     }
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
@@ -961,22 +1134,24 @@ void drawDocList(AppState& st, DocsState& D, const AdaptiveSurface& surf, float 
         }
         if (i == (int)attachedFrom && attachedFrom < entries.size()) {
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-            ImGui::TextUnformatted("Attached");
+            ImGui::TextUnformatted("Attached to next message");
             ImGui::PopStyleColor();
         }
         const DocEntry& e = entries[(size_t)i];
         if (D.selected == e.key) D.selectedKind = e.kind;
         bool removeClicked = false;
-        if (docRow(D, e, D.selected == e.key, surf, S, removeClicked)) {
-            D.selected     = e.key;
-            D.selectedKind = e.kind;
-        }
+        if (docRow(D, e, D.selected == e.key, surf, S, removeClicked))
+            requestSelect(D, e.key, e.kind);
         if (removeClicked) removeIdx = i;
     }
-    if (attached && removeIdx >= 0 && entries[(size_t)removeIdx].attached) {
+    if (removeIdx >= 0 && entries[(size_t)removeIdx].attached) {
         const std::string p = entries[(size_t)removeIdx].path;
-        attached->erase(std::remove(attached->begin(), attached->end(), p), attached->end());
-        if (D.selected == p) D.selected.clear();
+        st.pendingAttachments.erase(
+            std::remove(st.pendingAttachments.begin(), st.pendingAttachments.end(), p),
+            st.pendingAttachments.end());
+        savePromptDraft(st, /*force=*/true);
+        if (D.selected == p && !D.dirty && !entries[(size_t)removeIdx].agentTouched)
+            D.selected.clear();
     }
 }
 

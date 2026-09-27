@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "imgui.h"
@@ -98,8 +100,13 @@ ChatMsg* pbActivePlanMsg(AppState& st) {
 
 // ---- edit bookkeeping -------------------------------------------------------------
 
-// Subtle "queued — applies next turn" note after steering a running agent.
+// Short note under the plan header after an edit that went somewhere (steered / pending).
 double      s_noteUntil = 0.0;
+std::string s_noteText;
+// Sessions whose plan was edited while no run could take the change; the next user turn in that
+// session carries the edited plan (planBoardTakeEditsForTurn). Never a queued prompt: a plan
+// edit must not start a turn on its own.
+std::unordered_set<std::string> s_pendingPlanEdits;
 // Inline-rename state (one row at a time; owner = the ChatMsg holding the plan, so a
 // conversation switch or a new plan drops any in-flight edit).
 int         s_renameIdx   = -1;
@@ -108,50 +115,91 @@ bool        s_renameFocus = false;
 char        s_renameBuf[256] = {0};
 int         s_itemCtr = 0;
 
-// Persist + (while a turn runs) notify the agent through the EXISTING queued-prompt
-// path — drawComposer drains st.queuedPrompts into the next turn. Consecutive plan
-// notes coalesce so rapid edits don't flood the queue.
+// Status words the agent reads (same set the board shows).
+const char* pbStatusLabel(const std::string& s);
+
+// The whole checklist as plain text, so the agent sees the plan as the user left it rather than
+// a lone delta it has to replay.
+std::string pbPlanAsText(const PlanState& ps) {
+    std::string out = "Current plan";
+    if (!ps.title.empty()) out += " (" + ps.title + ")";
+    out += ":";
+    if (ps.items.empty()) return out + " (no items)";
+    int n = 0;
+    for (const auto& it : ps.items) {
+        out += "\n" + std::to_string(++n) + ". [" + pbStatusLabel(it.status) + "] " +
+               (it.title.empty() ? it.id : it.title);
+    }
+    return out;
+}
+
+// Persist, then tell the agent. While this session's run is live the change is steered into
+// that run (the composer's control channel — reaches a turn that holds the agent lane). With no
+// live run, or before the run has announced its id, the edit stays local and rides with the
+// next message the user sends in this session.
 void pbAfterEdit(AppState& st, const std::string& summary) {
     markChatHistoryDirty();
     for (auto& m : st.chat) m.uiCachedH = -1.0f;  // the plan card's height may change
-    if (!aiTurnActive(st)) return;
-    std::string note = "Plan updated: " + summary;
-    if (!st.queuedPrompts.empty() &&
-        st.queuedPrompts.back().rfind("Plan updated:", 0) == 0)
-        st.queuedPrompts.back() = std::move(note);
-    else
-        st.queuedPrompts.push_back(std::move(note));
-    s_noteUntil = ImGui::GetTime() + 6.0;
+    const std::string convId = st.activeConvId();
+    std::string runId;
+    if (st.workerStarted && aiTurnActive(st)) {
+        if (JobState* run = st.runIfExists(convId)) {
+            std::lock_guard<std::mutex> lk(run->mtx);
+            runId = run->runId;
+        }
+    }
+    const ChatMsg* msg = pbActivePlanMsg(st);
+    if (!runId.empty() && msg) {
+        agentControlDispatch(st, runId,
+                             "The user edited the plan: " + summary + ".\n" +
+                                 pbPlanAsText(msg->planState));
+        s_pendingPlanEdits.erase(convId);   // the steer carried the full plan
+        s_noteText  = "Plan change sent to the current run.";
+        s_noteUntil = ImGui::GetTime() + 6.0;
+        return;
+    }
+    s_pendingPlanEdits.insert(convId);
+    if (aiTurnActive(st)) {
+        s_noteText  = "Plan change will go with your next message.";
+        s_noteUntil = ImGui::GetTime() + 6.0;
+    }
 }
 
 void pbDropRename() { s_renameIdx = -1; s_renameFocus = false; }
 
 // ---- status mapping ---------------------------------------------------------------
 // PlanItem.status contract: pending|running|pass|fail|done|abandoned. The board shows
-// the user-facing quad Pending/Active/Done/Dropped.
+// Pending/Active/Done/Dropped plus Failed — a failed check needs attention, it is not a decision
+// to drop the item, so it never shares Dropped's label or weight.
+
+bool pbIsFailed(const std::string& s) { return s == "fail" || s == "failed"; }
 
 const char* pbStatusLabel(const std::string& s) {
     if (s == "running" || s == "active") return "Active";
     if (s == "done" || s == "pass") return "Done";
-    if (s == "abandoned" || s == "dropped" || s == "fail") return "Dropped";
+    if (pbIsFailed(s)) return "Failed";
+    if (s == "abandoned" || s == "dropped") return "Dropped";
     return "Pending";
 }
 
+// Click cycle Pending -> Active -> Done -> Dropped -> Pending. Failed sits outside it: clicking a
+// Failed chip is an explicit retry back to Pending, and nothing cycles INTO Failed.
 std::string pbStatusNext(const std::string& s) {
     if (s == "running" || s == "active") return "done";
     if (s == "done" || s == "pass") return "abandoned";
-    if (s == "abandoned" || s == "dropped" || s == "fail") return "pending";
+    if (pbIsFailed(s) || s == "abandoned" || s == "dropped") return "pending";
     return "running";
 }
 
 ImVec4 pbStatusColor(const std::string& s, const AdaptiveSurface& surf) {
-    // The two SEMANTIC states go through the kit tone table, so "active" and "done" read the
-    // same here as in the Copilot task list. Pending and Dropped are not statuses but weights
+    // The SEMANTIC states go through the kit tone table, so "active", "done" and "failed" read
+    // the same here as in the Copilot task list. Pending and Dropped are not statuses but weights
     // (not-yet vs. no-longer) and there is no kit Tone that separates them — they stay on the
     // surface's own ink ladder, which is what keeps them distinguishable from each other.
     if (s == "running" || s == "active") return ui::kit::toneOn(ui::kit::Tone::Accent, surf);
     if (s == "done" || s == "pass")      return ui::kit::toneOn(ui::kit::Tone::Ok, surf);
-    if (s == "abandoned" || s == "dropped" || s == "fail") return surf.textTertiary;
+    if (pbIsFailed(s))                   return ui::kit::toneOn(ui::kit::Tone::Err, surf);
+    if (s == "abandoned" || s == "dropped") return surf.textTertiary;
     return surf.textSecondary;
 }
 
@@ -242,17 +290,12 @@ bool pbTlAbsent(const core::RpcResult& r) {
 bool pbTlOk(const core::RpcResult& r, std::string& hint) {
     if (pbTlAbsent(r)) {
         s_aiVc.available = false;   // shared with the chat-side AI-VC chrome
-        hint = "AI checkpoints unavailable on this worker";
+        hint = "Checkpoints aren't available in this version.";
         return false;
     }
-    if (!r.ok) {
-        hint = r.err.empty() ? "the worker did not respond" : r.err;
-        return false;
-    }
-    if (r.result.is_object() && !r.result.value("ok", true)) {
-        const std::string reason = r.result.value("reason", std::string());
-        hint = r.result.value("hint", reason.empty() ? std::string("timeline failed")
-                                                     : reason);
+    const bool methodFailed = r.ok && r.result.is_object() && !r.result.value("ok", true);
+    if (!r.ok || methodFailed) {
+        hint = userFacingRpcError(r, "Checkpoints couldn't be loaded right now.");
         return false;
     }
     return true;
@@ -341,23 +384,22 @@ void pbDrawTimeline(AppState& st, const AdaptiveSurface& surf, int verbosity) {
                            /*count=*/-1, /*first=*/true);
     ui::kit::popDensity();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-    ImGui::TextWrapped("Silent agent version control — restore the document (and "
-                       "chat) to before a turn or tool call.");
+    ImGui::TextWrapped("Restore the document (and chat) to how it was before a run or an "
+                       "agent edit.");
     ImGui::PopStyleColor();
     ImGui::Spacing();
 
-    // Honest states first: worker down, method absent, poll error, empty vault.
+    // Honest states first: service offline, not supported, load error, none yet.
     if (!st.workerStarted) {
-        pbEmptyState("Worker not running.",
-                     "Checkpoints appear once the agent worker is up and a run edits "
+        pbEmptyState("AI service offline",
+                     "Checkpoints appear here once the AI service is back and a run edits "
                      "the active document.", surf);
         ImGui::EndChild();
         return;
     }
     if (!s_aiVc.available) {
-        pbEmptyState("AI checkpoints unavailable on this worker.",
-                     "The plm_timeline/plm_rollback methods are not registered — nothing "
-                     "to restore.", surf);
+        pbEmptyState("Checkpoints aren't available in this version.",
+                     "There is nothing to restore here.", surf);
         ImGui::EndChild();
         return;
     }
@@ -381,8 +423,8 @@ void pbDrawTimeline(AppState& st, const AdaptiveSurface& surf, int verbosity) {
     }
     if (s_tl.cps.empty()) {
         pbEmptyState("No checkpoints yet.",
-                     "The agent cuts one silently before every prompt turn and every "
-                     "mutating tool call on this document.", surf);
+                     "One is saved automatically before each run and before each change the "
+                     "agent makes to this document.", surf);
         ImGui::EndChild();
         return;
     }
@@ -405,10 +447,10 @@ void pbDrawTimeline(AppState& st, const AdaptiveSurface& surf, int verbosity) {
         float x = rowMin.x + ui::metrics::cpMenuRowPadX();
         const float y = rowMin.y + ui::metrics::cpMenuRowPadY() * 0.5f;
 
-        // Kind chip (prompt = accent, tool = iterBuilt blue, legacy = dim).
+        // Kind chip (before a run = accent, before an agent edit = iterBuilt blue, legacy = dim).
         const bool isPrompt = cp.kind == "prompt";
         const bool isTool   = cp.kind == "tool";
-        const char* kindTag = isPrompt ? "prompt" : (isTool ? "tool" : "turn");
+        const char* kindTag = isTool ? "edit" : "run";
         const ImVec4 kindCol = isPrompt
             ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f)
             : isTool ? ImVec4(pal.iterBuilt[0], pal.iterBuilt[1], pal.iterBuilt[2], 1.0f)
@@ -439,11 +481,11 @@ void pbDrawTimeline(AppState& st, const AdaptiveSurface& surf, int verbosity) {
         }
         ImGui::EndDisabled();
         if (cp.id.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("Checkpoint has no id — cannot restore");
+            ImGui::SetTooltip("This checkpoint can't be restored.");
         const float labelMaxW = (rowMin.x + rowW - rbW - 14.0f * S) - x;
 
         // Label + time (+ detail at full verbosity).
-        const std::string label = pbElide(cp.label.empty() ? cp.id : cp.label, labelMaxW);
+        const std::string label = pbElide(cp.label.empty() ? "Checkpoint" : cp.label, labelMaxW);
         ImGui::SetCursorScreenPos(ImVec2(x, y));
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
         ImGui::TextUnformatted(label.c_str());
@@ -457,7 +499,7 @@ void pbDrawTimeline(AppState& st, const AdaptiveSurface& surf, int verbosity) {
         if (cp.turn >= 0) {
             if (!meta.empty()) meta += " ";
             char buf[24];
-            std::snprintf(buf, sizeof(buf), "turn %d", cp.turn);
+            std::snprintf(buf, sizeof(buf), "run %d", cp.turn);
             meta += buf;
         }
         if (verbosity >= 2 && cp.msgIdx >= 0) {
@@ -482,7 +524,6 @@ void pbDrawTimeline(AppState& st, const AdaptiveSurface& surf, int verbosity) {
 
 void pbDrawPlanSection(AppState& st, const AdaptiveSurface& surf, int verbosity) {
     const float S = uiScale;
-    const auto& pal = palette;
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
     ChatMsg* msg = pbActivePlanMsg(st);
@@ -509,15 +550,20 @@ void pbDrawPlanSection(AppState& st, const AdaptiveSurface& surf, int verbosity)
     // text (it used to live only in the ring's tooltip, invisible until hovered), and the ring
     // is placed on the header's own row immediately left of it — still the app's one shared
     // circular gauge, never a bespoke bar.
-    int done = 0;
+    int done = 0, failed = 0;
     if (plan)
-        for (const auto& it : plan->items)
+        for (const auto& it : plan->items) {
             if (it.status == "done" || it.status == "pass") ++done;
+            else if (pbIsFailed(it.status)) ++failed;
+        }
     std::string meta;
     if (plan) {
-        char buf[64];
+        char buf[96];
         if (plan->items.empty())
             std::snprintf(buf, sizeof(buf), "no items · rev %d", plan->revision);
+        else if (failed > 0)
+            std::snprintf(buf, sizeof(buf), "%d/%d done · %d failed · rev %d", done,
+                          (int)plan->items.size(), failed, plan->revision);
         else
             std::snprintf(buf, sizeof(buf), "%d/%d done · rev %d", done,
                           (int)plan->items.size(), plan->revision);
@@ -527,7 +573,7 @@ void pbDrawPlanSection(AppState& st, const AdaptiveSurface& surf, int verbosity)
     const float  headW   = ImGui::GetContentRegionAvail().x;
     const float  headLh  = ImGui::GetTextLineHeight();
     ui::kit::pushDensity(ui::kit::Density::Cozy);
-    ui::kit::sectionHeader(plan && !plan->title.empty() ? plan->title.c_str() : "Session Plan",
+    ui::kit::sectionHeader(plan && !plan->title.empty() ? plan->title.c_str() : "Plan",
                            nullptr, meta.empty() ? nullptr : meta.c_str(),
                            /*count=*/-1, /*first=*/true);
     ui::kit::popDensity();
@@ -557,11 +603,10 @@ void pbDrawPlanSection(AppState& st, const AdaptiveSurface& surf, int verbosity)
         ImGui::TextWrapped("%s", plan->summary.c_str());
         ImGui::PopStyleColor();
     }
-    // "applies next turn" note after steering a running agent.
-    if (ImGui::GetTime() < s_noteUntil) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(pal.statusWarn[0], pal.statusWarn[1], pal.statusWarn[2], 0.95f));
-        ImGui::TextUnformatted("Plan changes queued for the agent — applies next turn.");
+    // Where the last edit went: steered into the current run, or held for the next message.
+    if (ImGui::GetTime() < s_noteUntil && !s_noteText.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::kit::toneOn(ui::kit::Tone::Info, surf));
+        ImGui::TextWrapped("%s", s_noteText.c_str());
         ImGui::PopStyleColor();
     }
     ImGui::Spacing();
@@ -588,7 +633,7 @@ void pbDrawPlanSection(AppState& st, const AdaptiveSurface& surf, int verbosity)
             PlanState ps;
             ps.present = true;
             ps.shape   = "checklist";
-            ps.title   = "Session plan";
+            ps.title   = "Plan";
             host->planState = std::move(ps);
             pbAfterEdit(st, "started a new plan");
         }
@@ -614,19 +659,23 @@ void pbDrawPlanSection(AppState& st, const AdaptiveSurface& surf, int verbosity)
         const float y = rowMin.y + ui::metrics::cpMenuRowPadY() * 0.5f;
         float x = rowMin.x + ui::metrics::cpMenuRowPadX();
 
-        // -- status chip (click cycles Pending -> Active -> Done -> Dropped) --
+        // -- status chip (click cycles Pending -> Active -> Done -> Dropped; Failed -> retry) --
+        const bool failedItem = pbIsFailed(it.status);
         const char* chipLabel = pbStatusLabel(it.status);
         const ImVec4 chipCol = pbStatusColor(it.status, surf);
         const float chipW = ImGui::CalcTextSize(chipLabel).x + 22.0f * S;
         ImGui::SetCursorScreenPos(ImVec2(x, y));
         ImGui::InvisibleButton("##status", ImVec2(chipW, frameH));
         if (ImGui::IsItemClicked()) {
+            const std::string name = it.title.empty() ? it.id : it.title;
             it.status = pbStatusNext(it.status);
-            pbAfterEdit(st, "'" + (it.title.empty() ? it.id : it.title) + "' -> " +
-                            pbStatusLabel(it.status));
+            pbAfterEdit(st, failedItem ? "marked '" + name + "' to retry (Pending)"
+                                       : "'" + name + "' -> " + pbStatusLabel(it.status));
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Click to cycle status (Pending / Active / Done / Dropped)");
+            ImGui::SetTooltip(failedItem
+                                  ? "Failed \xE2\x80\x94 click to retry (moves back to Pending)"
+                                  : "Click to cycle status (Pending / Active / Done / Dropped)");
         {
             const ImVec2 b0 = ImGui::GetItemRectMin();
             const ImVec2 b1 = ImGui::GetItemRectMax();
@@ -702,8 +751,8 @@ void pbDrawPlanSection(AppState& st, const AdaptiveSurface& surf, int verbosity)
             }
         } else {
             const bool isDone = it.status == "done" || it.status == "pass";
-            const bool isDropped = it.status == "abandoned" || it.status == "dropped" ||
-                                   it.status == "fail";
+            // A failed item needs attention, so its title keeps full ink (only Dropped dims).
+            const bool isDropped = it.status == "abandoned" || it.status == "dropped";
             const ImVec4 titleCol = isDropped ? surf.textTertiary
                                     : isDone    ? surf.textSecondary
                                                 : surf.textPrimary;
@@ -773,7 +822,7 @@ void drawPlanBoardView(AppState& st) {
         const std::string name = lexicalPath(projectDir).filename().string();
         const std::string title = "Nothing for " +
             (name.empty() ? std::string("this project") : name) + " yet";
-        ui::kit::emptyState(nullptr, title.c_str(), "Start a conversation in this project.");
+        ui::kit::emptyState(nullptr, title.c_str(), "Start a session in this project.");
         return;
     }
 
@@ -802,11 +851,12 @@ void drawPlanBoardView(AppState& st) {
             docName = "selected: " + selected->displayTitle();
     }
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    ImGui::Text("Session Plan | %s | %s", conv->title.c_str(), docName.c_str());
+    ImGui::Text("Plan \xC2\xB7 %s \xC2\xB7 %s", conv->title.c_str(), docName.c_str());
     ImGui::PopStyleColor();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextUnformatted(aiTurnActive(st) ? "Agent running; edits queue for its next turn."
-                                            : "Edits save with this session.");
+    ImGui::TextWrapped("%s", aiTurnActive(st)
+                                 ? "Agent running \xE2\x80\x94 edits are sent to the current run."
+                                 : "Edits save with this session and go with your next message.");
     ImGui::PopStyleColor();
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
 
@@ -848,6 +898,17 @@ void planBoardApply(AppState& st, const std::string& convId, const nlohmann::jso
     m.fromUser = false;
     m.planState = std::move(ps);
     msgs->push_back(std::move(m));
+}
+
+std::string planBoardTakeEditsForTurn(AppState& st, const std::string& convId) {
+    if (s_pendingPlanEdits.erase(convId) == 0) return std::string();
+    const std::vector<ChatMsg>* msgs = pbMsgsForConv(st, convId);
+    if (!msgs) return std::string();
+    for (auto it = msgs->rbegin(); it != msgs->rend(); ++it)
+        if (it->planState.present)
+            return "The user edited the plan since the last run.\n" +
+                   pbPlanAsText(it->planState);
+    return std::string();
 }
 
 }  // namespace ui

@@ -7499,6 +7499,12 @@ def _internal_fault_result(exc: BaseException, tool: str) -> dict:
     }
 
 
+# Guards one run's per-tool call counts: Chudcode host-tool calls (the parent
+# agent's parallel batch and its task sub-agents) dispatch on separate threads.
+# Held only for the read-modify-write, never across a tool body.
+_CALL_ACCOUNTING_LOCK = threading.Lock()
+
+
 def _dispatch_tool(
     tool: str,
     args: dict,
@@ -7586,8 +7592,20 @@ def _dispatch_tool(
         max_calls = effective_tool_call_cap(tool, opts=opts)
     except Exception:  # noqa: BLE001
         max_calls = None
+    # Reserve this call's slot atomically: concurrent host-tool calls (parallel
+    # Chudcode sub-agents share one run's counts) must neither both slip under
+    # the cap nor lose an increment. A call that never reaches the tool body
+    # hands its slot back in _charge_call below — a call refused by argument
+    # validation or tool binding never ran, and charging it let three malformed
+    # calls retire a tool the model had never once used.
+    reserved = False
     if max_calls is not None and _call_counts is not None:
-        if int(_call_counts.get(tool, 0)) >= int(max_calls):
+        with _CALL_ACCOUNTING_LOCK:
+            at_cap = int(_call_counts.get(tool, 0)) >= int(max_calls)
+            if not at_cap:
+                _call_counts[tool] = int(_call_counts.get(tool, 0)) + 1
+                reserved = True
+        if at_cap:
             if _loop_guard is not None:
                 # The refusal is final — never hand the streak the extra
                 # validation-retry slack, which exists for arguments the model
@@ -7599,9 +7617,6 @@ def _dispatch_tool(
             return _call_cap_error(
                 tool, int(max_calls), str(opts.get("prompt_note") or "")
             )
-    # NB: the counter is charged AFTER the call, in _charge_call below — a call
-    # refused by argument validation or tool binding never ran, and charging it
-    # let three malformed calls retire a tool the model had never once used.
 
     merged = dict(opts.get("param_defaults") or {})
     # Names the MODEL did not supply — a bad one here is a Settings bug, and the
@@ -7707,19 +7722,23 @@ def _dispatch_tool(
             ex.shutdown(wait=False)
 
     def _charge_call(*, did_work: bool) -> int | None:
-        """Charge this call against the per-turn cap, returning the new count.
+        """Settle this call's reserved slot, returning the resulting count.
 
         ``did_work`` is False only when the call never reached the tool body
-        (see ``_failed_before_tool_body``). A timeout DOES count: that call is
-        still running and may still mutate state.
+        (see ``_failed_before_tool_body``); its reservation is refunded. A
+        timeout DOES count: that call is still running and may still mutate
+        state.
         """
-        if max_calls is None or _call_counts is None:
+        if not reserved or _call_counts is None:
             return None
-        if not did_work:
+        with _CALL_ACCOUNTING_LOCK:
+            if not did_work:
+                refunded = int(_call_counts.get(tool, 0)) - 1
+                if refunded > 0:
+                    _call_counts[tool] = refunded
+                else:
+                    _call_counts.pop(tool, None)
             return int(_call_counts.get(tool, 0))
-        used = int(_call_counts.get(tool, 0)) + 1
-        _call_counts[tool] = used
-        return used
 
     try:
         result = _call_with_timeout() if timeout_f > 0 else _call()

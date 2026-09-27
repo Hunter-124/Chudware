@@ -20,6 +20,7 @@
 #include "core/app_state.h"
 #include "ui_theme.h"    // palette / uiScale / adaptivePanel / glassPanel / glassRowBackground
 #include "ui/metrics.h"  // cpMenu* / cpChat* rhythm tokens
+#include "ui/copilot/copilot_internal.h"  // userFacingRpcError / kAvailableAfterRun / aiTurnActive
 
 namespace ui {
 namespace {
@@ -63,6 +64,7 @@ struct AuthoringUi {
     std::vector<char> previewText{std::vector<char>(1, 0)};
     bool        saving = false;
     std::string error;
+    bool        errorCalm = false;      // `error` is a transient "after this run" note, not a fault
     std::string donePath;               // non-empty once the artifact is on disk
 };
 
@@ -362,6 +364,7 @@ void create(AppState& st, AuthoringUi& A) {
     if (A.saving) return;
     A.saving = true;
     A.error.clear();
+    A.errorCalm = false;
 
     std::string method;
     nlohmann::json p;
@@ -386,18 +389,21 @@ void create(AppState& st, AuthoringUi& A) {
     }
 
     const std::string path = A.previewPath;
-    st.rpc.call(method, p, [path, method](const core::RpcResult& r) {
+    st.rpc.call(method, p, [path](const core::RpcResult& r) {
         AuthoringUi& B = AU();
         B.saving = false;
+        if (core::workerLaneBusy(r)) {
+            B.error = kAvailableAfterRun;
+            B.errorCalm = true;
+            return;
+        }
+        B.errorCalm = false;
         if (rpcAbsent(r)) {
-            B.error = method + " is not available \xe2\x80\x94 the agent worker is too old or "
-                               "isn't running.";
+            B.error = "Saving isn't available in this version.";
             return;
         }
         if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) {
-            B.error = r.err.empty()
-                          ? r.result.value("reason", std::string(method + " failed"))
-                          : r.err;
+            B.error = userFacingRpcError(r, "Couldn't save it. Try again.");
             return;
         }
         B.donePath = path;
@@ -520,16 +526,21 @@ void drawPreviewPane(AppState& st, AuthoringUi& A) {
                               ImVec2(-1.0f, boxH), ImGuiInputTextFlags_ReadOnly);
 
     if (!A.error.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, v4(ui::palette.statusErr));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              v4(A.errorCalm ? ui::palette.textDim : ui::palette.statusErr));
         ImGui::TextWrapped("%s", A.error.c_str());
         ImGui::PopStyleColor();
     }
 
     const float gap = ui::metrics::cpMenuRowGap();
     if (A.donePath.empty()) {
-        ImGui::BeginDisabled(A.saving);
-        if (ImGui::Button("Create", ImVec2(ui::metrics::px(96.0f), 0.0f))) create(st, A);
-        ImGui::EndDisabled();
+        // Saving shares the service a running agent run holds: say when it opens instead of
+        // firing a call that is refused.
+        const bool runBusy = aiTurnActive(st) || st.anyRunActive();
+        if (ui::kit::primaryButton("Create", !A.saving && !runBusy,
+                                   runBusy ? kAvailableAfterRun : nullptr,
+                                   ImVec2(ui::metrics::px(96.0f), 0.0f)))
+            create(st, A);
         ImGui::SameLine(0.0f, gap);
         if (ImGui::Button("Back", ImVec2(ui::metrics::px(72.0f), 0.0f))) {
             A.preview = false;

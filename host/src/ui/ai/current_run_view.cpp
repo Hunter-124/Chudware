@@ -1,5 +1,6 @@
 #include "current_run_view.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <ctime>
 #include <string>
@@ -9,15 +10,18 @@
 #include "core/app_state.h"
 #include "ui/copilot/copilot_internal.h"
 #include "ui/copilot/copilot.h"
-#include "ui/ai/ai_prefs.h"
 #include "ui/ai/agent_dag.h"
 #include "ui/metrics.h"
 #include "ui/widgets/kit.h"
 #include "ui_theme.h"
 namespace ui {
 namespace {
-// Project-scoped Current Run roster and one docked inspector. Transcript and controls
-// use the existing asynchronous worker RPCs; steering takes effect at turn boundaries.
+// Current Run roster and one docked inspector. The roster merges two sources: the project's
+// sub-agent registry (subagent_list — sub-agents with transcript, steering and pause/terminate
+// controls) and the viewed session's execution trace (every sub-agent the run's events name,
+// including Chudcode `task` sub-agents that have no registry record; those are read-only here).
+// Registry calls are asynchronous; steering takes effect at turn boundaries. A refusal because
+// a run is holding the service keeps the last-known roster/transcript and never shows an error.
 
 struct SubMsg {
     std::string who;    // "user" | "subagent" | "system"
@@ -66,17 +70,48 @@ struct SubChatState {
 };
 static SubChatState s_inspector;
 
+// A trace step opened in the docked inspector. It takes the inspector over until the user goes
+// back to the agent (or selects another agent); the copy survives the step leaving the trace.
+struct StepSelection {
+    bool active = false;
+    bool stale = false;
+    AgentTraceStep step;
+};
+static StepSelection s_step;
+
+// The viewed session's trace sub-agents (tree order), refreshed every frame by pollCurrentRun.
+static std::vector<AgentTraceAgent> s_trace;
+// The roster/trace agent shown in the inspector. When the registry knows it, s_inspector.cur
+// carries its registry record (cur.id == s_selId); a trace-only agent leaves cur empty.
+static std::string s_selId;
+static int s_liveCount = 0;
+
+// Registry LIVE_STATUSES (subagent_registry.py): a paused or approved session is still live and
+// must keep its Resume / Terminate controls.
 static bool isLive(const SubagentSession& s) {
-    return s.status == "running" || s.status == "pending" ||
-           s.status == "in_progress" || s.status == "waiting";
+    return s.status == "running" || s.status == "pending" || s.status == "approved" ||
+           s.status == "in_progress" || s.status == "waiting" || s.status == "paused";
+}
+static bool traceLive(const AgentTraceAgent& a) {
+    return a.status == "running" || a.status == "pending";
+}
+static const SubagentSession* registryFor(const std::string& id) {
+    for (const auto& s : s_sub.sessions) if (s.id == id) return &s;
+    return nullptr;
+}
+static const AgentTraceAgent* traceFor(const std::string& id) {
+    for (const auto& a : s_trace) if (a.id == id) return &a;
+    return nullptr;
 }
 
-static kit::Tone statusTone(const SubagentSession& s) {
-    if (s.status == "abandoned") return kit::Tone::Neutral;
-    if (s.status == "failed" || s.status == "error") return kit::Tone::Err;
-    if (s.status == "done" || s.status == "complete" || s.status == "succeeded")
-        return kit::Tone::Ok;
-    return isLive(s) ? kit::Tone::Accent : kit::Tone::Neutral;
+// One meaning→tone map for registry and trace statuses alike.
+static kit::Tone toneFor(const std::string& status, bool live) {
+    if (status == "abandoned" || status == "stopped" || status == "cancelled")
+        return kit::Tone::Neutral;
+    if (status == "failed" || status == "error") return kit::Tone::Err;
+    if (status == "paused") return kit::Tone::Warn;
+    if (status == "done" || status == "complete" || status == "succeeded") return kit::Tone::Ok;
+    return live ? kit::Tone::Accent : kit::Tone::Neutral;
 }
 
 // "13m ago" from an ISO-8601 UTC timestamp (registry _now(): timespec=milliseconds).
@@ -138,6 +173,8 @@ static void pollSubagentList(AppState& st) {
         s_sub.listErr.clear();
         s_sub.recentExpanded = false;
         s_inspector = SubChatState{};
+        s_step = StepSelection{};
+        s_selId.clear();
     }
     if (key.empty() || !st.workerStarted || s_sub.listPending) return;
     const double now = ImGui::GetTime();
@@ -150,9 +187,10 @@ static void pollSubagentList(AppState& st) {
         if (generation != s_sub.generation || key != s_sub.projectKey) return;
         s_sub.listPending = false;
         s_sub.listedOnce = true;
-        if (!r.ok) { s_sub.listErr = r.err.empty() ? "worker unreachable" : r.err; return; }
-        if (!r.result.value("ok", false)) {
-            s_sub.listErr = r.result.value("reason", std::string("subagent_list failed"));
+        // A run holding the service: keep the last roster and retry on the normal cadence.
+        if (core::workerLaneBusy(r)) return;
+        if (!r.ok || !r.result.value("ok", false)) {
+            s_sub.listErr = userFacingRpcError(r, "Sub-agents couldn't be listed right now.");
             return;
         }
         s_sub.listErr.clear();
@@ -160,11 +198,15 @@ static void pollSubagentList(AppState& st) {
         if (r.result.contains("sessions") && r.result["sessions"].is_array())
             for (const auto& s : r.result["sessions"])
                 if (s.is_object()) s_sub.sessions.push_back(parseSubSession(s));
-        if (!s_inspector.cur.id.empty()) {
-            auto it = std::find_if(s_sub.sessions.begin(), s_sub.sessions.end(),
-                [](const SubagentSession& s) { return s.id == s_inspector.cur.id; });
-            if (it == s_sub.sessions.end()) s_inspector = SubChatState{};
-            else s_inspector.cur = *it;
+        if (s_selId.empty()) return;
+        const SubagentSession* reg = registryFor(s_selId);
+        if (!reg) {
+            if (!s_inspector.cur.id.empty()) s_inspector = SubChatState{};
+        } else if (s_inspector.cur.id == s_selId) {
+            s_inspector.cur = *reg;
+        } else {   // a trace agent selected before the registry listed it gains its controls
+            s_inspector = SubChatState{};
+            s_inspector.cur = *reg;
         }
     });
 }
@@ -184,9 +226,9 @@ static void fetchSubagentTranscript(AppState& st, SubChatState& cs, bool force =
         if (generation != s_sub.generation || s_inspector.cur.id != want) return;
         SubChatState& cs = s_inspector;
         cs.trPending = false;
-        if (!r.ok) { cs.viewErr = r.err.empty() ? "worker unreachable" : r.err; return; }
-        if (!r.result.value("ok", false)) {
-            cs.viewErr = r.result.value("reason", std::string("transcript unavailable"));
+        if (core::workerLaneBusy(r)) return;   // keep the transcript already shown
+        if (!r.ok || !r.result.value("ok", false)) {
+            cs.viewErr = userFacingRpcError(r, "The transcript isn't available right now.");
             return;
         }
         cs.viewErr.clear();
@@ -233,8 +275,7 @@ static void sendSubagentControl(AppState& st, SubChatState& cs, const char* op,
         SubChatState& cs = s_inspector;
         cs.ctlPending = false;
         if (!r.ok || !r.result.value("ok", false)) {
-            cs.steerNote = r.ok ? r.result.value("reason", std::string("sub-agent control failed"))
-                                : (r.err.empty() ? "worker unreachable" : r.err);
+            cs.steerNote = userFacingRpcError(r, "That change couldn't be applied.");
             return;
         }
         cs.steerNote = r.result.value("note", std::string("applied at the next turn boundary"));
@@ -263,9 +304,8 @@ static void sendSubagentSteer(AppState& st, SubChatState& cs) {
         if (generation != s_sub.generation || s_inspector.cur.id != want) return;
         SubChatState& cs = s_inspector;
         cs.steerPending = false;
-        if (!r.ok) { cs.steerNote = r.err.empty() ? "worker unreachable" : r.err; return; }
-        if (!r.result.value("ok", false)) {
-            cs.steerNote = r.result.value("reason", std::string("steer failed"));
+        if (!r.ok || !r.result.value("ok", false)) {
+            cs.steerNote = userFacingRpcError(r, "The steer couldn't be queued.");
             return;
         }
         cs.steerNote   = r.result.value("note", std::string("queued"));
@@ -290,20 +330,143 @@ static void requestSubagentTerminate(AppState& st, SubChatState& cs) {
             cs.steerNote = r.result.value(
                 "note", std::string("termination requested — honored at the next turn boundary"));
         else
-            cs.steerNote = r.ok ? r.result.value("reason", std::string("terminate failed"))
-                                : (r.err.empty() ? "worker unreachable" : r.err);
+            cs.steerNote = userFacingRpcError(r, "Termination couldn't be requested.");
         cs.lastTrT = 0.0;
     });
 }
 
-// A graph node is selectable only if its agent belongs to this project's registry.
-static void selectSubagent(AppState& st, const std::string& id, const std::string&) {
-    const auto it = std::find_if(s_sub.sessions.begin(), s_sub.sessions.end(),
-                                 [&id](const SubagentSession& s) { return s.id == id; });
-    if (it == s_sub.sessions.end()) return;
-    if (s_inspector.cur.id != id) s_inspector = SubChatState{};
-    s_inspector.cur = *it;
+// Inspect one agent: its registry record (transcript + controls) when the registry knows it,
+// else its trace state read-only.
+static void inspectAgent(AppState& st, const std::string& id) {
+    s_step.active = false;
+    if (s_selId != id) s_inspector = SubChatState{};
+    s_selId = id;
+    const SubagentSession* reg = registryFor(id);
+    if (!reg) { s_inspector = SubChatState{}; return; }
+    s_inspector.cur = *reg;
     fetchSubagentTranscript(st, s_inspector, true);
+}
+
+// Trace-tree click: the trace has already selected the agent's timeline.
+static void selectSubagent(AppState& st, const std::string& id, const std::string&) {
+    inspectAgent(st, id);
+}
+
+// Roster click: also show the agent's steps in the trace.
+static void selectRosterAgent(AppState& st, const std::string& id) {
+    agentTraceSelectAgent(st, st.activeConvId(), id);
+    inspectAgent(st, id);
+}
+
+static void selectTraceStep(AppState&, const AgentTraceStep& step) {
+    s_step.active = true;
+    s_step.stale = false;
+    s_step.step = step;
+}
+
+static kit::Tone stepTone(const std::string& status) {
+    if (status == "ok") return kit::Tone::Ok;
+    if (status == "failed") return kit::Tone::Err;
+    if (status == "retry") return kit::Tone::Warn;
+    if (status == "running") return kit::Tone::Accent;
+    return kit::Tone::Neutral;
+}
+
+static std::string stepDurationText(int ms) {
+    if (ms < 0) return std::string();
+    if (ms < 1000) return std::to_string(ms) + " ms";
+    return kit::fmtDuration(ms / 1000.0);
+}
+
+// Step mode of the docked inspector: the full record of one trace step.
+static void drawStepInspector(AppState& st, const AdaptiveSurface& surf) {
+    AgentTraceStep& s = s_step.step;
+    s_step.stale = !agentTraceRefreshStep(st, s);
+    kit::sectionHeader("Selected step", nullptr, nullptr, -1, true);
+    if (kit::secondaryButton(s_selId.empty() ? "Close step" : "Back to agent"))
+        s_step.active = false;
+    kit::chip(s.kind.c_str(), kit::Tone::Info);
+    if (!s.status.empty()) {
+        ImGui::SameLine();
+        kit::chip(s.status == "ok" ? "done" : s.status.c_str(), stepTone(s.status),
+                  s.status == "running");
+    }
+    kit::keyValueRow("Agent", s.agent.c_str());
+    if (!s.title.empty())
+        kit::keyValueRow(s.kind == "Tool call" ? "Tool" : "Title", s.title.c_str());
+    if (!s.target.empty()) kit::keyValueRow("Target", s.target.c_str());
+    const std::string dur = stepDurationText(s.durationMs);
+    if (!dur.empty()) kit::keyValueRow("Duration", dur.c_str());
+    if (s.ts > 0.0) kit::keyValueRow("When", kit::fmtAgo(s.ts).c_str());
+    if (s_step.stale)
+        kit::inlineStatus("No longer in the live trace; showing the last copy.",
+                          kit::Tone::Neutral);
+    const bool failed = !s.error.empty() && s.status != "ok";
+    if (failed) {
+        kit::sectionHeader("Error");
+        ImGui::PushStyleColor(ImGuiCol_Text, kit::toneOn(kit::Tone::Err, surf));
+        ImGui::TextWrapped("%s", s.error.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (!s.detail.empty()) {
+        kit::sectionHeader(s.kind == "Tool call" ? "Arguments" : "Content");
+        ImGui::BeginChild("##step_detail", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding,
+                          ImGuiWindowFlags_NoScrollbar);
+        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+        const AdaptiveSurface& dSurf = adaptivePanel(panelId("ai_ws_step_detail"),
+            ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), GlassGroup::Global);
+        ImGui::TextWrapped("%s", s.detail.c_str());
+        drawWindowPillScrollbarV(dSurf);
+        ImGui::EndChild();
+    } else if (!failed) {
+        kit::dimText("This step carries no further detail.");
+    }
+}
+
+// One roster row: a trace agent, a registry session, or both when they are the same sub-agent
+// (registry sub-agents' events carry their registry id as `subagent_id`).
+struct RosterEntry {
+    const AgentTraceAgent* tr = nullptr;
+    const SubagentSession* reg = nullptr;
+    bool live = false;
+};
+static void rosterEntries(std::vector<RosterEntry>& out) {
+    out.clear();
+    for (const auto& a : s_trace) {
+        RosterEntry e;
+        e.tr = &a;
+        e.reg = registryFor(a.id);
+        // The registry's status is authoritative (pause holds); the trace covers the rest.
+        e.live = e.reg ? isLive(*e.reg) : traceLive(a);
+        out.push_back(e);
+    }
+    for (const auto& s : s_sub.sessions) {
+        if (traceFor(s.id)) continue;
+        RosterEntry e;
+        e.reg = &s;
+        e.live = isLive(s);
+        out.push_back(e);
+    }
+}
+
+static std::string entryStatus(const RosterEntry& e) {
+    if (e.reg) return e.reg->paused && e.live ? std::string("paused") : e.reg->status;
+    return e.tr->status;
+}
+
+// Wall time the trace saw the agent working: running agents count up to now.
+static std::string traceElapsed(const AgentTraceAgent& a, bool live) {
+    if (a.startTs <= 0.0) return std::string();
+    const double end = live ? chatNowEpoch()
+                     : a.endTs > 0.0 ? a.endTs
+                     : a.lastStepTs > 0.0 ? a.lastStepTs : a.startTs;
+    return kit::fmtDuration(std::max(0.0, end - a.startTs));
+}
+
+static std::string toolCountText(const AgentTraceAgent& a) {
+    std::string s = std::to_string(a.toolCount) + (a.toolCount == 1 ? " tool" : " tools");
+    if (a.failCount > 0) s += " (" + std::to_string(a.failCount) + " failed)";
+    return s;
 }
 
 static void drawRoster(AppState& st, float height) {
@@ -313,40 +476,89 @@ static void drawRoster(AppState& st, float height) {
         ImRect(ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
                                             ImGui::GetWindowPos().y + ImGui::GetWindowSize().y)),
         GlassGroup::Global);
+    static std::vector<RosterEntry> entries;
+    rosterEntries(entries);
     int live = 0;
-    for (const auto& s : s_sub.sessions) live += isLive(s) ? 1 : 0;
+    for (const auto& e : entries) live += e.live ? 1 : 0;
     kit::sectionHeader("Live", nullptr, nullptr, live, true);
-    if (live == 0) kit::dimText("No active sub-agents for this project.");
+    if (!st.workerStarted && entries.empty())
+        kit::inlineStatus("AI service offline. Sub-agents appear here once it is running.",
+                          kit::Tone::Warn);
+    else if (live == 0) kit::dimText("No sub-agents are running.");
 
-    auto drawRow = [&st](const SubagentSession& s) {
-        const std::string secondary = s.status +
-            (!s.statusNote.empty() ? " · " + s.statusNote :
-             s.brief.empty() ? "" : " · " + s.brief);
-        std::string meta = s.model;
-        const std::string age = fmtAge(s.updatedTs);
-        if (!age.empty()) { if (!meta.empty()) meta += " · "; meta += age; }
+    auto drawRow = [&st](const RosterEntry& e) {
+        const std::string& id = e.tr ? e.tr->id : e.reg->id;
+        const std::string title = e.tr ? e.tr->name
+                                : e.reg->role.empty() ? std::string("Sub-agent") : e.reg->role;
+        std::string detail;
+        if (e.tr && !e.tr->lastStep.empty()) detail = e.tr->lastStep;
+        else if (e.reg) detail = !e.reg->statusNote.empty() ? e.reg->statusNote : e.reg->brief;
+        else detail = e.tr->brief;
+        std::string secondary = entryStatus(e);
+        if (!detail.empty()) secondary += " · " + detail;
+        std::string meta;
+        if (e.tr) {
+            meta = traceElapsed(*e.tr, e.live);
+            if (!meta.empty()) meta += " · ";
+            meta += toolCountText(*e.tr);
+        } else {
+            meta = fmtAge(e.reg->updatedTs);
+        }
+        const std::string& brief = e.reg && !e.reg->brief.empty() ? e.reg->brief
+                                 : e.tr ? e.tr->brief : e.reg->brief;
         kit::RowStyle style;
         style.secondary = secondary.c_str();
         style.meta = meta.c_str();
-        style.selected = s_inspector.cur.id == s.id;
-        style.tooltip = s.brief.empty() ? nullptr : s.brief.c_str();
-        ImGui::PushID(s.id.c_str());
-        if (kit::row("##agent", s.role.empty() ? s.id.c_str() : s.role.c_str(), style))
-            selectSubagent(st, s.id, s.role);
+        style.selected = s_selId == id;
+        style.tooltip = brief.empty() ? nullptr : brief.c_str();
+        ImGui::PushID(id.c_str());
+        if (kit::row("##agent", title.c_str(), style)) selectRosterAgent(st, id);
         ImGui::PopID();
     };
-    for (const auto& s : s_sub.sessions) if (isLive(s)) drawRow(s);
-    const int recent = static_cast<int>(s_sub.sessions.size()) - live;
+    for (const auto& e : entries) if (e.live) drawRow(e);
+    const int recent = static_cast<int>(entries.size()) - live;
     if (recent) {
         kit::sectionHeader("Recent", nullptr, nullptr, recent);
         if (kit::secondaryButton(s_sub.recentExpanded ? "Hide recent" : "Show recent"))
             s_sub.recentExpanded = !s_sub.recentExpanded;
         if (s_sub.recentExpanded)
-            for (const auto& s : s_sub.sessions) if (!isLive(s)) drawRow(s);
+            for (const auto& e : entries) if (!e.live) drawRow(e);
     }
-    if (!s_sub.listErr.empty()) kit::inlineStatus(s_sub.listErr.c_str(), kit::Tone::Err);
+    if (!s_sub.listErr.empty()) kit::inlineStatus(s_sub.listErr.c_str(), kit::Tone::Warn);
     drawWindowPillScrollbarV(surf);
     ImGui::EndChild();
+}
+
+// Trace facts for the inspected agent (both kinds): how long, how much, what it did last.
+static void drawTraceFacts(const AgentTraceAgent& a, bool live) {
+    const std::string elapsed = traceElapsed(a, live);
+    if (!elapsed.empty()) kit::keyValueRow(live ? "Running for" : "Ran for", elapsed.c_str());
+    kit::keyValueRow("Tool calls", toolCountText(a).c_str(),
+                     a.failCount > 0 ? kit::Tone::Warn : kit::Tone::Neutral);
+    if (!a.lastStep.empty()) {
+        std::string last = a.lastStep;
+        if (a.lastStepTs > 0.0) last += " · " + kit::fmtAgo(a.lastStepTs);
+        kit::keyValueRow("Last step", last.c_str());
+    }
+}
+
+// A sub-agent the trace knows but the registry does not (e.g. a Chudcode `task` sub-agent):
+// its state only. Its steps are the trace's timeline for it.
+static void drawTraceAgentInspector(const AgentTraceAgent& a) {
+    const bool live = traceLive(a);
+    kit::chip(a.status.c_str(), toneFor(a.status, live), live);
+    kit::keyValueRow("Agent", a.name.c_str());
+    if (!a.model.empty()) kit::keyValueRow("Model", a.model.c_str());
+    if (a.startTs > 0.0) kit::keyValueRow("Started", kit::fmtAgo(a.startTs).c_str());
+    drawTraceFacts(a, live);
+    if (!a.note.empty()) kit::dimText(a.note.c_str());
+    if (!a.brief.empty() && a.brief != a.name) {
+        kit::sectionHeader("Task");
+        kit::dimText(a.brief.c_str());
+    }
+    kit::gapRow();
+    kit::dimText("Its steps are shown in the execution trace. This sub-agent is directed by the "
+                 "main agent, so it has no steering controls here.");
 }
 
 static void drawInspector(AppState& st) {
@@ -356,11 +568,27 @@ static void drawInspector(AppState& st) {
         ImRect(ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
                                             ImGui::GetWindowPos().y + ImGui::GetWindowSize().y)),
         GlassGroup::Global);
+    if (s_step.active && s_step.step.convId != st.activeConvId()) s_step.active = false;
+    if (s_step.active) {
+        drawStepInspector(st, surf);
+        drawWindowPillScrollbarV(surf);
+        ImGui::EndChild();
+        return;
+    }
     kit::sectionHeader("Selected agent", nullptr, nullptr, -1, true);
     SubChatState& cs = s_inspector;
+    const AgentTraceAgent* tr = s_selId.empty() ? nullptr : traceFor(s_selId);
+    if (cs.cur.id.empty() && !tr) {
+        s_selId.clear();   // the agent left the viewed session's trace (e.g. session switch)
+        kit::emptyState("ai_panel", "Nothing selected",
+                        "Click a step in the execution trace to see its full detail, or a "
+                        "sub-agent in the roster or trace to inspect it.");
+        drawWindowPillScrollbarV(surf);
+        ImGui::EndChild();
+        return;
+    }
     if (cs.cur.id.empty()) {
-        kit::emptyState("ai_panel", "No agent selected",
-                        "Choose a roster row or a sub-agent node in the execution trace.");
+        drawTraceAgentInspector(*tr);
         drawWindowPillScrollbarV(surf);
         ImGui::EndChild();
         return;
@@ -374,18 +602,20 @@ static void drawInspector(AppState& st) {
         cs.runtimeSeeded = true;
     }
     kit::chip(cs.cur.status.empty() ? "unknown" : cs.cur.status.c_str(),
-              statusTone(cs.cur), isLive(cs.cur));
-    if (cs.cur.paused) {
+              toneFor(cs.cur.status, isLive(cs.cur)), isLive(cs.cur));
+    if (cs.cur.paused && cs.cur.status != "paused") {
         ImGui::SameLine();
         kit::chip("paused", kit::Tone::Warn);
     }
+    if (tr) kit::keyValueRow("Agent", tr->name.c_str());
     kit::keyValueRow("Role", cs.cur.role.empty() ? "sub-agent" : cs.cur.role.c_str());
-    kit::keyValueRow("ID", cs.cur.id.c_str(), kit::Tone::Neutral, true);
     kit::keyValueRow("Model", cs.cur.model.empty() ? "inherited" : cs.cur.model.c_str());
     const std::string budget = cs.cur.budgetTokens > 0
         ? std::to_string(cs.cur.budgetTokens) + " tokens" : "inherited";
     kit::keyValueRow("Budget", budget.c_str());
-    kit::keyValueRow("Started", cs.cur.createdTs.empty() ? "unknown" : cs.cur.createdTs.c_str());
+    const std::string started = fmtAge(cs.cur.createdTs);
+    kit::keyValueRow("Started", started.empty() ? "unknown" : started.c_str());
+    if (tr) drawTraceFacts(*tr, isLive(cs.cur));
     if (!cs.cur.statusNote.empty()) kit::dimText(cs.cur.statusNote.c_str());
     if (!cs.cur.brief.empty()) {
         kit::sectionHeader("Prompt");
@@ -400,7 +630,7 @@ static void drawInspector(AppState& st) {
         ImRect(ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
                                             ImGui::GetWindowPos().y + ImGui::GetWindowSize().y)),
         GlassGroup::Global);
-    if (!cs.viewErr.empty()) kit::inlineStatus(cs.viewErr.c_str(), kit::Tone::Err);
+    if (!cs.viewErr.empty()) kit::inlineStatus(cs.viewErr.c_str(), kit::Tone::Warn);
     if (cs.msgs.empty() && cs.viewErr.empty())
         kit::emptyState("file_doc", cs.trPending ? "Loading transcript" : "No transcript yet",
                         "Sub-agent messages and queued steering appear here.");
@@ -416,6 +646,7 @@ static void drawInspector(AppState& st) {
     ImGui::EndChild();
     if (isLive(cs.cur)) {
         kit::sectionHeader("Steer & control");
+        const char* offline = st.workerStarted ? nullptr : "AI service offline";
         ImGui::InputTextMultiline("##agent_steer", cs.steerBuf, sizeof(cs.steerBuf),
                                   ImVec2(-1.0f, ImGui::GetFrameHeightWithSpacing() * 2.0f));
         if (kit::primaryButton(cs.steerPending ? "Queuing" : "Steer",
@@ -424,10 +655,10 @@ static void drawInspector(AppState& st) {
             sendSubagentSteer(st, cs);
         ImGui::SameLine();
         if (kit::secondaryButton(cs.cur.paused ? "Resume" : "Pause",
-                                 st.workerStarted && !cs.ctlPending))
+                                 st.workerStarted && !cs.ctlPending, offline))
             sendSubagentControl(st, cs, cs.cur.paused ? "resume" : "pause");
         ImGui::SameLine();
-        if (kit::dangerButton("Terminate", st.workerStarted && !cs.termPending))
+        if (kit::dangerButton("Terminate", st.workerStarted && !cs.termPending, offline))
             cs.confirmTerminate = true;
         if (cs.confirmTerminate) {
             kit::inlineStatus("Stop at the next turn boundary? Existing work is kept.",
@@ -446,7 +677,7 @@ static void drawInspector(AppState& st) {
         ImGui::SetNextItemWidth(ui::metrics::px(94.0f));
         ImGui::Combo("##agent_effort", &cs.effortIdx, efforts, IM_ARRAYSIZE(efforts));
         ImGui::SameLine();
-        if (kit::secondaryButton("Apply", st.workerStarted && !cs.ctlPending))
+        if (kit::secondaryButton("Apply", st.workerStarted && !cs.ctlPending, offline))
             sendSubagentControl(st, cs, "set_runtime", {
                 {"model", std::string(cs.modelBuf)},
                 {"effort", cs.effortIdx == 0 ? "" : efforts[cs.effortIdx]}});
@@ -460,13 +691,18 @@ static void drawInspector(AppState& st) {
 
 }  // anonymous namespace
 
-void pollCurrentRun(AppState& st) { pollSubagentList(st); }
-
-int currentRunLiveCount() {
-    int count = 0;
-    for (const auto& session : s_sub.sessions) if (isLive(session)) ++count;
-    return count;
+// Every frame the AI workspace is drawn: registry poll + the viewed session's trace sub-agents,
+// so the roster and the nav's live badge follow the run as its events stream in.
+void pollCurrentRun(AppState& st) {
+    pollSubagentList(st);
+    agentTraceSubagents(st, st.activeConvId(), s_trace);
+    static std::vector<RosterEntry> entries;
+    rosterEntries(entries);
+    s_liveCount = 0;
+    for (const auto& e : entries) s_liveCount += e.live ? 1 : 0;
 }
+
+int currentRunLiveCount() { return s_liveCount; }
 
 void drawCurrentRunView(AppState& st) {
     pollSubagentList(st);
@@ -476,28 +712,38 @@ void drawCurrentRunView(AppState& st) {
                         "Select a project folder to see its runs and sub-agents.");
         return;
     }
-    if (!st.workerStarted && s_sub.sessions.empty()) {
-        kit::blockedState("Worker unavailable", "Cannot load the agent roster",
-                          "Start the Chudware worker service.");
+    const std::string convId = st.activeConvId();
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    auto drawTrace = [&st, &convId]() {
+        kit::sectionHeader("Execution trace", nullptr, nullptr, -1, true);
+        drawAgentTrace(st, convId, selectSubagent, selectTraceStep,
+                       s_step.active ? s_step.step.uid : 0ull);
+    };
+    // Wide: trace on the left, roster + inspector on the right. Narrow: stacked.
+    if (avail.x >= ui::metrics::px(760.0f)) {
+        const float leftW = std::floor(avail.x * 0.56f);
+        ImGui::BeginChild("##current_trace", ImVec2(leftW, 0), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoScrollbar);
+        drawTrace();
+        ImGui::EndChild();
+        ImGui::SameLine(0.0f, kit::gutter());
+        ImGui::BeginChild("##current_side", ImVec2(0, 0), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoScrollbar);
+        drawRoster(st, std::max(ui::metrics::px(90.0f), avail.y * 0.30f));
+        kit::gapRow();
+        drawInspector(st);
+        ImGui::EndChild();
         return;
     }
-    const std::string convId = st.activeConvId();
-    const auto dag = agentDagSummary(convId);
-    const float available = ImGui::GetContentRegionAvail().y;
-    const float graphH = std::max(ui::metrics::px(110.0f), available * 0.29f);
-    ImGui::BeginChild("##current_graph", ImVec2(0, graphH),
+    // Stacked: the trace (agent tree + step timeline) is the primary content, so it gets most of
+    // the column; the roster and inspector share the rest.
+    ImGui::BeginChild("##current_trace", ImVec2(0, std::max(ui::metrics::px(260.0f), avail.y * 0.62f)),
                       ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
-    kit::sectionHeader("Execution trace", nullptr, nullptr, -1, true);
-    if (dag.empty)
-        kit::emptyState("activity", st.convRunning(convId) ? "Agent is starting" : "No events yet",
-                        "Tool calls, thoughts and context injections appear as this run streams.");
-    else
-        drawAgentDagCanvas(st, convId, aiUiVerbosity(), selectSubagent);
+    drawTrace();
     ImGui::EndChild();
     kit::gapRow();
     const float remaining = ImGui::GetContentRegionAvail().y;
-    const float rosterH = std::max(ui::metrics::px(90.0f), remaining * 0.33f);
-    drawRoster(st, rosterH);
+    drawRoster(st, std::max(ui::metrics::px(90.0f), remaining * 0.33f));
     kit::gapRow();
     drawInspector(st);
 }

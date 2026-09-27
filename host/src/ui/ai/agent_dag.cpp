@@ -1,578 +1,1383 @@
 #include "agent_dag.h"
 #include <algorithm>
 #include <cstdio>
+#include <ctime>
+#include <deque>
+#include <iterator>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "core/app_state.h"
 #include "ui_theme.h"
 #include "ui/metrics.h"
+#include "ui/widgets/kit.h"
+#include "ui/copilot/copilot.h"
+#include "ui/copilot/copilot_internal.h"
+#include "ui/copilot/agent_text.h"
 namespace ui {
 namespace {
-// Agent execution trace: per-conversation event store and persisted canvas camera.
-// Nodes are built only from drained agent events, never synthesized as activity.
+// Execution trace = one agent tree per conversation. Agent "main" is always index 0; every
+// sub-agent is keyed by its `subagent_id` and nests under the agent that spawned it. Each agent
+// owns a bounded step deque (oldest dropped, counted in `dropped`, shown as one summary row).
 
-enum class AgKind { Root, Tool, Thought, Context, Spawn, Advisor, Other };
+constexpr size_t kMaxStepsPerAgent   = 2000;
+constexpr size_t kMaxStepText        = 64 * 1024;   // thinking / prose accumulation cap
+constexpr size_t kMaxAgents          = 256;
+constexpr size_t kMaxSpanIndex       = 100000;
+constexpr size_t kPersistStepsPerAgent = 400;
+constexpr size_t kPersistText        = 4000;
+constexpr size_t kSpanScan           = 512;         // upsert lookback per agent
+constexpr const char* kTimelineRegion = "aiws.trace_timeline";
 
-struct AgNode {
-    std::string id;         // span id (§2.1) — THE tree key
-    std::string parentId;   // join target
-    AgKind      kind = AgKind::Other;
-    std::string actor;      // emitting agent/role
-    std::string title;      // primary line (tool name / "thought" / injection source)
-    std::string detail;     // secondary line (target / label / verdict / text)
-    std::string status;     // "ok" | "failed" | "" (drives node accent)
-    std::string refId;      // subagent_id for spawn/root nodes: selects the docked inspector
-    int         latencyMs = -1;
-    long long   seq = 0;    // arrival order (advisory ordering fallback per §2.1)
-    // tree links (resolved each rebuild)
-    std::vector<int>   children;
-    int   depth = 0;        // BFS depth from a root (for indent/layout)
-    bool  collapsed = false;// M10: user-collapsed — hides the subtree
-    bool  descFailed = false;// M10: a DESCENDANT failed — surfaced on a COLLAPSED ancestor
+enum class StepKind : int {
+    Thinking, Reply, Tool, User, Steer, Spawn, SubagentEnd, Context, Compaction, Retry, Plan,
+    Note, Error, RunStart, RunEnd, Event, Count
 };
 
-struct AgentDagStore {
-    std::string          runId;          // envelope run_id this tree belongs to
-    std::vector<AgNode>  nodes;
-    std::unordered_map<std::string,int> byId;   // span id -> index
-    long long            seqCtr = 0;
-    bool                 sawSpawn = false;       // ever received a real subagent branch?
-    bool                 sawAdvisor = false;     // ever received a real advisor node?
-    int                  toolCount = 0, thoughtCount = 0, ctxCount = 0;
-    ImVec2 pan{0.0f, 0.0f};
-    float zoom = 1.0f;
+struct Step {
+    unsigned long long uid = 0, rev = 1;
+    StepKind    kind = StepKind::Event;
+    std::string spanId;     // tool call / sub-run / spawned sub-agent id, for in-place updates
+    std::string title;      // tool name, or a short heading
+    std::string target;     // what it acts on / source / counts
+    std::string detail;     // full body: thinking, prose, args preview, prompt text
+    std::string error;      // failure text (tool error_preview, run error)
+    std::string status;     // running | ok | failed | skipped | retry | stopped | cancelled | ""
+    int         durationMs = -1;
+    double      ts = 0.0;
+    bool        open = false;  // a thinking/prose block still receiving deltas
+};
 
+struct Agent {
+    std::string id, parent, name, brief, status, model, note;
+    double startTs = 0.0, endTs = 0.0;
+    int toolCount = 0, failCount = 0;
+    long long dropped = 0;
+    std::deque<Step> steps;
+};
+
+struct TraceStore {
+    std::string runId;
+    std::vector<Agent> agents;
+    std::unordered_map<std::string, int> agentIdx;
+    std::unordered_map<std::string, std::string> spanAgent;  // step span id -> agent id
+    unsigned long long uidCtr = 1;
+    int thoughtCount = 0, ctxCount = 0;
+    double userSyncTs = 0.0;
+    bool userSeeded = false;
+    std::string selAgent = "main";
+
+    TraceStore() { reset(std::string()); }
     void reset(const std::string& rid) {
-        runId = rid; nodes.clear(); byId.clear(); seqCtr = 0;
-        sawSpawn = sawAdvisor = false; toolCount = thoughtCount = ctxCount = 0;
+        runId = rid;
+        agents.clear(); agentIdx.clear(); spanAgent.clear();
+        thoughtCount = ctxCount = 0;
+        userSyncTs = 0.0; userSeeded = false;
+        selAgent = "main";
+        Agent m;
+        m.id = "main"; m.name = "Main agent"; m.status = "idle";
+        agents.push_back(std::move(m));
+        agentIdx["main"] = 0;
     }
-    bool empty() const { return nodes.empty(); }
+    bool hasContent() const {
+        if (agents.size() > 1) return true;
+        return !agents.empty() && (!agents[0].steps.empty() || agents[0].dropped > 0);
+    }
 };
 
-// The live DAG is PER CONVERSATION: two chats can run at once, so each owns its own execution
-// trace instead of one global tree that the other run blanks or hijacks on every run boundary.
-static std::unordered_map<std::string, AgentDagStore> s_agdags;   // conversation id -> tree
+static std::unordered_map<std::string, TraceStore> s_traces;   // conversation id -> live trace
 
-// The tree for `convId`, created empty on first touch. GL thread only (no mutex).
-static AgentDagStore& agStore(const std::string& convId) { return s_agdags[convId]; }
+struct FallbackTrace {
+    TraceStore store;
+    size_t sig = 0;
+    double builtAt = -1.0;
+    bool built = false;
+};
+static std::unordered_map<std::string, FallbackTrace> s_fallback;  // conv id -> transcript trace
 
-static std::string agEnvStr(const nlohmann::json& d, const char* k) {
+static std::string jstr(const nlohmann::json& d, const char* k) {
     auto it = d.find(k);
     return (it != d.end() && it->is_string()) ? it->get<std::string>() : std::string();
 }
-static int agEnvInt(const nlohmann::json& d, const char* k, int def) {
+static int jint(const nlohmann::json& d, const char* k, int def = 0) {
     auto it = d.find(k);
-    return (it != d.end() && it->is_number_integer()) ? it->get<int>() : def;
+    if (it == d.end() || !it->is_number()) return def;
+    return it->is_number_integer() ? it->get<int>() : (int)it->get<double>();
 }
 
-// Insert or update a node keyed by span id. Events without an `id` (legacy /1 records) get a
-// synthesized per-run id from actor+seq so they still land as leaves (§2.1 consumer fallback).
-static AgNode& agUpsert(AgentDagStore& dag, const std::string& id, const std::string& parentId) {
-    auto it = dag.byId.find(id);
-    if (it != dag.byId.end()) {
-        AgNode& n = dag.nodes[it->second];
-        if (n.parentId.empty() && !parentId.empty()) n.parentId = parentId;
-        return n;
+static void appendCapped(std::string& dst, const std::string& src) {
+    if (dst.size() >= kMaxStepText || src.empty()) return;
+    dst.append(src, 0, std::min(src.size(), kMaxStepText - dst.size()));
+}
+static bool blankText(const std::string& s) {
+    return s.find_first_not_of(" \t\r\n") == std::string::npos;
+}
+static bool terminalStatus(const std::string& s) {
+    return s == "done" || s == "failed" || s == "cancelled" || s == "stopped";
+}
+// Sub-run / sub-agent status vocabulary -> the agent vocabulary.
+static std::string agentStatusFrom(const std::string& raw) {
+    if (raw == "done" || raw == "complete" || raw == "completed" || raw == "ok" ||
+        raw == "pass" || raw == "passed" || raw == "success" || raw == "succeeded")
+        return "done";
+    if (raw == "fail" || raw == "failed" || raw == "error") return "failed";
+    if (raw == "cancel" || raw == "cancelled" || raw == "canceled" || raw == "aborted")
+        return "cancelled";
+    if (raw == "pending" || raw == "waiting") return "pending";
+    return "running";
+}
+// Activity-row / sub-run status -> the step vocabulary.
+static std::string stepStatusFrom(const std::string& raw) {
+    if (raw == "done" || raw == "pass" || raw == "ok" || raw == "complete" || raw == "completed")
+        return "ok";
+    if (raw == "fail" || raw == "failed" || raw == "error") return "failed";
+    if (raw == "skipped") return "skipped";
+    if (raw == "retry") return "retry";
+    if (raw == "cancelled" || raw == "canceled") return "cancelled";
+    if (raw == "running" || raw == "started" || raw == "pending") return "running";
+    return raw.empty() ? std::string() : std::string("ok");
+}
+
+static int findAgent(const TraceStore& t, const std::string& id) {
+    auto it = t.agentIdx.find(id);
+    return it == t.agentIdx.end() ? -1 : it->second;
+}
+
+// Agent that owns span `pid`: an agent id itself, or the agent a recorded step span belongs to.
+static int spanOwner(const TraceStore& t, const std::string& pid) {
+    if (pid.empty()) return 0;
+    const int direct = findAgent(t, pid);
+    if (direct >= 0) return direct;
+    auto s = t.spanAgent.find(pid);
+    if (s == t.spanAgent.end()) return 0;
+    const int owner = findAgent(t, s->second);
+    return owner >= 0 ? owner : 0;
+}
+
+// True when `ancestor` is `id` or sits above it — guards a re-parent from forming a cycle.
+static bool isAncestor(const TraceStore& t, const std::string& ancestor, const std::string& id) {
+    std::string cur = id;
+    for (size_t guard = 0; guard <= t.agents.size() && !cur.empty(); ++guard) {
+        if (cur == ancestor) return true;
+        const int i = findAgent(t, cur);
+        if (i < 0) return false;
+        cur = t.agents[(size_t)i].parent;
     }
-    AgNode n;
-    n.id = id;
-    n.parentId = parentId;
-    n.seq = dag.seqCtr++;
-    dag.byId[id] = (int)dag.nodes.size();
-    dag.nodes.push_back(std::move(n));
-    return dag.nodes.back();
+    return false;
 }
 
-// Stable serialization names for AgKind (distinct from the display tags in agKindTag below).
-static const char* agKindName(AgKind k) {
-    switch (k) {
-        case AgKind::Root:    return "root";
-        case AgKind::Tool:    return "tool";
-        case AgKind::Thought: return "thought";
-        case AgKind::Context: return "context";
-        case AgKind::Spawn:   return "spawn";
-        case AgKind::Advisor: return "advisor";
-        default:              return "other";
+static int ensureAgent(TraceStore& t, const std::string& id, int parentIdx, double now) {
+    const int have = findAgent(t, id);
+    if (have >= 0) return have;
+    if (t.agents.size() >= kMaxAgents) return 0;   // overflow folds into the main agent
+    Agent a;
+    a.id = id;
+    const std::string& pid = t.agents[(size_t)std::max(parentIdx, 0)].id;
+    a.parent = pid == id ? std::string("main") : pid;
+    a.status = "running";
+    a.startTs = now;
+    t.agentIdx[id] = (int)t.agents.size();
+    t.agents.push_back(std::move(a));
+    return (int)t.agents.size() - 1;
+}
+
+static void closeOpen(Agent& a) {
+    if (a.steps.empty() || !a.steps.back().open) return;
+    Step& s = a.steps.back();
+    s.open = false;
+    s.status.clear();
+    ++s.rev;
+}
+
+static Step& pushStep(TraceStore& t, int ai, StepKind k, double ts) {
+    Agent& a = t.agents[(size_t)ai];
+    closeOpen(a);
+    if (a.steps.size() >= kMaxStepsPerAgent) { a.steps.pop_front(); ++a.dropped; }
+    Step s;
+    s.uid = t.uidCtr++;
+    s.kind = k;
+    s.ts = ts;
+    a.steps.push_back(std::move(s));
+    return a.steps.back();
+}
+
+static void indexSpan(TraceStore& t, const std::string& span, int ai) {
+    if (span.empty()) return;
+    if (t.spanAgent.size() >= kMaxSpanIndex) t.spanAgent.clear();
+    t.spanAgent[span] = t.agents[(size_t)ai].id;
+}
+
+static Step* findSpanStep(Agent& a, const std::string& span, StepKind k) {
+    if (span.empty()) return nullptr;
+    size_t scanned = 0;
+    for (auto it = a.steps.rbegin(); it != a.steps.rend() && scanned < kSpanScan; ++it, ++scanned)
+        if (it->kind == k && it->spanId == span) return &*it;
+    return nullptr;
+}
+
+// An agent heard from without a start marker is running from its first event onward.
+static void touchAgent(Agent& a, double now) {
+    if (a.status == "idle" || a.status == "pending" || a.status.empty()) a.status = "running";
+    if (a.startTs <= 0.0) a.startTs = now;
+}
+
+// The owning agent of an event: `subagent_id` when present, else the agent `parent_id` joins
+// to, else the main agent.
+static int eventOwner(TraceStore& t, const nlohmann::json& d, double now) {
+    const std::string sub = jstr(d, "subagent_id");
+    const int ai = sub.empty() ? spanOwner(t, jstr(d, "parent_id"))
+                               : ensureAgent(t, sub, spanOwner(t, jstr(d, "parent_id")), now);
+    touchAgent(t.agents[(size_t)ai], now);
+    return ai;
+}
+
+// Coalesce a streamed thinking/prose delta into the agent's open block of the same kind.
+static void appendStream(TraceStore& t, int ai, StepKind k, const std::string& txt, double now) {
+    Agent& a = t.agents[(size_t)ai];
+    if (!a.steps.empty() && a.steps.back().open && a.steps.back().kind == k) {
+        appendCapped(a.steps.back().detail, txt);
+        ++a.steps.back().rev;
+        return;
     }
-}
-static AgKind agKindFromName(const std::string& s) {
-    if (s == "root")    return AgKind::Root;
-    if (s == "tool")    return AgKind::Tool;
-    if (s == "thought") return AgKind::Thought;
-    if (s == "context") return AgKind::Context;
-    if (s == "spawn")   return AgKind::Spawn;
-    if (s == "advisor") return AgKind::Advisor;
-    return AgKind::Other;
+    // A contentless flush never opens (or splits) a block.
+    if (blankText(txt)) return;
+    Step& s = pushStep(t, ai, k, now);
+    s.open = true;
+    s.status = "running";
+    appendCapped(s.detail, txt);
+    if (k == StepKind::Thinking) ++t.thoughtCount;
 }
 
-}  // close the file-level anonymous namespace so feedAgentDagEvent has external ui:: linkage
+static std::string toolStatus(const nlohmann::json& d) {
+    const std::string outcome = jstr(d, "outcome_kind");
+    if (outcome == "ok") return "ok";
+    if (outcome == "policy_refusal" || outcome == "guard_block") return "skipped";
+    if (outcome == "timeout_unknown") return "retry";
+    if (!outcome.empty()) return "failed";
+    auto it = d.find("ok");
+    const bool ok = (it == d.end() || !it->is_boolean()) ? true : it->get<bool>();
+    return ok ? "ok" : "failed";
+}
 
-// Feed one drained orchestrator event into the OWNING conversation's Agent Workflow DAG (GL
-// thread only). `convId` is the conversation whose run emitted the event — every chat builds
-// its own tree, so a second concurrent run never resets or hijacks the visible one.
+static void subagentLifecycle(TraceStore& t, const nlohmann::json& d, const std::string& raw,
+                              double now) {
+    const std::string sub = jstr(d, "subagent_id");
+    std::string parentSpan = jstr(d, "parent_id");
+    if (parentSpan.empty()) parentSpan = jstr(d, "parent_stage");
+    int parentIdx = spanOwner(t, parentSpan);
+    if (t.agents[(size_t)parentIdx].id == sub) parentIdx = 0;
+    const int ai = ensureAgent(t, sub, parentIdx, now);
+    if (ai == 0) return;   // agent table full
+    const std::string purpose = foldToAtlasGlyphs(jstr(d, "purpose"));
+    const std::string detail = jstr(d, "detail");
+    const std::string st = agentStatusFrom(raw);
+    {
+        Agent& a = t.agents[(size_t)ai];
+        if (a.name.empty() && !purpose.empty()) a.name = purpose;
+        if (a.brief.empty() && !purpose.empty()) a.brief = purpose;
+        if (!detail.empty()) a.note = detail;
+        if (!terminalStatus(st)) {
+            a.status = st;
+            if (a.startTs <= 0.0) a.startTs = now;
+            return;
+        }
+        if (terminalStatus(a.status)) return;   // repeated terminal frame
+        a.status = st;
+        a.endTs = now;
+        if (a.startTs <= 0.0) a.startTs = now;
+    }
+    // The sub-agent's own timeline ends with its result.
+    {
+        Step& s = pushStep(t, ai, StepKind::RunEnd, now);
+        s.title = st == "done" ? "Finished" : st == "failed" ? "Failed" : "Cancelled";
+        s.status = st == "done" ? "ok" : st;
+        s.detail = detail;
+        if (st == "failed") s.error = detail;
+    }
+    // The parent's spawn row turns into the outcome; without one, add an explicit marker.
+    const Agent& a = t.agents[(size_t)ai];
+    const int pi = std::max(findAgent(t, a.parent), 0);
+    const std::string name = a.name.empty() ? std::string("Sub-agent") : a.name;
+    const int ms = (int)std::max(0.0, (a.endTs - a.startTs) * 1000.0);
+    const std::string stepStatus = st == "done" ? std::string("ok") : st;
+    if (Step* sp = findSpanStep(t.agents[(size_t)pi], sub, StepKind::Spawn)) {
+        sp->status = stepStatus;
+        sp->durationMs = ms;
+        if (st == "failed") sp->error = detail;
+        ++sp->rev;
+        return;
+    }
+    Step& s = pushStep(t, pi, StepKind::SubagentEnd, now);
+    s.spanId = sub;
+    s.title = name + (st == "done" ? " finished" : st == "failed" ? " failed" : " cancelled");
+    s.status = stepStatus;
+    s.durationMs = ms;
+    s.detail = detail;
+    if (st == "failed") s.error = detail;
+}
+
+static const char* kindName(StepKind k) {
+    static const char* names[] = {"thinking", "reply", "tool", "user", "steer", "spawn",
+                                  "subagent_end", "context", "compaction", "retry", "plan",
+                                  "note", "error", "run_start", "run_end", "event"};
+    const int i = (int)k;
+    return (i >= 0 && i < (int)StepKind::Count) ? names[i] : "event";
+}
+static StepKind kindFromName(const std::string& s) {
+    for (int i = 0; i < (int)StepKind::Count; ++i)
+        if (s == kindName((StepKind)i)) return (StepKind)i;
+    return StepKind::Event;
+}
+
+static std::string capText(const std::string& s, size_t n) {
+    if (s.size() <= n) return s;
+    size_t cut = n;
+    while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80) --cut;
+    return s.substr(0, cut);
+}
+
+}  // namespace
+
+// Feed one drained orchestrator event into the OWNING conversation's execution trace (GL thread
+// only). `convId` is the conversation whose run emitted the event, so concurrent runs in two
+// chats never reset or hijack each other's trace.
 void feedAgentDagEvent(const std::string& convId, const std::string& kind,
                        const nlohmann::json& data) {
     if (!data.is_object()) return;
-    AgentDagStore& dag = agStore(convId);
+    TraceStore& t = s_traces[convId];
+    const double now = chatNowEpoch();
+    const std::string sub = jstr(data, "subagent_id");
 
-    // Run boundary: a fresh run replaces THIS conversation's previous tree (mirrors the
-    // context-meter reset).
-    const std::string runId = agEnvStr(data, "run_id");
-    if (kind == "run_started" || kind == "dag.run.started") {
-        dag.reset(runId);
+    if (kind == "run_started") {
+        if (!sub.empty()) {   // a nested agent's own start frame
+            const int ai = ensureAgent(t, sub, spanOwner(t, jstr(data, "parent_id")), now);
+            Agent& a = t.agents[(size_t)ai];
+            a.status = "running";
+            if (a.startTs <= 0.0) a.startTs = now;
+            const std::string model = jstr(data, "model");
+            if (!model.empty()) a.model = model;
+            return;
+        }
+        // A fresh top-level run replaces this conversation's previous trace.
+        t.reset(jstr(data, "run_id"));
+        Agent& m = t.agents[0];
+        m.status = "running";
+        m.startTs = now;
+        m.model = jstr(data, "model");
+        Step& s = pushStep(t, 0, StepKind::RunStart, now);
+        s.title = "Run started";
+        s.target = m.model;
         return;
     }
-    // If a new run_id arrives without a start marker (e.g. we joined mid-run), roll over cleanly.
-    if (!runId.empty() && !dag.runId.empty() && runId != dag.runId)
-        dag.reset(runId);
-    if (dag.runId.empty() && !runId.empty()) dag.runId = runId;
+    if (t.runId.empty() && sub.empty()) t.runId = jstr(data, "run_id");
 
-    // Only agent-level kinds carry §2.1 span linkage; everything else is ignored by this store
-    // (the buildgraph/Session Plan view owns the dag.* lifecycle).
-    if (kind.rfind("agent.", 0) != 0) return;
-
-    const std::string id       = agEnvStr(data, "id");
-    const std::string parentId = agEnvStr(data, "parent_id");
-    const std::string actor    = agEnvStr(data, "actor");
-    // A missing span id (legacy /1) can't seed the tree key — fall back to a synthetic leaf id so
-    // the record is still visible without a parent join.
-    const std::string key = !id.empty()
-        ? id
-        : ("_leaf" + std::to_string(dag.seqCtr) + agEnvStr(data, "node_id"));
-
-    if (kind == "agent.tool_call") {
-        AgNode& n = agUpsert(dag, key, parentId);
-        n.kind   = AgKind::Tool;
-        n.actor  = actor;
-        n.title  = agEnvStr(data, "tool_name");
-        if (n.title.empty()) n.title = "tool";
-        n.detail = agEnvStr(data, "target");        // human-readable "what it acts on" (M14)
-        bool ok  = data.value("ok", true);
-        n.status = ok ? "ok" : "failed";
-        n.latencyMs = agEnvInt(data, "latency_ms", -1);
-        ++dag.toolCount;
+    if (kind == "assistant_delta") {
+        const int ai = eventOwner(t, data, now);
+        appendStream(t, ai, jstr(data, "channel") == "thinking" ? StepKind::Thinking
+                                                                : StepKind::Reply,
+                     jstr(data, "text"), now);
+    } else if (kind == "agent.thought.delta") {
+        appendStream(t, eventOwner(t, data, now), StepKind::Thinking, jstr(data, "text"), now);
     } else if (kind == "agent.thought") {
-        AgNode& n = agUpsert(dag, key, parentId);
-        n.kind   = AgKind::Thought;
-        n.actor  = actor;
-        n.title  = "thought";
-        n.detail = agEnvStr(data, "text");          // completed reasoning block (not streamed)
-        ++dag.thoughtCount;
-    } else if (kind == "agent.context_injected") {
-        AgNode& n = agUpsert(dag, key, parentId);
-        n.kind   = AgKind::Context;
-        n.actor  = actor;
-        n.title  = "context: " + agEnvStr(data, "source");
-        n.detail = agEnvStr(data, "label");
-        int tok  = agEnvInt(data, "token_est", 0);
-        if (tok > 0) n.detail += (n.detail.empty() ? "" : "  ") + ("~" + std::to_string(tok) + " tok");
-        ++dag.ctxCount;
-    } else if (kind == "agent.spawn") {
-        // Subagent / worker branch. Emit-wired backend, no production sink today (M20) — but if a
-        // real one arrives we build the branch: the spawner span is `parent_id`, and the child's
-        // own execution root is `subagent_id`.
-        AgNode& n = agUpsert(dag, key, parentId);
-        n.kind   = AgKind::Spawn;
-        n.actor  = actor.empty() ? agEnvStr(data, "role") : actor;
-        n.title  = "spawn: " + agEnvStr(data, "role");
-        n.detail = agEnvStr(data, "brief");
-        // Seed the child's execution root so its later events attach under this spawn node.
-        // Copy the actor to a local BEFORE the second agUpsert — it push_backs into the node
-        // vector, which can reallocate and dangle the `n` reference above. (Only matters once a
-        // real spawn sink lands; harmless on the empty path today, but correct now.)
-        const std::string spawnActor = n.actor;
-        const std::string childId = agEnvStr(data, "subagent_id");
-        if (!childId.empty()) {
-            dag.nodes[dag.byId[key]].refId = childId;  // M11: click → open its chat
-            AgNode& c = agUpsert(dag, childId, key);
-            if (c.title.empty()) {
-                c.kind = AgKind::Root; c.actor = spawnActor; c.title = "subagent " + spawnActor;
-            }
-            c.refId = childId;
+        const int ai = eventOwner(t, data, now);
+        Agent& a = t.agents[(size_t)ai];
+        const std::string txt = jstr(data, "text");
+        if (!a.steps.empty() && a.steps.back().open && a.steps.back().kind == StepKind::Thinking) {
+            if (!txt.empty()) a.steps.back().detail = capText(txt, kMaxStepText);
+            closeOpen(a);
+        } else if (!blankText(txt)) {
+            Step& s = pushStep(t, ai, StepKind::Thinking, now);
+            s.detail = capText(txt, kMaxStepText);
+            ++t.thoughtCount;
         }
-        dag.sawSpawn = true;
+    } else if (kind == "status") {
+        const std::string phase = jstr(data, "phase");
+        if (phase == "tool") {
+            std::string id = jstr(data, "tool_call_id");
+            if (id.empty()) id = jstr(data, "id");
+            const int ai = eventOwner(t, data, now);
+            Agent& a = t.agents[(size_t)ai];
+            if (Step* s = findSpanStep(a, id, StepKind::Tool)) {
+                if (s->title.empty()) { s->title = foldToAtlasGlyphs(jstr(data, "tool_name")); ++s->rev; }
+                return;
+            }
+            Step& s = pushStep(t, ai, StepKind::Tool, now);
+            s.spanId = id;
+            s.title = foldToAtlasGlyphs(jstr(data, "tool_name"));
+            if (s.title.empty()) s.title = "tool";
+            s.status = "running";
+            ++t.agents[(size_t)ai].toolCount;
+            indexSpan(t, id, ai);
+        } else if (phase == "error") {
+            const int ai = eventOwner(t, data, now);
+            Step& s = pushStep(t, ai, StepKind::Error, now);
+            s.title = foldToAtlasGlyphs(jstr(data, "text"));
+            if (s.title.empty()) s.title = "Agent error";
+            s.error = jstr(data, "error_detail");
+            if (s.error.empty()) s.error = s.title;
+            s.target = jstr(data, "stop_reason");
+            s.status = "failed";
+        } else if (phase == "notice" || phase == "progress_nudge") {
+            const int ai = eventOwner(t, data, now);
+            Step& s = pushStep(t, ai, StepKind::Note, now);
+            s.title = foldToAtlasGlyphs(jstr(data, "text"));
+            s.detail = jstr(data, "text");
+        }
+    } else if (kind == "agent.tool_call") {
+        std::string id = jstr(data, "id");
+        if (id.empty()) id = jstr(data, "span_id");
+        const int ai = eventOwner(t, data, now);
+        Step* s = findSpanStep(t.agents[(size_t)ai], id, StepKind::Tool);
+        const bool wasFailed = s && s->status == "failed";
+        if (!s) {
+            s = &pushStep(t, ai, StepKind::Tool, now);
+            s->spanId = id;
+            ++t.agents[(size_t)ai].toolCount;
+            indexSpan(t, id, ai);
+        } else {
+            closeOpen(t.agents[(size_t)ai]);
+        }
+        s->title = foldToAtlasGlyphs(jstr(data, "tool_name"));
+        if (s->title.empty()) s->title = "tool";
+        s->target = foldToAtlasGlyphs(jstr(data, "target"));
+        s->detail = jstr(data, "args_preview");
+        if (s->detail.empty() && data.contains("args")) {
+            const auto& args = data["args"];
+            if (args.is_string()) s->detail = args.get<std::string>();
+            else if (args.is_object() || args.is_array()) s->detail = capText(args.dump(2), kPersistText);
+        }
+        const std::string intent = jstr(data, "intent");
+        if (!intent.empty()) s->detail = intent + (s->detail.empty() ? "" : "\n\n") + s->detail;
+        s->status = toolStatus(data);
+        s->error = s->status == "ok" ? std::string() : jstr(data, "error_preview");
+        const int lat = jint(data, "latency_ms", -1);
+        s->durationMs = lat > 0 ? lat : (int)std::max(0.0, (now - s->ts) * 1000.0);
+        ++s->rev;
+        if (s->status == "failed" && !wasFailed) ++t.agents[(size_t)ai].failCount;
+    } else if (kind == "agent.spawn") {
+        std::string child = sub;
+        if (child.empty()) child = jstr(data, "id");
+        if (child.empty()) return;
+        std::string spawner = jstr(data, "parent_id");
+        int pi = spanOwner(t, spawner);
+        if (t.agents[(size_t)pi].id == child) pi = 0;
+        const int ci = ensureAgent(t, child, pi, now);
+        if (ci == 0) return;
+        const std::string role = foldToAtlasGlyphs(jstr(data, "role"));
+        const std::string brief = foldToAtlasGlyphs(jstr(data, "brief"));
+        {
+            Agent& c = t.agents[(size_t)ci];
+            if (!role.empty()) c.name = role;
+            if (!brief.empty()) c.brief = brief;
+            if (c.status.empty() || c.status == "idle") c.status = "running";
+            if (c.startTs <= 0.0) c.startTs = now;
+            // A frame that arrived before the spawn parented it under main; the spawn knows better.
+            const std::string& pid = t.agents[(size_t)pi].id;
+            if (c.parent != pid && !isAncestor(t, child, pid)) c.parent = pid;
+        }
+        if (findSpanStep(t.agents[(size_t)pi], child, StepKind::Spawn)) return;
+        Step& s = pushStep(t, pi, StepKind::Spawn, now);
+        s.spanId = child;
+        s.title = "Spawned " + (role.empty() ? std::string("sub-agent") : role);
+        s.target = brief;
+        s.detail = jstr(data, "brief");
+        s.status = "running";
+        indexSpan(t, jstr(data, "id"), pi);
+    } else if (kind == "sub_run") {
+        const std::string status = jstr(data, "status");
+        if (!sub.empty()) { subagentLifecycle(t, data, status, now); return; }
+        const int ai = eventOwner(t, data, now);
+        const std::string id = jstr(data, "id");
+        std::string purpose = foldToAtlasGlyphs(jstr(data, "purpose"));
+        StepKind k = StepKind::Event;
+        if (id.rfind("compaction", 0) == 0 || purpose.rfind("Compact", 0) == 0)
+            k = StepKind::Compaction;
+        else if (purpose.rfind("Retry", 0) == 0 || purpose.rfind("Fallback", 0) == 0 ||
+                 id.rfind("fallback", 0) == 0)
+            k = StepKind::Retry;
+        Step* s = findSpanStep(t.agents[(size_t)ai], id, k);
+        if (!s) {
+            s = &pushStep(t, ai, k, now);
+            s->spanId = id;
+            indexSpan(t, id, ai);
+        }
+        if (!purpose.empty()) s->title = purpose;
+        if (s->title.empty()) s->title = "Sub-run";
+        s->status = stepStatusFrom(status.empty() ? std::string("running") : status);
+        const std::string detail = jstr(data, "detail");
+        if (!detail.empty()) s->detail = capText(detail, kMaxStepText);
+        s->error = s->status == "failed" ? s->detail : std::string();
+        if (s->status != "running") s->durationMs = (int)std::max(0.0, (now - s->ts) * 1000.0);
+        ++s->rev;
+    } else if (kind == "run_finished") {
+        const std::string raw = jstr(data, "status");
+        if (!sub.empty()) { subagentLifecycle(t, data, raw.empty() ? "done" : raw, now); return; }
+        const std::string st = agentStatusFrom(raw.empty() ? std::string("done") : raw);
+        for (Agent& a : t.agents) closeOpen(a);
+        Agent& m = t.agents[0];
+        m.status = st == "running" || st == "pending" ? std::string("done") : st;
+        m.endTs = now;
+        if (m.startTs <= 0.0) m.startTs = now;
+        for (Step& s : m.steps)
+            if (s.status == "running") { s.status = "stopped"; ++s.rev; }
+        const std::string model = jstr(data, "model");
+        if (!model.empty()) m.model = model;
+        Step& s = pushStep(t, 0, StepKind::RunEnd, now);
+        s.title = m.status == "done" ? "Run finished" : m.status == "failed" ? "Run failed"
+                                                                          : "Run cancelled";
+        s.status = m.status == "done" ? "ok" : m.status;
+        s.target = jstr(data, "stop_reason");
+        std::string err = jstr(data, "error_human");
+        const std::string ed = jstr(data, "error_detail");
+        if (!ed.empty()) err += (err.empty() ? "" : "\n\n") + ed;
+        s.error = err;
+        s.durationMs = (int)std::max(0.0, (m.endTs - m.startTs) * 1000.0);
+    } else if (kind == "plan_state") {
+        const int ai = eventOwner(t, data, now);
+        int total = 0, done = 0;
+        auto it = data.find("items");
+        if (it != data.end() && it->is_array())
+            for (const auto& item : *it) {
+                if (!item.is_object()) continue;
+                ++total;
+                const std::string s = jstr(item, "status");
+                if (s == "done" || s == "completed" || s == "complete") ++done;
+            }
+        Agent& a = t.agents[(size_t)ai];
+        Step* s = (!a.steps.empty() && a.steps.back().kind == StepKind::Plan) ? &a.steps.back()
+                                                                              : nullptr;
+        if (!s) s = &pushStep(t, ai, StepKind::Plan, now);
+        s->title = "Plan updated";
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%d/%d done", done, total);
+        s->target = buf;
+        s->detail = foldToAtlasGlyphs(jstr(data, "summary"));
+        ++s->rev;
+    } else if (kind == "provider_call") {
+        const int ai = eventOwner(t, data, now);
+        Step& s = pushStep(t, ai, StepKind::Retry, now);
+        const int attempt = jint(data, "attempt", 1), maxA = jint(data, "max_attempts", 0);
+        char buf[64];
+        if (maxA > 0) std::snprintf(buf, sizeof(buf), "Retry attempt %d/%d", attempt, maxA);
+        else          std::snprintf(buf, sizeof(buf), "Retry attempt %d", attempt);
+        s.title = buf;
+        const std::string prov = jstr(data, "provider"), model = jstr(data, "model");
+        s.target = prov + (!prov.empty() && !model.empty() ? " \xC2\xB7 " : "") + model;
+        s.error = jstr(data, "error_excerpt");
+        s.status = "retry";
+        s.durationMs = jint(data, "delay_ms", -1);
+    } else if (kind == "agent.context_injected") {
+        const int ai = eventOwner(t, data, now);
+        Step& s = pushStep(t, ai, StepKind::Context, now);
+        s.title = foldToAtlasGlyphs(jstr(data, "label"));
+        if (s.title.empty()) s.title = "context";
+        s.target = foldToAtlasGlyphs(jstr(data, "source"));
+        const int tok = jint(data, "token_est");
+        if (tok > 0) s.target += (s.target.empty() ? "~" : "  ~") + std::to_string(tok) + " tok";
+        ++t.ctxCount;
     } else if (kind == "agent.advisor") {
-        AgNode& n = agUpsert(dag, key, parentId);
-        n.kind   = AgKind::Advisor;
-        n.actor  = actor;
-        n.title  = "advisor: " + agEnvStr(data, "advisor_kind");
-        n.detail = agEnvStr(data, "verdict_summary");
-        dag.sawAdvisor = true;
+        const int ai = eventOwner(t, data, now);
+        Step& s = pushStep(t, ai, StepKind::Note, now);
+        s.title = "Advisor \xC2\xB7 " + foldToAtlasGlyphs(jstr(data, "advisor_kind"));
+        s.detail = jstr(data, "verdict_summary");
+        s.target = foldToAtlasGlyphs(s.detail);
     }
-    // Any other agent.* kind (artifact/question/answer) is tolerated but not graphed here.
 }
 
-// Serialize one conversation's Agent Workflow DAG — every field the canvas draws. Null json
-// when that conversation never ran, so there is nothing to snapshot.
+// Serialize one conversation's trace: every agent and its newest persisted steps. Null when the
+// conversation never ran. "nodes" is the flat step list (conversations.cpp saves only when it is
+// non-empty).
 nlohmann::json agentDagToJson(const std::string& convId) {
-    auto sit = s_agdags.find(convId);
-    if (sit == s_agdags.end()) return nlohmann::json();
-    const AgentDagStore& dag = sit->second;
+    auto sit = s_traces.find(convId);
+    if (sit == s_traces.end() || !sit->second.hasContent()) return nlohmann::json();
+    const TraceStore& t = sit->second;
     nlohmann::json j;
-    j["runId"]        = dag.runId;
-    j["seqCtr"]       = dag.seqCtr;
-    j["sawSpawn"]     = dag.sawSpawn;
-    j["sawAdvisor"]   = dag.sawAdvisor;
-    j["toolCount"]    = dag.toolCount;
-    j["thoughtCount"] = dag.thoughtCount;
-    j["ctxCount"]     = dag.ctxCount;
-    j["pan"] = {dag.pan.x, dag.pan.y};
-    j["zoom"] = dag.zoom;
-    nlohmann::json arr = nlohmann::json::array();
-    for (const AgNode& n : dag.nodes) {
-        nlohmann::json jn;
-        jn["id"]        = n.id;
-        jn["parentId"]  = n.parentId;
-        jn["kind"]      = agKindName(n.kind);
-        jn["actor"]     = n.actor;
-        jn["title"]     = n.title;
-        jn["detail"]    = n.detail;
-        jn["status"]    = n.status;
-        jn["refId"]     = n.refId;
-        jn["latencyMs"] = n.latencyMs;
-        jn["seq"]       = n.seq;
-        arr.push_back(std::move(jn));
+    j["v"] = 2;
+    j["runId"] = t.runId;
+    j["uidCtr"] = t.uidCtr;
+    j["userSyncTs"] = t.userSyncTs;
+    j["userSeeded"] = t.userSeeded;
+    j["thoughtCount"] = t.thoughtCount;
+    j["ctxCount"] = t.ctxCount;
+    nlohmann::json agents = nlohmann::json::array(), nodes = nlohmann::json::array();
+    for (size_t ai = 0; ai < t.agents.size(); ++ai) {
+        const Agent& a = t.agents[ai];
+        const size_t skip = a.steps.size() > kPersistStepsPerAgent
+            ? a.steps.size() - kPersistStepsPerAgent : 0;
+        agents.push_back({{"id", a.id}, {"parent", a.parent}, {"name", a.name},
+                          {"brief", capText(a.brief, kPersistText)}, {"status", a.status},
+                          {"model", a.model}, {"note", capText(a.note, kPersistText)},
+                          {"startTs", a.startTs}, {"endTs", a.endTs},
+                          {"toolCount", a.toolCount}, {"failCount", a.failCount},
+                          {"dropped", a.dropped + (long long)skip}});
+        for (size_t i = skip; i < a.steps.size(); ++i) {
+            const Step& s = a.steps[i];
+            nodes.push_back({{"a", (int)ai}, {"k", kindName(s.kind)}, {"u", s.uid},
+                             {"sp", s.spanId}, {"t", capText(s.title, kPersistText)},
+                             {"g", capText(s.target, kPersistText)},
+                             {"d", capText(s.detail, kPersistText)},
+                             {"e", capText(s.error, kPersistText)},
+                             {"s", s.status}, {"ms", s.durationMs}, {"ts", s.ts}});
+        }
     }
-    j["nodes"] = std::move(arr);
+    j["agents"] = std::move(agents);
+    j["nodes"] = std::move(nodes);
     return j;
 }
 
-// Restore a serialized tree (agentDagToJson) into `convId`'s store. Rebuilds the id index; tree
-// links (children/depth/failure roll-up) are re-derived by agResolveTree at draw time.
+// Restore agentDagToJson output. Pre-v2 graph records are ignored: the transcript fallback
+// reconstructs those sessions from their persisted activity rows instead.
 void agentDagFromJson(const std::string& convId, const nlohmann::json& j) {
-    if (!j.is_object()) return;
-    AgentDagStore& dag = agStore(convId);
-    dag.reset(j.value("runId", std::string()));
-    dag.sawSpawn     = j.value("sawSpawn", false);
-    dag.sawAdvisor   = j.value("sawAdvisor", false);
-    dag.toolCount    = j.value("toolCount", 0);
-    dag.thoughtCount = j.value("thoughtCount", 0);
-    dag.ctxCount     = j.value("ctxCount", 0);
-    if (j.contains("pan") && j["pan"].is_array() && j["pan"].size() == 2 &&
-        j["pan"][0].is_number() && j["pan"][1].is_number())
-        dag.pan = ImVec2(j["pan"][0].get<float>(), j["pan"][1].get<float>());
-    if (j.contains("zoom") && j["zoom"].is_number())
-        dag.zoom = std::clamp(j["zoom"].get<float>(), 0.35f, 2.5f);
-    if (j.contains("nodes") && j["nodes"].is_array()) {
-        for (const auto& jn : j["nodes"]) {
-            if (!jn.is_object()) continue;
-            AgNode n;
-            n.id        = jn.value("id", "");
-            n.parentId  = jn.value("parentId", "");
-            n.kind      = agKindFromName(jn.value("kind", std::string("other")));
-            n.actor     = jn.value("actor", "");
-            n.title     = jn.value("title", "");
-            n.detail    = jn.value("detail", "");
-            n.status    = jn.value("status", "");
-            n.refId     = jn.value("refId", "");
-            n.latencyMs = jn.value("latencyMs", -1);
-            n.seq       = jn.value("seq", (long long)0);
-            if (n.id.empty()) n.id = "_leaf" + std::to_string(n.seq);
-            if (dag.byId.count(n.id)) continue;   // corrupt duplicate id — skip
-            dag.byId[n.id] = (int)dag.nodes.size();
-            dag.nodes.push_back(std::move(n));
-        }
+    if (!j.is_object() || j.value("v", 0) != 2) return;
+    auto ja = j.find("agents");
+    if (ja == j.end() || !ja->is_array() || ja->empty()) return;
+    TraceStore& t = s_traces[convId];
+    t.reset(j.value("runId", std::string()));
+    t.agents.clear();
+    t.agentIdx.clear();
+    for (const auto& x : *ja) {
+        if (!x.is_object()) continue;
+        Agent a;
+        a.id = x.value("id", std::string());
+        if (a.id.empty() || t.agentIdx.count(a.id)) continue;
+        a.parent = x.value("parent", std::string());
+        a.name = x.value("name", std::string());
+        a.brief = x.value("brief", std::string());
+        a.status = x.value("status", std::string());
+        a.model = x.value("model", std::string());
+        a.note = x.value("note", std::string());
+        a.startTs = x.value("startTs", 0.0);
+        a.endTs = x.value("endTs", 0.0);
+        a.toolCount = x.value("toolCount", 0);
+        a.failCount = x.value("failCount", 0);
+        a.dropped = x.value("dropped", (long long)0);
+        t.agentIdx[a.id] = (int)t.agents.size();
+        t.agents.push_back(std::move(a));
     }
-    // Restore the arrival counter past every restored seq so new events keep ordering.
-    long long maxSeq = -1;
-    for (const AgNode& n : dag.nodes) maxSeq = std::max(maxSeq, n.seq);
-    dag.seqCtr = std::max(j.value("seqCtr", (long long)0), maxSeq + 1);
+    if (t.agents.empty() || t.agents[0].id != "main") { t.reset(std::string()); return; }
+    unsigned long long maxUid = 0;
+    auto jn = j.find("nodes");
+    if (jn != j.end() && jn->is_array())
+        for (const auto& x : *jn) {
+            if (!x.is_object()) continue;
+            const int ai = x.value("a", -1);
+            if (ai < 0 || ai >= (int)t.agents.size()) continue;
+            Step s;
+            s.kind = kindFromName(x.value("k", std::string()));
+            s.uid = x.value("u", (unsigned long long)0);
+            s.spanId = x.value("sp", std::string());
+            s.title = x.value("t", std::string());
+            s.target = x.value("g", std::string());
+            s.detail = x.value("d", std::string());
+            s.error = x.value("e", std::string());
+            s.status = x.value("s", std::string());
+            s.durationMs = x.value("ms", -1);
+            s.ts = x.value("ts", 0.0);
+            maxUid = std::max(maxUid, s.uid);
+            indexSpan(t, s.spanId, ai);
+            Agent& a = t.agents[(size_t)ai];
+            if (a.steps.size() >= kMaxStepsPerAgent) { a.steps.pop_front(); ++a.dropped; }
+            a.steps.push_back(std::move(s));
+        }
+    t.uidCtr = std::max(j.value("uidCtr", (unsigned long long)1), maxUid + 1);
+    t.userSyncTs = j.value("userSyncTs", 0.0);
+    t.userSeeded = j.value("userSeeded", false);
+    t.thoughtCount = j.value("thoughtCount", 0);
+    t.ctxCount = j.value("ctxCount", 0);
 }
 
 AgentDagSummary agentDagSummary(const std::string& convId) {
-    const auto it = s_agdags.find(convId);
-    if (it == s_agdags.end()) return {};
-    const AgentDagStore& dag = it->second;
-    return {dag.runId, dag.toolCount, dag.thoughtCount, dag.ctxCount, dag.empty()};
+    const auto it = s_traces.find(convId);
+    if (it == s_traces.end()) return {};
+    const TraceStore& t = it->second;
+    AgentDagSummary s;
+    s.runId = t.runId;
+    for (const Agent& a : t.agents) s.toolCount += a.toolCount;
+    s.thoughtCount = t.thoughtCount;
+    s.ctxCount = t.ctxCount;
+    s.empty = !t.hasContent();
+    return s;
 }
-// ---- Agent Workflow DAG (Phase 2, M9/M10) ---------------------------------------
-// A collapsible, scalable execution tree over the VIEWED conversation's event store
-// (s_agdags[convId]). Its own layout so M10 can hide collapsed subtrees BEFORE laying out —
-// and roll a descendant failure up onto the collapsed ancestor that hides it.
 
-static const float* agNodeColor(const AgNode& n) {
-    switch (n.kind) {
-        case AgKind::Tool:    return n.status == "failed" ? palette.statusErr : palette.statusOk;
-        case AgKind::Thought: return palette.accent;
-        case AgKind::Context: return palette.statusWarn;
-        case AgKind::Spawn:   return palette.accent;
-        case AgKind::Advisor: return palette.accent;
-        case AgKind::Root:    return palette.textDim;
-        default:              return palette.textDisabled;
+// ---- transcript fallback + drawing ---------------------------------------------------------------
+namespace {
+
+// First line-ish preview: whitespace runs collapsed, capped on a UTF-8 boundary, atlas-folded.
+static std::string oneLine(const std::string& s, size_t cap = 280) {
+    std::string out;
+    out.reserve(std::min(s.size(), cap));
+    bool space = false;
+    for (char c : s) {
+        if (out.size() >= cap) break;
+        if (c == '\n' || c == '\r' || c == '\t' || c == ' ') { space = !out.empty(); continue; }
+        if (space) { out.push_back(' '); space = false; }
+        out.push_back(c);
+    }
+    return foldToAtlasGlyphs(capText(out, cap));
+}
+
+static int wordCount(const std::string& s) {
+    int n = 0;
+    bool in = false;
+    for (char c : s) {
+        const bool ws = c == ' ' || c == '\n' || c == '\t' || c == '\r';
+        if (!ws && !in) ++n;
+        in = !ws;
+    }
+    return n;
+}
+
+// Insert a user prompt / steer into the main timeline at its send time.
+static void insertUserStep(TraceStore& t, const ChatMsg& m, StepKind k) {
+    Agent& a = t.agents[0];
+    if (a.steps.size() >= kMaxStepsPerAgent) { a.steps.pop_front(); ++a.dropped; }
+    Step s;
+    s.uid = t.uidCtr++;
+    s.kind = k;
+    s.ts = m.ts;
+    s.title = oneLine(m.text);
+    s.detail = m.text;
+    auto pos = a.steps.end();
+    while (pos != a.steps.begin() && std::prev(pos)->ts > m.ts) --pos;
+    a.steps.insert(pos, std::move(s));
+}
+
+// Prompts and steers are chat messages, not orch events: mirror the ones sent during this run.
+// Only while the run is live — a prompt typed after it ended opens the NEXT run (run_started
+// resets the trace and re-seeds it as that run's prompt).
+static void syncUserMarkers(AppState& st, const std::string& convId, TraceStore& t) {
+    const std::vector<ChatMsg>* msgs = conversationMsgs(st, convId);
+    if (!msgs || msgs->empty()) return;
+    const double runStart = t.agents[0].startTs;
+    if (!t.userSeeded) {
+        t.userSeeded = true;
+        const ChatMsg* seed = nullptr;
+        for (const ChatMsg& m : *msgs)
+            if (m.fromUser && m.ts > 0.0 && (runStart <= 0.0 || m.ts <= runStart + 2.0)) seed = &m;
+        if (seed && !blankText(seed->text)) insertUserStep(t, *seed, StepKind::User);
+        t.userSyncTs = seed ? seed->ts : runStart;
+        if (t.userSyncTs <= 0.0) t.userSyncTs = chatNowEpoch();
+    }
+    size_t first = msgs->size();
+    if (!st.convRunning(convId)) return;
+    while (first > 0 && (*msgs)[first - 1].ts > t.userSyncTs) --first;
+    for (size_t i = first; i < msgs->size(); ++i) {
+        const ChatMsg& m = (*msgs)[i];
+        if (!m.fromUser || blankText(m.text)) continue;
+        insertUserStep(t, m, StepKind::Steer);
+        t.userSyncTs = std::max(t.userSyncTs, m.ts);
     }
 }
 
-static const char* agKindTag(AgKind k) {
-    switch (k) {
-        case AgKind::Tool:    return "tool";
-        case AgKind::Thought: return "think";
-        case AgKind::Context: return "context";
-        case AgKind::Spawn:   return "subagent";
-        case AgKind::Advisor: return "advisor";
-        case AgKind::Root:    return "run";
-        default:              return "node";
-    }
+static std::string rowStatus(const ActivityItem& a) {
+    if (a.status == "running") return "running";
+    return stepStatusFrom(a.status);
 }
 
-// Resolve parent->children links + depth from the flat node list (join parent_id -> id, §2.1).
-// Nodes whose parent is absent become roots. Also rolls a "something under me failed" bit up
-// every ancestor chain, so a COLLAPSED branch can still show the failure hiding inside it.
-// Cheap enough to run every frame (tens of nodes).
-static void agResolveTree(AgentDagStore& dag, std::vector<int>& roots) {
-    for (auto& n : dag.nodes) { n.children.clear(); n.depth = 0; n.descFailed = false; }
-    roots.clear();
-    for (size_t i = 0; i < dag.nodes.size(); ++i) {
-        const std::string& pid = dag.nodes[i].parentId;
-        auto it = pid.empty() ? dag.byId.end() : dag.byId.find(pid);
-        if (it == dag.byId.end() || it->second == (int)i) roots.push_back((int)i);
-        else dag.nodes[it->second].children.push_back((int)i);
-    }
-    // Depth via BFS from roots (advisory ordering; ts/seq keep siblings stable).
-    std::vector<int> stack(roots.begin(), roots.end());
-    std::vector<char> seen(dag.nodes.size(), 0);
-    for (int r : roots) seen[r] = 1;
-    while (!stack.empty()) {
-        int cur = stack.back(); stack.pop_back();
-        for (int c : dag.nodes[cur].children) {
-            if (seen[c]) continue;
-            seen[c] = 1;
-            dag.nodes[c].depth = dag.nodes[cur].depth + 1;
-            stack.push_back(c);
+// Rebuild a trace from the conversation's persisted activity rows (restored sessions).
+static void buildFallback(const std::vector<ChatMsg>& msgs, TraceStore& t) {
+    const std::string keepSel = t.selAgent;
+    t.reset(std::string());
+    double first = 0.0, last = 0.0;
+    bool running = false, failed = false;
+    int delegate = 0;
+    for (const ChatMsg& m : msgs) {
+        if (m.ts > 0.0) {
+            first = first > 0.0 ? std::min(first, m.ts) : m.ts;
+            last = std::max(last, m.ts);
         }
-    }
-    // Failure roll-up: walk each failed node's ancestor chain, stopping at the first ancestor
-    // already marked — which is also what terminates a malformed cyclic parent chain.
-    for (const AgNode& n : dag.nodes) {
-        if (n.status != "failed") continue;
-        std::string pid = n.parentId;
-        while (!pid.empty()) {
-            auto it = dag.byId.find(pid);
-            if (it == dag.byId.end()) break;
-            AgNode& p = dag.nodes[it->second];
-            if (p.descFailed) break;
-            p.descFailed = true;
-            pid = p.parentId;
+        if (m.fromUser) {
+            if (blankText(m.text)) continue;
+            Step& s = pushStep(t, 0, StepKind::User, m.ts);
+            s.title = oneLine(m.text);
+            s.detail = m.text;
+            continue;
         }
-    }
-}
-
-// M10: flatten to the VISIBLE set (stop descending at a collapsed node) in tree order, assigning
-// each visible node a (layer=depth, row=running counter) grid slot. Returns visible node indices.
-static void agFlattenVisible(const AgentDagStore& dag, const std::vector<int>& roots,
-                             std::vector<int>& visible, std::unordered_map<int,int>& rowOf) {
-    visible.clear(); rowOf.clear();
-    // Iterative pre-order DFS honoring collapse; children in seq order (arrival-ordered rows).
-    std::vector<int> stack(roots.rbegin(), roots.rend());
-    int row = 0;
-    while (!stack.empty()) {
-        int cur = stack.back(); stack.pop_back();
-        visible.push_back(cur);
-        rowOf[cur] = row++;
-        if (!dag.nodes[cur].collapsed) {
-            // push children in reverse-seq so they pop in seq order
-            std::vector<int> kids = dag.nodes[cur].children;
-            std::sort(kids.begin(), kids.end(), [&dag](int a, int b) {
-                return dag.nodes[a].seq < dag.nodes[b].seq;
-            });
-            for (auto rit = kids.rbegin(); rit != kids.rend(); ++rit) stack.push_back(*rit);
-        }
-    }
-}
-
-// verbosity: 0 = title only, 1 = detail, 2 = actor / latency.
-void drawAgentDagCanvas(AppState& st, const std::string& convId, int verbosity,
-                        void (*selectAgent)(AppState&, const std::string&, const std::string&)) {
-    AgentDagStore& dag = agStore(convId);
-    const float S = ui::uiScale;
-
-    std::vector<int> roots;
-    agResolveTree(dag, roots);
-    std::sort(roots.begin(), roots.end(),
-              [&dag](int a, int b) { return dag.nodes[a].seq < dag.nodes[b].seq; });
-    std::vector<int> visible;
-    std::unordered_map<int,int> rowOf;
-    agFlattenVisible(dag, roots, visible, rowOf);
-
-    ImGui::BeginChild("##ag_dag_canvas", ImVec2(0, 0), ImGuiChildFlags_None,
-                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    const ImVec2 cMin = ImGui::GetWindowPos();
-    const ImVec2 cSz  = ImGui::GetWindowSize();
-    const ImVec2 cMax(cMin.x + cSz.x, cMin.y + cSz.y);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->PushClipRect(cMin, cMax, true);
-
-    // Camera state belongs to this conversation, not to the workspace shell.
-    ImGui::InvisibleButton("##ag_dag_nav", cSz,
-                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle);
-    bool navActive = ImGui::IsItemActive();
-    if (navActive) {
-        dag.pan.x += ImGui::GetIO().MouseDelta.x;
-        dag.pan.y += ImGui::GetIO().MouseDelta.y;
-    }
-    if (ImGui::IsItemHovered()) {
-        float wheel = ImGui::GetIO().MouseWheel;
-        if (wheel != 0.0f) {
-            float oldZ = dag.zoom;
-            dag.zoom = std::min(2.5f, std::max(0.35f, dag.zoom * (1.0f + wheel * 0.1f)));
-            ImVec2 m = ImGui::GetIO().MousePos;
-            ImVec2 local(m.x - cMin.x - dag.pan.x, m.y - cMin.y - dag.pan.y);
-            dag.pan.x -= local.x * (dag.zoom / oldZ - 1.0f);
-            dag.pan.y -= local.y * (dag.zoom / oldZ - 1.0f);
-        }
-    }
-
-    const float z     = dag.zoom;
-    const float nodeW = 200.0f * S * z, nodeH = 44.0f * S * z;
-    const float gapY  = 12.0f * S * z;
-    // layer = depth (indent by tree level), row = pre-order counter.
-    auto slotPos = [&](int nodeIdx) {
-        const AgNode& n = dag.nodes[nodeIdx];
-        int rr = rowOf.count(nodeIdx) ? rowOf[nodeIdx] : 0;
-        return ImVec2(cMin.x + dag.pan.x + 16.0f * S + n.depth * (32.0f * S * z),
-                      cMin.y + dag.pan.y + 16.0f * S + rr * (nodeH + gapY));
-    };
-
-    // Edges (parent right/bottom -> child left) behind boxes.
-    const ImU32 edgeCol = ImGui::ColorConvertFloat4ToU32(
-        ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 0.55f));
-    for (int idx : visible) {
-        const AgNode& n = dag.nodes[idx];
-        auto pit = n.parentId.empty() ? dag.byId.end() : dag.byId.find(n.parentId);
-        if (pit == dag.byId.end()) continue;
-        if (!rowOf.count(pit->second)) continue;   // parent not visible (shouldn't happen)
-        ImVec2 pC = slotPos(idx);
-        ImVec2 pP = slotPos(pit->second);
-        ImVec2 a(pP.x + 14.0f * S * z, pP.y + nodeH);          // out the bottom-left of the parent
-        ImVec2 b(pC.x,                 pC.y + nodeH * 0.5f);    // into the child's left edge
-        float  cy = std::max(12.0f * S * z, (b.y - a.y) * 0.5f);
-        dl->AddBezierCubic(a, ImVec2(a.x, a.y + cy), ImVec2(b.x - 20.0f * S * z, b.y), b,
-                           edgeCol, 1.4f * S * z);
-    }
-
-    // Nodes.
-    (void)navActive;
-    for (int idx : visible) {
-        const AgNode& n = dag.nodes[idx];
-        ImVec2 p0 = slotPos(idx);
-        ImVec2 p1(p0.x + nodeW, p0.y + nodeH);
-        if (p1.y < cMin.y || p0.y > cMax.y) continue;   // vertical cull
-        // A COLLAPSED branch hiding a failed step takes the error accent (and the "!" badge
-        // below), so a failure deep inside it stays visible without expanding.
-        const bool hidFail = n.collapsed && n.descFailed;
-        const float* sc = hidFail ? palette.statusErr : agNodeColor(n);
-        const float rr  = 6.0f * S * z;
-        dl->AddRectFilled(p0, p1,
-            ImGui::ColorConvertFloat4ToU32(
-                ImVec4(palette.panelBg[0], palette.panelBg[1], palette.panelBg[2], 0.92f)), rr);
-        dl->AddRectFilled(p0, ImVec2(p0.x + 4.0f * S * z, p1.y),
-            ImGui::ColorConvertFloat4ToU32(ImVec4(sc[0], sc[1], sc[2], 0.95f)), rr,
-            ImDrawFlags_RoundCornersLeft);
-        dl->AddRect(p0, p1,
-            ImGui::ColorConvertFloat4ToU32(ImVec4(sc[0], sc[1], sc[2], 0.65f)), rr, 0, 1.2f * S * z);
-
-        // Collapse toggle: a [-]/[+] hit-box at the node's right edge when it has children.
-        bool hasKids = !n.children.empty();
-        if (hasKids && z > 0.5f) {
-            ImVec2 tg0(p1.x - 20.0f * S * z, p0.y + (nodeH - 16.0f * S * z) * 0.5f);
-            ImVec2 tg1(tg0.x + 16.0f * S * z, tg0.y + 16.0f * S * z);
-            bool hov = ImGui::IsMouseHoveringRect(tg0, tg1);
-            dl->AddRectFilled(tg0, tg1,
-                ImGui::ColorConvertFloat4ToU32(ImVec4(sc[0], sc[1], sc[2], hov ? 0.5f : 0.28f)),
-                3.0f * S * z);
-            dl->AddText(ImVec2(tg0.x + 4.0f * S * z, tg0.y + 1.0f * S * z),
-                ImGui::ColorConvertFloat4ToU32(ImVec4(palette.text[0], palette.text[1],
-                                                      palette.text[2], 1.0f)),
-                n.collapsed ? "+" : "-");
-            // Toggle on RELEASE of a tap (not press): the full-canvas nav InvisibleButton claims
-            // the click on press, so `navActive` is true the same frame IsMouseClicked fires —
-            // gating on click-down can never pass. A release with near-zero drag = a tap (a drag
-            // pans instead). Threshold keeps a slightly-jittery click from being read as a pan.
-            if (hov && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-                ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left, 0.0f);
-                if (dd.x * dd.x + dd.y * dd.y < (4.0f * S) * (4.0f * S))
-                    dag.nodes[idx].collapsed = !dag.nodes[idx].collapsed;
+        running = running || m.running;
+        for (const ActivityItem& a : m.activity) {
+            switch (a.rowKind) {
+            case 2: {
+                const bool prose = a.stage == "stream:out";
+                if (blankText(a.detail)) break;
+                Step& s = pushStep(t, 0, prose ? StepKind::Reply : StepKind::Thinking, m.ts);
+                s.detail = capText(a.detail, kMaxStepText);
+                if (prose && a.opsCount > 0) s.title = "Building ops";
+                if (a.streaming && m.running) { s.open = true; s.status = "running"; }
+                if (!prose) ++t.thoughtCount;
+                break;
             }
-        }
-
-        if (z > 0.5f) {
-            char head[160];
-            if (verbosity >= 2) {
-                const std::string lat = n.latencyMs >= 0
-                    ? (std::to_string(n.latencyMs) + " ms") : std::string();
-                std::snprintf(head, sizeof(head), "%s%s%s%s%s", agKindTag(n.kind),
-                              n.actor.empty() ? "" : "  \xC2\xB7  ", n.actor.c_str(),
-                              lat.empty() ? "" : "  \xC2\xB7  ", lat.c_str());
-            } else {
-                std::snprintf(head, sizeof(head), "%s", agKindTag(n.kind));
+            case 3: {
+                const ToolRowDetail d = splitToolRowDetail(a.detail);
+                Step& s = pushStep(t, 0, StepKind::Tool, d.ts > 0.0 ? d.ts : m.ts);
+                s.title = a.title.empty() ? std::string("tool") : a.title;
+                s.target = a.reason;
+                s.detail = d.args;
+                s.error = d.err;
+                s.status = rowStatus(a);
+                if (s.status == "running" && !m.running) s.status = "stopped";
+                s.durationMs = a.durationMs > 0 ? a.durationMs : -1;
+                ++t.agents[0].toolCount;
+                if (s.status == "failed") ++t.agents[0].failCount;
+                if (d.ts > 0.0) last = std::max(last, d.ts);
+                break;
             }
-            dl->AddText(ImVec2(p0.x + 10.0f * S * z, p0.y + 4.0f * S * z),
-                ImGui::ColorConvertFloat4ToU32(ImVec4(sc[0], sc[1], sc[2], 1.0f)), head);
-            // primary line = title; verbosity 1+ appends the dim detail (target/label/verdict/
-            // thought) with a wider budget at full verbosity (tooltip always carries ALL text)
-            std::string lbl = n.title;
-            if (verbosity >= 1 && !n.detail.empty()) lbl += "  " + n.detail;
-            // The collapse marker is budgeted OUT of the ellipsis so "(+N)" and the failure
-            // badge survive truncation of a long title.
-            std::string tail;
-            if (n.collapsed && hasKids) {
-                tail = "  (+" + std::to_string((int)n.children.size()) + ")";
-                if (n.descFailed) tail += " !";
+            case 1: {
+                Step& s = pushStep(t, 0, StepKind::Context, m.ts);
+                s.title = a.title;
+                s.target = a.reason;
+                if (a.ctxTokens > 0)
+                    s.target += (s.target.empty() ? "~" : "  ~") + std::to_string(a.ctxTokens) + " tok";
+                ++t.ctxCount;
+                break;
             }
-            const size_t maxCh  = (size_t)std::max(10.0f, (verbosity >= 2 ? 72.0f : 34.0f) * z);
-            const size_t budget = maxCh > tail.size() ? maxCh - tail.size() : 1;
-            if (lbl.size() > budget) lbl = lbl.substr(0, budget - 1) + "\xE2\x80\xA6";
-            lbl += tail;
-            dl->AddText(ImVec2(p0.x + 10.0f * S * z, p0.y + nodeH * 0.46f),
-                ImGui::ColorConvertFloat4ToU32(
-                    ImVec4(palette.text[0], palette.text[1], palette.text[2], 1.0f)), lbl.c_str());
-        }
-        if (ImGui::IsMouseHoveringRect(p0, p1)) {
-            ImGui::BeginTooltip();
-            ImGui::TextUnformatted(n.title.c_str());
-            if (!n.detail.empty()) { ImGui::PushTextWrapPos(340.0f * S); ImGui::TextDisabled("%s", n.detail.c_str()); ImGui::PopTextWrapPos(); }
-            ImGui::TextDisabled("%s%s%s%s", agKindTag(n.kind),
-                n.actor.empty() ? "" : " · ", n.actor.c_str(),
-                n.latencyMs >= 0 ? (" · " + std::to_string(n.latencyMs) + " ms").c_str() : "");
-            if (hidFail)
-                ImGui::TextDisabled("a step inside this collapsed branch failed");
-            if (!n.refId.empty())
-                ImGui::TextDisabled("click to inspect this sub-agent");
-            ImGui::EndTooltip();
-            // Tapping a spawn or its execution root selects the docked inspector.
-            if (!n.refId.empty() && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-                ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left, 0.0f);
-                bool overToggle = false;
-                if (hasKids && z > 0.5f) {
-                    ImVec2 tg0(p1.x - 20.0f * S * z, p0.y + (nodeH - 16.0f * S * z) * 0.5f);
-                    ImVec2 tg1(tg0.x + 16.0f * S * z, tg0.y + 16.0f * S * z);
-                    overToggle = ImGui::IsMouseHoveringRect(tg0, tg1);
+            case 9: {
+                if (a.status != "fail") break;   // only failed provider attempts are steps
+                Step& s = pushStep(t, 0, StepKind::Retry, m.ts);
+                s.title = a.title;
+                s.error = a.reason;
+                s.detail = a.detail;
+                s.status = "retry";
+                s.durationMs = a.durationMs > 0 ? a.durationMs : -1;
+                break;
+            }
+            case 17: {
+                StepKind k = StepKind::Event;
+                if (a.title.rfind("Compact", 0) == 0) k = StepKind::Compaction;
+                else if (a.title.rfind("Retry", 0) == 0 || a.title.rfind("Fallback", 0) == 0)
+                    k = StepKind::Retry;
+                Step& s = pushStep(t, 0, k, m.ts);
+                s.title = a.title;
+                s.target = a.reason;
+                s.status = rowStatus(a);
+                if (s.status == "running" && !m.running) s.status = "stopped";
+                if (s.status == "failed") s.error = a.detail;
+                break;
+            }
+            case 19: {
+                const nlohmann::json meta = nlohmann::json::parse(a.detail, nullptr, false);
+                if (!meta.is_object() || !meta.contains("delegates") ||
+                    !meta["delegates"].is_array())
+                    break;
+                for (const auto& dlg : meta["delegates"]) {
+                    if (!dlg.is_object()) continue;
+                    const std::string id = "transcript:" + std::to_string(delegate++);
+                    const int ci = ensureAgent(t, id, 0, m.ts);
+                    if (ci == 0) break;
+                    Agent& c = t.agents[(size_t)ci];
+                    c.name = jstr(dlg, "role");
+                    c.brief = jstr(dlg, "brief");
+                    c.status = m.running ? "running" : "done";
+                    Step& s = pushStep(t, 0, StepKind::Spawn, m.ts);
+                    s.spanId = id;
+                    s.title = "Spawned " + (c.name.empty() ? std::string("sub-agent") : c.name);
+                    s.target = c.brief;
+                    s.status = m.running ? "running" : "ok";
                 }
-                if (!overToggle && dd.x * dd.x + dd.y * dd.y < (4.0f * S) * (4.0f * S))
-                    selectAgent(st, n.refId, n.actor);
+                break;
+            }
+            default:
+                if (a.stage == "__stop_meta__" && (!a.detail.empty() || !a.title.empty())) {
+                    Step& s = pushStep(t, 0, StepKind::Error, m.ts);
+                    s.title = a.title.empty() ? std::string("Stopped") : "Stopped: " + a.title;
+                    s.error = a.detail;
+                    s.status = "failed";
+                }
+                break;
             }
         }
+        if (!timelineHasInlineProse(m) && !blankText(m.text)) {
+            Step& s = pushStep(t, 0, StepKind::Reply, m.ts);
+            s.detail = capText(m.text, kMaxStepText);
+        }
+        failed = m.errKind != ERR_NONE && m.errKind != ERR_PARTIAL;
+        if (failed) {
+            Step& s = pushStep(t, 0, StepKind::Error, m.ts);
+            s.title = m.errorHuman.empty() ? std::string("Run failed") : m.errorHuman;
+            s.error = m.errorFull.empty() ? m.text : m.errorFull;
+            s.status = "failed";
+        }
     }
+    for (Agent& a : t.agents) if (!running) closeOpen(a);
+    Agent& main = t.agents[0];
+    main.status = running ? "running" : failed ? "failed" : main.steps.empty() ? "idle" : "done";
+    main.startTs = first;
+    main.endTs = running ? 0.0 : last;
+    t.selAgent = findAgent(t, keepSel) >= 0 ? keepSel : std::string("main");
+}
 
-    // The hint floats over the canvas, so without a backing it overprints whatever node card
-    // happens to sit in the bottom-left corner (it collided with a `tool` card in the aiws
-    // capture). Wash a plate behind it, the way the graph tab haloes its labels.
+static size_t transcriptSig(const std::vector<ChatMsg>& msgs) {
+    size_t h = msgs.size();
+    for (const ChatMsg& m : msgs)
+        h = h * 1315423911u ^ (m.activity.size() * 131u + m.text.size() * 7u +
+                               (m.running ? 3u : 0u) + (size_t)m.errKind);
+    return h;
+}
+
+// The trace to show: live events when any were recorded, else the transcript reconstruction.
+static TraceStore* activeTrace(AppState& st, const std::string& convId, bool* fromTranscript) {
+    *fromTranscript = false;
+    auto it = s_traces.find(convId);
+    if (it != s_traces.end() && it->second.hasContent()) return &it->second;
+    const std::vector<ChatMsg>* msgs = conversationMsgs(st, convId);
+    if (!msgs || msgs->empty()) return nullptr;
+    FallbackTrace& fb = s_fallback[convId];
+    const size_t sig = transcriptSig(*msgs);
+    const double now = ImGui::GetTime();
+    const bool live = !msgs->empty() && msgs->back().running;
+    if (!fb.built || fb.sig != sig || (live && now - fb.builtAt > 1.0)) {
+        buildFallback(*msgs, fb.store);
+        fb.sig = sig;
+        fb.builtAt = now;
+        fb.built = true;
+    }
+    if (!fb.store.hasContent()) return nullptr;
+    *fromTranscript = true;
+    return &fb.store;
+}
+
+static const char* kindLabel(StepKind k) {
+    switch (k) {
+        case StepKind::Thinking:    return "Thinking";
+        case StepKind::Reply:       return "Reply";
+        case StepKind::Tool:        return "Tool";
+        case StepKind::User:        return "Prompt";
+        case StepKind::Steer:       return "Steer";
+        case StepKind::Spawn:
+        case StepKind::SubagentEnd: return "Sub-agent";
+        case StepKind::Context:     return "Context";
+        case StepKind::Compaction:  return "Compaction";
+        case StepKind::Retry:       return "Retry";
+        case StepKind::Plan:        return "Plan";
+        case StepKind::Note:        return "Note";
+        case StepKind::Error:       return "Error";
+        case StepKind::RunStart:
+        case StepKind::RunEnd:      return "Run";
+        default:                    return "Event";
+    }
+}
+
+static kit::Tone kindTone(const Step& s) {
+    if (s.status == "failed") return kit::Tone::Err;
+    switch (s.kind) {
+        case StepKind::Tool:        return kit::Tone::Accent;
+        case StepKind::Thinking:
+        case StepKind::Plan:
+        case StepKind::Spawn:
+        case StepKind::SubagentEnd: return kit::Tone::Info;
+        case StepKind::User:
+        case StepKind::Steer:       return kit::Tone::Accent;
+        case StepKind::Compaction:
+        case StepKind::Retry:       return kit::Tone::Warn;
+        case StepKind::Error:       return kit::Tone::Err;
+        case StepKind::RunEnd:      return s.status == "ok" ? kit::Tone::Ok : kit::Tone::Neutral;
+        default:                    return kit::Tone::Neutral;
+    }
+}
+
+// A status glyph for steps that have an outcome; text blocks only show one while streaming.
+static bool stepGlyph(const Step& s, kit::Status* out) {
+    const std::string& v = s.status;
+    if (v.empty()) return false;
+    if (v == "running")   *out = kit::Status::Running;
+    else if (v == "ok")   *out = kit::Status::Done;
+    else if (v == "failed") *out = kit::Status::Failed;
+    else if (v == "retry")  *out = kit::Status::Retry;
+    else                  *out = kit::Status::Skipped;   // skipped / stopped / cancelled
+    return true;
+}
+
+static kit::Status agentGlyph(const std::string& status) {
+    if (status == "running") return kit::Status::Running;
+    if (status == "done")    return kit::Status::Done;
+    if (status == "failed")  return kit::Status::Failed;
+    if (status == "pending" || status == "idle") return kit::Status::Pending;
+    return kit::Status::Skipped;   // cancelled / stopped
+}
+
+// "42s" / "12m" / "1h 05m" — the tree's compact elapsed readout.
+static std::string compactElapsed(double seconds) {
+    const long s = (long)std::max(0.0, seconds);
+    char buf[32];
+    if (s < 60)        std::snprintf(buf, sizeof(buf), "%lds", s);
+    else if (s < 3600) std::snprintf(buf, sizeof(buf), "%ldm", s / 60);
+    else               std::snprintf(buf, sizeof(buf), "%ldh %02ldm", s / 3600, (s % 3600) / 60);
+    return buf;
+}
+
+static std::string stepDuration(const Step& s, double now) {
+    if (s.status == "running" && s.ts > 0.0 &&
+        (s.kind == StepKind::Tool || s.kind == StepKind::Spawn || s.kind == StepKind::Compaction))
+        return kit::fmtDuration(now - s.ts);
+    if (s.durationMs < 0) return std::string();
+    if (s.durationMs < 1000) return std::to_string(s.durationMs) + " ms";
+    return kit::fmtDuration(s.durationMs / 1000.0);
+}
+
+static std::string clockTime(double ts) {
+    if (ts <= 0.0) return std::string();
+    const time_t tt = (time_t)ts;
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &tt);
+#else
+    localtime_r(&tt, &tm);
+#endif
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", &tm);
+    return buf;
+}
+
+static std::string agentLabel(const Agent& a) {
+    if (!a.name.empty()) return a.name;
+    return a.id == "main" ? std::string("Main agent") : std::string("Sub-agent");
+}
+
+// Display status: any agent still marked running after its run ended was interrupted (no event
+// can arrive for it once the run's stream is gone).
+static std::string agentDisplayStatus(const Agent& a, bool convRunning, bool fromTranscript) {
+    if (!fromTranscript && a.status == "running" && !convRunning) return "stopped";
+    if (a.status == "idle" && !a.steps.empty()) return "done";
+    return a.status.empty() ? std::string("idle") : a.status;
+}
+
+static AgentTraceStep stepView(const std::string& convId, const Agent& a, const Step& s) {
+    AgentTraceStep v;
+    v.uid = s.uid;
+    v.rev = s.rev;
+    v.convId = convId;
+    v.agent = agentLabel(a);
+    v.kind = s.kind == StepKind::Tool ? "Tool call" : kindLabel(s.kind);
+    v.title = s.title;
+    if (v.title.empty() && (s.kind == StepKind::Thinking || s.kind == StepKind::Reply))
+        v.title = oneLine(s.detail, 120);
+    v.target = s.target;
+    v.detail = foldToAtlasGlyphs(s.detail);
+    v.error = foldToAtlasGlyphs(s.error);
+    v.status = s.status;
+    v.durationMs = s.durationMs;
+    v.ts = s.ts;
+    return v;
+}
+
+static ImU32 inkU32(const ImVec4& c) { return ImGui::ColorConvertFloat4ToU32(c); }
+
+// Pre-order walk of the agent tree: (agent index, depth). Unknown parents attach to main.
+static void treeOrder(const TraceStore& t, std::vector<std::pair<int, int>>& out) {
+    out.clear();
+    std::vector<std::vector<int>> kids(t.agents.size());
+    for (size_t i = 1; i < t.agents.size(); ++i) {
+        int p = findAgent(t, t.agents[i].parent);
+        if (p < 0 || p == (int)i) p = 0;
+        kids[(size_t)p].push_back((int)i);
+    }
+    std::vector<char> seen(t.agents.size(), 0);
+    std::vector<std::pair<int, int>> stack{{0, 0}};
+    while (!stack.empty()) {
+        const auto cur = stack.back();
+        stack.pop_back();
+        if (seen[(size_t)cur.first]) continue;
+        seen[(size_t)cur.first] = 1;
+        out.push_back(cur);
+        const auto& k = kids[(size_t)cur.first];
+        for (auto it = k.rbegin(); it != k.rend(); ++it) stack.push_back({*it, cur.second + 1});
+    }
+    // Anything left out by a malformed parent cycle still gets a row.
+    for (size_t i = 0; i < t.agents.size(); ++i)
+        if (!seen[i]) out.push_back({(int)i, 1});
+}
+
+static void drawAgentRow(AppState& st, TraceStore& t, int ai, int depth, bool convRunning,
+                         bool fromTranscript, const AdaptiveSurface& surf,
+                         AgentTraceSelectAgentFn onAgent) {
+    const Agent& a = t.agents[(size_t)ai];
+    const float lineH = ImGui::GetTextLineHeight();
+    const float h = lineH + kit::padY() * 2.0f;
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float w = std::max(ImGui::GetContentRegionAvail().x, ui::metrics::stroke(1.0f));
+    ImGui::PushID(ai);
+    const bool clicked = kit::rowBegin(a.id.c_str(), h, t.selAgent == a.id);
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float gap = ui::metrics::U(1.5f);
+    float x = p0.x + kit::padX() + depth * ui::metrics::U(4.0f);
+    const float y = p0.y + kit::padY();
+    const float right = p0.x + w - kit::padX();
+
+    const std::string status = agentDisplayStatus(a, convRunning, fromTranscript);
+    kit::statusGlyph(dl, ImVec2(x + lineH * 0.5f, y + lineH * 0.5f), lineH * 0.30f,
+                     agentGlyph(status), surf);
+    x += lineH + gap;
+
+    const double now = chatNowEpoch();
+    const double end = (status == "running" || a.endTs <= 0.0) ? now : a.endTs;
+    std::string meta;
+    if (a.startTs > 0.0) meta += "  \xE2\x80\xA2  " + compactElapsed(end - a.startTs);
+    meta += "  \xE2\x80\xA2  " + std::to_string(a.toolCount) +
+            (a.toolCount == 1 ? " tool" : " tools");
+    std::string failTxt;
+    if (a.failCount > 0) failTxt = "  \xE2\x80\xA2  " + std::to_string(a.failCount) + " failed";
+    const std::string statusTxt = "  \xE2\x80\xA2  " + status;
+
+    const float wStatus = ImGui::CalcTextSize(statusTxt.c_str()).x;
+    const float wMeta = ImGui::CalcTextSize(meta.c_str()).x;
+    const float wFail = ImGui::CalcTextSize(failTxt.c_str()).x;
+    const std::string name = kit::elide(agentLabel(a).c_str(),
+        std::max(right - x - wStatus - wMeta - wFail, ui::metrics::U(6.0f)));
+    dl->AddText(ImVec2(x, y), inkU32(surf.textPrimary), name.c_str());
+    x += ImGui::CalcTextSize(name.c_str()).x;
+    const kit::Tone tone = kit::statusTone(agentGlyph(status));
+    dl->AddText(ImVec2(x, y), inkU32(kit::toneOn(tone, surf)), statusTxt.c_str());
+    x += wStatus;
+    if (x + wMeta <= right) {
+        dl->AddText(ImVec2(x, y), inkU32(surf.textSecondary), meta.c_str());
+        x += wMeta;
+    }
+    if (!failTxt.empty() && x + wFail <= right)
+        dl->AddText(ImVec2(x, y), inkU32(kit::toneOn(kit::Tone::Err, surf)), failTxt.c_str());
+    kit::rowEnd();
+    ImGui::PopID();
+
+    if (hovered) {
+        std::string tip = agentLabel(a);
+        if (!a.brief.empty()) tip += "\n" + a.brief;
+        if (!a.model.empty()) tip += "\nModel: " + a.model;
+        if (ai != 0) tip += "\nClick to show its steps and inspect it";
+        ImGui::SetTooltip("%s", tip.c_str());
+    }
+    if (clicked) {
+        if (t.selAgent != a.id) chatLogJumpToBottom(kTimelineRegion);
+        t.selAgent = a.id;
+        if (ai != 0 && onAgent) onAgent(st, a.id, a.name);
+    }
+}
+
+static void drawStepRow(AppState& st, const std::string& convId, const Agent& a, const Step& s,
+                        float h, bool selected, const AdaptiveSurface& surf,
+                        AgentTraceSelectStepFn onStep) {
+    const float lineH = ImGui::GetTextLineHeight();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float w = std::max(ImGui::GetContentRegionAvail().x, ui::metrics::stroke(1.0f));
+    char id[32];
+    std::snprintf(id, sizeof(id), "s%llu", s.uid);
+    const bool clicked = kit::rowBegin(id, h, selected);
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float gap = ui::metrics::U(1.5f);
+    const float x0 = p0.x + kit::padX();
+    const float y1 = p0.y + kit::padY();
+    const float y2 = y1 + lineH + ui::metrics::U(0.5f);
+    const float right = p0.x + w - kit::padX();
+    const double now = chatNowEpoch();
+
+    kit::Status gs;
+    if (stepGlyph(s, &gs))
+        kit::statusGlyph(dl, ImVec2(x0 + lineH * 0.5f, y1 + lineH * 0.5f), lineH * 0.30f, gs, surf);
+    float x = x0 + lineH + gap;
+
+    // Line 1: kind label, title, duration.
+    const kit::Tone tone = kindTone(s);
+    const char* label = kindLabel(s.kind);
+    dl->AddText(ImVec2(x, y1), inkU32(kit::toneOn(tone, surf)), label);
+    x += ImGui::CalcTextSize(label).x + gap * 2.0f;
+    const std::string dur = stepDuration(s, now);
+    float titleRight = right;
+    if (!dur.empty()) {
+        const float dw = ImGui::CalcTextSize(dur.c_str()).x;
+        dl->AddText(ImVec2(right - dw, y1), inkU32(surf.textSecondary), dur.c_str());
+        titleRight = right - dw - gap * 2.0f;
+    }
+    const bool textKind = s.kind == StepKind::Thinking || s.kind == StepKind::Reply ||
+                          s.kind == StepKind::User || s.kind == StepKind::Steer;
+    std::string title = s.title;
+    if (title.empty() && textKind) title = oneLine(s.detail);
+    const std::string t1 = kit::elide(title.c_str(), std::max(titleRight - x, gap));
+    dl->AddText(ImVec2(x, y1), inkU32(surf.textPrimary), t1.c_str());
+
+    // Line 2: error / target / preview, clock time on the right.
+    const std::string clock = clockTime(s.ts);
+    float secondRight = right;
+    if (!clock.empty()) {
+        const float cw = ImGui::CalcTextSize(clock.c_str()).x;
+        dl->AddText(ImVec2(right - cw, y2), inkU32(surf.textTertiary), clock.c_str());
+        secondRight = right - cw - gap * 2.0f;
+    }
+    std::string second;
+    ImVec4 secondInk = surf.textSecondary;
+    if (!s.error.empty() && s.status != "ok") {
+        second = oneLine(s.error);
+        secondInk = kit::toneOn(kit::Tone::Err, surf);
+    } else if (textKind) {
+        const int words = wordCount(s.detail);
+        second = std::to_string(words) + (words == 1 ? " word" : " words");
+        if (s.open) second += " \xC2\xB7 streaming";
+        if (s.kind == StepKind::User || s.kind == StepKind::Steer) second = "You \xC2\xB7 " + second;
+    } else if (!s.target.empty()) {
+        second = s.target;
+    } else if (!s.detail.empty()) {
+        second = oneLine(s.detail);
+    } else if (s.status == "running") {
+        second = "in progress";
+    }
+    const float x2 = x0 + lineH + gap;
+    if (!second.empty()) {
+        const std::string t2 = kit::elide(second.c_str(), std::max(secondRight - x2, gap));
+        dl->AddText(ImVec2(x2, y2), inkU32(secondInk), t2.c_str());
+    }
+    kit::rowEnd();
+    if (hovered) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (t1 != title) ImGui::SetTooltip("%s", title.c_str());
+    }
+    if (clicked && onStep) onStep(st, stepView(convId, a, s));
+}
+
+}  // namespace
+
+void drawAgentTrace(AppState& st, const std::string& convId, AgentTraceSelectAgentFn onAgent,
+                    AgentTraceSelectStepFn onStep, unsigned long long selectedStepUid) {
+    bool fromTranscript = false;
+    TraceStore* tp = activeTrace(st, convId, &fromTranscript);
+    const bool convRunning = st.convRunning(convId);
+    if (!tp) {
+        kit::emptyState("activity", convRunning ? "Agent is starting" : "No steps yet",
+                        "The main agent, its sub-agents and every step they take appear here "
+                        "as the run streams.");
+        return;
+    }
+    TraceStore& t = *tp;
+    if (!fromTranscript) syncUserMarkers(st, convId, t);
+    int sel = findAgent(t, t.selAgent);
+    if (sel < 0) { t.selAgent = "main"; sel = 0; }
+
+    // ---- agent tree ----
+    static std::vector<std::pair<int, int>> order;
+    treeOrder(t, order);
+    const float spacingY = ImGui::GetStyle().ItemSpacing.y;
+    const float agentRowH = ImGui::GetTextLineHeight() + kit::padY() * 2.0f;
+    const float avail = ImGui::GetContentRegionAvail().y;
+    const float treeContent = order.size() * (agentRowH + spacingY) + ImGui::GetStyle().WindowPadding.y * 2.0f;
+    const float treeH = std::min(treeContent, std::max(avail * 0.34f, (agentRowH + spacingY) * 2.0f));
+    ImGui::BeginChild("##trace_tree", ImVec2(0, treeH), ImGuiChildFlags_AlwaysUseWindowPadding,
+                      ImGuiWindowFlags_NoScrollbar);
     {
-        const char* hint = "drag to pan · wheel to zoom · [-] collapse a branch";
-        const ImVec2 hs = ImGui::CalcTextSize(hint);
-        const ImVec2 hp(cMin.x + 8.0f * S, cMax.y - ImGui::GetTextLineHeight() - 6.0f * S);
-        dl->AddRectFilled(ImVec2(hp.x - 4.0f * S, hp.y - 2.0f * S),
-                          ImVec2(hp.x + hs.x + 4.0f * S, hp.y + hs.y + 2.0f * S),
-                          ui::Palette::toU32(palette.panelBg), 3.0f * S);
-        dl->AddText(hp,
-            ImGui::ColorConvertFloat4ToU32(
-                ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                       palette.textDisabled[2], 0.9f)),
-            hint);
+        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+        const AdaptiveSurface& surf = adaptivePanel(panelId("ai_ws_trace_tree"),
+            ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), GlassGroup::Global);
+        for (const auto& [ai, depth] : order)
+            drawAgentRow(st, t, ai, depth, convRunning, fromTranscript, surf, onAgent);
+        drawWindowPillScrollbarV(surf);
     }
-
-    dl->PopClipRect();
     ImGui::EndChild();
+
+    // ---- selected agent's step timeline ----
+    sel = std::max(findAgent(t, t.selAgent), 0);
+    const Agent& a = t.agents[(size_t)sel];
+    const std::string header = "Steps \xC2\xB7 " + agentLabel(a);
+    kit::sectionHeader(header.c_str(), nullptr,
+                       fromTranscript ? "from saved transcript" : nullptr,
+                       (int)std::min<long long>(a.dropped + (long long)a.steps.size(), 1 << 30));
+    ImGui::BeginChild("##trace_timeline", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding,
+                      ImGuiWindowFlags_NoScrollbar);
+    const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+    const AdaptiveSurface& surf = adaptivePanel(panelId("ai_ws_trace_timeline"),
+        ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), GlassGroup::Global);
+    const float lineH = ImGui::GetTextLineHeight();
+    const float stepH = lineH * 2.0f + ui::metrics::U(0.5f) + kit::padY() * 2.0f;
+    const int offset = a.dropped > 0 ? 1 : 0;
+    const int count = (int)a.steps.size() + offset;
+    if (count == 0) {
+        kit::dimText("No steps recorded for this agent yet.");
+    } else {
+        ImGuiListClipper clip;
+        clip.Begin(count, stepH + spacingY);
+        while (clip.Step()) {
+            for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
+                if (i < offset) {
+                    const std::string earlier = kit::fmtCount(a.dropped) +
+                        (a.dropped == 1 ? " earlier step" : " earlier steps") +
+                        " not shown (oldest dropped)";
+                    kit::rowBegin("##earlier", stepH, false);
+                    ImGui::GetWindowDrawList()->AddText(
+                        ImVec2(ImGui::GetCursorScreenPos().x + lineH + ui::metrics::U(1.5f),
+                               ImGui::GetCursorScreenPos().y + lineH * 0.5f),
+                        inkU32(surf.textTertiary), earlier.c_str());
+                    kit::rowEnd();
+                    continue;
+                }
+                const Step& s = a.steps[(size_t)(i - offset)];
+                drawStepRow(st, convId, a, s, stepH, s.uid == selectedStepUid, surf, onStep);
+            }
+        }
+        clip.End();
+    }
+    chatLogStickToBottom(kTimelineRegion);
+    drawWindowPillScrollbarV(surf);
+    ImGui::EndChild();
+    chatDrawJumpToLatest(kTimelineRegion, wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
+}
+
+bool agentTraceRefreshStep(AppState& st, AgentTraceStep& io) {
+    if (io.uid == 0) return false;
+    bool fromTranscript = false;
+    TraceStore* t = activeTrace(st, io.convId, &fromTranscript);
+    if (!t) return false;
+    for (const Agent& a : t->agents) {
+        // uids grow along each deque except around inserted user markers: scan from the back.
+        for (auto it = a.steps.rbegin(); it != a.steps.rend(); ++it) {
+            if (it->uid != io.uid) continue;
+            if (it->rev != io.rev) io = stepView(io.convId, a, *it);
+            return true;
+        }
+    }
+    return false;
+}
+
+void agentTraceSubagents(AppState& st, const std::string& convId,
+                         std::vector<AgentTraceAgent>& out) {
+    out.clear();
+    bool fromTranscript = false;
+    TraceStore* t = activeTrace(st, convId, &fromTranscript);
+    if (!t || t->agents.size() < 2) return;
+    const bool convRunning = st.convRunning(convId);
+    static std::vector<std::pair<int, int>> order;
+    treeOrder(*t, order);
+    out.reserve(order.size());
+    for (const auto& entry : order) {
+        if (entry.first == 0) continue;
+        const Agent& a = t->agents[(size_t)entry.first];
+        AgentTraceAgent v;
+        v.id = a.id;
+        v.parent = a.parent;
+        v.name = agentLabel(a);
+        v.brief = a.brief;
+        v.model = a.model;
+        v.note = a.note;
+        v.status = agentDisplayStatus(a, convRunning, fromTranscript);
+        v.startTs = a.startTs;
+        v.endTs = a.endTs;
+        v.toolCount = a.toolCount;
+        v.failCount = a.failCount;
+        if (!a.steps.empty()) {
+            const Step& s = a.steps.back();
+            std::string title = s.title;
+            if (title.empty()) title = oneLine(s.detail, 120);
+            v.lastStep = s.kind == StepKind::Tool ? std::string("Tool call") : kindLabel(s.kind);
+            if (!title.empty()) v.lastStep += " \xC2\xB7 " + title;
+            v.lastStepTs = s.ts;
+        }
+        out.push_back(std::move(v));
+    }
+}
+
+bool agentTraceSelectAgent(AppState& st, const std::string& convId, const std::string& agentId) {
+    bool fromTranscript = false;
+    TraceStore* t = activeTrace(st, convId, &fromTranscript);
+    if (!t || findAgent(*t, agentId) < 0) return false;
+    if (t->selAgent != agentId) chatLogJumpToBottom(kTimelineRegion);
+    t->selAgent = agentId;
+    return true;
 }
 
 }  // namespace ui

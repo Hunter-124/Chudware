@@ -41,23 +41,11 @@ void saveAgentInt(const char* key, int v) {
     });
 }
 
-}  // namespace
-
-int  aiUiVerbosity()                 { return loadAgentInt("ui_verbosity", 2, 0, 2); }
-void setAiUiVerbosity(int v)         { if (v < 0) v = 0; if (v > 2) v = 2; saveAgentInt("ui_verbosity", v); }
-
-bool aiFollowActiveSession()         { return loadAgentInt("ui_follow_session", 1, 0, 1) != 0; }
-void setAiFollowActiveSession(bool on) { saveAgentInt("ui_follow_session", on ? 1 : 0); }
-
-bool aiActiveWorkPreviews()          { return loadAgentInt("ui_active_work_previews", 1, 0, 1) != 0; }
-void setAiActiveWorkPreviews(bool on){ saveAgentInt("ui_active_work_previews", on ? 1 : 0); }
-
-// ---- chat transcript display -----------------------------------------------------------
-// Unlike the knobs above (read a handful of times per frame from ONE view), these are read
-// once per activity row per frame — a transcript with 60 rows would do 60 config.json opens
-// every frame through loadAgentInt. Cache the value on first read and let the setter be the
-// single invalidation point; nothing else writes these keys.
-namespace {
+// Every pref here is read from per-frame draw code (the workspace views, the Settings modal and,
+// for the chat-display knobs, once per activity row), so each goes through a cached accessor:
+// one config.json read per process, with the setter as the single invalidation point. Nothing
+// else writes these keys, and because both AI > Options and Settings > AI read the same cache,
+// a change made in one surface shows in the other on the next frame.
 struct CachedInt {
     const char* key;
     int def, lo, hi;
@@ -71,18 +59,36 @@ struct CachedInt {
     void set(int v) {
         if (v < lo) v = lo;
         if (v > hi) v = hi;
+        if (loaded && v == value) return;
         value = v;
         loaded = true;
         saveAgentInt(key, v);
     }
 };
 
+CachedInt g_verbosity    {"ui_verbosity",            2, 0, 2};
+CachedInt g_follow       {"ui_follow_session",       1, 0, 1};
+CachedInt g_previews     {"ui_active_work_previews", 1, 0, 1};
+CachedInt g_aiView       {"ui_ai_view",              0, 0, 5};
 CachedInt g_toolDetail   {"ui_chat_tool_detail",   1, 0, 2};
 CachedInt g_collapseAnim {"ui_chat_collapse_anim", 1, 0, 1};
 CachedInt g_groupCalls   {"ui_chat_group_calls",   1, 0, 1};
 CachedInt g_showRenders  {"ui_chat_show_renders",  1, 0, 1};
 CachedInt g_humanizeIds  {"ui_chat_humanize_ids",  1, 0, 1};
+
 }  // namespace
+
+int  aiUiVerbosity()                   { return g_verbosity.get(); }
+void setAiUiVerbosity(int v)           { g_verbosity.set(v); }
+
+bool aiFollowActiveSession()           { return g_follow.get() != 0; }
+void setAiFollowActiveSession(bool on) { g_follow.set(on ? 1 : 0); }
+
+bool aiActiveWorkPreviews()            { return g_previews.get() != 0; }
+void setAiActiveWorkPreviews(bool on)  { g_previews.set(on ? 1 : 0); }
+
+int  aiWorkspaceView()                 { return g_aiView.get(); }
+void setAiWorkspaceView(int v)         { g_aiView.set(v); }
 
 int  chatToolDetail()                { return g_toolDetail.get(); }
 void setChatToolDetail(int v)        { g_toolDetail.set(v); }

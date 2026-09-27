@@ -28,6 +28,19 @@ class RpcFrameState:
     def __init__(self) -> None:
         self._calls: OrderedDict[str, dict[str, str]] = OrderedDict()
         self._terminals: OrderedDict[str, None] = OrderedDict()
+        self._subagents: OrderedDict[str, str] = OrderedDict()
+
+    def remember_subagent(self, subagent_id: str, parent_tool_call_id: str) -> None:
+        """Bind a task sub-agent to the parent ``task`` call that spawned it."""
+        if not subagent_id or not parent_tool_call_id:
+            return
+        self._subagents[subagent_id] = parent_tool_call_id
+        self._subagents.move_to_end(subagent_id)
+        if len(self._subagents) > _MAX_CALLS:
+            self._subagents.popitem(last=False)
+
+    def subagent_parent(self, subagent_id: str) -> str:
+        return self._subagents.get(subagent_id, "")
 
     def remember(self, call_id: str, data: Mapping[str, Any]) -> None:
         if not call_id or call_id in self._terminals:
@@ -847,6 +860,85 @@ def _remember_tool_call(tool_call: Any, state: RpcFrameState | None) -> None:
     state.remember(call_id, normalized)
 
 
+_SUBAGENT_STATUS = {
+    "pending": "running",
+    "started": "running",
+    "running": "running",
+    "completed": "done",
+    "failed": "fail",
+    "aborted": "fail",
+}
+_SUBAGENT_TOOL_EVENTS = frozenset(
+    {"tool_execution_start", "tool_execution_update", "tool_execution_end"}
+)
+
+
+def _subagent_frame(
+    kind: str,
+    frame: Mapping[str, Any],
+    ctx: Mapping[str, Any],
+    state: RpcFrameState | None,
+) -> list[tuple[str, dict[str, Any]]] | None:
+    """Map Chudcode's ``subagent_*`` subscription frames with their lineage.
+
+    ``subagent_lifecycle``/``subagent_progress`` upsert ONE ``sub_run`` per task
+    sub-agent (id = the sub-agent id, parent = the spawning ``task`` call).
+    ``subagent_event`` wraps the sub-agent's own AgentSessionEvent: its tool
+    frames map exactly like the parent's, stamped with ``subagent_id`` and the
+    ``task`` call as ``parent_id`` so the execution trace nests them; its text,
+    thinking and lifecycle frames are the sub-agent's private transcript and
+    must never render as the parent's reply. ``None`` falls back to the generic
+    mapping for a shape this does not recognize.
+    """
+    payload = frame.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    if kind == "subagent_event":
+        subagent_id = _str(payload, "id", limit=160)
+        inner = payload.get("event")
+        if not subagent_id or not isinstance(inner, Mapping):
+            return None
+        if _name(inner.get("type")) not in _SUBAGENT_TOOL_EVENTS:
+            return []
+        parent = state.subagent_parent(subagent_id) if state is not None else ""
+        mapped = map_rpc_frame(inner, ctx, state)
+        for _kind, body in mapped:
+            body["subagent_id"] = subagent_id
+            if parent:
+                body["parent_id"] = parent
+        return mapped
+    if kind == "subagent_progress":
+        progress = payload.get("progress")
+        if not isinstance(progress, Mapping):
+            return None
+        body: Mapping[str, Any] = {**payload, **progress}
+    else:
+        body = payload
+    subagent_id = _str(body, "id", limit=160)
+    if not subagent_id:
+        return None
+    parent = _str(body, "parentToolCallId", "parent_tool_call_id", limit=160)
+    if state is not None:
+        state.remember_subagent(subagent_id, parent)
+    raw_status = _name(_str(body, "status"))
+    work: dict[str, Any] = {
+        "subagent_id": subagent_id,
+        "purpose": _str(body, "description", limit=240)
+        or _str(body, "agent", limit=120)
+        or "Subagent",
+    }
+    if parent:
+        work["parent_tool_call_id"] = parent
+    session_file = _str(body, "sessionFile", limit=_MAX_PREVIEW)
+    if session_file:
+        work["sessionFile"] = session_file
+    detail = "aborted" if raw_status == "aborted" else _str(body, "lastIntent")
+    if detail:
+        work["detail"] = detail
+    return [_subrun(work, ctx, kind, _SUBAGENT_STATUS.get(raw_status, "running"))]
+
+
+
 def map_rpc_frame(
     frame: Mapping[str, Any],
     context: Mapping[str, Any] | None = None,
@@ -856,6 +948,11 @@ def map_rpc_frame(
     ctx: Mapping[str, Any] = context if isinstance(context, Mapping) else {}
     if not isinstance(frame, Mapping):
         return [_unknown("invalid_frame", {"value": _bounded(frame)}, ctx)]
+    kind = _name(frame.get("type"))
+    if kind in {"subagent_event", "subagent_lifecycle", "subagent_progress"}:
+        mapped = _subagent_frame(kind, frame, ctx, state)
+        if mapped is not None:
+            return mapped
     event, data = _flatten(frame)
     if event in {
         "message_start",

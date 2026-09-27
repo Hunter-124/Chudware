@@ -527,6 +527,130 @@ std::string newConvId(AppState& st) {
         nullptr);
 }
 
+// ---- session titles -------------------------------------------------------------------------
+// A session starts as "Session N" and takes its name from its first prompt; a name the user
+// typed (Rename) is never overwritten. N comes from a monotonic counter persisted in index.json
+// ("session_seq", additive — older builds ignore it), so deleting a session can never make two
+// live sessions share a number the way conversations.size()+1 did. The user-named flag rides
+// in each session file as "title_user".
+static int s_sessionSeq = 0;                  // highest "Session N" handed out
+static std::set<std::string> s_userTitled;    // conversation ids the user named
+
+// "Session 12" -> 12, anything else -> 0.
+static int sessionTitleOrdinal(const std::string& t) {
+    static const std::string kPrefix = "Session ";
+    if (t.size() <= kPrefix.size() || t.compare(0, kPrefix.size(), kPrefix) != 0) return 0;
+    int n = 0;
+    for (size_t i = kPrefix.size(); i < t.size(); ++i) {
+        if (!std::isdigit((unsigned char)t[i]) || n > 100000000) return 0;
+        n = n * 10 + (t[i] - '0');
+    }
+    return n;
+}
+
+// A title nobody chose: empty, the placeholders, or the numbered defaults (current
+// "Session N" and the legacy "Chat N").
+static bool isDefaultSessionTitle(const std::string& t) {
+    if (t.empty() || t == "Chat" || t == "Session") return true;
+    if (sessionTitleOrdinal(t) > 0) return true;
+    static const std::string kLegacy = "Chat ";
+    if (t.size() <= kLegacy.size() || t.compare(0, kLegacy.size(), kLegacy) != 0) return false;
+    return std::all_of(t.begin() + (long)kLegacy.size(), t.end(),
+                       [](char ch) { return std::isdigit((unsigned char)ch) != 0; });
+}
+
+static std::string nextSessionTitle() { return "Session " + std::to_string(++s_sessionSeq); }
+
+// Collapse whitespace runs (incl. newlines) to single spaces and trim both ends.
+static std::string collapseWhitespace(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    bool pendingSpace = false;
+    for (char ch : in) {
+        if (std::isspace((unsigned char)ch)) { pendingSpace = !out.empty(); continue; }
+        if (pendingSpace) { out.push_back(' '); pendingSpace = false; }
+        out.push_back(ch);
+    }
+    return out;
+}
+
+// Cut to at most `maxChars` code points, preferring the last word boundary past the halfway
+// mark, and mark the cut with an ellipsis. Never splits a UTF-8 sequence.
+static std::string clipTitle(const std::string& s, size_t maxChars) {
+    size_t chars = 0, cut = 0, lastSpace = std::string::npos;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (((unsigned char)s[i] & 0xC0) == 0x80) continue;  // continuation byte
+        if (chars == maxChars) { cut = i; break; }
+        if (s[i] == ' ' && chars >= maxChars / 2) lastSpace = i;
+        ++chars;
+    }
+    if (cut == 0) return s;  // fits
+    std::string out = s.substr(0, lastSpace != std::string::npos ? lastSpace : cut);
+    while (!out.empty() && (out.back() == ' ' || out.back() == ',' || out.back() == '.' ||
+                            out.back() == ':' || out.back() == ';'))
+        out.pop_back();
+    return out + "\xe2\x80\xa6";
+}
+
+// The title a prompt earns: the typed text only — the "[attached image: …]", "[attached: …]"
+// and "[context: …]" marker lines composer.cpp appends to the user bubble are dropped.
+static std::string sessionTitleFromPrompt(const std::string& prompt) {
+    std::string typed;
+    size_t pos = 0;
+    while (pos <= prompt.size()) {
+        size_t nl = prompt.find('\n', pos);
+        if (nl == std::string::npos) nl = prompt.size();
+        const std::string line = prompt.substr(pos, nl - pos);
+        const size_t lead = line.find_first_not_of(" \t\r");
+        const bool marker = lead != std::string::npos &&
+                            (line.compare(lead, 16, "[attached image:") == 0 ||
+                             line.compare(lead, 10, "[attached:") == 0 ||
+                             line.compare(lead, 9, "[context:") == 0);
+        if (!marker) { typed += line; typed += ' '; }
+        pos = nl + 1;
+    }
+    return clipTitle(collapseWhitespace(typed), 40);
+}
+
+// Returns true when the title changed. Does not mark history dirty: persistChatHistory calls
+// it on the snapshot it is about to write.
+static bool applyAutoTitle(AppState& st, int idx) {
+    if (idx < 0 || idx >= (int)st.conversations.size()) return false;
+    Conversation& c = st.conversations[idx];
+    if (s_userTitled.count(c.id) || !isDefaultSessionTitle(c.title)) return false;
+    const std::vector<ChatMsg>& msgs = (idx == st.activeConv) ? st.chat : c.msgs;
+    for (const ChatMsg& m : msgs) {
+        if (!m.fromUser) continue;
+        std::string t = sessionTitleFromPrompt(m.text);
+        if (t.empty()) continue;  // attachment-only prompt: the next typed one names it
+        c.title = std::move(t);
+        return true;
+    }
+    return false;
+}
+
+void autoTitleConversation(AppState& st, int idx) {
+    if (applyAutoTitle(st, idx)) markChatHistoryDirty();
+}
+
+bool renameConversation(AppState& st, int idx, const std::string& title) {
+    if (idx < 0 || idx >= (int)st.conversations.size()) return false;
+    Conversation& c = st.conversations[idx];
+    const std::string clean = clipTitle(collapseWhitespace(title), 80);
+    if (clean.empty()) {
+        // Clearing the name hands it back to the automatic title.
+        if (!s_userTitled.erase(c.id)) return false;
+        c.title = nextSessionTitle();
+        applyAutoTitle(st, idx);
+    } else {
+        if (clean == c.title && s_userTitled.count(c.id)) return false;
+        c.title = clean;
+        s_userTitled.insert(c.id);
+    }
+    markChatHistoryDirty();
+    return true;
+}
+
 // Guarantee the CURRENTLY VIEWED conversation exists, adopting whatever is already in st.chat.
 // Additive: never clears other resident conversations (other doc keys, or idle same-doc
 // siblings) — those stay resident regardless of what the active view needs right now.
@@ -534,7 +658,7 @@ void ensureConversations(AppState& st) {
     if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size()) return;
     Conversation c;
     c.id = newConvId(st);
-    c.title = "Chat 1";
+    c.title = nextSessionTitle();
     c.docLink = convDocKey(st);  // link to whatever document is current — reference only
     c.projectDir = convProjectDir(st);  // initial scope; a turn may run in another workspace
     st.conversations.push_back(std::move(c));
@@ -1023,6 +1147,9 @@ void persistChatHistory(AppState& st) {
         }
         return false;
     };
+    // Every write names still-untitled sessions from their first prompt — the one place titles
+    // are derived, whichever path appended that prompt (send, queued drain, adoption, load).
+    for (int i = 0; i < (int)st.conversations.size(); ++i) applyAutoTitle(st, i);
     for (int i = 0; i < (int)st.conversations.size(); ++i) {
         // Fresh sessions (no messages, no queue, no run, no draft) are never written — same
         // rule as empty parts never autosaving.
@@ -1175,6 +1302,7 @@ void persistChatHistory(AppState& st) {
         nlohmann::json convObj = {{"id", st.conversations[i].id},
                                  {"title", st.conversations[i].title},
                                  {"msgs", serializeMsgs(liveMsgs)}};
+        if (s_userTitled.count(st.conversations[i].id)) convObj["title_user"] = true;
         // Revert branches: tails a rollback moved aside. Persisted so a revert stays
         // undoable after a restart.
         if (!st.conversations[i].branches.empty()) {
@@ -1220,7 +1348,8 @@ void persistChatHistory(AppState& st) {
     nlohmann::json index = {{"version", 3},
                             {"active", activeId},
                             {"active_by_project", std::move(activeByProject)},
-                            {"order", order}};
+                            {"order", order},
+                            {"session_seq", s_sessionSeq}};
     try {
         // Durable atomic write (tmp + fsync + rename + dir fsync) — a hard crash mid-run must
         // never be able to leave a truncated/empty transcript behind.
@@ -1300,7 +1429,8 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         // Every id that comes back from disk pushes the allocator past it, so the next
         // "+ New session" cannot land on a transcript that already exists.
         noteConvIdSeen(st, c.id);
-        c.title = jc.value("title", std::string("Chat"));
+        c.title = jc.value("title", std::string("Session"));
+        const bool titleUser = jc.value("title_user", false);
         c.docLink = docLink;
         c.archived = jc.value("archived", false);
         // Project scope. Legacy sessions (written before the field existed) recover one
@@ -1423,7 +1553,11 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         // left on disk by older builds instead of resurrecting them.
         // A session reverted all the way back still holds its branches — that is user
         // history, and dropping it here would make the revert unrecoverable.
-        if (c.msgs.empty() && c.queuedPrompts.empty() && c.branches.empty()) return false;
+        // A session the user named is kept even when empty: the name is content they chose.
+        if (c.msgs.empty() && c.queuedPrompts.empty() && c.branches.empty() && !titleUser)
+            return false;
+        if (titleUser) s_userTitled.insert(c.id);
+        s_sessionSeq = std::max(s_sessionSeq, sessionTitleOrdinal(c.title));
         // Chudcode runtime link (id/file/health): restore into the conversation-keyed
         // registry only for sessions that are actually kept.
         chudcodeLinkRestore(c.id, jc);
@@ -1431,7 +1565,7 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         //   1) the Chudcode session JSONL's own `cwd` (exactly where that run worked), then
         //   2) the old artifact heuristic against the CURRENT project root (a session that
         //      produced a file under this project belongs to it).
-        // Neither answers -> projectDir stays empty, which means "unscoped": always listed.
+        // Neither answers -> projectDir stays empty: listed only under Sessions' "Unassigned".
         // The next persist writes whatever was recovered, so this runs at most once per
         // session for the life of the store.
         if (c.projectDir.empty()) {
@@ -1586,6 +1720,10 @@ void loadChatHistory(AppState& st) {
     // Per-session transcript store: index.json (order + active ids) + <id>.json transcripts.
     // The remembered per-project active map is rebuilt with the store.
     s_activeByProject.clear();
+    // Titles are rebuilt with the store too: the user-named set from each session file, the
+    // number counter from the index (and from any "Session N" already on disk).
+    s_userTitled.clear();
+    s_sessionSeq = 0;
     const std::string projectKey = convProjectKey(convProjectDir(st));
     {
         nlohmann::json index = nlohmann::json::object();
@@ -1597,6 +1735,8 @@ void loadChatHistory(AppState& st) {
             // v3: per-project active pointer wins for the project we are opening under; the
             // top-level `active` remains the fallback (and is all a v2 index carries).
             activeId = index.value("active", std::string());
+            if (index.contains("session_seq") && index["session_seq"].is_number_integer())
+                s_sessionSeq = std::max(s_sessionSeq, index["session_seq"].get<int>());
             if (index.contains("active_by_project") && index["active_by_project"].is_object()) {
                 for (auto it = index["active_by_project"].begin();
                      it != index["active_by_project"].end(); ++it) {
@@ -1719,7 +1859,7 @@ void loadChatHistory(AppState& st) {
         }
     }
     if (st.conversations.empty()) {
-        ensureConversations(st);  // seeds "Chat 1" linked to the current document
+        ensureConversations(st);  // seeds a numbered session linked to the current document
     } else {
         st.activeConv = 0;
         if (!activeId.empty())
@@ -1728,6 +1868,8 @@ void loadChatHistory(AppState& st) {
         restoreActiveConversation(st);
     }
     restorePromptDraft(st);
+    // Sessions saved under a placeholder ("Chat 3") show their first prompt straight away.
+    for (int i = 0; i < (int)st.conversations.size(); ++i) autoTitleConversation(st, i);
     // Loading is not a new chat event. Seed change detection from the restored state so the
     // first persistence tick does not duplicate the entire prior transcript into the archive.
     for (int i = 0; i < (int)st.conversations.size(); ++i) {
@@ -1824,6 +1966,7 @@ static void wasmApplySharedChatPending(AppState& st) {
     // Local store: index.json order + per-session transcript files.
     nlohmann::json localSessions = nlohmann::json::array();
     std::string localActive;
+    int localSeq = 0;
     {
         nlohmann::json index = nlohmann::json::object();
         {
@@ -1838,6 +1981,8 @@ static void wasmApplySharedChatPending(AppState& st) {
         }
         if (index.is_object() && index.contains("order") && index["order"].is_array()) {
             localActive = index.value("active", std::string());
+            if (index.contains("session_seq") && index["session_seq"].is_number_integer())
+                localSeq = index["session_seq"].get<int>();
             for (const auto& jid : index["order"]) {
                 if (!jid.is_string()) continue;
                 nlohmann::json js;
@@ -1882,6 +2027,7 @@ static void wasmApplySharedChatPending(AppState& st) {
             if (!atomicWriteFileDurable(chatSessionFilePath(id), ls.dump(1))) return;
         }
         nlohmann::json index = {{"version", 2}, {"active", localActive}, {"order", order}};
+        if (localSeq > 0) index["session_seq"] = localSeq;
         if (!atomicWriteFileDurable(chatSessionsIndexPath(), index.dump(1))) return;
         appstatePersistSync();
     } catch (...) {
@@ -2078,7 +2224,8 @@ static bool conversationIsFresh(const AppState& st, int idx) {
     // The composer's unsent draft is content too — a session the user is typing into is
     // not fresh.
     if (active && st.prompt[0] != 0) return false;
-    return msgs.empty() && queued.empty() && !st.convRunning(c.id);
+    // A session the user named is not disposable either.
+    return msgs.empty() && queued.empty() && !st.convRunning(c.id) && !s_userTitled.count(c.id);
 }
 
 // Drop the ACTIVE conversation when it is still fresh (see above), fixing up activeConv.
@@ -2138,12 +2285,20 @@ bool activeConversationRunning(AppState& st) {
 void newConversation(AppState& st) {
     ensureConversations(st);
     // A fresh outgoing session is replaced, not parked — "+ New session" from an untouched
-    // chat must not accumulate "Chat 1, Chat 2, …" empties in the list or on disk.
-    if (!discardActiveConversationIfFresh(st))
+    // chat must not accumulate "Session 1, Session 2, …" empties in the list or on disk. The
+    // replaced session hands its number back so repeated clicks do not burn through the count.
+    const std::string outgoingTitle =
+        (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size())
+            ? st.conversations[st.activeConv].title : std::string();
+    if (discardActiveConversationIfFresh(st)) {
+        if (s_sessionSeq > 0 && sessionTitleOrdinal(outgoingTitle) == s_sessionSeq)
+            --s_sessionSeq;
+    } else {
         parkActiveConversation(st);  // force-saves old draft
+    }
     Conversation c;
     c.id = newConvId(st);
-    c.title = "Chat " + std::to_string((int)st.conversations.size() + 1);
+    c.title = nextSessionTitle();
     c.docLink = convDocKey(st);  // link to the current document — reference only
     c.projectDir = convProjectDir(st);  // initial scope; a turn may run in another workspace
     st.conversations.push_back(std::move(c));
@@ -2191,6 +2346,7 @@ void closeConversation(AppState& st, int idx) {
     // Drop draft key for the closed conversation.
     {
         const std::string closedId = st.conversations[idx].id;
+        s_userTitled.erase(closedId);
         try {
             namespace fs = std::filesystem;
             const std::string path = promptDraftsPath();

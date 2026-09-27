@@ -1,5 +1,5 @@
-// Composed Insights view: global Model Leaderboard (explicitly marked All projects) and
-// per-project token spend, with an opt-in All projects toggle on the latter.
+// Composed Insights view: global Model leaderboard (trailing note "All projects") and
+// per-project token spend, with an opt-in "Include all projects" toggle on the latter.
 #include "insights_view.h"
 
 #include "imgui.h"
@@ -12,7 +12,7 @@
 namespace ui {
 
 void drawInsightsView(AppState& st) {
-    ui::kit::sectionHeader("All projects", nullptr, "Model leaderboard",
+    ui::kit::sectionHeader("Model leaderboard", nullptr, "All projects",
                            /*count=*/-1, /*first=*/true);
     static ui::leaderboard::Board s_board;
     static bool s_loaded = false;

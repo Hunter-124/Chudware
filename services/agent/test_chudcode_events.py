@@ -354,6 +354,105 @@ class ChudcodeEventMapperTests(unittest.TestCase):
         )
         self.assertEqual((kind, end["status"]), ("sub_run", "fail"))
 
+    def test_task_subagent_frames_nest_tool_calls_under_the_task_call(self):
+        """Chudcode's subscription frames for a `task` sub-agent: one upserted
+        sub_run per sub-agent under the spawning task call, its CAD tool calls
+        as agent.tool_call rows carrying subagent_id/parent_id, and none of its
+        private text reaching the parent's reply."""
+        state = RpcFrameState()
+
+        def mapped(frame):
+            return map_rpc_frame(frame, CTX, state)
+
+        def nested(event):
+            return {"type": "subagent_event", "payload": {"id": "CubeBuilder", "event": event}}
+
+        [(kind, started)] = mapped(
+            {
+                "type": "subagent_lifecycle",
+                "payload": {
+                    "id": "CubeBuilder",
+                    "agent": "task",
+                    "agentSource": "bundled",
+                    "description": "Build the 10 mm cube",
+                    "status": "started",
+                    "parentToolCallId": "toolu_task_1",
+                    "index": 0,
+                },
+            }
+        )
+        self.assertEqual(kind, "sub_run")
+        self.assertEqual(
+            (started["id"], started["subagent_id"], started["parent_id"], started["status"]),
+            ("CubeBuilder", "CubeBuilder", "toolu_task_1", "running"),
+        )
+        self.assertEqual(started["purpose"], "Build the 10 mm cube")
+
+        call = {
+            "toolCallId": "toolu_cube_1",
+            "toolName": "write",
+            "args": {"path": "xd://new_part", "content": '{"name": "cube"}'},
+        }
+        mapped(nested({"type": "tool_execution_start", **call}))
+        self.assertEqual(
+            mapped(
+                nested(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "Cube done"},
+                    }
+                )
+            ),
+            [],
+        )
+        [(kind, tool_call)] = mapped(
+            nested(
+                {
+                    "type": "tool_execution_end",
+                    "toolCallId": "toolu_cube_1",
+                    "toolName": "new_part",
+                    "result": {"content": [{"type": "text", "text": "{}"}], "details": {"ok": True}},
+                    "isError": False,
+                }
+            )
+        )
+        self.assertEqual(kind, "agent.tool_call")
+        self.assertEqual(
+            (tool_call["id"], tool_call["tool_name"], tool_call["ok"]),
+            ("toolu_cube_1", "new_part", True),
+        )
+        self.assertEqual(
+            (tool_call["subagent_id"], tool_call["parent_id"]), ("CubeBuilder", "toolu_task_1")
+        )
+
+        [(kind, progress)] = mapped(
+            {
+                "type": "subagent_progress",
+                "payload": {
+                    "index": 0,
+                    "agent": "task",
+                    "task": "Build the 10 mm cube",
+                    "parentToolCallId": "toolu_task_1",
+                    "progress": {"id": "CubeBuilder", "status": "running", "description": "Build the 10 mm cube"},
+                },
+            }
+        )
+        self.assertEqual((kind, progress["id"], progress["status"]), ("sub_run", "CubeBuilder", "running"))
+
+        [(kind, ended)] = mapped(
+            {
+                "type": "subagent_lifecycle",
+                "payload": {
+                    "id": "CubeBuilder",
+                    "agent": "task",
+                    "status": "completed",
+                    "parentToolCallId": "toolu_task_1",
+                    "index": 0,
+                },
+            }
+        )
+        self.assertEqual((kind, ended["id"], ended["status"]), ("sub_run", "CubeBuilder", "done"))
+
     def test_usage_and_context_shapes_and_order(self):
         mapped = map_rpc_frame(
             {

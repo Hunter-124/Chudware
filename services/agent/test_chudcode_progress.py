@@ -140,6 +140,27 @@ def test_failed_mutation_does_not_rearm():
     assert len(steers(calls)) == len(nudges(emitted)) == 1
 
 
+def subagent(frames, agent="CubeBuilder"):
+    """Chudcode forwards a task sub-agent's own events wrapped in subagent_event."""
+    return [(seconds, {"type": "subagent_event", "payload": {"id": agent, "event": frame}})
+            for seconds, frame in frames]
+
+
+def test_subagent_cad_mutation_is_turn_progress_but_its_research_is_not():
+    parent_research = [item for i in range(11) for item in tool("web_search", i)]
+    later_research = [item for i in range(11, 22) for item in tool("web_search", i)]
+    child_research = subagent([item for i in range(100, 120) for item in tool("web_search", i)])
+
+    built = subagent(tool("write", 50, args={"path": "xd://new_part"}))
+    _, calls, emitted = run(parent_research + child_research + built + later_research,
+                            FakeClock())
+    assert steers(calls) == [] and nudges(emitted) == []
+
+    failed = subagent(tool("write", 51, args={"path": "xd://new_part"}, is_error=True))
+    _, calls, emitted = run(parent_research + failed + later_research, FakeClock())
+    assert len(steers(calls)) == len(nudges(emitted)) == 1
+
+
 def test_visible_text_resets_stall_timer_but_thinking_does_not(monkeypatch):
     monkeypatch.setenv("CHUDWARE_PROGRESS_RESEARCH_CALLS", "0")
     monkeypatch.setenv("CHUDWARE_PROGRESS_STALL_S", "480")

@@ -542,6 +542,8 @@ def test_persistent_reuse_one_time_history_seed_and_mapped_streaming(online_lane
         "steering_mode": "all",
         "auto_compaction": True,
         "auto_retry": False,
+        # Sub-agent CAD calls reach the trace/watchdog only via subagent_event frames.
+        "subagent_subscription": "events",
     }
     assert online_lane.host.turns[0]["attachments"] == [
         {"path": "/tmp/image.png", "kind": "image", "mime": "image/png"}

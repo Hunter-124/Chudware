@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 
 #include "imgui.h"
 #include "imgui_internal.h"   // ImRect (glassPanel/adaptivePanel rects)
@@ -32,11 +33,20 @@ namespace ui {
 namespace {
 
 struct AiWsState {
-    int view = 0;  // Current Run by default; main conversation is always visible.
-    std::string lastAutoRun;
+    int view = -1;  // -1 = not yet restored from ai_prefs (agent.ui_ai_view) on first draw.
+    // Follow live runs: the last run id seen per session. A session is seeded silently on first
+    // sight, so switching sessions (whose saved trace carries an old run id) never moves the
+    // pane — only a NEW run in the same session does.
+    std::unordered_map<std::string, std::string> seenRunByConv;
 };
 
 static AiWsState s_ai;
+
+static void setView(int v) {
+    if (s_ai.view == v) return;
+    s_ai.view = v;
+    setAiWorkspaceView(v);
+}
 
 
 // coloredRowWash / glassRowBackground / glassPanel take a LOGICAL dp radius (they multiply by
@@ -119,11 +129,11 @@ static void drawNavColumn(AppState& st, float navW) {
 
     const int live = currentRunLiveCount();
 
-    if (navRow(0, "Current Run", s_ai.view == 0, live)) s_ai.view = 0;
-    if (navRow(1, "Plan",        s_ai.view == 1))       s_ai.view = 1;
-    if (navRow(2, "Activity",    s_ai.view == 2))       s_ai.view = 2;
-    if (navRow(3, "Sessions", s_ai.view == 3)) s_ai.view = 3;
-    if (navRow(4, "Insights", s_ai.view == 4)) s_ai.view = 4;
+    if (navRow(0, "Current Run", s_ai.view == 0, live)) setView(0);
+    if (navRow(1, "Plan",        s_ai.view == 1))       setView(1);
+    if (navRow(2, "Activity",    s_ai.view == 2))       setView(2);
+    if (navRow(3, "Sessions",    s_ai.view == 3))       setView(3);
+    if (navRow(4, "Insights",    s_ai.view == 4))       setView(4);
 
     // Hairline + the utility section.
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
@@ -135,7 +145,7 @@ static void drawNavColumn(AppState& st, float navW) {
     }
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
 
-    if (navRow(5, "Options", s_ai.view == 5)) s_ai.view = 5;
+    if (navRow(5, "Options", s_ai.view == 5)) setView(5);
 
     drawWindowPillScrollbarV(surf);
     ImGui::EndChild();
@@ -143,10 +153,37 @@ static void drawNavColumn(AppState& st, float navW) {
 
 // ---- center: expanded chat --------------------------------------------------------
 
+// Session header: which session this chat belongs to + the Sessions panel's New session action
+// (newConversation — safe mid-run, runs are per session and keep streaming when parked), then
+// the shared runtime banner the docked Copilot shows under its own header.
+static void drawSessionHeader(AppState& st) {
+    const Conversation* conv =
+        (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size())
+            ? &st.conversations[(size_t)st.activeConv] : nullptr;
+    const char* newLabel = "+ New session";
+    const float x0     = ImGui::GetCursorPosX();
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const float btnW   = ImGui::CalcTextSize(newLabel).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    const std::string title = kit::elide(
+        conv && !conv->title.empty() ? conv->title.c_str() : "New session",
+        availW - btnW - ui::metrics::cpMenuLabelGap());
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(title.c_str());
+    ImGui::SameLine(x0 + availW - btnW);
+    if (kit::secondaryButton(newLabel)) {
+        newConversation(st);
+        st.prompt[0] = 0;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh session.");
+    drawRuntimeBanner(st);
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+}
+
 static void drawChatCenter(AppState& st, bool busy, bool canRun) {
     const float S = ui::uiScale;
 
     // Main conversation stays visible while Current Run inspects one selected agent.
+    drawSessionHeader(st);
 
     // Reserve the composer height measured last frame so the log fills the rest
     // (same one-frame-lag trick as the docked Copilot).
@@ -173,8 +210,7 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
                            lw0.y + ImGui::GetWindowSize().y)),
         GlassGroup::Global);
     if (st.chat.empty()) {
-        emptyState("ai_panel", "Start a conversation",
-                   "Describe what to build — the copilot plans, models and verifies it.");
+        chatDrawEmptyState();
     } else {
         chatDrawLog(st);
         // Shared stick-to-bottom (releases on a user scroll-up). The region id scopes the flag
@@ -214,28 +250,25 @@ static void drawOptionsView(AppState& st, bool busy) {
         ImGui::TableNextColumn();
         {
             int v = aiUiVerbosity();
-            static const char* kVerb[] = {"Quiet", "Normal", "Full"};
             ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Detail level");
+            ImGui::TextUnformatted(aiPrefCopy::kDetailLabel);
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::Combo("##ai_ws_verb", &v, kVerb, 3)) setAiUiVerbosity(v);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("How much detail the Current Run and Active Work views show.");
+            if (ImGui::Combo("##ai_ws_verb", &v, aiPrefCopy::kDetailLevels, 3))
+                setAiUiVerbosity(v);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", aiPrefCopy::kDetailHelp);
         }
         ImGui::TableNextColumn();
         {
             bool follow = aiFollowActiveSession();
-            if (ImGui::Checkbox("Follow live runs", &follow)) setAiFollowActiveSession(follow);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Switch to Current Run when the viewed conversation starts a new run.");
+            if (ImGui::Checkbox(aiPrefCopy::kFollowLabel, &follow))
+                setAiFollowActiveSession(follow);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", aiPrefCopy::kFollowHelp);
         }
         ImGui::TableNextColumn();
         {
             bool prev = aiActiveWorkPreviews();
-            if (ImGui::Checkbox("Active Work previews", &prev)) setAiActiveWorkPreviews(prev);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Render iso-preview thumbnails for the docs agents are "
-                                  "editing (worker render jobs; cached per saved revision).");
+            if (ImGui::Checkbox(aiPrefCopy::kPreviewsLabel, &prev)) setAiActiveWorkPreviews(prev);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", aiPrefCopy::kPreviewsHelp);
         }
         ImGui::TableNextColumn();
         ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
@@ -265,9 +298,8 @@ static void drawOptionsView(AppState& st, bool busy) {
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(palette.textDisabled[0], palette.textDisabled[1],
                palette.textDisabled[2], 1.0f));
-    ImGui::TextWrapped("Workflow knobs persist to config.json (shared with the docked Copilot). "
-                       "Provider, model, API key and privacy live on the main Settings page "
-                       "(Settings -> AI).");
+    ImGui::TextWrapped("These settings are shared with the docked Copilot. Provider, model, "
+                       "API key and privacy are in Settings > AI.");
     ImGui::PopStyleColor();
 }
 
@@ -295,12 +327,18 @@ static void drawViewPane(AppState& st, bool busy) {
         adaptivePanel(panelId("ai_ws_view_glass"), vRect, GlassGroup::Global);
     glassPanel(ImGui::GetWindowDrawList(), vRect, GlassLevel::Thin, rowRoundDp(), viewSurf);
 
-    // Follow new runs in the viewed conversation only.
-    const auto dag = agentDagSummary(st.activeConvId());
-    const std::string runKey = st.activeConvId() + ":" + dag.runId;
-    if (aiFollowActiveSession() && !dag.runId.empty() && runKey != s_ai.lastAutoRun) {
-        s_ai.lastAutoRun = runKey;
-        s_ai.view = 0;
+    // Follow live runs: only a NEW run in the session being viewed moves the pane. A session is
+    // seeded silently the first time it is seen, and a run id that changes while nothing is
+    // running (a saved trace restored on switch) just updates the record.
+    {
+        const std::string convId = st.activeConvId();
+        const std::string runId  = agentDagSummary(convId).runId;
+        auto [seen, firstSight] = s_ai.seenRunByConv.try_emplace(convId, runId);
+        if (!firstSight && seen->second != runId) {
+            seen->second = runId;
+            if (aiFollowActiveSession() && !runId.empty() && st.convRunning(convId))
+                setView(0);
+        }
     }
 
     // The child's WindowPadding gutter (cpMenuGutter) IS the left margin now — one indent for
@@ -311,12 +349,8 @@ static void drawViewPane(AppState& st, bool busy) {
         case 0:
             drawCurrentRunView(st);
             break;
-        case 1:  // Session Plan: the plan board over persisted buildgraph runs.
-            if (!st.workerStarted)
-                emptyState("health_check", "Worker not running",
-                           "The Chudware worker service is required to load and steer plans.");
-            else
-                drawPlanBoardView(st);
+        case 1:  // Plan: the active session's editable checklist + document checkpoints.
+            drawPlanBoardView(st);
             break;
         case 2:  // Activity: live render grid of agent-edited docs + the documents panel.
             drawActivityView(st);
@@ -331,7 +365,7 @@ static void drawViewPane(AppState& st, bool busy) {
             drawOptionsView(st, busy);
             break;
         default:
-            s_ai.view = 0;
+            setView(0);
             break;
     }
     drawWindowPillScrollbarV(viewSurf);
@@ -354,6 +388,7 @@ void drawAiWorkspace(AppState& st) {
     // drawn while the AI tab is active, so flush streaming chat here too — a crash mid-turn
     // keeps the assistant text on disk (drafts ride the shared composer's savePromptDraft).
     maybePersistChatHistoryDebounced(st, /*force=*/false);
+    if (s_ai.view < 0) s_ai.view = aiWorkspaceView();   // restore the last nav selection
 
     // v3 layout (Hunter's directive): MAIN CHAT on the left, everything else in the right
     // utility panel — a vertical nav menu + the selected view. No sessions rail, no bottom

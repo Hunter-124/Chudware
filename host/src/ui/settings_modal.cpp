@@ -4585,9 +4585,6 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     static bool s_learn = true;       // agent.memory_learn
     static bool s_autolearn = false;  // agent.autolearn_enabled
     static bool s_autoContinue = false; // agent.autolearn_auto_continue
-    static int s_verbosity = 2;       // ui::aiUiVerbosity (0 quiet | 1 normal | 2 full)
-    static bool s_follow = true;      // ui::aiFollowActiveSession
-    static bool s_previews = true;    // ui::aiActiveWorkPreviews
     if (!s_loaded) {
         s_loaded = true;
         {
@@ -4606,9 +4603,6 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         s_learn = loadAgentConfigBool("memory_learn", true);
         s_autolearn = loadAgentConfigBool("autolearn_enabled", false);
         s_autoContinue = loadAgentConfigBool("autolearn_auto_continue", false);
-        s_verbosity = ui::aiUiVerbosity();
-        s_follow = ui::aiFollowActiveSession();
-        s_previews = ui::aiActiveWorkPreviews();
     }
 
 
@@ -4621,10 +4615,10 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         helpMarker("Learning switch: when on, the agent writes decisions and notes it "
                    "judges worth keeping into project memory (agent.memory_learn, "
                    "default on). Recall still works when off; nothing new is learned.");
-        if (ImGui::Checkbox("Autopopulate (follow active session)", &s_follow))
-            ui::setAiFollowActiveSession(s_follow);
-        helpMarker("Views follow the ACTIVE chat session / latest run automatically "
-                   "instead of manual picking.");
+        bool follow = ui::aiFollowActiveSession();
+        if (ImGui::Checkbox(ui::aiPrefCopy::kFollowLabel, &follow))
+            ui::setAiFollowActiveSession(follow);
+        helpMarker(ui::aiPrefCopy::kFollowHelp);
         return;
     }
     static const char* kCompModes[] = {
@@ -4633,7 +4627,6 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         "Shake",
         "Summary",
     };
-    static const char* kVerbosity[] = {"Quiet", "Normal", "Full"};
 
     auto saveCompMode = [&](int mode) {
         const char* strategy = "off";
@@ -4649,7 +4642,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     // Compaction and Verbosity sit in the left column of two stacked tables; one shared label
     // column keeps both combos on the same left edge.
     const float memLabelColW = ImMax(settingsLabelLeadWidth("Compaction", true),
-                                     settingsLabelLeadWidth("Verbosity", true));
+                                     settingsLabelLeadWidth(ui::aiPrefCopy::kDetailLabel, true));
     if (ImGui::BeginTable("##memory_learning", 2,
                           ImGuiTableFlags_SizingStretchSame |
                           ImGuiTableFlags_NoPadOuterX)) {
@@ -4797,26 +4790,27 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
                           ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextColumn();
         {
-            settingsLabelLead("Verbosity",
-                              "How much the Agent Workflow / Active Work / Session Plan views "
-                              "render. Quiet = titles + status. Normal = last op. "
-                              "Full = op tickers, counts, token/latency detail (default).",
+            // Read the shared getters every frame (cached in ai_prefs, one config read per
+            // process) so a change made in AI > Options shows here immediately.
+            int verbosity = ui::aiUiVerbosity();
+            settingsLabelLead(ui::aiPrefCopy::kDetailLabel, ui::aiPrefCopy::kDetailHelp,
                               memLabelColW);
             ImGui::SetNextItemWidth(-1.0f);
-            if (settingsPopupRowCombo("##ws_verbosity", &s_verbosity, kVerbosity, 3))
-                ui::setAiUiVerbosity(s_verbosity);
+            if (settingsPopupRowCombo("##ws_verbosity", &verbosity,
+                                      ui::aiPrefCopy::kDetailLevels, 3))
+                ui::setAiUiVerbosity(verbosity);
         }
         ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Autopopulate (follow active session)", &s_follow))
-            ui::setAiFollowActiveSession(s_follow);
-        helpMarker("Views follow the ACTIVE chat session / latest run automatically "
-                   "instead of manual picking.");
+        bool follow = ui::aiFollowActiveSession();
+        if (ImGui::Checkbox(ui::aiPrefCopy::kFollowLabel, &follow))
+            ui::setAiFollowActiveSession(follow);
+        helpMarker(ui::aiPrefCopy::kFollowHelp);
 
         ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Active-Work previews", &s_previews))
-            ui::setAiActiveWorkPreviews(s_previews);
-        helpMarker("Render iso preview thumbnails for agent-touched documents in the "
-                   "Active Work view. Off = lightweight placeholder only.");
+        bool previews = ui::aiActiveWorkPreviews();
+        if (ImGui::Checkbox(ui::aiPrefCopy::kPreviewsLabel, &previews))
+            ui::setAiActiveWorkPreviews(previews);
+        helpMarker(ui::aiPrefCopy::kPreviewsHelp);
         ImGui::EndTable();
     }
 }

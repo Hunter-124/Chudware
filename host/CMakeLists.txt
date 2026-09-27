@@ -199,6 +199,7 @@ set(CHUDWARE_CORE_SOURCES
   ../core/util/aicm_handoff.cpp   # T-PERF10: aicm-shm:// map for loadAicmFile
   src/render/id_pass.cpp
   src/render/overlays.cpp
+  src/render/doc_thumbnail.cpp      # offscreen shaded DocMesh previews (AI Active Work cards)
   src/render/splat_renderer.cpp     # RE-28: 3DGS splat renderer
   src/render/re_points.cpp          # RE-21: sparse point-cloud + camera-frusta overlay (GL)
   src/render/re_points_fixture.cpp  # RE-21: GL-free fixture builder (also linked by ctest)

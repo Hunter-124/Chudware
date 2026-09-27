@@ -361,8 +361,15 @@ def _register_category_refresh(
         initial_names = {
             _text(getattr(binding, "name", None)) for binding in initial_tools
         }
+        # Task sub-agents share this turn's bindings; two concurrent loads must
+        # not publish their set_custom_tools snapshots out of order.
+        refresh_lock = threading.Lock()
 
         def enable_categories(values: Any) -> dict[str, Any]:
+            with refresh_lock:
+                return _enable_locked(values)
+
+        def _enable_locked(values: Any) -> dict[str, Any]:
             from services.agent.tool_categories import resolve_tool_requests
 
             incoming = [values] if isinstance(values, str) else list(values or ())

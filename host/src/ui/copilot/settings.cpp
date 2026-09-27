@@ -97,6 +97,13 @@ void refreshModelAvailability(AppState& st, bool force) {
                             {"api_key", apiKey ? apiKey : ""}};
         st.rpc.call("agent_list_models", std::move(p),
                     [&st, provider, slots = std::vector<int>(slots)](const core::RpcResult& r) {
+            if (core::workerLaneBusy(r)) {
+                // A running agent turn holds the lane. Transient, not a provider failure: keep
+                // the last model list and backoff state, and retry on the normal 5 s cadence.
+                s_probeTiming[provider].inFlight = false;
+                st.modelProbeInFlight.store(anyProbeInFlight());
+                return;
+            }
             ProviderModels pm;
             pm.checked = true;
             if (r.ok && r.result.is_object()) {
@@ -838,9 +845,9 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                 st.rpc.call("subscription_login",
                             nlohmann::json{{"provider", "xai"}, {"device", true}},
                             [](const core::RpcResult& r) {
-                    if (!r.ok) {
+                    if (!r.ok || core::workerLaneBusy(r)) {
                         s_xaiLoginBusy = false;
-                        s_xaiError = r.err.empty() ? "login failed" : r.err;
+                        s_xaiError = userFacingRpcError(r, "Sign-in didn't start. Try again.");
                     } else if (r.result.is_object() && jsonOptBool(r.result, "ok", true) == false) {
                         s_xaiLoginBusy = false;
                         auto reason = jsonOptStr(r.result, "reason");

@@ -331,9 +331,9 @@ static void drawCopilotHeader(AppState& st, bool busy) {
 
     // One tooltip at most; each says what the click will DO, including the click that takes
     // you back to the conversation. The brand mark's tooltip is the run status.
-    const char* kBack = "Back to the conversation";
+    const char* kBack = "Back to the session";
     if (hChat.hovered) {
-        ImGui::SetTooltip(tabOut == CpTab::Chat ? "Chat \xc2\xb7 conversation with the agent"
+        ImGui::SetTooltip(tabOut == CpTab::Chat ? "Chat \xc2\xb7 the current session with the agent"
                                                 : kBack);
     } else if (hTasks.hovered) {
         if (tabOut == CpTab::Tasks) ImGui::SetTooltip("%s", kBack);
@@ -345,7 +345,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
                               : "Artifacts \xc2\xb7 documents, renders and files this session");
     } else if (hSess.hovered) {
         ImGui::SetTooltip(tabOut == CpTab::Sessions ? kBack
-                                                    : "Sessions \xc2\xb7 switch between chats");
+                                                    : "Sessions \xc2\xb7 switch between sessions");
     } else if (hGear.hovered) {
         ImGui::SetTooltip(tabOut == CpTab::Settings
                               ? kBack
@@ -423,7 +423,12 @@ bool ccConsumeFailure(const std::string& convId, const core::RpcResult& r, const
         return true;
     }
     if (!r.ok) {
-        s_ccm.err = std::string(what) + " failed: " + (r.err.empty() ? "worker error" : r.err);
+        // A run holding the AI service answers "busy" — say when the action comes back, never
+        // the internal refusal text.
+        s_ccm.err = core::workerLaneBusy(r)
+                        ? std::string(kAvailableAfterRun)
+                        : std::string(what) + " failed: " +
+                              userFacingRpcError(r, "the AI service did not respond.");
         return true;
     }
     if (chudcodeSessionNotLive(r.result)) {
@@ -507,7 +512,10 @@ void ccStartClose(AppState& st, const std::string& convId) {
             return;
         }
         if (!r.ok) {
-            s_ccm.err = "Close failed: " + (r.err.empty() ? std::string("worker error") : r.err);
+            s_ccm.err = core::workerLaneBusy(r)
+                            ? std::string(kAvailableAfterRun)
+                            : "Close failed: " +
+                                  userFacingRpcError(r, "the AI service did not respond.");
             return;
         }
         if (!parseChudcodeCloseResult(r.result)) {
@@ -575,12 +583,14 @@ void drawChudcodeManageCard(AppState& st, const Conversation& c, bool running) {
     const bool serviceOk = chudcodeSessionServiceAvailable();
     const bool live = link && link->runtimeLive;
     const bool busy = s_ccm.exportBusy || s_ccm.doctorBusy || s_ccm.closeBusy || s_ccm.branchBusy;
+    // Every recovery action goes to the AI service, which cannot take them while ANY run (on
+    // this session or another) is in progress — so they wait for the run instead of failing.
+    const bool runActive = running || st.anyRunActive();
     // One disabled-reason string per state — kit buttons show it as the tooltip, so the
     // action is never hidden, only explained.
     const char* whyNot = !serviceOk
                              ? "The AI service does not offer session recovery (older service)."
-                         : running
-                             ? "A run is in progress on this session \xe2\x80\x94 wait for it to finish."
+                         : runActive ? kAvailableAfterRun
                          : !live ? kCcNotLiveHint
                          : busy  ? "Another recovery action is still running."
                                  : nullptr;
@@ -643,11 +653,11 @@ void drawChudcodeManageCard(AppState& st, const Conversation& c, bool running) {
                 s_ccm.confirmRepair = !s_ccm.confirmRepair;
             ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
             if (ui::kit::secondaryButton(s_ccm.closeBusy ? "Closing\xe2\x80\xa6" : "Close runtime",
-                                         serviceOk && live && !running && !busy,
+                                         serviceOk && live && !runActive && !busy,
                                          !live ? "No live runtime to close \xe2\x80\x94 already inactive."
                                                : whyNot))
                 ccStartClose(st, convId);
-            if (ImGui::IsItemHovered() && live && !running)
+            if (ImGui::IsItemHovered() && live && !runActive)
                 ImGui::SetTooltip("Stops the service-side process only. The transcript and the "
                                   "persisted session file are kept \xe2\x80\x94 unlike Delete.");
 
@@ -661,7 +671,13 @@ void drawChudcodeManageCard(AppState& st, const Conversation& c, bool running) {
                 if (ui::kit::secondaryButton("Cancel")) s_ccm.confirmRepair = false;
             }
 
-            if (!s_ccm.err.empty()) ui::kit::inlineStatus(s_ccm.err.c_str(), ui::kit::Tone::Err);
+            // A "wait for the run" refusal is not a failure: calm tone, and it clears itself
+            // once the run is over and the actions are live again.
+            const bool waitNote = s_ccm.err == kAvailableAfterRun;
+            if (waitNote && !runActive) s_ccm.err.clear();
+            if (!s_ccm.err.empty())
+                ui::kit::inlineStatus(s_ccm.err.c_str(),
+                                      waitNote ? ui::kit::Tone::Neutral : ui::kit::Tone::Err);
 
             // ---- last export ----------------------------------------------------------------
             if (!s_ccm.exportPath.empty()) {
@@ -734,6 +750,120 @@ void drawChudcodeManageCard(AppState& st, const Conversation& c, bool running) {
 
 }  // namespace
 
+// ---- Sessions project scope -------------------------------------------------------------------
+// The list shows ONE project's sessions at a time, chosen by a compact switcher in the header.
+// Membership is the session's STORED projectDir key, compared at view time — never re-derived
+// from what a session produced. Sessions with no stored key live under "Unassigned" only.
+// The scope follows the active project (convProjectDir) and snaps back to it whenever that
+// changes; peeking at another project is a view choice until the user explicitly switches.
+namespace {
+enum class SessScope { Project, Unassigned, All };
+struct SessScopeState {
+    SessScope   scope = SessScope::Project;
+    std::string key;           // viewed project key (SessScope::Project)
+    std::string dir;           // a stored projectDir carrying `key` (the switch target)
+    std::string followedKey;   // active-project key the scope last synced to
+    bool        seeded = false;
+};
+SessScopeState s_sessScope;
+
+// Inline rename of ONE session row (the row's title becomes an edit box). Keyed by id, not row
+// index, so a list that reorders mid-edit cannot move the box onto another session.
+struct SessRename {
+    std::string id;        // session being renamed; empty = none
+    char buf[128] = {};
+    int  frames = 0;       // frames the box has been up (focus is requested on the first)
+    bool everActive = false;
+};
+SessRename s_rename;
+
+struct SessProjectEntry {
+    std::string key, dir, name;
+    int         count = 0;     // sessions listed under the current archived filter
+};
+
+std::string sessProjectName(const std::string& dir) {
+    if (dir.empty()) return "No project";
+    const std::filesystem::path p = lexicalPath(dir);
+    if (!p.filename().empty()) return p.filename().generic_string();
+    if (!p.parent_path().filename().empty()) return p.parent_path().filename().generic_string();
+    return p.generic_string();
+}
+
+// Distinct stored project keys (active project first, then by name) + the unassigned count.
+std::vector<SessProjectEntry> sessProjects(const AppState& st, bool archived,
+                                           const std::string& activeKey,
+                                           const std::string& activeDir, int& unassigned) {
+    std::vector<SessProjectEntry> out;
+    unassigned = 0;
+    if (!activeKey.empty()) out.push_back({activeKey, activeDir, sessProjectName(activeDir), 0});
+    for (const Conversation& c : st.conversations) {
+        const std::string key = convProjectKey(c.projectDir);
+        const int n = (c.archived == archived) ? 1 : 0;
+        if (key.empty()) { unassigned += n; continue; }
+        auto it = std::find_if(out.begin(), out.end(),
+                               [&](const SessProjectEntry& e) { return e.key == key; });
+        if (it == out.end())
+            out.push_back({key, c.projectDir, sessProjectName(c.projectDir), n});
+        else
+            it->count += n;
+    }
+    const auto first = out.begin() + (activeKey.empty() ? 0 : 1);
+    std::sort(first, out.end(), [](const SessProjectEntry& a, const SessProjectEntry& b) {
+        return a.name != b.name ? a.name < b.name : a.key < b.key;
+    });
+    return out;
+}
+
+// Header switcher: a popover listing every project that has sessions, the viewed one checked.
+void drawSessionsProjectSwitcher(const std::vector<SessProjectEntry>& projects, int unassigned,
+                                 const std::string& activeKey, float maxLabelW) {
+    SessScopeState& S = s_sessScope;
+    std::string label;
+    if (S.scope == SessScope::All)             label = "All projects";
+    else if (S.scope == SessScope::Unassigned) label = "Unassigned";
+    else {
+        label = "No project";
+        for (const auto& e : projects)
+            if (e.key == S.key) { label = e.name; break; }
+    }
+    label = ui::kit::elide(label.c_str(), maxLabelW);
+    if (!ui::kit::popoverBegin("##sess_project", label.c_str())) {
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(S.scope == SessScope::All
+                ? "Showing sessions from every project. Click to pick one project."
+                : S.scope == SessScope::Unassigned
+                    ? "Showing sessions with no project. Click to pick a project."
+                    : "Showing this project's sessions only. Click to view another project's.");
+        return;
+    }
+    for (const auto& e : projects) {
+        ImGui::PushID(e.key.c_str());
+        char item[160];
+        std::snprintf(item, sizeof(item), "%s  (%d)", e.name.c_str(), e.count);
+        const bool checked = S.scope == SessScope::Project && S.key == e.key;
+        if (ImGui::MenuItem(item, e.key == activeKey ? "active" : nullptr, checked)) {
+            S.scope = SessScope::Project;
+            S.key   = e.key;
+            S.dir   = e.dir;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.dir.c_str());
+        ImGui::PopID();
+    }
+    if (projects.empty()) ui::cpMenuHint("No project has sessions yet.");
+    ImGui::Separator();
+    char un[64];
+    std::snprintf(un, sizeof(un), "Unassigned  (%d)", unassigned);
+    if (ImGui::MenuItem(un, nullptr, S.scope == SessScope::Unassigned))
+        S.scope = SessScope::Unassigned;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Sessions that never recorded a project folder.");
+    if (ImGui::MenuItem("All projects", nullptr, S.scope == SessScope::All))
+        S.scope = SessScope::All;
+    ui::kit::popoverEnd();
+}
+}  // namespace
+
 
 // Sessions list — replaces the chat log while open so users can jump between sessions easily.
 void drawSessionsPanel(AppState& st, bool busy) {
@@ -744,14 +874,28 @@ void drawSessionsPanel(AppState& st, bool busy) {
 
     ensureConversations(st);
 
-    // One title treatment for every copilot menu (ui_common cpMenu*). The "Show archived"
-    // filter sits in the header's accessory slot — above the rule, next to the title cluster
-    // — instead of a full body row between the button and the list.
+    // One title treatment for every copilot menu (ui_common cpMenu*). The project switcher and
+    // the "Show archived" filter sit in the header's accessory slot — above the rule, next to
+    // the title cluster — instead of full body rows between the button and the list.
     static bool s_showArchived = false;
-    // Project scope filter: the list shows this project's sessions (plus unscoped ones) by
-    // default; "All projects" drops the filter and reveals each row's project folder.
-    static bool s_allProjects = false;
+    SessScopeState& scope = s_sessScope;
+    const std::string activeDir = convProjectDir(st);
+    const std::string activeKey = convProjectKey(activeDir);
+    if (!scope.seeded || activeKey != scope.followedKey) {
+        // The active project changed (or first draw): the list follows it.
+        scope.seeded      = true;
+        scope.followedKey = activeKey;
+        scope.scope       = activeKey.empty() ? SessScope::Unassigned : SessScope::Project;
+        scope.key         = activeKey;
+        scope.dir         = activeDir;
+    }
+    int unassigned = 0;
+    const std::vector<SessProjectEntry> projects =
+        sessProjects(st, s_showArchived, activeKey, activeDir, unassigned);
     ui::cpMenuHeader(st.fonts, "Sessions", nullptr, [&]{
+        drawSessionsProjectSwitcher(projects, unassigned, activeKey,
+                                    ImGui::GetContentRegionAvail().x * 0.45f);
+        ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
         // Checkbox ink must come from the glass surface like every other label in this menu:
         // the theme's default text tone is tuned for opaque panels and vanished against the
         // bright viewport backdrop showing through the copilot column.
@@ -763,17 +907,26 @@ void drawSessionsPanel(AppState& st, bool busy) {
                 ? "Showing archived sessions only. Uncheck to return to your active list."
                 : "Archived sessions are hidden from this list \xe2\x80\x94 check to review or "
                   "restore them. Archiving keeps the full transcript (unlike Delete).");
-        ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-        ImGui::Checkbox("All projects", &s_allProjects);
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(s_allProjects
-                ? "Showing sessions from every project \xe2\x80\x94 each row names its project "
-                  "folder. Uncheck to see only this project's sessions."
-                : "Only sessions started in this project (and sessions with no project) are "
-                  "listed \xe2\x80\x94 check to see every session on disk.");
     });
+    const bool allProjects = scope.scope == SessScope::All;
+    // Peeking at another project's sessions: offer the real project switch (the same path as
+    // the title bar / Explorer "Set as working folder"), but keep the user on this surface.
+    const bool peeking = scope.scope == SessScope::Project && scope.key != activeKey;
+    std::string peekName;
+    if (peeking) {
+        peekName = sessProjectName(scope.dir);
+        const std::string hint = "Viewing " + peekName + " \xe2\x80\x94 not the active project.";
+        ui::cpMenuHint(hint.c_str());
+        const std::string btn = "Switch active project to " + peekName;
+        if (ui::kit::secondaryButton(ui::kit::elide(btn.c_str(),
+                                         ImGui::GetContentRegionAvail().x).c_str())) {
+            const AppState::Workspace keepWs = st.activeWorkspace;
+            setActiveProjectDir(st, scope.dir);
+            st.activeWorkspace = keepWs;   // switching projects must not yank the user to PLM
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", scope.dir.c_str());
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
+    }
 
     // New-session is the one PRIMARY action in the copilot menus, so it uses the accent
     // primaryButton rather than the theme's default slab (which rendered as a flat dark block
@@ -789,7 +942,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
         cpSetTab(st, CpTab::Chat);   // land in the new chat, not stuck on the list
     }
     ImGui::PopStyleVar();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh conversation.");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh session.");
 
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
 
@@ -807,27 +960,25 @@ void drawSessionsPanel(AppState& st, bool busy) {
     const float subH  = fh * 0.92f;
     const float rowH  = padY * 2.0f + titleH + 2.0f * sc + subH;
     const float trashSz = ImGui::GetFrameHeight();
-    // Project scope comes from the session's OWN stored projectDir (captured at creation),
-    // never from a live scan of what it produced: a chat that wrote nothing under the folder
-    // — or ran while the project path differed — used to vanish from this list entirely.
-    const std::string projectKey = convProjectKey(convProjectDir(st));
+    // Project scope comes from the session's OWN stored projectDir (captured at creation,
+    // restamped per turn), never from a live scan of what it produced. Only the viewed
+    // project's sessions are listed; sessions with no stored project appear ONLY under
+    // "Unassigned" (they used to leak into every project's list).
+    const std::string viewKey = scope.scope == SessScope::Unassigned ? std::string() : scope.key;
     bool anyRowShown = false;
     // Newest sessions first: newConversation() appends, so the tail of st.conversations is the
     // most recent session — walk the vector back-to-front so it lands at the TOP of the list.
     for (int i = (int)st.conversations.size() - 1; i >= 0; --i) {
         Conversation& c = st.conversations[i];
         if (c.archived != s_showArchived) continue;
-        // Shown iff the session belongs to this project, or carries no project at all
-        // (unscoped: a legacy session with nothing to recover a folder from). The active
-        // transcript lives in st.chat; parked conversations retain theirs in Conversation::msgs.
-        const std::string convKey = convProjectKey(c.projectDir);
-        if (!s_allProjects && !convKey.empty() && !projectKey.empty() && convKey != projectKey)
-            continue;
+        // The active transcript lives in st.chat; parked conversations retain theirs in
+        // Conversation::msgs.
+        if (!allProjects && convProjectKey(c.projectDir) != viewKey) continue;
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
         anyRowShown = true;
         // Fallback number is the conversation's own slot, not the display row — with the
         // newest-first order a row position changes every session, a slot number does not.
-        std::string title = c.title.empty() ? ("Chat " + std::to_string(i + 1)) : c.title;
+        std::string title = c.title.empty() ? ("Session " + std::to_string(i + 1)) : c.title;
         // Truthful per-session state: this conversation's own run, not a global flag. The
         // trailing-message scan catches one-shot RPC turns (agent_ask_v2 …) that never get
         // a JobState in st.runs.
@@ -858,22 +1009,36 @@ void drawSessionsPanel(AppState& st, bool busy) {
         const float rightMargin = 4.0f * sc;
         const float actionsW = delBtnW + archBtnW + forkBtnW + manageBtnW +
                                actionGap * 3.0f + rightMargin;
+        // The overflow button is PERMANENT on every row — the visible sign that a session can be
+        // managed, and the only route to its actions without a hover-capable pointer. The hover
+        // buttons stay as a shortcut to its left.
+        const float moreW = delBtnH;
+        const float moreReserve = moreW + rightMargin + actionGap;
+        const bool renaming = s_rename.id == c.id;
 
         ImGui::PushID(i);
         const ImVec2 rowMin = ImGui::GetCursorScreenPos();
         const float  rowW   = ImGui::GetContentRegionAvail().x;
         const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
 
-        // The action-button zone (Archive/Delete) only EXISTS on hover/active rows, so only
-        // those rows reserve its width — reserving it on idle rows squeezed every title to a
-        // stub for buttons that were not even drawn. Hovering re-clips the title, which reads
-        // as the buttons taking their place. Hover is tested against the row rect directly:
+        // Every row reserves the permanent overflow button; the hover shortcut buttons
+        // (Manage/Fork/Archive/Delete) only EXIST on hover/active rows, so only those rows
+        // reserve their width — reserving it on idle rows squeezed every title to a stub for
+        // buttons that were not even drawn. Hover is tested against the row rect directly:
         // the reserve is needed BEFORE this frame's InvisibleButton reports its hover state.
         const bool rowHot = active || ImGui::IsMouseHoveringRect(rowMin, rowMax);
-        const float actionsReserve = rowHot ? actionsW : 0.0f;
+        const float actionsReserve = moreReserve + ((rowHot && !renaming) ? actionsW : 0.0f);
 
-        bool picked = ImGui::InvisibleButton("##pickconv",
-                                            ImVec2(std::max(1.0f, rowW - actionsReserve - padX), rowH));
+        // While the title is an edit box the row must not also be a click target: the button
+        // would claim hover first and swallow the clicks meant for the text field.
+        bool picked = false;
+        const ImVec2 pickSize(std::max(1.0f, rowW - actionsReserve - padX), rowH);
+        if (renaming) {
+            ImGui::Dummy(pickSize);
+        } else {
+            picked = ImGui::InvisibleButton("##pickconv", pickSize);
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) ImGui::OpenPopup("##sessrow_menu");
+        }
         // NOTE: do NOT use IsItemHovered() on ##pickconv for row-hover logic — that
         // button is shrunk to exclude the action zone, so its hover drops the moment
         // the mouse reaches for the Archive/Delete buttons and they vanish under the
@@ -906,9 +1071,36 @@ void drawSessionsPanel(AppState& st, bool busy) {
                                         : 0.0f;
         const float textMaxW = std::max(ui::metrics::px(24.0f),
                                         rowW - padX * 2.0f - actionsReserve - runIndent);
-        const std::string titleShown = ui::kit::elide(title.c_str(), textMaxW);
-        ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
-        dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY), ink, titleShown.c_str());
+        if (renaming) {
+            // Inline rename: Enter or clicking away saves, Esc cancels. An empty name hands the
+            // session back to its automatic title.
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * sc, 1.0f * sc));
+            ImGui::SetCursorScreenPos(ImVec2(rowMin.x + padX + runIndent,
+                                             std::max(rowMin.y, titleY - 1.0f * sc)));
+            ImGui::SetNextItemWidth(textMaxW);
+            if (s_rename.frames++ == 0) ImGui::SetKeyboardFocusHere();
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+            const bool enter = ImGui::InputText("##rename", s_rename.buf, sizeof(s_rename.buf),
+                                                ImGuiInputTextFlags_EnterReturnsTrue |
+                                                    ImGuiInputTextFlags_AutoSelectAll);
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar();
+            if (ImGui::IsItemActive()) s_rename.everActive = true;
+            const bool deactivated = ImGui::IsItemDeactivated();
+            if (enter || (deactivated && !ImGui::IsKeyPressed(ImGuiKey_Escape))) {
+                renameConversation(st, i, s_rename.buf);
+                s_rename = SessRename{};
+            } else if (deactivated || (!s_rename.everActive && s_rename.frames > 3) ||
+                       (s_rename.everActive && !ImGui::IsItemActive())) {
+                // Esc, focus never landed, or the box lost focus while the row was off-screen:
+                // leave the name as it was.
+                s_rename = SessRename{};
+            }
+        } else {
+            const std::string titleShown = ui::kit::elide(title.c_str(), textMaxW);
+            ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
+            dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY), ink, titleShown.c_str());
+        }
 
         // Project-matching sessions can optionally carry a docLink reference. Show the linked
         // document's name on the sub line; clicking it jumps to that document's tab when open.
@@ -943,33 +1135,30 @@ void drawSessionsPanel(AppState& st, bool busy) {
             badge = ui::kit::elide(badge.c_str(),
                                    std::max(ui::metrics::px(24.0f), rowW * 0.5f - padX));
             badgeW = ImGui::CalcTextSize(badge.c_str()).x + 8.0f * sc;
-            // Right-aligned at the row's true right edge — hover/active rows never reach
-            // here (showBadge above), so this never collides with the action buttons.
-            badgeX1 = rowMax.x - padX;
+            // Right-aligned just left of the permanent overflow button — hover/active rows never
+            // reach here (showBadge above), so this never collides with the action buttons.
+            badgeX1 = rowMax.x - moreReserve;
             badgeX0 = std::max(rowMin.x + padX + runIndent, badgeX1 - badgeW);
         }
         // Clip the subtitle to the room it ACTUALLY has: up to the badge's left edge when a
-        // badge is drawn (not the row edge — the badge sits left of the action zone).
-        const float subRight = badgeW > 0.0f ? badgeX0 - 6.0f * sc : rowMax.x - padX;
+        // badge is drawn, else up to the row's action zone (overflow button, plus the hover
+        // buttons on a hot row).
+        const float subRight = badgeW > 0.0f ? badgeX0 - 6.0f * sc : rowMax.x - actionsReserve;
         const float subMaxW = std::max(ui::metrics::px(24.0f),
                                        subRight - (rowMin.x + padX + runIndent));
         dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY + titleH + 2.0f * sc),
                     ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
                     ui::kit::elide(sub, subMaxW).c_str());
         // "All projects" reveals which project each session belongs to: a dimmed column on
-        // the sub line, right of the message count. Unscoped sessions say so explicitly
+        // the sub line, right of the message count. Unassigned sessions say so explicitly
         // rather than looking like they belong to the current project.
-        if (s_allProjects) {
+        if (allProjects) {
             const float subW = ImGui::CalcTextSize(ui::kit::elide(sub, subMaxW).c_str()).x;
             const float projX = rowMin.x + padX + runIndent + subW + 8.0f * sc;
             const float projMaxW = subRight - projX;
             if (projMaxW > ui::metrics::px(16.0f)) {
-                std::string projName = "no project";
-                if (!c.projectDir.empty()) {
-                    const std::filesystem::path p = lexicalPath(c.projectDir);
-                    projName = p.filename().empty() ? p.generic_string()
-                                                    : p.filename().generic_string();
-                }
+                const std::string projName =
+                    c.projectDir.empty() ? std::string("Unassigned") : sessProjectName(c.projectDir);
                 ImVec4 projInk = surf.textTertiary;
                 projInk.w = 1.0f;
                 dl->AddText(ImVec2(projX, titleY + titleH + 2.0f * sc),
@@ -1006,20 +1195,25 @@ void drawSessionsPanel(AppState& st, bool busy) {
         bool doArchiveToggle = false;
         bool doFork = false;
         bool doManage = false;
-        if (rowHot) {
-            const float delX = rowMax.x - delBtnW - rightMargin;
-            ImGui::SetCursorScreenPos(ImVec2(delX, rowMin.y + (rowH - delBtnH) * 0.5f));
+        bool doRename = false;
+        const float btnY = rowMin.y + (rowH - delBtnH) * 0.5f;
+        const float moreX = rowMax.x - rightMargin - moreW;
+        if (rowHot && !renaming) {
+            const float delX = moreX - actionGap - delBtnW;
+            ImGui::SetCursorScreenPos(ImVec2(delX, btnY));
             IconUV trash = ui::getIcon("delete", 20);
             bool del = trash.valid
                 ? ImGui::ImageButton("##delconv", trash.texId, ImVec2(delImg, delImg), trash.uv0, trash.uv1)
                 : ImGui::SmallButton("x");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete this session");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(running ? "Delete \xe2\x80\x94 available when this session's run finishes."
+                                          : "Delete this session");
             // Destructive row actions are blocked only for the row whose own run is live —
             // an unrelated background run never locks them.
             doDel = del && !running;
 
             const float archX = delX - archBtnW - actionGap;
-            ImGui::SetCursorScreenPos(ImVec2(archX, rowMin.y + (rowH - delBtnH) * 0.5f));
+            ImGui::SetCursorScreenPos(ImVec2(archX, btnY));
             bool archClick = ImGui::Button(archLabel, ImVec2(archBtnW, delBtnH));
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(c.archived
@@ -1029,18 +1223,50 @@ void drawSessionsPanel(AppState& st, bool busy) {
             doArchiveToggle = archClick && !running;
 
             const float forkX = archX - forkBtnW - actionGap;
-            ImGui::SetCursorScreenPos(ImVec2(forkX, rowMin.y + (rowH - delBtnH) * 0.5f));
+            ImGui::SetCursorScreenPos(ImVec2(forkX, btnY));
             doFork = ImGui::Button("Fork", ImVec2(forkBtnW, delBtnH));
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Fork this session into a new idle copy");
 
             const float mgX = forkX - manageBtnW - actionGap;
-            ImGui::SetCursorScreenPos(ImVec2(mgX, rowMin.y + (rowH - delBtnH) * 0.5f));
+            ImGui::SetCursorScreenPos(ImVec2(mgX, btnY));
             doManage = ImGui::Button("Manage", ImVec2(manageBtnW, delBtnH));
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(s_ccm.convId == c.id
                     ? "Hide session recovery"
                     : "Session recovery: export, diagnose/repair, branch, close runtime");
+        }
+
+        // Permanent overflow: the same actions (plus Rename) on every row, hover or not.
+        // Right-clicking the row opens the same menu.
+        ImGui::SetCursorScreenPos(ImVec2(moreX, btnY));
+        if (ImGui::Button("\xe2\x80\xa6##sessrow_more", ImVec2(moreW, delBtnH)))
+            ImGui::OpenPopup("##sessrow_menu");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Session actions");
+        ui::pushContextMenuStyle();
+        if (ImGui::BeginPopup("##sessrow_menu")) {
+            constexpr const char* kAfterThisRun =
+                "Available when this session's run finishes.";
+            if (ImGui::MenuItem("Rename")) doRename = true;
+            if (ImGui::MenuItem("Fork")) doFork = true;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fork this session into a new idle copy");
+            if (ImGui::MenuItem(archLabel, nullptr, false, !running)) doArchiveToggle = true;
+            if (running && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s", kAfterThisRun);
+            if (ImGui::MenuItem(s_ccm.convId == c.id ? "Hide recovery" : "Manage")) doManage = true;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Session recovery: export, diagnose/repair, branch, close runtime");
+            ImGui::Separator();
+            if (ImGui::MenuItem("Delete", nullptr, false, !running)) doDel = true;
+            if (running && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s", kAfterThisRun);
+            ImGui::EndPopup();
+        }
+        ui::popContextMenuStyle();
+        if (doRename) {
+            s_rename = SessRename{};
+            s_rename.id = c.id;
+            std::snprintf(s_rename.buf, sizeof(s_rename.buf), "%s", c.title.c_str());
         }
 
         ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + rowGap));
@@ -1058,13 +1284,17 @@ void drawSessionsPanel(AppState& st, bool busy) {
     }
     if (!anyRowShown) {
         // Same tone and indent as every other "nothing here yet" line in the copilot menus.
-        if (s_showArchived)
-            ui::cpMenuHint(s_allProjects ? "No archived sessions."
-                                         : "No archived sessions in this project.");
-        else
-            ui::cpMenuHint(s_allProjects ? "No sessions yet."
-                                         : "No sessions in this project \xe2\x80\x94 check "
-                                           "\"All projects\" to see every session.");
+        std::string where;
+        if (scope.scope == SessScope::Project)
+            where = peeking ? " in " + peekName : std::string(" in this project");
+        const std::string hint =
+            allProjects                           ? std::string(s_showArchived ? "No archived sessions."
+                                                                               : "No sessions yet.")
+            : scope.scope == SessScope::Unassigned ? std::string(s_showArchived
+                                                        ? "No archived unassigned sessions."
+                                                        : "No unassigned sessions.")
+            : (s_showArchived ? "No archived sessions" : "No sessions") + where + ".";
+        ui::cpMenuHint(hint.c_str());
     }
 
 }

@@ -125,6 +125,9 @@ def resolve_settings(
     ):
         if key in raw_params:
             settings[key] = raw_params[key]
+    # Task sub-agents' CAD calls are only visible to the feed/trace and the
+    # progress watchdog through their forwarded `subagent_event` frames.
+    settings.setdefault("subagent_subscription", "events")
     return settings
 
 

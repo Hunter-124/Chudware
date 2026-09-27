@@ -70,8 +70,10 @@ bool force_release_doc_lock();
 // plus "duplicate_doc_ids" when several answer to the name. Callers that mean "the part
 // called X" (services/mcp new_part) pass true; callers that mean "another document"
 // (new_part(fresh=True), import, reverse-engineering) leave it false and keep uniquifying.
+// `project_dir`, when non-empty, limits the resume to documents without a file or whose
+// file lies inside it: another project's open document is never resumed.
 nlohmann::json doc_new(const std::string& kind, const std::string& name,
-                       bool resume_if_open = false);
+                       bool resume_if_open = false, const std::string& project_dir = {});
 
 // Apply an op batch. `base_revision` < 0 skips the optimistic-concurrency guard;
 // otherwise a mismatch throws OpError("stale_revision"). A bad op throws OpError.

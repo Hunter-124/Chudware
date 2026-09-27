@@ -4916,3 +4916,15 @@ dangle). Tests: `test_document` "primitive boss and cut leave no coplanar seam f
 (11→8, 7→6 faces), `test_selectors` A9. Gotcha: after `./build.sh stage` an auto-spawned dev
 hostd keeps serving the old engine until it drains — check `chudware-hostd --status`
 before trusting an MCP smoke.
+
+Same day, from the verification rerun: `new_assembly("sixaxis_arm")` in `/tmp/sixaxis-run4`
+RESUMED the user's Desktop assembly of that name, open in the shared hostd, and the agent
+added 13 components before noticing (it removed them; the file re-verified intact). By-name
+resume now never crosses projects: `doc_new` takes `project_dir` and `resume_open_doc`
+skips documents whose file lies outside it (`core/doc/session.cpp`, dispatch in
+`libchudware.cpp`), and `cad_common._resumable_docs` / `_doc_new_scope` apply the same
+filter to the Python name, path-stem and version-series lookups in `new_part`,
+`new_assembly` and the `add_features` batch head. Unsaved documents stay resumable.
+Test: `test_new_part_and_assembly_never_resume_another_projects_open_doc`. Rerun 4 built a
+14-component arm: 7 printed parts, each one solid with zero redundant faces; 6 DOF,
+residual 0, 0 collisions.

@@ -29,6 +29,7 @@ from .cad_common import (
     _autosave,
     _default_deliverable_path,
     _doc,
+    _doc_new_scope,
     _doc_revision,
     _docs_in_version_series,
     _docs_named,
@@ -39,6 +40,7 @@ from .cad_common import (
     _publish_current,
     _project_save,
     _resolve_alias,
+    _resumable_docs,
     _resolve_appearance,
     _material_candidates,
     _material_norm,
@@ -7017,8 +7019,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 # The PATH-STEM resume still needs the doc list: the engine keys documents
                 # by name, not by the file they were imported from. It never mints, so two
                 # racing callers both land on the same imported document.
-                docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
-                        if isinstance(e, dict) and e.get("doc_id")]
+                docs = _resumable_docs()
                 exact_open = bool(_docs_named(docs, name))
                 if not exact_open:
                     folded = (name or "").strip().casefold()
@@ -7054,7 +7055,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # so a concurrent loser resumes the winner's document instead of minting.
             mint_name = name if exact_open else _strip_version_suffix(name)
             r = cb.call("doc_new", {"kind": "part", "name": mint_name,
-                                    "resume_if_open": not fresh})
+                                    "resume_if_open": not fresh, **_doc_new_scope()})
             did = r.get("doc_id")
             if r.get("reused"):
                 out = _resumed_reply(r, name)
@@ -7356,8 +7357,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 # ("holster_v4" while "holster_v3" is open and built) is the next
                 # REVISION of one design, not a second part. Same rule as the tool, so a
                 # model cannot dodge it by opening a batch with the create instead.
-                head_docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
-                             if isinstance(e, dict) and e.get("doc_id")]
+                head_docs = _resumable_docs()
                 series = _pick_best_doc(_docs_in_version_series(head_docs, head_name))
                 if series is not None:
                     created = series["doc_id"]
@@ -7376,7 +7376,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 head_mint_name = (head_name if _docs_named(head_docs, head_name)
                                   else _strip_version_suffix(head_name))
                 r = cb.call("doc_new", {"kind": "part", "resume_if_open": True,
-                                        "name": head_mint_name})
+                                        "name": head_mint_name, **_doc_new_scope()})
                 created = r.get("doc_id")
                 _CUR["doc_id"] = created
                 note_touched_doc(created)

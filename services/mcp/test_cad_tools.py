@@ -1959,6 +1959,39 @@ def test_new_part_resume_reports_the_feature_count_it_resumed_onto():
         cad_tools._LAST_VOLUME[doc]
 
 
+def test_new_part_and_assembly_never_resume_another_projects_open_doc(tmp_path, monkeypatch):
+    """Live 2026-09-27: an agent building "sixaxis_arm" in /tmp/sixaxis-run4 called
+    new_assembly("sixaxis_arm"), got the user's Desktop assembly of that name (left open in
+    the shared hostd) and added 13 components to it. A document saved OUTSIDE the turn's
+    project is not a resume target; one saved inside it still is."""
+    home, other = tmp_path / "home", tmp_path / "other"
+    home.mkdir()
+    other.mkdir()
+    for kind in ("part", "assembly"):
+        tool = "new_part" if kind == "part" else "new_assembly"
+        name = _unique_part_name(f"scoped_{kind}")
+        monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(home))
+        first, _ = _call(tool, {"name": name})
+        doc = first["doc_id"]
+        if kind == "part":
+            built, _ = _call("add_features", {"doc_id": doc, "ops": [
+                cb.feat("box", "B", {"length": cb.dim(10), "width": cb.dim(10),
+                                     "height": cb.dim(10)})]})
+            assert built["ok"], built
+        cb.call("doc_save", {"doc_id": doc, "path": str(home / f"{name}.step+")})
+
+        same, _ = _call(tool, {"name": name})
+        assert same["doc_id"] == doc and same.get("reused"), same
+
+        monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(other))
+        fresh, _ = _call(tool, {"name": name})
+        assert fresh["doc_id"] != doc and not fresh.get("reused"), fresh
+        docs = {e["doc_id"]: e for e in cb.call("doc_list", {})["docs"]}
+        assert docs[doc]["revision"] == (1 if kind == "part" else 0), docs[doc]
+        for d in (doc, fresh["doc_id"]):
+            cb.call("doc_close", {"doc_id": d})
+
+
 @pytest.mark.parametrize("suffix", ["", "4"])
 def test_new_part_resume_discards_unbuilt_orphans(suffix):
     """A worker SIGKILLed on the run timeout leaves its zero-geometry document open in the

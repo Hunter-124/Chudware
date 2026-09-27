@@ -5504,6 +5504,14 @@ static std::string fold_doc_name(const std::string& s) {
     return out;
 }
 
+// True when `file` lies inside `dir` (both made absolute and normalized; no symlink walk).
+static bool path_within(const std::string& file, const std::string& dir) {
+    namespace fs = std::filesystem;
+    const auto rel = fs::absolute(fs::path(file)).lexically_normal().lexically_relative(
+        fs::absolute(fs::path(dir)).lexically_normal());
+    return !rel.empty() && *rel.begin() != "..";
+}
+
 // The already-open document `requested` names, or nullopt. MUST be called with
 // g_doc_mint_mtx held, which is what makes doc_new's resume-or-mint atomic.
 //
@@ -5517,8 +5525,15 @@ static std::string fold_doc_name(const std::string& s) {
 // caller can tell the agent what it resumed onto (docs/REFACTOR_LOG.md ~5274, ~5309 —
 // inheriting a stranger's half-built body silently is what produced twelve "boss added
 // no material (it is buried inside the body)" failures, so the count must travel).
+//
+// `project_dir` (optional) scopes the match: a document opened from or saved to a file
+// OUTSIDE it belongs to another project and is never resumed. An agent building
+// "sixaxis_arm" in /tmp/run4 resumed the user's Desktop assembly of that name, left open
+// in the shared hostd, and added 13 components to it (2026-09-27). Unsaved documents have
+// no location and stay resumable.
 static std::optional<json> resume_open_doc(const std::string& requested,
-                                           const std::string& kind) {
+                                           const std::string& kind,
+                                           const std::string& project_dir) {
     std::vector<std::pair<std::string, std::shared_ptr<Session>>> pins;
     {
         std::lock_guard<std::mutex> reg(g_registry_mtx);
@@ -5544,6 +5559,8 @@ static std::optional<json> resume_open_doc(const std::string& requested,
         const std::string nm = sp->doc.value("name", std::string());
         const bool exact = nm == requested;
         if (!exact && fold_doc_name(nm) != want) continue;
+        if (!project_dir.empty() && !sp->path.empty() && !path_within(sp->path, project_dir))
+            continue;
         Cand c;
         c.id = id;
         c.name = nm;
@@ -5620,7 +5637,8 @@ static std::string unique_doc_name(const std::string& requested) {
 }
 
 // ----------------------------------------------------------------- public API
-json doc_new(const std::string& kind, const std::string& name, bool resume_if_open) {
+json doc_new(const std::string& kind, const std::string& name, bool resume_if_open,
+             const std::string& project_dir) {
     const std::string k = kind.empty() ? std::string("part") : kind;
     if (k != "part" && k != "assembly")
         throw OpError("invalid_op", "doc kind must be part|assembly, got '" + k + "'",
@@ -5632,7 +5650,8 @@ json doc_new(const std::string& kind, const std::string& name, bool resume_if_op
     // resume the same-named document if the caller opted in, otherwise uniquify and mint.
     std::unique_lock<std::mutex> mint(g_doc_mint_mtx);
     if (resume_if_open) {
-        if (std::optional<json> resumed = resume_open_doc(requested, k)) return *resumed;
+        if (std::optional<json> resumed = resume_open_doc(requested, k, project_dir))
+            return *resumed;
     }
     const std::string resolved = unique_doc_name(requested);
     if (k == "assembly") {

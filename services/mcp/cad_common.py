@@ -514,6 +514,38 @@ def _docs_named(docs: list, value: str) -> list:
     return [e for e in docs if (e.get("name") or "").strip().casefold() == folded]
 
 
+def _project_dir() -> str:
+    """The turn's project directory (CHUDWARE_PROJECT_DIR), absolute and normalized; "" if unset."""
+    raw = os.environ.get("CHUDWARE_PROJECT_DIR", "").strip()
+    return os.path.normpath(os.path.abspath(os.path.expanduser(raw))) if raw else ""
+
+
+def _resumable_docs() -> list:
+    """Open docs a by-name resume may land on: every doc when no project is set, else the
+    unsaved ones plus those whose file lies inside the project. Another project's open doc
+    is never resumed (the engine applies the same rule to doc_new's `project_dir`) — an
+    agent building "sixaxis_arm" in /tmp/run4 edited the user's Desktop assembly of that
+    name because it happened to be open in the shared hostd (2026-09-27)."""
+    docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+            if isinstance(e, dict) and e.get("doc_id")]
+    project = _project_dir()
+    if not project:
+        return docs
+
+    def inside(path: Any) -> bool:
+        if not path:
+            return True
+        p = os.path.normpath(os.path.abspath(str(path)))
+        return os.path.commonpath([p, project]) == project
+
+    return [e for e in docs if inside(e.get("path"))]
+
+
+def _doc_new_scope() -> dict:
+    """doc_new params that scope its resume_if_open match to the turn's project."""
+    project = _project_dir()
+    return {"project_dir": project} if project else {}
+
 # ---------------------------------------------------------------------------
 # Version-series resolution — "the next version" is a REVISION, not a new part.
 # ---------------------------------------------------------------------------

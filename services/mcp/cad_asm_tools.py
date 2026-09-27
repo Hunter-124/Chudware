@@ -14,6 +14,7 @@ from .cad_common import (
     _autosave_all_open,
     _describe_type,
     _doc,
+    _doc_new_scope,
     _docs_named,
     _docs_in_version_series,
     _dumps,
@@ -27,6 +28,7 @@ from .cad_common import (
     _resolve_face_points,
     _resolve_one_selector,
     _resolve_material,
+    _resumable_docs,
     _strip_version_suffix,
     _tmp,
     _version_series_base,
@@ -167,8 +169,7 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         in its history (plm_timeline / plm_rollback). Reuse the name the reply hands back.
         """
         try:
-            docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
-                    if isinstance(e, dict) and e.get("doc_id")]
+            docs = _resumable_docs()
             series = _pick_best_doc(_docs_in_version_series(docs, name, kind="assembly"))
             if series is not None:
                 did = series["doc_id"]
@@ -197,7 +198,7 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                           if (e.get("kind") or "part") == "assembly"]
             mint_name = name if exact_open else _strip_version_suffix(name)
             r = cb.call("doc_new", {"kind": "assembly", "name": mint_name,
-                                    "resume_if_open": True})
+                                    "resume_if_open": True, **_doc_new_scope()})
             did = r.get("doc_id")
             _CUR["doc_id"] = did
             note_touched_doc(did)

@@ -843,7 +843,9 @@ def test_provider_auth_model_and_login_results_are_bounded_and_secret_free(onlin
     assert auth["accounts"] == [
         {"accountId": "acct-1", "email": "user@example.com", "orgName": "Example"}
     ]
-    assert len(models["models"]) == 256
+    # Filter by provider before bounding: unrelated providers cannot hide a late model.
+    assert len(models["models"]) == 265
+    assert any(model["id"] == "model-528" for model in models["models"])
     assert set(models["models"][0]) == {
         "id",
         "name",

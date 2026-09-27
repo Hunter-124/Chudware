@@ -2224,20 +2224,29 @@ def _chudcode_models_list(params: dict, _emit: Callable) -> dict:
     if unknown:
         return {"ok": False, "reason": "chudcode_models_list has unknown params"}
     provider_id = _bounded_text(params.get("providerId"), 128)
+    # Chudcode's get_available_models reads an in-memory registry. Re-querying that
+    # process cannot discover a newly released model; the host refreshes Chudcode's
+    # own on-disk catalog off-lane and replaces only the idle service process.
+    host = get_default_chudcode_host()
+    try:
+        refreshing = host.refresh_catalog_if_stale()
+    except Exception:  # noqa: BLE001 - discovery must not hide the last good catalog
+        refreshing = False
     raw = _chudcode_transient_call("get_available_models", {})
     if not raw.get("ok"):
         return raw
     models: list[dict[str, Any]] = []
     raw_models = raw.get("models")
     if isinstance(raw_models, list):
-        for item in raw_models[:_CHUDCODE_MAX_MODELS]:
+        for item in raw_models:
             model = _sanitize_model(item)
             if model is not None and (
                 provider_id is None or model["provider"] == provider_id
             ):
                 models.append(model)
     models.sort(key=lambda item: (item["provider"], item["name"].lower(), item["id"]))
-    return {"ok": True, "models": models[:_CHUDCODE_MAX_MODELS]}
+    return {"ok": True, "models": models[:_CHUDCODE_MAX_MODELS],
+            "refreshing": refreshing}
 
 
 def _chudcode_session_call(

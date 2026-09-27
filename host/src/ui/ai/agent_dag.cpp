@@ -1143,19 +1143,20 @@ static void drawAgentRow(AppState& st, TraceStore& t, int ai, int depth, bool co
         std::string tip = agentLabel(a);
         if (!a.brief.empty()) tip += "\n" + a.brief;
         if (!a.model.empty()) tip += "\nModel: " + a.model;
-        if (ai != 0) tip += "\nClick to show its steps and inspect it";
+        tip += ai == 0 ? "\nClick to inspect the main agent and its steps"
+                       : "\nClick to show its steps and inspect it";
         ImGui::SetTooltip("%s", tip.c_str());
     }
     if (clicked) {
         if (t.selAgent != a.id) chatLogJumpToBottom(kTimelineRegion);
         t.selAgent = a.id;
-        if (ai != 0 && onAgent) onAgent(st, a.id, a.name);
+        if (onAgent) onAgent(st, a.id, a.name);
     }
 }
 
 static void drawStepRow(AppState& st, const std::string& convId, const Agent& a, const Step& s,
                         float h, bool selected, const AdaptiveSurface& surf,
-                        AgentTraceSelectStepFn onStep) {
+                        AgentTraceSelectAgentFn onAgent, AgentTraceSelectStepFn onStep) {
     const float lineH = ImGui::GetTextLineHeight();
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     const float w = std::max(ImGui::GetContentRegionAvail().x, ui::metrics::stroke(1.0f));
@@ -1230,7 +1231,10 @@ static void drawStepRow(AppState& st, const std::string& convId, const Agent& a,
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (t1 != title) ImGui::SetTooltip("%s", title.c_str());
     }
-    if (clicked && onStep) onStep(st, stepView(convId, a, s));
+    if (clicked && onStep) {
+        if (onAgent) onAgent(st, a.id, a.name);
+        onStep(st, stepView(convId, a, s));
+    }
 }
 
 }  // namespace
@@ -1252,6 +1256,7 @@ void drawAgentTrace(AppState& st, const std::string& convId, AgentTraceSelectAge
     if (sel < 0) { t.selAgent = "main"; sel = 0; }
 
     // ---- agent tree ----
+    kit::sectionHeader("Agents", nullptr, "Select an agent to inspect its steps");
     static std::vector<std::pair<int, int>> order;
     treeOrder(t, order);
     const float spacingY = ImGui::GetStyle().ItemSpacing.y;
@@ -1307,7 +1312,7 @@ void drawAgentTrace(AppState& st, const std::string& convId, AgentTraceSelectAge
                     continue;
                 }
                 const Step& s = a.steps[(size_t)(i - offset)];
-                drawStepRow(st, convId, a, s, stepH, s.uid == selectedStepUid, surf, onStep);
+                drawStepRow(st, convId, a, s, stepH, s.uid == selectedStepUid, surf, onAgent, onStep);
             }
         }
         clip.End();

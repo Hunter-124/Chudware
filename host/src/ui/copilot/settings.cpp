@@ -1496,17 +1496,17 @@ bool moonshotKeyPresent(AppState& st) {
 }
 
 // ============================ Chudcode model catalog + session cost (S-UI-PROV) ===
-// Static model catalog (capabilities + $/Mtok cost) via the Chudcode worker's
-// `chudcode_models_list`, and the per-session cost strip via `chudcode_session_stats`
-// (authoritative per-session accounting on the Chudcode host). Both degrade permanently on
-// unknown_method (sibling slice absent / older service) and quietly keep the last good data
-// on soft failures.
+// Chudcode's catalog (capabilities + $/Mtok cost) via `chudcode_models_list`,
+// and the per-session cost strip via `chudcode_session_stats`. The worker
+// re-discovers models in the background; poll briefly until the fresh service is ready.
+// Both degrade permanently on unknown_method and keep the last good data on soft failures.
 
 namespace {
 
 std::vector<ui::BridgeModelMeta> s_bridgeModels;
 bool s_bridgeCatalogAvailable = true;  // false after unknown_method — stop polling, no sublabels
 bool s_bridgeCatalogInFlight = false;
+bool s_bridgeCatalogRefreshing = false;
 double s_bridgeCatalogLastFetch = -1e9;
 
 // True when the RPC is permanently absent (unknown method / older core) — mirrors
@@ -1630,15 +1630,20 @@ bool isDeprecatedModelId(const std::string& id) {
 void refreshBridgeModelCatalog(AppState& st, bool force) {
     if (!s_bridgeCatalogAvailable || s_bridgeCatalogInFlight) return;
     const double now = ImGui::GetTime();
-    // Catalog changes slowly (only on a Chudcode update) — 5-min TTL like the usage polls.
-    if (!force && (now - s_bridgeCatalogLastFetch) < 300.0) return;
+    // During Chudcode's background discovery, follow up promptly rather than waiting
+    // five minutes after showing the old list. Steady-state polling stays at five minutes.
+    if (!force && (now - s_bridgeCatalogLastFetch) < (s_bridgeCatalogRefreshing ? 5.0 : 300.0))
+        return;
     s_bridgeCatalogLastFetch = now;
     s_bridgeCatalogInFlight = true;
     st.rpc.call("chudcode_models_list", nlohmann::json::object(),
                 [](const core::RpcResult& r) {
         s_bridgeCatalogInFlight = false;
+        if (r.ok && r.result.is_object() && r.result.value("ok", true))
+            s_bridgeCatalogRefreshing = r.result.value("refreshing", false);
         if (bridgeRpcAbsent(r)) {
             s_bridgeCatalogAvailable = false;
+            s_bridgeCatalogRefreshing = false;
             s_bridgeModels.clear();
             return;
         }

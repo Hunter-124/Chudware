@@ -4994,3 +4994,30 @@ mirror moved to a third doc (New/Open) is still followed (`host/tests/test_switc
 Not verified: the rebuilt GUI (no relink during the live session). Side effect worth knowing:
 agent-lane calls (chudcode_*) made during a turn now reach hostd and get `worker_lane_busy` at
 once instead of hanging for the turn.
+
+## 2026-09-27 — model discovery refresh and Current Run navigation
+
+`chudcode_models_list` had been re-reading the same no-session Chudcode process every five
+minutes: the runtime never refreshed its in-memory catalog. On a catalog request,
+`ChudcodeSessionHost` runs Chudcode's own `models refresh --json` off the worker call lane
+when the last successful refresh is at least two hours old, with
+five-minute failure backoff and a bounded/cancelled child process. On success only the shared
+no-session catalog service is replaced; live conversations and running turns are not stopped.
+The GUI polls every five seconds during discovery, then resumes its five-minute cadence.
+Provider filtering precedes the worker's 512-row cap, so unrelated catalog entries cannot
+displace late rows. A real refresh on this machine still returned five Codex GPT-5.5/5.6
+models and **no GPT-6**; Chudware does not invent a model that the installed Chudcode
+runtime does not advertise or accept. Existing conversation processes keep their own
+catalog until they are closed/resumed; a newly discovered model may require a new session
+until Chudcode exposes in-session model refresh. Current Run's main-agent trace row now
+selects the main-agent inspector instead of leaving a sub-agent transcript on screen;
+the sub-agent inspector has a `Back to main agent` action, step details return to the
+selected agent, and conversation switches restore their own selection. Main chat remains
+visible on the left. Files: `services/agent/{chudcode_host,worker_rpc}.py`,
+`host/src/ui/copilot/settings.cpp`, `host/src/ui/ai/{agent_dag,current_run_view}.cpp`,
+focused `test_chudcode_host.py` and `test_worker_rpc_chudcode.py`.
+Gate status: focused Chudcode tests (64 passed), GUI build, AI workspace screenshot
+smoke, and source/GUI lint passed. The full gate compiled core/GUI/WASM, passed
+ctest, hostd and web parity, and passed `services/agent` (3436 tests); it recorded
+seven failures in `services/mcp/test_face_attribution.py` (face-owner geometry, outside
+this change) and timed out in the sensor-node demo. Neither failure was silenced.

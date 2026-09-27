@@ -5,6 +5,7 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "core/app_state.h"
@@ -81,10 +82,13 @@ static StepSelection s_step;
 
 // The viewed session's trace sub-agents (tree order), refreshed every frame by pollCurrentRun.
 static std::vector<AgentTraceAgent> s_trace;
-// The roster/trace agent shown in the inspector. When the registry knows it, s_inspector.cur
-// carries its registry record (cur.id == s_selId); a trace-only agent leaves cur empty.
-static std::string s_selId;
+// Inspector selection is per conversation, just like the trace timeline's own selection.
+static std::unordered_map<std::string, std::string> s_selectedByConv;
+static std::string s_viewConv;
+// "main" is a real inspector selection, not a registry sub-agent.
+static std::string s_selId = "main";
 static int s_liveCount = 0;
+static bool s_resetInspectorScroll = false;
 
 // Registry LIVE_STATUSES (subagent_registry.py): a paused or approved session is still live and
 // must keep its Resume / Terminate controls.
@@ -174,7 +178,10 @@ static void pollSubagentList(AppState& st) {
         s_sub.recentExpanded = false;
         s_inspector = SubChatState{};
         s_step = StepSelection{};
-        s_selId.clear();
+        s_selectedByConv.clear();
+        s_viewConv.clear();
+        s_selId = "main";
+        s_resetInspectorScroll = true;
     }
     if (key.empty() || !st.workerStarted || s_sub.listPending) return;
     const double now = ImGui::GetTime();
@@ -198,7 +205,7 @@ static void pollSubagentList(AppState& st) {
         if (r.result.contains("sessions") && r.result["sessions"].is_array())
             for (const auto& s : r.result["sessions"])
                 if (s.is_object()) s_sub.sessions.push_back(parseSubSession(s));
-        if (s_selId.empty()) return;
+        if (s_selId == "main" || s_selId.empty()) return;
         const SubagentSession* reg = registryFor(s_selId);
         if (!reg) {
             if (!s_inspector.cur.id.empty()) s_inspector = SubChatState{};
@@ -336,15 +343,19 @@ static void requestSubagentTerminate(AppState& st, SubChatState& cs) {
 }
 
 // Inspect one agent: its registry record (transcript + controls) when the registry knows it,
-// else its trace state read-only.
+// else its trace state read-only. Main is the left-hand conversation, never a registry lookup.
 static void inspectAgent(AppState& st, const std::string& id) {
     s_step.active = false;
-    if (s_selId != id) s_inspector = SubChatState{};
+    const bool changed = s_selId != id;
+    const bool hadRegistry = s_inspector.cur.id == id;
+    if (changed) { s_inspector = SubChatState{}; s_resetInspectorScroll = true; }
     s_selId = id;
+    if (!st.activeConvId().empty()) s_selectedByConv[st.activeConvId()] = id;
+    if (id == "main") return;
     const SubagentSession* reg = registryFor(id);
     if (!reg) { s_inspector = SubChatState{}; return; }
     s_inspector.cur = *reg;
-    fetchSubagentTranscript(st, s_inspector, true);
+    if (changed || !hadRegistry) fetchSubagentTranscript(st, s_inspector, true);
 }
 
 // Trace-tree click: the trace has already selected the agent's timeline.
@@ -352,16 +363,42 @@ static void selectSubagent(AppState& st, const std::string& id, const std::strin
     inspectAgent(st, id);
 }
 
-// Roster click: also show the agent's steps in the trace.
+// Roster click: also show the agent's steps in the trace when they exist.
 static void selectRosterAgent(AppState& st, const std::string& id) {
-    agentTraceSelectAgent(st, st.activeConvId(), id);
+    if (!agentTraceSelectAgent(st, st.activeConvId(), id))
+        agentTraceSelectAgent(st, st.activeConvId(), "main");
     inspectAgent(st, id);
 }
 
 static void selectTraceStep(AppState&, const AgentTraceStep& step) {
     s_step.active = true;
+    s_resetInspectorScroll = true;
     s_step.stale = false;
     s_step.step = step;
+}
+
+// Session changes restore that session's own inspector/trace selection, never the last
+// session's step or transcript. An agent removed from both sources falls back to main.
+static void syncViewedConversation(AppState& st) {
+    const std::string convId = st.activeConvId();
+    if (s_viewConv == convId) return;
+    s_viewConv = convId;
+    s_step = StepSelection{};
+    s_inspector = SubChatState{};
+    s_resetInspectorScroll = true;
+    const auto it = s_selectedByConv.find(convId);
+    s_selId = it == s_selectedByConv.end() ? "main" : it->second;
+    if (s_selId != "main" && !traceFor(s_selId) && !registryFor(s_selId))
+        s_selId = "main";
+    if (!agentTraceSelectAgent(st, convId, s_selId))
+        agentTraceSelectAgent(st, convId, "main");
+    if (s_selId != "main") {
+        if (const SubagentSession* reg = registryFor(s_selId)) {
+            s_inspector.cur = *reg;
+            fetchSubagentTranscript(st, s_inspector, true);
+        }
+    }
+    if (!convId.empty()) s_selectedByConv[convId] = s_selId;
 }
 
 static kit::Tone stepTone(const std::string& status) {
@@ -383,8 +420,10 @@ static void drawStepInspector(AppState& st, const AdaptiveSurface& surf) {
     AgentTraceStep& s = s_step.step;
     s_step.stale = !agentTraceRefreshStep(st, s);
     kit::sectionHeader("Selected step", nullptr, nullptr, -1, true);
-    if (kit::secondaryButton(s_selId.empty() ? "Close step" : "Back to agent"))
+    if (kit::secondaryButton(s_selId == "main" ? "Back to main agent" : "Back to selected agent")) {
         s_step.active = false;
+        s_resetInspectorScroll = true;
+    }
     kit::chip(s.kind.c_str(), kit::Tone::Info);
     if (!s.status.empty()) {
         ImGui::SameLine();
@@ -561,9 +600,36 @@ static void drawTraceAgentInspector(const AgentTraceAgent& a) {
                  "main agent, so it has no steering controls here.");
 }
 
+static void drawMainAgentInspector(AppState& st) {
+    const bool running = st.convRunning(st.activeConvId());
+    kit::chip(running ? "running" : "main chat", running ? kit::Tone::Accent : kit::Tone::Neutral,
+              running);
+    kit::keyValueRow("Agent", "Main agent");
+    const std::vector<ChatMsg>* msgs = conversationMsgs(st, st.activeConvId());
+    if (msgs) {
+        char count[32];
+        std::snprintf(count, sizeof(count), "%zu messages", msgs->size());
+        kit::keyValueRow("Conversation", count);
+        for (auto it = msgs->rbegin(); it != msgs->rend(); ++it) {
+            if (!it->fromUser || it->text.empty()) continue;
+            kit::sectionHeader("Latest request");
+            ImGui::TextWrapped("%.*s%s", (int)std::min<size_t>(it->text.size(), 260),
+                               it->text.c_str(), it->text.size() > 260 ? "..." : "");
+            break;
+        }
+    }
+    kit::gapRow();
+    kit::dimText("The full main-agent conversation and message composer are in the left chat "
+                 "pane. Its steps are shown in the execution trace.");
+}
+
 static void drawInspector(AppState& st) {
     ImGui::BeginChild("##current_inspector", ImVec2(0, 0),
                       ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
+    if (s_resetInspectorScroll) {
+        ImGui::SetScrollY(0.0f);
+        s_resetInspectorScroll = false;
+    }
     const AdaptiveSurface& surf = adaptivePanel(panelId("ai_ws_current_inspector"),
         ImRect(ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
                                             ImGui::GetWindowPos().y + ImGui::GetWindowSize().y)),
@@ -575,18 +641,23 @@ static void drawInspector(AppState& st) {
         ImGui::EndChild();
         return;
     }
+    if (s_selId != "main" && s_inspector.cur.id.empty() && !traceFor(s_selId)) {
+        agentTraceSelectAgent(st, st.activeConvId(), "main");
+        inspectAgent(st, "main");
+    }
     kit::sectionHeader("Selected agent", nullptr, nullptr, -1, true);
-    SubChatState& cs = s_inspector;
-    const AgentTraceAgent* tr = s_selId.empty() ? nullptr : traceFor(s_selId);
-    if (cs.cur.id.empty() && !tr) {
-        s_selId.clear();   // the agent left the viewed session's trace (e.g. session switch)
-        kit::emptyState("ai_panel", "Nothing selected",
-                        "Click a step in the execution trace to see its full detail, or a "
-                        "sub-agent in the roster or trace to inspect it.");
+    if (s_selId != "main" && kit::secondaryButton("Back to main agent")) {
+        agentTraceSelectAgent(st, st.activeConvId(), "main");
+        inspectAgent(st, "main");
+    }
+    if (s_selId == "main") {
+        drawMainAgentInspector(st);
         drawWindowPillScrollbarV(surf);
         ImGui::EndChild();
         return;
     }
+    SubChatState& cs = s_inspector;
+    const AgentTraceAgent* tr = traceFor(s_selId);
     if (cs.cur.id.empty()) {
         drawTraceAgentInspector(*tr);
         drawWindowPillScrollbarV(surf);
@@ -608,6 +679,8 @@ static void drawInspector(AppState& st) {
         kit::chip("paused", kit::Tone::Warn);
     }
     if (tr) kit::keyValueRow("Agent", tr->name.c_str());
+    else kit::inlineStatus("No steps recorded for this sub-agent in the selected session; "
+                           "the trace remains on the main agent.", kit::Tone::Neutral);
     kit::keyValueRow("Role", cs.cur.role.empty() ? "sub-agent" : cs.cur.role.c_str());
     kit::keyValueRow("Model", cs.cur.model.empty() ? "inherited" : cs.cur.model.c_str());
     const std::string budget = cs.cur.budgetTokens > 0
@@ -696,6 +769,7 @@ static void drawInspector(AppState& st) {
 void pollCurrentRun(AppState& st) {
     pollSubagentList(st);
     agentTraceSubagents(st, st.activeConvId(), s_trace);
+    syncViewedConversation(st);
     static std::vector<RosterEntry> entries;
     rosterEntries(entries);
     s_liveCount = 0;

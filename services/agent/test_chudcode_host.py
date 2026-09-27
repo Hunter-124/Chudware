@@ -1222,6 +1222,136 @@ def test_dead_service_process_is_replaced_on_the_next_transient_call():
     assert first.stop_count == 1
     assert factory.clients[1].stop_count == 0
 
+def test_catalog_refresh_replaces_service_without_interrupting_live_session(monkeypatch):
+    discovery = {"model": "gpt-5.6-sol", "calls": 0}
+
+    class CatalogClient(FakeClient):
+        def __init__(self, factory, **kwargs):
+            super().__init__(factory, **kwargs)
+            self.catalog_model = discovery["model"]
+
+        def get_available_models(self):
+            return ({"id": self.catalog_model, "name": self.catalog_model,
+                     "provider": "openai-codex"},)
+
+    class CatalogFactory(FakeFactory):
+        def __call__(self, **kwargs):
+            client = CatalogClient(self, **kwargs)
+            self.clients.append(client)
+            return client
+
+    factory = CatalogFactory()
+    clock = [100.0]
+    host = ChudcodeSessionHost(client_factory=factory, binary="/fake/chud",
+                               clock=lambda: clock[0])
+    monkeypatch.setattr(host, "_resolve_binary", lambda *, required: "/fake/chud")
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+
+    class RefreshProcess:
+        args = ["/fake/chud", "models", "refresh", "--json"]
+
+        def __init__(self, argv, **kwargs):
+            assert argv == self.args
+            discovery["calls"] += 1
+            refresh_started.set()
+
+        def wait(self, **kwargs):
+            assert release_refresh.wait(2)
+            discovery["model"] = "gpt-6-sol"
+            return 0
+
+        def terminate(self):
+            release_refresh.set()
+
+    monkeypatch.setattr(chudcode_host_module.subprocess, "Popen", RefreshProcess)
+    live, _ = run(host, "open-conversation")
+    assert live["ok"]
+    session = factory.clients[0]
+    assert host.transient_call("get_available_models")["models"][0]["id"] == "gpt-5.6-sol"
+    service = factory.clients[1]
+    assert host.refresh_catalog_if_stale() is True
+    assert refresh_started.wait(2)
+    assert host.refresh_catalog_if_stale() is True
+    assert discovery["calls"] == 1
+    assert session.stop_count == 0
+    release_refresh.set()
+    host._catalog_refresh_thread.join(timeout=2)
+    assert not host._catalog_refresh_thread.is_alive()
+    assert host.transient_call("get_available_models")["models"][0]["id"] == "gpt-6-sol"
+    assert session.stop_count == 0
+    assert host.refresh_catalog_if_stale() is False
+    assert discovery["calls"] == 1
+    assert len(factory.clients) == 3
+    assert factory.clients[-1].kwargs["no_session"] is True
+    assert service.stop_count == 1
+    host.shutdown()
+
+
+
+def test_failed_catalog_discovery_keeps_service_and_retries_after_backoff(monkeypatch):
+    factory = FakeFactory()
+    clock = [100.0]
+    host = ChudcodeSessionHost(client_factory=factory, binary="/fake/chud",
+                               clock=lambda: clock[0])
+    monkeypatch.setattr(host, "_resolve_binary", lambda *, required: "/fake/chud")
+    calls = []
+
+    class FailedRefresh:
+        def __init__(self, argv, **kwargs):
+            self.args = argv
+            calls.append(argv)
+
+        def wait(self, **kwargs):
+            return 1
+
+    monkeypatch.setattr(chudcode_host_module.subprocess, "Popen", FailedRefresh)
+    assert host.transient_call("get_available_models")["models"]
+    service = factory.clients[0]
+    assert host.refresh_catalog_if_stale() is True
+    host._catalog_refresh_thread.join(timeout=2)
+    assert service.stop_count == 0
+    clock[0] += 299
+    assert host.refresh_catalog_if_stale() is False
+    clock[0] += 1
+    assert host.refresh_catalog_if_stale() is True
+    host._catalog_refresh_thread.join(timeout=2)
+    assert len(calls) == 2
+    assert host.transient_call("get_available_models")["models"]
+    assert factory.clients == [service]
+    host.shutdown()
+
+
+def test_shutdown_stops_background_catalog_discovery(monkeypatch):
+    host = ChudcodeSessionHost(client_factory=FakeFactory(), binary="/fake/chud")
+    monkeypatch.setattr(host, "_resolve_binary", lambda *, required: "/fake/chud")
+    started = threading.Event()
+    released = threading.Event()
+
+    class BlockingRefresh:
+        def __init__(self, argv, **kwargs):
+            self.args = argv
+            self.terminated = False
+
+        def wait(self, **kwargs):
+            started.set()
+            assert released.wait(2)
+            return 1
+
+        def terminate(self):
+            self.terminated = True
+            released.set()
+
+    monkeypatch.setattr(chudcode_host_module.subprocess, "Popen", BlockingRefresh)
+    assert host.refresh_catalog_if_stale()
+    assert started.wait(2)
+    process = host._catalog_process
+    host.shutdown()
+    host._catalog_refresh_thread.join(timeout=2)
+    assert process.terminated
+    assert not host._catalog_refresh_thread.is_alive()
+    assert not host.refresh_catalog_if_stale()
+
 
 def test_live_session_calls_are_isolated_and_never_create_for_status():
     factory = FakeFactory()

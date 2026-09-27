@@ -18,6 +18,7 @@ import sys
 import tempfile
 import re
 import threading
+import subprocess
 import time
 import uuid
 from urllib.parse import urlsplit
@@ -45,6 +46,11 @@ _TURN_ABSOLUTE_CAP_SECONDS = 2 * 60 * 60.0
 # agent_end. It must stay under hostd's bridge slack (budget + 60 s) so the GUI still
 # receives this result instead of its own transport timeout.
 _BUDGET_ABORT_GRACE_SECONDS = 30.0
+# The shared RPC service keeps its model registry in memory. A catalog RPC alone never
+# re-discovers models; refresh Chudcode's own cache periodically, off the worker call lane.
+_CATALOG_REFRESH_SECONDS = 2 * 60 * 60.0
+_CATALOG_RETRY_SECONDS = 5 * 60.0
+_CATALOG_COMMAND_TIMEOUT_SECONDS = 90
 
 _LOG = logging.getLogger(__name__)
 _BYOK_PROVIDER_ENV = {
@@ -318,6 +324,12 @@ class ChudcodeSessionHost:
         self._service_client: Any = None
         self._service_lock = threading.Lock()
         self._shutdown = False
+        self._catalog_refresh_lock = threading.Lock()
+        self._catalog_refreshing = False
+        self._catalog_last_attempt = float("-inf")
+        self._catalog_last_success = float("-inf")
+        self._catalog_refresh_thread: threading.Thread | None = None
+        self._catalog_process: subprocess.Popen | None = None
 
     def run_turn(self, params, emit) -> dict:
         """Schedule a prompt and block until a terminal ``agent_end`` is observed."""
@@ -1005,6 +1017,13 @@ class ChudcodeSessionHost:
                 session.dispose_started = True
             for run in self._runs.values():
                 run.cancel_requested = True
+        with self._catalog_refresh_lock:
+            refresh = self._catalog_process
+        if refresh is not None:
+            try:
+                refresh.terminate()
+            except OSError:
+                pass
         for session in sessions:
             _stop_client(session.client)
         if service_client is not None:
@@ -1455,6 +1474,70 @@ class ChudcodeSessionHost:
                 raise RuntimeError("chudcode session host is shut down")
             self._service_client = client
         return client
+
+    def refresh_catalog_if_stale(self) -> bool:
+        """Refresh Chudcode discovery without holding the agent worker's RPC lane.
+
+        Only the no-session service is recycled; conversation processes and active
+        turns are never stopped. A fresh catalog reaches the GUI on its next poll.
+        """
+        with self._catalog_refresh_lock:
+            if self._shutdown:
+                return False
+            if self._catalog_refreshing:
+                return True
+            now = self._clock()
+            if (now - self._catalog_last_success < _CATALOG_REFRESH_SECONDS or
+                    now - self._catalog_last_attempt < _CATALOG_RETRY_SECONDS):
+                return False
+            # Tests with an injected client factory have no real binary to refresh.
+            if self._client_factory is not None and self._binary_hint is None:
+                return False
+            binary = self._resolve_binary(required=True)
+            self._catalog_last_attempt = now
+            self._catalog_refreshing = True
+            thread = threading.Thread(target=self._refresh_catalog, args=(binary,),
+                                      name="chudcode-model-refresh", daemon=True)
+            self._catalog_refresh_thread = thread
+            thread.start()
+            return True
+
+    def _refresh_catalog(self, binary: str) -> None:
+        try:
+            process = subprocess.Popen([binary, "models", "refresh", "--json"],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with self._catalog_refresh_lock:
+                self._catalog_process = process
+                stopping = self._shutdown
+            if stopping:
+                process.terminate()
+            try:
+                exit_code = process.wait(timeout=_CATALOG_COMMAND_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                raise
+            if exit_code:
+                raise subprocess.CalledProcessError(exit_code, process.args)
+            # The CLI updated Chudcode's cache, but the service still holds its old
+            # in-memory registry. Replace only that service under its normal call lock.
+            with self._service_lock:
+                with self._lock:
+                    client = self._service_client if not self._shutdown else None
+                    if client is not None:
+                        self._service_client = None
+                if client is not None:
+                    _stop_client(client)
+            with self._catalog_refresh_lock:
+                if not self._shutdown:
+                    self._catalog_last_success = self._clock()
+        except (OSError, subprocess.SubprocessError) as exc:
+            if not self._shutdown:
+                _LOG.warning("Chudcode model refresh failed (%s)", type(exc).__name__)
+        finally:
+            with self._catalog_refresh_lock:
+                self._catalog_process = None
+                self._catalog_refreshing = False
 
     def warm_service(self) -> None:
         """Spawn the shared service process ahead of the first transient call.

@@ -196,9 +196,13 @@ def test_local_library_place_is_import_file(tmp_path, monkeypatch) -> None:
     if not cb.available():
         pytest.skip("native core (libchudware) not available in this environment")
     r = cb.call("part_place", {"part_id": part["part_id"], "record": part})
-    assert r["ok"] is True, f"place failed: {r}"
-    assert r["editable"] is True
-    assert r["doc_id"]
+    try:
+        assert r["ok"] is True, f"place failed: {r}"
+        assert r["editable"] is True
+        assert r["doc_id"]
+    finally:
+        if r.get("doc_id"):
+            cb.call("doc_close", {"doc_id": r["doc_id"]})
 
 def main() -> None:
     test_scan_registers_and_is_idempotent()

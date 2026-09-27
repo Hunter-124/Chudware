@@ -406,6 +406,7 @@
    "browser_profiles",
    "cam_cost_estimate",
    "cam_tool_import",
+   "fetch_cad_model",
    "import_artifact",
    "list_spec_templates",
    "match_model",
@@ -748,6 +749,7 @@
   "export_part": "Export the current part to an interchange/mesh file; returns the written path.",
   "export_reveng_bundle": "Export the full RE session directory as a zip bundle to *dest*.",
   "feeds_speeds": "Compute table-driven rpm / feed / stepdown / stepover envelope for a material + tool type + operation (aicad.calc/1, contracts/advisor.md …",
+  "fetch_cad_model": "Download CAD geometry from an HTTPS file URL or model page into this project.",
   "fit_calc": "ISO 286 fit maths, in DESIGN mode (what should the sizes be?) or MEASURED mode (what fit do these two real sizes actually give?) — code …",
   "fit_cylinder_axis": "Least-squares CYLINDER AXIS from the geometry around a point — works on TESSELLATED imports where there is no analytic cylindrical face to …",
   "fit_report": "The fit report to review before printing: each mating pair's modeled-vs-source dimension, the clearance applied for the process, its …",
@@ -1638,6 +1640,10 @@
   "feeds_speeds": {
    "prompt_note": "Look up the envelope before pinning params in cam_add_operation; pass machine= to clamp to a real machine's rpm/feed limits."
   },
+  "fetch_cad_model": {
+   "prompt_note": "Use for a specific CAD model page or STEP/IGES URL found after checking the parts library and product matches. Returns a sourced artifact and, by default, imports it; with import_part=False pass artifact_path to import_artifact. A page is not dimensional evidence.",
+   "timeout_s": 180
+  },
   "fit_calc": {
    "prompt_note": "Call BEFORE any hole/bore sizing decision; if the fit class is unknown, resolve function first with recommend_fit. A bare diameter alone returns a teaching error naming both modes."
   },
@@ -1820,7 +1826,7 @@
    "prompt_note": "Verify node for the piping coupling; no args reuses the session's last handoff+solve. Pass supply/load pressures to refresh the pump margin."
   },
   "import_artifact": {
-   "prompt_note": "Second step of the scrape lane — only call with an artifact_path from a done scrape job (scrape_queue_status); afterwards reverse_engineer(source=doc_id) can recover features."
+   "prompt_note": "Import an acquired CAD artifact_path (from a done scrape job or fetch_cad_model(import_part=False)); afterwards reverse_engineer(source=doc_id) can recover features."
   },
   "import_part": {
    "prompt_note": "into=doc_id adds an import feature there; omit for a NEW independent doc (resume=False default), even if the source is open. resume=True explicitly reuses that saved session. Use the returned doc_id and its feature ids. .sldprt prefers the SW tree; mesh → as_solid=True to sew a solid. Multi-body source: describe_part rosters the bodies, keep_bodies/exclude_bodies (ordinals or names) drop the ones you don't want.",
@@ -1943,7 +1949,7 @@
    "prompt_note": "Rows mix prose labels, provenance value cells and live formulas ('=SUM(B2:B5)') that recompute on open; spec in cad_guide('deliverables')."
   },
   "match_model": {
-   "prompt_note": "For branded products (MPN/brand, no standard designation). On no confident repo match, follow fallback.how — usually reverse_engineer_product."
+   "prompt_note": "For a discrete branded product (MPN/brand) after checking catalog parts. Only exact/attach:true matches can auto-place; confirm ambiguous identities, or use a known CAD URL with fetch_cad_model."
   },
   "match_part_number": {
    "prompt_note": "First stop for a purchased MPN — strips vendor suffixes (-ND etc.) and runs fully offline; on matched=false fall through to match_model, never guess params."
@@ -2080,10 +2086,10 @@
    "prompt_note": "doc is the document dict (or its json.dumps), NEVER a doc id; omit doc for mechanical parts — they create their own document."
   },
   "part_search": {
-   "prompt_note": "Use when you know the designation or category; for a plain-language need start with part_source instead. Rows are compact — part_get for the full record."
+   "prompt_note": "First stop for catalog/standard hardware by designation or category (e.g. MG90S, 608 bearing, M3 screw). Rows are compact — part_get for the full record."
   },
   "part_source": {
-   "prompt_note": "One call for 'I need X with dims' — each candidate carries an artifact_plan (part_place / scrape_enqueue+import_artifact / make_standard_part); follow it, don't re-search."
+   "prompt_note": "Rank a plain-language product need and follow its candidate's artifact_plan (part_place / scrape_import / make_standard_part / find_model / fetch_cad_model). Confirm uncertain identities; do not re-search indefinitely."
   },
   "parts_taxonomy": {
    "prompt_note": "Browse here when the user names a category loosely; a node's effective facets are exactly the facet keys part_search(facets=...) accepts there."
@@ -2343,7 +2349,7 @@
    "prompt_note": "Not an arithmetic tool (no add/sum). On an unknown-formula error, pick from the returned `known` catalogue instead of retrying spellings; list_calcs shows the schemas up front."
   },
   "research_fetch_page": {
-   "prompt_note": "The READ step after research_web_search FINDs a source. Cached per URL, so repeat reads are cheap; set tier by how fast the fact changes (pricing/datasheet/standard).",
+   "prompt_note": "Read a specific HTML specs/datasheet source after the parts library cannot supply a needed dimension. Capture its citation and build; a model page's CAD file belongs in fetch_cad_model.",
    "timeout_s": 120
   },
   "research_material_lookup": {
@@ -2360,7 +2366,7 @@
   },
   "research_web_search": {
    "max_calls_per_turn": 24,
-   "prompt_note": "FIND step: returns ranked sources to then READ with research_fetch_page. Without TAVILY_API_KEY the DuckDuckGo fallback is labeled confidence:limited.",
+   "prompt_note": "Use for missing specs/datasheets or locating a specific CAD model URL after checking the library. For a found CAD page/file, use fetch_cad_model(url), not research_fetch_page as geometry. Without TAVILY_API_KEY the DuckDuckGo fallback is labeled confidence:limited.",
    "timeout_s": 120
   },
   "resolve_process": {

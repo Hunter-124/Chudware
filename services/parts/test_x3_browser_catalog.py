@@ -56,9 +56,19 @@ def _core_available() -> bool:
         return False
 
 
+@pytest.fixture
+def close_test_docs():
+    """Release only documents minted by this test, even after an assertion fails."""
+    created = []
+    yield created
+    from services.mcp import core_bridge as cb
+    for doc_id in reversed(created):
+        cb.call("doc_close", {"doc_id": doc_id})
+
+
 @pytest.mark.skipif(not _core_available(),
                     reason="native core (libchudware) not available in this environment")
-def test_place_import_file_real_core_editable_doc(tmp_path):
+def test_place_import_file_real_core_editable_doc(tmp_path, close_test_docs):
     """End-to-end with the REAL engine: export a STEP from a core-built box, then
     place it back via the part_import_file RPC and assert a genuine editable doc_id —
     the same RPC the import_artifact / import_part MCP tools drive."""
@@ -70,6 +80,7 @@ def test_place_import_file_real_core_editable_doc(tmp_path):
     npr = cb.call("doc_new", {"kind": "part", "name": "x3_coupon"})
     doc_id = npr.get("doc_id") or npr.get("id")
     assert doc_id, f"doc_new gave no doc_id: {npr!r}"
+    close_test_docs.append(doc_id)
     cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": [
         cb.feat("box", "b1",
                 {"length": cb.dim(10), "width": cb.dim(10), "height": cb.dim(10)}),
@@ -80,6 +91,8 @@ def test_place_import_file_real_core_editable_doc(tmp_path):
 
     # The real placement: import the STEP as a NEW editable doc.
     r = cb.call("part_import_file", {"path": str(step)})
+    if r.get("doc_id"):
+        close_test_docs.append(r["doc_id"])
 
     assert r["ok"] is True, f"real import failed: {r.get('reason')!r}"
     assert r["editable"] is True

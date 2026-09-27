@@ -39,7 +39,7 @@ The repo has a knowledge graph at `graphify-out/` (skill: `.claude/skills/graphi
 - `graphify-out/GRAPH_REPORT.md` / `graphify-out/wiki/index.md` — broad architecture only
 - After meaningful structural changes: `graphify update .` (AST-only, free)
 
-## Repo map (verified against master, 2026-08-31)
+## Repo map (verified in working tree, 2026-09-26)
 
 **Current GUI ownership:** `host/` is the sole GUI target; `ui/imgui/` and `ui/abstract/` are gone, and T-G11's deletion of `host/` was reversed.
 
@@ -52,7 +52,7 @@ The repo has a knowledge graph at `graphify-out/` (skill: `.claude/skills/graphi
 | `core/print/**` | Additive-print model |
 | `host/` | **The production GUI** — C++ GLFW/ImGui desktop app. `host/src/app.cpp` frame loop, `host/src/ui/` panels (52k LOC), `host/src/core/app_state.h` central data model. Details: the gui-* skills |
 | `ui/viewport/` | AICM mesh loader (`render/aicm_loader.*`) consumed by `core/`; the host renderer lives under `host/src/render/` |
-| `services/agent/` | Chudcode RPC host/adapters plus CAD-owned roles, councils, missions, governance, tool registry projection, and event mapping |
+| `services/agent/` | Chudcode RPC host/adapters, `online_turn.py` turn assembly, `progress_watchdog.py`, `subagent_registry.py`, CAD-owned roles/missions/governance, tool projection and event mapping |
 | `services/mcp/` | MCP server exposing the engine to external agents (Claude Code etc.) |
 | `services/worker/` | Engine routing seam: WorkerClient / DocMirror / bootstrap |
 | `services/installer/` | Provisioning, MCP self-registration, packaging |
@@ -375,12 +375,12 @@ judgment).
   `transform` MOVES its body (`copy:true` duplicates; a consumed owner is a named
   refusal); assembly transforms compose with placements; `set_suppressed` takes component
   ids on assembly docs. Sim job `_reconcile` observes exit before reading `result.json`.
-- **Chat sessions are keyed by project (2026-09-04).** `Conversation.projectDir` is stamped
-  once at creation from `convProjectDir(st)` (= `st.workspaceDir`, else `plmProjectPath()`) —
-  the same value the composer sends Chudcode as `workspace_dir`. `index.json` v3 keeps
-  `active_by_project`; the Sessions panel filters on the stored key (never on a live artifact
-  scan) and adopts headless Chudcode `*.jsonl` files found in the Sessions dir. Do not
-  re-derive project membership at draw time.
+- **Chat sessions are keyed by the workspace of their latest turn (2026-09-26).**
+  `Conversation.projectDir` starts at `convProjectDir(st)` (= `st.workspaceDir`, else
+  `plmProjectPath()`), then `bindActiveConversationProject` restamps it to the actual
+  `workspace_dir` sent on each turn. `index.json` v3 keeps `active_by_project`; Sessions
+  filters the stored key (never a live artifact scan) and adopts headless Chudcode
+  `*.jsonl` files from the Sessions dir. Do not re-derive membership at draw time.
 - **Sim results are evidence-grade or they are not results.** `sim_run_static|adaptive|modal|
   thermal` emit top-level `mesh_quality`, `reactions` (static/adaptive), `provenance`
   (`engine_build_id`, `polymesh_commit`) and honour `study.vtu_path`; `sim_cache` schema `/3`.
@@ -482,8 +482,10 @@ judgment).
 - **Tool events correlate by the Chudcode call id.** Start/progress map to status only;
   terminal result/cancel maps once to `agent.tool_call`, carrying bounded previews, digests,
   outcome and usage. A synchronous `host_tool_call` with a result is already terminal.
-  Unknown frames become deterministic bounded `sub_run` rows rather than being dropped or
-  guessed. Provider usage emits both `agent.provider_usage` and `agent.context`.
+  `RpcFrameState` carries start args/intent into terminal cards and unwraps `xd://` write
+  content for the actual target; `read xd://` only inspects tool docs. Unknown frames
+  become deterministic bounded `sub_run` rows, not guessed successes; provider usage emits
+  both `agent.provider_usage` and `agent.context`.
 - **A turn is not complete merely because the process is idle.** `run_turn` requires a
   terminal `agent_end`; ending without it is a protocol error. Event-forwarding failure
   fails the turn. Cancel before prompt is a valid cancellation; cancel after prompt calls
@@ -512,15 +514,36 @@ judgment).
   `chudcode_close_session` call the live runtime. Export uses Chudcode HTML export;
   branch uses a real entry id; doctor is bounded and `repair:true` uses Chudcode's
   backup-producing repair workflow. Never hand-edit persisted session JSONL.
-- **The main chat has a broad core plus a visible catalog (2026-09-03).** The online
-  `general_agent` lane advertises `tool_categories.MAIN_CHAT_CORE_TOOLS` (~62 tools, ~27k
-  tokens) with native schemas, and `mission_dispatch._apply_session_preferences` appends a
-  MORE TOOLS menu naming EVERY other registered tool by group (`render_tool_menu`, ~2.3k
-  tokens). Nothing is hidden and nothing is capped: `enable_tools(tools=[...])` /
-  `enable_tools(categories=[group])` resolve through `resolve_tool_requests` (group → pack →
-  `family:` → exact name) and report `unknown`. The full registry is ~460 tools / ~150k
-  tokens, so never "fix" reachability by widening the core — put a tool in the core only if
-  ordinary part work needs it every turn. `run_shell` stays on the menu, off the core.
+- **The main chat includes ordinary sourcing (2026-09-26).** The online `general_agent`
+  advertises `tool_categories.MAIN_CHAT_CORE_TOOLS`, including `part_search`, `part_get`,
+  `part_source`, `match_model`, `make_standard_part`, `fetch_cad_model`,
+  `import_artifact` and `simulate_motion`. `mission_dispatch._apply_session_preferences`
+  appends the MORE TOOLS menu naming every other registered tool by group. Load specialty
+  tools via `enable_tools(tools=[...])` / `enable_tools(categories=[group])`, resolved by
+  `resolve_tool_requests` (group → pack → `family:` → exact name); unknown tokens are
+  reported. Do not move the whole registry into core; `run_shell` remains menu-only.
+- **Research is not CAD progress (2026-09-26).** `progress_watchdog.ProgressWatchdog`
+  counts completed research calls; after 12 calls or 6 minutes without a successful CAD
+  mutation it steers once per stall, at most twice per turn. `read xd://` is not a mutation.
+  `chudcode_host.run_turn` disables it for Ask/Plan and `plan_only`. For multi-part
+  mechanisms, `roles/general_agent.yaml` directs `design/layout.md` first, one saved
+  editable part at a time, mates at every joint, then `simulate_motion` sweeps.
+- **Source real geometry before guessing (2026-09-26).** `core/parts/catalog.cpp` and
+  `generate.cpp` provide the sourced `hobby_servo` family (SG90/MG90S/MG996R/MG995/
+  DS3218/micro_9g); `core/api/libchudware.cpp::parts_make_impl` exposes its
+  `output_axis` datum. `services/mcp/parts_tools.py::fetch_cad_model_impl` imports
+  direct HTTPS CAD or supported model pages and saves provenance beside the file in
+  `<project>/reference/`; `services/browser/adapters/printables.py` gets guest files
+  through public GraphQL, whereas MakerWorld/GrabCAD may return `login_required`.
+  `services/research/fetch_page.py` retries JS shells with rendered content; web search
+  must report DDG challenges as `provider_blocked` and empty results as `no_results`.
+- **Sub-agent status is evidence-based (2026-09-26).** `subagent_registry.list_sessions`
+  reconciles owner PID/start time and heartbeat to terminal `abandoned`, never by live
+  process age alone. Records carry a run project root; `subagent_list{project_dir}`
+  excludes missing or different project ownership. In mixed pytest collections root
+  `conftest.py` isolates non-MCP engine tests per test; `services/mcp/conftest.py`
+  opts its daemon tests out at collection.
+
 - **Tool floors stay CAD-authoritative.** Preserve allowlist tri-state: `None` is
   unrestricted, explicit `[]` is restricted to live floors, and a non-empty list is an
   ordinary restriction. `chudcode_tools._effective_names` unions on-demand loads BEFORE the

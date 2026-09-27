@@ -993,6 +993,12 @@ static json parts_make_impl(const json& params, int& rc) {
                                  mn[2].get<double>()}},
                 {"axis", {0, 0, 1}},
                 {"note", "base seats at z=0, axis +Z; translate base_center to the seat point"}};
+            // Unlike coaxial hardware, a servo's output axis is offset toward
+            // one end of its case. Keep the existing seating datum intact.
+            if (pb.meta.contains("output_axis")) {
+                out["datum"]["output_axis"] = pb.meta["output_axis"];
+                out["output_axis"] = pb.meta["output_axis"];
+            }
         } catch (...) {
         }
         if (aresp.contains("revision")) out["revision"] = aresp["revision"];

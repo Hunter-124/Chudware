@@ -517,8 +517,7 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     if model_path is None:
         # get_model_path() returning None means the GGUF isn't provisioned on this
         # machine. str(None) == "None" is truthy, which used to silently defeat
-        # services.installer.llamacpp's find_default_model() fallback — fail closed instead
-        # (mirrors local_runtime.py's guard: only set model_path when non-None).
+        # services.installer.llamacpp's find_default_model() fallback — fail closed instead.
         raise model_manager.ModelProvisionError(
             f"local tier {tier!r} needs model {model_id!r}, which is not "
             f"provisioned on this machine (no GGUF found for it). Provision "

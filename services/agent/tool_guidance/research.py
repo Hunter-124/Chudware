@@ -71,9 +71,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "research_fetch_page": {
         "prompt_note": (
-            "The READ step after research_web_search FINDs a source. Cached "
-            "per URL, so repeat reads are cheap; set tier by how fast the "
-            "fact changes (pricing/datasheet/standard)."
+            "Read a specific HTML specs/datasheet source after the parts "
+            "library cannot supply a needed dimension. Capture its citation "
+            "and build; a model page's CAD file belongs in fetch_cad_model."
         ),
         "timeout_s": 120,
     },
@@ -107,9 +107,11 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "research_web_search": {
         "prompt_note": (
-            "FIND step: returns ranked sources to then READ with "
-            "research_fetch_page. Without TAVILY_API_KEY the DuckDuckGo "
-            "fallback is labeled confidence:limited."
+            "Use for missing specs/datasheets or locating a specific CAD "
+            "model URL after checking the library. For a found CAD page/file, "
+            "use fetch_cad_model(url), not research_fetch_page as geometry. "
+            "Without TAVILY_API_KEY the DuckDuckGo fallback is "
+            "labeled confidence:limited."
         ),
         "timeout_s": 120,
         # SCOPE: this cap is per RUN — one whole user request — not per model

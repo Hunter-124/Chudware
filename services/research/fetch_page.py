@@ -1,10 +1,7 @@
-"""``fetch_page(url)`` — contract ``contracts/research_tools.md`` §3.
+"""Fetch public research pages as readable Markdown, with rendered-page recovery.
 
-Built-in **readability -> markdown** using only the standard library (``html.parser``,
-``re``) so there is **zero new hard dependency** and the offline gate/CI stay green.
-Firecrawl ``/scrape`` is used only when ``FIRECRAWL_API_KEY`` is present (hard/JS pages);
-its absence degrades to the built-in extractor, never an error. Fetched content is cached
-under the per-user knowledge cache (§4); offline mode serves cache only (§5).
+Static HTML is preferred. A JavaScript shell is retried in the existing rendered
+browser, then with Firecrawl if a key is configured. Only usable content is cached.
 """
 from __future__ import annotations
 
@@ -111,11 +108,18 @@ from .common import HIGH, MEDIUM, OFFLINE, envelope, fail, is_offline, now_ts
 
 _UA = "Mozilla/5.0 (compatible; Chudware-research/1.0)"
 _MAX_CONTENT = 200_000  # cap markdown to protect the model window (contract §3)
-_DROP_TAGS = {"script", "style", "nav", "footer", "aside", "noscript", "form",
-              "svg", "iframe", "template"}
+_DROP_TAGS = {"script", "style", "nav", "header", "footer", "aside", "noscript",
+              "form", "svg", "iframe", "template"}
 _BLOCK_TAGS = {"p", "div", "section", "article", "br", "tr", "ul", "ol", "table",
                "blockquote", "pre", "hr"}
 _HEADINGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+_CHROME_ROLES = {"navigation", "banner", "contentinfo", "complementary"}
+_APP_ROOT = re.compile(r"""(?:id=["'](?:root|app|__next|__nuxt)["']|data-reactroot|ng-version=)""", re.I)
+_JS_REQUIRED = re.compile(r"<noscript\b[^>]*>[^<]*(?:javascript|enable js|enable javascript)",
+                          re.I | re.S)
+_GENERIC_TITLES = {"grabcad", "grabcad community library", "makerworld",
+                   "researchgate", "researchgate | find and share research"}
+_MIN_MAIN_CHARS = 180
 
 
 class _Readability(HTMLParser):
@@ -126,19 +130,29 @@ class _Readability(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._out: list[str] = []
-        self._drop_depth = 0
+        self._drop_stack: list[str] = []
+        self._in_head = False
         self.title: str = ""
         self._in_title = False
 
     def handle_starttag(self, tag: str, attrs) -> None:
-        if tag in _DROP_TAGS:
-            self._drop_depth += 1
+        if self._drop_stack:
+            if tag not in {"meta", "link", "img", "input", "br", "hr"}:
+                self._drop_stack.append(tag)
             return
-        if self._drop_depth:
-            return
-        if tag == "title":
+        if tag == "head":
+            self._in_head = True
+        if tag == "title" and self._in_head:
             self._in_title = True
-        elif tag in _HEADINGS:
+            return
+        attributes = dict(attrs)
+        if (tag in _DROP_TAGS or attributes.get("role") in _CHROME_ROLES
+                or (attributes.get("aria-hidden") == "true" and tag not in {"meta", "link"})):
+            self._drop_stack.append(tag)
+            return
+        if self._in_head:
+            return
+        if tag in _HEADINGS:
             self._out.append("\n\n" + "#" * int(tag[1]) + " ")
         elif tag == "li":
             self._out.append("\n- ")
@@ -146,21 +160,26 @@ class _Readability(HTMLParser):
             self._out.append("\n\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in _DROP_TAGS and self._drop_depth:
-            self._drop_depth -= 1
+        if self._drop_stack:
+            if tag in self._drop_stack:
+                del self._drop_stack[self._drop_stack.index(tag):]
             return
         if tag == "title":
             self._in_title = False
-        elif tag in _HEADINGS or tag in _BLOCK_TAGS:
+            return
+        if tag == "head":
+            self._in_head = False
+            return
+        if not self._in_head and (tag in _HEADINGS or tag in _BLOCK_TAGS):
             self._out.append("\n")
 
     def handle_data(self, data: str) -> None:
-        if self._drop_depth:
+        if self._drop_stack:
             return
         if self._in_title:
             self.title += data
             return
-        if data.strip():
+        if not self._in_head and data.strip():
             self._out.append(data)
 
     def markdown(self) -> str:
@@ -178,6 +197,48 @@ def html_to_markdown(html_text: str) -> tuple[str, str]:
     if len(md) > _MAX_CONTENT:
         md = md[:_MAX_CONTENT] + "\n\n… [truncated]"
     return md, parser.title.strip()
+
+def _is_js_shell(html_text: str, markdown: str, title: str) -> bool:
+    """Distinguish an app bootstrap/nav shell from a short but real article."""
+    if len(markdown.strip()) >= _MIN_MAIN_CHARS:
+        return False
+    scripts = len(re.findall(r"<script\b", html_text, re.I))
+    title_generic = title.strip().lower() in _GENERIC_TITLES
+    return (not markdown.strip() or bool(_JS_REQUIRED.search(html_text))
+            or bool(_APP_ROOT.search(html_text)) and scripts > 0
+            or scripts >= 2 or title_generic and scripts > 0)
+
+
+def _render_page(url: str) -> tuple[str, str, str] | None:
+    """Use the existing rate-limited browser/session path, not a second CEF client."""
+    from services.browser.session import browser_fetch
+
+    site = urlparse(url).hostname or "research"
+    result = browser_fetch(url, site=site, no_cache=True)
+    if not result.get("ok"):
+        return None
+    final_url = result.get("final_url") or url
+    _validate_public_url(final_url)
+    markdown, title = html_to_markdown(result.get("content") or "")
+    if _is_js_shell(result.get("content") or "", markdown, title):
+        return None
+    return markdown, final_url, title
+
+
+def _firecrawl_page(url: str) -> tuple[str, str, str] | None:
+    from . import firecrawl_pool
+
+    if not firecrawl_pool.load_keys():
+        return None
+    markdown, meta = firecrawl_pool.scrape(url, timeout=15.0, max_wait_s=15.0)
+    title = str(meta.get("title") or "")
+    final_url = str(meta.get("sourceURL") or meta.get("url") or url)
+    _validate_public_url(final_url)
+    # Firecrawl produces Markdown, but its own navigation-only result is no
+    # better than a browser shell. Do not cache it as a successful page.
+    if len(markdown.strip()) < _MIN_MAIN_CHARS:
+        return None
+    return markdown[:_MAX_CONTENT], final_url, title
 
 
 def _valid_url_syntax(url: str) -> bool:
@@ -197,7 +258,7 @@ def _valid_url(url: str) -> bool:
     return True
 
 
-def _http_get(url: str) -> tuple[str, str, str]:
+def _http_get(url: str) -> tuple[str, str, str, str]:
     """Fetch a public HTTPS page, revalidating DNS and every redirect target.
 
     The redirect walk is bounded by ``_WALK_BUDGET_S`` in TOTAL (see the budget
@@ -232,8 +293,9 @@ def _http_get(url: str) -> tuple[str, str, str]:
                 current = urljoin(current, location)
                 continue
             resp.raise_for_status()
-            md, title = html_to_markdown(resp.text)
-            return md, current, title
+            html_text = resp.text
+            md, title = html_to_markdown(html_text)
+            return md, current, title, html_text
     raise OutboundPolicyError("too many redirects")
 
 
@@ -288,21 +350,47 @@ def fetch_page(
         )
 
     try:
-        content, final_url, title = (_fetcher or _http_get)(url)
+        fetched = (_fetcher or _http_get)(url)
+        content, final_url, title = fetched[:3]
+        html_text = fetched[3] if len(fetched) > 3 else (
+            content if content.lstrip().lower().startswith(("<!doctype", "<html")) else "")
+        if html_text and len(fetched) == 3:
+            content, title = html_to_markdown(html_text)
+        if _is_js_shell(html_text, content, title):
+            if _fetcher is None:
+                _validate_public_url(final_url)
+            # A static bootstrap is not success. Try the rendered DOM and only
+            # then a configured external scraper; never put the shell in cache.
+            try:
+                rendered = _render_page(final_url)
+            except Exception:  # noqa: BLE001 — unavailable CEF/browser
+                rendered = None
+            if rendered is None:
+                try:
+                    rendered = _firecrawl_page(final_url)
+                except Exception:  # noqa: BLE001 — unavailable Firecrawl/key
+                    rendered = None
+            if rendered is None:
+                stale = store.get(url, tier=tier, allow_stale=True)
+                if stale is not None:
+                    return _from_cache(stale, offline=False)
+                cad_hint = (" Try fetch_cad_model for the CAD model instead."
+                            if any(site in (urlparse(final_url).hostname or "").lower()
+                                   for site in ("grabcad", "makerworld")) else "")
+                return fail("js_shell", f"{final_url} only returned a JavaScript app shell; "
+                            f"no page content was available after rendering.{cad_hint}")
+            content, final_url, title = rendered
     except Exception as exc:  # noqa: BLE001
         stale = store.get(url, tier=tier, allow_stale=True)
         if stale is not None:
             return _from_cache(stale, offline=False)  # stale beats nothing on a fetch error
         if isinstance(exc, RedirectBudgetError):
-            # contract §6 `reason` is a closed token set, so this stays "network";
-            # the hint carries the hop and the budget so the remedy is actionable
-            # instead of "retry the same slow chain".
-            return fail(
-                "network",
-                f"The redirect chain for this URL is too slow: {exc}. Fetch the "
-                "final URL directly, or pick a different source.",
-            )
-        return fail("network", f"Could not fetch the page: {exc}. Check the URL / connectivity.")
+            return fail("network", f"The redirect chain for {url} is too slow: {exc}. "
+                        "Fetch the final URL directly, or pick a different source.")
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (403, 404):
+            return fail("http_error", f"{url} returned HTTP {status}; choose another source.")
+        return fail("network", f"Could not fetch {url}: {exc}. Check the URL / connectivity.")
 
     fetched_ts = now_ts()
     store.put(url, content, tier=tier, fetched_ts=fetched_ts,

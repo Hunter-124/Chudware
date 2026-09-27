@@ -1146,6 +1146,11 @@ class MissionDispatch:
                 parent_id=parent_id,
                 kind=kind,
                 docs=docs,
+                project_dir=(
+                    self.execution_options.get("project_dir")
+                    or self.execution_options.get("project_path")
+                    or self.execution_options.get("workspace_dir")
+                ),
             )
         except Exception as exc:  # noqa: BLE001 — error is data for the model
             return {

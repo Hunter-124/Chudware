@@ -86,11 +86,9 @@ _LOCAL_KINDS = frozenset({"lmstudio", "llamacpp", "ollama", "vllm"})
 SYMBOLIC_TOKENS = ("strongest", "strong", "cheap_local", "cheapest")
 
 # Public view of the tier vocabulary _parse_source()/validate() accept for a model's
-# "tier" field. Consumers that WRITE into routing.yaml (e.g.
-# services.agent.local_runtime.register_routing_source) must translate any other tier
-# vocabulary (e.g. services.agent.tiers's context-length buckets: local-24k/local-48k/
-# mid) into one of these before writing, or load_routing() raises RoutingError on the
-# very next parse (unknown tier).
+# "tier" field. Sources written to routing.yaml must use one of these tiers; the
+# context-length buckets in services.agent.tiers (local-24k/local-48k/mid) are
+# different, and load_routing() refuses unknown tiers.
 KNOWN_TIERS = frozenset(_TIER_RANK)
 
 # Source kinds exposed by the GUI (subset of _SOURCE_KINDS, no internal mocks).

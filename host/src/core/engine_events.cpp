@@ -47,6 +47,36 @@ int tabIndexForDoc(AppState& st, const std::string& docId) {
     return -1;
 }
 
+// Only a never-edited, never-saved empty CAD tab is disposable as a viewport
+// placeholder. Dirty alone is insufficient: saving or undoing an edit clears it.
+// A new part's mirror tree is initially {}, so revision zero is the authority
+// for that case; an assembly already has its empty tree on creation.
+bool activeOwnDocIsPristine(AppState& st) {
+    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size() ||
+        userMidEdit(st)) return false;
+    const AppState::DocTab& t = st.docTabs[st.activeTab];
+    if (t.kind != AppState::DocTab::TabKind::Part &&
+        t.kind != AppState::DocTab::TabKind::Assembly) return false;
+    if (t.aiHandoff || t.userAdopted || t.dirty || !t.path.empty() ||
+        t.docId.empty() || st.docMirror.docId() != t.docId ||
+        st.docMirror.revision() != 0) return false;
+    const json& tree = st.docMirror.tree();
+    if (!tree.is_null() && !tree.is_object()) return false;
+    for (const char* key : {"features", "components", "bodies"}) {
+        const auto it = tree.find(key);
+        if (it != tree.end() && (!it->is_array() || !it->empty())) return false;
+    }
+    return !st.renderer || st.renderer->bodyCount() == 0;
+}
+
+bool canFocusMirror(AppState& st, bool firstMirror) {
+    if (activeOwnDocIsPristine(st)) return true;
+    if (!firstMirror) return false;
+    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return true;
+    const AppState::DocTab& t = st.docTabs[st.activeTab];
+    return t.aiHandoff && !t.userAdopted;
+}
+
 std::string docLabel(AppState& st, const std::string& docId) {
     const int idx = tabIndexForDoc(st, docId);
     if (idx >= 0) {
@@ -156,10 +186,10 @@ std::string eventDocName(const json& d) {
     return {};
 }
 
-// Open a read-only mirror tab for a doc another client minted. Mirrors the
-// poller's focus rules: the FIRST mirror ever opened may take focus, but only
-// when the user is not already looking at a document of their own; every other
-// reveal opens in the background with the aiPulse glow.
+// Open a read-only mirror tab for a doc another client minted. The first
+// mirror may take focus when no user document is on screen; an agent-minted
+// document may also replace an untouched empty CAD tab. Any user content
+// keeps its viewport, and background reveals retain the aiPulse glow.
 bool openMirrorTab(AppState& st, const std::string& docId, const std::string& name = {}) {
     if (docId.rfind("doc-cpp", 0) != 0) return true;  // parts/assemblies only
     if (tabIndexForDoc(st, docId) >= 0) {        // already visible (ours or a prior mirror)
@@ -202,15 +232,11 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     bool anyMirror = false;
     for (const auto& t : st.docTabs)
         if (t.aiHandoff) anyMirror = true;
-    // The user's own document on screen is never swapped out from under them. An agent
-    // opening a component file just to READ it (import_part resume:true of the frame part
-    // while the user viewed the Rover assembly) used to take focus here, and the frame
-    // part's legacy rotors-without-wheels looked like "the agent took the wheels off"
-    // (2026-09-24). A user-adopted mirror counts as the user's own.
-    const bool userDocOnScreen =
-        st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
-        (!st.docTabs[st.activeTab].aiHandoff || st.docTabs[st.activeTab].userAdopted);
-    const bool takeFocus = !anyMirror && !userDocOnScreen;
+    const bool takeFocus = canFocusMirror(st, !anyMirror);
+    const int activeBefore = st.activeTab;
+    const std::string activeDocBefore =
+        activeBefore >= 0 && activeBefore < (int)st.docTabs.size()
+            ? st.docTabs[activeBefore].docId : std::string();
 
     // Fallback ONLY when the event carried no name (older daemon): read it off the
     // doc tree. ASYNC via st.rpc — doc_tree takes the doc's engine lock, and with an
@@ -241,6 +267,17 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     // the frame it appears — no dependency on the doc_tree round-trip above.
     t.title = name.empty() ? std::string("AI part") : name;
     t.handoffName = name;
+    // The active GUI project may differ from the project of a background agent
+    // turn. Attribute an unsaved mirror only when one running conversation is
+    // unambiguous; otherwise it remains unscoped until saved to a project path.
+    const Conversation* owner = nullptr;
+    bool ambiguousOwner = false;
+    for (const auto& conversation : st.conversations) {
+        if (!st.convRunning(conversation.id)) continue;
+        if (owner) { ambiguousOwner = true; break; }
+        owner = &conversation;
+    }
+    if (owner && !ambiguousOwner) t.projectDir = owner->projectDir;
     t.aiHandoff = true;
     t.handoffDocId = docId;
     st.docTabs.push_back(std::move(t));
@@ -264,12 +301,18 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     // later user click both take switchToTab's pushed/cached path instead of issuing a
     // doc_activate that queues on the doc's engine mutex behind the agent writing it.
     if (takeFocus && !crashLoopBraked) {
-        core::primeMirrorFromSnapshot(st, docId, [&st, docId](bool) {
-            // Focus once the snapshot is parked (or once we know there is none — a doc
-            // nobody has written yet activates instantly, so the fallback is cheap).
-            // Re-resolve: tabs may have opened or closed while the call was in flight.
+        core::primeMirrorFromSnapshot(st, docId,
+                                      [&st, docId, activeBefore, activeDocBefore, anyMirror](bool) {
+            // A user can switch or edit tabs while the snapshot request is in
+            // flight. Never steal the viewport after that change of intent.
+            if (userMidEdit(st) || crashLoopBraked || st.activeTab != activeBefore ||
+                (activeBefore >= 0 &&
+                 (activeBefore >= (int)st.docTabs.size() ||
+                  st.docTabs[activeBefore].docId != activeDocBefore)))
+                return;
             const int i = tabIndexForDoc(st, docId);
-            if (i >= 0 && i != st.activeTab) st.switchToTab(i);
+            if (i >= 0 && i != st.activeTab &&
+                canFocusMirror(st, !anyMirror)) st.switchToTab(i);
         });
         st.toast(ui::ToastLevel::Info,
                  "Live view of the AI's part — it updates as it builds");

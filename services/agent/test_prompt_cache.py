@@ -297,6 +297,28 @@ def test_the_linear_lane_carries_the_skills_catalog_and_its_fetch_verb(
     assert not re.search(r"skill://[a-z0-9]", system_prompt), (
         "a skill:// pointer resolves against Chudcode's own registry, not CAD's")
     assert "cad_skill" in allowed, "the catalog names a tool the lane cannot call"
+    if role == "general_agent":
+        # Acquisition policy reaches the actual composed Chudcode prompt once;
+        # repeating it in the role, global header, and skill catalog invites
+        # contradictory search-first behavior on a servo reference request.
+        assert system_prompt.count("REFERENCE ACQUISITION ORDER") == 1
+        assert system_prompt.index("part_search / make_standard_part") < system_prompt.index(
+            "match_model / part_source") < system_prompt.index("fetch_cad_model(url)")
+        assert system_prompt.index("fetch_cad_model(url)") < system_prompt.index(
+            "Web search only for specs/datasheets")
+        # The live MG90S turn sourced a servo, then deliberated for 25 minutes
+        # without saving a bracket. The composed prompt must move from a short
+        # project artifact to incremental saved parts and then assembly.
+        assert system_prompt.count("MULTI-PART MECHANISMS") == 1
+        assert system_prompt.index('fs_write(path="design/layout.md"') < system_prompt.index(
+            "new_part + add_features") < system_prompt.index(
+            "asm_add_component(fixed=True)") < system_prompt.index(
+            "simulate_motion")
+        assert 'value={"value": 0,' in system_prompt
+        assert '"axis_point":' in system_prompt
+        assert "mate EVERY joint" in system_prompt
+        assert "never use hand-rolled kinematics or throwaway pose assemblies" in system_prompt
+        assert "few minutes deliberating without producing a file or a CAD change" in system_prompt
 
 
 def test_a_repeat_turn_reuses_the_tools_block_but_a_new_fingerprint_recomposes(
@@ -310,6 +332,7 @@ def test_a_repeat_turn_reuses_the_tools_block_but_a_new_fingerprint_recomposes(
     """
     from services.agent import mission_dispatch as md
     from services.agent import tool_schemas as tsch
+    from services.agent.preferences import resolve_turn_preferences
 
     rendered: list[list[str]] = []
     real_render = tsch.render_tools_block
@@ -322,13 +345,26 @@ def test_a_repeat_turn_reuses_the_tools_block_but_a_new_fingerprint_recomposes(
 
     def _turn():
         dispatcher = md.MissionDispatch(run_id="turn", tier="frontier")
+        # Reference acquisition mutators belong to Agent mode, not the
+        # interactive Plan default's intentionally read-only roster.
+        preferences = resolve_turn_preferences(
+            "Build an MG90S servo arm",
+            cfg={"copilot": {"work_style": "do_it"}},
+            task_kind="mission")
         return md.linear_role_prompt(
             "general_agent", resolver=at.resolver_for(dispatcher),
-            tier="frontier")
+            tier="frontier", preferences=preferences)
 
     first = _turn()
     assert first[2], "the tools slot must render on the first turn"
     after_first = len(rendered)
+    # The MG90S arm turn researched the web without ever loading the sourcing
+    # tools. Check the rendered frontier prompt, not just an allowlist: these
+    # schemas must be visible in the model's immediate CAD tool surface.
+    for name in ("part_search", "part_get", "part_source", "match_model",
+                 "make_standard_part", "list_standard_parts", "fetch_cad_model",
+                 "import_artifact"):
+        assert f"- {name}(" in first[2], name
     assert after_first >= 1
 
     second = _turn()

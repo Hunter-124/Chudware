@@ -125,12 +125,18 @@ Common lengths 6,8,10,12,15,20,25,30,35,40 mm. PCB standoff default M2.5 or M3, 
 2020 20×20, slot 6, M5 T-nut · 2040 20×40 · 3030 30×30, slot 8, M6 · 4040 40×40, slot 8, M8 ·
 1515 (15×15, slot ~6.2, M3). Bolt through with a button-head + drop-in/roll-in T-nut.
 
-**Servos** (Body L×W×H, mounting tab span, mount screw):
-- **SG90 / MG90S micro**: body 22.8 × 12.0 × 22.5; flange span 32.2 across tabs, ~2.5 thick at ~16 up
-  the body; 2× M2 holes (clear Ø 2.2) 4.6 in from each tab end; output boss one end, allow ⌀6 above
-  for the horn. MOUNT: cut a 23.0 × 12.2 pocket + the two flange holes; flange rests on the wall.
-- **MG996R standard**: body 40.7 × 19.7 × 42.9; flange span 49.5; 4× M3 (clear 3.2), boss for ⌀7 horn.
-- **DS3218 / DS3225 (1/4-scale)**: body 40 × 20 × 40.5; flange span 49.5; 4× M3; high-torque.
+**Servos** (body L×W×H below output; flange span across the long axis; output spline axis is offset toward one short end):
+- **SG90**: 22.7×12.2×27.0 body, 32.3 flange span; flange underside 17.0 above base, ~2.5 thick;
+  2× nominal Ø2.2 holes ~28.1 apart. Overall height through output ~30.3.
+- **MG90S**: 22.8×12.4×28.4 body, 32.1 flange span; flange underside 18.5 above base, ~2.5 thick;
+  2× nominal Ø2.2 holes ~28.0 apart. Overall height through output ~32.5.
+- **MG996R / MG995 standard**: ~40.9×20×37 body, 54 flange span; flange underside ~26.8 above base,
+  2× nominal Ø3.2 holes ~49.5 apart. Overall height ~42.9.
+- **DS3218 standard**: 40×20×40.5 overall. Mounting-hole and boss dimensions vary; check your actual
+  supplier's drawing before machining a bracket. Use `make_standard_part(family="hobby_servo", size="MG90S")`
+  for editable nominal geometry and its off-center `datum.output_axis`. TowerPro's A–F drawings:
+  https://towerpro.com.tw/product/sg90-analog/ · https://towerpro.com.tw/product/mg90s-3/ ·
+  https://towerpro.com.tw/product/mg996r/ ; DS3218MG: https://m.media-amazon.com/images/I/81p5zAoqJ0L.pdf
 
 **Stepper motors** (NEMA frame = body sq mm; mount square; screw; pilot boss; shaft):
 - **NEMA17**: 42.3 sq, mount square 31.0, 4× M3, pilot ⌀22 × 2, shaft ⌀5 (length 20–24).

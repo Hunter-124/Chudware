@@ -153,9 +153,10 @@ string in `core/tests/test_firmware.cpp:385`.
 - Agent role/permission wiring for firmware: `services/agent/roles.py:81-88` (`"fw"`/`"firmware"`
   role tool allowlists), `services/agent/agent_turn.py:2279-2286,6571-6665` (bootstrap-opener +
   mega-rule gating: `fw_new_project` must be followed by `fw_build` to count as product success),
-  `services/agent/prompts/firmware.md`, `services/agent/roles/firmware_engineer.yaml` (dedicated
-  firmware-engineer agent role/system-prompt), `services/agent/mission_criteria.py:43-45,128-133`
-  (AC7/AC8 acceptance-criteria hooks for `fw_build`/`fw_sim_run` in mission grading).
+  `services/agent/prompts/firmware.md`, and
+  `services/agent/roles/firmware_engineer.yaml` (dedicated agent role/system prompt).
+  The mission-specific AC7/AC8 declaration module mentioned in the original inventory
+  had no production importer and was removed; generic grading stays in `reviewer_exec.py`.
 - **No firmware-specific trigger/magic-keyword entries** exist in
   `services/agent/advisor/triggers.yaml` (grep returned zero hits for
   firmware/fw_/embedded/mcu/debug) — this is a genuine gap: the "magic keywords" ask (slash
@@ -182,7 +183,7 @@ string in `core/tests/test_firmware.cpp:385`.
 | GUI workspace (build console, UART console, GPIO trace, flash/debug rail) | **EXISTS**, extensible |
 | ECAD↔firmware co-verification, power profiling | **EXISTS**, mature, novel |
 | MCP tool registration seam for new tools | **EXISTS**, trivial to extend (`services/mcp/firmware_tools.py`) |
-| Agent role/prompt/grading wiring for firmware | **EXISTS** (`roles.py`, `firmware_engineer.yaml`, `mission_criteria.py`) |
+| Agent role/prompt and generic grading wiring for firmware | **EXISTS** (`roles.py`, `firmware_engineer.yaml`, `reviewer_exec.py`) |
 | Magic-keyword/slash-command triggers for firmware | **GREENFIELD** (`triggers.yaml` has none) |
 | External MCP-server client (consuming 3rd-party hardware MCP servers) | **GREENFIELD** |
 | Host process-spawn seam for a new debugger/programmer process | **EXISTS AND REUSABLE** (`core/firmware/subprocess.{h,cpp}`) |

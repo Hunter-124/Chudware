@@ -4846,3 +4846,56 @@ from `asm_add_component`/`asm_mate`) also unloaded the displayed mesh. Now only
 `host/src/ui/copilot/activity_timeline.cpp`. Deferred: the 7200 s default itself
 (`kOnlineTurnBudgetS`, hostd `server.cpp`) is unchanged; the asm writers still skip
 tessellation, so a newly added component appears at the next mesh-bearing revision.
+
+## 2026-09-26 — six-axis turn: sourcing, progress, Agent Hub and reference recovery
+
+The original MG90S six-axis prompt spent 13 minutes researching with zero CAD mutations:
+ordinary sourcing was outside `MAIN_CHAT_CORE_TOOLS`, there was no servo family or
+URL-to-STEP acquisition, no online no-progress steer, and noisy/mislabelled RPC events.
+**Reference path:** `tool_categories.MAIN_CHAT_CORE_TOOLS` now includes `part_search`,
+`part_get`, `part_source`, `match_model`, `make_standard_part`, `fetch_cad_model`,
+`import_artifact` and `simulate_motion`. `core/parts/catalog.cpp::hobby_servos` cites
+manufacturer dimensions/proxy caveats for SG90, MG90S, MG996R, MG995, DS3218 and
+micro_9g; `generate.cpp` makes editable `hobby_servo` geometry and
+`core/api/libchudware.cpp::parts_make_impl` returns its `output_axis` datum.
+`services/mcp/parts_tools.py::fetch_cad_model_impl(url,name,import_part)` stores CAD and a
+provenance sidecar in `<project>/reference/`; direct HTTPS files need no browser,
+`services/browser/adapters/printables.py` uses public GraphQL via curl (the Python HTTP
+path hit Cloudflare), while MakerWorld/GrabCAD gate downloads with `login_required`.
+`services/research/fetch_page.py` detects JS shells and retries rendering;
+`web_search.py`/`providers.py` report DDG HTTP 202 as `provider_blocked` and genuine empty
+results as `no_results`, never `ok:true` empty.
+
+**Agent execution:** `progress_watchdog.ProgressWatchdog` steers after 12 completed research
+calls or 6 minutes without CAD mutation, one nudge per stall and two maximum; reading
+`xd://` docs is not a mutation, and `chudcode_host.run_turn` exempts Ask/Plan and
+`plan_only`. `chudcode_events.map_rpc_frame` unwraps `custom{customType}` and keeps
+lifecycle frames out of completed tool cards; `RpcFrameState` carries start args/intent
+(including content-derived `xd://` targets) to terminal calls.
+`roles/general_agent.yaml` prescribes `design/layout.md` → one saved part at a time →
+mates for every joint → motion sweeps.
+`online_turn.py` now owns worker turn-assembly helpers; retired `effort.py`,
+`eta_estimator.py`, `ladder*.py`, `local_runtime.py`, `mission_criteria.py`,
+`shadow.py` and their tests. Root `conftest.py` isolates the engine per non-MCP test
+in mixed collections; `services/mcp/conftest.py` marks daemon tests during collection.
+
+**Agent Hub / Parts Library:** `subagent_registry.py::list_sessions` reconciles stale
+PID/start-time/heartbeat owners to `abandoned` and filters stamped records through
+`subagent_list{project_dir}`. `host/src/ui/ai/ai_workspace.cpp` is the shell,
+`agent_dag.cpp` the execution trace, `current_run_view.cpp` the project-scoped roster
+and one docked inspector (no auto-popup); nav is Current Run / Plan / Activity /
+Sessions / Insights / Options plus project chip. Activity/Documents/Plan and Insights
+token spend follow `convProjectDir`; Insights has an All projects toggle (its model
+leaderboard is explicitly global). `conversations.cpp::bindActiveConversationProject`
+restamps project ownership to each sent workspace; `engine_events.cpp` stamps unsaved
+`DocTab::projectDir` from the unique running conversation and gives an agent mirror
+focus over a pristine empty active CAD tab, not edited user work. Parts Library
+`applyResultSort` ranks local parametric matches first; Printables live CAD shows file/
+license previews and download/import; CEF-off vendor skips collapse to one notice.
+**Headless proof:** `scripts/run_mission.py` original prompt run 1 stalled before the
+watchdog correction; run 3 (`scratch/mission-sessions/2026-09-27T03-01-59-466Z_01a0e0cf-f22a-7000-ab5a-67ba0cd711f9.jsonl`)
+finished in ~25 minutes with seven printed parts, seven MG90S plus horns/sleeves,
+23 components, six joint DOF, zero solver residual and no home-pose interference.
+`simulate_motion` individual joint sweeps and bounded combined sweeps were clean;
+unbounded combined ±90° folds did collide with the base, so safe travel limits
+are documented in that run's `design/layout.md`.

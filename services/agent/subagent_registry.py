@@ -48,11 +48,79 @@ from services.agent import raw_log
 SCHEMA = "aicad.subagent_session/1"
 RAW_SCHEMA = "chudware.subagent.raw/1"
 
-#: Session statuses mirror delegation node statuses plus "terminated".
+#: Live statuses can outlive a worker crash; reconciliation marks them abandoned.
 STATUSES = (
-    "pending", "approved", "running", "paused", "done", "failed", "revoked",
-    "terminated",
+    "pending", "approved", "running", "in_progress", "waiting", "paused",
+    "done", "failed", "revoked", "terminated", "abandoned",
 )
+LIVE_STATUSES = frozenset(("pending", "approved", "running", "in_progress", "waiting", "paused"))
+UNKNOWN_OWNER_GRACE_S = 24 * 60 * 60
+
+
+def _process_start_time(pid: int) -> str | None:
+    """Linux /proc stat field 22 (clock ticks since boot), stable across PID reuse."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        return stat[stat.rfind(")") + 2:].split()[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _runner_gone(meta: dict) -> str:
+    """Return a reason only when a live status has lost its owning runner."""
+    if meta.get("status") not in LIVE_STATUSES:
+        return ""
+    pid = meta.get("owner_pid")
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return f"owning runner pid {pid} is gone"
+        except PermissionError:
+            return ""  # inaccessible, but still running
+        except OSError:
+            pass  # PID lookup unavailable on this platform
+        else:
+            recorded_start = str(meta.get("owner_start_time") or "")
+            actual_start = _process_start_time(pid)
+            if recorded_start and actual_start and recorded_start != actual_start:
+                return f"owning runner pid {pid} was reused"
+            return ""  # a live process is never abandoned on age alone
+    timestamp = (
+        meta.get("runner_heartbeat_ts")
+        or meta.get("created_ts")
+        or meta.get("updated_ts")
+    )
+    try:
+        age = time.time() - datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if age > UNKNOWN_OWNER_GRACE_S:
+        return "owning runner unavailable; no heartbeat for over 24 hours"
+    return ""
+
+
+def resolve_project_dir(start: str | Path | None = None) -> str:
+    """Resolve the run's project root, preferring explicit run-scoped roots."""
+    root = (
+        os.environ.get("CHUDWARE_PROJECT_DIR")
+        or os.environ.get("CHUDWARE_FS_ROOT")
+        or start
+    )
+    if not root:
+        from services.agent.config import workspace_dir
+        root = workspace_dir()
+    from services.agent.project_context import resolve_project_root
+    return os.path.realpath(os.path.expanduser(str(resolve_project_root(root))))
+
+
+def heartbeat(subagent_id: str) -> None:
+    """Runner-only liveness write at turn boundaries, including pause holds."""
+    meta = get_session(subagent_id)
+    if meta is None or meta.get("status") not in LIVE_STATUSES:
+        return
+    meta["runner_heartbeat_ts"] = _now()
+    _write_meta(meta["id"], meta)
 
 _CONTROL_DEFAULTS = {
     "paused": False,
@@ -187,6 +255,7 @@ def register_session(
     status: str = "pending",
     session_id: str = "",
     transcript_dir: str = "",
+    project_dir: str | Path | None = None,
 ) -> dict:
     """Create (or refresh) a session record.  Returns the stored metadata dict."""
     sid = _safe_id(subagent_id)
@@ -218,6 +287,10 @@ def register_session(
         "effort_override": str(existing.get("effort_override", "")),
         "session_id": owner_session_id,
         "raw_transcript_path": str(raw_transcript_path),
+        "project_dir": existing.get("project_dir") or resolve_project_dir(project_dir),
+        "owner_pid": existing.get("owner_pid") or os.getpid(),
+        "owner_start_time": existing.get("owner_start_time") or _process_start_time(os.getpid()),
+        "runner_heartbeat_ts": existing.get("runner_heartbeat_ts") or _now(),
         "created_ts": existing.get("created_ts") or _now(),
         "updated_ts": _now(),
     }
@@ -255,8 +328,12 @@ def set_status(subagent_id: str, status: str, *, note: str = "") -> bool:
     return True
 
 
-def list_sessions(limit: int = 50) -> list[dict]:
-    """Registry snapshot, newest-updated first.  Adds live queue/transcript counts."""
+def list_sessions(limit: int = 50, *, project_dir: str | None = None) -> list[dict]:
+    """Registry snapshot, newest-updated first, optionally scoped to a project."""
+    project_filter = (
+        os.path.realpath(os.path.expanduser(project_dir))
+        if project_dir is not None else None
+    )
     sessions: list[dict] = []
     try:
         for p in subagents_dir().glob("*.json"):
@@ -270,6 +347,24 @@ def list_sessions(limit: int = 50) -> list[dict]:
                 continue
             sid = meta.get("id", "")
             _default_control_state(meta)
+            reason = _runner_gone(meta)
+            if reason:
+                # Re-read before replacing: another process may have completed it
+                # while this list request was reading the registry.
+                current = get_session(sid)
+                if current is not None and current.get("status") in LIVE_STATUSES:
+                    reason = _runner_gone(current)
+                    if reason:
+                        current["status"] = "abandoned"
+                        current["status_note"] = reason
+                        current["updated_ts"] = _now()
+                        _write_meta(sid, current)
+                        meta = current
+            if project_filter is not None and (
+                not meta.get("project_dir")
+                or meta["project_dir"] != project_filter
+            ):
+                continue
             meta["pending_steers"] = len(pending_steers(sid)) if sid else 0
             meta["transcript_len"] = len(_read_lines(_transcript_path(sid))) if sid else 0
             sessions.append(meta)

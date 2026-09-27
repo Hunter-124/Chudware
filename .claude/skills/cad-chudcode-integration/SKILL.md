@@ -38,9 +38,10 @@ host GUI / hostd
 ```
 
 `services/worker_main.py` is long-lived. Its process-global `ChudcodeSessionHost` owns one
-persistent RPC process per Chudware conversation. `worker_rpc._agent_admin_turn` assembles the
-CAD role prompt, workspace, effective host-tool set, callbacks, and event context before it
-hands the turn to that host. Nested provider execution stays in Chudcode.
+persistent RPC process per Chudware conversation. `worker_rpc._agent_admin_turn` coordinates
+the online request; `online_turn.py` owns workspace/model/settings assembly and run-scoped
+environment lifetime. CAD role prompt, effective host tools, callbacks and event context
+reach the Chudcode host without a second provider loop.
 
 Ordinary calls and event notifications use the services worker's newline-delimited stdio
 protocol. Stop/steer/status cannot wait behind a blocked turn, so `worker_main` also starts
@@ -56,6 +57,9 @@ log the token or move control back onto the serialized stdio lane.
 | `services/agent/chudcode_control.py` | Bounded authenticated control server and platform endpoint |
 | `services/agent/chudcode_tools.py` | Live CAD registry → run-scoped Chudcode host-tool definitions and guarded dispatch |
 | `services/agent/chudcode_events.py` | Deterministic bounded RPC-frame → Chudware feed-event mapping |
+| `services/agent/online_turn.py` | Worker turn-assembly helpers and run-scoped workspace/credential lifetime |
+| `services/agent/progress_watchdog.py` | Per-turn research/no-mutation detection and bounded steer |
+| `services/agent/subagent_registry.py` | PID/start-time/heartbeat liveness reconciliation and project-scoped roster |
 | `services/agent/chudcode_roles.py` | CAD role/prompt conversion at the Chudcode boundary |
 | `services/agent/worker_rpc.py` | Public worker methods, online turn assembly, settings/auth/memory/session seams |
 | `services/worker_main.py` | Persistent worker entrypoint, control-server lifetime, global Chudcode shutdown |
@@ -115,13 +119,14 @@ runtime's doctor command.
    → mode policy (so Ask/Plan stay read-only whatever was loaded) → meta/bug-report floors →
    `verify_battery` when mutating tools are present → render schemas.
 2b. The main chat (`worker_rpc._agent_admin_turn`) advertises
-   `tool_categories.MAIN_CHAT_CORE_TOOLS` and its system prompt carries the MORE TOOLS menu
+   `tool_categories.MAIN_CHAT_CORE_TOOLS`, now including `part_search`, `part_get`,
+   `part_source`, `match_model`, `make_standard_part`, `fetch_cad_model`,
+   `import_artifact` and `simulate_motion`. Its system prompt carries the MORE TOOLS menu
    naming every other registered tool; `enable_tools(tools=[...])` and
    `enable_tools(categories=[group])` load the rest mid-turn through the single refresh
-   callback `chudcode_roles._register_category_refresh` (which re-runs `build_host_tools` and
-   `set_custom_tools`, and reports `unknown` tokens). The composer's `scope`
-   (`{doc_id, feature_ids, selection}`) is rendered into the user message by
-   `worker_rpc._editor_context_block`.
+   callback `chudcode_roles._register_category_refresh` (re-runs `build_host_tools` and
+   `set_custom_tools`, reports `unknown` tokens). The composer's `scope`
+   (`{doc_id, feature_ids, selection}`) is rendered by `worker_rpc._editor_context_block`.
 3. Advertise and dispatch the same effective set. Skip unbound and async-only entries.
    Chudcode builtin names remain Chudcode-owned unless a CAD registry entry explicitly claims
    ownership.
@@ -160,17 +165,44 @@ runtime's doctor command.
    injection is `chudcode_tools._with_skill_injection`: a skill whose `triggers.tools` names
    the dispatched tool rides back as a bounded prefix on that tool's FIRST result text per
    session, with `details` untouched. Never re-copy a SKILL.md into a role card.
+10. For physical sourcing, `core/parts/{catalog,generate}.cpp` supplies the cited
+    `hobby_servo` envelopes (SG90/MG90S/MG996R/MG995/DS3218/micro_9g);
+    `core/api/libchudware.cpp::parts_make_impl` publishes the `output_axis` datum.
+    `parts_tools.fetch_cad_model_impl(url,name,import_part)` accepts direct HTTPS CAD and
+    supported model pages, stores file + provenance sidecar under `<project>/reference/`
+    and optionally imports. Printables guest CAD uses `adapters/printables.py` GraphQL
+    via curl; MakerWorld/GrabCAD may require login rather than promise a download.
+11. `chudcode_host.run_turn` owns `ProgressWatchdog`: after 12 completed research calls
+    or six minutes since progress without a successful CAD mutation, steer once per
+    stall and at most twice per turn. Reading `xd://` is documentation, not a
+    mutation; only successful CAD mutators reset progress. `host_params` mode
+    Ask/Plan and `plan_only` exempt the turn. `roles/general_agent.yaml` tells multi-part
+    mechanisms to write `design/layout.md`, build/save each part, mate every joint
+    and sweep with `simulate_motion` instead of researching indefinitely.
+12. `research_fetch_page` (`services/research/fetch_page.py`) flags JS bootstrap
+    shells and retries a rendered browser before returning `js_shell`;
+    `research_web_search` (`web_search.py`/`providers.py`) distinguishes DDG's
+    HTTP 202 challenge (`provider_blocked`) from a real empty search (`no_results`).
+    Neither is an `ok:true` empty page/result.
+13. `subagent_registry.list_sessions(project_dir=...)` returns only records stamped
+    for that project; missing project ownership never matches. Stale live records
+    become terminal `abandoned` only from owner PID/start-time or heartbeat
+    evidence, not age while the owner is alive.
 
 ## Event rules
 
-`chudcode_events.map_rpc_frame` is the only translation authority.
+`chudcode_events.map_rpc_frame` with per-turn `RpcFrameState` is the translation authority.
 
 - Only streamed deltas produce visible assistant text. Final message envelopes are lifecycle
   records; replaying their content double-renders text.
 - Preserve `text`/`thinking` channels. Empty text flushes are not thinking boundaries.
-- Start/progress tool events map to status. A terminal result/cancel maps once to
-  `agent.tool_call`, keyed by the real tool-call id. A synchronous host call already carrying
-  a result is terminal.
+- Unwrap `custom{customType}` before classification: title/thinking/notice/available-command
+  lifecycle frames are metadata/status (or ignored), never completed tool cards.
+- Remember start args/intent by actual Chudcode call id, carrying bounded previews and
+  content-derived targets to the terminal `agent.tool_call`; `write xd://tool` uses
+  the JSON content rather than the device path to name its target, while `read xd://`
+  only inspects tool documentation. Start/progress tool events map to status; a
+  terminal result/cancel maps once. A synchronous host call with a result is terminal.
 - Preserve correlation (`run_id`, `session_id`, node/span/parent/subagent ids), but synthesize
   only deterministic digest ids when the source omitted one.
 - Unknown frames remain visible as bounded deterministic `sub_run` rows. Never drop them or
@@ -188,10 +220,11 @@ runtime's doctor command.
 
 ## Auth, memory, and settings
 
-Use `ChudcodeSessionHost.transient_call` for service-level auth/model/memory operations; those
-clients run with `no_session=True` and are always disposed after the call. Use `session_call`
-only for an already-live session: stats/state, compact/handoff, auto-compaction/auto-retry, and
-STT. A status/settings request must not silently create or resume a conversation.
+Service-level auth/model/memory calls use the shared, serialized no-session client
+`ChudcodeSessionHost._service_client` (through `transient_call`); it is replaced after death
+and disposed on shutdown, not spawned per request. Use `session_call` only for an already-live
+session: stats/state, compact/handoff, auto-compaction/auto-retry, and STT. A status/settings
+request must not silently create or resume a conversation.
 
 Secrets stay in typed `chudcode_rpc` wrappers. UI responses may expose state, account labels,
 usage, and model metadata, never credential bytes. Login UI requests are bounded and allow only

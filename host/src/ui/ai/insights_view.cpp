@@ -1,8 +1,5 @@
-// Composed "Insights" view (AI workspace utility pane): the aicad.leaderboard/1 board followed
-// by the token-spend aggregation on one scrolling surface, split by one hairline + header
-// boundary. The leaderboard cache moved here from ai_workspace.cpp's view switch (same
-// load-once + on-demand-refresh shape). The board titles itself ("Model Leaderboard"), so only
-// the lower section gets a section header — no doubled titles.
+// Composed Insights view: global Model Leaderboard (explicitly marked All projects) and
+// per-project token spend, with an opt-in All projects toggle on the latter.
 #include "insights_view.h"
 
 #include "imgui.h"
@@ -15,6 +12,8 @@
 namespace ui {
 
 void drawInsightsView(AppState& st) {
+    ui::kit::sectionHeader("All projects", nullptr, "Model leaderboard",
+                           /*count=*/-1, /*first=*/true);
     static ui::leaderboard::Board s_board;
     static bool s_loaded = false;
     if (!s_loaded) {

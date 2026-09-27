@@ -286,13 +286,18 @@ run_fea_static answers "is this link strong enough at the worst instant" in one 
 conforming to aicad.simhandoff/1 (see cad_guide('simulation'), CROSS-SIM HANDOFF).
 
 HOW TO USE
-  1. Open/build an ASSEMBLY with mates (asm_insert_component + asm_add_mate; solve_mates to seat
-     it). You DRIVE a DIMENSIONAL mate — one whose `value` means motion: angle / angle_limit
-     (deg), distance / distance_limit (mm), gear / rack_pinion / screw. A revolute/concentric/
-     slot mate has no value to sweep; drive the angle/distance mate that DIMENSIONS that joint.
-  2. simulate_motion(mate_id="m3", start=0, stop=360, steps=48, loop=True) — sweep the driver
-     0->360 and close the cycle. Omit mate_id if there's exactly one drivable mate; omit start to
-     begin at the mate's current value.
+  1. Build an ASSEMBLY with asm_add_component + asm_mate, ground the base, then
+     solve_mates. Every moving joint needs a mate: a driven revolute angle uses
+     value={"value":0,"axis":[ax,ay,az],"axis_point":[px,py,pz]}
+     from the measured WORLD-space hinge line. Concentric+coincident seat the
+     pivot; an angle/distance mate defines the scalar you drive. Fixed
+     interfaces use coincident/concentric/lock mates.
+     `at` is only a starting pose, not a persistent joint relation.
+  2. simulate_motion(mate_id="m3", start=0, stop=180, steps=48) sweeps that
+     joint's range with interference at each sample; repeat for each joint.
+     Use drivers=[{"mate_id":"m3","start":0,"stop":180}, ...] for a synchronized
+     multi-joint sweep. Do not hand-roll forward kinematics in Python or build
+     throwaway pose assemblies.
   3. Read the result: trajectory[i].bodies[j].transform is body j's world pose at sample i (the
      datum a viewer animates); interference.first_collision_step / _value is the first clash (with
      the interfering pair in `detail`). The study RESTORES the driven mate to its original value
@@ -320,12 +325,19 @@ TWO WAYS TO ASSEMBLE
      or a one-off clearance check, wrong for a real mechanism.
 
 TRUE-ASSEMBLY WORKFLOW
-  1. Build/obtain each part: new_part + add_features, make_standard_part (fasteners/bearings),
-     or import_part (a downloaded STEP). save_part(path) each one to .step+.
-  2. new_assembly("motor_mount")                    create the assembly doc (it becomes current).
-  3. asm_add_component(path, fixed=True)            the grounded base (first one defaults fixed).
-     asm_add_component(path2, at=[x,y,z])           free components; `at` is a starting pose
-                                                    (helps the solver pick the right side).
+  0. For a multi-part mechanism, write a short design/layout.md in the project
+     with fs_write (read/amend it if already present): joint axes, link lengths,
+     motor/horn interfaces, clearances, fasteners. Choose stated fit tolerances
+     or shims and start building within a few minutes, not after extended thought.
+  1. Build/obtain ONE part at a time: new_part + add_features,
+     make_standard_part for catalog hardware, or import_part for acquired CAD.
+     describe_part/measure_part, then save_part(path) to editable .step+ before
+     starting the next.
+  2. new_assembly("motor_mount") once a saved base exists; add each component
+     and its mates as the part becomes available, not after all parts are done.
+  3. asm_add_component(path, fixed=True) grounds the base (first defaults fixed);
+     add other saved parts as they arrive. `at` gives only a starting pose for
+     the solver, never a substitute for mates on moving/fixed interfaces.
   4. asm_mate(mate_type, a, b, ...)                 constrain pairs of faces/edges:
        a/b = {"component": "k1", "query": {"of":"face","side":"top"}}
        The query is the SAME plain-word geometry query as query_geometry, resolved against
@@ -339,12 +351,22 @@ TRUE-ASSEMBLY WORKFLOW
        motor on bracket  concentric (pilot boss ↔ pilot bore) + coincident (flange ↔ plate)
                          + parallel or a second concentric (bolt ↔ hole) to stop spin
        pin joint         concentric (pin ↔ bore) + coincident/distance for axial position
+     MATE EVERY JOINT: driven revolute = angle mate with
+       value={"value":0,"axis":[ax,ay,az],"axis_point":[px,py,pz]}
+       (measured WORLD hinge line);
+       concentric+coincident seats a pin and its axial position; fixed servo
+       pockets and horn-to-link interfaces use coincident/concentric/lock.
   5. asm_mate solves after each add (solve=True default) — or call solve_mates() explicitly.
   6. VALIDATE: describe_assembly() (world bboxes + solve status), check_interference()
      (clashes + tightest clearances; min_clearance_mm flags too-tight fits), interface_check
      (do hole patterns/axes actually line up), measure_between (spot dimensions).
-  7. save_part(path) the assembly .step+; simulate_motion drives a dimensional mate for
-     kinematics + swept-clash.
+  7. Drive EACH joint over its range with simulate_motion(mate_id, start, stop)
+     and swept interference, not hand-rolled kinematics or throwaway pose
+     assemblies. save_part(path) the mated assembly .step+; simulate_motion
+     restores the starting pose after the study.
+  Iterate on the saved feature trees when fits change; parametric geometry is
+  cheap to edit. Never spend more than a few minutes deliberating without a
+  file or CAD change.
 
 BEST PRACTICE (structure)
   * Build DEEP products as SUBASSEMBLIES — each its own .step+, mated into the parent —
@@ -737,6 +759,17 @@ def cad_guide_text(topic: str = "overview") -> str:
             "STANDARD-PARTS LIBRARY — search → get → place (T-P3, aicad.parts/1)\n\n"
             "BIAS: always prefer standard parts over custom geometry for hardware.\n"
             "Standard parts are editable, sourced, and BOM-ready out of the box.\n\n"
+            "REFERENCE ACQUISITION ORDER:\n"
+            "  1. part_search / make_standard_part for catalog and standard parts\n"
+            "     (servos, steppers, bearings, fasteners, extrusions); part_get\n"
+            "     confirms dimensions and part_place places a catalog record.\n"
+            "  2. match_model / part_source for a discrete product's CAD.\n"
+            "  3. fetch_cad_model(url) for a specific model page or STEP/IGES file\n"
+            "     found by web search; import_artifact if not auto-imported.\n"
+            "  4. Web search only for specs/datasheets absent from the library.\n"
+            "     Then COMMIT to cited dimensions with clearance and build; never\n"
+            "     loop on research. For an MG90S six-axis arm, search MG90S first,\n"
+            "     use its reference envelope/mount dimensions, and build brackets.\n\n"
             "WORKFLOW:\n"
             "  1. part_search(query, domain?, limit?)\n"
             "       Search the federated catalog.  Returns ranked PartRecord list.\n"
@@ -809,9 +842,8 @@ def cad_guide_text(topic: str = "overview") -> str:
             "                price_max=40, vendors='mcmaster', in_stock=True)\n"
             "  The response's facet_summary shows the top param values in THIS result\n"
             "  set — read it to see what to narrow by next.\n\n"
-            "NEED-DRIVEN SOURCING: part_source('4130 chromoly tube OD 25.4 wall 1.25')\n"
-            "  deterministically matches the taxonomy + extracts facets + returns scored\n"
-            "  candidates, each with an artifact_plan — see cad_guide('sourcing').\n\n"
+            "NEED-DRIVEN SOURCING: part_source extracts taxonomy facets and ranks\n"
+            "  candidates with artifact plans; see cad_guide('sourcing').\n\n"
             "SOURCING:\n"
             "  Each PartRecord carries a sourcing[] list of VendorPart dicts (aicad.sourcing/1).\n"
             "  Use bom_rollup after placing multiple parts to get a costed BOM.\n"
@@ -959,41 +991,31 @@ def cad_guide_text(topic: str = "overview") -> str:
                  "scrape", "scrape_enqueue", "import_artifact"):
         return (
             "SOURCING — need → candidates → geometry → BOM → quote (Parts Library V2)\n\n"
-            "THE FULL LOOP:\n"
-            "  1. parts_taxonomy(node_id?)          Browse categories; a node's facets\n"
-            "                                       are the filter keys it supports\n"
-            "                                       (cad_guide('parts') for examples).\n"
-            "  2. part_source(need, constraints?, limit?)\n"
-            "       Deterministic sourcing fan-out for a plain-language need:\n"
-            "         part_source('4130 chromoly tube OD 25.4 wall 1.25')\n"
-            "         part_source('bearing 12mm bore', constraints='sealed, under $10')\n"
-            "       It matches taxonomy categories, extracts spec facets from the text\n"
-            "       (OD/bore/wall/alloy/...), searches the routed domains, and returns\n"
-            "       scored candidates: {part_id, title, vendor, price, specs, score,\n"
-            "       rationale, artifact_plan}.  Schema: contracts/sourcing.md.\n"
-            "  3. Narrow interactively when needed: part_search(query, category_id,\n"
-            "       facets, price_max, vendors, in_stock) + its facet_summary.\n"
-            "       part_get(part_id) for the full record before committing.\n"
-            "  4. Follow each candidate's artifact_plan.how to get REAL geometry:\n"
-            "       part_place          → local record with geometry_ref: place it.\n"
-            "       scrape_import       → vendor catalog record: scrape_enqueue(site,\n"
-            "                             query) → poll scrape_queue_status() → done →\n"
-            "                             import_artifact(artifact_path).\n"
-            "       make_standard_part  → standard hardware family: make_standard_part.\n"
-            "       find_model          → discrete manufactured product (MPN/brand, no\n"
-            "                             model, not stock/hardware): match_model(part_id).\n"
-            "                             AUTO-PLACE only confidence 'exact'/attach:true;\n"
-            "                             strong/weak need user confirmation.\n"
-            "       reverse_engineer    → match_model's fallback when no confident match:\n"
-            "                             reverse_engineer_product(part_id|url) harvests\n"
-            "                             photos+datasheets into a seeded RE session.\n"
-            "  5. CUTTING TOOLS are special: an end mill / drill from the library goes\n"
+            "Use cad_guide('parts') for the reference acquisition order.\n"
+            "PART SOURCE DETAILS:\n"
+            "  parts_taxonomy(node_id?) shows categories and effective facet keys.\n"
+            "  part_source(need, constraints?, limit?) ranks a plain-language need:\n"
+            "    part_source('4130 chromoly tube OD 25.4 wall 1.25')\n"
+            "  It extracts facets and returns {part_id, title, vendor, price,\n"
+            "  specs, score, rationale, artifact_plan}; see contracts/sourcing.md.\n"
+            "  Narrow via part_search(query, category_id, facets, price_max,\n"
+            "  vendors, in_stock), inspect facet_summary, then part_get(part_id).\n"
+            "  Follow artifact_plan.how for real geometry: part_place for local\n"
+            "  geometry_ref; scrape_import via scrape_enqueue(site, query),\n"
+            "  scrape_queue_status(), import_artifact(artifact_path) for vendor\n"
+            "  catalogs; make_standard_part for standard families; find_model via\n"
+            "  match_model(part_id) for a branded product. Only confidence 'exact'/\n"
+            "  attach:true can auto-place; confirm strong/weak matches with the human.\n"
+            "  A specific CAD URL goes to fetch_cad_model(url); match_model's\n"
+            "  reverse_engineer fallback requires human confirmation before starting\n"
+            "  reverse_engineer_product(part_id|url).\n"
+            "CUTTING TOOLS: an end mill / drill from the library goes\n"
             "       into the CAM job via cam_tool_import(part_id, number=0) — it maps\n"
             "       the vendor record (tool_diameter_mm→diameter, flutes, coating) into\n"
             "       the tool library with provenance and suggests conservative\n"
             "       stepover/stepdown.  Feeds/speeds ALWAYS come from the CuttingDB\n"
             "       (feeds_speeds / cam_check_feeds_envelope), never the vendor row.\n"
-            "  6. BOM + COST: bom_rollup(doc_path) rolls the tree into a flat BOM\n"
+            "BOM + COST: bom_rollup(doc_path) rolls the tree into a flat BOM\n"
             "       (PartRecord sourcing[] rows merge in automatically); bom_price\n"
             "       resolves live prices via approved providers (Nexar, DigiKey,\n"
             "       Mouser); request_quote(doc_path, vendor, qty) for PO decisions;\n"
@@ -1006,9 +1028,9 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  for the human and continue with the healthy sites; NEVER fabricate\n"
             "  results for a logged-out site, and never retry a login-required site\n"
             "  in a loop.  vendor_status() lists adapter login state cheaply.\n\n"
-            "BIAS: always prefer part_search/part_source + part_place for hardware —\n"
-            "  candidates arrive pre-sourced and editable.  Never invent prices or\n"
-            "  specs: every number in a recommendation comes from a tool result."
+            "BIAS: prefer the catalog/standard family before custom geometry.\n"
+            "  Never invent prices or specs: every number in a recommendation\n"
+            "  comes from a tool result."
         )
     if topic in ("cost", "cost_estimate", "cam_cost", "quote", "request_quote", "pricing"):
         return (

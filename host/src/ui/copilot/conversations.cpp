@@ -6,8 +6,8 @@
 
 #include "copilot_internal.h"
 
-#include "ui/ai/ai_workspace.h"  // ui::agentDagToJson / agentDagFromJson — persist the live
-                                 // agent-execution DAG with the active session's artifacts.
+#include "ui/ai/agent_dag.h"  // ui::agentDagToJson / agentDagFromJson — persist the live
+                              // agent-execution DAG with the active session's artifacts.
 
 #include "conv_ids.h"  // session-id allocation (GL-free TU, unit-tested in host/tests)
 #include "ui/chudcode_session_actions.h"  // per-conversation Chudcode session link (GL-free TU)
@@ -364,10 +364,9 @@ std::string convProjectKey(std::string_view rawDir) {
     return comparablePath(lexicalPath(rawDir));
 }
 
-// The project folder a session created RIGHT NOW belongs to. Deliberately the SAME
-// expression the composer sends Chudcode as workspace_dir (attachAgentConversationOptions):
-// st.workspaceDir when set, else the derived PLM project path. Anything else would scope a
-// session to a folder the agent never worked in.
+// The project folder a newly created session belongs to. A turn launch can restamp this
+// when its actual workspace differs; until then the current workspace (or PLM path if
+// none is set) scopes an empty/draft conversation.
 std::string convProjectDir(AppState& st) {
     return st.workspaceDir.empty() ? st.plmProjectPath() : st.workspaceDir;
 }
@@ -487,6 +486,20 @@ static bool hasProjectArtifact(const std::vector<ChatMsg>& msgs,
 // active anywhere. Keyed by convProjectKey.
 static std::map<std::string, std::string> s_activeByProject;
 
+// A run binds the session to the workspace actually sent to the worker. A session
+// resumed under another project must also stop being the old project's remembered tab.
+void bindActiveConversationProject(AppState& st, const std::string& workspace) {
+    if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
+    Conversation& active = st.conversations[st.activeConv];
+    const std::string previous = convProjectKey(active.projectDir);
+    if (previous == convProjectKey(workspace)) return;
+    const auto old = s_activeByProject.find(previous);
+    if (old != s_activeByProject.end() && old->second == active.id)
+        s_activeByProject.erase(old);
+    active.projectDir = workspace;
+    markChatHistoryDirty();
+}
+
 // Keep the id source ahead of an id we just took in from disk. st.convCounter starts at 0
 // EVERY launch, so without this a second run handed out c1, c2, c3… straight on top of the
 // c3/c7/c8 transcripts already on disk — and a colliding session was then silently dropped
@@ -523,7 +536,7 @@ void ensureConversations(AppState& st) {
     c.id = newConvId(st);
     c.title = "Chat 1";
     c.docLink = convDocKey(st);  // link to whatever document is current — reference only
-    c.projectDir = convProjectDir(st);  // project scope, captured once at creation
+    c.projectDir = convProjectDir(st);  // initial scope; a turn may run in another workspace
     st.conversations.push_back(std::move(c));
     st.activeConv = (int)st.conversations.size() - 1;  // st.chat remains the active buffer
 }
@@ -1172,7 +1185,7 @@ void persistChatHistory(AppState& st) {
         // Optional document LINK (reference only — never an ownership key).
         if (!st.conversations[i].docLink.empty())
             convObj["doc"] = st.conversations[i].docLink;
-        // Project scope, captured at creation — what the Sessions list filters on.
+        // Project scope follows the workspace of the last launched turn.
         if (!st.conversations[i].projectDir.empty())
             convObj["project"] = st.conversations[i].projectDir;
         if (st.conversations[i].archived) convObj["archived"] = true;
@@ -1984,11 +1997,9 @@ static void pollChudcodeSessionHealth(AppState& st) {
 }
 
 
-// A project switch at runtime (Explorer workspace root or "Open project folder…" changing
-// what convProjectDir resolves to) re-points the view at the session that was last active in
-// the project being ENTERED, and remembers where the user was in the one being LEFT. A
-// project we have no memory of keeps the current session — there is nothing better to show.
-// Gated on the key itself, so this costs one string compare per frame.
+// On a project switch, remember the last active session in the project being left and
+// reselect the last active one in the project being entered. An empty/draft session has
+// not run anywhere yet: move its scope instead of stranding a ghost in the old project.
 static void followProjectActiveConversation(AppState& st) {
     static bool s_seeded = false;
     static std::string s_lastKey;
@@ -1999,9 +2010,17 @@ static void followProjectActiveConversation(AppState& st) {
         return;
     }
     if (key == s_lastKey) return;
-    if (!s_lastKey.empty() && st.activeConv >= 0 &&
-        st.activeConv < (int)st.conversations.size())
-        s_activeByProject[s_lastKey] = st.conversations[st.activeConv].id;
+    if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size()) {
+        Conversation& active = st.conversations[st.activeConv];
+        const bool hasNotRun = st.chat.empty() && active.msgs.empty() &&
+                               st.queuedPrompts.empty() && !st.convRunning(active.id);
+        if (hasNotRun && !key.empty()) {
+            // A draft belongs to its session id, not its project: leave the draft intact.
+            bindActiveConversationProject(st, convProjectDir(st));
+        } else if (!s_lastKey.empty()) {
+            s_activeByProject[s_lastKey] = active.id;
+        }
+    }
     s_lastKey = key;
     if (key.empty()) return;
     const auto it = s_activeByProject.find(key);
@@ -2123,7 +2142,7 @@ void newConversation(AppState& st) {
     c.id = newConvId(st);
     c.title = "Chat " + std::to_string((int)st.conversations.size() + 1);
     c.docLink = convDocKey(st);  // link to the current document — reference only
-    c.projectDir = convProjectDir(st);  // project scope, captured once at creation
+    c.projectDir = convProjectDir(st);  // initial scope; a turn may run in another workspace
     st.conversations.push_back(std::move(c));
     st.activeConv = (int)st.conversations.size() - 1;
     st.showSessionsPicker = false;

@@ -34,11 +34,27 @@ struct BearingRow {
     const char* size;  // bearing number, e.g. "608"
     double bore, od, width;
 };
+// Nominal servo envelopes. z=0 at case bottom; tab bottom and all axial
+// dimensions are measured upwards. A dimension not printed on the cited
+// manufacturer's drawing is identified as a nominal fit dimension in notes.
+struct HobbyServoRow {
+    const char* size;
+    double body_l, body_w, body_h;
+    double tab_span, tab_thickness, tab_bottom_z;
+    double hole_d, hole_pitch;
+    double shaft_from_end, boss_d, boss_h, shaft_d, shaft_h;
+    int spline_teeth;
+    const char* source;
+    const char* notes;
+};
+
 
 const std::vector<MetricRow>& metric();
 const std::vector<SaeRow>& sae();
 const std::vector<BearingRow>& bearings();
 const std::vector<double>& dowel_diameters();
+const std::vector<HobbyServoRow>& hobby_servos();
+const HobbyServoRow* find_hobby_servo(const std::string& size);
 
 // nullptr when not found.
 const MetricRow* find_metric(const std::string& size);

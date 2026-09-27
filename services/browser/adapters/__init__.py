@@ -179,6 +179,60 @@ def is_login_wall(content: str, markers: tuple[str, ...]) -> bool:
     return any(marker in content for marker in markers)
 
 
+def download_public_cad(url: str, dest: Path, *, max_bytes: int = 200 * 1024 * 1024) -> dict:
+    """Stream a public HTTPS CAD file without a browser, with a hard byte cap.
+
+    Follow only validated public HTTPS redirects (the research HTTP policy);
+    never issue a request to a private or credential-bearing endpoint.
+    """
+    import httpx
+    from urllib.parse import urljoin
+    from services.research.fetch_page import OutboundPolicyError, _validate_public_url
+
+    current = url
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    saved = False
+    try:
+        with httpx.Client(timeout=30.0, follow_redirects=False) as client:
+            for hop in range(7):
+                _validate_public_url(current)
+                with client.stream("GET", current) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            return {"ok": False, "reason": "no_cad_link",
+                                    "detail": f"Redirect at {current} has no destination."}
+                        current = urljoin(current, location)
+                        continue
+                    if response.status_code >= 400:
+                        return {"ok": False, "reason": f"http_{response.status_code}",
+                                "status": response.status_code,
+                                "detail": f"HTTP {response.status_code} at {current}."}
+                    declared = response.headers.get("content-length")
+                    if declared and int(declared) > max_bytes:
+                        return {"ok": False, "reason": "too_large",
+                                "detail": f"CAD download exceeds {max_bytes} bytes."}
+                    size = 0
+                    with dest.open("wb") as output:
+                        for chunk in response.iter_bytes(chunk_size=65536):
+                            size += len(chunk)
+                            if size > max_bytes:
+                                return {"ok": False, "reason": "too_large",
+                                        "detail": f"CAD download exceeds {max_bytes} bytes."}
+                            output.write(chunk)
+                    saved = True
+                    return {"ok": True, "dest": str(dest), "url": current,
+                            "status": response.status_code, "bytes": size}
+        return {"ok": False, "reason": "no_cad_link", "detail": "Too many HTTPS redirects."}
+    except (OutboundPolicyError, ValueError) as exc:
+        return {"ok": False, "reason": "unsupported_format", "detail": str(exc)}
+    except (httpx.HTTPError, OSError) as exc:
+        return {"ok": False, "reason": "no_cad_link", "detail": f"HTTPS download failed: {exc}"}
+    finally:
+        if not saved:
+            dest.unlink(missing_ok=True)
+
+
 def download_dir(site: str) -> Path:
     """Local landing directory for artifacts acquired from ``site``.
 
@@ -198,6 +252,7 @@ def download_dir(site: str) -> Path:
 # package's top level.
 from . import (amazon, content3d, digikey_web, grabcad, jlcpcb, lcsc, mcmaster,  # noqa: E402,F401
                misumi, pcbway, snapeda, traceparts)
+from . import makerworld, printables  # noqa: E402,F401 — public CAD communities
 from . import (acehardware, fastenal, grainger, harborfreight, homedepot,  # noqa: E402,F401
                lowes, metalsdepot, onlinemetals, tractorsupply)
 # Wave 3 (2026-07-07): supplier expansion — hydraulics/fluid-power, Chinese &

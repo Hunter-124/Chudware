@@ -121,11 +121,8 @@ void trim_load_cache(const std::string& path) {
 std::string resolve_source_path(const std::string& path, const std::string& base_dir) {
     std::filesystem::path p(path);
     if (p.is_absolute()) return p.string();
-    if (!base_dir.empty()) {
-        std::filesystem::path cand = std::filesystem::path(base_dir) / p;
-        std::error_code ec;
-        if (std::filesystem::exists(cand, ec)) return cand.string();
-    }
+    if (!base_dir.empty())
+        return (std::filesystem::path(base_dir) / p).lexically_normal().string();
     std::error_code ec;
     return std::filesystem::absolute(p, ec).string();
 }
@@ -1115,15 +1112,23 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
 
 json asm_component_fingerprints(const json& doc, const std::string& base_dir) {
     json fp = json::array();
-    auto append_path = [&](const std::string& abspath) {
+    const auto root = base_dir.empty() ? std::filesystem::path()
+        : std::filesystem::absolute(base_dir).lexically_normal();
+    auto append_path = [&](const std::string& source_path) {
+        const auto absolute = std::filesystem::absolute(source_path).lexically_normal();
+        const auto local = root.empty() ? std::filesystem::path()
+            : absolute.lexically_relative(root);
+        const auto first = local.begin();
+        const std::string stored = !local.empty() && first != local.end() &&
+            *first != ".." && *first != "." ? local.generic_string() : absolute.string();
         uint64_t size = 0;
         long long mtime = 0;
         std::error_code ec;
-        auto sz = std::filesystem::file_size(abspath, ec);
+        auto sz = std::filesystem::file_size(absolute, ec);
         if (!ec) size = static_cast<uint64_t>(sz);
-        auto ft = std::filesystem::last_write_time(abspath, ec);
+        auto ft = std::filesystem::last_write_time(absolute, ec);
         if (!ec) mtime = static_cast<long long>(ft.time_since_epoch().count());
-        fp.push_back({{"path", abspath}, {"size", size}, {"mtime", mtime}});
+        fp.push_back({{"path", stored}, {"size", size}, {"mtime", mtime}});
     };
     auto append_components = [&](const json& assembly, const std::string& directory) {
         if (assembly.contains("components") && assembly["components"].is_array())
@@ -1145,7 +1150,8 @@ json asm_component_fingerprints(const json& doc, const std::string& base_dir) {
     // collapse, but distinct adjacent part files remain independent dependencies.
     std::set<std::pair<std::string, std::string>> visited;
     for (size_t i = 0; i < fp.size(); ++i) {
-        const std::string path = fp[i].at("path").get<std::string>();
+        const std::string path = resolve_source_path(
+            fp[i].at("path").get<std::string>(), root.string());
         const std::string low = lower(path);
         if (!ends_with(low, ".step+") && !ends_with(low, ".stepplus")) continue;
         std::error_code ec;

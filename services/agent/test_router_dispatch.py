@@ -95,10 +95,17 @@ class TestLinearRoleTurn:
         assert "enable_tools" in allowed
         assert "delegate" not in allowed
         assert "mission_start" not in allowed
-        # The broad CAD core is loaded up front — the model never has to
-        # enable_tools(['modeling']) before a fillet.
+        # The 6-axis MG90S turn had only web tools available and researched
+        # indefinitely instead of loading library/CAD acquisition. Keep the
+        # reference path in the immediate main-chat loadout.
+        # A zero-clash transform-only arm is not a driveable mechanism; keep
+        # simulate_motion with the mate/solve tools on the loaded floor.
         for t in ("new_part", "add_features", "asm_add_component", "asm_mate",
-                  "describe_part", "measure_part", "verify_battery"):
+                  "solve_mates", "simulate_motion", "describe_part", "measure_part",
+                  "verify_battery", "part_search", "part_get", "part_source",
+                  "match_model", "make_standard_part", "list_standard_parts",
+                  "fetch_cad_model", "import_artifact", "research_web_search",
+                  "research_fetch_page"):
             assert t in allowed, f"{t} must be in the main-chat core loadout"
 
     def test_main_chat_prompt_lists_every_unloaded_tool_by_name(self):
@@ -120,8 +127,11 @@ class TestLinearRoleTurn:
             linear_role_allowed_tools(card),
             effective_role_system_prompt(card),
         )
-        assert "MORE TOOLS" in system
-        menu = system.split("MORE TOOLS", 1)[1]
+        # Split on the actual rendered menu header, not the role's prose
+        # mention of "MORE TOOLS": instructions can list loaded tool names too.
+        heading = "MORE TOOLS (registered, not loaded yet)."
+        assert heading in system
+        menu = system.split(heading, 1)[1]
         listed = {
             tok.strip()
             for line in menu.splitlines()

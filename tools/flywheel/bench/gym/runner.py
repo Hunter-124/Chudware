@@ -640,9 +640,9 @@ def run_cell(
     )
 
     from dataclasses import asdict
-    from services.agent.effort import TurnInputs
+    from services.agent.preferences import resolve_turn_preferences
 
-    turn_preferences = TurnInputs(challenge.request).resolve()
+    turn_preferences = resolve_turn_preferences(challenge.request)
     preference_snapshot = asdict(turn_preferences)
     ledger.append("harness", "preferences", preference_snapshot)
 

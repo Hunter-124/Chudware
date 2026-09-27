@@ -102,6 +102,95 @@ def test_register_list_and_status_roundtrip():
     assert reg.get_session("nope") is None
 
 
+def test_old_live_runner_is_not_abandoned_by_age():
+    reg.register_session("dg_live_old", role="worker", status="running")
+    meta = reg.get_session("dg_live_old")
+    meta["created_ts"] = "2020-01-01T00:00:00+00:00"
+    meta["runner_heartbeat_ts"] = "2020-01-01T00:00:00+00:00"
+    reg._write_meta(meta["id"], meta)
+    assert reg.list_sessions()[0]["status"] == "running"
+    assert reg.get_session(meta["id"])["status"] == "running"
+
+
+def test_dead_runner_is_persistently_abandoned(monkeypatch):
+    meta = reg.register_session("dg_orphan", role="worker", status="running")
+    meta["owner_pid"] = 987654321
+    reg._write_meta(meta["id"], meta)
+    original_kill = reg.os.kill
+
+    def missing_runner(pid, signal):
+        if pid == meta["owner_pid"]:
+            raise ProcessLookupError(pid)
+        return original_kill(pid, signal)
+
+    monkeypatch.setattr(reg.os, "kill", missing_runner)
+    first = reg.list_sessions()[0]
+    assert first["status"] == "abandoned"
+    assert "pid" in first["status_note"]
+    assert reg.get_session(meta["id"])["status"] == "abandoned"
+    assert reg.list_sessions()[0]["status"] == "abandoned"
+    assert not _rpc("subagent_control", {
+        "subagent_id": meta["id"], "op": "pause",
+    })["ok"]
+
+
+def test_reused_runner_pid_is_abandoned(monkeypatch):
+    meta = reg.register_session("dg_reused", role="worker", status="waiting")
+    monkeypatch.setattr(reg, "_process_start_time", lambda pid: "different-start")
+    assert reg.list_sessions()[0]["status"] == "abandoned"
+    assert "reused" in reg.get_session(meta["id"])["status_note"]
+
+
+def test_legacy_orphan_expires_but_terminal_records_are_untouched():
+    old = "2020-01-01T00:00:00+00:00"
+    for sid, status in (("dg_legacy_old", "in_progress"), ("dg_done_old", "done")):
+        reg._write_meta(sid, {
+            "schema": reg.SCHEMA, "id": sid, "status": status,
+            "created_ts": old, "updated_ts": old,
+        })
+    rows = {row["id"]: row for row in reg.list_sessions()}
+    assert rows["dg_legacy_old"]["status"] == "abandoned"
+    assert rows["dg_done_old"]["status"] == "done"
+    assert reg.get_session("dg_done_old")["updated_ts"] == old
+
+
+def test_project_filter_excludes_foreign_and_unscoped_records(tmp_path, monkeypatch):
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(first, target_is_directory=True)
+    reg.register_session("dg_first", role="worker", project_dir=str(first))
+    reg.register_session("dg_second", role="worker", project_dir=str(second))
+    reg._write_meta("dg_unscoped", {
+        "schema": reg.SCHEMA, "id": "dg_unscoped", "status": "done",
+        "created_ts": reg._now(), "updated_ts": reg._now(),
+    })
+    assert {row["id"] for row in _rpc("subagent_list", {})["sessions"]} == {
+        "dg_first", "dg_second", "dg_unscoped",
+    }
+    scoped = _rpc("subagent_list", {"project_dir": str(alias), "limit": 1})
+    assert scoped["ok"]
+    assert [row["id"] for row in scoped["sessions"]] == ["dg_first"]
+    assert reg.get_session("dg_first")["project_dir"] == str(first)
+
+
+def test_environment_project_root_precedes_fs_root_and_fallback(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    jail = tmp_path / "jail"
+    project.mkdir()
+    jail.mkdir()
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(project))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(jail))
+    registered = reg.register_session("dg_env", role="worker", project_dir=str(jail))
+    assert registered["project_dir"] == str(project)
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR")
+    assert reg.register_session("dg_fs", role="worker")["project_dir"] == str(jail)
+
+
 def test_bad_ids_rejected():
     with pytest.raises(ValueError):
         reg.register_session("../evil", role="x")
@@ -172,6 +261,21 @@ def test_run_turn_consumes_pre_queued_steer():
     assert "subagent" in whos and "system" in whos
 
 
+def test_turn_boundary_keeps_pidless_runner_live():
+    meta = reg.register_session("dg_pidless", role="worker", status="running")
+    meta["owner_pid"] = None
+    meta["runner_heartbeat_ts"] = "2020-01-01T00:00:00+00:00"
+    reg._write_meta(meta["id"], meta)
+    result = run_turn(
+        "summarize the shaft design decisions",
+        RecordingProvider([_DONE]),
+        name="worker",
+        subagent_id=meta["id"],
+    )
+    assert result.success
+    assert reg.list_sessions()[0]["status"] == "running"
+
+
 def test_run_turn_consumes_steer_queued_mid_turn():
     """A steer queued while the sub-agent is mid-turn (the GUI's cross-process
     subagent_steer) is applied at the NEXT model-call boundary."""
@@ -213,8 +317,12 @@ def test_run_turn_honors_terminate_at_boundary():
 # ---------------------------------------------------------------------------
 
 
-def test_delegate_registers_streams_spawn_and_executes(monkeypatch):
+def test_delegate_registers_streams_spawn_and_executes(monkeypatch, tmp_path):
     from services.agent import chudcode_roles
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    project = tmp_path / "active-project"
+    project.mkdir()
 
     events: list[dict] = []
 
@@ -240,7 +348,7 @@ def test_delegate_registers_streams_spawn_and_executes(monkeypatch):
         run_id="r_test",
         delegation_tree=tree,
         on_event=on_event,
-        options={"session_id": "chat-registry"},
+        options={"session_id": "chat-registry", "project_dir": str(project)},
     )
     out = md.delegate(
         role="sketcher",
@@ -254,6 +362,7 @@ def test_delegate_registers_streams_spawn_and_executes(monkeypatch):
     assert len(spawns) == 1 and spawns[0]["subagent_id"] == node_id
     sess = reg.get_session(node_id)
     assert sess["status"] == "done" and sess["role"] == "sketcher"
+    assert sess["project_dir"] == str(project)
     assert any(row["who"] == "subagent" for row in reg.get_transcript(node_id))
 
 

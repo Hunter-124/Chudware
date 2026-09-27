@@ -100,8 +100,8 @@ def register_serving_tools(mcp: FastMCP) -> None:
                          min_calls: int = 100, report_out: str | None = None) -> str:
         """Compute promotion EVIDENCE for an insertion point from a T-H7 shadow log.
 
-        Reads the JSONL ``shadow_log`` (services.agent.shadow output), aggregates incumbent vs
-        challenger verifier-score + accept-rate, and returns the verdict. If ``report_out`` is
+        Reads the JSONL ``shadow_log``, aggregates incumbent vs challenger
+        verifier-score + accept-rate, and returns the verdict. If ``report_out`` is
         given, also writes the human-readable evidence report there (the artifact Erik signs
         off). THIS PROMOTES NOTHING — ``eligible=true`` is necessary, not sufficient.
         """

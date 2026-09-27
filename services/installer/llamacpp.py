@@ -31,8 +31,7 @@ SERVER_NAMES = ("llama-server.exe", "server.exe", "llama-server", "server")
 # GPU / build-variant selection (T-W31)
 #
 # The installed runtime at APP_LLAMA may carry per-variant build trees produced
-# from the pinned source checkout (tag b9860, commit fdb1db8 — see
-# services/agent/local_runtime.py LLAMA_CPP_PINNED_BUILD for provenance):
+# from the pinned source checkout (tag b9860, commit fdb1db8):
 #
 #   APP_LLAMA/build-cuda/bin/llama-server   GGML_CUDA=ON  (sm_86; T-W29 bench +
 #                                           integrator smoke: gemma3-4b-qat

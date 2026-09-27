@@ -1743,6 +1743,15 @@
        "type": "range",
        "unit": "V"
       }
+     ],
+     "children": [
+      {
+       "id": "electronics.motors_actuators.servo",
+       "label": "Hobby Servos",
+       "description": "Micro and standard-size servo motors with editable local geometry.",
+       "domains": ["mech_family"],
+       "query_terms": ["servo"]
+      }
      ]
     },
     {

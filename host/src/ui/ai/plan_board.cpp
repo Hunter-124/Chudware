@@ -1,7 +1,6 @@
-// See plan_board.h. Editable Session Plan checklist (live PlanState in st.chat) + ai_vc
-// checkpoint timeline with Restore. Colors only via ui::palette + semanticOnGlass; all
-// sizes scale by ui::uiScale. The plan JSON snapshot shape matches conversations.cpp
-// planStateToJson so parsePlanState (core/app_state.h) round-trips it.
+// See plan_board.h. The active conversation owns the editable PlanState checklist;
+// checkpoints belong to the selected project document and are never a global timeline.
+// The plan JSON snapshot matches conversations.cpp's planStateToJson shape.
 #include "ui/ai/plan_board.h"
 
 #include <algorithm>
@@ -15,8 +14,8 @@
 #include "imgui_internal.h"   // ImRect
 
 #include "core/app_state.h"
-#include "ui/copilot/copilot_internal.h"  // markChatHistoryDirty / aiVcRollback / s_aiVc /
-                                          // aiTurnActive / ensureConversations / semanticOnGlass
+#include "ui/copilot/copilot_internal.h"  // chat history, project scope, AI checkpoints
+#include "ui/ai/active_work.h"             // saved/unsaved document project ownership
 #include "ui_theme.h"
 #include "ui/metrics.h"       // cpMenu* rhythm tokens (gutter / row pad / gap / corner)
 #include "ui/ai/ai_prefs.h"
@@ -202,11 +201,16 @@ struct PbTimeline {
 };
 PbTimeline s_tl;
 
-std::string pbActiveDocId(const AppState& st) {
-    if (st.docMirror.hasDoc()) return st.docMirror.docId();
-    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
-        return st.docTabs[st.activeTab].docId;
-    return {};
+const AppState::DocTab* pbActiveProjectDoc(const AppState& st,
+                                           const std::string& projectDir) {
+    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return nullptr;
+    const auto& tab = st.docTabs[(size_t)st.activeTab];
+    return agentDocInProject(tab.path, tab.projectDir, projectDir) ? &tab : nullptr;
+}
+
+std::string pbActiveDocId(AppState& st) {
+    const auto* tab = pbActiveProjectDoc(st, convProjectDir(st));
+    return tab ? tab->docId : std::string();
 }
 
 // Same "method not registered" envelopes the chat-side AI-VC code accepts (kept in
@@ -259,6 +263,7 @@ bool pbTlOk(const core::RpcResult& r, std::string& hint) {
 void pbPollTimeline(AppState& st) {
     if (!st.workerStarted || !s_aiVc.available || s_tl.loading) return;
     const std::string doc = pbActiveDocId(st);
+    if (doc.empty()) return; // never fetch the worker's global checkpoint timeline
     const double now = ImGui::GetTime();
     if (doc == s_tl.lastDoc && now - s_tl.lastFetch < 2.0) return;
     if (now - s_tl.lastFetch < 0.4) return;
@@ -353,6 +358,18 @@ void pbDrawTimeline(AppState& st, const AdaptiveSurface& surf, int verbosity) {
         pbEmptyState("AI checkpoints unavailable on this worker.",
                      "The plm_timeline/plm_rollback methods are not registered — nothing "
                      "to restore.", surf);
+        ImGui::EndChild();
+        return;
+    }
+    const std::string docId = pbActiveDocId(st);
+    if (docId != s_tl.lastDoc) {
+        s_tl.lastDoc = docId;  // fence an in-flight response for the previous project's doc
+        s_tl.cps.clear();
+        s_tl.err.clear();
+    }
+    if (docId.empty()) {
+        pbEmptyState("No project document selected",
+                     "Select a saved document in this project to see its checkpoints.", surf);
         ImGui::EndChild();
         return;
     }
@@ -745,18 +762,51 @@ void drawPlanBoardView(AppState& st) {
 
     ensureConversations(st);
 
-    // ---- header strip ---------------------------------------------------------------
+    // This checklist belongs to a conversation, not to whichever document is in the viewport.
+    // Never expose a parked conversation from another project while switching folders.
+    const std::string projectDir = convProjectDir(st);
     const Conversation* conv =
         (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size())
             ? &st.conversations[st.activeConv] : nullptr;
+    if (!conv || convProjectKey(projectDir).empty() ||
+        convProjectKey(conv->projectDir) != convProjectKey(projectDir)) {
+        const std::string name = lexicalPath(projectDir).filename().string();
+        const std::string title = "Nothing for " +
+            (name.empty() ? std::string("this project") : name) + " yet";
+        ui::kit::emptyState(nullptr, title.c_str(), "Start a conversation in this project.");
+        return;
+    }
+
+    std::string docName = "no linked document";
+    if (conv->docLink.rfind("file:", 0) == 0) {
+        const std::string path = conv->docLink.substr(5);
+        if (agentDocInProject(path, std::string(), projectDir)) {
+            docName = lexicalPath(path).filename().string();
+            for (const auto& tab : st.docTabs)
+                if (!tab.path.empty() && convProjectKey(tab.path) == convProjectKey(path)) {
+                    docName = tab.displayTitle();
+                    break;
+                }
+        }
+    } else if (conv->docLink.rfind("doc:", 0) == 0) {
+        const std::string id = conv->docLink.substr(4);
+        for (const auto& tab : st.docTabs)
+            if (tab.docId == id &&
+                agentDocInProject(tab.path, tab.projectDir, projectDir)) {
+                docName = tab.displayTitle();
+                break;
+            }
+    }
+    if (docName == "no linked document") {
+        if (const auto* selected = pbActiveProjectDoc(st, projectDir))
+            docName = "selected: " + selected->displayTitle();
+    }
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    ImGui::Text("Session Plan%s%s", conv ? " — " : "",
-                conv ? conv->title.c_str() : "");
+    ImGui::Text("Session Plan | %s | %s", conv->title.c_str(), docName.c_str());
     ImGui::PopStyleColor();
-    ImGui::SameLine(0, 12.0f * uiScale);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-    ImGui::TextUnformatted(aiTurnActive(st) ? "agent running — edits queue as a note"
-                                            : "edits save with the session");
+    ImGui::TextUnformatted(aiTurnActive(st) ? "Agent running; edits queue for its next turn."
+                                            : "Edits save with this session.");
     ImGui::PopStyleColor();
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuHeadGap()));
 

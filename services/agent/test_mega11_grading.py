@@ -1,12 +1,6 @@
-"""Mega-11 grading regressions (GradingPaths = LegitimateHeron).
+"""Mega-11 grading regressions for tool evidence and report-card rules.
 
-Axes:
-  K — ≥6 of AC1–AC9 evidence-gradeable (tool-mapped, unit-tested pass_rules)
-  L — AC live pass ≥2 is MegaRun11's concern; unit proves rules grade correctly
-  M — non-CAD artifact production is LegProduction; grading consumes the evidence
-
-Policy: do NOT weaken criteria — PASS only from real tool-shaped evidence;
-SKIP only with explicit provision-absence evidence.
+PASS requires real tool-shaped evidence; SKIP requires an explicit provision refusal.
 """
 from __future__ import annotations
 
@@ -14,6 +8,12 @@ import json
 
 import pytest
 
+
+# Representative report-card legs for independent grading tests.
+_REPORT_CARD_LEGS = (
+    "plan", "parts", "schematic", "sim", "board", "trace_opt",
+    "antenna", "checks", "firmware", "sensor_loop", "power", "airframe",
+)
 
 class _MemLedger:
     def __init__(self):
@@ -398,11 +398,11 @@ def test_ac9_report_card_missing_leg_fail():
 
 def test_ac9_grade_from_ledger_events():
     from services.agent import reviewer_exec as re
-    from services.agent.mission_criteria import ROCKET_PLANE_LEGS
+    legs = _REPORT_CARD_LEGS
 
     led = _MemLedger()
     # Seed stage/decision/tool evidence covering every leg.
-    for leg in ROCKET_PLANE_LEGS:
+    for leg in legs:
         led.append("builder", "decision", {
             "leg": leg, "verdict": "PASS" if leg not in ("antenna", "sensor_loop") else "SKIP",
             "id": f"leg_{leg}",
@@ -414,7 +414,7 @@ def test_ac9_grade_from_ledger_events():
                 "id": "AC9",
                 "check": {
                     "tool": "report_card",
-                    "params_hint": {"legs": list(ROCKET_PLANE_LEGS)},
+                    "params_hint": {"legs": list(legs)},
                     "pass_rule": "all legs have PASS|WARN|FAIL|SKIP",
                 },
             }],
@@ -427,275 +427,6 @@ def test_ac9_grade_from_ledger_events():
         if e["kind"] == "criterion_result" and e["payload"].get("id") == "AC9"
     )
     assert ac9["payload"]["evidence"].get("source") == "ledger_report_card"
-
-
-# ---------------------------------------------------------------------------
-# Manifest composition + round-trip
-# ---------------------------------------------------------------------------
-
-
-def test_mission_criteria_all_nine_tool_mapped():
-    from services.agent.mission_criteria import (
-        gradeable_ac_ids,
-        rocket_plane_flight_computer_acs,
-    )
-
-    acs = rocket_plane_flight_computer_acs()
-    found = {}
-    for did, rows in acs.items():
-        for ac in rows:
-            found[ac["id"]] = ac["check"]
-    for ac_id in gradeable_ac_ids():
-        assert ac_id in found, ac_id
-        tool = found[ac_id].get("tool") or ""
-        assert tool and tool != "manual", (ac_id, tool)
-        assert found[ac_id].get("pass_rule"), ac_id
-
-
-def test_manifest_round_trip_validate():
-    """apply_rocket_plane_checks yields a structurally valid deliverables manifest."""
-    from services.agent.mission_criteria import apply_rocket_plane_checks
-    from services.agent.pipeline.manifest import manifest_valid, validate_manifest
-
-    base = {
-        "schema": "aicad.deliverables/1",
-        "request_verbatim": "rocket plane + flight computer",
-        "deliverables": [
-            {
-                "id": "DL1", "kind": "part", "name": "airframe",
-                "description": "airframe",
-                "acceptance_criteria": [
-                    {"id": "AC1", "text": "x",
-                     "check": {"tool": "manual", "pass_rule": "x"}},
-                ],
-                "depends_on": [], "target_refs": {"doc_id": None, "features": []},
-                "status": "pending",
-            },
-            {
-                "id": "DL2", "kind": "assembly", "name": "integration",
-                "description": "asm",
-                "acceptance_criteria": [
-                    {"id": "AC3", "text": "x",
-                     "check": {"tool": "manual", "pass_rule": "x"}},
-                ],
-                "depends_on": ["DL1", "DL3"],
-                "target_refs": {"doc_id": None, "features": []},
-                "status": "pending",
-            },
-            {
-                "id": "DL3", "kind": "analysis", "name": "ecad",
-                "description": "ecad",
-                "acceptance_criteria": [
-                    {"id": "AC4", "text": "x",
-                     "check": {"tool": "manual", "pass_rule": "x"}},
-                ],
-                "depends_on": [], "target_refs": {"doc_id": None, "features": []},
-                "status": "pending",
-            },
-            {
-                "id": "DL4", "kind": "analysis", "name": "fw",
-                "description": "fw",
-                "acceptance_criteria": [
-                    {"id": "AC7", "text": "x",
-                     "check": {"tool": "manual", "pass_rule": "x"}},
-                ],
-                "depends_on": ["DL3"],
-                "target_refs": {"doc_id": None, "features": []},
-                "status": "pending",
-            },
-            {
-                "id": "DL5", "kind": "report", "name": "card",
-                "description": "card",
-                "acceptance_criteria": [
-                    {"id": "AC9", "text": "x",
-                     "check": {"tool": "manual", "pass_rule": "x"}},
-                ],
-                "depends_on": ["DL1", "DL2", "DL3", "DL4"],
-                "target_refs": {"doc_id": None, "features": []},
-                "status": "pending",
-            },
-        ],
-        "ambiguities": [],
-        "assumptions": [
-            {
-                "text": "Manual acceptance criteria (AC4–AC9) are satisfied when tools return.",
-                "basis": "old",
-                "needs_confirm": True,
-            },
-        ],
-    }
-    m = apply_rocket_plane_checks(base)
-    findings = validate_manifest(m)
-    errors = [f for f in findings if f.level == "error"]
-    assert not errors, errors
-    assert manifest_valid(findings)
-
-    # All AC tools non-manual.
-    tools = {
-        ac["id"]: ac["check"]["tool"]
-        for d in m["deliverables"]
-        for ac in d["acceptance_criteria"]
-    }
-    assert tools["AC2"] == "measure_part"
-    assert "ecad_run_drc" in tools["AC4"]
-    assert tools["AC5"] == "ecad_simulate"
-    assert tools["AC6"] == "ecad_antenna_analyze"
-    assert tools["AC7"] == "fw_build"
-    assert tools["AC8"] == "fw_sim_run"
-    assert tools["AC9"] == "report_card"
-    assert all(t != "manual" for t in tools.values())
-
-
-def test_gradeable_count_at_least_six():
-    """Axis K: ≥6 of AC1–AC9 have mechanical pass_rules under evaluate_pass_rule."""
-    from services.agent.mission_criteria import rocket_plane_flight_computer_acs
-    from services.agent.reviewer_exec import (
-        FAIL, NOT_CHECKED, PASS, SKIP, evaluate_pass_rule,
-    )
-
-    # Minimal evidence that SHOULD grade (not NOT-CHECKED) per AC.
-    samples = {
-        "AC1": ("PASS", {
-            "scores": {"is_manifold": 1.0, "eval_check": 1.0},
-            "findings": [],
-        }),
-        "AC2": ("bay envelope >= board outline", {
-            "bay_length": 50, "board_length": 40,
-            "bay_width": 30, "board_width": 20,
-        }),
-        "AC3": ("interferences empty or volume==0", {"interferences": []}),
-        "AC4": ("errors==0", {"drc": {"errors": 0}, "erc": {"errors": 0}}),
-        "AC5": ("V(3V3) in [3.135, 3.465]", {"V(3V3)": 3.3}),
-        "AC6": ("PASS|SKIP", {"ok": True, "kind": "ifa"}),
-        "AC7": ("returncode==0", {"returncode": 0, "elf_path": "/x.elf"}),
-        "AC8": ("PASS|SKIP(renode)", {
-            "skipped": True, "error": "emulator_not_found: renode",
-        }),
-        "AC9": ("all legs have PASS|WARN|FAIL|SKIP", {
-            "legs_required": ["plan", "airframe"],
-            "leg_verdicts": {"plan": "PASS", "airframe": "WARN"},
-        }),
-    }
-    # Align pass_rules with composition module.
-    acs = {
-        ac["id"]: ac["check"]["pass_rule"]
-        for rows in rocket_plane_flight_computer_acs().values()
-        for ac in rows
-    }
-    gradeable = 0
-    for ac_id, rule in acs.items():
-        _rule, evidence = samples[ac_id]
-        # Prefer composition pass_rule.
-        v, d = evaluate_pass_rule(rule, evidence)
-        assert v != NOT_CHECKED, (ac_id, rule, v, d)
-        assert v in (PASS, FAIL, SKIP, "WARN")
-        gradeable += 1
-    assert gradeable >= 6
-    assert gradeable == 9
-
-
-def test_end_to_end_ac_sweep_mixed(monkeypatch):
-    """Full run_acceptance_checks over composition ACs with mocked tools."""
-    from services.agent import reviewer_exec as re
-    from services.agent.mission_criteria import (
-        ROCKET_PLANE_LEGS,
-        apply_rocket_plane_checks,
-    )
-
-    tool_results = {
-        "verify_battery": {
-            "scores": {"is_manifold": 1.0, "eval_check": 1.0, "measure_part": 1.0},
-            "findings": [],
-        },
-        "measure_part": {
-            "ok": True,
-            "bay_length": 80.0, "board_length": 50.0,
-            "bay_width": 40.0, "board_width": 30.0,
-            "bay_height": 20.0, "board_height": 5.0,
-        },
-        "check_interference": {"ok": True, "interferences": []},
-        "ecad_run_drc": {"ok": True, "errors": 0, "warnings": 0},
-        "ecad_run_erc": {"ok": True, "errors": 0, "warnings": 0},
-        "ecad_simulate": {"ok": True, "V(3V3)": 3.301, "analysis": "op"},
-        "ecad_antenna_analyze": {
-            "ok": True, "fullwave": {"skipped": True, "reason": "openEMS not installed"},
-            "verdict": "SKIP", "provision_note": "openEMS absent",
-        },
-        "fw_build": {
-            "success": True, "returncode": 0, "elf_path": "/tmp/fc.elf",
-        },
-        "fw_sim_run": {
-            "ok": False, "skipped": True,
-            "error": "emulator_not_found: renode",
-            "provision_note": "Renode not installed",
-        },
-    }
-
-    monkeypatch.setattr(
-        re, "_resolve_fn",
-        lambda tool: (lambda **kw: tool_results[tool]) if tool in tool_results else None,
-    )
-
-    led = _MemLedger()
-    for leg in ROCKET_PLANE_LEGS:
-        led.append("builder", "decision", {
-            "leg": leg,
-            "verdict": "SKIP" if leg in ("antenna", "sensor_loop") else "PASS",
-        })
-
-    base = {
-        "schema": "aicad.deliverables/1",
-        "request_verbatim": "fc rocket",
-        "deliverables": [
-            {"id": "DL1", "kind": "part", "name": "a", "description": "a",
-             "acceptance_criteria": [{"id": "X", "text": "t",
-                                      "check": {"tool": "manual", "pass_rule": "x"}}],
-             "depends_on": [], "target_refs": {}, "status": "pending"},
-            {"id": "DL2", "kind": "assembly", "name": "b", "description": "b",
-             "acceptance_criteria": [{"id": "X", "text": "t",
-                                      "check": {"tool": "manual", "pass_rule": "x"}}],
-             "depends_on": [], "target_refs": {}, "status": "pending"},
-            {"id": "DL3", "kind": "analysis", "name": "c", "description": "c",
-             "acceptance_criteria": [{"id": "X", "text": "t",
-                                      "check": {"tool": "manual", "pass_rule": "x"}}],
-             "depends_on": [], "target_refs": {}, "status": "pending"},
-            {"id": "DL4", "kind": "analysis", "name": "d", "description": "d",
-             "acceptance_criteria": [{"id": "X", "text": "t",
-                                      "check": {"tool": "manual", "pass_rule": "x"}}],
-             "depends_on": [], "target_refs": {}, "status": "pending"},
-            {"id": "DL5", "kind": "report", "name": "e", "description": "e",
-             "acceptance_criteria": [{"id": "X", "text": "t",
-                                      "check": {"tool": "manual", "pass_rule": "x"}}],
-             "depends_on": [], "target_refs": {}, "status": "pending"},
-        ],
-        "assumptions": [],
-        "ambiguities": [],
-    }
-    manifest = apply_rocket_plane_checks(base)
-
-    bat = re.run_verify_battery(led, doc_id="doc-cpp1")
-    results = re.run_acceptance_checks(
-        manifest, led, doc_id="doc-cpp1", battery_payload=bat,
-    )
-
-    assert results["AC1"] == re.PASS, results
-    assert results["AC2"] == re.PASS, results
-    assert results["AC3"] == re.PASS, results
-    assert results["AC4"] == re.PASS, results
-    assert results["AC5"] == re.PASS, results
-    assert results["AC6"] == re.SKIP, results
-    assert results["AC7"] == re.PASS, results
-    assert results["AC8"] == re.SKIP, results
-    assert results["AC9"] == re.PASS, results
-
-    # criterion_result artifacts for each AC (like AC1/AC3 today).
-    ids = {
-        e["payload"]["id"]
-        for e in led.events
-        if e["kind"] == "criterion_result"
-    }
-    for ac in ("AC1", "AC2", "AC3", "AC4", "AC5", "AC6", "AC7", "AC8", "AC9"):
-        assert ac in ids, (ac, ids)
 
 
 # ---------------------------------------------------------------------------
@@ -968,7 +699,7 @@ def test_live_ac7_injects_project_id_from_ledger(monkeypatch):
 def test_ac9_plan_from_stage_entered():
     """Pipeline stage=plan with entered maps to plan WARN/PASS (not missing)."""
     from services.agent import reviewer_exec as re
-    from services.agent.mission_criteria import ROCKET_PLANE_LEGS
+    legs = _REPORT_CARD_LEGS
 
     led = _MemLedger()
     led.append("pipeline", "stage", {
@@ -978,12 +709,12 @@ def test_ac9_plan_from_stage_entered():
         "exit_gate": None,
     })
     # Seed other legs so only plan was the previous residual class.
-    for leg in ROCKET_PLANE_LEGS:
+    for leg in legs:
         if leg == "plan":
             continue
         led.append("builder", "decision", {"leg": leg, "verdict": "PASS"})
     evidence = re.grade_report_card_from_ledger(
-        led, {"legs": list(ROCKET_PLANE_LEGS)},
+        led, {"legs": list(legs)},
     )
     assert evidence["leg_verdicts"].get("plan") in ("PASS", "WARN"), evidence
     v, d = re.evaluate_pass_rule(
@@ -1034,7 +765,7 @@ def test_ac9_trace_opt_warn_when_board_pass_without_optimize():
 def test_ac9_mega12_residual_legs_grade_from_live_shaped_ledger():
     """Regrade shape of mega-12 missing plan/trace_opt/power → covered."""
     from services.agent import reviewer_exec as re
-    from services.agent.mission_criteria import ROCKET_PLANE_LEGS
+    legs = _REPORT_CARD_LEGS
 
     led = _MemLedger()
     # What mega-12 had for the three missing legs:
@@ -1060,7 +791,7 @@ def test_ac9_mega12_residual_legs_grade_from_live_shaped_ledger():
     ):
         led.append("builder", "decision", {"leg": leg, "verdict": "PASS"})
     evidence = re.grade_report_card_from_ledger(
-        led, {"legs": list(ROCKET_PLANE_LEGS)},
+        led, {"legs": list(legs)},
     )
     for must in ("plan", "trace_opt", "power"):
         assert must in evidence["leg_verdicts"], (must, evidence["leg_verdicts"])

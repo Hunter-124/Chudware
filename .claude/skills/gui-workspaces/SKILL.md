@@ -17,17 +17,35 @@ the frame loop in `host/src/app.cpp`.
 
 | Workspace | Files | Notes |
 |---|---|---|
-| **Parts Library** | `host/src/ui/parts/parts_workspace.cpp/.h`, `parts_browser_panel.cpp`, `parts_filters.cpp`, `parts_results.cpp`, `parts_taxonomy_pane.cpp`, `parts_vendors.cpp`, `parts_widgets.cpp/.h`, `parts_internal.h` | Vendor search, taxonomy tree, thumbnails, streaming results. Data contracts: `contracts/parts.md`, `contracts/sourcing*.md` |
+| **Parts Library** | `host/src/ui/parts/parts_workspace.cpp/.h`, `parts_browser_panel.cpp`, `parts_filters.cpp`, `parts_results.cpp`, `parts_taxonomy_pane.cpp`, `parts_vendors.cpp`, `parts_widgets.cpp/.h`, `parts_internal.h` | Local parametric standards sort first by relevance (`applyResultSort`); Printables live CAD results show file/license and download/import (`parts_results.cpp`); CEF-off vendor skips collapse to one notice while public CAD search remains available. Data: `contracts/parts.md`, `contracts/sourcing*.md`, `services/browser/adapters/printables.py` |
 | **Assembly** | `host/src/ui/asm_panels.cpp/.h` | Mates, component insertion, BOM, exploded view |
 | **CAM** | `host/src/ui/cam/cam_panel.cpp/.h`, `cam_mirror.cpp/.h` | Integrated Explorer / Job Manager / NC Output left rail; all stock, toolpath, tool and removal previews render in the native viewport |
 | **ECAD** | `host/src/ui/ecad/ecad_panel.cpp/.h`, `ecad_canvas.cpp/.h`, `ecad_mirror.cpp/.h` | Schematic/PCB 2D canvas editor; schemas in `contracts/ecad/` |
 | **PLM** | `host/src/ui/plm/plm_workspace.cpp`, `plm_pages.cpp`, `plm_hub.h`, `plm_state.cpp`, `plm_quickbar.cpp` | Versioning, releases, document control; `contracts/plm.md`. Shared item/status caches; Files requests basic Git status/log, Git/Planning request full details. All hub pages enter `plmEnsureOverview` for one-shot outside-change recording; do not duplicate it in project selection. |
 | **Reverse Eng.** | `host/src/ui/reveng/`: `reveng_workspace.cpp` (shell), `reveng_widgets.h/.cpp` (shared visual kit), `sources_panel.cpp`, `webcam_capture.cpp`, `stage_panels.cpp`, `dim_review.cpp`, `image_gallery.cpp`, `img_tex.cpp` | Native live/video Gaussian reconstruction plus the separate six-stage measured-CAD wizard (`contracts/reveng.md` §13). **Every panel draws with `ui::reveng::kit`** and uses `ui::metrics::re*()`. Camera seam: `host/src/platform/camera.h` v2. Native splat/point rendering reads `kit::previewSlotRect` and `previewSlotClip`. Full breakdown below. |
-| **AI / Activity** | `host/src/ui/ai/ai_workspace.cpp/.h` + `ai/{plan_board,docs_panel,active_work,metrics_view,activity_view,insights_view}.cpp` (activity_view/insights_view are the composed Activity and Insights views of the 6-view nav), and `host/src/ui/copilot/` (the chat impl the workspace embeds via the reuse hooks at the bottom of `copilot/copilot.h`; the old `legacy_chat.cpp` monolith is GONE — see the module map in `copilot/copilot_internal.h`) | Agent run tree, role-prompt editor, live progress; Context Injection tab edits `aicad.trigger/1` via `triggers_*` RPCs; events per `contracts/agent_events.md` |
+| **AI / Activity** | `host/src/ui/ai/ai_workspace.cpp/.h` shell/nav + `ai/agent_dag.cpp/.h` execution graph, `ai/current_run_view.cpp/.h` roster/single docked inspector, `ai/{plan_board,docs_panel,active_work,metrics_view,activity_view,insights_view}.cpp`, plus `host/src/ui/copilot/` chat modules (reuse hooks in `copilot.h`; `legacy_chat.cpp` is gone) | Current Run / Plan / Activity / Sessions / Insights / Options, project chip; project scoping via `convProjectDir(st)`; events per `contracts/agent_events.md` |
 | **Drawing** | `host/src/ui/drawing_panel.cpp` | Sheet layout, views, DXF export |
 | **Simulation** | `host/src/ui/sim_manager.cpp`, `host/src/ui/evaluate_dialogs.cpp` | Study tree, fixtures/loads, results; Evaluate dialogs (measure, mass props, …) |
 | **Firmware** | `host/src/ui/firmware/fw_workspace.cpp/.h` | T-FIN5: project rail + sources, build console (parsed warnings), emulation + UART console, GPIO trace viewer (`contracts/firmware_rpc.md` §7/§8); fw_status-gated Flash/Debug; tab is progressively disclosed (`ui::firmwareTabVisible`); shot: `CHUDWARE_SHOT=firmware` |
 | **Manufacture** | `host/src/ui/manufacture/{manufacture_panel,device_panel,run_panel,approval_dialog,attention_panel,mfg_mirror}.cpp/.h` | Capability-truth chips, gate-report rendering. **No floating operator surface**: Devices / Run / Attention are rail tabs 3–5 of the pinned left column (`layout.cpp`), and the Offline/Live mode strip is chrome under the ribbon. All three bodies draw with `ui::kit` — cards, tone chips, `keyValueRow`, `emptyState`/`blockedState`, `inlineStatus` — never bespoke text dumps. **Tone convention: Offline Simulation is the SAFE state and reads calm (`Tone::Ok` dot chip on neutral glass); LIVE MACHINE is the hazardous one and is the only state that gets the `statusErr` wash + danger button.** Shot: `CHUDWARE_SHOT=manufacture` (the rail opens on Attention for that shot only — `layout.cpp` resolves the shot tab ONCE from `CHUDWARE_SHOT`, so `cam` keeps the Job Manager default) |
+
+### Agent Hub / project ownership (2026-09-26)
+
+- `ai_workspace.cpp` draws the shell; `agent_dag.cpp` owns per-conversation execution
+  traces and node selection; `current_run_view.cpp` polls `subagent_list` with
+  `{project_dir:convProjectDir(st)}` and owns one **docked** inspector. Do not restore
+  floating sub-agent popups or auto-open an inspector when a subagent starts.
+- Activity (`active_work.cpp`, `docs_panel.cpp`) and Plan (`plan_board.cpp`) scope
+  artifacts/links to `convProjectDir(st)`. `insights_view.cpp` labels the global
+  model leaderboard "All projects"; `metrics_view.cpp` scopes token spend to the
+  current project by default with an opt-in All projects toggle. Keep Sessions
+  filtered by the stored conversation project key.
+- `conversations.cpp::bindActiveConversationProject` restamps `Conversation.projectDir`
+  to the workspace sent on **each turn**, not only at creation. `engine_events.cpp`
+  stamps agent `DocTab::projectDir` from the uniquely owning running conversation;
+  saved docs instead use their file path to establish project ownership. The first
+  agent mirror may take focus from a pristine, empty active CAD tab
+  (`activeOwnDocIsPristine`), not from user work.
 
 ### CAM / Manufacture internals (native viewport cutover)
 

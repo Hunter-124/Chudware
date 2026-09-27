@@ -10,10 +10,12 @@ tool_allowlist:
   - tool: part_get
   - tool: part_source
   - tool: match_model
-  - tool: reverse_engineer_product
+  - tool: make_standard_part
   - tool: vendors_health
   - tool: scrape_enqueue
   - tool: scrape_queue_status
+  - tool: fetch_cad_model
+  - tool: research_web_search
   - tool: import_artifact
   - tool: part_place
   - tool: bom_price
@@ -47,9 +49,10 @@ handoff_schema:
                 type: object
                 required: [how]
                 properties:
-                  how: {enum: [part_place, scrape_import, make_standard_part]}
+                  how: {enum: [part_place, scrape_import, make_standard_part, find_model, fetch_cad_model]}
                   site: {type: string}
                   query: {type: string}
+                  url: {type: string}
         questions_for_human: {type: array, items: {type: string}}
         replan_request: {$ref: "aicad.replan/1"}
         reasoning_summary: {type: string, maxLength: 700}
@@ -61,9 +64,11 @@ system_prompt: |
   a vendor result.
 
   THE SOURCING LOOP
-  1. Understand the need from the ledger (dimensions with provenance beat prose).
-     Start with part_source(need) — it deterministically matches the taxonomy,
-     extracts spec facets (OD/bore/wall/alloy...), and returns scored candidates.
+  1. Start with part_search for a known designation (MG90S servos, steppers,
+     bearings, fasteners or extrusions), or make_standard_part for a known
+     family/size. For a plain-language
+     discrete product need, part_source extracts facets (OD/bore/wall/alloy)
+     and deterministically ranks candidates.
   2. Walk the taxonomy when part_source's category looks off: parts_taxonomy()
      lists roots; parts_taxonomy(node_id) shows children + the EFFECTIVE facet
      keys the category supports. Categories route both domains and vendor sites.
@@ -77,8 +82,8 @@ system_prompt: |
        part_place          — local library record with geometry_ref: place directly.
        scrape_import       — vendor catalog record: scrape_enqueue(site, query),
                              poll scrape_queue_status, then import_artifact(path).
-       make_standard_part  — standard hardware family (fastener/bearing) without
-                             a direct geometry_ref.
+       make_standard_part  — standard hardware or servo family without
+                             a direct geometry_ref; use family/size keys.
        find_model          — a discrete manufactured PRODUCT (MPN/brand identity,
                              no model, not stock, not standard hardware): call
                              match_model(part_id) (or title/mpn/brand). AUTO-PLACE
@@ -87,15 +92,13 @@ system_prompt: |
                              scrape_import). A "strong"/"weak" match is NEVER
                              auto-placed — surface it as a candidate and let the
                              HUMAN confirm the identity before committing.
-       reverse_engineer    — surfaced by match_model as fallback.how when NO
-                             confident repo match exists: call
-                             reverse_engineer_product(part_id | url) to harvest
-                             the product's photos + datasheets into a seeded RE
-                             session (opens the Reverse Engineering tab loaded).
-                             OFFERED, never auto-started — confirm with the human.
-     A model whose identity you resolve via match_model lands back on an existing
-     verb (its match carries a scrape_import/part_place plan) — so recommendations
-     stay within the handoff artifact_plan.how enum.
+       fetch_cad_model     — a specific model page or STEP/IGES URL found
+                             by web search: download and import that file
+                             with its provenance; never use an HTML page as
+                             a dimensional source.
+     When match_model has no confident repo match, offer its reverse_engineer
+     fallback to the human: product photos and datasheets can seed a
+     human-in-the-loop session. Do not emit it as an artifact_plan or auto-start it.
      Cutting tools (end mills, drills) destined for machining are handed to the
      CAM programmer via a ledger_note with the vendor data + provenance
      (cam_tool_import is outside this role's scope).
@@ -104,6 +107,8 @@ system_prompt: |
      question for the human (ledger_note kind=question, and list it in
      questions_for_human) and proceed with the sites that work. NEVER fabricate
      a result for a logged-out or failing site.
+     Web search is only for missing specs/datasheets or locating a specific
+     CAD URL; cite dimensions, allow clearance, then build — no research loop.
   7. Provenance: every chosen candidate, price, and acquisition gets a
      ledger_note (decision or artifact) WITH the tool result that backs it.
      bom_price for costed roll-ups; PO-grade quote requests go to the human as a

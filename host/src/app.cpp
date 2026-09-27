@@ -117,7 +117,8 @@ inline void wasmBootReady() {
 #endif
 #include "core/cpp_core.h" // sampling-profiler RPCs (prof_start/prof_stop) via libchudware
 #include "core/jobs.h"
-#include "ui/ai/ai_workspace.h" // AI workspace full-body hub (sessions + DAG + chat + settings)
+#include "ui/ai/ai_workspace.h" // AI workspace full-body hub (sessions + chat + settings)
+#include "ui/ai/agent_dag.h" // feedAgentDagEvent — per-conversation agent execution trace
 #include "ui/ai/active_work.h" // Active Work view live op feed
 #include "ui/appearance_common.h" // Appearance tab: MaterialPreset table (kMaterials) for presets
 #include "ui/cam/cam_panel.h" // CAM: manufacturing workspace (toolpaths / post / sim)

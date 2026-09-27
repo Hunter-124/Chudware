@@ -37,7 +37,14 @@ from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
 
-from services.agent.chudcode_host import byok_provider_env, get_default_chudcode_host
+from services.agent.online_turn import (
+    activate_turn_env,
+    compose_request_text,
+    resolve_settings,
+    resolve_workspace,
+    resolve_model_and_effort,
+)
+from services.agent.chudcode_host import get_default_chudcode_host
 
 
 _LOG = logging.getLogger(__name__)
@@ -2741,28 +2748,7 @@ def _terminal_text(host_result: Mapping[str, Any]) -> str:
     return ""
 
 
-def _restore_process_workspace(
-    previous_cwd: str, previous_env: Mapping[str, str | None]
-) -> list[str]:
-    errors: list[str] = []
-    try:
-        os.chdir(previous_cwd)
-    except Exception as exc:  # noqa: BLE001 - restore every remaining key
-        errors.append(f"cwd_restore: {type(exc).__name__}: {exc}")
-    for key, value in previous_env.items():
-        try:
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"env_restore[{key}]: {type(exc).__name__}: {exc}")
-    return errors
-
-
-def _clear_chudware_run_credentials(config_module: Any | None) -> None:
-    if config_module is None:
-        return
+def _clear_chudware_run_credentials(config_module: Any) -> None:
     try:
         config_module.clear_pooled_credentials()
     except Exception as exc:  # noqa: BLE001 - credential cleanup must not mask failure
@@ -2804,74 +2790,44 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             f"{type(exc).__name__}: {exc}",
         }
 
-    project_root = ""
-    save_dir = ""
-    if "workspace_dir" in raw_params:
-        raw_workspace = raw_params.get("workspace_dir")
-        if not isinstance(raw_workspace, str) or not raw_workspace.strip():
-            return {
-                "ok": False,
-                "reason": "invalid_workspace: workspace_dir must be a non-empty directory",
-            }
-        try:
-            from services.agent.project_context import resolve_project_root
+    project_root, save_dir, workspace_error = resolve_workspace(raw_params)
+    if workspace_error is not None:
+        return {"ok": False, "reason": workspace_error}
 
-            candidate = Path(raw_workspace).expanduser().resolve()
-            if not candidate.is_dir():
-                return {
-                    "ok": False,
-                    "reason": f"invalid_workspace: not an existing directory: {candidate}",
-                }
-            root = Path(resolve_project_root(candidate)).expanduser().resolve()
-            if not root.is_dir():
-                return {
-                    "ok": False,
-                    "reason": (
-                        "invalid_workspace: resolved project root is not a directory: "
-                        f"{root}"
-                    ),
-                }
-            project_root = str(root)
-            save_dir = str(candidate)
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "ok": False,
-                "reason": f"invalid_workspace: {type(exc).__name__}: {exc}",
-            }
-
-    agent_config: Any | None = None
     try:
         from services.agent import config as agent_config
     except ImportError as exc:
         return {"ok": False, "reason": f"agent_admin_turn: import failed: {exc}"}
 
     agent_config.clear_pooled_credentials()
+
+    def refuse_before_run(reason: str, **extra: Any) -> dict[str, Any]:
+        _clear_chudware_run_credentials(agent_config)
+        return {"ok": False, "reason": reason, **extra}
     raw_actor = raw_params.get("_chudware_actor")
     if raw_actor is None:
         credit_actor = None
     else:
         if not isinstance(raw_actor, dict):
-            return {"ok": False, "reason": "invalid_chudware_actor"}
+            return refuse_before_run("invalid_chudware_actor")
         if str(raw_actor.get("key_source") or "").strip().lower() not in {
             "byok", "subscription", "pool"
         }:
-            return {"ok": False, "reason": "web_credential_source_invalid"}
+            return refuse_before_run("web_credential_source_invalid")
         try:
             credit_actor = agent_config.Actor.from_mapping(raw_actor)
         except ValueError:
-            return {"ok": False, "reason": "invalid_chudware_actor"}
+            return refuse_before_run("invalid_chudware_actor")
     if credit_actor is not None and credit_actor.key_source != "byok" and raw_params.get("api_key") is not None:
-        return {"ok": False, "reason": "web_credential_source_invalid"}
+        return refuse_before_run("web_credential_source_invalid")
 
     cfg = dict(agent_config.load_config() or {})
-    from services.agent.preferences import resolve_turn_preferences
-    from services.agent.role_models import resolve_role_model, _auto_local_provider
+    from services.agent.role_models import resolve_role_model
 
     byok_key = raw_params.get("api_key")
     if credit_actor is not None and credit_actor.key_source == "byok":
         if not isinstance(byok_key, str) or not byok_key.strip():
-            agent_config.clear_pooled_credentials()
-            return {"ok": False, "reason": "BYOK provider credential unavailable"}
+            return refuse_before_run("BYOK provider credential unavailable")
     web_credential = None
     web_provider = ""
     if credit_actor is not None:
@@ -2879,20 +2835,20 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         if source == "subscription":
             grant = raw_actor.get("_subscription")
             if not isinstance(grant, dict):
-                return {"ok": False, "reason": "invalid_subscription_grant"}
+                return refuse_before_run("invalid_subscription_grant")
             web_provider = str(grant.get("provider") or "").strip().lower()
             web_credential = grant.get("access_token")
             if web_provider != "anthropic-sub":
-                return {"ok": False, "reason": "subscription_isolation_unsupported"}
+                return refuse_before_run("subscription_isolation_unsupported")
             proof = raw_actor.get("_subscription_token_sha256")
             failure = "subscription_credential_mismatch"
         elif source == "pool":
             pool = raw_actor.get("_pool")
             if not isinstance(pool, dict) or not str(pool.get("api_key") or "").strip():
-                return {
-                    "ok": False, "reason": "pool_credential_unconfigured",
-                    "hint": "The managed AI pool is not configured. Contact the site operator or connect your own provider.",
-                }
+                return refuse_before_run(
+                    "pool_credential_unconfigured",
+                    hint="The managed AI pool is not configured. Contact the site operator or connect your own provider.",
+                )
             web_provider = str(pool.get("provider") or "").strip().lower()
             web_credential = pool.get("api_key")
             proof = raw_actor.get("_pool_key_sha256")
@@ -2902,71 +2858,30 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             proof = raw_actor.get("_byok_key_sha256")
             failure = "byok_credential_mismatch"
         if not param_str("provider") or not param_str("model"):
-            return {"ok": False, "reason": "web_model_required"}
+            return refuse_before_run("web_model_required")
         if source == "subscription":
             if param_str("provider").lower() not in {"anthropic", "anthropic-sub", "claude"}:
-                return {"ok": False, "reason": "subscription_credential_mismatch"}
+                return refuse_before_run("subscription_credential_mismatch")
         elif param_str("provider").lower() != web_provider:
-            return {"ok": False, "reason": failure}
+            return refuse_before_run(failure)
         if not isinstance(web_credential, str) or not web_credential.strip():
-            return {"ok": False, "reason": failure}
+            return refuse_before_run(failure)
         actual = hashlib.sha256(web_credential.encode("utf-8")).hexdigest()
         if not isinstance(proof, str) or not hmac.compare_digest(proof, actual):
-            return {"ok": False, "reason": failure}
+            return refuse_before_run(failure)
     if byok_key is not None and (
         not isinstance(byok_key, str) or not byok_key.strip()
         or (credit_actor is not None and not (param_str("provider") and param_str("model")))
     ):
-        agent_config.clear_pooled_credentials()
-        return {"ok": False, "reason": "byok_unsupported_online"}
+        return refuse_before_run("byok_unsupported_online")
     try:
-        # An explicit composer/CLI choice is the user's turn override, not Auto.
-        requested_mode = param_str("mode")
-        styles = {"agent": "do_it", "plan": "check_with_me", "ask": "answer_only"}
-        turn_cfg = cfg
-        if requested_mode in styles:
-            turn_cfg = {**cfg, "copilot": {**(cfg.get("copilot") or {}),
-                                         "work_style": styles[requested_mode]}}
-        turn_preferences = resolve_turn_preferences(
-            request, cfg=turn_cfg,
-            feature_count=max(0, int(raw_params.get("feature_count") or 0)),
-            doc_count=max(1, int(raw_params.get("doc_count") or 1)),
-            context_tokens=max(0, int(raw_params.get("context_tokens") or 0)),
-            context_window=max(0, int(raw_params.get("context_window") or cfg.get("context_window") or 0)),
+        (turn_preferences, provider_name, model_name, assignment,
+         auto_candidates) = resolve_model_and_effort(
+            request, raw_params, cfg, credit_actor, byok_key,
+            _chudcode_transient_call, _auth_providers,
         )
-        provider_name, model_name = param_str("provider"), param_str("model")
-        assignment = None
-        auto_candidates = None
-        if not provider_name and not model_name:
-            catalog = _chudcode_transient_call("get_available_models", {})
-            auth = _chudcode_transient_call("get_auth_state", {})
-            if not catalog.get("ok") or not auth.get("ok"):
-                raise RuntimeError("Cannot inspect available models. Repair the runtime or sign in in Accounts.")
-            authenticated = {row["id"] for row in _auth_providers(auth) if row["authenticated"]}
-            auto_candidates = [
-                {"provider": row["provider"], "model": row["id"],
-                 "base_url": row.get("baseUrl") or row.get("base_url") or ""}
-                for row in catalog.get("models", [])
-                if isinstance(row, Mapping) and row.get("provider") and row.get("id")
-                and (row["provider"] in authenticated
-                     or _auto_local_provider(row["provider"], cfg, row.get("baseUrl") or row.get("base_url")))
-            ]
-            assignment = resolve_role_model("chat", cfg=cfg, request=request,
-                                           turn_preferences=turn_preferences,
-                                           enabled=auto_candidates)
-            provider_name, model_name = assignment.provider, assignment.model
-        else:
-            provider_name = provider_name or str(cfg.get("provider") or "")
-            model_name = model_name or str(cfg.get("model") or "")
-        if credit_actor is not None and credit_actor.key_source == "subscription":
-            provider_name = "anthropic"
-        if turn_preferences.local_only and not _auto_local_provider(provider_name, cfg):
-            raise ValueError("This computer only requires a loopback model. Configure a local model in Accounts.")
-        if byok_key is not None and byok_provider_env(provider_name) is None:
-            raise ValueError("byok_unsupported_online")
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        agent_config.clear_pooled_credentials()
-        return {"ok": False, "reason": str(exc)}
+        return refuse_before_run(str(exc))
 
     attachments = None
     raw_attachments = raw_params.get("attachments")
@@ -2976,13 +2891,14 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         ][:_ATTACH_MAX] or None
 
     resumed_session = bool(param_str("chudcode_session_file"))
+    with _HISTORY_SEED_LOCK:
+        history_already_seeded = session_id in _HISTORY_SEEDED_SESSIONS
     migration_candidate = (
-        "" if resumed_session else _bounded_history_seed(raw_params.get("history"))
+        "" if resumed_session or history_already_seeded
+        else _bounded_history_seed(raw_params.get("history"))
     )
-    preflight_prompt = (
-        f"{migration_candidate}\n\nCURRENT USER REQUEST\n{request}"
-        if migration_candidate
-        else request
+    preflight_prompt = compose_request_text(
+        request, migration_candidate, _editor_context_block(raw_params)
     )
     try:
         configured_max_tokens = max(0, int(cfg.get("max_output_tokens") or 0))
@@ -2993,16 +2909,14 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     if credit_actor is not None and credit_actor.key_source == "pool":
         prompt_estimate = max(1, math.ceil(len(preflight_prompt.encode("utf-8")) / 4))
         if credit_actor.rated_model and credit_actor.rated_model != model_name:
-            agent_config.clear_pooled_credentials()
-            return {"ok": False, "reason": "insufficient_credits"}
+            return refuse_before_run("insufficient_credits")
         credit_preflight = agent_config.pooled_credit_preflight(
             credit_actor,
             prompt_tokens_estimate=prompt_estimate,
             max_output_tokens=turn_max_tokens,
         )
         if not credit_preflight.get("ok"):
-            agent_config.clear_pooled_credentials()
-            return {"ok": False, "reason": "insufficient_credits"}
+            return refuse_before_run("insufficient_credits")
         approved_output_tokens = max(
             0, int(credit_preflight.get("max_output_tokens") or 0)
         )
@@ -3010,18 +2924,16 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         # be enforced downstream, so fail closed rather than overspend the
         # gateway's reservation while pretending the smaller cap was applied.
         if approved_output_tokens < turn_max_tokens:
-            agent_config.clear_pooled_credentials()
-            return {"ok": False, "reason": "insufficient_credits"}
+            return refuse_before_run("insufficient_credits")
 
     try:
         from services.agent import agent_turn as _agent_turn
-        from services.agent.chudcode_events import map_rpc_frame
+        from services.agent.chudcode_events import RpcFrameState, map_rpc_frame
         from services.agent.chudcode_tools import build_host_tools
         from services.agent.mission_dispatch import MissionDispatch, linear_role_prompt
         from services.agent.providers import token_usage
     except ImportError as exc:
-        _clear_chudware_run_credentials(agent_config)
-        return {"ok": False, "reason": f"agent_admin_turn: import failed: {exc}"}
+        return refuse_before_run(f"agent_admin_turn: import failed: {exc}")
 
     turn_tier = None
     turn_capability = None
@@ -3068,12 +2980,9 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             preferences=turn_preferences,
         )
     except Exception as exc:  # noqa: BLE001
-        agent_config.clear_pooled_credentials()
-        return {
-            "ok": False,
-            "reason": f"agent_admin_turn: prompt assembly failed: "
-            f"{type(exc).__name__}: {exc}",
-        }
+        return refuse_before_run(
+            f"agent_admin_turn: prompt assembly failed: {type(exc).__name__}: {exc}"
+        )
 
     raw_categories = raw_params.get("categories")
     categories = [
@@ -3110,54 +3019,33 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
     try:
         host_tools = build_host_tools(tool_context)
     except Exception as exc:  # noqa: BLE001
-        agent_config.clear_pooled_credentials()
-        return {
-            "ok": False,
-            "reason": f"agent_admin_turn: host tool assembly failed: "
-            f"{type(exc).__name__}: {exc}",
-        }
+        return refuse_before_run(
+            f"agent_admin_turn: host tool assembly failed: {type(exc).__name__}: {exc}"
+        )
 
-    from services.agent.chudcode_roles import _register_category_refresh
+    try:
+        from services.agent.chudcode_roles import _register_category_refresh
 
-    register_callbacks = _register_category_refresh(tool_context, host_tools)
+        register_callbacks = _register_category_refresh(tool_context, host_tools)
+    except Exception as exc:  # noqa: BLE001 - registration can fail before turn activation
+        return refuse_before_run(
+            f"agent_admin_turn: host tool assembly failed: {type(exc).__name__}: {exc}"
+        )
 
-    settings_value = raw_params.get("settings")
-    settings = dict(settings_value) if isinstance(settings_value, Mapping) else {}
-    if not any(key in raw_params or key in settings for key in ("thinking", "reasoning_effort")):
-        settings["thinking"] = turn_preferences.thinking
-    if turn_preferences.schedule_compaction:
-        settings.setdefault("auto_compaction", True)
-    if provider_name:
-        settings["provider"] = provider_name
-    if model_name:
-        settings["model"] = model_name
-    for key in (
-        "thinking",
-        "reasoning_effort",
-        "steering_mode",
-        "follow_up_mode",
-        "interrupt_mode",
-        "auto_compaction",
-        "auto_retry",
-        "subagent_subscription",
-        "queue",
-    ):
-        if key in raw_params:
-            settings[key] = raw_params[key]
+    settings = resolve_settings(raw_params, turn_preferences, provider_name, model_name)
 
     migration, claimed_history_seed = _claim_history_seed(
         session_id,
         raw_params.get("history"),
         resumed=resumed_session,
     )
-    prompt = f"{migration}\n\nCURRENT USER REQUEST\n{request}" if migration else request
-    editor = _editor_context_block(raw_params)
-    if editor:
-        prompt = f"{prompt}\n\n{editor}"
+    prompt = compose_request_text(request, migration, _editor_context_block(raw_params))
     host_params: dict[str, Any] = {
         "request": prompt,
         "run_id": run_id,
         "session_id": session_id,
+        "mode": options["mode"],
+        "plan_only": options.get("plan_only"),
         "system_prompt": system_prompt,
         "host_tools": host_tools,
         "settings": settings,
@@ -3203,12 +3091,13 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         "role": role,
         "project_root": project_root,
     }
+    event_state = RpcFrameState()
 
     def raw_emit(frame: Any) -> None:
         raw = (
             frame if isinstance(frame, Mapping) else {"type": "unknown", "value": frame}
         )
-        for kind, payload in map_rpc_frame(raw, event_context):
+        for kind, payload in map_rpc_frame(raw, event_context, event_state):
             data = (
                 dict(payload) if isinstance(payload, Mapping) else {"payload": payload}
             )
@@ -3226,22 +3115,10 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 )
             _emit(data)
 
-    previous_cwd = os.getcwd()
-    workspace_env_keys = (
-        "CHUDWARE_FS_ROOT",
-        "CHUDWARE_PROJECT_DIR",
-        "CHUDWARE_PROJECT_SAVE_DIR",
-    )
-    previous_env = {key: os.environ.get(key) for key in workspace_env_keys}
+    turn_env = activate_turn_env(project_root, save_dir, agent_config)
     try:
-        if project_root:
-            os.chdir(project_root)
-            os.environ["CHUDWARE_FS_ROOT"] = project_root
-            os.environ["CHUDWARE_PROJECT_DIR"] = project_root
-            os.environ["CHUDWARE_PROJECT_SAVE_DIR"] = save_dir
+        restore_errors = turn_env.__enter__()
     except Exception as exc:  # noqa: BLE001
-        agent_config.clear_pooled_credentials()
-        _restore_process_workspace(previous_cwd, previous_env)
         if claimed_history_seed:
             with _HISTORY_SEED_LOCK:
                 _HISTORY_SEEDED_SESSIONS.discard(session_id)
@@ -3270,8 +3147,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         token_usage.begin_turn_usage()
         usage_sink_token = token_usage.bind_usage_sink(lambda _payload: None)
     except Exception as exc:  # noqa: BLE001
-        agent_config.clear_pooled_credentials()
-        _restore_process_workspace(previous_cwd, previous_env)
+        turn_env.__exit__(None, None, None)
         if claimed_history_seed:
             with _HISTORY_SEED_LOCK:
                 _HISTORY_SEEDED_SESSIONS.discard(session_id)
@@ -3384,13 +3260,8 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 else persistence_failure
             )
             finalization_errors.append(f"persistence: {reason}")
-        try:
-            agent_config.clear_pooled_credentials()
-        except Exception as exc:  # noqa: BLE001
-            finalization_errors.append(f"credential_reset: {type(exc).__name__}: {exc}")
-        finalization_errors.extend(
-            _restore_process_workspace(previous_cwd, previous_env)
-        )
+        turn_env.__exit__(None, None, None)
+        finalization_errors.extend(restore_errors)
 
         response["persistence"] = persistence
         response["usage"] = usage

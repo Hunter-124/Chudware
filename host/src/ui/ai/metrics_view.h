@@ -1,11 +1,7 @@
-// AI workspace — Metrics view.
-//
-// Token spend and overall usage across every session in the current chat history: total
-// observed spend + tokens, a per-model breakdown, and a per-session breakdown so the user can
-// see where the tokens (and dollars) went. Pure client-side aggregation over st.chat /
-// st.conversations[].msgs (the same completed-turn ActivityItem token counts the per-session
-// cost strip uses), priced with cached Chudcode model metadata (ui::bridgeModelMeta). No extra
-// RPC and no fake numbers: sessions/models with no priced turns simply do not appear.
+// AI workspace — token spend for the active project, with an opt-in All projects toggle.
+// Aggregates completed assistant turns in resident conversations (active st.chat, parked
+// Conversation::msgs), priced with cached Chudcode model metadata. Unknown-price turns
+// contribute tokens, with their spend explicitly labelled as a floor.
 #pragma once
 
 struct AppState;

@@ -44,15 +44,20 @@ See contracts/parts.md for the full PartRecord envelope spec.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import sys
 import time
+import zipfile
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Annotated, Any, Optional
+from urllib.parse import unquote, urljoin, urlparse
 
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
@@ -542,6 +547,251 @@ _PLACE_PARAM_KEYS = {
     "rotate": "rotation",
     "size": "size", "dimensions": "size", "extents": "size",
 }
+
+_CAD_EXT = {".step": "step", ".stp": "step", ".iges": "iges", ".igs": "iges",
+            ".stl": "stl", ".3mf": "3mf", ".obj": "obj", ".zip": "zip"}
+_CAD_RANK = {"step": 0, "iges": 1, "3mf": 2, "stl": 3, "obj": 4, "zip": 5}
+_CAD_MAX = 200 * 1024 * 1024
+_CAD_HOSTS = {"grabcad.com": "grabcad", "traceparts.com": "traceparts",
+              "3dcontentcentral.com": "content3d", "printables.com": "printables",
+              "makerworld.com": "makerworld"}
+
+
+def _cad_fail(reason: str, detail: str, candidates: list[str] | None = None) -> dict:
+    if reason not in {"login_required", "no_cad_link", "unsupported_format", "too_large",
+                      "browser_unavailable"} and (
+            not reason.startswith("http_") or not reason[5:].isdigit()):
+        reason = "no_cad_link"
+    return {"ok": False, "reason": reason, "detail": detail, "candidates": candidates or []}
+
+
+def _cad_format(url: str) -> str | None:
+    return _CAD_EXT.get(Path(unquote(urlparse(url).path)).suffix.lower())
+
+
+def _cad_site(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.hostname in {"github.com", "www.github.com"} and (
+            parsed.path.startswith("/FreeCAD/FreeCAD-library/")):
+        return "freecadlibrary"
+    host = (parsed.hostname or "").lower()
+    for domain, site in _CAD_HOSTS.items():
+        if host == domain or host.endswith("." + domain):
+            return site
+    return host or "web"
+
+
+def _cad_slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")[:70] or "cad-model"
+
+
+class _CADLinks(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[str] = []
+        self.license: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        fields = dict(attrs)
+        if tag == "a" and fields.get("href"):
+            self.links.append(fields["href"] or "")
+        if tag == "meta" and (fields.get("name") or "").lower() in {
+                "license", "dc.rights", "dc.rights.license"}:
+            self.license = fields.get("content") or self.license
+        if tag == "link" and (fields.get("rel") or "").lower() == "license":
+            self.license = fields.get("href") or self.license
+
+
+def _cad_links(content: str, page_url: str) -> tuple[list[str], str | None]:
+    parser = _CADLinks()
+    parser.feed(content)
+    links = (urljoin(page_url, href) for href in parser.links)
+    candidates = {link for link in links if urlparse(link).scheme == "https" and _cad_format(link)}
+    return sorted(candidates, key=lambda link: (_CAD_RANK[_cad_format(link)], link)), parser.license
+
+
+def _cad_project() -> Path:
+    from services.agent.project_context import resolve_project_root
+    for key in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT"):
+        start = os.environ.get(key, "").strip()
+        if start:
+            root = resolve_project_root(start).resolve()
+            if root.is_dir():
+                return root
+    return resolve_project_root(Path.cwd()).resolve()
+
+
+def _cad_unpack(archive_path: Path, folder: Path, url: str) -> tuple[Path | None, dict | None]:
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            members = [entry for entry in archive.infolist()
+                       if not entry.is_dir() and _cad_format(entry.filename) not in {None, "zip"}]
+            members.sort(key=lambda entry: (_CAD_RANK[_cad_format(entry.filename)], entry.filename))
+            if not members:
+                return None, _cad_fail("unsupported_format", "ZIP contains no supported CAD file.", [url])
+            member = members[0]
+            if member.file_size > _CAD_MAX:
+                return None, _cad_fail("too_large", "Archived CAD exceeds 200 MB.", [url])
+            dest = folder / (_cad_slug(Path(member.filename).stem) + Path(member.filename).suffix.lower())
+            with archive.open(member) as source, dest.open("wb") as target:
+                shutil.copyfileobj(source, target)
+            if dest.stat().st_size > _CAD_MAX:
+                dest.unlink()
+                return None, _cad_fail("too_large", "Archived CAD exceeds 200 MB.", [url])
+            return dest, None
+    except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
+        return None, _cad_fail("unsupported_format", f"Could not read ZIP at {url}: {exc}", [url])
+
+
+def _cad_download(url: str, folder: Path) -> tuple[Path | None, dict | None]:
+    from services.browser.adapters import download_public_cad
+    kind = _cad_format(url)
+    if not kind:
+        return None, _cad_fail("unsupported_format", f"No supported CAD extension at {url}.")
+    filename = _cad_slug(Path(unquote(urlparse(url).path)).stem) + "." + kind
+    dest = folder / filename
+    staging = folder / (filename + ".download")
+    try:
+        outcome = download_public_cad(url, staging, max_bytes=_CAD_MAX)
+        if not outcome.get("ok"):
+            code = outcome.get("status")
+            reason = f"http_{code}" if isinstance(code, int) and code >= 400 else (
+                "login_required" if outcome.get("reason") in {"bot_walled", "challenge_page"} else
+                outcome.get("reason") or "no_cad_link")
+            detail = outcome.get("detail") or outcome.get("hint") or f"Download failed at {url}."
+            if reason == "login_required":
+                detail += f" Download it at {url} and drop the CAD file in your project."
+            return None, _cad_fail(reason, detail, [url])
+        if not staging.is_file():
+            return None, _cad_fail("no_cad_link", f"No file downloaded from {url}.", [url])
+        if staging.stat().st_size > _CAD_MAX:
+            return None, _cad_fail("too_large", "CAD download exceeds 200 MB.", [url])
+        with staging.open("rb") as stream:
+            prefix = stream.read(256).lstrip().lower()
+        if prefix.startswith((b"<!doctype html", b"<html", b"{", b"[")) or (
+                kind in {"zip", "3mf"} and not zipfile.is_zipfile(staging)):
+            return None, _cad_fail("unsupported_format",
+                                   f"{url} returned HTML or non-CAD content, not a {kind} file.", [url])
+        if kind == "zip":
+            return _cad_unpack(staging, folder, url)
+        else:
+            staging.replace(dest)
+        return dest, None
+    except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
+        return None, _cad_fail("unsupported_format", f"Could not read CAD file at {url}: {exc}", [url])
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+def fetch_cad_model_impl(url: str, name: str | None = None,
+                         import_part: bool = True, *, importer=None) -> dict:
+    """Acquire a CAD file from a direct HTTPS URL or a model page into this project."""
+    from services.browser import adapters
+    from services.browser.session import browser_fetch
+
+    parsed = urlparse(url.strip())
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        return _cad_fail("unsupported_format", "A public HTTPS URL is required.", [url])
+    site = _cad_site(url)
+    source_url = url
+    license_note = None
+    artifact: Path | None = None
+    download_url = url if _cad_format(url) else None
+    if not download_url:
+        adapter = adapters.get_adapter(site) if site in {
+            "grabcad", "traceparts", "content3d", "freecadlibrary", "printables", "makerworld"
+        } else None
+        if adapter:
+            acquired = adapter.acquire({"url": url, "title": name or ""})
+            if not acquired.get("ok"):
+                reason = acquired.get("reason") or "no_cad_link"
+                if site in {"grabcad", "makerworld"} and reason in {
+                        "no_download_link", "bot_walled", "challenge_page",
+                        "browser_fetch_failed", "browser_download_failed"}:
+                    reason = "login_required"
+                detail = acquired.get("detail") or acquired.get("hint") or f"No CAD download at {url}."
+                if reason == "login_required":
+                    detail += f" Download it at {url} and drop the CAD file in your project."
+                return _cad_fail(reason, detail, acquired.get("candidates") or [url])
+            artifact = Path(str(acquired.get("artifact_path") or ""))
+            license_note = acquired.get("license_note")
+            download_url = acquired.get("raw_url") or acquired.get("download_url") or url
+        else:
+            # Research's static HTTP path is independent of CEF. A visible CAD
+            # href on an ordinary page needs no browser.
+            from services.research.fetch_page import _http_get
+            try:
+                _text, final_url, _title, raw_html = _http_get(url)
+            except Exception as exc:
+                code = getattr(getattr(exc, "response", None), "status_code", None)
+                reason = f"http_{code}" if isinstance(code, int) else "no_cad_link"
+                return _cad_fail(reason, f"Could not fetch {url}: {exc}", [url])
+            links, license_note = _cad_links(raw_html, final_url)
+            if not links:
+                page = browser_fetch(final_url, site)
+                if not page.get("ok"):
+                    reason = ("browser_unavailable" if page.get("reason") in {
+                        "browser_fetch_failed", "browser_busy", "playwright_not_installed"
+                    } else page.get("reason") or "browser_unavailable")
+                    return _cad_fail(reason,
+                                     f"No static CAD link at {url}; browser rendering unavailable: "
+                                     f"{page.get('hint') or page.get('detail') or reason}.", links)
+                links, license_note = _cad_links(page.get("content") or "", final_url)
+            if not links:
+                return _cad_fail("no_cad_link", f"No CAD link on rendered page {url}.", links)
+            download_url = links[0]
+            site = _cad_site(download_url) if _cad_site(download_url) != "web" else site
+    label = name or (Path(unquote(parsed.path)).stem if _cad_format(url)
+                     else Path(unquote(parsed.path)).name)
+    root = _cad_project()
+    folder = root / "reference" / _cad_slug(label)
+    if not folder.resolve().is_relative_to(root):
+        return _cad_fail("unsupported_format", "Reference directory points outside the project.")
+    folder.mkdir(parents=True, exist_ok=True)
+    if artifact is not None:
+        if not artifact.is_file() or not _cad_format(str(artifact)):
+            return _cad_fail("unsupported_format", f"Adapter returned no CAD file for {url}.", [url])
+        if artifact.stat().st_size > _CAD_MAX:
+            return _cad_fail("too_large", "CAD download exceeds 200 MB.", [url])
+        dest = folder / (_cad_slug(artifact.stem) + artifact.suffix.lower())
+        shutil.copyfile(artifact, dest)
+        with dest.open("rb") as stream:
+            prefix = stream.read(256).lstrip().lower()
+        if prefix.startswith((b"<!doctype html", b"<html", b"{", b"[")) or (
+                _cad_format(str(dest)) in {"zip", "3mf"} and not zipfile.is_zipfile(dest)):
+            dest.unlink()
+            return _cad_fail("unsupported_format", f"Adapter returned HTML, not CAD, from {url}.", [url])
+        if _cad_format(str(dest)) == "zip":
+            path, error = _cad_unpack(dest, folder, url)
+            dest.unlink()
+        else:
+            path, error = dest, None
+    else:
+        path, error = _cad_download(download_url, folder)
+    if error:
+        return error
+    with path.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    provenance = {"site": site, "url": source_url, "retrieved_at": datetime.now(timezone.utc).isoformat(),
+                  "sha256": digest}
+    if license_note:
+        provenance["license"] = license_note
+    path.with_name(path.name + ".provenance.json").write_text(
+        json.dumps(provenance, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    result = {"ok": True, "artifact_path": str(path), "format": _cad_format(str(path)),
+              "source_url": source_url, "provenance": provenance}
+    if import_part:
+        if importer is None:
+            return _cad_fail("unsupported_format", "CAD importer is unavailable.", [str(path)])
+        imported = importer(str(path), {"source_url": source_url, "site": site,
+                                        "license_note": license_note or "", "fetched_ts": provenance["retrieved_at"]})
+        if not imported.get("ok"):
+            return _cad_fail(imported.get("reason") or "unsupported_format",
+                             imported.get("hint") or imported.get("error") or "CAD import failed.", [str(path)])
+        result["doc_id"] = imported.get("doc_id")
+        result["bbox_mm"] = imported.get("bbox_mm")
+    return result
+
 
 def taxonomy_browse(node_id: str = "", depth: int = 2,
                     include_facets: bool = True) -> dict:
@@ -2260,6 +2510,33 @@ def register_parts_tools(mcp: FastMCP) -> None:
         else:
             result["vendor_source"] = vendor_source
         return json.dumps(result, ensure_ascii=False)
+
+    def _import_cad_reference(path: str, source: dict) -> dict:
+        imported = json.loads(import_artifact(path, source=source))
+        if imported.get("ok") and imported.get("doc_id"):
+            from . import core_bridge as cb
+            bbox = cb.call("doc_bbox", {"doc_id": imported["doc_id"]})
+            imported["bbox_mm"] = bbox.get("size") if isinstance(bbox, dict) else None
+        return imported
+
+    @mcp.tool()
+    def fetch_cad_model(url: str, name: str | None = None,
+                        import_part: bool = True) -> str:
+        """Download CAD geometry from an HTTPS file URL or model page into this project.
+
+        Direct STEP/STP/IGES/IGS/STL/3MF/OBJ/ZIP links and public Printables
+        files download over HTTPS without a browser. They land in this project's
+        reference/<name> with a source/license/time/SHA-256 JSON sidecar. For
+        other pages, try static CAD links before rendering with the configured
+        browser. STEP takes precedence over STL. By default import through
+        import_artifact and return doc_id plus bbox_mm; set import_part=False
+        to fetch only. Returns {ok, artifact_path, format, source_url,
+        provenance}; refusals return {ok:false, reason, detail, candidates}.
+        Login-required results tell the user where to download and drop the
+        file. Without a renderer, dynamic pages return browser_unavailable.
+        """
+        return json.dumps(fetch_cad_model_impl(
+            url, name, import_part, importer=_import_cad_reference), ensure_ascii=False)
 
     @mcp.tool()
     def vendor_part_register(supplier: str = "", part_number: str = "",

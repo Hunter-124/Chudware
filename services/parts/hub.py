@@ -46,7 +46,7 @@ _DEFAULT_LIVE_BUDGET_S = 4.0
 # Bumped BY HAND whenever adapter code changes the shape/content of emitted
 # PartRecords. It is mixed into the fingerprint, so bumping it invalidates every
 # user's on-disk snapshot without touching their data files.
-_INDEX_CODE_VERSION = 1
+_INDEX_CODE_VERSION = 2
 
 # Default seconds between cheap stat-only revalidations during search().
 _DEFAULT_REVALIDATE_S = 20.0

@@ -749,25 +749,7 @@ void drawDownloadQueue(AppState& st) {
                 if (q.importing) {
                     spinner("Importing");
                 } else if (ImGui::SmallButton("Import into doc")) {
-                    q.importing = true;
-                    nlohmann::json p;
-                    p["artifact_path"] = q.artifactPath;
-                    st.rpc.call("parts_import_artifact", p,
-                        [&st, id = q.id](const core::RpcResult& r) {
-                            for (auto& j : S().queue)
-                                if (j.id == id) j.importing = false;
-                            bool ok = r.ok && r.result.is_object() &&
-                                      r.result.value("ok", false);
-                            if (ok) {
-                                st.toast(ui::ToastLevel::Success,
-                                    "Imported as " + jstr(r.result, "doc_id", "doc"));
-                            } else {
-                                std::string why = r.ok
-                                    ? jstr(r.result, "reason", "import failed")
-                                    : r.err;
-                                st.toast(ui::ToastLevel::Error, "Import failed: " + why);
-                            }
-                        });
+                    importQueuedArtifact(st, q.id, q.artifactPath);
                 }
             }
         } else if (q.status == "error") {

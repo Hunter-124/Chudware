@@ -15,12 +15,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import mmap
+import re
 import os
 import sqlite3
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import tempfile
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout, as_completed
 from pathlib import Path
 from typing import Any, Callable
@@ -67,6 +72,8 @@ _SITE_LABELS: dict[str, str] = {
     "tractorsupply":    "Tractor Supply",
     "onlinemetals":     "OnlineMetals",
     "metalsdepot":      "Metals Depot",
+    "printables":       "Printables",
+    "makerworld":       "MakerWorld",
 }
 
 # API pricing providers (the engine_oracle/parts_providers.py chain was deleted in
@@ -125,6 +132,7 @@ _SITE_DOMAINS: dict[str, str] = {
     "fastenal": "fastenal.com", "harborfreight": "harborfreight.com",
     "tractorsupply": "tractorsupply.com", "onlinemetals": "onlinemetals.com",
     "metalsdepot": "metalsdepot.com",
+    "printables": "printables.com", "makerworld": "makerworld.com",
 }
 
 
@@ -211,11 +219,32 @@ def _record_to_item(rec: dict) -> dict:
     desc = _params_summary(params)
     if rec.get("standard"):
         desc = f"{rec['standard']}  {desc}".strip()
+    title = str(rec.get("title") or "")
+    if gref.get("kind") == "core_family" and gref.get("family") == "hobby_servo":
+        # The catalog's descriptive sentence puts the actual model at the END;
+        # in a narrow card every servo otherwise looks identical.
+        desc = f"{title}  {desc}".strip()
+        title = f"Hobby Servo {rec.get('designation') or gref.get('size') or ''}".strip()
+    length = (rec.get("insert_params") or {}).get("length_mm")
+    if length is not None and gref.get("kind") == "core_family":
+        family_label = {"shcs": "Socket Head Cap Screw", "bhcs": "Button Head Cap Screw",
+                        "fhcs": "Flat Head Cap Screw", "hex_bolt": "Hex Head Bolt"}
+        title = f"{family_label.get(gref.get('family'), title)} {rec.get('designation')} × {length:g} mm"
+    part_id = str(rec.get("part_id") or "")
+    part_number = rec.get("designation") or ""
+    if not part_number and part_id.startswith("catalog:") and "::" in part_id:
+        part_number = urllib.parse.urlsplit(part_id.split("::", 1)[1]).path.rsplit("/", 1)[-1]
+    if not part_number:
+        part_number = part_id.rsplit(":", 1)[-1]
+    if length is not None:
+        part_number = f"{rec.get('designation')}×{length:g}"
+    if params.get("model_file"):
+        part_number = str(params["model_file"])
     return {
         "id":          rec.get("part_id", ""),
-        "name":        rec.get("title", ""),
+        "name":        title,
         "vendor":      _vendor_of(rec),
-        "part_number": rec.get("designation") or rec.get("part_id", "").rsplit(":", 1)[-1],
+        "part_number": part_number,
         "description": desc,
         "unit":        "ea",
         "price_usd":   price if currency == "USD" else 0.0,
@@ -228,6 +257,10 @@ def _record_to_item(rec: dict) -> dict:
         "datasheet":   str(params.get("datasheet_url", "") or params.get("datasheet", "")),
         "image_url":   str(params.get("image_url", "") or params.get("thumbnail", "")),
         "license":     rec.get("license", ""),
+        "file_name":   str(params.get("model_file") or ""),
+        "insert_params": rec.get("insert_params") or {},
+        "score":       rec.get("score", 0),
+        "sizes":       rec.get("sizes", []),
     }
 
 
@@ -274,6 +307,174 @@ def _parts_taxonomy(params: dict, _emit: Callable) -> dict:
 
 # ---- search -----------------------------------------------------------------------
 
+_COMMUNITY_SITES = ("printables", "makerworld")
+
+
+def _search_score(rec: dict, query: str) -> int:
+    """Score visible identity matches, rather than hidden FTS synonyms."""
+    terms = re.findall(r"[a-z0-9]+", query.lower())
+    if not terms:
+        return 0
+    name = str(rec.get("title") or "").lower()
+    designation = str(rec.get("designation") or "").lower()
+    text = f"{name} {designation}"
+    matched = sum(bool(re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", text))
+                  for t in terms)
+    if query.lower().strip() == designation:
+        return 100
+    if not matched:
+        return 0
+    identity_match = any(re.search(
+        rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", designation) for t in terms)
+    score = min(95, round(70 * matched / len(terms)) +
+                (15 if query.lower().strip() in name else 0) +
+                (20 if identity_match else 0))
+    if rec.get("domain") == "catalog" and rec.get("source") == "live":
+        # Community search APIs also return brackets, lubricant adapters and
+        # other accessories. Prefer the actual requested component when it is
+        # present; an explicitly requested "servo horn" is not an accessory.
+        accessory = {"adapter", "adaptor", "lubricant", "grease", "mount",
+                     "mounts", "holder", "housing", "bracket", "kit", "clip",
+                     "arm", "arms", "horn", "pulley", "finger", "claw", "cover",
+                     "support", "gear", "gears", "pan", "tilt", "turret", "turet",
+                     "base", "tool", "pusher", "helper", "removal", "applicator"}
+        title_words = set(re.findall(r"[a-z0-9]+", name))
+        filename = str((rec.get("params") or {}).get("model_file") or "").lower()
+        file_words = set(re.findall(r"[a-z0-9]+", filename))
+        unexpected_accessory = bool((accessory & (title_words | file_words)) - set(terms))
+        if unexpected_accessory:
+            score = max(0, score - 20)
+        model_codes = [term for term in terms
+                       if len(term) >= 4 and any(char.isdigit() for char in term)]
+        if filename and model_codes:
+            if not any(code in filename for code in model_codes):
+                score = max(0, score - 25)
+            elif not unexpected_accessory:
+                score = min(95, score + 15)
+                suffix = Path(filename).suffix
+                score = min(99, score + (4 if suffix in {".step", ".stp", ".iges", ".igs"}
+                                         else 2 if suffix == ".3mf" else 0))
+        if (model_codes and
+                re.search(r"\b(?:mg90s|sg90|mg995|mg996r|ds3218)\b", query.lower()) and
+                not ({"servo", "motor"} & title_words)):
+            score = max(0, score - 20)
+    return score
+
+
+def _family_size_options(records: list[dict]) -> None:
+    """Attach the actual cached core catalog sizes to parametric hits."""
+    families = {str((r.get("geometry_ref") or {}).get("family") or "")
+                for r in records if (r.get("geometry_ref") or {}).get("kind") == "core_family"}
+    if not families:
+        return
+    from services.parts import _get_hub
+    for provider in _get_hub()._registry.get_by_domain("mech_family"):
+        if getattr(provider, "provider_id", "") != "core_families":
+            continue
+        options = {str(entry.get("key") or entry.get("family") or ""): entry.get("sizes", [])
+                   for entry in provider._load_catalog() if isinstance(entry, dict)}
+        for rec in records:
+            family = str((rec.get("geometry_ref") or {}).get("family") or "")
+            if family in families:
+                rec["sizes"] = options.get(family, [])
+        break
+
+
+def _routed_sites(query: str) -> list[str]:
+    """Compact reference and supplier fan-out for unfiltered searches."""
+    q = query.lower()
+    if "servo" in q or re.search(r"\b(?:mg90s|sg90|mg995|mg996r|ds3218)\b", q):
+        return ["printables", "makerworld", "servocity", "pololu"]
+    if "bearing" in q or "lm8uu" in q:
+        return ["printables", "makerworld", "mcmaster", "misumi"]
+    if "socket" in q or re.search(r"\bm\d+(?:x\d+)?\b", q):
+        return ["printables", "makerworld", "mcmaster", "fastenal"]
+    if "extrusion" in q:
+        return ["printables", "makerworld", "eightytwenty", "misumi"]
+    if "nema" in q or "pulley" in q:
+        return ["printables", "makerworld", "pololu", "servocity"]
+    return ["printables", "makerworld"]
+
+
+def _cef_unavailable() -> bool:
+    """Inspect the selected binary without spawning a desktop or CEF process."""
+    from services.browser.driver import headless_backend
+    if headless_backend() != "cef":
+        return False
+    from services.browser.cef_client import resolve_cef_bin
+    binary = resolve_cef_bin()
+    if binary is None or not binary.is_file():
+        return True
+    cache = binary.parent.parent / "CMakeCache.txt"
+    if cache.is_file():
+        config = cache.read_text(errors="replace")
+        if "CHUDWARE_ENABLE_CEF:BOOL=OFF" in config:
+            return True
+        if "CHUDWARE_ENABLE_CEF:BOOL=ON" in config:
+            return False
+    with binary.open("rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as image:
+        return b"this build has no CEF backend" in image or b"--cef-daemon" not in image
+
+
+def _printables_file_names(hits: list[dict]) -> dict[str, str]:
+    """Preview the file PrintablesAdapter.acquire selects, in one API request."""
+    from services.browser.adapters import printables
+    models = []
+    for hit in hits:
+        url = str(hit.get("url") or "")
+        match = re.search(r"/model/(\d+)(?:[-/]|$)", urllib.parse.urlsplit(url).path)
+        if match:
+            models.append((url, match.group(1)))
+    if not models:
+        return {}
+    selection = " ".join(
+        f'p{i}:print(id:"{model_id}"){{stls{{id name fileSize}}}}'
+        for i, (_, model_id) in enumerate(models))
+    response = printables._query(f"query{{{selection}}}", {})
+    data = response.get("data") or {}
+    # Same CAD precedence and filename tie-break as PrintablesAdapter.acquire.
+    priority = {".step": 0, ".stp": 0, ".iges": 1, ".igs": 1,
+                ".3mf": 2, ".stl": 3, ".obj": 4, ".zip": 5}
+    names = {}
+    for i, (url, _) in enumerate(models):
+        files = [file for file in ((data.get(f"p{i}") or {}).get("stls") or [])
+                 if isinstance(file, dict) and
+                 Path(str(file.get("name") or "")).suffix.lower() in priority]
+        files.sort(key=lambda file: (
+            priority[Path(str(file["name"])).suffix.lower()], str(file["name"])))
+        if files:
+            names[url] = str(files[0]["name"])
+    return names
+
+
+def _community_records(site: str, query: str) -> list[dict]:
+    from services.browser.adapters import get_adapter
+    adapter = get_adapter(site)
+    if adapter is None:
+        return []
+    records = []
+    hits = adapter.search(query)
+    try:
+        filenames = _printables_file_names(hits) if site == "printables" else {}
+    except Exception:  # CAD file previews are optional; search results still matter
+        filenames = {}
+    for hit in hits:
+        if hit.get("ok") is False:
+            records.append({**hit, "site": site})
+            continue
+        if not hit.get("url") or not hit.get("title"):
+            continue
+        records.append({
+            "part_id": f"catalog:{site}::{hit['url']}", "title": hit["title"],
+            "designation": "", "domain": "catalog", "source": "live",
+            "params": {"site": site, "url": hit["url"],
+                       "thumbnail": hit.get("thumbnail", ""),
+                       "model_file": filenames.get(hit["url"], "")},
+            "license": hit.get("license") or "License not specified",
+        })
+    return records
+
+
 def _compute_routing(p: dict) -> dict:
     """Resolve a GUI search request into engine routing (domain / site / vendor
     fan-out list / facet defs). Shared by the instant local search and the
@@ -302,6 +503,13 @@ def _compute_routing(p: dict) -> dict:
         domain, site = "catalog", category.split(":", 1)[1]
     elif category:
         domain = category
+
+    if site:
+        route_sites = [site]
+    elif query and not route_sites and not category_id and not category:
+        route_sites = _routed_sites(query)
+    elif query and len(route_sites) > 1 and domain != "ecad":
+        route_sites = list(dict.fromkeys([*_COMMUNITY_SITES, *route_sites]))
 
     vendor_query = " ".join([query] + [t for t in query_terms if t]).strip()
     return {"query": query, "category_id": category_id, "domain": domain, "site": site,
@@ -410,41 +618,90 @@ def _parts_index_status(params: dict, _emit: Callable) -> dict:
 def _parts_search(params: dict, _emit: Callable) -> dict:
     """Instant local parts search.
 
-    By default (``live`` unset) this behaves like the legacy call: local FTS plus a
-    synchronous browser fan-out. The Parts Library GUI now passes ``live=False`` to
-    get ONLY the instant local layer, then streams live vendor hits separately via
-    ``parts_search_live_start`` / ``parts_search_live_poll`` so results paint as they
-    arrive instead of blocking on the slowest vendor."""
+    The default returns only indexed local parts immediately. Callers stream public
+    CAD models and available vendors with ``parts_search_live_start`` /
+    ``parts_search_live_poll``; explicit ``live=True`` requests a blocking merge."""
     try:
         from services.parts import search as _search
         p = params or {}
         limit = max(1, min(int(p.get("limit", 50)), 200))
-        want_live = bool(p.get("live", True)) and str(p.get("source", "")).lower() != "local"
+        want_live = bool(p.get("live", False)) and str(p.get("source", "")).lower() != "local"
         rt = _compute_routing(p)
 
         records = _search(rt["query"], domain=rt["domain"], limit=limit,
-                          include_live=want_live)
+                          include_live=False)
         if rt["site"]:
             prefix = f"catalog:{rt['site']}::"
             records = [r for r in records if str(r.get("part_id", "")).startswith(prefix)]
 
-        if want_live and rt["category_id"] and rt["route_sites"]:
-            # Legacy blocking fan-out (only when the caller opted into live here).
-            try:
-                cat_records = _search(rt["vendor_query"], domain="catalog", limit=limit,
-                                      sites=rt["route_sites"])
-            except Exception:  # noqa: BLE001 — live layer optional
-                cat_records = []
-            prefixes = tuple(f"catalog:{s}::" for s in rt["route_sites"])
-            seen_ids = {str(r.get("part_id", "")) for r in records}
-            for rec in cat_records:
-                pid = str(rec.get("part_id", ""))
-                if pid.startswith(prefixes) and pid not in seen_ids:
-                    seen_ids.add(pid)
-                    records.append(rec)
+        _family_size_options(records)
+        # FTS relaxes terms to synonyms. Exclude visibly unrelated one-token
+        # matches and half-matched two-token titles from unfiltered searches.
+        scored = []
+        terms = rt["query"].lower().split()
+        model_pattern = (re.compile(rf"(?<![a-z0-9]){re.escape(terms[0])}(?![a-z0-9])")
+                         if len(terms) > 1 and re.fullmatch(r"[a-z]+\d+", terms[0])
+                         else None)
+        # Standard screw families accept the requested shaft length (M3x10).
+        length_match = re.search(
+            r"\b(m\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)\b", rt["query"], re.I)
+        thread_model = length_match.group(1).lower() if length_match else ""
+        thread_pattern = (re.compile(rf"(?<![a-z0-9]){re.escape(thread_model)}(?![a-z0-9])")
+                          if thread_model else None)
+        tooth_variants = [re.compile(rf"(?<![a-z0-9]){t}(?![a-z0-9])")
+                          for t in terms if re.fullmatch(r"\d+t", t)]
+        for rec in records:
+            score = _search_score(rec, rt["query"])
+            title = f"{rec.get('title') or ''} {rec.get('designation') or ''}".lower()
+            identity = str(rec.get("designation") or rec.get("title") or "").lower()
+            model_mismatch = model_pattern is not None and not model_pattern.search(identity)
+            if tooth_variants and rec.get("designation") and not all(
+                    variant.search(identity) for variant in tooth_variants):
+                continue
+            if thread_pattern is not None:
+                if not thread_pattern.search(title):
+                    continue
+                score = min(95, score + 10)
+            if rt["query"] and not p.get("facets") and (
+                    score == 0 or
+                    (len(terms) == 2 and score < 50) or
+                    (len(terms) >= 3 and score < 40) or model_mismatch):
+                continue
+            rec["score"] = score
+            gref = rec.get("geometry_ref") or {}
+            if (length_match and gref.get("kind") == "core_family" and
+                    gref.get("family") in {"shcs", "bhcs", "fhcs", "hex_bolt"} and
+                    str(rec.get("designation") or "").lower() == thread_model):
+                rec["insert_params"] = {"length_mm": float(length_match.group(2))}
+            scored.append(rec)
+        records = scored
+        if want_live and rt["route_sites"]:
+            cef_off = _cef_unavailable()
+            for site in rt["route_sites"]:
+                if cef_off and site != "printables":
+                    continue
+                try:
+                    if site in _COMMUNITY_SITES:
+                        records.extend(_community_records(site, rt["vendor_query"]))
+                    else:
+                        records.extend(_search(rt["vendor_query"], domain="catalog",
+                                               limit=limit, sites=[site]))
+                except Exception:  # one optional vendor must not sink local results
+                    continue
+            if cef_off and any(s != "printables" for s in rt["route_sites"]):
+                records.append({"ok": False, "site": "browser",
+                                "reason": "cef_unavailable",
+                                "hint": "Browser vendors unavailable in this CEF-off build; public CAD search remains available."})
 
         records, notices = _split_notices(records)
+        if want_live:
+            for rec in records:
+                if rec.get("source") == "live" or "score" not in rec:
+                    rec["score"] = _search_score(rec, rt["query"])
         items = _filter_items(records, p, rt["facet_defs"])
+        if want_live:
+            items.sort(key=lambda item: (
+                not (item["source"] == "local" and item["placeable"]), -item["score"]))
         has_live = any(i["source"] == "live" for i in items)
         idx = _index_status()
         return {"ok": True, "count": len(items), "has_live": has_live,
@@ -542,7 +799,8 @@ def _vendor_cache_conn() -> Any:
 
 
 def _vendor_cache_key(site: str, query: str, limit: int) -> str:
-    return hashlib.blake2b(f"{site}\n{query}\n{limit}".encode("utf-8"),
+    version = "files-v2" if site == "printables" else "1"
+    return hashlib.blake2b(f"{version}\n{site}\n{query}\n{limit}".encode("utf-8"),
                            digest_size=16).hexdigest()
 
 
@@ -693,22 +951,30 @@ def _run_live_site_inner(site: str, rt: dict, limit: int, p: dict, job: dict) ->
     site_status = "done"
     if cached is not None:
         recs = cached
+    elif site == "printables":
+        try:
+            recs = _community_records(site, rt["vendor_query"])
+        except Exception:  # public API failure must not strand this live job
+            recs = []
+            site_status = "error"
+        if site_status == "done":
+            _vendor_cache_put(site, rt["vendor_query"], limit, recs)
     else:
         _live_fetch_slots.acquire()
-        # A cold worker may have been superseded while waiting for a scrape slot.
-        # Check again before turning that slot into a real vendor navigation.
         if job.get("cancelled"):
             _live_fetch_slots.release()
             return
         try:
-            recs = _search(rt["vendor_query"], domain="catalog", limit=limit, sites=[site])
-        except Exception:  # noqa: BLE001 — one vendor failing must not sink the others
+            if site in _COMMUNITY_SITES:
+                recs = _community_records(site, rt["vendor_query"])
+            else:
+                recs = _search(rt["vendor_query"], domain="catalog", limit=limit, sites=[site])
+        except Exception:  # one vendor failing must not sink the others
             recs = []
             site_status = "error"
         finally:
             _live_fetch_slots.release()
         if site_status == "done":
-            # Cache writes are disk work, not CEF work, and must not occupy a scrape slot.
             _vendor_cache_put(site, rt["vendor_query"], limit, recs)
     with _live_lock:
         if job.get("cancelled"):
@@ -720,6 +986,8 @@ def _run_live_site_inner(site: str, rt: dict, limit: int, p: dict, job: dict) ->
         if rec.get("ok") is False and not rec.get("site"):
             rec["site"] = site
     clean, notices = _split_notices(recs)
+    for rec in clean:
+        rec["score"] = _search_score(rec, rt.get("query") or rt["vendor_query"])
     if notices:
         site_status = "error"
     items = _filter_items(clean, p, rt["facet_defs"])
@@ -746,7 +1014,7 @@ def _run_live_site_inner(site: str, rt: dict, limit: int, p: dict, job: dict) ->
 
 
 def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
-    """Run one vendor search; only a cold scrape consumes a shared CEF slot."""
+    """Run one site; Printables' public API does not consume a browser slot."""
     _run_live_site_inner(site, rt, limit, p, job)
 
 
@@ -759,13 +1027,21 @@ def _parts_search_live_start(params: dict, _emit: Callable) -> dict:
         p = params or {}
         limit = max(1, min(int(p.get("limit", 50)), 200))
         rt = _compute_routing(p)
-        sites = list(rt["route_sites"])
+        requested = list(dict.fromkeys(rt["route_sites"]))
+        cef_off = bool(requested) and _cef_unavailable()
+        sites = [s for s in requested if not cef_off or s == "printables"]
+        skipped = [s for s in requested if s not in sites]
         token = uuid.uuid4().hex
         vendors = {s: {"site": s, "label": _site_label(s), "domain": _site_domain(s),
                        "status": "queued"} for s in sites}
         job = {"results": [], "notices": [], "seen_ids": set(), "seen_notices": set(),
                "pending": len(sites), "done": not sites, "cancelled": False,
                "vendors": vendors}
+        if skipped:
+            job["notices"].append({
+                "site": "browser", "reason": "cef_unavailable",
+                "hint": f"Browser vendors unavailable in this CEF-off build ({len(skipped)} skipped); public CAD search remains available.",
+            })
         with _live_lock:
             # A new search supersedes anything still running. The RPC carries no
             # client/session identity, so cancel EVERY older live job: their workers
@@ -784,7 +1060,8 @@ def _parts_search_live_start(params: dict, _emit: Callable) -> dict:
             threading.Thread(target=_run_live_site, args=(s, rt, limit, p, job),
                              name=f"parts-live-{s}", daemon=True).start()
         return {"ok": True, "token": token, "sites": sites,
-                "vendors": list(vendors.values()), "done": job["done"]}
+                "vendors": list(vendors.values()), "notices": list(job["notices"]),
+                "done": job["done"]}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_search_live_start failed: {exc}"}
 
@@ -847,13 +1124,36 @@ def _parts_queue_status(params: dict, _emit: Callable) -> dict:
 
 
 def _parts_import_artifact(params: dict, _emit: Callable) -> dict:
-    """Import a finished fetch-queue artifact (STEP/IGES) as a new editable doc."""
+    """Import a downloaded STEP/IGES or mesh; unpack CAD from ZIP bundles."""
     try:
-        from services.mcp import core_bridge as cb  # _place_import_file ported to core (T-RF19)
+        from services.mcp import core_bridge as cb
         path = str((params or {}).get("artifact_path", "")).strip()
         if not path:
             return {"ok": False, "reason": "artifact_path required"}
-        return cb.call("part_import_file", {"path": path})
+        suffix = Path(path).suffix.lower()
+        supported = {".step", ".stp", ".iges", ".igs", ".stl", ".3mf", ".obj"}
+        if suffix == ".zip":
+            with zipfile.ZipFile(path) as archive:
+                candidates = [entry for entry in archive.infolist()
+                              if not entry.is_dir() and Path(entry.filename).suffix.lower() in supported
+                              and 0 < entry.file_size <= 200 * 1024 * 1024]
+                rank = {".step": 0, ".stp": 0, ".iges": 1, ".igs": 1,
+                        ".3mf": 2, ".stl": 3, ".obj": 4}
+                candidates.sort(key=lambda e: (rank[Path(e.filename).suffix.lower()], e.filename))
+                if not candidates:
+                    return {"ok": False, "reason": "No importable CAD model in this ZIP bundle."}
+                selected = candidates[0]
+                with tempfile.TemporaryDirectory(prefix="chudware-part-") as directory:
+                    extracted = Path(directory) / ("model" + Path(selected.filename).suffix.lower())
+                    with archive.open(selected) as source, extracted.open("wb") as dest:
+                        import shutil
+                        shutil.copyfileobj(source, dest)
+                    return cb.call("part_import_file", {"path": str(extracted),
+                              "as_solid": extracted.suffix in {".stl", ".3mf", ".obj"}})
+        if suffix not in supported:
+            return {"ok": False, "reason": f"Unsupported CAD artifact format: {suffix or '(none)'}"}
+        return cb.call("part_import_file", {"path": path,
+                      "as_solid": suffix in {".stl", ".3mf", ".obj"}})
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_import_artifact failed: {exc}"}
 
@@ -893,7 +1193,8 @@ def _parts_prepare_for_assembly(params: dict, emit: Callable) -> dict:
     except OSError as exc:
         return {"ok": False, "reason": f"Could not create project folder: {exc}"}
 
-    placed = _parts_insert_into_doc({"item_id": (params or {}).get("item_id")}, emit)
+    placed = _parts_insert_into_doc({"item_id": (params or {}).get("item_id"),
+                                     "params": (params or {}).get("params")}, emit)
     if not placed.get("ok"):
         return placed
     doc_id = placed.get("doc_id")

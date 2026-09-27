@@ -1,14 +1,15 @@
 """Deterministic Chudcode RPC-frame to Chudware feed-event mapping.
 
-Only streamed deltas produce visible assistant text.  Completed message envelopes
+Only streamed deltas produce visible assistant text. Completed message envelopes
 are lifecycle records, so a final message cannot duplicate text already displayed.
-The function keeps no state and never mutates its inputs.
+Per-turn tool-call state retains bounded start arguments until the terminal frame.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from collections import OrderedDict
 from collections.abc import Mapping
 from typing import Any
 
@@ -16,6 +17,58 @@ _MAX_DELTA = 16 * 1024
 _MAX_DETAIL = 4096
 _MAX_PREVIEW = 2048
 _MAX_LABEL = 240
+_MAX_CALLS = 512
+_MAX_TERMINALS = 4096
+_MAX_TOOL_CONTENT = 64 * 1024
+
+
+class RpcFrameState:
+    """One turn's bounded tool-start previews and terminal call identifiers."""
+
+    def __init__(self) -> None:
+        self._calls: OrderedDict[str, dict[str, str]] = OrderedDict()
+        self._terminals: OrderedDict[str, None] = OrderedDict()
+
+    def remember(self, call_id: str, data: Mapping[str, Any]) -> None:
+        if not call_id or call_id in self._terminals:
+            return
+        args = data.get("args", data.get("arguments", data.get("input")))
+        display_args, xd_kind = _tool_display_args(args)
+        preview = (
+            "" if xd_kind else _str(data, "argsPreview", "args_preview", limit=_MAX_PREVIEW)
+        )
+        if (xd_kind == "call" or not preview) and display_args not in (None, {}, []):
+            preview = _cap(_bounded(display_args), _MAX_PREVIEW)
+        previous = self._calls.get(call_id, {})
+        fields = {
+            "tool_name": _str(data, "toolName", "tool_name", "tool", "name", limit=160),
+            "target": _tool_target(display_args, data, xd_kind),
+            "args_preview": preview,
+            "args_digest": _digest(args) if args not in (None, {}, []) else "",
+            "intent": _str(data, "intent", limit=_MAX_LABEL),
+            "parent_id": _str(
+                data, "parentToolCallId", "parent_tool_call_id", "parentId", "parent_id"
+            ),
+        }
+        self._calls[call_id] = {
+            key: value or previous.get(key, "") for key, value in fields.items()
+        }
+        self._calls.move_to_end(call_id)
+        if len(self._calls) > _MAX_CALLS:
+            self._calls.popitem(last=False)
+
+    def complete(self, call_id: str) -> dict[str, str] | None:
+        if not call_id or call_id in self._terminals:
+            return None
+        saved = self._calls.pop(call_id, {})
+        self._terminals[call_id] = None
+        if len(self._terminals) > _MAX_TERMINALS:
+            self._terminals.popitem(last=False)
+        return saved
+
+    def terminal_seen(self, call_id: str) -> bool:
+        return bool(call_id) and call_id in self._terminals
+
 
 
 def _cap(value: Any, limit: int) -> str:
@@ -147,6 +200,10 @@ def _flatten(frame: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
             if key not in {"event", "params", "data", "payload"}:
                 merged[key] = value
     event_name = event if isinstance(event, str) else ""
+    if _name(body.get("type")) in {"custom", "custom_message"}:
+        custom_type = body.get("customType", body.get("custom_type"))
+        if isinstance(custom_type, str) and custom_type.strip():
+            return _name(custom_type), merged
     for source in (body, merged):
         if event_name:
             break
@@ -280,27 +337,54 @@ def _channel(event: str, data: Mapping[str, Any]) -> str:
     return "text"
 
 
-def _tool_target(args: Any, data: Mapping[str, Any]) -> str:
-    explicit = _str(data, "target", "label", limit=120)
+def _tool_display_args(args: Any) -> tuple[Any, str]:
+    """Unwrap CAD host-tool writes; read xd:// calls only consult tool docs."""
+    if not isinstance(args, Mapping) or not _str(args, "path").startswith("xd://"):
+        return args, ""
+    if "content" not in args:
+        return {}, "docs"
+    content = args["content"]
+    if isinstance(content, Mapping):
+        return content, "call"
+    if isinstance(content, str) and len(content) <= _MAX_TOOL_CONTENT:
+        try:
+            parsed = json.loads(content)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if isinstance(parsed, Mapping):
+                return parsed, "call"
+    return {}, "call"
+
+
+def _tool_target(args: Any, data: Mapping[str, Any], xd_kind: str = "") -> str:
+    if xd_kind == "docs":
+        return "docs"
+    explicit = _str(data, "target", "label", limit=120) if not xd_kind else ""
     if explicit:
         return explicit
     if isinstance(args, Mapping):
-        for key in (
-            "name",
-            "part_name",
-            "assembly_name",
-            "feature_name",
-            "title",
-            "query",
-            "file_path",
-            "folder_path",
-            "path",
-            "doc_id",
-            "id",
-        ):
+        tool = _name(_str(data, "toolName", "tool_name", "tool", limit=160))
+        if tool in {"read", "fetch_cad_model"}:
+            keys = ("url", "path", "name", "query")
+        elif tool == "web_search" or tool.startswith("research_") or tool.endswith("_search"):
+            keys = ("query", "url", "name", "path")
+        elif tool.startswith("fs_"):
+            keys = ("path", "file_path", "folder_path", "name")
+        else:
+            keys = (
+                "name", "part_name", "assembly_name", "feature_name", "title",
+                "query", "url", "file_path", "folder_path", "path", "doc_id",
+                "feature", "feature_id", "id",
+            )
+        for key in keys:
             value = args.get(key)
             if isinstance(value, (str, int, float)) and str(value):
                 return _cap(value, 120)
+        family = _str(args, "family", limit=80)
+        size = _str(args, "size", limit=80)
+        if family or size:
+            return _cap(" · ".join(part for part in (family, size) if part), 120)
     return ""
 
 
@@ -330,13 +414,25 @@ def _tool_progress(
 
 
 def _tool_end(
-    event: str, data: Mapping[str, Any], context: Mapping[str, Any]
+    event: str,
+    data: Mapping[str, Any],
+    context: Mapping[str, Any],
+    saved: Mapping[str, str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
+    saved = saved or {}
     link = _link(data, context, event)
     call_id = _str(data, "toolCallId", "tool_call_id", "callId", "call_id")
     if call_id:
         link["id"] = call_id
-    tool = _str(data, "toolName", "tool_name", "tool", "name", limit=160) or "tool"
+    if saved.get("parent_id") and not _str(
+        data, "parentToolCallId", "parent_tool_call_id", "parentId", "parent_id"
+    ):
+        link["parent_id"] = saved["parent_id"]
+    tool = (
+        _str(data, "toolName", "tool_name", "tool", "name", limit=160)
+        or saved.get("tool_name")
+        or "tool"
+    )
     args = data.get("args", data.get("arguments", data.get("input", {})))
     result = data.get("result", data.get("output", data.get("response")))
     error = _str(
@@ -360,13 +456,19 @@ def _tool_end(
     if ok is None:
         is_error = _bool(data, "isError", "is_error")
         ok = not cancelled and is_error is not True and not bool(error)
-    args_preview = _str(data, "argsPreview", "args_preview", limit=_MAX_PREVIEW)
-    if not args_preview and args not in (None, {}, []):
-        args_preview = _cap(_bounded(args), _MAX_PREVIEW)
+    display_args, xd_kind = _tool_display_args(args)
+    args_preview = (
+        "" if xd_kind else _str(data, "argsPreview", "args_preview", limit=_MAX_PREVIEW)
+    )
+    if (xd_kind == "call" or not args_preview) and display_args not in (None, {}, []):
+        args_preview = _cap(_bounded(display_args), _MAX_PREVIEW)
+    args_preview = args_preview or saved.get("args_preview", "")
+    target = _tool_target(display_args, data, xd_kind) or saved.get("target", "")
     payload: dict[str, Any] = {
         "tool_name": tool,
-        "target": _tool_target(args, data),
+        "target": target,
         "args_digest": _str(data, "argsDigest", "args_digest", limit=64)
+        or (saved.get("args_digest") if args in (None, {}, []) else None)
         or _digest(args),
         "result_digest": _str(data, "resultDigest", "result_digest", limit=64)
         or _digest(result),
@@ -377,6 +479,9 @@ def _tool_end(
     }
     if args_preview:
         payload["args_preview"] = args_preview
+    intent = _str(data, "intent", limit=_MAX_LABEL) or saved.get("intent", "")
+    if intent:
+        payload["intent"] = intent
     if not ok:
         payload["error_preview"] = error or (
             "cancelled" if cancelled else "tool failed"
@@ -679,7 +784,7 @@ def _unknown(
 
 
 def _message_update(
-    data: Mapping[str, Any], context: Mapping[str, Any]
+    data: Mapping[str, Any], context: Mapping[str, Any], state: RpcFrameState | None
 ) -> list[tuple[str, dict[str, Any]]]:
     assistant_event = data.get("assistantMessageEvent")
     if not isinstance(assistant_event, Mapping):
@@ -706,11 +811,24 @@ def _message_update(
     ):
         if key in data and key not in child:
             child[key] = data[key]
-    return map_rpc_frame(child, context)
+    return map_rpc_frame(child, context, state)
+
+
+def _remember_tool_call(tool_call: Any, state: RpcFrameState | None) -> None:
+    if state is None or not isinstance(tool_call, Mapping):
+        return
+    call_id = _str(tool_call, "toolCallId", "id")
+    if not call_id:
+        return
+    normalized = dict(tool_call)
+    normalized["toolName"] = _str(tool_call, "toolName", "name")
+    state.remember(call_id, normalized)
 
 
 def map_rpc_frame(
-    frame: Mapping[str, Any], context: Mapping[str, Any] | None = None
+    frame: Mapping[str, Any],
+    context: Mapping[str, Any] | None = None,
+    state: RpcFrameState | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Map one raw ``AgentSessionEvent`` to ordered Chudware feed shapes."""
     ctx: Mapping[str, Any] = context if isinstance(context, Mapping) else {}
@@ -727,6 +845,12 @@ def map_rpc_frame(
         "turn_completed",
         "turn_complete",
     } and isinstance(data.get("message"), Mapping):
+        if event in {"message_end", "message_completed", "message_complete"}:
+            content = data["message"].get("content")
+            if isinstance(content, list):
+                for item in content[:32]:
+                    if isinstance(item, Mapping) and _name(item.get("type")) == "toolcall":
+                        _remember_tool_call(item, state)
         # Lifecycle frames carry linkage inside message; copy only identifiers.
         # Content remains intentionally suppressed because its deltas already rendered.
         normalized = dict(data)
@@ -738,7 +862,29 @@ def map_rpc_frame(
     link = _link(data, ctx, event or "unknown")
 
     if event == "message_update":
-        return _message_update(data, ctx)
+        return _message_update(data, ctx, state)
+
+    # Persistent-session bookkeeping is not user activity.
+    if event in {
+        "available_commands_update",
+        "available_commands_updated",
+        "credential_pin",
+        "credential_unpin",
+        "eager_todo_prelude",
+    }:
+        return []
+    if event == "session_exit":
+        return [_status(link, "session_end", "Session exited")]
+    if event == "title_change":
+        title = _str(data, "title", limit=_MAX_LABEL)
+        return [
+            _status(link, "title_change", title or "Conversation title changed", title=title)
+        ]
+    if event in {"notice", "agent_progress_nudge"}:
+        text = _str(data, "text", "message", "content", limit=_MAX_LABEL)
+        if not text:
+            return []
+        return [_status(link, "notice" if event == "notice" else "progress_nudge", text)]
 
     deltas = {
         "assistant_delta",
@@ -772,6 +918,8 @@ def map_rpc_frame(
     # Until 2026-09-03 they fell through to _unknown() and every turn's live feed was
     # dozens of "Chudcode · toolcall delta" / "Chudcode · text end" rows that pushed
     # the actual answer out of view.
+    if event == "toolcall_end":
+        _remember_tool_call(data.get("toolCall"), state)
     if event in {
         "text_start",
         "text_end",
@@ -867,15 +1015,24 @@ def map_rpc_frame(
         "tool_call_canceled",
         "host_tool_cancel",
     }
-    if event in tool_start | tool_update:
-        # A raw host_tool_call carrying a synchronous result is already complete.
-        if event == "host_tool_call" and any(
-            key in data for key in ("result", "output", "isError")
-        ):
-            return [_tool_end(event, data, ctx)]
+    if event in tool_start | tool_update | tool_end | tool_cancel:
+        call_id = _str(data, "toolCallId", "tool_call_id", "callId", "call_id")
+        if not call_id and event.startswith("host_tool"):
+            call_id = _str(data, "id")
+        if state is not None and state.terminal_seen(call_id):
+            return []
+        # A synchronous host call carrying a result is already complete.
+        terminal = event in tool_end | tool_cancel or (
+            event == "host_tool_call" and any(
+                key in data for key in ("result", "output", "isError")
+            )
+        )
+        if terminal:
+            saved = state.complete(call_id) if state is not None else None
+            return [_tool_end(event, data, ctx, saved)]
+        if state is not None and event in tool_start:
+            state.remember(call_id, data)
         return [_tool_progress(event, data, ctx)]
-    if event in tool_end | tool_cancel:
-        return [_tool_end(event, data, ctx)]
 
     if event in {
         "todo_update",
@@ -935,12 +1092,16 @@ def map_rpc_frame(
     if event in {
         "thinking_change",
         "thinking_changed",
+        "thinking_level_change",
+        "thinking_level_changed",
         "thinking_mode",
         "reasoning_effort_changed",
         "reasoning_change",
     }:
         mode = _str(
             data,
+            "thinkingLevel",
+            "thinking_level",
             "thinking",
             "mode",
             "effort",
@@ -1317,4 +1478,4 @@ def map_rpc_frame(
     return [_unknown(event, data, ctx)]
 
 
-__all__ = ["map_rpc_frame"]
+__all__ = ["RpcFrameState", "map_rpc_frame"]

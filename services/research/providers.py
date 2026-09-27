@@ -20,6 +20,15 @@ from typing import Optional
 
 _UA = "Mozilla/5.0 (compatible; Chudware-research/1.0)"
 
+class ProviderBlocked(RuntimeError):
+    """Search host returned a bot challenge or an explicit access denial."""
+
+
+_BLOCKED_PAGE = re.compile(
+    r"(?:anomaly-modal|bots use duckduckgo too|please complete the following challenge|captcha)",
+    re.I,
+)
+
 
 class SearchProvider:
     """One search back-end. ``search`` returns ``{"results": [...], "answer": str|None,
@@ -73,6 +82,8 @@ class TavilyProvider(SearchProvider):
                   "include_answer": True},
             timeout=20.0,
         )
+        if resp.status_code in (403, 429):
+            raise ProviderBlocked(f"Tavily returned HTTP {resp.status_code}")
         resp.raise_for_status()
         data = resp.json()
         results = [
@@ -104,15 +115,21 @@ class DDGProvider(SearchProvider):
                     timeout=20.0,
                     follow_redirects=True,
                 )
+                if resp.status_code in (202, 403, 429) or _BLOCKED_PAGE.search(resp.text):
+                    raise ProviderBlocked(f"DuckDuckGo returned an access challenge "
+                                          f"(HTTP {resp.status_code})")
                 resp.raise_for_status()
                 return {
                     "results": parse_ddg_html(resp.text, max_results),
                     "answer": None,
                     "confidence": "limited",
                 }
-            except Exception as exc:  # noqa: BLE001 — retry with backoff
+            except ProviderBlocked:
+                raise  # retrying the same CAPTCHA/blocked host cannot solve it
+            except Exception as exc:  # noqa: BLE001 — transient transport failure
                 last_exc = exc
-                time.sleep(0.5 * (2 ** attempt))
+                if attempt < 2:
+                    time.sleep(0.5 * (2 ** attempt))
         raise last_exc or RuntimeError("DuckDuckGo request failed")
 
 

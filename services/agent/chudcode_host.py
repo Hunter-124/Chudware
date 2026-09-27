@@ -18,6 +18,7 @@ import sys
 import tempfile
 import re
 import threading
+import time
 import uuid
 from urllib.parse import urlsplit
 from collections import OrderedDict, deque
@@ -25,6 +26,8 @@ from collections.abc import Callable, Mapping, Reversible, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from services.agent.progress_watchdog import ProgressWatchdog
 
 _DEFAULT_MAX_SESSIONS = 8
 _MAX_MAX_SESSIONS = 32
@@ -293,7 +296,9 @@ class ChudcodeSessionHost:
     fake accepting the same keyword arguments.
     """
 
-    def __init__(self, client_factory=None, binary=None):
+    def __init__(self, client_factory=None, binary=None, *, clock=None):
+        self._clock = clock or time.monotonic
+        self._realtime_watchdog = clock is None
         self._client_factory = client_factory
         self._binary_hint = os.fspath(binary) if binary is not None else None
         self._max_sessions = _session_limit_from_env()
@@ -345,6 +350,81 @@ class ChudcodeSessionHost:
         emit_errors: list[str] = []
         provider_frames: deque[dict[str, Any]] = deque(maxlen=256)
         terminal: dict[str, Any] | None = None
+        chosen_mode = params.get("mode")
+        preferences = params.get("turn_preferences")
+        readonly_turn = (
+            bool(params.get("plan_only"))
+            or chosen_mode in ("ask", "plan")
+            or getattr(preferences, "mode", None) in ("ask", "plan")
+        )
+        progress = ProgressWatchdog(self._clock, enabled=not readonly_turn)
+        progress_lock = threading.RLock()
+        progress_timer: threading.Timer | None = None
+        scheduled_deadline: float | None = None
+        progress_closed = False
+        progress_threads: list[threading.Thread] = []
+
+        def schedule_progress_timer() -> None:
+            nonlocal progress_timer, scheduled_deadline
+            deadline = progress.deadline() if not progress_closed else None
+            if deadline == scheduled_deadline:
+                return
+            if progress_timer is not None:
+                progress_timer.cancel()
+                progress_timer = None
+            scheduled_deadline = deadline
+            if self._realtime_watchdog and deadline is not None:
+                progress_timer = threading.Timer(
+                    max(0.0, deadline - self._clock()), check_progress_timer
+                )
+                progress_timer.daemon = True
+                progress_timer.start()
+
+        def send_progress_nudge(text: str) -> None:
+            try:
+                outcome = self.steer(run_id, text)
+            except Exception as exc:  # noqa: BLE001 - advisory steering never aborts a turn
+                _LOG.warning("Progress steering failed (%s)", exc)
+                return
+            if outcome.get("steered") and not outcome.get("duplicate"):
+                try:
+                    emit({
+                        "type": "agent.progress_nudge",
+                        "message": text,
+                        "text": (
+                            "Progress nudge: "
+                            + text.split(" without building anything.", 1)[0]
+                            + ". Commit sourced dimensions; start modeling and save one part at a time."
+                        ),
+                        "run_id": run_id,
+                        "session_id": session_id,
+                    })
+                except Exception as exc:  # noqa: BLE001 - same boundary as RPC events
+                    emit_errors.append(str(exc))
+
+        def dispatch_progress_nudge(text: str) -> None:
+            # RpcClient notifications can run on the reader thread. Steering there
+            # would wait for a response only that same reader can receive.
+            if self._realtime_watchdog:
+                thread = threading.Thread(
+                    target=send_progress_nudge, args=(text,), daemon=True
+                )
+                progress_threads.append(thread)
+                thread.start()
+            else:
+                send_progress_nudge(text)
+
+        def check_progress_timer() -> None:
+            nonlocal progress_timer, scheduled_deadline
+            with progress_lock:
+                progress_timer = None
+                scheduled_deadline = None
+                if progress_closed:
+                    return
+                text = progress.due()
+                schedule_progress_timer()
+            if text is not None:
+                dispatch_progress_nudge(text)
         try:
             session = self._get_or_create_session(session_id, params, resume_file)
             with session.turn_lock:
@@ -359,7 +439,7 @@ class ChudcodeSessionHost:
                 opening: list[dict[str, Any]] = []
 
                 def forward(event: Any) -> None:
-                    nonlocal terminal
+                    nonlocal terminal, progress_closed
                     # Keep distinct notifications when the RPC client reuses a frame's
                     # object identity.
                     frame = _json_value(event)
@@ -370,8 +450,17 @@ class ChudcodeSessionHost:
                         "isTerminal", frame.get("is_terminal")
                     ) is not False:
                         terminal = frame
+                        with progress_lock:
+                            progress_closed = True
+                            schedule_progress_timer()
                     if kind in _RETRY_FAILED_FRAMES or kind in _ASSISTANT_OUTPUT_FRAMES:
                         provider_frames.append(frame)
+                    if not progress_closed:
+                        with progress_lock:
+                            nudge = progress.observe(frame, session.host_tool_names)
+                            schedule_progress_timer()
+                        if nudge is not None:
+                            dispatch_progress_nudge(nudge)
                     try:
                         emit(frame)
                         if kind == "agent_start" and opening:
@@ -432,6 +521,8 @@ class ChudcodeSessionHost:
                     return self._stop_budget_exhausted_run(
                         run, session, budget_s, lambda: terminal
                     )
+                for thread in progress_threads:
+                    thread.join(timeout=1)
 
                 if terminal is None:
                     raise RuntimeError(
@@ -484,6 +575,13 @@ class ChudcodeSessionHost:
                 "reason": str(exc),
             }
         finally:
+            with progress_lock:
+                progress_closed = True
+                if progress_timer is not None:
+                    progress_timer.cancel()
+            for thread in progress_threads:
+                if thread.is_alive():
+                    thread.join(timeout=1)
             if unsubscribe is not None:
                 try:
                     unsubscribe()

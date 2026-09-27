@@ -38,7 +38,7 @@ from .providers.base import Provider
 # config.json is read on EVERY tool dispatch (get_tool_options / is_tool_family_enabled
 # call load_config() with cfg=None at least twice per tool call), so re-reading and
 # re-parsing the file on every call is wasted work. Cache keyed on the resolved path
-# (str(paths.CONFIG) — tests monkeypatch this to a tmp_path fixture, see test_effort.py)
+# (str(paths.CONFIG) — tests monkeypatch this to a tmp_path fixture)
 # plus its mtime_ns; either changing invalidates and reparses. Mirrors
 # advisor/triggers.py's _ensure_cache_fresh pattern. load_config() returns a deep copy
 # so callers (notably save_config below, which mutates its result in place) can never
@@ -1746,8 +1746,7 @@ def get_provider(
     *role* (optional) is a routing.yaml role tag (e.g. ``"overseer"``, ``"fixer"``, or a DAG
     node name) — see ``_resolve_via_routing``. When *name* / ``CHUDWARE_PROVIDER`` is not given,
     routing.yaml's role->source assignment (contract §14) is consulted BEFORE falling back to
-    config.json's flat ``provider`` field, so a source registered into routing.yaml (e.g. the
-    bundled llama.cpp runtime's ``register_routing_source``) actually gets picked up here.
+    config.json's flat ``provider`` field, so configured routing.yaml sources take effect.
 
     When ``compliance_mode == "redact"``, the resolved provider is wrapped in
     :class:`services.agent.redaction.RedactingProvider` so outbound text is scrubbed and
@@ -1826,9 +1825,8 @@ def _resolve_via_routing(
         from .routing import load_routing  # noqa: PLC0415 — avoid import cost/cycles
 
         # Re-parse routing.yaml from disk each call (not the process-lifetime cache
-        # in get_routing_table()) — the file is user-editable and can also be mutated
-        # at runtime by local_runtime.register_routing_source(), so a stale cache would
-        # silently ignore a source registered after the first resolution in-process.
+        # in get_routing_table()) — the file is user-editable, so a stale cache would
+        # silently ignore an updated source after the first resolution in-process.
         table = load_routing()
         resolution = table.resolve(role or "default")
         if resolution is None:

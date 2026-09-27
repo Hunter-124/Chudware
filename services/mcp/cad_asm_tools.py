@@ -257,10 +257,9 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         report `placement_unverified`. Never position a part by editing STEP/JSONL text.
         """
         try:
-            import os as _os
             d = _doc(doc_id)
-            p = _os.path.abspath(path)
-            if not _os.path.exists(p):
+            p = _component_source_path(path, d)
+            if not os.path.exists(p):
                 return _dumps({"ok": False, "error": f"no such file: {p}"})
             op: dict = {"op": "asm_insert_component", "source": {"path": p}}
             if name:

@@ -20,6 +20,10 @@
 struct AppState;
 
 namespace ui {
+// Saved agent tabs belong by file location; never-saved tabs require their originating
+// conversation's project directory. Missing provenance is not attributed to this project.
+bool agentDocInProject(const std::string& path, const std::string& originProjectDir,
+                       const std::string& activeProjectDir);
 
 // Feed one drained orchestrator event (kind with "orch_" already stripped). GL-thread only.
 void activeWorkFeedEvent(const std::string& kind, const nlohmann::json& data);

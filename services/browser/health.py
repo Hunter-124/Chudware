@@ -27,6 +27,8 @@ CANARY_QUERIES: dict[str, str] = {
     # original wave (T-X2/T-X7)
     "mcmaster": "m6 socket head cap screw",
     "grabcad": "nema 17 mount",
+    "printables": "MG90S",  # public API includes model 569094-micro-servo-mg90s
+    "makerworld": "MG90S",  # discovery may be browser-walled; acquire requires login
     "traceparts": "608 bearing",
     "amazon": "608zz bearing",
     "jlcpcb": "0603 resistor 10k",

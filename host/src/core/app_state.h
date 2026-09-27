@@ -974,6 +974,9 @@ struct AppState {
         // doc from a DELIBERATE mid-session New Part/Assembly is NOT a starter, so it always survives.
         bool        isStarter = false;
         std::string path;           // last saved file path ("" = never saved)
+        // Project folder that was active (convProjectDir) when this tab was first opened. Scopes
+        // never-saved agent docs in the AI workspace; a saved doc is scoped by `path` instead.
+        std::string projectDir;
 
         // Live MCP handoff mirror: this tab shows the part the external Chudware MCP engine is
         // building (pollAiCadHandoff opens it from %APPDATA%\Chudware\handoff\live.step+ and refreshes

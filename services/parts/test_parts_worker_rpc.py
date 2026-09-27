@@ -555,6 +555,26 @@ class TestDomainListSearch:
 
 
 class TestPartPlace:
+    @pytest.fixture(autouse=True)
+    def close_placed_docs(self, monkeypatch):
+        """Placements are native docs; do not leave them for the next agent test."""
+        from services.parts import worker_rpc
+        from services.mcp import core_bridge as cb
+
+        place = worker_rpc._part_place
+        created = []
+
+        def tracked(*args, **kwargs):
+            result = place(*args, **kwargs)
+            if isinstance(result, dict) and result.get("doc_id"):
+                created.append(result["doc_id"])
+            return result
+
+        monkeypatch.setattr(worker_rpc, "_part_place", tracked)
+        yield
+        for doc_id in created:
+            cb.call("doc_close", {"doc_id": doc_id})
+
     @pytest.fixture
     def placeable_part_id(self):
         """Return a fastener part_id with geometry_ref (geometry available for placement)."""

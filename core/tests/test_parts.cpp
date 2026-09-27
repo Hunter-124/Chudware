@@ -244,3 +244,58 @@ TEST_CASE("unknown family / size throws") {
     CHECK_THROWS_AS(build("nonesuch", "M3", 10.0, json::object()), std::invalid_argument);
     CHECK_THROWS_AS(build("shcs", "M99", 10.0, json::object()), std::invalid_argument);
 }
+
+TEST_CASE("hobby servo MG90S has TowerPro envelope, usable mounting pattern and output datum") {
+    // TowerPro A–F mechanical drawing: https://towerpro.com.tw/product/mg90s-3/
+    const json cat = catalog_json();
+    bool offered = false;
+    for (const json& family : cat["families"])
+        if (family["key"] == "hobby_servo")
+            offered = std::find(family["sizes"].begin(), family["sizes"].end(), "MG90S")
+                      != family["sizes"].end();
+    REQUIRE(offered);
+    const PartBuild pb = build("hobby_servo", "MG90S", 0, json::object());
+    REQUIRE(pb.ops.size() == 6);
+    const json& body = pb.ops[0]["feature"]["params"];
+    const json& flange = pb.ops[1]["feature"]["params"];
+    CHECK(body["length"]["value"].get<double>() == doctest::Approx(22.8));
+    CHECK(body["width"]["value"].get<double>() == doctest::Approx(12.4));
+    CHECK(body["height"]["value"].get<double>() == doctest::Approx(28.4));
+    CHECK(body["at"][0].get<double>() == doctest::Approx(-11.4));
+    CHECK(flange["length"]["value"].get<double>() == doctest::Approx(32.1));
+    CHECK(flange["at"][0].get<double>() == doctest::Approx(-16.05));
+    CHECK(flange["at"][2].get<double>() == doctest::Approx(18.5));
+    CHECK(flange["height"]["value"].get<double>() == doctest::Approx(2.5));
+    for (int i = 2; i <= 3; ++i) {
+        const json& hole = pb.ops[i]["feature"]["params"];
+        CHECK(hole["mode"] == "cut");
+        CHECK(hole["radius"]["value"].get<double>() == doctest::Approx(1.1));
+        CHECK(hole["at"][0].get<double>() == doctest::Approx(i == 2 ? -14.0 : 14.0));
+    }
+    const json& boss = pb.ops[4]["feature"]["params"];
+    const json& spline = pb.ops[5]["feature"]["params"];
+    CHECK(boss["at"][0].get<double>() == doctest::Approx(5.8));
+    CHECK(boss["radius"]["value"].get<double>() == doctest::Approx(3.0));
+    CHECK(boss["at"][2].get<double>() == doctest::Approx(28.4));
+    CHECK(spline["at"][2].get<double>() + spline["height"]["value"].get<double>()
+          == doctest::Approx(32.5));
+    CHECK(pb.meta["output_axis"]["origin"][0].get<double>() == doctest::Approx(5.8));
+    CHECK(pb.meta["output_axis"]["origin"][2].get<double>() == doctest::Approx(30.9));
+    CHECK(pb.meta["specs"]["spline_teeth"] == 20);
+    CHECK(pb.meta["specs"]["source"] == "https://towerpro.com.tw/product/mg90s-3/");
+}
+
+TEST_CASE("every advertised hobby servo size builds without assuming an interchangeable spline") {
+    const json cat = catalog_json();
+    for (const json& family : cat["families"]) {
+        if (family["key"] != "hobby_servo") continue;
+        for (const std::string size : family["sizes"].get<std::vector<std::string>>()) {
+            INFO(size);
+            const PartBuild pb = build("hobby_servo", size, 0, json::object());
+            CHECK(pb.ops.size() == 6);
+            CHECK(pb.meta["specs"]["source"].is_string());
+            CHECK(pb.meta["output_axis"]["axis"] == json::array({0, 0, 1}));
+        }
+    }
+    CHECK_THROWS_AS(build("hobby_servo", "UNKNOWN", 0, json::object()), std::invalid_argument);
+}

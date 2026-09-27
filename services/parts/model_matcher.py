@@ -1,22 +1,18 @@
 """model_matcher — deterministic product → CAD-model matcher (aicad.match_model/1).
 
-Given a discrete manufactured product that lacks a 3D model, fan out across the
-CAD-MODEL-YIELDING source adapters (grabcad, traceparts, content3d,
-freecadlibrary, ultralibrarian, componentsearchengine, snapeda, cadenas + the
-native-CAD vendors) and rank candidate models by IDENTITY confidence. There is
-NO LLM inside — same input, same output. The result envelope is documented in
+Given a discrete manufactured product that lacks a 3D model, fan out across
+CAD-model-yielding source adapters and rank candidates by identity confidence.
+The public Printables API remains available even when the compiled browser
+backend is absent. There is no LLM inside; the result follows
 contracts/sourcing.md §2a.
 
 Pipeline:
-  STEP 1 — resolve the product's MPN against the standard-hardware clean-room
-           tables (:func:`spec_sheet_matcher.match_part_number`). A hit IS the
-           answer (an ``exact``, ``attach:true`` match) — no repo search needed.
-  STEP 2 — fan out ``adapter.search(query)`` across the CAD-model sites, rank
-           each hit by confidence tier (exact / strong / weak). Only ``exact``
-           (normalized-MPN equality) auto-attaches. When no ``exact`` match
-           exists a ``reverse_engineer`` fallback (§2b) is offered — never
-           auto-started — seeded with the product identity (images/documents are
-           filled by the media-harvest step, left EMPTY here).
+  STEP 1 — resolve the product MPN against native standard-hardware tables.
+           A hobby servo keeps its exact standard geometry as a fallback while
+           still looking for downloadable community CAD.
+  STEP 2 — search available CAD model sites, rank exact/strong/weak matches.
+           Only exact MPN matches auto-attach; otherwise reverse engineering
+           is offered but never auto-started.
 
 Honesty: an adapter needing a human login contributes ZERO matches (it degrades
 to an ``ok:false`` login_required response) — counted for coverage, never a
@@ -66,6 +62,7 @@ _ssm = _Ssm()
 # direct scrape_import plan instead of round-tripping through find_model.
 CAD_MODEL_SITES = {
     "grabcad", "traceparts", "content3d", "3dcontentcentral", "freecadlibrary",
+    "printables", "makerworld",
     "ultralibrarian", "componentsearchengine", "snapeda", "cadenas", "mcmaster",
     "misumi", "boschrexroth", "hydraforce", "parker", "maxon", "orientalmotor",
     "anaheimautomation", "thk", "hiwin", "thomson", "igus",
@@ -168,17 +165,30 @@ def _classify(product: dict, hit: dict) -> str | None:
             return "strong"
 
     title = _first_str(hit, ("title",))
-    if title and product["title"] and _token_overlap(product["title"], title) > 0.0:
+    if title and _token_overlap(product["title"] or product["mpn"], title) > 0.0:
         return "weak"
     return None
 
 
 def _cad_adapters() -> list[Any]:
     try:
-        from services.browser import adapters as _adapters
-        return [a for a in _adapters.all_adapters()
-                if getattr(a, "key", None) in _CAD_MODEL_SITES]
-    except Exception:  # noqa: BLE001 — no browser stack → no repo search, RE fallback stands
+        from services.browser import adapters as _adapters, cef_client, driver
+        available = [a for a in _adapters.all_adapters()
+                     if getattr(a, "key", None) in _CAD_MODEL_SITES]
+        # This checkout can ship a CEF-OFF host binary: its daemon never starts.
+        # The cache exists alongside a developer build, whereas packaged CEF
+        # binaries have no CMakeCache and remain eligible for normal searches.
+        browser_ready = driver.backend_available(driver.headless_backend())
+        if driver.headless_backend() == "cef":
+            binary = cef_client.resolve_cef_bin()
+            cache = binary.parent.parent / "CMakeCache.txt" if binary else None
+            if binary is None or cache and cache.is_file() and (
+                    "CHUDWARE_ENABLE_CEF:BOOL=OFF" in cache.read_text()):
+                browser_ready = False
+        if not browser_ready:
+            available = [a for a in available if a.key == "printables"]
+        return sorted(available, key=lambda a: (a.key != "printables", a.key))
+    except Exception:  # noqa: BLE001 — no browser stack → RE fallback stands
         return []
 
 
@@ -236,9 +246,10 @@ def match_model(product: dict, *, limit: int = 8) -> dict:
     limit = max(1, min(int(limit or 8), 50))
     prod_out = {"title": prod["title"], "mpn": prod["mpn"], "brand": prod["brand"]}
 
-    # STEP 1 — standard-hardware resolution short-circuits the repo search.
+    # Standard hobby-servo geometry is a dependable local fallback, but do not
+    # hide downloadable vendor/community CAD from MG90S sourcing requests.
     std = _standard_match(prod)
-    if std is not None:
+    if std is not None and std.get("artifact_plan", {}).get("family") != "hobby_servo":
         return {
             "ok": True,
             "product": prod_out,
@@ -250,7 +261,7 @@ def match_model(product: dict, *, limit: int = 8) -> dict:
 
     # STEP 2 — fan out across CAD-model adapters.
     query = prod["mpn"] or (f"{prod['brand']} {prod['title']}".strip())
-    matches: list[dict] = []
+    matches: list[dict] = [std] if std is not None else []
     sites_searched = 0
     raw_hits = 0
     for adapter in _cad_adapters():

@@ -3,6 +3,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 import hashlib
 
+import math
+import os
+
 import pytest
 
 from services.agent import (
@@ -641,6 +644,75 @@ def test_pool_requires_proven_credential_and_preserves_credit_preflight(online_l
             {**params, "run_id": reason, "_chudware_actor": changed}, lambda event: None)
         assert denied["reason"] == reason
     assert len(online_lane.host.turns) == 1
+
+
+def test_pool_preflight_estimates_the_exact_sent_request(online_lane, monkeypatch):
+    from services.agent.online_turn import compose_request_text
+
+    actor = {
+        "email": "tenant@example.test", "plan": "studio",
+        "credits_remaining": 100, "key_source": "pool",
+        "_pool": {"provider": "openrouter", "api_key": "pool-secret"},
+        "_pool_key_sha256": hashlib.sha256(b"pool-secret").hexdigest(),
+    }
+    estimates = []
+
+    def preflight(_actor, *, prompt_tokens_estimate, max_output_tokens):
+        estimates.append(prompt_tokens_estimate)
+        return {"ok": True, "max_output_tokens": max_output_tokens}
+
+    monkeypatch.setattr(config, "pooled_credit_preflight", preflight)
+    result = worker_rpc._agent_admin_turn(
+        _params(
+            online_lane, run_id="preflight-same-text", provider="openrouter",
+            model="vendor/cheap", _chudware_actor=actor,
+            history=[{"role": "user", "text": "Earlier question"}],
+            scope={"doc_id": "selected-doc", "feature_ids": ["feature-7"]},
+        ),
+        lambda _event: None,
+    )
+    assert result["ok"]
+    sent = online_lane.host.turns[-1]["request"]
+    migration = worker_rpc._bounded_history_seed(
+        [{"role": "user", "text": "Earlier question"}]
+    )
+    editor = worker_rpc._editor_context_block(
+        {"scope": {"doc_id": "selected-doc", "feature_ids": ["feature-7"]}}
+    )
+    assert sent == compose_request_text("Do the work", migration, editor)
+    assert estimates == [max(1, math.ceil(len(sent.encode("utf-8")) / 4))]
+    followup = worker_rpc._agent_admin_turn(
+        _params(
+            online_lane, run_id="preflight-followup", provider="openrouter",
+            model="vendor/cheap", _chudware_actor=actor,
+            history=[{"role": "user", "text": "Earlier question"}],
+            scope={"doc_id": "selected-doc", "feature_ids": ["feature-7"]},
+        ),
+        lambda _event: None,
+    )
+    assert followup["ok"]
+    next_sent = online_lane.host.turns[-1]["request"]
+    assert next_sent == compose_request_text("Do the work", "", editor)
+    assert estimates[-1] == max(1, math.ceil(len(next_sent.encode("utf-8")) / 4))
+
+
+def test_crashed_turn_restores_workspace_and_credentials(online_lane, monkeypatch):
+    original_cwd = os.getcwd()
+    original = {
+        key: os.environ.get(key)
+        for key in ("CHUDWARE_FS_ROOT", "CHUDWARE_PROJECT_DIR", "CHUDWARE_PROJECT_SAVE_DIR")
+    }
+    clear_calls = []
+    monkeypatch.setattr(config, "clear_pooled_credentials", lambda: clear_calls.append(True))
+    online_lane.host.mode = "crash"
+    response = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="restore-after-crash"), lambda _event: None
+    )
+    assert response["ok"] is False
+    assert response["persistence"]["saved"] == ["part.step+"]
+    assert os.getcwd() == original_cwd
+    assert {key: os.environ.get(key) for key in original} == original
+    assert len(clear_calls) == 2
 
 
 @pytest.mark.parametrize(

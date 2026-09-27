@@ -43,10 +43,19 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "the part record."
         ),
     },
+    "fetch_cad_model": {
+        "prompt_note": (
+            "Use for a specific CAD model page or STEP/IGES URL found after "
+            "checking the parts library and product matches. Returns a sourced "
+            "artifact and, by default, imports it; with import_part=False pass "
+            "artifact_path to import_artifact. A page is not dimensional evidence."
+        ),
+        "timeout_s": 180,
+    },
     "import_artifact": {
         "prompt_note": (
-            "Second step of the scrape lane — only call with an artifact_path "
-            "from a done scrape job (scrape_queue_status); afterwards "
+            "Import an acquired CAD artifact_path (from a done scrape job or "
+            "fetch_cad_model(import_part=False)); afterwards "
             "reverse_engineer(source=doc_id) can recover features."
         ),
     },
@@ -58,9 +67,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "match_model": {
         "prompt_note": (
-            "For branded products (MPN/brand, no standard designation). On no "
-            "confident repo match, follow fallback.how — usually "
-            "reverse_engineer_product."
+            "For a discrete branded product (MPN/brand) after checking catalog "
+            "parts. Only exact/attach:true matches can auto-place; confirm "
+            "ambiguous identities, or use a known CAD URL with fetch_cad_model."
         ),
     },
     "match_part_number": {
@@ -84,16 +93,17 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "part_search": {
         "prompt_note": (
-            "Use when you know the designation or category; for a plain-language "
-            "need start with part_source instead. Rows are compact — part_get "
-            "for the full record."
+            "First stop for catalog/standard hardware by designation or "
+            "category (e.g. MG90S, 608 bearing, M3 screw). Rows are compact "
+            "— part_get for the full record."
         ),
     },
     "part_source": {
         "prompt_note": (
-            "One call for 'I need X with dims' — each candidate carries an "
-            "artifact_plan (part_place / scrape_enqueue+import_artifact / "
-            "make_standard_part); follow it, don't re-search."
+            "Rank a plain-language product need and follow its candidate's "
+            "artifact_plan (part_place / scrape_import / make_standard_part / "
+            "find_model / fetch_cad_model). Confirm uncertain identities; "
+            "do not re-search indefinitely."
         ),
     },
     "parts_taxonomy": {

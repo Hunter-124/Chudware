@@ -3139,8 +3139,8 @@ def test_asm_mate_on_a_saved_assembly_resolves_relative_component_sources(
     pin_path = str(parts / "rel_pin.step+")
     assert _call("save_part", {"doc_id": pin, "path": pin_path})[0]["ok"]
 
-    # Rover Review's components are stored relative to the assembly file; build that shape
-    # directly (asm_add_component itself records absolute paths).
+    # Legacy saved assemblies may still contain sibling references outside the
+    # assembly directory; they must keep resolving against the assembly file.
     asm = _call("new_assembly", {"name": "rel_asm"})[0]["doc_id"]
     saved = str(asm_dir / "rel_asm.step+")
     cb.call("doc_save", {"doc_id": asm, "path": saved})
@@ -3152,27 +3152,96 @@ def test_asm_mate_on_a_saved_assembly_resolves_relative_component_sources(
          "name": "Plate", "fixed": True, "transform": ident},
         {"op": "asm_insert_component", "source": {"path": "../Frame/rel_pin.step+"},
          "name": "Pin", "fixed": False, "transform": pin_pose}]})
-    cb.call("doc_save", {"doc_id": asm, "path": saved})
-    cb.call("doc_close", {"doc_id": asm})
-    reopened = cb.call("doc_open", {"path": saved})["doc_id"]
     elsewhere = tmp_path / "worker" / "cwd"  # ../Frame from here is NOT the parts folder
     elsewhere.mkdir(parents=True)
     monkeypatch.chdir(elsewhere)
     try:
-        comps = cb.call("doc_tree", {"doc_id": reopened})["tree"]["components"]
-        sources = [(c.get("source") or {}).get("path") for c in comps]
-        assert all(s and not os.path.isabs(s) for s in sources), sources
-        ids = [c["id"] for c in comps]
-        r, _ = _call("asm_mate", {"doc_id": reopened, "mate_type": "concentric",
+        ids = [c["id"] for c in cb.call("doc_tree", {"doc_id": asm})["tree"]["components"]]
+        r, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric",
                                   "a": {"component": ids[0],
                                         "query": {"of": "face", "surf": "round"}},
                                   "b": {"component": ids[1],
                                         "query": {"of": "face", "surf": "round"}}})
         assert r["ok"], r
+        cb.call("doc_save", {"doc_id": asm, "path": saved})
+    finally:
+        cb.call("doc_close", {"doc_id": asm})
+    reopened = cb.call("doc_open", {"path": saved})["doc_id"]
+    try:
+        comps = cb.call("doc_tree", {"doc_id": reopened})["tree"]["components"]
+        sources = [(c.get("source") or {}).get("path") for c in comps]
+        assert sources == [plate_path, pin_path], sources
+        r, _ = _call("describe_assembly", {"doc_id": reopened})
+        assert len(r["bodies"]) == 2, r
     finally:
         cb.call("doc_close", {"doc_id": reopened})
         _call("close_part", {"doc_id": pin})
         _call("close_part", {"doc_id": plate})
+
+
+def test_saved_assembly_rebases_component_sources_when_project_moves(tmp_path, monkeypatch):
+    import shutil
+    import zipfile
+
+    original = tmp_path / "original"
+    relocated = tmp_path / "relocated"
+    (original / "parts").mkdir(parents=True)
+    external = tmp_path / "external.step+"
+    r, _ = _call("new_part", {"name": "portable_box"})
+    part = r["doc_id"]
+    try:
+        added, _ = _call("add_features", {"doc_id": part, "ops": [
+            cb.feat("box", "Body", {"length": cb.dim(12), "width": cb.dim(10),
+                                    "height": cb.dim(8)})]})
+        assert added["ok"], added
+        inside = original / "parts" / "portable_box.step+"
+        assert _call("save_part", {"doc_id": part, "path": str(inside)})[0]["ok"]
+        shutil.copyfile(inside, external)
+    finally:
+        _call("close_part", {"doc_id": part})
+
+    asm = _call("new_assembly", {"name": "portable_assembly"})[0]["doc_id"]
+    source_file = original / "portable_assembly.step+"
+    cb.call("doc_save", {"doc_id": asm, "path": str(source_file)})
+    try:
+        for path, name, position in (("parts/portable_box.step+", "inside", [0, 0, 0]),
+                                     (external, "external", [100, 0, 0])):
+            inserted, _ = _call("asm_add_component", {
+                "doc_id": asm, "path": str(path), "name": name,
+                "fixed": True, "at": position})
+            assert inserted["ok"], inserted
+        saved, _ = _call("save_part", {"doc_id": asm, "path": str(source_file)})
+        assert saved["ok"], saved
+        with zipfile.ZipFile(source_file) as archive:
+            stored = json.loads(archive.read("document.json"))
+            paths = {c["name"]: c["source"]["path"] for c in stored["components"]}
+            assert paths == {"inside": "parts/portable_box.step+",
+                             "external": str(external)}, paths
+            assert "cache.json" in archive.namelist()
+            cache = json.loads(archive.read("cache.json"))
+            assert cache["components"][0]["path"] == paths["inside"]
+            assert cache["components"][1]["path"] == paths["external"]
+            assert (cache["response"]["tree"]["components"][0]["source"]["path"]
+                    == paths["inside"])
+        live = cb.call("doc_tree", {"doc_id": asm})["tree"]["components"]
+        assert live[0]["source"]["path"] == paths["inside"]
+    finally:
+        _call("close_part", {"doc_id": asm})
+
+    shutil.move(str(original), str(relocated))
+    monkeypatch.chdir(tmp_path)
+    opened = cb.call("doc_open", {"path": str(relocated / source_file.name)})
+    assert opened.get("cache_hit") is True, opened
+    reopened = opened["doc_id"]
+    try:
+        report, _ = _call("describe_assembly", {"doc_id": reopened})
+        assert report["ok"] and len(report["bodies"]) == 2, report
+        checked, _ = _call("check_interference", {"doc_id": reopened})
+        assert checked["ok"] and not checked["interferences"], checked
+    finally:
+        _call("close_part", {"doc_id": reopened})
+
+
 
 def test_asm_mate_operand_shapes(tmp_path):
     """Class-2/4 selector-shape gaps in asm_mate `a`/`b` — hunted alongside cad_doc_tools'

@@ -2839,6 +2839,7 @@ def _run_turn_impl(
         resume, so parking on would strand the sub-agent forever.
         """
         started = time.monotonic()
+        next_heartbeat = started
         _sreg.set_status(subagent_id, "paused", note="pause hold active")
         note = (
             "Pause hold entered; work already in flight finished before "
@@ -2847,7 +2848,11 @@ def _run_turn_impl(
         _sreg.append_transcript(subagent_id, "system", note)
         _raw_lifecycle(subagent_id, _sreg, "paused", note)
         while True:
-            elapsed = time.monotonic() - started
+            now = time.monotonic()
+            if now >= next_heartbeat:
+                _sreg.heartbeat(subagent_id)
+                next_heartbeat = now + 30.0
+            elapsed = now - started
             if _sreg.terminate_requested(subagent_id):
                 return "terminate", elapsed
             if not _sreg.is_paused(subagent_id):
@@ -2915,6 +2920,7 @@ def _run_turn_impl(
             _sreg = None
             try:
                 from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+                _sreg.heartbeat(subagent_id)
 
                 _terminate = bool(_sreg.terminate_requested(subagent_id))
             except Exception:  # noqa: BLE001 — an unreadable control plane is not a stop

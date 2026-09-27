@@ -1,10 +1,10 @@
 ---
 name: source-parts
-description: Find and place standard parts from the library — correct search phrasing, taxonomy facets, part_source for plain-language needs, never hand-model catalog hardware.
+description: Acquire sourced catalog hardware or product CAD before modeling around it — search, match, fetch, verify and place with provenance.
 inject: auto
 triggers:
-  keywords: [fastener, screw, bolt, bearing, purchase, catalog, off the shelf, standard part, McMaster, MISUMI, source a, source an, source the, nema, stepper, nut, washer, standoff, dowel pin, o-ring]
-  tools: [part_search, part_place, part_source, parts_taxonomy, bom_rollup]
+  keywords: [fastener, screw, bolt, bearing, purchase, catalog, off the shelf, standard part, McMaster, MISUMI, source a, source an, source the, servo, micro servo, MG90S, SG90, MG996R, stepper, NEMA, motor, actuator, reference model, STEP file, grabcad, printables, nut, washer, standoff, dowel pin, o-ring]
+  tools: [part_search, part_place, part_source, match_model, make_standard_part, fetch_cad_model, import_artifact, parts_taxonomy, bom_rollup]
   phases: []
 ---
 
@@ -25,15 +25,14 @@ Prefer **spec-like queries** over prose:
 
 Avoid: "a small bolt", "bearing for the shaft" without size.
 
-## Sequence
+## Reference acquisition order
 
-1. Browse if lost: `parts_taxonomy(node_id?)`.
-2. Narrow: `part_search(query, category_id?, facets?)` — use facet keys the taxonomy returns.
-3. Plain-language need: `part_source(need, constraints?)` → scored candidates each with `artifact_plan` (`part_place` | scrape | `make_standard_part`).
-4. Place: `part_place(part_id)` — editable, sourced, BOM-ready.
-5. Vendors: `vendors_health()`; if `needs_human_login`, ask the human to `vendor_login` — never fabricate stock/price.
-6. CAM tools from catalog: `cam_tool_import(part_id)` when cutting tools are needed.
-7. After several placements: `bom_rollup()` → optional `bom_price()`.
+1. `part_search` / `make_standard_part` for catalog and standard parts (servos, steppers, bearings, fasteners, extrusions); use `part_get` to confirm dimensions, `list_standard_parts` for family/size keys, and `part_place` for a catalog record.
+2. `match_model` / `part_source` for a discrete product's CAD. Follow the candidate's artifact plan; confirm ambiguous product identities.
+3. `fetch_cad_model(url)` for a specific model page or STEP/IGES file found by web search; if `import_part=False`, pass its `artifact_path` to `import_artifact`.
+4. Web search only for specs/datasheets absent from the library. Then COMMIT to cited dimensions with clearance and build; never loop on research. For an MG90S six-axis arm, search MG90S first, use its referenced servo envelope and mount dimensions, then design mating brackets.
+
+Browse `parts_taxonomy(node_id?)` for facet keys when needed. Vendors requiring human login need `vendor_login`; never invent stock or price. Use `cam_tool_import(part_id)` for catalog cutting tools and `bom_rollup()` after placements (optionally `bom_price()`).
 
 ## Rules
 

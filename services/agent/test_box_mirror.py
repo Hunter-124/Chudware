@@ -2,8 +2,7 @@
 
 No network: every test monkeypatches ``box_mirror._http`` with an in-memory
 fake of the three Box surfaces the mirror touches (folders, uploads, oauth
-token). Config/appdata land in tmp_path via the same ``services.paths``
-monkeypatch pattern test_effort.py uses.
+token). Config/appdata land in tmp_path via a ``services.paths`` monkeypatch.
 """
 from __future__ import annotations
 

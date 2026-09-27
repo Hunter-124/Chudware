@@ -45,6 +45,29 @@ json op_cylinder(const std::string& name, double r, double h, double z0,
     op["feature"] = feat;
     return op;
 }
+// Servo case and cross-case mounting flange: false-centered boxes sit on z0,
+// while x/y remain centered on the footprint.
+json op_box(const std::string& name, double l, double w, double h, double z0,
+            const std::string& mode) {
+    json p;
+    p["length"] = dim(l);
+    p["width"] = dim(w);
+    p["height"] = dim(h);
+    p["at"] = json::array({-l / 2.0, -w / 2.0, z0});
+    p["centered"] = false;
+    p["mode"] = mode;
+    p["merge"] = true;
+    return {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", name},
+                                                 {"params", std::move(p)}}}};
+}
+
+json op_servo_cylinder(const std::string& name, double r, double h,
+                       double x, double z0, const std::string& mode) {
+    json op = op_cylinder(name, r, h, z0, mode);
+    op["feature"]["params"]["at"][0] = x;
+    return op;
+}
+
 
 // Truncated cone, base radius r1 at z0, top radius r2 at z0+h (90° csink head etc.).
 json op_cone(const std::string& name, double r1, double r2, double h, double z0,
@@ -177,6 +200,7 @@ PartBuild build(const std::string& family, const std::string& size_in,
                 double length_mm, const json& options) {
     json ops = json::array();
     json specs;
+    json output_axis;
     std::string name;
 
     if (family.empty())
@@ -322,6 +346,33 @@ PartBuild build(const std::string& family, const std::string& size_in,
         ops.push_back(op_cylinder("bore", b->bore / 2.0, b->width + 2.0, -1.0, "cut"));
         specs = {{"bore", b->bore}, {"od", b->od}, {"width", b->width}};
         name = "Bearing " + size;
+    } else if (family == "hobby_servo") {
+        const data::HobbyServoRow* s = data::find_hobby_servo(size);
+        if (!s) bad("unknown hobby servo: " + size);
+        const double shaft_x = s->body_l / 2.0 - s->shaft_from_end;
+        ops.push_back(op_box("case body", s->body_l, s->body_w, s->body_h, 0.0, "boss"));
+        ops.push_back(op_box("mounting flange", s->tab_span, s->body_w,
+                             s->tab_thickness, s->tab_bottom_z, "boss"));
+        for (double x : {-s->hole_pitch / 2.0, s->hole_pitch / 2.0}) {
+            ops.push_back(op_servo_cylinder(x < 0 ? "mount hole -X" : "mount hole +X",
+                                             s->hole_d / 2.0, s->tab_thickness + 2.0,
+                                             x, s->tab_bottom_z - 1.0, "cut"));
+        }
+        ops.push_back(op_servo_cylinder("output boss", s->boss_d / 2.0,
+                                         s->boss_h, shaft_x, s->body_h, "boss"));
+        ops.push_back(op_servo_cylinder("output spline envelope", s->shaft_d / 2.0,
+                                         s->shaft_h, shaft_x, s->body_h + s->boss_h, "boss"));
+        output_axis = {{"origin", {shaft_x, 0.0, s->body_h + s->boss_h}},
+                       {"axis", {0, 0, 1}}};
+        specs = {{"body_l", s->body_l}, {"body_w", s->body_w}, {"body_h", s->body_h},
+                 {"tab_span", s->tab_span}, {"tab_thickness", s->tab_thickness},
+                 {"tab_bottom_z", s->tab_bottom_z}, {"hole_d", s->hole_d},
+                 {"hole_pitch", s->hole_pitch}, {"shaft_from_end", s->shaft_from_end},
+                 {"boss_d", s->boss_d}, {"boss_h", s->boss_h},
+                 {"shaft_d", s->shaft_d}, {"shaft_h", s->shaft_h},
+                 {"spline_teeth", s->spline_teeth},
+                 {"source", s->source}, {"notes", s->notes}};
+        name = "Hobby Servo " + size;
     } else {
         bad(std::string("unknown part family: \"") + family +
             "\"; valid families: " + family_keys_csv());
@@ -331,6 +382,7 @@ PartBuild build(const std::string& family, const std::string& size_in,
     pb.name = name;
     pb.ops = std::move(ops);
     pb.meta = {{"family", family}, {"size", size}, {"length_mm", length_mm}, {"specs", specs}};
+    if (!output_axis.is_null()) pb.meta["output_axis"] = std::move(output_axis);
     return pb;
 }
 

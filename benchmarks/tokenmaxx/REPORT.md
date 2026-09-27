@@ -48,10 +48,8 @@ All numbers below come from `results/matrix.json`, produced by `bench.py` on a
    `~/.local/share/Chudware/llamacpp/build-cuda/` — **no pin change, bundled binary
    untouched.** GPU offload verified (E4B load: VRAM 264→3706 MB, no fallback warning).
    **Recommendation: production should ship a CUDA build.**
-2. **Version mismatch:** `local_runtime.py` / `model_manager` claim pin **b9871**; the
-   installed source + binary are **b9860** (`fdb1db8`). b9860 ≥ b8637 so Gemma 4 runs
-   fine — no functional bump needed — but the pin string is wrong. Lead should reconcile
-   the constant or the install.
+2. **Pin at benchmark time:** the installed source and binary were b9860
+   (`fdb1db8`); the now-removed local-runtime module had claimed b9871.
 
 ## Model provenance
 
@@ -140,16 +138,14 @@ on-GPU here anyway.
 
 ---
 
-## Transformers GPU backend seam (DoD)
+## Transformers GPU backend seam (historical DoD)
 
-`services/agent/local_runtime.py` gained an **extras-guarded** `TransformersBackend` +
-`select_backend()` (env `CHUDWARE_LOCAL_BACKEND` / cfg `local_backend`). Proven to actually
-run on the 3080 Ti (`results/transformers_backend_seam.json`): loaded Qwen2.5-0.5B fp16,
-988 MB VRAM, emitted valid JSON. In the **gate venv** (no torch) it degrades honestly —
-`transformers_available()=False`, `TransformersBackend(...)` raises `BackendUnavailable`;
-6 gate-safe tests (`TestBackendSeam`) cover this. torch/transformers live in a **separate
-venv**: `~/.local/share/Chudware/torch-venv` (torch 2.6.0+cu124, transformers 5.13.0) —
-never the gate venv. This is the seam T-W27 gym cycle 2 selects by config, not a fork.
+The experiment used a now-removed local-runtime module with an extras-guarded
+`TransformersBackend` and `select_backend()`. It was proven on the 3080 Ti
+(`results/transformers_backend_seam.json`): Qwen2.5-0.5B fp16 used 988 MB VRAM
+and emitted valid JSON. At the time, six gate-safe tests covered the no-torch
+behavior, while torch/transformers lived in a separate venv. This backend was
+not wired into production and has since been removed.
 Note: the transformers path has **no GBNF engine**, so structured output there is
 prompted-JSON + `validate_handoff` — the same asymmetry the diffusion NO-GO hinges on.
 
@@ -220,7 +216,4 @@ export TOKENMAXX_LLAMA_SERVER=~/.local/share/Chudware/llamacpp/build-cuda/bin/ll
 ~/.local/share/Chudware/mcp-venv/bin/python benchmarks/tokenmaxx/bench.py \
     --models qwen3-4b gemma3-4b-qat gemma4-e4b --parallel 1 2 4 8 --trials 6
 # results -> benchmarks/tokenmaxx/results/{matrix.json,<model>.json}
-# transformers seam proof (separate torch venv):
-~/.local/share/Chudware/torch-venv/bin/python -c "import sys; sys.path.insert(0,'.'); \
-    from services.agent import local_runtime as lr; print(lr.transformers_available())"
 ```

@@ -291,12 +291,20 @@ static void wantVendorLogo(const std::string& site) {
     g_logoQueue.push_back(site);
 }
 
-// Client-side result sort, shared by the initial local search and each live append
-// so the merged list stays ordered as vendor results trickle in. Relevance (0) keeps
-// the backend order (local first, then live in arrival order).
+// Shared by the instant local results and streamed CAD candidates. Relevance (0)
+// keeps insertable standards before community models, then uses backend identity
+// scores; ties retain local/index/vendor order.
 static void applyResultSort() {
     auto& v = S().results;
     switch (S().sortMode) {
+        case 0: std::stable_sort(v.begin(), v.end(),
+                    [](const PartsItem& a, const PartsItem& b) {
+                        const bool standardA = a.source == "local" && a.placeable;
+                        const bool standardB = b.source == "local" && b.placeable;
+                        if (standardA != standardB) return standardA;
+                        return a.score > b.score;
+                    });
+                break;
         case 1: std::stable_sort(v.begin(), v.end(),
                     [](const PartsItem& a, const PartsItem& b) {
                         if ((a.priceUsd > 0) != (b.priceUsd > 0)) return a.priceUsd > 0;
@@ -320,6 +328,7 @@ static PartsItem itemFromJson(const nlohmann::json& it) {
     item.vendor      = it.value("vendor",      "");
     item.partNumber  = it.value("part_number", "");
     item.description = it.value("description", "");
+    item.fileName    = it.value("file_name",   "");
     item.unit        = it.value("unit",        "ea");
     item.material    = it.value("material",    "");
     item.domain      = it.value("domain",      "");
@@ -328,6 +337,12 @@ static PartsItem itemFromJson(const nlohmann::json& it) {
     item.datasheet   = it.value("datasheet",   "");
     item.imageUrl    = it.value("image_url",   "");
     item.license     = it.value("license",     "");
+    if (it.contains("sizes") && it["sizes"].is_array())
+        for (const auto& size : it["sizes"])
+            if (size.is_string()) item.sizes.push_back(size.get<std::string>());
+    item.score       = it.value("score",       0);
+    if (it.contains("insert_params") && it["insert_params"].is_object())
+        item.lengthMm = it["insert_params"].value("length_mm", 0.0);
     item.priceUsd    = it.value("price_usd",   0.0);
     item.downloaded  = it.value("downloaded",  false);
     item.placeable   = it.value("placeable",   false);
@@ -440,8 +455,8 @@ void doSearch(AppState& st) {
         if (r.result.contains("results"))
             for (auto& it : r.result["results"])
                 S().results.push_back(itemFromJson(it));
-        // Client-side sort (relevance = backend order). 1 = price low→high (zero-price
-        // last), 2 = price high→low, 3 = name.
+        // Client-side sort: relevance by score, 1 = price low→high (zero last),
+        // 2 = price high→low, 3 = name.
         applyResultSort();
         // Local results are up — now stream live vendor hits in the background so the
         // slow browser fan-out never blocks the initial paint. Skipped when the user
@@ -668,8 +683,9 @@ void startLiveSearch(AppState& st) {
     st.rpc.call("parts_search_live_start", p, [gen, &st](const core::RpcResult& r) {
         if (gen != g_searchGen) return;   // superseded by a newer query
         if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) return;
+        collectNotices(r.result);
         std::string token = r.result.value("token", "");
-        if (token.empty() || r.result.value("done", false)) return;  // no live vendors
+        if (token.empty() || r.result.value("done", false)) return;
         S().liveToken     = token;
         S().liveCursor    = 0;
         S().liveSearching = true;
@@ -697,9 +713,13 @@ void pollLiveSearch(AppState& st) {
         bool appended = false;
         if (r.result.contains("results"))
             for (auto& it : r.result["results"]) {
-                S().results.push_back(itemFromJson(it));
-                S().hasLive = true;
-                appended = true;
+                PartsItem item = itemFromJson(it);
+                if (std::none_of(S().results.begin(), S().results.end(),
+                                 [&item](const PartsItem& existing) { return existing.id == item.id; })) {
+                    S().results.push_back(std::move(item));
+                    S().hasLive = true;
+                    appended = true;
+                }
             }
         collectNotices(r.result);
         applyLiveVendors(st, r.result);
@@ -712,11 +732,87 @@ void pollLiveSearch(AppState& st) {
     });
 }
 
+// Standard-part placement and downloaded CAD both yield editable native documents.
+// Open either through the same mirror/viewport path, rather than leaving a doc
+// silently created in the worker with no tab in the user's workspace.
+static void activatePartDocument(AppState& st, const std::string& doc,
+                                 const std::string& name, bool standardInsert) {
+    st.rpc.call("doc_activate", {{"doc_id", doc}},
+        [&st, name, doc, standardInsert](const core::RpcResult& response) {
+            if (standardInsert) S().insertBusy = false;
+            if (st.asmPanels) st.asmPanels->closeAllToolForms(st);
+            std::string aicm, err;
+            const bool wasSuppressing = st.suppressTabDirty;
+            st.suppressTabDirty = true;
+            const bool activated = response.ok && response.result.is_object() &&
+                st.docMirror.adoptActivateResponse(doc, response.result, aicm, err);
+            st.suppressTabDirty = wasSuppressing;
+            if (!activated) {
+                if (!response.ok) err = response.err;
+                S().insertNote = "Created " + name + " (" + doc +
+                                 "), but could not open it: " + err;
+                S().insertError = true;
+                st.toast(ui::ToastLevel::Warn, S().insertNote);
+                return;
+            }
+            int existing = -1;
+            for (int i = 0; i < static_cast<int>(st.docTabs.size()); ++i)
+                if (st.docTabs[i].docId == doc) { existing = i; break; }
+            if (existing >= 0) {
+                st.docTabs[existing].userAdopted = true;
+                if (st.activeTab == existing) {
+                    st.clearViewportForNewDoc();
+                    st.applyDocDrivenVisibility(st.docMirror.tree());
+                    if (!aicm.empty()) st.loadDocMeshAsync(aicm);
+                } else {
+                    st.switchToTab(existing);
+                }
+            } else {
+                st.clearViewportForNewDoc();
+                st.applyDocDrivenVisibility(st.docMirror.tree());
+                st.addDocTab(false);
+                if (!aicm.empty()) st.loadDocMeshAsync(aicm);
+            }
+            st.activeWorkspace = AppState::Workspace::Model;
+            S().insertError = false;
+            S().insertNote = (standardInsert ? "Created " : "Imported ") + name + " as a new part";
+            st.toast(ui::ToastLevel::Success, S().insertNote);
+        });
+}
+
+void importQueuedArtifact(AppState& st, const std::string& id, const std::string& artifactPath) {
+    S().autoImportJobs.erase(id);
+    for (auto& job : S().queue)
+        if (job.id == id) job.importing = true;
+    st.rpc.call("parts_import_artifact", {{"artifact_path", artifactPath}},
+        [&st, id](const core::RpcResult& r) {
+            std::string label = "CAD model";
+            for (auto& job : S().queue)
+                if (job.id == id) {
+                    job.importing = false;
+                    label = job.site + " CAD model";
+                }
+            const bool ok = r.ok && r.result.is_object() && r.result.value("ok", false);
+            if (!ok) {
+                const std::string why = r.ok && r.result.is_object()
+                    ? r.result.value("reason", std::string("import failed")) : r.err;
+                st.toast(ui::ToastLevel::Error, "Import failed: " + why);
+                return;
+            }
+            const std::string doc = r.result.value("doc_id", std::string());
+            if (doc.empty()) {
+                st.toast(ui::ToastLevel::Error, "Import returned no editable document");
+                return;
+            }
+            activatePartDocument(st, doc, label, false);
+        });
+}
+
 void pollQueue(AppState& st) {
     if (S().queuePolling) return;
     S().queuePolling  = true;
     S().lastQueuePoll = ImGui::GetTime();
-    st.rpc.call("parts_queue_status", {}, [](const core::RpcResult& r) {
+    st.rpc.call("parts_queue_status", {}, [&st](const core::RpcResult& r) {
         S().queuePolling = false;
         if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) return;
         // Preserve per-job "importing" spinners across refreshes.
@@ -740,6 +836,13 @@ void pollQueue(AppState& st) {
             }
         S().queue       = std::move(jobs);
         S().queueActive = active;
+        for (const auto& job : S().queue) {
+            if (!S().autoImportJobs.count(job.id)) continue;
+            if (job.status == "done" && !job.artifactPath.empty())
+                importQueuedArtifact(st, job.id, job.artifactPath);
+            else if (job.status == "error" || job.status == "cancelled")
+                S().autoImportJobs.erase(job.id);
+        }
     });
 }
 
@@ -747,13 +850,19 @@ void queueDownload(AppState& st, const PartsItem& item) {
     nlohmann::json p;
     p["item_id"] = item.id;
     p["name"]    = item.name;
-    st.rpc.call("parts_download", p, [&st, name = item.name](const core::RpcResult& r) {
+    st.rpc.call("parts_download", p, [&st, name = item.name, community =
+        item.id.rfind("catalog:printables::", 0) == 0 ||
+        item.id.rfind("catalog:makerworld::", 0) == 0](const core::RpcResult& r) {
         bool ok = r.ok && r.result.is_object() && r.result.value("ok", false);
         if (ok && r.result.value("downloaded", false)) {
             st.toast(ui::ToastLevel::Info, name + ": local library part — use Insert to place it");
             return;
         }
         if (ok) {
+            if (community) {
+                const std::string id = r.result.value("id", std::string());
+                if (!id.empty()) S().autoImportJobs.insert(id);
+            }
             st.toast(ui::ToastLevel::Success, "Queued download: " + name);
             S().queueActive = true;
             pollQueue(st);
@@ -784,6 +893,7 @@ void insertItem(AppState& st, const PartsItem& item) {
     st.toast(ui::ToastLevel::Info, S().insertNote);
     nlohmann::json p;
     p["item_id"] = item.id;
+    if (item.lengthMm > 0.0) p["params"] = {{"length_mm", item.lengthMm}};
     if (intoAssembly) {
         p["project_dir"] = projectDir;
         st.rpc.call("parts_prepare_for_assembly", p,
@@ -840,48 +950,7 @@ void insertItem(AppState& st, const PartsItem& item) {
                 // Mechanical placement creates a separate editable document, not an
                 // assembly component. Open that document so the result cannot be lost.
                 // Activation may compile the new part; do it off the GL thread.
-                st.rpc.call("doc_activate", {{"doc_id", doc}},
-                    [&st, name, doc](const core::RpcResult& activatedResult) {
-                        S().insertBusy = false;
-                        if (st.asmPanels) st.asmPanels->closeAllToolForms(st);
-                        std::string aicm, err;
-                        const bool wasSuppressing = st.suppressTabDirty;
-                        st.suppressTabDirty = true;
-                        const bool activated = activatedResult.ok &&
-                            activatedResult.result.is_object() &&
-                            st.docMirror.adoptActivateResponse(
-                                doc, activatedResult.result, aicm, err);
-                        st.suppressTabDirty = wasSuppressing;
-                        if (!activated) {
-                            if (!activatedResult.ok) err = activatedResult.err;
-                            S().insertNote = "Created " + name + " as a new part (" + doc +
-                                             "), but could not open it: " + err;
-                            S().insertError = true;
-                            st.toast(ui::ToastLevel::Warn, S().insertNote);
-                            return;
-                        }
-                        int existing = -1;
-                        for (int i = 0; i < static_cast<int>(st.docTabs.size()); ++i)
-                            if (st.docTabs[i].docId == doc) { existing = i; break; }
-                        if (existing >= 0) {
-                            st.docTabs[existing].userAdopted = true;
-                            if (st.activeTab == existing) {
-                                st.clearViewportForNewDoc();
-                                st.applyDocDrivenVisibility(st.docMirror.tree());
-                                if (!aicm.empty()) st.loadDocMeshAsync(aicm);
-                            } else {
-                                st.switchToTab(existing);
-                            }
-                        } else {
-                            st.clearViewportForNewDoc();
-                            st.applyDocDrivenVisibility(st.docMirror.tree());
-                            st.addDocTab(false);
-                            if (!aicm.empty()) st.loadDocMeshAsync(aicm);
-                        }
-                        st.activeWorkspace = AppState::Workspace::Model;
-                        S().insertNote = "Created " + name + " as a new part";
-                        st.toast(ui::ToastLevel::Success, S().insertNote);
-                    });
+                activatePartDocument(st, doc, name, true);
             } else {
                 S().insertBusy = false;
                 S().insertNote = "Prepared " + name + "; no new part document was created";
@@ -1509,12 +1578,18 @@ void drawPartsLibraryWorkspace(AppState& st) {
             ImGui::PopStyleColor();
             if (S().fonts && S().fonts->body) ImGui::PopFont();
         }
-        // Subtle one-line hint for per-site skip notices (login_required stubs).
         if (!S().notices.empty()) {
-            char hint[128];
-            std::snprintf(hint, sizeof(hint), "%d vendor%s need sign-in — see Vendors",
-                          (int)S().notices.size(), S().notices.size() == 1 ? "" : "s");
-            ImGui::TextDisabled("%s", hint);
+            int unavailable = 0, signIn = 0, other = 0;
+            for (const auto& n : S().notices) {
+                if (n.reason == "cef_unavailable") ++unavailable;
+                else if (n.reason == "login_required") ++signIn;
+                else ++other;
+            }
+            if (unavailable) ImGui::TextDisabled("Browser vendors unavailable in this build · public CAD search still works");
+            if (signIn) ImGui::TextDisabled("%d vendor%s require sign-in · see Vendors",
+                                           signIn, signIn == 1 ? "" : "s");
+            if (other) ImGui::TextDisabled("%d source%s could not be searched",
+                                          other, other == 1 ? "" : "s");
             if (ImGui::IsItemHovered()) {
                 std::string tip;
                 for (const auto& n : S().notices) {

@@ -106,6 +106,82 @@ def test_web_search_provider_error_degrades():
     assert out["ok"] is False and out["reason"] == "network"
 
 
+def test_web_search_relaxes_empty_query_once_before_success():
+    calls = []
+
+    class _Search(MockSearchProvider):
+        def search(self, query, max_results=5):
+            calls.append(query)
+            if query == "MG90S servo datasheet dimensions":
+                return {"results": [{"title": "Servo", "url": "https://ex/servo"}],
+                        "answer": None, "confidence": "limited"}
+            return {"results": [], "answer": None, "confidence": "limited"}
+
+    query = "MG90S servo datasheet dimensions 22.8 x 12.2 mounting hole spacing 27.8 output shaft offset"
+    with _OfflineToggle(False):
+        out = research.web_search(query, provider=_Search())
+    assert out["ok"] and out["source_url"] == "https://ex/servo"
+    assert out["searched_query"] == "MG90S servo datasheet dimensions"
+    assert calls == [query, out["searched_query"]]
+
+
+def test_web_search_zero_results_reports_provider_and_never_claims_success():
+    with _OfflineToggle(False):
+        out = research.web_search("MG90S servo datasheet", provider=MockSearchProvider())
+    assert out["ok"] is False and out["reason"] == "no_results"
+    assert out["providers_tried"] == ["mock"]
+
+
+def test_ddg_challenge_does_not_retry_or_claim_empty_results(monkeypatch):
+    import httpx
+    from services.research.providers import DDGProvider
+
+    calls = []
+
+    def challenge(*args, **kwargs):
+        calls.append(kwargs["data"]["q"])
+        return httpx.Response(202, text="<title>DuckDuckGo</title>"
+                             "<p>Unfortunately, bots use DuckDuckGo too.</p>")
+
+    monkeypatch.setattr(httpx, "post", challenge)
+    with _OfflineToggle(False):
+        out = research.web_search("MG90S servo", provider=DDGProvider())
+    assert out["ok"] is False and out["reason"] == "provider_blocked"
+    assert out["providers_tried"] == ["ddg"]
+    assert calls == ["MG90S servo"]
+
+
+def test_blocked_provider_falls_through_to_configured_provider(monkeypatch):
+    from services.research.providers import ProviderBlocked
+
+    calls = []
+
+    class _Blocked(MockSearchProvider):
+        name = "ddg"
+
+        def search(self, query, max_results=5):
+            calls.append(("ddg", query))
+            raise ProviderBlocked("HTTP 202")
+
+    class _Keyed(MockSearchProvider):
+        name = "tavily"
+        requires_key = "TAVILY_API_KEY"
+
+        def search(self, query, max_results=5):
+            calls.append(("tavily", query))
+            return {"results": [{"title": "STEP", "url": "https://ex/step"}],
+                    "answer": None, "confidence": "high"}
+
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    monkeypatch.setattr(ws_mod, "select_provider", lambda name: _Blocked())
+    monkeypatch.setattr(ws_mod, "TavilyProvider", _Keyed)
+    with _OfflineToggle(False):
+        out = research.web_search("MG90S STEP model", provider="ddg")
+    assert out["ok"] and out["provider"] == "tavily"
+    assert calls == [("ddg", "MG90S STEP model"),
+                     ("tavily", "MG90S STEP model")]
+
+
 # --------------------------------------------------------------------------- fetch_page
 
 
@@ -175,6 +251,23 @@ def test_fetch_page_network_error_degrades():
         with _OfflineToggle(False):
             out = research.fetch_page("https://ex/x", cache=_tmp_cache(td), _fetcher=boom)
     assert out["ok"] is False and out["reason"] == "network"
+
+
+def test_fetch_page_names_http_denial_and_missing_page():
+    import httpx
+
+    with tempfile.TemporaryDirectory() as td, _OfflineToggle(False):
+        for status in (403, 404):
+            url = "https://example.com/servo"
+
+            def rejected(_url):
+                request = httpx.Request("GET", url)
+                response = httpx.Response(status, request=request)
+                raise httpx.HTTPStatusError("unavailable", request=request, response=response)
+
+            out = fp_mod.fetch_page(url, cache=_tmp_cache(td), _fetcher=rejected)
+            assert out["ok"] is False and out["reason"] == "http_error"
+            assert url in out["hint"] and str(status) in out["hint"]
 
 
 def test_fetch_page_rejects_private_targets_before_fetch(monkeypatch):
@@ -360,6 +453,112 @@ def test_html_to_markdown_strips_script_style():
     assert title == "Doc"
     assert "evil" not in md and ".a{" not in md
     assert "# Head" in md and "276 MPa" in md
+
+
+def test_grabcad_shell_uses_rendered_browser_and_caches_content(monkeypatch):
+    from services.browser import session
+
+    shell = (
+        '<html><head><title>GrabCAD Community Library</title>'
+        '<meta name="description" content="Find CAD models"></head>'
+        '<body><header>Explore CAD Models</header><div id="root"></div>'
+        '<noscript>Please enable JavaScript to use this site</noscript>'
+        '<script src="/assets/main.js"></script></body></html>'
+    )
+    rendered = (
+        '<html><head><title>MG90S Servo CAD Model</title></head><body>'
+        '<nav>Login Search Popular Downloads</nav><main><article>'
+        '<h1>MG90S servo housing</h1><p>MG90S micro servo STEP geometry includes '
+        'mounting ears, the output shaft, and the 23 mm tall housing. This model '
+        'allows the shoulder mount to be dimensioned from the shaft datum and '
+        'the mounting holes, and includes a description of the assembly and its '
+        'source so the engineer can verify the fit before reuse.</p>'
+        '</article></main></body></html>'
+    )
+    calls = []
+    monkeypatch.setattr(session, "browser_fetch", lambda url, site, no_cache: (
+        calls.append((url, site, no_cache)) or {
+            "ok": True, "final_url": url, "content": rendered}))
+    _stub_public_dns(monkeypatch)
+    with tempfile.TemporaryDirectory() as td, _OfflineToggle(False):
+        cache = _tmp_cache(td)
+        first = fp_mod.fetch_page("https://grabcad.com/library/mg90s-1", cache=cache,
+                                  _fetcher=lambda url: (shell, url, "ignored"))
+        second = fp_mod.fetch_page("https://grabcad.com/library/mg90s-1", cache=cache,
+                                   _fetcher=lambda url: (shell, url, "ignored"))
+    assert first["ok"] and first["cached"] is False
+    assert first["title"] == "MG90S Servo CAD Model"
+    assert first["content"].startswith("# MG90S servo housing")
+    assert "shaft datum" in first["content"]
+    assert "Login Search" not in first["content"]
+    assert second["ok"] and second["cached"] is True
+    assert calls == [("https://grabcad.com/library/mg90s-1", "grabcad.com", True)]
+
+
+def test_js_shell_remaining_after_rendering_is_not_cached(monkeypatch):
+    from services.browser import session
+
+    shell = ('<html><head><title>MakerWorld</title></head><body>'
+             '<nav>Explore Sign in Models</nav><div id="app"></div>'
+             '<noscript>Enable JavaScript to continue</noscript>'
+             '<script src="/assets/app.js"></script></body></html>')
+    calls = []
+    monkeypatch.setattr(session, "browser_fetch", lambda url, site, no_cache: (
+        calls.append(url) or {"ok": True, "final_url": url, "content": shell}))
+    monkeypatch.setattr(fp_mod, "_firecrawl_page", lambda url: None)
+    _stub_public_dns(monkeypatch)
+    with tempfile.TemporaryDirectory() as td, _OfflineToggle(False):
+        cache = _tmp_cache(td)
+        for _ in range(2):
+            out = fp_mod.fetch_page("https://makerworld.com/en/models/42", cache=cache,
+                                    _fetcher=lambda url: (shell, url, "ignored"))
+            assert out["ok"] is False and out["reason"] == "js_shell"
+            assert "makerworld.com/en/models/42" in out["hint"]
+            assert "fetch_cad_model" in out["hint"]
+    assert len(calls) == 2
+
+
+def test_js_shell_uses_firecrawl_only_after_rendered_page_fails(monkeypatch):
+    shell = ('<html><head><title>ResearchGate</title></head>'
+             '<body><div id="root"></div><script src="/app.js"></script></body></html>')
+    calls = []
+    monkeypatch.setattr(fp_mod, "_render_page",
+                        lambda url: calls.append("render") or None)
+    monkeypatch.setattr(fp_mod, "_firecrawl_page",
+                        lambda url: calls.append("firecrawl") or (
+                            "A research paper describes servo gearbox load paths and "
+                            "their mechanical fatigue across repeated actuation. " * 4,
+                            url, "Servo gearbox fatigue"))
+    with tempfile.TemporaryDirectory() as td, _OfflineToggle(False):
+        result = fp_mod.fetch_page("https://researchgate.net/publication/servo",
+                                   cache=_tmp_cache(td),
+                                   _fetcher=lambda url: (shell, url, "ignored"))
+    assert result["ok"] and result["title"] == "Servo gearbox fatigue"
+    assert "mechanical fatigue" in result["content"]
+    assert calls == ["render", "firecrawl"]
+
+
+def test_article_markdown_starts_with_content_not_site_chrome():
+    article = (
+        '<html><head><title>Servo dimensions</title><meta name="description" '
+        'content="Site metadata"><script>window.app={}</script></head><body>'
+        '<div role="navigation"><a>Projects</a><a>Search</a></div>'
+        '<header><h1>Member login</h1></header><main><article>'
+        '<h1>Measuring servo brackets</h1><p>The mounting centers are measured '
+        'between the holes, and the horn clearance is measured from the shaft.</p>'
+        '</article></main><footer>Legal Privacy Contact</footer></body></html>'
+    )
+    markdown, title = fp_mod.html_to_markdown(article)
+    assert title == "Servo dimensions"
+    assert markdown.startswith("# Measuring servo brackets")
+    assert "mounting centers" in markdown
+    assert all(word not in markdown for word in (
+        "Site metadata", "Projects", "Member login", "Legal Privacy"))
+    with tempfile.TemporaryDirectory() as td, _OfflineToggle(False):
+        result = fp_mod.fetch_page("https://example.com/servo-dimensions",
+                                   cache=_tmp_cache(td),
+                                   _fetcher=lambda url: (article, url, "ignored"))
+    assert result["ok"] and result["content"] == markdown
 
 
 def test_parse_ddg_html():

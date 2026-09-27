@@ -1,0 +1,167 @@
+"""Pure turn-assembly seams and the run-scoped workspace/credential lifetime."""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+
+def resolve_workspace(raw_params: Mapping[str, Any]) -> tuple[str, str, str | None]:
+    """Return (project root, requested save directory, refusal reason)."""
+    if "workspace_dir" not in raw_params:
+        return "", "", None
+    raw_workspace = raw_params.get("workspace_dir")
+    if not isinstance(raw_workspace, str) or not raw_workspace.strip():
+        return "", "", "invalid_workspace: workspace_dir must be a non-empty directory"
+    try:
+        from services.agent.project_context import resolve_project_root
+
+        candidate = Path(raw_workspace).expanduser().resolve()
+        if not candidate.is_dir():
+            return "", "", f"invalid_workspace: not an existing directory: {candidate}"
+        root = Path(resolve_project_root(candidate)).expanduser().resolve()
+        if not root.is_dir():
+            return "", "", (
+                "invalid_workspace: resolved project root is not a directory: "
+                f"{root}"
+            )
+        return str(root), str(candidate), None
+    except Exception as exc:  # noqa: BLE001 - invalid workspace is an RPC refusal
+        return "", "", f"invalid_workspace: {type(exc).__name__}: {exc}"
+
+
+def compose_request_text(request: str, migration: str, editor: str = "") -> str:
+    """One formatter for the migration preflight estimate and actual RPC request."""
+    prompt = f"{migration}\n\nCURRENT USER REQUEST\n{request}" if migration else request
+    return f"{prompt}\n\n{editor}" if editor else prompt
+
+
+def resolve_model_and_effort(
+    request: str,
+    raw_params: Mapping[str, Any],
+    cfg: Mapping[str, Any],
+    credit_actor: Any,
+    byok_key: Any,
+    transient_call: Any,
+    auth_providers: Any,
+) -> tuple[Any, str, str, Any, list[dict[str, Any]] | None]:
+    """Resolve the turn preferences, available models and explicit override."""
+    from services.agent.chudcode_host import byok_provider_env
+    from services.agent.preferences import resolve_turn_preferences
+    from services.agent.role_models import _auto_local_provider, resolve_role_model
+
+    def param_str(key: str) -> str:
+        value = raw_params.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    requested_mode = param_str("mode")
+    styles = {"agent": "do_it", "plan": "check_with_me", "ask": "answer_only"}
+    turn_cfg = cfg
+    if requested_mode in styles:
+        turn_cfg = {
+            **cfg,
+            "copilot": {**(cfg.get("copilot") or {}), "work_style": styles[requested_mode]},
+        }
+    preferences = resolve_turn_preferences(
+        request, cfg=turn_cfg,
+        feature_count=max(0, int(raw_params.get("feature_count") or 0)),
+        doc_count=max(1, int(raw_params.get("doc_count") or 1)),
+        context_tokens=max(0, int(raw_params.get("context_tokens") or 0)),
+        context_window=max(0, int(raw_params.get("context_window") or cfg.get("context_window") or 0)),
+    )
+    provider, model = param_str("provider"), param_str("model")
+    assignment = None
+    candidates = None
+    if not provider and not model:
+        catalog = transient_call("get_available_models", {})
+        auth = transient_call("get_auth_state", {})
+        if not catalog.get("ok") or not auth.get("ok"):
+            raise RuntimeError("Cannot inspect available models. Repair the runtime or sign in in Accounts.")
+        authenticated = {row["id"] for row in auth_providers(auth) if row["authenticated"]}
+        candidates = [
+            {"provider": row["provider"], "model": row["id"],
+             "base_url": row.get("baseUrl") or row.get("base_url") or ""}
+            for row in catalog.get("models", [])
+            if isinstance(row, Mapping) and row.get("provider") and row.get("id")
+            and (row["provider"] in authenticated
+                 or _auto_local_provider(row["provider"], cfg, row.get("baseUrl") or row.get("base_url")))
+        ]
+        assignment = resolve_role_model(
+            "chat", cfg=cfg, request=request, turn_preferences=preferences, enabled=candidates
+        )
+        provider, model = assignment.provider, assignment.model
+    else:
+        provider = provider or str(cfg.get("provider") or "")
+        model = model or str(cfg.get("model") or "")
+    if credit_actor is not None and credit_actor.key_source == "subscription":
+        provider = "anthropic"
+    if preferences.local_only and not _auto_local_provider(provider, cfg):
+        raise ValueError("This computer only requires a loopback model. Configure a local model in Accounts.")
+    if byok_key is not None and byok_provider_env(provider) is None:
+        raise ValueError("byok_unsupported_online")
+    return preferences, provider, model, assignment, candidates
+
+
+def resolve_settings(
+    raw_params: Mapping[str, Any], preferences: Any, provider_name: str, model_name: str
+) -> dict[str, Any]:
+    value = raw_params.get("settings")
+    settings = dict(value) if isinstance(value, Mapping) else {}
+    if not any(key in raw_params or key in settings for key in ("thinking", "reasoning_effort")):
+        settings["thinking"] = preferences.thinking
+    if preferences.schedule_compaction:
+        settings.setdefault("auto_compaction", True)
+    if provider_name:
+        settings["provider"] = provider_name
+    if model_name:
+        settings["model"] = model_name
+    for key in (
+        "thinking", "reasoning_effort", "steering_mode", "follow_up_mode",
+        "interrupt_mode", "auto_compaction", "auto_retry",
+        "subagent_subscription", "queue",
+    ):
+        if key in raw_params:
+            settings[key] = raw_params[key]
+    return settings
+
+
+@contextmanager
+def activate_turn_env(
+    project_root: str, save_dir: str, config_module: Any
+) -> Iterator[list[str]]:
+    """Restore cwd, workspace variables and run-scoped credentials even on failure.
+
+    The yielded error list records failures while restoring state; callers retain
+    their response finalization policy (a cleanup failure must not be hidden).
+    """
+    previous_cwd = os.getcwd()
+    keys = ("CHUDWARE_FS_ROOT", "CHUDWARE_PROJECT_DIR", "CHUDWARE_PROJECT_SAVE_DIR")
+    previous_env = {key: os.environ.get(key) for key in keys}
+    errors: list[str] = []
+    try:
+        if project_root:
+            os.chdir(project_root)
+            os.environ["CHUDWARE_FS_ROOT"] = project_root
+            os.environ["CHUDWARE_PROJECT_DIR"] = project_root
+            os.environ["CHUDWARE_PROJECT_SAVE_DIR"] = save_dir
+        yield errors
+    finally:
+        try:
+            config_module.clear_pooled_credentials()
+        except Exception as exc:  # noqa: BLE001 - attempt all remaining restores
+            errors.append(f"credential_reset: {type(exc).__name__}: {exc}")
+        try:
+            os.chdir(previous_cwd)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"cwd_restore: {type(exc).__name__}: {exc}")
+        for key, value in previous_env.items():
+            try:
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"env_restore[{key}]: {type(exc).__name__}: {exc}")

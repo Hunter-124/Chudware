@@ -61,6 +61,47 @@ const std::vector<BearingRow>& bearings() {
     };
     return t;
 }
+const std::vector<HobbyServoRow>& hobby_servos() {
+    // TowerPro product pages include the A–F mechanical drawing: B=case L,
+    // D=case W, C=case H below output, E=outer tab span, F=tab underside
+    // above base. A is overall height including the output spline.
+    // Holes/boss details absent from those drawings are nominal fit geometry
+    // (not claimed as manufacturer-toleranced dimensions).
+    static const std::vector<HobbyServoRow> t = {
+        {"SG90", 22.7, 12.2, 27.0, 32.3, 2.5, 17.0, 2.2, 28.1,
+         5.6, 6.0, 2.0, 4.5, 1.3, 21,
+         "https://towerpro.com.tw/product/sg90-analog/",
+         "TowerPro drawing B/D/C/E/F/A=22.7/12.2/27/32.3/17/30.3 mm; hole pitch, diameter, boss and spline are nominal fit dimensions, verify on actual servo."},
+        {"MG90S", 22.8, 12.4, 28.4, 32.1, 2.5, 18.5, 2.2, 28.0,
+         5.6, 6.0, 2.5, 4.8, 1.6, 20,
+         "https://towerpro.com.tw/product/mg90s-3/",
+         "TowerPro drawing B/D/C/E/F/A=22.8/12.4/28.4/32.1/18.5/32.5 mm (product text rounds width to 12.2); hole pitch, diameter, boss and spline are nominal fit dimensions, verify on actual servo."},
+        {"MG996R", 40.9, 20.0, 37.0, 54.0, 3.0, 26.8, 3.2, 49.5,
+         10.0, 12.0, 3.0, 5.9, 2.9, 25,
+         "https://towerpro.com.tw/product/mg996r/",
+         "TowerPro drawing B/D/C/E/F=40.9/20/37/54/26.8; product text quotes approx. 40.7x19.7x42.9. Hole pitch, diameter and boss dimensions are nominal fit dimensions; verify on actual servo."},
+        {"MG995", 40.7, 19.7, 37.0, 54.0, 3.0, 26.8, 3.2, 49.5,
+         10.0, 12.0, 3.0, 5.9, 2.9, 25,
+         "https://cdn.shopify.com/s/files/1/0058/3145/8904/files/MG995.PDF",
+         "MG995 sheet: approx. 40.7x19.7x42.9 overall. Case height and mounting details use TowerPro MG996R envelope as a nominal fit proxy; check the actual MG995 before tooling."},
+        {"DS3218", 40.0, 20.0, 36.5, 54.0, 3.0, 26.0, 3.2, 49.5,
+         10.0, 12.0, 2.0, 5.9, 2.0, 25,
+         "https://m.media-amazon.com/images/I/81p5zAoqJ0L.pdf",
+         "ANNIMOS DS3218MG datasheet: 40x20x40.5 overall. Case-versus-output and tab/hole/boss details are nominal standard-size fit proxies; check the maker drawing before tooling."},
+        {"micro_9g", 22.7, 12.2, 27.0, 32.3, 2.5, 17.0, 2.2, 28.1,
+         5.6, 6.0, 2.0, 4.5, 1.3, 0,
+         "https://towerpro.com.tw/product/sg90-analog/",
+         "Generic micro 9g envelope based on TowerPro SG90; tooth count unspecified because generic servos do not share a spline standard."},
+    };
+    return t;
+}
+
+const HobbyServoRow* find_hobby_servo(const std::string& size) {
+    for (const HobbyServoRow& r : hobby_servos())
+        if (size == r.size) return &r;
+    return nullptr;
+}
+
 
 const std::vector<double>& dowel_diameters() {
     static const std::vector<double> t = {1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0};
@@ -125,6 +166,12 @@ std::vector<std::string> dowel_sizes() {
     return v;
 }
 
+std::vector<std::string> hobby_servo_sizes() {
+    std::vector<std::string> v;
+    for (const data::HobbyServoRow& r : data::hobby_servos()) v.push_back(r.size);
+    return v;
+}
+
 }  // namespace
 
 std::vector<Family> catalog() {
@@ -163,6 +210,9 @@ std::vector<Family> catalog() {
                  metric_sizes(2, 6), kInsertLengths});
     f.push_back({"bearing", "Deep-Groove Ball Bearing", "Bearings", "ISO 15 (deep groove)",
                  "Ball-bearing envelope (outer ring × bore × width).", false, bearing_sizes(), {}});
+    f.push_back({"hobby_servo", "Hobby Servo", "Motors & Actuators", "Manufacturer nominal envelopes",
+                 "Micro and standard-size hobby servo; editable case, mounting flange/holes and output axis.",
+                 false, hobby_servo_sizes(), {}});
     return f;
 }
 
@@ -178,6 +228,11 @@ json catalog_json() {
         j["needs_length"] = fam.needs_length;
         j["sizes"] = fam.sizes;
         j["lengths_mm"] = fam.lengths_mm;
+        if (fam.key == "hobby_servo") {
+            j["size_sources"] = json::object();
+            for (const data::HobbyServoRow& row : data::hobby_servos())
+                j["size_sources"][row.size] = {{"source", row.source}, {"notes", row.notes}};
+        }
         families.push_back(std::move(j));
     }
     json out;

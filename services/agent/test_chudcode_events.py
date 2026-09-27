@@ -4,7 +4,7 @@ import copy
 import json
 import unittest
 
-from services.agent.chudcode_events import map_rpc_frame
+from services.agent.chudcode_events import RpcFrameState, map_rpc_frame
 
 CTX = {
     "run_id": "run-7",
@@ -522,7 +522,7 @@ class ChudcodeEventMapperTests(unittest.TestCase):
 
     def test_unknown_events_are_transparent_bounded_and_deterministic(self):
         frame = {
-            "type": "available_commands_update",
+            "type": "future_event",
             "status": "completed",
             "commands": [{"name": "x" * 5000} for _ in range(100)],
             "huge": "z" * 10000,
@@ -534,7 +534,7 @@ class ChudcodeEventMapperTests(unittest.TestCase):
         self.assertEqual(frame, original)
         kind, payload = first[0]
         self.assertEqual(kind, "sub_run")
-        self.assertEqual(payload["rpc_event"], "available_commands_update")
+        self.assertEqual(payload["rpc_event"], "future_event")
         self.assertEqual(payload["status"], "done")
         self.assertLessEqual(len(payload["detail"]), 4096)
         self.assertTrue(payload["id"].startswith("rpc-"))
@@ -545,6 +545,225 @@ class ChudcodeEventMapperTests(unittest.TestCase):
         mixed_kind, mixed = one({"type": "future_event", "odd": {1: "a", "1": "b"}})
         self.assertEqual(mixed_kind, "sub_run")
         self.assertLessEqual(len(mixed["detail"]), 4096)
+
+    def test_recorded_custom_tool_lifecycle_retains_start_arguments_and_intent(self):
+        state = RpcFrameState()
+        read_url = "https://grabcad.com/library/servo-motor-mg90s-2"
+        frames = [
+            {
+                "type": "custom",
+                "customType": "tool_execution_start",
+                "data": {
+                    "toolCallId": "read-1",
+                    "toolName": "read",
+                    "args": {"path": read_url},
+                    "intent": "Reading MG90S STEP model",
+                },
+                "id": "envelope-1",
+                "parentId": "assistant-1",
+            },
+            {
+                "type": "custom_message",
+                "customType": "tool_execution_start",
+                "data": {
+                    "toolCallId": "search-1",
+                    "toolName": "web_search",
+                    "args": {"query": "MG90S STEP model"},
+                    "intent": "Finding servo reference",
+                },
+            },
+            {
+                "type": "custom",
+                "customType": "tool_execution_update",
+                "data": {"toolCallId": "read-1", "partialResult": "Fetching"},
+            },
+            {
+                "type": "custom",
+                "customType": "tool_execution_end",
+                "data": {"toolCallId": "read-1", "toolName": "read", "result": "page"},
+            },
+            {
+                "type": "custom",
+                "customType": "tool_execution_end",
+                "data": {
+                    "toolCallId": "search-1",
+                    "toolName": "web_search",
+                    "result": "results",
+                },
+            },
+            {
+                "type": "custom",
+                "customType": "tool_execution_end",
+                "data": {"toolCallId": "read-1", "toolName": "read", "result": "page"},
+            },
+        ]
+        mapped = [row for frame in frames for row in map_rpc_frame(frame, CTX, state)]
+        self.assertEqual([kind for kind, _ in mapped], ["status"] * 3 + ["agent.tool_call"] * 2)
+        self.assertEqual(mapped[0][1]["id"], "read-1")
+        self.assertEqual(mapped[0][1]["parent_id"], "assistant-1")
+        read_result, search_result = (row for kind, row in mapped if kind == "agent.tool_call")
+        self.assertEqual(read_result["target"], read_url)
+        self.assertIn(read_url, read_result["args_preview"])
+        self.assertEqual(read_result["intent"], "Reading MG90S STEP model")
+        self.assertEqual(search_result["target"], "MG90S STEP model")
+        self.assertEqual(search_result["intent"], "Finding servo reference")
+        self.assertEqual(read_result["id"], "read-1")
+
+    def test_toolcall_boundary_supplies_query_when_custom_start_omits_args(self):
+        state = RpcFrameState()
+        self.assertEqual(
+            map_rpc_frame(
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {
+                        "type": "toolcall_end",
+                        "toolCall": {
+                            "id": "search-2",
+                            "name": "web_search",
+                            "arguments": {"query": "MG90S mounting dimensions"},
+                        },
+                    },
+                },
+                CTX,
+                state,
+            ),
+            [],
+        )
+        self.assertEqual(
+            map_rpc_frame(
+                {
+                    "type": "custom",
+                    "customType": "tool_execution_start",
+                    "data": {
+                        "toolCallId": "search-2",
+                        "toolName": "web_search",
+                        "intent": "Finding servo mounting dimensions",
+                    },
+                },
+                CTX,
+                state,
+            )[0][0],
+            "status",
+        )
+        kind, row = map_rpc_frame(
+            {
+                "type": "custom",
+                "customType": "tool_execution_end",
+                "data": {"toolCallId": "search-2", "result": "results"},
+            },
+            CTX,
+            state,
+        )[0]
+        self.assertEqual(kind, "agent.tool_call")
+        self.assertEqual(row["target"], "MG90S mounting dimensions")
+        self.assertIn("MG90S mounting dimensions", row["args_preview"])
+        self.assertEqual(row["intent"], "Finding servo mounting dimensions")
+
+    def test_tool_targets_prefer_semantic_arguments_and_bound_large_previews(self):
+        state = RpcFrameState()
+        for call_id, tool, args, expected in [
+            ("fs-1", "fs_read", {"name": "untitled", "path": "parts/servo.step"}, "parts/servo.step"),
+            ("cad-1", "new_part", {"name": "Servo bracket", "path": "parts/"}, "Servo bracket"),
+            ("research-1", "research_parts", {"name": "other", "query": "MG90S horn"}, "MG90S horn"),
+        ]:
+            self.assertEqual(
+                map_rpc_frame(
+                    {"type": "tool_execution_start", "toolCallId": call_id, "toolName": tool, "args": args},
+                    CTX,
+                    state,
+                )[0][0],
+                "status",
+            )
+            kind, row = map_rpc_frame(
+                {"type": "tool_execution_end", "toolCallId": call_id, "toolName": tool, "result": {}},
+                CTX,
+                state,
+            )[0]
+            self.assertEqual(kind, "agent.tool_call")
+            self.assertEqual(row["target"], expected)
+        map_rpc_frame(
+            {"type": "tool_execution_start", "toolCallId": "large", "toolName": "new_part", "args": {"name": "x" * 10000}},
+            CTX,
+            state,
+        )
+        _, row = map_rpc_frame(
+            {"type": "tool_execution_end", "toolCallId": "large", "result": {}},
+            CTX,
+            state,
+        )[0]
+        self.assertLessEqual(len(row["args_preview"]), 2048)
+        self.assertLessEqual(len(row["target"]), 120)
+
+    def test_xd_host_calls_show_inner_arguments_not_the_write_wrapper(self):
+        state = RpcFrameState()
+        for call_id, tool, arguments, target in [
+            ("search", "part_search", {"query": "MG90S", "limit": 5}, "MG90S"),
+            ("standard", "make_standard_part", {"family": "hobby_servo", "size": "MG90S"}, "hobby_servo · MG90S"),
+            ("source", "fetch_cad_model", {"url": "https://example.org/servo.step"}, "https://example.org/servo.step"),
+            ("feature", "inspect_feature", {"feature": "Servo mount"}, "Servo mount"),
+        ]:
+            raw_args = {"path": f"xd://{tool}", "content": json.dumps(arguments)}
+            map_rpc_frame(
+                {"type": "tool_execution_start", "toolCallId": call_id, "toolName": tool, "args": raw_args},
+                CTX,
+                state,
+            )
+            kind, row = map_rpc_frame(
+                {"type": "tool_execution_end", "toolCallId": call_id, "toolName": tool, "result": {"ok": True}},
+                CTX,
+                state,
+            )[0]
+            self.assertEqual(kind, "agent.tool_call")
+            self.assertEqual(row["target"], target)
+            self.assertEqual(json.loads(row["args_preview"]), arguments)
+            self.assertNotIn("xd://", row["args_preview"])
+
+        kind, docs = one(
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "docs",
+                "toolName": "read",
+                "args": {"path": "xd://part_search"},
+            }
+        )
+        self.assertEqual(kind, "agent.tool_call")
+        self.assertEqual(docs["target"], "docs")
+        self.assertNotIn("args_preview", docs)
+        kind, invalid = one(
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "bad-json",
+                "toolName": "write",
+                "args": {"path": "xd://part_search", "content": "{broken"},
+            }
+        )
+        self.assertEqual(kind, "agent.tool_call")
+        self.assertEqual(invalid["target"], "")
+        self.assertNotIn("args_preview", invalid)
+
+    def test_known_metadata_and_notices_do_not_produce_completed_subruns(self):
+        for frame in [
+            {"type": "thinking_level_change", "thinkingLevel": "xhigh"},
+            {"type": "thinking_level_changed", "thinkingLevel": "high"},
+            {"type": "title_change", "title": "Design 6-axis arm"},
+            {"type": "notice", "text": "Session signed in"},
+            {"type": "agent.progress_nudge", "message": "Proceed to CAD"},
+            {"type": "session_exit", "data": {"reason": "dispose"}},
+        ]:
+            kind, payload = one(frame)
+            self.assertEqual(kind, "status", frame["type"])
+            self.assertNotIn("Chudcode ·", json.dumps(payload))
+        self.assertEqual(one({"type": "thinking_level_change", "thinkingLevel": "xhigh"})[1]["thinking"], "xhigh")
+        self.assertEqual(one({"type": "title_change", "title": "Design 6-axis arm"})[1]["title"], "Design 6-axis arm")
+        self.assertEqual(one({"type": "notice", "text": "Session signed in"})[1]["text"], "Session signed in")
+        self.assertEqual(one({"type": "agent.progress_nudge", "message": "Proceed to CAD"})[1]["text"], "Proceed to CAD")
+        for frame in [
+            {"type": "available_commands_update", "commands": [{"name": "read"}]},
+            {"type": "notice"},
+            {"type": "credential_pin", "provider": "anthropic", "hash": "secret"},
+            {"type": "custom_message", "customType": "eager-todo-prelude", "content": "hidden"},
+        ]:
+            self.assertEqual(map_rpc_frame(frame, CTX), [], frame["type"])
 
     def test_content_block_boundaries_emit_no_row(self):
         # Chudcode brackets every assistant content block with start/end frames and

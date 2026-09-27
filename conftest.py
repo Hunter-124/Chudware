@@ -202,6 +202,8 @@ def _isolated_box_mirror_spool(tmp_path_factory):
 # CHUDWARE_HOSTD_SOCKET or CHUDWARE_ENGINE_DAEMON always wins — that caller has already
 # chosen what to talk to.
 _WANTS_DAEMON_ENV = "CHUDWARE_TEST_WANTS_DAEMON"
+_EXPLICIT_ENGINE_TARGET = ("CHUDWARE_ENGINE_DAEMON" in os.environ or
+                           "CHUDWARE_HOSTD_SOCKET" in os.environ)
 
 
 @_pytest.fixture(autouse=True, scope="session")
@@ -216,6 +218,27 @@ def _isolated_engine_session():
         yield True
     finally:
         os.environ.pop("CHUDWARE_ENGINE_DAEMON", None)
+
+
+@_pytest.fixture(autouse=True)
+def _isolated_engine_in_mixed_suite(request, monkeypatch):
+    """Keep non-MCP tests off the user's daemon when MCP tests are collected too.
+
+    services/mcp/conftest.py sets its daemon opt-out during collection, before
+    the session fixture above runs. That opt-out must apply only to MCP tests:
+    their private daemon starts at first use, not before preceding parts tests.
+    """
+    if os.environ.get(_WANTS_DAEMON_ENV) != "1" or _EXPLICIT_ENGINE_TARGET:
+        yield
+        return
+    from pathlib import Path
+
+    mcp_dir = Path(_ROOT) / "services" / "mcp"
+    if Path(str(request.node.path)).resolve().is_relative_to(mcp_dir):
+        yield
+        return
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "0")
+    yield
 
 # ---------------------------------------------------------------------------
 # `live` marker (Parts Library V2): tests that hit real vendor sites over the

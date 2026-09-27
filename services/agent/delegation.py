@@ -508,6 +508,7 @@ class DelegationTree:
         docs: list[dict] | None = None,
         availability: dict[str, bool] | None = None,
         effort: str | None = None,
+        project_dir: str | None = None,
     ) -> DelegationNode:
         """Request a new sub-agent delegation.
 
@@ -728,7 +729,7 @@ class DelegationTree:
                 parent_run_id=self._run_id, parent_node_id=parent_id,
                 requested_by=parent.role,
                 model=(model_assign.id or ""), budget_tokens=budget_tokens,
-                status="pending")
+                status="pending", project_dir=project_dir)
         except Exception:  # noqa: BLE001
             pass
 
@@ -1044,6 +1045,7 @@ def delegate(
     docs: list[dict] | None = None,
     availability: dict[str, bool] | None = None,
     effort: str | None = None,
+    project_dir: str | None = None,
 ) -> dict:
     """The ``delegate`` tool exposed to role cards per contract §12 + roles.py allowlist.
 
@@ -1069,6 +1071,7 @@ def delegate(
             docs=docs,
             availability=availability,
             effort=effort,
+            project_dir=project_dir,
         )
         # `tree` is duck-typed at several call sites (mission dispatchers and
         # tests supply their own), and a node from any tree that predates the

@@ -293,6 +293,23 @@ class TestPartsHub:
             assert rec["domain"] == "mech_family"
             _validate_record(rec)
 
+    def test_native_hobby_servo_is_first_local_hit(self):
+        """The real core catalog, not a duplicate Python table, backs model search."""
+        from services.mcp import core_bridge as cb
+        try:
+            families = cb.call("parts_catalog_list", {})["families"]
+        except Exception as exc:
+            pytest.skip(f"native core unavailable: {exc}")
+        if not any(f["key"] == "hobby_servo" for f in families):
+            pytest.fail("native parts catalog lacks hobby_servo (rebuild libchudware)")
+        self.hub.rebuild_index()
+        for query in ("MG90S", "SG90", "micro servo"):
+            hits = self.hub.search(query, include_live=False)
+            assert hits and hits[0]["geometry_ref"]["family"] == "hobby_servo", hits[:3]
+        assert self.hub.search("MG90S", include_live=False)[0]["designation"] == "MG90S"
+        assert any(r["part_id"] == "mech_family:hobby_servo:MG90S"
+                   for r in self.hub.search("MG90S", domain=["ecad", "mech_family"], include_live=False))
+
     def test_get_by_part_id_bearing(self):
         rec = self.hub.get("bearing:ISO 15:6205")
         assert rec is not None

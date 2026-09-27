@@ -6,7 +6,9 @@
 #include "active_work.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <cstdint>
+#include <mutex>
 #include <deque>
 #include <string>
 #include <unordered_map>
@@ -18,11 +20,28 @@
 #include "core/app_state.h"
 #include "ui_theme.h"      // ui::palette / uiScale / adaptivePanel / glassPanel / glassRowBackground
 #include "ui/metrics.h"    // cpMenu* rhythm tokens (gutter / row pad / gap / corner)
+#include "ui/copilot/copilot_internal.h" // convProjectDir, project path normalization
 #include "ai_prefs.h"
 #include "ui/plm/graph_thumbs.h"
 #include "ui/widgets/kit.h"   // ui::kit::emptyState — the one empty-state painter
 
 namespace ui {
+
+bool agentDocInProject(const std::string& path, const std::string& originProjectDir,
+                       const std::string& activeProjectDir) {
+    const std::string root = convProjectKey(activeProjectDir);
+    if (root.empty()) return false;
+    if (path.empty()) return !originProjectDir.empty() &&
+                             convProjectKey(originProjectDir) == root;
+    std::filesystem::path file = lexicalPath(path);
+    if (!file.is_absolute())
+        file = (lexicalPath(activeProjectDir) / file).lexically_normal();
+    const std::string key = comparablePath(file);
+    return key == root || (key.size() > root.size() &&
+        key.compare(0, root.size(), root) == 0 &&
+        (root.back() == '/' || key[root.size()] == '/'));
+}
+
 namespace {
 
 // glassPanel / glassCardWash take a LOGICAL dp radius (they multiply by uiScale themselves),
@@ -45,7 +64,6 @@ inline ImU32 fracArcCol(float frac) {
 struct AwOp {
     std::string tool;
     std::string target;
-    std::string actor;
     bool        ok = true;
     int         latencyMs = -1;
     long long   seq = 0;
@@ -53,9 +71,9 @@ struct AwOp {
 
 struct AwStore {
     std::string      runId;
-    std::deque<AwOp> ops;        // global run ticker, newest at back (cap kMaxOps)
+    std::string      projectDir;  // resolved from the owning conversation's run slot
+    std::deque<AwOp> ops;        // current run ticker, newest at back (cap kMaxOps)
     long long        seqCtr = 0;
-    int              failed = 0;
 };
 static AwStore s_aw;
 
@@ -115,26 +133,22 @@ void activeWorkFeedEvent(const std::string& kind, const nlohmann::json& data) {
     if (!data.is_object()) return;
     if (kind == "run_started" || kind == "dag.run.started") {
         s_aw.ops.clear();
-        s_aw.failed = 0;
-        s_aw.runId  = awStr(data, "run_id");
+        s_aw.projectDir.clear();
+        s_aw.runId = awStr(data, "run_id");
         return;
     }
     if (kind == "agent.tool_call") {
+        if (s_aw.runId.empty() || awStr(data, "run_id") != s_aw.runId) return;
         AwOp op;
         op.tool      = awStr(data, "tool_name");
         if (op.tool.empty()) op.tool = "tool";
         op.target    = awStr(data, "target");
-        op.actor     = awStr(data, "actor");
         op.ok        = data.value("ok", true);
         auto lat     = data.find("latency_ms");
         op.latencyMs = (lat != data.end() && lat->is_number()) ? lat->get<int>() : -1;
         op.seq       = s_aw.seqCtr++;
         s_aw.ops.push_back(std::move(op));
-        if (!s_aw.ops.back().ok) ++s_aw.failed;
-        while (s_aw.ops.size() > kMaxOps) {
-            if (!s_aw.ops.front().ok) --s_aw.failed;
-            s_aw.ops.pop_front();
-        }
+        while (s_aw.ops.size() > kMaxOps) s_aw.ops.pop_front();
     }
     // doc.* daemon events reach docTabs via engine_events.cpp — the view re-derives liveness
     // from st.docTabs every frame, so no extra feed is needed for open/close/changed.
@@ -151,17 +165,17 @@ void activeWorkPump(AppState& st) {
 void activeWorkReset() {
     s_aw.ops.clear();
     s_aw.runId.clear();
-    s_aw.failed = 0;
+    s_aw.projectDir.clear();
     s_aw.seqCtr = 0;
 }
 
 void drawActiveWorkView(AppState& st) {
     const float S = ui::uiScale;
     const int   verbosity = aiUiVerbosity();
-    // Iso-preview textures (THUMB SEAM below) share the project dir the PLM Graph worker
-    // cache keys thumbnails under — resolved the same way graph_tab.cpp tracks G.projectDir.
-    const bool        previewsOn = aiActiveWorkPreviews();
-    const std::string projectDir = previewsOn ? st.plmProjectPath() : std::string();
+    // Resolve the scope from the same folder the composer uses for new conversations.
+    // The thumbnail cache must not receive a different PLM root for this view.
+    const bool previewsOn = aiActiveWorkPreviews();
+    const std::string projectDir = convProjectDir(st);
 
     // One adaptive glass surface for the whole pane (idempotent per frame — same recipe as
     // chatSurf()/drawLeftPane): every card + strip fetches this cached contrast-matched tone.
@@ -176,26 +190,45 @@ void drawActiveWorkView(AppState& st) {
         const AppState::DocTab* tab = nullptr;
         std::vector<const AwOp*> ops;   // newest at back
         long long lastSeq = -1;
-        bool       lastFailed = false;
     };
     std::vector<Card> cards;
     for (const auto& t : st.docTabs) {
-        if (!docIsAgentWip(t)) continue;
+        if (!docIsAgentWip(t) || !agentDocInProject(t.path, t.projectDir, projectDir))
+            continue;
         Card c;
         c.tab = &t;
         cards.push_back(std::move(c));
     }
-    // Attribute ops; a doc with ops but no live tab flag still gets a card (agent touched a
-    // background doc the poller hasn't flagged yet).
-    for (const auto& op : s_aw.ops) {
-        bool hit = false;
-        for (auto& c : cards) {
-            if (!opHitsDoc(op, *c.tab)) continue;
-            c.ops.push_back(&op);
-            c.lastSeq = std::max(c.lastSeq, op.seq);
-            hit = true;
+    if (!s_aw.runId.empty() && s_aw.projectDir.empty()) {
+        for (const auto& conv : st.conversations) {
+            const auto slot = st.runs.find(conv.id);
+            if (slot == st.runs.end() || !slot->second) continue;
+            std::lock_guard<std::mutex> lock(slot->second->mtx);
+            if (slot->second->runId == s_aw.runId) {
+                s_aw.projectDir = conv.projectDir;
+                break;
+            }
         }
-        if (!hit && op.ok) { /* unattributed (non-doc target like a sketch/param) — global ticker only */ }
+    }
+    // Attribute only operations naming a visible project document. Unattributed events
+    // have no project provenance and must never leak another run into this project's ticker.
+    std::vector<const AwOp*> visibleOps;
+    int visibleFailed = 0;
+    if (!s_aw.projectDir.empty() &&
+        convProjectKey(s_aw.projectDir) == convProjectKey(projectDir)) {
+        for (const auto& op : s_aw.ops) {
+            bool hit = false;
+            for (auto& c : cards) {
+                if (!opHitsDoc(op, *c.tab)) continue;
+                c.ops.push_back(&op);
+                c.lastSeq = std::max(c.lastSeq, op.seq);
+                hit = true;
+            }
+            if (hit) {
+                visibleOps.push_back(&op);
+                if (!op.ok) ++visibleFailed;
+            }
+        }
     }
     // Sort: actively-pulsing first, then most recent op, then title.
     std::sort(cards.begin(), cards.end(), [](const Card& a, const Card& b) {
@@ -211,15 +244,16 @@ void drawActiveWorkView(AppState& st) {
         ImGui::PopStyleColor();
         ImGui::SameLine(0, 12 * S);
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::Text("%d ops this run", (int)s_aw.ops.size());
+        ImGui::Text("%d doc op%s", (int)visibleOps.size(),
+                    visibleOps.size() == 1 ? "" : "s");
         ImGui::PopStyleColor();
-        if (s_aw.failed > 0) {
+        if (visibleFailed > 0) {
             // "How much of this run went wrong" as the app's shared circular gauge — the same
             // ring shape every compact fraction readout uses, never a bespoke mini-bar.
             ImGui::SameLine(0, ui::metrics::cpMenuSectionGap());
-            const float frac = s_aw.ops.empty()
+            const float frac = visibleOps.empty()
                 ? 0.0f
-                : (float)s_aw.failed / (float)s_aw.ops.size();
+                : (float)visibleFailed / (float)visibleOps.size();
             ImDrawList* hdl = ImGui::GetWindowDrawList();
             const float  r   = ImGui::GetFrameHeight() * 0.34f;
             const float  lh  = ImGui::GetTextLineHeight();
@@ -233,18 +267,18 @@ void drawActiveWorkView(AppState& st) {
             ImGui::SameLine(0, ui::metrics::cpMenuLabelGap());
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 1.0f));
-            ImGui::Text("%d failed", s_aw.failed);
+            ImGui::Text("%d failed", visibleFailed);
             ImGui::PopStyleColor();
         }
     }
-    if (verbosity >= 2 && !s_aw.ops.empty()) {
-        // Global run ticker: the last few operations across ALL docs, newest last.
+    if (verbosity >= 2 && !visibleOps.empty()) {
+        // Recent operations attributable to this project's visible documents.
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        const size_t n = s_aw.ops.size();
+        const size_t n = visibleOps.size();
         const size_t from = n > 4 ? n - 4 : 0;
         std::string line;
         for (size_t i = from; i < n; ++i) {
-            const AwOp& op = s_aw.ops[i];
+            const AwOp& op = *visibleOps[i];
             if (!line.empty()) line += "   ";
             line += op.tool;
             // "→" (U+2192) is outside the UI font's requested ranges and drew a literal '?'.
@@ -257,9 +291,10 @@ void drawActiveWorkView(AppState& st) {
     ImGui::Spacing();
 
     if (cards.empty()) {
-        awEmptyState("No active agent work",
-                     "Parts and assemblies agents open or edit appear here live — with the "
-                     "operations they make along the way. Start an Agent run to see it.");
+        const std::string name = lexicalPath(projectDir).filename().string();
+        const std::string title = "Nothing for " +
+            (name.empty() ? std::string("this project") : name) + " yet";
+        awEmptyState(title.c_str(), "Parts and assemblies agents edit appear here live.");
         return;
     }
 

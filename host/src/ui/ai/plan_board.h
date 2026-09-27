@@ -1,18 +1,14 @@
 // AI workspace — Session Plan board.
 //
-// Interactive replacement for the static buildgraph "Session Plan" view: the active
-// conversation's current PlanState (the same per-message plan the Copilot plan section
-// renders — PlanState in core/app_state.h) presented as an EDITABLE checklist with
-// per-item status cycling, inline rename, add/remove, and up/down reordering. Edits
-// mutate the live plan in st.chat and flag the chat history dirty; while an agent turn
-// is running a concise "Plan updated: ..." note is pushed through the existing
-// queued-prompts path (drawComposer drains it into the next turn — no fabricated steer).
+// The active project's selected conversation owns the editable PlanState checklist.
+// The header identifies its session title and linked document; selecting another CAD tab
+// does not transfer ownership of the plan. Edits mutate st.chat and mark history dirty.
+// While a turn is active, the existing queued-prompts path delivers a short plan note to
+// the next turn, not to the already-running turn.
 //
-// Below the checklist, an ai_vc (agent version control) timeline strip lists the active
-// document's silent checkpoints (plm_timeline over st.rpc, throttled) with a per-row
-// Restore that routes through the shared ui::aiVcRollback (honors chat_truncate_to,
-// refreshes the doc mirror, toasts). Every state degrades honestly: worker down, ai_vc
-// method absent, no plan, no checkpoints.
+// The checkpoint strip is separate: it displays only the selected document's AI version
+// history inside this project, with Restore routed through ui::aiVcRollback. It never
+// requests a global timeline without a project document selected.
 //
 // planBoardSerialize/planBoardApply round-trip one conversation's plan snapshot to JSON
 // (plan object shape matches conversations.cpp planStateToJson so parsePlanState accepts

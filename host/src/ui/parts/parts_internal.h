@@ -30,6 +30,7 @@ struct PartsItem {
     std::string vendor;
     std::string partNumber;
     std::string description;
+    std::string fileName;     // selected CAD filename for a community listing
     std::string unit;
     std::string material;
     std::string domain;
@@ -38,6 +39,9 @@ struct PartsItem {
     std::string datasheet;
     std::string imageUrl;
     std::string license;
+    std::vector<std::string> sizes;  // available parametric sizes from the core catalog
+    int         score      = 0;     // backend identity relevance (0–100)
+    double      lengthMm   = 0.0;   // search-resolved standard screw length
     double      priceUsd   = 0.0;
     bool        downloaded = false;
     bool        placeable  = false;
@@ -207,6 +211,7 @@ struct PartsState {
     std::string insertNote;  // in-flight phase or last insert outcome, also shown as a toast
     bool insertError = false;
     bool   queueActive   = false;  // any pending/running job → keep polling
+    std::set<std::string> autoImportJobs;  // community downloads requested for immediate import
 
     // ---- thumbnails ----
     std::map<std::string, Thumb> thumbs;      // part_id → GL texture; LRU-capped in storeThumb
@@ -232,6 +237,7 @@ void startLiveSearch(AppState& st);
 void pollLiveSearch(AppState& st);
 void pollQueue(AppState& st);
 void queueDownload(AppState& st, const PartsItem& item);
+void importQueuedArtifact(AppState& st, const std::string& id, const std::string& artifactPath);
 void insertItem(AppState& st, const PartsItem& item);
 void sendToReverseEngineering(AppState& st, const PartsItem& item);
 // RE-32: one-click "Generate 3D model" for metadata-only (no-model) parts.

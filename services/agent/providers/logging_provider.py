@@ -17,14 +17,9 @@ Design decisions:
    output_ref.  See work/questions/T-H7.md Q1.
 
 3. CONSENT GATES SIDECAR WRITES — at meta/off consent tiers, request/response bodies
-   are NOT written (empty refs returned).  Metadata fields (hash, latency) are always
-   recorded.  Shadow runs inherit the same gate.
+   are NOT written (empty refs returned). Metadata fields (hash, latency) remain.
 
-4. OFFLINE GATE — the challenger provider for shadow mode must also be offline-safe
-   when offline_mode is enabled.  ShadowExecutor enforces this; the wrapper itself
-   does not call the challenger.
-
-5. OVERHEAD — body serialization is O(message bytes).  On typical CAD design calls
+4. OVERHEAD — body serialization is O(message bytes). On typical CAD design calls
    (~8 KB prompt) the path is sub-millisecond.  Large image payloads can approach
    10 ms; the DoD threshold is honoured because image bytes are B64 already inside
    the provider, we only hash + optionally write the neutral message dict (not the

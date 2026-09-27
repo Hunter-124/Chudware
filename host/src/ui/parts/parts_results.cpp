@@ -47,19 +47,23 @@ constexpr const char* kGenModelTip =
     "Pulls specs from the internet and builds a parametric\n"
     "model, then attaches it to this part so you can place it.";
 
+bool isCommunityCad(const PartsItem& item) {
+    return item.id.rfind("catalog:printables::", 0) == 0 ||
+           item.id.rfind("catalog:makerworld::", 0) == 0;
+}
+
 int collectActions(const PartsItem& item, ItemAction* out) {
     int n = 0;
     const bool isCatalog = item.id.rfind("catalog:", 0) == 0;
-    if (isCatalog && !item.downloaded) out[n++] = {"Download", ActKind::Download};
-    out[n++] = {"Insert", ActKind::Insert};
-    // Un-modeled parts (live vendor listings with no CAD to download) can be
-    // reconstructed instead: hand their photos/datasheet/specs to a new Reverse
-    // Engineering session. Offered on live results — the ones that often ship no model.
-    if (item.source == "live") out[n++] = {"Reverse-engineer", ActKind::ReverseEngineer};
-    // RE-32: "Reverse Engineer → Generate 3D model" — one-click internet-research
-    // + parametric build for any part that has metadata but no placeable 3D model.
-    // Hidden for parts that are already placeable (have a model attached).
-    if (!item.placeable) out[n++] = {"Generate 3D model", ActKind::GenerateModel};
+    const bool community = isCommunityCad(item);
+    if (community) {
+        out[n++] = {"Download & import", ActKind::Download};
+    } else {
+        if (isCatalog && !item.downloaded) out[n++] = {"Download", ActKind::Download};
+        if (item.placeable) out[n++] = {"Insert", ActKind::Insert};
+        if (item.source == "live") out[n++] = {"Reverse-engineer", ActKind::ReverseEngineer};
+        if (!item.placeable) out[n++] = {"Generate 3D model", ActKind::GenerateModel};
+    }
     IM_ASSERT(n <= kMaxItemActions);
     return n;
 }
@@ -279,12 +283,23 @@ static void itemTooltipAt(const PartsItem& item, bool hovered) {
         ImGui::PopStyleColor();
     }
     if (!item.vendor.empty())     ImGui::Text("Vendor: %s", item.vendor.c_str());
-    if (!item.partNumber.empty()) ImGui::Text("Part #: %s", item.partNumber.c_str());
+    if (!item.fileName.empty()) ImGui::Text("CAD file to download: %s", item.fileName.c_str());
+    else if (!item.partNumber.empty()) ImGui::Text("Part #: %s", item.partNumber.c_str());
     if (!item.material.empty()) ImGui::Text("Material: %s", item.material.c_str());
     if (!item.standard.empty()) ImGui::Text("Standard: %s", item.standard.c_str());
+    if (!item.sizes.empty()) {
+        std::string sizes = "Available sizes: ";
+        for (const auto& size : item.sizes) {
+            if (sizes.size() > 17) sizes += " · ";
+            sizes += size;
+        }
+        ImGui::TextWrapped("%s", sizes.c_str());
+    }
     if (!item.license.empty())  ImGui::TextDisabled("License: %s", item.license.c_str());
     if (!item.datasheet.empty()) ImGui::TextDisabled("Datasheet: %s", item.datasheet.c_str());
-    ImGui::TextDisabled("%s", item.source == "live" ? "Live vendor result" : "Local library");
+    ImGui::TextDisabled("%s", item.source == "live"
+                              ? (item.domain == "catalog" ? "Community / vendor CAD result" : "Live vendor result")
+                              : "Local standard-parts library");
     ImGui::EndTooltip();
 }
 
@@ -407,21 +422,21 @@ static const ListColumnWidths& listColumnWidths() {
 
     auto textW = [](const std::string& s) { return ImGui::CalcTextSize(s.c_str()).x; };
     w.vendor   = ImGui::CalcTextSize("Vendor").x;
-    w.part     = ImGui::CalcTextSize("Part #").x;
-    w.material = ImGui::CalcTextSize("Material").x;
+    w.part     = ImGui::CalcTextSize("Part # / CAD file").x;
+    w.material = ImGui::CalcTextSize("Material / License").x;
     w.price    = ImGui::CalcTextSize("Price").x;
     char buf[64];
     for (const auto& it : rs) {
         w.vendor   = std::max(w.vendor,   textW(it.vendor));
         w.part     = std::max(w.part,     textW(it.partNumber));
-        w.material = std::max(w.material, textW(it.material));
+        w.material = std::max(w.material, textW(isCommunityCad(it) ? it.license : it.material));
         priceLabel(it, buf, sizeof(buf));
         w.price    = std::max(w.price, ImGui::CalcTextSize(buf).x);
     }
     const float sc = ui::uiScale;
     w.vendor   = std::ceil(std::min(w.vendor,   130.0f * sc));
-    w.part     = std::ceil(std::min(w.part,     140.0f * sc));
-    w.material = std::ceil(std::min(w.material, 110.0f * sc));
+    w.part     = std::ceil(std::min(w.part,     180.0f * sc));
+    w.material = std::ceil(std::min(w.material, 150.0f * sc));
     w.price    = std::ceil(std::min(w.price,    110.0f * sc));
     return w;
 }
@@ -507,8 +522,8 @@ void drawResultsList(AppState& st) {
     }
     ImGui::TableSetupColumn("Name",     ImGuiTableColumnFlags_WidthStretch);
     ImGui::TableSetupColumn("Vendor",   fixedCol(showVendor),   cw.vendor);
-    ImGui::TableSetupColumn("Part #",   fixedCol(showPart),     cw.part);
-    ImGui::TableSetupColumn("Material", fixedCol(showMaterial), cw.material);
+    ImGui::TableSetupColumn("Part # / CAD file", fixedCol(showPart), cw.part);
+    ImGui::TableSetupColumn("Material / License", fixedCol(showMaterial), cw.material);
     ImGui::TableSetupColumn("Price",    fixedCol(showPrice),    cw.price);
     ImGui::TableSetupColumn("##act",    ImGuiTableColumnFlags_WidthFixed, wAct);
 
@@ -516,7 +531,7 @@ void drawResultsList(AppState& st) {
     ImGui::TableNextRow();
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-    const char* heads[5] = {"Name", "Vendor", "Part #", "Material", "Price"};
+    const char* heads[5] = {"Name", "Vendor", "Part # / CAD file", "Material / License", "Price"};
     for (int c = 0; c < 5; ++c) {
         ImGui::TableSetColumnIndex(c);
         cellText(heads[c]);
@@ -661,7 +676,8 @@ void drawResultsList(AppState& st) {
         };
         dimCell(1, item.vendor.c_str());
         dimCell(2, item.partNumber.c_str());
-        dimCell(3, item.material.empty() ? "-" : item.material.c_str());
+        dimCell(3, isCommunityCad(item) && !item.license.empty()
+                   ? item.license.c_str() : (item.material.empty() ? "-" : item.material.c_str()));
 
         cellLine(4);
         {
@@ -876,12 +892,16 @@ void drawResultsGrid(AppState& st) {
             contentText(ty, item.partNumber.c_str(), Palette::toU32(palette.textDim));
             ty += lineH + 2.0f * sc;
         }
-        // The "live" marker moved to the preview badge, so this line is just the price.
+        // Community CAD licenses matter more than an absent commerce price.
         char pbuf[48];
-        if (item.priceUsd > 0.0) std::snprintf(pbuf, sizeof(pbuf), "$%.2f", item.priceUsd);
-        else                     std::snprintf(pbuf, sizeof(pbuf), "%s", "—");
-        contentText(ty, pbuf, item.priceUsd > 0.0 ? Palette::toU32(palette.accent)
-                                                  : Palette::toU32(palette.textDisabled));
+        if (isCommunityCad(item) && !item.license.empty()) {
+            contentText(ty, item.license.c_str(), Palette::toU32(palette.textDim));
+        } else {
+            if (item.priceUsd > 0.0) std::snprintf(pbuf, sizeof(pbuf), "$%.2f", item.priceUsd);
+            else                     std::snprintf(pbuf, sizeof(pbuf), "%s", "—");
+            contentText(ty, pbuf, item.priceUsd > 0.0 ? Palette::toU32(palette.accent)
+                                                      : Palette::toU32(palette.textDisabled));
+        }
 
         dl->PopClipRect();
 
@@ -912,7 +932,7 @@ void drawResultsGrid(AppState& st) {
                 // Sized from its own label but never past 62% of the content width, so the
                 // "…" button always has room on the same line no matter how long the label.
                 const float primW = std::min(ImGui::CalcTextSize(acts[0].label).x + fpX * 2.0f,
-                                             contentW * 0.62f);
+                                             contentW - (n > 1 ? lineH + gapX : 0.0f));
 
                 ImGui::PushClipRect(b0, b1, true);
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(fpX, 0.0f));

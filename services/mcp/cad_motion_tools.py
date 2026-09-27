@@ -734,12 +734,18 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
         _LOCAL_BBOX[source_path] = hit
         return hit
 
-    def _source_path(comp: dict) -> str:
+    def _source_path(comp: dict, asm_doc: str) -> str:
         path = ((comp.get("source") or {}).get("path")) or ""
         if not path:
             raise ValueError(f"component '{comp.get('id')}' has no source part file; "
                              "its geometry cannot be swept")
-        return path
+        if not os.path.isabs(path):
+            asm_path = next((row.get("path") for row in
+                             (cb.call("doc_list", {}) or {}).get("docs", [])
+                             if isinstance(row, dict) and row.get("doc_id") == asm_doc), None)
+            if asm_path:
+                path = os.path.join(os.path.dirname(asm_path), path)
+        return os.path.abspath(path)
 
     def _corners(bbox: dict) -> list:
         lo, hi = bbox["min"], bbox["max"]
@@ -1028,7 +1034,7 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                     if not poses.get(cid):
                         continue
                     built = _build_swept_solid(c.get("name") or cid,
-                                               _source_path(c), poses[cid])
+                                               _source_path(c, d), poses[cid])
                     built["component"] = cid
                     solids.append(built)
                     if not built.get("ok"):

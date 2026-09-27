@@ -859,6 +859,9 @@ MAIN_CHAT_CORE_TOOLS: tuple[str, ...] = (
     "asm_add_component",
     "asm_mate",
     "solve_mates",
+    # Motion must be callable alongside mates so mechanisms stay driveable,
+    # not just positioned by fixed component transforms.
+    "simulate_motion",
     # drawing
     "make_drawing",
     "export_drawing",
@@ -871,7 +874,18 @@ MAIN_CHAT_CORE_TOOLS: tuple[str, ...] = (
     "plm_history",
     "plm_timeline",
     "plm_rollback",
+    # reference / sourcing
+    "part_search",
+    "part_get",
+    "part_source",
+    "match_model",
+    "make_standard_part",
+    "list_standard_parts",
+    "fetch_cad_model",
+    "import_artifact",
     # research
+    # Chudcode owns its builtin web_search/read; the distinctly named CAD
+    # research tools coexist with them (we do not hide Chudcode's builtins).
     "research_web_search",
     "research_fetch_page",
     "research_material_lookup",

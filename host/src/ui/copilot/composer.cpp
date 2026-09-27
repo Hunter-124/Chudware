@@ -815,7 +815,10 @@ static void attachAgentConversationOptions(AppState& st, nlohmann::json& opts) {
     opts["session_id"] = st.activeConvId();
     opts["sessions_dir"] = chatSessionsDir();
     ui::ensureWorkspaceDir(st);
-    if (!st.workspaceDir.empty()) opts["workspace_dir"] = st.workspaceDir;
+    if (!st.workspaceDir.empty()) {
+        opts["workspace_dir"] = st.workspaceDir;
+        bindActiveConversationProject(st, st.workspaceDir);
+    }
     if (nlohmann::json hist = chatHistoryForAgent(st); !hist.empty())
         opts["history"] = std::move(hist);
     // Chudcode session continuity: a conversation whose persisted link carries a session

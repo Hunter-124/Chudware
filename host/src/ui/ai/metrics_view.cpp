@@ -14,6 +14,8 @@
 #include "ui_theme.h"
 #include "ui/metrics.h"           // cpMenu* rhythm tokens / px / stroke
 #include "ui/copilot/copilot.h"   // BridgeModelMeta / bridgeModelMeta
+#include "ui/copilot/copilot_internal.h" // convProjectDir / convProjectKey
+#include "ui/widgets/kit.h"
 
 namespace ui {
 namespace {
@@ -98,7 +100,12 @@ struct SessionSpend {
 }  // namespace
 
 void drawMetricsView(AppState& st) {
-    const float S = ui::uiScale;
+    static bool allProjects = false;
+    const std::string projectDir = convProjectDir(st);
+    const std::string projectKey = convProjectKey(projectDir);
+    ui::kit::toggleChip("All projects", &allProjects, ui::kit::Tone::Accent,
+                        "Include token usage from conversations in every project");
+    ui::kit::gapRow();
 
     // Same adaptive surface the host pane (drawViewPane) resolves — idempotent per frame, and
     // it gives the fraction rings a track tone that matches the glass they sit on.
@@ -108,10 +115,10 @@ void drawMetricsView(AppState& st) {
     const AdaptiveSurface& surf =
         adaptivePanel(panelId("ai_ws_view_glass"), paneRect, GlassGroup::Global);
 
-    // ---- aggregate every completed, model-stamped assistant turn across every session —
-    // active (st.chat) + parked (Conversation::msgs) — pricing with cached Chudcode model
-    // metadata. The same $/Mtok formula used by the per-session strip is computed client-side,
-    // so Metrics needs no extra round-trip and remains available while catalog refresh is down.
+    // Aggregate completed, model-stamped turns from this project's conversations by default,
+    // or from every conversation when All projects is enabled. The active conversation's
+    // messages live in st.chat; parked conversations keep theirs in Conversation::msgs.
+    // Price each model using cached Chudcode metadata, without a worker round-trip.
     // Pricing provenance is carried through with the money, exactly like the cost strip: a model
     // the catalog has no price for adds tokens but NO dollars, so every total it touches is a
     // floor and is labelled one. `hasCost` cannot make that distinction (`cost` is an object
@@ -126,6 +133,8 @@ void drawMetricsView(AppState& st) {
 
     for (int i = 0; i < (int)st.conversations.size(); ++i) {
         const Conversation& c = st.conversations[i];
+        if (!allProjects && (projectKey.empty() ||
+            convProjectKey(c.projectDir) != projectKey)) continue;
         const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
         SessionSpend ss;
         ss.title = c.title.empty() ? ("Chat " + std::to_string(i + 1)) : c.title;
@@ -161,30 +170,13 @@ void drawMetricsView(AppState& st) {
     }
 
     if (totalTurns == 0) {
-        float avail = ImGui::GetContentRegionAvail().y;
-        ImGui::Dummy(ImVec2(0, avail * 0.35f));
-        const char* msg = "No token usage yet";
-        const char* sub = "Tokens and spend show up here once an assistant turn completes. "
-                          "Models without catalog pricing still report tokens, but not dollars.";
-        float mw = ImGui::CalcTextSize(msg).x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             (ImGui::GetContentRegionAvail().x - mw) * 0.5f);
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::TextUnformatted(msg);
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
-        float avail2 = ImGui::GetContentRegionAvail().x;
-        float wrapW  = std::min(avail2 - 16.0f * S, 460.0f * S);
-        float sw     = ImGui::CalcTextSize(sub, nullptr, false, wrapW).x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (avail2 - sw) * 0.5f));
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                   palette.textDisabled[2], 0.75f));
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
-        ImGui::TextWrapped("%s", sub);
-        ImGui::PopTextWrapPos();
-        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, ImGui::GetContentRegionAvail().y * 0.35f));
+        const std::string basename = lexicalPath(projectDir).filename().string();
+        const std::string name = basename.empty() ? "this project" : basename;
+        const std::string title = allProjects ? "No token usage yet"
+                                              : "Nothing for " + name + " yet";
+        ui::kit::emptyState(nullptr, title.c_str(),
+                            "Tokens and spend appear after an assistant turn completes.");
         return;
     }
 

@@ -6,7 +6,7 @@ degrades to an ``ok: false`` envelope rather than raising.
 
 Methods:
 
-  subagent_list       {limit?, session_id?}              -> {ok, sessions}
+  subagent_list       {limit?, session_id?, project_dir?} -> {ok, sessions}
   subagent_transcript {subagent_id, limit?, raw?}        -> {ok, session,
                                                              messages,
                                                              pending_steers}
@@ -35,7 +35,8 @@ def _subagent_list(params: dict, _emit: Callable) -> dict:
         limit = int(request.get("limit", 50))
         session_id = str(request.get("session_id", "")).strip()
         sessions = reg.list_sessions(
-            limit=2_147_483_647 if session_id else limit
+            limit=2_147_483_647 if session_id else limit,
+            project_dir=request.get("project_dir"),
         )
         if session_id:
             sessions = [
@@ -149,7 +150,7 @@ def _subagent_control(params: dict, _emit: Callable) -> dict:
         note = ""
         if op == "pause":
             if session.get("status") in (
-                "done", "failed", "revoked", "terminated",
+                "done", "failed", "revoked", "terminated", "abandoned",
             ):
                 return {
                     "ok": False,

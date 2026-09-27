@@ -1,5 +1,5 @@
-// See docs_panel.h. Two-pane glass layout: session document list (agent artifacts + user
-// attachments) on the left, extension-keyed preview/edit on the right.
+// See docs_panel.h. Project-scoped conversation artifacts and agent-touched tabs on the
+// left, with extension-keyed preview/edit of the selected visible document on the right.
 #include "docs_panel.h"
 
 #include <algorithm>
@@ -24,6 +24,8 @@
 #include <nlohmann/json.hpp>
 
 #include "core/app_state.h"
+#include "ui/ai/active_work.h" // saved/unsaved agent-tab project ownership
+#include "ui/copilot/copilot_internal.h" // convProjectDir / convProjectKey
 #include "ui/file_dialog.h"   // ui::openFileDialog (native open dialog)
 #include "ui_theme.h"         // ui::palette / uiScale / adaptivePanel / glassPanel / glassRowBackground
 #include "ui/metrics.h"       // cpMenu* rhythm tokens (gutter / row pad / corner)
@@ -255,34 +257,43 @@ bool pathExists(DocsState& D, const std::string& path) {
 
 // ---------------------------------------------------------------- artifact collection
 
-// Agent-created files packed into activity detail after "\x1eART\x1e" (live + restored) —
-// the same blob conversations.cpp persists as {kind,path,tool} and panel.cpp's Artifacts
-// panel lists. Active conversation messages live in st.chat.
-void collectArtifacts(const AppState& st, std::vector<DocEntry>& out,
+// Activity artifact blobs are attached to a conversation, not to an arbitrary selected tab.
+// Include both the live chat and parked conversations belonging to this project.
+void collectArtifacts(const AppState& st, const std::string& projectDir,
+                      std::vector<DocEntry>& out,
                       std::unordered_set<std::string>& seen) {
-    for (const auto& m : st.chat) {
-        if (m.fromUser) continue;
-        for (const auto& a : m.activity) {
-            const size_t sep = a.detail.find("\x1e" "ART\x1e");
-            if (sep == std::string::npos) continue;
-            std::string blob = a.detail.substr(sep);
-            const size_t nl = blob.find('\n');
-            if (nl != std::string::npos) blob = blob.substr(nl + 1);
-            std::istringstream iss(blob);
-            std::string line;
-            while (std::getline(iss, line)) {
-                if (line.empty()) continue;
-                const size_t tab = line.find('\t');
-                DocEntry e;
-                e.kind = tab == std::string::npos ? "file" : line.substr(0, tab);
-                e.path = tab == std::string::npos ? line : line.substr(tab + 1);
-                e.tool = a.title.empty() ? a.stage : a.title;
-                if (e.path.empty() || !seen.insert(e.path).second) continue;
-                e.name = baseName(e.path);
-                e.key  = e.path;
-                e.agentTouched = true;   // an activity blob IS agent output by construction
-                seen.insert(nameKey(e.name));
-                out.push_back(std::move(e));
+    const std::string projectKey = convProjectKey(projectDir);
+    if (projectKey.empty()) return;
+    for (int i = 0; i < (int)st.conversations.size(); ++i) {
+        const Conversation& conv = st.conversations[(size_t)i];
+        if (convProjectKey(conv.projectDir) != projectKey) continue;
+        const auto& msgs = i == st.activeConv ? st.chat : conv.msgs;
+        for (const auto& m : msgs) {
+            if (m.fromUser) continue;
+            for (const auto& a : m.activity) {
+                const size_t sep = a.detail.find("\x1e" "ART\x1e");
+                if (sep == std::string::npos) continue;
+                std::string blob = a.detail.substr(sep);
+                const size_t nl = blob.find('\n');
+                if (nl != std::string::npos) blob = blob.substr(nl + 1);
+                std::istringstream iss(blob);
+                std::string line;
+                while (std::getline(iss, line)) {
+                    if (line.empty()) continue;
+                    const size_t tab = line.find('\t');
+                    DocEntry e;
+                    e.kind = tab == std::string::npos ? "file" : line.substr(0, tab);
+                    e.path = tab == std::string::npos ? line : line.substr(tab + 1);
+                    e.tool = a.title.empty() ? a.stage : a.title;
+                    if (e.path.empty() ||
+                        !agentDocInProject(e.path, conv.projectDir, projectDir) ||
+                        !seen.insert(e.path).second) continue;
+                    e.name = baseName(e.path);
+                    e.key  = e.path;
+                    e.agentTouched = true;
+                    seen.insert(nameKey(e.name));
+                    out.push_back(std::move(e));
+                }
             }
         }
     }
@@ -291,9 +302,11 @@ void collectArtifacts(const AppState& st, std::vector<DocEntry>& out,
 // The agent's DOCUMENTS, not just its files: a part it opened or edited belongs in this list
 // even when no file was ever written for it. "Agent-touched" is the shared contract —
 // aiHandoff, or a non-zero lastAgentEditAt.
-void collectAgentDocs(const AppState& st, std::vector<DocEntry>& out,
+void collectAgentDocs(const AppState& st, const std::string& projectDir,
+                      std::vector<DocEntry>& out,
                       std::unordered_set<std::string>& seen) {
     for (const auto& t : st.docTabs) {
+        if (!agentDocInProject(t.path, t.projectDir, projectDir)) continue;
         if (!t.aiHandoff && t.lastAgentEditAt == std::chrono::steady_clock::time_point{})
             continue;
         DocEntry e;
@@ -309,16 +322,23 @@ void collectAgentDocs(const AppState& st, std::vector<DocEntry>& out,
     }
 }
 
-std::vector<std::string>& attachedFor(const AppState& st) {
-    std::string key = "default";
-    if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size() &&
-        !st.conversations[st.activeConv].id.empty())
-        key = st.conversations[st.activeConv].id;
-    return DS().attachedByConv[key];
+std::vector<std::string>* attachedFor(const AppState& st,
+                                      const std::string& projectDir) {
+    if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size())
+        return nullptr;
+    const auto& conv = st.conversations[(size_t)st.activeConv];
+    if (convProjectKey(conv.projectDir) != convProjectKey(projectDir) ||
+        conv.projectDir.empty()) return nullptr;
+    return &DS().attachedByConv[conv.id.empty() ? "default" : conv.id];
 }
 
-void attachPath(DocsState& D, std::vector<std::string>& attached, const std::string& p) {
+void attachPath(AppState& st, DocsState& D, std::vector<std::string>& attached,
+                const std::string& p, const std::string& projectDir) {
     if (p.empty()) return;
+    if (!agentDocInProject(p, std::string(), projectDir)) {
+        st.toast(ToastLevel::Warn, "Choose a file inside the active project folder.");
+        return;
+    }
     if (std::find(attached.begin(), attached.end(), p) == attached.end())
         attached.push_back(p);
     D.selected = p;
@@ -857,13 +877,16 @@ bool docRow(DocsState& D, const DocEntry& e, bool selected, const AdaptiveSurfac
 }
 
 void drawDocList(AppState& st, DocsState& D, const AdaptiveSurface& surf, float S) {
-    std::vector<std::string>& attached = attachedFor(st);
+    const std::string projectDir = convProjectDir(st);
+    std::vector<std::string>* attached = attachedFor(st, projectDir);
 
+    ImGui::BeginDisabled(attached == nullptr);
     // ---- attach affordances ----
     if (!dialogsDisabled()) {
         if (ImGui::Button("Attach file...", ImVec2(-1.0f, 0.0f))) {
             const std::string p = ui::openFileDialog(kDocsFilter);
-            if (!p.empty()) attachPath(D, attached, p);
+            if (attached && !p.empty())
+                attachPath(st, D, *attached, p, projectDir);
         }
     }
     {
@@ -876,27 +899,31 @@ void drawDocList(AppState& st, DocsState& D, const AdaptiveSurface& surf, float 
         ImGui::SameLine(0, 4.0f * S);
         ImGui::BeginDisabled(D.pathBuf[0] == '\0');
         if (ImGui::SmallButton("Add") || (entered && D.pathBuf[0] != '\0')) {
-            attachPath(D, attached, D.pathBuf);
+            if (attached) attachPath(st, D, *attached, D.pathBuf, projectDir);
             D.pathBuf[0] = '\0';
         }
         ImGui::EndDisabled();
     }
     ImGui::Spacing();
+    ImGui::EndDisabled();
 
     // ---- entries: everything the agent touched first, then the user's own attachments ----
     std::vector<DocEntry> entries;
     std::unordered_set<std::string> seen;
-    collectArtifacts(st, entries, seen);
-    collectAgentDocs(st, entries, seen);
-    for (const auto& p : attached) {
-        if (!seen.insert(p).second) continue;
-        DocEntry e;
-        e.path = p;
-        e.name = baseName(p);
-        e.key  = p;
-        e.kind = "attached";
-        e.attached = true;
-        entries.push_back(std::move(e));
+    collectArtifacts(st, projectDir, entries, seen);
+    collectAgentDocs(st, projectDir, entries, seen);
+    if (attached) {
+        for (const auto& p : *attached) {
+            if (!agentDocInProject(p, std::string(), projectDir) ||
+                !seen.insert(p).second) continue;
+            DocEntry e;
+            e.path = p;
+            e.name = baseName(p);
+            e.key  = p;
+            e.kind = "attached";
+            e.attached = true;
+            entries.push_back(std::move(e));
+        }
     }
     // ONE flat vector — selection still addresses entries[i] directly; the two labelled
     // sections are only a header drawn before each run.
@@ -904,10 +931,19 @@ void drawDocList(AppState& st, DocsState& D, const AdaptiveSurface& surf, float 
         std::stable_partition(entries.begin(), entries.end(),
                               [](const DocEntry& e) { return e.agentTouched; }) -
         entries.begin());
+    // Selection survives panel visits but cannot survive project changes or row removal:
+    // otherwise the right-hand preview exposes a document from another project.
+    if (!D.selected.empty() &&
+        std::none_of(entries.begin(), entries.end(),
+                     [&](const DocEntry& e) { return e.key == D.selected; }))
+        D.selected.clear();
     if (entries.empty()) {
-        emptyState("No documents yet",
-                   "Files agents create in this session show up here. Attach a file to "
-                   "preview or edit it next to the chat.");
+        const std::string name = lexicalPath(projectDir).filename().string();
+        const std::string title = "Nothing for " +
+            (name.empty() ? std::string("this project") : name) + " yet";
+        emptyState(title.c_str(),
+                   "Files agents create in this project show up here. Attach a project file "
+                   "to preview or edit it next to the chat.");
         return;
     }
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
@@ -937,9 +973,9 @@ void drawDocList(AppState& st, DocsState& D, const AdaptiveSurface& surf, float 
         }
         if (removeClicked) removeIdx = i;
     }
-    if (removeIdx >= 0 && entries[(size_t)removeIdx].attached) {
+    if (attached && removeIdx >= 0 && entries[(size_t)removeIdx].attached) {
         const std::string p = entries[(size_t)removeIdx].path;
-        attached.erase(std::remove(attached.begin(), attached.end(), p), attached.end());
+        attached->erase(std::remove(attached->begin(), attached->end(), p), attached->end());
         if (D.selected == p) D.selected.clear();
     }
 }

@@ -14,7 +14,7 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from services.agent.chudcode_events import map_rpc_frame
+from services.agent.chudcode_events import RpcFrameState, map_rpc_frame
 from services.agent.chudcode_host import get_default_chudcode_host
 from services.agent.chudcode_tools import build_host_tools
 from services.agent.roles import RoleError, load_role
@@ -838,6 +838,7 @@ def run_role_turn(
         "role": role_name,
         "actor": role_name,
     }
+    event_state = RpcFrameState()
 
     def raw_emit(frame: Any) -> None:
         raw = (
@@ -848,7 +849,7 @@ def run_role_turn(
                 "value": frame,
             }
         )
-        for kind, mapped in map_rpc_frame(raw, event_context):
+        for kind, mapped in map_rpc_frame(raw, event_context, event_state):
             payload = (
                 dict(mapped) if isinstance(mapped, Mapping) else {"payload": mapped}
             )

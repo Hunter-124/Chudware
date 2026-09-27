@@ -1,13 +1,10 @@
 // AI workspace — Documents panel.
 //
-// Per-session document attach / preview / edit surface for the AI tab (wired into the
-// utility panel at nav view 3). LEFT: the active conversation's agent-created artifacts (parsed from
-// the same "\x1eART\x1e" activity blobs conversations.cpp persists as {kind,path,tool}) plus
-// paths the user attached this session (native open dialog, or the manual path entry for
-// headless runs). RIGHT: an extension-keyed preview — text/source via drawCodeBox, CSV as a
-// table, PNG/JPG as a GL texture, office/PDF through the worker's office_extract RPC (the
-// pane degrades to an honest note when the method is absent). Plain-text/CSV/MD files are
-// editable in place (multiline buffer + Save, atomic tmp+rename write-back).
+// The left list collects artifact files from every conversation in the active project,
+// agent-touched saved tabs beneath the project directory, never-saved agent tabs with
+// matching originating project, and attachments of the selected conversation in that
+// project. The right pane previews only the selected visible entry. Text/source, CSV,
+// images, and office/PDF use their existing preview/edit paths.
 #pragma once
 
 struct AppState;

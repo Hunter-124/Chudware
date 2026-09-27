@@ -5700,6 +5700,31 @@ static void absolutize_component_paths(json& doc, const std::filesystem::path& b
     }
 }
 
+// The document's references are interpreted relative to its current location. Rebase
+// them for a save-as, and write paths under the destination assembly's directory as
+// portable POSIX-relative paths. References outside that subtree remain absolute.
+static void rebase_component_paths(json& doc, const std::filesystem::path& old_base,
+                                   const std::filesystem::path& target_base) {
+    if (!doc.is_object() || !doc.contains("components")) return;
+    const auto dest = std::filesystem::absolute(target_base).lexically_normal();
+    for (json& component : doc["components"]) {
+        if (!component.contains("source") || !component["source"].is_object()) continue;
+        json& source = component["source"];
+        if (!source.contains("path") || !source["path"].is_string()) continue;
+        const std::filesystem::path ref(source["path"].get<std::string>());
+        if (ref.empty()) continue;
+        const auto absolute = std::filesystem::absolute(
+            ref.is_absolute() ? ref : old_base / ref).lexically_normal();
+        const auto relative = absolute.lexically_relative(dest);
+        const auto first = relative.begin();
+        if (!relative.empty() && first != relative.end() && *first != ".." &&
+            *first != ".")
+            source["path"] = relative.generic_string();
+        else
+            source["path"] = absolute.string();
+    }
+}
+
 json doc_dry_run_ops(const std::string& doc_id, const json& ops) {
     DocLock lk;
     Session& live = require_session(doc_id);
@@ -13702,6 +13727,14 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
 
     // Make every imported body self-contained before writing (Bug N-8).
     bake_import_features(s.doc);
+    json saved_doc;
+    if (s.is_assembly()) {
+        saved_doc = s.doc;
+        const auto old_base = s.path.empty() ? std::filesystem::current_path()
+            : std::filesystem::absolute(s.path).parent_path();
+        rebase_component_paths(saved_doc, old_base,
+                               std::filesystem::absolute(target).parent_path());
+    }
 
     // Persisted geometry cache (fast cold-open): embed the compiled tessellation + ops-response
     // as additive cache.* entries so a later doc_open can skip the full compile_document rebuild.
@@ -13773,17 +13806,18 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
                     s.extra_entries["geometry.step"] = std::move(geometry_step);
                 std::vector<uint8_t> blob;
                 json cached = ops_response_assembly(s, json::object(), /*with_tess=*/true, &blob);
+                cached["tree"] = saved_doc;
                 if (cached.contains("tess") && cached["tess"].is_object())
                     cached["tess"].erase("aicm_path");
                 const std::string base_dir =
                     std::filesystem::path(target).parent_path().string();
                 json header = {{"engine", stepplus_cache_engine_key()},
-                               {"doc_hash", stepplus_doc_hash(s.doc)},
+                               {"doc_hash", stepplus_doc_hash(saved_doc)},
                                {"solved", true},
                                {"assembly_appearance", 1},
                                {"display_quality",
                                 ::geom::display_quality_name(s.display_quality)},
-                               {"components", asm_component_fingerprints(s.doc, base_dir)},
+                               {"components", asm_component_fingerprints(saved_doc, base_dir)},
                                {"response", cached}};
                 if (!blob.empty()) {
                     s.extra_entries["cache.json"] = header.dump();
@@ -13799,7 +13833,8 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
         s.extra_entries.erase("geometry.step");
     }
 
-    std::string out = stepplus_save(s.doc, target, s.extra_entries);
+    std::string out = stepplus_save(s.is_assembly() ? saved_doc : s.doc, target, s.extra_entries);
+    if (s.is_assembly()) s.doc = std::move(saved_doc);
     s.path = out;
     s.dirty = false;
     json result = {{"path", out}};

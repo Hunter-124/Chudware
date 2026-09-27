@@ -1,8 +1,7 @@
 """Shadow comparison report generator.
 
-Reads a JSONL shadow log (produced by services/agent/shadow.ShadowExecutor) and
-produces a human-readable comparison table: incumbent vs challenger verifier scores,
-latency, cost, and accept-rate.
+Reads JSONL comparison records and summarizes incumbent/challenger verifier
+scores, latency, cost, and accept-rate.
 
 Usage:
     python tools/flywheel/shadow_report.py shadow_log.jsonl [--min-calls 100]
@@ -46,7 +45,7 @@ class ShadowRow:
 
 
 def load_shadow_log(path: Path) -> list[ShadowRow]:
-    """Load all ShadowRecord entries from a JSONL shadow log."""
+    """Load comparison records from a JSONL shadow log."""
     rows: list[ShadowRow] = []
     with open(path, encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, 1):

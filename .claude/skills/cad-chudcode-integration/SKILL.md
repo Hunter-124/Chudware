@@ -203,6 +203,11 @@ runtime's doctor command.
   the JSON content rather than the device path to name its target, while `read xd://`
   only inspects tool documentation. Start/progress tool events map to status; a
   terminal result/cancel maps once. A synchronous host call with a result is terminal.
+- A failed builtin's reason lives only in `tool_execution_end.result.content[].text`
+  (`isError:true`): unknown tool names, calls skipped because a steer was queued
+  ("Skipped due to queued user message" — Chudcode drops the rest of that tool batch and
+  tells the model to retry), thrown tool errors. `_tool_end` carries it as `error_preview`;
+  before 2026-09-27 every such card read "tool failed".
 - Preserve correlation (`run_id`, `session_id`, node/span/parent/subagent ids), but synthesize
   only deterministic digest ids when the source omitted one.
 - Unknown frames remain visible as bounded deterministic `sub_run` rows. Never drop them or

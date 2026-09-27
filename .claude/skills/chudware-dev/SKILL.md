@@ -260,6 +260,12 @@ judgment).
   failures, and the GUI shows an amber "Turn time limit reached" card, not "System error".
   A failure after streamed prose is APPENDED to `ChatMsg::text` (the error card renders
   only `timelineProseTail`; replacing the text hid the card entirely).
+- **A steer splits the running bubble (2026-09-27).** The event and result drains feed the
+  LAST running assistant `ChatMsg`. A mid-run steer used to append only the user bubble, so
+  the rest of the run and its final reply streamed into the bubble ABOVE the steer with
+  nothing live below it. `composer.cpp::appendSteerToTranscript` closes the live bubble
+  (`steerSplit`, persisted `"split"`, exempt from the empty/summary placeholders), appends
+  the steer, then a fresh running bubble. Append-only: AI-VC `msg_idx` anchors never shift.
 - **Agent edits reach the user's active tab live (2026-09-25).** `engine_events.cpp`
   defers a `doc.changed` only while `userMidEdit` (sketch/PM preview). It used to defer any
   dirty user-owned tab, and the first applied agent revision itself dirties that tab, so the

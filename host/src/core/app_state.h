@@ -697,6 +697,9 @@ struct ChatMsg {
     double ts = chatNowEpoch();    // send/receive time (epoch s); 0 = legacy/unknown (no age label)
     std::string text;              // user prompt, or the assistant's final summary
     bool running = false;          // assistant turn still streaming
+    // Assistant turn closed early because the user steered the run: the SAME run continues in
+    // the next assistant message, below the steer. Its empty text is not an empty turn.
+    bool steerSplit = false;
     std::string model;             // assistant turn: model id at run start (label); empty = plain "Assistant"
     int errKind = ERR_NONE;        // ERR_CAD = generated code didn't build (calm, amber);
                                    // ERR_SYSTEM = app/runtime/provider failure (red)

@@ -1046,7 +1046,7 @@ void persistChatHistory(AppState& st) {
         nlohmann::json jm = nlohmann::json::array();
         for (const auto& m : msgs) {
             std::string body = m.text;
-            if (body.empty() && !m.fromUser && !m.activity.empty()) {
+            if (body.empty() && !m.fromUser && !m.activity.empty() && !m.steerSplit) {
                 // Design/build turns put their result in the activity timeline, not
                 // m.text — persist a concise summary so the turn survives reload
                 // instead of vanishing (the whole session used to disappear).
@@ -1070,9 +1070,11 @@ void persistChatHistory(AppState& st) {
             // message. Persist an explicit placeholder instead (marked "empty" so the load
             // path can render a subdued note), keeping save/load a position-preserving
             // bijection across restarts.
-            const bool emptyTurn = body.empty() && !m.planState.present && !m.running;
+            const bool emptyTurn =
+                body.empty() && !m.planState.present && !m.running && !m.steerSplit;
             nlohmann::json entry = {{"u", m.fromUser}, {"t", body}, {"e", m.errKind}};
             if (emptyTurn) entry["empty"] = true;
+            if (m.steerSplit) entry["split"] = true;
             // In-flight marker: this turn was still streaming when the snapshot was taken. On
             // reload it means the app died (or was killed) mid-run — see parseChatSessionJson.
             if (!m.fromUser && m.running) entry["run"] = true;
@@ -1386,6 +1388,7 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
                 else if (cm.text.find("Interrupted \xe2\x80\x94") == std::string::npos)
                     cm.text += std::string("\n\n") + note;
             }
+            cm.steerSplit = !cm.fromUser && m.value("split", false);
             cm.running = false;
             // Placeholder for a turn that produced no visible output (persisted as
             // "empty" so message ORDINALS survive the round trip — AI-VC msg_idx

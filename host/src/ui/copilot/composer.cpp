@@ -3555,6 +3555,43 @@ static void finalizeStoppedTurnActivity(ChatMsg& m) {
     }
 }
 
+// A steer lands mid-run, so the transcript must read in the order things happened: the turn
+// so far, the user's message, then everything the run does after it. The event drain and the
+// result drain (app.cpp) both feed the LAST running assistant message; appending the steer
+// alone left the rest of the run, final reply included, streaming into the bubble ABOVE it
+// with nothing live below. Close the current bubble and open a fresh running one under the
+// steer instead. Append-only: AI-VC msg_idx anchors must never shift.
+static void appendSteerToTranscript(AppState& st, const std::string& text) {
+    ChatMsg* live = nullptr;
+    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
+        if (!it->fromUser && it->running) { live = &*it; break; }
+    const int mode = live ? live->copilotMode : st.aiInteraction;
+    const std::string model = live ? live->model : std::string();
+    if (live) {
+        finalizeStoppedTurnActivity(*live);
+        live->running = false;
+        live->liveStatus.clear();
+        live->steerSplit = true;
+        live->uiCachedH = -1.0f;
+    }
+    ChatMsg u; u.fromUser = true; u.text = text;
+    u.copilotMode = mode;
+    st.chat.push_back(std::move(u));
+    appendChatRawMessage(st, st.chat.back());
+    if (live) {
+        ChatMsg a;
+        a.running = true;
+        a.copilotMode = mode;
+        a.model = model;
+        a.liveStatus = "Thinking\xe2\x80\xa6";
+        st.chat.push_back(std::move(a));
+        appendChatRawMessage(st, st.chat.back());
+    }
+    chatLogResetStick();
+    markChatHistoryDirty();
+    maybePersistChatHistoryDebounced(st, /*force=*/true);
+}
+
 static void requestStopRun(AppState& st) {
     // Stop only ever acts on the VIEWED conversation's run — a background run in another
     // conversation keeps streaming (that is the point of per-conversation runs).
@@ -4143,13 +4180,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
                 }
                 if (!runId.empty() && st.workerStarted) {
                     agentControlDispatch(st, runId, text);
-                    // Record the steering text in the visible conversation (it otherwise
-                    // only reaches the engine + debug log and vanishes from the composer).
-                    ChatMsg u; u.fromUser = true; u.text = text;
-                    u.copilotMode = st.aiInteraction;
-                    u.liveStatus = "steering";  // subtle caption under the bubble
-                    st.chat.push_back(std::move(u));
-                    appendChatRawMessage(st, st.chat.back());
+                    appendSteerToTranscript(st, text);
                 } else {
                     // Auto-sends when the assistant frees up (drain at the top of drawComposer).
                     st.queuedPrompts.emplace_back(text);

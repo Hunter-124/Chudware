@@ -184,6 +184,25 @@ class ChudcodeEventMapperTests(unittest.TestCase):
         self.assertEqual(cancelled["error_preview"], "cancelled")
         self.assertTrue(cancelled["executed"])
 
+    def test_failed_builtin_reports_its_own_reason(self):
+        # Chudcode puts a builtin failure's reason ONLY in result.content; the card said
+        # "tool failed" for an unknown tool and for calls a queued steer skipped.
+        for reason in (
+            "Tool xd___recall not found",
+            "Skipped due to queued user message. Do not count this skipped result.",
+        ):
+            _, end = one(
+                {
+                    "type": "tool_execution_end",
+                    "toolCallId": "call-x",
+                    "toolName": "read",
+                    "result": {"content": [{"type": "text", "text": reason}], "details": {}},
+                    "isError": True,
+                }
+            )
+            self.assertFalse(end["ok"])
+            self.assertEqual(end["error_preview"], reason)
+
     def test_todos_map_to_scoped_full_snapshot(self):
         kind, plan = one(
             {

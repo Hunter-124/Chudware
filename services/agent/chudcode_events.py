@@ -413,6 +413,26 @@ def _tool_progress(
     return _status(link, "tool", text, tool_name=tool, tool_call_id=call_id)
 
 
+def _result_text(result: Any) -> str:
+    """Text of a Chudcode ``{content:[{type:"text",text}]}`` tool result.
+
+    A failed builtin (unknown tool, a call skipped for a queued steer, a thrown
+    tool error) reports its reason only here, with ``isError`` beside it.
+    """
+    if isinstance(result, str):
+        return _cap(result, _MAX_PREVIEW)
+    if not isinstance(result, Mapping) or not isinstance(result.get("content"), list):
+        return ""
+    parts = [
+        item["text"]
+        for item in result["content"][:8]
+        if isinstance(item, Mapping)
+        and item.get("type") == "text"
+        and isinstance(item.get("text"), str)
+    ]
+    return _cap("\n".join(parts).strip(), _MAX_PREVIEW)
+
+
 def _tool_end(
     event: str,
     data: Mapping[str, Any],
@@ -483,8 +503,10 @@ def _tool_end(
     if intent:
         payload["intent"] = intent
     if not ok:
-        payload["error_preview"] = error or (
-            "cancelled" if cancelled else "tool failed"
+        payload["error_preview"] = (
+            error
+            or _result_text(result)
+            or ("cancelled" if cancelled else "tool failed")
         )
     outcome = _name(_str(data, "outcomeKind", "outcome_kind", "outcome"))
     if outcome in {

@@ -1923,12 +1923,27 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   const bool isCppSimCancel =
       (method == "sim_cancel" && routeSimToCpp(method, params));
   const bool bypassCallMutex = isAgentControl || isCppSimCancel;
-  // The long streaming runs keep full serialization: two runs must never
-  // overlap (they would interleave ops on the same doc in the daemon).
+  // The long streaming runs keep full serialization among themselves: two runs
+  // must never overlap (they would interleave ops on the same doc in the daemon).
   const bool isLongRun = (method == "agent_run_v2" ||
                           method == "agent_mission_v1" ||
                           method == "agent_admin_turn");
-  std::unique_lock<std::mutex> lk(callMtx_, std::defer_lock);
+  // In daemon mode a long run needs nothing callMtx_ guards: it streams on
+  // engine_backend's dedicated run connection (isLongRunMethod), and its
+  // worker-control state has its own mutex. Holding callMtx_ for a turn that
+  // lives for hours parked EVERY other call on this client behind it — any
+  // worker-routed call (subscription_*, chudcode_*, plm_*) queued on the GUI's
+  // single-FIFO st.rpc lane blocked in lk.lock() below, and every later
+  // doc_activate/doc_tree/doc_snapshot waited behind that one forever: a tab
+  // click showed "Loading" for the whole turn (2026-09-27). So a daemon-mode
+  // long run serializes on longRunMtx_ only. Pipe mode keeps callMtx_: the
+  // Python stdio pipe carries one request at a time. So does a run that could
+  // not get the dedicated connection (it would hold the shared one instead,
+  // and the engine-bound side-channel below only engages behind callMtx_).
+  const bool daemonLongRun =
+      isLongRun && engine::daemonMode() && engine::runConnectionReady();
+  std::unique_lock<std::mutex> lk(daemonLongRun ? longRunMtx_ : callMtx_,
+                                  std::defer_lock);
   if (isCppSimCancel && engine::daemonMode()) {
     // The shared EngineClient serializes socket calls internally, so it is
     // blocked behind the solve even after bypassing callMtx_. Use the same
@@ -1936,10 +1951,10 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     return callViaSideClient(method, params, result, err, timeoutMs, onEvent);
   }
   if (!bypassCallMutex && !isLongRun && engine::daemonMode()) {
-    // Engine-bound call arriving while another call holds callMtx_ —
-    // typically a multi-minute agent_run: the GUI thread makes config_list /
-    // doc_tree / pick calls on normal interaction, and blocking it behind
-    // the run froze the whole app (2026-07-21 SIGABRT crash). In daemon mode
+    // Engine-bound call arriving while another call holds callMtx_ — e.g. a
+    // slow doc_rebuild: the GUI thread makes config_list / doc_tree / pick
+    // calls on normal interaction, and blocking it behind that call froze the
+    // whole app (2026-07-21 SIGABRT crash, then behind an agent_run). In daemon mode
     // hostd serves each connection on its own thread, so sidestep the wait
     // with a short-lived side connection. Excluded (keep legacy blocking):
     // minting calls (doc_new/doc_open/import_file, ecad_new/ecad_open —

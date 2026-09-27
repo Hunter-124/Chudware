@@ -251,8 +251,8 @@ void providerUsagePollAccounts(AppState& st, double ttlSec, bool force) {
         g.accountsInFlight = false;
         // hostd's worker_lane_busy (an agent turn holds the agent worker lane) is transient
         // and internal: keep the rings as they are and say nothing — the next poll after the
-        // turn succeeds. Checked first, whichever way the transport reports the method error.
-        if (r.result.is_object() && jstr(r.result, "code") == "worker_lane_busy") return;
+        // turn succeeds.
+        if (core::workerLaneBusy(r)) return;
         if (!r.ok || !r.result.is_object()) {
             if (!r.ok && g.lastError.empty())
                 g.lastError = r.err.empty() ? "subscription_accounts unavailable" : r.err;

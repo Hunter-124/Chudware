@@ -4972,3 +4972,25 @@ call's own timeout; the usage rings treat the busy reply as silent
 (`test_agent_lane_call_behind_a_turn_fails_fast_and_hostd_survives`).
 Not changed: agent-minted docs still open as background mirror tabs while a user doc is
 active (the 2026-09-24 never-steal-focus rule).
+
+## 2026-09-27 — "clicking the AI's part flashes Loading, then kicks me back to Part1"
+
+Two causes. (1) The hostd lane fix above did not reach the GUI side: the agent job thread held
+`WorkerClient::callMtx_` for the whole `agent_admin_turn`, so any worker-routed call on the
+single-FIFO `st.rpc` lane (usage/PLM/Chudcode polls) blocked in `lk.lock()` and every later
+`doc_activate`/`doc_snapshot` waited behind it for the rest of the turn (log: gen=1 never
+delivered, gen=2..5 coalesced forever). In daemon mode a long run now serializes on
+`longRunMtx_` only — it already streams on engine_backend's dedicated run connection
+(`engine::runConnectionReady()`); pipe mode and a run without that connection keep `callMtx_`
+(`services/worker/worker_client.{h,cpp}`, `engine_backend.{h,cpp}`;
+`host/tests/test_worker_long_run.cpp` drives the real WorkerClient + AsyncRpc against a fake
+hostd on a private socket and fails 4/4 on the old locking). (2) `AppState::ensureActiveTab`
+re-points `activeTab` at the mirror's doc every frame; an async switch selects the tab before
+its `doc_activate` lands, so any activation slower than one frame snapped the strip back to
+the previous part and the late result landed "off-screen". `core::SwitchHold`
+(`host/src/core/switch_hold.h`, `doc_tabs.cpp`) keeps the clicked tab selected until its newest
+activation lands or fails; a failure still returns to the mirror's doc with the error toast, and a
+mirror moved to a third doc (New/Open) is still followed (`host/tests/test_switch_hold.cpp`).
+Not verified: the rebuilt GUI (no relink during the live session). Side effect worth knowing:
+agent-lane calls (chudcode_*) made during a turn now reach hostd and get `worker_lane_busy` at
+once instead of hanging for the turn.

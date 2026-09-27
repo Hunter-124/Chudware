@@ -895,6 +895,64 @@ add_test(NAME test_async_rpc
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end AsyncRpc streamed events ---
 
+# --- WorkerClient daemon-mode long runs: links the REAL worker_client.cpp + engine_backend.cpp
+# + IPC client/transport + async_rpc.cpp against an in-process fake hostd on a private socket.
+# Guards the 2026-09-27 starvation: an hours-long agent_admin_turn held callMtx_, so a
+# worker-routed call on the GUI's single-FIFO st.rpc lane — and every tab-switch doc_activate
+# queued behind it — waited out the whole turn. Also: two long runs still never overlap.
+if(UNIX)
+  add_executable(test_worker_long_run
+    tests/test_worker_long_run.cpp
+    src/core/async_rpc.cpp
+    src/bootstrap.cpp
+    ../services/worker/worker_client.cpp
+    ../services/worker/engine_backend.cpp
+    ../services/worker/cpp_core.cpp
+    ../services/ipc/ipc_client.cpp
+    ../services/ipc/ipc_transport.cpp
+    ../services/ipc/ipc_discovery.cpp
+    ../core/util/platform_paths.cpp
+    ../core/security/integrity.cpp
+    ../core/security/containment.cpp
+    ../core/security/runtime_guard.cpp
+    ../core/security/event_queue.cpp
+    ../core/util/entitlement.cpp
+    ../core/util/randombytes.cpp
+    ../core/util/tweetnacl.c
+    ../core/util/device_identity.cpp
+    ../core/util/secret_store.cpp)
+  target_include_directories(test_worker_long_run PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker
+    ${CMAKE_CURRENT_SOURCE_DIR}/../core
+    ${miniz_SOURCE_DIR})
+  target_link_libraries(test_worker_long_run PRIVATE
+    nlohmann_json::nlohmann_json chudware_host_miniz Threads::Threads ${CMAKE_DL_LIBS})
+  if(APPLE)
+    target_link_libraries(test_worker_long_run PRIVATE
+      "-framework CoreFoundation" "-framework Security")
+  endif()
+  set_target_properties(test_worker_long_run PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME test_worker_long_run
+    COMMAND test_worker_long_run
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
+# --- end WorkerClient daemon-mode long runs ---
+
+# --- Async tab switch vs the per-frame mirror reconcile: header-only core/switch_hold.h (no
+# GL / imgui / AppState). Guards the 2026-09-27 "click a tab, it flashes Loading for a frame,
+# then kicks me back to the last part and deselects the tab".
+add_executable(test_switch_hold tests/test_switch_hold.cpp)
+target_include_directories(test_switch_hold PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_switch_hold PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_switch_hold
+  COMMAND test_switch_hold
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end async tab switch hold ---
+
 # --- CEF metrics spool bound: links the REAL GL/CEF-free filesystem cleanup.
 # Exercises both exact Chromium spool directories without loading libcef or a GL context.
 add_executable(test_cef_spool_reaper

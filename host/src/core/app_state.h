@@ -33,6 +33,7 @@
 #include "selection.h"   // core::Selection (pulls render::PickHit; all GL-free headers)
 #include "doc_mirror.h"  // core::DocMirror (C16)
 #include "async_rpc.h"   // core::AsyncRpc (C39) — non-blocking worker calls
+#include "switch_hold.h" // core::SwitchHold — async tab switch survives ensureActiveTab
 
 #include "../ui/toast.h"    // W1-B: ToastLevel / Toast (toast queue lives on AppState)
 #include "../ui/cursors.h"  // W1-B: CursorKind (per-frame cursor request)
@@ -1551,6 +1552,9 @@ struct AppState {
     int pendingActivateTab = -1;          // -1 = no coalesced switch waiting; else docTabs index
     std::string pendingActivateDocId;     // pendingActivateTab's doc id (staleness check on drain)
     uint64_t pendingActivateGeneration = 0;
+    // The async switch-in the strip is showing while its doc_activate is outstanding (see
+    // switch_hold.h): ensureActiveTab must not snap the selection back to the mirror's doc.
+    core::SwitchHold switchHold;
     // doc_ids with a lock-free doc_snapshot prime in flight (switchToTab). Dedup only:
     // a spectator can click the same wedged mirror tab a dozen times while the agent writes,
     // and each click re-enters switchToTab — without this every click would queue another

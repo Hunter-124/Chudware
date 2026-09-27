@@ -470,6 +470,10 @@ void AppState::switchToTab(int idx) {
         zoomToBBoxRequested = false;
         suppressTabDirty = false;
         unloadDocMesh();
+        // The strip shows this tab from now on, but the mirror still holds the leaving doc until
+        // the activation drains: hold the selection against ensureActiveTab's per-frame
+        // mirror reconcile, or it snaps back to the previous part one frame after the click.
+        switchHold.begin(rebuildDocId, docMirror.docId());
         // Activation coalescing: bump the generation for every switch that needs an async
         // doc_activate. While one is already in flight, don't queue a second RPC — overwrite
         // the pending slot so N rapid switches during that one in-flight call collapse to a
@@ -637,10 +641,6 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                      addLog("[tabs] async activation for " + docId + " completed off-screen");
                  }
                  std::string aicm, e2;
-                 if (!r.ok) {
-                     toast(ui::ToastLevel::Error, "Couldn't switch document: " + r.err);
-                     return;
-                 }
                  // Only adopt into the live mirror if this tab is still active AND this is
                  // still the newest activation for it. `generation` was previously logged but
                  // never compared: a doc_activate that queued 142.9 s behind an agent's write
@@ -649,6 +649,14 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                  // in the meantime. Superseded results still park below (the `else` branch),
                  // where a stale revision is harmless.
                  const bool current = generation == activationGeneration;
+                 // The newest activation for this doc ended: release the strip's hold. A
+                 // success adopts below within this same drain; a failure lets the next
+                 // ensureActiveTab return the selection to the doc the mirror still holds.
+                 if (current) switchHold.end(docId);
+                 if (!r.ok) {
+                     toast(ui::ToastLevel::Error, "Couldn't switch document: " + r.err);
+                     return;
+                 }
                  if (!current)
                      addLog("[tabs] async activation for " + docId + " superseded (gen " +
                             std::to_string(generation) + " < " +
@@ -923,6 +931,12 @@ void AppState::ensureActiveTab() {
     // ECAD editor owns the center; leave the ECAD tab active.
     if (activeTabIsEcad()) return;
     if (!docMirror.hasDoc()) return;          // empty start state — nothing to track
+    // An async switch-in is showing its shell while its doc_activate is outstanding; the mirror
+    // still holds the leaving doc. Re-pointing here snapped the strip back to that doc one frame
+    // after every click whose activation took longer than a frame (switch_hold.h).
+    if (activeTab >= 0 && activeTab < (int)docTabs.size() &&
+        switchHold.keepsActiveTab(docTabs[activeTab].docId, docMirror.docId()))
+        return;
     int idx = tabIndexForActiveDoc();
     if (idx >= 0) {
         // The mirror's doc already has a tab. Make sure it's the active one (a doc-creating path

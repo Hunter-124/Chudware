@@ -172,6 +172,19 @@ judgment).
   behind it (an AI-tab click showed "Loading" for 9 min). `provider_usage.cpp` treats the
   busy reply as silent and keeps its rings
   (`test_agent_lane_call_behind_a_turn_fails_fast_and_hostd_survives`).
+- **A turn never holds the GUI's call lane (2026-09-27).** hostd's fail-fast did not reach the
+  GUI side: the job thread held `WorkerClient::callMtx_` for the whole `agent_admin_turn`, so a
+  worker-routed call on `st.rpc` (single FIFO dispatch thread) blocked on that mutex and every
+  later `doc_activate`/`doc_snapshot`/`doc_tree` sat behind it for the rest of the turn — its
+  120 s timeout never starts because the call never starts. In daemon mode a long run
+  (`agent_admin_turn`/`agent_run_v2`/`agent_mission_v1`) now serializes on `longRunMtx_` only
+  (it already streams on engine_backend's dedicated run connection); pipe mode, or a run that
+  could not open that connection, keeps `callMtx_`. Invariant: no GUI call may wait on a turn
+  client-side; two long runs still never overlap (`test_worker_long_run`, fake hostd). Its
+  visible twin was a GUI bug: `AppState::ensureActiveTab` re-points the strip at the mirror's
+  doc every frame, so an async switch whose activation took more than one frame snapped back to
+  the previous tab ("flashes Loading, kicks me back, deselects it"). `core::SwitchHold` keeps an
+  async switch selected until its activation lands or fails (`test_switch_hold`).
 - **Web actors never use ambient `chud` auth (2026-09-24).** BYOK, personal Claude OAuth and
   the pool (`CHUDWARE_WEB_POOL_API_KEY`/`_PROVIDER`/`_MODEL`) each run in a credential-scoped
   Chudcode process with a gateway digest proof; a web actor without a servable credential

@@ -60,7 +60,7 @@ std::mutex g_runClientMtx;                          // guards g_runClient creati
 // engine::call — miss either and the run silently falls back to the shared client.
 // agent_admin_turn is the ONLINE lane every chat send takes (there is no other since
 // 2026-08-31) and it streams for as long as the model works, so it belongs here too:
-// WorkerClient::callImpl already classifies it as a long run for its own call mutex, and
+// WorkerClient::callImpl already classifies it as a long run for its own long-run mutex, and
 // omitting it here put multi-minute turns back on the shared GUI connection — exactly the
 // starvation this dedicated connection exists to prevent.
 bool isLongRunMethod(const std::string& method) {
@@ -343,6 +343,8 @@ void abortRunClient() {
     std::lock_guard<std::mutex> lk(g_runClientMtx);
     if (g_runClient) g_runClient->abortPending();
 }
+
+bool runConnectionReady() { return daemonMode() && runClient() != nullptr; }
 
 bool available() {
     if (daemonMode()) {

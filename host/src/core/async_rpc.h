@@ -47,6 +47,15 @@ struct RpcResult {
     std::string err;
 };
 
+// hostd's agent worker lane is held by a running agent turn; agent-lane service calls
+// (chudcode_*, subscription_*) fail fast with this code instead of waiting hours. Transient
+// and internal: callers keep what they last showed and retry after the turn.
+inline bool workerLaneBusy(const RpcResult& r) {
+    if (!r.result.is_object()) return false;
+    const auto it = r.result.find("code");
+    return it != r.result.end() && it->is_string() && *it == "worker_lane_busy";
+}
+
 class AsyncRpc {
 public:
     using Done = std::function<void(const RpcResult&)>;

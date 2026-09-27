@@ -77,6 +77,11 @@ bool call(const std::string& method, const nlohmann::json& params,
 // quit / AsyncRpc shutdown never hangs on a multi-minute call. No-op if never opened.
 void abortRunClient();
 
+// True when daemon-mode long runs will stream on the dedicated run connection (opening it
+// lazily if needed), i.e. engine::call of a long-run method will NOT occupy the shared GUI
+// connection. WorkerClient only lets a long run off its call mutex when this holds.
+bool runConnectionReady();
+
 // Backend availability probes with InProcCore semantics (routing predicates in
 // worker_client.cpp use these instead of core::cpp_core() directly). In daemon
 // mode both report the connection state (the daemon owns the DLL).

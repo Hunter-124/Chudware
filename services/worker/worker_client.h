@@ -285,10 +285,10 @@ private:
                   nlohmann::json& result, std::string& err, int timeoutMs,
                   const EventFn& onEvent);
 
-    // Daemon-mode fallback when another call (typically a long agent_run) holds
+    // Daemon-mode fallback when another call (e.g. a slow doc_rebuild) holds
     // callMtx_: run this call on a short-lived side EngineClient connection
     // (the same pattern callAgentCancel/callAgentSteer use) instead of freezing
-    // the caller behind the run. hostd serves each connection on its own thread,
+    // the caller behind it. hostd serves each connection on its own thread,
     // and its doc registry gates multi-writer overlap, so a concurrent read or
     // edit is safe. Only used for engine-bound calls — pipe-bound methods still
     // serialize on callMtx_.
@@ -333,6 +333,12 @@ private:
     std::string workerModule_ = "services.worker_main";
     bool poisoned_ = false;
     std::mutex callMtx_;             // serialize concurrent call()s
+    // Daemon-mode long runs (agent_admin_turn / agent_run_v2 / agent_mission_v1)
+    // serialize on THIS mutex instead of callMtx_: they stream on engine_backend's
+    // dedicated run connection, so holding callMtx_ for an hours-long turn only
+    // parked every other call on this client (the GUI's single-FIFO st.rpc lane)
+    // behind it. Two long runs still never overlap. Pipe mode keeps callMtx_.
+    std::mutex longRunMtx_;
     ErrorSink errorSink_;            // W1-B: transport-error notification (optional)
     std::atomic<bool> abort_{false}; // C39: teardown abort (one-way; see abortPending)
     // Independent from callMtx_: cancel/steer must snapshot the authenticated

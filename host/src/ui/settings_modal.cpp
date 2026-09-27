@@ -1410,6 +1410,11 @@ static void pollOmpProviderList(AppState& st, bool force) {
             s_omp.listRequestGeneration != requestGeneration)
             return;
         s_omp.listInFlight = false;
+        if (core::workerLaneBusy(r)) {
+            // An agent turn is running; keep the last rows and say when they refresh.
+            s_omp.lastError = "Provider status refreshes when the current agent turn finishes.";
+            return;
+        }
         if (ompRpcAbsent(r)) {
             s_omp.available = false;
             s_omp.lastError = "Chudcode provider service unavailable in this runtime.";

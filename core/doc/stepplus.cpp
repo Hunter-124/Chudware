@@ -1150,7 +1150,10 @@ std::string stepplus_cache_engine_key() {
     // shared cylindrical bore/boss fingerprint. Old cached colors cannot override
     // the authored face metadata retained in document.json.
     // /4 binds finishes to exact fingerprints even when their short SIDs collide.
-    static constexpr const char* kCacheSchema = "chudware-geomcache/4";
+    // /5 unifies same-domain faces after every feature-level boolean (primitive, extrude,
+    // loft, revolve, sweep, rib, boolean, mirror; boss and cut); older snapshots carry the
+    // split seams.
+    static constexpr const char* kCacheSchema = "chudware-geomcache/5";
 #ifdef OCC_VERSION_COMPLETE
     return std::string(kCacheSchema) + ";occt=" OCC_VERSION_COMPLETE;
 #else

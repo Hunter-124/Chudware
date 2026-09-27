@@ -3576,7 +3576,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 const BodyTargets targets = solid_targets(solid, mode);
                 TopoDS_Shape out = solid;
                 if (!targets.ids.empty()) {
-                    out = mode == "cut" ? ::geom::cut(targets.shape, solid)
+                    out = mode == "cut" ? ::geom::cut_unify(targets.shape, solid)
                                         : ::geom::fuse_unify(targets.shape, solid);
                     if (out.IsNull())
                         throw std::runtime_error("loft " + mode + " produced an empty shape");
@@ -3811,8 +3811,13 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     record_tool(id, "add", solid);
                 } else {
                     const TopoDS_Shape& target = targets.shape;
-                    TopoDS_Shape out = (pmode == "cut") ? ::geom::cut(target, solid)
-                                                        : ::geom::fuse(target, solid);
+                    // Additive booleans run build123d's clean() (UnifySameDomain) like the
+                    // extrude/loft/mirror/pattern boss paths: a plain fuse leaves every flush
+                    // or overlapping primitive's coplanar faces split, and the viewport draws
+                    // those splits as seams that read as "not fused" (6-axis arm, 2026-09-27:
+                    // upper_arm had 125 faces where 57 describe the solid).
+                    TopoDS_Shape out = (pmode == "cut") ? ::geom::cut_unify(target, solid)
+                                                        : ::geom::fuse_unify(target, solid);
                     if (out.IsNull())
                         throw std::runtime_error("primitive boolean " + pmode +
                                                  " produced an empty shape");
@@ -4452,7 +4457,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         if (prism.IsNull())
                             throw std::runtime_error("extrude: dir2 fuse failed");
                     }
-                    solid = solid.IsNull() ? prism : ::geom::fuse(solid, prism);
+                    solid = solid.IsNull() ? prism : ::geom::fuse_unify(solid, prism);
                     if (solid.IsNull())
                         throw std::runtime_error("extrude region fuse failed");
                 }
@@ -4498,7 +4503,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     if (tgt_id.empty())
                         throw std::runtime_error("extrude cut requires an existing body");
                     const TopoDS_Shape& tgt = require_solid(results, tgt_id, "target");
-                    TopoDS_Shape out = ::geom::cut(tgt, solid);
+                    TopoDS_Shape out = ::geom::cut_unify(tgt, solid);
                     if (out.IsNull())
                         throw std::runtime_error("extrude cut produced an empty shape");
                     GProp_GProps gb, ga;
@@ -4525,11 +4530,11 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         for (const TopoDS_Face& f : faces) {
                             TopoDS_Shape pr = ::geom::extrude_face(f, -dir, depth, false);
                             if (pr.IsNull()) { flipped.Nullify(); break; }
-                            flipped = flipped.IsNull() ? pr : ::geom::fuse(flipped, pr);
+                            flipped = flipped.IsNull() ? pr : ::geom::fuse_unify(flipped, pr);
                             if (flipped.IsNull()) break;
                         }
                         if (!flipped.IsNull()) {
-                            TopoDS_Shape out2 = ::geom::cut(tgt, flipped);
+                            TopoDS_Shape out2 = ::geom::cut_unify(tgt, flipped);
                             if (!out2.IsNull()) {
                                 GProp_GProps ga2;
                                 BRepGProp::VolumeProperties(out2, ga2);
@@ -4809,8 +4814,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 } else {
                     const TopoDS_Shape& target = targets.shape;
                     TopoDS_Shape out = (rmode == "cut")
-                        ? ::geom::cut(target, tool)
-                        : ::geom::fuse(target, tool);
+                        ? ::geom::cut_unify(target, tool)
+                        : ::geom::fuse_unify(target, tool);
                     if (out.IsNull())
                         throw std::runtime_error(
                             std::string("revolve boolean ") + rmode + " produced an empty shape");
@@ -4947,7 +4952,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         throw std::runtime_error("sweep produced an empty solid "
                             "(check the profile sits on/near the path start, roughly "
                             "perpendicular to it)");
-                    solid = solid.IsNull() ? pipe : ::geom::fuse(solid, pipe);
+                    solid = solid.IsNull() ? pipe : ::geom::fuse_unify(solid, pipe);
                     if (solid.IsNull())
                         throw std::runtime_error("sweep region fuse failed");
                 }
@@ -5050,7 +5055,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (!stgt.empty()) {
                     const TopoDS_Shape& tgt = targets.shape;
                     TopoDS_Shape out = (smode == "cut")
-                        ? ::geom::cut(tgt, solid)
+                        ? ::geom::cut_unify(tgt, solid)
                         : ::geom::fuse_unify(tgt, solid);
                     if (out.IsNull())
                         throw std::runtime_error(
@@ -5137,7 +5142,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
                 GProp_GProps gb, ga;
                 BRepGProp::VolumeProperties(body, gb);
-                TopoDS_Shape out = ::geom::fuse(body, trimmed);
+                TopoDS_Shape out = ::geom::fuse_unify(body, trimmed);
                 if (out.IsNull())
                     throw std::runtime_error("rib: fusing the rib to the body failed");
                 BRepGProp::VolumeProperties(out, ga);
@@ -5172,7 +5177,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
                 TopoDS_Shape out;
                 if (op == "fuse")        out = ::geom::fuse_unify(a, b);  // T-PERF10: skip unify if no section edges
-                else if (op == "cut")    out = ::geom::cut(a, b);
+                else if (op == "cut")    out = ::geom::cut_unify(a, b);
                 else if (op == "common") out = ::geom::common(a, b);
                 else throw std::runtime_error(
                     "unknown boolean op '" + op + "'. Boolean ops: fuse, cut, common");
@@ -5880,7 +5885,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         throw std::runtime_error("mirror: reflecting the seed feature produced "
                                                  "an empty shape");
                     TopoDS_Shape out = (so.second == "cut")
-                        ? ::geom::cut(body, rtool)
+                        ? ::geom::cut_unify(body, rtool)
                         : ::geom::fuse_unify(body, rtool);
                     if (out.IsNull())
                         throw std::runtime_error("mirror: feature mirror "

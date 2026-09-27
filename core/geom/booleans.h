@@ -65,4 +65,8 @@ TopoDS_Shape unify_same_domain(const TopoDS_Shape& s);
 // flush-touching fuses keep the clean() face-merge. Empty on kernel failure.
 TopoDS_Shape fuse_unify(const TopoDS_Shape& a, const TopoDS_Shape& b);
 
+// Cut then UnifySameDomain: the feature-level material-removal counterpart of
+// fuse_unify, so a flush cut leaves no coplanar seam faces. Empty on kernel failure.
+TopoDS_Shape cut_unify(const TopoDS_Shape& a, const TopoDS_Shape& b);
+
 }  // namespace geom

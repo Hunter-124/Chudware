@@ -382,6 +382,48 @@ TEST_CASE("A8 coaxial cylinders resolve by selector area (bore vs boss)") {
     MESSAGE("A8 equal-area non-snapshot tie still dangles: " << *rg.dangling_reason);
 }
 
+// A9. A planar face recorded before its coplanar neighbours were unified (an older engine
+//   left the split; fuse_unify/cut_unify now merges it) moved centroid and grew in area, so
+//   the score dangles. The plane + signed normal + "at least as large" names ONE face; the
+//   6-axis arm's mates m11..m21 dangled on exactly this after the unify fix.
+TEST_CASE("A9 planar selector resolves to the unique coplanar merged face") {
+    auto plane = [](int idx, Eigen::Vector3d c, Eigen::Vector3d n, double area) {
+        TopoInfo t;
+        t.kind = "face";
+        t.index = idx;
+        t.surf = std::string("plane");
+        t.centroid = c;
+        t.axis = n;
+        t.rep_dir = n;
+        t.measure = area;
+        t.hint_index = idx;
+        return t;
+    };
+    const Eigen::Vector3d down(0, 0, -1), up(0, 0, 1);
+    std::vector<TopoInfo> faces = {
+        plane(0, {45, 0, 173}, down, 2600.0),  // merged bottom (recorded piece + neighbour)
+        plane(1, {0, 0, 216}, up, 2600.0),     // top
+        plane(2, {-40, 0, 173}, down, 300.0),  // smaller coplanar pad: cannot contain it
+    };
+    const double diag = 60.0;
+    json sel;
+    sel["kind"] = "face";
+    sel["surf"] = "plane";
+    sel["centroid"] = json::array({0.0, 0.0, 173.0});
+    sel["axis"] = json::array({0.0, 0.0, 1.0});
+    sel["normal"] = json::array({0.0, 0.0, -1.0});
+    sel["area_or_len"] = 1262.0;
+    sel["hint_index"] = 4;
+    ResolveResult r = resolve(sel, faces, diag);
+    REQUIRE(r.index.has_value());
+    CHECK(*r.index == 0);
+
+    // Two coplanar same-facing faces large enough to contain it: no guess.
+    faces[2].measure = 2600.0;
+    ResolveResult amb = resolve(sel, faces, diag);
+    CHECK_FALSE(amb.index.has_value());
+}
+
 // B7. describe_faces over a 20x10x6 box (min corner at origin): 6 planar faces,
 //   each with a unit axis, areas summing to the box surface area, and the +Z top
 //   face is identifiable (centroid z=6, axis ~ +/-Z, area=200).

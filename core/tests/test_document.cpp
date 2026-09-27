@@ -576,6 +576,46 @@ TEST_CASE("buried primitive boss errors loudly instead of silently adding nothin
     REQUIRE(r.body_count == 1);
 }
 
+// 1g2. NO COPLANAR SEAMS after primitive booleans. A primitive boss flush with the body's
+//      sides and two adjacent primitive cuts sharing a floor used to leave those faces split
+//      (plain BRepAlgoAPI_Fuse/Cut); the viewport drew the splits as seams and a user read a
+//      single-solid 6-axis arm link as "not fused" (2026-09-27, upper_arm: 125 faces vs 57).
+TEST_CASE("primitive boss and cut leave no coplanar seam faces") {
+    SUBCASE("flush boss welds into one L-shaped solid with 8 faces") {
+        json doc;
+        doc["features"] = json::array({
+            json{{"id", "base"}, {"type", "box"}, {"length", 40.0}, {"width", 20.0},
+                 {"height", 10.0}},  // x -20..20, y -10..10, z -5..5
+            json{{"id", "up"}, {"type", "box"}, {"length", 20.0}, {"width", 20.0},
+                 {"height", 10.0}, {"at", json::array({10.0, 0.0, 10.0})},
+                 {"mode", "boss"}},  // x 0..20, z 5..15: flush on +X, +Y, -Y
+        });
+        CompileResult r = compile_document(doc, json::object());
+        REQUIRE(r.ok);
+        REQUIRE(r.body_count == 1);
+        render::DocMesh dm = parse(r);
+        REQUIRE(dm.bodies.size() == 1);
+        CHECK(dm.bodies[0].faces.size() == 8);  // L profile: 6 sides + 2 caps
+    }
+    SUBCASE("two adjacent cuts leave one unsplit floor: a 6-face box") {
+        json doc;
+        doc["features"] = json::array({
+            json{{"id", "base"}, {"type", "box"}, {"length", 40.0}, {"width", 20.0},
+                 {"height", 10.0}},
+            json{{"id", "c1"}, {"type", "box"}, {"length", 20.0}, {"width", 30.0},
+                 {"height", 10.0}, {"at", json::array({-10.0, 0.0, 5.0})}, {"mode", "cut"}},
+            json{{"id", "c2"}, {"type", "box"}, {"length", 20.0}, {"width", 30.0},
+                 {"height", 10.0}, {"at", json::array({10.0, 0.0, 5.0})}, {"mode", "cut"}},
+        });
+        CompileResult r = compile_document(doc, json::object());
+        REQUIRE(r.ok);
+        REQUIRE(r.body_count == 1);
+        render::DocMesh dm = parse(r);
+        REQUIRE(dm.bodies.size() == 1);
+        CHECK(dm.bodies[0].faces.size() == 6);  // 40x20x5 slab, no seam at x=0
+    }
+}
+
 // 1h. HOLE CENTRING on a PRIMITIVE face. Regression for the pln.Location()-vs-centroid
 //     bug: the hole drilled at the surface PARAMETER origin (a corner on a primitive's
 //     face) instead of the area centroid, so a Ø10 bore removed only the quarter inside

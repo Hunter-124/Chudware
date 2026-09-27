@@ -231,14 +231,9 @@ TEST_CASE("mirror explicit-plane merge: reflection fused into one body") {
 //     (bbox 30 x 10 x 5, volume 1500, ONE surviving body) — the load-bearing proof that
 //     the face-selector plane drove a correct, coincident-face merge.
 //
-//     FACE COUNT — OCCT actual = 10 (NOT the 6 of a pristine box). BRepAlgoAPI_Fuse
-//     removes the two interior x=15 cap faces but does NOT run a coplanar-unify pass, so
-//     the four side faces (top z=5, bottom z=0, +Y y=10, -Y y=0) stay SPLIT at x=15 as
-//     two coplanar pieces each: 5 faces of A + 5 of B = 10. Collapsing them to a 6-face
-//     box would require an explicit ShapeUpgrade_UnifySameDomain step, which the doc
-//     model's fuse() (a plain BRepAlgoAPI_Fuse, matching boolean.py) deliberately does
-//     not do. We assert the kernel's true count (10) — the geometry is a single solid of
-//     the right size/volume, just with un-unified coplanar seams.
+//     FACE COUNT = 6 (a pristine box). The fuse removes the two interior x=15 cap faces
+//     and fuse_unify's UnifySameDomain pass collapses the four side faces split at x=15,
+//     so the merged body carries no coplanar seams.
 TEST_CASE("mirror face-selector merge: reflection about a picked +X face") {
     json face_sel = plus_x_face_selector(15.0, 10.0, 5.0);
     REQUIRE(face_sel.is_object());  // a real +X face selector was harvested

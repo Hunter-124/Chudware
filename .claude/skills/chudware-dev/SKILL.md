@@ -124,6 +124,12 @@ judgment).
   theme|icons` when styling/icons changed.
 - Notable multi-file efforts get a one-paragraph handoff appended to `docs/REFACTOR_LOG.md`
   (files touched, deferred items, gotchas).
+- **Feature booleans unify same-domain faces (2026-09-27).** Additive/removal feature paths
+  in `core/doc/document.cpp` use `geom::fuse_unify` / `geom::cut_unify`, never plain
+  `fuse`/`cut`: split coplanar faces render as seams users read as "not fused". Any change
+  to compiled geometry/topology bumps `stepplus_cache_engine_key`. After `./build.sh stage`
+  an auto-spawned dev hostd serves the OLD engine until it drains — check
+  `chudware-hostd --status` before trusting an MCP smoke.
 
 ### Manufacturing rules that bind every change
 

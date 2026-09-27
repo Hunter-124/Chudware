@@ -739,6 +739,41 @@ ResolveResult resolve(const nlohmann::json& selector,
         }
     }
 
+    // ── Merged-face fallback for planar faces ─────────────────────────────────────────
+    // Booleans unify same-domain faces (fuse_unify / cut_unify), so a face recorded before
+    // an edit — or by an older engine that left coplanar splits — may now be one piece of a
+    // larger face on the same plane. Its centroid and area moved, so the score dangles, yet
+    // the plane, the signed outward normal and "at least as large" still name exactly one
+    // face. Accept only a UNIQUE such candidate; two coplanar same-facing faces dangle.
+    if (kind == "face" && selector.value("surf", std::string()) == "plane" &&
+        selector.contains("centroid") && selector.at("centroid").is_array() &&
+        selector.at("centroid").size() == 3 && selector.contains("normal") &&
+        selector.at("normal").is_array() && selector.at("normal").size() == 3) {
+        const auto& sc = selector.at("centroid");
+        const auto& sn = selector.at("normal");
+        const Eigen::Vector3d s_c(sc.at(0).get<double>(), sc.at(1).get<double>(),
+                                  sc.at(2).get<double>());
+        Eigen::Vector3d s_n(sn.at(0).get<double>(), sn.at(1).get<double>(),
+                            sn.at(2).get<double>());
+        const double s_area = sel_has_area ? selector.at("area_or_len").get<double>() : 0.0;
+        const double plane_tol = std::max(1e-3, 1e-6 * bbox_diag);
+        if (s_n.norm() > 1e-12) {
+            s_n.normalize();
+            const TopoInfo* pick = nullptr;
+            int n_match = 0;
+            for (const TopoInfo* c : same_kind) {
+                if (!c->surf || *c->surf != "plane" || !c->rep_dir) continue;
+                if (c->rep_dir->dot(s_n) < 1.0 - 1e-6) continue;
+                if (std::fabs((c->centroid - s_c).dot(s_n)) > plane_tol) continue;
+                if (c->measure && *c->measure < s_area * (1.0 - 1e-6)) continue;
+                pick = c;
+                ++n_match;
+            }
+            if (n_match == 1)
+                return ResolveResult{pick->index, best_score, second_score, std::nullopt};
+        }
+    }
+
     // Dangling — explain why (match the Python reason strings).
     std::string reason;
     if (best_score >= 0.35) {

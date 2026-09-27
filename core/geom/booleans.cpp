@@ -125,6 +125,14 @@ TopoDS_Shape cut(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     return run_pair<BRepAlgoAPI_Cut>(a, b);
 }
 
+TopoDS_Shape cut_unify(const TopoDS_Shape& a, const TopoDS_Shape& b) {
+    // A cut tool flush with an existing face (a pocket floor level with a step, a slot
+    // through a wall joint) leaves the survivors of that face split along the tool's
+    // boundary; build123d's BuildPart subtract runs clean() for the same reason.
+    const TopoDS_Shape out = cut(a, b);
+    return out.IsNull() ? out : unify_same_domain(out);
+}
+
 // Multi-argument fuse/cut. The modern BRepAlgoAPI_BooleanOperation API takes the operands
 // as two lists (Arguments + Tools) and runs ONE BOPDS intersection over the whole set —
 // the union/difference is computed in a single pass instead of N pairwise rebuilds. We put

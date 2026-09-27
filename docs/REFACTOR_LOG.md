@@ -4899,3 +4899,20 @@ finished in ~25 minutes with seven printed parts, seven MG90S plus horns/sleeves
 `simulate_motion` individual joint sweeps and bounded combined sweeps were clean;
 unbounded combined ±90° folds did collide with the base, so safe travel limits
 are documented in that run's `design/layout.md`.
+
+## 2026-09-27 — "parts look unfused": same-domain faces after feature booleans
+
+Every 6-axis arm part was one closed solid, but the viewport drew seams across flat faces
+(upper_arm: 125 faces where 57 describe it). The primitive boss/cut, revolve, sweep, rib and
+multi-region extrude paths used plain `geom::fuse`/`geom::cut`, so flush or overlapping
+primitives left coplanar faces split. They now use `geom::fuse_unify` / new
+`geom::cut_unify` (`core/geom/booleans.*`, `core/doc/document.cpp`); sheet-metal, split,
+trim and hole cuts are unchanged. `stepplus_cache_engine_key` is now
+`chudware-geomcache/5`, so saved documents recompile unified on open. Merged faces moved the
+centroid/area of face selectors recorded earlier, and 6 of the arm's 22 mates dangled:
+`selectors.cpp::resolve` now accepts, before dangling, the UNIQUE planar candidate on the
+same plane with the same signed normal and at least the recorded area (two such faces still
+dangle). Tests: `test_document` "primitive boss and cut leave no coplanar seam faces"
+(11→8, 7→6 faces), `test_selectors` A9. Gotcha: after `./build.sh stage` an auto-spawned dev
+hostd keeps serving the old engine until it drains — check `chudware-hostd --status`
+before trusting an MCP smoke.

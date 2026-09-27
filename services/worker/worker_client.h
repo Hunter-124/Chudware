@@ -255,11 +255,13 @@ public:
     // uses a side-channel socket in daemon mode so Stop lands while a run is blocked.
     bool callAgentCancel(const std::string& runId, nlohmann::json& result, std::string& err);
 
-    // Mid-run steering: agent_steer {run_id, text} → {ok, steered}. Same mutex-bypass /
-    // side-channel transport as cancel — a steer that queued behind the in-flight run
-    // would only land after the run finished, i.e. never.
+    // Mid-run steering: agent_steer {run_id, text, attachments?} → {ok, steered}. Same
+    // mutex-bypass / side-channel transport as cancel — a steer that queued behind the in-flight
+    // run would only land after the run finished, i.e. never. `attachments` is the composer's
+    // attachment array (images ride to Chudcode as image parts); empty = text-only.
     bool callAgentSteer(const std::string& runId, const std::string& text,
-                        nlohmann::json& result, std::string& err);
+                        const nlohmann::json& attachments, nlohmann::json& result,
+                        std::string& err);
 
     // C39: one-way teardown abort — makes a blocked (and any future) call() fail fast with
     // err "aborted" instead of running out its timeout. Set at app exit (AsyncRpc::shutdown)

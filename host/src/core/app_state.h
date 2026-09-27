@@ -193,10 +193,6 @@ struct Settings {
     // Serialized as "disabled_providers".
     std::set<std::string> disabledProviders;
 
-    // One-time model-picker default seeding: on first run we keep only the top 2-3 models per
-    // provider enabled (rest added to hiddenModels), so the picker isn't flooded. Once seeded we
-    // never re-seed (the user's explicit choices win). Serialized "model_defaults_seeded".
-    bool modelDefaultsSeeded = false;
     // ITAR/IP outbound redaction (WS3 compliance_mode). "off" | "redact" | "local_only".
     // "redact" wraps cloud traffic: deterministic scrub (+ optional local-LLM residual pass) with
     // inbound rehydrate, images blocked. "local_only" refuses non-loopback (== offlineMode).

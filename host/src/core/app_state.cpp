@@ -533,7 +533,6 @@ void loadSettings(Settings& s) {
             std::string cm = j.value("compliance_mode", std::string("off"));
             std::snprintf(s.complianceMode, sizeof(s.complianceMode), "%s", cm.c_str());
         }
-        s.modelDefaultsSeeded = j.value("model_defaults_seeded", false);
         // Preference enums (off|option|encourage|require). Migrate legacy plan_mode bool.
         auto parsePref = [](const nlohmann::json& jn, const char* key, int def) -> int {
             if (!jn.contains(key)) return def;
@@ -725,9 +724,14 @@ void loadSettings(Settings& s) {
 #endif
         // Chat-picker model visibility (opt-out hidden set).
         s.hiddenModels.clear();
-        if (auto it = j.find("hidden_models"); it != j.end() && it->is_array())
-            for (const auto& e : *it)
-                if (e.is_string()) s.hiddenModels.insert(e.get<std::string>());
+        // A config still carrying "model_defaults_seeded" holds the list the removed first-run
+        // seeding pass wrote (2026-07-23): it ran on the unfiltered ~2,350-row catalog, keyed
+        // hides by bare id across providers and ranked dated snapshots above undated flagships,
+        // so every model older than that day was hidden. Drop it once; saving erases the marker.
+        if (!j.value("model_defaults_seeded", false))
+            if (auto it = j.find("hidden_models"); it != j.end() && it->is_array())
+                for (const auto& e : *it)
+                    if (e.is_string()) s.hiddenModels.insert(e.get<std::string>());
         s.disabledProviders.clear();
         if (auto it = j.find("disabled_providers"); it != j.end() && it->is_array())
             for (const auto& e : *it)
@@ -954,7 +958,8 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     for (const char* k : {"provider", "model", "api_key", "openai", "llamacpp", "freellmapi",
                           "keys", "reasoning_effort", "max_output_tokens",
                           "context_window", "system_prompt", "appearance", "workspace_dir",
-                          "hidden_models", "disabled_providers", "experimental", "box"})
+                          "hidden_models", "disabled_providers", "experimental", "box",
+                          "model_defaults_seeded"})
         j.erase(k);
     if (s.provider == 4) {
         j["provider"] = "gemini";
@@ -1061,7 +1066,6 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     if (s.reasoningEffort[0]) j["reasoning_effort"] = s.reasoningEffort;
         j["offline_mode"] = s.offlineMode;
         j["compliance_mode"] = s.complianceMode[0] ? s.complianceMode : "off";
-        j["model_defaults_seeded"] = s.modelDefaultsSeeded;
     {
         static const char* kPrefNames[] = {"off", "option", "encourage", "require"};
         auto prefName = [&](int p) -> const char* {

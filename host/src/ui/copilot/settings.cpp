@@ -2063,42 +2063,6 @@ static bool modelRow(AppState& st, int provider, const std::string& id, const st
     return clicked && usable;
 }
 
-// One-time model-picker default seeding: on first run keep only the top 3 models per provider
-// enabled (the rest go into hiddenModels) so a fresh install's composer picker isn't flooded.
-// Runs once — settings.modelDefaultsSeeded flips and the user's explicit choices win after that.
-// The ACTIVE model is never hidden. Chudcode catalog seeding needs the async catalog; when it
-// hasn't arrived yet we still seed the builtin half so the picker is sane on builtin alone.
-static void seedModelDefaultsOnce(AppState& st) {
-    if (st.settings.modelDefaultsSeeded) return;
-    const std::string active = st.settings.model;
-    auto hideUnlessActive = [&](const std::string& id) {
-        if (id != active) st.settings.hiddenModels.insert(id);
-    };
-    // (a) Built-in catalog, in catalog order: first 3 per provider stay enabled.
-    {
-        std::map<int, int> kept;
-        for (const auto& m : ui::builtinModels()) {
-            int& n = kept[m.provider];
-            if (n < 3) { ++n; continue; }
-            hideUnlessActive(m.id);
-        }
-    }
-    // (b) Chudcode catalog, pre-sorted per provider (non-deprecated first, newest first):
-    // the first 3 non-deprecated rows stay enabled; everything else — including ALL deprecated
-    // rows — hides. Skipped while the catalog is empty (first async fetch not back yet).
-    if (!ui::bridgeModelCatalog().empty()) {
-        std::map<std::string, int> kept;
-        for (const auto& m : ui::bridgeModelCatalog()) {
-            int& n = kept[m.provider];
-            if (!m.deprecated && n < 3) { ++n; continue; }
-            hideUnlessActive(m.id);
-        }
-    }
-    st.settings.hiddenModels.erase(active);  // the active model always stays visible
-    st.settings.modelDefaultsSeeded = true;
-    saveSettings(st.settings);
-}
-
 // Providers whose ONLY credential is dead (bridge state "error": no active key/OAuth grant but
 // at least one revoked row on file). They are deliberately kept OUT of the usable set below —
 // every request against them fails — so the picker names them instead, or the models would just
@@ -2161,7 +2125,6 @@ void drawModelDropdown(AppState& st, bool busy) {
     refreshModelAvailability(st, false);
     refreshBridgeModelCatalog(st, false);  // Chudcode catalog sublabels (ctx/cost/capability chips)
     refreshSignedInProviders(st, false);  // mirror Settings->Providers signed-in set into the picker
-    seedModelDefaultsOnce(st);             // first-run top-3-per-provider seeding; no-op after
 
     if (ImGui::IsWindowAppearing()) { s_modelSearch[0] = 0; ImGui::SetKeyboardFocusHere(); }
 

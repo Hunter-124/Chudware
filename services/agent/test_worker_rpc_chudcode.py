@@ -89,7 +89,7 @@ class _FakeHost:
         self.cancel_calls.append(run_id)
         return {"ok": True, "run_id": run_id, "cancelled": True, "active": True}
 
-    def steer(self, run_id, text):
+    def steer(self, run_id, text, attachments=None):
         self.steer_calls.append((run_id, text))
         return {"ok": True, "run_id": run_id, "steered": True, "active": True}
 

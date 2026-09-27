@@ -102,8 +102,8 @@ class FakeClient:
         ]
         self.release.set()
 
-    def steer(self, message):
-        self.calls.append(("steer", {"message": message}))
+    def steer(self, message, *, images=None):
+        self.calls.append(("steer", {"message": message, "images": images}))
 
     def switch_session(self, session_path):
         self.calls.append(("switch_session", {"sessionPath": session_path}))
@@ -854,6 +854,36 @@ def test_cancel_and_steer_are_immediate_and_idempotent_during_terminal_wait():
     assert host.steer("run-race", "too late")["steered"] is False
 
 
+def test_steer_carries_attached_images_to_chudcode(tmp_path):
+    # A picture sent while a turn runs is a steer; the GUI used to have no way to send it.
+    picture = tmp_path / "board.png"
+    picture.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    factory = FakeFactory(block=True)
+    host = ChudcodeSessionHost(client_factory=factory)
+    thread = threading.Thread(target=lambda: run(host, "pic", "run-pic"), daemon=True)
+    thread.start()
+    while not factory.clients:
+        time.sleep(0.001)
+    client = factory.clients[0]
+    assert client.prompted.wait(1.0)
+
+    result = host.steer(
+        "run-pic",
+        "use this board",
+        [{"path": str(picture), "kind": "image", "mime": "image/png"}],
+    )
+    host.cancel("run-pic")
+    thread.join(1.0)
+
+    assert result["steered"] is True
+    steer = next(payload for name, payload in client.calls if name == "steer")
+    assert steer["message"] == "use this board"
+    assert steer["images"] == [
+        {"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgpmYWtl"}
+    ]
+
+
+
 def test_failed_abort_and_steer_retry_transport_instead_of_claiming_success():
     class FlakyControl(FakeClient):
         def __init__(self, factory, **kwargs):
@@ -868,12 +898,12 @@ def test_failed_abort_and_steer_retry_transport_instead_of_claiming_success():
                 raise LookupError("abort connection interrupted")
             super().abort()
 
-        def steer(self, message):
+        def steer(self, message, *, images=None):
             if self.fail_steer:
                 self.fail_steer = False
                 self.calls.append(("steer", {"message": message}))
                 raise LookupError("steer connection interrupted")
-            super().steer(message)
+            super().steer(message, images=images)
 
     factory = FakeFactory(block=True)
     def make_client(**kwargs):

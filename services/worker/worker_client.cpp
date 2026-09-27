@@ -1847,9 +1847,12 @@ bool WorkerClient::callAgentCancel(const std::string &runId, json &result,
 }
 
 bool WorkerClient::callAgentSteer(const std::string &runId,
-                                  const std::string &text, json &result,
+                                  const std::string &text,
+                                  const json &attachments, json &result,
                                   std::string &err) {
-  const json params{{"run_id", runId}, {"text", text}};
+  json params{{"run_id", runId}, {"text", text}};
+  if (attachments.is_array() && !attachments.empty())
+    params["attachments"] = attachments;
   bool matched = false;
   if (callWorkerControl("steer", runId, params, matched, result, err))
     return true;

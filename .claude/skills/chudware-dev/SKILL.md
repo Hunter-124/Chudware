@@ -266,6 +266,17 @@ judgment).
   nothing live below it. `composer.cpp::appendSteerToTranscript` closes the live bubble
   (`steerSplit`, persisted `"split"`, exempt from the empty/summary placeholders), appends
   the steer, then a fresh running bubble. Append-only: AI-VC `msg_idx` anchors never shift.
+  A steer carries the composer's attachments/context refs like a fresh turn (a picture alone
+  is a valid steer): `agent_steer {run_id, text, attachments?}` → `chudcode_host.steer` →
+  `_prompt_payload` images → Chudcode `steer(message, images)`. The control lane caps a
+  request at 64 KB, so images travel as paths, never inline bytes.
+- **The model picker has no default-hiding pass (2026-09-27).** The removed
+  `seedModelDefaultsOnce` ran on the unfiltered ~2,350-row catalog on 2026-07-23, hid by
+  bare id across providers and ranked dated snapshots above undated flagships, so every
+  model older than that day (gpt-5.6-*, claude-opus-4-8, gemini-3.1-pro …) vanished. The
+  catalog is now signed-in-only; `hidden_models` is purely the user's own Settings →
+  Providers choices. `loadSettings` drops a list that still carries the
+  `model_defaults_seeded` marker, and saving erases the marker.
 - **Agent edits reach the user's active tab live (2026-09-25).** `engine_events.cpp`
   defers a `doc.changed` only while `userMidEdit` (sketch/PM preview). It used to defer any
   dirty user-owned tab, and the first applied agent revision itself dirties that tab, so the

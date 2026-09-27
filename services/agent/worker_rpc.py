@@ -1798,7 +1798,7 @@ def chudcode_control(action: str, params: dict) -> dict:
             return get_default_chudcode_host().cancel(params.get("run_id"))
         if command == "steer":
             return get_default_chudcode_host().steer(
-                params.get("run_id"), params.get("text")
+                params.get("run_id"), params.get("text"), params.get("attachments")
             )
         if command == "status":
             return get_default_chudcode_host().status(

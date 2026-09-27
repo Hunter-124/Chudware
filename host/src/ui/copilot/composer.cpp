@@ -763,6 +763,34 @@ static nlohmann::json consumeContextRefs(AppState& st, std::string& requestText)
     return refs;
 }
 
+// The user bubble for a sent message: the typed text plus the markers chat_log.cpp renders —
+// one "[attached image: name]" line per image (lifted out and drawn as the picture), a
+// "[attached: …]" roster for the other files, and a "[context: …]" roster. Shared by a fresh
+// turn and a mid-run steer so both show exactly what was sent.
+static std::string userBubbleText(const std::string& text, const nlohmann::json& attachments,
+                                  const nlohmann::json& contextRefs) {
+    std::string out = text;
+    std::string files;
+    for (const auto& a : attachments) {
+        const std::string nm = a.value("name", std::string());
+        if (a.value("kind", std::string("file")) == "image")
+            out += "\n[attached image: " + nm + "]";
+        else
+            files += " " + nm;
+    }
+    if (!files.empty()) out += "\n[attached:" + files + "]";
+    if (!contextRefs.empty()) {
+        out += "\n[context:";
+        for (const auto& r : contextRefs) {
+            std::string lbl = r.value("label", std::string());
+            if (lbl.empty()) lbl = r.value("kind", std::string("ref"));
+            out += " " + lbl;
+        }
+        out += "]";
+    }
+    return out;
+}
+
 // Create a fresh part document if needed and launch the v2 orchestrator for `request`. The
 // current doc is replaced only when it already has features (so an empty new part is reused).
 // Centralized so both the direct Design path and the post-clarify "Build it" path share it.
@@ -1805,31 +1833,9 @@ void submitTurn(AppState& st, const std::string& text) {
     if (!attachments.empty()) extra["attachments"] = attachments;
     if (!contextRefs.empty()) extra["context_refs"] = contextRefs;
     {
-        ChatMsg u; u.fromUser = true; u.text = text;
+        ChatMsg u; u.fromUser = true;
+        u.text = userBubbleText(text, attachments, contextRefs);
         u.copilotMode = mode;  // stamp composer mode for colored border
-        if (!attachments.empty()) {
-            // Images get one line each so chat_log.cpp can lift them out and render the real
-            // picture; the plain [attached:] roster lists ONLY the non-image files, and is
-            // omitted entirely when every attachment was an image. A name never appears twice.
-            std::string files;
-            for (const auto& a : attachments) {
-                const std::string nm = a.value("name", std::string());
-                if (a.value("kind", std::string("file")) == "image")
-                    u.text += "\n[attached image: " + nm + "]";
-                else
-                    files += " " + nm;
-            }
-            if (!files.empty()) u.text += "\n[attached:" + files + "]";
-        }
-        if (!contextRefs.empty()) {
-            u.text += "\n[context:";
-            for (const auto& r : contextRefs) {
-                std::string lbl = r.value("label", std::string());
-                if (lbl.empty()) lbl = r.value("kind", std::string("ref"));
-                u.text += " " + lbl;
-            }
-            u.text += "]";
-        }
         st.chat.push_back(u);
         appendChatRawMessage(st, st.chat.back());
     }
@@ -3455,7 +3461,8 @@ bool aiTurnActive(AppState& st) {
 // (under the SAME mtx that already guards the job deque); agentControlDrainLogs() drains that
 // queue into AppState::addLog() from the GL thread once per composer frame.
 struct AgentControlChannel {
-    struct Job { std::string runId; std::string steer; };  // empty steer = cancel
+    // empty steer = cancel; attachments ride only with a steer
+    struct Job { std::string runId; std::string steer; nlohmann::json attachments; };
     std::mutex mtx;
     std::condition_variable cv;
     std::deque<Job> q;
@@ -3495,7 +3502,7 @@ struct AgentControlChannel {
                         pushLog("[..] agent_cancel exception");
                     }
                 } else {
-                    s->worker.callAgentSteer(job.runId, job.steer, r, e);
+                    s->worker.callAgentSteer(job.runId, job.steer, job.attachments, r, e);
                     if (!e.empty()) {
                         pushLog(std::string("[..] agent_steer: ") + e);
                     } else if (!r.value("steered", false)) {
@@ -3530,11 +3537,12 @@ static void agentControlDrainLogs(AppState& st) {
     }
 }
 
-static void agentControlDispatch(AppState& st, const std::string& runId, const std::string& steer) {
+static void agentControlDispatch(AppState& st, const std::string& runId, const std::string& steer,
+                                 nlohmann::json attachments = nlohmann::json::array()) {
     g_agentCtl.st.store(&st, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lk(g_agentCtl.mtx);
-        g_agentCtl.q.push_back({runId, steer});
+        g_agentCtl.q.push_back({runId, steer, std::move(attachments)});
     }
     g_agentCtl.cv.notify_one();
 }
@@ -4171,7 +4179,9 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
             // (agent_steer: text is folded into the live turn at its next step). Fall
             // back to next-turn queueing only when no run_id is available (e.g. the
             // run hasn't announced itself yet). Never both — that would double-send.
-            if (!text.empty()) {
+            // Attachments ride with the steer, so a picture alone is a valid follow-up.
+            const bool hasChips = !st.pendingAttachments.empty() || !st.pendingContextRefs.empty();
+            if (!text.empty() || hasChips) {
                 std::string runId;
                 {
                     auto steerRun = st.activeRun();
@@ -4179,10 +4189,14 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
                     runId = steerRun->runId;
                 }
                 if (!runId.empty() && st.workerStarted) {
-                    agentControlDispatch(st, runId, text);
-                    appendSteerToTranscript(st, text);
-                } else {
-                    // Auto-sends when the assistant frees up (drain at the top of drawComposer).
+                    std::string sendText = text;
+                    nlohmann::json attachments = consumeAttachments(st, sendText);
+                    const nlohmann::json contextRefs = consumeContextRefs(st, sendText);
+                    appendSteerToTranscript(st, userBubbleText(text, attachments, contextRefs));
+                    agentControlDispatch(st, runId, sendText, std::move(attachments));
+                } else if (!text.empty()) {
+                    // Auto-sends when the assistant frees up (drain at the top of drawComposer);
+                    // pending chips stay attached and go with that send.
                     st.queuedPrompts.emplace_back(text);
                 }
                 clearComposerBox();

@@ -285,7 +285,8 @@ class _Run:
     cancel_sent: bool = False
     steers: set[str] = field(default_factory=set)
     control_lock: threading.Lock = field(default_factory=threading.Lock)
-    pending_steers: list[str] = field(default_factory=list)
+    # (message, images) queued before prompt() returned; images are Chudcode ImageContent.
+    pending_steers: list[tuple[str, list[dict[str, Any]]]] = field(default_factory=list)
 
 
 class ChudcodeSessionHost:
@@ -490,12 +491,12 @@ class ChudcodeSessionHost:
                     run.started = True
                     pending_steers = tuple(run.pending_steers)
 
-                for text in pending_steers:
+                for text, steer_images in pending_steers:
                     with run.control_lock:
-                        session.client.steer(text)
+                        session.client.steer(text, images=steer_images or None)
                         with self._lock:
                             run.steers.add(text)
-                            run.pending_steers.remove(text)
+                            run.pending_steers.remove((text, steer_images))
                 # `wait_for_idle(timeout=None)` inherits the RPC client's own 60s default,
                 # which is a short-wait default and not a turn budget: nothing in CAD ever
                 # set `timeout`, so EVERY online turn was killed at 60 seconds with
@@ -695,13 +696,22 @@ class ChudcodeSessionHost:
                     run.cancel_sent = True
         return {"ok": True, "run_id": run_key, "cancelled": True, "active": True}
 
-    def steer(self, run_id, text) -> dict:
+    def steer(self, run_id, text, attachments=None) -> dict:
         run_key = _nonempty_string(run_id)
         message = _nonempty_string(text)
         if run_key is None or message is None:
             return {
                 "ok": False,
                 "reason": "run_id and non-empty steering text are required",
+            }
+        try:
+            message, images = _prompt_payload(message, attachments, None)
+        except OSError as exc:
+            return {
+                "ok": False,
+                "run_id": run_key,
+                "steered": False,
+                "reason": f"steer attachment unreadable: {exc}",
             }
         with self._lock:
             run = self._runs.get(run_key)
@@ -714,7 +724,9 @@ class ChudcodeSessionHost:
                 }
         with run.control_lock:
             with self._lock:
-                if message in run.steers or message in run.pending_steers:
+                if message in run.steers or any(
+                    queued == message for queued, _ in run.pending_steers
+                ):
                     return {
                         "ok": True,
                         "run_id": run_key,
@@ -725,10 +737,10 @@ class ChudcodeSessionHost:
                 client = run.client
                 send_now = client is not None and run.started and not run.cancel_requested
                 if not send_now:
-                    run.pending_steers.append(message)
+                    run.pending_steers.append((message, images))
             if send_now:
                 try:
-                    client.steer(message)
+                    client.steer(message, images=images or None)
                 except Exception as exc:  # noqa: BLE001 - RPC transport failures are retryable
                     return {
                         "ok": False,

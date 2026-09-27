@@ -10,6 +10,8 @@
 #include <TopTools_ListIteratorOfListOfShape.hxx>
 #include <TopTools_ListOfShape.hxx>
 
+#include "geom/op_history.h"
+
 namespace geom {
 
 // All three follow the same OCCT recipe: seed the arguments + tools, Build() to run it,
@@ -80,6 +82,7 @@ TopoDS_Shape run_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     op.SetNonDestructive(Standard_True);  // never mutate cached argument TShapes (see above)
     op.Build();
     if (!op.IsDone()) return TopoDS_Shape();
+    if (op_history_recording()) op_history_record(op.History());
     return op.Shape();
 }
 }  // namespace
@@ -104,6 +107,7 @@ TopoDS_Shape fuse_unify(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     op.SetNonDestructive(Standard_True);
     op.Build();
     if (!op.IsDone()) return TopoDS_Shape();
+    if (op_history_recording()) op_history_record(op.History());
     TopoDS_Shape out = op.Shape();
     // T-PERF10 skipped unify when SectionEdges() was empty, but that shortcut misses the
     // FLUSH-WELD case: two solids sharing a coincident coplanar face (e.g. mirroring a body
@@ -152,6 +156,7 @@ TopoDS_Shape fuse_many(const TopoDS_Shape& base, const std::vector<TopoDS_Shape>
     op.SetNonDestructive(Standard_True);  // never mutate cached argument TShapes (see above)
     op.Build();
     if (!op.IsDone()) return TopoDS_Shape();
+    if (op_history_recording()) op_history_record(op.History());
     return op.Shape();
 }
 
@@ -168,6 +173,7 @@ TopoDS_Shape cut_many(const TopoDS_Shape& base, const std::vector<TopoDS_Shape>&
     op.SetNonDestructive(Standard_True);  // never mutate cached argument TShapes (see above)
     op.Build();
     if (!op.IsDone()) return TopoDS_Shape();
+    if (op_history_recording()) op_history_record(op.History());
     return op.Shape();
 }
 
@@ -184,7 +190,10 @@ TopoDS_Shape unify_same_domain(const TopoDS_Shape& s) {
         ShapeUpgrade_UnifySameDomain up(s, Standard_True, Standard_True, Standard_False);
         up.Build();
         TopoDS_Shape r = up.Shape();
-        return r.IsNull() ? s : r;
+        if (r.IsNull()) return s;
+        // UnifySameDomain rebuilds every face it merges; its history names the pieces.
+        if (op_history_recording()) op_history_record(up.History());
+        return r;
     } catch (...) {
         return s;  // best-effort: keep the un-unified shape on any kernel hiccup
     }

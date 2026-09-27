@@ -2979,11 +2979,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                 } else {
                   selected.selector = reply.result["selector"].dump();
                   selected.resolution_error.clear();
-                  // Assembly: a component-pattern instance's seed row is only known from here.
+                  // Assembly: a component-pattern instance's seed row is only known from here, and
+                  // so is the owning feature inside the component's part (owner_feature).
                   if (active && reply.result.contains("component") &&
                       reply.result["component"].is_string())
-                    ui::featureTreeNoteAssemblyPick(st, hit.body_id,
-                                                    reply.result["component"].get<std::string>());
+                    ui::featureTreeNoteAssemblyPick(
+                        st, hit, reply.result["component"].get<std::string>(),
+                        reply.result.value("owner_feature", std::string()));
                 }
                 if (!selected.resolution_error.empty())
                   st.addLog("[selection] " + selected.resolution_error);
@@ -3012,7 +3014,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           item.pending_resolve = false;
           item.resolution_error = asel.empty() ? err : std::string();
           if (!asel.empty()) {
-            ui::featureTreeNoteAssemblyPick(st, item.hit.body_id, comp);
+            ui::featureTreeNoteAssemblyPick(st, item.hit, comp);
             item.selector = asel;
             item.pending_resolve = false;
             try {
@@ -3032,7 +3034,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           item.pending_resolve = false;
           item.resolution_error = item.selector.empty() ? err : std::string();
           if (!comp.empty()) {
-            ui::featureTreeNoteAssemblyPick(st, item.hit.body_id, comp);
+            ui::featureTreeNoteAssemblyPick(st, item.hit, comp);
             ap->routeAsmPatternPick(comp);
           }
           continue; // handled — skip the part-doc resolve path

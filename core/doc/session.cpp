@@ -6832,7 +6832,15 @@ json resolve_pick_assembly(Session& s, int body_id, const std::string& kind, int
         throw OpError("invalid_op", "topo_id " + std::to_string(topo_id) +
                       " is not a live " + kind + " on body " + std::to_string(body_id),
                       {{"reason", "bad topo_id"}, {"body_id", body_id}, {"topo_id", topo_id}});
-    return json{{"selector", std::move(selector)}, {"component", abody.component_id}};
+    json reply{{"selector", std::move(selector)}, {"component", abody.component_id}};
+    // The feature inside the component's own part that owns the picked face/edge, so the
+    // host can highlight it in the component's nested feature list. The selector stays
+    // component-local and owner-free (mate/PM consumers resolve it as before).
+    std::string base_dir;
+    if (!s.path.empty()) base_dir = std::filesystem::path(s.path).parent_path().string();
+    const std::string owner = component_pick_owner(s.doc, base_dir, abody, kind, topo_id);
+    if (!owner.empty()) reply["owner_feature"] = owner;
+    return reply;
 }
 
 json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string& kind,

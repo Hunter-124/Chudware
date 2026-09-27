@@ -106,12 +106,17 @@ struct CompileResult {
     std::vector<BodyInfo> bodies_info;    // per-surviving-body stats (surfacing parity gate)
     // Per-creating-feature topology map (host picking): {fid: {bodies:[ordinal...],
     // faces:[[ordinal,topo_id]...], edges:[...]}} with 1-based AICM body ordinal +
-    // 1-based TopExp topo index. Empty for an all-error compile. (Linear single-chain
-    // attribution; matches engine/doc/session.py::_owner_map for the common case.)
+    // 1-based TopExp topo index. Empty for an all-error compile. A face/edge belongs to the
+    // feature that GENERATED it; one a later feature only MODIFIED (trimmed by a chamfer,
+    // split by a boss, merged by UnifySameDomain) keeps its earlier owner (geom/op_history.h).
     nlohmann::json owner_map;
     // The surviving solid shapes in AICM body order (shapes[i] <-> body ordinal i+1).
     // Lets a caller describe a picked body's topology (doc_resolve_pick).
     std::vector<TopoDS_Shape> shapes;
+    // Owner (solid id: a feature id, or "<fid>#k" for a split piece) per 1-based TopExp
+    // face/edge index of shapes[i]. Filled only by a `with_owners` compile (the
+    // geometry-only component path, which has no owner_map) — assembly pick resolution.
+    std::vector<std::map<int, std::string>> shape_face_owners, shape_edge_owners;
     // Per-feature pre-boolean tool solids + add/cut role (see ToolRec). Empty for a
     // doc with no boolean-producing features, or when every feature errored.
     std::vector<ToolRec> tool_recs;
@@ -213,11 +218,13 @@ nlohmann::json config_effective_features(const nlohmann::json& features,
 // `with_display=false` is for component geometry consumers: retain exact per-body
 // triangulations at `quality`, shapes/statuses/count, but omit AICM extraction and
 // serialization, body statistics, picking owner-map inversion and datum display data.
+// `with_owners=true` additionally attributes face/edge owners and returns them per shape
+// (shape_face_owners/shape_edge_owners) — a component's owning feature for an assembly pick.
 CompileResult compile_document(const nlohmann::json& doc, const nlohmann::json& env,
                                CompileCache* cache = nullptr,
                                ::geom::DisplayQuality quality =
                                    ::geom::DisplayQuality::Fine,
-                               bool with_display = true);
+                               bool with_display = true, bool with_owners = false);
 
 // Per-body appearance (C26 colour + C32-A RealView material) for AICM body ordinal `body_num`
 // (1-based). Reads doc["appearances"]["b<body_num>"] — a bare [r,g,b] (colour only) or

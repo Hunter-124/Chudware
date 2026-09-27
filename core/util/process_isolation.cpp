@@ -8,8 +8,10 @@
 // unbuildable" answer the drop-failing path already handles.
 #include "util/process_isolation.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -56,12 +58,18 @@ bool shape_isolation_active() {
 }
 
 IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& build,
-                                        std::chrono::milliseconds timeout) {
-#if defined(__unix__) || defined(__APPLE__)
-    if (g_fork_unusable || !shape_isolation_enabled()) {
+                                        std::chrono::milliseconds timeout,
+                                        std::string* sidecar) {
+    if (sidecar) sidecar->clear();
+    // In-process build: the lambda fills *sidecar itself; a failed build leaves it empty.
+    auto in_process = [&]() -> IsolatedShapeResult {
+        if (sidecar) sidecar->clear();
         TopoDS_Shape s = build();
+        if (s.IsNull() && sidecar) sidecar->clear();
         return {!s.IsNull(), s};
-    }
+    };
+#if defined(__unix__) || defined(__APPLE__)
+    if (g_fork_unusable || !shape_isolation_enabled()) return in_process();
 
     // Honour TMPDIR: /tmp can be a tiny tmpfs, and a large blended shape is megabytes.
     std::string tmpl;
@@ -103,7 +111,12 @@ IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& bui
             }
             TopoDS_Shape s = build();
             if (!s.IsNull()) {
+                // Payload: [u64 sidecar length][sidecar bytes][BinTools shape].
                 std::ofstream out(filename, std::ios::binary | std::ios::trunc);
+                const std::string side = sidecar ? *sidecar : std::string();
+                const std::uint64_t n = side.size();
+                out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+                out.write(side.data(), static_cast<std::streamsize>(side.size()));
                 BinTools::Write(s, out);
                 ok = out.good();
             }
@@ -126,8 +139,7 @@ IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& bui
             ::close(fd);
             ::unlink(filename.c_str());
             g_fork_unusable = true;
-            TopoDS_Shape s = build();
-            return {!s.IsNull(), s};
+            return in_process();
         }
         if (std::chrono::steady_clock::now() >= deadline) {
             // The child never finished. Almost certainly a fork-in-a-multithreaded-process
@@ -138,8 +150,7 @@ IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& bui
             ::close(fd);
             ::unlink(filename.c_str());
             g_fork_unusable = true;
-            TopoDS_Shape s = build();
-            return {!s.IsNull(), s};
+            return in_process();
         }
         ::usleep(nap);
         if (nap < 10000) nap *= 2;
@@ -150,8 +161,15 @@ IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& bui
         return {};
     }
     TopoDS_Shape shape;
+    std::string side;
     try {
         std::ifstream in(filename, std::ios::binary);
+        std::uint64_t n = 0;
+        in.read(reinterpret_cast<char*>(&n), sizeof(n));
+        if (!in || n > (std::uint64_t{1} << 32)) throw std::runtime_error("bad payload");
+        side.resize(static_cast<std::size_t>(n));
+        in.read(side.data(), static_cast<std::streamsize>(n));
+        if (!in) throw std::runtime_error("bad payload");
         BinTools::Read(shape, in);
     } catch (...) {
         // A truncated or unreadable payload is an unbuildable subset, not a throw.
@@ -159,11 +177,11 @@ IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& bui
     }
     const bool ok = !shape.IsNull();
     ::unlink(filename.c_str());
+    if (ok && sidecar) *sidecar = std::move(side);
     return {ok, shape};
 #else
     (void)timeout;
-    TopoDS_Shape s = build();
-    return {!s.IsNull(), s};
+    return in_process();
 #endif
 }
 

@@ -86,7 +86,10 @@ Python kernel executes → result drained per-frame by `host/src/core/engine_eve
   `st.selection` (body id = ordinal among non-suppressed components, `featureTreeAssemblyComponent`;
   pattern instances via the resolve reply → `featureTreeNoteAssemblyPick`). A pending
   `treeScrollToSelection` force-opens the Features section / folder / instance group and scrolls.
-  Assemblies have an empty engine `owner_map`, so nested component feature rows are not lit.
+  Assemblies have an empty engine `owner_map`; instead the assembly `doc_resolve_pick` reply's
+  `owner_feature` (feature inside the component's part) goes through
+  `featureTreeNoteAssemblyPick(st, hit, component, owner)` → the nested component feature row
+  lights while that pick stays selected, and its component row / Dress-up folder open once + scroll.
   Selected rows (every kind) paint via `fmRowSelectedPaint` (accentSoft fill + accent glow).
 - The AI "Name & group" tree-header button was removed (sidelined); `nameAndGroupFeatures`
   is kept `[[maybe_unused]]` for later re-wiring.

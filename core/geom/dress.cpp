@@ -1,4 +1,5 @@
 #include "geom/dress.h"
+#include "geom/op_history.h"
 #include "util/process_isolation.h"
 
 #include <algorithm>
@@ -169,7 +170,9 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
     if (n_dropped) *n_dropped = 0;
     if (good.empty()) return TopoDS_Shape();
 
-    auto build = [&](const std::vector<TopoDS_Edge>& edges) -> TopoDS_Shape {
+    // `prov` (non-null only for the build whose shape is RETURNED) receives the blend's face/
+    // edge provenance for owner attribution; bisect probes skip it.
+    auto build = [&](const std::vector<TopoDS_Edge>& edges, std::string* prov) -> TopoDS_Shape {
         auto result = chudware::util::isolate_shape_build([&]() -> TopoDS_Shape {
             try {
                 Builder mk(shape);
@@ -177,23 +180,31 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
                 mk.Build();
                 if (!mk.IsDone()) return {};
                 TopoDS_Shape s = mk.Shape();
-                return blend_is_watertight(s) ? s : TopoDS_Shape();
+                if (!blend_is_watertight(s)) return {};
+                if (prov) *prov = op_provenance_encode(shape, s, mk);
+                return s;
             } catch (const Standard_Failure&) {
                 return {};
             }
-        }, kBlendTimeout);
+        }, kBlendTimeout, prov);
         return result.ok ? result.shape : TopoDS_Shape();
     };
+    const bool recording = op_history_recording();
+    std::string prov;
+    auto finish = [&](const TopoDS_Shape& out) {
+        if (recording && !out.IsNull()) op_provenance_record(shape, out, prov);
+        return out;
+    };
 
-    TopoDS_Shape all = build(good);
-    if (!all.IsNull()) return all;
+    TopoDS_Shape all = build(good, recording ? &prov : nullptr);
+    if (!all.IsNull()) return finish(all);
 
     // T-PERF10: bisect over the edge list instead of O(E²) one-edge-at-a-time rebuilds.
     // A crashing subset is indistinguishable from any other failed build, preserving the
     // established drop count and \"round what you can\" behavior.
     auto try_build = [&](const std::vector<TopoDS_Edge>& edges) -> bool {
         if (edges.empty()) return true;
-        return !build(edges).IsNull();
+        return !build(edges, nullptr).IsNull();
     };
     std::function<std::vector<TopoDS_Edge>(const std::vector<TopoDS_Edge>&)> select;
     select = [&](const std::vector<TopoDS_Edge>& span) -> std::vector<TopoDS_Edge> {
@@ -218,7 +229,8 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
     };
     std::vector<TopoDS_Edge> accepted = select(good);
     if (n_dropped) *n_dropped = (int)(good.size() - accepted.size());
-    return accepted.empty() ? TopoDS_Shape() : build(accepted);
+    return accepted.empty() ? TopoDS_Shape()
+                            : finish(build(accepted, recording ? &prov : nullptr));
 }
 
 }  // namespace
@@ -238,35 +250,47 @@ TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
                           std::optional<Eigen::Vector3d> dir) {
     const std::vector<TopoDS_Edge> sel = select_blendable(shape, dir);
     if (sel.empty()) return TopoDS_Shape();  // nothing selected -> nothing to do
+    const bool recording = op_history_recording();
+    std::string prov;
     auto built = chudware::util::isolate_shape_build([&]() -> TopoDS_Shape {
         try {
             BRepFilletAPI_MakeFillet mk(shape);
             for (const TopoDS_Edge& e : sel) mk.Add(r, e);
             mk.Build();
-            return mk.IsDone() ? mk.Shape() : TopoDS_Shape();
+            if (!mk.IsDone()) return {};
+            if (recording) prov = op_provenance_encode(shape, mk.Shape(), mk);
+            return mk.Shape();
         } catch (const Standard_Failure&) {
             return {};
         }
-    }, kBlendTimeout);
-    return built.ok ? built.shape : TopoDS_Shape();
+    }, kBlendTimeout, recording ? &prov : nullptr);
+    if (!built.ok || built.shape.IsNull()) return TopoDS_Shape();
+    if (recording) op_provenance_record(shape, built.shape, prov);
+    return built.shape;
 }
 
 TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
                            std::optional<Eigen::Vector3d> dir) {
     const std::vector<TopoDS_Edge> sel = select_blendable(shape, dir);
     if (sel.empty()) return TopoDS_Shape();
+    const bool recording = op_history_recording();
+    std::string prov;
     auto built = chudware::util::isolate_shape_build([&]() -> TopoDS_Shape {
         try {
             BRepFilletAPI_MakeChamfer mk(shape);
             // Symmetric chamfer: the single-distance Add(d, edge) sets both legs to d.
             for (const TopoDS_Edge& e : sel) mk.Add(d, e);
             mk.Build();
-            return mk.IsDone() ? mk.Shape() : TopoDS_Shape();
+            if (!mk.IsDone()) return {};
+            if (recording) prov = op_provenance_encode(shape, mk.Shape(), mk);
+            return mk.Shape();
         } catch (const Standard_Failure&) {
             return {};
         }
-    }, kBlendTimeout);
-    return built.ok ? built.shape : TopoDS_Shape();
+    }, kBlendTimeout, recording ? &prov : nullptr);
+    if (!built.ok || built.shape.IsNull()) return TopoDS_Shape();
+    if (recording) op_provenance_record(shape, built.shape, prov);
+    return built.shape;
 }
 
 // --- explicit-edge overloads ---
@@ -417,9 +441,12 @@ TopoDS_Shape chamfer_vertices(const TopoDS_Shape& shape, double d,
         return {};
     }
 
+    const bool recording = op_history_recording();
+    std::string prov;
     auto built = chudware::util::isolate_shape_build([&]() -> TopoDS_Shape {
         try {
             TopoDS_Shape current = shape;
+            std::vector<Handle(BRepTools_History)> chain;
             for (const Corner& corner : corners) {
                 const auto& p = corner.points;
                 BRepBuilderAPI_Sewing sew;
@@ -450,6 +477,7 @@ TopoDS_Shape chamfer_vertices(const TopoDS_Shape& shape, double d,
                 cut.Build();
                 if (!cut.IsDone() || cut.Shape().IsNull()) return {};
                 TopoDS_Shape next = cut.Shape();
+                if (recording) chain.push_back(cut.History());
                 GProp_GProps after;
                 BRepGProp::VolumeProperties(next, after);
                 const double removed = before.Mass() - after.Mass();
@@ -458,15 +486,17 @@ TopoDS_Shape chamfer_vertices(const TopoDS_Shape& shape, double d,
                     return {};
                 current = next;
             }
+            if (recording) prov = op_provenance_encode(shape, current, chain);
             return current;
         } catch (const Standard_Failure&) {
             return {};
         }
-    }, kBlendTimeout);
+    }, kBlendTimeout, recording ? &prov : nullptr);
     if (!built.ok || built.shape.IsNull()) {
         if (diag) *diag = "vertex corner cut failed; select a convex three-edge corner and reduce the distance";
         return {};
     }
+    if (recording) op_provenance_record(shape, built.shape, prov);
     return built.shape;
 }
 

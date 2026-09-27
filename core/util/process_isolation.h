@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <functional>
+#include <string>
 
 #include <TopoDS_Shape.hxx>
 
@@ -15,8 +16,13 @@ struct IsolatedShapeResult {
 // Run an OCCT shape-producing operation out of process on POSIX. The child serializes
 // the result; crashes and timeouts are reported as ordinary failure. Elsewhere this
 // executes in-process so callers remain portable.
+// `sidecar` (optional): a string the `build` lambda fills alongside its shape (e.g. the
+// op's face provenance, geom/op_history.h). In-process the lambda writes it directly;
+// across the fork the child ships it back with the shape and the parent restores it.
+// It is cleared first and left empty whenever the build fails.
 IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& build,
-                                        std::chrono::milliseconds timeout);
+                                        std::chrono::milliseconds timeout,
+                                        std::string* sidecar = nullptr);
 
 // Configured on (CHUDWARE_BLEND_ISOLATION != "0").
 bool shape_isolation_enabled();

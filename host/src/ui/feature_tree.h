@@ -120,9 +120,13 @@ void featureTreeRevealPick(AppState& st, const render::PickHit& hit);
 const nlohmann::json* featureTreeAssemblyComponent(const nlohmann::json& tree, uint32_t bodyId);
 
 // Record the engine's doc_resolve_pick answer for an assembly pick (`componentId`, "<seed>#<k>" for
-// a pattern instance) so a pattern-instance body lights its seed component's row. Ordinary bodies
-// resolve locally and are ignored. Scoped to the active doc revision.
-void featureTreeNoteAssemblyPick(AppState& st, uint32_t bodyId, const std::string& componentId);
+// a pattern instance) so a pattern-instance body lights its seed component's row (ordinary bodies
+// resolve locally). `ownerFeature` (the reply's optional owner_feature: the feature inside that
+// component's own part owning the picked face/edge) lights that nested feature row with the
+// selected style and opens + scrolls to it, while `hit` stays selected. Scoped to the doc revision.
+void featureTreeNoteAssemblyPick(AppState& st, const render::PickHit& hit,
+                                 const std::string& componentId,
+                                 const std::string& ownerFeature = {});
 
 // Wave 4C/4D: FeatureManager copy / cut / paste, driven by the global Ctrl+C/X/V routing and the
 // "edit_copy" / "edit_cut" / "edit_paste" dispatcher ids. Call from app.cpp's pre-draw key handler

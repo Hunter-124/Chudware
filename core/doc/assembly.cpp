@@ -44,6 +44,10 @@
 #include <gp_Cylinder.hxx>
 #include <gp_Sphere.hxx>
 #include <gp_Trsf.hxx>
+#include <gp_Pnt.hxx>
+#include <BRepGProp.hxx>
+#include <GProp_GProps.hxx>
+#include <TopoDS_Iterator.hxx>
 
 #include "doc/document.h"
 #include "doc/formats.h"
@@ -1221,6 +1225,141 @@ TopoDS_Shape placed_world_shape(const AsmBodyOut& body,
         return body.shape_local.Moved(TopLoc_Location(t));
     BRepBuilderAPI_Transform xf(body.shape_local, t, true);
     return xf.Shape();
+}
+
+namespace {
+// A native part component compiled WITH owner attribution, for assembly pick resolution.
+// The normal component load path is geometry-only (and may come straight from cache.brep),
+// so it never carries owners; this is built lazily on the first pick and cached by the same
+// file-stamp key as the geometry.
+struct ComponentOwners {
+    std::vector<TopoDS_Shape> shapes;
+    std::vector<std::map<int, std::string>> faces, edges;
+};
+constexpr std::size_t kOwnerCacheLimit = 16;
+std::mutex g_owner_mtx;
+std::map<std::string, std::pair<std::uint64_t, std::shared_ptr<const ComponentOwners>>>
+    g_owner_cache;
+std::uint64_t g_owner_clock = 0;  // protected by g_owner_mtx
+
+std::shared_ptr<const ComponentOwners> component_owners(const std::string& abspath) {
+    const std::string key = component_cache_key(abspath);
+    {
+        std::lock_guard<std::mutex> lock(g_owner_mtx);
+        auto it = g_owner_cache.find(key);
+        if (it != g_owner_cache.end()) {
+            it->second.first = ++g_owner_clock;
+            return it->second.second;
+        }
+    }
+    const auto doc = component_document(abspath);
+    if (doc->value("schema", std::string()) == "aicad.asm/1") return nullptr;
+    CompileResult r = compile_document(*doc, env_from_doc(*doc), nullptr,
+                                       ::geom::DisplayQuality::Fine, false, /*with_owners=*/true);
+    if (r.shape_face_owners.size() != r.shapes.size() ||
+        r.shape_edge_owners.size() != r.shapes.size())
+        return nullptr;
+    auto owners = std::make_shared<ComponentOwners>();
+    owners->shapes = std::move(r.shapes);
+    owners->faces = std::move(r.shape_face_owners);
+    owners->edges = std::move(r.shape_edge_owners);
+    std::lock_guard<std::mutex> lock(g_owner_mtx);
+    g_owner_cache[key] = {++g_owner_clock, owners};
+    while (g_owner_cache.size() > kOwnerCacheLimit) {
+        auto oldest = std::min_element(g_owner_cache.begin(), g_owner_cache.end(),
+            [](const auto& a, const auto& b) { return a.second.first < b.second.first; });
+        g_owner_cache.erase(oldest);
+    }
+    return owners;
+}
+
+// Area (face) / length (edge) + centroid: enough to confirm two shapes are the same
+// face/edge of the same compiled part without trusting index order alone.
+struct TopoProbe {
+    double measure = 0.0;
+    gp_Pnt centroid;
+};
+TopoProbe topo_probe(const TopoDS_Shape& s, bool face) {
+    GProp_GProps g;
+    if (face) BRepGProp::SurfaceProperties(s, g);
+    else BRepGProp::LinearProperties(s, g);
+    return {g.Mass(), g.CentreOfMass()};
+}
+bool same_probe(const TopoProbe& a, const TopoProbe& b, double diag) {
+    return std::abs(a.measure - b.measure) <= 1e-6 * std::max(1.0, std::abs(a.measure)) &&
+           a.centroid.Distance(b.centroid) <= 1e-6 * std::max(1.0, diag);
+}
+}  // namespace
+
+std::string component_pick_owner(const json& asm_doc, const std::string& base_dir,
+                                 const AsmBodyOut& body, const std::string& kind, int topo_id) {
+    if ((kind != "face" && kind != "edge") || body.shape_local.IsNull() || topo_id < 1)
+        return {};
+    const bool face = kind == "face";
+    const TopAbs_ShapeEnum te = face ? TopAbs_FACE : TopAbs_EDGE;
+    // A pattern instance "<cid>#k" is a placed copy of its seed component.
+    const std::string cid = body.component_id.substr(0, body.component_id.find('#'));
+    std::string path;
+    if (asm_doc.contains("components") && asm_doc["components"].is_array())
+        for (const json& c : asm_doc["components"])
+            if (c.is_object() && c.value("id", std::string()) == cid && c.contains("source") &&
+                c["source"].is_object())
+                path = c["source"].value("path", std::string());
+    if (path.empty()) return {};
+    try {
+        const std::string abspath =
+            std::filesystem::absolute(resolve_source_path(path, base_dir)).string();
+        const std::string low = lower(abspath);
+        if (!ends_with(low, ".step+") && !ends_with(low, ".stepplus")) return {};
+        const auto owners = component_owners(abspath);
+        if (!owners || owners->shapes.empty()) return {};
+
+        TopTools_IndexedMapOfShape picked_map;
+        TopExp::MapShapes(body.shape_local, te, picked_map);
+        if (topo_id > picked_map.Extent()) return {};
+        const TopoDS_Shape& picked = picked_map.FindKey(topo_id);
+        // shape_local is compound_of(the component's bodies): the body itself for one body,
+        // else a compound whose children are the bodies in compile order.
+        std::vector<TopoDS_Shape> bodies;
+        if (owners->shapes.size() == 1) {
+            bodies.push_back(body.shape_local);
+        } else {
+            for (TopoDS_Iterator it(body.shape_local); it.More(); it.Next())
+                bodies.push_back(it.Value());
+        }
+        if (bodies.size() != owners->shapes.size()) return {};
+        for (std::size_t bi = 0; bi < bodies.size(); ++bi) {
+            TopTools_IndexedMapOfShape local;
+            TopExp::MapShapes(bodies[bi], te, local);
+            const int li = local.FindIndex(picked);
+            if (li == 0) continue;
+            TopTools_IndexedMapOfShape compiled;
+            TopExp::MapShapes(owners->shapes[bi], te, compiled);
+            const double diag = bbox_diag({owners->shapes[bi]});
+            const TopoProbe want = topo_probe(picked, face);
+            int match = 0;
+            if (li <= compiled.Extent() &&
+                same_probe(want, topo_probe(compiled.FindKey(li), face), diag)) {
+                match = li;
+            } else {
+                // Index order disagreed (e.g. a cache written by another compile): accept
+                // only a UNIQUE geometric match.
+                for (int j = 1; j <= compiled.Extent(); ++j) {
+                    if (!same_probe(want, topo_probe(compiled.FindKey(j), face), diag)) continue;
+                    if (match != 0) return {};
+                    match = j;
+                }
+            }
+            if (match == 0) return {};
+            const auto& om = (face ? owners->faces : owners->edges)[bi];
+            const auto it = om.find(match);
+            if (it == om.end()) return {};
+            return it->second.substr(0, it->second.find('#'));  // split piece -> its feature
+        }
+        return {};
+    } catch (...) {
+        return {};  // an unreadable/uncompilable component simply has no owner to report
+    }
 }
 
 }  // namespace chudware::doc

@@ -91,3 +91,10 @@ Epoch 4 extends §6: exact selected-face fingerprints can independently paint
 faces that share a coarse short SID. Older display caches must not hide this
 authored distinction. Invalidated caches rebuild from the native source;
 neither an ordinal guess nor a rewritten old engine identity is permitted.
+
+## 8. Owner-attribution cache epoch (2026-09-27)
+
+The current semantic key is `chudware-geomcache/6` plus the OCCT version.
+Epoch 6 re-attributes `owner_map` faces/edges through operation history (a
+dress-up or boolean feature owns only the faces it generates); cached display
+responses from epoch 5 carry the old owner map and are a cache miss.

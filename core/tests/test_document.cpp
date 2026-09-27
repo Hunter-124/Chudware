@@ -21,7 +21,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -2923,6 +2925,132 @@ TEST_CASE("B6-4: cylinder mode:boss on a box fuses and increases the volume") {
     CHECK(r.volume == doctest::Approx(box_vol + cyl_vol).epsilon(0.02));
 }
 
+// Owner attribution through MODIFYING ops. A face a later feature only trims, splits or
+// merges keeps its creating feature; the later feature owns only what it GENERATES. Before
+// op histories were traced, faces were matched by exact TShape identity, and UnifySameDomain /
+// BRepFilletAPI rebuild every face — so the last dress-up feature owned the whole body
+// (box+boss+chamfer came back {chamfer: 11}; the user's turntable: one chamfer owned 89 faces).
+namespace {
+struct OwnedFace {
+    GeomAbs_SurfaceType type;
+    gp_Dir normal;  // planes only
+};
+std::map<std::string, std::vector<OwnedFace>> owned_faces(const CompileResult& r) {
+    std::map<std::string, std::vector<OwnedFace>> out;
+    for (auto it = r.owner_map.begin(); it != r.owner_map.end(); ++it) {
+        for (const json& bf : it.value().at("faces")) {
+            const int body = bf[0].get<int>(), idx = bf[1].get<int>();
+            TopTools_IndexedMapOfShape faces;
+            TopExp::MapShapes(r.shapes.at(static_cast<std::size_t>(body - 1)), TopAbs_FACE, faces);
+            BRepAdaptor_Surface s(TopoDS::Face(faces.FindKey(idx)));
+            OwnedFace f{s.GetType(), gp_Dir(0, 0, 1)};
+            if (f.type == GeomAbs_Plane) f.normal = s.Plane().Axis().Direction();
+            out[it.key()].push_back(f);
+        }
+    }
+    return out;
+}
+bool axis_aligned(const gp_Dir& d) {
+    return std::abs(std::abs(d.X()) - 1) < 1e-9 || std::abs(std::abs(d.Y()) - 1) < 1e-9 ||
+           std::abs(std::abs(d.Z()) - 1) < 1e-9;
+}
+int face_total(const CompileResult& r) {
+    int n = 0;
+    for (const TopoDS_Shape& s : r.shapes) {
+        TopTools_IndexedMapOfShape faces;
+        TopExp::MapShapes(s, TopAbs_FACE, faces);
+        n += faces.Extent();
+    }
+    return n;
+}
+json owner_box_boss() {
+    // 20x20x10 box centred on the origin (top at z=+5) + a r3 x 8 cylinder boss on top.
+    return json::array({
+        json{{"id", "blk"}, {"type", "box"}, {"length", 20.0}, {"width", 20.0}, {"height", 10.0}},
+        json{{"id", "boss"}, {"type", "cylinder"}, {"radius", 3.0}, {"height", 8.0},
+             {"mode", "boss"}, {"centered", false}, {"at", json::array({0, 0, 5.0})}},
+    });
+}
+}  // namespace
+
+TEST_CASE("owner map: a chamfer owns only its bevel faces; box and boss keep theirs") {
+    json doc;
+    doc["features"] = owner_box_boss();
+    doc["features"].push_back(json{{"id", "ch"}, {"type", "chamfer"}, {"length", 1.0},
+                                   {"edges", json{{"of", "edge"}, {"side", "-z"}}}});
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.ok);
+    REQUIRE(r.shapes.size() == 1);
+    auto owned = owned_faces(r);
+    // Box: its 6 faces (4 sides + bottom trimmed by the bevel, top split by the boss).
+    CHECK(owned["blk"].size() == 6);
+    // Boss: the cylinder wall + its top cap; its base merged into the box top.
+    REQUIRE(owned["boss"].size() == 2);
+    CHECK(std::count_if(owned["boss"].begin(), owned["boss"].end(), [](const OwnedFace& f) {
+              return f.type == GeomAbs_Cylinder;
+          }) == 1);
+    // Chamfer: exactly the 4 bevels on the bottom rim, each a tilted plane.
+    REQUIRE(owned["ch"].size() == 4);
+    for (const OwnedFace& f : owned["ch"]) {
+        CHECK(f.type == GeomAbs_Plane);
+        CHECK_FALSE(axis_aligned(f.normal));
+    }
+    CHECK(owned.size() == 3);
+    CHECK(face_total(r) == 12);
+}
+
+TEST_CASE("owner map: a fillet on the boss rim owns the round; the boss keeps its wall and cap") {
+    json doc;
+    doc["features"] = owner_box_boss();
+    doc["features"].push_back(json{{"id", "fl"}, {"type", "fillet"}, {"radius", 1.0},
+                                   {"edges", json{{"of", "edge"}, {"side", "+z"}}}});
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.ok);
+    auto owned = owned_faces(r);
+    CHECK(owned["blk"].size() == 6);
+    // The fillet trims the boss wall and cap; both stay the boss's.
+    REQUIRE(owned["boss"].size() == 2);
+    CHECK(std::count_if(owned["boss"].begin(), owned["boss"].end(), [](const OwnedFace& f) {
+              return f.type == GeomAbs_Cylinder;
+          }) == 1);
+    // The round itself: one toroidal blend face.
+    REQUIRE(owned["fl"].size() == 1);
+    CHECK(owned["fl"][0].type == GeomAbs_Torus);
+    CHECK(face_total(r) == 9);
+}
+
+TEST_CASE("owner map: a cut owns its bore wall; a later chamfer does not take the box") {
+    json doc;
+    doc["features"] = json::array({
+        json{{"id", "blk"}, {"type", "box"}, {"length", 20.0}, {"width", 20.0}, {"height", 10.0}},
+        // Through-bore: a centred r3 x 20 cylinder straddles the whole 10 mm box height.
+        json{{"id", "bore"}, {"type", "cylinder"}, {"radius", 3.0}, {"height", 20.0},
+             {"mode", "cut"}},
+    });
+    {
+        CompileResult r = compile_document(doc, json::object());
+        REQUIRE(r.ok);
+        auto owned = owned_faces(r);
+        CHECK(owned["blk"].size() == 6);  // top and bottom pierced, still the box's
+        REQUIRE(owned["bore"].size() == 1);
+        CHECK(owned["bore"][0].type == GeomAbs_Cylinder);
+    }
+    doc["features"].push_back(json{{"id", "ch"}, {"type", "chamfer"}, {"length", 1.0},
+                                   {"edges", json{{"of", "edge"}, {"side", "-z"}}}});
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.ok);
+    auto owned = owned_faces(r);
+    CHECK(owned["blk"].size() == 6);
+    REQUIRE(owned["bore"].size() == 1);
+    CHECK(owned["bore"][0].type == GeomAbs_Cylinder);
+    // Every chamfer face is a bevel (a tilted plane on the outer rim or a cone on the bore rim).
+    REQUIRE(!owned["ch"].empty());
+    for (const OwnedFace& f : owned["ch"])
+        CHECK((f.type == GeomAbs_Cone || (f.type == GeomAbs_Plane && !axis_aligned(f.normal))));
+    CHECK(static_cast<int>(owned["blk"].size() + owned["bore"].size() + owned["ch"].size()) ==
+          face_total(r));
+}
+
 // ============================================================================
 // W1 / E10 regression tests
 // ============================================================================
@@ -3609,6 +3737,66 @@ TEST_CASE("eval_measure preserves repeated nested assembly pick identity and wor
     CHECK_THROWS(doc_eval_measure(root, json::array({a.at("selector")})));
     CHECK(doc_close(root));
     CHECK(doc_close(nested));
+    CHECK(doc_close(part));
+    std::filesystem::remove_all(dir);
+}
+
+// An assembly face/edge pick names the feature that owns it INSIDE the component's own part
+// (owner_feature), so the host can highlight the nested component feature row. It must agree
+// with the part's own owner_map for the same face/edge.
+TEST_CASE("assembly doc_resolve_pick reports the component part's owning feature") {
+    using namespace chudware::doc;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    const std::string part = doc_new("part", "OwnerSource").at("doc_id");
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / part;
+    std::filesystem::create_directories(dir);
+    const auto part_path = dir / "owned.step+";
+    const json built = doc_apply_ops(part, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+            {"params", {{"length", dimv(10)}, {"width", dimv(20)}, {"height", dimv(30)},
+                        {"centered", false}}}}}},
+        {{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "Boss"},
+            {"params", {{"radius", dimv(3)}, {"height", dimv(8)}, {"mode", "boss"},
+                        {"centered", false}, {"at", json::array({5.0, 10.0, 30.0})}}}}}},
+        {{"op", "add_feature"}, {"feature", {{"type", "chamfer"}, {"name", "Bevel"},
+            {"params", {{"length", dimv(1.0)}}},
+            {"refs", {{"edges", json{{"of", "edge"}, {"side", "-z"}}}}}}}},
+    }), false);
+    for (const json& st : built.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(st.at("ok").get<bool>(), st.dump());
+    doc_save(part, part_path.string());
+    // The part's own answer: owner per face/edge topo id of its single body.
+    std::map<std::pair<std::string, int>, std::string> expected;
+    for (auto it = built.at("owner_map").begin(); it != built.at("owner_map").end(); ++it)
+        for (const char* kind : {"faces", "edges"})
+            for (const json& bt : it.value().at(kind))
+                expected[{kind, bt[1].get<int>()}] = it.key();
+
+    const std::string root = doc_new("assembly", "OwnerAsm").at("doc_id");
+    doc_apply_ops(root, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_path.string()}}},
+         {"fixed", true},
+         {"transform", json::array({0.0, -1.0, 0.0, 100.0, 1.0, 0.0, 0.0, 0.0,
+                                    0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0})}},
+    }), false);
+    std::set<std::string> seen;
+    int faces = 0;
+    for (const auto& [key, owner] : expected) {
+        const std::string kind = key.first == "faces" ? "face" : "edge";
+        const json reply = doc_resolve_pick(root, 1, kind, key.second);
+        REQUIRE_MESSAGE(reply.contains("owner_feature"), kind << " " << key.second);
+        CHECK(reply.at("owner_feature").get<std::string>() == owner);
+        CHECK(reply.at("component").is_string());
+        if (kind == "face") {
+            ++faces;
+            seen.insert(owner);
+        }
+    }
+    CHECK(faces == 12);          // 6 box + 2 boss + 4 bevels
+    CHECK(seen.size() == 3);     // Block, Boss and Bevel each own faces
+    // A body pick names the component only.
+    CHECK_FALSE(doc_resolve_pick(root, 1, "body", 0).contains("owner_feature"));
+    CHECK(doc_close(root));
     CHECK(doc_close(part));
     std::filesystem::remove_all(dir);
 }

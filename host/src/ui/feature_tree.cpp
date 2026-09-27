@@ -1340,16 +1340,53 @@ const nlohmann::json* featureTreeAssemblyComponent(const nlohmann::json& tree, u
     return nullptr;
 }
 
-void featureTreeNoteAssemblyPick(AppState& st, uint32_t bodyId, const std::string& componentId) {
-    if (bodyId < kAsmPatternBodyBase || componentId.empty()) return;   // ordinals resolve locally
+// The engine's owner_feature for the latest assembly face/edge pick: the feature inside the
+// picked component's own part. Its nested feature row (drawComponentFeatureRow) lights while that
+// exact pick stays selected. One-shot requests: `openRow` expands the component row once (the
+// user can collapse it again), `reveal` opens the feature's folder and scrolls to its row.
+struct AsmPickOwner {
+    std::string docId;
+    int revision = -1;
+    render::PickHit hit;
+    std::string component;   // component tree row id (a pattern instance's seed)
+    std::string feature;     // owning feature id within that component's part
+    bool openRow = false;
+    bool reveal = false;
+};
+static AsmPickOwner s_asmPickOwner;
+
+void featureTreeNoteAssemblyPick(AppState& st, const render::PickHit& hit,
+                                 const std::string& componentId,
+                                 const std::string& ownerFeature) {
+    if (componentId.empty()) return;
+    const std::string seed = componentId.substr(0, componentId.find('#'));   // instance -> seed row
+    if (!ownerFeature.empty()) {
+        s_asmPickOwner = {st.docMirror.docId(), st.docMirror.revision(), hit, seed, ownerFeature,
+                          true, true};
+        st.treeScrollToSelection = true;
+    }
+    if (hit.body_id < kAsmPatternBodyBase) return;   // ordinals resolve locally
     AsmPickComponents& cache = s_asmPickComponents;
     if (cache.docId != st.docMirror.docId() || cache.revision != st.docMirror.revision()) {
         cache.docId = st.docMirror.docId();
         cache.revision = st.docMirror.revision();
         cache.byBody.clear();
     }
-    cache.byBody[bodyId] = componentId.substr(0, componentId.find('#'));   // instance -> its seed row
+    cache.byBody[hit.body_id] = seed;
     st.treeScrollToSelection = true;   // the row can light only now — bring it into view
+}
+
+// The recorded owner for component row `componentId`, while its pick is still selected in the
+// same doc revision; nullptr otherwise (a stale answer never lights a row).
+static AsmPickOwner* asmPickOwnerFor(AppState& st, const std::string& componentId) {
+    AsmPickOwner& o = s_asmPickOwner;
+    if (o.feature.empty() || o.component != componentId || o.docId != st.docMirror.docId() ||
+        o.revision != st.docMirror.revision())
+        return nullptr;
+    for (const auto& item : st.selection.items())
+        if (item.hit == o.hit) return &o;
+    o.openRow = o.reveal = false;   // deselected: never open/scroll to it later
+    return nullptr;
 }
 
 // Component id (tree row) owning an assembly pick's body, or "" when unknown.
@@ -2416,15 +2453,18 @@ static void componentScanSketchRefs(const nlohmann::json& node, const std::strin
     }
 }
 
+// `picked`: this row owns the latest assembly viewport pick (engine owner_feature) — drawn with
+// the shared selected style; `reveal` (one-shot, cleared here) scrolls it into view.
 static bool drawComponentFeatureRow(AppState& st, const std::string& idSuffix,
                                     const ui::NestedFeature& feature, bool expandable,
                                     bool nested, const std::string& topComponentId,
-                                    const std::string& sourcePath, bool editable) {
+                                    const std::string& sourcePath, bool editable,
+                                    bool picked = false, bool* reveal = nullptr) {
     const float nestIndent = 14.0f * ui::uiScale;
     if (nested) ImGui::Indent(nestIndent);
     const bool isCut = false;  // nested history has no live cut-mode bit; wash by type only
     const float* kindTint = featureKindTint(feature.type, isCut);
-    FmRowRect rect = fmRowPill(false, kindTint);
+    FmRowRect rect = fmRowPill(picked, kindTint);
     ImGuiTreeNodeFlags flags =
         ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding;
     if (expandable) flags |= ImGuiTreeNodeFlags_OpenOnArrow;
@@ -2439,8 +2479,12 @@ static bool drawComponentFeatureRow(AppState& st, const std::string& idSuffix,
         ? (feature.type.empty() ? std::string("Feature") : feature.type) : feature.name;
     if (expandable) fmSeedCollapsed();
     const bool open = ImGui::TreeNodeEx((name + "##" + idSuffix).c_str(), flags);
+    if (picked && reveal && *reveal) {
+        ImGui::SetScrollHereY(0.5f);
+        *reveal = false;
+    }
     if (!expandable) treeIconInArrowSlot(rowPos, icon, "[f]");
-    fmRowPillEnd(rect);
+    fmRowPillEnd(rect, picked);
     const bool activate = editable && ImGui::IsItemHovered() &&
                           ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
     ui::pushContextMenuStyle();
@@ -2457,11 +2501,14 @@ static bool drawComponentFeatureRow(AppState& st, const std::string& idSuffix,
     return expandable && open;
 }
 
+// `pickedFeature`: the feature owning the latest assembly pick in THIS component (see
+// drawComponentFeatureRow); a pending `reveal` also opens the folder that holds it.
 static void drawComponentFeatureTree(AppState& st, const std::string& idPrefix,
                                      const std::string& topComponentId,
                                      const std::string& sourcePath,
                                      const std::vector<ui::NestedFeature>& features,
-                                     bool editable) {
+                                     bool editable, const std::string& pickedFeature = {},
+                                     bool* reveal = nullptr) {
     auto isReference = [](const ui::NestedFeature& feature) {
         return feature.type == "plane" || feature.type == "datum_plane" ||
                feature.type == "axis" || feature.type == "point" ||
@@ -2509,7 +2556,8 @@ static void drawComponentFeatureTree(AppState& st, const std::string& idPrefix,
         const bool hasChildren = children != childrenOf.end() && !children->second.empty();
         const bool open = drawComponentFeatureRow(
             st, idPrefix + "_" + feature.id, feature, hasChildren, false,
-            topComponentId, sourcePath, editable);
+            topComponentId, sourcePath, editable,
+            !pickedFeature.empty() && feature.id == pickedFeature, reveal);
         if (open && hasChildren) {
             for (const std::string& sketchId : children->second) {
                 if (const ui::NestedFeature* sketch = findFeature(sketchId))
@@ -2545,6 +2593,12 @@ static void drawComponentFeatureTree(AppState& st, const std::string& idPrefix,
     // same contiguous-folder convention the part tree uses.
     std::string openFolder;
     bool folderOpen = false;
+    // A pending reveal opens the folder holding the picked feature (runs of one folder name
+    // share one ImGui id, so opening the name opens its run).
+    std::string revealFolder;
+    if (reveal && *reveal && !pickedFeature.empty())
+        if (const ui::NestedFeature* target = findFeature(pickedFeature))
+            if (isFolderFeature(*target)) revealFolder = target->folder;
     for (const auto& feature : features) {
         if (isReference(feature)) continue;
         if (feature.type == "sketch" && nestedSketches.count(feature.id)) continue;
@@ -2558,6 +2612,7 @@ static void drawComponentFeatureTree(AppState& st, const std::string& idPrefix,
                 treeIcon("body_folder", "[F]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);
                 fmSeedCollapsed();
+                if (!revealFolder.empty() && folder == revealFolder) ImGui::SetNextItemOpen(true);
                 folderOpen = ImGui::TreeNodeEx(
                     (folder + "##cfld_" + idPrefix + "_" + folder).c_str(),
                     ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding |
@@ -2688,8 +2743,14 @@ static void drawNestedDocumentContents(AppState& st, const std::string& idPrefix
         ImGui::Unindent(nestIndent);
         return;
     }
-    if (!document.features.empty())
-        drawComponentFeatureTree(st, idPrefix, topComponentId, sourcePath, document.features, true);
+    if (!document.features.empty()) {
+        // Only the top component's OWN history can hold the engine's owner_feature (it names a
+        // feature of that component's part, never of a nested sub-assembly's children).
+        AsmPickOwner* picked = depth == 0 ? asmPickOwnerFor(st, topComponentId) : nullptr;
+        drawComponentFeatureTree(st, idPrefix, topComponentId, sourcePath, document.features, true,
+                                 picked ? picked->feature : std::string(),
+                                 picked ? &picked->reveal : nullptr);
+    }
 
     if (depth >= 16 || document.components.empty()) {
         ImGui::Unindent(nestIndent);
@@ -2928,6 +2989,12 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
         const std::string shownLabel = fmFitRowLabel(label,
             fmEyeColumnW() + (fmBadgeShown(fs.ok, fs.dangling, false, fs.warning) ? fmBadgeW() : 0.0f));
         fmSeedCollapsed();
+        // The engine named the picked face's owning feature inside this component: open the row
+        // so drawComponentFeatureRow can light and scroll to it.
+        if (AsmPickOwner* owner = asmPickOwnerFor(st, cid); owner && owner->openRow) {
+            ImGui::SetNextItemOpen(true);
+            owner->openRow = false;
+        }
         const bool compOpen = ImGui::TreeNodeEx((shownLabel + "##comp_" + cid).c_str(), lf);
         if (compSel && cid == revealComp) {
             ImGui::SetScrollHereY(0.5f);

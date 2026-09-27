@@ -145,4 +145,14 @@ TopoDS_Shape placed_world_shape(const AsmBodyOut& body,
 gp_Trsf placed_world_trsf(const AsmBodyOut& body,
                           const std::optional<Eigen::Vector3d>& explode_offset = std::nullopt);
 
+// The feature — an id in the picked component's OWN part document — that owns face/edge
+// `topo_id` of `body.shape_local` (the TopExp numbering doc_resolve_pick uses). The part is
+// compiled once with owner attribution (cached by file stamp); the pick is matched to the
+// compiled body by index AND verified by area/length + centroid, falling back to a unique
+// geometric match. A pattern instance ("<cid>#k") resolves through its seed component.
+// "" when the component is not a native part (neutral import, nested assembly), `kind` is not
+// face|edge, or no confident match exists.
+std::string component_pick_owner(const nlohmann::json& asm_doc, const std::string& base_dir,
+                                 const AsmBodyOut& body, const std::string& kind, int topo_id);
+
 }  // namespace chudware::doc

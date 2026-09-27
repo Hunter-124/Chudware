@@ -1857,3 +1857,19 @@ view's component projection relative to its view origin by view id, source
 revision, orientation and scale. Moving a view translates cached anchors/bounds
 without another component HLR pass; source edits or orientation/scale changes
 invalidate them. Regular drawing fetches retain only combined-view projection.
+
+## Assembly pick owner + owner-map attribution addendum (2026-09-27)
+
+`doc_resolve_pick` on an **assembly** returns `{selector, component}` plus an
+optional `owner_feature` (string) for `kind:"face"|"edge"`: the id of the
+feature, inside the picked component's OWN part document, that owns the picked
+face/edge. It agrees with that part's own `owner_map` for the same topology (a
+pattern instance `"<cid>#k"` answers through its seed). Absent when the
+component is not a native part (neutral import, nested assembly), for
+`vertex`/`body` picks, or when the engine cannot match the pick to the compiled
+part with confidence. `selector` stays component-local and carries no owner.
+
+`owner_map` attribution (parts): a face/edge belongs to the feature that
+GENERATED it. A face a later feature only modifies — trimmed by a fillet or
+chamfer, split or merged by a boolean / same-domain unify — keeps its earlier
+owner; a face merged from several owners goes to the earliest in history order.

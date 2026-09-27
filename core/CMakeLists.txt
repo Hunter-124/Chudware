@@ -1251,6 +1251,7 @@ if(CHUDWARE_WITH_OCCT)
     geom/profile.cpp
     geom/profile3d.cpp
     geom/booleans.cpp
+    geom/op_history.cpp
     util/process_isolation.cpp
     geom/dress.cpp
     geom/transform.cpp

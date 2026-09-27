@@ -130,6 +130,10 @@ judgment).
   to compiled geometry/topology bumps `stepplus_cache_engine_key`. After `./build.sh stage`
   an auto-spawned dev hostd serves the OLD engine until it drains — check
   `chudware-hostd --status` before trusting an MCP smoke.
+- **Face ownership follows op history (2026-09-27).** A geom op that rebuilds faces of an
+  existing body must record its history (`geom::op_history_record`, or index provenance via
+  `op_provenance_encode`/`_record` across `isolate_shape_build`'s `sidecar`) — otherwise the
+  owner map hands every rebuilt face to that feature (`core/geom/op_history.h`).
 
 ### Manufacturing rules that bind every change
 

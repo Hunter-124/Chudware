@@ -1153,7 +1153,9 @@ std::string stepplus_cache_engine_key() {
     // /5 unifies same-domain faces after every feature-level boolean (primitive, extrude,
     // loft, revolve, sweep, rib, boolean, mirror; boss and cut); older snapshots carry the
     // split seams.
-    static constexpr const char* kCacheSchema = "chudware-geomcache/5";
+    // /6 re-attributes face/edge owners through op histories (a dress-up feature owns only
+    // the faces it generates); cached display responses carry the old owner_map.
+    static constexpr const char* kCacheSchema = "chudware-geomcache/6";
 #ifdef OCC_VERSION_COMPLETE
     return std::string(kCacheSchema) + ";occt=" OCC_VERSION_COMPLETE;
 #else

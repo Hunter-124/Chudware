@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 
 #include "app_state.h"
+#include "tess_catchup.h"
 #include "engine_backend.h"      // services/worker (include dir)
 #include "ipc_client.h"          // services/ipc (include dir)
 #include "../renderer.h"
@@ -172,6 +173,8 @@ bool noteReconnectAndCheckBrake() {
 // unapplied doc.changed payload per doc.
 std::map<std::string, std::string> pendingOpen;
 std::map<std::string, json> pendingChanged;
+// Viewport catch-up after tess-less revisions of the ACTIVE doc (see tess_catchup.h).
+TessCatchup tessCatchup;
 
 // Display name out of a doc.opened / doc.changed payload. doc.opened carries it
 // flat (hostd DocRegistry::sniffName); doc.changed pushes the whole document as
@@ -332,6 +335,49 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     return true;
 }
 
+void applyChangedActive(AppState& st, const std::string& docId, const json& d);
+
+// The active view just applied a revision that carried no tessellation. Ask the daemon for
+// the current mesh (doc_activate: the warm read-cache answer, no recompile; an assembly's
+// AICM is its cached component meshes re-posed) and draw it when it still matches the tree
+// on screen. Async on st.rpc — never on the GL thread — and single-flight per doc, so a pose
+// sweep costs at most one outstanding request.
+void fetchActiveTess(AppState& st, const std::string& docId) {
+    st.rpc.call("doc_activate", json{{"doc_id", docId}}, [&st, docId](const core::RpcResult& r) {
+        const json& res = r.result;
+        // A tree is required: without one applyChangedActive would fall back to a SYNC resync.
+        const bool usable = r.ok && res.is_object() && !res.contains("code") &&
+                            res.contains("revision") && res["revision"].is_number_integer() &&
+                            res.contains("tree") && res["tree"].is_object() &&
+                            res.contains("tess") && res["tess"].is_object() &&
+                            !res["tess"].value("aicm_path", std::string()).empty();
+        const long rev = usable ? res["revision"].get<long>() : -1;
+        const int idx = tabIndexForDoc(st, docId);
+        // A deferred push for this doc (pendingChanged) is newer than anything drawn now.
+        const bool viewing = idx >= 0 && idx == st.activeTab && st.docMirror.docId() == docId &&
+                             !userMidEdit(st) && !pendingChanged.count(docId);
+        switch (tessCatchup.onFetched(docId, usable, rev, viewing,
+                                      (long)st.docMirror.revision())) {
+        case TessCatchup::Outcome::Commit: {
+            // Same shape as a doc.changed push (doc_snapshot serves that shape verbatim too).
+            json d = res;
+            d["doc_id"] = docId;
+            d["aicm_path"] = res["tess"]["aicm_path"];
+            applyChangedActive(st, docId, d);
+            break;
+        }
+        case TessCatchup::Outcome::Refetch:
+            fetchActiveTess(st, docId);
+            break;
+        case TessCatchup::Outcome::Drop:
+            if (!r.ok || (res.is_object() && res.contains("code")))
+                st.addLog("[daemon] viewport mesh catch-up failed for " + docId + ": " +
+                          (r.ok ? res.value("message", std::string()) : r.err));
+            break;
+        }
+    });
+}
+
 // Apply a pushed foreign revision to the active live view without a blocking worker round-trip.
 // The event carries the immutable tree/owner map and AICM path; disk parse runs on the mesh loader.
 void applyChangedActive(AppState& st, const std::string& docId, const json& d) {
@@ -357,9 +403,10 @@ void applyChangedActive(AppState& st, const std::string& docId, const json& d) {
     // A revision published without a tessellation (asm_add_component / asm_mate and the
     // animation pose writers call doc_apply_ops with with_tess:false) carries NO aicm_path
     // key; an empty document carries an EMPTY one. Only the latter means "nothing to draw".
-    // For the former keep the displayed mesh — the next mesh-bearing revision replaces it —
-    // and drop the tab's cached mesh so a switch-in re-activates instead of binding a mesh
-    // older than its tree. Unloading here blanked the viewport after every agent mate.
+    // For the former keep the displayed mesh (unloading blanked the viewport after every
+    // agent mate), drop the tab's cached mesh so a switch-in never binds a mesh older than
+    // its tree, and fetch the current tessellation: waiting for the next mesh-bearing
+    // revision left an assembly's components unmoved for a whole mate/sweep stretch.
     if (!d.contains("aicm_path")) {
         if (t.session) {
             t.session->cachedAicmPath.clear();
@@ -368,8 +415,10 @@ void applyChangedActive(AppState& st, const std::string& docId, const json& d) {
             t.session->cachedDocMesh.reset();
         }
         pendingChanged.erase(docId);
+        if (tessCatchup.wantMesh(docId, (long)snapshot.revision)) fetchActiveTess(st, docId);
         return;
     }
+    tessCatchup.satisfied(docId);
     const std::string aicm = d.value("aicm_path", std::string());
     if (t.session) {
         t.session->cachedAicmPath = aicm;

@@ -21,61 +21,62 @@ static bool chatLocalTime(double ts, std::tm& out) {
     return chudware::util::localTime(t, out);
 }
 
-static std::string chatAgeLabel(double ts) {
-    if (ts <= 0.0) return std::string();
-    static const char* kMonths[] = {"Jan","Feb","Mar","Apr","May","Jun",
-                                    "Jul","Aug","Sep","Oct","Nov","Dec"};
-    const double age = chatNowEpoch() - ts;
-    char buf[40];
-    if (age < 45.0) return "now";
-    if (age < 3600.0) {
-        int mins = (int)(age / 60.0); if (mins < 1) mins = 1;
-        std::snprintf(buf, sizeof(buf), "%dm ago", mins);
-        return buf;
-    }
-    if (age < 86400.0) {
-        std::snprintf(buf, sizeof(buf), "%dh ago", (int)(age / 3600.0));
-        return buf;
-    }
-    std::tm tmv; if (!chatLocalTime(ts, tmv)) return std::string();
-    std::tm nowTm; chatLocalTime(chatNowEpoch(), nowTm);
-    if (tmv.tm_year == nowTm.tm_year)
-        std::snprintf(buf, sizeof(buf), "%s %d", kMonths[tmv.tm_mon], tmv.tm_mday);
+static const char* const kChatMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+// "2:26 PM" (or "2:26:07 PM").
+static std::string chatClock(const std::tm& t, bool seconds) {
+    int h = t.tm_hour % 12; if (h == 0) h = 12;
+    char buf[24];
+    if (seconds)
+        std::snprintf(buf, sizeof(buf), "%d:%02d:%02d %s", h, t.tm_min, t.tm_sec,
+                      t.tm_hour < 12 ? "AM" : "PM");
     else
-        std::snprintf(buf, sizeof(buf), "%s %d, %d", kMonths[tmv.tm_mon], tmv.tm_mday,
-                      tmv.tm_year + 1900);
+        std::snprintf(buf, sizeof(buf), "%d:%02d %s", h, t.tm_min, t.tm_hour < 12 ? "AM" : "PM");
     return buf;
 }
 
+// The visible message timestamp: clock time today, "Sep 26, 2:26 PM" earlier this year,
+// "Sep 26, 2025, 2:26 PM" before that. Static text — it never re-measures as time passes.
+static std::string chatStampLabel(double ts) {
+    std::tm tmv; if (!chatLocalTime(ts, tmv)) return std::string();
+    std::tm nowTm; chatLocalTime(chatNowEpoch(), nowTm);
+    const std::string clock = chatClock(tmv, false);
+    char buf[64];
+    if (tmv.tm_year == nowTm.tm_year && tmv.tm_yday == nowTm.tm_yday)
+        return clock;
+    if (tmv.tm_year == nowTm.tm_year)
+        std::snprintf(buf, sizeof(buf), "%s %d, %s", kChatMonths[tmv.tm_mon], tmv.tm_mday,
+                      clock.c_str());
+    else
+        std::snprintf(buf, sizeof(buf), "%s %d, %d, %s", kChatMonths[tmv.tm_mon], tmv.tm_mday,
+                      tmv.tm_year + 1900, clock.c_str());
+    return buf;
+}
+
+// Hover twin: how long ago, then the full date with seconds ("3m ago · Sep 27, 2026, 2:26:07 PM").
 static std::string chatTimeTooltip(double ts) {
     std::tm tmv; if (!chatLocalTime(ts, tmv)) return std::string();
-    static const char* kMonths[] = {"Jan","Feb","Mar","Apr","May","Jun",
-                                    "Jul","Aug","Sep","Oct","Nov","Dec"};
-    std::tm nowTm; chatLocalTime(chatNowEpoch(), nowTm);
-    int h = tmv.tm_hour % 12; if (h == 0) h = 12;
-    char clock[24];
-    std::snprintf(clock, sizeof(clock), "%d:%02d %s", h, tmv.tm_min,
-                  tmv.tm_hour < 12 ? "AM" : "PM");
-    char buf[64];
-    const bool sameDay = tmv.tm_year == nowTm.tm_year && tmv.tm_yday == nowTm.tm_yday;
-    if (sameDay)
-        std::snprintf(buf, sizeof(buf), "%s", clock);
-    else if (tmv.tm_year == nowTm.tm_year)
-        std::snprintf(buf, sizeof(buf), "%s %d, %s", kMonths[tmv.tm_mon], tmv.tm_mday, clock);
-    else
-        std::snprintf(buf, sizeof(buf), "%s %d, %d, %s", kMonths[tmv.tm_mon], tmv.tm_mday,
-                      tmv.tm_year + 1900, clock);
+    const double age = chatNowEpoch() - ts;
+    char rel[32];
+    if (age < 45.0) std::snprintf(rel, sizeof(rel), "just now");
+    else if (age < 3600.0) std::snprintf(rel, sizeof(rel), "%dm ago", std::max(1, (int)(age / 60.0)));
+    else if (age < 86400.0) std::snprintf(rel, sizeof(rel), "%dh ago", (int)(age / 3600.0));
+    else std::snprintf(rel, sizeof(rel), "%dd ago", (int)(age / 86400.0));
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "%s \xc2\xb7 %s %d, %d, %s", rel, kChatMonths[tmv.tm_mon],
+                  tmv.tm_mday, tmv.tm_year + 1900, chatClock(tmv, true).c_str());
     return buf;
 }
 
-// Age label with the turn's prompt-cache figure appended ("3m ago · 21.4k cached").
+// Timestamp with the turn's prompt-cache figure appended ("2:26 PM · 21.4k cached").
 // Shared by the in-card meta row and the above-card model label so a mutating
 // turn's cache reads are visible in the same form as a prose turn's.
 // `cacheTok` is the PEAK single-completion read (ChatMsg::cacheReadTok), never the
 // turn sum — with prompt caching the same prefix is re-read every call, so the sum
 // outgrows the context window and reads as nonsense next to the meter.
-static std::string chatAgeCacheLabel(double ts, int cacheTok) {
-    std::string age = chatAgeLabel(ts);
+static std::string chatStampCacheLabel(double ts, int cacheTok) {
+    std::string age = chatStampLabel(ts);
     if (cacheTok > 0 && !age.empty()) {
         age += " \xc2\xb7 ";
         age += chatTokCount(cacheTok);
@@ -84,7 +85,7 @@ static std::string chatAgeCacheLabel(double ts, int cacheTok) {
     return age;
 }
 
-// Tooltip twin of chatAgeCacheLabel: absolute time + cache sentence. The tooltip is
+// Tooltip twin of chatStampCacheLabel: relative + full time and the cache sentence. The tooltip is
 // where the CUMULATIVE figure belongs — it is a cost quantity, and spelling out the
 // call count is what stops the two numbers looking contradictory.
 static std::string chatAgeCacheTip(double ts, int cacheTok, int totTok = 0, int calls = 0) {
@@ -112,7 +113,7 @@ static void drawMsgMetaRow(const ui::Fonts& fonts, const char* name, const ImVec
                            double ts, int cacheTok = 0, int totTok = 0, int calls = 0,
                            const char* fullName = nullptr) {
     const ui::AdaptiveSurface& surf = chatSurf();
-    const std::string age = chatAgeCacheLabel(ts, cacheTok);
+    const std::string age = chatStampCacheLabel(ts, cacheTok);
     if ((!name || !name[0]) && age.empty()) return;   // legacy turn, no model — no blank row
     // Right inset clears the hover "copy" glyph that owns the bubble's top-right corner
     // (14px glyph + 4px pad, chatHoverCopyGlyph) plus a small breathing gap.
@@ -398,8 +399,8 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
         }
     }
 
-    // Age at the bar's right edge (hover = absolute time).
-    const std::string age = chatAgeLabel(m.ts);
+    // Timestamp at the bar's right edge (hover = relative age + full date).
+    const std::string age = chatStampLabel(m.ts);
     if (!age.empty()) {
         const float ageW = ImGui::CalcTextSize(age.c_str()).x;
         const float rx = ImGui::GetWindowContentRegionMax().x - ageW;
@@ -621,7 +622,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             // Inline age (+ prompt-cache total) trails the label on this same line
             // (in-card rows right-align it via drawMsgMetaRow), so the name only gets the
             // rest of the row: unbounded, a long model id ran off the column's right edge.
-            const std::string age = chatAgeCacheLabel(m.ts, m.cacheReadTok);
+            const std::string age = chatStampCacheLabel(m.ts, m.cacheReadTok);
             const float ageW = age.empty() ? 0.0f
                                            : ImGui::CalcTextSize(age.c_str()).x + 6 * sc;
             ImGui::PushFont(fonts.medium);
@@ -989,7 +990,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     if (metaInCard && !metaDrawn && haveModel) {
         // Same bound as the above-card label: the inline age owns the row's tail, the
         // name gets the rest, and the full id stays on hover when it is clipped.
-        const std::string age = chatAgeLabel(m.ts);
+        const std::string age = chatStampLabel(m.ts);
         const float ageW = age.empty() ? 0.0f : ImGui::CalcTextSize(age.c_str()).x + 6 * sc;
         ImGui::PushFont(fonts.medium);
         const std::string fit = chatEllipsize(

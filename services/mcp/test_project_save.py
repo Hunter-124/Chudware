@@ -32,6 +32,7 @@ class _FakeEngine:
     def __init__(self):
         self.names: dict = {}
         self.paths: dict = {}
+        self.origins: dict = {}  # doc_id -> hostd origin_kind ("gui" = the user opened it)
         self.saves: list = []
         self.exports: list = []
 
@@ -42,7 +43,8 @@ class _FakeEngine:
             return {"doc_id": _DOC, "revision": 0}
         if method == "doc_list":
             return {"docs": [{"doc_id": d, "name": n, "revision": 1,
-                              "path": self.paths.get(d)}
+                              "path": self.paths.get(d),
+                              "origin_kind": self.origins.get(d, "mcp")}
                              for d, n in self.names.items()]}
         if method == "asm_world_bodies":
             return {"bodies": [{"name": "Block"}]}
@@ -334,3 +336,36 @@ def test_explicit_save_retires_only_the_copy_the_harness_placed(engine, monkeypa
     again = json.loads(_tool("save_part")(doc_id=_DOC, path=str(elsewhere)))
     assert destination.is_file() and elsewhere.is_file()
     assert "removed_stale_copy" not in again
+
+
+def test_save_over_the_file_open_in_the_users_tab_is_refused(engine, tmp_path):
+    """Live 2026-09-27: the agent rebuilt the arm in a NEW assembly and saved it over
+    sixaxis_arm.step+, the file the user had open. The user's tab kept rev C (none of its
+    revisions changed, so nothing reached the viewport) and saving that tab would have put
+    rev C back over the agent's file. The agent must edit the open document instead."""
+    opened = tmp_path / "sixaxis_arm.step+"
+    opened.write_text("rev C")
+    engine.names.update({"doc-user": "sixaxis_arm", "doc-agent": "sixaxis_arm_revD",
+                         "doc-agent-copy": "sixaxis_arm"})
+    engine.paths["doc-user"] = str(opened)
+    engine.origins["doc-user"] = "gui"
+
+    refused = json.loads(_tool("save_part")(doc_id="doc-agent", path=str(opened)))
+    assert refused["ok"] is False
+    assert refused["reason"] == "path_open_in_user_tab"
+    assert refused["open_doc_id"] == "doc-user"
+    assert "doc-user" in refused["content"]
+    assert engine.saves == [] and opened.read_text() == "rev C"
+
+    # The user's own document saves in place; another name is still the agent's to take.
+    in_place = json.loads(_tool("save_part")(doc_id="doc-user", path=str(opened)))
+    assert in_place["ok"] is True and in_place["path"] == str(opened)
+    other = json.loads(_tool("save_part")(doc_id="doc-agent",
+                                          path=str(tmp_path / "sixaxis_arm_revD.step+")))
+    assert other["ok"] is True
+
+    # An AGENT-opened doc at the path does not hold it (agent-owned lifecycle unchanged).
+    engine.origins["doc-user"] = "mcp"
+    engine.paths["doc-agent-copy"] = str(opened)
+    replaced = json.loads(_tool("save_part")(doc_id="doc-agent", path=str(opened)))
+    assert replaced["ok"] is True and replaced["path"] == str(opened)

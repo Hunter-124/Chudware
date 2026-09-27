@@ -65,6 +65,7 @@ from .cad_common import (
     recover_autosaved,
     retire_harness_copy,
     recover_skipped,
+    user_doc_open_at,
 )
 
 from .cad_guide import (
@@ -8346,6 +8347,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         unsaved docs, so anything you don't save (and don't close_part(discard=True)) is only
         recoverable from a fallback crash-recovery tier — not a delivery mechanism.
         Empty documents are refused without writing; allow_empty=True explicitly saves one.
+        A file the user has open in a tab is refused too (`path_open_in_user_tab`, naming the
+        open doc_id): edit that document in place so the user sees the change live, then save
+        it — never rebuild it in a second document and save that over its file.
         """
         try:
             d = _doc(doc_id)
@@ -8358,9 +8362,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # exactly where the file will be written (no hidden navigation).
             out = (_sanitize_output_path(path) if path
                    else _default_deliverable_path(d, ".step+"))
-            prior_path = next((e.get("path") for e in (cb.call("doc_list", {}) or {})
-                               .get("docs", []) if isinstance(e, dict)
-                               and e.get("doc_id") == d), None)
+            open_docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                         if isinstance(e, dict)]
+            prior_path = next((e.get("path") for e in open_docs if e.get("doc_id") == d), None)
             note = None
             if not out.lower().endswith(".step+"):
                 # A caller who wrote "bracket.step" asked for a CAD file by name and gets the
@@ -8378,6 +8382,24 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                             f"flat .{ext.lower()})")
                 else:
                     out += ".step+"
+            # One design is one document: the file the USER has open in a tab is edited in
+            # place, never replaced from a second document. Overwriting it from another doc left
+            # the user's tab showing the old model (no revision of THAT doc ever changed, so
+            # nothing reached the viewport) and a later save of the tab would silently put the
+            # old model back over the agent's file (2026-09-27: a new "sixaxis_arm_revD"
+            # assembly was saved over sixaxis_arm.step+ while the user watched rev C for 80 min).
+            holder = user_doc_open_at(open_docs, out, d)
+            if holder is not None:
+                return _dumps({
+                    "ok": False, "reason": "path_open_in_user_tab", "doc_id": d,
+                    "path": out, "open_doc_id": holder.get("doc_id"),
+                    "open_doc_name": holder.get("name"),
+                    "content": (
+                        f"Save refused: {os.path.basename(out)} is open in the user's tab as "
+                        f"{holder.get('doc_id')}. Apply your changes to {holder.get('doc_id')} "
+                        f"in place (add_features / asm_* with doc_id={holder.get('doc_id')}) so "
+                        "the user sees them live, then save_part(doc_id="
+                        f"{holder.get('doc_id')}); or save this document under a new name.")})
             r = cb.call("doc_save", {"doc_id": d, "path": out})
             written = r.get("path", out)
             ok = os.path.exists(written)

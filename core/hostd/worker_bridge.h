@@ -104,7 +104,10 @@ private:
     std::string activeWorkerRunId_;
 
     const bool agentLane_;
-    std::mutex mtx_;
+    // Timed: a call waits for the lane no longer than its own timeout (see call()). A plain
+    // lock let an agent-lane call queue behind an hours-long agent_admin_turn until hostd's
+    // long-tier watchdog killed the whole daemon (2026-09-27, subscription_accounts).
+    std::timed_mutex mtx_;
     // Set once stop() begins: an in-flight call that loses its child must not respawn one.
     std::atomic<bool> stopping_{false};
     static std::atomic<bool> agentCreated_;

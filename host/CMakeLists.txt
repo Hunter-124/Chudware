@@ -826,6 +826,19 @@ add_test(NAME test_conv_ids
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end session-id allocation ---
 
+# --- viewport catch-up after tess-less revisions: header-only core/tess_catchup.h (no GL /
+# imgui / AppState). Guards the frozen-assembly bug: asm_mate / asm_add_component / pose
+# sweeps publish without a mesh and the active viewport never redrew until the turn ended.
+add_executable(test_tess_catchup tests/test_tess_catchup.cpp)
+target_include_directories(test_tess_catchup PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_tess_catchup PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_tess_catchup
+  COMMAND test_tess_catchup
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end viewport catch-up ---
+
 # --- Chudcode worker payload parsing: links the REAL chudcode_descriptors.cpp (no GL /
 # imgui / AppState). Guards the sanitized provider-descriptor spellings, the usable-state
 # whitelist, streamed chudcode_login open_url normalization, session-stats provenance

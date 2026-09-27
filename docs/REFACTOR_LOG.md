@@ -4948,3 +4948,27 @@ component file stamp, pick matched by index and verified by area/length + centro
 `chudware-geomcache/6`. Tests: `owner map: *` + `assembly doc_resolve_pick reports the component
 part's owning feature` (test_document). Gotcha: a boss whose every face merges flush into older
 faces now owns no face, so `doc_eval_overlap` can list it under `dead_features`.
+
+## 2026-09-27 — "live previews not working": frozen assemblies, an overwritten open file, a hostd self-kill
+
+Evidence: the GUI's journal for c217 (14:32–16:02) holds ~250 `live_mesh_prewarm` lines for
+agent docs and zero `live_mesh_refresh`; c215 shows `live_mesh_refresh` on the user's open
+assembly stopping at rev 130 and resuming only at rev 166, ten minutes later. Three causes.
+(1) Tess-less revisions (`asm_mate`, `asm_add_component`, pose sweeps: `with_tess:false`) kept
+the active viewport's previous mesh until the next mesh-bearing revision; the active view now
+fetches the current tessellation (`doc_activate` on `st.rpc`, single-flight per doc,
+`core/tess_catchup.h`, drawn only when it matches the displayed tree;
+`host/tests/test_tess_catchup.cpp`). (2) The agent rebuilt the arm in a NEW assembly and
+`save_part`-ed it over `sixaxis_arm.step+`, which the user's active tab held, so the tab showed
+rev C throughout and a later save of it would have reverted the file; `save_part` now refuses
+`path_open_in_user_tab` for a user-opened (`origin_kind:"gui"`) holder and names the doc to
+edit in place (`cad_common.user_doc_open_at`; `test_save_over_the_file_open_in_the_users_tab_is_refused`).
+(3) `WorkerBridge::call` waited unbounded for its lane: the Copilot usage rings'
+`subscription_accounts` queued behind the running agent turn until the long-tier watchdog
+killed hostd at 16:02 (docs to the recovery tier), and the GUI's single-FIFO `st.rpc` lane
+stalled behind it, so an AI-tab click showed "Loading" for 9 min. A non-turn call behind a
+running turn now fails at once with `worker_lane_busy` and every other lane wait ends at the
+call's own timeout; the usage rings treat the busy reply as silent
+(`test_agent_lane_call_behind_a_turn_fails_fast_and_hostd_survives`).
+Not changed: agent-minted docs still open as background mirror tabs while a user doc is
+active (the 2026-09-24 never-steal-focus rule).

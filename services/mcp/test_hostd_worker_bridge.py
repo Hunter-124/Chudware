@@ -392,6 +392,49 @@ def test_blocked_agent_lane_does_not_block_general_worker(worker_daemon):
     assert all(not Path(f"/proc/{pid}").exists() for pid in worker_pids)
 
 
+def test_agent_lane_call_behind_a_turn_fails_fast_and_hostd_survives(worker_daemon):
+    # Live 2026-09-27: the GUI's subscription_accounts (agent lane) queued behind an
+    # hours-long agent_admin_turn on the lane's stdio mutex, ignoring its 120 s bound, until
+    # the long-tier watchdog _Exit'ed hostd and took the live session's docs with it; the
+    # GUI's single async RPC lane stalled behind it. A non-turn call behind a running turn
+    # must fail at once with a named error while the turn keeps running and hostd stays up.
+    requester, gui = DaemonClient(), DaemonClient()
+    requester.connect()
+    daemon_pid = _pid(requester)
+    worker_daemon["pids"].append(daemon_pid)
+    gui.connect()
+    outcome: dict = {}
+    thread = threading.Thread(
+        target=lambda: outcome.update(
+            result=requester.call(
+                "agent_admin_turn", {"run_id": "lane-held", "request": "work"}
+            )
+        ),
+        daemon=True,
+    )
+    thread.start()
+    _wait_for(worker_daemon["active"])
+
+    started = time.monotonic()
+    busy = gui.call("subscription_status")
+    waited = time.monotonic() - started
+    assert busy.get("_is_error") is True, busy
+    assert busy.get("code") == "worker_lane_busy", busy
+    assert busy.get("message") == "worker lane busy (agent turn in progress)", busy
+    assert waited < 2.0, waited  # the fake turn holds the lane for 10 s
+    assert thread.is_alive(), "the lane-busy refusal must not disturb the running turn"
+    assert _pid(gui) == daemon_pid
+
+    assert gui.call("agent_cancel", {"run_id": "lane-held"})["cancelled"]
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    assert outcome["result"]["control"] == "cancel"
+    # The lane is free again: the same call is served by the same worker child.
+    served = gui.call("subscription_status")
+    assert served.get("lane") == "agent", served
+    assert _worker_count(worker_daemon["counter"]) == 1
+
+
 def test_unknown_method_worker_fallback_contract_is_unchanged(worker_daemon):
     client = DaemonClient()
     client.connect()

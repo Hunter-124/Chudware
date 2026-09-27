@@ -1971,6 +1971,31 @@ def note_discarded_doc(doc_id: Optional[str]) -> None:
     _DISCARDED_DOCS[doc_id] = path
 
 
+def user_doc_open_at(open_docs: list, path: str, doc_id: Optional[str]) -> Optional[dict]:
+    """The `doc_list` entry of a document OTHER than `doc_id` that the user opened (hostd
+    origin_kind "gui") and whose file is `path` — or None.
+
+    save_part refuses to write another document over that file: the user's tab would keep
+    the old model (none of ITS revisions changed, so nothing reaches the viewport) and a
+    later save of the tab would put the old model back over the new file. A user doc the
+    agent close_part(discard=True)-ed (hostd degraded the close to a detach) is not held.
+    """
+    if not path:
+        return None
+    want = os.path.realpath(path)
+    for e in open_docs or []:
+        if not isinstance(e, dict) or e.get("origin_kind") != "gui":
+            continue
+        did, p = e.get("doc_id"), e.get("path")
+        if not did or did == doc_id or not isinstance(p, str) or not p:
+            continue
+        if did in _DISCARDED_DOCS and _DISCARDED_DOCS[did] == p:
+            continue
+        if os.path.realpath(p) == want:
+            return e
+    return None
+
+
 
 def _needs_project_save(entry: dict) -> bool:
     """True when this doc holds content that is NOT yet in a real user file.

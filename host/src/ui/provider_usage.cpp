@@ -249,9 +249,19 @@ void providerUsagePollAccounts(AppState& st, double ttlSec, bool force) {
     g.accountsInFlight = true;
     st.rpc.call("subscription_accounts", nlohmann::json::object(), [](const core::RpcResult& r) {
         g.accountsInFlight = false;
+        // hostd's worker_lane_busy (an agent turn holds the agent worker lane) is transient
+        // and internal: keep the rings as they are and say nothing — the next poll after the
+        // turn succeeds. Checked first, whichever way the transport reports the method error.
+        if (r.result.is_object() && jstr(r.result, "code") == "worker_lane_busy") return;
         if (!r.ok || !r.result.is_object()) {
             if (!r.ok && g.lastError.empty())
                 g.lastError = r.err.empty() ? "subscription_accounts unavailable" : r.err;
+            return;
+        }
+        // Any other method error carries no account list either: keep the rows shown.
+        if (r.result.contains("code")) {
+            const std::string msg = jstr(r.result, "message");
+            g.lastError = msg.empty() ? "accounts failed" : msg;
             return;
         }
         if (!jbool(r.result, "ok", true)) {

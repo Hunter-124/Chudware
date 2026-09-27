@@ -421,7 +421,7 @@ bool WorkerBridge::controlActiveRunImpl(const std::string& action, const json& p
 
 void WorkerBridge::stop() {
     stopping_.store(true, std::memory_order_release);
-    std::unique_lock<std::mutex> lk(mtx_, std::try_to_lock);
+    std::unique_lock<std::timed_mutex> lk(mtx_, std::try_to_lock);
     if (!lk.owns_lock()) {
         // A call holds the lane — an agent turn holds it for hours. Waiting here wedged the
         // daemon on tray Quit / SIGTERM mid-turn (2026-09-24): the accept loop was gone, the
@@ -884,17 +884,39 @@ bool WorkerBridge::callOnce(const std::string& method, const json& params, json&
 bool WorkerBridge::call(const std::string& method, const json& params, json& result,
                         std::string& err, int timeoutMs, const EventFn& onEvent) {
     // Only this lane's stdio mutex is held; an agent turn cannot serialize
-    // clients using the independent general-worker channel.
-    std::lock_guard<std::mutex> lk(mtx_);
+    // clients using the independent general-worker channel. WITHIN a lane the wait for
+    // the stdio channel is bounded: an agent_admin_turn holds the agent lane for hours,
+    // and a plain lock parked every other agent-lane call (subscription_accounts from the
+    // Copilot usage rings) behind it past its 120 s bound until the long-tier watchdog
+    // _Exit'ed hostd with the live session's docs (2026-09-27). A non-turn call behind a
+    // running turn fails at once — the GUI's single async RPC lane must not sit out its
+    // whole timeout per poll — and any other wait ends at the call's own timeout.
+    if (timeoutMs <= 0) timeoutMs = 120000;
+    const bool longAgentTurn = method == "agent_admin_turn";
+    const auto laneDeadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    std::unique_lock<std::timed_mutex> lk(mtx_, std::defer_lock);
+    while (!lk.try_lock_for(std::chrono::milliseconds(50))) {
+        bool turnActive = false;
+        {
+            std::lock_guard<std::mutex> controlLock(controlMtx_);
+            turnActive = !activeWorkerRunId_.empty();
+        }
+        if ((turnActive && !longAgentTurn) ||
+            std::chrono::steady_clock::now() >= laneDeadline) {
+            err = turnActive ? "worker lane busy (agent turn in progress)"
+                             : "worker lane busy";
+            result = json{{"code", "worker_lane_busy"}, {"message", err}};
+            return false;
+        }
+    }
     result = json::object();
     err.clear();
-    if (timeoutMs <= 0) timeoutMs = 120000;
     if (stopping_.load(std::memory_order_acquire)) {
         err = "worker bridge stopping";
         return false;
     }
 
-    const bool longAgentTurn = method == "agent_admin_turn";
     std::string runId;
     if (longAgentTurn && params.is_object()) {
         const auto runIt = params.find("run_id");

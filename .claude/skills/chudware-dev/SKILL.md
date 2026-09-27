@@ -163,6 +163,15 @@ judgment).
   child, and a stopping bridge never respawns. Before this a tray Quit mid-turn wedged hostd
   with its accept loop gone and the agent's next CAD call blocked forever
   (`test_sigterm_mid_turn_ends_the_turn_and_the_daemon`).
+  Nor does any other call wait unbounded (2026-09-27): in `WorkerBridge::call` a non-turn
+  call behind a running `agent_admin_turn` fails AT ONCE with `worker_lane_busy` ("worker
+  lane busy (agent turn in progress)"), and any other lane wait ends at the call's own
+  timeout. The GUI's `subscription_accounts` (agent lane) used to queue behind a running
+  turn past its 120 s bound until the long-tier watchdog `_Exit`ed hostd after 3600 s,
+  retiring the live session's unsaved docs — and the GUI's single-FIFO `st.rpc` lane stalled
+  behind it (an AI-tab click showed "Loading" for 9 min). `provider_usage.cpp` treats the
+  busy reply as silent and keeps its rings
+  (`test_agent_lane_call_behind_a_turn_fails_fast_and_hostd_survives`).
 - **Web actors never use ambient `chud` auth (2026-09-24).** BYOK, personal Claude OAuth and
   the pool (`CHUDWARE_WEB_POOL_API_KEY`/`_PROVIDER`/`_MODEL`) each run in a credential-scoped
   Chudcode process with a gateway digest proof; a web actor without a servable credential
@@ -282,7 +291,11 @@ judgment).
   dirty user-owned tab, and the first applied agent revision itself dirties that tab, so the
   viewport froze for the rest of the turn. A revision with no `aicm_path` key (the
   `with_tess:false` writers: `asm_add_component`, `asm_mate`, animation poses) keeps the
-  displayed mesh; only an EMPTY `aicm_path` means an empty document.
+  displayed mesh; only an EMPTY `aicm_path` means an empty document. Since 2026-09-27 the
+  active view then fetches the current mesh (`doc_activate` on `st.rpc`, single-flight per
+  doc via `core/tess_catchup.h`, drawn only when it matches the tree on screen): without it
+  an assembly's components stayed put through a whole mate/sweep stretch (36 revisions,
+  ~10 min) until the turn ended (`host/tests/test_tess_catchup.cpp`).
 - **`render_study_setup` figures are load-vector-specific (2026-09-07).** One arrow per
   load entry through the engine frame, a bottom banner with resultant/direction/per-entry
   vectors; multi-body docs paint (AICM face ids are per-body 1-based — `_mesh_topo_index`
@@ -532,6 +545,12 @@ judgment).
   `save_part(path=…)` deletes the root copy the harness itself placed for that doc
   (`cad_common._HARNESS_SAVED_PATHS`, only when it is the doc's current file) and reports
   `removed_stale_copy` — a live run left five `<Stem>.step+` duplicates in the project root.
+  Since 2026-09-27 `save_part` REFUSES (`path_open_in_user_tab`, naming `open_doc_id`) to
+  write a document over a file another, user-opened doc (hostd `origin_kind:"gui"`) holds:
+  one design is one document, so the agent edits the user's open doc in place and the tab
+  updates live. A run rebuilt the arm as a new assembly and saved it over the user's open
+  `sixaxis_arm.step+`; the tab showed rev C for 80 min and saving it would have reverted the
+  file (`cad_common.user_doc_open_at`).
 - **Nested agents remain inside Chudcode.** CAD owns the role/council/mission/governance
   context and the host-tool surface, but does not run a nested provider loop. Session,
   subagent, retry, compaction, todo, and usage events are mapped back into the existing

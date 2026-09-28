@@ -193,6 +193,11 @@ build_python_sidecar() {
     }
     echo "==> compiling $name"
     local -a includes=("--include-module=chudware_protected_assets" "--include-module=services.$module")
+    # pycolmap is a bundled runtime package declared in packaging/requirements-release.txt.
+    # It publishes arm64 macOS wheels only, so Intel builds ship without sparse SfM.
+    if [ "$(uname -m)" = arm64 ]; then
+        includes+=(--include-package=pycolmap)
+    fi
     if [ "$module" = "worker_main" ]; then
         includes+=(
             --include-module=services.parts.vendor_parts

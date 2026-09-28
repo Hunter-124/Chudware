@@ -220,6 +220,8 @@ build_python_sidecar() {
         exit 1
     }
     echo "==> compiling $name"
+    # pycolmap is a bundled runtime package declared in packaging/requirements-release.txt;
+    # forcing it makes a release Python without it fail here instead of shipping without it.
     local -a includes=("--include-module=chudware_protected_assets" "--include-module=services.$module"
                        "--include-package=pycolmap")
     if [ "$module" = "worker_main" ]; then

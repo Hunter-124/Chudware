@@ -232,7 +232,8 @@ fails at its capability check with an explicit message otherwise):
   `sha256sum`, `strip`, `rsync`
 * `xvfb-run` for the headless screenshot
 * `CHUDWARE_CHUD_BIN` naming the local Linux x86_64 `chud` artifact pinned by
-  `vendor/chudcode/CHUDCODE_ARTIFACT.lock`
+  `vendor/chudcode/CHUDCODE_ARTIFACT.lock` (per-machine procedure:
+  `docs/reference/CI_RUNNERS.md`, "Pinned Chudcode artifact")
 * Nuitka and the rest of `packaging/requirements-release.txt` in the release
   Python (the AppImage compiles the Python sidecars)
 * write access to `<releases_dir>/incoming`
@@ -255,7 +256,9 @@ fails at its capability check with an explicit message otherwise):
   `%LOCALAPPDATA%\Nuitka` and later builds reuse the cache. That runner
   therefore needs outbound HTTPS beyond app.chudware.com on its first build.
 * `CHUDWARE_CHUD_BIN` naming the local Windows x86_64 `chud.exe` artifact
-  pinned by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`
+  pinned by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`. That lock row is still
+  unpinned (see "Current pin status" below), so this leg fails at its
+  capability check until a Windows `chud.exe` exists and is pinned.
 * `CHUDWARE_SIGN_IDENTITY` if you want Authenticode on the installer; without it
   the installer is unsigned and SmartScreen will warn (see `docs/SIGNING.md`)
 * outbound HTTPS to `app.chudware.com`. This runner cannot reach the gateway's
@@ -283,6 +286,8 @@ fails at its capability check with an explicit message otherwise):
 * `CHUDWARE_CHUD_BIN` naming the local `chud` artifact for that Mac's
   architecture, pinned by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`. Release
   packaging verifies and copies it without a source checkout or network fetch.
+  Per-machine procedure: `docs/reference/CI_RUNNERS.md`, "Pinned Chudcode
+  artifact".
 * outbound HTTPS to `app.chudware.com`, for the same reason as the Windows
   builder: neither Mac can route to `192.168.0.183`.
 
@@ -301,6 +306,19 @@ Windows steps are Windows PowerShell 5.1 with ASCII-only bodies. `bash` on those
 hosts is an empty WSL shim that exits 0 without running anything, and PowerShell
 5.1 misreads non-ASCII in the runner's BOM-less script; `scripts/verify-ci-workflows.py`
 enforces both rules.
+
+`packaging/requirements-release.txt` holds two kinds of pin: the build tools
+(Nuitka, cryptography, PyYAML, patchelf) and the runtime packages the compiled
+sidecars must bundle. Nuitka can bundle only what the release Python imports, so
+each bundled package is also force-included (`--include-package`) by the three
+packaging scripts under the same platform condition as its marker, and a release
+Python without it fails the build instead of shipping without the feature. Today
+that is `pycolmap` (plus its dependency `numpy`) for Gaussian/sparse reverse
+engineering, on Linux x86_64, Windows x86_64 and macOS arm64. `pycolmap` 3.13.0
+publishes no Intel macOS wheel, so the x86_64 `.app` ships without it and
+`reveng_status` reports sparse SfM unavailable there. Every `nightly-release`
+leg `pip install`s the file into its release Python before building, so a new
+pin needs no re-provision; `runner-provision` syncs it into an existing venv too.
 
 ## Chudcode artifact pin
 
@@ -324,31 +342,36 @@ optional source provenance only; it never changes executable identity.
 Every artifact must report exactly `Chudcode v0.3.0` from `--version`, and the
 engine provenance value is never accepted as or appended to the product version.
 
-### Current pin status (2026-08-31)
+### Current pin status (2026-09-28)
 
 Chudcode `v0.3.0` is published at
 `https://github.com/Hunter-124/chudcode/releases/tag/chudcode-v0.3.0` from commit
 `9fab19a6af`, carrying real `chudcode-linux-x64`, `chudcode-linux-arm64`,
 `chudcode-darwin-x64`, and `chudcode-darwin-arm64` CLI artifacts, the Linux and
-macOS x64 desktop archives, and `SHA256SUMS.txt`. Four of the five lock targets
-therefore have genuine binaries; the published `chudcode-linux-x64` was
-re-downloaded and matched its build hash while reporting `Chudcode v0.3.0`.
+macOS x64 desktop archives, and `SHA256SUMS.txt`.
 
-Two prerequisites remain before `pin` can run:
+The lock pins three of its five rows: `linux-x86_64` (for production) and
+`macos-x86_64`/`macos-arm64` (sha256 checked against that release's
+`SHA256SUMS.txt`), all since 2026-09-03. `verify`, `stage` and `fetch` act on
+one target and need only that row pinned, so the Linux and both macOS release
+legs can stage `chud` today. Two rows stay `null`:
 
 1. **`windows-x86_64` has no artifact.** `napi-build` requires a Windows
    `libnode.dll` import library, so the natives addon cannot come from the
    zig-based Linux cross-build; GitHub Actions is budget-blocked
    (`The job was not started because an Actions budget is preventing further
    use`); and no fleet Windows host carries MSVC plus Rust. Build it on a real
-   Windows toolchain — never hand-fake the row.
-2. **The Chudcode repository is private,** so release asset URLs need
-   authentication. Offline `stage` with a local `CHUDWARE_CHUD_BIN` is
-   unaffected, but the optional `fetch` path needs either a public release or a
-   credentialed mirror before those URLs count as unauthenticated.
+   Windows toolchain — never hand-fake the row. Until then the nightly
+   `windows-beta` leg fails at its capability check by design.
+2. **`linux-aarch64`** is unpinned. The release publishes
+   `chudcode-linux-arm64`, but no pipeline builds that target, so nothing needs
+   the row yet.
 
-`pin` requires all five targets at once, so the lock stays fully `null` and every
-packaging and deployment path stays fail-closed until both are resolved.
+The Chudcode repository is private, so release asset URLs need authentication.
+Offline `stage` with a local `CHUDWARE_CHUD_BIN` is unaffected; `fetch` needs a
+public release or a credentialed mirror, which is why runners carry a local
+copy instead (`docs/reference/CI_RUNNERS.md`). `check-lock` and `pin` still
+require all five rows.
 
 The `stage` command used by packaging is offline and accepts only a local
 `CHUDWARE_CHUD_BIN`; it verifies the executable format/architecture, SHA-256,

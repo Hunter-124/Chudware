@@ -1,4 +1,5 @@
 # Release-build-only Python dependencies. Runtime dependencies remain in requirements.txt.
+# nightly-release.yml syncs this file into every leg's release Python before compiling.
 Nuitka==4.1.3
 ordered-set==4.1.0
 zstandard==0.25.0
@@ -6,3 +7,15 @@ PyYAML==6.0.3
 cryptography==50.0.0
 # Nuitka onefile uses this wheel-provided binary on Linux release hosts.
 patchelf==0.17.2.4; sys_platform == "linux"
+
+# Runtime packages the Nuitka sidecars (chudware-worker, chudware-mcp) must bundle.
+# Nuitka can bundle only what this interpreter imports, so a package listed here is
+# also force-included by packaging/linux/build_appimage.sh, packaging/macos/build_app.sh
+# and packaging/windows/build_sidecars.ps1 under the same platform condition; a
+# release Python without it fails the build instead of shipping without the feature.
+# Pins match requirements.txt. pycolmap 3.13.0 (Gaussian/sparse reverse engineering)
+# publishes wheels for Linux x86_64, Windows x86_64 and macOS arm64 only; Intel macOS
+# has none, so that build ships without it and reveng_status reports sparse SfM
+# unavailable. numpy is pycolmap's only dependency, pinned to the runtime version.
+pycolmap==3.13.0; (sys_platform == "linux" and platform_machine == "x86_64") or sys_platform == "win32" or (sys_platform == "darwin" and platform_machine == "arm64")
+numpy==2.4.6; (sys_platform == "linux" and platform_machine == "x86_64") or sys_platform == "win32" or (sys_platform == "darwin" and platform_machine == "arm64")

@@ -162,6 +162,61 @@ be invisible until someone reboots the box. So:
   six-line block. This is the whole mechanism; there is no machine `PATH` entry
   to find and nothing survives outside that directory.
 
+### Pinned Chudcode artifact (`CHUDWARE_CHUD_BIN`)
+
+Every release leg embeds the compiled Chudcode `chud` binary. The job never
+downloads it: its capability step runs `scripts/pin_chudcode.py verify` on the
+file named by `CHUDWARE_CHUD_BIN` (executable format and architecture, SHA-256
+against `vendor/chudcode/CHUDCODE_ARTIFACT.lock`, and `--version` reporting
+exactly `Chudcode v<lock version>`), and packaging later `stage`s that same file.
+No workflow provisions it, deliberately: the Chudcode repository is private, so
+its release assets need a credential, and `pin_chudcode.py fetch` accepts only
+unauthenticated, non-redirecting URLs. Each builder therefore carries one local
+copy, outside `_work` so checkout cleaning never removes it, named in its runner
+service environment.
+
+| Runner | Lock target | Release asset | Where the file lives | State (run 36326800240) |
+|---|---|---|---|---|
+| `livingroom-pc` | `linux-x86_64` | `chudcode-linux-x64` | `/home/liveuser/chudware-web-data/chud` (shared with `deploy-prod.yml`) | set and verifies |
+| `imac-intel` | `macos-x86_64` | `chudcode-darwin-x64` | `/Users/apple/chudware-ci-tools/chudcode/chud` | unset |
+| `macbook-air-m2` | `macos-arm64` | `chudcode-darwin-arm64` | `/Users/garrison/chudware-ci-tools/chudcode/chud` | unset |
+| `ryzen-7900x3d` | `windows-x86_64` | none published | `%USERPROFILE%\chudware-ci-tools\chudcode\chud.exe` | blocked: lock row unpinned |
+
+The runner reads `.env` in its install directory only when it starts, so every
+change needs a runner restart. On a Mac, as the runner's login user:
+
+1. Get the asset from a machine that can read `Hunter-124/chudcode`, for
+   example `gh release download chudcode-v0.3.0 -R Hunter-124/chudcode
+   -p chudcode-darwin-x64` (arm64: `chudcode-darwin-arm64`). Move it to the Mac
+   by hand: the Macs are not reachable over SSH from the workstation.
+2. Install it: `mkdir -p ~/chudware-ci-tools/chudcode`, copy it to
+   `~/chudware-ci-tools/chudcode/chud`, `chmod 755` it, and
+   `xattr -d com.apple.quarantine ~/chudware-ci-tools/chudcode/chud` if it
+   arrived through a browser or AirDrop.
+3. Prove it from any CAD checkout, for instance the runner's own
+   `~/actions-runner-cad/_work/CAD/CAD`:
+   `~/chudware-ci-tools/release-python/bin/python3 scripts/pin_chudcode.py verify
+   --target macos-x86_64 --input ~/chudware-ci-tools/chudcode/chud` must print a
+   JSON line with `"version_output": "Chudcode v0.3.0"`.
+4. Append `CHUDWARE_CHUD_BIN=/Users/<user>/chudware-ci-tools/chudcode/chud` to
+   `~/actions-runner-cad/.env` (absolute path: `.env` does not expand `~`), then
+   `cd ~/actions-runner-cad && ./svc.sh stop && ./svc.sh start`.
+5. Re-dispatch `nightly-release`.
+
+`ryzen-7900x3d` cannot take this step yet: the lock has no `windows-x86_64` row
+because no Windows `chud.exe` has been built (`docs/RELEASING.md`, "Current pin
+status"), and its leg says so at the capability check. Once the row is pinned,
+place `chud.exe` in the runner service account's profile (the `NETWORK
+SERVICE` profile is `C:\Windows\ServiceProfiles\NetworkService`), add
+`CHUDWARE_CHUD_BIN=<absolute path>` to `C:\actions-runner-cad\.env`, and restart
+the runner service from an elevated prompt, since that account cannot restart
+its own service.
+
+Repinning the lock to a new Chudcode release means replacing the file on every
+builder before the next nightly, or each leg fails at its capability check.
+Never commit the binary, attach it to an Actions artifact, or copy it anywhere
+public.
+
 ### PowerShell step bodies are ASCII-only
 
 The runner writes a step's script to disk as UTF-8 with no BOM, and Windows

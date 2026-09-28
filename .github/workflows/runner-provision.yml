@@ -160,7 +160,9 @@ jobs:
           venv="${HOME}/${RELEASE_VENV_SUBDIR}"
           if [ -x "${venv}/bin/python3" ] \
             && "${venv}/bin/python3" -c 'import cryptography, nuitka' >/dev/null 2>&1; then
-            echo "release python already provisioned: $("${venv}/bin/python3" --version)"
+            # Still sync: a working venv can predate a new pin in the file.
+            "${venv}/bin/python3" -m pip install --quiet -r packaging/requirements-release.txt
+            echo "release python synced: $("${venv}/bin/python3" --version)"
             exit 0
           fi
 
@@ -356,7 +358,9 @@ jobs:
           venv="${HOME}/chudware-ci-tools/release-python"
           if [ -x "${venv}/bin/python3" ] \
             && "${venv}/bin/python3" -c 'import nuitka, cryptography, yaml' >/dev/null 2>&1; then
-            echo "release python already provisioned: $("${venv}/bin/python3" --version)"
+            # Still sync: a working venv can predate a new pin in the file.
+            "${venv}/bin/python3" -m pip install --quiet -r packaging/requirements-release.txt
+            echo "release python synced: $("${venv}/bin/python3" --version)"
             exit 0
           fi
           mkdir -p "$(dirname "${venv}")"

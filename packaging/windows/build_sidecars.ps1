@@ -111,7 +111,10 @@ function Build-PythonSidecar([string]$Module, [string]$Name) {
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $work | Out-Null
 
-    $includes = @("--include-module=chudware_protected_assets", "--include-module=services.$Module")
+    # pycolmap is a bundled runtime package declared in packaging\requirements-release.txt;
+    # forcing it makes a release Python without it fail here instead of shipping without it.
+    $includes = @("--include-module=chudware_protected_assets", "--include-module=services.$Module",
+                  "--include-package=pycolmap")
     if ($Module -eq "worker_main") {
         $includes += @(
             "--include-module=services.parts.vendor_parts",

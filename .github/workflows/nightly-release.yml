@@ -244,6 +244,14 @@ jobs:
           # system interpreter does not carry (PEP 668). runner-provision's
           # provision-linux job creates this venv.
           release_python="${HOME}/chudware-ci-tools/release-python/bin/python3"
+          # Sync the pinned release set on every run, as the Windows leg does: a new
+          # pin (a runtime package the sidecars must bundle, e.g. pycolmap) reaches
+          # this runner without a re-provision, and a failed sync stops the job here
+          # instead of 30 minutes later in Nuitka. Near-instant when already satisfied.
+          if [ -x "${release_python}" ] && ! "${release_python}" -m pip install --quiet \
+              --disable-pip-version-check -r packaging/requirements-release.txt; then
+            missing+=("release-python-sync-of-packaging/requirements-release.txt")
+          fi
           if [ -x "${release_python}" ] && "${release_python}" -c 'import nuitka, cryptography, yaml' >/dev/null 2>&1; then
             echo "CHUDWARE_RELEASE_PYTHON=${release_python}" >> "$GITHUB_ENV"
             echo "release python: $("${release_python}" --version) with nuitka"
@@ -987,8 +995,15 @@ jobs:
               exit 1
             }
           }
+          # The lock row is checked first: while windows-x86_64 is unpinned no
+          # chud.exe can verify, so "set CHUDWARE_CHUD_BIN" would be the wrong fix.
+          $lock = Get-Content -Raw vendor\chudcode\CHUDCODE_ARTIFACT.lock | ConvertFrom-Json
+          if (-not $lock.artifacts.'windows-x86_64'.sha256) {
+            Write-Host '::error::vendor/chudcode/CHUDCODE_ARTIFACT.lock pins no windows-x86_64 Chudcode artifact; no Windows chud.exe exists yet (docs/RELEASING.md, Chudcode artifact pin). This leg cannot pass until that row is pinned.'
+            exit 1
+          }
           if (-not $env:CHUDWARE_CHUD_BIN) {
-            Write-Host '::error::CHUDWARE_CHUD_BIN is required'
+            Write-Host '::error::CHUDWARE_CHUD_BIN is required; install the pinned chud.exe per docs/reference/CI_RUNNERS.md (Pinned Chudcode artifact)'
             exit 1
           }
           & python scripts\pin_chudcode.py verify --target windows-x86_64 --input $env:CHUDWARE_CHUD_BIN
@@ -1669,9 +1684,15 @@ jobs:
             echo "::error::this runner is $(uname -m) but the matrix row is ${RELEASE_ARCH}; the runner labels and the matrix disagree"
             exit 1
           fi
+          # Same sync as the Linux and Windows legs; see packaging/requirements-release.txt.
+          if ! "${release_python}" -m pip install --quiet --disable-pip-version-check \
+              -r packaging/requirements-release.txt; then
+            echo "::error::could not sync packaging/requirements-release.txt into ${release_python}; re-run runner-provision with runner_label=${{ matrix.runner_label }}"
+            exit 1
+          fi
           if ! "${release_python}" scripts/pin_chudcode.py verify \
               --target "macos-${RELEASE_ARCH}" --input "${CHUDWARE_CHUD_BIN:-/missing}"; then
-            echo "::error::CHUDWARE_CHUD_BIN is missing or does not match the pinned ${RELEASE_ARCH} artifact"
+            echo "::error::CHUDWARE_CHUD_BIN is missing or does not match the pinned ${RELEASE_ARCH} artifact; install it per docs/reference/CI_RUNNERS.md (Pinned Chudcode artifact)"
             exit 1
           fi
 

@@ -80,8 +80,20 @@ void sanitizeAgentTextInPlace(AppState& st, std::string& s, bool jsonBody) {
     s = sanitizeAgentText(st, s, jsonBody);
 }
 
+// A FAILED tool row is frozen to exactly what the harness wrote. The in-place pass above runs
+// every frame against the CURRENT tab map, so an id the call could not resolve got rewritten the
+// moment any later document took that number: after an app restart the agent passed its stale
+// "doc-cpp00000003", the render failed "no such document 'doc-cpp00000003'", a re-import then
+// minted a new doc-cpp00000003, and the card turned into "no such document 'AI: upper_arm_revD'
+// … Open parts: sixaxis=\"sixaxis\"" — a tab label the agent never sent, reported as missing
+// while it sat open (2026-09-28, c221). A failure is a diagnostic; its ids stay verbatim.
 static void sanitizeActivityItem(AppState& st, ActivityItem& a) {
     if (a.rowKind > 3) return;
+    if (a.rowKind == 3 && a.status == "fail") {
+        for (std::string* s : {&a.reason, &a.detail, &a.title})
+            if (!s->empty() && ui::agentTextMayChange(*s)) *s = ui::foldToAtlasGlyphs(*s);
+        return;
+    }
     sanitizeAgentTextInPlace(st, a.reason);
     sanitizeAgentTextInPlace(st, a.detail, /*jsonBody=*/a.rowKind == 3);
     sanitizeAgentTextInPlace(st, a.title);

@@ -5078,3 +5078,25 @@ from the gate venv), all other units green; the FIN25 sensor-node demo again hun
 60-min cap, so the shot stage ran separately (`CHUDWARE_SHOT=m1`, exit 0). Chudcode commits
 `a5ccf5afc9`, `0ad857087f`, `6b1e705d2e` are local on `main` (not pushed; `c0fff5e617` before
 them was also unpushed).
+
+## 2026-09-28 — stale doc ids after an app restart (c221 "no such document 'AI: upper_arm_revD'")
+
+The app closed mid-run; on "continue" the resumed turn called
+`render_part(doc_id="doc-cpp00000003")` from its transcript. hostd had restarted, only
+`doc-cpp00000002` was open, and the call failed; the agent re-imported the part (which happened
+to get `doc-cpp00000003` again). The card then read "no such document 'AI: upper_arm_revD' …
+Open parts: sixaxis_arm_revD_final4=\"sixaxis_arm_revD_final4\"": `sanitizeActivityItem`
+re-humanizes every row in place, every frame, with the CURRENT tab map, so the failed row was
+rewritten after the fact with the re-imported tab's label (and persisted that way in `c221.json`;
+`c221.raw.jsonl` has the real args). Fixes: (1) `activity_timeline.cpp` never humanizes a failed
+tool row (glyph fold only), so a failure shows the exact ids the tool saw; (2)
+`cad_common._doc` answers a well-formed `doc-cpp…` miss (also with zero docs open) with a
+reopen-by-path hint instead of "pass one of the ids above"; (3) `worker_rpc._agent_admin_turn`
+leads the first turn of a persisted conversation in a fresh worker (`chudcode_session_file` set,
+session not yet claimed in `_HISTORY_SEEDED_SESSIONS`) with a RESUMED CONVERSATION block listing
+the live `doc_list` ids/names/paths (`_resumed_documents_block`). Deferred: engine doc ids still
+restart at 1 per daemon (`core/doc/session.cpp new_doc_id`), so a model that ignores the note
+can still address a different part with an old id; making ids unique across restarts needs a
+persisted counter in hostd. Tests: `test_current_part.py::test_stale_engine_id_is_refused_with_a_reopen_path`,
+`test_worker_rpc_chudcode.py::test_resumed_conversation_first_turn_names_the_live_document_ids`
+and `…::test_resume_note_survives_an_unreachable_engine`.

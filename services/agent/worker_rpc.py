@@ -3203,6 +3203,53 @@ def _editor_context_block(raw_params: Mapping[str, Any], *,
     return "\n".join(lines) + (f"\n\n{picked}" if picked else "")
 
 
+_RESUME_DOCS_MAX = 20
+
+
+def _resumed_documents_block(
+    engine_call: Callable[[str, dict], Any] | None = None,
+) -> str:
+    """The note for the first turn of a PERSISTED conversation in this worker process.
+
+    Engine doc_ids are a per-daemon counter: once the app (and with it hostd and this
+    worker) restarts, every id in the conversation's history is dead, and the next one
+    minted may re-issue the same number to a different part. The model cannot know that
+    from its transcript, so a resumed turn went straight to
+    render_part(doc_id="doc-cpp00000003") and failed "no such document" (2026-09-28, c221)
+    — and with a different open order it would have rendered, or edited, the wrong part.
+    Tell it which ids are live right now, with each document's file, before it acts.
+    """
+    call = engine_call or _editor_engine_call
+    lines = [
+        "RESUMED CONVERSATION",
+        "- This conversation is continuing in a new agent process (the app or its engine "
+        "restarted since your last turn). A doc_id quoted earlier is valid ONLY if it is "
+        "listed below: a restarted engine re-issues ids, so an old id may now name a "
+        "different part. Reopen any other part with import_part(path=\"<its .step+>\", "
+        "resume=True) and use the doc_id it returns.",
+    ]
+    try:
+        listed = (call("doc_list", {}) or {}).get("docs") or []
+    except Exception as exc:  # noqa: BLE001 - the note must never fail the turn
+        _LOG.debug("resume note: doc_list unavailable: %s", exc, exc_info=exc)
+        lines.append("- open documents: unknown — call list_parts() before using any doc_id.")
+        return "\n".join(lines)
+    docs = [e for e in listed if isinstance(e, Mapping) and e.get("doc_id")]
+    if not docs:
+        lines.append("- open documents: none")
+        return "\n".join(lines)
+    lines.append("- open documents now:")
+    for entry in docs[:_RESUME_DOCS_MAX]:
+        doc_id = _bounded_text(entry.get("doc_id"), 64)
+        name = _bounded_text(entry.get("name"), 128) or ""
+        kind = _bounded_text(entry.get("kind"), 32) or "part"
+        path = _bounded_text(entry.get("path"), 512) or "unsaved"
+        lines.append(f'  - {doc_id}: "{name}" ({kind}, {path})')
+    if len(docs) > _RESUME_DOCS_MAX:
+        lines.append(f"  - … +{len(docs) - _RESUME_DOCS_MAX} more (call list_parts())")
+    return "\n".join(lines)
+
+
 def _terminal_text(host_result: Mapping[str, Any]) -> str:
     value = host_result.get("result")
     if isinstance(value, str):
@@ -3366,8 +3413,13 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         else _bounded_history_seed(raw_params.get("history"))
     )
     # Rendered once: resolving picked context reads the engine, and the preflight estimate
-    # must price exactly the text that is sent.
-    editor_block = _editor_context_block(raw_params)
+    # must price exactly the text that is sent. A persisted conversation's first turn in this
+    # process leads with the live document ids: its transcript's ids died with the old engine.
+    editor_block = "\n\n".join(block for block in (
+        _resumed_documents_block()
+        if resumed_session and not history_already_seeded else "",
+        _editor_context_block(raw_params),
+    ) if block)
     preflight_prompt = compose_request_text(request, migration_candidate, editor_block)
     try:
         configured_max_tokens = max(0, int(cfg.get("max_output_tokens") or 0))

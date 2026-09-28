@@ -451,6 +451,8 @@ _DOC_QUOTED_RE = re.compile(r"""['"]([^'"]+)['"]""")
 # so only "doc-" ids are ours to verify. Matches a <namespace>cpp<hex> handle that is not a
 # part/assembly id — a bare "cpp00000009" (the dropped-prefix typo) deliberately does not.
 _FOREIGN_HANDLE_RE = re.compile(r"^(?!doc-)[a-z]{3,8}-?cpp[0-9a-f]{4,}$", re.I)
+# A part/assembly id as the engine mints it (core/doc/session.cpp new_doc_id), either spelling.
+_ENGINE_DOC_ID_RE = re.compile(r"^doc[-_]cpp[0-9a-f]{1,16}$", re.I)
 
 
 class DocRefError(CoreError, ValueError):
@@ -827,11 +829,26 @@ def _doc(doc_id: Optional[str]) -> str:
                 'document handle: doc_id takes an open document\'s id ("doc-cpp0000000b") or '
                 "its name.",
                 docs, code="doc_id_is_source_text", hint=hint)
-        if not docs:
+        if not docs and not _ENGINE_DOC_ID_RE.match(raw):
             raise _doc_error(
                 f"no such document {raw!r}: ZERO documents are open in this engine session.",
                 docs, code="doc_not_found",
                 hint='call new_part(name="…") first, then pass the doc_id it returns.')
+        if _ENGINE_DOC_ID_RE.match(raw):
+            # A well-formed engine id that is not open was open once: its document was closed,
+            # reaped by doc-GC, or lived in an engine session that ended with the app. "Pass
+            # one of the ids above" there invites editing whichever part IS open; the way back
+            # to the part the caller meant is to reopen it (2026-09-28: a resumed turn's
+            # render_part(doc_id="doc-cpp00000003") after an app restart).
+            raise _doc_error(
+                f"no such document {raw!r}: no open document has that id.",
+                docs, code="doc_not_found",
+                hint=("a doc_id lives only while its document stays open in this engine "
+                      "session — closing the part, doc-GC or an app restart retires it, and "
+                      "the engine may later re-issue the same number to a DIFFERENT part. "
+                      "Do not substitute an open id unless it is the same part: reopen the "
+                      'part you meant with import_part(path="<its .step+>", resume=True) and '
+                      "use the doc_id it returns."))
         near = _doc_near_misses(docs, raw)
         raise _doc_error(
             f"no such document {raw!r}: it matches no open document's id or name.",

@@ -76,6 +76,23 @@ def test_no_claim_and_several_open_teaches_new_part(open_docs):
     assert "doc-cpp00000001" in str(exc.value)
 
 
+def test_stale_engine_id_is_refused_with_a_reopen_path(open_docs):
+    """2026-09-28 c221: after an app restart the agent passed the transcript's
+    doc-cpp00000003. It must never land on the one part still open, and the refusal
+    must name the way back (reopen by path), not "pass one of the ids above"."""
+    open_docs.append({"doc_id": "doc-cpp00000002", "name": "sixaxis_arm"})
+
+    with pytest.raises(cad_common.DocRefError) as exc:
+        cad_common._doc("doc-cpp00000003")
+    assert exc.value.code == "doc_not_found"
+    assert "import_part" in exc.value.detail["hint"]
+
+    open_docs.clear()
+    with pytest.raises(cad_common.DocRefError) as none_open:
+        cad_common._doc("doc-cpp00000003")
+    assert "import_part" in none_open.value.detail["hint"]
+
+
 def test_sole_open_part_is_adopted(open_docs):
     """One part open and nothing claimed: act on what the user is looking at."""
     open_docs.append({"doc_id": "doc-cpp00000001", "name": "Part1"})

@@ -470,6 +470,49 @@ def test_failed_followup_does_not_reseed_successful_session(online_lane):
     assert online_lane.host.turns[2]["request"] == "Do the work"
 
 
+def test_resumed_conversation_first_turn_names_the_live_document_ids(
+    online_lane, monkeypatch
+):
+    """2026-09-28 c221: the app restarted mid-run; the resumed turn reused the transcript's
+    doc-cpp00000003 and render_part failed "no such document" (a different open order
+    would have hit the wrong part). The first turn of a persisted conversation in a fresh
+    worker must say which ids are live now; later turns in the same process must not."""
+    listing = {"docs": [{"doc_id": "doc-cpp00000002", "name": "sixaxis_arm",
+                         "kind": "assembly", "path": "/p/sixaxis_arm.step+"}]}
+    monkeypatch.setattr(worker_rpc, "_editor_engine_call",
+                        lambda method, params: listing if method == "doc_list" else {})
+    resume = {"chudcode_session_file": "/sessions/conversation-1.jsonl"}
+
+    first = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="run-resumed", **resume), lambda _event: None
+    )
+    second = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="run-next", **resume), lambda _event: None
+    )
+
+    assert first["ok"] is True and second["ok"] is True
+    sent = online_lane.host.turns[0]["request"]
+    assert sent.startswith("Do the work\n\nRESUMED CONVERSATION")
+    assert 'doc-cpp00000002: "sixaxis_arm" (assembly, /p/sixaxis_arm.step+)' in sent
+    assert "import_part" in sent
+    assert online_lane.host.turns[1]["request"] == "Do the work"
+
+
+def test_resume_note_survives_an_unreachable_engine(online_lane, monkeypatch):
+    def unreachable(method, params):
+        raise ConnectionError("engine down")
+
+    monkeypatch.setattr(worker_rpc, "_editor_engine_call", unreachable)
+    result = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="run-resumed",
+                chudcode_session_file="/sessions/conversation-1.jsonl"),
+        lambda _event: None,
+    )
+
+    assert result["ok"] is True
+    assert "call list_parts() before using any doc_id" in online_lane.host.turns[0]["request"]
+
+
 def test_tools_loaded_in_one_turn_stay_loaded_for_the_next_turn_of_that_session(
     online_lane,
 ):

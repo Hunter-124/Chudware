@@ -826,10 +826,13 @@ void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     ImGui::PopFont();
     dimText("Accept the suggested values or change them, then build. Skip uses the defaults.");
 
-    // Drain context-cube picks into an armed geometry_select question.
+    // Drain context-cube picks into an armed geometry_select question — once they have resolved,
+    // so the answer carries the stable sid rather than the provisional pick key.
     if (m.clarify.geometryPickQ >= 0 &&
         m.clarify.geometryPickQ < (int)m.clarify.questions.size() &&
-        !st.pendingContextRefs.empty()) {
+        !st.pendingContextRefs.empty() &&
+        std::none_of(st.pendingContextRefs.begin(), st.pendingContextRefs.end(),
+                     [](const core::ContextRef& r) { return r.resolving; })) {
         ClarifyQ& gq = m.clarify.questions[(size_t)m.clarify.geometryPickQ];
         if (gq.kind == "geometry_select") {
             auto targetOk = [&](const std::string& k) {

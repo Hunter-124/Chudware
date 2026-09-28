@@ -8,6 +8,7 @@
 #include "ui/clipboard_image.h"   // isImageAttachment / pastedImagePath — resolve sent attachments
 #include "image_lightbox.h"       // attachmentThumbnail / openImageLightbox
 #include "util/time_local.h"
+#include "ui/copilot/context_chips.h"  // context-picker chips on the sent bubble
 
 namespace ui {
 
@@ -154,8 +155,9 @@ static void drawMsgMetaRow(const ui::Fonts& fonts, const char* name, const ImVec
 // list — it has `text` plus card/plan/activity state and nothing else — and app_state.h
 // is out of scope here, so the only source of truth available at this render site is the
 // trailing marker block composer.cpp appends in submitTurn: one "[attached image: NAME]"
-// line per image, then an optional "[attached: ...]" line for non-image files, then an
-// optional "[context: ...]" line. NAME is a basename, so a thumbnail can only be drawn
+// line per image, then an optional "[attached: ...]" line for non-image files (transcripts
+// saved before 2026-09-27 may end with a "[context: ...]" line; context chips now ride on
+// ChatMsg::contextRefs). NAME is a basename, so a thumbnail can only be drawn
 // for names that resolve to a real file inside the pasted-image cache; anything else
 // (a paperclip-attached picture from elsewhere on disk, a deleted file) draws nothing and
 // keeps its text marker rather than fabricating a path or showing a broken tile.
@@ -274,6 +276,29 @@ static void drawSentImageStrip(const ChatMsg& m) {
     ImGui::PopID();
 }
 
+// The model entities this message carried (composer context picker): one chip per item, same
+// painter as the pending chips above the composer. Clicking one shows it in the viewport.
+static void drawSentContextChips(AppState& st, const ChatMsg& m) {
+    if (m.contextRefs.empty()) return;
+    const float gap = ui::metrics::px(4.0f);
+    const float maxX = ImGui::GetContentRegionMax().x;
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
+    ImGui::PushID("##umsg_ctx");
+    for (size_t i = 0; i < m.contextRefs.size(); ++i) {
+        const core::ContextRef& ref = m.contextRefs[i];
+        const float w = contextRefChipWidth(st, ref, /*removable=*/false);
+        if (i > 0) {
+            ImGui::SameLine(0.0f, gap);
+            if (ImGui::GetCursorPosX() + w > maxX) ImGui::NewLine();
+        }
+        ImGui::PushID((int)i);
+        if (drawContextRefChip(st, ref, /*removable=*/false) == ContextChipAction::Focus)
+            focusContextRef(st, ref);
+        ImGui::PopID();
+    }
+    ImGui::PopID();
+}
+
 void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                           float panelW, int msgIdx) {
     const auto& pal = ui::palette;
@@ -303,6 +328,8 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     const ImGuiID textId = chatDrawSelectableText("##umsg_sel", userBody, chatSurf().textPrimary);
     // Pasted images this message carried: clickable thumbnails, click = full-size viewer.
     drawSentImageStrip(m);
+    // Model context the message carried: chips (click = show it in the model).
+    drawSentContextChips(st, m);
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
 
     // ---- meta bar: You [rewind edit] ......... age ----

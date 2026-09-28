@@ -34,6 +34,7 @@
 #include "doc_mirror.h"  // core::DocMirror (C16)
 #include "async_rpc.h"   // core::AsyncRpc (C39) — non-blocking worker calls
 #include "switch_hold.h" // core::SwitchHold — async tab switch survives ensureActiveTab
+#include "context_ref.h" // core::ContextRef — composer context-picker chips
 
 #include "../ui/toast.h"    // W1-B: ToastLevel / Toast (toast queue lives on AppState)
 #include "../ui/cursors.h"  // W1-B: CursorKind (per-frame cursor request)
@@ -745,6 +746,9 @@ struct ChatMsg {
     // rendering them (endless scroll-back without unbounded frame cost). -1 = never measured.
     float uiCachedH = -1.0f;
     float uiCachedW = -1.0f;
+    // User message: the model entities attached with the composer's context picker, drawn as
+    // chips on the bubble (click = select in the viewport) and persisted with the session.
+    std::vector<core::ContextRef> contextRefs;
 };
 
 // Fold one streamed orchestrator event (kind = stage_started / agent_output / stage_result /
@@ -1834,16 +1838,11 @@ struct AppState {
     std::vector<std::string> pendingAttachments;
     // pendingContextRefs (Wave4): model entities the user attached to the NEXT prompt via the
     // composer "context cube" button — parts/components, faces, edges, sketches, features picked
-    // from the viewport or the feature tree. Shown as chips above the input beside file
-    // attachments; consumed + cleared by submitTurn, which serializes them into the RPC payload's
-    // "context_refs" array so the agent can resolve/measure/target exactly those entities.
-    struct ContextRef {
-        std::string kind;   // "component" | "body" | "face" | "edge" | "sketch" | "feature"
-        std::string id;     // stable selector/id (feature id, component id, or face/edge sid)
-        std::string docId;  // owning doc (assembly/part) — empty = active doc
-        std::string label;  // human chip label (e.g. "Front face of Wheel", "Sketch1")
-    };
-    std::vector<ContextRef> pendingContextRefs;
+    // from the viewport or the feature tree (ui::addContextRef). Shown as chips above the input
+    // beside file attachments; consumed + cleared by submitTurn, which serializes them into the
+    // RPC payload's "context_refs" array (the worker resolves each against the engine) and copies
+    // them onto the sent bubble.
+    std::vector<core::ContextRef> pendingContextRefs;
     // While true the composer "context cube" is armed: viewport picks and feature-tree row clicks
     // append to pendingContextRefs instead of (or alongside) normal selection. Esc / re-click
     // disarms. Mirrors a PropertyManager selection well but routes into the chat context store.

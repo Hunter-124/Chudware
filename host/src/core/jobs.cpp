@@ -110,7 +110,16 @@ AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::st
                 route.params[it.key()] = it.value();
         }
     }
-    if (!route.online) return route;
+    if (!route.online) {
+        // The native core agent reads only the request text: the picked context rides inline.
+        // (Online, the worker resolves context_refs against the engine and renders them itself.)
+        if (extra.is_object() && extra.contains("context_refs")) {
+            const std::string ctx =
+                core::contextRefsPromptText(core::contextRefsFromJson(extra["context_refs"]));
+            if (!ctx.empty()) route.params["request"] = request + "\n\n" + ctx;
+        }
+        return route;
+    }
 
     // agent_admin_turn consumes these values at the top level. Keep the options object too:
     // host-tool context and the explicit offline core fallback still use its full shape.

@@ -4139,21 +4139,21 @@ def _created_face_matches(doc_id: str, feat, matches: list,
 def _face_attribution(doc_id: str, feats: Optional[list] = None,
                       owner_map: Optional[dict] = None,
                       faces: Optional[list] = None) -> dict:
-    """Who owns each face of the LAST body, de-smeared — the one feature->face join.
+    """Who owns each face, de-smeared — the one feature->face join.
 
-    owner_map keys each feature's topology as [body_id, topo_id] (1-based TopExp index) and
-    doc_query enumerates the same body in the same first-encounter order, so topo_id ==
-    match_index + 1. The join is taken against the highest body_id owner_map mentions: a
-    feature whose only pairs sit on a superseded body was consumed by a later boolean and owns
-    nothing addressable now, and joining its stale topo ids against the live body would frame
-    the WRONG faces.
+    owner_map keys each feature's topology as [body_id, topo_id] (1-based surviving-body
+    ordinal, 1-based TopExp index within that body). The engine stamps the same (body, topo)
+    pair on every doc_query match, and the join is taken on it across EVERY surviving body.
+    Legacy fallback (matches without those keys): doc_query enumerates the last body in
+    first-encounter order, so topo_id == match_index + 1 on the highest body_id owner_map
+    mentions, and a feature whose only pairs sit on another body reads as consumed.
 
     Each feature's claimed faces then go through _created_face_matches. A face it did not
     create is re-credited to the latest EARLIER feature whose tool could have authored it, and
     left unowned when none could.
 
     Returns {
-      "faces":   [match, ...] in doc_query order — index i is topo id i+1 on "last_body",
+      "faces":   [match, ...] in doc_query order,
       "owner":   [feature_id | None, ...] parallel to "faces" — the de-smeared partition,
       "owned":   {feature_id: [match, ...]} — that partition grouped, INCLUDING faces
                  re-credited from a later feature. The "who owns this face" view describe_part
@@ -4165,7 +4165,8 @@ def _face_attribution(doc_id: str, feats: Optional[list] = None,
       "claimed": {feature_id: int} — the raw owner_map face count on the live body, so a caller
                  can report honestly how many faces it moved,
       "reattributed": int — faces moved to a different feature,
-      "last_body": int}
+      "last_body": int,
+      "all_bodies": bool — True when the join used the engine's (body, topo) keys}
     """
     if feats is None or owner_map is None:
         feats, owner_map = _target_feature_roster(doc_id)
@@ -4196,11 +4197,23 @@ def _face_attribution(doc_id: str, feats: Optional[list] = None,
 
     claimed_idx: dict = {}
     owner: list = [None] * len(faces)
+    # An engine that stamps each match with its (body, topo) key joins EXACTLY, over every
+    # surviving body: doc_query counts faces across the whole document while owner_map counts
+    # per body, so the positional topo-1 join below is only right on a single-body part — a
+    # second solid (a floating rib) used to make every feature on body 1 read as consumed.
+    by_key = {(int(m["body"]), int(m["topo"])): i for i, m in enumerate(faces)
+              if isinstance(m, dict) and m.get("body") is not None
+              and m.get("topo") is not None}
     for fid, om in owner_map.items():
         for pair in (om.get("faces") or []):
-            if not (isinstance(pair, list) and len(pair) == 2 and int(pair[0]) == last_body):
+            if not (isinstance(pair, list) and len(pair) == 2):
                 continue
-            i = int(pair[1]) - 1
+            if by_key:
+                i = by_key.get((int(pair[0]), int(pair[1])), -1)
+            elif int(pair[0]) == last_body:
+                i = int(pair[1]) - 1
+            else:
+                continue
             if 0 <= i < len(faces):
                 claimed_idx.setdefault(str(fid), []).append(i)
                 owner[i] = str(fid)
@@ -4235,7 +4248,8 @@ def _face_attribution(doc_id: str, feats: Optional[list] = None,
             owned.setdefault(owner[i], []).append(f)
     return {"faces": faces, "owner": owner, "owned": owned, "created": created,
             "claimed": {fid: len(idxs) for fid, idxs in claimed_idx.items()},
-            "reattributed": reattributed, "last_body": last_body}
+            "reattributed": reattributed, "last_body": last_body,
+            "all_bodies": bool(by_key)}
 
 
 def _owned_matches_for(doc_id: str, fid: str, label: str, owner_map: dict,
@@ -4261,28 +4275,35 @@ def _owned_matches_for(doc_id: str, fid: str, label: str, owner_map: dict,
             f"{label}: the document tree records no owned topology at all (owner_map is empty). "
             f"Call describe_part(doc_id) for the face/edge sid roster and inspect by sid.")
 
+    # With exact (body, topo) keys every surviving body is live; without them only the
+    # highest body id is (the legacy single-body positional join).
+    live = (lambda b: True) if att.get("all_bodies") else (lambda b: b == last_body)
     om = (owner_map or {}).get(fid) or {}
-    face_topos = {int(p[1]) for p in (om.get("faces") or [])
-                  if isinstance(p, list) and len(p) == 2 and int(p[0]) == last_body}
-    edge_topos = {int(p[1]) for p in (om.get("edges") or [])
-                  if isinstance(p, list) and len(p) == 2 and int(p[0]) == last_body}
-    if not face_topos and not edge_topos:
+    face_keys = {(int(p[0]), int(p[1])) for p in (om.get("faces") or [])
+                 if isinstance(p, list) and len(p) == 2 and live(int(p[0]))}
+    edge_keys = {(int(p[0]), int(p[1])) for p in (om.get("edges") or [])
+                 if isinstance(p, list) and len(p) == 2 and live(int(p[0]))}
+    if not face_keys and not edge_keys:
         raise ValueError(
             f"{label} owns no faces/edges on the current body — a later boolean/fillet consumed "
             f"it, so there is nothing to frame. describe_part(doc_id) marks consumed features "
             f"and lists the sids that DO still exist.")
 
     out = list(att["created"].get(fid) or [])
-    if not out and edge_topos:
+    if not out and edge_keys:
         edges = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "edge"}})
                  .get("matches") or [])
-        out = [m for i, m in enumerate(edges) if (i + 1) in edge_topos]
+        if att.get("all_bodies"):
+            out = [m for m in edges if m.get("body") is not None and m.get("topo") is not None
+                   and (int(m["body"]), int(m["topo"])) in edge_keys]
+        else:
+            out = [m for i, m in enumerate(edges) if (last_body, i + 1) in edge_keys]
     if not out:
         feat = next((f for f in (feats or [])
                      if isinstance(f, dict) and str(f.get("id")) == fid), None)
         verb = "cut" if _feature_is_subtractive(feat, feats) else "fuse"
         raise ValueError(
-            f"{label} created no face of its own: every one of the {len(face_topos)} face(s) "
+            f"{label} created no face of its own: every one of the {len(face_keys)} face(s) "
             f"the kernel credited to it already existed — a {verb} regenerates the faces its "
             f"tool touches and OCCT re-attributes them to the {verb} — so there is nothing of "
             f"its own to frame. describe_part(doc_id) says which feature owns those faces; "
@@ -5155,7 +5176,13 @@ def _mesh_render_frame(mesh: dict, view_dir: tuple,
 def _screen_xyz(pts, frame: dict):
     """Bulk world -> (sx, sy, depth) through `frame`. depth is dot(p-centre, view_dir):
     LARGER is nearer the camera, matching the C++ z-buffer test. `scale_y` (only set by
-    _crop_frame) lets the same code project into a cropped-and-rescaled image."""
+    _crop_frame) lets the same code project into a cropped-and-rescaled image. A
+    perspective frame (engine camera_pose.v1) projects through the pinhole instead, with
+    reciprocal depth — still larger-is-nearer, and NaN/-1e30 for points behind the near
+    plane (cad_viewpoint.perspective_project)."""
+    if frame.get("projection") == "perspective":
+        from . import cad_viewpoint as _vp  # noqa: PLC0415
+        return _vp.perspective_project(pts, frame)
     import numpy as np  # noqa: PLC0415
     p = np.asarray(pts, dtype=np.float64).reshape(-1, 3) - np.asarray(frame["center"])
     sy_scale = frame.get("scale_y", frame["scale"])
@@ -5204,6 +5231,12 @@ def _frame_from_rpc(resp: Optional[dict]) -> Optional[dict]:
     f = (resp or {}).get("frame")
     if not isinstance(f, dict) or not f.get("width"):
         return None
+    if f.get("projection") == "perspective":
+        from . import cad_viewpoint as _vp  # noqa: PLC0415
+        try:
+            return dict(_vp.frame_from_echo(f, (resp or {}).get("camera")), focused=True)
+        except (KeyError, TypeError, ValueError):
+            return None
     try:
         return {"center": _v3(f["center"]), "r": _v3(f["right"]), "u": _v3(f["up"]),
                 "d": _v3(f["dir"]), "scale": float(f["scale"]),
@@ -5254,7 +5287,8 @@ def _render_view_png(doc_id: str, view_dir, out_png: str, *,
                      margin: float = _CLOSEUP_MARGIN, clip_near: bool = False,
                      W: int = _RENDER_W, H: int = _RENDER_H,
                      annotate: bool = True,
-                     background: Optional[Sequence] = None) -> tuple:
+                     background: Optional[Sequence] = None,
+                     camera: Optional[dict] = None) -> tuple:
     """One engine render along `view_dir`, optionally FRAMED on a world AABB.
 
     `focus` is a bbox dict ({"min","max"} — what _target_bbox returns). With it the engine fits
@@ -5265,12 +5299,21 @@ def _render_view_png(doc_id: str, view_dir, out_png: str, *,
     `background` is an [r, g, b] 0-255 frame clear colour handed straight to the engine
     (doc_render_view's `background`); None keeps the engine's flat 245 light grey.
 
+    `camera` is an exact perspective pose (cad_viewpoint.perspective_camera): it replaces the
+    direction/focus camera entirely — the engine refuses the two together — and the returned
+    frame is then a perspective frame every overlay helper projects through.
+
     Returns (png_path, frame, resp). `frame` is the engine's own projection record — pass it
     straight to _annotate_render so the overlay lands on the right pixels. Raises ValueError
     with the engine's reason when the render fails."""
-    view = {"dir": [float(x) for x in _vnorm(view_dir)], "name": str(name),
-            "width": int(W), "height": int(H)}
-    if focus:
+    if camera:
+        keys = ("projection", "position", "target", "up", "vertical_fov_deg", "near", "far",
+                "width", "height")
+        view = {"name": str(name), "camera": {k: camera[k] for k in keys if k in camera}}
+    else:
+        view = {"dir": [float(x) for x in _vnorm(view_dir)], "name": str(name),
+                "width": int(W), "height": int(H)}
+    if focus and not camera:
         view["focus"] = {"min": [float(x) for x in _v3(focus["min"])],
                          "max": [float(x) for x in _v3(focus["max"])],
                          "margin": float(margin), "clip_near": bool(clip_near)}
@@ -5370,7 +5413,9 @@ def _mesh_depth_buffer(mesh: dict, frame: dict) -> Optional[tuple]:
     When `frame` carries the engine's near-clip (`clip_near` + `clip_depth`, a focused cutaway),
     the same fragments are dropped here. Skipping that is not a cosmetic mismatch: the cut-away
     material would win this z-test, and the feature the cutaway was made to expose would come
-    back reported as invisible."""
+    back reported as invisible. A perspective frame instead clips each triangle against the
+    near/far planes in camera space (as the engine does) and interpolates reciprocal depth,
+    and back-faces are judged against the ray from the eye, not a single view direction."""
     import numpy as np  # noqa: PLC0415
     idx = mesh["idx"]
     if idx.shape[0] > _HLR_TRI_BUDGET:
@@ -5378,27 +5423,36 @@ def _mesh_depth_buffer(mesh: dict, frame: dict) -> Optional[tuple]:
     W, H = int(frame["W"]), int(frame["H"])
     pos = mesh["pos"]
     S = _screen_xyz(pos, frame)
-    d = np.asarray(frame["d"])
     p0, p1, p2 = pos[idx[:, 0]], pos[idx[:, 1]], pos[idx[:, 2]]
-    front = np.cross(p1 - p0, p2 - p0) @ d > 0.0
+    persp = frame.get("projection") == "perspective"
+    if persp:
+        eye = np.asarray(frame["position"], dtype=np.float64)
+        front = np.einsum("ij,ij->i", np.cross(p1 - p0, p2 - p0), eye[None, :] - p0) > 0.0
+    else:
+        front = np.cross(p1 - p0, p2 - p0) @ np.asarray(frame["d"]) > 0.0
     tri_ids = np.nonzero(front)[0]
     clip = (float(frame["clip_depth"])
-            if frame.get("clip_near") and frame.get("clip_depth") is not None else None)
+            if not persp and frame.get("clip_near") and frame.get("clip_depth") is not None
+            else None)
     tri_face = mesh["tri_face"]
 
     Z = np.full((H, W), -1e30, dtype=np.float64)
     FI = np.full((H, W), -1, dtype=np.int32)
-    for t in tri_ids:
-        s0, s1, s2 = S[idx[t, 0]], S[idx[t, 1]], S[idx[t, 2]]
-        minx = max(int(math.floor(min(s0[0], s1[0], s2[0]))), 0)
-        maxx = min(int(math.ceil(max(s0[0], s1[0], s2[0]))), W - 1)
-        miny = max(int(math.floor(min(s0[1], s1[1], s2[1]))), 0)
-        maxy = min(int(math.ceil(max(s0[1], s1[1], s2[1]))), H - 1)
+
+    def _raster(s0, s1, s2, face: int) -> None:
+        lo_x, hi_x = min(s0[0], s1[0], s2[0]), max(s0[0], s1[0], s2[0])
+        lo_y, hi_y = min(s0[1], s1[1], s2[1]), max(s0[1], s1[1], s2[1])
+        if hi_x < 0.0 or lo_x > W or hi_y < 0.0 or lo_y > H:
+            return
+        minx = max(int(math.floor(lo_x)), 0)
+        maxx = min(int(math.ceil(hi_x)), W - 1)
+        miny = max(int(math.floor(lo_y)), 0)
+        maxy = min(int(math.ceil(hi_y)), H - 1)
         if maxx < minx or maxy < miny:
-            continue
+            return
         area = (s1[0] - s0[0]) * (s2[1] - s0[1]) - (s2[0] - s0[0]) * (s1[1] - s0[1])
         if abs(area) < 1e-9:
-            continue
+            return
         fx = np.arange(minx, maxx + 1, dtype=np.float64)[None, :] + 0.5
         fy = np.arange(miny, maxy + 1, dtype=np.float64)[:, None] + 0.5
         a0 = ((s1[0] - fx) * (s2[1] - fy) - (s2[0] - fx) * (s1[1] - fy)) / area
@@ -5406,18 +5460,45 @@ def _mesh_depth_buffer(mesh: dict, frame: dict) -> Optional[tuple]:
         a2 = 1.0 - a0 - a1
         inside = (a0 >= 0) & (a1 >= 0) & (a2 >= 0)
         if not inside.any():
-            continue
+            return
         dep = a0 * s0[2] + a1 * s1[2] + a2 * s2[2]
         if clip is not None:
             inside = inside & (dep <= clip)
             if not inside.any():
-                continue
+                return
         zs = Z[miny:maxy + 1, minx:maxx + 1]
         upd = inside & (dep > zs)
         if not upd.any():
-            continue
+            return
         zs[upd] = dep[upd]
-        FI[miny:maxy + 1, minx:maxx + 1][upd] = tri_face[t]
+        FI[miny:maxy + 1, minx:maxx + 1][upd] = face
+
+    if not persp:
+        for t in tri_ids:
+            _raster(S[idx[t, 0]], S[idx[t, 1]], S[idx[t, 2]], tri_face[t])
+        return Z, FI, S
+
+    from . import cad_viewpoint as _vp  # noqa: PLC0415
+    C = _vp.camera_space(pos, frame)
+    near, far = float(frame["near"]), float(frame["far"])
+    focal, cx, cy = float(frame["focal"]), float(frame["cx"]), float(frame["cy"])
+
+    def _proj(p) -> tuple:
+        return (cx + focal * p[0] / p[2], cy - focal * p[1] / p[2], 1.0 / p[2])
+
+    for t in tri_ids:
+        zs3 = C[idx[t], 2]
+        if zs3.min() >= near and zs3.max() <= far:
+            _raster(S[idx[t, 0]], S[idx[t, 1]], S[idx[t, 2]], tri_face[t])
+            continue
+        if zs3.max() < near or zs3.min() > far:
+            continue
+        poly = _vp.clip_polygon_depth([tuple(C[i]) for i in idx[t]], near, far)
+        if len(poly) < 3:
+            continue
+        sp = [_proj(p) for p in poly]
+        for k in range(1, len(sp) - 1):
+            _raster(sp[0], sp[k], sp[k + 1], tri_face[t])
     return Z, FI, S
 
 
@@ -5448,7 +5529,14 @@ def _visible_runs(pts, frame: dict, Zmax, eps: float) -> list:
     run: list = []
     for k in range(S.shape[0] - 1):
         a, b = S[k], S[k + 1]
-        n = max(2, int(math.hypot(b[0] - a[0], b[1] - a[1]) / 2.0) + 2)
+        seg_len = math.hypot(b[0] - a[0], b[1] - a[1])
+        if not math.isfinite(seg_len):
+            # Perspective: an endpoint behind the near plane has no screen position.
+            if len(run) > 1:
+                runs.append(run)
+            run = []
+            continue
+        n = max(2, int(seg_len / 2.0) + 2)
         ts = np.linspace(0.0, 1.0, n)[:, None]
         seg = a[None, :] * (1.0 - ts) + b[None, :] * ts
         xi = np.clip(seg[:, 0].astype(np.int64), 0, W - 1)
@@ -5562,17 +5650,25 @@ def _draw_scale_bar(draw, font, frame: dict, size_mm: tuple, W: int, H: int) -> 
     # "part bbox", not "bbox": on a close-up this sits next to a 5 mm scale bar while quoting
     # the WHOLE part's 120 mm, and the unqualified word reads as the size of what is in frame.
     dims = f"part bbox {size_mm[0]:.4g} x {size_mm[1]:.4g} x {size_mm[2]:.4g} mm"
-    label = f"{mm:.4g} mm"
-    draw.rectangle([x0 - 8, y1 - 30, W - 4, H - 4], fill=(24, 26, 32))
+    # A perspective bar is true only at the look-at depth; say so in the image itself.
+    label = f"{mm:.4g} mm" + (" @ target" if frame.get("projection") == "perspective" else "")
+
+    def _text_w(text: str) -> int:
+        try:
+            bb = draw.textbbox((0, 0), text, font=font)
+            return int(bb[2] - bb[0])
+        except Exception:  # noqa: BLE001
+            return 7 * len(text)
+
+    # The plate grows to hold the label and the bbox line, so neither spills onto the render.
+    lx = min(x0, x1 - _text_w(label))
+    dx = W - 8 - _text_w(dims)
+    draw.rectangle([max(0, min(x0, lx, dx) - 8), y1 - 30, W - 4, H - 4], fill=(24, 26, 32))
     draw.line([(x0, y1), (x1, y1)], fill=(240, 242, 248), width=2)
     for x in (x0, x1):
         draw.line([(x, y1 - 5), (x, y1 + 5)], fill=(240, 242, 248), width=2)
-    draw.text((x0, y1 + 2), label, font=font, fill=(240, 242, 248))
-    try:
-        db = draw.textbbox((0, 0), dims, font=font)
-        draw.text((W - 8 - (db[2] - db[0]), y1 - 26), dims, font=font, fill=(196, 202, 214))
-    except Exception:  # noqa: BLE001
-        draw.text((x0 - 4, y1 - 26), dims, font=font, fill=(196, 202, 214))
+    draw.text((lx, y1 + 2), label, font=font, fill=(240, 242, 248))
+    draw.text((dx, y1 - 26), dims, font=font, fill=(196, 202, 214))
     return mm
 
 
@@ -5853,6 +5949,7 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
         # is pulled toward grey. Coverage is measured, not assumed — a target the camera cannot
         # see is reported as such rather than silently producing a picture of nothing.
         emp_draw: list = []
+        emp_ghost = None   # occluded target pixels, tinted through the occluder
         if emphasis:
             emp_matches = list(emphasis.get("matches") or [])
             emp_mode = emphasis.get("mode") or "emphasis"
@@ -5865,6 +5962,7 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                 lum = (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]) / 255.0
                 target_any = np.zeros((H, W), dtype=bool)
                 per_target = []
+                all_fidx: set = set()
                 for i, m in enumerate(emp_matches):
                     ftop, etop = _topos_for([m])
                     fidx = [face_by_topo[t] for t in sorted(ftop) if t in face_by_topo]
@@ -5872,6 +5970,7 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                     entry = (palette["entries"][i] if i < len(palette["entries"])
                              else palette["entries"][-1] if palette["entries"] else None)
                     rgb = tuple(entry["rgb"]) if entry else _EMPHASIS_PALETTE[0]
+                    all_fidx.update(fidx)
                     mask = (np.isin(FI, np.asarray(fidx, dtype=np.int32)) if fidx
                             else np.zeros((H, W), dtype=bool))
                     sid = str(m.get("sid") or f"m{i}")
@@ -5898,6 +5997,26 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                     shade = 0.45 + 0.85 * lum[t["mask"]]
                     for ch in range(3):
                         arr[..., ch][t["mask"]] = np.clip(t["rgb"][ch] * shade, 0, 255)
+                # GHOST: the target's own triangles rasterized ALONE give its whole silhouette;
+                # the part of it that lost the depth test above sits behind other material.
+                # Tint that through the occluder (half-strength, thin outline below) so a rib
+                # half-hidden behind a boss still reads as one shape, and SAY how much it was.
+                if all_fidx:
+                    tsel = np.isin(mesh["tri_face"], np.asarray(sorted(all_fidx), dtype=np.int32))
+                    tbuf = (_mesh_depth_buffer({"pos": mesh["pos"], "idx": mesh["idx"][tsel],
+                                                "tri_face": mesh["tri_face"][tsel]}, frame)
+                            if tsel.any() else None)
+                    if tbuf is not None:
+                        ghost = (tbuf[1] >= 0) & ~target_any
+                        if ghost.any():
+                            grgb = np.asarray(per_target[0]["rgb"] if per_target
+                                              else _EMPHASIS_PALETTE[0], dtype=np.float64)
+                            arr[ghost] = arr[ghost] * 0.55 + grgb * 0.45
+                            emp_ghost = ghost
+                        n_ghost = int(ghost.sum())
+                        rec["occluded_px"] = n_ghost
+                        rec["occluded_frac"] = round(
+                            n_ghost / float(max(n_ghost + int(target_any.sum()), 1)), 4)
                 rec["target_px"] = int(target_any.sum())
                 rec["coverage"] = round(rec["target_px"] / float(W * H), 4)
                 emp_draw = per_target
@@ -5958,19 +6077,36 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
         # ---- emphasis outlines + leader labels ----------------------------------------
         # Drawn before the highlight chips so an explicit `highlight` still wins the top layer.
         emp_taken: list = []
+        if emp_ghost is not None:
+            _mask_outline(draw, emp_ghost, (150, 150, 160), width=1)
+        # Shared-colour emphasis names the TARGET once (on its largest visible face); a chip
+        # per sid ("Fc51694", "F3bae34") only says something in per_face mode, where each
+        # colour needs its key.
+        one_label = (emphasis or {}).get("label") if (
+            emphasis and (emphasis.get("mode") or "emphasis") == "emphasis") else None
+        if one_label:
+            sized = [t for t in emp_draw if t["mask"] is not None]
+            biggest = max(sized, key=lambda t: int(t["mask"].sum())) if sized else None
         for t in emp_draw:
             if t["mask"] is not None:
                 _mask_outline(draw, t["mask"], _EMPHASIS_GLOW, width=2)
+            if emphasis.get("draw_label") is False:
+                continue   # the caller places its own label clear of the target
+            if one_label and t is not biggest and not (biggest is None and t is emp_draw[0]):
+                continue
             anchor = _mask_anchor(t["mask"]) if t["mask"] is not None else None
             if anchor is None and t["edge_idx"]:
                 pts = mesh["edges"][t["edge_idx"][0]]["pts"]
                 S = _screen_xyz(pts, frame)
-                anchor = (int(S[len(S) // 2, 0]), int(S[len(S) // 2, 1]))
+                mid = S[len(S) // 2]
+                if np.isfinite(mid[0]) and np.isfinite(mid[1]):
+                    anchor = (int(mid[0]), int(mid[1]))
             if anchor is None:
                 continue
             ax = max(2, min(int(anchor[0]), W - 3))
             ay = max(2, min(int(anchor[1]), H - 3))
-            _place_label(draw, font, (ax, ay), t["label"], tuple(t["rgb"]), W, H, emp_taken)
+            _place_label(draw, font, (ax, ay), str(one_label or t["label"]), tuple(t["rgb"]),
+                         W, H, emp_taken)
 
         # ---- load vectors + burned-in banner -------------------------------------------
         # After the emphasis paint (an arrow the desaturation pass could grey out is no
@@ -5997,13 +6133,15 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                 anchor = _mask_anchor(h["mask"])
             if anchor is None and h["edge_idx"]:
                 pts = mesh["edges"][h["edge_idx"][0]]["pts"]
-                S = _screen_xyz(pts, frame)
-                anchor = (int(S[len(S) // 2, 0]), int(S[len(S) // 2, 1]))
+                mid = _screen_xyz(pts, frame)[len(pts) // 2]
+                if np.isfinite(mid[0]) and np.isfinite(mid[1]):   # perspective: behind near
+                    anchor = (int(mid[0]), int(mid[1]))
             if anchor is None and rec["matches"]:
                 c = rec["matches"][0].get("centroid")
                 if isinstance(c, (list, tuple)) and len(c) >= 3:
                     S = _screen_xyz([c], frame)
-                    anchor = (int(S[0, 0]), int(S[0, 1]))
+                    if np.isfinite(S[0, 0]) and np.isfinite(S[0, 1]):
+                        anchor = (int(S[0, 0]), int(S[0, 1]))
             if anchor is not None:
                 ax = max(2, min(int(anchor[0]), W - 3))
                 ay = max(2, min(int(anchor[1]), H - 3))
@@ -6751,7 +6889,7 @@ GEOM_QUERY_ALIASES = {
 #: only alongside a real predicate, because on their own they select nothing.
 GEOM_QUERY_READBACK_KEYS = frozenset({
     "sid", "centroid", "normal", "axis", "radius", "area_or_len", "concavity",
-    "hint_index", "owner_feature",
+    "hint_index", "owner_feature", "body", "topo",
 })
 
 GEOM_QUERY_VOCAB_HELP = (

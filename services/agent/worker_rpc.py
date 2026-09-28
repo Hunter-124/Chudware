@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR
@@ -1771,6 +1772,41 @@ _HISTORY_SEED_MAX_CHARS = 24_000
 _HISTORY_SEED_MAX_MESSAGES = 24
 
 
+#: ``enable_tools`` loads per Chudware conversation. Every turn rebuilds the host-tool
+#: set from the GUI's request, but the conversation history still shows the tools the
+#: model loaded in an earlier turn — so without this, a later turn calls them and gets
+#: Chudcode's "No such tool: xd://inspect_section" (c219: loaded in turn 1, two
+#: failed calls and a re-load in turn 3). Worker-lifetime, like the live session.
+_SESSION_TOOL_LOADS_LOCK = threading.Lock()
+_SESSION_TOOL_LOADS: OrderedDict[str, list[str]] = OrderedDict()
+_SESSION_TOOL_LOADS_MAX = 256
+
+
+def _turn_tool_categories(session_id: str, requested: Any) -> list[str]:
+    """The GUI's requested categories plus every load earlier turns of this session made."""
+    out: list[str] = []
+    for value in requested if isinstance(requested, list) else ():
+        if isinstance(value, str) and value.strip() and value not in out:
+            out.append(value)
+    if session_id == "default":
+        return out
+    with _SESSION_TOOL_LOADS_LOCK:
+        remembered = list(_SESSION_TOOL_LOADS.get(session_id, ()))
+    return out + [value for value in remembered if value not in out]
+
+
+def _remember_session_tool_loads(session_id: str, categories: Any) -> None:
+    if session_id == "default" or not isinstance(categories, list):
+        return
+    loads = [value for value in categories if isinstance(value, str) and value.strip()]
+    with _SESSION_TOOL_LOADS_LOCK:
+        _SESSION_TOOL_LOADS[session_id] = list(dict.fromkeys(loads))
+        _SESSION_TOOL_LOADS.move_to_end(session_id)
+        while len(_SESSION_TOOL_LOADS) > _SESSION_TOOL_LOADS_MAX:
+            _SESSION_TOOL_LOADS.popitem(last=False)
+
+
+
 def chudcode_agent_turn(params: dict, emit: Callable) -> dict:
     """Run one online turn through the authoritative persistent Chudcode host."""
     try:
@@ -2675,25 +2711,443 @@ def _claim_history_seed(
 _SCOPE_MAX_FEATURES = 32
 _SCOPE_MAX_SELECTORS = 16
 _SCOPE_MAX_SELECTOR_CHARS = 200
+_CONTEXT_REFS_MAX = 24
+_CONTEXT_REF_MAX_CHARS = 700
+_CONTEXT_BLOCK_MAX_CHARS = 9000
+_CONTEXT_PARAMS_MAX = 8
 
 
-def _editor_context_block(raw_params: Mapping[str, Any]) -> str:
-    """Render the GUI's live editor context (active doc + selection) for the model.
+def _editor_engine_call(method: str, params: dict) -> Any:
+    """The engine seam the picked-context resolver reads through (tests replace it)."""
+    from services.mcp import core_bridge  # noqa: PLC0415 - loaded only when refs need it
+
+    return core_bridge.call(method, params)
+
+
+def _ctx_num(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    rounded = round(number, 3)
+    return f"{0.0 if rounded == 0 else rounded:g}"
+
+
+def _ctx_vec(value: Any) -> str | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+    parts = [_ctx_num(item) for item in value]
+    return None if None in parts else "[" + ", ".join(parts) + "]"  # type: ignore[arg-type]
+
+
+def _ctx_str(value: Any, limit: int = 120) -> str:
+    text = _bounded_text(value, 4 * limit) or ""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _ctx_geometry(selector: Mapping[str, Any]) -> str:
+    """One line of engine-computed geometry for a face/edge selector (contracts/selectors.md)."""
+    kind = str(selector.get("kind") or "")
+    surf = _ctx_str(selector.get("surf"), 24) or "other"
+    centroid = _ctx_vec(selector.get("centroid"))
+    axis = _ctx_vec(selector.get("axis"))
+    normal = _ctx_vec(selector.get("normal"))
+    measure = _ctx_num(selector.get("area_or_len"))
+    radius = _ctx_num(selector.get("radius"))
+    side = _ctx_str(selector.get("side"), 16)
+    bits: list[str] = []
+    if kind == "face":
+        bits.append(f"{surf} face")
+        if surf == "plane" and (normal or axis):
+            bits.append(f"normal {normal or axis}" + (f" ({side})" if side else ""))
+        else:
+            if axis:
+                bits.append(f"axis {axis}")
+            if normal:
+                bits.append(f"outward {normal}" + (f" ({side})" if side else ""))
+        if radius:
+            bits.append(f"radius {radius} mm")
+        concavity = _ctx_str(selector.get("concavity"), 8)
+        if concavity:
+            bits.append(concavity)
+        if measure:
+            bits.append(f"area {measure} mm²")
+        if centroid:
+            bits.append(f"centroid {centroid}")
+    elif kind == "edge":
+        bits.append(f"{surf} edge")
+        length = selector.get("area_or_len")
+        if measure:
+            bits.append(f"length {measure} mm")
+        point = selector.get("centroid")
+        if (surf == "line" and axis and centroid and isinstance(length, (int, float))
+                and isinstance(point, (list, tuple)) and len(point) == 3):
+            direction = selector.get("axis")
+            half = float(length) / 2.0
+            try:
+                ends = [
+                    [float(point[i]) + sign * half * float(direction[i]) for i in range(3)]
+                    for sign in (-1.0, 1.0)
+                ]
+            except (TypeError, ValueError, IndexError):
+                ends = []
+            if ends:
+                bits.append(f"from {_ctx_vec(ends[0])} to {_ctx_vec(ends[1])}")
+            bits.append(f"direction {axis}")
+        else:
+            full_circle = (
+                surf == "circle" and radius and isinstance(length, (int, float))
+                and abs(float(length) - 2.0 * math.pi * float(selector["radius"]))
+                <= 1e-3 * max(1.0, float(length))
+            )
+            if radius:
+                bits.append(f"radius {radius} mm" + (" (full circle)" if full_circle else ""))
+            if axis:
+                bits.append(f"axis {axis}")
+            if centroid:
+                bits.append(f"{'center' if full_circle else 'centroid'} {centroid}")
+    else:
+        if centroid:
+            bits.append(f"at {centroid}")
+    return ", ".join(bits)
+
+
+def _ctx_param_text(value: Any) -> str | None:
+    if isinstance(value, Mapping) and "value" in value:
+        shown = _ctx_num(value.get("value"))
+        expr = _ctx_str(value.get("expr"), 40)
+        if shown is None:
+            return None
+        return f"{shown} (= {expr})" if expr else shown
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    number = _ctx_num(value)
+    if number is not None:
+        return number
+    if isinstance(value, str) and value.strip():
+        return _ctx_str(value, 40)
+    return None
+
+
+def _ctx_ref_slot_text(value: Any) -> str:
+    if isinstance(value, list):
+        owners = {
+            str(item.get("owner_feature") or item.get("sketch") or item.get("feature") or "")
+            for item in value if isinstance(item, Mapping)
+        } - {""}
+        return f"{len(value)} ref(s)" + (f" on {', '.join(sorted(owners)[:3])}" if owners else "")
+    if isinstance(value, str):
+        return _ctx_str(value, 40)
+    if isinstance(value, Mapping):
+        try:
+            return _ctx_str(json.dumps(value, separators=(",", ":"), sort_keys=True), 60)
+        except (TypeError, ValueError):
+            return "selector"
+    return "set"
+
+
+def _ctx_feature_details(feature: Mapping[str, Any]) -> str:
+    ftype = _ctx_str(feature.get("type"), 32) or "feature"
+    params = feature.get("params") if isinstance(feature.get("params"), Mapping) else {}
+    refs = feature.get("refs") if isinstance(feature.get("refs"), Mapping) else {}
+    bits: list[str] = []
+    if ftype in {"sketch", "sketch3d"}:
+        plane = refs.get("plane", params.get("plane"))
+        if plane is not None:
+            bits.append(f"on {_ctx_ref_slot_text(plane)}")
+        entities = params.get("entities") if isinstance(params.get("entities"), list) else []
+        by_type: dict[str, int] = {}
+        for entity in entities:
+            if isinstance(entity, Mapping):
+                key = _ctx_str(entity.get("type"), 16) or "entity"
+                by_type[key] = by_type.get(key, 0) + 1
+        counts = ", ".join(f"{n} {t}" for t, n in sorted(by_type.items()))
+        bits.append(f"{len(entities)} entities" + (f" ({counts})" if counts else ""))
+        for key in ("constraints", "dimensions"):
+            if isinstance(params.get(key), list) and params[key]:
+                bits.append(f"{len(params[key])} {key}")
+    else:
+        shown = 0
+        for key, value in params.items():
+            if key in {"entities", "constraints", "dimensions"}:
+                continue
+            text = _ctx_param_text(value)
+            if text is None:
+                continue
+            bits.append(f"{_ctx_str(key, 24)}={text}")
+            shown += 1
+            if shown >= _CONTEXT_PARAMS_MAX:
+                break
+        for slot, value in list(refs.items())[:4]:
+            bits.append(f"refs.{_ctx_str(slot, 24)}: {_ctx_ref_slot_text(value)}")
+    if feature.get("suppressed") is True:
+        bits.append("SUPPRESSED")
+    return "; ".join(bits)
+
+
+class _ContextRefResolver:
+    """Bounded engine reads for one prompt: one doc_tree per doc, one doc_query per kind."""
+
+    def __init__(self, call: Callable[[str, dict], Any]):
+        self._call = call
+        self._trees: dict[str, Mapping[str, Any] | None] = {}
+        self._matches: dict[tuple[str, str], list[Mapping[str, Any]] | None] = {}
+
+    def tree(self, doc_id: str) -> Mapping[str, Any] | None:
+        if doc_id not in self._trees:
+            try:
+                reply = self._call("doc_tree", {"doc_id": doc_id})
+            except Exception as exc:  # noqa: BLE001 - context stays best-effort, never fails a turn
+                _LOG.info("picked-context doc_tree(%s) failed: %s", doc_id, exc)
+                reply = None
+            tree = reply.get("tree") if isinstance(reply, Mapping) else None
+            self._trees[doc_id] = tree if isinstance(tree, Mapping) else None
+        return self._trees[doc_id]
+
+    def is_assembly(self, doc_id: str) -> bool:
+        tree = self.tree(doc_id) or {}
+        return str(tree.get("schema") or "").startswith("aicad.asm") or bool(
+            tree.get("components") and not tree.get("features"))
+
+    def feature(self, doc_id: str, fid: str) -> Mapping[str, Any] | None:
+        for feature in (self.tree(doc_id) or {}).get("features") or ():
+            if isinstance(feature, Mapping) and feature.get("id") == fid:
+                return feature
+        return None
+
+    def component(self, doc_id: str, cid: str) -> Mapping[str, Any] | None:
+        for component in (self.tree(doc_id) or {}).get("components") or ():
+            if isinstance(component, Mapping) and component.get("id") == cid:
+                return component
+        return None
+
+    def live_selector(self, doc_id: str, kind: str, sid: str) -> tuple[str, Mapping | None]:
+        """("live", match) | ("gone", None) | ("unverified", None) for a part doc sid."""
+        key = (doc_id, kind)
+        if key not in self._matches:
+            try:
+                reply = self._call("doc_query", {"doc_id": doc_id, "query": {"of": kind}})
+                found = reply.get("matches") if isinstance(reply, Mapping) else None
+                self._matches[key] = [m for m in found if isinstance(m, Mapping)] \
+                    if isinstance(found, list) else None
+            except Exception as exc:  # noqa: BLE001 - verification is best-effort
+                _LOG.info("picked-context doc_query(%s,%s) failed: %s", doc_id, kind, exc)
+                self._matches[key] = None
+        matches = self._matches[key]
+        if matches is None:
+            return "unverified", None
+        want = sid.lower()
+        for match in matches:
+            if str(match.get("sid") or "").lower() == want:
+                return "live", match
+        return "gone", None
+
+    def resolve_pick(self, doc_id: str, ref: Mapping[str, Any]) -> tuple[Mapping | None, str]:
+        """Engine selector for a chip sent before the GUI's own resolve landed: (reply, error)."""
+        body_id, topo_id = ref.get("body_id"), ref.get("topo_id")
+        kind = str(ref.get("kind") or "")
+        if not isinstance(body_id, int) or body_id < 1:
+            return None, ""
+        if kind in {"face", "edge", "vertex"} and not (isinstance(topo_id, int) and topo_id >= 1):
+            return None, ""
+        params: dict[str, Any] = {"doc_id": doc_id, "body_id": body_id, "kind": kind,
+                                  "topo_id": topo_id if isinstance(topo_id, int) else 0}
+        if isinstance(ref.get("revision"), int) and ref["revision"] >= 0:
+            params["revision"] = ref["revision"]
+        try:
+            reply = self._call("doc_resolve_pick", params)
+        except Exception as exc:  # noqa: BLE001 - a stale pick is reported, not raised
+            return None, str(exc)[:160]
+        if isinstance(reply, Mapping) and isinstance(reply.get("selector"), Mapping):
+            return reply, ""
+        message = reply.get("message") if isinstance(reply, Mapping) else None
+        return None, _ctx_str(message, 160) or "the pick no longer resolves"
+
+
+def _ctx_feature_label(resolver: _ContextRefResolver, doc_id: str, fid: str,
+                       fallback_name: str = "") -> str:
+    feature = resolver.feature(doc_id, fid) if doc_id else None
+    name = _ctx_str(feature.get("name"), 60) if feature else fallback_name
+    ftype = _ctx_str(feature.get("type"), 32) if feature else ""
+    text = fid
+    if name and name != fid:
+        text += f' "{name}"'
+    return text + (f" ({ftype})" if ftype else "")
+
+
+def _ctx_render_ref(index: int, ref: Mapping[str, Any], resolver: _ContextRefResolver,
+                    active_doc: str) -> str:
+    kind = _ctx_str(ref.get("kind"), 16).lower() or "ref"
+    # A chip always names its document; only a legacy payload without one means the active doc.
+    doc_id = _ctx_str(ref.get("doc_id"), 128) or ("" if ref.get("doc_path") else active_doc)
+    label = _ctx_str(ref.get("label"), 80)
+    ref_id = _ctx_str(ref.get("id"), 128)
+    selector = ref.get("selector") if isinstance(ref.get("selector"), Mapping) else None
+    owner = _ctx_str(ref.get("owner_feature") or (selector or {}).get("owner_feature"), 64)
+    component = _ctx_str(ref.get("component"), 64)
+    resolve_error = ""
+    if selector is None and doc_id and kind in {"face", "edge", "vertex", "body"}:
+        reply, resolve_error = resolver.resolve_pick(doc_id, ref)
+        if reply is not None:
+            selector = reply["selector"]
+            owner = owner or _ctx_str(selector.get("owner_feature") or reply.get("owner_feature"), 64)
+            component = component or _ctx_str(reply.get("component"), 64)
+    sid = _ctx_str(ref.get("sid") or (selector or {}).get("sid"), 16)
+    topology = kind in {"face", "edge", "vertex"}
+    handle = sid or ("(unresolved pick)" if topology else ref_id) or "(no id)"
+    doc_name = _ctx_str(ref.get("doc_name"), 60)
+    where = f"doc {doc_id}" + (f" ({doc_name})" if doc_name else "") if doc_id else "no document"
+    head = f"{index}. {kind.upper()} {handle}" + (f' "{label}"' if label else "") + f" — {where}"
+    lines = [head]
+    component_name = _ctx_str(ref.get("component_name"), 60)
+
+    if topology:
+        if component:
+            comp = resolver.component(doc_id, component) if doc_id else None
+            source = comp.get("source") if isinstance(comp, Mapping) else None
+            path = _ctx_str(source.get("path"), 160) if isinstance(source, Mapping) else ""
+            name = component_name or (_ctx_str(comp.get("name"), 60) if comp else "")
+            lines.append(
+                f"   in component {component}" + (f' "{name}"' if name else "")
+                + (f" (part file {path})" if path else "")
+                + " — geometry below is in the component's own part coordinates")
+            if owner:
+                lines.append(f"   owner: feature {owner} of that component's part")
+        elif owner:
+            lines.append("   owner: feature " + _ctx_feature_label(
+                resolver, doc_id, owner, _ctx_str(ref.get("owner_name"), 60)))
+        status = "as picked (not re-verified)"
+        if sid and doc_id and kind != "vertex" and not component \
+                and not resolver.is_assembly(doc_id):
+            state, live = resolver.live_selector(doc_id, kind, sid)
+            if state == "live" and live is not None:
+                selector, status = live, "verified against the live document"
+            elif state == "gone":
+                status = (f"NOT in the current geometry — the part changed since the pick; "
+                          f"values are as picked. describe_part(doc_id=\"{doc_id}\") lists "
+                          "the current sids")
+        if selector:
+            geometry = _ctx_geometry(selector)
+            if geometry:
+                lines.append(f"   geometry: {geometry}")
+        else:
+            status = ("unresolved pick" + (f" ({resolve_error})" if resolve_error else "")
+                      + " — ask the user to pick it again if it matters")
+        lines.append(f"   status: {status}")
+    elif kind in {"feature", "sketch"}:
+        feature = resolver.feature(doc_id, ref_id) if doc_id and ref_id else None
+        if feature is None:
+            lines.append("   not found in the document's feature tree (deleted or doc closed)")
+        else:
+            details = _ctx_feature_details(feature)
+            ftype = _ctx_str(feature.get("type"), 32)
+            lines.append(f"   {ftype}: {details}" if details else f"   {ftype}")
+    elif kind == "component":
+        comp = resolver.component(doc_id, ref_id) if doc_id and ref_id else None
+        if comp is None:
+            feature = resolver.feature(doc_id, ref_id) if doc_id and ref_id else None
+            if feature is not None:
+                lines.append(f"   imported body feature: {_ctx_feature_details(feature)}")
+            else:
+                lines.append("   not found in the assembly (removed or doc closed)")
+        else:
+            bits: list[str] = []
+            source = comp.get("source") if isinstance(comp.get("source"), Mapping) else {}
+            if source.get("path"):
+                bits.append(f"part file {_ctx_str(source.get('path'), 160)}")
+            transform = comp.get("transform")
+            if isinstance(transform, list) and len(transform) == 16:
+                at = _ctx_vec([transform[3], transform[7], transform[11]])
+                if at:
+                    bits.append(f"placed at {at}")
+            for flag in ("fixed", "suppressed", "hidden"):
+                if comp.get(flag) is True:
+                    bits.append(flag)
+            if bits:
+                lines.append("   " + "; ".join(bits))
+    elif kind == "body":
+        body_id = ref.get("body_id")
+        bits = [f"body ordinal {body_id}"] if isinstance(body_id, int) else []
+        if owner:
+            bits.append("created by feature " + _ctx_feature_label(resolver, doc_id, owner))
+        if component:
+            bits.append(f"component {component}" + (f' "{component_name}"' if component_name else ""))
+        if bits:
+            lines.append("   " + "; ".join(bits))
+    text = "\n".join(lines)
+    return text if len(text) <= _CONTEXT_REF_MAX_CHARS else text[: _CONTEXT_REF_MAX_CHARS - 1] + "…"
+
+
+_CONTEXT_TARGETING = (
+    "HOW TO TARGET PICKED ITEMS: to LOOK at one, render_part(doc_id=…, target=\"<sid or "
+    "feature id>\") gives a single framed close-up of it; render_part(doc_id=…, "
+    "highlight=\"<sid>\") shows it in the context of the whole part; inspect_feature(target=…) "
+    "is a 4-panel sheet — use it only if one close-up is ambiguous. A face/edge sid (F…/E…) "
+    "goes wherever a face/edge ref is accepted (e.g. add_features refs.faces:[\"<sid>\"]); "
+    "feature/sketch ids (f4) go to feature edit ops; component ids (k2) name assembly "
+    "components for asm_* tools and mates. Pass the listed doc_id when an item is not in the "
+    "active document. Sids change when geometry moves: if one no longer resolves, "
+    "describe_part(doc_id) lists the current roster."
+)
+
+
+def _picked_context_block(raw_refs: Any, active_doc: str,
+                          call: Callable[[str, dict], Any]) -> tuple[str, set[str]]:
+    """Render the composer's picked context refs, resolved against the engine; (text, sids)."""
+    refs = [ref for ref in raw_refs if isinstance(ref, Mapping)] \
+        if isinstance(raw_refs, list) else []
+    if not refs:
+        return "", set()
+    resolver = _ContextRefResolver(call)
+    shown = refs[:_CONTEXT_REFS_MAX]
+    lines = [
+        f"PICKED CONTEXT — the user attached {len(refs)} model item(s) to this message with the "
+        "context picker; \"this\", \"these\", \"that face\" and similar words refer to them."
+    ]
+    sids: set[str] = set()
+    used = len(lines[0])
+    for index, ref in enumerate(shown, start=1):
+        rendered = _ctx_render_ref(index, ref, resolver, active_doc)
+        selector = ref.get("selector") if isinstance(ref.get("selector"), Mapping) else {}
+        sid = _bounded_text(ref.get("sid") or selector.get("sid"), 16)
+        if sid:
+            sids.add(sid.lower())
+        if used + len(rendered) + 1 > _CONTEXT_BLOCK_MAX_CHARS:
+            lines.append(f"(+{len(refs) - index + 1} more picked item(s) not shown)")
+            break
+        lines.append(rendered)
+        used += len(rendered) + 1
+    else:
+        if len(refs) > len(shown):
+            lines.append(f"(+{len(refs) - len(shown)} more picked item(s) not shown)")
+    lines.append(_CONTEXT_TARGETING)
+    return "\n".join(lines), sids
+
+
+def _editor_context_block(raw_params: Mapping[str, Any], *,
+                          engine_call: Callable[[str, dict], Any] | None = None) -> str:
+    """Render the GUI's live editor context (active doc + selection + picked refs).
 
     Copilot's "current file": the composer sends ``scope`` on every turn while a
     document is open — ``{doc_id, feature_ids, selection}`` — and the model must
     be TOLD it, not left to discover it, or a "make this 5 mm thicker" lands on
-    nothing. ``doc_id`` alone (no scope) still names the document. Bounded so a
+    nothing. ``doc_id`` alone (no scope) still names the document. ``context_refs``
+    are the chips the user attached with the composer's context picker: each is
+    resolved against the engine (feature params, sketch contents, live face/edge
+    geometry) so the model gets a usable description, not just an id. Bounded so a
     thousand-face box-select cannot flood the prompt. Empty string when there is
-    no document.
+    neither a document nor a picked item.
     """
     scope = raw_params.get("scope")
     scope = scope if isinstance(scope, Mapping) else {}
     doc_id = _bounded_text(scope.get("doc_id"), 256) or _bounded_text(
         raw_params.get("doc_id"), 256
-    )
+    ) or ""
+    picked, picked_sids = _picked_context_block(
+        raw_params.get("context_refs"), doc_id, engine_call or _editor_engine_call)
     if not doc_id:
-        return ""
+        return picked
     lines = [
         "ACTIVE DOCUMENT (what the user is looking at)",
         f"- doc_id: {doc_id} — CAD tools that take doc_id default to this document.",
@@ -2717,7 +3171,12 @@ def _editor_context_block(raw_params: Mapping[str, Any]) -> str:
     raw_selection = scope.get("selection")
     selectors: list[str] = []
     for item in raw_selection if isinstance(raw_selection, list) else ():
-        if isinstance(item, str):
+        if isinstance(item, Mapping) and item.get("kind") in {"face", "edge"}:
+            sid = _bounded_text(item.get("sid"), 16)
+            if sid and sid.lower() in picked_sids:
+                continue  # already described under PICKED CONTEXT
+            text = f"{sid or item.get('kind')}: {_ctx_geometry(item)}"
+        elif isinstance(item, str):
             text = item.strip()
         else:
             try:
@@ -2739,9 +3198,9 @@ def _editor_context_block(raw_params: Mapping[str, Any]) -> str:
                 else ""
             )
         )
-    if not features and not selectors:
+    if not features and not selectors and not picked:
         lines.append("- nothing selected")
-    return "\n".join(lines)
+    return "\n".join(lines) + (f"\n\n{picked}" if picked else "")
 
 
 def _terminal_text(host_result: Mapping[str, Any]) -> str:
@@ -2906,9 +3365,10 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         "" if resumed_session or history_already_seeded
         else _bounded_history_seed(raw_params.get("history"))
     )
-    preflight_prompt = compose_request_text(
-        request, migration_candidate, _editor_context_block(raw_params)
-    )
+    # Rendered once: resolving picked context reads the engine, and the preflight estimate
+    # must price exactly the text that is sent.
+    editor_block = _editor_context_block(raw_params)
+    preflight_prompt = compose_request_text(request, migration_candidate, editor_block)
     try:
         configured_max_tokens = max(0, int(cfg.get("max_output_tokens") or 0))
     except (TypeError, ValueError):
@@ -2993,12 +3453,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             f"agent_admin_turn: prompt assembly failed: {type(exc).__name__}: {exc}"
         )
 
-    raw_categories = raw_params.get("categories")
-    categories = [
-        str(value)
-        for value in (raw_categories if isinstance(raw_categories, list) else ())
-        if isinstance(value, str) and value.strip()
-    ]
+    categories = _turn_tool_categories(session_id, raw_params.get("categories"))
     tool_context: dict[str, Any] = {
         "role_card": card,
         "allowed_tools": allowed_tools,
@@ -3048,7 +3503,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         raw_params.get("history"),
         resumed=resumed_session,
     )
-    prompt = compose_request_text(request, migration, _editor_context_block(raw_params))
+    prompt = compose_request_text(request, migration, editor_block)
     host_params: dict[str, Any] = {
         "request": prompt,
         "run_id": run_id,
@@ -3233,6 +3688,8 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         }
     finally:
         finalization_errors: list[str] = []
+        # Even a failed turn's loads are in the session history the next turn resumes.
+        _remember_session_tool_loads(session_id, tool_context.get("categories"))
         try:
             usage = token_usage.get_turn_usage()
         except Exception as exc:  # noqa: BLE001

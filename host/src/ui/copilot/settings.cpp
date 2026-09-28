@@ -482,7 +482,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         else if (s.provider == ui::PROV_ANTHROPIC)
             std::strncpy(s.model, "claude-opus-4-8", sizeof(s.model) - 1);
         else if (s.provider == ui::PROV_OPENAI)
-            std::strncpy(s.model, "gpt-5.6-sol", sizeof(s.model) - 1);
+            std::strncpy(s.model, "gpt-6-sol", sizeof(s.model) - 1);
         else if (s.provider == ui::PROV_LOCAL) {
             std::strncpy(s.baseUrl, "http://localhost:1234/v1", sizeof(s.baseUrl) - 1);
             if (std::strstr(s.model, ".gguf") || std::strstr(s.model, "gemini") ||

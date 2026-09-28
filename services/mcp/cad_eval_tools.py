@@ -229,9 +229,49 @@ def _query_model_state(doc_id: str) -> dict:
     }
 
 
+def _doc_body_count(doc_id: str) -> int:
+    """Solids in the document, from doc_query's per-match body ordinal (1 if unstamped)."""
+    faces = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}}) or {}
+             ).get("matches") or []
+    return max((int(m["body"]) for m in faces
+                if isinstance(m, dict) and m.get("body") is not None), default=1)
+
+
+def _eval_thickness_all_bodies(doc_id: str) -> tuple[dict, list]:
+    """(merged eval_thickness reply, [(body ordinal, field handle), ...]).
+
+    eval_thickness measures ONE body — the last, unless `body` names one — so on a
+    part with a second solid every other body went unmeasured and the "thinnest wall"
+    could be anything but. A single-body part keeps the engine's reply byte-for-byte.
+    """
+    count = _doc_body_count(doc_id)
+    if count <= 1:
+        res = cb.call("eval_thickness", {"doc_id": doc_id})
+        handle = res.get("aicm_path")
+        return res, ([(1, str(handle))] if handle else [])
+    per = [(b, cb.call("eval_thickness", {"doc_id": doc_id, "body": b}))
+           for b in range(1, count + 1)]
+    measured = [(b, r) for b, r in per if r.get("min_thickness_mm") is not None]
+    n_total = sum(int(r.get("n_sampled") or 0) for _, r in per)
+    thinnest = min(measured, key=lambda br: br[1]["min_thickness_mm"], default=per[-1])[1]
+    weighted = sum(float(r.get("mean_thickness_mm") or 0) * int(r.get("n_sampled") or 0)
+                   for _, r in measured)
+    n_measured = sum(int(r.get("n_sampled") or 0) for _, r in measured)
+    merged = {
+        "aicm_path": thinnest.get("aicm_path"),
+        "max_thickness_mm": max((r["max_thickness_mm"] for _, r in measured
+                                 if r.get("max_thickness_mm") is not None), default=None),
+        "mean_thickness_mm": (weighted / n_measured) if n_measured else None,
+        "min_thickness_mm": thinnest.get("min_thickness_mm") if measured else None,
+        "n_sampled": n_total,
+        "bodies": [{"body": b, "min_thickness_mm": r.get("min_thickness_mm")} for b, r in per],
+    }
+    return merged, [(b, str(r["aicm_path"])) for b, r in measured if r.get("aicm_path")]
+
+
 def _wall_thickness_result(doc_id: str) -> dict:
     """Build the canonical whole-part wall-thickness response for every route."""
-    res = cb.call("eval_thickness", {"doc_id": doc_id})
+    res, fields = _eval_thickness_all_bodies(doc_id)
     mn = res.get("min_thickness_mm")
     if mn is not None:
         mean = res.get("mean_thickness_mm")
@@ -245,7 +285,87 @@ def _wall_thickness_result(doc_id: str) -> dict:
                    "is meant to be hollow, shell it first (add_features with a shell op) "
                    "so there ARE two walls to measure between.")
     # Keep this insertion order identical to the long-standing wall_thickness response.
-    return {"ok": True, "doc_id": doc_id, "summary": summary, **res}
+    out = {"ok": True, "doc_id": doc_id, "summary": summary, **res}
+    if mn is not None and fields:
+        try:
+            out["thinnest"] = _thinnest_wall_faces(doc_id, fields)
+        except Exception as exc:  # noqa: BLE001 — the measurement itself still stands
+            out["thinnest_unavailable"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+_THINNEST_FACES = 3
+
+
+def _thinnest_wall_faces(doc_id: str, fields: list) -> list:
+    """WHERE the thinnest walls are: the lowest-thickness faces, each with its thinnest sample.
+
+    eval_thickness samples the tessellation vertices and writes the per-vertex thickness
+    into its colour-map field. A bare minimum sent agents bisecting the tree by suppressing
+    features one at a time to find the face that owned it (c219: three sub-agents, ~25
+    add_features + wall_thickness round trips). Each field holds one body (always labelled
+    1 inside the field); `fields` pairs it with the document's body ordinal. Its FACE ids are
+    that body's TopExp index — the `topo` of doc_query and the second half of every owner_map
+    pair — so each spot is named by face sid and by the feature whose rebuild produced that
+    face. That is the raw owner_map join, not describe_part's de-smeared one: the de-smear
+    costs seconds per call on a 90-face part, and "the feature that last rebuilt this
+    face" is the one to edit.
+    """
+    import numpy as np
+
+    from .cad_common import _aicm_payload
+    from services.sim.tessellate import read_aicm
+
+    candidates = []
+    for body_no, handle in fields:
+        field = read_aicm(_aicm_payload(handle))
+        bodies = field.get("bodies") or []
+        for scalar in field.get("scalars") or []:
+            body = next((b for b in bodies if b["body_id"] == scalar.get("body_id")), None)
+            values = np.asarray(scalar.get("values"), dtype=float)
+            if body is None or len(values) != body["n_verts"]:
+                continue
+            tri_face = np.zeros(body["n_tris"], dtype=np.int64)
+            for face in body["faces"]:
+                tri_face[face["first_tri"]:face["first_tri"] + face["tri_count"]] = \
+                    face["face_id"]
+            vert_face = np.zeros(body["n_verts"], dtype=np.int64)
+            vert_face[body["idx"].reshape(-1)] = np.repeat(tri_face, 3)
+            order = np.argsort(values)
+            order = order[np.isfinite(values[order])]
+            # First occurrence of each face in ascending-thickness order = its minimum.
+            _, first = np.unique(vert_face[order], return_index=True)
+            for vi in order[np.sort(first)][:_THINNEST_FACES]:
+                candidates.append((float(values[vi]), int(body_no), int(vert_face[vi]),
+                                   [round(float(c), 3) for c in body["pos"][vi]]))
+    ranked = sorted(candidates)[:_THINNEST_FACES]
+    if not ranked:
+        return []
+
+    # The thickness field's (body_id, face_id) is the same (body ordinal, per-body TopExp
+    # index) key owner_map pairs and doc_query's body/topo stamps use, so every body joins.
+    feats, owner_map = _target_feature_roster(doc_id)
+    names = {str(f.get("id")): f.get("name") for f in feats}
+    faces = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}}) or {}
+             ).get("matches") or []
+    by_key = {(int(m["body"]), int(m["topo"])): m for m in faces
+              if isinstance(m, dict) and m.get("body") is not None
+              and m.get("topo") is not None}
+    built_by = {(int(pair[0]), int(pair[1])): str(fid) for fid, om in owner_map.items()
+                for pair in (om.get("faces") or [])
+                if isinstance(pair, list) and len(pair) == 2}
+    spots = []
+    for thickness, body_id, face_id, point in ranked:
+        spot = {"thickness_mm": round(thickness, 4), "at": point, "body": body_id}
+        match = by_key.get((body_id, face_id))
+        if match is not None:
+            spot["face"] = match.get("sid")
+            spot["surf"] = match.get("surf")
+        owner = built_by.get((body_id, face_id))
+        if owner:
+            spot["built_by"] = {"id": owner, "name": names.get(owner)}
+        spots.append(spot)
+    return spots
 
 
 def _add_box_call(doc_id: str) -> str:
@@ -1780,10 +1900,17 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         machined, or 3D-printed, and where it's likely to be weak or warp.
 
         Returns {ok, min_thickness_mm, mean_thickness_mm, max_thickness_mm, n_sampled,
-        aicm_path, summary}:
+        aicm_path, summary, thinnest}:
           * min_thickness_mm — the thinnest wall found (the key value). null if no sample got a
             through-wall hit (e.g. an open sheet body with no opposite wall).
           * mean/max — the average and thickest sampled wall.
+          * thinnest — WHERE: the (up to) 3 faces holding the thinnest samples, thinnest first,
+            each {thickness_mm, at:[x,y,z], body, face:<sid>, surf, built_by:{id,name}} —
+            built_by is the feature whose rebuild produced that face (a cut is credited with
+            the faces it pierced). Go straight there (inspect_section at `at`,
+            query_geometry on the sid) instead of suppressing features to find it. Samples
+            sit on tessellation vertices (face corners and edges), so confirm a surprising
+            reading with a section at `at` before redesigning.
           * aicm_path — a temp field file for the in-app thickness colour-map viewer.
         Compare min_thickness_mm against your process minimum (e.g. ~1 mm injection wall,
         ~0.8 mm FDM) to flag thin spots before manufacturing.

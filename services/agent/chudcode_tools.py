@@ -143,12 +143,75 @@ def host_tool_result(result: Any) -> dict[str, Any]:
     raw JSON object, so this is the single place the envelope is applied: the model
     reads the JSON as text and ``details`` keeps the structured result for the event
     mapper.
+
+    The text is the one copy the model pays for, on every later request of the
+    conversation, so JSON goes out in :func:`model_json` form. Most MCP tools hand
+    back ``json.dumps(..., indent=2)`` strings; those are re-rendered the same way.
     """
     if isinstance(result, str):
-        return {"content": [{"type": "text", "text": result}]}
+        return {"content": [{"type": "text", "text": _compact_json_text(result)}]}
     safe = _json_safe(result)
-    text = json.dumps(safe, ensure_ascii=False, indent=2, default=str)
+    text = model_json(safe)
     return {"content": [{"type": "text", "text": text}], "details": safe}
+
+
+#: A JSON container that fits on one line this wide stays on one line.
+_MODEL_JSON_WIDTH = 100
+
+
+def model_json(value: Any) -> str:
+    """Render JSON for a model: containers that fit ``_MODEL_JSON_WIDTH`` stay inline.
+
+    ``indent=2`` spends a line (and its indent) on every scalar, so a feature tree's
+    ``[[1, 41], [1, 43], …]`` topology pairs ran to 4,000 lines and the 65 KB
+    ``get_part`` result spilled to an artifact the model then had to page (c219).
+    Fully compact JSON would be one giant line, and Chudcode's head/tail elision keeps
+    lines, so a spilled one-line result loses its head. This form is valid JSON, keeps
+    one line per record, and on the c219 results is 0.4–0.8x the ``indent=2`` size.
+    """
+    return _model_json_node(value, 0)[1]
+
+
+def _model_json_node(value: Any, depth: int) -> tuple[str, str]:
+    """(one-line form, rendered form) of ``value`` nested ``depth`` levels deep."""
+    if isinstance(value, Mapping) and value:
+        items = [
+            (json.dumps(str(key), ensure_ascii=False), _model_json_node(item, depth + 1))
+            for key, item in value.items()
+        ]
+        inline = "{" + ",".join(f"{key}:{node[0]}" for key, node in items) + "}"
+        if depth + len(inline) <= _MODEL_JSON_WIDTH:
+            return inline, inline
+        pad = " " * (depth + 1)
+        body = ",\n".join(f"{pad}{key}:{node[1]}" for key, node in items)
+        return inline, "{\n" + body + "\n" + " " * depth + "}"
+    if isinstance(value, (list, tuple)) and value:
+        nodes = [_model_json_node(item, depth + 1) for item in value]
+        inline = "[" + ",".join(node[0] for node in nodes) + "]"
+        if depth + len(inline) <= _MODEL_JSON_WIDTH:
+            return inline, inline
+        pad = " " * (depth + 1)
+        body = ",\n".join(pad + node[1] for node in nodes)
+        return inline, "[\n" + body + "\n" + " " * depth + "]"
+    scalar = json.dumps(value, ensure_ascii=False, default=str)
+    return scalar, scalar
+
+
+def _compact_json_text(text: str) -> str:
+    """Re-render a tool's JSON text (plus any trailing prose notes) in model form.
+
+    Text that is not a JSON object/array, or that would not get shorter, is returned
+    unchanged — this is a size optimisation, never a content change.
+    """
+    stripped = text.lstrip()
+    if not stripped.startswith(("{", "[")):
+        return text
+    try:
+        value, end = json.JSONDecoder().raw_decode(stripped)
+    except ValueError:
+        return text
+    rendered = model_json(value) + stripped[end:]
+    return rendered if len(rendered) < len(text) else text
 
 
 def _with_skill_injection(

@@ -46,6 +46,7 @@
 #include "drawing_panel.h"  // DRAWINGS: 2D sheet renderer for a Drawing tab
 #include "doc_tabs.h"
 #include "feature_tree.h"  // openComponentPart + featureTreeActivePath (assembly component ctx)
+#include "copilot/context_chips.h"  // ui::addContextRef — context-cube picks → chat chips
 #include "file_dialog.h"   // revealInFileManager (assembly component ctx "Open Part Location")
 #include "layout.h"        // ui::overlayColumnEdge — HUD dodges the pinned glass columns
 
@@ -1806,19 +1807,6 @@ static std::string resolveVpComponentPath(const std::string& srcPath,
 }
 
 // ---- Wave4: chat context-ref capture (composer "context cube") ----------------------------
-// Toggle by id: re-picking the same entity removes it. Labels stay short for chip display.
-static void togglePendingContextRef(AppState& st, AppState::ContextRef ref) {
-    if (ref.id.empty()) return;
-    auto& refs = st.pendingContextRefs;
-    for (auto it = refs.begin(); it != refs.end(); ++it) {
-        if (it->id == ref.id) {
-            refs.erase(it);
-            return;
-        }
-    }
-    refs.push_back(std::move(ref));
-}
-
 // Human feature name from the mirror tree (fallback to fid).
 static std::string contextFeatureName(AppState& st, const std::string& fid) {
     if (fid.empty()) return {};
@@ -1828,74 +1816,51 @@ static std::string contextFeatureName(AppState& st, const std::string& fid) {
     return n.empty() ? fid : n;
 }
 
-// Build a ContextRef from a viewport pick. Face/edge ids prefer the resolved selector string
-// when the worker is ready; otherwise a stable body:topo key the agent can re-resolve.
-static bool makeContextRefFromPick(AppState& st, const render::PickHit& h,
-                                   AppState::ContextRef& out) {
-    if (!h.valid()) return false;
-    out = AppState::ContextRef{};
-    out.docId = st.docMirror.docId();
-
-    // Assembly: prefer component when the pick lands on a component body (still face/edge if
-    // those kinds win — the chip names the component for context).
-    const nlohmann::json* comp = nullptr;
-    std::string compName;
+// Attach a viewport pick (face / edge / vertex) as a chat context chip. The chip appears at once
+// with its local owner/component names; ui::addContextRef then resolves it asynchronously on
+// st.rpc (doc_resolve_pick) into the engine selector + stable sid the model can target — never a
+// synchronous worker call on the GL thread, and never skipped while a turn is running.
+static void addPickContextRef(AppState& st, const render::PickHit& h) {
+    if (!h.valid()) return;
+    core::ContextRef ref;
+    ref.kind = h.kind == render::PickKind::Face ? "face"
+             : h.kind == render::PickKind::Edge ? "edge"
+                                                : "vertex";
+    ref.bodyId = h.body_id;
+    ref.topoId = h.topo_id;
+    ref.revision = st.docMirror.revision();
+    ref.id = ref.kind + ":" + std::to_string(h.body_id) + ":" + std::to_string(h.topo_id);
+    std::string word = ref.kind;
+    word[0] = (char)std::toupper((unsigned char)word[0]);
     if (docIsAssembly(st)) {
-        comp = asmComponentByOrdinal(st, h.body_id);
-        if (comp) {
-            out.kind = "component";  // overwritten below for face/edge
-            out.id = comp->value("id", std::string());
-            compName = comp->value("name", std::string());
-            if (compName.empty()) compName = out.id;
-            out.label = compName;
+        if (const nlohmann::json* comp = asmComponentByOrdinal(st, h.body_id)) {
+            ref.component = comp->value("id", std::string());
+            ref.componentName = comp->value("name", std::string());
+        }
+        const std::string of = ref.componentName.empty() ? ref.component : ref.componentName;
+        ref.label = of.empty() ? word : word + " of " + of;
+    } else {
+        ref.owner = h.kind == render::PickKind::Face ? st.docMirror.ownerOfFace(h.body_id, h.topo_id)
+                  : h.kind == render::PickKind::Edge ? st.docMirror.ownerOfEdge(h.body_id, h.topo_id)
+                                                     : std::string();
+        ref.ownerName = contextFeatureName(st, ref.owner);
+        if (!ref.ownerName.empty()) ref.label = word + " of " + ref.ownerName;
+        else {
+            ref.label = st.pickLabel(h);
+            if (ref.label.empty()) ref.label = word;
         }
     }
+    ui::addContextRef(st, std::move(ref));
+}
 
-    if (h.kind == render::PickKind::Face || h.kind == render::PickKind::Edge) {
-        const bool isFace = h.kind == render::PickKind::Face;
-        out.kind = isFace ? "face" : "edge";
-        std::string sel;
-        if (st.workerStarted && st.docMirror.hasDoc() && !st.anyRunActive()) {
-            std::string err;
-            const char* k = isFace ? "face" : "edge";
-            if (docIsAssembly(st)) {
-                std::string cname;
-                sel = st.docMirror.resolvePickAsm(st.worker, h.body_id, k, h.topo_id, cname, err);
-                if (!cname.empty() && compName.empty()) compName = cname;
-            } else {
-                sel = st.docMirror.resolvePick(st.worker, h.body_id, k, h.topo_id, err);
-            }
-        }
-        if (!sel.empty()) {
-            out.id = std::move(sel);
-        } else {
-            // Stable local key until/without resolve.
-            out.id = (isFace ? "face:" : "edge:") + std::to_string(h.body_id) + ":" +
-                     std::to_string(h.topo_id);
-        }
-        std::string owner = isFace
-            ? st.docMirror.ownerOfFace(h.body_id, h.topo_id)
-            : st.docMirror.ownerOfEdge(h.body_id, h.topo_id);
-        std::string ownerName = contextFeatureName(st, owner);
-        if (!compName.empty()) {
-            out.label = isFace ? ("Face of " + compName) : ("Edge of " + compName);
-        } else if (!ownerName.empty()) {
-            out.label = isFace ? ("Face of " + ownerName) : ("Edge of " + ownerName);
-        } else {
-            out.label = st.pickLabel(h);
-            if (out.label.empty()) out.label = isFace ? "Face" : "Edge";
-        }
-        return true;
-    }
-
-    // Body-level (or assembly component with non face/edge pick): component already filled above.
-    if (comp && !out.id.empty()) return true;
-
-    // Part multi-body: treat as body.
-    out.kind = "body";
-    out.id = "b" + std::to_string(h.body_id);
-    out.label = "Body" + std::to_string(h.body_id);
-    return !out.id.empty();
+static void addComponentContextRef(AppState& st, const std::string& cid,
+                                   const std::string& cname) {
+    core::ContextRef ref;
+    ref.kind = "component";
+    ref.id = cid;
+    ref.label = cname.empty() ? cid : cname;
+    ref.componentName = cname;
+    ui::addContextRef(st, std::move(ref));
 }
 
 
@@ -3991,11 +3956,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 !blendDeselectHot && !s_pp.active && !s_dim.active && s_sectionDragIdx < 0) {
                 // Wave4 context cube: arm → append/toggle pendingContextRefs (chips via composer).
                 // Still update normal selection so the face/edge highlight stays readable.
-                if (st.contextPickActive && st.hover.valid()) {
-                    AppState::ContextRef ref;
-                    if (makeContextRefFromPick(st, st.hover, ref))
-                        togglePendingContextRef(st, std::move(ref));
-                }
+                if (st.contextPickActive && st.hover.valid()) addPickContextRef(st, st.hover);
                 if (io.KeyCtrl) {
                     if (st.hover.valid()) st.selection.toggle(st.hover);
                 } else if (st.hover.valid()) {
@@ -4169,14 +4130,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (!pathOk) ImGui::EndDisabled();
                 if (ImGui::MenuItem("Edit Mates"))
                     st.requestEditComponentMates = vpCompId;
-                if (ImGui::MenuItem("Add to AI context")) {
-                    AppState::ContextRef ref;
-                    ref.kind = "component";
-                    ref.id = vpCompId;
-                    ref.docId = st.docMirror.docId();
-                    ref.label = vpCompName.empty() ? vpCompId : vpCompName;
-                    togglePendingContextRef(st, std::move(ref));
-                }
+                if (ImGui::MenuItem("Add to AI context")) addComponentContextRef(st, vpCompId, vpCompName);
+                if (vpHasTopoSel && (vpHasFace || vpHasEdge) &&
+                    ImGui::MenuItem(vpHasFace ? "Add Face to AI context" : "Add Edge to AI context"))
+                    addPickContextRef(st, st.selection.items().back().hit);
                 if (ImGui::MenuItem(vpCompHidden ? "Show Component" : "Hide Component")) {
                     if (st.docMirror.hasDoc() && st.workerStarted) {
                         nlohmann::json op = {{"op", "asm_edit_component"},
@@ -4216,12 +4173,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
 
                 // Wave4: push current topo selection into chat context chips (no pick mode needed).
-                if (ImGui::MenuItem("Add to AI context")) {
-                    const render::PickHit& hit = st.selection.items().back().hit;
-                    AppState::ContextRef ref;
-                    if (makeContextRefFromPick(st, hit, ref))
-                        togglePendingContextRef(st, std::move(ref));
-                }
+                if (ImGui::MenuItem("Add to AI context"))
+                    addPickContextRef(st, st.selection.items().back().hit);
 
                 // Hide / Show / Isolate body (host-side bodyVisible, same as FM Solid Bodies).
                 if (vpHasBody) {

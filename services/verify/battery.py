@@ -613,6 +613,8 @@ CHECKS: dict[str, tuple[str, str, str, str, str]] = {
     "cam_simulate":              ("cam",  "cam_simulate",              "seconds",   "any",   "scalar"),
     # --- gap verifiers (implemented directly in this module)
     "is_manifold":               ("gap",  "is_manifold",               "subsecond", "any",   "binary"),
+    # Floating / overhanging / edge-touching additive features (engine eval_feature_attachment).
+    "feature_attachment":        ("gap",  "feature_attachment",        "subsecond", "any",   "findings"),
     "round_trip":                ("gap",  "round_trip",                "seconds",   "any",   "scalar"),
     "groundedness":              ("gap",  "groundedness",              "subsecond", "any",   "scalar"),
     "unit_sanity":               ("gap",  "unit_sanity",               "subsecond", "any",   "findings"),
@@ -632,6 +634,9 @@ CHECK_ALIASES: dict[str, str] = {
     "watertight": "is_manifold",
     "manifold": "is_manifold",
     "solid_health": "eval_check",
+    "attachment": "feature_attachment",
+    "floating_features": "feature_attachment",
+    "overhang": "feature_attachment",
 }
 
 # ---------------------------------------------------------------------------
@@ -745,6 +750,58 @@ def _gap_eval_check_direct(doc_id: str = None, **_) -> str:
         return json.dumps({"ok": ok, "doc_id": d, **r})
     except CoreError as e:
         return json.dumps({"ok": False, "error": str(e)})
+
+
+def _closeup_view_for(entry: dict, center) -> dict:
+    """The camera that shows an attachment defect: from outside the part toward the problem
+    location, LOW for an overhang (the unbacked underside is the evidence), level for a
+    floating body (the gap under it), slightly above for an edge contact. Returned in
+    render_part's {"azimuth", "elevation"} vocabulary (az 0 = front -Y, 90 = right +X)."""
+    loc = entry.get("location") or center
+    dx, dy = float(loc[0]) - float(center[0]), float(loc[1]) - float(center[1])
+    if math.hypot(dx, dy) < 1e-6:
+        dx, dy = 0.0, -1.0
+    elevation = {"overhang": -25, "floating": 5}.get(entry.get("verdict"), 20)
+    return {"azimuth": round(math.degrees(math.atan2(dx, -dy))), "elevation": elevation}
+
+
+def _gap_feature_attachment(doc_id: str = None, **_) -> str:
+    """Check: every additive feature is SEATED on the part — none floating as its own solid,
+    overhanging its supporting face, or touching only along an edge (engine
+    eval_feature_attachment). Each failure names the feature, where it is, and the close-up
+    render_part call that shows it."""
+    from services.mcp import core_bridge as cb
+    from services.mcp.core_bridge import CoreError
+    d = doc_id or _cur_doc()
+    if _is_drawing_doc(d):
+        return _skip_json("feature_attachment", "drawing document — nothing to attach")
+    try:
+        r = cb.call("eval_feature_attachment", {"doc_id": d})
+    except CoreError as e:
+        return json.dumps({"ok": False, "error": str(e)})
+    if r.get("skipped"):
+        return _skip_json("feature_attachment", r.get("skip_reason") or "skipped")
+    try:
+        bb = cb.call("doc_bbox", {"doc_id": d}) or {}
+        center = bb.get("center") or [0.0, 0.0, 0.0]
+    except CoreError:
+        center = [0.0, 0.0, 0.0]
+    findings = []
+    for e in r.get("features") or []:
+        view = _closeup_view_for(e, center)
+        findings.append({
+            "severity": "fail",
+            "feature_id": e.get("feature_id"),
+            "verdict": e.get("verdict"),
+            "location": e.get("location"),
+            "detail": e.get("detail"),
+            "fix": (f'look: render_part(doc_id="{d}", target="{e.get("feature_id")}", '
+                    f"view={json.dumps(view)}); then move its sketch/start plane onto the "
+                    "supporting face or trim its profile inside the support"),
+        })
+    return json.dumps({"ok": not findings, "summary": r.get("summary"),
+                       "solid_count": r.get("solid_count"), "flagged": r.get("flagged"),
+                       "independent": r.get("independent"), "findings": findings})
 
 
 def _gap_round_trip(doc_id: str = None, threshold: float = 99.0, **_) -> str:
@@ -1112,6 +1169,7 @@ def _gap_power_budget(doc_id: str = None, power_source: dict = None,
 GAP_FNS: dict[str, Any] = {
     "interface_check":   _gap_interface_check,
     "is_manifold":       _gap_is_manifold,
+    "feature_attachment": _gap_feature_attachment,
     "round_trip":        _gap_round_trip,
     "groundedness":      _gap_groundedness,
     "unit_sanity":       _gap_unit_sanity,

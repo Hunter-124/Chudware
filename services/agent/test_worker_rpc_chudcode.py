@@ -25,6 +25,9 @@ class _Binding:
     def __init__(self, name: str):
         self.name = name
 
+    def to_host_tool(self, factory):
+        return self.name
+
 
 class _FakeHost:
     def __init__(self):
@@ -355,6 +358,8 @@ def online_lane(monkeypatch, tmp_path):
     monkeypatch.setattr(worker_rpc, "get_default_chudcode_host", lambda: host)
     with worker_rpc._HISTORY_SEED_LOCK:
         worker_rpc._HISTORY_SEEDED_SESSIONS.clear()
+    with worker_rpc._SESSION_TOOL_LOADS_LOCK:
+        worker_rpc._SESSION_TOOL_LOADS.clear()
 
     card = SimpleNamespace(
         id="general_agent",
@@ -463,6 +468,46 @@ def test_failed_followup_does_not_reseed_successful_session(online_lane):
     assert failed["ok"] is False
     assert retry["ok"] is True
     assert online_lane.host.turns[2]["request"] == "Do the work"
+
+
+def test_tools_loaded_in_one_turn_stay_loaded_for_the_next_turn_of_that_session(
+    online_lane,
+):
+    """c219: turn 1 loaded inspect_section/render_animation with enable_tools; turn 3
+    rebuilt the tool set from the GUI's request alone, so the model's calls hit
+    "No such tool: xd://inspect_section". A load belongs to the conversation."""
+    real_run_turn = online_lane.host.run_turn
+
+    class Client:
+        def set_custom_tools(self, tools):
+            pass
+
+    def run_turn_loading(params, emit):
+        params["register_callbacks"](Client())
+        online_lane.tool_contexts[-1]["enable_categories"](["inspect_section"])
+        return real_run_turn(params, emit)
+
+    online_lane.host.mode = "error"  # a turn that dies after the load still loaded it
+    online_lane.host.run_turn = run_turn_loading
+    first = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="run-load"), lambda _event: None
+    )
+    online_lane.host.mode = "success"
+    online_lane.host.run_turn = real_run_turn
+    followup = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id="run-next", categories=["analysis"]),
+        lambda _event: None,
+    )
+    other = worker_rpc._agent_admin_turn(
+        {**_params(online_lane, run_id="run-other"), "session_id": "conversation-2"},
+        lambda _event: None,
+    )
+
+    turn_contexts = list({id(ctx): ctx for ctx in online_lane.tool_contexts}.values())
+    assert first["ok"] is False
+    assert followup["ok"] is True
+    assert turn_contexts[1]["categories"] == ["analysis", "inspect_section"]
+    assert turn_contexts[2]["categories"] == []
 
 
 def test_cancelled_first_turn_retries_legacy_history_seed(online_lane):

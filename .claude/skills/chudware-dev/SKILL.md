@@ -134,6 +134,12 @@ judgment).
   existing body must record its history (`geom::op_history_record`, or index provenance via
   `op_provenance_encode`/`_record` across `isolate_shape_build`'s `sidecar`) — otherwise the
   owner map hands every rebuilt face to that feature (`core/geom/op_history.h`).
+- **Agent visual review is numbers first, then one perspective close-up (2026-09-27).**
+  `render_part(target=…)` is a 512×384 true-perspective shot (`cad_render_tools._closeup`,
+  `cad_viewpoint.perspective_camera`); with no `view` it aims at an attachment defect found by
+  engine `eval_feature_attachment` (floating / overhang / edge-only contact), which also feeds
+  `verify_battery` `feature_attachment` and `add_features` `attachment_warnings`. Don't draw
+  labels on the target or re-add "render after every mutation" guidance.
 
 ### Manufacturing rules that bind every change
 

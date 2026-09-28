@@ -5021,3 +5021,60 @@ smoke, and source/GUI lint passed. The full gate compiled core/GUI/WASM, passed
 ctest, hostd and web parity, and passed `services/agent` (3436 tests); it recorded
 seven failures in `services/mcp/test_face_attribution.py` (face-owner geometry, outside
 this change) and timed out in the sensor-node demo. Neither failure was silenced.
+
+## 2026-09-27 — GPT-6 discovery, c219 trace fixes, perspective close-ups, context picker
+
+**GPT-6 Sol.** The Codex `/models` list is gated by `client_version`; Chudcode pinned
+`0.144.1`, which the backend answers without the GPT-6 family (probed live: 0.144.1 → no
+`gpt-6-*`; 0.156.0/0.157.1 → `gpt-6-astra|sol|luna`). Chudcode `a5ccf5afc9` bumps
+`CODEX_CLIENT_VERSION` to 0.157.1; `~/.local/bin/chud` rebuilt (previous binary kept as
+`chud.2026-09-27.bak`), and a live `openai-codex/gpt-6-sol` turn answered. CAD side:
+`ChudcodeSessionHost.refresh_catalog_if_stale` also re-discovers when the resolved binary's
+stat identity changes (`_binary_identity`), so an upgraded `chud` is picked up before the
+2-hour TTL; static rows/defaults/rankings now name `gpt-6-sol`. The release lock still pins
+v0.3.0 artifacts — a packaged build needs a new Chudcode release.
+
+**c219 trace (6-axis, $64.64).** (1) 8 sub-agents and the main turn died on
+`403 oauth_not_allowed_for_organization` from a second Anthropic account that was only ever
+blocked 60 s while the first was genuinely exhausted; Chudcode `0ad857087f` disables such a
+credential (verbatim `disabled_cause`), ignores already-reset exhausted usage windows served
+from cache, surfaces the retained credential's failure, and pages `read("xd://…", off, lim)`.
+(2) `enable_tools` loads now persist per conversation (`worker_rpc._turn_tool_categories`).
+(3) `asm_edit_mate` merge-patches object values (a partial `value` wiped mate axes).
+(4) `edit_feature` hoists op-level placement keys into `params` (`_hoist_edit_feature_keys`).
+(5) `wall_thickness` returns `thinnest` spots with owning feature and now measures every body
+(core `eval_thickness` defaults to the last body only). (6) Host-tool JSON reaches the model
+compact (`chudcode_tools` `model_json`, −28 % on c219 results). (7) Skill tool-triggers trimmed
+to workflow-specific tools; MORE TOOLS menu folds shared prefixes (9,742 → 8,005 chars).
+**Prompt baseline.** CAD session clients run `chud --tools <CAD_SESSION_TOOLS> --no-skills
+--no-lsp [--no-mcp]` (`--no-mcp` only when `--help` lists it; Chudcode `6b1e705d2e` adds it and
+makes task sub-agents inherit `--tools`/`--no-lsp`/`--no-mcp`): Chudcode's per-request baseline
+106,444 → 68,321 chars (get_state systemPrompt + dumpTools).
+
+**Close-ups + attachment.** `render_part(target=<feature|sid|query|[x,y,z]>, view={azimuth,
+elevation,dir,distance,fov,projection})` renders one 512×384 true-perspective shot via
+`camera_pose.v1`, target ~70 % of frame, rest dimmed, occluded target ghosted, no labels on
+the target (chip in the top band, triad, scale bar true at target depth). New engine RPC
+`eval_feature_attachment` (core `session.cpp`, ctest `test_interference`) flags floating /
+overhanging / edge-touching additive features; `verify_battery` `feature_attachment` and
+`add_features` `attachment_warnings` report feature id + location + a suggested call, and a
+no-view `render_part` on a defective feature aims the camera at the defect (hatched unsupported
+patch / gap band). Root cause of the floating-rib class: sketches on "top face" follow the
+part's current topmost face; role cards now seat sketches on the support face sid or a measured
+datum, and verify numbers first, images only for the changed feature. `_face_attribution`
+joins on (body, topo) across bodies; `test_face_attribution` updated to op-history ownership.
+
+**Context picker.** Chips are `core::ContextRef` (`host/src/core/context_ref.*`,
+`ui/copilot/context_chips.*`): background `doc_resolve_pick`, sent as structured
+`context_refs` (contract addendum in `contracts/worker_rpc.md`), resolved by the worker into a
+PICKED CONTEXT block with geometry summaries and targeting hints, drawn as icon chips on the
+sent bubble, persisted (`"ctx"`), clickable to select in the viewport, carried by steers.
+`CHUDWARE_SHOT=chat_context` shows both chip rows. Not driven live: chip click/select paths,
+assembly face picks, restart re-attachment.
+Gate: check.py 9/9, core+GUI+WASM build, ctest 100 %, hostd smoke, web parity, packaging,
+`services/mcp` 3106 passed (test_face_attribution updated to op-history ownership),
+`services/agent` 3444 passed after fixes (one test now importorskips `chudcode_rpc`, absent
+from the gate venv), all other units green; the FIN25 sensor-node demo again hung until the
+60-min cap, so the shot stage ran separately (`CHUDWARE_SHOT=m1`, exit 0). Chudcode commits
+`a5ccf5afc9`, `0ad857087f`, `6b1e705d2e` are local on `main` (not pushed; `c0fff5e617` before
+them was also unpushed).

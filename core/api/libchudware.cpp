@@ -3542,6 +3542,10 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(chudware::doc::doc_eval_feature_overlap(
                                 params.value("doc_id", std::string()), params),
                             out_json, 0);
+            if (m == "eval_feature_attachment")
+                return emit(chudware::doc::doc_eval_feature_attachment(
+                                params.value("doc_id", std::string()), params),
+                            out_json, 0);
             if (m == "eval_compare")
                 return emit(chudware::doc::doc_eval_compare(params), out_json, 0);
             if (m == "doc_face_wires")

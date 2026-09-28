@@ -1873,3 +1873,39 @@ part with confidence. `selector` stays component-local and carries no owner.
 GENERATED it. A face a later feature only modifies — trimmed by a fillet or
 chamfer, split or merged by a boolean / same-domain unify — keeps its earlier
 owner; a face merged from several owners goes to the earliest in history order.
+
+## `context_refs` element addendum (2026-09-27, composer context picker)
+
+Extends "AI context references (Wave 4)". `agent_admin_turn` (and the offline
+`agent_run_v2` / `agent_mission_v1`) accept a top-level `context_refs: [ContextRef]`.
+- Online: `worker_rpc._editor_context_block` resolves each item against the engine
+  (`doc_tree` once per doc, `doc_query {of: face|edge}` once per kind per doc to check
+  sids against live geometry, `doc_resolve_pick` when no `selector` is present) and
+  renders a PICKED CONTEXT block after ACTIVE DOCUMENT. The host no longer inlines the
+  plain-text block on this route.
+- Offline: the host appends the plain-text "Context references:" block to `request`.
+- Steer: `agent_steer` carries the same text inside `text`.
+
+All fields optional unless noted:
+
+| field | type | meaning |
+|---|---|---|
+| `kind` | string, required | `face`\|`edge`\|`vertex`\|`body`\|`component`\|`feature`\|`sketch` |
+| `id` | string, required | face/edge sid, feature id (`f<N>`), component id (`k<N>`), body `b<N>`; an unresolved topology pick is `"<kind>:<body_id>:<topo_id>"` |
+| `sid` | string | stable sid from `selector.sid` (F…/E…/V…) |
+| `label` | string | chip text |
+| `doc_id` | string | owning document (hostd id). Absent only in legacy payloads (active doc assumed); a ref with `doc_path` and no `doc_id` is never resolved against the active doc |
+| `doc_name`, `doc_path` | string | tab title / saved path when picked |
+| `type` | string | feature type for feature/sketch refs |
+| `selector` | object | engine selector from `doc_resolve_pick` (contracts/selectors.md); component-local for assembly picks |
+| `owner_feature`, `owner_name` | string | owning feature of a face/edge/vertex/body (inside the component's part for assembly picks) |
+| `component`, `component_name` | string | assembly component the pick landed on |
+| `body_id`, `topo_id` | int ≥ 1 | viewport pick ids at `revision` (lets the worker resolve a ref sent before the GUI's resolve landed) |
+| `revision` | int ≥ 0 | doc revision of the pick ids |
+| `epoch` | string | host-only: the app run that wrote the ref; a ref from another run is re-attached by `doc_path`, never trusted by `doc_id` |
+
+Worker limits: first 24 refs rendered, ≤ 700 chars per ref, ≤ 9000 chars per block; the
+rest are summarised as "(+N more picked item(s) not shown)". Engine read failures degrade
+to "as picked (not re-verified)" / "unresolved pick" and never fail the turn.
+`scope.selection` face/edge entries whose sid is also a picked ref are omitted from
+"selected geometry".

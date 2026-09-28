@@ -71,8 +71,9 @@ def _group(digest: dict, fid: str) -> dict:
 
 @pytest.fixture(scope="module")
 def bore_doc() -> str:
-    """120x80x15 plate pierced by an r8 through-bore. owner_map credits the bore BOTH plate
-    faces it punched through (9398.94 mm2 each) plus its own 753.98 mm2 wall."""
+    """120x80x15 plate pierced by an r8 through-bore. Since face ownership follows op
+    history (413e010df) owner_map credits the bore only its own 753.98 mm2 wall; before, it
+    was also handed both plate faces it punched through (9398.94 mm2 each)."""
     return _build("fa_plate_bore", [
         _PLATE,
         _prim("Bore", "cylinder", {"radius": 8, "height": 60}, at=[-30, 0, 0], mode="cut"),
@@ -81,8 +82,8 @@ def bore_doc() -> str:
 
 @pytest.fixture(scope="module")
 def boss_doc() -> str:
-    """Same plate with an r18 boss FUSED on top. owner_map credits the boss the plate's whole
-    8582.12 mm2 top face on top of its own wall + cap."""
+    """Same plate with an r18 boss FUSED on top. owner_map credits the boss its wall + cap
+    only; before op-history ownership it was also handed the plate's 8582.12 mm2 top."""
     return _build("fa_plate_boss", [
         _PLATE,
         _prim("Boss", "cylinder", {"radius": 18, "height": 10}, at=[0, 0, 12.5], mode="boss"),
@@ -106,11 +107,11 @@ def spout_doc() -> str:
 
 
 class TestSubtractiveSmear:
-    def test_owner_map_really_does_smear(self, bore_doc):
-        """The premise. Without this the rest proves nothing: the kernel hands the bore three
-        faces, two of which are the plate's."""
+    def test_kernel_credits_the_bore_only_the_face_it_generated(self, bore_doc):
+        """Face ownership follows op history: the pierced plate faces are modified plate
+        faces, so the kernel no longer hands them to the bore."""
         om = (cc.cb.call("doc_tree", {"doc_id": bore_doc}) or {}).get("owner_map") or {}
-        assert len(om["f2"]["faces"]) == 3
+        assert len(om["f2"]["faces"]) == 1
 
     def test_cad_common_keeps_only_the_bore_wall(self, bore_doc):
         ms = cc._feature_owned_matches(bore_doc, "Bore")
@@ -118,7 +119,7 @@ class TestSubtractiveSmear:
 
     def test_pierced_faces_go_back_to_the_plate(self, bore_doc):
         att = cc._face_attribution(bore_doc)
-        assert att["claimed"]["f2"] == 3 and att["reattributed"] == 2
+        assert att["claimed"]["f2"] == 1 and att["reattributed"] == 0
         # Conserved, not deleted: both 9398.94 mm2 faces now belong to the plate.
         plate = [round(m["area_or_len"], 2) for m in att["owned"]["f1"]]
         assert plate.count(9398.94) == 2
@@ -126,7 +127,8 @@ class TestSubtractiveSmear:
 
     def test_describe_part_agrees_with_the_targeting_join(self, bore_doc):
         d = gt._digest(bore_doc)
-        assert (_group(d, "f2")["faces"], _group(d, "f2")["attributed_faces"]) == (1, 3)
+        # attributed_faces appears only when the de-smear changed the kernel's count.
+        assert _group(d, "f2")["faces"] == 1 and "attributed_faces" not in _group(d, "f2")
         assert len(cc._feature_owned_matches(bore_doc, "Bore")) == _group(d, "f2")["faces"]
 
 
@@ -134,9 +136,9 @@ class TestSubtractiveSmear:
 
 
 class TestAdditiveFuseSmear:
-    def test_owner_map_really_does_smear(self, boss_doc):
+    def test_kernel_credits_the_boss_only_its_wall_and_cap(self, boss_doc):
         om = (cc.cb.call("doc_tree", {"doc_id": boss_doc}) or {}).get("owner_map") or {}
-        assert len(om["f2"]["faces"]) == 3
+        assert len(om["f2"]["faces"]) == 2
 
     def test_cad_common_drops_the_plate_top(self, boss_doc):
         """The regression this consolidation exists for: before it, this returned the plate's
@@ -147,7 +149,7 @@ class TestAdditiveFuseSmear:
 
     def test_the_plate_top_is_credited_to_the_plate(self, boss_doc):
         att = cc._face_attribution(boss_doc)
-        assert att["claimed"]["f2"] == 3 and att["reattributed"] == 1
+        assert att["claimed"]["f2"] == 2 and att["reattributed"] == 0
         tops = [round(m["area_or_len"], 2) for m in att["owned"]["f1"]]
         assert 8582.12 in tops
         assert 8582.12 not in [round(m["area_or_len"], 2) for m in att["owned"]["f2"]]
@@ -155,7 +157,7 @@ class TestAdditiveFuseSmear:
     def test_describe_part_narrates_two_faces(self, boss_doc):
         d = gt._digest(boss_doc)
         g = _group(d, "f2")
-        assert (g["faces"], g["attributed_faces"], d["reattributed_faces"]) == (2, 3, 1)
+        assert (g["faces"], d["reattributed_faces"]) == (2, 0) and "attributed_faces" not in g
         assert "f2 Boss [cylinder] (2 face(s)): on the top face of f1 Plate" in \
             gt._feature_group_line(g)
         # Both paths now answer the same question with the same number.
@@ -215,7 +217,8 @@ class TestNarrativeUnchanged:
         assert gt._feature_group_line(_group(d, "f3")) == \
             "f3 DrainSpout [cylinder] (4 face(s)): on the right face of f1 Body, " \
             "centered 165 mm from -Y edge / 52 mm from -Z edge"
-        assert d["reattributed_faces"] == 3
+        # The kernel now credits the spout its own 4 faces; nothing is left to move.
+        assert d["reattributed_faces"] == 0
 
     def test_targeting_join_now_agrees_with_that_narrative(self, spout_doc):
         """It used to disagree loudly: describe_part said 4 faces while the targeting join

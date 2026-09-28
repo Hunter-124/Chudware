@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <vector>
 #include <set>
+#include <map>
 
 #include <nlohmann/json.hpp>
 
@@ -981,4 +982,72 @@ TEST_CASE("invalid solid topology always produces an evaluate-check error") {
             return issue["kind"] == "brep_check" && issue["severity"] == "error";
         }));
     chudware::doc::doc_close(id);
+}
+
+// eval_feature_attachment: the "floating / overhanging rib" defect class. Plate
+// [0,40]x[0,40]x[0,4]; ribs sit on its top face (z=4). Every verdict below is closed-form:
+//   Good     [10,12]x[10,30]  fully on the plate           -> attached (never flagged)
+//   Overhang [30,32]x[30,50]  half its base past y=40       -> overhang, ~50 %, reach ~10 mm
+//   Floating [20,24]x[2,6]x[12,16]  8 mm above the plate    -> floating, gap 8
+//   Touching [40,44]x[0,4]x[4,8]  meets the plate on one edge -> barely_touching
+//   Solo     mode:"new" standalone body                    -> independent, not flagged
+TEST_CASE("eval_feature_attachment: floating, overhanging and edge-touching features are flagged") {
+    const Built b = build("attach_ribs", json::array({
+        box("Plate", 40, 40, 4, {0, 0, 0}),
+        box("Good", 2, 20, 8, {10, 10, 4}),
+        box("Overhang", 2, 20, 8, {30, 30, 4}),
+        box("Floating", 4, 4, 4, {20, 2, 12}),
+        box("Touching", 4, 4, 4, {40, 0, 4}),
+        box("Solo", 5, 5, 5, {80, 0, 0}, json{{"mode", "new"}}),
+    }));
+    const std::string good = fid(b, 1), over = fid(b, 2), flo = fid(b, 3), touch = fid(b, 4),
+                      solo = fid(b, 5);
+    const json res = chudware::doc::doc_eval_feature_attachment(b.id);
+    INFO(res.dump(2));
+    CHECK(res.at("ok") == false);
+    std::map<std::string, json> by_id;
+    for (const json& e : res.at("features")) by_id[e.at("feature_id").get<std::string>()] = e;
+    CHECK_FALSE(by_id.count(good));
+    CHECK(std::find(res.at("attached").begin(), res.at("attached").end(), json(good)) !=
+          res.at("attached").end());
+    CHECK(std::find(res.at("independent").begin(), res.at("independent").end(), json(solo)) !=
+          res.at("independent").end());
+    CHECK_FALSE(by_id.count(solo));
+
+    REQUIRE(by_id.count(over));
+    const json& o = by_id[over];
+    CHECK(o.at("verdict") == "overhang");
+    CHECK(o.at("overhang_frac").get<double>() == doctest::Approx(0.5).epsilon(0.06));
+    CHECK(o.at("overhang_mm").get<double>() == doctest::Approx(10.0).epsilon(0.1));
+    CHECK(o.at("location").at(1).get<double>() > 40.0);   // the unsupported half
+    CHECK(o.at("location").at(2).get<double>() == doctest::Approx(4.0).epsilon(1e-6));
+
+    REQUIRE(by_id.count(flo));
+    CHECK(by_id[flo].at("verdict") == "floating");
+    CHECK(by_id[flo].at("gap_mm").get<double>() == doctest::Approx(8.0).epsilon(1e-6));
+
+    REQUIRE(by_id.count(touch));
+    CHECK(by_id[touch].at("verdict") == "barely_touching");
+
+    // Restricting to the new batch (add_features' use) reports only those ids.
+    const json only = chudware::doc::doc_eval_feature_attachment(
+        b.id, json{{"features", json::array({good})}});
+    CHECK(only.at("ok") == true);
+    CHECK(only.at("features").empty());
+    chudware::doc::doc_close(b.id);
+}
+
+TEST_CASE("eval_feature_attachment: a part whose ribs all sit on the plate passes") {
+    const Built b = build("attach_ok", json::array({
+        box("Plate", 40, 40, 4, {0, 0, 0}),
+        box("RibA", 2, 30, 6, {5, 5, 4}),
+        box("RibB", 30, 2, 6, {5, 20, 4}),
+    }));
+    const json res = chudware::doc::doc_eval_feature_attachment(b.id);
+    INFO(res.dump(2));
+    CHECK(res.at("ok") == true);
+    CHECK(res.at("features").empty());
+    CHECK(res.at("attached_count") == 2);
+    CHECK(res.at("solid_count") == 1);
+    chudware::doc::doc_close(b.id);
 }

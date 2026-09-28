@@ -37,6 +37,7 @@
 #include "plm/plm_quickbar.h"  // ui::plmActiveDocPlmState
 #include "plm/graph_tab.h"     // ui::plmGraphFocus (jump to this part's links)
 #include "widgets/kit.h"       // ui::kit::elide — row labels elide against the right-edge eye
+#include "copilot/context_chips.h"  // ui::addContextRef — context-cube picks from tree rows
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
@@ -54,23 +55,12 @@ static inline bool jftbool(const nlohmann::json& o, const char* k, bool def = fa
     return (it != o.end() && it->is_boolean()) ? it->get<bool>() : def;
 }
 
-// Wave4: chat context-ref capture (composer "context cube"). Toggle by id.
-static void togglePendingContextRef(AppState& st, AppState::ContextRef ref) {
-    if (ref.id.empty()) return;
-    auto& refs = st.pendingContextRefs;
-    for (auto it = refs.begin(); it != refs.end(); ++it) {
-        if (it->id == ref.id) {
-            refs.erase(it);
-            return;
-        }
-    }
-    refs.push_back(std::move(ref));
-}
-
+// Wave4: chat context-ref capture (composer "context cube"). ui::addContextRef stamps the doc
+// and toggles the chip (re-adding the same row detaches it).
 static void pushFeatureContextRef(AppState& st, const std::string& fid,
                                   const std::string& name, const std::string& type) {
     if (fid.empty()) return;
-    AppState::ContextRef ref;
+    core::ContextRef ref;
     if (type == "sketch" || type == "sketch3d")
         ref.kind = "sketch";
     else if (type == "import")
@@ -78,9 +68,29 @@ static void pushFeatureContextRef(AppState& st, const std::string& fid,
     else
         ref.kind = "feature";
     ref.id = fid;
-    ref.docId = st.docMirror.docId();
+    ref.type = type;
     ref.label = name.empty() ? fid : name;
-    togglePendingContextRef(st, std::move(ref));
+    ui::addContextRef(st, std::move(ref));
+}
+
+static void pushComponentContextRef(AppState& st, const std::string& cid,
+                                    const std::string& cname) {
+    core::ContextRef ref;
+    ref.kind = "component";
+    ref.id = cid;
+    ref.label = cname.empty() ? cid : cname;
+    ref.componentName = cname;
+    ui::addContextRef(st, std::move(ref));
+}
+
+// A solid body row: its pick ordinal rides along so the engine names the feature that made it.
+static void pushBodyContextRef(AppState& st, uint32_t bid, const char* bname) {
+    core::ContextRef ref;
+    ref.kind = "body";
+    ref.id = "b" + std::to_string(bid);
+    ref.bodyId = bid;
+    ref.label = bname;
+    ui::addContextRef(st, std::move(ref));
 }
 
 // C37-E: tolerant number accessor (feature_status "ms" timing).
@@ -1978,7 +1988,7 @@ static bool featureModeIsCut(const nlohmann::json* feature) {
     return false;
 }
 
-static const char* featureIcon(const std::string& type, const nlohmann::json* feature = nullptr) {
+const char* fmFeatureIcon(const std::string& type, const nlohmann::json* feature) {
     if (type == "sketch")           return "sketch_node";
     if (type == "sketch3d")         return "spline";
     if (type == "extrude")          return featureModeIsCut(feature) ? "extrude_cut" : "extrude_boss";
@@ -2469,7 +2479,7 @@ static bool drawComponentFeatureRow(AppState& st, const std::string& idSuffix,
         ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding;
     if (expandable) flags |= ImGuiTreeNodeFlags_OpenOnArrow;
     else flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-    const char* icon = featureIcon(feature.type, &feature.raw);
+    const char* icon = fmFeatureIcon(feature.type, &feature.raw);
     if (expandable) {
         treeIcon(icon, "[f]", 16.0f);
         ImGui::SameLine(0, 4 * ui::uiScale);
@@ -3042,14 +3052,8 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) toggleCompHidden(!hidden);
         }
         // Wave4: armed cube — LMB on component (not the eye) toggles chat context ref.
-        if (st.contextPickActive && ImGui::IsItemClicked(ImGuiMouseButton_Left) && !overCompEye) {
-            AppState::ContextRef ref;
-            ref.kind = "component";
-            ref.id = cid;
-            ref.docId = st.docMirror.docId();
-            ref.label = cname.empty() ? cid : cname;
-            togglePendingContextRef(st, std::move(ref));
-        }
+        if (st.contextPickActive && ImGui::IsItemClicked(ImGuiMouseButton_Left) && !overCompEye)
+            pushComponentContextRef(st, cid, cname);
         ui::pushContextMenuStyle();
         if (ImGui::BeginPopupContextItem(("##cctx_" + cid).c_str())) {
             // "Edit" = edit this component's PLACEMENT / mates in the assembly (the common action):
@@ -3073,14 +3077,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 revealInFileManager(absPath);
             if (unavailable) ImGui::EndDisabled();
             ImGui::Separator();
-            if (ImGui::MenuItem("Add to AI context")) {
-                AppState::ContextRef ref;
-                ref.kind = "component";
-                ref.id = cid;
-                ref.docId = st.docMirror.docId();
-                ref.label = cname.empty() ? cid : cname;
-                togglePendingContextRef(st, std::move(ref));
-            }
+            if (ImGui::MenuItem("Add to AI context")) pushComponentContextRef(st, cid, cname);
             if (ImGui::MenuItem(hidden ? "Show Component" : "Hide Component"))
                 toggleCompHidden(!hidden);
             ImGui::EndPopup();
@@ -4327,14 +4324,8 @@ void drawFeatureTreeBody(AppState& st,
                             std::snprintf(ctxId, sizeof(ctxId), "##body_ctx%d", bi);
                             ui::pushContextMenuStyle();
                             if (ImGui::BeginPopupContextItem(ctxId)) {
-                                if (ImGui::MenuItem("Add to AI context")) {
-                                    AppState::ContextRef ref;
-                                    ref.kind = "body";
-                                    ref.id = "b" + std::to_string(bid);
-                                    ref.docId = st.docMirror.docId();
-                                    ref.label = bname;
-                                    togglePendingContextRef(st, std::move(ref));
-                                }
+                                if (ImGui::MenuItem("Add to AI context"))
+                                    pushBodyContextRef(st, bid, bname);
                                 if (ImGui::MenuItem(hidden ? "Show" : "Hide"))
                                     setBodyShown(st, bi, hidden);
                                 if (ImGui::MenuItem("Isolate")) {
@@ -4365,12 +4356,7 @@ void drawFeatureTreeBody(AppState& st,
                             ui::popContextMenuStyle();
                             if (rowClicked) {
                                 if (st.contextPickActive) {
-                                    AppState::ContextRef ref;
-                                    ref.kind = "body";
-                                    ref.id = "b" + std::to_string(bid);
-                                    ref.docId = st.docMirror.docId();
-                                    ref.label = bname;
-                                    togglePendingContextRef(st, std::move(ref));
+                                    pushBodyContextRef(st, bid, bname);
                                 } else {
                                     setBodyShown(st, bi, hidden);
                                 }
@@ -5455,7 +5441,7 @@ void drawFeatureTreeBody(AppState& st,
                         RowCtx ctx;
                         ctx.fid = fid; ctx.name = fname; ctx.type = ftype;
                         // Imported components render as part nodes (not the generic "open" glyph).
-                        ctx.iconName = (ftype == "import") ? "part" : featureIcon(ftype, &f);
+                        ctx.iconName = (ftype == "import") ? "part" : fmFeatureIcon(ftype, &f);
                         ctx.iconFallback = (ftype == "import") ? "[P]" : featureFallback(ftype);
                         ctx.suppressed = suppressed; ctx.selected = sel;
                         ctx.rolledBack = rolledBack; ctx.fs = fs;

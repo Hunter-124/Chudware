@@ -54,9 +54,10 @@ system_prompt: |
       * dimensions from the ledger (DIM ids / values)
       * what the sketch must produce (closed profile, slot, hole pattern, etc.)
   - Place the returned sketch on the correct plane/face/orientation.
-  - Verify placement before committing the solid feature: call `render_part` and
-    inspect the returned geometry; use `measure_part` when placement or scale is
-    ambiguous. Do not extrude or cut on unchecked placement.
+  - Verify placement with numbers before committing the solid feature: the sketch
+    plane's position (describe_sketch / query_geometry on the support face) and
+    measure_part/measure_between. Use vision only when a number is off or the shape needs
+    judging, with ONE render_part(target=<the feature>) close-up.
   - Own overall 3D part coherence — wall thickness, feature order, mates between
     features, and verify_battery before declaring done.
 
@@ -82,12 +83,13 @@ system_prompt: |
         dimensions, and profile intent. Do not freehand the profile in add_features
         when sketch2d can own it.
      b. Attach/place the returned sketch_ref on the planned plane/face/orientation.
-     c. Vision check: render_part (or delegate vision) — confirm placement, normal,
-        and profile sense before the solid op.
+     c. Seat the sketch on the support face's sid (or a datum at its measured
+        height), never a bare "top face", which moves as features grow.
      d. preflight_ops for the planned solid (after a first solid exists, or at most
         once when the plan is concrete), then add_features for the 3D op.
-     e. describe_part / measure_part the mutation; check_feature_overlap after
-        boolean-heavy nodes.
+     e. Read the reply's changes / overlap_warnings / attachment_warnings, then
+        measure_part the mutation; render_part(target=<feature>) only if a number
+        or warning says something is wrong.
   4. Fillets/chamfers last within their region. Standard catalog parts: part_search
      rather than approximating geometry. Call set_material once the brief's material
      is ratified; new parts default to 6061 aluminum, so prose cannot substitute.

@@ -154,6 +154,11 @@ runtime's doctor command.
    dozen of these at startup, so spawn-per-call was the "providers take 30 s" defect. Calls are
    serialized on `_service_lock`; a dead process is replaced on the next call; `shutdown()`
    stops it. Never reintroduce a per-call spawn.
+8b. **Session processes are lean (2026-09-27).** `_make_client` spawns conversation clients
+   with `--tools <CAD_SESSION_TOOLS> --no-skills --no-lsp`, plus `--no-mcp` only when the
+   binary's `--help` lists it (`_binary_supports_flag`, probed once per binary identity — the
+   pinned v0.3.0 artifact rejects it). Sub-agents inherit that ceiling (Chudcode `6b1e705d2e`).
+   Baseline per request 106k → 68k chars. The service client stays unrestricted.
 9. **CAD's skill packs reach the model through `cad_skill`, never `skill://`.** The
    `skill://` scheme is resolved by Chudcode's `read` builtin against Chudcode's OWN skill
    registry, which contains nothing from this repo — a role card that printed
@@ -270,6 +275,11 @@ it an id missing from `model_registry.h`'s static table fell back to Low/Medium/
 Anthropic OAuth requests present Chudcode's Claude Code fingerprint
 (`packages/ai/src/providers/claude-code-fingerprint.ts`). A `400 claude_code_version_too_old`
 on a new model means that version must be bumped and `chud` rebuilt.
+The Codex model list is gated by `CODEX_CLIENT_VERSION` (`packages/catalog/src/wire/codex.ts`):
+a stale pin silently hides new models (0.144.1 hid GPT-6). If a released Codex model is absent,
+probe `/backend-api/codex/models?client_version=<latest @openai/codex>` before anything else.
+`refresh_catalog_if_stale` re-discovers immediately when the `chud` binary's stat identity
+changes, not only after its 2-hour TTL.
 
 ## Binary and release workflow
 

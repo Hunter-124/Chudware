@@ -126,6 +126,7 @@ inline void wasmBootReady() {
 #include "ui/console_panel.h"
 #include "ui/chudcode_session_actions.h" // agent.session -> conversation resume link
 #include "ui/copilot/copilot.h"
+#include "ui/copilot/context_chips.h"  // pumpContextRefFocus — chip click waiting on a tab switch
 #include "ui/cursors.h"       // W1-B: cursor manager
 #include "ui/cutlist_panel.h" // Weldment Cut List (SolidWorks Weldment Cut List)
 #include "ui/design_table_panel.h" // Design Table (SolidWorks editable config grid)
@@ -4285,6 +4286,48 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     a.steps.push_back(s);
     st.chat.push_back(a);
   }
+  // CHUDWARE_SHOT=chat_context: a sent message carrying context-picker chips (a face + a
+  // feature) as the latest bubble, plus pending chips above the composer (an edge + a sketch).
+  // All are bound to the shot's open document once its tab has a hostd doc id.
+  const char* shotModeEnv = std::getenv("CHUDWARE_SHOT");
+  const bool shotChatContext =
+      shot && shotModeEnv && std::strcmp(shotModeEnv, "chat_context") == 0;
+  int chatContextBoundAt = -1;  // frame the chat_context chips were bound to a live doc
+  auto shotContextChip = [](const char* kind, const char* id, const char* label,
+                            const char* type, nlohmann::json selector) {
+    core::ContextRef r;
+    r.kind = kind;
+    r.id = id;
+    r.label = label;
+    r.type = type;
+    r.selector = std::move(selector);
+    if (r.selector.is_object()) {
+      r.owner = "f1";
+      r.ownerName = "Standoff";
+    }
+    return r;
+  };
+  const std::vector<core::ContextRef> shotPendingChips = {
+      shotContextChip("edge", "E5c1d2e", "Edge of Standoff", "",
+                      {{"kind", "edge"}, {"surf", "circle"}, {"centroid", {0, 0, 30}},
+                       {"axis", {0, 0, 1}}, {"radius", 5.5}, {"area_or_len", 34.558},
+                       {"sid", "E5c1d2e"}}),
+      shotContextChip("sketch", "f2", "Hex profile", "sketch", nullptr)};
+  if (shotChatContext) {
+    ChatMsg u;
+    u.fromUser = true;
+    u.text = "make this face 5 mm thicker and match the chamfer";
+    u.contextRefs = {
+        shotContextChip("face", "F3a9e71", "Face of Standoff", "",
+                        {{"kind", "face"}, {"surf", "plane"}, {"centroid", {0, 0, 22}},
+                         {"axis", {0, 0, 1}}, {"normal", {0, 0, 1}}, {"side", "top"},
+                         {"area_or_len", 95.3}, {"sid", "F3a9e71"}}),
+        shotContextChip("feature", "f3", "Top chamfer", "chamfer", nullptr)};
+    st.chat.push_back(u);
+    ChatMsg a;
+    a.text = "Thickened the top face of Standoff by 5 mm and re-applied the 1 mm chamfer.";
+    st.chat.push_back(a);
+  }
   if (st.wantChat) {
     ChatMsg u;
     u.fromUser = true;
@@ -4730,6 +4773,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // the GL thread, before this frame's panels draw, so results land like any
     // other state.
     st.rpc.drain();
+    // A chat context chip clicked for another tab selects its entity once that tab is live.
+    ui::pumpContextRefFocus(st);
     // Manufacturing panels enqueue intent only. Dispatch after the prior frame's
     // callbacks drain, before hostd events update the read-only mirror.
     ui::dispatchManufactureRequests(st);
@@ -6879,7 +6924,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     if (shot && st.frame == 1) {
       if (st.wantSettings)
         st.openSettings = true;
-      if (st.wantChat || st.wantAssembly || st.wantPlan || st.wantCopilotSlash) {
+      if (st.wantChat || st.wantAssembly || st.wantPlan || st.wantCopilotSlash ||
+          shotChatContext) {
         st.designStarted = true; // show the conversation takeover
         // Re-apply the seed the restore clobbered (see shotChatSeed).
         if (!shotChatSeed.empty() && st.chat.size() != shotChatSeed.size())
@@ -6889,6 +6935,39 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       // restoring the active conversation / prompt draft).
       if (st.wantCopilotSlash)
         std::snprintf(st.prompt.data(), st.prompt.size(), "/");
+      if (shotChatContext) st.pendingContextRefs = shotPendingChips;
+    }
+    // chat_context: bind the seeded chips to the shot's open document as soon as its tab has a
+    // hostd doc id, creating a fresh part for the shot when none is open, so they render live.
+    if (shotChatContext && st.frame >= 1 && chatContextBoundAt < 0) {
+      const bool haveDoc = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+                           !st.docTabs[(size_t)st.activeTab].docId.empty();
+      if (!haveDoc && st.frame == 3 && st.workerStarted) {
+        std::string err;
+        st.suppressTabDirty = true;
+        const bool ok = st.docMirror.newPart(st.worker, err);
+        st.suppressTabDirty = false;
+        if (ok) {
+          st.clearViewportForNewDoc();
+          st.addDocTab(/*isAssembly=*/false);
+        } else {
+          std::fprintf(stderr, "[chat_context] new part failed: %s\n", err.c_str());
+        }
+      }
+      if (haveDoc) {
+        chatContextBoundAt = st.frame;
+        const auto &tab = st.docTabs[(size_t)st.activeTab];
+        auto stamp = [&tab](core::ContextRef &r) {
+          r.docId = tab.docId;
+          r.docName = tab.title;
+          r.docPath = tab.path;
+        };
+        for (auto &r : st.pendingContextRefs) stamp(r);
+        for (auto &m : st.chat)
+          for (auto &r : m.contextRefs) stamp(r);
+        std::fprintf(stderr, "[chat_context] chips bound to %s (%s) at frame %d\n",
+                     tab.docId.c_str(), tab.title.c_str(), st.frame);
+      }
     }
     // copilot_slash: with the menu open (composer holds "/"), inject Enter on
     // frame 5 (release on 6) so the highlighted suggestion is accepted — the
@@ -8254,6 +8333,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // T-G15 iconpipe: keep the loop alive (offscreen icon renders happen in
     // tick()) until every recipe is captured, then exit promptly — the --shot
     // backbuffer capture is a throwaway.
+    // chat_context: capture a few frames after the chips bind to the live doc (ceiling 300).
+    if (shotChatContext)
+      shotFrame = chatContextBoundAt > 0 ? chatContextBoundAt + 8
+                                         : (st.frame >= 300 ? st.frame : 99999);
     if (st.wantIconPipe)
       shotFrame = st.iconPipeShotDone ? 3 : 99999;
     // H2 daemon_h2: wall-clock scenario. captureFrame==-1 => write the notice

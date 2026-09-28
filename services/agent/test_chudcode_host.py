@@ -1096,6 +1096,56 @@ def test_auth_and_memory_calls_use_only_canonical_command_shapes_on_one_shared_p
         host.memory_call("remember", {})
 
 
+def test_cad_session_process_drops_chudcode_dev_prompt_but_keeps_cad_tools(tmp_path):
+    """c219 baseline: every request re-read ~106 KB of Chudcode prompt + tool schema,
+    including the user's own skills catalog, LSP docs and a dozen code devices. A CAD
+    session process is started without them and still has everything a CAD turn uses;
+    the shared service process is untouched."""
+    RpcClient = pytest.importorskip("chudcode_rpc").RpcClient
+
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    assert run(host, "cad", "cad-1")[0]["ok"]
+    host.memory_call("memory_recall", {"root": "/project", "query": "m", "tokenBudget": 5})
+
+    session_kwargs = factory.clients[0].kwargs
+    argv = RpcClient(**{**session_kwargs, "executable": "chud"})._build_command()
+    tools = argv[argv.index("--tools") + 1].split(",")
+    for needed in ("read", "write", "edit", "bash", "eval", "task", "hub", "todo",
+                   "web_search", "browser"):
+        assert needed in tools
+    for dropped in ("lsp", "security_scan", "debug", "firmware", "cpp_static", "github"):
+        assert dropped not in tools
+    assert "--no-skills" in argv and "--no-lsp" in argv
+    service = next(c for c in factory.clients if c.kwargs.get("no_session"))
+    assert not {"tools", "no_skills", "extra_args"} & set(service.kwargs)
+    host.shutdown()
+
+
+@pytest.mark.parametrize(("help_text", "expected"), [
+    ("  --no-lsp  Disable LSP\n  --no-mcp  Disable MCP discovery\n", True),
+    ("  --no-lsp  Disable LSP\n  --no-mcp-cache  unrelated\n", False),  # pinned 0.3.0 shape
+])
+def test_no_mcp_reaches_only_a_chud_that_accepts_it(tmp_path, help_text, expected):
+    """The pinned release chud rejects unknown flags, so --no-mcp is passed only when the
+    resolved binary's --help lists it — probed once per binary identity."""
+    fake = tmp_path / "chud"
+    calls = tmp_path / "help-calls"
+    fake.write_text(f"#!/bin/sh\necho x >> {calls}\ncat <<'EOF'\n{help_text}EOF\n")
+    fake.chmod(0o755)
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory, binary=fake)
+    assert run(host, "cad", "cad-1")[0]["ok"]
+    assert run(host, "cad-2", "cad-2")[0]["ok"]
+
+    for client in factory.clients:
+        if not client.kwargs.get("no_session"):
+            assert ("--no-mcp" in client.kwargs["extra_args"]) is expected
+            assert "--no-lsp" in client.kwargs["extra_args"]
+    assert calls.read_text().count("x") == 1
+    host.shutdown()
+
+
 def test_missing_dependency_and_binary_are_actionable(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "chudcode_rpc", None)
     missing_dep = ChudcodeSessionHost()
@@ -1319,6 +1369,42 @@ def test_failed_catalog_discovery_keeps_service_and_retries_after_backoff(monkey
     assert len(calls) == 2
     assert host.transient_call("get_available_models")["models"]
     assert factory.clients == [service]
+    host.shutdown()
+
+
+def test_upgraded_binary_is_rediscovered_before_the_refresh_ttl(monkeypatch, tmp_path):
+    binary = tmp_path / "chud"
+    binary.write_bytes(b"v1")
+    factory = FakeFactory()
+    clock = [100.0]
+    host = ChudcodeSessionHost(client_factory=factory, binary=str(binary),
+                               clock=lambda: clock[0])
+    monkeypatch.setattr(host, "_resolve_binary", lambda *, required: str(binary))
+    calls = []
+
+    class Refresh:
+        def __init__(self, argv, **kwargs):
+            self.args = argv
+            calls.append(argv)
+
+        def wait(self, **kwargs):
+            return 0
+
+    monkeypatch.setattr(chudcode_host_module.subprocess, "Popen", Refresh)
+    assert host.refresh_catalog_if_stale() is True
+    host._catalog_refresh_thread.join(timeout=2)
+    clock[0] += 60
+    assert host.refresh_catalog_if_stale() is False  # same binary: TTL holds
+    assert host.transient_call("get_available_models")["models"]
+    old_binary_service = factory.clients[-1]
+
+    binary.write_bytes(b"v2 with a newer codex client_version")
+    assert host.refresh_catalog_if_stale() is True
+    host._catalog_refresh_thread.join(timeout=2)
+    assert len(calls) == 2
+    assert old_binary_service.stop_count == 1
+    clock[0] += 60
+    assert host.refresh_catalog_if_stale() is False
     host.shutdown()
 
 

@@ -12,6 +12,7 @@
 #include "ui/clipboard_image.h"          // image-kind probe / mime / clipboard->PNG capture
 #include "ui/copilot/image_lightbox.h"   // attachment thumbnail tile + full-size viewer
 #include "ui/copilot/context_estimate.h"  // transcript-size estimate behind the context meter
+#include "ui/copilot/context_chips.h"      // context-picker chips: add / reconcile / draw / focus
 #include "ui/chudcode_descriptors.h"      // ui::chudcodeCompactReplacement — compact-result guard
 #include "ui/chudcode_session_actions.h"  // per-conversation Chudcode session link (resume key)
 #include "ui/file_explorer.h"             // ui::ensureWorkspaceDir — the fs_* jail every turn rides
@@ -734,42 +735,35 @@ static nlohmann::json consumeAttachments(AppState& st, std::string& requestText)
     return atts;
 }
 
-// Wave4: serialize st.pendingContextRefs into the turn payload's "context_refs" array AND
-// inline a "Context references:" block into the request text (C++ agent_run only sees request
-// text — same honesty pattern as consumeAttachments). Then clear chips + disarm the cube.
-static nlohmann::json consumeContextRefs(AppState& st, std::string& requestText) {
-    nlohmann::json refs = nlohmann::json::array();
-    if (st.pendingContextRefs.empty()) {
-        st.contextPickActive = false;
-        return refs;
-    }
-    requestText += "\n\nContext references:";
-    for (const auto& r : st.pendingContextRefs) {
-        nlohmann::json o = {
-            {"kind", r.kind},
-            {"id", r.id},
-            {"doc_id", r.docId},
-            {"label", r.label},
-        };
-        refs.push_back(std::move(o));
-        // One line the model can resolve/measure/target: kind + label + ids.
-        requestText += "\n- " + (r.kind.empty() ? std::string("ref") : r.kind) + ": ";
-        requestText += r.label.empty() ? (r.id.empty() ? "(unnamed)" : r.id) : r.label;
-        requestText += " (id: " + r.id;
-        if (!r.docId.empty()) requestText += ", doc: " + r.docId;
-        requestText += ")";
+// Wave4: take the pending context chips for THIS turn and disarm the cube. A chip whose document
+// is no longer open is dropped here (its ids could name nothing — or, after a restart, a
+// different document), with a toast so the omission is visible. The online worker resolves the
+// rest against the engine and renders them into the prompt (worker_rpc._editor_context_block);
+// lanes it does not reach inline core::contextRefsPromptText instead (offline route, steer).
+static std::vector<core::ContextRef> consumeContextRefs(AppState& st) {
+    std::vector<core::ContextRef> refs;
+    st.contextPickActive = false;
+    if (st.pendingContextRefs.empty()) return refs;
+    reconcileContextRefDocs(st);
+    int dropped = 0;
+    for (auto& r : st.pendingContextRefs) {
+        if (contextRefTabIndex(st, r) < 0) { ++dropped; continue; }
+        refs.push_back(std::move(r));
     }
     st.pendingContextRefs.clear();
-    st.contextPickActive = false;
+    if (dropped > 0)
+        st.toast(ToastLevel::Info,
+                 std::to_string(dropped) + " context chip" + (dropped == 1 ? "" : "s") +
+                 " left out \xE2\x80\x94 " + (dropped == 1 ? "its document is" : "their documents are") +
+                 " no longer open.");
     return refs;
 }
 
 // The user bubble for a sent message: the typed text plus the markers chat_log.cpp renders —
-// one "[attached image: name]" line per image (lifted out and drawn as the picture), a
-// "[attached: …]" roster for the other files, and a "[context: …]" roster. Shared by a fresh
-// turn and a mid-run steer so both show exactly what was sent.
-static std::string userBubbleText(const std::string& text, const nlohmann::json& attachments,
-                                  const nlohmann::json& contextRefs) {
+// one "[attached image: name]" line per image (lifted out and drawn as the picture) and a
+// "[attached: …]" roster for the other files. Context refs are not text: they ride on
+// ChatMsg::contextRefs and draw as chips. Shared by a fresh turn and a mid-run steer.
+static std::string userBubbleText(const std::string& text, const nlohmann::json& attachments) {
     std::string out = text;
     std::string files;
     for (const auto& a : attachments) {
@@ -780,15 +774,6 @@ static std::string userBubbleText(const std::string& text, const nlohmann::json&
             files += " " + nm;
     }
     if (!files.empty()) out += "\n[attached:" + files + "]";
-    if (!contextRefs.empty()) {
-        out += "\n[context:";
-        for (const auto& r : contextRefs) {
-            std::string lbl = r.value("label", std::string());
-            if (lbl.empty()) lbl = r.value("kind", std::string("ref"));
-            out += " " + lbl;
-        }
-        out += "]";
-    }
     return out;
 }
 
@@ -815,8 +800,10 @@ static nlohmann::json chatHistoryForAgent(AppState& st) {
     for (const ChatMsg& m : st.chat) {
         if (m.running) continue;             // live placeholder / mid-stream turn
         if (m.errKind != ERR_NONE) continue; // error cards are not conversation content
-        if (m.text.find_first_not_of(" \t\r\n") == std::string::npos) continue;
         std::string t = m.text;              // text only — no images, tool cards, activity
+        if (m.fromUser && !m.contextRefs.empty())   // the chips it carried, as the model saw them
+            t += (t.empty() ? "" : "\n\n") + core::contextRefsPromptText(m.contextRefs);
+        if (t.find_first_not_of(" \t\r\n") == std::string::npos) continue;
         if (t.size() > kMaxEntryChars) t = t.substr(0, kMaxEntryChars) + " ...";
         hist.push_back({{"role", m.fromUser ? "user" : "assistant"}, {"text", std::move(t)}});
     }
@@ -1874,25 +1861,27 @@ void submitTurn(AppState& st, const std::string& text) {
     saveSettings(st.settings);
     // M23: fold pending attachments into THIS turn. `sendText` (what the model receives) gets
     // inlined text-file content / explicit paths appended; the chat shows a compact marker.
-    // Wave4: context_refs ride as structured payload and are also inlined into sendText so both
-    // the online host-tool lane and explicit offline core fallback receive resolvable context.
+    // Wave4: context_refs ride as structured payload only: the online worker resolves each
+    // against the engine and renders it into the prompt; the explicit offline core route gets
+    // them inlined by buildAgentJobRpcRoute. The bubble shows them as chips (ChatMsg).
     // Nothing else is prepended: the persistent Chudcode session already holds the conversation
     // (options.history only seeds a fresh one), so the request is the user's own words.
     std::string sendText = text;
     const nlohmann::json attachments = consumeAttachments(st, sendText);
-    const nlohmann::json contextRefs = consumeContextRefs(st, sendText);
+    std::vector<core::ContextRef> contextRefs = consumeContextRefs(st);
     // Plan edits made while idle ride with the next turn (agent-facing only, never the bubble).
     if (std::string planNote = planBoardTakeEditsForTurn(st, st.activeConvId());
         !planNote.empty())
         sendText += "\n\n" + planNote;
     nlohmann::json extra = nlohmann::json::object();
     if (!attachments.empty()) extra["attachments"] = attachments;
-    if (!contextRefs.empty()) extra["context_refs"] = contextRefs;
+    if (!contextRefs.empty()) extra["context_refs"] = core::contextRefsToJson(contextRefs);
     {
         ChatMsg u; u.fromUser = true;
-        u.text = userBubbleText(text, attachments, contextRefs);
+        u.text = userBubbleText(text, attachments);
+        u.contextRefs = std::move(contextRefs);
         u.copilotMode = mode;  // stamp composer mode for colored border
-        st.chat.push_back(u);
+        st.chat.push_back(std::move(u));
         appendChatRawMessage(st, st.chat.back());
     }
     {
@@ -3633,7 +3622,8 @@ static void finalizeStoppedTurnActivity(ChatMsg& m) {
 // alone left the rest of the run, final reply included, streaming into the bubble ABOVE it
 // with nothing live below. Close the current bubble and open a fresh running one under the
 // steer instead. Append-only: AI-VC msg_idx anchors must never shift.
-static void appendSteerToTranscript(AppState& st, const std::string& text) {
+static void appendSteerToTranscript(AppState& st, const std::string& text,
+                                    std::vector<core::ContextRef> contextRefs) {
     ChatMsg* live = nullptr;
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
         if (!it->fromUser && it->running) { live = &*it; break; }
@@ -3647,6 +3637,7 @@ static void appendSteerToTranscript(AppState& st, const std::string& text) {
         live->uiCachedH = -1.0f;
     }
     ChatMsg u; u.fromUser = true; u.text = text;
+    u.contextRefs = std::move(contextRefs);
     u.copilotMode = mode;
     st.chat.push_back(std::move(u));
     appendChatRawMessage(st, st.chat.back());
@@ -3923,6 +3914,8 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     // longer attached, whichever path removed it (the detach ×, a send that consumed the
     // chips, a conversation switch that cleared them). Cheap — the chip row is a handful.
     pruneAttachInfo(st);
+    // Context chips follow their documents (rebind by path after a restart).
+    reconcileContextRefDocs(st);
 
     // ---- chips above the input: file attachments (M23) + context refs (Wave4) ----
     if (!st.pendingAttachments.empty() || !st.pendingContextRefs.empty()) {
@@ -3935,13 +3928,6 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         const float maxX = ImGui::GetContentRegionMax().x;
         bool anyDrawn = false;
 
-        auto drawChipBorder = [&]() {
-            ImGui::GetWindowDrawList()->AddRect(
-                ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-                ImGui::ColorConvertFloat4ToU32(ImVec4(asurf.textPrimary.x, asurf.textPrimary.y,
-                                                      asurf.textPrimary.z, 0.35f)),
-                ui::metrics::rounding(6.0f), 0, ui::metrics::stroke(1.0f));
-        };
         auto placeChip = [&](float chipW, float gap) {
             if (anyDrawn) {
                 ImGui::SameLine(0, gap);
@@ -4059,38 +4045,21 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         }
         chipSplit.Merge(chipDl);
 
-        // Context-ref chips: kind letter + label + ×
+        // Context-ref chips: kind icon + label (+ the doc when it is not the active one) + ×.
+        // Clicking a chip shows its entity in the model; × detaches it.
         for (size_t ci = 0; ci < st.pendingContextRefs.size(); ++ci) {
             ImGui::PushID((int)ci + 14000);
-            const auto& ref = st.pendingContextRefs[ci];
-            char kindLetter = '?';
-            if (!ref.kind.empty()) {
-                if (ref.kind == "sketch") kindLetter = 'S';
-                else if (ref.kind == "feature") kindLetter = 'F';
-                else if (ref.kind == "component") kindLetter = 'C';
-                else if (ref.kind == "body") kindLetter = 'B';
-                else if (ref.kind == "face") kindLetter = 'A';
-                else if (ref.kind == "edge") kindLetter = 'E';
-                else kindLetter = (char)std::toupper((unsigned char)ref.kind[0]);
-            }
-            std::string name = ref.label.empty() ? (ref.kind.empty() ? "ref" : ref.kind) : ref.label;
-            if (name.size() > 28) name = name.substr(0, 27) + "\xE2\x80\xA6";
-            const std::string lbl = std::string(1, kindLetter) + "  " + name + "  \xC3\x97";
-            const float chipW = ImGui::CalcTextSize(lbl.c_str()).x + 16 * sc;
-            placeChip(chipW, 4 * sc);
-            const bool removed = ImGui::SmallButton(lbl.c_str());
-            drawChipBorder();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s · %s\nContext reference — rides your next message. Click to remove.",
-                                  ref.kind.c_str(),
-                                  ref.label.empty() ? ref.id.c_str() : ref.label.c_str());
-            if (removed) {
-                st.pendingContextRefs.erase(st.pendingContextRefs.begin() + ci);
+            const core::ContextRef& ref = st.pendingContextRefs[ci];
+            placeChip(contextRefChipWidth(st, ref, /*removable=*/true), 4 * sc);
+            const ContextChipAction act = drawContextRefChip(st, ref, /*removable=*/true);
+            ImGui::PopID();
+            if (act == ContextChipAction::Focus) {
+                focusContextRef(st, ref);
+            } else if (act == ContextChipAction::Remove) {
+                st.pendingContextRefs.erase(st.pendingContextRefs.begin() + (std::ptrdiff_t)ci);
                 savePromptDraft(st, /*force=*/true);
-                ImGui::PopID();
                 break;
             }
-            ImGui::PopID();
         }
 
         ImGui::PopStyleColor(2);
@@ -4265,8 +4234,13 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
                 if (!runId.empty() && st.workerStarted) {
                     std::string sendText = text;
                     nlohmann::json attachments = consumeAttachments(st, sendText);
-                    const nlohmann::json contextRefs = consumeContextRefs(st, sendText);
-                    appendSteerToTranscript(st, userBubbleText(text, attachments, contextRefs));
+                    std::vector<core::ContextRef> contextRefs = consumeContextRefs(st);
+                    // The control lane carries text + images only: the chips ride inline.
+                    if (const std::string ctx = core::contextRefsPromptText(contextRefs);
+                        !ctx.empty())
+                        sendText += "\n\n" + ctx;
+                    appendSteerToTranscript(st, userBubbleText(text, attachments),
+                                            std::move(contextRefs));
                     agentControlDispatch(st, runId, sendText, std::move(attachments));
                 } else if (!text.empty()) {
                     // Auto-sends when the assistant frees up (drain at the top of drawComposer);

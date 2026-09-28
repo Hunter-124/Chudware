@@ -97,6 +97,8 @@
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepClass_FaceClassifier.hxx>
+#include <BRepClass3d_SolidClassifier.hxx>  // eval_feature_attachment support probes
+#include <BRepTopAdaptor_FClass2d.hxx>      // eval_feature_attachment UV-grid face sampling
 #include <BRepLProp_SLProps.hxx>
 #include <GCPnts_AbscissaPoint.hxx>
 #include <GeomAbs_SurfaceType.hxx>
@@ -3001,8 +3003,17 @@ void op_asm_edit_mate(json& doc, const json& op, std::size_t idx) {
     if (doc.contains("mates") && doc["mates"].is_array())
         for (json& m : doc["mates"])
             if (m.value("id", std::string()) == mid) {
-                for (const char* k : {"value", "align", "suppressed"})
-                    if (op.contains(k) && !op[k].is_null()) m[k] = op[k];
+                for (const char* k : {"value", "align", "suppressed"}) {
+                    if (!op.contains(k) || op[k].is_null()) continue;
+                    // A partial value edit ({"value":{"value":60}}) must not wipe the hinge
+                    // `axis`/`axis_point` an angle mate carries beside its scalar: merge
+                    // object into object (edit keys win), replace anything else.
+                    if (std::string(k) == "value" && m.contains(k) && m[k].is_object() &&
+                        op[k].is_object())
+                        m[k].merge_patch(op[k]);
+                    else
+                        m[k] = op[k];
+                }
                 if (doc.contains("components") && doc["components"].is_array())
                     bind_mate_reference_frames(m, doc["components"]);
                 return;
@@ -8858,6 +8869,45 @@ json doc_query(const std::string& doc_id, const json& query) {
     chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(shape, query);
     if (!qp.error.empty())
         throw OpError("invalid_op", qp.error);
+    // Owner-map join keys (2026-09-27): owner_map addresses topology as [body ordinal,
+    // per-body 1-based TopExp index], while hint_index counts across the WHOLE document.
+    // Stamp both on every face/edge match so a caller joins exactly on a multi-body part
+    // instead of assuming one body (every feature on body 1 used to read as "consumed" as
+    // soon as a floating rib made a body 2).
+    if (qp.selectors.is_array() && !s.is_assembly()) {
+        std::vector<std::pair<int, int>> counts;  // per body: (faces, edges)
+        if (body_id >= 1) {
+            counts.assign(static_cast<std::size_t>(body_id), {0, 0});
+            TopTools_IndexedMapOfShape fm, em;
+            TopExp::MapShapes(shape, TopAbs_FACE, fm);
+            TopExp::MapShapes(shape, TopAbs_EDGE, em);
+            counts.back() = {fm.Extent(), em.Extent()};
+        } else {
+            for (const TopoDS_Shape& body : ensure_compiled(s).shapes) {
+                TopTools_IndexedMapOfShape fm, em;
+                TopExp::MapShapes(body, TopAbs_FACE, fm);
+                TopExp::MapShapes(body, TopAbs_EDGE, em);
+                counts.emplace_back(fm.Extent(), em.Extent());
+            }
+        }
+        for (json& m : qp.selectors) {
+            if (!m.is_object() || !m.contains("hint_index") || !m["hint_index"].is_number_integer())
+                continue;
+            const std::string kind = m.value("kind", std::string());
+            if (kind != "face" && kind != "edge") continue;
+            int h = m["hint_index"].get<int>();
+            const std::size_t first = body_id >= 1 ? static_cast<std::size_t>(body_id - 1) : 0;
+            for (std::size_t b = first; b < counts.size(); ++b) {
+                const int n = kind == "face" ? counts[b].first : counts[b].second;
+                if (h < n) {
+                    m["body"] = static_cast<int>(b) + 1;
+                    m["topo"] = h + 1;
+                    break;
+                }
+                h -= n;
+            }
+        }
+    }
     int count = qp.selectors.is_array() ? static_cast<int>(qp.selectors.size()) : 0;
     return json{{"count", count}, {"matches", qp.selectors}};
 }
@@ -11997,6 +12047,367 @@ json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
         {"pairs", pairs},
         {"dead_features", dead_features},
     };
+}
+
+// Feature ATTACHMENT (2026-09-27) — does each additive feature's material actually hang on
+// the rest of the part? A boss sketched on the wrong plane lands in the air as a second
+// solid; a rib whose profile runs past the plate rim fuses fine and still overhangs it; a
+// wall that meets the body only along an edge "fuses" into a non-manifold hinge. Each of
+// these compiles ok, so nothing else in the tree reports them (seen live: arc ribs floating
+// off a servo-mount disc). Per additive ToolRec solid `t` (patterns/mirrors: one entry per
+// instance solid) against the FINAL part compound B:
+//   X = B ∩ t (what the feature still contributes), Y = B − t (the rest of the part).
+//   floating        dist(X, Y) > gap tolerance — the feature is its own island.
+//   barely_touching X meets Y but the best-supported face of t has (near) zero contact
+//                   area: an edge or point contact.
+//   overhang        the best-supported face of t (its base) is only partly backed: its
+//                   points probed a hair outward along the face normal land outside Y.
+// The base/contact face is found by sampling every face of t on a UV grid and probing
+// p + eps*n_out against Y with a solid classifier — deterministic, no tessellation. The
+// first solid-producing feature (the base body) and explicit mode:"new"/merge:false bodies
+// are not attachment candidates; the latter are listed under `independent`.
+json doc_eval_feature_attachment(const std::string& doc_id, const json& params) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    if (s.is_assembly())
+        return json{{"ok", true}, {"skipped", true},
+                    {"skip_reason", "assembly document — feature attachment is checked per part"},
+                    {"summary", "Skipped: assembly document (check each part)."},
+                    {"features", json::array()}, {"flagged", json::array()}};
+    const CompileResult& r = ensure_compiled(s);
+    const auto t_start = std::chrono::steady_clock::now();
+
+    bool has_filter = false;
+    std::set<std::string> filter;
+    if (params.contains("features") && params["features"].is_array()) {
+        has_filter = true;
+        for (const json& v : params["features"])
+            if (v.is_string()) filter.insert(v.get<std::string>());
+    }
+    auto num_param = [&](const char* key, double fallback, double lo, double hi) {
+        double v = (params.contains(key) && params[key].is_number())
+                       ? params[key].get<double>() : fallback;
+        if (!std::isfinite(v)) v = fallback;
+        return std::max(lo, std::min(v, hi));
+    };
+    const double overhang_tol = num_param("overhang_frac", 0.05, 0.0, 1.0);
+    const double min_contact_frac = num_param("min_contact_frac", 0.02, 0.0, 1.0);
+    const double budget_s = num_param("budget_s", 10.0, 0.1, 120.0);
+
+    auto area_of = [](const TopoDS_Shape& shape) {
+        try {
+            GProp_GProps gp;
+            BRepGProp::SurfaceProperties(shape, gp);
+            return std::max(0.0, gp.Mass());
+        } catch (const Standard_Failure&) {
+            return 0.0;
+        }
+    };
+    auto centroid_of = [](const TopoDS_Shape& shape) -> json {
+        try {
+            GProp_GProps gp;
+            BRepGProp::VolumeProperties(shape, gp);
+            const gp_Pnt c = gp.CentreOfMass();
+            return json::array({c.X(), c.Y(), c.Z()});
+        } catch (const Standard_Failure&) {
+            return nullptr;
+        }
+    };
+    auto pt_json = [](const gp_Pnt& p) { return json::array({p.X(), p.Y(), p.Z()}); };
+    auto solids_of = [](const TopoDS_Shape& shape) {
+        std::vector<TopoDS_Shape> out;
+        for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next())
+            out.push_back(ex.Current());
+        return out;
+    };
+    auto compound_of = [](const std::vector<TopoDS_Shape>& shapes) {
+        TopoDS_Compound c;
+        BRep_Builder b;
+        b.MakeCompound(c);
+        for (const TopoDS_Shape& sh : shapes) b.Add(c, sh);
+        return c;
+    };
+    auto feature_name = [&](const std::string& fid) -> std::string {
+        const json* f = find_feature_c(s.doc, fid);
+        return (f && f->contains("name") && (*f)["name"].is_string())
+                   ? (*f)["name"].get<std::string>() : fid;
+    };
+    // The mode a feature was AUTHORED with ("new" also when merge:false).
+    auto authored_new = [&](const std::string& fid) {
+        const json* f = find_feature_c(s.doc, fid);
+        if (!f) return false;
+        for (const json* src : {f, f->contains("params") ? &(*f)["params"] : nullptr}) {
+            if (!src || !src->is_object()) continue;
+            if (src->contains("merge") && (*src)["merge"].is_boolean() &&
+                !(*src)["merge"].get<bool>())
+                return true;
+            if (src->contains("mode") && (*src)["mode"].is_string() &&
+                (*src)["mode"].get<std::string>() == "new")
+                return true;
+        }
+        return false;
+    };
+
+    std::vector<TopoDS_Shape> part_solids;
+    for (const TopoDS_Shape& sh : r.shapes)
+        for (const TopoDS_Shape& so : solids_of(sh)) part_solids.push_back(so);
+    json out{{"ok", true}, {"solid_count", part_solids.size()}, {"features", json::array()},
+             {"attached", json::array()}, {"independent", json::array()},
+             {"not_checked", json::array()},
+             {"thresholds", {{"overhang_frac", overhang_tol},
+                             {"min_contact_frac", min_contact_frac}}}};
+    if (part_solids.empty()) {
+        out["summary"] = "No solid bodies — nothing to check for attachment.";
+        return out;
+    }
+    const TopoDS_Compound part = compound_of(part_solids);
+    Bnd_Box part_box;
+    BRepBndLib::Add(part, part_box, Standard_False);
+    const double diag = part_box.IsVoid() ? 1.0 : std::sqrt(part_box.SquareExtent());
+    const double gap_tol = std::max(1e-3, 1e-6 * diag);
+    const double probe = std::max(0.01, 1e-4 * diag);
+    const double part_area = area_of(part);
+
+    // The base body: the first feature (tree order) that produced solid material.
+    std::set<std::string> add_fids;
+    for (const ToolRec& tr : r.tool_recs)
+        if (tr.role == "add") add_fids.insert(tr.feature_id);
+    std::string base_fid;
+    for (const FeatureStatus& st : r.statuses) {
+        if (!st.ok) continue;
+        const bool has_bodies = r.owner_map.is_object() && r.owner_map.contains(st.id) &&
+                                r.owner_map[st.id].contains("bodies") &&
+                                r.owner_map[st.id]["bodies"].is_array() &&
+                                !r.owner_map[st.id]["bodies"].empty();
+        if (add_fids.count(st.id) || has_bodies) { base_fid = st.id; break; }
+    }
+
+    struct Sample { gp_Pnt p; bool supported; };
+    // Sample face `f` on an n x n UV grid; `supported` = p + probe * outward normal lies
+    // INSIDE one of the rest-of-part solids.
+    auto sample_face = [&](const TopoDS_Face& f, int n,
+                           std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>>& cls,
+                           const std::vector<Bnd_Box>& boxes) {
+        std::vector<Sample> pts;
+        try {
+            double u0, u1, v0, v1;
+            BRepTools::UVBounds(f, u0, u1, v0, v1);
+            BRepAdaptor_Surface sa(f);
+            BRepTopAdaptor_FClass2d inside(f, 1e-7);
+            const bool reversed = f.Orientation() == TopAbs_REVERSED;
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j < n; ++j) {
+                    const double u = u0 + (i + 0.5) / n * (u1 - u0);
+                    const double v = v0 + (j + 0.5) / n * (v1 - v0);
+                    if (inside.Perform(gp_Pnt2d(u, v)) != TopAbs_IN) continue;
+                    BRepLProp_SLProps props(sa, u, v, 1, 1e-7);
+                    if (!props.IsNormalDefined()) continue;
+                    gp_Dir nrm = props.Normal();
+                    if (reversed) nrm.Reverse();
+                    const gp_Pnt p = props.Value();
+                    const gp_Pnt q(p.X() + probe * nrm.X(), p.Y() + probe * nrm.Y(),
+                                   p.Z() + probe * nrm.Z());
+                    bool sup = false;
+                    for (std::size_t k = 0; k < cls.size() && !sup; ++k) {
+                        if (boxes[k].IsOut(q)) continue;
+                        cls[k]->Perform(q, 1e-7);
+                        sup = cls[k]->State() == TopAbs_IN;
+                    }
+                    pts.push_back({p, sup});
+                }
+        } catch (const Standard_Failure&) {
+        }
+        return pts;
+    };
+
+    std::size_t n_float = 0, n_over = 0, n_touch = 0;
+    std::set<std::string> flagged, seen_independent, attached;
+    for (const ToolRec& tr : r.tool_recs) {
+        if (tr.role != "add") continue;
+        if (has_filter && !filter.count(tr.feature_id)) continue;
+        if (tr.feature_id == base_fid) continue;
+        if (authored_new(tr.feature_id)) {
+            if (seen_independent.insert(tr.feature_id).second)
+                out["independent"].push_back(tr.feature_id);
+            continue;
+        }
+        const std::vector<TopoDS_Shape> instances = solids_of(tr.tool);
+        for (std::size_t inst = 0; inst < instances.size(); ++inst) {
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_start).count();
+            if (elapsed > budget_s) {
+                out["not_checked"].push_back(tr.feature_id);
+                break;
+            }
+            const TopoDS_Shape& t = instances[inst];
+            const double tool_vol = eval_vol_or_zero(t);
+            TopoDS_Shape X, Y;
+            try {
+                BRepAlgoAPI_Common common(part, t);
+                common.Build();
+                BRepAlgoAPI_Cut cut(part, t);
+                cut.Build();
+                if (!common.IsDone() || !cut.IsDone()) continue;
+                X = common.Shape();
+                Y = cut.Shape();
+            } catch (const Standard_Failure&) {
+                continue;
+            }
+            const double kept = eval_vol_or_zero(X);
+            // Fully consumed downstream (eval_feature_overlap's dead/swallowed case) or the
+            // feature IS the whole remaining part: attachment is not the question.
+            if (kept < std::max(1e-3, 1e-4 * tool_vol)) continue;
+            const std::vector<TopoDS_Shape> rest = solids_of(Y);
+            if (rest.empty() || eval_vol_or_zero(Y) < 1e-3) continue;
+
+            json e{{"feature_id", tr.feature_id}, {"name", feature_name(tr.feature_id)},
+                   {"tool_volume_mm3", tool_vol}, {"kept_volume_mm3", kept}};
+            if (const json* f = find_feature_c(s.doc, tr.feature_id))
+                if (f->contains("type")) e["type"] = (*f)["type"];
+            if (instances.size() > 1) e["instance"] = inst;
+
+            BRepExtrema_DistShapeShape dss(X, Y);
+            const bool dist_ok = dss.IsDone() && dss.NbSolution() > 0;
+            const double gap = dist_ok ? dss.Value() : 0.0;
+            char buf[512];
+            const std::string who = tr.feature_id + " \"" + e["name"].get<std::string>() + "\"";
+            if (dist_ok && gap > gap_tol) {
+                const gp_Pnt a = dss.PointOnShape1(1), b = dss.PointOnShape2(1);
+                e["verdict"] = "floating";
+                e["gap_mm"] = gap;
+                e["location"] = centroid_of(X);
+                e["nearest_point"] = pt_json(a);
+                e["nearest_point_on_part"] = pt_json(b);
+                std::snprintf(buf, sizeof(buf),
+                    "%s is NOT attached: its material is a separate solid %.3g mm from the "
+                    "rest of the part (nearest [%.2f, %.2f, %.2f] -> [%.2f, %.2f, %.2f]). "
+                    "Check its sketch plane / start offset.",
+                    who.c_str(), gap, a.X(), a.Y(), a.Z(), b.X(), b.Y(), b.Z());
+                e["detail"] = buf;
+                ++n_float;
+                flagged.insert(tr.feature_id);
+                out["features"].push_back(e);
+                continue;
+            }
+            e["gap_mm"] = gap;
+            e["contact_area_mm2"] =
+                std::max(0.0, 0.5 * (area_of(X) + area_of(Y) - part_area));
+
+            std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> cls;
+            std::vector<Bnd_Box> boxes;
+            for (const TopoDS_Shape& so : rest) {
+                cls.push_back(std::make_unique<BRepClass3d_SolidClassifier>(so));
+                Bnd_Box bb;
+                BRepBndLib::Add(so, bb, Standard_False);
+                bb.Enlarge(probe);
+                boxes.push_back(bb);
+            }
+            // Coarse pass on every face of t picks the base (best-supported) face.
+            TopoDS_Face base;
+            double base_sup = 0.0, max_face_area = 0.0;
+            for (TopExp_Explorer fx(t, TopAbs_FACE); fx.More(); fx.Next()) {
+                const TopoDS_Face f = TopoDS::Face(fx.Current());
+                const double a = area_of(f);
+                max_face_area = std::max(max_face_area, a);
+                const std::vector<Sample> pts = sample_face(f, 8, cls, boxes);
+                if (pts.empty()) continue;
+                std::size_t sup = 0;
+                for (const Sample& sm : pts) sup += sm.supported ? 1 : 0;
+                const double sup_area = a * double(sup) / double(pts.size());
+                if (sup_area > base_sup) { base_sup = sup_area; base = f; }
+            }
+            const double min_contact = std::max(0.25, min_contact_frac * max_face_area);
+            if (base.IsNull() || base_sup < min_contact) {
+                const gp_Pnt a = dist_ok ? dss.PointOnShape1(1) : gp_Pnt();
+                e["verdict"] = "barely_touching";
+                e["supported_area_mm2"] = base_sup;
+                e["location"] = pt_json(a);
+                std::snprintf(buf, sizeof(buf),
+                    "%s only TOUCHES the part (edge/point contact near [%.2f, %.2f, %.2f], "
+                    "%.3g mm^2 of face contact): it is not seated on a supporting face.",
+                    who.c_str(), a.X(), a.Y(), a.Z(), base_sup);
+                e["detail"] = buf;
+                ++n_touch;
+                flagged.insert(tr.feature_id);
+                out["features"].push_back(e);
+                continue;
+            }
+            // Fine pass on the base face measures the unsupported share and where it is.
+            const double base_area = area_of(base);
+            const std::vector<Sample> pts = sample_face(base, 36, cls, boxes);
+            std::vector<gp_Pnt> sup_pts, un_pts;
+            for (const Sample& sm : pts) (sm.supported ? sup_pts : un_pts).push_back(sm.p);
+            const double frac = pts.empty() ? 1.0 : double(sup_pts.size()) / pts.size();
+            const double over_area = base_area * (1.0 - frac);
+            e["base_face_area_mm2"] = base_area;
+            e["supported_area_mm2"] = base_area * frac;
+            e["supported_frac"] = frac;
+            e["overhang_frac"] = 1.0 - frac;
+            if (1.0 - frac > overhang_tol && over_area > std::max(0.25, 1e-6 * diag * diag) &&
+                !sup_pts.empty()) {
+                double cx = 0, cy = 0, cz = 0, reach = 0.0;
+                Bnd_Box region;
+                for (const gp_Pnt& p : un_pts) {
+                    cx += p.X(); cy += p.Y(); cz += p.Z();
+                    region.Add(p);
+                    double best = 1e300;
+                    for (const gp_Pnt& q : sup_pts) best = std::min(best, p.SquareDistance(q));
+                    reach = std::max(reach, std::sqrt(best));
+                }
+                const double k = 1.0 / double(un_pts.size());
+                double x0, y0, z0, x1, y1, z1;
+                region.Get(x0, y0, z0, x1, y1, z1);
+                e["verdict"] = "overhang";
+                e["overhang_area_mm2"] = over_area;
+                e["overhang_mm"] = reach;
+                e["location"] = json::array({cx * k, cy * k, cz * k});
+                e["region"] = {{"min", json::array({x0, y0, z0})},
+                               {"max", json::array({x1, y1, z1})}};
+                // The unsupported patch itself (subsampled to <= 400 points, with the grid
+                // pitch) so a close-up can paint exactly where nothing is underneath.
+                json patch = json::array();
+                const std::size_t stride = std::max<std::size_t>(1, (un_pts.size() + 399) / 400);
+                for (std::size_t q = 0; q < un_pts.size(); q += stride)
+                    patch.push_back(json::array({std::round(un_pts[q].X() * 1e3) / 1e3,
+                                                 std::round(un_pts[q].Y() * 1e3) / 1e3,
+                                                 std::round(un_pts[q].Z() * 1e3) / 1e3}));
+                e["unsupported_points"] = std::move(patch);
+                e["sample_pitch_mm"] =
+                    std::sqrt(base_area / std::max<double>(1.0, double(pts.size()))) *
+                    std::sqrt(double(stride));
+                std::snprintf(buf, sizeof(buf),
+                    "%s OVERHANGS its support: %.0f%% (%.3g of %.3g mm^2) of its base face has "
+                    "no material behind it, reaching %.3g mm past the supported edge around "
+                    "[%.2f, %.2f, %.2f].",
+                    who.c_str(), 100.0 * (1.0 - frac), over_area, base_area, reach,
+                    cx * k, cy * k, cz * k);
+                e["detail"] = buf;
+                ++n_over;
+                flagged.insert(tr.feature_id);
+                out["features"].push_back(e);
+                continue;
+            }
+            attached.insert(tr.feature_id);
+        }
+    }
+    for (const std::string& fid : attached)
+        if (!flagged.count(fid)) out["attached"].push_back(fid);
+    out["ok"] = flagged.empty();
+    out["flagged"] = json(std::vector<std::string>(flagged.begin(), flagged.end()));
+    char sbuf[256];
+    if (flagged.empty())
+        std::snprintf(sbuf, sizeof(sbuf),
+                      "Every additive feature is seated on the part (%zu solid%s).",
+                      part_solids.size(), part_solids.size() == 1 ? "" : "s");
+    else
+        std::snprintf(sbuf, sizeof(sbuf),
+                      "%zu feature(s) not properly attached: %zu floating, %zu overhanging, "
+                      "%zu barely touching (%zu solid%s).",
+                      flagged.size(), n_float, n_over, n_touch, part_solids.size(),
+                      part_solids.size() == 1 ? "" : "s");
+    out["summary"] = sbuf;
+    out["attached_count"] = out["attached"].size();
+    return out;
 }
 
 // C1 (WS-C) — resolve one side of eval_compare: compile `doc_id` fresh, then pick either the

@@ -327,7 +327,7 @@ def _measured_rank_from_pass_rate(pass_rate: float) -> int:
 _FRONTIER_RANK_FLOOR_IDS = frozenset({
     "grok-4.5", "grok-4-5",
     "claude-opus-4-8", "claude-sonnet-5",
-    "gpt-5.6-sol", "gemini-2.5-pro",
+    "gpt-6-sol", "gpt-5.6-sol", "gemini-2.5-pro",
     "kimi-k3",
     "deepseek/deepseek-chat-v3.1", "deepseek-chat-v3.1",
     "deepseek/deepseek-chat-v3", "deepseek-chat-v3",

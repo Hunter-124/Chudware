@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import unittest
@@ -13,6 +14,7 @@ from services.agent.chudcode_tools import (
     HostToolBinding,
     build_host_tools,
     dispatch_host_tool,
+    host_tool_result,
 )
 
 
@@ -395,10 +397,38 @@ class HostToolDispatchTests(unittest.TestCase):
         self.assertEqual(out["details"], {"ok": False, "reason": "workspace_root_unavailable"})
         self.assertEqual(out["content"][0]["type"], "text")
         self.assertIn('"workspace_root_unavailable"', out["content"][0]["text"])
-        self.assertEqual(updates, [{
-            "content": [{"type": "text", "text": '{\n  "step": 1\n}'}],
-            "details": {"step": 1},
-        }])
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0]["details"], {"step": 1})
+        self.assertEqual(json.loads(updates[0]["content"][0]["text"]), {"step": 1})
+
+    def test_tool_json_reaches_the_model_smaller_but_identical(self):
+        """c219: get_part's indent=2 text put every topology pair's numbers on their
+        own lines (4,067 lines, 65.8 KB) and spilled to an artifact the model spent
+        eight calls paging. The model text must parse back to exactly the tool's
+        result, keep a line per record, keep trailing notes, and never grow."""
+        tree = {
+            "owner_map": {
+                f"f{i}": {"bodies": [1], "edges": [[1, 3 * i + k] for k in range(12)],
+                          "faces": [[1, 2 * i + k] for k in range(6)]}
+                for i in range(1, 40)
+            },
+            "tree": {"features": [
+                {"id": f"f{i}", "name": f"Rib — {i}", "type": "extrude",
+                 "params": {"depth": {"value": 2.5, "expr": None}}, "suppressed": False}
+                for i in range(1, 40)
+            ]},
+        }
+        pretty = json.dumps(tree, indent=2)
+        note = "\nnote: another client edited part doc-1 since your last call"
+        for raw in (tree, pretty + note):
+            text = host_tool_result(raw)["content"][0]["text"]
+            value, end = json.JSONDecoder().raw_decode(text)
+            self.assertEqual(value, tree)
+            self.assertLess(len(text), 0.6 * len(pretty))
+            self.assertGreater(text.count("\n"), 39)
+        self.assertEqual(text[end:], note)
+        for unchanged in ('{"ok":true}', "Rendered 3 views.", "[not json"):
+            self.assertEqual(host_tool_result(unchanged)["content"][0]["text"], unchanged)
 
     def test_a_kwargs_catch_all_is_not_a_plumbing_channel(self):
         """`add_features(ops=None, doc_id=None, background=False, **extra)` reads

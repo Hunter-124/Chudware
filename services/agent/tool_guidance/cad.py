@@ -169,8 +169,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "add_features": {
         "prompt_note": (
-            "Batch related ops in ONE call and read `interpreted` + per-feature status; "
-            "a heavy op may return {job_id} — poll get_job. Verify with render_part."
+            "Batch related ops in ONE call and read the reply's interpreted, per-feature "
+            "status and changes fields plus its overlap and attachment warnings "
+            "(floating/overhanging features) before anything else; a heavy op may return {job_id} — poll get_job."
         ),
     },
     "add_gdt": {
@@ -329,8 +330,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "contact_sheet": {
         "prompt_note": (
-            "Fast multi-angle self-check after a mutation; full manufacturing "
-            "6-ortho+iso grid → render_views, one feature's close-up → inspect_part."
+            "Whole-part multi-angle sheet (4 tiles, ~4x a close-up's image tokens) — only "
+            "when one render_part(target=...) close-up cannot settle the question."
         ),
     },
     "design_review": {
@@ -433,14 +434,14 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "inspect_feature": {
         "prompt_note": (
-            "One-call post-mutation feature check (render + dims + describe excerpt) — "
-            "prefer over hand-chaining inspect_part + measure; whole-part → render_part."
+            "4-panel sheet (hero/alt/cutaway/context) of one feature — ~4x a single "
+            "render_part(target=...) close-up; use it only when that close-up is ambiguous."
         ),
     },
     "inspect_part": {
         "prompt_note": (
-            "Close-up of ONE face/edge/feature via a plain-word target; orbit the same "
-            "target → look_around, one-call with dims/describe → inspect_feature."
+            "render_part(target=...) plus framing knobs (zoom_factor, margin, cutaway); same "
+            "perspective close-up, target and view vocabulary."
         ),
     },
     "inspect_section": {
@@ -505,8 +506,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "look_around": {
         "prompt_note": (
-            "Orbiting close-ups of one feature when a single angle is ambiguous; for "
-            "dims + describe excerpt in the same call use inspect_feature."
+            "Tiled close-ups of ONE target from separated angles — only when a single "
+            "render_part(target=...) close-up leaves the shape ambiguous."
         ),
     },
     "make_drawing": {
@@ -684,8 +685,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "render_part": {
         "prompt_note": (
-            "Default self-review after every mutation (labelled iso); highlight= points "
-            "at a target without reframing, target=/emphasize crops to a feature."
+            "Check numbers first; to LOOK at what you changed, target= the feature id "
+            "for one cheap perspective close-up (auto best angle, view={distance,fov,"
+            "azimuth,elevation} to steer); no target = whole part, once at the end."
         ),
     },
     "render_sketch": {
@@ -710,8 +712,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "render_views": {
         "prompt_note": (
-            "Full 6-ortho+iso grid — catches back/bottom features a single iso hides; "
-            "lighter 4-tile alternative → contact_sheet."
+            "Full 6-ortho+iso grid (7 tiles) — drawing-style coverage of back/bottom faces; "
+            "far heavier than one render_part(target=...) close-up."
         ),
     },
     "req_create": {
@@ -935,10 +937,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "verify_battery": {
         "prompt_note": (
-            "Geometry/check health for THIS doc only: PASS covers only keys present in "
-            "scores. Skipped checks are unverified, and a part-doc pass does NOT verify "
-            "drawings, assembly fits, loads, material intent, tolerances or manufacturability. "
-            "Run those domain checks separately before claiming the design is finished."
+            "Deterministic checks for THIS doc; the default set includes feature_attachment "
+            "(floating / overhanging / edge-touching features, each with its close-up call) "
+            "and solid health. PASS covers only keys in scores; drawings, fits, loads, "
+            "tolerances and manufacturability need their own checks."
         ),
     },
     "wall_thickness": {

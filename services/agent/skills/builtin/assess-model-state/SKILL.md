@@ -4,7 +4,7 @@ description: Read-only health check of the open model — describe, measure, ove
 inject: auto
 triggers:
   keywords: [model health check, geometry sanity check, state of this model, what is wrong with the model, what's wrong with the model, inspect the part, inspect the assembly, review the part, check the part, check the model, check the assembly, verify the geometry, model problems, geometry errors]
-  tools: [describe_part, describe_assembly, measure_part, verify_battery, check_feature_overlap, check_interference, interface_check]
+  tools: [verify_battery, check_feature_overlap, interface_check]
   phases: [part_verify]
 ---
 

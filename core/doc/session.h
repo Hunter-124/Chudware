@@ -448,6 +448,24 @@ nlohmann::json doc_eval_interference(const std::string& doc_id,
 nlohmann::json doc_eval_feature_overlap(const std::string& doc_id,
                                         const nlohmann::json& params = nlohmann::json::object());
 
+// Evaluate — is each ADDITIVE feature's material seated on the rest of the part? Per add
+// ToolRec solid (pattern/mirror: per instance) against the final part: X = part ∩ tool,
+// Y = part − tool. Verdicts: "floating" (dist(X,Y) > gap tolerance — its own island),
+// "barely_touching" (touches, but its best-supported face has < max(0.25 mm²,
+// min_contact_frac × largest tool face) of backed area — an edge/point contact),
+// "overhang" (the best-supported "base" face has > overhang_frac of its area with no
+// material behind it, probed along the outward normal). The first solid-producing feature
+// and authored mode:"new"/merge:false features are skipped (the latter in `independent`).
+// `params` (optional): features [ids], overhang_frac (0.05), min_contact_frac (0.02),
+// budget_s (10). Returns {ok, summary, solid_count, features:[flagged entries {feature_id,
+// name, type, instance?, verdict, detail, location[3], gap_mm, contact_area_mm2,
+// base_face_area_mm2?, supported_area_mm2, supported_frac?, overhang_frac?,
+// overhang_area_mm2?, overhang_mm?, region?{min,max}, nearest_point?, nearest_point_on_part?,
+// tool_volume_mm3, kept_volume_mm3}], flagged:[ids], attached:[ids], attached_count,
+// independent:[ids], not_checked:[ids], thresholds}. `ok` is false iff anything is flagged.
+nlohmann::json doc_eval_feature_attachment(const std::string& doc_id,
+                                           const nlohmann::json& params = nlohmann::json::object());
+
 // C1 (WS-C reverse-engineering) — general shape-vs-shape comparison; see recon.h::
 // compare_shapes for the full field/degraded-mode contract. `params`: `doc_a`, `doc_b`
 // (required doc ids); `body_a`/`body_b` (optional — a "bN" name as doc_eval_interference's

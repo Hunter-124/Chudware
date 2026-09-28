@@ -156,19 +156,9 @@ static std::string promptDraftKey(AppState& st) {
     return key;
 }
 
+// Every field, so a restored chip still carries its engine selector, owner and pick ids.
 static nlohmann::json serializePendingContextRefs(const AppState& st) {
-    nlohmann::json refs = nlohmann::json::array();
-    for (const auto& r : st.pendingContextRefs) {
-        nlohmann::json o = {
-            {"kind", r.kind},
-            {"id", r.id},
-            {"label", r.label},
-        };
-        // Prefer snake_case on disk; keep docId if set.
-        if (!r.docId.empty()) o["doc_id"] = r.docId;
-        refs.push_back(std::move(o));
-    }
-    return refs;
+    return core::contextRefsToJson(st.pendingContextRefs);
 }
 
 // Snapshot the composer (text + attachment paths + context refs) for prompt_drafts.json.
@@ -225,21 +215,8 @@ static void applyPromptDraftObject(AppState& st, const nlohmann::json& d) {
                 st.pendingAttachments.push_back(std::move(path));
         }
     }
-    if (d.contains("context_refs") && d["context_refs"].is_array()) {
-        for (const auto& r : d["context_refs"]) {
-            if (!r.is_object()) continue;
-            AppState::ContextRef ref;
-            ref.kind = r.value("kind", std::string());
-            ref.id = r.value("id", std::string());
-            ref.label = r.value("label", std::string());
-            if (r.contains("doc_id") && r["doc_id"].is_string())
-                ref.docId = r["doc_id"].get<std::string>();
-            else if (r.contains("docId") && r["docId"].is_string())
-                ref.docId = r["docId"].get<std::string>();
-            if (ref.id.empty() && ref.kind.empty() && ref.label.empty()) continue;
-            st.pendingContextRefs.push_back(std::move(ref));
-        }
-    }
+    if (d.contains("context_refs"))
+        st.pendingContextRefs = core::contextRefsFromJson(d["context_refs"]);
 }
 
 void savePromptDraft(AppState& st, bool force) {
@@ -847,6 +824,7 @@ static nlohmann::json rawMessageToJson(const ChatMsg& m) {
         {"cacheReadTok", m.cacheReadTok},
         {"cacheReadTotTok", m.cacheReadTotTok},
         {"cacheReadCalls", m.cacheReadCalls},
+        {"contextRefs", core::contextRefsToJson(m.contextRefs)},
     };
 }
 
@@ -1197,8 +1175,8 @@ void persistChatHistory(AppState& st) {
             // message. Persist an explicit placeholder instead (marked "empty" so the load
             // path can render a subdued note), keeping save/load a position-preserving
             // bijection across restarts.
-            const bool emptyTurn =
-                body.empty() && !m.planState.present && !m.running && !m.steerSplit;
+            const bool emptyTurn = body.empty() && !m.planState.present && !m.running &&
+                                   !m.steerSplit && m.contextRefs.empty();
             nlohmann::json entry = {{"u", m.fromUser}, {"t", body}, {"e", m.errKind}};
             if (emptyTurn) entry["empty"] = true;
             if (m.steerSplit) entry["split"] = true;
@@ -1213,6 +1191,9 @@ void persistChatHistory(AppState& st) {
             }
             if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
             if (m.copilotMode >= 0) entry["cm"] = m.copilotMode;
+            // The context chips a user message carried, so they still draw after a reload.
+            if (m.fromUser && !m.contextRefs.empty())
+                entry["ctx"] = core::contextRefsToJson(m.contextRefs);
             // Error card fields — the humanized headline and the raw failure text (capped like
             // an activity detail). Without these a reloaded error turn loses its guidance.
             if (!m.errorHuman.empty()) entry["eh"] = m.errorHuman;
@@ -1519,6 +1500,8 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
                     cm.text += std::string("\n\n") + note;
             }
             cm.steerSplit = !cm.fromUser && m.value("split", false);
+            if (cm.fromUser && m.contains("ctx"))
+                cm.contextRefs = core::contextRefsFromJson(m["ctx"]);
             cm.running = false;
             // Placeholder for a turn that produced no visible output (persisted as
             // "empty" so message ORDINALS survive the round trip — AI-VC msg_idx

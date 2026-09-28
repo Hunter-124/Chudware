@@ -4,7 +4,7 @@ description: Merge independently-sourced CAD with measured placement, then verif
 inject: auto
 triggers:
   keywords: [merge cad, merge the wheel, merge two parts, mount onto, graft, retrofit, swap the wheel, replace the wheel, two step files, imported step, vendor part, third-party part, foreign geometry, off-frame, independently sourced, assembled mechanism, motion study, kinematic simulation, motion interference]
-  tools: [import_part, fit_cylinder_axis, asm_add_component, asm_mate, solve_mates, check_interference, measure_between, list_world_bodies, describe_part, describe_assembly, simulate_motion]
+  tools: [fit_cylinder_axis, asm_add_component, asm_mate, solve_mates, simulate_motion]
   phases: [assembly]
 ---
 

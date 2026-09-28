@@ -52,6 +52,14 @@ _CATALOG_REFRESH_SECONDS = 2 * 60 * 60.0
 _CATALOG_RETRY_SECONDS = 5 * 60.0
 _CATALOG_COMMAND_TIMEOUT_SECONDS = 90
 
+#: Chudcode builtins a CAD conversation uses. CAD's own tools arrive as host tools
+#: (set_custom_tools), which this list does not restrict; MCP servers from the user's
+#: Chudcode config still mount because chud has no per-process MCP switch.
+CAD_SESSION_TOOLS = (
+    "read", "bash", "edit", "write", "glob", "grep", "eval", "task", "hub", "todo",
+    "web_search", "browser", "computer", "retain", "recall", "reflect",
+)
+
 _LOG = logging.getLogger(__name__)
 _BYOK_PROVIDER_ENV = {
     "openai": "OPENAI_API_KEY",
@@ -328,6 +336,11 @@ class ChudcodeSessionHost:
         self._catalog_refreshing = False
         self._catalog_last_attempt = float("-inf")
         self._catalog_last_success = float("-inf")
+        # Identity of the binary each refresh ran against: an upgraded `chud` (e.g. a new
+        # Codex client_version that unlocks newer models) is re-discovered at once rather
+        # than after the TTL, and the service still running the old binary is replaced.
+        self._catalog_attempt_binary: tuple | None = None
+        self._catalog_success_binary: tuple | None = None
         self._catalog_refresh_thread: threading.Thread | None = None
         self._catalog_process: subprocess.Popen | None = None
 
@@ -1318,6 +1331,19 @@ class ChudcodeSessionHost:
         system_prompt = _nonempty_string(params.get("system_prompt"))
         if system_prompt is not None:
             kwargs["append_system_prompt"] = system_prompt
+        if not no_session:
+            # A CAD conversation re-reads Chudcode's prompt on every request. Without
+            # these, a session carried the user's own Chudcode skills catalog (18 KB of
+            # repo-dev skills; CAD skills come from cad_skill), LSP docs, and a dozen
+            # code devices (security_scan, debug, firmware, cpp_*, ast_*, github ...):
+            # 106 KB of prompt + tool schema, 72 KB after (measured with get_state).
+            kwargs["tools"] = list(CAD_SESSION_TOOLS)
+            kwargs["no_skills"] = True
+            # The user's Chudcode MCP servers (stripe, graphify ...) are not CAD tools.
+            # The pinned release chud predates --no-mcp and rejects unknown flags.
+            kwargs["extra_args"] = ("--no-lsp",) + (
+                ("--no-mcp",) if binary is not None and _binary_supports_flag(binary, "--no-mcp")
+                else ())
         try:
             client = factory(**kwargs)
             if tempdir is not None:
@@ -1486,23 +1512,27 @@ class ChudcodeSessionHost:
                 return False
             if self._catalog_refreshing:
                 return True
-            now = self._clock()
-            if (now - self._catalog_last_success < _CATALOG_REFRESH_SECONDS or
-                    now - self._catalog_last_attempt < _CATALOG_RETRY_SECONDS):
-                return False
             # Tests with an injected client factory have no real binary to refresh.
             if self._client_factory is not None and self._binary_hint is None:
                 return False
             binary = self._resolve_binary(required=True)
+            identity = _binary_identity(binary)
+            now = self._clock()
+            if ((identity == self._catalog_success_binary and
+                 now - self._catalog_last_success < _CATALOG_REFRESH_SECONDS) or
+                    (identity == self._catalog_attempt_binary and
+                     now - self._catalog_last_attempt < _CATALOG_RETRY_SECONDS)):
+                return False
             self._catalog_last_attempt = now
+            self._catalog_attempt_binary = identity
             self._catalog_refreshing = True
-            thread = threading.Thread(target=self._refresh_catalog, args=(binary,),
+            thread = threading.Thread(target=self._refresh_catalog, args=(binary, identity),
                                       name="chudcode-model-refresh", daemon=True)
             self._catalog_refresh_thread = thread
             thread.start()
             return True
 
-    def _refresh_catalog(self, binary: str) -> None:
+    def _refresh_catalog(self, binary: str, identity: tuple | None = None) -> None:
         try:
             process = subprocess.Popen([binary, "models", "refresh", "--json"],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1531,6 +1561,7 @@ class ChudcodeSessionHost:
             with self._catalog_refresh_lock:
                 if not self._shutdown:
                     self._catalog_last_success = self._clock()
+                    self._catalog_success_binary = identity
         except (OSError, subprocess.SubprocessError) as exc:
             if not self._shutdown:
                 _LOG.warning("Chudcode model refresh failed (%s)", type(exc).__name__)
@@ -1961,6 +1992,45 @@ def _developer_mode() -> bool:
     if explicit in {"0", "false", "no", "off"}:
         return False
     return (Path(__file__).resolve().parents[2] / ".git").exists()
+
+
+def _binary_identity(path: str) -> tuple | None:
+    """Stat identity of a resolved binary; an in-place upgrade changes it."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+_FLAG_SUPPORT: dict[tuple[str, tuple | None, str], bool] = {}
+_FLAG_SUPPORT_LOCK = threading.Lock()
+_FLAG_PROBE_TIMEOUT_SECONDS = 10.0
+
+
+def _binary_supports_flag(path: str, flag: str) -> bool:
+    """Whether ``<path> --help`` lists ``flag``; probed once per binary identity.
+
+    A binary that cannot be probed (timeout, crash, missing) does not get the flag:
+    passing an unknown flag would stop the session from starting at all.
+    """
+    key = (path, _binary_identity(path), flag)
+    if key[1] is None:  # nothing on disk to ask
+        return False
+    with _FLAG_SUPPORT_LOCK:
+        cached = _FLAG_SUPPORT.get(key)
+    if cached is not None:
+        return cached
+    try:
+        proc = subprocess.run([path, "--help"], capture_output=True, text=True,
+                              timeout=_FLAG_PROBE_TIMEOUT_SECONDS, check=False)
+        text = f"{proc.stdout}\n{proc.stderr}"
+        supported = re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", text) is not None
+    except (OSError, subprocess.SubprocessError):
+        supported = False
+    with _FLAG_SUPPORT_LOCK:
+        _FLAG_SUPPORT[key] = supported
+    return supported
 
 
 def _binary_candidate(source: str, candidate: str) -> tuple[str | None, str | None]:

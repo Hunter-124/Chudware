@@ -1043,6 +1043,40 @@ def menu_group_names() -> list[str]:
     return list(dict.fromkeys(g.name for g in _MENU_GROUPS))
 
 
+def _compact_names(names: list[str]) -> str:
+    """``a, pre_{x|y|z}, b``: names sharing a ``word_`` prefix (3+) folded into one entry.
+
+    Every exact name stays recoverable (``pre_`` + each alternative); the menu is
+    re-read on every request of a conversation, so ``ecad_`` spelled 80 times was
+    most of its bytes. :func:`expand_menu_entry` is the inverse.
+    """
+    buckets: dict[str, list[str]] = {}
+    for name in names:
+        head, sep, _ = name.partition("_")
+        buckets.setdefault(head + sep if sep else name, []).append(name)
+    out: list[str] = []
+    emitted: set[str] = set()
+    for name in names:
+        head, sep, _ = name.partition("_")
+        key = head + sep if sep else name
+        group = buckets[key]
+        if len(group) < 3:
+            out.append(name)
+        elif key not in emitted:
+            emitted.add(key)
+            out.append(key + "{" + "|".join(n[len(key):] for n in group) + "}")
+    return ", ".join(out)
+
+
+def expand_menu_entry(entry: str) -> list[str]:
+    """The exact tool names one :func:`_compact_names` entry stands for."""
+    entry = entry.strip()
+    if entry.endswith("}") and "{" in entry:
+        prefix, _, rest = entry.partition("{")
+        return [prefix + alt for alt in rest[:-1].split("|")]
+    return [entry] if entry else []
+
+
 def render_tool_menu(loaded: Iterable[str] | None = None) -> str:
     """The prompt block that makes the WHOLE catalog visible to the main chat.
 
@@ -1057,14 +1091,15 @@ def render_tool_menu(loaded: Iterable[str] | None = None) -> str:
         if not rest:
             continue
         lines.append(f"- {name} ({len(rest)}) — {desc}:")
-        lines.append("  " + ", ".join(rest))
+        lines.append("  " + _compact_names(rest))
     if not lines:
         return ""
     head = (
         "MORE TOOLS (registered, not loaded yet). Load exact names with "
         "enable_tools(tools=[...]) or a whole group with "
         "enable_tools(categories=[<group>]); the schemas arrive for the rest of "
-        "the turn. Every tool below is available to you — nothing else exists."
+        "the turn. `pre_{a|b}` means pre_a and pre_b. Every tool below is "
+        "available to you — nothing else exists."
     )
     return head + "\n" + "\n".join(lines)
 
@@ -1082,7 +1117,8 @@ def resolve_tool_requests(tokens: Iterable[str] | None) -> tuple[set[str], list[
     groups = {name: set(items) for name, _desc, items in tool_menu_groups()}
     out: set[str] = set()
     unknown: list[str] = []
-    for raw in tokens or ():
+    expanded = [name for raw in tokens or () for name in expand_menu_entry(str(raw or ""))]
+    for raw in expanded:
         token = str(raw or "").strip()
         key = token.lower()
         if not key:

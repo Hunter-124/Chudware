@@ -3991,6 +3991,32 @@ def test_delete_feature_keeps_reading_the_flat_spellings():
     assert quiet == []
 
 
+def test_edit_feature_placement_beside_params_moves_the_feature():
+    """c219 FixToolFlange: {"op":"edit_feature","id":"f8","at":[…],"params":{"height":…}}
+    applied the height and silently dropped the move — the engine reads only
+    params/refs/name, and a primitive's placement lives in its params."""
+    notes: list = []
+    ops = M._normalize_op_elements(
+        [{"op": "edit_feature", "id": "f8", "at": [5.6569, 5.6569, 304.5],
+          "centered": False, "params": {"height": {"value": 4.8, "expr": None}}}], notes)
+    assert ops == [{"op": "edit_feature", "id": "f8", "params": {
+        "height": {"value": 4.8, "expr": None}, "at": [5.6569, 5.6569, 304.5],
+        "centered": False}}]
+    assert any("moved" in n and "params" in n for n in notes), notes
+
+
+@pytest.mark.parametrize(("op", "needle"), [
+    ({"op": "edit_feature", "id": "f8", "suppressed": True}, "set_suppressed"),
+    ({"op": "edit_feature", "id": "f8", "radius": 3}, "inside \"params\""),
+    ({"op": "edit_feature", "id": "f8", "at": [0, 0, 1], "params": {"at": [0, 0, 2]}},
+     "both beside and inside"),
+])
+def test_edit_feature_never_drops_a_key_it_cannot_apply(op, needle):
+    with pytest.raises(ValueError, match="edit_feature") as err:
+        M._normalize_op_elements([op], [])
+    assert needle in str(err.value)
+
+
 # ------------------------------------------------------- asm_edit_component re-pose
 # Live session: "asm_edit_component no-ops on this document". Two silent-success paths
 # were behind it — the at/rotate pose dialect the op never reads, and a pose the

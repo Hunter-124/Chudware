@@ -1527,6 +1527,60 @@ def test_wall_thickness_numeric_on_shell():
     assert "wall" in w["summary"].lower(), w
 
 
+def test_wall_thickness_says_where_the_thinnest_wall_is():
+    """c219: three sub-agents got only `min_thickness_mm` and bisected the tree —
+    suppressing features one by one, ~25 round trips — to find which face held it.
+    A 60x40x10 plate with a pocket cut to leave a 0.6 mm floor and a boss on top: the
+    thinnest face must be the pocket floor, located on it and credited to the pocket."""
+    r, _ = _call("new_part", {"name": "wt_where"})
+    doc = r["doc_id"]
+    a, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature", "feature": {"type": "box", "name": "Plate",
+                                          "params": {"length": 60, "width": 40, "height": 10}}},
+        {"op": "add_feature", "feature": {"type": "cylinder", "name": "Boss",
+                                          "params": {"radius": 6, "height": 8},
+                                          "at": [-20, 0, 9]}},
+        {"op": "add_feature", "feature": {"type": "box", "name": "Pocket",
+                                          "params": {"length": 20, "width": 10, "height": 9.4},
+                                          "at": [10, 0, 0.3], "mode": "cut"}}]})
+    assert a["ok"] and [f["ok"] for f in a["features"]] == [True, True, True], a
+    w, _ = _call("wall_thickness", {"doc_id": doc})
+    spots = w["thinnest"]
+    assert 1 <= len(spots) <= 3, w
+    assert [s["thickness_mm"] for s in spots] == sorted(s["thickness_mm"] for s in spots)
+    floor = spots[0]
+    assert abs(floor["thickness_mm"] - 0.6) < 0.02, w
+    assert abs(floor["thickness_mm"] - w["min_thickness_mm"]) < 1e-3, w
+    assert floor["surf"] == "plane" and floor["built_by"]["name"] == "Pocket", w
+    x, y, z = floor["at"]
+    assert 0 - 1e-3 <= x <= 20 + 1e-3 and abs(y) <= 5 + 1e-3 and abs(z + 4.4) < 1e-3, w
+    # Every other reported face is a different face and no thinner.
+    assert len({s["face"] for s in spots}) == len(spots), w
+
+
+def test_wall_thickness_locates_the_thin_wall_on_a_second_body():
+    """A part with two solids (a plate and a separate 0.8 mm shim). eval_thickness
+    measures one body per call, so every body must be measured, and the shim's face must
+    be named and credited on ITS body, not aliased onto the plate's first faces."""
+    r, _ = _call("new_part", {"name": "wt_two_bodies"})
+    doc = r["doc_id"]
+    a, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature", "feature": {"type": "box", "name": "Plate",
+                                          "params": {"length": 60, "width": 40, "height": 10}}},
+        {"op": "add_feature", "feature": {"type": "box", "name": "Shim",
+                                          "params": {"length": 20, "width": 20, "height": 0.8},
+                                          "at": [100, 0, 0], "merge": False}}]})
+    assert a["ok"] and a["body_count"] == 2, a
+    w, _ = _call("wall_thickness", {"doc_id": doc})
+    shim = w["thinnest"][0]
+    assert abs(shim["thickness_mm"] - 0.8) < 0.02, w
+    assert shim["at"][0] > 80, w
+    assert shim["built_by"]["name"] == "Shim" and shim["face"] and shim["surf"] == "plane", w
+    assert shim["body"] == 2, w
+    by_body = {b["body"]: b["min_thickness_mm"] for b in w["bodies"]}
+    assert set(by_body) == {1, 2} and abs(by_body[2] - 0.8) < 0.02 and by_body[1] > 9, w
+
+
 def test_one_element_query_list_still_builds_a_shell():
     """A geometry query in a ONE-ELEMENT LIST must build the same geometry as the bare query.
 

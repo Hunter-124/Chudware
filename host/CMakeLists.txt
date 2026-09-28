@@ -155,6 +155,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/scenarios.cpp   # scripted screenshot/test scenarios (extracted from app.cpp)
   src/core/app_state.cpp
   src/core/jobs.cpp
+  src/core/context_ref.cpp  # context-picker chip record + wire/prompt forms (GL-free; unit-tested)
   # --- AI Copilot (T-RF6: split of the legacy_chat.cpp monolith — one chat impl, two hosts) ---
   src/ui/copilot/ui_common.cpp          # glass/bubble toolkit + shared small-UI helpers
   src/ui/copilot/chat_log.cpp           # message list rendering + stick-to-bottom
@@ -172,6 +173,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/context_estimate.cpp   # transcript token/cost estimate (GL-free; unit-tested)
   src/ui/copilot/settings.cpp           # AI settings sections + model dropdown
   src/ui/copilot/composer.cpp           # chat input + send path + composer chrome
+  src/ui/copilot/context_chips.cpp      # context-picker chips: add/resolve, draw, focus in viewport
   src/ui/copilot/panel.cpp              # drawAIPanel host + ai_workspace reuse hooks
   src/ui/settings_modal.cpp
   src/ui/onboarding.cpp       # first-run account/provider/test/workspace wizard
@@ -645,7 +647,8 @@ add_test(NAME test_worker_control COMMAND test_worker_control)
 # pure routing helpers under test without linking the desktop/worker runtime.
 add_executable(test_agent_job_routing
   tests/test_agent_job_routing.cpp
-  src/core/jobs.cpp)
+  src/core/jobs.cpp
+  src/core/context_ref.cpp)
 target_include_directories(test_agent_job_routing PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/../core
@@ -826,6 +829,20 @@ add_test(NAME test_conv_ids
   COMMAND test_conv_ids
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end session-id allocation ---
+
+# --- composer context-picker chips: links the REAL context_ref.cpp (GL-free). The chip record
+# is the turn payload's context_refs element and is persisted with drafts and transcripts.
+add_executable(test_context_ref
+  src/core/context_ref.cpp
+  tests/test_context_ref.cpp)
+target_include_directories(test_context_ref PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_context_ref PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(test_context_ref PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_context_ref
+  COMMAND test_context_ref
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 # --- viewport catch-up after tess-less revisions: header-only core/tess_catchup.h (no GL /
 # imgui / AppState). Guards the frozen-assembly bug: asm_mate / asm_add_component / pose

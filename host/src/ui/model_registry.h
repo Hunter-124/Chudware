@@ -211,7 +211,8 @@ inline const std::vector<ModelInfo>& builtinModels() {
         {PROV_ANTHROPIC, "claude-sonnet-4-6", "Claude Sonnet 4.6", true, true},
         {PROV_ANTHROPIC, "claude-opus-4-6", "Claude Opus 4.6", true, true},
         {PROV_ANTHROPIC, "claude-haiku-4-5", "Claude Haiku 4.5", true, false},
-        // OpenAI cloud (gpt-5.6-sol is current; older ≤ gpt-5.5 and o3 purged).
+        // OpenAI cloud (gpt-6-sol is current, 2026-09-22; older ≤ gpt-5.5 and o3 purged).
+        {PROV_OPENAI, "gpt-6-sol", "GPT-6 Sol", true, true},
         {PROV_OPENAI, "gpt-5.6-sol", "GPT-5.6 Sol", true, true},
         // Cursor — Composer only. The proxied cursor/claude-* + cursor/gpt-* rows were
         // removed 2026-07-21: Cursor rejects those wire ids upstream

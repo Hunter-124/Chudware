@@ -42,6 +42,10 @@ void      fmRowStripeReset();
 // SameLine(0, 4*uiScale)). Falls back to `fallback` text when the atlas lacks the glyph.
 void fmTreeIcon(const char* name, const char* fallback, float size = 16.0f, float alpha = 1.0f);
 
+// Atlas icon id the FeatureManager draws for a feature `type` ("extrude", "sketch", …); the
+// feature's JSON, when given, picks the cut variant (extrude_cut vs extrude_boss).
+const char* fmFeatureIcon(const std::string& type, const nlohmann::json* feature = nullptr);
+
 // 16px atlas icon painted INSIDE the (empty) leaf-arrow slot of the TreeNodeEx just submitted;
 // pass the cursor pos captured immediately BEFORE the node. Vertically centered in the row.
 void fmTreeIconInArrowSlot(ImVec2 rowPos, const char* name, const char* fallback,

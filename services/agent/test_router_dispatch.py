@@ -117,7 +117,7 @@ class TestLinearRoleTurn:
             linear_role_allowed_tools,
         )
         from services.agent.roles import load_role
-        from services.agent.tool_categories import _live_catalog
+        from services.agent.tool_categories import _live_catalog, expand_menu_entry
         from services.mcp import tool_registry
 
         tool_registry.warm_catalog()
@@ -133,16 +133,23 @@ class TestLinearRoleTurn:
         assert heading in system
         menu = system.split(heading, 1)[1]
         listed = {
-            tok.strip()
+            name
             for line in menu.splitlines()
             if line.startswith("  ")
             for tok in line.split(",")
+            for name in expand_menu_entry(tok)
         }
         registry = set(_live_catalog())
         unloaded = registry - set(allowed)
         assert unloaded, "registry must be warm for this test to mean anything"
         assert unloaded <= listed, sorted(unloaded - listed)[:20]
         assert not (listed & set(allowed)), sorted(listed & set(allowed))[:20]
+        # The menu folds shared prefixes (`ecad_{a|b}`); a model that copies an entry
+        # verbatim into enable_tools gets exactly those tools, nothing unknown.
+        from services.agent.tool_categories import resolve_tool_requests
+        folded = next(tok.strip() for line in menu.splitlines() if line.startswith("  ")
+                      for tok in line.split(",") if "{" in tok)
+        assert resolve_tool_requests([folded]) == (set(expand_menu_entry(folded)), [])
 
     def test_main_chat_runs_past_old_thirty_call_limit(self):
         """The old linear budget killed a composed 31st dispatch. Main chat now

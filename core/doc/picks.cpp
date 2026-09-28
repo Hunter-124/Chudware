@@ -63,7 +63,7 @@ static const std::set<std::string> kQueryNarrowingKeys = {
 static const std::set<std::string> kQueryDomainKeys = {"of", "kind"};
 static const std::set<std::string> kQueryReadbackKeys = {
     "sid", "centroid", "normal", "axis", "radius", "area_or_len", "concavity",
-    "hint_index", "owner_feature",
+    "hint_index", "owner_feature", "body", "topo",
 };
 
 

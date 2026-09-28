@@ -465,6 +465,21 @@ TEST_CASE("doc_simulate_motion: offset revolute pose survives rebuilds and save 
         check_tree_pose(doc::doc_rebuild(did), degrees);
         check_current_motion(did, degrees);
     }
+    // A partial edit carries only the scalar; the hinge axis/axis_point it omits must
+    // survive (a whole-object replace used to drop them and unresolve the revolute).
+    {
+        const auto edited = doc::doc_apply_ops(did, -1, json::array({
+            {{"op", "asm_edit_mate"}, {"id", mid}, {"value", {{"value", -2.5}}}}
+        }), false);
+        const auto& mate = edited.at("tree").at("mates").front().at("value");
+        CHECK(mate.at("axis") == json({0, 1, 0}));
+        CHECK(mate.at("axis_point") == json({910, 0, 545}));
+        check_tree_pose(edited, -2.5);
+        check_current_motion(did, -2.5);
+        doc::doc_apply_ops(did, -1, json::array({
+            {{"op", "asm_edit_mate"}, {"id", mid}, {"value", angle_value(-4.0)}}
+        }), false);
+    }
     doc::doc_save(did, saved_path.string());
     const auto reopened = doc::doc_open(saved_path.string());
     const auto reopened_id = reopened.at("doc_id").get<std::string>();

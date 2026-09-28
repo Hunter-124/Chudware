@@ -4,7 +4,7 @@ description: Run FEA, thermal, vibration, CFD, motion, and EM studies with actua
 inject: auto
 triggers:
   keywords: [fea, cfd, simulate, simulation, stress, modal, thermal, vibration, wind tunnel, drag, motion, eigenmode, s-parameter, antenna, contact, load case, strong enough, will this hold, can this hold, factor of safety, deflection, buckling, von mises]
-  tools: [run_fea_static, run_fea_adaptive, run_fea_modal, run_fea_fatigue, run_fea_frequency_response, run_fea_thermal, run_fea_buckling, run_fea_contact, run_fea_convergence, sim_evidence_packet, verify_packet, polymesh_cli, run_cfd_flow, run_cfd_accurate, simulate_motion, em_eigenmode, em_driven, em_timedomain, ecad_antenna_design, ecad_antenna_analyze]
+  tools: [run_fea_static, run_fea_adaptive, run_fea_modal, run_fea_fatigue, run_fea_frequency_response, run_fea_thermal, run_fea_buckling, run_fea_contact, run_fea_convergence, sim_evidence_packet, verify_packet, polymesh_cli, run_cfd_flow, run_cfd_accurate, em_eigenmode, em_driven, em_timedomain, ecad_antenna_design, ecad_antenna_analyze]
   phases: [sim]
 ---
 

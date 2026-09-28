@@ -31,6 +31,11 @@ models:
     rank: 5
     source: shipped
     notes: "Claude Sonnet 5"
+  - id: gpt-6-sol
+    provider: openai
+    rank: 5
+    source: shipped
+    notes: "OpenAI GPT-6 Sol (2026-09-22)"
   - id: gpt-5.6-sol
     provider: openai
     rank: 5

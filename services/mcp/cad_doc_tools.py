@@ -3303,6 +3303,51 @@ def _rewrite_param_edit(el: dict, index: int, notes: list) -> dict:
     return {"op": "edit_feature", "id": fid, "params": params, **order}
 
 
+#: What op_edit_feature (core/doc/session.cpp) reads beside the target id; the engine drops
+#: any other op-level key without a word. before/after ride along from op rewrites, and a
+#: `type` copied out of a {"feature":{…}} wrapper only restates what the feature is.
+_EDIT_FEATURE_OP_KEYS = frozenset({"op", "id", "params", "refs", "name", "type",
+                                   "before", "after"})
+#: add_feature's feature-envelope placement keys. The engine stores them IN params, so an
+#: edit that sets one beside "params" means that param.
+_EDIT_FEATURE_PARAM_KEYS = ("at", "at_offset", "axis", "axis_dir", "centered", "mode", "merge")
+
+
+def _hoist_edit_feature_keys(op: dict, index: int, notes: list) -> dict:
+    """Move edit_feature's op-level placement keys into ``params``; refuse any other stray key.
+
+    Live c219: ``{"op":"edit_feature","id":"f8","at":[…],"params":{"height":…}}`` applied
+    the height and silently dropped the move (preflight_ops passed it too); the sub-agent
+    only noticed from a face count and spent three calls finding out why.
+    """
+    stray = [k for k in op if k not in _EDIT_FEATURE_OP_KEYS]
+    if not stray:
+        return op
+    unknown = [k for k in stray if k not in _EDIT_FEATURE_PARAM_KEYS]
+    if unknown:
+        hint = (' To suppress a feature use {"op":"set_suppressed","id":…,"value":true}.'
+                if "suppressed" in unknown else "")
+        raise ValueError(
+            f"ops[{index}] edit_feature: unknown key(s) {unknown} beside \"params\" — "
+            f"edit_feature applies only params, refs and name, so they would be ignored. "
+            f'Put parameter changes inside "params".{hint}')
+    params = op.get("params")
+    params = dict(params) if isinstance(params, dict) else {}
+    for key in stray:
+        if key in params and params[key] != op[key]:
+            raise ValueError(
+                f'ops[{index}] edit_feature: "{key}" is given both beside and inside "params" '
+                f"with different values ({op[key]!r} vs {params[key]!r}) — send it once, "
+                f'inside "params".')
+        params[key] = op[key]
+    out = {k: v for k, v in op.items() if k not in stray}
+    out["params"] = params
+    notes.append(f"edit_feature {op.get('id')}: moved {stray} into params — a feature's "
+                 f"placement lives in its params, and edit_feature reads only params/refs/name")
+    return out
+
+
+
 def _normalize_op_elements(ops: list, notes: list) -> list:
     """Give every batch element a valid `op`. Raises ValueError with a teaching message
     for an element that names neither an op nor a feature type."""
@@ -3372,7 +3417,10 @@ def _normalize_op_elements(ops: list, notes: list) -> list:
                 out.append(_normalize_op_target(normalized, kind, notes))
                 continue
             if kind in docops or kind == "new_part":
-                out.append(_normalize_op_target(el, kind, notes))
+                normalized = _normalize_op_target(el, kind, notes)
+                if kind == "edit_feature":
+                    normalized = _hoist_edit_feature_keys(normalized, i, notes)
+                out.append(normalized)
                 continue
             ftype = _canon_feature_type(kind, ftypes)
             if ftype:
@@ -7749,6 +7797,25 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                             if getattr(exc, "code", None) == "engine_connection_lost":
                                 raise
                             pass
+                        # A rib/boss that floats, overhangs, or barely touches the body reads
+                        # as "ok" in feature_status; name it in this reply (no extra call).
+                        try:
+                            att = cb.call("eval_feature_attachment",
+                                          {"doc_id": d, "features": added_ids, "budget_s": 3.0})
+                            bad = att.get("features") or []
+                            if att.get("ok") is False and bad:
+                                out["attachment_warnings"] = {
+                                    "summary": att.get("summary"),
+                                    "features": [{k: e.get(k) for k in
+                                                  ("feature_id", "verdict", "detail", "location")}
+                                                 for e in bad],
+                                    "next": (f'render_part(target="{bad[0]["feature_id"]}") — '
+                                             "perspective close-up of the flagged feature; fix "
+                                             "its sketch plane/profile, then re-check"),
+                                }
+                        except Exception as exc:  # noqa: BLE001
+                            if getattr(exc, "code", None) == "engine_connection_lost":
+                                raise
                 # Push the updated part to the desktop app's viewport (if it's open) so the user
                 # watches it build. Best-effort; only when something actually got built.
                 if ok and bodies:

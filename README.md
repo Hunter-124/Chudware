@@ -1,4 +1,4 @@
-# Chudware (formerly Billet / AI-CAD)
+# Chudware
 
 Chudware is a **SolidWorks-class parametric CAD application**: a native C++ desktop app
 (ribbon UI, FeatureManager tree, PropertyManager, constraint-solver sketcher) on the

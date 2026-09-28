@@ -5120,3 +5120,20 @@ expressions, but it now bumps the revision; the "tree unchanged" motion tests co
 minus `studies` instead. Not covered: steer sweeps (`steer=`) have no mate to record, so a steer
 film is still file-only. Tests: `test_hostd_registry.py::test_study_mutation_announces_studies_changed`,
 `test_cad_tools.py::test_simulate_motion_records_one_study_per_joint_and_loop_closes_exactly`.
+
+## 2026-09-28 — "no obvious way to open the motion sim; the Simulation tab shows none"
+
+Root cause for `sixaxis_arm_revD_final5.step+`: no Motion study existed. Its saved
+`document.json` has no `studies` key; the agent (session c227) never ran `simulate_motion`, it
+only found two films (`design/renders/revE/sixaxis_revE_motion.mp4`, 09-27, and
+`revF_arm_polished_motion.mp4`, 08:21) rendered before sweeps were persisted as studies and from
+other assembly files. Separately, Model had no way into Motion at all: the Motion ribbon tab only
+exists in the Simulate workspace and the legacy Simulation tab's Study group had no Motion
+button. Fixes: `sim_motion_study` ("Motion Study", appended to Features > Assembly and
+Simulation > Study in `ribbon_def.cpp`) switches to Simulate + the Motion tab and opens the
+assembly's saved Motion study on its playback node, creating one only when none exists
+(`SimManager::handleCommand`); an assembly with no studies now says "No studies saved in <doc>"
+and that rendered videos are files, not studies, with a "New Motion study" action. The
+`simulate_motion` `view` hint and `cad_guide('motion')` point at the new entry and tell the agent
+to sweep the open assembly rather than only cite old films. Not covered: with several Motion
+studies the button opens the selected/first one; the others stay in the Simulation tree.

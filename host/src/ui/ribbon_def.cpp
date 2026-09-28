@@ -699,6 +699,12 @@ static const RibbonCmd kCmds[] = {
     { "sch_export_svg",       "SVG",             "file_image",     "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
     { "sch_export_pdf",       "PDF",             "file_doc",       "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
     { "sch_plot",             "Plot / Print",    "file_doc",       "Schematic", "Outputs",   true,  nullptr,     false, CommandCapability::Export },
+
+    // Motion study entry points (2026-09-28): the Motion tab only exists in the Simulate
+    // workspace, so an assembly in Model had no visible way into its Motion study. Both rows
+    // open the doc's saved Motion study on its playback node (or create one) — SimManager.
+    { "sim_motion_study",     "Motion Study",    "mate",           "Features",   "Assembly",  true,  nullptr,     false },
+    { "sim_motion_study",     "Motion Study",    "mate",           "Simulation", "Study",     true,  nullptr,     false },
 };
 // clang-format on
 

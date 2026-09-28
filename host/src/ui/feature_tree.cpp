@@ -534,12 +534,14 @@ void fmSectionDivider(const char* label) { treeSectionDivider(label); }
 // name / Reference / Features), so they share structure, rhythm and chevron placement exactly.
 // A header that carries a leading control reserves `leadW` px at the row's left edge (the left
 // hairline starts after it) and paints it in `lead(rowMin, rowH)`, submitted on top of the row
-// toggle (which allows overlap so the control receives its own clicks). The label stays centred on
-// the full row — every header's label shares one axis — and is clamped/elided so it never runs
-// into the lead control or the chevron at narrow widths (full text in a hover tooltip).
-template <class LeadFn>
+// toggle (which allows overlap so the control receives its own clicks). Trailing controls work
+// the same way: `trailW` px just left of the chevron (the right hairline stops short of it),
+// painted by `trail(slotMin, rowH)` where slotMin is the slot's top-left. The label stays centred
+// on the full row — every header's label shares one axis — and is clamped/elided so it never runs
+// into the lead/trail controls or the chevron at narrow widths (full text in a hover tooltip).
+template <class LeadFn, class TrailFn>
 static bool fmSectionHeaderRow(const char* label, bool* open, bool* rightClicked, float leadW,
-                               LeadFn&& lead) {
+                               LeadFn&& lead, float trailW, TrailFn&& trail) {
     const auto& pal = fmPalette();
     const float S = ui::uiScale;
     const float chev = 18.0f * S;                     // end-of-line chevron hit box
@@ -549,8 +551,10 @@ static bool fmSectionHeaderRow(const char* label, bool* open, bool* rightClicked
     const float rowH = std::max(lineH + 4.0f * S, chev + 2.0f * S);
     const float cy = p.y + rowH * 0.5f;
     const float chevX = p.x + w - chev;
+    const float trailX = chevX - 6.0f * S - trailW;   // trailing-control slot (empty when trailW==0)
     const float leftLineStart = p.x + 4.0f * S + leadW;
-    const float rightLineEnd = chevX - 8.0f * S;      // cut the right hairline short of the chevron
+    // Cut the right hairline short of the chevron — or of the trailing controls when present.
+    const float rightLineEnd = (trailW > 0.0f ? trailX : chevX) - 8.0f * S;
     const std::string shown = ui::kit::elide(label, rightLineEnd - leftLineStart);
     const ImVec2 tsz = ImGui::CalcTextSize(shown.c_str());
     const float textX = std::max(leftLineStart,
@@ -595,6 +599,7 @@ static bool fmSectionHeaderRow(const char* label, bool* open, bool* rightClicked
                               ImVec2(cc.x + a * 0.7f, cc.y), ink);
 
     lead(p, rowH);
+    if (trailW > 0.0f) trail(ImVec2(trailX, p.y), rowH);
     ImGui::PopID();
 
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y));
@@ -605,7 +610,8 @@ static bool fmSectionHeaderRow(const char* label, bool* open, bool* rightClicked
 // Toggles *open; returns *open. `rightClicked`, if given, reports a right-click on the row so the
 // caller can raise a context menu (e.g. the filename's Appearance...).
 bool fmSectionDividerCollapse(const char* label, bool* open, bool* rightClicked) {
-    return fmSectionHeaderRow(label, open, rightClicked, 0.0f, [](ImVec2, float) {});
+    return fmSectionHeaderRow(label, open, rightClicked, 0.0f, [](ImVec2, float) {},
+                              0.0f, [](ImVec2, float) {});
 }
 
 // Section divider carrying a small square "+" button pinned at the right edge. The right hairline is
@@ -3683,7 +3689,7 @@ static bool fmFeaturesHeader(bool* open, bool addEn, bool* addFolder) {
         if (hov)
             ImGui::SetTooltip("Add Folder\n(groups the selected features, or drops an empty folder "
                               "to drag features into)");
-    });
+    }, 0.0f, [](ImVec2, float) {});
     if (addFolder) *addFolder = addClicked;
     return *open;
 }
@@ -4093,30 +4099,48 @@ void drawFeatureTreeBody(AppState& st,
         if (featuresReveal) s_featSecOpen = true;
         bool fileRightClicked = false;
         const bool fileOpenBefore = s_fileSecOpen;
-        fmSectionDividerCollapse(docName.c_str(), &s_fileSecOpen, &fileRightClicked);
-        if (s_fileSecOpen != fileOpenBefore) sec.fileUserToggled = true;
-        // PLM: revision badge + a jump-to-this-part's-links button on the title row.
-        {
-            std::string plmRev, plmLife; bool plmDirty = false;
-            if (ui::plmActiveDocPlmState(st, plmRev, plmLife, plmDirty)) {
-                const float S = ui::uiScale;
-                const float badgeW = 64.0f * S;
-                const float btnW = ImGui::CalcTextSize("links").x + 12.0f * S;
-                const float rightX =
-                    ImGui::GetContentRegionMax().x - badgeW - btnW - 10.0f * S;
-                if (rightX > ImGui::GetCursorPosX()) ImGui::SameLine(rightX);
-                else ImGui::SameLine();
-                if (ImGui::SmallButton("links##fm_graph")) {
-                    st.activeWorkspace = AppState::Workspace::PLM;
-                    g_plmHub.page = PlmPage::Graph;
-                    ui::plmGraphFocus(docName);
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Show this part's links in the project graph");
-                ImGui::SameLine();
-                ui::plmLifecycleBadge(plmLife, plmRev);
+        // PLM: revision badge + a jump-to-this-part's-links button. They ride in the header's
+        // trailing slot when the full doc name still fits beside them; on a narrow pane they drop
+        // to their own right-aligned row below instead of overlapping the name and chevron.
+        std::string plmRev, plmLife; bool plmDirty = false;
+        const bool hasPlm = ui::plmActiveDocPlmState(st, plmRev, plmLife, plmDirty);
+        const ImGuiStyle& fmStyle = ImGui::GetStyle();
+        float plmW = 0.0f;
+        if (hasPlm) {
+            const std::string badgeText =
+                plmRev.empty() ? plmLife : plmRev + " \xc2\xb7 " + plmLife;
+            plmW = ImGui::CalcTextSize("links").x + fmStyle.FramePadding.x * 2.0f +
+                   fmStyle.ItemSpacing.x + ImGui::CalcTextSize(badgeText.c_str()).x;
+        }
+        auto drawPlmControls = [&](ImVec2 at) {
+            ImGui::SetCursorScreenPos(at);
+            if (ImGui::SmallButton("links##fm_graph")) {
+                st.activeWorkspace = AppState::Workspace::PLM;
+                g_plmHub.page = PlmPage::Graph;
+                ui::plmGraphFocus(docName);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Show this part's links in the project graph");
+            ImGui::SameLine();
+            ui::plmLifecycleBadge(plmLife, plmRev);
+        };
+        // Header geometry mirrors fmSectionHeaderRow: 4dp inset, name, 6+8dp gaps, slot, 6dp, 18dp chevron.
+        const float plmS = ui::uiScale;
+        const float plmInline = ImGui::CalcTextSize(docName.c_str()).x + plmW + 44.0f * plmS;
+        if (hasPlm && plmInline <= ImGui::GetContentRegionAvail().x) {
+            fmSectionHeaderRow(docName.c_str(), &s_fileSecOpen, &fileRightClicked, 0.0f,
+                               [](ImVec2, float) {}, plmW, [&](ImVec2 slot, float rowH) {
+                drawPlmControls(ImVec2(slot.x, slot.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f));
+            });
+        } else {
+            fmSectionDividerCollapse(docName.c_str(), &s_fileSecOpen, &fileRightClicked);
+            if (hasPlm) {
+                const ImVec2 row = ImGui::GetCursorScreenPos();
+                const float avail = ImGui::GetContentRegionAvail().x;
+                drawPlmControls(ImVec2(row.x + std::max(0.0f, avail - plmW - 24.0f * plmS), row.y));
             }
         }
+        if (s_fileSecOpen != fileOpenBefore) sec.fileUserToggled = true;
 
         // C26: filename "Appearance…" — sets the primary body's color (the common single-body
         // case). Body key "b1" matches the engine's per-body appearance key (session._write_aicm).

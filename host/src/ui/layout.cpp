@@ -494,6 +494,7 @@ void drawLeftPane(AppState& st,
         // Explorer + Simulation Manager two-button rail — same chrome as the Electronics rail so
         // every workspace column shares one navigation pattern (Hunter directive).
         static int s_simTab = 1;   // 0 = Explorer, 1 = Simulation Manager
+        if (st.revealSimManager) { s_simTab = 1; st.revealSimManager = false; }
         const float ebtn = 30.0f * S, eglyph = 18.0f * S, egap = 6.0f * S, erowPad = 6.0f * S;
         const float erailRowH = erowPad + ebtn + erowPad;
         const ImVec2 ePaneOrigin  = ImGui::GetCursorScreenPos();

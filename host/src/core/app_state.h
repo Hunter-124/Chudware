@@ -1724,6 +1724,10 @@ struct AppState {
     enum LeftPaneTab { LP_Explorer = 0, LP_FeatureManager = 1, LP_PropertyManager = 2,
                        LP_Configurations = 3, LP_Simulation = 4 };
     int leftPaneTab = LP_FeatureManager;
+    // One-shot: the Simulate workspace's left rail switches to its Simulation Manager tab next
+    // frame (it otherwise remembers the user's Explorer/Simulation choice). Set by commands that
+    // open a study so the study is actually visible; layout.cpp consumes and clears it.
+    bool revealSimManager = false;
 
     // ---- PropertyManager (C17) — occupies the tree dock slot while a command is active ----
     // W1-B: typed pointer (forward-declared above) so app_state.h stays free of the heavy

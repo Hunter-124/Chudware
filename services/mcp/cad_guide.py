@@ -302,6 +302,12 @@ HOW TO USE
      datum a viewer animates); interference.first_collision_step / _value is the first clash (with
      the interfering pair in `detail`). The study RESTORES the driven mate to its original value
      when it finishes — it reads motion, it doesn't leave the assembly moved.
+  4. The user WATCHES it as the document's Motion study: every successful sweep is saved into
+     the open assembly (result `motion_study.view`; Features > Assembly > Motion Study opens it).
+     A rendered .mp4/.gif is a file, not a study — a film of another assembly file is not a
+     study of the open one. Asked to show/animate the OPEN assembly, run simulate_motion on it
+     (re-sweeping the same joints replaces its study, never duplicates it); do not only point
+     at old films.
 
 TIPS
   * More `steps` = smoother playback and safer against a re-solve flipping a tight mechanism to a

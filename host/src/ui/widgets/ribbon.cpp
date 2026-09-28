@@ -795,6 +795,8 @@ static const char* ribbon_tipFor(const char* cmd_id) {
         {"asm_interference",  "Detect interference between components."},
         {"asm_bom",           "Generate a bill of materials."},
         {"asm_explode",       "Create an exploded view."},
+        {"sim_motion_study",  "Open this assembly's Motion study and play it in the viewport "
+                              "(creates one when the assembly has none)."},
         // --- Sketch: corner fillet/chamfer + airfoil generator (flyout/tools) ---
         {"sk_fillet",         "Round a sharp sketch corner between two lines."},
         {"sk_chamfer",        "Bevel a sharp sketch corner between two lines."},

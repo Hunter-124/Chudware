@@ -49,6 +49,15 @@ static void simTip(const char *tip) {
     ImGui::SetTooltip("%s", tip);
 }
 
+// Index of the "Motion" per-type tab in ribbon.cpp's kRibbonTabs[] (the Simulate-workspace sim
+// tabs are append-only at 13..19, so the index is stable).
+static constexpr int kRibbonTabMotion = 18;
+
+static bool activeDocIsAssembly(const AppState &st) {
+  return st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+         st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly;
+}
+
 // ---- liquid-glass v2: shared FeatureManager-column surface (host contract
 // §H4) ---------------- The Simulation tree body is drawn EMBEDDED inside
 // drawLeftPane's tab child (layout.cpp), which already painted ONE glass
@@ -1892,6 +1901,31 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
     return newAndOpen(StudyType::Contact);
   if (cmdId == "sim_new_freqresp")
     return newAndOpen(StudyType::FreqResponse);
+  // The one obvious way into Motion: Features > Assembly "Motion Study", the Simulation
+  // tab's Study group and the assembly empty state all land here. It opens this assembly's
+  // saved Motion study (an agent's simulate_motion sweep persists as one) on its playback
+  // node in the Simulate workspace, where playback drives the viewport; only when the
+  // document has none does it create one, exactly like "New Study" on the Motion tab.
+  if (cmdId == "sim_motion_study") {
+    if (!activeDocIsAssembly(st)) {
+      st.toast(ui::ToastLevel::Warn,
+               "Motion studies drive assembly mates. Open an assembly first.");
+      return true;
+    }
+    st.activeWorkspace = AppState::Workspace::Simulate;
+    st.leftPaneTab = AppState::LP_Simulation;
+    st.revealSimManager = true;
+    st.showRibbon = true;
+    st.ribbonTab = kRibbonTabMotion;
+    refresh(st);
+    if (!selectStudyOfType(StudyType::Motion))
+      return newAndOpen(StudyType::Motion);
+    node_ = SimNode::Results;
+    loadIdx_ = -1;
+    armedWell_ = -1;
+    panelOpen_ = true;
+    return true;
+  }
   refresh(st);
 
   // Per-type setup tools (the per-type ribbon tabs): target a study of the
@@ -6113,9 +6147,23 @@ void SimManager::drawTreeBody(AppState &st) {
   if (studies_.empty()) {
     // FM chrome convention: Spacing alone separates — no orphaned hairline under the button.
     ImGui::Spacing();
+    if (activeDocIsAssembly(st)) {
+      // Say plainly that THIS document has no study: an agent may have pointed at motion
+      // videos, and those are files (often of another assembly), never studies of this one.
+      const std::string title =
+          "No studies saved in " + st.docTabs[st.activeTab].title;
+      if (kit::emptyState(
+              "rotate_component", title.c_str(),
+              "A Motion study drives this assembly's mates and plays the sweep in the "
+              "viewport. Rendered motion videos (.mp4 / .gif) are files, not studies, and "
+              "a video of another assembly file is not a study of this one.",
+              "New Motion study"))
+        handleCommand(st, "sim_motion_study");
+      return;
+    }
     kit::dimText("No studies yet. Create a study above to add fixtures, "
                  "loads, and run an "
-                 "analysis. Studies are saved inside this part file.");
+                 "analysis. Studies are saved inside this document.");
     return;
   }
 

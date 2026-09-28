@@ -558,7 +558,8 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         if not study_id:
             return None
         return {"doc_id": doc_id, "study_id": study_id, "name": name,
-                "view": f"Simulation tab > {name} > Results > Run motion"}
+                "view": (f"Features > Assembly > Motion Study (or Simulate workspace > "
+                         f"{name}) > Run motion")}
 
     @mcp.tool()
     def simulate_motion(mate_id: Optional[str] = None, start: Optional[float] = None,

@@ -23,6 +23,7 @@
 
 #include "imgui.h"
 #include "imgui_internal.h"  // ImRect (ui::adaptivePanel rect argument)
+#include "widgets/kit.h"     // ui::kit::elide (row labels that outgrow the pane)
 
 #include "file_explorer.h"
 #include "dragdrop.h"       // kFileDragPayload (Explorer drag source -> viewport drop target)
@@ -122,6 +123,16 @@ static void itemPathTooltip(const std::string& name, const std::string& fullPath
         ImGui::SetTooltip("%s", name.c_str());
     else
         ImGui::SetTooltip("%s\n%s", name.c_str(), fullPath.c_str());
+}
+
+// TreeNodeEx label for a row about to be submitted at the cursor: the name elided with "…" to
+// the width left after the arrow/icon slot, so a long filename never runs under the pane edge
+// (itemPathTooltip carries the full name). A fixed "##row" id keeps the node stable as the pane
+// resizes; callers PushID the path/index first.
+static std::string rowLabel(const std::string& name) {
+    const float w = ImGui::GetContentRegionAvail().x - ImGui::GetTreeNodeToLabelSpacing() -
+                    ImGui::GetStyle().FramePadding.x;
+    return ui::kit::elide(name.c_str(), w) + "##row";
 }
 
 
@@ -344,7 +355,7 @@ static void drawFileRow(AppState& st, const std::string& root, const std::string
         // unused leaf-arrow slot so icon + label share the FM's exact metrics and centering.
         ui::FmRowRect rr = ui::fmRowPill(selected);
         ImVec2 rowPos = ImGui::GetCursorScreenPos();
-        ImGui::TreeNodeEx(fname.c_str(),
+        ImGui::TreeNodeEx(rowLabel(fname).c_str(),
                           ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
                           ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
         ui::fmTreeIconInArrowSlot(rowPos, fileIconName(ext), fileIconFallback(ext));
@@ -426,7 +437,7 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
     ui::FmRowRect rr = ui::fmRowPill(dirSelected);
     ui::fmTreeIcon("body_folder", "[D]");
     ImGui::SameLine(0, 4.0f * ui::uiScale);
-    bool open = ImGui::TreeNodeEx(label.c_str(), flags);
+    bool open = ImGui::TreeNodeEx(rowLabel(label).c_str(), flags);
     ui::fmRowPillEnd(rr, dirSelected);
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
         s_selectedPath = dir;
@@ -546,7 +557,7 @@ static void drawRecentSection(AppState& st) {
         ui::FmRowRect rr = ui::fmRowPill(false);
         ImVec2 rowPos = ImGui::GetCursorScreenPos();
         if (!exists) ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
-        ImGui::TreeNodeEx(fname.c_str(),
+        ImGui::TreeNodeEx(rowLabel(fname).c_str(),
                           ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
                           ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
         if (!exists) ImGui::PopStyleColor();

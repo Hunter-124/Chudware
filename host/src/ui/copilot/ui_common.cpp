@@ -5,6 +5,8 @@
 // and small model-label/token helpers. Included by every other copilot TU via
 // copilot_internal.h.
 
+#include <algorithm>
+
 #include "copilot_internal.h"
 #include "ui/tesseract.h"  // ui::drawTesseractSpinner — the brand mark doubles as the busy art
 
@@ -501,22 +503,50 @@ void chatDrawCopyFlash() {
 }
 
 // Soft-wrap preserving hard newlines (paragraph breaks). InputTextMultiline does not wrap, so
-// we reflow each hard line into the available width the same way the composer does.
-static std::string chatSoftWrap(const std::string& in, float wrapW) {
+// we reflow each hard line into the available width the same way the composer does. rewrapCore
+// only breaks at spaces, so a token wider than wrapW on its own (a path, a URL, a markdown link
+// target) would still run past the bubble and clip; those visual lines are then broken at
+// codepoint boundaries by INSERTING '\n'. `inserted` receives the soft-buffer index of every
+// inserted byte (ascending) so selections map back to the plain text.
+static std::string chatSoftWrap(const std::string& in, float wrapW, std::vector<int>& inserted) {
+    inserted.clear();
     if (in.empty() || wrapW <= 1.0f) return in;
     std::string out;
     out.reserve(in.size() + 16);
+    std::vector<char> buf;
     size_t i = 0;
     while (i <= in.size()) {
         size_t nl = in.find('\n', i);
         const size_t end = (nl == std::string::npos) ? in.size() : nl;
-        // Copy one hard line into a mutable buffer and rewrap it.
-        std::string line = in.substr(i, end - i);
-        if (!line.empty()) {
-            std::vector<char> buf(line.begin(), line.end());
+        const size_t len = end - i;
+        if (len > 0) {
+            buf.assign(in.begin() + (std::ptrdiff_t)i, in.begin() + (std::ptrdiff_t)end);
             buf.push_back('\0');
-            rewrapInPlace(buf.data(), (int)line.size(), wrapW);
-            out.append(buf.data(), line.size());
+            rewrapInPlace(buf.data(), (int)len, wrapW);
+            // Hard-break any visual line rewrapCore left wider than wrapW.
+            const char* p = buf.data();
+            const char* const e = p + len;
+            while (p < e) {
+                const char* vEnd = static_cast<const char*>(std::memchr(p, '\n', (size_t)(e - p)));
+                if (!vEnd) vEnd = e;
+                float w = 0.0f;
+                const char* cp = p;
+                while (cp < vEnd) {
+                    const char* nx = cp + 1;
+                    while (nx < vEnd && ((unsigned char)*nx & 0xC0) == 0x80) ++nx;
+                    const float cw = ImGui::CalcTextSize(cp, nx).x;
+                    if (w > 0.0f && w + cw > wrapW) {
+                        inserted.push_back((int)out.size());
+                        out.push_back('\n');
+                        w = 0.0f;
+                    }
+                    out.append(cp, nx);
+                    w += cw;
+                    cp = nx;
+                }
+                if (vEnd < e) out.push_back('\n');
+                p = vEnd + 1;
+            }
         }
         if (nl == std::string::npos) break;
         out.push_back('\n');
@@ -525,18 +555,25 @@ static std::string chatSoftWrap(const std::string& in, float wrapW) {
     return out;
 }
 
-// The soft-wrapped buffer chatDrawSelectableText hands InputText is SAME-LENGTH as the plain
-// text it was built from (rewrapCore only swaps ' ' <-> '\n'), so a selection's byte range
-// indexes the plain text directly. ImGui keeps InputTextState for exactly one item at a time,
-// so one record suffices: the plain text of whichever selectable currently owns that state.
-// Every copy path (native Ctrl+C, the context menu's "Copy") reads through here so the
-// clipboard never carries the wrapper's visual newlines.
+// The soft-wrapped buffer chatDrawSelectableText hands InputText is the plain text with ' '
+// swapped to '\n' at word breaks plus the '\n' bytes chatSoftWrap INSERTED inside over-wide
+// tokens; dropping those inserted indices maps a selection's byte range back to the plain text.
+// ImGui keeps InputTextState for exactly one item at a time, so one record suffices: the plain
+// text of whichever selectable currently owns that state. Every copy path (native Ctrl+C, the
+// context menu's "Copy") reads through here so the clipboard never carries the wrapper's visual
+// newlines.
 namespace {
 struct SelectablePlain {
-    ImGuiID     id = 0;
-    std::string plain;
+    ImGuiID          id = 0;
+    std::string      plain;
+    std::vector<int> inserted;   // soft-buffer indices of chatSoftWrap's inserted '\n' bytes
 };
 SelectablePlain s_selPlain;
+
+// Soft-buffer index -> plain index: subtract the inserted bytes strictly before it.
+int softToPlain(const std::vector<int>& inserted, int s) {
+    return s - (int)(std::lower_bound(inserted.begin(), inserted.end(), s) - inserted.begin());
+}
 }  // namespace
 
 // Pull the active selection (UTF-8) from an InputText id, if any — in PLAIN text when the
@@ -551,8 +588,12 @@ std::string chatInputSelection(ImGuiID id) {
     if (a < 0) a = 0;
     if (b > state->TextLen) b = state->TextLen;
     if (b <= a) return {};
-    if (s_selPlain.id == id && s_selPlain.plain.size() == (size_t)state->TextLen)
-        return s_selPlain.plain.substr((size_t)a, (size_t)(b - a));
+    if (s_selPlain.id == id &&
+        s_selPlain.plain.size() + s_selPlain.inserted.size() == (size_t)state->TextLen) {
+        const int pa = softToPlain(s_selPlain.inserted, a);
+        const int pb = softToPlain(s_selPlain.inserted, b);
+        return s_selPlain.plain.substr((size_t)pa, (size_t)(pb - pa));
+    }
     return std::string(state->TextA.Data + a, state->TextA.Data + b);
 }
 
@@ -599,7 +640,8 @@ ImGuiID chatDrawSelectableText(const char* id, const std::string& plain,
     const ImGuiStyle& style = ImGui::GetStyle();
     float wrapW = ImGui::GetContentRegionAvail().x - style.FramePadding.x * 2.0f;
     if (wrapW < 1.0f) wrapW = 1.0f;
-    const std::string soft = chatSoftWrap(plain, wrapW);
+    static std::vector<int> s_inserted;   // GL-thread scratch; copied only for the state owner
+    const std::string soft = chatSoftWrap(plain, wrapW, s_inserted);
     int lines = 1;
     for (char c : soft) if (c == '\n') ++lines;
     const float lh = ImGui::GetTextLineHeight();
@@ -631,9 +673,11 @@ ImGuiID chatDrawSelectableText(const char* id, const std::string& plain,
     // This item owns ImGui's InputTextState (active, or the last one deactivated with a live
     // selection): remember its plain text so selection copies map back through it.
     if (ImGui::GetInputTextState(itemId)) {
-        if (s_selPlain.id != itemId || s_selPlain.plain != plain) {
+        if (s_selPlain.id != itemId || s_selPlain.plain != plain ||
+            s_selPlain.inserted != s_inserted) {
             s_selPlain.id = itemId;
             s_selPlain.plain = plain;
+            s_selPlain.inserted = s_inserted;
         }
     }
     // Ctrl+C — InputText already put the WRAPPED selection on the clipboard; replace it with

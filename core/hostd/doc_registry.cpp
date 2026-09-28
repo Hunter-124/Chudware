@@ -670,6 +670,21 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                     fanoutLocked(docId, json{{"event", "doc.changed"}, {"data", data}},
                                  fanoutExclude, pending);
                 }
+            } else if (advanced && !d.internal && method.rfind("sim_study_", 0) == 0 &&
+                       method != "sim_study_list") {
+                // Study add/edit/delete stays read-only for ACCESS (a GUI viewer may edit the
+                // studies of an agent's doc) but it is a real revision with no tree, so it is
+                // announced on its own event instead of a doc.changed the mirror would reject.
+                // Without it an agent's persisted FEA/motion study never reached an open
+                // Simulation tree until some unrelated edit bumped the mirror's revision.
+                fanoutLocked(docId,
+                             json{{"event", "doc.studies_changed"},
+                                  {"data", {{"doc_id", docId},
+                                            {"revision", rev},
+                                            {"source_client", clientId},
+                                            {"source_kind", kind},
+                                            {"method", method}}}},
+                             fanoutExclude, pending);
             }
         } else if (a.lastSeenRev < 0) {
             a.lastSeenRev = d.revision;  // first touch via a rev-less response

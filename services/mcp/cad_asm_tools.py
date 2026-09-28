@@ -531,6 +531,35 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
 
 
 
+    def _persist_motion_study(doc_id: str, mates: list, drivers: list, steps: int,
+                              check_interference: bool, min_clearance_mm: float):
+        """Record a solved sweep as the document's native Motion study so the user can open
+        it in the Simulation tab and watch it play in the viewport. Only the INPUTS are stored
+        (the GUI re-solves them with the same engine call); the record is keyed by its driven
+        joints, so re-sweeping a joint replaces its study instead of piling up copies."""
+        labels = []
+        for row in drivers:
+            mate = next((m for m in mates if m.get("id") == row["mate_id"]), {})
+            labels.append(str(mate.get("name") or row["mate_id"]))
+        name = "Motion: " + ", ".join(labels)
+        study_id = _persist_study(doc_id, {
+            "type": "motion",
+            "name": name,
+            "motion": {
+                "drivers": [{"mate_id": r["mate_id"], "start": r["start"], "stop": r["stop"]}
+                            for r in drivers],
+                "steps": steps,
+                "loop": True,
+                "fps": 24.0,
+                "check_interference": check_interference,
+                "min_clearance": min_clearance_mm,
+            },
+        })
+        if not study_id:
+            return None
+        return {"doc_id": doc_id, "study_id": study_id, "name": name,
+                "view": f"Simulation tab > {name} > Results > Run motion"}
+
     @mcp.tool()
     def simulate_motion(mate_id: Optional[str] = None, start: Optional[float] = None,
                         stop: Optional[float] = None, steps: int = 24,
@@ -608,6 +637,9 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         is true, all computed samples were checked, and no collisions were reported.
         Missing/failed geometry is incomplete evidence, not a collision-free sweep.
         The engine solves an immutable snapshot; live poses, mates and history never change.
+        A successful sweep is recorded as the document's native Motion study (`motion_study`
+        {doc_id, study_id, name, view}; re-sweeping the same joints replaces it). When you
+        report a motion check, tell the user where to watch it: its `view` path.
         """
         try:
             d = _doc(doc_id)
@@ -750,6 +782,11 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
             })
             if loop and out.get("summary"):
                 out["summary"] += "; loop closure reuses the solved start pose"
+            if out.get("ok") and len(trajectory) >= 2:
+                study = _persist_motion_study(
+                    d, mates, normalized, steps, bool(check_interference), min_clearance_mm)
+                if study:
+                    out["motion_study"] = study
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)

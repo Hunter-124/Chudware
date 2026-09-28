@@ -5100,3 +5100,23 @@ can still address a different part with an old id; making ids unique across rest
 persisted counter in hostd. Tests: `test_current_part.py::test_stale_engine_id_is_refused_with_a_reopen_path`,
 `test_worker_rpc_chudcode.py::test_resumed_conversation_first_turn_names_the_live_document_ids`
 and `…::test_resume_note_survives_an_unreachable_engine`.
+
+## 2026-09-28 — "no way for me to open/view/watch the motion simulations"
+
+An agent's `simulate_motion` returned a trajectory to the model and nothing to the user: unlike
+`run_fea_*` (`_persist_study`), it recorded no study, so the assembly's Simulation tree never
+listed it. Fixes: (1) `cad_asm_tools.simulate_motion` records every successful sweep as the doc's
+native Motion study (`_persist_motion_study`: GUI `studyFromJson` shape, name `Motion: <mate
+names>`, keyed by type+name so re-sweeping a joint replaces it) and returns `motion_study
+{doc_id, study_id, name, view}`; a `render_animation(kind="motion")` film carries it in its
+`measured` caption. (2) hostd (`DocRegistry::postCall`) announces `sim_study_add|edit|delete`
+as `doc.studies_changed` (contracts/doc_ops.md §29) — they stay read-only for access and bump a
+tree-less revision, so an open Simulation tree never heard about an agent's study (FEA too);
+`engine_events.cpp` calls `SimManager::markStudiesStale`. (3) The Motion Results pane offers
+"Run motion" (it only said "Open Motion setup … then Run"); results stay unpersisted by design.
+(4) GUI `runMotion` sent `min_clearance`, the engine reads `min_clearance_mm`: the GUI's minimum
+clearance field was silently ignored. The sweep still never touches geometry, mates, poses or
+expressions, but it now bumps the revision; the "tree unchanged" motion tests compare the tree
+minus `studies` instead. Not covered: steer sweeps (`steer=`) have no mate to record, so a steer
+film is still file-only. Tests: `test_hostd_registry.py::test_study_mutation_announces_studies_changed`,
+`test_cad_tools.py::test_simulate_motion_records_one_study_per_joint_and_loop_closes_exactly`.

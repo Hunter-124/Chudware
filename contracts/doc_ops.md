@@ -813,3 +813,23 @@ may leave explicitly reported partial copies; this is not an all-files atomic
 transaction. MCP persists large inspection results and every relocation result
 in guarded, non-overwriting JSON artifacts. A failed artifact write preserves
 native outcome counts and warns that copies may already exist.
+
+
+## 29. `doc.studies_changed` and agent Motion studies (append-only, 2026-09-28)
+
+`sim_study_add` / `sim_study_edit` / `sim_study_delete` stay read-only for access control
+(a GUI viewer may edit the studies of an agent's doc), but each bumps the revision without
+a tree, so hostd announces it on its own event — never as a `doc.changed` — to every
+subscriber except the caller:
+
+```json
+{"event":"doc.studies_changed","data":{"doc_id":"…","revision":7,"source_client":3,
+ "source_kind":"mcp","method":"sim_study_add"}}
+```
+
+A GUI re-pulls that document's `sim_study_list` on its next Simulation-tree draw. A
+successful MCP `simulate_motion` records its inputs as the document's native Motion study
+(`{type:"motion", name:"Motion: <mate names>", motion:{drivers, steps, loop, fps,
+check_interference, min_clearance}}`, keyed by type+name, so re-sweeping the same joints
+replaces it) and returns it as `motion_study {doc_id, study_id, name, view}`. Only inputs are
+stored; the GUI re-solves them with the same engine `simulate_motion` call to play them.

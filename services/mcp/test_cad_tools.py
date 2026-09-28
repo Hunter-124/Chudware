@@ -2463,6 +2463,15 @@ def _bar_part(name: str, L: float, W: float, H: float, sidecar: str) -> tuple:
     return path, faces
 
 
+def _mechanism(doc_id: str) -> dict:
+    """doc_tree without the revision and the persisted studies. A sweep records its Motion
+    study (a revision) but must never touch geometry, mates, poses or expressions."""
+    snap = cb.call("doc_tree", {"doc_id": doc_id})
+    snap.pop("revision", None)
+    snap["tree"].pop("studies", None)
+    return snap
+
+
 def _build_swinging_arm_assembly(tmp_path) -> tuple:
     """A driven single-DOF planar CRANK mechanism (honestly named: not a full 4-bar; see
     work/questions/T-BL16.md for the fidelity decision — the tool itself drives any dimensional
@@ -2681,7 +2690,7 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
                     "type": "angle", "align": "aligned", "refs": refs, "value": value}},
             ]})
             mate_id = added["id_map"]["$0"]
-        before = cb.call("doc_tree", {"doc_id": asm})
+        before = _mechanism(asm)
         out, _ = _call("simulate_motion", {
             "doc_id": asm, "mate_id": mate_id, "start": 0, "stop": -180,
             "steps": 37, "check_interference": False})
@@ -2735,7 +2744,7 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
             assert checked["translation_ok"] and checked["rotation_ok"]
             expected_invariant = {"axis": invariant_axis, "ok": True} if invariant_axis else None
             assert checked["invariant_coordinate"] == expected_invariant
-        assert cb.call("doc_tree", {"doc_id": asm}) == before
+        assert _mechanism(asm) == before
         if line_source == "authored":
             # A second mate forbids the requested rotation. Neither convergence
             # of some other pose nor its interference numbers can certify motion.
@@ -2823,10 +2832,12 @@ def test_simulate_motion_trajectory_and_swept_interference(tmp_path):
     assert pair == {"Arm", "Obstacle"}, f"unexpected clash pair {pair}: {inter}"
 
 
-def test_simulate_motion_is_snapshot_read_only_and_loop_closes_exactly(tmp_path):
-    """Sweep/loop leaves revision, mate expression, transforms and whole tree untouched."""
+def test_simulate_motion_records_one_study_per_joint_and_loop_closes_exactly(tmp_path):
+    """The sweep leaves the mechanism untouched, closes its loop on the solved start pose, and
+    records the inputs as the doc's native Motion study (what the GUI opens and re-plays).
+    Re-sweeping the same joint replaces that study rather than adding another."""
     asm, mate_id, _ = _build_swinging_arm_assembly(tmp_path)
-    before = cb.call("doc_tree", {"doc_id": asm})
+    before = _mechanism(asm)
     r, _ = _call("simulate_motion", {"doc_id": asm, "mate_id": mate_id,
                                      "start": 0.0, "stop": 90.0, "steps": 7,
                                      "loop": True, "check_interference": False})
@@ -2834,9 +2845,24 @@ def test_simulate_motion_is_snapshot_read_only_and_loop_closes_exactly(tmp_path)
     assert len(r["trajectory"]) == 8
     assert r["trajectory"][-1]["value"] == 0.0
     assert r["trajectory"][-1]["bodies"] == r["trajectory"][0]["bodies"]
-    after = cb.call("doc_tree", {"doc_id": asm})
-    assert after["revision"] == before["revision"]
-    assert after["tree"] == before["tree"]
+    assert _mechanism(asm) == before
+    study = r["motion_study"]
+    assert study["doc_id"] == asm
+    assert cb.call("sim_study_list", {"doc_id": asm})["studies"] == [{
+        "id": study["study_id"], "type": "motion", "name": study["name"],
+        "motion": {"drivers": [{"mate_id": mate_id, "start": 0.0, "stop": 90.0}],
+                   "steps": 7, "loop": True, "fps": 24.0,
+                   "check_interference": False, "min_clearance": 0.0}}]
+
+    r, _ = _call("simulate_motion", {"doc_id": asm, "mate_id": mate_id,
+                                     "start": 0.0, "stop": 45.0, "steps": 4,
+                                     "check_interference": True, "min_clearance_mm": 0.5})
+    assert r["ok"], r
+    studies = cb.call("sim_study_list", {"doc_id": asm})["studies"]
+    assert [s["id"] for s in studies] == [study["study_id"]]
+    assert studies[0]["motion"]["drivers"] == [{"mate_id": mate_id, "start": 0.0, "stop": 45.0}]
+    assert studies[0]["motion"]["steps"] == 4
+    assert studies[0]["motion"]["min_clearance"] == 0.5
 
 
 def test_simulate_motion_autopicks_single_drivable_mate(tmp_path):

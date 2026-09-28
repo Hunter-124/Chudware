@@ -309,6 +309,9 @@ public:
     // Pull this document's studies from the engine (sim_study_list) into the local mirror. Called
     // on tab activation / first draw and after each mutation.
     void refresh(AppState& st);
+    // Another client (an agent's run_fea_* / simulate_motion) added or edited a study: re-pull
+    // the list on the next tree draw. Driven by hostd's doc.studies_changed event.
+    void markStudiesStale() { lastRevision_ = -1; }
     // Drop the local result overlay state (called when leaving the tab / deleting a study).
     void clearResultOverlay(AppState& st);
     // Reconcile the viewport with the current view: the result overlay (FEA mesh, colormap, deformed)

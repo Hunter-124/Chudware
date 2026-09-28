@@ -9112,7 +9112,7 @@ void SimManager::runMotion(AppState &st, Study &s) {
                  {"start", first.start}, {"stop", first.stop},
                  {"drivers", motionDriversJson(s)}, {"steps", s.motionSteps},
                  {"check_interference", s.motionCheckInterference},
-                 {"min_clearance", s.motionMinClearance}};
+                 {"min_clearance_mm", s.motionMinClearance}};
   motionRun_ = run;
   s.motionRunning = true;
   s.summary = "Preparing Motion snapshot...";
@@ -10114,13 +10114,18 @@ void SimManager::highlightMotionCollisions(AppState &st, const Study &s,
 
 void SimManager::drawMotionResults(AppState &st, Study &s) {
   if (!s.motionHasResult) {
-    if (s.motionRunning)
+    if (s.motionRunning) {
       kit::spinner(s.summary.c_str());
-    else if (!s.summary.empty())
+    } else if (!s.summary.empty()) {
       kit::inlineStatus(s.summary.c_str(), kit::Tone::Warn);
-    else
-      kit::emptyState("rotate_component", "No Motion results",
-                      "Open Motion setup, choose named drivers, then Run.");
+      if (kit::primaryButton("Run motion"))
+        run(st, s);
+    } else if (kit::emptyState("rotate_component", "No Motion results",
+                               "Studies keep their setup, not their samples. Run to solve the "
+                               "sweep and play it here.",
+                               "Run motion")) {
+      run(st, s);
+    }
     return;
   }
   const float S = ui::uiScale;

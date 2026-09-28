@@ -1227,6 +1227,9 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                                           + f" {lo:g}->{hi:g} {unit or 'deg'}")
                         else:
                             measured["min_clearance_mm"] = float(min_clearance_mm)
+                            if sweep.get("motion_study"):
+                                # The film's sweep is also the doc's live Motion study.
+                                measured["motion_study"] = sweep["motion_study"]
                             foot_right = (f"mate {sweep.get('mate_id')} "
                                           f"{traj[0].get('value')}->"
                                           f"{traj[-1].get('value')} {unit}")

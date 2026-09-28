@@ -367,7 +367,7 @@ def test_mated_film_renders_solved_poses_without_resolving_them(tools, tmp_path,
         mate = added["id_map"]["$0"]
         assert json.loads(tools["save_part"](path=str(tmp_path / "pose_assembly.step+"),
                                               doc_id=doc))["ok"]
-        before = cb.call("doc_tree", {"doc_id": doc})
+        before = cb.call("doc_tree", {"doc_id": doc})["tree"]
         result = tools["render_animation"](
             kind="motion", doc_id=doc, mate_id=mate, start=-30, stop=-150,
             steps=3, frames=3, fps=3, size=[640, 480],
@@ -382,7 +382,11 @@ def test_mated_film_renders_solved_poses_without_resolving_them(tools, tmp_path,
                 [min(point[a] for point in points) for a in range(3)], abs=1e-4)
             assert bounds["max"] == pytest.approx(
                 [max(point[a] for point in points) for a in range(3)], abs=1e-4)
-        assert cb.call("doc_tree", {"doc_id": doc}) == before
+        # Filming never re-poses the assembly; its sweep is recorded as the Motion study.
+        after = cb.call("doc_tree", {"doc_id": doc})["tree"]
+        assert [s["type"] for s in after.pop("studies")] == ["motion"]
+        before.pop("studies", None)
+        assert after == before
     finally:
         cb.call("doc_close", {"doc_id": doc})
         cb.call("doc_close", {"doc_id": part})

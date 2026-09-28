@@ -233,6 +233,40 @@ def test_doc_changed_event_reaches_subscriber(scratch_daemon):
     assert not _events(a, "doc.changed")
 
 
+def test_study_mutation_announces_studies_changed(scratch_daemon):
+    """An agent's persisted study (FEA results, a simulate_motion sweep) bumps the revision
+    with no tree, so it must arrive as doc.studies_changed — never as a doc.changed the GUI
+    mirror would reject — or an open Simulation tree never lists it."""
+    a, b = DaemonClient(), DaemonClient()
+    a.connect()
+    scratch_daemon.append(_pid(a))
+    b.connect()
+    b.call("subscribe", {"doc_ids": "*"})
+    doc = a.call("doc_new", {"name": "studies"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    time.sleep(0.2)
+    _events(b, "doc.changed")  # drain the geometry edit
+
+    added = a.call("sim_study_add", {"doc_id": doc, "study": {"type": "motion", "name": "M"}})
+    time.sleep(0.2)
+    b.call("ping")
+    events = [e for e in b.poll_events()
+              if e.get("event") in ("doc.changed", "doc.studies_changed")]
+    assert [e["event"] for e in events] == ["doc.studies_changed"], events
+    d = events[0]["data"]
+    assert d["doc_id"] == doc and d["revision"] == added["revision"]
+    assert d["method"] == "sim_study_add"
+
+    # Listing is a read: no announcement. The writer never hears its own edit.
+    a.call("subscribe", {"doc_ids": "*"})
+    a.call("sim_study_list", {"doc_id": doc})
+    a.call("sim_study_delete", {"doc_id": doc, "study_id": added["study_id"]})
+    time.sleep(0.2)
+    assert not _events(a, "doc.studies_changed")
+    assert [e["data"]["method"] for e in _events(b, "doc.studies_changed")] == [
+        "sim_study_delete"]
+
+
 def test_doc_snapshot_served_immediately_after_mint(scratch_daemon):
     """A freshly minted doc must answer doc_snapshot with a REAL empty-tree snapshot,
     before any edit ever lands. This is what lets a GUI mirror tab prime itself the

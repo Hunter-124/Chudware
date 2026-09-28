@@ -741,7 +741,7 @@ def test_multi_driver_motion_carries_joint_frame_and_reuses_checked_start(motion
     """World placement must equal Rz(steer)*Rx(roll), not two independent world spins."""
     doc = motion_joint_chain["doc_id"]
     ids, mates = motion_joint_chain["components"], motion_joint_chain["mates"]
-    before = cb.call("doc_tree", {"doc_id": doc})
+    before = cb.call("doc_tree", {"doc_id": doc})["tree"]
     # Descendant first deliberately: declaration order is not kinematic dependency order.
     out = _call("simulate_motion", {
         "doc_id": doc, "steps": 3, "loop": True, "check_interference": True,
@@ -784,7 +784,16 @@ def test_multi_driver_motion_carries_joint_frame_and_reuses_checked_start(motion
     assert out["interference"]["complete"] is True
     assert out["interference"]["frames_checked"] == 3
     assert out["interference"]["pair_failures"] == []
-    assert cb.call("doc_tree", {"doc_id": doc}) == before
+    # The mechanism is untouched; the synchronized drive set is recorded, in call order, as
+    # the doc's one Motion study so the GUI can re-play exactly this sweep.
+    after = cb.call("doc_tree", {"doc_id": doc})["tree"]
+    studies = after.pop("studies")
+    before.pop("studies", None)
+    assert after == before
+    assert [s["id"] for s in studies] == [out["motion_study"]["study_id"]]
+    assert studies[0]["motion"]["drivers"] == [
+        {"mate_id": mates["roll"], "start": 15.0, "stop": 75.0},
+        {"mate_id": mates["steer"], "start": 0.0, "stop": 30.0}]
 
 
 @pytest.mark.parametrize("invalid", ["duplicate", "suppressed", "nonfinite", "missing_bound"])

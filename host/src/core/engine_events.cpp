@@ -24,6 +24,7 @@
 #include "../ui/reveng/reveng_internal.h"  // RevEngEvent / feedRevEngEvent / RevEngState
 #include "../ui/manufacture/mfg_mirror.h"
 #include "../ui/sketch_mode.h"
+#include "../ui/sim_manager.h"
 
 namespace core {
 
@@ -670,6 +671,16 @@ void handleEvent(AppState& st, const json& evt) {
             return;
         }
         applyChangedActive(st, docId, d);
+        return;
+    }
+    if (name == "doc.studies_changed") {
+        // An agent persisted a study (run_fea_* results, a simulate_motion sweep) — a revision
+        // with no tree, so doc.changed never carries it. Re-pull that document's study list on
+        // its next Simulation-tree draw. GUI-sourced edits already live in the local mirror.
+        if (docId.empty() || d.value("source_kind", std::string()) == "gui") return;
+        const int idx = tabIndexForDoc(st, docId);
+        if (idx >= 0 && st.docTabs[idx].session && st.docTabs[idx].session->sim)
+            st.docTabs[idx].session->sim->markStudiesStale();
         return;
     }
     if (name == "doc.closed") {

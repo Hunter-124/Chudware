@@ -440,6 +440,11 @@ judgment).
   `workspace_dir` sent on each turn. `index.json` v3 keeps `active_by_project`; Sessions
   filters the stored key (never a live artifact scan) and adopts headless Chudcode
   `*.jsonl` files from the Sessions dir. Do not re-derive membership at draw time.
+- **An agent's sim is a study the user can open (2026-09-28).** `run_fea_*` and
+  `simulate_motion` persist their study into the doc (`_persist_study`; motion stores inputs
+  only, keyed by driven mate names) and hostd fans `sim_study_*` mutations as
+  `doc.studies_changed` so an open Simulation tree re-pulls. A new agent sim tool must persist
+  the same way, or the user cannot see what the agent verified.
 - **Sim results are evidence-grade or they are not results.** `sim_run_static|adaptive|modal|
   thermal` emit top-level `mesh_quality`, `reactions` (static/adaptive), `provenance`
   (`engine_build_id`, `polymesh_commit`) and honour `study.vtu_path`; `sim_cache` schema `/3`.

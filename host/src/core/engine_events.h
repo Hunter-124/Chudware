@@ -13,6 +13,9 @@
 //                       "last_writer_detached" (fires every turn when the agent's
 //                       per-turn worker exits; the doc is still live) which keeps
 //                       the tab and just clears aiPulse / sets agentDone.
+//   doc.studies_changed -> another client added/edited/deleted a sim study
+//                       (tree-less revision): the tab's SimManager re-pulls its
+//                       study list on the next Simulation-tree draw.
 //   doc.lease_change -> toasts; an expired hold on the doc our PropertyManager
 //                       is previewing cancels the preview (revision-parentage
 //                       checked before the undo — see engine_events.cpp).

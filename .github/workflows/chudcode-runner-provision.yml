@@ -1,0 +1,166 @@
+# Register a third, Chudcode-scoped runner on an existing CAD macOS runner.
+# Dispatch once per Mac; the CAD and CloudCastle installations are not modified.
+name: chudcode-runner-provision
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: Mac hosting the new Chudcode runner
+        required: true
+        type: choice
+        options: [imac-intel, macbook-air-m2]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chudcode-runner-provision-${{ inputs.host }}
+  cancel-in-progress: false
+
+jobs:
+  register:
+    name: Register Chudcode runner on ${{ inputs.host }}
+    runs-on: [self-hosted, macOS, cloudcastle-ci, "${{ inputs.host == 'imac-intel' && 'cc-mac-intel' || 'cc-mac-arm' }}"]
+    timeout-minutes: 20
+    env:
+      CHUDCODE_RUNNER_REG_TOKEN: ${{ secrets.CHUDCODE_RUNNER_REG_TOKEN }}
+      TARGET_HOST: ${{ inputs.host }}
+    steps:
+      - name: Clone, register, and start independent runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No checkout and no shell tracing: the token is passed only to config.sh.
+          case "${TARGET_HOST}" in
+            imac-intel)
+              expected_arch=x86_64
+              capacity_label=cc-mac-intel
+              ;;
+            macbook-air-m2)
+              expected_arch=arm64
+              capacity_label=cc-mac-arm
+              ;;
+            *) echo '::error::Invalid host choice'; exit 1 ;;
+          esac
+          if [ "${RUNNER_NAME}" != "${TARGET_HOST}" ] || [ "$(uname -m)" != "${expected_arch}" ]; then
+            echo '::error::CAD runner identity or architecture does not match the requested Mac'
+            exit 1
+          fi
+          source_dir="${HOME}/actions-runner-cad"
+          target_dir="${HOME}/actions-runner-chudcode"
+          runner_name="${TARGET_HOST}-chudcode"
+          service_name="actions.runner.Hunter-124-chudcode.${runner_name}"
+          plist="${HOME}/Library/LaunchAgents/${service_name}.plist"
+          if [ ! -x "${source_dir}/config.sh" ] || [ ! -x "${source_dir}/bin/Runner.Listener" ]; then
+            echo '::error::Existing CAD runner installation is missing or incomplete'
+            exit 1
+          fi
+          if [ -L "${target_dir}" ]; then
+            echo '::error::Chudcode runner directory must not be a symlink'
+            exit 1
+          fi
+          if [ -z "${CHUDCODE_RUNNER_REG_TOKEN}" ] && [ ! -f "${target_dir}/.runner" ]; then
+            echo '::error::Set CAD repository secret CHUDCODE_RUNNER_REG_TOKEN to a fresh Chudcode runner registration token'
+            exit 1
+          fi
+
+          if [ ! -f "${target_dir}/.runner" ]; then
+            # Only clone while unconfigured. Re-runs must not overwrite the live
+            # Chudcode binary or alter the active CAD runner's own state.
+            if [ -e "${target_dir}/.service" ] || [ -e "${target_dir}/.credentials" ] || [ -e "${target_dir}/.credentials_rsaparams" ]; then
+              echo '::error::Unconfigured target has partial credentials or service state; inspect it manually before retrying'
+              exit 1
+            fi
+            mkdir -p "${target_dir}"
+            rsync -a \
+              --exclude='_work/' --exclude='_diag/' --exclude='_update/' \
+              --exclude='.runner' --exclude='.runner_migrated' \
+              --exclude='.credentials*' --exclude='.service' \
+              --exclude='.path' --exclude='.env' \
+              --exclude='.agent' --exclude='.agent_migrated' \
+              --exclude='svc.sh' --exclude='runsvc.sh' \
+              --exclude='bin/actions.runner.plist.temp' --exclude='bin.*/actions.runner.plist.temp' \
+              "${source_dir}/" "${target_dir}/"
+            # Runner auto-updates may leave bin/externals pointing at absolute
+            # paths inside actions-runner-cad. rsync -a preserves those links:
+            # invoking config.sh before fixing them would execute CAD's listener
+            # against CAD's credentials and could disrupt its active service.
+            for link in bin externals; do
+              if [ -L "${target_dir}/${link}" ]; then
+                linked="$(readlink "${target_dir}/${link}")"
+                case "${linked}" in
+                  "${source_dir}/${link}."*|"${link}."*) ;;
+                  *) echo "::error::Unexpected ${link} link in CAD runner"; exit 1 ;;
+                esac
+                local_version="$(basename "${linked}")"
+                if [ ! -d "${target_dir}/${local_version}" ]; then
+                  echo "::error::Clone lacks the ${link} version directory"
+                  exit 1
+                fi
+                ln -sfn "${local_version}" "${target_dir}/${link}"
+              fi
+            done
+            if [ ! -x "${target_dir}/bin/Runner.Listener" ] || [ ! -d "${target_dir}/externals" ]; then
+              echo '::error::Cloned runner binaries are missing or inaccessible'
+              exit 1
+            fi
+            cd "${target_dir}"
+            # --replace is needed only if an earlier attempt registered this
+            # exact runner with GitHub but never finished writing local state.
+            ./config.sh --unattended \
+              --url https://github.com/Hunter-124/chudcode \
+              --token "${CHUDCODE_RUNNER_REG_TOKEN}" \
+              --name "${runner_name}" \
+              --labels "cloudcastle-ci,${capacity_label}" \
+              --work _work --replace
+          else
+            cd "${target_dir}"
+          fi
+          # A pre-existing configured clone must not still reference the CAD
+          # runner's version directories. Never run its service script.
+          for link in bin externals; do
+            if [ -L "${target_dir}/${link}" ]; then
+              case "$(readlink "${target_dir}/${link}")" in
+                "${link}."*) ;;
+                *) echo "::error::Configured ${link} points outside Chudcode installation"; exit 1 ;;
+              esac
+            fi
+          done
+          # A configured target must belong to the intended repository and
+          # runner. Never reset credentials or reconfigure a working instance.
+          python3 -c 'import json,sys; r=json.load(open(".runner")); sys.exit(0 if r.get("agentName")==sys.argv[1] and r.get("gitHubUrl", "").rstrip("/")=="https://github.com/Hunter-124/chudcode" else 1)' "${runner_name}" || {
+            echo '::error::Target directory belongs to a different runner or repository'
+            exit 1
+          }
+          if [ ! -x ./svc.sh ]; then
+            echo '::error::Configured Chudcode runner lacks its own service script'
+            exit 1
+          fi
+          if [ -f .service ]; then
+            if [ "$(cat .service)" != "${plist}" ] || [ ! -f "${plist}" ]; then
+              echo '::error::Chudcode service registration is inconsistent; inspect before retrying'
+              exit 1
+            fi
+          else
+            if [ -e "${plist}" ]; then
+              echo '::error::Chudcode LaunchAgent already exists without matching runner service state'
+              exit 1
+            fi
+            ./svc.sh install
+          fi
+          if [ "$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' "${plist}")" != "${target_dir}" ] || \
+             [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "${plist}")" != "${target_dir}/runsvc.sh" ]; then
+            echo '::error::Chudcode LaunchAgent points to an unexpected installation'
+            exit 1
+          fi
+          if launchctl list "${service_name}" >/dev/null 2>&1; then
+            if launchctl list "${service_name}" | grep -q '"PID"'; then
+              echo 'Chudcode runner LaunchAgent is already running'
+            else
+              launchctl kickstart "gui/$(id -u)/${service_name}"
+            fi
+          else
+            ./svc.sh start
+          fi
+          echo "Chudcode runner ${runner_name} registered with ${capacity_label} and its own LaunchAgent"

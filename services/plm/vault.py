@@ -18,6 +18,7 @@ Every public method returns plain Python; the ``plm_*`` MCP tools + the §7.1
 from __future__ import annotations
 
 import getpass
+import json
 import os
 import tempfile
 import time
@@ -1217,8 +1218,13 @@ class Vault:
                 rel = (Path(dirpath) / fn).relative_to(self.project_dir).as_posix()
                 generic_snapshot.contained_path(self.project_dir, rel)
                 p = Path(dirpath) / fn
-                if p.is_file():  # skip dangling symlinks / non-regular entries
-                    out.append(p)
+                try:
+                    if p.is_file():  # skip dangling symlinks / non-regular entries
+                        out.append(p)
+                except OSError:
+                    # Discovery is best-effort. Tracked paths are still checked
+                    # explicitly in _explode_project_into_shadow on save.
+                    continue
         out.sort()
         return out
 
@@ -1469,16 +1475,20 @@ class Vault:
         except OSError:
             return None
 
-    def _dirty_items(self, m: dict[str, Any]) -> list[str]:
-        """Return item_ids whose working container differs from HEAD's canonical form.
+    def _dirty_items(self, m: dict[str, Any], *,
+                     changes: dict[str, str] | None = None) -> list[str]:
+        """Return item_ids whose working content differs from HEAD.
 
-        Hot path for overview/status. On a warm process, unchanged working files
-        skip ``snapshot.explode_container`` / generic content hashing via the
-        module-level stamp cache (see ``_dirty_scan_cache``). A full compare
-        always runs on cache miss, HEAD change, or stamp mismatch.
+        When requested, populate ``changes`` from the same stat/content scan:
+        A has a working file but no HEAD content, D has HEAD content but no
+        working file, and M differs from HEAD. The legacy dirty list deliberately
+        keeps its existing missing-file semantics.
         """
         head = self._bind.head_commit()
         if head is None:
+            if changes is not None:
+                for it in m["items"]:
+                    changes[it["item_id"]] = "A"
             return [it["item_id"] for it in m["items"]]
 
         root_key = _vault_cache_key(self.project_dir)
@@ -1497,35 +1507,76 @@ class Vault:
             iid = it["item_id"]
             live_ids.add(iid)
             stamp = self._working_stamp(it)
+            dt = it.get("doc_type")
+            store = doctypes.storage_form(dt) if dt in doctypes.GENERIC_DOC_TYPES else None
+            head_has_content = False
+            missing = False
+            if changes is not None:
+                prefix = snapshot.item_prefix(iid)
+                if store == "link":
+                    content_path = prefix + "link.json"
+                elif store == "tree":
+                    content_path = prefix + "tree.index.json"
+                elif store == "file":
+                    content_path = generic_snapshot._file_path(iid, it["path"])
+                else:
+                    content_path = prefix + "document.json"
+                head_has_content = self._bind.entry_at(head, content_path) is not None
+                if store != "link" and (stamp is None or stamp == ("missing",)):
+                    # is_file()/is_dir() suppresses OS errors. Only a genuine
+                    # absent path is a deletion; permission errors and wrong-kind
+                    # existing paths are not.
+                    path = generic_snapshot.contained_path(self.project_dir, it["path"])
+                    try:
+                        path.stat()
+                    except (FileNotFoundError, NotADirectoryError):
+                        missing = True
+                    except OSError:
+                        pass
+            def item_change(is_dirty: bool) -> str:
+                if missing:
+                    return "D" if head_has_content else ""
+                if not head_has_content and store != "link":
+                    return "A"
+                return "M" if is_dirty else ""
             if stamp is None:
                 path = generic_snapshot.contained_path(self.project_dir, it["path"])
                 try:
                     path.stat()
-                except FileNotFoundError:
-                    # An actually missing path is an intentional deletion.
+                except (FileNotFoundError, NotADirectoryError):
+                    # An actually missing container is intentionally not dirty.
                     item_cache.pop(iid, None)
+                    if changes is not None:
+                        changes[iid] = item_change(False)
                     continue
                 except OSError:
                     pass
                 # Existing-but-unreadable and wrong-kind paths are not clean.
                 item_cache[iid] = {"stamp": ("unreadable",), "dirty": True}
                 dirty.append(iid)
+                if changes is not None:
+                    changes[iid] = item_change(True)
                 continue
 
             prev = item_cache.get(iid)
             if (prev is not None and prev.get("stamp") == stamp
                     and not _stat_cache_expired(prev)
-                    and self._stamp_is_stable(stamp, prev.get("recorded_ns", 0))):
+                    and self._stamp_is_stable(stamp, prev.get("recorded_ns", 0))
+                    and (changes is None or "content_changed" in prev or store == "link")):
                 if prev.get("dirty"):
                     dirty.append(iid)
+                if changes is not None:
+                    changes[iid] = item_change(bool(prev.get("content_changed",
+                                                              prev.get("dirty"))))
                 continue
 
             # Full content compare (cache miss or working file changed).
             is_dirty = False
-            dt = it.get("doc_type")
+            content_changed = False
             if dt and dt in doctypes.GENERIC_DOC_TYPES:
                 item_tree = self._bind.read_subtree(head, snapshot.item_prefix(iid))
                 is_dirty = generic_snapshot.is_dirty(it, self.project_dir, item_tree)
+                content_changed = is_dirty
             else:
                 path = generic_snapshot.contained_path(self.project_dir, it["path"])
                 head_path = snapshot.item_prefix(iid) + "document.json"
@@ -1555,17 +1606,74 @@ class Vault:
                     # A malformed tracked container is not clean: surface it as
                     # dirty so callers do not mistake corruption for no change.
                     is_dirty = True
+                if changes is not None and not is_dirty:
+                    prefix = snapshot.item_prefix(iid)
+                    old = {path: oid for path, oid in self._bind.subtree_ids(head, prefix).items()
+                           if path == prefix + "document.json"
+                           or path == prefix + "thumbnail.png"
+                           or path.startswith(prefix + "extra/")}
+                    current = snapshot.item_paths(iid, exploded)
+                    content_changed = any(
+                        Blob.from_string(data).id != old.pop(name, None)
+                        for name, data in current.items()
+                    ) or bool(old)
+                else:
+                    content_changed = is_dirty
 
-            item_cache[iid] = {"stamp": stamp, "dirty": is_dirty,
-                               "recorded_ns": time.time_ns(), "recorded_at": time.monotonic()}
+            entry = {"stamp": stamp, "dirty": is_dirty,
+                     "recorded_ns": time.time_ns(), "recorded_at": time.monotonic()}
+            if changes is not None:
+                entry["content_changed"] = content_changed
+            item_cache[iid] = entry
             if is_dirty:
                 dirty.append(iid)
+            if changes is not None:
+                changes[iid] = item_change(content_changed)
 
         # Drop stamps for items no longer in the manifest (untrack / restore).
         stale = [k for k in item_cache if k not in live_ids]
         for k in stale:
             del item_cache[k]
         return dirty
+
+    def working_changes(self, m: dict[str, Any], *, doc_type: str = "", kind: str = ""
+                        ) -> tuple[list[str], dict[str, str], list[dict[str, str]]]:
+        """Read-only working-file state for the Files page."""
+        changes: dict[str, str] = {}
+        dirty = self._dirty_items(m, changes=changes)
+        registered = {it["path"] for it in m["items"]}
+        untracked: list[dict[str, str]] = []
+        root_key = _vault_cache_key(self.project_dir)
+        for path in self._project_containers():
+            rel = path.relative_to(self.project_dir).as_posix()
+            if rel in registered:
+                continue
+            stamp = _container_stamp(path)
+            key = f"{root_key}\x00{rel}"
+            hit = _explode_cache_get(key, stamp)
+            try:
+                if hit is None:
+                    exploded = snapshot.explode_container(path)
+                    doc = json.loads(exploded.document_json)
+                    if not isinstance(doc, dict):
+                        continue
+                    if stamp is not None:
+                        _explode_cache_put(key, stamp, exploded, doc)
+                else:
+                    doc = hit["doc"]
+                    if doc is None:
+                        doc = json.loads(hit["exploded"].document_json)
+                        hit["doc"] = doc
+                    if not isinstance(doc, dict):
+                        continue
+            except Exception:  # malformed/new file or unreadable: discovery is best-effort
+                continue
+            suffix = next(s for s in _CONTAINER_SUFFIXES if rel.endswith(s))
+            inferred_kind = _kind_from_schema(doc.get("schema", "")) or _SUFFIX_KIND[suffix]
+            if (kind and inferred_kind != kind) or (doc_type and inferred_kind != doc_type):
+                continue
+            untracked.append({"path": rel, "change": "U"})
+        return dirty, changes, untracked
 
     @staticmethod
     def _stamp_is_stable(stamp: tuple, recorded_ns: int) -> bool:

@@ -1,13 +1,13 @@
-// File Explorer panel (Wave 3, GUI rework).
+// Explorer: the working project's PLM changes/checkpoint and browsable file tree.
 //
-// Renders the "Explorer" tab of the SolidWorks-faithful tabbed left pane (ui::drawLeftPane in
-// layout.cpp routes kLeftPaneExplorer here). A workspace file browser: a recursive, lazy-expand
-// directory tree rooted at AppState::workspaceDir (default Documents/Chudware), filtered to known
-// CAD/ECAD extensions, plus a "Recent" section backed by AppState::recentFiles.
+// The rail shows vault-derived M/A/D/U changes and revision/lifecycle labels,
+// with a project-wide checkpoint action and links into the full PLM workspace.
+// Explicit revision-named sibling CAD files are grouped visually as distinct,
+// individually openable files, never auto-merged or deleted.
 //
-// Like drawFeatureTreeBody, this draws into the caller's container child — it does NOT open its own
-// Begin/End. The standalone right-click context menu (Open / Rename / Copy / Paste / Delete /
-// New Folder), inline rename (F2), and Del-to-delete are handled inside the body.
+// The tree is lazy, rooted at AppState::workspaceDir and filtered to known
+// CAD/ECAD extensions. Right-click Open / Rename / Copy / Paste / Delete /
+// New Folder, inline F2 rename and Del-to-delete remain available.
 #pragma once
 
 #include <string>

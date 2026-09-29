@@ -26,10 +26,8 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size);
 
 namespace ui {
 
-// Wave 1D: left-pane tab indices. These MUST match AppState::LeftPaneTab (LP_*) values 0..3; the
-// brief specifies the kLeftPane* spelling for this module, and the two enums are kept numerically
-// identical (Explorer=0, FeatureManager=1, PropertyManager=2, Configurations=3).
-// kLeftPanePLM (=5) lives in plm_overview.h — int leftPaneTab accepts it without an app_state.h edit.
+// Left-pane tab indices match AppState::LeftPaneTab (LP_*) values 0..4.
+// Retired rail tab 5 redirects to Explorer; Graph's jump-only tab retains 6.
 enum {
     kLeftPaneExplorer        = 0,
     kLeftPaneFeatureManager  = 1,
@@ -37,6 +35,7 @@ enum {
     kLeftPaneConfigurations  = 3,
     kLeftPaneSimulation      = 4,
 };
+constexpr int kLeftPaneGraph = 6;
 
 // ---- overlay band ------------------------------------------------------------------------------
 // The screen-space rect between the ribbon (bottom edge of the chrome) and the status bar — the

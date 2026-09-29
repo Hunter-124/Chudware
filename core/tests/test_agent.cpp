@@ -24,6 +24,10 @@ TEST_CASE("sanitize_part_name keeps revision identity in PLM") {
     CHECK(sanitize_part_name("holster_v1") == "holster");
     CHECK(sanitize_part_name("bracket-rev2") == "bracket");
     CHECK(sanitize_part_name("arm gen3") == "arm");
+    CHECK(sanitize_part_name("sixaxis_arm_revD_final5") == "sixaxis_arm");
+    CHECK(sanitize_part_name("base_revD") == "base");
+    CHECK(sanitize_part_name("arm-rev C") == "arm");
+    CHECK(sanitize_part_name("part_final2") == "part");
     CHECK(sanitize_part_name("PN-1234") == "PN-1234");
     CHECK(sanitize_part_name("v1") == "v1");
 

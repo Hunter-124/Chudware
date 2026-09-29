@@ -564,28 +564,34 @@ def _doc_new_scope() -> dict:
 #
 # A trailing EXPLICIT version token is an unambiguous statement of "version N of the
 # thing I already have". A trailing bare NUMBER is not (PN-1235 is a different part from
-# PN-1234, and 8 in "engine_v8" is a configuration), so the token is REQUIRED and must
-# be separated: "holster_v4"/"bracket-rev2"/"arm gen3" are versions, "PN-1235" and
-# "holster4" are not (the latter is already the engine uniquifier's own series — see
-# _in_name_series in cad_doc_tools).
+# PN-1234), so the token is REQUIRED and must be separated: "holster_v4",
+# "arm-rev C", and "part_final2" are versions; "PN-1235" and "holster4" are not
+# (the latter is already the engine uniquifier's own series — see _in_name_series
+# in cad_doc_tools). A revision followed by a final pass is still one series:
+# "sixaxis_arm_revD_final5" -> "sixaxis_arm". The revision/final *tokens* need a
+# separator from the design, not between "rev" and its letter or "final" and its number.
 _VERSION_SUFFIX_RE = re.compile(
-    r"[\s._\-]+(?:v|ver|vers|version|rev|revision|mk|mark|gen|iter|iteration"
-    r"|attempt|try|pass|round)\s*(\d{1,4})$",
+    r"[\s._\-]+(?:(?:v|ver|vers|version|rev|revision|mk|mark|gen|iter|iteration"
+    r"|attempt|try|pass|round)\s*\d{1,4}|(?:rev|revision)\s*[a-z]"
+    r"|final\s*\d{1,4})$",
     re.IGNORECASE,
 )
 
 
 def _version_series_base(name: Optional[str]) -> str:
-    """`name` with a trailing explicit version token stripped, or "" when it carries none.
+    """`name` with trailing explicit version tokens stripped, or "" with none.
 
-    "holster_v4" -> "holster"; "bracket-rev2" -> "bracket"; "arm gen 3" -> "arm";
-    "PN-1235" -> "" (a part number, not a version); "holster" -> "".
+    "holster_v4" -> "holster"; "arm-rev C" -> "arm";
+    "sixaxis_arm_revD_final5" -> "sixaxis_arm"; "PN-1235" -> "".
     """
     n = (name or "").strip()
-    m = _VERSION_SUFFIX_RE.search(n)
-    if not m:
-        return ""
-    return n[: m.start()].strip(" ._-")
+    base = n
+    while m := _VERSION_SUFFIX_RE.search(base):
+        remaining = base[: m.start()].strip(" ._-")
+        if not remaining:
+            break
+        base = remaining
+    return base if base != n else ""
 
 
 def _strip_version_suffix(name: str) -> str:
@@ -599,7 +605,8 @@ def _strip_version_suffix(name: str) -> str:
     a genuine designator such as ``Intake_Manifold_V8`` is minted as
     ``Intake_Manifold``. That tradeoff is accepted rather than forking a second
     definition of "version token"; the tool reply reports the normalization so the
-    caller can see it.
+    caller can see it. This only normalizes new document names, never a save path or
+    an existing document/file.
     """
     return _version_series_base(name) or (name or "").strip()
 
@@ -607,8 +614,8 @@ def _strip_version_suffix(name: str) -> str:
 def _docs_in_version_series(docs: list, name: str, kind: str = "part") -> list:
     """Open, non-empty `kind` docs that are an EARLIER VERSION of `name`.
 
-    Membership is base-to-base, so "holster", "holster_v3" and "holster-rev7" are one
-    series. Excluded deliberately:
+    Membership is base-to-base, so "holster", "holster_v3", "holster-rev C",
+    and "holster_revD_final5" are one series. Excluded deliberately:
       * the exact name asked for — that is the engine's own resume_if_open path, decided
         under its mint lock, and second-guessing it here reintroduces the unlocked
         check-then-mint race that produced three tabs for one part (run-42508173312214);

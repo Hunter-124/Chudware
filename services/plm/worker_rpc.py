@@ -219,18 +219,20 @@ def _plm_restore(params: dict, _emit: Callable) -> dict:
 
 
 def _plm_item_list(params: dict, _emit: Callable) -> dict:
-    """The full item registry for the Files/Items page: each item's view (with
-    ``doc_type``), whether it has unsaved changes, and its thumbnail path when
-    one exists. Optional ``doc_type`` / ``kind`` filters. Fixes the historical
-    empty-param GUI call."""
+    """List registered items and discover working containers not yet checked in.
+
+    ``change`` compares each working item with the vault's current history
+    snapshot; discovery never registers or saves a file.
+    """
     def run(v: Any) -> dict:
         from services.plm import items as items_mod
-        from services.plm import manifest as manifest_mod
 
         m = v.manifest()
-        dirty = set(v._dirty_items(m))  # noqa: SLF001 — same package
         want_dt = str((params or {}).get("doc_type", "") or "")
         want_kind = str((params or {}).get("kind", "") or "")
+        dirty_ids, changes, untracked = v.working_changes(
+            m, doc_type=want_dt, kind=want_kind)
+        dirty = set(dirty_ids)
         out: list[dict[str, Any]] = []
         for it in m["items"]:
             if want_dt and it.get("doc_type") != want_dt:
@@ -239,9 +241,9 @@ def _plm_item_list(params: dict, _emit: Callable) -> dict:
                 continue
             view = items_mod.item_view(it)
             view["dirty"] = it["item_id"] in dirty
+            view["change"] = changes[it["item_id"]]
             out.append(view)
-        _ = manifest_mod  # imported for parity with other methods
-        return {"ok": True, "items": out}
+        return {"ok": True, "items": out, "untracked": untracked}
     return _with_vault(params, run)
 
 

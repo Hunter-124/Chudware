@@ -34,13 +34,15 @@ std::string sanitize_part_name(std::string name) {
     // a genuine designator such as Intake_Manifold_V8 becomes Intake_Manifold; a second,
     // divergent definition of "version token" would be worse than that known cost.
     static const std::regex version_suffix(
-        R"([\s._-]+(?:v|ver|vers|version|rev|revision|mk|mark|gen|iter|iteration|attempt|try|pass|round)\s*(\d{1,4})$)",
+        R"([\s._-]+(?:(?:v|ver|vers|version|rev|revision|mk|mark|gen|iter|iteration|attempt|try|pass|round)\s*\d{1,4}|(?:rev|revision)\s*[a-z]|final\s*\d{1,4})$)",
         std::regex_constants::icase);
     std::smatch version_match;
-    if (std::regex_search(name, version_match, version_suffix)) {
-        std::string base = name.substr(0, static_cast<size_t>(version_match.position()));
-        const size_t last = base.find_last_not_of(" ._-");
-        if (last != std::string::npos) name = base.substr(0, last + 1);
+    while (std::regex_search(name, version_match, version_suffix)) {
+        const size_t prefix_end = static_cast<size_t>(version_match.position());
+        if (prefix_end == 0) break;
+        const size_t last = name.find_last_not_of(" ._-", prefix_end - 1);
+        if (last == std::string::npos) break;
+        name.erase(last + 1);
     }
 
     // Strip illegal filename characters: / \ : * ? " < > |

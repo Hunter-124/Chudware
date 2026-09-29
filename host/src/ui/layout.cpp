@@ -24,7 +24,6 @@
 #include "cam/cam_panel.h"      // drawCamTreeBody (the Manufacture workspace's left tree)
 #include "manufacture/manufacture_panel.h"  // Manufacture Devices/Run/Attention rail bodies + critical count
 #include "ecad/ecad_panel.h"    // drawEcadManagerBody (the Electronics workspace's left tree)
-#include "plm_overview.h"       // compact PLM overview tab (left of Explorer on Model)
 #include "doc_tabs.h"           // docTabStripHeight (the column never overlaps the doc-tab band)
 #include "icons.h"              // getIcon / IconUV
 #include "metrics.h"            // logical dp scaling
@@ -820,7 +819,6 @@ void drawLeftPane(AppState& st,
     // reserves chevRsv on its right so the two never collide. ----
     struct TabDef { int id; const char* icon; const char* fallback; const char* tip; };
     static const TabDef kTabs[] = {
-        { kLeftPanePLM,             "app",         "P", "PLM" },
         { kLeftPaneExplorer,        "body_folder", "E", "Explorer" },
         { kLeftPaneFeatureManager,  "history",     "F", "Feature Manager" },
         { kLeftPaneGraph,           "mesh",        "G", "Graph" },
@@ -918,8 +916,7 @@ void drawLeftPane(AppState& st,
             // the collapse chip; elide within that measured span rather than painting through
             // either control when the pane is narrow.
             const char* paneTitle = "Feature Manager";
-            if (st.leftPaneTab == kLeftPanePLM)                  paneTitle = "PLM";
-            else if (st.leftPaneTab == kLeftPaneExplorer)        paneTitle = "Explorer";
+            if (st.leftPaneTab == kLeftPaneExplorer)             paneTitle = "Explorer";
             else if (st.leftPaneTab == kLeftPaneConfigurations) paneTitle = "Configurations";
             else if (st.leftPaneTab == kLeftPaneGraph)           paneTitle = "Graph";
             const float titleLeftX = paneOrigin.x + railW + gap;
@@ -982,9 +979,6 @@ void drawLeftPane(AppState& st,
         // Title moved up into the tab-button row; the tree/body starts straight below the top
         // divider under the buttons (no centered header chip, no extra separator here).
         switch (st.leftPaneTab) {
-            case kLeftPanePLM:
-                drawPlmOverviewBody(st);
-                break;
 
             case kLeftPaneExplorer:
                 // Wave 3: the workspace file browser (file_explorer.cpp).
@@ -999,6 +993,10 @@ void drawLeftPane(AppState& st,
                 st.leftPaneTab = kLeftPaneFeatureManager;
                 break;
 
+            case 5:  // retired PLM rail tab; preserve older in-memory selections
+                st.leftPaneTab = kLeftPaneExplorer;
+                drawFileExplorerBody(st);
+                break;
             case kLeftPaneGraph:
                 // Should not stick — click handler jumps to PLM Graph workspace.
                 st.leftPaneTab = kLeftPaneFeatureManager;

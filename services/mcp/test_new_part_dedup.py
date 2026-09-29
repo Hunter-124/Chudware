@@ -537,3 +537,127 @@ def test_new_assembly_keeps_a_name_that_is_already_open_verbatim(engine):
     assert r["doc_id"] == "doc-cpp00000052"
     assert r["reused"] is True
     assert "requested_name" not in r
+
+
+@pytest.mark.parametrize(
+    ("requested", "base"),
+    [
+        ("sixaxis_arm_revD_final5", "sixaxis_arm"),
+        ("base_revD", "base"),
+        ("arm-rev C", "arm"),
+        ("part_revisionB", "part"),
+        ("part_final2", "part"),
+    ],
+)
+def test_revision_letter_and_final_requests_resume_existing_design(engine, requested, base):
+    fake = engine([
+        {"doc_id": "doc-existing", "name": base, "revision": 6,
+         "feature_count": 12, "kind": "part"},
+    ])
+
+    r = _new_part(name=requested)
+
+    assert fake.new_calls == []
+    assert r["doc_id"] == "doc-existing"
+    assert r["resumed_by"] == "version_series"
+    assert r["version_series"] == base
+    assert r["requested_name"] == requested
+    assert fake.docs[0]["name"] == base
+
+
+@pytest.mark.parametrize(
+    ("requested", "base"),
+    [
+        ("sixaxis_arm_revD_final5", "sixaxis_arm"),
+        ("base_revD", "base"),
+        ("arm-rev C", "arm"),
+        ("part_revisionB", "part"),
+        ("part_final2", "part"),
+    ],
+)
+def test_revision_letter_and_final_first_mint_uses_clean_name(engine, requested, base):
+    fake = engine([])
+
+    r = _new_part(name=requested)
+
+    assert fake.new_calls == [base]
+    assert r["name"] == base
+    assert r["requested_name"] == requested
+
+
+def test_revision_letter_and_final_resume_older_versioned_sibling(engine):
+    fake = engine([
+        {"doc_id": "doc-old", "name": "sixaxis_arm_revC_final4", "revision": 4,
+         "feature_count": 15, "kind": "part"},
+    ])
+
+    r = _new_part(name="sixaxis_arm_revD_final5")
+
+    assert fake.new_calls == []
+    assert r["doc_id"] == "doc-old"
+    assert r["version_series"] == "sixaxis_arm"
+    assert r["name"] == "sixaxis_arm_revC_final4"
+
+
+def test_exact_open_revision_letter_name_uses_engine_mint_lock(engine):
+    fake = engine([
+        {"doc_id": "doc-base", "name": "sixaxis_arm", "feature_count": 20},
+        {"doc_id": "doc-exact", "name": "sixaxis_arm_revD_final5",
+         "feature_count": 3},
+    ])
+
+    r = _new_part(name="sixaxis_arm_revD_final5")
+
+    assert fake.new_calls == []
+    assert r["doc_id"] == "doc-exact"
+    assert "resumed_by" not in r
+    assert len(fake.docs) == 2
+
+
+def test_fresh_revision_letter_mints_even_with_existing_series(engine):
+    fake = engine([
+        {"doc_id": "doc-base", "name": "sixaxis_arm", "feature_count": 20},
+    ])
+
+    r = _new_part(name="sixaxis_arm_revD_final5", fresh=True)
+
+    assert fake.new_calls == ["sixaxis_arm"]
+    assert r["name"] == "sixaxis_arm2"
+    assert r["requested_name"] == "sixaxis_arm_revD_final5"
+
+
+@pytest.mark.parametrize(
+    "requested",
+    ["PN-1235", "part_revisionBracket", "part_finalBracket", "armrevD",
+     "base_revD_mount"],
+)
+def test_unmarked_designators_remain_distinct(engine, requested):
+    fake = engine([])
+
+    r = _new_part(name=requested)
+
+    assert fake.new_calls == [requested]
+    assert r["name"] == requested
+    assert "requested_name" not in r
+
+
+def test_assembly_and_batch_head_share_revision_letter_series(engine):
+    fake = engine([
+        {"doc_id": "doc-assembly", "name": "sixaxis_arm", "kind": "assembly",
+         "component_count": 5},
+        {"doc_id": "doc-part", "name": "part", "kind": "part",
+         "feature_count": 7},
+    ])
+
+    assembly = _new_assembly(name="sixaxis_arm_revD_final5")
+    batch = _add_features([
+        {"op": "new_part", "name": "part_revisionB"},
+        {"op": "add_feature", "feature": {
+            "type": "box", "name": "Base",
+            "params": {"length": 40, "width": 30, "height": 20}}},
+    ])
+
+    assert fake.new_calls == []
+    assert assembly["doc_id"] == "doc-assembly"
+    assert assembly["resumed_by"] == "version_series"
+    assert batch["doc_id"] == "doc-part"

@@ -730,3 +730,27 @@ HTTPS profiles still use advisory locks and automatic copy-as-new-item
 collision preservation. A `plm-server` profile suppresses that advisory lock
 only while an item is joined to an authenticated live session. Tokens are
 external secrets and MUST NOT enter `manifest.json` or vault history.
+
+## Appendix F — Explorer working changes (additive, 2026-09)
+
+`plm_item_list` keeps its existing `items` fields and adds a `change` string on
+each row: `"M"` for working content different from HEAD, `"A"` for an item not
+yet present in HEAD, `"D"` for a tracked file missing from disk while HEAD still
+contains its content, or `""` when unchanged. `dirty` retains its existing
+meaning for older consumers. The response also adds `untracked:[{path,
+change:"U"}]` for valid, unregistered native design containers found under
+the project root; these rows have no `item_id` and are not registered by a
+status read. Paths are project-relative POSIX paths. This is vault state, not
+Git staging: the Explorer cannot stage a subset or discard a file through this
+response. A named `plm_checkpoint` records the project as a whole.
+
+When a missing native container is checkpointed, its document blob is absent
+from the new HEAD; the registry row remains for history and its working change
+becomes clean. Restoring an earlier entry can recover the prior content.
+Generic files follow the B.2 carry-forward law instead: a missing generic file
+still compares as deleted until its tracked working content is restored.
+
+Revision strings and lifecycle belong to the item registry, not the filename.
+Two physical native files with distinct revision-suffixed names remain separate
+items until explicitly reconciled; a UI MUST NOT silently delete or merge them
+based only on their names.

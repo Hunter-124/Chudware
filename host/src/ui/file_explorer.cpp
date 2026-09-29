@@ -1,16 +1,7 @@
-// File Explorer panel (Wave 3, GUI rework) — see file_explorer.h.
-//
-// Workspace file browser for the left task pane's "Explorer" tab. Renders a "Recent" section
-// (AppState::recentFiles) plus a recursive, lazy-expand directory tree rooted at the workspace dir
-// (AppState::workspaceDir, default <Documents>/Chudware), filtered to known CAD/ECAD extensions.
-//
-// Double-click opens a file (CAD -> featureTreeOpenPath via st.requestOpenPath; ECAD/KiCad files
-// route through the same request flag and app.cpp's pump dispatches them to the ECAD open path).
-// Right-click yields Open / Rename / Copy / Paste / Delete / New Folder. F2 renames inline,
-// Del deletes (with a confirm modal). All filesystem mutations are clamped to the workspace root.
-//
-// Filesystem ops go through chudware::FsBackend (desktop = std::filesystem; web = gateway
-// /workspace/*) so the WASM client browses the server workspace.
+// Explorer: working-project PLM changes and a browsable CAD/ECAD file tree.
+// Vault status/checkpoints are async; filesystem browsing uses FsBackend
+// snapshots. Explicit revision-named sibling files group only in the view:
+// every original path remains available for open, rename, copy and delete.
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -19,11 +10,14 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "imgui.h"
 #include "imgui_internal.h"  // ImRect (ui::adaptivePanel rect argument)
-#include "widgets/kit.h"     // ui::kit::elide (row labels that outgrow the pane)
+#include "widgets/kit.h"
+#include "plm/plm_hub.h"
+#include "plm/plm_workspace.h"
 
 #include "file_explorer.h"
 #include "dragdrop.h"       // kFileDragPayload (Explorer drag source -> viewport drop target)
@@ -101,13 +95,169 @@ static std::string s_pendingNewFolder; // a just-created folder to auto-enter in
 // UI caches hold filtered/sorted rows; backend snapshots own refresh scheduling.
 // Shared ownership keeps a tree walk valid when a child mutation invalidates the
 // cache while its parent's rows are still being iterated.
+struct LegacyFileGroup {
+    std::string title;
+    std::vector<size_t> members;
+    size_t head = 0;
+};
 struct DirListCache {
     uint64_t revision = UINT64_MAX;
     chudware::FsReadState state = chudware::FsReadState::Loading;
     std::string error;
     std::vector<std::string> dirs;   // full paths, name-sorted (case-insensitive)
     std::vector<std::string> files;  // full paths, mtime-desc (unknown mtime = oldest)
+    std::vector<int> fileGroup;  // -1 for ungrouped; otherwise index into legacyGroups
+    std::vector<LegacyFileGroup> legacyGroups;
 };
+static bool withinWorkspace(const std::string& root, const std::string& child);
+// The hub's item rows do not carry vault change codes. Keep the Explorer's
+// read-only status snapshot separately, fenced by project and request serial.
+struct ExplorerPlmItem {
+    std::string path, itemId, rev, lifecycle, workingRev, change;
+};
+struct ExplorerPlmState {
+    std::string project, branch, error, checkpointError, checkpointOk;
+    std::vector<ExplorerPlmItem> items, untracked;
+    std::unordered_map<std::string, const ExplorerPlmItem*> byPath;
+    int hubGeneration = -1;
+    unsigned serial = 0;
+    bool loading = false, ready = false, checkpointing = false;
+    bool changesOpen = true, filesOpen = true;
+    double fetchedAt = -1.0e9;
+    char message[256] = {};
+};
+static ExplorerPlmState s_plm;
+static constexpr double kPlmRefreshSeconds = 15.0;
+
+static std::string plmField(const nlohmann::json& row, const char* key) {
+    const auto it = row.find(key);
+    return it != row.end() && it->is_string() ? it->get<std::string>() : std::string();
+}
+
+static void invalidateExplorerPlm() {
+    s_plm.fetchedAt = -1.0e9;
+    plmInvalidate();
+}
+
+static void openPlm(AppState& st, PlmPage page, const std::string& itemId = {}) {
+    g_plmHub.page = page;
+    if (page == PlmPage::Files) plmSelectFilesPage();
+    if (page == PlmPage::Releases) plmSelectReleasesPage();
+    if (!itemId.empty()) {
+        g_plmHub.selectedItem = itemId;
+        g_plmHub.histItemFilter = itemId;
+        g_plmHub.histGen = -1;
+    }
+    st.activeWorkspace = AppState::Workspace::PLM;
+}
+
+static void pollExplorerPlm(AppState& st, const std::string& project, bool force = false) {
+    auto& P = s_plm;
+    if (project != P.project) {
+        ++P.serial;
+        P.project = project;
+        P.branch.clear();
+        P.error.clear();
+        P.checkpointError.clear();
+        P.checkpointOk.clear();
+        P.byPath.clear();
+        P.items.clear();
+        P.untracked.clear();
+        P.ready = false;
+        P.loading = false;
+        P.checkpointing = false;
+        P.fetchedAt = -1.0e9;
+        P.hubGeneration = -1;
+    }
+    if (!st.workerStarted) {
+        if (P.loading || P.ready || P.checkpointing) ++P.serial;
+        if (P.checkpointing)
+            P.checkpointError = "Connection lost during checkpoint; refresh to confirm its result.";
+        P.checkpointing = false;
+        P.loading = false;
+        P.ready = false;
+        P.branch.clear();
+        P.fetchedAt = -1.0e9;
+        return;
+    }
+    if (project.empty() || P.loading || P.checkpointing) return;
+    const double now = ImGui::GetTime();
+    if (!force && P.hubGeneration == g_plmHub.generation &&
+        now - P.fetchedAt < kPlmRefreshSeconds) return;
+    P.loading = true;
+    P.error.clear();
+    P.hubGeneration = g_plmHub.generation;
+    P.fetchedAt = now;
+    const unsigned serial = ++P.serial;
+    st.rpc.call("plm_item_list", {{"path", project}}, [project, serial, &st](const core::RpcResult& r) {
+        auto& state = s_plm;
+        if (state.serial != serial || state.project != project ||
+            st.plmProjectPath() != project) return;
+        state.loading = false;
+        if (!plmOk(r, state.error)) {
+            state.ready = false;
+            return;
+        }
+        state.error.clear();
+        state.ready = true;
+        state.byPath.clear();
+        state.items.clear();
+        state.untracked.clear();
+        auto parse = [](const nlohmann::json& row) {
+            ExplorerPlmItem item;
+            item.path = plmField(row, "path");
+            item.itemId = plmField(row, "item_id");
+            item.rev = plmField(row, "rev");
+            item.lifecycle = plmField(row, "lifecycle");
+            item.workingRev = plmField(row, "working_rev");
+            item.change = plmField(row, "change");
+            return item;
+        };
+        if (auto it = r.result.find("items"); it != r.result.end() && it->is_array())
+            for (const auto& row : *it)
+                if (row.is_object()) state.items.push_back(parse(row));
+        if (auto it = r.result.find("untracked"); it != r.result.end() && it->is_array())
+            for (const auto& row : *it)
+                if (row.is_object()) state.untracked.push_back(parse(row));
+        state.byPath.reserve(state.items.size() + state.untracked.size());
+        auto index = [&state](const std::vector<ExplorerPlmItem>& rows) {
+            for (const auto& item : rows) {
+                std::string key = item.path;
+                for (char& c : key) if (c == '\\') c = '/';
+                state.byPath.emplace(std::move(key), &item);
+            }
+        };
+        index(state.items);
+        index(state.untracked);
+    });
+    st.rpc.call("plm_branch_list", {{"path", project}}, [project, serial, &st](const core::RpcResult& r) {
+        auto& state = s_plm;
+        if (state.serial != serial || state.project != project ||
+            st.plmProjectPath() != project) return;
+        std::string err;
+        state.branch = plmOk(r, err) ? plmField(r.result, "active") : std::string();
+    });
+}
+
+static const ExplorerPlmItem* statusForPath(const std::string& path) {
+    const std::string& project = s_plm.project;
+    if (!s_plm.ready || project.empty() || path.size() <= project.size() ||
+        !withinWorkspace(project, path)) return nullptr;
+    std::string rel = path.substr(project.size());
+    while (!rel.empty() && (rel.front() == '/' || rel.front() == '\\')) rel.erase(rel.begin());
+    for (char& c : rel) if (c == '\\') c = '/';
+    const auto found = s_plm.byPath.find(rel);
+    return found == s_plm.byPath.end() ? nullptr : found->second;
+}
+static std::string statusFileLabel(const std::string& name, const ExplorerPlmItem* status) {
+    if (!status) return name;
+    std::string label = name;
+    if (!status->change.empty()) label = "[" + status->change + "] " + label;
+    const std::string& rev = status->workingRev.empty() ? status->rev : status->workingRev;
+    if (!rev.empty()) label += " · rev " + rev;
+    if (!status->lifecycle.empty()) label += " · " + status->lifecycle;
+    return label;
+}
 static std::map<std::string, std::shared_ptr<DirListCache>> s_dirListCache;
 static std::string s_workspaceError;
 
@@ -247,6 +397,7 @@ static void commitRename(AppState& st, const std::string& root) {
         st.toast(ui::ToastLevel::Error, "Rename failed: " + err);
     } else {
         invalidateDirListCache();
+        invalidateExplorerPlm();
         st.addLog("[explorer] renamed " + pathFilename(oldP) + " -> " + newName);
         if (s_selectedPath == oldP) s_selectedPath = newP;
     }
@@ -288,6 +439,7 @@ static bool doPaste(AppState& st, const std::string& root, const std::string& de
     }
     st.addLog("[explorer] pasted -> " + dest);
     invalidateDirListCache();
+    invalidateExplorerPlm();
 
     st.toast(ui::ToastLevel::Info, "Pasted " + pathFilename(dest));
     s_selectedPath = dest;
@@ -311,6 +463,7 @@ static void createNewFolder(AppState& st, const std::string& root, const std::st
         s_currentFolder = dir;
         st.addLog("[explorer] new folder " + cand);
         invalidateDirListCache();
+        invalidateExplorerPlm();
 
     } else {
         st.toast(ui::ToastLevel::Error, "New Folder failed" + (err.empty() ? "" : (": " + err)));
@@ -328,6 +481,122 @@ static void requestOpen(AppState& st, const std::string& p) {
     st.requestOpenPath = p;
 }
 
+static kit::Tone changeTone(const std::string& code) {
+    if (code == "D") return kit::Tone::Err;
+    if (code == "M") return kit::Tone::Warn;
+    if (code == "A" || code == "U") return kit::Tone::Accent;
+    return kit::Tone::Neutral;
+}
+
+static const char* changeName(const std::string& code) {
+    if (code == "M") return "Modified";
+    if (code == "A") return "Added";
+    if (code == "D") return "Deleted";
+    if (code == "U") return "Untracked";
+    return "";
+}
+
+static void drawChanges(AppState& st, const std::string& project) {
+    auto& P = s_plm;
+    int count = 0;
+    if (P.ready) {
+        for (const auto& row : P.items) if (!row.change.empty()) ++count;
+        for (const auto& row : P.untracked) if (!row.change.empty()) ++count;
+    }
+    const std::string title = P.ready ? "Changes (" + std::to_string(count) + ")" : "Changes";
+    const bool open = kit::cardBegin("##explorer_changes", title.c_str(), "history", &P.changesOpen);
+    if (open) {
+        if (kit::iconButton("##changes_refresh", "refresh", "Refresh vault changes",
+                            !P.loading && !P.checkpointing && st.workerStarted)) {
+            invalidateExplorerPlm();
+            pollExplorerPlm(st, project, true);
+        }
+        ImGui::SameLine();
+        kit::dimText("Project-wide checkpoint");
+        if (!st.workerStarted)
+            kit::blockedState("Vault offline", "The Chudware service is unavailable.",
+                              "Files can still be browsed; reconnect to see changes.");
+        else if (!P.error.empty())
+            kit::blockedState("Vault status unavailable", P.error.c_str(), "Refresh to retry.");
+        else if (P.loading && !P.ready)
+            kit::spinner("Checking project changes");
+        else if (!P.ready)
+            kit::emptyState("history", "Checking vault", "Your files are still available below.");
+        else if (!count)
+            kit::emptyState("ok_badge", "No changes", "The project matches its last checkpoint.");
+        else {
+            ImGui::BeginChild("##changes_rows", ImVec2(0, std::min(160.0f * uiScale,
+                       ImGui::GetTextLineHeightWithSpacing() * (count + 1))),
+                       ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+            auto drawRow = [&](const ExplorerPlmItem& item) {
+                if (item.change.empty()) return;
+                ImGui::PushID(item.path.c_str());
+                kit::RowStyle style;
+                style.icon = "new_doc";
+                style.iconTone = changeTone(item.change);
+                style.meta = item.change.c_str();
+                const std::string tooltip = item.path + "\n" + changeName(item.change);
+                style.tooltip = tooltip.c_str();
+                if (kit::row("##change", item.path.c_str(), style)) {
+                    const std::string absolute = pathJoin(project, item.path);
+                    if (item.change != "D" && isKnownExt(lowerExt(absolute)))
+                        requestOpen(st, absolute);
+                    else if (!item.itemId.empty())
+                        openPlm(st, PlmPage::Files, item.itemId);
+                }
+                if (!item.itemId.empty()) {
+                    ui::pushContextMenuStyle();
+                    if (ImGui::BeginPopupContextItem("##change_menu")) {
+                        if (ImGui::MenuItem("History"))
+                            openPlm(st, PlmPage::Files, item.itemId);
+                        if (ImGui::MenuItem("Release in PLM"))
+                            openPlm(st, PlmPage::Releases, item.itemId);
+                        ImGui::EndPopup();
+                    }
+                    ui::popContextMenuStyle();
+                }
+                ImGui::PopID();
+            };
+            for (const auto& item : P.items) drawRow(item);
+            for (const auto& item : P.untracked) drawRow(item);
+            ui::drawWindowPillScrollbarV(explorerSurf());
+            ImGui::EndChild();
+        }
+        kit::rule();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##checkpoint_msg", "Checkpoint message",
+                                 P.message, sizeof(P.message));
+        if (kit::primaryButton("Checkpoint", P.ready && !P.loading && !P.checkpointing &&
+                                               count > 0 && st.workerStarted,
+                               "Requires available vault changes")) {
+            P.checkpointing = true;
+            P.checkpointError.clear();
+            P.checkpointOk.clear();
+            const std::string message = P.message;
+            const unsigned serial = P.serial;
+            st.rpc.call("plm_checkpoint", {{"path", project}, {"message", message}},
+                        [project, serial, message, &st](const core::RpcResult& r) {
+                auto& state = s_plm;
+                if (state.project != project || state.serial != serial ||
+                    st.plmProjectPath() != project) return;
+                state.checkpointing = false;
+                if (!plmOk(r, state.checkpointError)) return;
+                state.checkpointOk = "Checkpoint saved";
+                state.checkpointError.clear();
+                if (message == state.message) state.message[0] = '\0';
+                invalidateExplorerPlm();
+            });
+        }
+        ImGui::SameLine();
+        if (kit::secondaryButton("PLM", st.workerStarted, "Service unavailable"))
+            openPlm(st, PlmPage::Files);
+        if (P.checkpointing) kit::spinner("Saving checkpoint");
+        kit::inlineStatus(P.checkpointError.c_str(), kit::Tone::Err);
+        kit::inlineStatus(P.checkpointOk.c_str(), kit::Tone::Ok);
+    }
+    kit::cardEnd();
+}
+
 // ---- tree node rendering --------------------------------------------------
 // A file row: icon + name, selectable, double-click opens, F2/Del/context-menu act on it.
 static void drawFileRow(AppState& st, const std::string& root, const std::string& p,
@@ -336,6 +605,8 @@ static void drawFileRow(AppState& st, const std::string& root, const std::string
     const bool isRenaming = (s_renameId == pathStr);
     const bool selected = (s_selectedPath == pathStr);
     const std::string fname = pathFilename(p);
+    const ExplorerPlmItem* status = statusForPath(p);
+    const std::string annotated = statusFileLabel(fname, status);
     ImGui::PushID(pathStr.c_str());
     if (isRenaming) {
         // Inline rename: pill + icon + InputText (same frame height as a normal row).
@@ -355,7 +626,7 @@ static void drawFileRow(AppState& st, const std::string& root, const std::string
         // unused leaf-arrow slot so icon + label share the FM's exact metrics and centering.
         ui::FmRowRect rr = ui::fmRowPill(selected);
         ImVec2 rowPos = ImGui::GetCursorScreenPos();
-        ImGui::TreeNodeEx(rowLabel(fname).c_str(),
+        ImGui::TreeNodeEx(rowLabel(annotated).c_str(),
                           ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
                           ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
         ui::fmTreeIconInArrowSlot(rowPos, fileIconName(ext), fileIconFallback(ext));
@@ -379,6 +650,12 @@ static void drawFileRow(AppState& st, const std::string& root, const std::string
             s_selectedPath = pathStr;
             s_currentFolder = pathParent(p);
             if (ImGui::MenuItem("Open"))   requestOpen(st, p);
+            if (status && !status->itemId.empty()) {
+                if (ImGui::MenuItem("History"))
+                    openPlm(st, PlmPage::Files, status->itemId);
+                if (ImGui::MenuItem("Release in PLM"))
+                    openPlm(st, PlmPage::Releases, status->itemId);
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Rename", "F2")) {
                 s_renameId = pathStr;
@@ -393,8 +670,114 @@ static void drawFileRow(AppState& st, const std::string& root, const std::string
         }
         ui::popContextMenuStyle();
         itemPathTooltip(fname, pathStr);
+        if (ImGui::IsItemHovered() && status) {
+            const std::string rev = status->workingRev.empty() ? status->rev : status->workingRev;
+            std::string detail = pathStr;
+            if (!status->change.empty()) detail += "\n" + std::string(changeName(status->change));
+            if (!rev.empty()) detail += "\nRevision " + rev;
+            if (!status->lifecycle.empty()) detail += "\n" + status->lifecycle;
+            ImGui::SetTooltip("%s", detail.c_str());
+        }
     }
     ImGui::PopID();
+}
+
+// Only explicit suffixes count as legacy copies: generic trailing numbers often
+// identify distinct model sizes, not revisions. This groups siblings visually,
+// without renaming, deleting, or treating them as revisions of one vault item.
+static std::string legacySeriesName(const std::string& path) {
+    const std::string name = pathFilename(path), ext = pathExtension(name);
+    if (!isKnownExt(lowerExt(path))) return {};
+    const std::string stem = pathStem(name);
+    std::string low = stem;
+    std::transform(low.begin(), low.end(), low.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    for (size_t at = low.find_last_of("_-"); at != std::string::npos && at > 0;
+         at = low.find_last_of("_-", at - 1)) {
+        const std::string suffix = low.substr(at + 1);
+        bool version = false;
+        if (suffix.size() >= 2 && suffix[0] == 'v') {
+            version = std::all_of(suffix.begin() + 1, suffix.end(),
+                                  [](unsigned char c) { return std::isdigit(c); });
+        } else if (suffix.size() >= 4 && suffix.compare(0, 3, "rev") == 0) {
+            const size_t end = suffix.find("_final", 3);
+            const std::string rev = suffix.substr(3, end == std::string::npos ? end : end - 3);
+            version = !rev.empty() && std::all_of(rev.begin(), rev.end(),
+                           [](unsigned char c) { return std::isalnum(c); });
+            if (end != std::string::npos) {
+                const std::string final = suffix.substr(end + 6);
+                version = version && !final.empty() &&
+                          std::all_of(final.begin(), final.end(),
+                                      [](unsigned char c) { return std::isdigit(c); });
+            }
+        }
+        if (version) {
+            std::string key = low.substr(0, at) + ext;
+            std::transform(key.begin(), key.end(), key.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            return key;
+        }
+    }
+    return {};
+}
+
+static void groupLegacyFiles(DirListCache& rows) {
+    const auto& files = rows.files;
+    rows.fileGroup.assign(files.size(), -1);
+    std::map<std::string, std::vector<size_t>> groups;
+    for (size_t i = 0; i < files.size(); ++i) {
+        const std::string key = legacySeriesName(files[i]);
+        if (!key.empty()) groups[key].push_back(i);
+    }
+    for (size_t i = 0; i < files.size(); ++i) {
+        std::string key = pathFilename(files[i]);
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        const auto found = groups.find(key);
+        if (found != groups.end()) found->second.insert(found->second.begin(), i);
+    }
+    for (auto& [key, members] : groups) {
+        if (members.size() < 2) continue;
+        LegacyFileGroup group;
+        group.members = std::move(members);
+        group.head = *std::min_element(group.members.begin(), group.members.end());
+        const std::string firstName = pathFilename(files[group.members.front()]);
+        const std::string ext = pathExtension(firstName);
+        const std::string name = legacySeriesName(files[group.members.front()]).empty()
+            ? firstName : pathStem(firstName).substr(0, key.size() - ext.size()) + ext;
+        group.title = name + " · " + std::to_string(group.members.size()) + " files";
+        for (const size_t index : group.members)
+            rows.fileGroup[index] = static_cast<int>(rows.legacyGroups.size());
+        rows.legacyGroups.push_back(std::move(group));
+    }
+}
+
+static void drawDirectoryFiles(AppState& st, const std::string& root,
+                               const DirListCache& rows) {
+    for (size_t i = 0; i < rows.files.size(); ++i) {
+        const int groupIndex = rows.fileGroup[i];
+        if (groupIndex < 0) {
+            drawFileRow(st, root, rows.files[i], lowerExt(rows.files[i]));
+            continue;
+        }
+        const LegacyFileGroup& group = rows.legacyGroups[static_cast<size_t>(groupIndex)];
+        if (i != group.head) continue;
+        ImGui::PushID(rows.files[group.head].c_str());
+        const bool open = ImGui::TreeNodeEx(rowLabel(group.title).c_str(),
+                         ImGuiTreeNodeFlags_OpenOnArrow |
+                         ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("These are separate files and may be separate PLM items. "
+                              "No files have been merged or removed.");
+        if (open) {
+            kit::inlineStatus("Revision-named copies are separate files, not merged.",
+                              kit::Tone::Warn);
+            for (const size_t index : group.members)
+                drawFileRow(st, root, rows.files[index], lowerExt(rows.files[index]));
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
 }
 
 // Recursively draw a directory: a tree node that lazy-lists its children on open. Folders first
@@ -504,11 +887,12 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
                       });
             fresh->files.reserve(filePairs.size());
             for (auto& fp : filePairs) fresh->files.push_back(std::move(fp.first));
+            groupLegacyFiles(*fresh);
             cached = std::move(fresh);
         }
         const auto rows = cached;
         for (const auto& d : rows->dirs) drawDirNode(st, root, d, /*isRoot=*/false);
-        for (const auto& f : rows->files) drawFileRow(st, root, f, lowerExt(f));
+        drawDirectoryFiles(st, root, *rows);
         if (rows->state == chudware::FsReadState::Error)
             ImGui::TextWrapped("Unable to read folder: %s", rows->error.c_str());
         else if (rows->state == chudware::FsReadState::Missing)
@@ -557,7 +941,7 @@ static void drawRecentSection(AppState& st) {
         ui::FmRowRect rr = ui::fmRowPill(false);
         ImVec2 rowPos = ImGui::GetCursorScreenPos();
         if (!exists) ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
-        ImGui::TreeNodeEx(rowLabel(fname).c_str(),
+        ImGui::TreeNodeEx(rowLabel(statusFileLabel(fname, statusForPath(rp))).c_str(),
                           ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
                           ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
         if (!exists) ImGui::PopStyleColor();
@@ -600,6 +984,7 @@ static void drawDeleteModal(AppState& st, const std::string& root) {
                     st.toast(ui::ToastLevel::Error, "Delete failed: " + err);
                 } else {
                     invalidateDirListCache();
+                    invalidateExplorerPlm();
                     st.addLog("[explorer] deleted " + p);
                     st.toast(ui::ToastLevel::Info, "Deleted " + pathFilename(p));
                     if (s_selectedPath == s_pendingDelete) s_selectedPath.clear();
@@ -633,6 +1018,31 @@ void drawFileExplorerBody(AppState& st) {
     const std::string root = st.workspaceDir;
     if (root.empty()) {
         ImGui::TextWrapped("%s", s_workspaceError.empty() ? "Loading workspace..." : s_workspaceError.c_str());
+        return;
+    }
+    kit::pushDensity(kit::Density::Compact);
+    struct DensityPop { ~DensityPop() { kit::popDensity(); } } densityPop;
+    const std::string project = st.plmProjectPath();
+    pollExplorerPlm(st, project);
+    const std::string projectTitle = project.empty() ? "No working project" : plmProjectName(st);
+    kit::sectionHeader(projectTitle.c_str(), "body_folder", nullptr, -1, true);
+    if (!project.empty()) {
+        const char* branch = !st.workerStarted ? "Vault offline"
+            : s_plm.branch.empty() ? (s_plm.loading ? "Loading branch" : "Branch unavailable")
+                                   : s_plm.branch.c_str();
+        kit::chip(branch, kit::Tone::Neutral, false, "Active vault branch");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", project.c_str());
+        drawChanges(st, project);
+    } else {
+        kit::emptyState("body_folder", "No working project",
+                        "Choose a working folder to see its PLM changes.");
+    }
+
+    const bool filesOpen = kit::cardBegin("##explorer_files", "Files", "body_folder",
+                                          &s_plm.filesOpen);
+    if (!filesOpen) {
+        kit::cardEnd();
+        drawDeleteModal(st, root);
         return;
     }
 
@@ -683,6 +1093,7 @@ void drawFileExplorerBody(AppState& st) {
             doPaste(st, root, current);
         if (toolBtn("fx_refresh", "refresh", "Refresh", true)) {
             invalidateDirListCache();
+            invalidateExplorerPlm();
             st.toast(ui::ToastLevel::Info, "Explorer refreshed");
         }
         ImGui::SetCursorScreenPos(ImVec2(toolRowMin.x, toolRowMin.y + bw));
@@ -721,10 +1132,12 @@ void drawFileExplorerBody(AppState& st) {
         }
     }
 
-    ui::fmSectionDivider("Workspace");
-    ImGui::BeginChild("##fx_tree", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::BeginChild("##fx_tree", ImVec2(0, 0), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar);
     drawDirNode(st, root, root, /*isRoot=*/true);
+    ui::drawWindowPillScrollbarV(explorerSurf());
     ImGui::EndChild();
+    kit::cardEnd();
 
     drawDeleteModal(st, root);
 }

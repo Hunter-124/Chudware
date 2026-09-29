@@ -15,6 +15,7 @@ import zipfile
 import pytest
 
 from services.plm import vault as vault_mod
+from services.plm import worker_rpc
 from services.plm.vault import Vault
 
 
@@ -207,5 +208,128 @@ def test_reformatted_recipe_reuses_canonical_content_without_losing_extras(tmp_p
         assert v._bind.read_blob_at(saved, prefix + "document.json") == original
         assert v._bind.read_blob_at(
             saved, prefix + "extra/source.dat") == b"preserved source attachment"
+    finally:
+        v.close()
+
+
+def test_item_list_detects_preserved_member_change_without_changing_legacy_dirty(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    v = Vault.open(tmp_path)
+    try:
+        project = {"path": str(tmp_path)}
+        path = tmp_path / "Bracket.step+"
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("thumbnail.png", b"\x89PNG\r\n_stub_thumbnail")
+            zf.writestr("document.json", json.dumps(_part()))
+            zf.writestr("attachment.txt", b"new drawing note")
+        # The overview's existing recipe-only dirty semantics remain unchanged.
+        assert v.status()["dirty"] == []
+        result = worker_rpc._plm_item_list(project, None)
+        assert result["ok"], result
+        assert result["items"][0]["change"] == "M"
+        assert result["items"][0]["dirty"] is False
+        # A second list uses the same HEAD-bound stamp cache.
+        assert worker_rpc._plm_item_list(project, None)["items"][0]["change"] == "M"
+        v.checkpoint("Add drawing note")
+        assert worker_rpc._plm_item_list(project, None)["items"][0]["change"] == ""
+    finally:
+        v.close()
+
+
+def test_item_list_changes_and_discovery_do_not_save_or_register(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    project = {"path": str(tmp_path)}
+    vault_mod._invalidate_dirty_cache(tmp_path)
+    v = Vault.open(tmp_path)
+    try:
+        iid = v.manifest()["items"][0]["item_id"]
+        original_head = v._bind.head_commit()
+
+        def listing():
+            result = worker_rpc._plm_item_list(project, None)
+            assert result["ok"], result
+            assert v._bind.head_commit() == original_head
+            return result
+
+        initial = listing()
+        assert [(row["item_id"], row["change"], row["dirty"])
+                for row in initial["items"]] == [(iid, "", False)]
+        assert initial["untracked"] == []
+
+        _write(tmp_path, "Bracket.step+", _part(9.0))
+        (tmp_path / "nested").mkdir()
+        _write(tmp_path / "nested", "Board.ecad+",
+               {"schema": "aicad.pcb/1", "id": "new-board", "name": "Board"})
+        (tmp_path / "broken.step+").write_bytes(b"not a container")
+        changed = listing()
+        assert [(row["item_id"], row["change"], row["dirty"])
+                for row in changed["items"]] == [(iid, "M", True)]
+        assert changed["untracked"] == [{"path": "nested/Board.ecad+", "change": "U"}]
+        assert len(v.manifest()["items"]) == 1
+        assert worker_rpc._plm_item_list({**project, "kind": "ecad"}, None)["untracked"] == (
+            changed["untracked"])
+        assert worker_rpc._plm_item_list({**project, "kind": "part"}, None)["untracked"] == []
+
+        saved = v.checkpoint("Update bracket and board")["commit"]
+        checked = worker_rpc._plm_item_list(project, None)
+        assert {row["path"]: (row["change"], row["dirty"]) for row in checked["items"]} == {
+            "Bracket.step+": ("", False), "nested/Board.ecad+": ("", False)}
+        assert checked["untracked"] == []
+
+        (tmp_path / "Bracket.step+").unlink()
+        deleted = worker_rpc._plm_item_list(project, None)
+        assert next(row for row in deleted["items"] if row["item_id"] == iid)["change"] == "D"
+        assert next(row for row in deleted["items"] if row["item_id"] == iid)["dirty"] is False
+        assert v._bind.head_commit() == saved
+
+        v.checkpoint("Remove bracket")
+        after_delete = worker_rpc._plm_item_list(project, None)
+        assert next(row for row in after_delete["items"] if row["item_id"] == iid)["change"] == ""
+        assert not (tmp_path / "Bracket.step+").exists()
+        _write(tmp_path, "Bracket.step+", _part())
+        added = worker_rpc._plm_item_list(project, None)
+        assert next(row for row in added["items"] if row["item_id"] == iid)["change"] == "A"
+        v.restore(saved)
+        restored = worker_rpc._plm_item_list(project, None)
+        assert next(row for row in restored["items"] if row["item_id"] == iid)["change"] == ""
+    finally:
+        v.close()
+
+
+def test_item_list_unreadable_working_path_is_not_deleted(tmp_path, monkeypatch):
+    _write(tmp_path, "Bracket.step+", _part())
+    project = {"path": str(tmp_path)}
+    v = Vault.open(tmp_path)
+    try:
+        path = tmp_path / "Bracket.step+"
+        original_stat = type(path).stat
+
+        def refuse_stat(self, *args, **kwargs):
+            if self == path:
+                raise PermissionError("file temporarily inaccessible")
+            return original_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(type(path), "stat", refuse_stat)
+        result = worker_rpc._plm_item_list(project, None)
+        assert result["ok"], result
+        row = result["items"][0]
+        assert row["change"] != "D"
+        assert row["dirty"] is True
+    finally:
+        v.close()
+
+
+def test_generic_file_deletion_remains_visible_when_checkpoint_carries_content(tmp_path):
+    (tmp_path / "spec.md").write_text("revision one\n")
+    v = Vault.open(tmp_path)
+    try:
+        item = v.add_item("spec.md")
+        (tmp_path / "spec.md").unlink()
+        project = {"path": str(tmp_path)}
+        before = worker_rpc._plm_item_list(project, None)["items"]
+        assert next(row for row in before if row["item_id"] == item["item_id"])["change"] == "D"
+        v.checkpoint("Other project changes")
+        after = worker_rpc._plm_item_list(project, None)["items"]
+        assert next(row for row in after if row["item_id"] == item["item_id"])["change"] == "D"
     finally:
         v.close()

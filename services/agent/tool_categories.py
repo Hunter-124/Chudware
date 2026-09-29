@@ -43,6 +43,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "export_part",
         "inspect_native_files",
         "read_native_file",
+        "browse_models",
         "relocate_native_files",
         "undo",
         "redo",
@@ -820,6 +821,8 @@ MAIN_CHAT_CORE_TOOLS: tuple[str, ...] = (
     "fs_glob",
     "fs_grep",
     "fs_list",
+    # The model-facing thumbnail explorer: every CAD file's card + ASCII preview.
+    "browse_models",
     "fs_write",
     "fs_edit",
     # documents

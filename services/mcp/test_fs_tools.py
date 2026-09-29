@@ -117,14 +117,14 @@ def _big(dirpath, n=2000):
 
 def test_all_tools_register():
     t = _tools()
-    assert set(t) == {"fs_read", "fs_list", "fs_glob", "fs_grep",
+    assert set(t) == {"fs_read", "fs_list", "fs_glob", "fs_grep", "browse_models",
                       "fs_write", "fs_edit", "run_shell"}
 
 
 def test_risk_classification():
     _tools()  # populates the catalog via view()
     cat = reg.catalog()
-    for name in ("fs_read", "fs_list", "fs_glob", "fs_grep"):
+    for name in ("fs_read", "fs_list", "fs_glob", "fs_grep", "browse_models"):
         assert cat[name]["risk"] == "read", name
     for name in ("fs_write", "fs_edit", "run_shell"):
         assert cat[name]["risk"] == "write", name
@@ -348,11 +348,12 @@ def test_fs_read_not_found_in_unreadable_parent_still_clean():
             os.chmod(locked, 0o755)
 
 
-# --------------------------------------------------------------------------- CAD redirect
+# --------------------------------------------------------------------------- CAD preview
 
-def test_fs_read_step_plus_redirects_to_import_part():
-    """fs_read on a real .step+ (ZIP container) must not answer a useless binary_file —
-    it redirects to import_part + describe/measure/inspect, even with raw=True."""
+def test_fs_read_corrupt_step_plus_is_a_failed_preview_pointing_at_import_part():
+    """A .step+ is never dumped as binary. A container that cannot be read is a
+    failure carrying its card's reason, and still points at import_part — even with
+    raw=True."""
     t = _tools()
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "CD-1102_MudBucket_OilRig.step+")
@@ -361,32 +362,34 @@ def test_fs_read_step_plus_redirects_to_import_part():
         for kwargs in ({}, {"raw": True}):
             r = t["fs_read"](p, **kwargs)
             assert not r["ok"] and r["reason"] == "use_import_part"
+            assert "unreadable" in r["card"]["summary"]
             assert "import_part" in r["hint"]
             assert "describe_part" in r["hint"] and "measure_part" in r["hint"]
 
 
-def test_fs_read_draw_plus_redirects_to_drawing_import():
+def test_fs_read_draw_plus_names_import_part():
     t = _tools()
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "x.draw+")
         with open(p, "wb") as fh:
             fh.write(b"PK\x03\x04" + b"\x00" * 64)
         r = t["fs_read"](p)
-        assert not r["ok"] and r["reason"] == "use_import_part"
         assert f'import_part(path="{p}")' in r["hint"]
 
 
-def test_fs_read_text_step_redirects_but_raw_true_escapes():
-    """Plain-text B-rep exchange formats still redirect by default (the geometry reader
-    is the right tool), but an explicit raw=True proceeds with the normal text read."""
+def test_fs_read_text_step_previews_but_raw_true_escapes():
+    """Plain-text B-rep exchange formats preview by default (header card + the route to
+    the geometry reader), but an explicit raw=True proceeds with the normal text read."""
     t = _tools()
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "part.step")
         with open(p, "w") as fh:
-            fh.write("ISO-10303-21;\nHEADER;\nENDSEC;\n")
+            fh.write("ISO-10303-21;\nHEADER;\nFILE_NAME('bracket','2026',(''),(''),'',"
+                     "'SolidWorks 2024','');\nFILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\nENDSEC;\n")
         r = t["fs_read"](p)
-        assert not r["ok"] and r["reason"] == "use_import_part"
-        assert "import_part" in r["hint"] and "raw=True" in r["hint"]
+        assert r["ok"] and r["kind"] == "cad_preview" and r["open_with"] == "import_part"
+        assert r["card"]["name"] == "bracket" and r["card"]["schema"] == "AUTOMOTIVE_DESIGN"
+        assert "raw=True" in r["hint"]
         r2 = t["fs_read"](p, raw=True)
         assert r2["ok"] and "ISO-10303-21" in r2["text"]
 
@@ -398,7 +401,7 @@ def test_fs_read_dxf_mentions_wires_and_allows_raw():
         with open(p, "w") as fh:
             fh.write("0\nSECTION\n2\nENTITIES\n")
         r = t["fs_read"](p)
-        assert not r["ok"] and r["reason"] == "use_import_part"
+        assert r["ok"] and r["kind"] == "cad_preview"
         assert "import_part" in r["hint"] and "wires" in r["hint"] and "raw=True" in r["hint"]
         assert t["fs_read"](p, raw=True)["ok"]
 

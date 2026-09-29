@@ -60,6 +60,7 @@
   ],
   "mode_tools": {
     "ask": [
+      "browse_models",
       "cad_guide",
       "describe_assembly",
       "describe_board",
@@ -170,6 +171,7 @@
       "bearing_life",
       "bom_price",
       "bom_rollup",
+      "browse_models",
       "buildgraph_plan",
       "buildgraph_status",
       "cad_guide",

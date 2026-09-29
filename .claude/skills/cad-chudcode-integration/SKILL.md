@@ -127,7 +127,11 @@ runtime's doctor command.
    `import_artifact` and `simulate_motion`, plus (2026-09-28, the tools c211–c233 loaded on
    demand or bypassed through bash) `inspect_native_files`, `read_native_file`, `get_job`,
    `wait_job`, `inspect_section`, `dfm_check`, `analyze_stl_geometry`, `list_world_bodies`,
-   `interface_check` and `render_animation`. Its system prompt carries the MORE TOOLS menu
+   `interface_check` and `render_animation`, and `browse_models` — the model-facing thumbnail
+   explorer (`services/mcp/model_card.py`: each CAD file's card + shaded top/front/right ASCII
+   silhouettes, read from the `.step+` document/cache/mesh without importing; `fs_list` rows
+   carry the one-line summary and `fs_read` of a CAD file returns the card, `ok:true`, instead
+   of a failed redirect). Its system prompt carries the MORE TOOLS menu
    naming every other registered tool; `enable_tools(tools=[...])` and
    `enable_tools(categories=[group])` load the rest mid-turn through the single refresh
    callback `chudcode_roles._register_category_refresh` (re-runs `build_host_tools` and

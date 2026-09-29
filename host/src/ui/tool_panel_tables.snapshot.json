@@ -305,6 +305,7 @@
    "em_timedomain"
   ],
   "files": [
+   "browse_models",
    "fs_edit",
    "fs_glob",
    "fs_grep",
@@ -610,6 +611,7 @@
   "bom_rollup": "Roll an assembly (+ any linked ECAD board) up into a unified made/bought BOM.",
   "box_status": "Box.com mirror status: whether mirroring is enabled/connected, the connected account, pending spooled projects, and — when ``path`` (or the …",
   "box_sync": "Mirror the project's saved files up to the configured Box.com folder now (uploads new/changed files; never downloads). Requires Box …",
+  "browse_models": "Browse the project's CAD files like a thumbnail explorer: one card per model with an ASCII preview.",
   "browser_profiles": "List, refresh, or delete persistent browser login profiles.",
   "buildgraph_plan": "Consume a BUILD PLAN, a dag/1 mission, or a plain description of the build, and return an aicad.buildgraph/1 graph.",
   "buildgraph_status": "Return the current node statuses of a buildgraph run.",
@@ -1190,6 +1192,9 @@
   "box_sync": {
    "prompt_note": "Uploads the project's saved files to the configured Box.com folder NOW (new/changed only, never downloads). Saves already mirror automatically when Box is enabled — reach for this only when the user asks to push or box_status shows pending/errors."
   },
+  "browse_models": {
+   "prompt_note": "The thumbnail view of a project's CAD files, read from the files without importing: use it to find the right part before import_part, never unzip/jq. Narrow with path/pattern (e.g. 'parts/*') to get ASCII previews for more than 12 models."
+  },
   "browser_profiles": {
    "prompt_note": "Persistent vendor browser-profile manager. action='list' performs a fresh no-cache login probe for every saved profile and reports only active/expired/unknown; action='refresh' opens the headed human login flow; action='delete' removes that site's local profile and refuses while it is open. Never refresh-loop or delete without the user's request.",
    "timeout_s": 360
@@ -1673,10 +1678,10 @@
    "prompt_note": "Python regex, line-oriented; skips files >8 MiB and stops after 5000 files, so narrow big trees with path+glob; follow hits up with fs_read's line selector."
   },
   "fs_list": {
-   "prompt_note": "Directories only (a file path errors) — orient here first, then fs_glob/fs_grep to go deeper; dirs sort before files."
+   "prompt_note": "Directories only (a file path errors) — orient here first, then fs_glob/fs_grep to go deeper; dirs sort before files; CAD rows carry a one-line card summary."
   },
   "fs_read": {
-   "prompt_note": "Windowed by design: after a fs_grep hit, jump straight there with a 'path:50-200' selector instead of paging from the top; binary files are refused, directories list entries."
+   "prompt_note": "Windowed by design: after a fs_grep hit, jump straight there with a 'path:50-200' selector instead of paging from the top; binary files are refused, directories list entries; a CAD file returns its preview card (summary + ASCII thumbnail), not its bytes."
   },
   "fs_write": {
    "prompt_note": "Full overwrite, no append — never use it to patch an existing file; that is fs_edit's job. Parent dirs are created for you."

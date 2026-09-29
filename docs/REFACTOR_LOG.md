@@ -5236,3 +5236,21 @@ sessions loaded on demand (`list_world_bodies`, `inspect_native_files`, `interfa
 the two new ones; `contracts/copilot_modes.json` allows `read_native_file` (ask, plan) and
 `wait_job` (plan). Not done: the Chudcode-side "No such tool: xd://<cad tool>" for an
 unloaded tool still does not say `enable_tools` loads it.
+
+## 2026-09-28 — text thumbnails: a file explorer for the models
+
+`services/mcp/model_card.py` builds a CAD file's card straight from the file, never by
+importing it: a `.step+` gives kind/name/material, feature histogram and suppressed count
+(`document.json`), revision, volume, bodies and failing features (`cache.json`), and bbox plus
+three shaded ASCII silhouettes — top (−Z), front (+Y), right (−X), denser glyph = nearer — from
+area-weighted samples of `cache.aicm`; binary/ASCII STL get bbox + silhouettes; STEP a header
+card. Cached per (path, mtime, size): 21 parts cold in 2.8 s, repeat free. Surfaces:
+`browse_models(path, pattern, thumbnails, limit)` (files family, main-chat core, Ask/Plan;
+thumbnails auto for ≤12 models; the whole 6-axis project is 14 KB with them off),
+a one-line `card` on `fs_list` CAD rows (first 60), and `fs_read` of a CAD file now returns
+`ok:true, kind:"cad_preview"` with the card instead of a failed `use_import_part` redirect
+(an unreadable container still fails, carrying its card). `tool_registry._READ_EXACT` now
+includes `browse_models`, `read_native_file` and `wait_job` — they had defaulted to WRITE,
+which also let the progress watchdog count a listing or a job wait as modeling progress.
+Assemblies saved without `cache.aicm` (reference assemblies such as ME-490 Rover Review) get
+counts only, no bbox/thumbnail.

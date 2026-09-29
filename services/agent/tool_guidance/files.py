@@ -8,13 +8,23 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Windowed by design: after a fs_grep hit, jump straight there with "
             "a 'path:50-200' selector instead of paging from the top; binary "
-            "files are refused, directories list entries."
+            "files are refused, directories list entries; a CAD file returns "
+            "its preview card (summary + ASCII thumbnail), not its bytes."
         ),
     },
     "fs_list": {
         "prompt_note": (
             "Directories only (a file path errors) — orient here first, then "
-            "fs_glob/fs_grep to go deeper; dirs sort before files."
+            "fs_glob/fs_grep to go deeper; dirs sort before files; CAD rows "
+            "carry a one-line card summary."
+        ),
+    },
+    "browse_models": {
+        "prompt_note": (
+            "The thumbnail view of a project's CAD files, read from the files "
+            "without importing: use it to find the right part before import_part, "
+            "never unzip/jq. Narrow with path/pattern (e.g. 'parts/*') to get "
+            "ASCII previews for more than 12 models."
         ),
     },
     "fs_glob": {

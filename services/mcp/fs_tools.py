@@ -13,9 +13,9 @@ Families (server.py wires each via _reg.view(mcp, family)):
 Envelope: ``{ok:true, …}`` | ``{ok:false, reason, hint}`` — never a traceback (mirrors
 office_tools.py / plm_tools.py). A ``not_found`` also carries ``did_you_mean`` (near-miss
 suggestions, incl. the ``X`` vs ``X+`` native-container trap) and folds the top suggestion
-into ``hint``. CAD/geometry files (.step+, .step, .stl, …) refuse with ``use_import_part``
-and point at import_part + describe_part/measure_part/inspect_part instead of a useless
-``binary_file``.
+into ``hint``. CAD/geometry files (.step+, .step, .stl, …) are never dumped: fs_read returns
+their ``model_card`` preview (summary + ASCII thumbnail) and points at import_part +
+describe_part/measure_part/inspect_part; ``browse_models`` is the thumbnail explorer.
 
 CONTEXT-SAFE READING (the point of fs_read): a raw file dump overflows a small model's
 context. fs_read never returns unbounded text. It emits LINE-NUMBERED output, honours an
@@ -332,8 +332,13 @@ CAD_EXTS = CAD_BINARY_EXTS | CAD_TEXT_EXTS
 
 
 def _cad_redirect(path: str, kind: str) -> dict:
-    """Teaching redirect: fs_read serves text/documents; CAD geometry goes through
-    import_part (returns a doc_id) and the describe/measure/inspect readers."""
+    """fs_read of a CAD file: its text thumbnail card plus the route to the real reader.
+
+    fs_read serves text/documents; CAD geometry is edited and measured through
+    import_part (returns a doc_id) and the describe/measure/inspect readers. The card
+    (model_card: name, kind, features, size, bbox, shaded ASCII silhouettes) is read
+    straight from the file, so a glance never costs an import. Only an unreadable file
+    is a failure; a preview is a successful read."""
     name = Path(path).name
     if kind == "dxf":
         hint = (f"{name} is a 2D CAD drawing — open it with import_part(path=\"{path}\") "
@@ -346,10 +351,34 @@ def _cad_redirect(path: str, kind: str) -> dict:
                 "with describe_part / measure_part / inspect_part; this format is plain "
                 "text, so if you truly need the raw file text pass raw=True to fs_read")
     else:
-        hint = (f"{name} is a binary CAD/geometry container — fs_read cannot show it as "
-                f"text; open it with import_part(path=\"{path}\") which returns a doc_id, "
-                "then read the model with describe_part / measure_part / inspect_part")
-    return _err("use_import_part", hint)
+        hint = (f"{name} is a binary CAD/geometry container — fs_read shows its preview "
+                f"card, not its bytes; open it with import_part(path=\"{path}\") which "
+                "returns a doc_id, then read the model with describe_part / measure_part / "
+                "inspect_part")
+    from .model_card import VIEWS_LEGEND, model_card
+
+    card = model_card(path)
+    if card.get("ok") is False or card.get("error"):
+        return {**_err("use_import_part", hint), "card": card}
+    out = _ok(path=path, kind="cad_preview", is_document=False, open_with="import_part",
+              card=card, hint=hint)
+    if card.get("thumbnail"):
+        out["legend"] = VIEWS_LEGEND
+    return out
+
+
+#: Cards are cheap (cached, read from the file) but a directory of large assemblies
+#: still costs; a listing summarises this many CAD files and names the rest.
+MAX_LIST_CARDS = 60
+
+
+def _card_summary(path: str) -> Optional[str]:
+    try:
+        from .model_card import summary_line
+
+        return summary_line(path)
+    except Exception:  # noqa: BLE001 - a listing never fails on one bad file
+        return None
 
 
 def _reader_for(name: str) -> str:
@@ -606,6 +635,7 @@ def _list_dir(path: str, show_hidden: bool) -> dict:
     except Exception as exc:  # noqa: BLE001
         return _err("list_failed", str(exc))
     rows = []
+    carded = 0
     for e in entries:
         if not show_hidden and e.name.startswith("."):
             continue
@@ -621,14 +651,19 @@ def _list_dir(path: str, show_hidden: bool) -> dict:
             reader = _reader_for(e.name)
             if reader == "import_part":
                 row["open_with"] = "import_part"
+                if carded < MAX_LIST_CARDS:
+                    summary = _card_summary(str(e))
+                    if summary:
+                        row["card"] = summary
+                        carded += 1
         rows.append(row)
     geometry = sorted({r["name"] for r in rows if r.get("open_with") == "import_part"})
     out = _ok(path=str(p), entries=rows, count=len(rows))
     if geometry:
         out["note"] = (
-            f"{len(geometry)} CAD/geometry file(s) here are NOT readable with fs_read — "
-            'open one with import_part(path="...") to get a doc_id, then read it with '
-            "describe_part / measure_part / inspect_part"
+            f"{len(geometry)} CAD/geometry file(s) here; each row's card summarises it. "
+            "browse_models(path) shows every model with an ASCII thumbnail; to edit or "
+            'measure one, open it with import_part(path="...") for a doc_id'
         )
     return out
 
@@ -652,9 +687,10 @@ def register_fs_tools(mcp) -> None:
                  .xls/.ods/.csv) is extracted to text (via office_extract) and paginated
                  the same way. A CAD/geometry
                  file (.draw+/.step+/.step/.stp/.iges/.stl/.3mf/.obj/…) is NOT dumped —
-                 you get a use_import_part redirect: open it with import_part(path=...) and
-                 read the model via describe_part / measure_part / inspect_part (plain-text
-                 formats honour raw=True as an explicit escape).
+                 you get its preview card (kind, features, bbox, ASCII thumbnail, read from
+                 the file); open it with import_part(path=...) and read the model via
+                 describe_part / measure_part / inspect_part (plain-text formats honour
+                 raw=True as an explicit escape).
         offset : 1-indexed start line when no selector is given (default: from the top).
         limit  : max lines to return (default 400, hard cap 4000).
         raw    : omit line numbers / column clipping.
@@ -730,6 +766,65 @@ def register_fs_tools(mcp) -> None:
             out["note"] = ("these are CAD/geometry files — fs_read cannot read them; call "
                            'import_part(path="...") for a doc_id, then describe_part / '
                            "measure_part / inspect_part")
+        return out
+
+    @mcp.tool()
+    def browse_models(path: str = ".", pattern: str = "**/*",
+                      thumbnails: Optional[bool] = None, limit: int = 40) -> dict:
+        """Browse the project's CAD files like a thumbnail explorer: one card per model with an ASCII preview.
+
+        Each card is read straight from the file (no import): kind, name, material,
+        features/components/mates, bounding box, volume, revision, failing features, and
+        — for .step+ parts/assemblies and STL meshes — ``thumbnail`` top/front/right
+        shaded silhouettes (denser glyph = nearer the viewer). ``pattern`` is a glob under
+        ``path`` (default every file, hidden folders skipped). ``thumbnails`` defaults to
+        on for ≤12 models; ``limit`` caps the cards (max 200, the rest are only named).
+        Open one with import_part(path=...) to edit or measure it. Risk: read.
+        """
+        from .model_card import VIEWS_LEGEND, model_card
+
+        base, blocked = _canonical_target(path, read=True)
+        if blocked:
+            return blocked
+        assert base is not None
+        if not base.is_dir():
+            return _err("not_a_directory", f"{path} is not a directory")
+        cap = max(1, min(int(limit or 40), 200))
+        found: list[Path] = []
+        try:
+            for match in base.glob(pattern):
+                rel = match.relative_to(base)
+                if any(part.startswith(".") for part in rel.parts):
+                    continue
+                if not match.is_file() or _kind_for(match.name) not in CAD_EXTS:
+                    continue
+                resolved, descendant_block = _canonical_target(str(match), read=True)
+                if descendant_block or resolved is None:
+                    continue
+                found.append(match)
+        except Exception as exc:  # noqa: BLE001
+            return _err("glob_failed", str(exc))
+        found.sort(key=lambda m: str(m.relative_to(base)).lower())
+        show_thumbs = thumbnails if thumbnails is not None else len(found) <= 12
+        models = []
+        for match in found[:cap]:
+            card = model_card(match, thumbnail=bool(show_thumbs))
+            # The summary already spells out kind/name/material/features/size/volume;
+            # a row adds only what it does not: where it sits, what is broken, the view.
+            row = {"file": str(match.relative_to(base)), "summary": card["summary"],
+                   "modified": card.get("modified")}
+            for key in ("bbox_min_mm", "failing_features", "geometry", "thumbnail"):
+                if card.get(key) is not None:
+                    row[key] = card[key]
+            models.append(row)
+        out = _ok(root=str(base), count=len(found), shown=len(models), models=models)
+        if len(found) > cap:
+            out["not_shown"] = [str(m.relative_to(base)) for m in found[cap:cap + 200]]
+        if show_thumbs and any(m.get("thumbnail") for m in models):
+            out["legend"] = VIEWS_LEGEND
+        elif found and not show_thumbs:
+            out["note"] = ("thumbnails are off for more than 12 models; pass thumbnails=True "
+                           "or narrow path/pattern to see the ASCII previews")
         return out
 
     @mcp.tool()

@@ -17,6 +17,7 @@ After the fix the same prompt completes in two calls with zero failures.
 from __future__ import annotations
 
 import json
+import os
 
 from services.agent.agent_turn import (
     _dispatch_tool,
@@ -394,6 +395,56 @@ class TestToolResultSerialization:
         assert "view_id" in parts[0]["text"]
         assert parts[1] == {
             "type": "image", "path": str(png), "mime": "image/png"}
+
+    def test_inline_image_bytes_stay_attachable_in_the_turn_feed(self, tmp_path,
+                                                                 monkeypatch):
+        """An `Image(data=...)` used to become {"kind":"image","bytes":N}: no path,
+        so `_tool_result_parts` had nothing to attach and the model got a count."""
+        from PIL import Image as PILImage
+        from mcp.server.fastmcp import Image
+        from services.agent.agent_turn import _json_safe_result, _tool_result_parts
+
+        monkeypatch.setattr("services.paths.CACHE", tmp_path / "cache")
+        src = tmp_path / "src.png"
+        PILImage.new("RGB", (32, 24), (10, 20, 30)).save(src)
+        data = src.read_bytes()
+        safe = _json_safe_result([Image(data=data, format="png"), "inline render"])
+        ref = safe[0]
+        assert ref["kind"] == "image" and ref["mime"] == "image/png"
+        assert open(ref["path"], "rb").read() == data
+        parts = _tool_result_parts("Result of render_part:", safe)
+        assert parts[1] == {"type": "image", "path": ref["path"], "mime": "image/png"}
+
+    def test_oversized_tool_image_is_downscaled_not_dropped(self, tmp_path,
+                                                            monkeypatch):
+        import random
+
+        from PIL import Image as PILImage
+        from services.agent import tool_images
+        from services.agent.agent_turn import _tool_result_parts
+
+        monkeypatch.setattr("services.paths.CACHE", tmp_path / "cache")
+        big = tmp_path / "big.png"
+        pixels = random.Random(3).randbytes(1500 * 1400 * 3)
+        PILImage.frombytes("RGB", (1500, 1400), pixels).save(big)
+        assert big.stat().st_size > tool_images.MAX_BYTES
+        parts = _tool_result_parts(
+            "Result of render_part:",
+            [{"kind": "image", "path": str(big), "mime": "image/png"}, "caption"])
+        images = [p for p in parts if p["type"] == "image"]
+        assert len(images) == 1 and images[0]["path"] != str(big)
+        assert os.path.getsize(images[0]["path"]) <= tool_images.MAX_BYTES
+        assert "original 1500x1400" in parts[-1]["text"]
+
+    def test_unreadable_tool_image_is_named_not_silently_dropped(self, tmp_path):
+        from services.agent.agent_turn import _tool_result_parts
+
+        gone = str(tmp_path / "gone.png")
+        parts = _tool_result_parts(
+            "Result of render_part:",
+            [{"kind": "image", "path": gone, "mime": "image/png"}, "caption"])
+        assert [p["type"] for p in parts] == ["text", "text"]
+        assert f"[image not attached: {gone} is unreadable" in parts[-1]["text"]
 
     def test_drawing_export_requires_review_after_the_last_mutation(self):
         from services.agent.agent_turn import _drawing_export_review_block

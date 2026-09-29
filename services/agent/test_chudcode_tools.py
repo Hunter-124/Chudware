@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import queue
+import tempfile
 import threading
 import unittest
 from collections import OrderedDict
@@ -745,6 +746,222 @@ class SubagentHostToolDispatchTests(unittest.TestCase):
         agent = self._tool("add_features", add_features, mode="agent")
         self.assertTrue(agent({"ops": []}, _SubagentCall("Builder", "Main"))["details"]["ok"])
         self.assertEqual(ran, [[]])
+
+
+def _png(path, size=(64, 48), noise=False):
+    """Write a real PNG (solid, or incompressible noise) and return its path."""
+    import random
+
+    from PIL import Image
+
+    if noise:
+        pixels = random.Random(7).randbytes(size[0] * size[1] * 3)
+        image = Image.frombytes("RGB", size, pixels)
+    else:
+        image = Image.new("RGB", size, (40, 90, 160))
+    image.save(path, format="PNG")
+    return str(path)
+
+
+def _decoded(block):
+    import base64
+    import io
+
+    from PIL import Image
+
+    raw = base64.b64decode(block["data"], validate=True)
+    with Image.open(io.BytesIO(raw)) as image:
+        return raw, image.format, image.size
+
+
+# Neutral per-tool options: the dispatch must not read the developer's Settings.
+_NEUTRAL_TOOL_OPTIONS = {
+    "enabled": True,
+    "timeout_s": None,
+    "max_calls_per_turn": None,
+    "param_defaults": {},
+    "prompt_note": "",
+}
+
+
+class HostToolImageDeliveryTests(unittest.TestCase):
+    """Render tools return FastMCP ``[Image, caption]``. c205/c213/c217: the RPC
+    ``host_tool_result`` frame carried only ``"<mcp.server.fastmcp.utilities.types.
+    Image object at 0x…>"`` text, so the model never saw a single render. Every
+    render-producing tool family must reach the frame as an image content block
+    with the caption kept as text, whoever called it (top level, a task sub-agent,
+    or code inside eval)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        patches = (
+            mock.patch("services.agent.config.get_tool_options",
+                       return_value=dict(_NEUTRAL_TOOL_OPTIONS)),
+            # Inline image bytes are written to the render cache: keep it in tmp.
+            mock.patch("services.paths.CACHE", self.tmp / "cache"),
+        )
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _frame(self, name, handler, **frame):
+        """Run *handler* as host tool *name* through the real chudcode_rpc client and
+        return the ``host_tool_result`` frame it writes back to Chudcode."""
+        from chudcode_rpc import RpcClient, host_tool
+
+        binding = HostToolBinding(
+            name=name,
+            description=name,
+            input_schema={"type": "object"},
+            handler=handler,
+            context={"policy_registry": _Policy(), "tool_calls": []},
+        )
+        client = RpcClient(custom_tools=[binding.to_host_tool(host_tool)])
+        sent = queue.Queue()
+        with mock.patch.object(client, "_send_notification", sent.put):
+            client._handle_host_tool_call({
+                "type": "host_tool_call",
+                "id": "req-1",
+                "toolCallId": frame.pop("toolCallId", "toolu_render"),
+                "toolName": name,
+                "arguments": {},
+                **frame,
+            })
+            out = sent.get(timeout=30)
+        self.assertEqual(out["type"], "host_tool_result")
+        self.assertNotIn("isError", out, out)
+        return out, binding.context["tool_calls"]
+
+    def _assert_image_frame(self, frame, caption, size):
+        content = frame["result"]["content"]
+        self.assertEqual(content[0]["type"], "text")
+        text = content[0]["text"]
+        self.assertIn(caption, text)
+        self.assertNotIn("Image object at", text)
+        images = [block for block in content if block.get("type") == "image"]
+        self.assertEqual(len(images), 1, content)
+        self.assertEqual(images[0]["mimeType"], "image/png")
+        raw, fmt, decoded_size = _decoded(images[0])
+        self.assertTrue(raw.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual((fmt, decoded_size), ("PNG", size))
+        # The structured copy keeps the path reference, never the pixels.
+        self.assertNotIn(images[0]["data"], json.dumps(frame["result"]["details"]))
+        return text
+
+    def test_every_render_tool_family_reaches_the_frame_as_an_image_block(self):
+        from mcp.server.fastmcp import Image
+
+        png = _png(self.tmp / "render.png")
+        review_json = json.dumps({"ok": True, "views": [{"view_id": "v1"}]})
+        families = {
+            # _captioned_render / _with_save_note pairs.
+            "render_part": lambda: [Image(path=png), "iso view of 'bracket'"],
+            "contact_sheet": lambda: [Image(path=png), "Contact sheet, 4 tiles"],
+            "render_views": lambda: [Image(path=png), "render_views grid (2 tiles)"],
+            "render_study_setup": lambda: [Image(path=png), "fixtures blue, load red"],
+            # Close-up tools return [Image(path=out), caption].
+            "inspect_feature": lambda: [Image(path=png), "feature F3 close-up"],
+            "inspect_part": lambda: [Image(path=png), "target face close-up"],
+            "look_around": lambda: [Image(path=png), "4 views around F9"],
+            "measure": lambda: [Image(path=png), "distance 12.5 mm"],
+            # review_drawing pairs the sheet with its JSON diagnostics.
+            "review_drawing": lambda: [Image(path=png), review_json],
+            # _captioned_render's caption-less fallback is a bare Image.
+            "sketch_render": lambda: Image(path=png),
+        }
+        captions = {
+            "review_drawing": "view_id",
+            "sketch_render": png,
+        }
+        for name, handler in families.items():
+            with self.subTest(tool=name):
+                frame, records = self._frame(name, handler)
+                caption = captions.get(name) or handler()[1]
+                text = self._assert_image_frame(frame, caption, (64, 48))
+                self.assertIn(png, text)
+                # Run records (artifact events, the GUI feed) keep the path reference.
+                recorded = records[-1]["result"]
+                refs = recorded if isinstance(recorded, list) else [recorded]
+                self.assertIn({"kind": "image", "path": png, "mime": "image/png"}, refs)
+
+    def test_image_reaches_subagent_eval_and_arg_note_wrapped_calls(self):
+        from mcp.server.fastmcp import Image
+
+        png = _png(self.tmp / "render.png")
+        pair = lambda: [Image(path=png), "iso view of 'bracket'"]
+        # A task sub-agent's call carries its registry ids on the frame.
+        frame, _ = self._frame(
+            "render_part", pair, agentId="Builder", parentAgentId="Main"
+        )
+        self._assert_image_frame(frame, "iso view of 'bracket'", (64, 48))
+        # eval's tool bridge calls the same host tool under a js-* call id.
+        frame, _ = self._frame(
+            "render_part", pair, toolCallId="js-render_part-7f1c"
+        )
+        self._assert_image_frame(frame, "iso view of 'bracket'", (64, 48))
+        # _attach_arg_notes wraps a list result in {"ok", "result", ...}.
+        wrapped = lambda: {
+            "ok": True,
+            "result": [Image(path=png), "iso view of 'bracket'"],
+            "arg_interpretation": "interpreted 'part' as 'doc_id'",
+        }
+        frame, _ = self._frame("render_part", wrapped)
+        text = self._assert_image_frame(frame, "iso view of 'bracket'", (64, 48))
+        self.assertIn("arg_interpretation", text)
+
+    def test_inline_image_bytes_reach_the_frame_as_an_image_block(self):
+        from mcp.server.fastmcp import Image
+
+        data = Path(_png(self.tmp / "inline.png", size=(80, 60))).read_bytes()
+        frame, records = self._frame(
+            "render_part", lambda: [Image(data=data, format="png"), "inline render"]
+        )
+        self._assert_image_frame(frame, "inline render", (80, 60))
+        ref = records[-1]["result"][0]
+        self.assertEqual(ref["kind"], "image")
+        self.assertTrue(ref["path"].startswith(str(self.tmp / "cache" / "renders")))
+        self.assertEqual(Path(ref["path"]).read_bytes(), data)
+
+    def test_oversized_image_is_downscaled_to_the_model_edge_not_dropped(self):
+        from mcp.server.fastmcp import Image
+
+        from services.agent.tool_images import MAX_EDGE_PX
+
+        sheet = _png(self.tmp / "sheet.png", size=(4000, 3000))
+        frame, _ = self._frame(
+            "review_drawing", lambda: [Image(path=sheet), '{"ok": true}']
+        )
+        text = self._assert_image_frame(
+            frame, "original 4000x3000", (MAX_EDGE_PX, 1176)
+        )
+        self.assertIn(sheet, text)
+
+    def test_image_over_the_byte_limit_is_reencoded_under_it(self):
+        from mcp.server.fastmcp import Image
+
+        from services.agent.tool_images import MAX_BYTES
+
+        noisy = _png(self.tmp / "noisy.png", size=(1500, 1400), noise=True)
+        self.assertGreater(Path(noisy).stat().st_size, MAX_BYTES)
+        frame, _ = self._frame("render_part", lambda: [Image(path=noisy), "noisy"])
+        images = [b for b in frame["result"]["content"] if b.get("type") == "image"]
+        self.assertEqual(len(images), 1)
+        raw, fmt, size = _decoded(images[0])
+        self.assertEqual(fmt, "PNG")
+        self.assertLessEqual(len(raw), MAX_BYTES)
+        self.assertLess(size[0], 1500)
+        self.assertAlmostEqual(size[0] / size[1], 1500 / 1400, places=2)
+
+    def test_missing_image_file_is_named_in_the_text_not_silently_dropped(self):
+        from mcp.server.fastmcp import Image
+
+        gone = str(self.tmp / "gone.png")
+        frame, _ = self._frame("render_part", lambda: [Image(path=gone), "iso"])
+        content = frame["result"]["content"]
+        self.assertEqual([block["type"] for block in content], ["text"])
+        self.assertIn(f"[image not attached: {gone} is unreadable", content[0]["text"])
 
 
 if __name__ == "__main__":

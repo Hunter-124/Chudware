@@ -7903,21 +7903,13 @@ def _json_safe_result(result: Any, _depth: int = 0) -> Any:
         return {str(k): _json_safe_result(v, _depth + 1) for k, v in result.items()}
     if isinstance(result, (list, tuple, set)):
         return [_json_safe_result(v, _depth + 1) for v in result]
-    # fastmcp Image: `path` is a PosixPath (or None when the bytes are inline).
-    if hasattr(result, "_mime_type") and (
-        hasattr(result, "path") or hasattr(result, "data")
-    ):
-        out: dict[str, Any] = {"kind": "image"}
-        path = getattr(result, "path", None)
-        if path is not None:
-            out["path"] = os.fspath(path)
-        data = getattr(result, "data", None)
-        if path is None and isinstance(data, (bytes, bytearray)):
-            out["bytes"] = len(data)
-        mime = getattr(result, "_mime_type", None)
-        if isinstance(mime, str):
-            out["mime"] = mime
-        return out
+    # fastmcp Image / MCP ImageContent: one path reference shared with the Chudcode
+    # adapter; inline bytes are written to the render cache so they stay attachable.
+    from services.agent.tool_images import image_ref  # noqa: PLC0415
+
+    image = image_ref(result)
+    if image is not None:
+        return image
     try:
         json.dumps(result)
     except Exception:  # noqa: BLE001
@@ -7962,7 +7954,9 @@ def _tool_result_parts(label: str, result: Any, *, suffix: str = "") -> list[dic
     to the provider reduced the actual pixels to ``{"kind":"image","path":...}``.
     A vision-capable model therefore had to guess at drawings and 3D renders it had
     explicitly requested. Keep the compact text/caption and attach each readable
-    image as a real provider image part.
+    image as a real provider image part. An image over ``tool_images.MAX_BYTES`` is
+    attached as a downscaled copy (it used to be dropped silently), and one that
+    cannot be attached at all is named in the text.
     """
     text = f"{label}\n{_as_text(result)}"
     if suffix:
@@ -7972,39 +7966,25 @@ def _tool_result_parts(label: str, result: Any, *, suffix: str = "") -> list[dic
         from services.agent.providers.base import image_part  # noqa: PLC0415
     except Exception:  # noqa: BLE001 — text feedback still reaches the model
         return parts
+    from services.agent import tool_images  # noqa: PLC0415
 
-    seen: set[str] = set()
-
-    def visit(value: Any, depth: int = 0) -> None:
-        if depth > 6 or len(seen) >= _ATTACH_MAX_IMAGES:
-            return
-        if isinstance(value, dict):
-            if str(value.get("kind") or "").strip().lower() == "image":
-                path = value.get("path")
-                if isinstance(path, str) and path and path not in seen:
-                    try:
-                        if (
-                            os.path.isfile(path)
-                            and os.access(path, os.R_OK)
-                            and os.path.getsize(path) <= _ATTACH_MAX_BYTES
-                        ):
-                            mime = value.get("mime")
-                            mime = (
-                                mime.strip()
-                                if isinstance(mime, str) and mime.strip()
-                                else "image/png"
-                            )
-                            parts.append(image_part(path, mime))
-                            seen.add(path)
-                    except OSError:
-                        pass
-            for nested in value.values():
-                visit(nested, depth + 1)
-        elif isinstance(value, (list, tuple)):
-            for nested in value:
-                visit(nested, depth + 1)
-
-    visit(result)
+    notes: list[str] = []
+    for ref in tool_images.image_refs(result)[:_ATTACH_MAX_IMAGES]:
+        path = ref["path"]
+        mime = ref.get("mime")
+        mime = mime.strip() if isinstance(mime, str) and mime.strip() else "image/png"
+        try:
+            if not os.path.isfile(path) or not os.access(path, os.R_OK):
+                raise tool_images.ImageUnavailable(f"{path} is unreadable")
+            if os.path.getsize(path) > tool_images.MAX_BYTES:
+                image = tool_images.load_model_image(path)
+                notes.append(image.note(path))
+                path, mime = tool_images.materialize(image.data, image.mime), image.mime
+            parts.append(image_part(path, mime))
+        except (OSError, tool_images.ImageUnavailable) as exc:
+            notes.append(f"[image not attached: {exc}]")
+    if notes:
+        parts.extend(_parts("\n".join(notes)))
     return parts
 
 

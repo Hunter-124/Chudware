@@ -19,6 +19,13 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Union, get_args, get_origin
 
+from services.agent.tool_images import (
+    ImageUnavailable,
+    image_ref,
+    image_refs,
+    load_model_image,
+)
+
 _MISSING = object()
 _LOG = logging.getLogger(__name__)
 # Run records (``tool_calls``) are shared by every agent in a turn, including
@@ -155,12 +162,44 @@ def host_tool_result(result: Any) -> dict[str, Any]:
     The text is the one copy the model pays for, on every later request of the
     conversation, so JSON goes out in :func:`model_json` form. Most MCP tools hand
     back ``json.dumps(..., indent=2)`` strings; those are re-rendered the same way.
+
+    Images a tool returned (render tools' ``[Image, caption]``) follow the text as
+    ``{"type": "image", "mimeType", "data"}`` blocks — Chudcode passes result content
+    through to the model unchanged, so this is where the pixels must be. The text keeps
+    each image's path reference and the caption; ``details`` never carries base64.
+    Before this, ``_json_safe`` stringified the ``Image`` object and every render the
+    model asked for arrived as ``"<mcp.server.fastmcp.utilities.types.Image object at
+    0x…>"`` (c205, c213, c217: the model re-rendered with ``save_path`` and ``read``
+    the PNG to see anything).
     """
     if isinstance(result, str):
         return {"content": [{"type": "text", "text": _compact_json_text(result)}]}
     safe = _json_safe(result)
-    text = model_json(safe)
-    return {"content": [{"type": "text", "text": text}], "details": safe}
+    images, notes = _model_image_blocks(safe)
+    text = "\n".join((model_json(safe), *notes))
+    return {"content": [{"type": "text", "text": text}, *images], "details": safe}
+
+
+def _model_image_blocks(safe: Any) -> tuple[list[dict[str, str]], list[str]]:
+    """Image content blocks for every image reference in *safe*, plus model notes.
+
+    An image that cannot be loaded is named in a note rather than silently missing,
+    and one re-encoded to fit the limits says so, so the model never reasons about
+    pixels it did not get.
+    """
+    blocks: list[dict[str, str]] = []
+    notes: list[str] = []
+    for ref in image_refs(safe):
+        path = ref["path"]
+        try:
+            image = load_model_image(path)
+        except ImageUnavailable as exc:
+            notes.append(f"[image not attached: {exc}]")
+            continue
+        blocks.append(image.block())
+        if image.reencoded:
+            notes.append(image.note(path))
+    return blocks, notes
 
 
 def _nested_call_reporter(
@@ -1311,4 +1350,9 @@ def _json_safe(value: Any, _seen: set[int] | None = None) -> Any:
             return [_json_safe(item, seen) for item in value]
         finally:
             seen.remove(ident)
+    # A render tool's Image object becomes the path reference host_tool_result turns
+    # into an image block; str() of it was the placeholder the model used to receive.
+    image = image_ref(value)
+    if image is not None:
+        return image
     return str(value)

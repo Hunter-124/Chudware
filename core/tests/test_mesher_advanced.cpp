@@ -868,12 +868,12 @@ TEST_CASE("local refine: centroid grading leaves the distant background alone") 
         std::vector<double> longest;
         for (int e = 0; e < mesh.n_elems; ++e) {
             std::array<int, 4> nodes{};
-            bool far = true;
+            bool distal = true;  // not `far`: an empty macro under <windows.h>
             for (int a = 0; a < 4; ++a) {
                 nodes[a] = mesh.tets[e * mesh.nodes_per_elem + a];
-                far &= mesh.points[3 * nodes[a] + 2] > 30.0;
+                distal &= mesh.points[3 * nodes[a] + 2] > 30.0;
             }
-            if (!far) continue;
+            if (!distal) continue;
             double length2 = 0.0;
             for (int a = 0; a < 4; ++a)
                 for (int b = a + 1; b < 4; ++b) {

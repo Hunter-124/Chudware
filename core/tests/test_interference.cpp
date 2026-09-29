@@ -459,24 +459,25 @@ TEST_CASE("model integrity: positive gap is proximity, not touching, and nearest
         box("A", 10, 10, 10, {0, 0, 0}, {{"merge", false}}),
         box("B", 10, 10, 10, {10.02, 0, 0}, {{"merge", false}}),
     }));
-    json near = doc_eval_model_integrity(b.id, {{"proximity_mm", 0.05}});
-    REQUIRE_MESSAGE(near["complete"] == true, near.dump());
-    REQUIRE(near["pairs"].size() == 1);
-    CHECK(near["pairs"][0]["relation"] == "proximity");
-    CHECK(near["pairs"][0]["distance_mm"].get<double>() == doctest::Approx(0.02));
-    CHECK(near["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(0.0));
-    CHECK(near["isolated_solids"].empty());
-    CHECK(near["islands"].size() == 1);
+    // Not near/far: <windows.h> defines both as empty macros (MSVC build).
+    json within = doc_eval_model_integrity(b.id, {{"proximity_mm", 0.05}});
+    REQUIRE_MESSAGE(within["complete"] == true, within.dump());
+    REQUIRE(within["pairs"].size() == 1);
+    CHECK(within["pairs"][0]["relation"] == "proximity");
+    CHECK(within["pairs"][0]["distance_mm"].get<double>() == doctest::Approx(0.02));
+    CHECK(within["pairs"][0]["overlap_volume_mm3"].get<double>() == doctest::Approx(0.0));
+    CHECK(within["isolated_solids"].empty());
+    CHECK(within["islands"].size() == 1);
 
-    json far = doc_eval_model_integrity(b.id, {{"proximity_mm", 0.01}});
-    REQUIRE_MESSAGE(far["complete"] == true, far.dump());
-    CHECK(far["pairs"].empty());
-    CHECK(far["islands"].size() == 2);
-    CHECK(far["isolated_solids"].size() == 2);
-    CHECK(far["summary"]["theoretical_pairs"] == 1);
-    CHECK(far["summary"]["candidate_pairs"] == 0);
-    REQUIRE(far["nearest"].size() == 2);
-    for (const json& nearest : far["nearest"]) {
+    json beyond = doc_eval_model_integrity(b.id, {{"proximity_mm", 0.01}});
+    REQUIRE_MESSAGE(beyond["complete"] == true, beyond.dump());
+    CHECK(beyond["pairs"].empty());
+    CHECK(beyond["islands"].size() == 2);
+    CHECK(beyond["isolated_solids"].size() == 2);
+    CHECK(beyond["summary"]["theoretical_pairs"] == 1);
+    CHECK(beyond["summary"]["candidate_pairs"] == 0);
+    REQUIRE(beyond["nearest"].size() == 2);
+    for (const json& nearest : beyond["nearest"]) {
         CHECK(nearest["status"] == "exact");
         CHECK(nearest["nearest_id"] != nearest["solid_id"]);
         CHECK(nearest["distance_mm"].get<double>() == doctest::Approx(0.02));

@@ -79,7 +79,7 @@ jobs:
               --exclude='.credentials*' --exclude='.service' \
               --exclude='.path' --exclude='.env' \
               --exclude='.agent' --exclude='.agent_migrated' \
-              --exclude='svc.sh' --exclude='runsvc.sh' \
+              --exclude='/svc.sh' --exclude='/runsvc.sh' \
               --exclude='bin/actions.runner.plist.temp' --exclude='bin.*/actions.runner.plist.temp' \
               "${source_dir}/" "${target_dir}/"
             # Runner auto-updates may leave bin/externals pointing at absolute
@@ -133,6 +133,15 @@ jobs:
             echo '::error::Target directory belongs to a different runner or repository'
             exit 1
           }
+          # A previous install can lack the service template if it was excluded
+          # while cloning. Repair only after validating this runner's identity.
+          if [ ! -f ./bin/runsvc.sh ]; then
+            if [ ! -f "${source_dir}/bin/runsvc.sh" ]; then
+              echo '::error::CAD runner is missing the service template'
+              exit 1
+            fi
+            cp "${source_dir}/bin/runsvc.sh" ./bin/runsvc.sh
+          fi
           if [ ! -x ./svc.sh ]; then
             echo '::error::Configured Chudcode runner lacks its own service script'
             exit 1
@@ -144,8 +153,13 @@ jobs:
             fi
           else
             if [ -e "${plist}" ]; then
-              echo '::error::Chudcode LaunchAgent already exists without matching runner service state'
-              exit 1
+              if [ "$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' "${plist}")" != "${target_dir}" ] || \
+                 [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "${plist}")" != "${target_dir}/runsvc.sh" ] || \
+                 launchctl list "${service_name}" >/dev/null 2>&1; then
+                echo '::error::Unexpected or active LaunchAgent without matching runner service state'
+                exit 1
+              fi
+              rm "${plist}"
             fi
             ./svc.sh install
           fi

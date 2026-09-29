@@ -365,9 +365,16 @@ class RenderPool:
     """Spawned worker processes, each with its own in-process engine. Reuse one pool across
     parts: a worker keeps its last part open, and jobs are whole parts or chunks of one."""
 
-    def __init__(self, workers: Optional[int] = None, *, max_tasks_per_child: int = 400):
+    def __init__(self, workers: Optional[int] = None, *, max_tasks_per_child: int = 400,
+                 stall_s: Optional[float] = None):
         self.workers = int(workers or default_workers())
         self.max_tasks_per_child = max_tasks_per_child
+        # No job finishing for this long means the pool is wedged, not slow: the 2026-09-29
+        # campaign sat 2 h on a parent whose workers had all vanished (as_completed never
+        # returns once the executor stops noticing its dead children). One part renders in
+        # well under a minute; 10 min is generous for the slowest.
+        self.stall_s = float(stall_s if stall_s is not None
+                             else os.environ.get("CHUDWARE_VIEWNET_RENDER_STALL_S", "600"))
         self._ex: Optional[ProcessPoolExecutor] = None
 
     def _executor(self) -> ProcessPoolExecutor:
@@ -381,8 +388,10 @@ class RenderPool:
 
     def run(self, fn, jobs: list):
         """Yield (job, result | exception) as jobs complete. A crashed worker (engine
-        segfault) breaks the pool and every job still in it: the pool is rebuilt and those
+        segfault) breaks the pool and every job still in it, and a pool with no completion for
+        `stall_s` is treated the same way: the pool is killed and rebuilt and the unfinished
         jobs retried once; a job that breaks it twice is yielded with its exception."""
+        from concurrent.futures import FIRST_COMPLETED, wait  # noqa: PLC0415
         pending = list(jobs)
         attempts: dict = {}
         while pending:
@@ -390,29 +399,56 @@ class RenderPool:
             futs = {ex.submit(fn, *job): i for i, job in enumerate(pending)}
             retry: list = []
             broken = False
-            for fut in as_completed(futs):
-                job = pending[futs[fut]]
-                try:
-                    res = fut.result()
-                except BrokenProcessPool as e:
+
+            def _fail(job, err) -> Optional[tuple]:
+                n = attempts.get(id(job), 0) + 1
+                attempts[id(job)] = n
+                if n >= 2:
+                    return job, err
+                retry.append(job)
+                return None
+
+            waiting = set(futs)
+            while waiting:
+                done, waiting = wait(waiting, timeout=self.stall_s, return_when=FIRST_COMPLETED)
+                if not done:
                     broken = True
-                    n = attempts.get(id(job), 0) + 1
-                    attempts[id(job)] = n
-                    if n >= 2:
-                        yield job, e
-                    else:
-                        retry.append(job)
-                    continue
-                except Exception as e:  # noqa: BLE001
-                    res = e
-                yield job, res
+                    err = BrokenProcessPool(f"render pool stalled: no job finished in "
+                                            f"{self.stall_s:.0f} s")
+                    for fut in waiting:
+                        out = _fail(pending[futs[fut]], err)
+                        if out:
+                            yield out
+                    break
+                for fut in done:
+                    job = pending[futs[fut]]
+                    try:
+                        res = fut.result()
+                    except BrokenProcessPool as e:
+                        broken = True
+                        out = _fail(job, e)
+                        if out:
+                            yield out
+                        continue
+                    except Exception as e:  # noqa: BLE001
+                        res = e
+                    yield job, res
             if broken:
-                self.close()
+                self.close(kill=True)
             pending = retry
 
-    def close(self) -> None:
+    def close(self, *, kill: bool = False) -> None:
         if self._ex is not None:
-            self._ex.shutdown(wait=True, cancel_futures=True)
+            if kill:
+                # A wedged pool never drains: kill its workers so shutdown cannot block.
+                for proc in list((getattr(self._ex, "_processes", None) or {}).values()):
+                    try:
+                        proc.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
+                self._ex.shutdown(wait=False, cancel_futures=True)
+            else:
+                self._ex.shutdown(wait=True, cancel_futures=True)
             self._ex = None
 
     def __enter__(self) -> "RenderPool":

@@ -54,6 +54,11 @@ jobs:
     env:
       # The whole point of this job. See the header block above.
       CHUDWARE_GATE_STRICT: '1'
+      # The runner's per-job temp is on disk. /tmp has a per-user quota shared
+      # with live CAD sessions and old simulation caches; filling it made every
+      # build/check subprocess fail while its redirected log remained empty.
+      TMPDIR: ${{ runner.temp }}
+      GATE_TMPDIR: ${{ runner.temp }}/chudware-gate
     steps:
       - name: Check runner capabilities
         shell: bash

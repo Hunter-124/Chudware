@@ -285,8 +285,24 @@ bool map_file(const std::string& path, Mapping& out, std::string& err) {
 
 bool is_shm_uri(const std::string& uri) { return uri.rfind(kUriPrefix, 0) == 0; }
 
+// Doc ids are per-process sequential ("doc-cpp00000001"), so a bare doc_id+rev name is shared
+// by every engine on the box: the user's hostd, an in-process MCP/training engine and parallel
+// render workers all published /dev/shm/chudware_doc-cpp00000001_r0, and each publish
+// shm_unlink+ftruncate'd the other process's live object (SIGBUS in the reader, or a silently
+// foreign mesh). The publishing process id scopes the name; readers only ever use the URI.
+static std::string doc_key_prefix(const std::string& doc_id) {
+#ifdef _WIN32
+    const unsigned long pid = static_cast<unsigned long>(::GetCurrentProcessId());
+#elif defined(__EMSCRIPTEN__)
+    const unsigned long pid = 0;
+#else
+    const unsigned long pid = static_cast<unsigned long>(::getpid());
+#endif
+    return "p" + std::to_string(pid) + "_" + sanitize(doc_id) + "_r";
+}
+
 std::string key_for(const std::string& doc_id, long revision) {
-    return sanitize(doc_id) + "_r" + std::to_string(revision);
+    return doc_key_prefix(doc_id) + std::to_string(revision);
 }
 
 void release_all() {
@@ -399,7 +415,7 @@ void release(const std::string& key) {
 }
 
 void release_older_than(const std::string& doc_id, long keep_rev) {
-    const std::string prefix = sanitize(doc_id) + "_r";
+    const std::string prefix = doc_key_prefix(doc_id);
     std::vector<std::string> drop;
     {
         std::lock_guard<std::mutex> lk(g_mu);
@@ -417,7 +433,7 @@ void release_older_than(const std::string& doc_id, long keep_rev) {
 }
 
 void release_doc(const std::string& doc_id) {
-    const std::string prefix = sanitize(doc_id) + "_r";
+    const std::string prefix = doc_key_prefix(doc_id);
     std::vector<std::string> drop;
     {
         std::lock_guard<std::mutex> lk(g_mu);

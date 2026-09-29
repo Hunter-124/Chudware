@@ -1211,6 +1211,51 @@ def test_no_mcp_reaches_only_a_chud_that_accepts_it(tmp_path, help_text, expecte
     host.shutdown()
 
 
+_MNEMO_TOOLS = {"retain", "recall", "reflect"}
+
+
+@pytest.mark.parametrize(("workspace", "backend", "knows_ss", "expected", "memory_tools"), [
+    (True, "sharpshooter", True, "sharpshooter", set()),
+    (True, "mnemo", True, "mnemo", _MNEMO_TOOLS),
+    (True, "off", True, "\"off\"", set()),
+    (True, None, True, "sharpshooter", set()),  # no setting sent: the default backend
+    (False, "mnemo", True, "\"off\"", set()),  # no project folder: no memory at all
+    # A chud that predates sharpshooter exits at startup on its name.
+    (True, "sharpshooter", False, "mnemo", _MNEMO_TOOLS),
+])
+def test_memory_is_the_projects_and_its_tools_match_the_backend(
+    tmp_path, monkeypatch, workspace, backend, knows_ss, expected, memory_tools
+):
+    """A CAD session's memory lives in its project folder's store, per the user's backend
+    setting; with no project folder there is no store it could own. --tools must name
+    exactly the chosen backend's memory tools: chud refuses to start on one it lacks."""
+    from services import paths
+
+    monkeypatch.setattr(paths, "ROOT", tmp_path / "data")
+    fake = tmp_path / "chud"
+    settings = '"sharpshooter.model"' if knows_ss else '"mnemo.bank"'
+    fake.write_text(
+        "#!/bin/sh\n"
+        f"if [ \"$1\" = config ]; then echo '{{{settings}: null}}'; exit 0; fi\n"
+        "echo '  --no-mcp x\n  --config=<value> y'\n"
+    )
+    fake.chmod(0o755)
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory, binary=fake)
+    extra = {"workspace_dir": str(tmp_path)} if workspace else {}
+    if backend is not None:
+        extra["memory_backend"] = backend
+    assert run(host, "cad", "cad-1", **extra)[0]["ok"]
+
+    [client] = [c for c in factory.clients if not c.kwargs.get("no_session")]
+    args = client.kwargs["extra_args"]
+    overlay = Path(args[args.index("--config") + 1]).read_text()
+    assert f"memory:\n  backend: {expected}\n" in overlay
+    assert "context-file:user:CLAUDE.md" in overlay
+    assert set(client.kwargs["tools"]) & _MNEMO_TOOLS == memory_tools
+    host.shutdown()
+
+
 def test_missing_dependency_and_binary_are_actionable(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "chudcode_rpc", None)
     missing_dep = ChudcodeSessionHost()

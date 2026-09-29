@@ -1112,14 +1112,30 @@ def is_tool_family_enabled(family: str, cfg: dict | None = None) -> bool:
     return bool(fams.get(family, True))
 
 
-def memory_enabled(cfg: dict | None = None) -> bool:
+#: Chudcode memory backends a CAD conversation may run with. Every one is scoped to the
+#: project folder (the session cwd); "off" gives the conversation no memory at all.
+MEMORY_BACKENDS = ("off", "sharpshooter", "mnemo")
+DEFAULT_MEMORY_BACKEND = "sharpshooter"
+
+
+def memory_backend(cfg: dict | None = None) -> str:
+    """The project-memory backend: ``memory_backend``, else legacy ``memory_enabled``.
+
+    A config written before the backend choice existed keeps its meaning: an explicit
+    ``memory_enabled: false`` is "off", anything else gets the default backend.
+    """
     c = cfg if cfg is not None else load_config()
-    if isinstance(c, dict) and "memory_enabled" in c:
-        return bool(c.get("memory_enabled"))
-    agent = _agent_block(c if isinstance(c, dict) else None)
-    if "memory_enabled" in agent:
-        return bool(agent.get("memory_enabled"))
-    return DEFAULT_MEMORY_ENABLED
+    c = c if isinstance(c, dict) else {}
+    agent = _agent_block(c)
+    raw = c.get("memory_backend", agent.get("memory_backend"))
+    if isinstance(raw, str) and raw.strip().lower() in MEMORY_BACKENDS:
+        return raw.strip().lower()
+    enabled = c.get("memory_enabled", agent.get("memory_enabled", DEFAULT_MEMORY_ENABLED))
+    return DEFAULT_MEMORY_BACKEND if enabled else "off"
+
+
+def memory_enabled(cfg: dict | None = None) -> bool:
+    return memory_backend(cfg) != "off"
 
 
 def get_memory_token_budget(cfg: dict | None = None) -> int:

@@ -598,6 +598,22 @@ void loadSettings(Settings& s) {
             s.memoryTokenBudget = (b < 50) ? 50 : (b > 4000 ? 4000 : b);
         }
         {
+            // A config from before the backend choice keeps its meaning: memory_enabled
+            // false is "off"; otherwise the default backend.
+            std::string backend;
+            if (j.contains("memory_backend") && j["memory_backend"].is_string())
+                backend = j["memory_backend"].get<std::string>();
+            else if (j.contains("agent") && j["agent"].is_object() &&
+                     j["agent"].contains("memory_backend") &&
+                     j["agent"]["memory_backend"].is_string())
+                backend = j["agent"]["memory_backend"].get<std::string>();
+            if (backend == "off" || backend == "sharpshooter" || backend == "mnemo")
+                s.memoryBackend = backend;
+            else if (!s.memoryEnabled)
+                s.memoryBackend = "off";
+            s.memoryEnabled = s.memoryBackend != "off";
+        }
+        {
             // Accept string names or a persisted int from any build; legacy swarm/edit/eng_firm
             // collapse to Agent (those lanes are the model's own decision now, not a mode).
             int cm = 0;
@@ -1088,7 +1104,8 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         j["advisor_preference"] = prefName(s.advisorPreference);
         j["proactive_advisor"] = s.proactiveAdvisor;
         j["corporate_mode"] = s.corporateMode;
-        j["memory_enabled"] = s.memoryEnabled;
+        j["memory_backend"] = s.memoryBackend;
+        j["memory_enabled"] = s.memoryBackend != "off";
         j["memory_token_budget"] = s.memoryTokenBudget;
         // Merge-overlay into agent{} so Python config helpers see the same values.
         nlohmann::json agent = nlohmann::json::object();
@@ -1100,7 +1117,8 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         agent["corporate_mode"] = s.corporateMode;
         agent["subagent_preference"] = prefName(s.subagentPreference);
         agent["task_list_preference"] = prefName(s.taskListPreference);
-        agent["memory_enabled"] = s.memoryEnabled;
+        agent["memory_backend"] = s.memoryBackend;
+        agent["memory_enabled"] = s.memoryBackend != "off";
         agent["memory_token_budget"] = s.memoryTokenBudget;
         j["agent"] = std::move(agent);
         j.erase("role_adoption");

@@ -5173,5 +5173,36 @@ Not fixed, agent quality: c230 edited `forearm_lower` in place but left the open
 unrefreshed and never swept it; c233 ended with FDM `dfm_check` failing (0.118 mm yoke wall)
 and `feature_attachment` 0.6 when the machine hung (nvidia-drm pageflip timeouts, reboot
 15:26); c227 linked two old films instead of sweeping the open assembly (guidance fixed in
-c631d8698). Open question: CAD sessions still use the user's global mnemo bank
-(auto-retain + recall across all projects).
+c631d8698).
+
+## 2026-09-28 — project memory: one real switch, per-folder, Sharpshooter default
+
+Correction to the entry above: CAD sessions were NOT pooling memory. Chudcode's mnemo
+default scoping is `per-project` keyed by the process cwd (the workspace), and the 6-axis
+turns wrote only to bank `…-6-axis-1dcd9kaxtypzw` (10 rows, all 6-axis prompts). What was
+wrong: (1) the Settings "Project memory (per-folder)" checkbox drove only the pre-Chudcode
+`.plm/memory.db` store (last write 2026-08-28) — the memory the agent actually used ignored
+it; (2) the scoping came from the user's global Chudcode config, so a `global` setting would
+have pooled every project; (3) a session with no workspace ran with the worker's cwd (the
+Chudware tree) and so shared the dev repo's bank. Now the setting is a backend choice —
+Settings → AI → Harness and the copilot menu, "Project memory": Off / Decisions (Chudcode
+`sharpshooter`, default) / Full recall (`mnemo`) — persisted as `agent.memory_backend`
+(`config.memory_backend`; a legacy `memory_enabled:false` reads as off, and
+`memory_enabled` still mirrors it for the offline loop). The worker sends it as
+`memory_backend`; `_make_client` writes `cad-session-<backend>.yml` pinning
+`memory.backend` (+ mnemo `scoping: per-project`), adds only that backend's tools to
+`--tools` (mnemo: retain/recall/reflect; sharpshooter: none — chud exits on a tool its
+backend lacks), gives a no-workspace session `off`, and falls back to mnemo when
+`chud config list --json` shows no `sharpshooter.*` settings (an older chud exits on the
+unknown backend; probe cached per binary identity like `--help`). Sharpshooter is ported
+from oh-my-pi 18.4.2 in Chudcode `06dc85d486` (local, not pushed): per-project decision
+files under `~/.chudcode/agent/memories/sharpshooter/<basename>-<hash(cwd)>/`, extraction
+model = `sharpshooter.model` → smol role → the session's model; `~/.local/bin/chud`
+rebuilt (previous kept as `chud.2026-09-28.bak`; the build also carries the uncommitted
+Chudcode updater fix in that tree). The pinned release artifacts are still v0.3.0 without
+it, so packaged builds get mnemo until a Chudcode release. The choice applies when a
+conversation's Chudcode process starts (new conversation or app restart). Verified live
+against both binaries: sharpshooter scope `6-axis-1dcd9kaxtypzw`; mnemo `per-project`;
+no workspace `off`; old binary + sharpshooter → mnemo, starts.
+(`test_memory_is_the_projects_and_its_tools_match_the_backend`,
+`test_memory_backend_config.py`.)

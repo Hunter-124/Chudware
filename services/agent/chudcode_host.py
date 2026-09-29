@@ -53,11 +53,11 @@ _CATALOG_RETRY_SECONDS = 5 * 60.0
 _CATALOG_COMMAND_TIMEOUT_SECONDS = 90
 
 #: Chudcode builtins a CAD conversation uses. CAD's own tools arrive as host tools
-#: (set_custom_tools), which this list does not restrict; MCP servers from the user's
-#: Chudcode config still mount because chud has no per-process MCP switch.
+#: (set_custom_tools), which this list does not restrict. Memory tools are added per the
+#: session's memory backend (``_CAD_MEMORY_TOOLS``).
 CAD_SESSION_TOOLS = (
     "read", "bash", "edit", "write", "glob", "grep", "eval", "task", "hub", "todo",
-    "web_search", "browser", "computer", "retain", "recall", "reflect",
+    "web_search", "browser", "computer",
 )
 
 _LOG = logging.getLogger(__name__)
@@ -1374,16 +1374,30 @@ class ChudcodeSessionHost:
             # repo-dev skills; CAD skills come from cad_skill), LSP docs, and a dozen
             # code devices (security_scan, debug, firmware, cpp_*, ast_*, github ...):
             # 106 KB of prompt + tool schema, 72 KB after (measured with get_state).
-            kwargs["tools"] = list(CAD_SESSION_TOOLS)
             kwargs["no_skills"] = True
             # The user's Chudcode MCP servers (stripe, graphify ...) are not CAD tools.
             # The pinned release chud predates --no-mcp and rejects unknown flags.
             extra: tuple[str, ...] = ("--no-lsp",)
             if binary is not None and _binary_supports_flag(binary, "--no-mcp"):
                 extra += ("--no-mcp",)
-            overlay = _cad_session_overlay() if binary is not None else None
-            if overlay is not None and _binary_supports_flag(binary, "--config"):
+            memory = _session_memory_backend(params, workspace)
+            if binary is not None and not _binary_has_memory_backend(binary, memory):
+                # A chud that predates the backend exits at startup on its name; the
+                # conversation keeps project-scoped recall instead.
+                _LOG.warning("chud at %s lacks memory backend %r; using mnemo", binary, memory)
+                memory = "mnemo"
+            overlay = (
+                _cad_session_overlay(memory)
+                if binary is not None and _binary_supports_flag(binary, "--config")
+                else None
+            )
+            tools = list(CAD_SESSION_TOOLS)
+            if overlay is not None:
                 extra += ("--config", overlay)
+                # Only a backend this overlay pins is known to register its tools; chud
+                # refuses to start when --tools names one it lacks.
+                tools += _CAD_MEMORY_TOOLS[memory]
+            kwargs["tools"] = tools
             kwargs["extra_args"] = extra
         try:
             client = factory(**kwargs)
@@ -2083,32 +2097,49 @@ def _binary_identity(path: str) -> tuple | None:
     return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
 
-_HELP_TEXT: dict[tuple[str, tuple | None], str] = {}
+_PROBE_OUTPUT: dict[tuple[str, tuple | None, tuple[str, ...]], str] = {}
 _FLAG_SUPPORT_LOCK = threading.Lock()
 _FLAG_PROBE_TIMEOUT_SECONDS = 10.0
 
 
-def _binary_supports_flag(path: str, flag: str) -> bool:
-    """Whether ``<path> --help`` lists ``flag``; ``--help`` runs once per binary identity.
-
-    A binary that cannot be probed (timeout, crash, missing) does not get the flag:
-    passing an unknown flag would stop the session from starting at all.
-    """
-    key = (path, _binary_identity(path))
+def _binary_probe(path: str, args: tuple[str, ...]) -> str:
+    """``<path> <args>`` stdout+stderr, run once per binary identity; "" when it fails."""
+    key = (path, _binary_identity(path), args)
     if key[1] is None:  # nothing on disk to ask
-        return False
+        return ""
     with _FLAG_SUPPORT_LOCK:
-        text = _HELP_TEXT.get(key)
+        text = _PROBE_OUTPUT.get(key)
     if text is None:
         try:
-            proc = subprocess.run([path, "--help"], capture_output=True, text=True,
+            proc = subprocess.run([path, *args], capture_output=True, text=True,
                                   timeout=_FLAG_PROBE_TIMEOUT_SECONDS, check=False)
             text = f"{proc.stdout}\n{proc.stderr}"
         except (OSError, subprocess.SubprocessError):
             text = ""
         with _FLAG_SUPPORT_LOCK:
-            _HELP_TEXT[key] = text
+            _PROBE_OUTPUT[key] = text
+    return text
+
+
+def _binary_supports_flag(path: str, flag: str) -> bool:
+    """Whether ``<path> --help`` lists ``flag``.
+
+    A binary that cannot be probed (timeout, crash, missing) does not get the flag:
+    passing an unknown flag would stop the session from starting at all.
+    """
+    text = _binary_probe(path, ("--help",))
     return re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", text) is not None
+
+
+def _binary_has_memory_backend(path: str, backend: str) -> bool:
+    """Whether ``chud`` knows ``backend``: it exits at startup on an unknown one.
+
+    Only the built-ins "off"/"mnemo" predate the setting listing; a newer backend is
+    recognized by its own settings in ``chud config list --json``.
+    """
+    if backend in ("off", "mnemo"):
+        return True
+    return f'"{backend}.' in _binary_probe(path, ("config", "list", "--json"))
 
 
 #: Chudcode settings every CAD conversation process runs with (``--config`` overlay).
@@ -2125,9 +2156,40 @@ _CAD_SESSION_SETTINGS = (
     "  - context-file:user:GEMINI.md\n"
     "  - context-file:user:copilot-instructions.md\n"
 )
+#: Per-backend memory settings. Chudcode keys every backend's store by the process cwd,
+#: which is the CAD project folder, so memory never crosses projects; mnemo's scoping is
+#: pinned so a user-level `global` setting cannot pool all projects into one bank.
+_CAD_MEMORY_SETTINGS = {
+    "off": "memory:\n  backend: \"off\"\n",
+    "mnemo": "memory:\n  backend: mnemo\nmnemo:\n  scoping: per-project\n",
+    "sharpshooter": "memory:\n  backend: sharpshooter\n",
+}
+#: The Chudcode tools each backend provides. chud refuses to start when --tools names a
+#: tool the configured backend does not register.
+_CAD_MEMORY_TOOLS: dict[str, tuple[str, ...]] = {
+    "off": (),
+    "mnemo": ("retain", "recall", "reflect"),
+    "sharpshooter": (),
+}
 
 
-def _cad_session_overlay() -> str | None:
+def _session_memory_backend(params: Mapping[str, Any], workspace: str | None) -> str:
+    """The memory backend for a CAD conversation process (``params["memory_backend"]``).
+
+    Without a workspace the cwd is the services worker's own directory (the Chudware
+    install or source tree), a store no CAD project owns: such a session gets none.
+    """
+    if workspace is None:
+        return "off"
+    backend = params.get("memory_backend")
+    if backend in _CAD_MEMORY_SETTINGS:
+        return backend
+    from services.agent.config import DEFAULT_MEMORY_BACKEND
+
+    return DEFAULT_MEMORY_BACKEND
+
+
+def _cad_session_overlay(memory: str) -> str | None:
     """Path of the CAD session settings overlay, (re)written when its content differs.
 
     Returns ``None`` when the file cannot be written; the session then starts without it
@@ -2135,14 +2197,15 @@ def _cad_session_overlay() -> str | None:
     """
     from services import paths
 
-    target = Path(paths.ROOT) / "chudcode" / "cad-session.yml"
+    content = _CAD_SESSION_SETTINGS + _CAD_MEMORY_SETTINGS[memory]
+    target = Path(paths.ROOT) / "chudcode" / f"cad-session-{memory}.yml"
     try:
-        if target.is_file() and target.read_text(encoding="utf-8") == _CAD_SESSION_SETTINGS:
+        if target.is_file() and target.read_text(encoding="utf-8") == content:
             return str(target)
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".cad-session-", suffix=".yml")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(_CAD_SESSION_SETTINGS)
+            handle.write(content)
         os.replace(tmp, target)
     except OSError as exc:
         _LOG.warning("CAD session settings overlay unavailable: %s", exc)

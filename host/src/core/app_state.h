@@ -134,8 +134,12 @@ struct Settings {
     // Opt-in company structure auto-route (agent.corporate_mode). Default off —
     // Agent never auto-invokes company; enable in Settings → AI → Behavior when ready.
     bool corporateMode = false;
-    bool memoryEnabled = true;   // project SQLite memory under .plm/memory.db
-    int memoryTokenBudget = 400; // max tokens injected from project memory per turn
+    // Agent memory, kept per project folder by Chudcode: "sharpshooter" (curated decisions
+    // injected every turn), "mnemo" (searchable recall of this project's conversations) or
+    // "off". memoryEnabled mirrors backend != off for older Python readers.
+    std::string memoryBackend = "sharpshooter";
+    bool memoryEnabled = true;
+    int memoryTokenBudget = 400; // legacy offline loop's .plm/memory.db recall budget
     // Copilot composer mode: Agent | Plan | Ask. Persisted as "copilot_mode" (name string).
     // Values match AppState::aiInteraction / CopilotMode.
     int copilotMode = 0;

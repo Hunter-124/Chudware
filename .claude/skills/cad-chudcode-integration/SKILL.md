@@ -162,12 +162,16 @@ runtime's doctor command.
    binary's `--help` lists it (`_binary_supports_flag`, probed once per binary identity — the
    pinned v0.3.0 artifact rejects it). Sub-agents inherit that ceiling (Chudcode `6b1e705d2e`).
    Baseline per request 106k → 68k chars. The service client stays unrestricted.
-8c. **No user-level context files in a CAD session (2026-09-28).** Chudcode loads
-   `~/.claude/CLAUDE.md` / `~/.chudcode/agent/AGENTS.md` / GEMINI / copilot user files in RPC
-   mode; Hunter's dev brief ("git pull --rebase, commit + push") made gpt-6-sol pull, commit
-   and push the firmware repo inside a CAD project. `_make_client` passes
-   `--config <data>/chudcode/cad-session.yml` (`_cad_session_overlay`, `disabledExtensions`
-   `context-file:user:*`), gated on `--help`. Project files in the workspace still load.
+8c. **CAD session overlay (2026-09-28).** `_make_client` passes
+   `--config <data>/chudcode/cad-session-<backend>.yml` (`_cad_session_overlay`, gated on
+   `--help`). It disables user-level context files (`context-file:user:*` — Hunter's
+   `~/.claude/CLAUDE.md` dev brief made gpt-6-sol pull/commit/push a firmware repo) and pins
+   memory: the GUI's "Project memory" (`agent.memory_backend` = off | sharpshooter |
+   mnemo, default sharpshooter) arrives as host param `memory_backend`; every backend is keyed
+   by the process cwd = the project folder, and a no-workspace session gets `off`.
+   `--tools` carries only that backend's tools (`_CAD_MEMORY_TOOLS`; chud exits on one it
+   lacks). A chud without sharpshooter (no `sharpshooter.*` in `chud config list --json`)
+   exits on its name, so it falls back to mnemo. Project context files still load.
    Chudcode's `<active-repo-context>` (a nested repo = "Active project") cannot be switched
    off; `general_agent.yaml` HOW TO WORK 7 overrides it.
 8d. **CAD calls made inside eval get feed rows (2026-09-28).** eval's `tool.write("xd://…")`

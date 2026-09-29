@@ -4097,7 +4097,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         ImMax(ImMax(settingsLabelLeadWidth("Plan preference", true),
                     settingsLabelLeadWidth("Subagent preference", true)),
               ImMax(settingsLabelLeadWidth("Subagent tool-call budget", true),
-                    settingsLabelLeadWidth("Memory token budget", false)));
+                    settingsLabelLeadWidth("Project memory", true)));
     const float harnessRightColW =
         ImMax(ImMax(settingsLabelLeadWidth("Task list preference", true),
                     settingsLabelLeadWidth("Advisor preference", true)),
@@ -4197,10 +4197,6 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         ImGui::Checkbox("Show assistant thoughts", &ui::assistantThoughtsVisible());
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Show the AI's reasoning steps inline in the conversation.");
-        ImGui::TableNextColumn();
-        if (ImGui::Checkbox("Project memory (per-folder)", &settings.memoryEnabled)) changed = true;
-        helpMarker("Remembers decisions and notes under the PLM project "
-                   "(.plm/memory.db). Auto-created; recall is token-budgeted.");
 
         ImGui::TableNextColumn();
         {
@@ -4375,14 +4371,27 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         }
 
         ImGui::TableNextColumn();
-        if (settings.memoryEnabled) {
-            settingsLabelLead("Memory token budget", nullptr, harnessLeftColW);
+        {
+            static const char* kMemoryBackends[] = {"off", "sharpshooter", "mnemo"};
+            static const char* kMemoryLabels[] = {"Off", "Decisions", "Full recall"};
+            int cur = 1;
+            for (int i = 0; i < 3; ++i)
+                if (settings.memoryBackend == kMemoryBackends[i]) cur = i;
+            settingsLabelLead(
+                "Project memory",
+                "What the agent remembers between conversations, kept separately for each "
+                "project folder; other projects never see it.\n"
+                "Decisions: a short curated list of the design decisions and preferences "
+                "you established, given to the agent every turn.\n"
+                "Full recall: searchable memory of this project's past conversations.\n"
+                "Applies to new conversations.",
+                harnessLeftColW);
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::SliderInt("##h_membudget", &settings.memoryTokenBudget, 100, 2000,
-                                 "%d tokens"))
+            if (settingsPopupRowCombo("##h_memory", &cur, kMemoryLabels, 3)) {
+                settings.memoryBackend = kMemoryBackends[cur];
+                settings.memoryEnabled = cur != 0;
                 changed = true;
-        } else {
-            ImGui::Dummy(ImVec2(1, ImGui::GetFrameHeight()));
+            }
         }
 
         ImGui::EndTable();

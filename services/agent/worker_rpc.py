@@ -3584,6 +3584,12 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         )
     if project_root:
         host_params["workspace_dir"] = project_root
+    try:
+        from services.agent.config import memory_backend
+
+        host_params["memory_backend"] = memory_backend()
+    except (ImportError, OSError, ValueError) as exc:
+        _LOG.debug("memory backend setting unavailable; using the default: %s", exc)
     session_dir = param_str("chudcode_session_dir") or param_str("sessions_dir")
     if session_dir:
         host_params["chudcode_session_dir"] = session_dir

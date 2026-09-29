@@ -283,7 +283,6 @@ def test_strategy_config_defaults() -> None:
     assert cc["drop_useless"] is True
     assert cc["keep_recent_tokens"] == 20_000
     for removed in (
-        "memory_backend",
         "compaction_backend",
         "compaction_snap_frames",
         "compaction_snap_dir",

@@ -1227,16 +1227,20 @@ void drawAISettingsBody(AppState& st, bool busy) {
     popField();
 
     cpMenuSection("Memory");
-    pushField();
-    if (ImGui::Checkbox("Project memory", &s.memoryEnabled)) changed = true;
-    popField();
-    if (s.memoryEnabled) {
-        ctlGap();
-        cpMenuLabel("Memory token budget");
+    {
+        static const char* kMemoryBackends[] = {"off", "sharpshooter", "mnemo"};
+        static const char* kMemoryLabels[] = {"Off", "Decisions", "Full recall"};
+        int cur = 1;
+        for (int i = 0; i < 3; ++i)
+            if (s.memoryBackend == kMemoryBackends[i]) cur = i;
+        cpMenuLabel("Project memory (per folder)");
         ImGui::SetNextItemWidth(-1);
         pushField();
-        if (ImGui::SliderInt("##q_membudget", &s.memoryTokenBudget, 100, 2000, "%d tokens"))
+        if (ImGui::Combo("##q_memory", &cur, kMemoryLabels, 3)) {
+            s.memoryBackend = kMemoryBackends[cur];
+            s.memoryEnabled = cur != 0;
             changed = true;
+        }
         popField();
     }
 

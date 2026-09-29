@@ -373,6 +373,7 @@ class ChudcodeSessionHost:
 
         session: _Session | None = None
         unsubscribe: Callable[[], None] | None = None
+        observed_contexts: list[dict[str, Any]] = []
         emit_errors: list[str] = []
         provider_frames: deque[dict[str, Any]] = deque(maxlen=256)
         terminal: dict[str, Any] | None = None
@@ -464,6 +465,12 @@ class ChudcodeSessionHost:
                 # the resume key first, then get_state's contextUsage — the resumed session's
                 # real fill.
                 opening: list[dict[str, Any]] = []
+                # Top-level Chudcode tool calls in flight (id -> name). A host call made
+                # under one of these ids IS that visible call (`write xd://add_features`);
+                # any other id was made from inside a tool, e.g. `tool.write(...)` in eval.
+                open_calls: dict[str, str] = {}
+                # Host-tool threads report nested calls concurrently with the reader thread.
+                emit_lock = threading.Lock()
 
                 def forward(event: Any) -> None:
                     nonlocal terminal, progress_closed
@@ -473,6 +480,13 @@ class ChudcodeSessionHost:
                     if not isinstance(frame, dict):
                         frame = {"type": "unknown", "value": frame}
                     kind = frame.get("type")
+                    call_id, phase, tool = _tool_execution_phase(frame)
+                    if phase == "start":
+                        with emit_lock:
+                            open_calls[call_id] = tool
+                    elif phase == "end":
+                        with emit_lock:
+                            open_calls.pop(call_id, None)
                     if kind == "agent_end" and frame.get(
                         "isTerminal", frame.get("is_terminal")
                     ) is not False:
@@ -489,13 +503,34 @@ class ChudcodeSessionHost:
                         if nudge is not None:
                             dispatch_progress_nudge(nudge)
                     try:
-                        emit(frame)
-                        if kind == "agent_start":
-                            while opening:
-                                emit(opening.pop(0))
+                        with emit_lock:
+                            emit(frame)
+                            if kind == "agent_start":
+                                while opening:
+                                    emit(opening.pop(0))
                     except Exception as exc:  # noqa: BLE001 - emit is an injected boundary
                         emit_errors.append(str(exc))
+
+                def observe_host_call(frame: dict[str, Any]) -> None:
+                    """A CAD host call made inside another tool gets its own feed row.
+
+                    c230 ran every add_features through eval's ``tool.write``: 49 "eval"
+                    rows and no add_features row, so the user could not see one feature
+                    the agent built, and the progress watchdog never counted them.
+                    """
+                    call_id = frame.get("toolCallId")
+                    with emit_lock:
+                        if not call_id or call_id in open_calls:
+                            return
+                        outer = list(open_calls)
+                    if len(outer) == 1:
+                        frame["parentToolCallId"] = outer[0]
+                    forward(frame)
+
                 unsubscribe = _register_listener(session.client, forward)
+                observed_contexts = _bind_host_call_observer(
+                    params.get("host_tools"), observe_host_call
+                )
                 self._configure_turn(session, params)
                 opening_state = _safe_client_state(session.client)
                 bound_file = opening_state.get("sessionFile") or opening_state.get(
@@ -631,6 +666,8 @@ class ChudcodeSessionHost:
                         "Chudcode event unsubscription failed (%s)",
                         type(exc).__name__,
                     )
+            for context in observed_contexts:
+                context.pop("host_call_observer", None)
             dispose = False
             with self._lock:
                 if session is not None:
@@ -1341,9 +1378,13 @@ class ChudcodeSessionHost:
             kwargs["no_skills"] = True
             # The user's Chudcode MCP servers (stripe, graphify ...) are not CAD tools.
             # The pinned release chud predates --no-mcp and rejects unknown flags.
-            kwargs["extra_args"] = ("--no-lsp",) + (
-                ("--no-mcp",) if binary is not None and _binary_supports_flag(binary, "--no-mcp")
-                else ())
+            extra: tuple[str, ...] = ("--no-lsp",)
+            if binary is not None and _binary_supports_flag(binary, "--no-mcp"):
+                extra += ("--no-mcp",)
+            overlay = _cad_session_overlay() if binary is not None else None
+            if overlay is not None and _binary_supports_flag(binary, "--config"):
+                extra += ("--config", overlay)
+            kwargs["extra_args"] = extra
         try:
             client = factory(**kwargs)
             if tempdir is not None:
@@ -1879,6 +1920,45 @@ def _invoke_session_canonical(
     return client.request_raw(command, **payload)
 
 
+_EXECUTION_PHASES = {"tool_execution_start": "start", "tool_execution_end": "end"}
+
+
+def _tool_execution_phase(frame: Mapping[str, Any]) -> tuple[str, str, str]:
+    """(call id, "start"|"end"|"", tool name) of a Chudcode top-level tool frame."""
+    kind = frame.get("type")
+    body: Any = frame
+    if kind == "custom":
+        kind = frame.get("customType")
+        body = frame.get("data")
+    phase = _EXECUTION_PHASES.get(kind) if isinstance(kind, str) else None
+    if phase is None or not isinstance(body, Mapping):
+        return "", "", ""
+    call_id = _nonempty_string(body.get("toolCallId"))
+    if call_id is None:
+        return "", "", ""
+    return call_id, phase, _nonempty_string(body.get("toolName")) or ""
+
+
+def _bind_host_call_observer(
+    host_tools: Any, observer: Callable[[dict[str, Any]], None]
+) -> list[dict[str, Any]]:
+    """Hand the turn's nested-call observer to its host tools' shared run context.
+
+    Bindings rebuilt mid-turn by ``enable_tools`` share the same context dict, so
+    they report too. Returns the contexts to unbind when the turn ends.
+    """
+    if not isinstance(host_tools, Sequence) or isinstance(host_tools, (str, bytes)):
+        return []
+    contexts: dict[int, dict[str, Any]] = {}
+    for binding in host_tools:
+        context = getattr(binding, "context", None)
+        if isinstance(context, dict):
+            contexts[id(context)] = context
+    for context in contexts.values():
+        context["host_call_observer"] = observer
+    return list(contexts.values())
+
+
 def _session_host_tool_names(session: _Session) -> set[str]:
     names = set(session.host_tool_names)
     for tool in getattr(session.client, "_custom_tools", ()):
@@ -2003,34 +2083,71 @@ def _binary_identity(path: str) -> tuple | None:
     return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
 
-_FLAG_SUPPORT: dict[tuple[str, tuple | None, str], bool] = {}
+_HELP_TEXT: dict[tuple[str, tuple | None], str] = {}
 _FLAG_SUPPORT_LOCK = threading.Lock()
 _FLAG_PROBE_TIMEOUT_SECONDS = 10.0
 
 
 def _binary_supports_flag(path: str, flag: str) -> bool:
-    """Whether ``<path> --help`` lists ``flag``; probed once per binary identity.
+    """Whether ``<path> --help`` lists ``flag``; ``--help`` runs once per binary identity.
 
     A binary that cannot be probed (timeout, crash, missing) does not get the flag:
     passing an unknown flag would stop the session from starting at all.
     """
-    key = (path, _binary_identity(path), flag)
+    key = (path, _binary_identity(path))
     if key[1] is None:  # nothing on disk to ask
         return False
     with _FLAG_SUPPORT_LOCK:
-        cached = _FLAG_SUPPORT.get(key)
-    if cached is not None:
-        return cached
+        text = _HELP_TEXT.get(key)
+    if text is None:
+        try:
+            proc = subprocess.run([path, "--help"], capture_output=True, text=True,
+                                  timeout=_FLAG_PROBE_TIMEOUT_SECONDS, check=False)
+            text = f"{proc.stdout}\n{proc.stderr}"
+        except (OSError, subprocess.SubprocessError):
+            text = ""
+        with _FLAG_SUPPORT_LOCK:
+            _HELP_TEXT[key] = text
+    return re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", text) is not None
+
+
+#: Chudcode settings every CAD conversation process runs with (``--config`` overlay).
+#: A user-level context file is the user's own coding-agent brief, not CAD policy:
+#: ~/.claude/CLAUDE.md ("git pull --rebase before starting; commit + push as you go")
+#: reached every CAD turn, and the GPT-6 sessions of 2026-09-28 pulled, committed and
+#: pushed the firmware repo inside the user's CAD project. Project-level context files
+#: in the workspace still load: those are the user's instructions for this project.
+_CAD_SESSION_SETTINGS = (
+    "# Written by Chudware for its CAD conversation processes; regenerated on use.\n"
+    "disabledExtensions:\n"
+    "  - context-file:user:AGENTS.md\n"
+    "  - context-file:user:CLAUDE.md\n"
+    "  - context-file:user:GEMINI.md\n"
+    "  - context-file:user:copilot-instructions.md\n"
+)
+
+
+def _cad_session_overlay() -> str | None:
+    """Path of the CAD session settings overlay, (re)written when its content differs.
+
+    Returns ``None`` when the file cannot be written; the session then starts without it
+    rather than not at all.
+    """
+    from services import paths
+
+    target = Path(paths.ROOT) / "chudcode" / "cad-session.yml"
     try:
-        proc = subprocess.run([path, "--help"], capture_output=True, text=True,
-                              timeout=_FLAG_PROBE_TIMEOUT_SECONDS, check=False)
-        text = f"{proc.stdout}\n{proc.stderr}"
-        supported = re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", text) is not None
-    except (OSError, subprocess.SubprocessError):
-        supported = False
-    with _FLAG_SUPPORT_LOCK:
-        _FLAG_SUPPORT[key] = supported
-    return supported
+        if target.is_file() and target.read_text(encoding="utf-8") == _CAD_SESSION_SETTINGS:
+            return str(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".cad-session-", suffix=".yml")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(_CAD_SESSION_SETTINGS)
+        os.replace(tmp, target)
+    except OSError as exc:
+        _LOG.warning("CAD session settings overlay unavailable: %s", exc)
+        return None
+    return str(target)
 
 
 def _binary_candidate(source: str, candidate: str) -> tuple[str | None, str | None]:

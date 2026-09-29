@@ -94,6 +94,9 @@ log the token or move control back onto the serialized stdio lane.
   work, dispose the process, and preserve persisted history.
 - On worker exit, stop the control server before disposing all saved-session and transient
   clients. Do not leave an RPC process detached from the worker that owns it.
+- hostd never replays an `agent_admin_turn` whose worker died after receiving it
+  (`worker_bridge.cpp`, `worker_lost_mid_turn`): a replay is a second, unwatched run in a new
+  Chudcode session (c221 → c223, 2026-09-27). "continue" resumes from the bound session file.
 
 ## Recovery/export worker methods
 
@@ -159,6 +162,21 @@ runtime's doctor command.
    binary's `--help` lists it (`_binary_supports_flag`, probed once per binary identity — the
    pinned v0.3.0 artifact rejects it). Sub-agents inherit that ceiling (Chudcode `6b1e705d2e`).
    Baseline per request 106k → 68k chars. The service client stays unrestricted.
+8c. **No user-level context files in a CAD session (2026-09-28).** Chudcode loads
+   `~/.claude/CLAUDE.md` / `~/.chudcode/agent/AGENTS.md` / GEMINI / copilot user files in RPC
+   mode; Hunter's dev brief ("git pull --rebase, commit + push") made gpt-6-sol pull, commit
+   and push the firmware repo inside a CAD project. `_make_client` passes
+   `--config <data>/chudcode/cad-session.yml` (`_cad_session_overlay`, `disabledExtensions`
+   `context-file:user:*`), gated on `--help`. Project files in the workspace still load.
+   Chudcode's `<active-repo-context>` (a nested repo = "Active project") cannot be switched
+   off; `general_agent.yaml` HOW TO WORK 7 overrides it.
+8d. **CAD calls made inside eval get feed rows (2026-09-28).** eval's `tool.write("xd://…")`
+   reaches the host under an eval-bridge id (`js-write-…`) no tool frame owns, so the feed
+   showed only "eval". `run_turn` binds `host_call_observer` on the run context
+   (`_bind_host_call_observer`, unbound in `finally`); `HostToolBinding.execute` reports
+   `host_tool_start/_end` frames for top-level-agent calls (`_nested_call_reporter`); the host
+   forwards only ids no in-flight `tool_execution_*` call owns, parented to the single open
+   call, through `forward` (mapper + watchdog). Sub-agent calls stay on `subagent_event`.
 9. **CAD's skill packs reach the model through `cad_skill`, never `skill://`.** The
    `skill://` scheme is resolved by Chudcode's `read` builtin against Chudcode's OWN skill
    registry, which contains nothing from this repo — a role card that printed

@@ -943,7 +943,13 @@ bool WorkerBridge::call(const std::string& method, const json& params, json& res
     }
 
     // Child died (write fail/EOF) → reap + respawn once, then fail.
-    // Timeouts and method-level errors do NOT respawn.
+    // Timeouts and method-level errors do NOT respawn, and neither does an agent turn
+    // the worker had already received: a turn is not idempotent. Replaying it on the
+    // fresh worker started the same prompt as a SECOND run in a new Chudcode session
+    // with no GUI attached (2026-09-27, c221: the app went away mid-turn, the replay
+    // ran 23 min unwatched, edited the user's firmware repo and pushed it; the GUI
+    // later listed it as an "external" conversation, c223). The conversation resumes
+    // from its persisted session when the user sends "continue".
     for (int attempt = 0; attempt < 2; ++attempt) {
         std::string attemptErr;
         result = json::object();
@@ -981,9 +987,20 @@ bool WorkerBridge::call(const std::string& method, const json& params, json& res
             err = std::move(attemptErr);
             return false;
         }
+        const bool replayable = !(longAgentTurn && attemptErr == "closed waiting for response");
         log().line("worker_bridge: child lost during %s (%s); %s", method.c_str(),
-                   attemptErr.c_str(), attempt == 0 ? "respawning once" : "giving up");
+                   attemptErr.c_str(),
+                   !replayable ? "turn not replayed"
+                               : attempt == 0 ? "respawning once" : "giving up");
         reap();
+        if (!replayable) {
+            err = "worker lost during agent turn";
+            result = json{{"code", "worker_lost_mid_turn"},
+                          {"message",
+                           "The agent worker stopped mid-turn; the turn was not restarted. "
+                           "Send \"continue\" to resume the conversation."}};
+            return false;
+        }
         err = std::move(attemptErr);
         if (attempt == 1 || stopping_.load(std::memory_order_acquire)) return false;
         // loop: respawn inside fetchControlInfo/callOnce

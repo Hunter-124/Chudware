@@ -523,6 +523,71 @@ def test_failed_provider_retry_survives_long_lifecycle_tail():
     assert result["terminal"]["isTerminal"] is True
 
 
+def test_cad_calls_made_inside_eval_get_their_own_feed_rows_once():
+    """c230 (2026-09-28) built every feature through eval's `tool.write(xd://add_features)`:
+    the feed showed 49 "eval" rows and not one add_features row. A host call under an id
+    no visible tool row owns is reported as its own row, parented to the eval; a
+    top-level `write xd://` call keeps exactly the one row Chudcode's frames produce."""
+    rpc = pytest.importorskip("chudcode_rpc")
+    from services.agent.chudcode_events import RpcFrameState, map_rpc_frame
+    from services.agent.chudcode_tools import HostToolBinding
+
+    binding = HostToolBinding(
+        name="add_features",
+        description="add features",
+        input_schema={"type": "object"},
+        handler=lambda doc_id, ops: {"ok": True, "doc_id": doc_id, "revision": len(ops)},
+        context={"tool_call_counts": {}, "tool_calls": []},
+    )
+
+    def call(client, call_id):
+        [tool] = [t for t in client._custom_tools if t.name == "add_features"]
+        context = rpc.HostToolContext(
+            tool_call_id=call_id, _cancel_event=threading.Event(), _send_update=lambda _: None
+        )
+        return tool.execute({"doc_id": "doc-5", "ops": [{"op": "fillet"}]}, context)
+
+    def emit_all(client, events):
+        for event in events:
+            for listener in tuple(client.listeners):
+                listener(event)
+
+    class EvalBuilds(FakeClient):
+        def wait_for_idle(self, timeout=None):
+            emit_all(self, [{"type": "agent_start"},
+                            {"type": "tool_execution_start", "toolCallId": "eval-1",
+                             "toolName": "eval", "args": {"code": "tool.write(...)"}}])
+            call(self, "js-write-1")
+            emit_all(self, [{"type": "tool_execution_end", "toolCallId": "eval-1",
+                             "toolName": "eval", "result": {"content": []}},
+                            {"type": "tool_execution_start", "toolCallId": "w-1",
+                             "toolName": "write",
+                             "args": {"path": "xd://add_features", "content": "{}"}}])
+            call(self, "w-1")
+            emit_all(self, [{"type": "tool_execution_end", "toolCallId": "w-1",
+                             "toolName": "add_features", "result": {"content": []}},
+                            {"type": "agent_end", "messages": [], "isTerminal": True}])
+            return ()
+
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(
+        client_factory=lambda **kw: factory.clients.append(EvalBuilds(factory, **kw))
+        or factory.clients[-1]
+    )
+    result, emitted = run(host, "evalbuild", host_tools=[binding])
+    assert result["ok"] is True
+
+    state = RpcFrameState()
+    rows = [p for f in emitted for k, p in map_rpc_frame(f, {"run_id": "r"}, state)
+            if k == "agent.tool_call"]
+    by_id = {row["id"]: row for row in rows}
+    assert sorted(row["id"] for row in rows) == ["eval-1", "js-write-1", "w-1"]
+    nested = by_id["js-write-1"]
+    assert (nested["tool_name"], nested["target"], nested["ok"]) == ("add_features", "doc-5", True)
+    assert nested["parent_id"] == "eval-1"
+    assert "host_call_observer" not in binding.context  # unbound when the turn ends
+
+
 def _scripted_turn(events):
     class Scripted(FakeClient):
         def wait_for_idle(self, timeout=None):

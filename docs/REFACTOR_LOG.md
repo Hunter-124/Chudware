@@ -5137,3 +5137,41 @@ and that rendered videos are files, not studies, with a "New Motion study" actio
 `simulate_motion` `view` hint and `cad_guide('motion')` point at the new entry and tell the agent
 to sweep the open assembly rather than only cite old films. Not covered: with several Motion
 studies the button opens the selected/first one; the others stay in the Simulation tree.
+
+## 2026-09-28 — 6-axis trace review (c221/c223/c227/c229/c230/c233)
+
+Six gpt-6-sol conversations on `~/Desktop/6-axis` (arm `sixaxis_arm_revD_final5.step+`).
+**(1) A turn was replayed unattended.** c221's app went away at 22:58:55 local and its worker
+died mid-`agent_admin_turn`; `WorkerBridge::call` respawned the worker and replayed the same
+request, which ran 23 minutes with no GUI in a NEW Chudcode session (the GUI later adopted
+it as the "external" c223): it rewrote `roboarm6/firmware` (claw axis), built it, and pushed
+two commits to the user's GitHub. `core/hostd/worker_bridge.cpp` now never replays a turn
+the worker received ("closed waiting for response"); it answers `worker_lost_mid_turn`
+and the conversation resumes from its bound session on "continue". A child lost before
+the request was written still respawns once (`test_worker_death_mid_turn_is_not_replayed…`,
+which replaced the test that pinned the replay). **(2) Hunter's personal coding-agent brief
+reached every CAD turn.** Chudcode loads user-level context files in RPC mode:
+`~/.claude/CLAUDE.md` ("`git pull --rebase` before starting; commit + push as you go") sat
+in the CAD system prompt (probed with `get_state`), next to Chudcode's `<active-repo-context>`
+naming the only nested git repo, `roboarm6/`, "Active project". Every gpt-6-sol turn opened
+with `git pull --rebase` in `roboarm6`; c221/c223 committed and pushed. `_make_client` now
+passes `--config <data>/chudcode/cad-session.yml` (written by `_cad_session_overlay`, gated
+on `--help` like `--no-mcp`) disabling `context-file:user:{AGENTS,CLAUDE,GEMINI,
+copilot-instructions}.md`; project context files in the workspace still load. The
+active-repo block is unconditional in Chudcode, so `general_agent.yaml` HOW TO WORK 7 says
+nested repos belong to the user: no git pull/commit/push, no edits unless asked.
+`_binary_supports_flag` now caches `--help` text per binary identity, not per flag.
+**(3) CAD work inside eval was invisible.** gpt-6-sol drives CAD through eval's
+`tool.write("xd://add_features")`; those host calls carry eval-bridge ids (`js-write-…`) no
+tool frame owns, so c230 showed 49 "eval" rows and zero add_features rows, and the progress
+watchdog never counted those mutations. `run_turn` binds a `host_call_observer` on the run
+context; `HostToolBinding.execute` reports `host_tool_start/_end` frames for top-level-agent
+calls, and the host forwards only ids no in-flight Chudcode tool call owns (parented to the
+single open call), through the same mapper and watchdog
+(`test_cad_calls_made_inside_eval_get_their_own_feed_rows_once`).
+Not fixed, agent quality: c230 edited `forearm_lower` in place but left the open assembly
+unrefreshed and never swept it; c233 ended with FDM `dfm_check` failing (0.118 mm yoke wall)
+and `feature_attachment` 0.6 when the machine hung (nvidia-drm pageflip timeouts, reboot
+15:26); c227 linked two old films instead of sweeping the open assembly (guidance fixed in
+c631d8698). Open question: CAD sessions still use the user's global mnemo bank
+(auto-retain + recall across all projects).

@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import threading
+import time
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -103,19 +104,26 @@ class HostToolBinding:
             # A Chudcode task sub-agent inherits these bindings and calls them over
             # the parent's client; chudcode_rpc names it on the context (None for
             # the top-level agent, and on runtimes that predate the field).
-            result = host_tool_result(
-                dispatch_host_tool(
-                    self,
-                    params,
-                    progress,
-                    cancel,
-                    agent_id=getattr(host_context, "agent_id", None),
-                    parent_agent_id=getattr(host_context, "parent_agent_id", None),
+            agent_id = getattr(host_context, "agent_id", None)
+            report = _nested_call_reporter(
+                self, getattr(host_context, "tool_call_id", None), agent_id, params
+            )
+            try:
+                result = host_tool_result(
+                    dispatch_host_tool(
+                        self,
+                        params,
+                        progress,
+                        cancel,
+                        agent_id=agent_id,
+                        parent_agent_id=getattr(host_context, "parent_agent_id", None),
+                    )
                 )
-            )
-            return _with_skill_injection(
-                self, result, agent_id=getattr(host_context, "agent_id", None)
-            )
+            except Exception as exc:
+                report(None, exc)
+                raise
+            report(result, None)
+            return _with_skill_injection(self, result, agent_id=agent_id)
 
         return factory(
             name=self.name,
@@ -153,6 +161,49 @@ def host_tool_result(result: Any) -> dict[str, Any]:
     safe = _json_safe(result)
     text = model_json(safe)
     return {"content": [{"type": "text", "text": text}], "details": safe}
+
+
+def _nested_call_reporter(
+    binding: HostToolBinding, tool_call_id: Any, agent_id: Any, params: Any
+) -> Callable[[Any, BaseException | None], None]:
+    """Report one host call to the turn's observer as start/end tool frames.
+
+    The observer (bound by ``ChudcodeSessionHost.run_turn``) forwards only calls no
+    visible Chudcode tool row covers, i.e. ones made from inside eval. A task
+    sub-agent's calls already arrive as its own ``subagent_event`` rows.
+    """
+    observer = _ctx(binding.context, "host_call_observer", None)
+    if not callable(observer) or agent_id or not isinstance(tool_call_id, str):
+        return lambda _result, _error: None
+    args = dict(params) if isinstance(params, Mapping) else {}
+    started = time.monotonic()
+
+    def send(frame: dict[str, Any]) -> None:
+        try:
+            observer(frame)
+        except Exception as exc:  # noqa: BLE001 - a feed row never fails the CAD call
+            _debug_fallback("nested host-call report", exc)
+
+    send({"type": "host_tool_start", "toolCallId": tool_call_id,
+          "toolName": binding.name, "args": args})
+
+    def finish(result: Any, error: BaseException | None) -> None:
+        frame: dict[str, Any] = {
+            "type": "host_tool_end",
+            "toolCallId": tool_call_id,
+            "toolName": binding.name,
+            "args": args,
+            "durationMs": int((time.monotonic() - started) * 1000),
+        }
+        if error is not None:
+            frame.update(isError=True, error=f"{type(error).__name__}: {error}")
+        else:
+            details = result.get("details") if isinstance(result, Mapping) else None
+            frame.update(result=result,
+                         ok=not (isinstance(details, Mapping) and details.get("ok") is False))
+        send(frame)
+
+    return finish
 
 
 #: A JSON container that fits on one line this wide stays on one line.

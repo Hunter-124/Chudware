@@ -494,9 +494,12 @@ def test_unknown_method_worker_fallback_contract_is_unchanged(worker_daemon):
     assert missing.get("message") == "unknown method: definitely_missing_worker_method"
 
 
-def test_worker_death_restarts_once_then_invalidates_control_state(
+def test_worker_death_mid_turn_is_not_replayed_and_clears_control_state(
     worker_daemon, monkeypatch: pytest.MonkeyPatch
 ):
+    # Live 2026-09-27 (c221 -> c223): the worker died mid-turn and hostd replayed the
+    # turn on a fresh worker; the replay ran as a second, unwatched run in a new
+    # Chudcode session. A turn the worker received must fail by name instead.
     monkeypatch.setenv("CHUDWARE_TEST_WORKER_MODE", "die")
     client = DaemonClient()
     client.connect()
@@ -504,15 +507,21 @@ def test_worker_death_restarts_once_then_invalidates_control_state(
 
     failed = client.call("agent_admin_turn", {"run_id": "dead-run", "request": "work"})
     assert failed.get("_is_error") is True
-    assert _worker_count(worker_daemon["counter"]) == 2
+    assert failed.get("code") == "worker_lost_mid_turn"
+    assert _worker_count(worker_daemon["counter"]) == 1
 
-    # Both dead children have been reaped and their cached endpoint/token/run
-    # state cleared. An inactive cancel remains a core call and must not spawn a
-    # third worker merely to discover that nothing is active.
+    # The dead child has been reaped and its cached endpoint/token/run state cleared.
+    # An inactive cancel remains a core call and must not spawn a worker merely to
+    # discover that nothing is active.
     cancelled = client.call("agent_cancel", {"run_id": "dead-run"})
     assert cancelled.get("cancelled") is False
-    assert _worker_count(worker_daemon["info_counter"]) == 2
+    assert _worker_count(worker_daemon["info_counter"]) == 1
     time.sleep(0.1)
+    assert _worker_count(worker_daemon["counter"]) == 1
+
+    # The lane recovers: the next turn spawns a fresh worker (which dies again here).
+    again = client.call("agent_admin_turn", {"run_id": "next-run", "request": "continue"})
+    assert again.get("code") == "worker_lost_mid_turn"
     assert _worker_count(worker_daemon["counter"]) == 2
 
 

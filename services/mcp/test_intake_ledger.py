@@ -181,7 +181,8 @@ def test_confirm_dimensions_persists_through_reopen(tmp_path, minted_documents):
     assert replay["canonical"] == {"value": 8.2, "unit": "mm"}
 
 
-def _call_dfm(monkeypatch, *, process: str, profile_params: dict, engine_call) -> dict:
+def _call_dfm(monkeypatch, *, process: str, profile_params: dict, engine_call,
+              **options) -> dict:
     from mcp.server.fastmcp import FastMCP
     from services.mcp import intake_tools
 
@@ -193,7 +194,7 @@ def _call_dfm(monkeypatch, *, process: str, profile_params: dict, engine_call) -
     mcp = FastMCP("dfm-test")
     intake_tools.register_intake_tools(mcp)
     _content, structured = asyncio.run(mcp.call_tool(
-        "dfm_check", {"process": process, "doc_id": "dfm-doc"}))
+        "dfm_check", {"process": process, "doc_id": "dfm-doc", **options}))
     return json.loads(structured["result"])
 
 
@@ -290,3 +291,204 @@ def test_dfm_evaluation_exceptions_are_reported_not_swallowed(monkeypatch):
               if check["status"] == "not_evaluated"]
     assert any("eval_thickness exploded" in error for error in errors), result
     assert any("doc_tree exploded" in error for error in errors), result
+
+
+def test_dfm_overhang_engine_unavailable_is_not_evaluated(monkeypatch):
+    def missing_query(method, params=None):
+        if method == "eval_thickness":
+            return {"min_thickness_mm": 4}
+        if method == "doc_tree":
+            return {"tree": {"features": [
+                {"id": "f1", "type": "box", "params": {"length": 20}},
+            ]}}
+        if method == "doc_query":
+            raise RuntimeError("geometry backend unavailable")
+        raise AssertionError(method)
+
+    result = _call_dfm(
+        monkeypatch, process="fdm",
+        profile_params={"min_wall_mm": 1, "min_feature_mm": 1,
+                        "overhang": {"max_deg": 45}}, engine_call=missing_query,
+    )
+    check = _overhang(result)
+    assert check["status"] == "not_evaluated" and check["ok"] is None, result
+    assert "geometry backend unavailable" in check["note"], result
+    assert result["status"] == "not_evaluated" and result["dfm_pass"] is None, result
+
+
+def test_dfm_overhang_sub_one_square_millimeter_is_not_a_failure(minted_documents):
+    doc = _part_with_ops(minted_documents, [
+        cb.feat("box", "Stem", {"length": cb.dim(10), "width": cb.dim(10),
+                                 "height": cb.dim(20)}),
+        cb.feat("box", "Cap", {"length": cb.dim(10.08), "width": cb.dim(10),
+                                "height": cb.dim(5), "at": [0, 0, 12.5]}),
+    ])
+    result = _real_dfm(doc)
+    check = _overhang(result)
+    assert check["status"] == "pass", result
+    assert check["unsupported_area_mm2"] == pytest.approx(0.8, abs=0.05), result
+    assert check["unsupported_face_count"] >= 1, result
+
+
+def _real_dfm(doc_id: str, **options) -> dict:
+    from mcp.server.fastmcp import FastMCP
+    from services.mcp.intake_tools import register_intake_tools
+
+    mcp = FastMCP("fdm-overhang")
+    register_intake_tools(mcp)
+    _content, structured = asyncio.run(mcp.call_tool(
+        "dfm_check", {"doc_id": doc_id, "process": "fdm", **options}))
+    return json.loads(structured["result"])
+
+
+def _overhang(result: dict) -> dict:
+    return next(check for check in result["checks"] if check["check"] == "overhang")
+
+
+def _part_with_ops(minted_documents, ops: list) -> str:
+    doc = minted_documents(cb.call(
+        "doc_new", {"kind": "part", "name": f"fdm_{uuid.uuid4().hex[:8]}"})["doc_id"])
+    result = cb.call("doc_apply_ops", {"doc_id": doc, "ops": ops})
+    assert cb.call("doc_query", {"doc_id": doc, "query": {"of": "face"}})["matches"], result
+    return doc
+
+
+def test_dfm_fdm_box_on_plate_passes_and_recommends_zero_support(minted_documents):
+    doc = _part_with_ops(minted_documents, [
+        cb.feat("box", "Block", {"length": cb.dim(30), "width": cb.dim(20),
+                                  "height": cb.dim(20)}),
+    ])
+    result = _real_dfm(doc, suggest_orientation=True)
+    check = _overhang(result)
+    assert check["status"] == "pass" and check["ok"] is True, result
+    assert check["unsupported_area_mm2"] == 0 and check["unsupported_face_count"] == 0
+    assert len(check["orientation"]) == 6
+    assert check["orientation"][0]["unsupported_area_mm2"] == 0
+    assert check["orientation"][0]["base_contact_area_mm2"] > 0
+    assert result["dfm_pass"] is True, result
+
+
+def test_dfm_fdm_cantilever_support_area_and_flipped_plate(minted_documents):
+    doc = _part_with_ops(minted_documents, [
+        cb.feat("box", "Stem", {"length": cb.dim(10), "width": cb.dim(20),
+                                 "height": cb.dim(20)}),
+        cb.feat("box", "Cap", {"length": cb.dim(30), "width": cb.dim(20),
+                                "height": cb.dim(5), "at": [0, 0, 12.5]}),
+    ])
+    result = _real_dfm(doc, suggest_orientation=True)
+    check = _overhang(result)
+    assert check["status"] == "fail" and result["dfm_pass"] is False, result
+    assert check["unsupported_area_mm2"] == pytest.approx(400, rel=0.05), check
+    assert check["unsupported_face_count"] >= 1
+    assert all(face["face"] and len(face["centroid"]) == 3 for face in check["worst"])
+    assert check["orientation"][0]["unsupported_area_mm2"] == 0, check
+    flipped = _real_dfm(doc, build_dir=[0, 0, -3])
+    assert _overhang(flipped)["status"] == "pass", flipped
+    assert _overhang(flipped)["build_dir"] == [0.0, 0.0, -1.0]
+
+
+@pytest.mark.parametrize("slope, verdict", [(1.0, "pass"), (0.5773502692, "fail")])
+def test_dfm_fdm_chamfered_underside_boundary(minted_documents, slope, verdict):
+    # XZ prism: a ten-millimetre base reaches the plate; the following 20 mm
+    # underside rises by 20*slope, making exactly 45° or 30° to horizontal.
+    rise = 20 * slope
+    points = [(0, 0), (10, 0), (30, rise), (30, 35), (0, 35)]
+    ops = [{"op": "add_feature", "feature": {
+        "type": "sketch", "name": "Section",
+        "params": {"entities": [], "constraints": []},
+        "refs": {"plane": "plane.right"}}}]
+    for start, end in zip(points, points[1:] + points[:1]):
+        ops.append({"op": "sketch_add_entity", "sketch": "$0",
+                    "entity": {"type": "line", "p1": list(start), "p2": list(end)}})
+    ops.append({"op": "add_feature", "feature": {
+        "type": "extrude", "name": "Prism",
+        "params": {"mode": "boss", "end": "blind", "depth": cb.dim(20)},
+        "refs": {"profile": [{"kind": "region", "sketch": "$0",
+                              "centroid": [12, 10], "hint_index": 0}]}}})
+    doc = _part_with_ops(minted_documents, ops)
+    result = _real_dfm(doc)
+    assert _overhang(result)["status"] == verdict, result
+
+
+@pytest.mark.parametrize("direction", [[0, 0, 0], [1, 0], [1, float("nan"), 0],
+                                             [1, float("inf"), 0], ["bad", 0, 1],
+                                             [True, 0, 0]])
+def test_dfm_rejects_invalid_build_direction(minted_documents, direction):
+    doc = _part_with_ops(minted_documents, [
+        cb.feat("box", "Block", {"length": cb.dim(10), "width": cb.dim(10),
+                                  "height": cb.dim(10)}),
+    ])
+    result = _real_dfm(doc, build_dir=direction)
+    assert result["ok"] is False and "build_dir" in result["error"], result
+
+
+def test_dfm_fdm_vertical_through_hole_does_not_require_support(minted_documents):
+    doc = _part_with_ops(minted_documents, [
+        cb.feat("box", "Block", {"length": cb.dim(30), "width": cb.dim(30),
+                                  "height": cb.dim(20)}),
+        cb.feat("hole", "Bore", {"style": "simple", "end": "through_all",
+                                 "diameter": cb.dim(6)},
+                {"face": {"of": "face", "side": "top"}}),
+    ])
+    result = _real_dfm(doc)
+    assert _overhang(result)["status"] == "pass", result
+
+
+def test_dfm_fdm_upward_top_fillet_is_evaluated(minted_documents):
+    doc = _part_with_ops(minted_documents, [
+        cb.feat("box", "Block", {"length": cb.dim(30), "width": cb.dim(20),
+                                  "height": cb.dim(20)}),
+        cb.feat("fillet", "Top radius", {"radius": cb.dim(3)},
+                {"edges": {"of": "edge", "side": "+z"}}),
+    ])
+    result = _real_dfm(doc)
+    assert _overhang(result)["status"] == "pass", result
+    assert _overhang(result)["unsupported_area_mm2"] == 0, result
+
+
+def test_dfm_fdm_bottom_fillet_has_bounded_support_area(minted_documents):
+    doc = _part_with_ops(minted_documents, [
+        cb.feat("box", "Block", {"length": cb.dim(30), "width": cb.dim(20),
+                                  "height": cb.dim(20)}),
+        cb.feat("fillet", "Bottom radius", {"radius": cb.dim(3)},
+                {"edges": {"of": "edge", "side": "-z"}}),
+    ])
+    result = _real_dfm(doc)
+    check = _overhang(result)
+    fillet_area = sum(face["area_or_len"] for face in cb.call(
+        "doc_query", {"doc_id": doc, "query": {"of": "face"}})["matches"]
+        if face["surf"] != "plane")
+    assert fillet_area > 0
+    assert check["status"] in {"pass", "fail"}, result
+    assert 0 <= check["unsupported_area_mm2"] <= fillet_area * 1.02, result
+
+
+def test_dfm_fdm_horizontal_cylinder_supports_lower_arc(minted_documents):
+    radius, length = 10, 30
+    doc = _part_with_ops(minted_documents, [
+        cb.feat("cylinder", "Raised bar", {
+            "radius": cb.dim(radius), "height": cb.dim(length),
+            "at": [0, 0, 30], "axis": [1, 0, 0]}),
+    ])
+    result = _real_dfm(doc)
+    check = _overhang(result)
+    expected = 0.5 * 3.141592653589793 * radius * length
+    assert check["status"] == "fail", result
+    assert check["unsupported_area_mm2"] == pytest.approx(expected, rel=0.08), result
+
+
+def test_dfm_fdm_support_counts_first_of_multiple_bodies(minted_documents):
+    doc = _part_with_ops(minted_documents, [
+        cb.feat("box", "Stem", {"length": cb.dim(10), "width": cb.dim(20),
+                                 "height": cb.dim(20)}),
+        cb.feat("box", "Cap", {"length": cb.dim(30), "width": cb.dim(20),
+                                "height": cb.dim(5), "at": [0, 0, 12.5]}),
+        cb.feat("box", "Separate block", {"length": cb.dim(10),
+                                           "width": cb.dim(10), "height": cb.dim(20),
+                                           "at": [100, 0, 0], "mode": "new",
+                                           "merge": False}),
+    ])
+    result = _real_dfm(doc)
+    check = _overhang(result)
+    assert check["status"] == "fail", result
+    assert check["unsupported_area_mm2"] == pytest.approx(400, rel=0.05), result

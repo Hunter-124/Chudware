@@ -94,7 +94,7 @@ def test_turntable_of_a_box_writes_a_gif_whose_frames_and_digest_are_reported(to
 
     out = str(tmp_path / "turntable.gif")
     res = tools["render_animation"](kind="turntable", doc_id=doc, save_path=out,
-                                    frames=12, fps=12, size=[320, 240])
+                                    frames=12, fps=12, size=[320, 240], keyframes=0)
     assert isinstance(res, list) and len(res) == 2, res
     caption = res[1]
     assert os.path.exists(out), caption
@@ -207,8 +207,8 @@ def test_a_steer_sweep_films_the_solved_kingpin_rotation(tools, tmp_path, monkey
                "axis": [{"point": [0, 400, 0], "dir": [0, 0, 1]},
                         {"point": [0, -400, 0], "dir": [0, 0, 1]}],
                "angle_deg": 30})
-    assert isinstance(res, list) and len(res) == 2, res
-    caption = res[1]
+    assert isinstance(res, list) and len(res) == 3, res
+    caption = res[2]
     assert os.path.exists(out), caption
 
     probe = _probe(out)
@@ -260,8 +260,8 @@ def test_fea_kind_animates_a_solved_field_into_a_playable_mp4(tmp_path, monkeypa
     out = str(tmp_path / "field.mp4")
     res = m.tools["render_animation"](kind="fea", vtu_path=str(vtu), save_path=out,
                                       frames=8, fps=8, size=[320, 240])
-    assert isinstance(res, list) and len(res) == 2, res
-    caption = res[1]
+    assert isinstance(res, list) and len(res) == 3, res
+    caption = res[2]
     assert os.path.exists(out), caption
     probe = _probe(out)
     assert probe["frames"] == 8, (probe, caption)
@@ -271,6 +271,93 @@ def test_fea_kind_animates_a_solved_field_into_a_playable_mp4(tmp_path, monkeypa
     assert measured["n_cells"] == 2 and measured["n_points"] == 5, measured
     assert measured["peak_disp_mm"] == pytest.approx(0.25), measured
     assert "sha256 " in caption
+
+
+def test_keyframe_sheet_contains_both_endpoints_and_first_collision(tmp_path):
+    from PIL import Image
+
+    frames = []
+    for index in range(13):
+        path = tmp_path / f"f{index:05d}.png"
+        Image.new("RGB", (960, 540), (index * 17, 50, 75)).save(path)
+        frames.append(str(path))
+    sheet_path = tmp_path / "keyframes_motion.png"
+    indices = anim._keyframe_sheet(frames, str(sheet_path), fps=10, count=6,
+                                   collision_index=4)
+    assert indices == [0, 2, 4, 7, 10, 12]
+    assert sheet_path.exists()
+    with Image.open(sheet_path) as sheet:
+        assert sheet.format == "PNG"
+        assert sheet.size == (1600, 602)  # three 528x297 columns, two rows, 8px gaps
+        for tile, index in enumerate(indices):
+            x, y = (tile % 3) * 536, (tile // 3) * 305
+            assert sheet.getpixel((x + 264, y + 150)) == (index * 17, 50, 75)
+            corner = sheet.crop((x, y, x + 160, y + 55))
+            has_collision_label = (255, 135, 105) in corner.get_flattened_data()
+            assert has_collision_label == (index == 4)
+    assert anim._keyframe_indices(13, 2, 4) == [0, 4, 12]
+    assert anim._keyframe_indices(13, 1) == [0, 12]
+    assert anim._keyframe_indices(20, 100)[0] == 0
+    assert anim._keyframe_indices(20, 100)[-1] == 19
+    assert len(anim._keyframe_indices(20, 100)) == 12
+    assert anim._keyframe_indices(13, 0) == []
+
+
+@needs_ffmpeg
+def test_keyframes_result_and_disabled_shape_without_engine(tmp_path, monkeypatch):
+    """Render synthetic field PNGs through the actual film/preview output boundary."""
+    from PIL import Image
+
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    vtu = tmp_path / "field.vtu"
+    vtu.write_text("synthetic renderer input", encoding="utf-8")
+
+    def fake_fea_frames(_path, out_dir, count, size, _view, _warp, _field):
+        paths = []
+        for index in range(count):
+            path = os.path.join(out_dir, f"f{index:05d}.png")
+            Image.new("RGB", size, (index * 20, 50, 75)).save(path)
+            paths.append(path)
+        return {"frames": paths, "field": "von_mises", "peak_field": 12.0,
+                "warp_factor": 1.0}
+
+    monkeypatch.setattr(anim, "_fea_frames", fake_fea_frames)
+    monkeypatch.setattr(anim, "_provenance", lambda: {
+        "engine_build_id": None, "engine_build_id_source": "synthetic frames",
+        "polymesh_commit": None, "polymesh_commit_source": "synthetic frames"})
+    m = _CaptureMCP()
+    register_cad_animation_tools(m)
+    render = m.tools["render_animation"]
+    film = tmp_path / "synthetic.gif"
+    result = render(kind="fea", vtu_path=str(vtu), save_path=str(film),
+                    frames=5, fps=5, size=[320, 240])
+    assert len(result) == 3, result
+    assert film.exists()
+    sheet = tmp_path / "keyframes_synthetic.png"
+    assert sheet.exists() and str(sheet) in result[2]
+    assert "frames: [0, 1, 2, 3, 4]" in result[2]
+    with Image.open(sheet) as image:
+        assert image.size[0] <= 1600
+        assert image.getpixel((150, 100)) == (0, 50, 75)
+        assert image.getpixel((480, 348)) == (80, 50, 75)
+
+    no_sheet = render(kind="fea", vtu_path=str(vtu),
+                      save_path=str(tmp_path / "disabled.gif"),
+                      frames=5, fps=5, size=[320, 240], keyframes=0)
+    assert len(no_sheet) == 2, no_sheet
+    assert not (tmp_path / "keyframes_disabled.png").exists()
+    assert "keyframes " not in no_sheet[1]
+
+    def sheet_failure(*_args, **_kwargs):
+        raise OSError("preview filesystem unavailable")
+
+    monkeypatch.setattr(anim, "_keyframe_sheet", sheet_failure)
+    failed_sheet = render(kind="fea", vtu_path=str(vtu),
+                          save_path=str(tmp_path / "failed_sheet.gif"),
+                          frames=5, fps=5, size=[320, 240])
+    assert len(failed_sheet) == 2, failed_sheet
+    assert (tmp_path / "failed_sheet.gif").exists()
+    assert "[keyframes unavailable: preview filesystem unavailable]" in failed_sheet[1]
 
 
 @needs_ffmpeg
@@ -548,8 +635,8 @@ def test_pattern_film_bounds_contain_native_seed_motion(tools, tmp_path, monkeyp
     result = tools["render_animation"](
         kind=kind, doc_id=assembly, save_path=str(tmp_path / "pattern.gif"),
         frames=3, fps=3, size=[320, 240], **kwargs)
-    assert isinstance(result, list) and len(result) == 2, result
-    measured = json.loads(result[1].split("measured: ", 1)[1].split("  render wall time")[0])
+    assert isinstance(result, list) and len(result) == 3, result
+    measured = json.loads(result[2].split("measured: ", 1)[1].split("  render wall time")[0])
     bounds = measured["framing"]["bounds_mm"]
     if kind == "explode":
         pose_rows = [{}] + [

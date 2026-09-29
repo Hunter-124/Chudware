@@ -42,6 +42,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "import_part",
         "export_part",
         "inspect_native_files",
+        "read_native_file",
         "relocate_native_files",
         "undo",
         "redo",
@@ -198,6 +199,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "run_cfd_accurate",
         "simulate_motion",
         "get_job",
+        "wait_job",
         "describe_results",
         # Background solve lifecycle (2026-07-29). The synchronous run_* calls above block for
         # minutes and a live turn hit max_iters waiting on one; these let the model start a solve,
@@ -836,6 +838,16 @@ MAIN_CHAT_CORE_TOOLS: tuple[str, ...] = (
     "set_material",
     "undo",
     "redo",
+    # Saved .step+ files read without opening them. c211-c233 agents shelled out to
+    # `unzip -p X.step+ document.json | jq` ~40 times for features/import params/
+    # components/mates/materials; inspect_native_files was enable_tools-loaded in 5
+    # of the 19 sessions.
+    "inspect_native_files",
+    "read_native_file",
+    # background jobs: a heavy call hands back a job_id; wait_job replaces the
+    # `sleep 600; ps -p <pid>` loops agents wrote in bash.
+    "get_job",
+    "wait_job",
     # modeling
     "add_features",
     "preflight_ops",
@@ -853,15 +865,24 @@ MAIN_CHAT_CORE_TOOLS: tuple[str, ...] = (
     "render_part",
     "inspect_part",
     "inspect_feature",
+    "inspect_section",
     "check_geometry_health",
     "check_interference",
+    # Printability: every "optimize for 3D printing" turn loaded these on demand.
+    "dfm_check",
+    "analyze_stl_geometry",
     # assembly
     "asm_add_component",
     "asm_mate",
     "solve_mates",
+    # Per-solid assembly census and fit checks; the two most-loaded on-demand
+    # tools across the c211-c233 sessions (7 and 4 sessions).
+    "list_world_bodies",
+    "interface_check",
     # Motion must be callable alongside mates so mechanisms stay driveable,
     # not just positioned by fixed component transforms.
     "simulate_motion",
+    "render_animation",
     # drawing
     "make_drawing",
     "export_drawing",
@@ -929,8 +950,9 @@ _MENU_GROUPS: tuple[_MenuGroup, ...] = (
                "Session helpers, task list, bug report, run_shell, live doc events"),
     _MenuGroup("files", ("files",), (),
                "Project-jailed file read/search/write/edit"),
-    _MenuGroup("files", ("cad",), ("inspect_native_files", "relocate_native_files"),
-               "Native STEP+ metadata inspection and copy/rename plans without geometry evaluation"),
+    _MenuGroup("files", ("cad",),
+               ("inspect_native_files", "read_native_file", "relocate_native_files"),
+               "Native STEP+ metadata/tree reads and copy/rename plans without geometry evaluation"),
     _MenuGroup("sketch", ("cad", "gsl"),
                ("sketch_", "sketch3d_", "check_sketch", "check_sketch3d", "render_sketch",
                 "render_sketch_ascii", "describe_sketch", "doc_sketch_contact_sheet",
@@ -968,7 +990,7 @@ _MENU_GROUPS: tuple[_MenuGroup, ...] = (
                 "design_review", "design_audit", "draft_analysis", "verify_battery",
                 "doc_diff_tool", "engine_profile", "engine_profile_tree",
                 "assess_mesh_quality", "analyze_stl_geometry", "health_check",
-                "describe_", "apply_ascii_edits", "show_in_app", "get_job",
+                "describe_", "apply_ascii_edits", "show_in_app", "get_job", "wait_job",
                 "list_artifacts"),
                "Render/inspect views, health/DFM/overlap checks, describers, ASCII views"),
     _MenuGroup("plm", ("cad",), ("plm_graph_",),

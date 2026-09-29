@@ -84,6 +84,7 @@
       "parts_taxonomy",
       "query_adjacency",
       "query_geometry",
+      "read_native_file",
       "research_datasheet_fetch",
       "research_eng_calc",
       "research_fetch_page",
@@ -233,6 +234,7 @@
       "preflight_ops",
       "query_adjacency",
       "query_geometry",
+      "read_native_file",
       "recommend_fit",
       "render_ascii",
       "render_part",
@@ -263,6 +265,7 @@
       "suggest_dimension_scheme",
       "tap_drill",
       "verify_battery",
+      "wait_job",
       "wall_thickness",
       "workspace_status"
     ]

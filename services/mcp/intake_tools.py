@@ -580,6 +580,140 @@ def _dfm_thread_strategy(features: list[dict], process: str, profile_thread: dic
     }
 
 
+def _dfm_build_direction(value: Optional[list[float]]) -> list[float]:
+    vector = [0, 0, 1] if value is None else value
+    if not isinstance(vector, (list, tuple)) or len(vector) != 3:
+        raise ValueError("build_dir must be a finite, nonzero [x, y, z] vector")
+    if any(isinstance(x, bool) for x in vector):
+        raise ValueError("build_dir must be a finite, nonzero [x, y, z] vector")
+    try:
+        components = [float(x) for x in vector]
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("build_dir must be a finite, nonzero [x, y, z] vector") from None
+    magnitude = _math.hypot(*components)
+    if not _math.isfinite(magnitude) or magnitude == 0:
+        raise ValueError("build_dir must be a finite, nonzero [x, y, z] vector")
+    return [x / magnitude for x in components]
+
+
+def _dfm_overhang(doc_id: str, limit, build_dir: list[float],
+                  suggest_orientation: bool) -> dict:
+    threshold = _dfm_number(limit)
+    result = {
+        "check": "overhang", "status": "not_evaluated", "ok": None,
+        "limit_deg": threshold, "build_dir": build_dir,
+        "unsupported_area_mm2": None, "unsupported_face_count": None,
+        "worst": [],
+    }
+    if threshold is None or not 0 <= threshold <= 90:
+        result["note"] = "ProcessProfile has no valid overhang.max_deg threshold"
+        return result
+    try:
+        import numpy as np
+
+        from services.mcp.cad_common import _doc_mesh
+
+        faces = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}})["matches"]
+        by_key = {(int(face["body"]), int(face["topo"])): face for face in faces
+                  if face.get("kind") == "face" and face.get("sid")
+                  and face.get("body") is not None and face.get("topo") is not None}
+        if not by_key:
+            raise ValueError("geometry query returned no identifiable solid faces")
+        mesh = _doc_mesh(doc_id)
+        if mesh is None:
+            raise ValueError("current display tessellation unavailable")
+        face_rows = []
+        face_index = np.full(len(mesh["idx"]), -1, dtype=np.int32)
+        for rec in mesh["faces"]:
+            first, count = int(rec["first_tri"]), int(rec["tri_count"])
+            if count <= 0:
+                continue
+            body_id = int(rec["body"])
+            match = by_key.get((body_id, int(rec["face_id"])))
+            if match is None:
+                raise ValueError(f"body {body_id} face {rec['face_id']} has no sid")
+            face_index[first:first + count] = len(face_rows)
+            face_rows.append(match)
+        if (not len(face_index) or np.any(face_index < 0) or
+                {body_id for body_id, _ in by_key} !=
+                {int(rec["body"]) for rec in mesh["faces"] if rec["tri_count"] > 0}):
+            raise ValueError("display tessellation omits identifiable solid faces or bodies")
+        points = np.asarray(mesh["pos"], dtype=np.float64)[mesh["idx"]]
+        indices = face_index
+        if np.unique(indices).size != len(face_rows):
+            raise ValueError("one or more solid faces have no tessellated triangles")
+        edges = np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0])
+        twice_area = np.linalg.norm(edges, axis=1)
+        if not np.all(np.isfinite(points)) or not np.all(np.isfinite(twice_area)):
+            raise ValueError("tessellation has non-finite coordinates")
+        valid = twice_area > 1e-12
+        normals = np.zeros_like(edges)
+        normals[valid] = edges[valid] / twice_area[valid, None]
+        triangle_area = twice_area * 0.5
+        centroids = np.mean(points, axis=1)
+        n_faces = len(face_rows)
+
+        def evaluate(direction: list[float]) -> tuple[list[dict], float]:
+            axis = np.asarray(direction, dtype=np.float64)
+            plate = float(np.min(points.reshape(-1, 3) @ axis))
+            downward = -(normals @ axis)
+            heights = points @ axis
+            contact = (valid & (downward >= 1 - 1e-6)
+                       & (np.max(heights, axis=1) - plate <= 0.05))
+            degrees = np.degrees(np.arcsin(np.clip(downward, -1, 1)))
+            bad = valid & ~contact & (degrees > threshold + 1e-6)
+            weights = triangle_area * bad
+            area_by_face = np.bincount(indices, weights=weights, minlength=n_faces)
+            counts = np.flatnonzero(area_by_face > 0)
+            if len(counts):
+                maxima = np.full(n_faces, -90.0)
+                np.maximum.at(maxima, indices[bad], degrees[bad])
+                centers = [np.bincount(indices, weights=weights * centroids[:, i],
+                                       minlength=n_faces) for i in range(3)]
+            unsupported = []
+            for face_i in counts:
+                face = face_rows[int(face_i)]
+                area = float(area_by_face[face_i])
+                row = {"face": face["sid"], "area_mm2": area,
+                       "overhang_deg": round(float(maxima[face_i]), 3),
+                       "centroid": [round(float(c[face_i] / area), 3) for c in centers]}
+                if face.get("owner_feature"):
+                    row["built_by"] = {"id": face["owner_feature"]}
+                unsupported.append(row)
+            return unsupported, float(triangle_area[contact].sum())
+
+        unsupported, _contact = evaluate(build_dir)
+        area = sum(face["area_mm2"] for face in unsupported)
+        result.update({
+            "status": "fail" if area > 1.0 else "pass", "ok": area <= 1.0,
+            "unsupported_area_mm2": round(area, 3),
+            "unsupported_face_count": len(unsupported),
+            "worst": sorted(unsupported, key=lambda face: -face["area_mm2"])[:5],
+            "note": "support recommended for downward faces above the overhang limit"
+                    if area > 1.0 else "no significant unsupported downward faces",
+        })
+        if suggest_orientation:
+            orientations = []
+            for axis in range(3):
+                for sign in (1, -1):
+                    direction = [float(sign if i == axis else 0) for i in range(3)]
+                    bad, base = evaluate(direction)
+                    orientations.append({
+                        "build_dir": direction,
+                        "unsupported_area_mm2": round(sum(f["area_mm2"] for f in bad), 3),
+                        "base_contact_area_mm2": round(base, 3),
+                    })
+            result["orientation"] = sorted(
+                orientations,
+                key=lambda row: (row["unsupported_area_mm2"], -row["base_contact_area_mm2"]),
+            )
+    except Exception as exc:  # noqa: BLE001
+        result.update({"status": "not_evaluated", "ok": None,
+                       "unsupported_area_mm2": None, "unsupported_face_count": None,
+                       "worst": [], "note": f"overhang geometry unavailable: {exc}"})
+    return result
+
+
 def _dfm_verdict(checks: list[dict]) -> tuple[str, Optional[bool]]:
     if any(check.get("status") == "fail" for check in checks):
         return "fail", False
@@ -669,15 +803,20 @@ def register_intake_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def dfm_check(process: Optional[str] = None, doc_id: Optional[str] = None) -> str:
+    def dfm_check(process: Optional[str] = None, doc_id: Optional[str] = None,
+                  build_dir: Optional[list] = None,
+                  suggest_orientation: bool = False) -> str:
         """Evaluate DfM as pass, fail, or not_evaluated against the ProcessProfile.
 
-        Checks wall and declared minimum feature size, molding draft, machining blind-hole
-        depth/diameter, and thread strategy.  ``dfm_pass`` is true only when every applicable
-        check ran and passed; evaluation gaps/errors are returned as ``not_evaluated`` with
-        ``dfm_pass:null`` and the original error.
+        Checks wall and declared minimum feature size, molding draft, FDM overhang/support,
+        machining blind-hole depth/diameter, and thread strategy. ``build_dir`` is the
+        normalized print-up vector (default [0,0,1]); ``suggest_orientation`` ranks six
+        axis-aligned print directions by unsupported area and base contact. ``dfm_pass`` is
+        true only when every applicable check ran and passed; evaluation gaps/errors are
+        returned as ``not_evaluated`` with ``dfm_pass:null`` and the original error.
         """
         try:
+            direction = _dfm_build_direction(build_dir)
             d = _doc(doc_id)
             proc = _canon_process(process) or _process_id(d)
             prof = _dfm("dfm_get_profile", {"process": proc})
@@ -730,6 +869,11 @@ def register_intake_tools(mcp: FastMCP) -> None:
                     params.get("thread") if isinstance(params.get("thread"), dict) else {},
                 ))
 
+            if proc == "fdm":
+                overhang = params.get("overhang") if isinstance(params.get("overhang"), dict) else {}
+                checks.append(_dfm_overhang(
+                    d, overhang.get("max_deg"), direction, suggest_orientation,
+                ))
             draft = params.get("draft") if isinstance(params.get("draft"), dict) else {}
             if draft.get("required"):
                 minimum_draft = _dfm_number(draft.get("min_deg"))

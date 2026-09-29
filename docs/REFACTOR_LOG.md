@@ -5206,3 +5206,33 @@ against both binaries: sharpshooter scope `6-axis-1dcd9kaxtypzw`; mnemo `per-pro
 no workspace `off`; old binary + sharpshooter → mnemo, starts.
 (`test_memory_is_the_projects_and_its_tools_match_the_backend`,
 `test_memory_backend_config.py`.)
+
+## 2026-09-28 — tool-surface gaps from c211–c233 + host-tool execution edge cases
+
+Mined the 19 Chudcode sessions since 09-20 (2,536 tool calls). Execution fixes in
+`services/agent/chudcode_tools.py`: JSON-text returns (most MCP tools) now reach Chudcode
+with structured `details` (they had none, so every `{"ok": false}` looked like success to
+the feed, the records and the watchdog); a result over 46 000 B (Chudcode spills >50 KB and
+the xd device then REPLACES `details` with truncation meta) is shortened to valid JSON by
+`_shorten_largest` (largest-saving list/string/map halved first; top-level keys kept) with
+`_truncated.full_result` naming the complete JSON under `<data>/cache/tool_results/<session>/`;
+eval-bridged calls (`js-…` ids) get no first-touch skill prefix (it broke every
+`json.loads`) and do not consume it; the host dispatch path now runs
+`agent_turn._reconcile_kwargs` (was a raw `TypeError … <locals> … 'message'`), strips
+declared `progress`/`cancel` from advertised schemas and never lets a model value replace
+the host callables. `chudcode_events.cad_result_payload` reads `details` or
+`details.xdev.inner`: CAD ok:false cards fail with the tool's own error/outcome_kind, and
+`ProgressWatchdog` no longer counts a failed xd mutation as progress. New tools:
+`read_native_file` (saved `.step+` tree/params/mates/materials without opening — agents ran
+`unzip|jq` ~40 times), `wait_job` (bounded blocking wait; replaces `sleep 600; ps -p`),
+`render_animation(keyframes=6)` (labelled keyframe sheet incl. first collision — agents
+shelled out to ffmpeg), `dfm_check` FDM `overhang` + `build_dir` + `suggest_orientation`
+(per-triangle on `cad_common._doc_mesh`, curved faces included; small horizontal bores
+count as overhang — bridging via `max_bridge_mm` is not modelled yet). Appearance presets
+gained wood/dark wood/mdf/clear/rubber (+ plywood/birch/oak/acrylic/tpu… aliases);
+`simulate_motion` guidance timeout 300 → 900 s. `MAIN_CHAT_CORE_TOOLS` adds the tools the
+sessions loaded on demand (`list_world_bodies`, `inspect_native_files`, `interface_check`,
+`render_animation`, `dfm_check`, `analyze_stl_geometry`, `inspect_section`, `get_job`) plus
+the two new ones; `contracts/copilot_modes.json` allows `read_native_file` (ask, plan) and
+`wait_job` (plan). Not done: the Chudcode-side "No such tool: xd://<cad tool>" for an
+unloaded tool still does not say `enable_tools` loads it.

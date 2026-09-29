@@ -803,6 +803,72 @@ def _fea_frames(vtu_path: str, out_dir: str, frames: int, size: tuple, view,
             if grid.n_cells else "unknown"}
 
 
+def _keyframe_indices(frame_count: int, count: int,
+                      collision_index: Optional[int] = None) -> list[int]:
+    """Select rendered frames, preserving endpoints and a recorded collision."""
+    if count <= 0 or frame_count <= 0:
+        return []
+    n = min(frame_count, max(2, min(12, count)))
+    if n == 1:
+        return [0]
+    indices = [round(i * (frame_count - 1) / (n - 1)) for i in range(n)]
+    if (isinstance(collision_index, int) and not isinstance(collision_index, bool)
+            and 0 <= collision_index < frame_count and collision_index not in indices):
+        # The endpoint tiles are never displaced. With only two requested tiles,
+        # add a third rather than losing either the start or the finish.
+        if n == 2:
+            indices.append(collision_index)
+        else:
+            replacement = min(indices[1:-1], key=lambda i: abs(i - collision_index))
+            indices[indices.index(replacement)] = collision_index
+    return sorted(indices)
+
+
+def _keyframe_sheet(paths: list[str], destination: str, fps: int, count: int,
+                    collision_index: Optional[int] = None,
+                    times_s: Optional[list[float]] = None) -> list[int]:
+    """Compose labeled rendered PNGs directly, without decoding the encoded film."""
+    from PIL import Image as PILImage, ImageDraw
+
+    indices = _keyframe_indices(len(paths), count, collision_index)
+    if not indices:
+        raise ValueError("no keyframes requested or rendered")
+    with PILImage.open(paths[indices[0]]) as image:
+        source_w, source_h = image.size
+    columns = min(3, len(indices))
+    gap = 8
+    tile_w = min(source_w, (1600 - gap * (columns - 1)) // columns)
+    tile_h = max(1, round(source_h * tile_w / source_w))
+    rows = (len(indices) + columns - 1) // columns
+    sheet = PILImage.new("RGB", (columns * tile_w + gap * (columns - 1),
+                                 rows * tile_h + gap * (rows - 1)), _BG)
+    draw = ImageDraw.Draw(sheet)
+    font = _font(True, min(16, max(11, tile_w // 28)))
+    for tile, index in enumerate(indices):
+        x = (tile % columns) * (tile_w + gap)
+        y = (tile // columns) * (tile_h + gap)
+        with PILImage.open(paths[index]) as source:
+            image = source.convert("RGB")
+        if image.size != (tile_w, tile_h):
+            image = image.resize((tile_w, tile_h), PILImage.Resampling.LANCZOS)
+        sheet.paste(image, (x, y))
+        seconds = times_s[index] if times_s is not None else index / fps
+        labels = [f"#{index} t={seconds:.2f}s"]
+        if index == collision_index:
+            labels.append("COLLISION")
+        label_h = draw.textbbox((0, 0), labels[0], font=font)[3] + 4
+        for line, label in enumerate(labels):
+            ly = y + 4 + line * label_h
+            bounds = draw.textbbox((0, 0), label, font=font)
+            label_w = min(tile_w - 4, bounds[2] + 12)
+            draw.rectangle((x + 4, ly, x + label_w, ly + label_h),
+                           fill=(36, 14, 14) if line else _BG)
+            draw.text((x + 8, ly + 2), label, font=font,
+                      fill=(255, 135, 105) if line else (240, 240, 240))
+    sheet.save(destination, format="PNG")
+    return indices
+
+
 def register_cad_animation_tools(mcp: FastMCP) -> None:
     """The CAD animation MCP tool: render_animation (turntable | explode | motion | fea)."""
 
@@ -837,7 +903,8 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                          frames_dir: Optional[str] = None,
                          footer_note: Optional[str] = None,
                          dark: bool = True,
-                         annotate: bool = False) -> list:
+                         annotate: bool = False,
+                         keyframes: int = 6) -> list:
         """Render a document as an ANIMATION (.gif or .mp4) — the artifact a review PLAYS.
 
         kind:
@@ -886,6 +953,10 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
         frames/fps/size : frame COUNT, playback rate, [width, height] px. Duration is
                     frames/fps; a GIF over `max_bytes` (25 MB default) walks fps then width
                     and the caption reports the leg it landed on.
+        keyframes : number of evenly spaced RENDERED frames (default 6, clamped 0..12)
+                    to tile beside the poster as keyframes_<stem>.png. 0 disables it;
+                    positive counts preserve both endpoints (at least two tiles) and
+                    include the recorded first collision (an extra tile when needed).
         view      : starting camera — "iso"/"front"/... or {"azimuth","elevation"}/{"dir"}.
         highlight : render_part's highlight vocabulary (sid / feature id / query / list),
                     drawn on every frame.
@@ -908,12 +979,13 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                     untouched; dark=False keeps the engine's own light background exactly
                     as render_part shows it.
 
-        Returns [poster Image, caption]. The caption states the written path, bytes,
-        sha256, frame count, fps, measured duration from ffprobe, the engine build id and
-        polymesh commit burned into every frame's footer, and each kind's own measured
-        numbers (component offsets, sweep range / `steer_range_deg` and first collision,
-        peak MPa and warp factor). Numbers the engine did not report read "unknown" —
-        never a guess.
+        Returns [poster Image, keyframe-sheet Image, caption] by default, or
+        [poster Image, caption] when keyframes=0 or sheet construction fails. The caption
+        states the written path, bytes, sha256, frame count, fps, measured duration from
+        ffprobe, the engine build id and polymesh commit burned into every frame's footer,
+        and each kind's own measured numbers (component offsets, sweep range /
+        `steer_range_deg` and first collision, peak MPa and warp factor). Numbers the
+        engine did not report read "unknown" — never a guess.
         """
         work: Optional[str] = None
         clone: Optional[str] = None
@@ -949,6 +1021,7 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                           if frames_dir else None)
             frames = max(2, int(frames))
             fps = max(1, min(60, int(fps)))
+            keyframes = max(0, min(12, int(keyframes)))
             W, H = (int(size[0]), int(size[1])) if (isinstance(size, (list, tuple))
                                                     and len(size) == 2) else (1280, 720)
             W, H = max(160, W - W % 2), max(120, H - H % 2)
@@ -1315,6 +1388,7 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                 "downsample": "Lanczos before film typography",
                 "material_appearance": "stored CAD appearance; no film recolouring"
                 if kind != "fea" else "solved scalar field"}
+            rendered_paths = list(paths) if keyframes else []
 
             # ---- playback: hold each solved sample until the film is `frames` long ----
             if len(paths) < frames:
@@ -1395,7 +1469,25 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                 cap.append(f"WARNING: {enc['bytes']} B is still over the {int(max_bytes)} B "
                            + ("budget after the GIF size ladder." if ext == ".gif" else
                               "budget; MP4 quality is not reduced by the GIF size ladder."))
-            return [Image(path=inline), "  ".join(cap)]
+            result = [Image(path=inline)]
+            if keyframes:
+                try:
+                    sheet_path = _render_save_target(os.path.join(
+                        os.path.dirname(poster), f"keyframes_{stem}.png"))
+                    first_collision = ((measured.get("interference") or {})
+                                       .get("first_collision_step") if kind == "motion" else None)
+                    first_time: dict[str, float] = {}
+                    for index, path in enumerate(ordered):
+                        first_time.setdefault(path, index / fps)
+                    selected = _keyframe_sheet(
+                        rendered_paths, sheet_path, fps, keyframes, first_collision,
+                        [first_time[path] for path in rendered_paths])
+                    result.append(Image(path=sheet_path))
+                    cap.append(f"keyframes {sheet_path} (frames: {selected})")
+                except Exception as exc:  # noqa: BLE001
+                    cap.append(f"[keyframes unavailable: {exc}]")
+            result.append("  ".join(cap))
+            return result
         except Exception as e:  # noqa: BLE001
             return [_err(e)]
         finally:

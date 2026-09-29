@@ -13,6 +13,15 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "not permission to unzip or hand-edit CAD containers."
         ),
     },
+    "read_native_file": {
+        "prompt_note": (
+            "Read a saved .step+ tree (features with params/refs, components, mates, "
+            "materials, appearances, meta) without opening it — use this, never unzip/jq. "
+            "Narrow with sections=[...] / feature_ids / component_ids; embedded BREP and "
+            "other long strings come back as '<N chars omitted>'. Read-only: to change the "
+            "file, import_part it and edit the document."
+        ),
+    },
     "relocate_native_files": {
         "prompt_note": (
             "Metadata-only COPY via the native serializer, not a geometry operation. "
@@ -414,6 +423,14 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Poll the job_id a backgrounded heavy call returned (add_features / "
             "run_fea_* / run_cfd_flow) — never re-issue the original call."
         ),
+    },
+    "wait_job": {
+        "prompt_note": (
+            "Block on a get_job/sim job_id until it finishes (timeout_s ≤ 900, default "
+            "120) instead of sleep/ps loops or repeated get_job polls. still_running:true "
+            "means call it again; waiting never cancels the job (sim_cancel does)."
+        ),
+        "timeout_s": 960,
     },
     "get_part": {
         "prompt_note": (

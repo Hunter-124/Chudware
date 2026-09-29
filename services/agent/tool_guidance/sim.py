@@ -431,12 +431,15 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "simulate_motion": {
         "prompt_note": (
-            "Kinematic sweep of one dimensional mate. stop is required; angle ranges are "
-            "degrees, distance ranges mm, steps>=2. fixtures/loads do not apply. "
-            "check_interference samples each step, so refine steps near first contact. "
-            "dynamics={} adds inverse-dynamics reactions but not contact dynamics."
+            "Kinematic sweep of one dimensional mate (mate_id/start/stop) or several at once "
+            "(drivers=[{mate_id,start,stop}]). Angle ranges are degrees, distance ranges mm, "
+            "steps>=2. fixtures/loads do not apply. check_interference samples each step, so "
+            "refine steps near first contact. dynamics={} adds inverse-dynamics reactions "
+            "but not contact dynamics."
         ),
-        "timeout_s": 300,
+        # A 36-body arm sweep with interference checks outran 300 s (live 2026-09-25) and
+        # was abandoned while still posing the assembly; render_animation already gets 900.
+        "timeout_s": 900,
     },
     "struct_analyze": {
         "prompt_note": (

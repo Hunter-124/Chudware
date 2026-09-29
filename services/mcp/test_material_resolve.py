@@ -298,6 +298,10 @@ def _appearance_family(name: str) -> str:
     ("C360", "brass"), ("C360 brass", "brass"), ("C110", "copper"),
     ("PETG", "plastic"), ("pla", "plastic"), ("ABS", "abs"), ("nylon", "nylon"),
     ("polyamide", "nylon"),
+    # non-metals named in chat (live 2026-09-28: "birch plywood" failed outright)
+    ("birch plywood", "wood"), ("3/4 in oak plywood", "wood"), ("pine", "wood"),
+    ("walnut", "dark wood"), ("MDF", "mdf"), ("clear acrylic", "clear"),
+    ("polycarbonate", "clear"), ("TPU", "rubber"), ("ASA", "plastic"),
 ])
 def test_appearance_designation_lands_on_the_right_family(spelling, family):
     assert _appearance_family(spelling) == family

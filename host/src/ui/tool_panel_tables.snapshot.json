@@ -132,6 +132,7 @@
    "plm_graph_watch",
    "preflight_ops",
    "query_geometry",
+   "read_native_file",
    "recover_parts",
    "redo",
    "regen_diagnose",
@@ -179,6 +180,7 @@
    "suggest_drawing_dimension_scheme",
    "undo",
    "verify_battery",
+   "wait_job",
    "wall_thickness"
   ],
   "cam": [
@@ -808,7 +810,7 @@
   "inspect_feature": "One-call feature inspection: a multi-panel EMPHASIS sheet + describe excerpt + dims.",
   "inspect_model_integrity": "Census every solid, including disconnected solids INSIDE assembly components.",
   "inspect_native_files": "Inspect native .step+ metadata WITHOUT opening a document or evaluating geometry.",
-  "inspect_part": "CLOSE-UP of one face/edge/feature/point with framing controls — render_part(target=) plus zoom_factor (>1 tighter), margin (context padding …",
+  "inspect_part": "CLOSE-UP of one face/edge/feature/point with framing controls — render_part(target=, view=\"auto\") plus zoom_factor (>1 tighter), margin …",
   "inspect_section": "Cut the part with a plane and report the CROSS-SECTION area + section moments.",
   "intake_status": "Where the intake stands: bound process, measured parts, the critical-dim ledger, what is still blocking first-try fit, and any pending …",
   "interface_check": "Design-time INTERFACE ALIGNMENT check between mating components — the errors that pass check_interference (nothing overlaps) but are still …",
@@ -937,6 +939,7 @@
   "project_into_sketch": "\"Convert entities\" INTO an existing sketch — SolidWorks-style edge/face projection that appends real (or construction) geometry to a sketch …",
   "query_adjacency": "The face-adjacency graph (W3): which faces touch which, and whether each shared edge is a CONVEX outside-corner or a CONCAVE …",
   "query_geometry": "Resolve a STRUCTURED face/edge query against the part — explore/confirm geometry.",
+  "read_native_file": "Read a saved .step+ file's feature tree, components, mates, materials and metadata WITHOUT opening it.",
   "recommend_fit": "Map a functional description to recommended ISO 286 fit classes with rationale.",
   "recover_parts": "Reopen auto-saved parts after a server restart (recover a dropped session).",
   "redo": "Redo the last undone edit on the current part.",
@@ -953,7 +956,7 @@
   "render_sketch": "Render the part containing a 2D sketch as a multi-view image.",
   "render_sketch_ascii": "ASCII/plaintext rendering of sketch entities + dimensions/constraints + checks.",
   "render_study_setup": "The FIXTURE/LOAD figure for an FEA evidence document — what is held, what pushes.",
-  "render_views": "Multi-view contact sheet — 6 orthographic + iso by default, each tile labelled.",
+  "render_views": "Multi-view sheet — by default the planner's 7 most useful complementary views.",
   "replan_request": "Route an ``aicad.replan/1`` request per §17 and report the approvers.",
   "req_create": "Create a new ``aicad.req/1`` requirements document.",
   "req_report": "Return the requirements document as a markdown or JSON report.",
@@ -1077,6 +1080,7 @@
   "vendors_health": "Run a canary health check across the vendor source adapters.",
   "verify_battery": "Run deterministic checks on one explicit document.",
   "verify_packet": "Check ONE evidence-packet folder for mutual consistency BEFORE citing it.",
+  "wait_job": "Block until a background job (get_job id) finishes or timeout_s passes — use instead of sleep/poll loops.",
   "wall_thickness": "How THIN is the thinnest wall? Inward ray-cast wall-thickness over the whole part.",
   "workspace_doc_events": "Return per-doc event stream entries starting at *since_seq*.",
   "workspace_status": "Return the full workspace snapshot for *run_id*."
@@ -1330,7 +1334,7 @@
    "prompt_note": "The only way to close fit-critical demands: typed caliper values, not photo reads. Pass run_id so DAG gates never re-ask."
   },
   "contact_sheet": {
-   "prompt_note": "Whole-part multi-angle sheet (4 tiles, ~4x a close-up's image tokens) — only when one render_part(target=...) close-up cannot settle the question."
+   "prompt_note": "Same planner 2x2 grid as render_part without a view; pass views=[...] only when you need specific named angles."
   },
   "convert_face_to_sketch": {
    "prompt_note": "Creates a NEW sketch on one planar face; to trace into an open sketch use project_into_sketch. Get face sids from describe_part, then extrude/cut/revolve the regions."
@@ -1836,7 +1840,7 @@
    "prompt_note": "Bypasses photogrammetry when a scan mesh already exists; pass scale_mm if known, else calibrate afterwards with reveng_set_scale."
   },
   "inspect_feature": {
-   "prompt_note": "4-panel sheet (hero/alt/cutaway/context) of one feature — ~4x a single render_part(target=...) close-up; use it only when that close-up is ambiguous."
+   "prompt_note": "Planner close-ups (hero/alt/alt2, a section for internal features) + whole-part context of one feature — only when render_part(target=...)'s grid is ambiguous."
   },
   "inspect_model_integrity": {
    "prompt_note": "Read-only census of EVERY solid, including disconnected children inside assembly components. Inspect complete, source_failures, pair_failures, isolated_solids and nearest; ok only means the query ran. proximity_mm is a search radius, not approved clearance; a positive gap is not contact. Increase pair_budget_s (maximum60) when exact checks time out, never treat unknown evidence as clean. Geometric islands, overlaps and fixed flags do not establish fastening, mechanical capture or a load path."
@@ -1845,7 +1849,7 @@
    "prompt_note": "Inventory .step+ metadata without import/open/compile/solve. Pass absolute project-root paths and a NEW .json output_path for large inventories; full results live there, not in the bounded chat summary. document_hash is native canonical FNV, not SHA256. Unsupported dependencies and failures are evidence, not permission to unzip or hand-edit CAD containers."
   },
   "inspect_part": {
-   "prompt_note": "render_part(target=...) plus framing knobs (zoom_factor, margin, cutaway); same perspective close-up, target and view vocabulary."
+   "prompt_note": "Single close-up = render_part(target=..., view=\"auto\") plus framing knobs (zoom_factor, margin, cutaway); same target and view vocabulary."
   },
   "inspect_section": {
    "prompt_note": "The cut always passes through the ORIGIN on a reserved plane — returns area/centroid/Ixx/Iyy; an offset cut belongs in a drawing (add_section_view)."
@@ -1908,7 +1912,7 @@
    "prompt_note": "World-placed bboxes per body/component — read right after solve_mates to confirm where everything landed; pair with check_interference for fit."
   },
   "look_around": {
-   "prompt_note": "Tiled close-ups of ONE target from separated angles — only when a single render_part(target=...) close-up leaves the shape ambiguous."
+   "prompt_note": "Tiled close-ups of ONE target (planner set, or ranked=False for an even orbit) — only when render_part(target=...)'s grid leaves the shape ambiguous."
   },
   "machining_ref_get": {
    "prompt_note": "Fetch one curated record by stable record_id for its full conditions, units and source citation. Lookup facts are advisory; a delegate_tool record points to the canonical calculator/tool instead of duplicating its values."
@@ -2247,6 +2251,9 @@
   "query_geometry": {
    "prompt_note": "Plain-word phrases work for faces AND edges ('the vertical edges', 'the top face') — confirm a pick resolves before referencing it in a feature; zero or >1 match on a slot needing one → narrow with pick/near/count/index. Fully open-ended explore → describe_part + hover instead."
   },
+  "read_native_file": {
+   "prompt_note": "Read a saved .step+ tree (features with params/refs, components, mates, materials, appearances, meta) without opening it — use this, never unzip/jq. Narrow with sections=[...] / feature_ids / component_ids; embedded BREP and other long strings come back as '<N chars omitted>'. Read-only: to change the file, import_part it and edit the document."
+  },
   "recommend_fit": {
    "prompt_note": "Function-to-fit-class step before fit_calc; pass the diameter in the same call to get the computed band and skip the follow-up fit_calc entirely."
   },
@@ -2281,7 +2288,7 @@
    "timeout_s": 180
   },
   "render_part": {
-   "prompt_note": "Check numbers first; to LOOK at what you changed, target= the feature id for one cheap perspective close-up (auto best angle, view={distance,fov,azimuth,elevation} to steer); no target = whole part, once at the end."
+   "prompt_note": "Check numbers first; don't render after every mutation. One call = a 2x2 grid of the 4 most useful complementary shots (measured, SID-tagged, caption lists what each tile shows and faces no tile sees); target= the feature id to frame it; view= only for one specific single shot."
   },
   "render_schematic_ascii": {
    "prompt_note": "Keep its grid+index output — that is the cell contract apply_ascii_edits(kind='schematic') resolves edits against."
@@ -2296,10 +2303,10 @@
    "prompt_note": "add_features batches already append a compact auto-readback — read that first; pair this with sketch_health for the final verify loop."
   },
   "render_study_setup": {
-   "prompt_note": "The fixture/load FIGURE an FEA report needs beside its stress plot: fixtures painted magenta, load faces violet, rest desaturated, plus ONE ARROW PER LOAD ENTRY (tip on that entry's face centroid, along its own force vector, scaled to its magnitude) and the resultant burned into a band at the bottom, so two cases on the same faces are different figures. fixtures/load are EXACTLY run_fea_static's dialect and are resolved by the same gates, so pass the identical arguments and draw this BEFORE the solve — a refusal here is the setup error the solver would have raised. Omit view to let the occlusion scorer pick the camera that sees the most of those faces; save_path also writes the embeddable PNG."
+   "prompt_note": "The fixture/load FIGURE an FEA report needs beside its stress plot: fixtures painted magenta, load faces violet, rest desaturated, plus ONE ARROW PER LOAD ENTRY (tip on that entry's face centroid, along its own force vector, scaled to its magnitude) and the resultant burned into a band at the bottom, so two cases on the same faces are different figures. fixtures/load are EXACTLY run_fea_static's dialect and are resolved by the same gates, so pass the identical arguments and draw this BEFORE the solve — a refusal here is the setup error the solver would have raised. Omit view to let the shot planner pick the camera that shows the most of those faces; save_path also writes the embeddable PNG."
   },
   "render_views": {
-   "prompt_note": "Full 6-ortho+iso grid (7 tiles) — drawing-style coverage of back/bottom faces; far heavier than one render_part(target=...) close-up."
+   "prompt_note": "Planner set of 7 complementary views (or views=[...] for a fixed drawing set) — heavier than render_part's 4-tile grid; only when four views leave a face unseen."
   },
   "replan_request": {
    "prompt_note": "Routing dry-run only — reports required approvers, changes nothing; apply with dag_replan once ruled on."
@@ -2566,8 +2573,8 @@
    "prompt_note": "job_id from sim_run. Reports queued/running/done/failed/cancelled and is reconciled against the OS — it never says running for a dead worker. Poll this before sim_results; call sim_jobs() if you lost the id."
   },
   "simulate_motion": {
-   "prompt_note": "Kinematic sweep of one dimensional mate. stop is required; angle ranges are degrees, distance ranges mm, steps>=2. fixtures/loads do not apply. check_interference samples each step, so refine steps near first contact. dynamics={} adds inverse-dynamics reactions but not contact dynamics.",
-   "timeout_s": 300
+   "prompt_note": "Kinematic sweep of one dimensional mate (mate_id/start/stop) or several at once (drivers=[{mate_id,start,stop}]). Angle ranges are degrees, distance ranges mm, steps>=2. fixtures/loads do not apply. check_interference samples each step, so refine steps near first contact. dynamics={} adds inverse-dynamics reactions but not contact dynamics.",
+   "timeout_s": 900
   },
   "sketch3d_add_constraints": {
    "prompt_note": "Point handles are 'e3.p1'/'e3.p2'/'e3.pm'; tangent/symmetric/equal/midpoint are NOT in v1 (validator rejects). Re-check with check_sketch3d."
@@ -2700,6 +2707,10 @@
   },
   "verify_packet": {
    "prompt_note": "Read a packet folder back and check its files describe one run (same input hash, same engine build, result.json matching the hash convergence.md cites, reduction fields present). Run it before citing a packet; ok:false means do not cite it."
+  },
+  "wait_job": {
+   "prompt_note": "Block on a get_job/sim job_id until it finishes (timeout_s ≤ 900, default 120) instead of sleep/ps loops or repeated get_job polls. still_running:true means call it again; waiting never cancels the job (sim_cancel does).",
+   "timeout_s": 960
   },
   "wall_thickness": {
    "prompt_note": "Headline is min_thickness_mm vs your process floor (~1 mm injection, ~0.8 mm FDM); null means an open/sheet body — confirm a solid with measure_part."

@@ -12,6 +12,8 @@ import json
 import math
 import os
 import re
+import time
+import zipfile
 from pathlib import Path
 from uuid import uuid4
 
@@ -6672,6 +6674,118 @@ def _native_plan_object(pairs: list[tuple[str, Any]]) -> dict:
     return obj
 
 
+_NATIVE_READ_SECTIONS = (
+    "features", "components", "mates", "explode", "material", "body_materials",
+    "appearances", "face_appearances", "meta", "equations", "configurations",
+    "rollback_after", "studies",
+)
+
+
+def _native_read_bounded(value: Any) -> Any:
+    """Keep large embedded payloads out of the model's tool response."""
+    if isinstance(value, str):
+        return f"<{len(value)} chars omitted>" if len(value) > 2000 else value
+    if isinstance(value, dict):
+        return {key: _native_read_bounded(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_native_read_bounded(item) for item in value]
+    return value
+
+
+def _native_read_rows(rows: Any, keys: tuple[str, ...],
+                      ids: Optional[list[str]] = None) -> list[dict]:
+    return [
+        {key: row[key] for key in keys if key in row}
+        for row in rows if isinstance(row, dict) and
+        (ids is None or row.get("id") in ids)
+    ]
+
+
+def _native_read_file(path: str, sections: Optional[list[str]],
+                      feature_ids: Optional[list[str]], component_ids: Optional[list[str]],
+                      include_params: bool) -> str:
+    if sections is not None and (
+            not isinstance(sections, list) or
+            any(not isinstance(section, str) or section not in _NATIVE_READ_SECTIONS
+                for section in sections)):
+        return _dumps({"ok": False, "code": "unknown_section",
+                       "error": f"Unknown section(s): {sections!r}. "
+                                f"Valid sections: {', '.join(_NATIVE_READ_SECTIONS)}",
+                       "valid_sections": list(_NATIVE_READ_SECTIONS)})
+    try:
+        if isinstance(path, str) and path.strip() and not Path(path).is_absolute():
+            from .fs_tools import _canonical_target
+            target, blocked = _canonical_target(path, allow_missing=True)
+            if blocked:
+                raise cb.CoreError(blocked["hint"], code=blocked["reason"],
+                                   detail={"field": "path"})
+            assert target is not None
+            path = str(target)
+        path = _native_file_path(path, "path", native=True)
+        with zipfile.ZipFile(path) as archive:
+            try:
+                document = json.loads(archive.read("document.json"))
+            except KeyError:
+                return _dumps({"ok": False, "code": "missing_document",
+                               "error": "Native file is missing document.json"})
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                return _dumps({"ok": False, "code": "bad_document_json",
+                               "error": f"Invalid document.json: {exc}"})
+    except (zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        return _dumps({"ok": False, "code": "invalid_zip",
+                       "error": f"Not a valid .step+ ZIP container: {exc}"})
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+    if not isinstance(document, dict):
+        return _dumps({"ok": False, "code": "bad_document_json",
+                       "error": "document.json must contain a JSON object"})
+    schema = document.get("schema")
+    if schema not in ("aicad.part/1", "aicad.asm/1"):
+        return _dumps({"ok": False, "code": "unsupported_schema",
+                       "error": f"Unsupported part/assembly document schema: {schema!r}"})
+    selected = set(_NATIVE_READ_SECTIONS if sections is None else sections)
+    features = document.get("features") or []
+    components = document.get("components") or []
+    mates = document.get("mates") or []
+    result = {
+        "ok": True, "path": path, "schema": schema, "id": document.get("id"),
+        "name": document.get("name"), "units": document.get("units"),
+        "kind": "assembly" if schema == "aicad.asm/1" else "part",
+        "counts": {
+            "features": len(features), "components": len(components),
+            "mates": len(mates),
+            "bodies_with_material": len(document.get("body_materials") or {}),
+            "appearances": len(document.get("appearances") or {}),
+        },
+    }
+    if "features" in selected:
+        keys = ("id", "type", "name", "suppressed", "folder", "refs")
+        if include_params:
+            keys += ("params",)
+        result["features"] = _native_read_rows(features, keys, feature_ids)
+    if "components" in selected:
+        result["components"] = _native_read_rows(
+            components, ("id", "name", "source", "transform", "fixed",
+                         "suppressed", "hidden"), component_ids)
+    if "mates" in selected:
+        result["mates"] = _native_read_rows(
+            mates, ("id", "type", "align", "suppressed", "refs", "value"))
+    for section in _NATIVE_READ_SECTIONS:
+        if section in selected and section not in {
+                "features", "components", "mates", "configurations", "studies"}:
+            result[section] = document.get(section)
+    if "configurations" in selected:
+        result["configurations"] = document.get("configurations", [])
+        result["active_configuration"] = document.get("active_configuration")
+    if "studies" in selected:
+        result["studies"] = [
+            {"id": study.get("id"), "name": study.get("name"),
+             "kind": study.get("kind", study.get("type"))}
+            for study in (document.get("studies") or []) if isinstance(study, dict)
+        ]
+    return _dumps(_native_read_bounded(result))
+
+
 def register_cad_doc_tools(mcp: FastMCP) -> None:
     """CAD document-lifecycle MCP tools (T-RF8 split of cad_tools.py): new_part, add_features, get_part, undo/redo, save/close/recover, configurations, material, engine_profile, cad_guide."""
 
@@ -8307,6 +8421,19 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             return _native_file_error(exc, "inspect")
 
     @mcp.tool()
+    def read_native_file(path: str, sections: Optional[list[str]] = None,
+                         feature_ids: Optional[list[str]] = None,
+                         component_ids: Optional[list[str]] = None,
+                         include_params: bool = True) -> str:
+        """Read a saved .step+ file's feature tree, components, mates, materials and metadata WITHOUT opening it.
+
+        Path may be absolute or relative to CHUDWARE_FS_ROOT, but must remain inside it.
+        Choose sections or feature_ids/component_ids to narrow the reply. Large strings
+        (including embedded BREP) are omitted; the saved file is never modified.
+        """
+        return _native_read_file(path, sections, feature_ids, component_ids, include_params)
+
+    @mcp.tool()
     def relocate_native_files(plan_path: str) -> str:
         """Copy native .step+ files with metadata-only renames/rebased references; NEVER solve.
 
@@ -8402,6 +8529,15 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                save_part("bracket.step") writes "bracket.step+" and never
                "bracket.step.step+". Returns the written path and bytes so you can confirm a
                real save, plus a note whenever the extension was rewritten.
+
+        Explicit paths are destinations, not design names: save_part(path="arm_revD_final5.step+")
+        writes that exact requested filename (subject only to path canonicalization and the
+        native .step+ extension rule above). Version-token normalization applies only when
+        MINTING a new document, not to saved files or already-open documents. Saving never
+        renames or removes a user-authored revision file; an explicit destination can retire
+        only a stale copy this harness itself placed for the SAME document. To revise an
+        existing design, open/edit that document and save it in place; an explicitly chosen
+        different path is not silently merged with or redirected to the series base.
 
         On an assembly (or any doc with 2+ world bodies) the reply carries non-blocking
         `warnings:["placement_unverified: N component(s) placed by transform with no
@@ -8547,6 +8683,40 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         return _dumps(out)
 
 
+
+    @mcp.tool()
+    def wait_job(job_id: str, timeout_s: float = 120.0, poll_s: float = 2.0,
+                 cancel=None) -> str:
+        """Block until a background job (get_job id) finishes or timeout_s passes — use instead of sleep/poll loops.
+
+        Waiting does not cancel the underlying job. A host-supplied cancel callable
+        interrupts only this wait; call wait_job again to retrieve its eventual result.
+        """
+        timeout_s = max(0.0, min(900.0, timeout_s))
+        poll_s = max(0.5, min(30.0, poll_s))
+        start = time.monotonic()
+        deadline = start + timeout_s
+        next_poll = start
+        while True:
+            now = time.monotonic()
+            if now >= next_poll:
+                snapshot = json.loads(get_job(job_id))
+                if "status" not in snapshot or snapshot["status"] != "running":
+                    return _dumps({**snapshot, "waited_s": time.monotonic() - start})
+                next_poll = time.monotonic() + poll_s
+            if cancel is not None and cancel():
+                snapshot = json.loads(get_job(job_id))
+                return _dumps({**snapshot, "waited_s": time.monotonic() - start,
+                               "cancelled_wait": True})
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                snapshot = json.loads(get_job(job_id))
+                result = {**snapshot, "waited_s": time.monotonic() - start}
+                if snapshot.get("status") == "running":
+                    result.update(still_running=True,
+                                  hint=f"Call wait_job('{job_id}') again for the result.")
+                return _dumps(result)
+            time.sleep(min(remaining, max(0.0, next_poll - time.monotonic()), 0.1))
 
     @mcp.tool()
     def recover_parts(all: bool = False, limit: int = 0) -> str:

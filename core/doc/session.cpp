@@ -11517,8 +11517,8 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
         Bnd_Box box;
         std::string id;
         bool usable = false;
-        std::size_t previous_index = no_memo;
-        std::size_t next_index = no_memo;
+        std::size_t previous_index = std::numeric_limits<std::size_t>::max();
+        std::size_t next_index = std::numeric_limits<std::size_t>::max();
     };
     std::vector<Solid> solids;
     auto source_failure = [&](json provenance, const std::string& reason) {
@@ -11709,7 +11709,7 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
         if (!solids[a].usable || !solids[b].usable) return 0.0;
         return solids[a].box.Distance(solids[b].box);
     };
-    auto evaluate = [&](std::size_t a, std::size_t b, bool near) -> PairEvidence {
+    auto evaluate = [&](std::size_t a, std::size_t b, bool check_overlap) -> PairEvidence {
         const auto key = std::minmax(a, b);
         auto cached = distances.find(key);
         if (cached != distances.end()) return cached->second;
@@ -11747,7 +11747,7 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
                 if (!std::isfinite(evidence.distance) || evidence.distance < 0.0)
                     throw std::runtime_error("invalid_distance");
                 evidence.distance_ok = true;
-                if (near) {
+                if (check_overlap) {
                     phase = "overlap";
                     TopTools_ListOfShape args, tools;
                     args.Append(solids[a].shape);
@@ -11767,7 +11767,7 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
                     if (!std::isfinite(overlap)) throw std::runtime_error("invalid_overlap_volume");
                 }
             }
-            if (near) {
+            if (check_overlap) {
                 if (reused) ++reused_exact_pairs;
                 else ++computed_exact_pairs;
                 ++exact_pairs;
@@ -11783,7 +11783,7 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
             // A nearest-only distance is NOT full pair evidence. In particular it
             // cannot skip Common when a larger proximity makes this a candidate
             // on the next call. Failed/partial evidence never reaches this point.
-            if ((near || reused) && next &&
+            if ((check_overlap || reused) && next &&
                 solids[a].next_index != no_memo && solids[b].next_index != no_memo) {
                 const auto new_key = std::minmax(solids[a].next_index, solids[b].next_index);
                 if (next->pairs.size() < IntegrityMemo::max_pairs || next->pairs.count(new_key)) {

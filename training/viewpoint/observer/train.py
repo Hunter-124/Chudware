@@ -459,7 +459,7 @@ def train_observer(corpus: Corpus, train_idx: list, val_idx: list, cfg: TrainCon
         model.train()
         t0 = time.time()
         tot, n_q, n_sets, n_tiles = torch.zeros((), device=device), 0, 0, 0
-        for batch in loader:
+        for step, batch in enumerate(loader):
             tiles, tmask, qvec, mask = _inputs(batch, device, train=True, gen=gen, cfg=cfg,
                                                blind=blind)
             ans = batch["ans"].to(device)
@@ -477,6 +477,13 @@ def train_observer(corpus: Corpus, train_idx: list, val_idx: list, cfg: TrainCon
             n_q += nq
             n_sets += tiles.shape[0]
             n_tiles += int(batch["tmask"].sum())
+            # In-epoch progress: a full-corpus epoch is long enough that silence is
+            # indistinguishable from a stall (the first campaign ran 1.5 h with no line).
+            if step and step % 200 == 0:
+                el = time.time() - t0
+                log(f"[observer] epoch {epoch} step {step}/{steps_per_epoch} "
+                    f"loss={float(tot) / max(n_q, 1):.4g} tiles/s={n_tiles / max(el, 1e-9):.0f} "
+                    f"eta={el / step * (steps_per_epoch - step) / 60:.1f}min")
         dt = time.time() - t0
         rec = {"epoch": epoch, "train_loss": float(tot) / max(n_q, 1), "seconds": round(dt, 2),
                "sets_per_s": round(n_sets / max(dt, 1e-9), 1),

@@ -6,7 +6,8 @@
 #
 #   training/viewpoint/campaign.sh [stage...]     stages: render trials observer observe
 #                                                          utility round2 ab   (default: all)
-# Env: CHUDWARE_VIEWNET_DATA (default ~/.cache/chudware/viewnet), VIEWNET_WORKERS (default 10).
+# Env: CHUDWARE_VIEWNET_DATA (default ~/.cache/chudware/viewnet), VIEWNET_WORKERS (default 10),
+#      VIEWNET_OBS_EPOCHS (default 12), VIEWNET_OBS_FOLDS (default: all; e.g. "2,3,4" to resume).
 # Engine: always a private in-process libchudware — never the user's running hostd.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -28,9 +29,16 @@ stage() {
 run_render()   { stage render   $PY -m training.viewpoint.observer render --workers "$WORKERS"; }
 run_trials()   { stage trials   $PY -m training.viewpoint.utility trials --render-workers "$WORKERS"; }
 run_observer() {
-    stage obs_crossfit    $PY -m training.viewpoint.observer train --judge crossfit
-    stage obs_independent $PY -m training.viewpoint.observer train --judge independent
-    stage obs_report      $PY -m training.viewpoint.observer report
+    # 12 cosine epochs ≈ 1 h per fold on the RTX 3080 Ti at ~150k sets/fold; the report's
+    # learning curve says whether more data or epochs would still pay.
+    local ep="${VIEWNET_OBS_EPOCHS:-12}" folds=()
+    [ -n "${VIEWNET_OBS_FOLDS:-}" ] && folds=(--folds "$VIEWNET_OBS_FOLDS")
+    stage obs_crossfit    $PY -m training.viewpoint.observer train --judge crossfit \
+        --epochs "$ep" "${folds[@]}"
+    stage obs_independent $PY -m training.viewpoint.observer train --judge independent \
+        --epochs "$ep"
+    # Learning curve over 1/8..1 of the training parts × 2 seeds + controls at 8 epochs ≈ 3 h.
+    stage obs_report      $PY -m training.viewpoint.observer report --seeds 0,1 --epochs 8
 }
 run_observe() {
     stage observe_crossfit    $PY -m training.viewpoint.utility observe --judge crossfit

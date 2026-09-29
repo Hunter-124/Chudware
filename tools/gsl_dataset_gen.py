@@ -490,11 +490,12 @@ def _label_faces(doc_id: str, tree_result: dict) -> dict:
 
     doc_query does not itself populate `owner_feature` (that field is only threaded through
     ref selectors, not the plain query path) — so we resolve it ourselves from doc_tree's
-    owner_map, which records each feature's owned (body_id, face_id) pairs. face_id in
-    owner_map is 1-based and equal to the query match's 0-based `hint_index` + 1 (both walk
-    the same describe_faces() enumeration order — see core/doc/session.cpp:doc_query comment).
-    doc_query only ever returns the LAST body's faces, so we resolve that body's id from the
-    current tess bodies list (default 1 for the common single-body case).
+    owner_map, which records each feature's owned [body ordinal, per-body 1-based TopExp face
+    id] pairs. doc_query enumerates EVERY body with one running `hint_index`, so hint_index+1
+    equals the per-body id only on the first body; the engine stamps the exact join keys
+    (`body`, `topo`) on each part-doc match (core/doc/session.cpp doc_query), and those are
+    what we join on. The old `(last body, hint_index+1)` join aliased body 1's faces onto the
+    last body's owners on any multi-body sample.
     """
     owner_map = tree_result.get("owner_map") or {}
     feats = ((tree_result.get("tree") or {}).get("features")) or []
@@ -505,22 +506,14 @@ def _label_faces(doc_id: str, tree_result: dict) -> dict:
             if isinstance(pair, (list, tuple)) and len(pair) == 2:
                 owner_of[(pair[0], pair[1])] = fid
 
-    body_id = 1
-    try:
-        tess = cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": []}).get("tess", {})
-        bodies = tess.get("bodies") or []
-        if bodies:
-            body_id = bodies[-1].get("body_id", 1)
-    except Exception:  # noqa: BLE001 — best-effort; default body_id=1 covers the common case.
-        pass
-
     result = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}})
     matches = result.get("matches", [])
     labelled = []
     for m in matches:
-        hint = m.get("hint_index")
-        face_id = (hint + 1) if isinstance(hint, int) else None
-        fid = owner_of.get((body_id, face_id)) if face_id is not None else None
+        body, topo = m.get("body"), m.get("topo")
+        if not isinstance(body, int) or not isinstance(topo, int):
+            raise CoreError(f"doc_query face match lacks the body/topo join keys: {m!r}")
+        fid = owner_of.get((body, topo))
         m2 = dict(m)
         m2["owner_feature_id"] = fid
         m2["label"] = fmap.get(fid, {}).get("type") if fid else "import_or_base"

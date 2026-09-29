@@ -39,10 +39,17 @@ Run from the repo root; requires the built C++ core (`libchudware.so` under
 ## Label semantics
 
 `faces.json[i].label` = the TYPE of the feature that owns the face, resolved by
-joining `doc_tree`'s `owner_map` `[body_id, topo_id]` pairs against the match's
-`hint_index+1` (both follow the same `describe_faces()` enumeration order —
-`doc_query`'s own `owner_feature` field is always null on this RPC path).
-Ownerless faces get `"import_or_base"`.
+joining `doc_tree`'s `owner_map` `[body, face_id]` pairs (body ordinal, per-body
+1-based TopExp face id) against the match's engine-stamped `body` and `topo`
+keys. `doc_query` numbers faces across EVERY body with one running
+`hint_index`, so `hint_index+1` equals the per-body id only on the first body;
+joining on it (as the generator did before 2026-09-28) mislabels every
+multi-body sample. `doc_query`'s own `owner_feature` field is always null on
+this RPC path. Ownerless faces get `"import_or_base"`.
+
+`adjacency.json` comes from `doc_adjacency`, which covers the LAST body only:
+its `ord` is that body's describe_faces index, so on a multi-body sample
+`faces.json` index = `ord` + the face count of every preceding body.
 
 ## Consumers
 

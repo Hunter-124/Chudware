@@ -124,7 +124,10 @@ runtime's doctor command.
 2b. The main chat (`worker_rpc._agent_admin_turn`) advertises
    `tool_categories.MAIN_CHAT_CORE_TOOLS`, now including `part_search`, `part_get`,
    `part_source`, `match_model`, `make_standard_part`, `fetch_cad_model`,
-   `import_artifact` and `simulate_motion`. Its system prompt carries the MORE TOOLS menu
+   `import_artifact` and `simulate_motion`, plus (2026-09-28, the tools c211–c233 loaded on
+   demand or bypassed through bash) `inspect_native_files`, `read_native_file`, `get_job`,
+   `wait_job`, `inspect_section`, `dfm_check`, `analyze_stl_geometry`, `list_world_bodies`,
+   `interface_check` and `render_animation`. Its system prompt carries the MORE TOOLS menu
    naming every other registered tool; `enable_tools(tools=[...])` and
    `enable_tools(categories=[group])` load the rest mid-turn through the single refresh
    callback `chudcode_roles._register_category_refresh` (re-runs `build_host_tools` and
@@ -189,9 +192,29 @@ runtime's doctor command.
    delegated roles) appends `skills.catalog_block()`; the fetch verb is the CAD host tool
    `cad_skill(name, path=None)` (`cad_doc_tools`, `MAIN_CHAT_CORE_TOOLS` +
    `copilot_mode_tools.META_TOOL_FLOOR`, so a capped role can still see it). Trigger-based
-   injection is `chudcode_tools._with_skill_injection`: a skill whose `triggers.tools` names
-   the dispatched tool rides back as a bounded prefix on that tool's FIRST result text per
-   session, with `details` untouched. Never re-copy a SKILL.md into a role card.
+   injection is `chudcode_tools._skill_prefix` + `_prefixed`: a skill whose `triggers.tools`
+   names the dispatched tool rides back as a bounded prefix on that tool's FIRST result text
+   per session, with `details` untouched. A call from eval (`_eval_bridged`: Chudcode's
+   bridge ids are `js-<tool>-<uuid>` for the Python and JS kernels) never gets it and does
+   not consume it — eval code `json.loads` the text, and the prefix broke every parse.
+   Never re-copy a SKILL.md into a role card.
+9b. **Results stay parseable, bounded and honest (2026-09-28).** Chudcode spills a result over
+   `tools.artifactSpillThreshold` (50 KB) to an artifact with a 20 KB head + tail, and `write
+   xd://` then REPLACES the CAD `details` with its truncation meta, so a 600 KB `describe_part`
+   reached the model and eval as broken JSON (c211–c230: dozens of eval cells writing
+   `[X result]`/artifact/line-number strippers). `host_tool_result` parses JSON-text returns
+   (most MCP tools return `json.dumps`) into `details`, and bounds the text to
+   `_RESULT_TEXT_BYTES` (46 000 B) minus any skill prefix: top-level keys survive, and below
+   them the list/string/id-keyed map whose halving saves most is halved first
+   (`_shorten_largest`, so a 16-number transform stays whole while the component list
+   shortens); a `_truncated{full_result, full_bytes, shortened}` key names the complete JSON
+   spilled to `<data>/cache/tool_results/<session>/` (`_spill_full_result`, 100 kept).
+   A CAD `{"ok": false}` is a normal return with `isError` unset: `chudcode_events.
+   cad_result_payload` reads `details` or `details.xdev.inner`, so the feed card fails with
+   the tool's own `error`/`outcome_kind` and `ProgressWatchdog` does not count it as a
+   mutation. The host dispatch path runs `agent_turn._reconcile_kwargs` like the offline
+   resolver: synonyms map (reported in `arg_interpretation`), unknown/missing arguments are
+   teaching errors that charge no cap — never a raw `TypeError` naming `<locals>`.
 10. For physical sourcing, `core/parts/{catalog,generate}.cpp` supplies the cited
     `hobby_servo` envelopes (SG90/MG90S/MG996R/MG995/DS3218/micro_9g);
     `core/api/libchudware.cpp::parts_make_impl` publishes the `output_axis` datum.

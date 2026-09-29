@@ -446,6 +446,45 @@ def _result_text(result: Any) -> str:
     return _cap("\n".join(parts).strip(), _MAX_PREVIEW)
 
 
+def cad_result_payload(result: Any) -> Mapping[str, Any] | None:
+    """The CAD tool's own structured result inside a Chudcode tool result.
+
+    A direct host-tool call carries it as ``details``; ``write xd://<tool>`` nests
+    it as ``details.xdev.inner``. Both reach Chudcode with ``isError`` unset for a
+    CAD ``{"ok": false, ...}`` result, which is a normal return, not an exception.
+    """
+    if not isinstance(result, Mapping):
+        return None
+    details = result.get("details")
+    if isinstance(details, Mapping) and isinstance(details.get("xdev"), Mapping):
+        details = details["xdev"].get("inner")
+    return details if isinstance(details, Mapping) else None
+
+
+def _cad_failure(result: Any) -> Mapping[str, Any] | None:
+    payload = cad_result_payload(result)
+    return payload if payload is not None and payload.get("ok") is False else None
+
+
+def _cad_failure_outcome(failure: Mapping[str, Any]) -> str:
+    """``outcome_kind`` for a CAD ``ok:false`` payload (the feed's one vocabulary)."""
+    status = _name(_str(failure, "status"))
+    if status == "guardrail_blocked":
+        return "guard_block"
+    if failure.get("policy_refusal") is True:
+        return "policy_refusal"
+    if failure.get("timed_out") is True:
+        return "timeout_unknown"
+    try:
+        from services.agent.tool_loop_guard import VALIDATION_FAILURE_STATUSES
+    except Exception:  # noqa: BLE001 - classification is best-effort
+        VALIDATION_FAILURE_STATUSES = frozenset()
+    if status in VALIDATION_FAILURE_STATUSES:
+        return "validation_error"
+    return "tool_error"
+
+
+
 def _tool_end(
     event: str,
     data: Mapping[str, Any],
@@ -489,6 +528,10 @@ def _tool_end(
     if ok is None:
         is_error = _bool(data, "isError", "is_error")
         ok = not cancelled and is_error is not True and not bool(error)
+    failure = _cad_failure(result) if ok else None
+    if failure is not None:
+        ok = False
+        error = error or _str(failure, "error", "reason", "status", limit=_MAX_PREVIEW)
     display_args, xd_kind = _tool_display_args(args)
     args_preview = (
         "" if xd_kind else _str(data, "argsPreview", "args_preview", limit=_MAX_PREVIEW)
@@ -532,7 +575,11 @@ def _tool_end(
         "tool_error",
     }:
         payload["outcome_kind"] = outcome
+    elif failure is not None:
+        payload["outcome_kind"] = _cad_failure_outcome(failure)
     executed = _bool(data, "executed")
+    if executed is None and failure is not None:
+        executed = _bool(failure, "executed")
     if executed is not None:
         payload["executed"] = executed
     artifacts = data.get("artifacts")

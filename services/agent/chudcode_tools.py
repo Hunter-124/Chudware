@@ -11,9 +11,11 @@ import inspect
 import json
 import logging
 import math
+import os
 import threading
 import time
 import types
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
@@ -112,25 +114,36 @@ class HostToolBinding:
             # the parent's client; chudcode_rpc names it on the context (None for
             # the top-level agent, and on runtimes that predate the field).
             agent_id = getattr(host_context, "agent_id", None)
-            report = _nested_call_reporter(
-                self, getattr(host_context, "tool_call_id", None), agent_id, params
-            )
+            tool_call_id = getattr(host_context, "tool_call_id", None)
+            report = _nested_call_reporter(self, tool_call_id, agent_id, params)
             try:
+                raw = dispatch_host_tool(
+                    self,
+                    params,
+                    progress,
+                    cancel,
+                    agent_id=agent_id,
+                    parent_agent_id=getattr(host_context, "parent_agent_id", None),
+                )
+                # eval's own code reads this text (json.loads), so a skill body in
+                # front of the JSON broke every parse, and the model never sees the
+                # text anyway. The first-touch injection waits for a direct call.
+                prefix = (
+                    ""
+                    if _eval_bridged(tool_call_id)
+                    else _skill_prefix(self, agent_id=agent_id)
+                )
+                prefix_bytes = len(prefix.encode("utf-8"))
                 result = host_tool_result(
-                    dispatch_host_tool(
-                        self,
-                        params,
-                        progress,
-                        cancel,
-                        agent_id=agent_id,
-                        parent_agent_id=getattr(host_context, "parent_agent_id", None),
-                    )
+                    raw,
+                    max_bytes=max(_RESULT_MIN_BYTES, _RESULT_TEXT_BYTES - prefix_bytes),
+                    spill=lambda value: _spill_full_result(self, value),
                 )
             except Exception as exc:
                 report(None, exc)
                 raise
             report(result, None)
-            return _with_skill_injection(self, result, agent_id=agent_id)
+            return _prefixed(self, result, prefix)
 
         return factory(
             name=self.name,
@@ -146,7 +159,37 @@ class HostToolBinding:
         return self.as_dict()
 
 
-def host_tool_result(result: Any) -> dict[str, Any]:
+#: Chudcode spills any tool result whose text exceeds ``tools.artifactSpillThreshold``
+#: (50 KB default) to an artifact, keeping a 20 KB head and tail, and the
+#: ``write xd://`` device then REPLACES the host tool's ``details`` with its
+#: truncation meta. The model got a head and a tail of broken JSON; eval code got
+#: text no ``json.loads`` could parse and no structured fallback (c211-c230: dozens
+#: of cells writing ``[describe_assembly result]``/artifact/line-number strippers,
+#: a 615 KB describe_part). Results are bounded below that threshold here instead:
+#: still valid JSON, the full value saved to a file the text names. The budget
+#: covers any skill body prefixed to the same text.
+_RESULT_TEXT_BYTES = 46_000
+#: Floor for a result that shares the budget with a skill body.
+_RESULT_MIN_BYTES = 16_000
+#: Shortening rounds before falling back to the marker alone; each round halves every
+#: node within 2x of the best saving, so real results converge in a few dozen.
+_SHORTEN_ROUNDS = 200
+#: Strings keep at least this many chars; objects with more keys than this are maps.
+_MIN_STRING_CHARS = 80
+_MAP_KEYS = 16
+_TRUNCATED_KEY = "_truncated"
+_SHORTENED_LISTED = 12
+_TRAILING_NOTE_CHARS = 2000
+#: Spilled results kept per conversation.
+_SPILL_KEEP = 100
+
+
+def host_tool_result(
+    result: Any,
+    *,
+    max_bytes: int = _RESULT_TEXT_BYTES,
+    spill: Callable[[Any], str | None] | None = None,
+) -> dict[str, Any]:
     """Wrap a CAD tool's return value in the envelope Chudcode's RPC requires.
 
     A ``host_tool_result`` whose ``result`` lacks ``content`` NEVER resolves inside
@@ -155,13 +198,16 @@ def host_tool_result(result: Any) -> dict[str, Any]:
     cap (verified live with ``chud --mode rpc`` 0.3.0 for ``{"ok": false, ...}``,
     ``{"ok": true, ...}`` and ``{"docs": [...]}``; a bare string or a
     ``{"content": [...]}`` mapping completes immediately).  Every CAD tool returns a
-    raw JSON object, so this is the single place the envelope is applied: the model
-    reads the JSON as text and ``details`` keeps the structured result for the event
-    mapper.
+    JSON object or JSON text, so this is the single place the envelope is applied:
+    the model reads the JSON as text and ``details`` keeps the structured result for
+    the event mapper, the progress watchdog and eval code. Most MCP tools return
+    ``json.dumps(...)`` strings; those are parsed for ``details`` too, or a failed
+    ``{"ok": false}`` looked like a success to every structured consumer.
 
     The text is the one copy the model pays for, on every later request of the
-    conversation, so JSON goes out in :func:`model_json` form. Most MCP tools hand
-    back ``json.dumps(..., indent=2)`` strings; those are re-rendered the same way.
+    conversation, so JSON goes out in :func:`model_json` form, and a result over
+    *max_bytes* (UTF-8) is shortened to fit (see :func:`_bounded_result`), the
+    complete value going to ``spill``'s file.
 
     Images a tool returned (render tools' ``[Image, caption]``) follow the text as
     ``{"type": "image", "mimeType", "data"}`` blocks — Chudcode passes result content
@@ -173,11 +219,198 @@ def host_tool_result(result: Any) -> dict[str, Any]:
     the PNG to see anything).
     """
     if isinstance(result, str):
-        return {"content": [{"type": "text", "text": _compact_json_text(result)}]}
+        parsed = _json_text_value(result)
+        if parsed is None:
+            return {"content": [{"type": "text", "text": result}]}
+        value, trailing = parsed
+        safe = _json_safe(value)
+        text = _compact_json_text(result)
+        if _fits(text, max_bytes):
+            return {"content": [{"type": "text", "text": text}], "details": safe}
+        return _bounded_result(safe, [trailing], [], max_bytes, spill)
     safe = _json_safe(result)
     images, notes = _model_image_blocks(safe)
     text = "\n".join((model_json(safe), *notes))
-    return {"content": [{"type": "text", "text": text}, *images], "details": safe}
+    if _fits(text, max_bytes):
+        return {"content": [{"type": "text", "text": text}, *images], "details": safe}
+    return _bounded_result(safe, notes, images, max_bytes, spill)
+
+
+def _json_text_value(text: str) -> tuple[Any, str] | None:
+    """(value, trailing prose) of a tool's JSON object/array text, else None."""
+    stripped = text.lstrip()
+    if not stripped.startswith(("{", "[")):
+        return None
+    try:
+        value, end = json.JSONDecoder().raw_decode(stripped)
+    except ValueError:
+        return None
+    return value, stripped[end:].strip()
+
+
+def _fits(text: str, max_bytes: int) -> bool:
+    return len(text.encode("utf-8")) <= max_bytes
+
+
+def _bounded_result(
+    value: Any,
+    notes: Sequence[str],
+    images: list[dict[str, str]],
+    max_bytes: int,
+    spill: Callable[[Any], str | None] | None,
+) -> dict[str, Any]:
+    """Shorten an over-budget result to valid JSON that names where the rest is.
+
+    Top-level keys always survive (``ok``/``error``/``doc_id`` are what a caller
+    branches on). Below them, whatever shrinks the text most is halved first — the
+    long list, the huge string, the id-keyed map — so small records stay whole: a
+    57-component list gets shorter, each component's 16-number transform does not.
+    A ``_truncated`` key records the shortened paths with their original sizes and
+    ``full_result``, a JSON file holding the complete value. ``details`` carries the
+    same shortened value, so structured consumers and the text never disagree.
+    """
+    full_bytes = len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+    path: str | None = None
+    if spill is not None:
+        try:
+            path = spill(value)
+        except Exception as exc:  # noqa: BLE001 - a failed save never fails the call
+            _debug_fallback("tool result spill", exc)
+    tail = [
+        note if len(note) <= _TRAILING_NOTE_CHARS else note[:_TRAILING_NOTE_CHARS] + " …"
+        for note in notes
+        if note
+    ]
+    holder = [json.loads(json.dumps(value, ensure_ascii=False, default=str))]
+    shortened: dict[str, int] = {}
+    for _round in range(_SHORTEN_ROUNDS):
+        body = _with_truncation_marker(holder[0], shortened, full_bytes, max_bytes, path)
+        text = "\n".join((model_json(body), *tail))
+        if _fits(text, max_bytes):
+            return {"content": [{"type": "text", "text": text}, *images], "details": body}
+        if not _shorten_largest(holder, shortened):
+            break
+    body = _with_truncation_marker(None, {"$": full_bytes}, full_bytes, max_bytes, path)
+    return {"content": [{"type": "text", "text": model_json(body)}, *images], "details": body}
+
+
+def _shorten_largest(holder: list[Any], shortened: dict[str, int]) -> bool:
+    """Halve every node whose halving saves at least half the best saving; False when
+    nothing can shrink. Lists keep their head (≥1 item), strings their start, and only
+    map-like objects (more than ``_MAP_KEYS`` keys, below the top level) lose keys."""
+    candidates: list[tuple[int, Any, Any, str, Any]] = []
+
+    def size(node: Any, container: Any, key: Any, where: str, depth: int) -> int:
+        if isinstance(node, str):
+            total = len(node) + 2
+            if len(node) > _MIN_STRING_CHARS:
+                candidates.append((total // 2, container, key, where, node))
+            return total
+        if isinstance(node, list):
+            sizes = [
+                size(item, node, index, f"{where}[{index}]", depth + 1)
+                for index, item in enumerate(node)
+            ]
+            if len(node) > 1:
+                candidates.append((sum(sizes[len(node) // 2:]), container, key, where, node))
+            return 2 + sum(sizes) + len(sizes)
+        if isinstance(node, dict):
+            sizes = [
+                size(item, node, name, f"{where}.{name}", depth + 1) + len(name) + 4
+                for name, item in node.items()
+            ]
+            if depth > 0 and len(node) > _MAP_KEYS:
+                candidates.append((sum(sizes[len(node) // 2:]), container, key, where, node))
+            return 2 + sum(sizes)
+        return len(json.dumps(node, default=str))
+
+    size(holder[0], holder, 0, "$", 0)
+    if not candidates:
+        return False
+    best = max(gain for gain, *_ in candidates)
+    for gain, container, key, where, node in candidates:
+        if gain * 2 < best:
+            continue
+        shortened.setdefault(where, len(node))
+        if isinstance(node, str):
+            container[key] = node[: max(_MIN_STRING_CHARS, len(node) // 2)] + " …"
+        elif isinstance(node, list):
+            container[key] = node[: len(node) // 2]
+        else:
+            container[key] = dict(list(node.items())[: len(node) // 2])
+    return True
+
+
+def _with_truncation_marker(
+    body: Any,
+    shortened: Mapping[str, int],
+    full_bytes: int,
+    max_bytes: int,
+    path: str | None,
+) -> dict[str, Any]:
+    listed = dict(list(shortened.items())[:_SHORTENED_LISTED])
+    marker: dict[str, Any] = {
+        "full_result": path,
+        "full_bytes": full_bytes,
+        "shortened": listed,
+        "note": (
+            f"This result is {full_bytes} bytes, over the {max_bytes}-byte tool-result "
+            "budget, so the lists/objects/strings listed under 'shortened' (path: "
+            "original size) keep only their first entries. "
+            + (
+                "The complete JSON is saved at the full_result path: load it with "
+                "json.load(open(path)) in eval, or read it with a line range."
+                if path
+                else "The complete result could not be saved; narrow the call instead."
+            )
+        ),
+    }
+    if len(shortened) > len(listed):
+        marker["shortened_paths_total"] = len(shortened)
+    if isinstance(body, Mapping):
+        return {**body, _TRUNCATED_KEY: marker}
+    if body is None:
+        return {_TRUNCATED_KEY: marker}
+    return {"items": body, _TRUNCATED_KEY: marker}
+
+
+def _spill_full_result(binding: HostToolBinding, value: Any) -> str | None:
+    """Write a complete over-budget result under the conversation's cache dir."""
+    from services import paths
+
+    conversation = str(
+        _ctx(binding.context, "session_id", None)
+        or _ctx(binding.context, "run_id", None)
+        or "adhoc"
+    )
+    safe_conversation = "".join(
+        ch if ch.isalnum() or ch in "._-" else "_" for ch in conversation
+    )[:80] or "adhoc"
+    folder = Path(paths.ROOT) / "cache" / "tool_results" / safe_conversation
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    target = folder / f"{stamp}-{binding.name}-{uuid.uuid4().hex[:8]}.json"
+    staging = target.with_suffix(".json.part")
+    staging.write_text(
+        json.dumps(value, ensure_ascii=False, indent=1, default=str), encoding="utf-8"
+    )
+    os.replace(staging, target)
+    kept = sorted(folder.glob("*.json"), key=lambda item: item.stat().st_mtime)
+    for stale in kept[:-_SPILL_KEEP]:
+        try:
+            stale.unlink()
+        except OSError as exc:
+            _debug_fallback("tool result spill prune", exc)
+    return str(target)
+
+
+def _eval_bridged(tool_call_id: Any) -> bool:
+    """True for a CAD call made from eval code (``tool.write("xd://…")``).
+
+    Chudcode's eval bridge mints ``js-<tool>-<uuid>`` call ids for the Python and
+    JS kernels alike; model tool calls carry the provider's id.
+    """
+    return isinstance(tool_call_id, str) and tool_call_id.startswith("js-")
 
 
 def _model_image_blocks(safe: Any) -> tuple[list[dict[str, str]], list[str]]:
@@ -304,27 +537,19 @@ def _compact_json_text(text: str) -> str:
     return rendered if len(rendered) < len(text) else text
 
 
-def _with_skill_injection(
-    binding: HostToolBinding, envelope: dict[str, Any], *, agent_id: str | None = None
-) -> dict[str, Any]:
-    """Prefix a trigger-matched skill body to this tool's FIRST result text.
+def _skill_prefix(binding: HostToolBinding, *, agent_id: str | None = None) -> str:
+    """Trigger-matched skill bodies for this tool's FIRST result, else ``""``.
 
     The offline loop injects a skill's body when a turn is about to reach one of
     its ``triggers.tools`` (``agent_turn`` calls ``skills.activate_for_prompt``
     with ``tools_about_to_run``). Online, the model's turn is inside Chudcode and
     the only CAD chokepoint left is this dispatch, so the body rides back on the
     tool's own result — the first time that conversation touches the tool, once,
-    within ``skills.SKILL_BODY_CHAR_LIMIT``. ``details`` is untouched, so the
-    event mapper and every structured consumer see exactly the tool's own result.
-    A Chudcode task sub-agent (``agent_id``) has its own context window, so it
-    gets its own first-touch injection rather than inheriting the parent's.
+    within ``skills.SKILL_BODY_CHAR_LIMIT``. Activation marks the body delivered,
+    so call this only for a result that will carry it. A Chudcode task sub-agent
+    (``agent_id``) has its own context window, so it gets its own first-touch
+    injection rather than inheriting the parent's.
     """
-    content = envelope.get("content")
-    if not isinstance(content, list) or not content:
-        return envelope
-    first = content[0]
-    if not isinstance(first, dict) or first.get("type") != "text":
-        return envelope
     conversation = str(
         _ctx(binding.context, "session_id", None)
         or _ctx(binding.context, "run_id", None)
@@ -345,10 +570,24 @@ def _with_skill_injection(
         )
     except Exception as exc:  # noqa: BLE001 — a broken skills dir never fails a call
         _debug_fallback(f"skill injection for {binding.name}", exc)
+        return ""
+    return "\n\n".join(bodies) if bodies else ""
+
+
+def _prefixed(
+    binding: HostToolBinding, envelope: dict[str, Any], prefix: str
+) -> dict[str, Any]:
+    """Put *prefix* (skill bodies) in front of the result's first text block.
+
+    ``details`` is untouched, so the event mapper and every structured consumer
+    see exactly the tool's own result.
+    """
+    content = envelope.get("content")
+    if not prefix or not isinstance(content, list) or not content:
         return envelope
-    if not bodies:
+    first = content[0]
+    if not isinstance(first, dict) or first.get("type") != "text":
         return envelope
-    prefix = "\n\n".join(bodies)
     merged = dict(envelope)
     merged["content"] = [
         {
@@ -735,8 +974,12 @@ def _var_param_names(fn: Any) -> frozenset[str]:
     )
 
 
+#: Parameters dispatch supplies itself (the host's progress sink and Stop probe).
+_HOST_INJECTED_PARAMS = ("progress", "cancel")
+
+
 def _without_catch_alls(schema: dict[str, Any], fn: Any) -> dict[str, Any]:
-    """Drop catch-all pseudo-properties from a registry-supplied tool schema.
+    """Drop catch-all and host-injected pseudo-properties from a registry schema.
 
     FastMCP derives a tool's ``inputSchema`` from its signature through Pydantic,
     which models a ``**extra: Any`` catch-all as a field named ``extra`` — and,
@@ -747,8 +990,11 @@ def _without_catch_alls(schema: dict[str, Any], fn: Any) -> dict[str, Any]:
     the live plan panel therefore never published a single item. Thirty-four
     further tools advertised the same phantom argument as optional, inviting the
     model to fill it with junk that lands in the tool's user-intent channel.
+    A declared ``progress``/``cancel`` is the host's callable, never model input.
     """
-    names = _var_param_names(fn)
+    names = _var_param_names(fn) | {
+        name for name in _HOST_INJECTED_PARAMS if callable(fn) and _accepts(fn, name)
+    }
     if not names:
         return schema
     out = dict(schema)
@@ -1263,25 +1509,35 @@ def dispatch_host_tool(
 
     def inner(name: str, merged: dict[str, Any]) -> Any:
         actual = _document_args(target, merged, binding.context)
-        if callable(mission_fn):
-            if _accepts(mission_fn, "progress"):
-                actual.setdefault("progress", progress)
-            if _accepts(mission_fn, "cancel"):
-                actual.setdefault("cancel", cancel)
-            return mission_fn(**actual)
-        if callable(dispatcher):
+        if not callable(mission_fn) and callable(dispatcher):
             return _call_run_dispatcher(
                 dispatcher, name, actual, binding.context, progress, cancel
             )
         if not callable(target):
             raise TypeError(f"tool {name!r} is no longer bound in this run")
+        # The offline resolver path reconciles keyword arguments against the
+        # tool's real signature (synonyms, dropped labels, teaching errors); this
+        # path used to call straight through, so a model's `plm_save(message=…)`
+        # surfaced as "register_plm_tools.<locals>.plm_save() got an unexpected
+        # keyword argument 'message'" — a raised error that also charged the cap.
+        model_args = {k: v for k, v in actual.items() if k not in _HOST_INJECTED_PARAMS}
+        kwargs, notes, arg_error = _reconcile_kwargs(name, target, model_args)
+        if arg_error is not None:
+            return arg_error
+        # Host callables, never a model-supplied value (`"cancel": true` would be
+        # called as a function).
         if _accepts(target, "progress"):
-            actual.setdefault("progress", progress)
+            kwargs["progress"] = progress
         if _accepts(target, "cancel"):
-            actual.setdefault("cancel", cancel)
-        return target(**actual)
+            kwargs["cancel"] = cancel
+        result = target(**kwargs)
+        return _attach_arg_notes(result, notes) if notes else result
 
-    from services.agent.agent_turn import _dispatch_tool
+    from services.agent.agent_turn import (
+        _attach_arg_notes,
+        _dispatch_tool,
+        _reconcile_kwargs,
+    )
 
     call_counts = _ctx(binding.context, "tool_call_counts", None)
     if call_counts is None and isinstance(binding.context, dict):
@@ -1300,7 +1556,11 @@ def dispatch_host_tool(
     if records is None:
         records = binding.metadata.get("tool_calls")
     if isinstance(records, list):
-        ok = not (isinstance(safe_result, Mapping) and safe_result.get("ok") is False)
+        structured = safe_result
+        if isinstance(safe_result, str):
+            parsed = _json_text_value(safe_result)
+            structured = parsed[0] if parsed is not None else None
+        ok = not (isinstance(structured, Mapping) and structured.get("ok") is False)
         record = {
             "tool": binding.name,
             "args": _json_safe(call_args),

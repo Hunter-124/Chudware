@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
+from services.agent.chudcode_events import cad_result_payload
 from services.mcp.tool_registry import RISK_READ, catalog, classify_risk
 
 _DEFAULT_RESEARCH_CALLS = 12
@@ -66,11 +67,12 @@ def _succeeded(data: Mapping[str, Any]) -> bool:
     if data.get("ok", data.get("success", True)) is False:
         return False
     response = data.get("result", data.get("output", data))
-    if isinstance(response, Mapping):
-        details = response.get("details", response)
-        if isinstance(details, Mapping) and details.get("ok") is False:
-            return False
-    return True
+    # A CAD ok:false comes back as a normal result; under `write xd://` it sits in
+    # details.xdev.inner, so a failed add_features used to count as progress.
+    payload = cad_result_payload(response)
+    if payload is None and isinstance(response, Mapping) and "details" not in response:
+        payload = response
+    return not (payload is not None and payload.get("ok") is False)
 
 
 def _research_tool(name: str, args: Any) -> bool:

@@ -859,6 +859,32 @@ class ChudcodeEventMapperTests(unittest.TestCase):
         self.assertEqual(invalid["target"], "")
         self.assertNotIn("args_preview", invalid)
 
+    def test_a_cad_ok_false_result_is_a_failed_card_not_a_success(self):
+        """Chudcode reports a CAD {"ok": false} return with isError unset; under
+        `write xd://` it sits in details.xdev.inner. The card must fail with the
+        tool's own reason and outcome, direct or via the device."""
+        refusal = {"ok": False, "status": "guardrail_blocked", "policy_refusal": True,
+                   "executed": False, "error": "HARD guardrail: dangling refs m3"}
+        failure = {"ok": False, "error": "fillet: 4 mm is too large for the selected edge(s)"}
+        cases = [
+            ({"content": [{"type": "text", "text": "{}"}],
+              "details": {"xdev": {"tool": "add_features", "mode": "execute", "inner": refusal}}},
+             "HARD guardrail: dangling refs m3", "guard_block", False),
+            ({"content": [{"type": "text", "text": "{}"}], "details": failure},
+             failure["error"], "tool_error", None),
+        ]
+        for result, error, outcome, executed in cases:
+            _, row = one({"type": "tool_execution_end", "toolCallId": "c", "toolName": "write",
+                          "args": {"path": "xd://add_features", "content": "{}"}, "result": result})
+            self.assertIs(row["ok"], False)
+            self.assertEqual(row["error_preview"], error)
+            self.assertEqual(row["outcome_kind"], outcome)
+            self.assertEqual(row.get("executed"), executed)
+        _, ok_row = one({"type": "tool_execution_end", "toolCallId": "d", "toolName": "write",
+                         "args": {"path": "xd://add_features", "content": "{}"},
+                         "result": {"details": {"xdev": {"inner": {"ok": True}}}}})
+        self.assertIs(ok_row["ok"], True)
+
     def test_known_metadata_and_notices_do_not_produce_completed_subruns(self):
         for frame in [
             {"type": "thinking_level_change", "thinkingLevel": "xhigh"},

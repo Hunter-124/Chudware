@@ -964,5 +964,175 @@ class HostToolImageDeliveryTests(unittest.TestCase):
         self.assertIn(f"[image not attached: {gone} is unreadable", content[0]["text"])
 
 
+class _CallContext:
+    """The chudcode_rpc HostToolContext fields ``execute`` reads."""
+
+    cancelled = False
+    agent_id = None
+    parent_agent_id = None
+
+    def __init__(self, tool_call_id):
+        self.tool_call_id = tool_call_id
+
+
+class HostToolResultEdgeTests(unittest.TestCase):
+    """c211-c230: CAD results reached eval as unparseable text and every ok:false
+    looked like a success to structured consumers."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        patcher = mock.patch("services.paths.ROOT", Path(self._tmp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _execute(self, handler, params=None, *, call_id="toolu_1", name="probe", **context):
+        binding = HostToolBinding(
+            name=name,
+            description=name,
+            input_schema={"type": "object"},
+            handler=handler,
+            context={"policy_registry": _Policy(), "session_id": "c1", **context},
+        )
+        tool = binding.to_host_tool(lambda **kw: kw)
+        return tool["execute"](params or {}, _CallContext(call_id)), binding.context
+
+    def test_json_text_result_carries_structured_details_and_its_failure(self):
+        records = []
+        out, _ = self._execute(
+            lambda: json.dumps({"ok": False, "error": "fillet too large"}, indent=2),
+            tool_calls=records,
+        )
+        self.assertEqual(out["details"], {"ok": False, "error": "fillet too large"})
+        self.assertEqual(json.loads(out["content"][0]["text"])["error"], "fillet too large")
+        self.assertIs(records[-1]["ok"], False)
+
+    def test_oversized_result_is_valid_json_under_budget_with_the_full_value_saved(self):
+        faces = [{"sid": f"F{i:05d}", "area": i * 1.5, "side": "top"} for i in range(6000)]
+        full = {"ok": True, "doc_id": "doc-9", "summary": "6000 faces", "faces": faces}
+        out, _ = self._execute(lambda: json.dumps(full, indent=2))
+        text = out["content"][0]["text"]
+        self.assertLessEqual(len(text.encode("utf-8")), 46_000)
+        body = json.loads(text)
+        self.assertEqual(body, out["details"])
+        # What a caller branches on survives; the long list keeps its head.
+        self.assertEqual((body["ok"], body["doc_id"], body["summary"]), (True, "doc-9", "6000 faces"))
+        self.assertEqual(body["faces"][0], faces[0])
+        marker = body["_truncated"]
+        self.assertEqual(marker["shortened"]["$.faces"], 6000)
+        with open(marker["full_result"], encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), full)
+
+    def test_shortening_cuts_the_long_list_not_each_records_small_fields(self):
+        """A partial 4x4 transform is wrong data, not less data (live: the first
+        uniform cut halved every component's 16 numbers)."""
+        comps = [{"id": f"k{i}", "name": f"Part {i}", "transform": [float(i)] * 16,
+                  "source": {"path": f"parts/p{i}.step+"}} for i in range(900)]
+        out, _ = self._execute(lambda: {"ok": True, "components": comps})
+        body = json.loads(out["content"][0]["text"])
+        self.assertLess(len(body["components"]), 900)
+        self.assertTrue(all(len(c["transform"]) == 16 for c in body["components"]))
+        self.assertEqual(body["_truncated"]["shortened"], {"$.components": 900})
+
+    def test_oversized_top_level_list_stays_parseable(self):
+        rows = [{"i": i, "name": "x" * 40} for i in range(5000)]
+        out, _ = self._execute(lambda: rows)
+        body = json.loads(out["content"][0]["text"])
+        self.assertEqual(body["items"][0], rows[0])
+        with open(body["_truncated"]["full_result"], encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), rows)
+
+    def test_eval_bridged_call_defers_first_touch_skill_body_to_a_direct_call(self):
+        delivered = set()
+
+        def activate(_text, *, session_id=None, **_kw):
+            if session_id in delivered:
+                return []
+            delivered.add(session_id)
+            return ["[SKILL: probe]\nbody"]
+
+        handler = lambda: {"ok": True, "n": 1}
+        with mock.patch("services.agent.skills.activate_for_prompt", side_effect=activate):
+            from_eval, _ = self._execute(handler, call_id="js-write-0b1c")
+            direct, _ = self._execute(handler, call_id="toolu_2")
+            again, _ = self._execute(handler, call_id="toolu_3")
+        self.assertEqual(json.loads(from_eval["content"][0]["text"]), {"ok": True, "n": 1})
+        self.assertTrue(direct["content"][0]["text"].startswith("[SKILL: probe]"))
+        self.assertEqual(json.loads(again["content"][0]["text"]), {"ok": True, "n": 1})
+
+    def test_unknown_keyword_is_a_teaching_error_that_charges_nothing(self):
+        """Live: plm_save(message=…) surfaced as "register_plm_tools.<locals>.
+        plm_save() got an unexpected keyword argument 'message'"."""
+        calls = []
+
+        def plm_save(path: str | None = None, doc_id: str | None = None):
+            calls.append(path)
+            return {"ok": True}
+
+        counts = {}
+        with mock.patch(
+            "services.agent.config.effective_tool_call_cap", return_value=1
+        ):
+            result = dispatch_host_tool(
+                HostToolBinding(
+                    name="plm_save",
+                    description="plm_save",
+                    input_schema={"type": "object"},
+                    handler=plm_save,
+                    context={"policy_registry": _Policy(), "tool_call_counts": counts},
+                ),
+                {"path": "/p", "zzz_unrelated_flag": 7},
+                None,
+                None,
+            )
+        self.assertIs(result["ok"], False)
+        self.assertIn("zzz_unrelated_flag", json.dumps(result))
+        self.assertEqual(calls, [])
+        self.assertEqual(counts, {})
+
+    def test_synonym_argument_is_mapped_and_the_mapping_reported(self):
+        seen = {}
+
+        def measure(doc_id: str | None = None, density_g_cm3: float | None = None):
+            seen["density"] = density_g_cm3
+            return {"ok": True}
+
+        result = dispatch_host_tool(
+            HostToolBinding(
+                name="measure_part",
+                description="measure_part",
+                input_schema={"type": "object"},
+                handler=measure,
+                context={"policy_registry": _Policy()},
+            ),
+            {"density": 1.24},
+            None,
+            None,
+        )
+        self.assertEqual(seen["density"], 1.24)
+        self.assertIn("density_g_cm3", result["arg_interpretation"])
+
+    def test_host_cancel_is_hidden_from_the_schema_and_never_model_supplied(self):
+        seen = {}
+
+        def wait_job(job_id: str, timeout_s: float = 1.0, cancel=None):
+            seen["cancel"] = cancel
+            return {"ok": True, "stopped": cancel()}
+
+        entries = {"wait_job": _entry(wait_job, "wait", {
+            "type": "object",
+            "properties": {"job_id": {"type": "string"}, "timeout_s": {"type": "number"},
+                           "cancel": {"default": None, "title": "Cancel"}},
+            "required": ["job_id"],
+        })}
+        [binding] = [b for b in build_host_tools(_context(entries)) if b.name == "wait_job"]
+        self.assertNotIn("cancel", binding.input_schema["properties"])
+        probes = iter((False, True))  # dispatch's own pre-check, then the tool's
+        stop = lambda: next(probes)
+        result = dispatch_host_tool(binding, {"job_id": "job-1", "cancel": False}, None, stop)
+        self.assertIs(seen["cancel"], stop)
+        self.assertIs(result["stopped"], True)
+
+
 if __name__ == "__main__":
     unittest.main()

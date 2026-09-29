@@ -132,6 +132,18 @@ def test_chudcode_parts_search_counts_and_refused_cad_mutation_does_not_rearm():
     assert len(steers(calls)) == len(nudges(emitted)) == 1
 
 
+def test_cad_failure_inside_the_xd_device_result_does_not_rearm():
+    # `write xd://add_features` nests the CAD result under details.xdev.inner;
+    # a rolled-back batch there used to count as modeling progress.
+    frames = [item for i in range(12) for item in tool("web_search", i)]
+    frames += tool("write", 50, args={"path": "xd://add_features"})
+    frames[-1][1]["result"] = {"details": {"xdev": {"tool": "add_features", "inner": {
+        "ok": False, "rolled_back": True, "error": "batch rejected"}}}}
+    frames += [item for i in range(12, 24) for item in tool("web_search", i)]
+    _, calls, emitted = run(frames, FakeClock())
+    assert len(steers(calls)) == len(nudges(emitted)) == 1
+
+
 def test_failed_mutation_does_not_rearm():
     frames = [item for i in range(12) for item in tool("web_search", i)]
     frames += tool("new_part", 50, is_error=True)

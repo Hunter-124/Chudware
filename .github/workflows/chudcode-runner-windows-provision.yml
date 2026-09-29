@@ -108,21 +108,23 @@ jobs:
           }
           # Only the current runner account, SYSTEM and local administrators may
           # read this directory. No token is passed in task actions or job logs.
+          # Set-Acl tries to set SACL too and fails under NETWORK SERVICE
+          # without SeSecurityPrivilege. icacls changes only this owned
+          # directory's DACL; verify the result before writing a secret.
+          & icacls.exe $root /inheritance:r /grant:r `
+            'NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M' `
+            'BUILTIN\Administrators:(OI)(CI)F' `
+            'NT AUTHORITY\SYSTEM:(OI)(CI)F' /Q | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Could not restrict bootstrap state directory ACL' }
           $acl = Get-Acl -LiteralPath $root
-          $acl.SetAccessRuleProtection($true, $false)
-          foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRuleAll($rule) }
-          foreach ($entry in @(@('NT AUTHORITY\NETWORK SERVICE','Modify'),
-                             @('BUILTIN\Administrators','FullControl'),
-                             @('NT AUTHORITY\SYSTEM','FullControl'))) {
-            $rights = [Enum]::Parse([Security.AccessControl.FileSystemRights], $entry[1])
-            $inherit = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
-            $rule = [Security.AccessControl.FileSystemAccessRule]::new(
-              $entry[0], $rights, $inherit,
-              [Security.AccessControl.PropagationFlags]::None,
-              [Security.AccessControl.AccessControlType]::Allow)
-            $acl.AddAccessRule($rule)
+          $allowed = @('NT AUTHORITY\NETWORK SERVICE','BUILTIN\Administrators','NT AUTHORITY\SYSTEM')
+          if (-not $acl.AreAccessRulesProtected) { throw 'Bootstrap state directory inherited access unexpectedly' }
+          foreach ($rule in $acl.Access) {
+            if ($rule.IsInherited -or $rule.AccessControlType -ne 'Allow' -or
+                $allowed -notcontains $rule.IdentityReference.Value) {
+              throw 'Bootstrap state directory permits an unexpected account'
+            }
           }
-          Set-Acl -LiteralPath $root -AclObject $acl
           $dir = Join-Path $root $env:GITHUB_RUN_ID
           if (Test-Path -LiteralPath $dir) { throw 'Provisioning run directory already exists' }
           New-Item -ItemType Directory -Path $dir | Out-Null

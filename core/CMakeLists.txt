@@ -105,8 +105,10 @@ option(CHUDWARE_WITH_OCCT "Provision + link the OCCT geometry kernel (Wave 2)" O
 # clobber std::min / std::max / std::numeric_limits<>::min, breaking e.g. core/api/libchudware.cpp.
 # Suppress project-wide. Harmless without OCCT (windows.h isn't included then); mirrors the
 # per-file `#define NOMINMAX` already present in a few sources.
+# Also: MSVC only defines M_PI et al. in <cmath> under _USE_MATH_DEFINES; POSIX libcs always do,
+# so tests written on Linux (test_mate, test_fea_contact, ...) used it freely. Project-wide.
 if(MSVC)
-  add_compile_definitions(NOMINMAX)
+  add_compile_definitions(NOMINMAX _USE_MATH_DEFINES)
 endif()
 
 include(FetchContent)

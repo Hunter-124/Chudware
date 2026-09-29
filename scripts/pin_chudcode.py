@@ -41,6 +41,8 @@ SUPPORTED_TARGETS = (
     "macos-x86_64",
     "windows-x86_64",
 )
+# Targets present in locks pinned before the release matrix became x64-only.
+LEGACY_TARGETS = ("linux-aarch64", "macos-arm64")
 CANONICAL_NAMES = {target: ("chud.exe" if target.startswith("windows-") else "chud") for target in SUPPORTED_TARGETS}
 
 
@@ -89,7 +91,9 @@ def _require_string(value: Any, label: str, *, pattern: str | None = None) -> st
     return value
 
 
-def load_lock(path: Path = DEFAULT_LOCK, *, require_pinned: bool = True) -> dict[str, Any]:
+def load_lock(
+    path: Path = DEFAULT_LOCK, *, require_pinned: bool = True, strict_targets: bool = False
+) -> dict[str, Any]:
     if path.is_symlink():
         raise ArtifactLockError(f"Chudcode artifact lock must not be a symlink: {path}")
     try:
@@ -149,8 +153,20 @@ def load_lock(path: Path = DEFAULT_LOCK, *, require_pinned: bool = True) -> dict
             notice["sha256"], f"notice {payload_name} sha256", pattern="sha"
         )
     artifacts = lock["artifacts"]
-    if not isinstance(artifacts, dict) or tuple(sorted(artifacts)) != tuple(sorted(SUPPORTED_TARGETS)):
-        raise ArtifactLockError("artifact lock must define exactly every supported platform target")
+    if not isinstance(artifacts, dict) or not set(SUPPORTED_TARGETS) <= set(artifacts):
+        raise ArtifactLockError("artifact lock must define every supported platform target")
+    # Locks written before the x64-only matrix also carry these targets, and
+    # retained releases keep their own lock: rollback and recovery must still
+    # verify them. Only publication (pin/check-lock) demands the exact set.
+    extra = set(artifacts) - set(SUPPORTED_TARGETS)
+    if extra and (strict_targets or not extra <= set(LEGACY_TARGETS)):
+        raise ArtifactLockError(
+            "artifact lock must define exactly every supported platform target; "
+            f"unexpected: {', '.join(sorted(extra))}"
+        )
+    for target in extra:
+        if not isinstance(artifacts[target], dict) or set(artifacts[target]) != {"filename", "sha256", "url"}:
+            raise ArtifactLockError(f"legacy artifact {target} has unexpected or missing keys")
     for target in SUPPORTED_TARGETS:
         artifact = artifacts[target]
         if not isinstance(artifact, dict) or set(artifact) != {"filename", "sha256", "url"}:
@@ -496,7 +512,7 @@ def pin_lock(args: argparse.Namespace) -> dict[str, Any]:
         temporary = Path(stream.name)
         stream.write(_canonical_json(lock))
     try:
-        load_lock(temporary)
+        load_lock(temporary, strict_targets=True)
         verify_notices(args.notice_dir, lock_path=temporary)
         current = host_target()
         verify_binary(Path(binaries[current]), current, lock_path=temporary)
@@ -578,7 +594,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "pin":
             result = pin_lock(args)
         elif args.command == "check-lock":
-            lock = load_lock(args.lock)
+            lock = load_lock(args.lock, strict_targets=True)
             notice_evidence = verify_notices(args.lock.parent, lock_path=args.lock)
             result = {
                 "lock": str(args.lock),

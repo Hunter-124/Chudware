@@ -102,6 +102,34 @@ def test_stage_needs_only_the_staged_targets_pin(
         pin.load_lock(lock)
 
 
+def test_retained_legacy_lock_still_verifies_but_cannot_be_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Releases retained for rollback keep the lock they were deployed with; locks
+    # from before the x64-only matrix also list ARM targets. Rollback verifies them
+    # with the current script, so they must still load; publication must not.
+    lock, binaries = _lock(tmp_path)
+    legacy = json.loads(lock.read_bytes())
+    legacy["artifacts"]["linux-aarch64"] = {"filename": "chud", "sha256": None, "url": None}
+    legacy["artifacts"]["macos-arm64"] = {
+        "filename": "chud",
+        "sha256": "a" * 64,
+        "url": "https://releases.example.invalid/v0.2.0/macos-arm64/chud",
+    }
+    lock.write_bytes(pin._canonical_json(legacy))
+    monkeypatch.setattr(pin, "_verify_executable_version", lambda *_args: "Chudcode v0.2.0")
+
+    assert pin.verify_binary(binaries["linux-x86_64"], "linux-x86_64", lock_path=lock)
+    assert pin.verify_notices(tmp_path, lock_path=lock, require_pinned=False)["notices"]
+    with pytest.raises(pin.ArtifactLockError, match="unexpected: linux-aarch64, macos-arm64"):
+        pin.load_lock(lock, strict_targets=True)
+
+    legacy["artifacts"]["linux-riscv64"] = {"filename": "chud", "sha256": None, "url": None}
+    lock.write_bytes(pin._canonical_json(legacy))
+    with pytest.raises(pin.ArtifactLockError, match="unexpected: .*linux-riscv64"):
+        pin.load_lock(lock, require_pinned=False)
+
+
 def test_retained_notice_integrity_does_not_require_foreign_binary_pins(
     tmp_path: Path,
 ) -> None:
@@ -320,3 +348,12 @@ def test_target_selector_requires_exactly_one_complete_mode() -> None:
     for selector in invalid:
         with pytest.raises(pin.ArtifactLockError):
             pin._selected_target(selector)
+
+
+def test_committed_lock_loads_and_pins_the_production_target() -> None:
+    # Production's deploy stages linux-x86_64 from the committed lock; a lock
+    # whose target set drifts from SUPPORTED_TARGETS makes every deploy fail
+    # at webd staging even though the binary itself is fine.
+    lock = pin.load_lock(pin.DEFAULT_LOCK, require_pinned=False)
+    assert lock["artifacts"]["linux-x86_64"]["sha256"]
+    pin.verify_notices(lock_path=pin.DEFAULT_LOCK, require_pinned=False)

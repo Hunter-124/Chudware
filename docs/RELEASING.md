@@ -325,36 +325,36 @@ re-provision; `runner-provision` syncs it into an existing venv too.
 ## Chudcode artifact pin
 
 `vendor/chudcode/CHUDCODE_ARTIFACT.lock` is the release authority for the
-compiled RPC service. A lock with `null` artifact URL/hash fields declares
-unpublished required inputs and deliberately makes package/deploy paths
-fail closed. The Chudcode-backed release targets are exactly Linux x86_64,
-macOS x86_64 and Windows x86_64. After `chudcode-v0.3.6` is published, pin
-all three artifacts atomically using the published commit and URLs:
+compiled RPC service (`chud`) that runs every online agent turn. A lock with
+`null` artifact URL/hash fields declares unpublished required inputs and
+deliberately makes package/deploy paths fail closed. The supported targets are
+exactly Linux x86_64, macOS x86_64 and Windows x86_64. A future repin pins all
+three atomically from one published commit:
 
 ```bash
 python3 scripts/pin_chudcode.py pin \
-  --version 0.3.6 --rpc-protocol 2 --repository-commit COMMIT \
+  --version X.Y.Z --rpc-protocol 2 --repository-commit COMMIT \
   --artifact linux-x86_64=/secure/chud-linux-x86_64 --url linux-x86_64=https://... \
   --artifact macos-x86_64=/secure/chud-macos-x86_64 --url macos-x86_64=https://... \
   --artifact windows-x86_64=/secure/chud-windows-x86_64.exe --url windows-x86_64=https://...
 ```
 
-The lock's `version` is the Chudcode product release. `engine_version` is
-optional source provenance only; it never changes executable identity.
-Every v0.3.6 artifact must report exactly `Chudcode v0.3.6` from
-`--version`; engine provenance is never accepted as or appended to the
-product version.
+The lock's `version` is the runtime release. `engine_version` is optional
+source provenance only; it never changes executable identity. Every artifact
+must report exactly `Chudcode vX.Y.Z` from `--version` (the executable's own
+identity string); engine provenance is never accepted as or appended to it.
 
 ### Current pin status (2026-09-29)
 
-`chudcode-v0.3.6` publication and CAD lock repinning are pending. Do not
-assume its assets have been published, installed on the CAD Mac/Windows
-runners, or deployed to production. The earlier `v0.3.0` lock/release
-does not establish v0.3.6 runner readiness; check the committed lock and
-verify each runner's local binary before packaging. No Linux ARM or macOS
-ARM Chudcode release artifact is planned under this release matrix: there
-is no available Mac ARM build host. The CAD `macos-arm64` core-only preset
-may remain, but it is not a Chudcode-backed release target.
+Chudcode is retired as a product: no further releases, distribution or
+marketing. The runtime stays in use internally, pinned at `v0.3.0`
+(Linux x86_64 and macOS x86_64 pinned; Windows x86_64 unpinned, so Windows
+installer legs fail closed). `chudcode-v0.3.6` was never published and its tag
+was removed. Locks written before the x64-only matrix also list
+`linux-aarch64`/`macos-arm64`; `load_lock` still accepts those so rollback can
+verify retained releases, but `pin` and `check-lock` require the exact
+supported set. No Linux ARM or macOS ARM artifact is planned; the CAD
+`macos-arm64` core-only preset is not a Chudcode-backed release target.
 
 The Chudcode repository is private, so release asset URLs need authentication.
 Offline `stage` with a local `CHUDWARE_CHUD_BIN` is unaffected; `fetch` needs a

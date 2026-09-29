@@ -13,6 +13,9 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 export CHUDWARE_ENGINE_DAEMON=0
 export CHUDWARE_LIBCHUDWARE="${CHUDWARE_LIBCHUDWARE:-$PWD/core/build-linux/bin/libchudware.so}"
+# Stage output goes through tee: without this, print() is block-buffered and a healthy
+# multi-hour stage looks silent for tens of minutes.
+export PYTHONUNBUFFERED=1
 DATA="${CHUDWARE_VIEWNET_DATA:-$HOME/.cache/chudware/viewnet}"
 WORKERS="${VIEWNET_WORKERS:-10}"
 LOG="$DATA/campaign/logs"

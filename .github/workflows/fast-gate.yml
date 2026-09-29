@@ -81,8 +81,8 @@ jobs:
             runner_label: cc-win-primary
           - label: macOS
             runner_os: macOS
-            runner_arch: ARM64
-            runner_label: cc-mac-arm
+            runner_arch: X64
+            runner_label: cc-mac-intel
     steps:
       # Before checkout: a missing or too-old Python otherwise surfaces as a
       # confusing traceback from an audit script rather than as the runner

@@ -19,11 +19,10 @@ NOTICE_BYTES = {
 
 
 def _binary(target: str) -> bytes:
-    if target.startswith("linux-"):
-        machine = 62 if target.endswith("x86_64") else 183
+    if target == "linux-x86_64":
         data = bytearray(128)
         data[:6] = b"\x7fELF\x02\x01"
-        struct.pack_into("<H", data, 18, machine)
+        struct.pack_into("<H", data, 18, 62)
         return bytes(data)
     if target == "windows-x86_64":
         data = bytearray(256)
@@ -32,8 +31,9 @@ def _binary(target: str) -> bytes:
         data[128:132] = b"PE\0\0"
         struct.pack_into("<H", data, 132, 0x8664)
         return bytes(data)
-    cpu = 0x01000007 if target.endswith("x86_64") else 0x0100000C
-    return b"\xcf\xfa\xed\xfe" + struct.pack("<I", cpu) + bytes(120)
+    if target == "macos-x86_64":
+        return b"\xcf\xfa\xed\xfe" + struct.pack("<I", 0x01000007) + bytes(120)
+    raise AssertionError(f"unexpected release target: {target}")
 
 
 def _lock(tmp_path: Path) -> tuple[Path, dict[str, Path]]:
@@ -107,7 +107,7 @@ def test_retained_notice_integrity_does_not_require_foreign_binary_pins(
 ) -> None:
     lock, _ = _lock(tmp_path)
     partial = json.loads(lock.read_bytes())
-    partial["artifacts"]["linux-aarch64"].update({"sha256": None, "url": None})
+    partial["artifacts"]["macos-x86_64"].update({"sha256": None, "url": None})
     lock.write_bytes(pin._canonical_json(partial))
     args = ["--lock", str(lock), "verify-notices", "--source-dir", str(tmp_path)]
 

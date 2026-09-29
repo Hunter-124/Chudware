@@ -24,8 +24,8 @@ Every night, and on demand from the Actions tab:
    nightly version `<base>-beta.<run number>` — e.g. `0.1.0-beta.42`. On a
    *scheduled* run it asks the gateway over loopback whether `ci_builds` already
    holds a `published` row for `HEAD`; if so the night is skipped. A manual
-   dispatch always builds. Every build leg is recorded as `queued`:
-   `linux/x86_64`, `windows/x86_64`, `macos/arm64` and `macos/x86_64`.
+   dispatch always builds. Every Chudcode-backed build leg is recorded as
+   `queued`: `linux/x86_64`, `windows/x86_64` and `macos/x86_64`.
 2. **`linux-beta`** (gateway host, `cc-linux-build`) configures core and host with
    `-DCHUDWARE_VERSION_OVERRIDE=<version> -DCHUDWARE_DEVELOPER_BUILD=OFF`, builds,
    runs `ctest` for core and host, takes a headless `CHUDWARE_SHOT=m1` screenshot
@@ -50,31 +50,28 @@ Every night, and on demand from the Actions tab:
    `Chudware-Setup-<version>-x86_64.exe`. `ISCC.exe` is a hard requirement: if
    Inno Setup is missing the job fails at the capability check. It never
    substitutes a zip.
-4. **`macos-beta`** (`cc-mac-intel` and `cc-mac-arm`, one matrix row each,
-   `fail-fast: false`) configures the `macos-x86_64` / `macos-arm64` core preset
-   and `host/build-macos-<arch>` at the pinned version, runs `ctest` for core and
-   host, then packages with `packaging/macos/build_app.sh`: `--prepare-signing`
-   retains the immutable `Chudware.app` and emits the payload preimage,
-   `packaging/ci_sign.py` signs it, and `--finalize-signing` seals that exact
-   bundle and archives it with `ditto` as
-   `Chudware-<version>-macos-<arch>.zip`. The finished zip is then expanded and
-   verified before anything is offered to a customer: `Chudware.app` is present
-   with its `payload-manifest.v1.json` + `.sig` verifying against
-   `release-ci-v1`, `otool -L` shows no shipped Mach-O file loading an absolute
-   path outside `/System` or `/usr/lib`, and `chudware-hostd --status` loads and
-   reports this exact version. That is the same shape
-   `host/src/update/apply_macos.cpp` requires of an update: it expands the zip
-   with `ditto -x -k`, refuses an archive whose root is not `Chudware.app`, and
-   re-verifies the in-bundle payload manifest before swapping the app.
+4. **`macos-beta`** (`cc-mac-intel`, x86_64) configures the `macos-x86_64`
+   core preset and `host/build-macos-x86_64` at the pinned version, runs
+   `ctest` for core and host, then packages with
+   `packaging/macos/build_app.sh`: `--prepare-signing` retains the immutable
+   `Chudware.app` and emits the payload preimage, `packaging/ci_sign.py` signs
+   it, and `--finalize-signing` seals that exact bundle and archives it with
+   `ditto` as `Chudware-<version>-macos-x86_64.zip`. The finished zip is then
+   expanded and verified before anything is offered to a customer:
+   `Chudware.app` is present with its `payload-manifest.v1.json` + `.sig`
+   verifying against `release-ci-v1`, `otool -L` shows no shipped Mach-O file
+   loading an absolute path outside `/System` or `/usr/lib`, and
+   `chudware-hostd --status` loads and reports this exact version. That is
+   the same shape `host/src/update/apply_macos.cpp` requires of an update: it
+   expands the zip with `ditto -x -k`, refuses an archive whose root is not
+   `Chudware.app`, and re-verifies the in-bundle payload manifest before
+   swapping the app.
 
-   Both Macs are Command Line Tools only, so no step here uses `xcodebuild`, and
-   both Macs sign unnotarized: a nightly beta makes no Gatekeeper claim.
-   `macbook-air-m2` (`cc-mac-arm`) is a laptop and is often asleep. Its row then
-   sits **queued** until the runner returns, and GitHub fails it after 24 hours
-   queued. That is accepted: the rows are independent, so `imac-intel` publishes
-   regardless, and a row that never starts runs no steps, so it posts no
-   `failed` transition — it stays `queued` in `/admin` until the next night's
-   run supersedes it.
+   The Intel Mac has Command Line Tools only, so no step here uses
+   `xcodebuild`, and the nightly beta is signed but unnotarized: it makes no
+   Gatekeeper claim. `macbook-air-m2` can still run the CAD core-only
+   `macos-arm64` preset, but no Mac ARM Chudcode builder or release artifact
+   exists; it cannot package a Chudcode-backed release.
 5. **Publish.** Every job gets its bytes into `<releases_dir>/incoming/` on the
    gateway host and then calls `POST /api/releases/ci/publish`. There are two
    transports, because the fleet is not one network:
@@ -255,10 +252,11 @@ fails at its capability check with an explicit message otherwise):
   `--assume-yes-for-downloads`, so the first release build fetches it into
   `%LOCALAPPDATA%\Nuitka` and later builds reuse the cache. That runner
   therefore needs outbound HTTPS beyond app.chudware.com on its first build.
-* `CHUDWARE_CHUD_BIN` naming the local Windows x86_64 `chud.exe` artifact
-  pinned by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`. That lock row is still
-  unpinned (see "Current pin status" below), so this leg fails at its
-  capability check until a Windows `chud.exe` exists and is pinned.
+* `CHUDWARE_CHUD_BIN` naming a locally installed Windows x86_64 `chud.exe`
+  matching `vendor/chudcode/CHUDCODE_ARTIFACT.lock`. Publishing and pinning
+  the Windows release asset do not install it on this runner: verify it and
+  configure the runner service environment as described in
+  `docs/reference/CI_RUNNERS.md`.
 * `CHUDWARE_SIGN_IDENTITY` if you want Authenticode on the installer; without it
   the installer is unsigned and SmartScreen will warn (see `docs/SIGNING.md`)
 * outbound HTTPS to `app.chudware.com`. This runner cannot reach the gateway's
@@ -266,7 +264,7 @@ fails at its capability check with an explicit message otherwise):
   job's first channel step fails loudly with the unreachable origin if 443 is
   blocked.
 
-**`cc-mac-intel` (imac-intel, x86_64) and `cc-mac-arm` (macbook-air-m2, arm64):**
+**`cc-mac-intel` (imac-intel, x86_64):**
 
 * Xcode **Command Line Tools** only (`xcode-select -p`, `clang`, `xcrun`). No
   step uses `xcodebuild`, and the capability check asserts the compiler rather
@@ -275,29 +273,31 @@ fails at its capability check with an explicit message otherwise):
   plus the Command Line Tools' `ditto`, `otool`, `install_name_tool`, `plutil`
   and `codesign`
 * Homebrew, with `opencascade` installed: off Windows `ProvisionOCCT.cmake`
-  downloads nothing and the `macos-*` presets `find_package` OCCT through the
-  brew prefix (`/opt/homebrew` on arm64, `/usr/local` on Intel)
+  downloads nothing and the `macos-x86_64` preset `find_package`s OCCT
+  through `/usr/local`.
 * a release Python 3.11+ carrying `packaging/requirements-release.txt` (Nuitka
   for the compiled `chudware-worker`/`chudware-mcp` sidecars, `cryptography` for
   every signature). macOS ships 3.9.6, so the job picks its interpreter by
   capability: `~/chudware-ci-tools/release-python/bin/python3` first, then
   `python3.14`..`python3` from `PATH`, and the first one that imports both
   `cryptography` and `nuitka` wins.
-* `CHUDWARE_CHUD_BIN` naming the local `chud` artifact for that Mac's
-  architecture, pinned by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`. Release
-  packaging verifies and copies it without a source checkout or network fetch.
-  Per-machine procedure: `docs/reference/CI_RUNNERS.md`, "Pinned Chudcode
-  artifact".
+* `CHUDWARE_CHUD_BIN` naming the local macOS x86_64 `chud` artifact pinned
+  by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`. Release packaging verifies
+  and copies it without a source checkout or network fetch. Installation
+  and runner environment configuration are still prerequisites; see
+  `docs/reference/CI_RUNNERS.md`, "Pinned Chudcode artifact".
 * outbound HTTPS to `app.chudware.com`, for the same reason as the Windows
-  builder: neither Mac can route to `192.168.0.183`.
+  builder: the Intel Mac cannot route to `192.168.0.183`.
 
-`runner-provision.yml` covers both Macs: dispatch it with `runner_label` set to
-`cc-mac-intel` or `cc-mac-arm` and it installs the brew formulae
+`runner-provision.yml` can prepare the Intel builder: dispatch it with
+`runner_label` set to `cc-mac-intel` and it installs the brew formulae
 (`cmake ninja python@3.13 opencascade`) and the release-Python venv at
 `~/chudware-ci-tools/release-python`, then prints a capability report that exits
 non-zero on any `MISSING`. Homebrew itself is the one thing it will not install:
 that installer needs an interactive sudo, so it fails with an explicit
-instruction instead. macOS steps are bash 3.2 (Apple's `/bin/bash`): no
+instruction instead. The ARM Mac's CAD core-only environment may also be
+provisioned, but it is not a Chudcode-backed release builder. macOS steps
+are bash 3.2 (Apple's `/bin/bash`): no
 associative arrays, no `mapfile`, no `${var^^}`, and string accumulators instead
 of arrays, because expanding an empty array under `set -u` is an
 unbound-variable error before bash 4.4.
@@ -314,64 +314,53 @@ each bundled package is also force-included (`--include-package`) by the three
 packaging scripts under the same platform condition as its marker, and a release
 Python without it fails the build instead of shipping without the feature. Today
 that is `pycolmap` (plus its dependency `numpy`) for Gaussian/sparse reverse
-engineering, on Linux x86_64, Windows x86_64 and macOS arm64. `pycolmap` 3.13.0
-publishes no Intel macOS wheel, so the x86_64 `.app` ships without it and
-`reveng_status` reports sparse SfM unavailable there. Every `nightly-release`
-leg `pip install`s the file into its release Python before building, so a new
-pin needs no re-provision; `runner-provision` syncs it into an existing venv too.
+engineering on Linux x86_64 and Windows x86_64 release legs. The dependency
+also supports macOS arm64 core-only builds, but macOS ARM is not a
+Chudcode-backed release leg. `pycolmap` 3.13.0 publishes no Intel macOS
+wheel, so the x86_64 `.app` ships without it and `reveng_status` reports
+sparse SfM unavailable there. Each active `nightly-release` leg `pip install`s
+the file into its release Python before building, so a new pin needs no
+re-provision; `runner-provision` syncs it into an existing venv too.
 
 ## Chudcode artifact pin
 
 `vendor/chudcode/CHUDCODE_ARTIFACT.lock` is the release authority for the
 compiled RPC service. A lock with `null` artifact URL/hash fields declares
-unpublished required inputs and deliberately makes every package/deploy path
-fail closed. Once all five platform artifacts exist, replace it atomically with:
+unpublished required inputs and deliberately makes package/deploy paths
+fail closed. The Chudcode-backed release targets are exactly Linux x86_64,
+macOS x86_64 and Windows x86_64. After `chudcode-v0.3.6` is published, pin
+all three artifacts atomically using the published commit and URLs:
 
 ```bash
 python3 scripts/pin_chudcode.py pin \
-  --version 0.3.0 --engine-version 18.0.8 --rpc-protocol 2 --repository-commit COMMIT \
+  --version 0.3.6 --rpc-protocol 2 --repository-commit COMMIT \
   --artifact linux-x86_64=/secure/chud-linux-x86_64 --url linux-x86_64=https://... \
-  --artifact linux-aarch64=/secure/chud-linux-aarch64 --url linux-aarch64=https://... \
   --artifact macos-x86_64=/secure/chud-macos-x86_64 --url macos-x86_64=https://... \
-  --artifact macos-arm64=/secure/chud-macos-arm64 --url macos-arm64=https://... \
   --artifact windows-x86_64=/secure/chud-windows-x86_64.exe --url windows-x86_64=https://...
 ```
 
 The lock's `version` is the Chudcode product release. `engine_version` is
 optional source provenance only; it never changes executable identity.
-Every artifact must report exactly `Chudcode v0.3.0` from `--version`, and the
-engine provenance value is never accepted as or appended to the product version.
+Every v0.3.6 artifact must report exactly `Chudcode v0.3.6` from
+`--version`; engine provenance is never accepted as or appended to the
+product version.
 
-### Current pin status (2026-09-28)
+### Current pin status (2026-09-29)
 
-Chudcode `v0.3.0` is published at
-`https://github.com/Hunter-124/chudcode/releases/tag/chudcode-v0.3.0` from commit
-`9fab19a6af`, carrying real `chudcode-linux-x64`, `chudcode-linux-arm64`,
-`chudcode-darwin-x64`, and `chudcode-darwin-arm64` CLI artifacts, the Linux and
-macOS x64 desktop archives, and `SHA256SUMS.txt`.
-
-The lock pins three of its five rows: `linux-x86_64` (for production) and
-`macos-x86_64`/`macos-arm64` (sha256 checked against that release's
-`SHA256SUMS.txt`), all since 2026-09-03. `verify`, `stage` and `fetch` act on
-one target and need only that row pinned, so the Linux and both macOS release
-legs can stage `chud` today. Two rows stay `null`:
-
-1. **`windows-x86_64` has no artifact.** `napi-build` requires a Windows
-   `libnode.dll` import library, so the natives addon cannot come from the
-   zig-based Linux cross-build; GitHub Actions is budget-blocked
-   (`The job was not started because an Actions budget is preventing further
-   use`); and no fleet Windows host carries MSVC plus Rust. Build it on a real
-   Windows toolchain — never hand-fake the row. Until then the nightly
-   `windows-beta` leg fails at its capability check by design.
-2. **`linux-aarch64`** is unpinned. The release publishes
-   `chudcode-linux-arm64`, but no pipeline builds that target, so nothing needs
-   the row yet.
+`chudcode-v0.3.6` publication and CAD lock repinning are pending. Do not
+assume its assets have been published, installed on the CAD Mac/Windows
+runners, or deployed to production. The earlier `v0.3.0` lock/release
+does not establish v0.3.6 runner readiness; check the committed lock and
+verify each runner's local binary before packaging. No Linux ARM or macOS
+ARM Chudcode release artifact is planned under this release matrix: there
+is no available Mac ARM build host. The CAD `macos-arm64` core-only preset
+may remain, but it is not a Chudcode-backed release target.
 
 The Chudcode repository is private, so release asset URLs need authentication.
 Offline `stage` with a local `CHUDWARE_CHUD_BIN` is unaffected; `fetch` needs a
 public release or a credentialed mirror, which is why runners carry a local
-copy instead (`docs/reference/CI_RUNNERS.md`). `check-lock` and `pin` still
-require all five rows.
+copy instead (`docs/reference/CI_RUNNERS.md`). The global `check-lock` and
+`pin` require all three release targets.
 
 The `stage` command used by packaging is offline and accepts only a local
 `CHUDWARE_CHUD_BIN`; it verifies the executable format/architecture, SHA-256,
@@ -383,12 +372,12 @@ invocation.
 
 The lock is the complete identity of the embedded online runtime, not a source-vendoring
 hint. It records schema `chudcode-artifact-lock-v1`, the Chudcode product version, repository
-commit, RPC protocol 2, and exactly five immutable platform rows. Each row pairs the canonical
-filename with an unauthenticated HTTPS URL and SHA-256.
+commit, RPC protocol 2, and exactly three immutable release-platform rows. Each row pairs
+the canonical filename with an unauthenticated HTTPS URL and SHA-256.
 
 `pin` validates every executable format, executes the host-target binary for product-version
 identity, writes canonical JSON to a temporary file, and replaces the lock only after those
-checks pass. All five `--artifact` and `--url` pairs are mandatory, so a partial platform
+checks pass. All three `--artifact` and `--url` pairs are mandatory, so a partial platform
 update is intentionally impossible. Useful focused checks are:
 
 ```bash
@@ -437,12 +426,10 @@ pipeline pinned the commit it built.
   the "already published" check, so it always builds.
 * **Watch progress without Actions:** `/admin` -> Releases -> CI builds, or
   `GET /api/admin/ci/builds?limit=20`.
-* **A macOS row stuck on `queued`:** its Mac is asleep or offline (usually
-  `macbook-air-m2` / `cc-mac-arm`). GitHub keeps the row queued and fails it
-  after 24 hours; the job never runs a step, so it never posts `failed` and the
-  `/admin` row stays `queued` for that `run_id`. Wake the Mac and re-dispatch,
-  or ignore it: the next night's run publishes the arch again. The Intel row is
-  unaffected (`fail-fast: false`).
+* **A macOS release row stuck on `queued`:** check `imac-intel` /
+  `cc-mac-intel` availability and re-dispatch when the runner is online.
+  The ARM Mac may run core-only CI but has no Chudcode release artifact,
+  so waiting on `cc-mac-arm` cannot publish a Chudcode-backed release.
 * **A rejected publish:** the gateway recomputes the digest and size, and a
   mismatch (422) **deletes the staged artifact** from `incoming/` while leaving
   the sidecars. Re-run the job: it rebuilds and re-stages everything before

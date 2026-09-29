@@ -47,11 +47,9 @@ permissions:
   contents: read
 
 concurrency:
-  # One nightly at a time. A fresh dispatch SUPERSEDES a stale one: an always-
-  # offline runner (the cc-mac-arm laptop sleeps most days) would otherwise hold
-  # this group hostage for GitHub's 24h queued-job timeout and stop every later
-  # build. ci/publish is idempotent by run identity and the gateway re-digests
-  # anything staged, so a cancelled leg leaves nothing trusted behind.
+  # One nightly at a time. A fresh dispatch supersedes a stale one; ci/publish
+  # is idempotent by run identity and the gateway re-digests anything staged,
+  # so a cancelled leg leaves nothing trusted behind.
   group: nightly-release
   cancel-in-progress: true
 
@@ -184,10 +182,9 @@ jobs:
         run: |
           set -euo pipefail
           body="${RUNNER_TEMP}/queued.json"
-          # One row per build leg, keyed the way ci_builds is: (run_id, platform,
-          # arch). The macOS rows matter most: cc-mac-arm is often asleep, and a
-          # queued row is the only honest record that a leg was expected at all.
-          for target in linux:x86_64 windows:x86_64 macos:arm64 macos:x86_64; do
+          # One row per supported release target, keyed the way ci_builds is:
+          # (run_id, platform, arch).
+          for target in linux:x86_64 windows:x86_64 macos:x86_64; do
             platform="${target%%:*}"
             arch="${target##*:}"
             python3 - "${platform}" "${arch}" "${{ steps.plan.outputs.version }}" > "${body}" <<'PY'
@@ -1561,32 +1558,22 @@ jobs:
           }
 
   macos-beta:
-    name: macOS beta app (${{ matrix.arch }})
+    name: macOS x86_64 beta app
     needs: plan
     if: needs.plan.outputs.skip != 'true'
-    runs-on: [self-hosted, macOS, "${{ matrix.runner_arch }}", cloudcastle-ci, "${{ matrix.runner_label }}"]
-    # Longer than the other two legs: the macOS core carries OCCT/Polyhedral-FEA,
-    # and the two Nuitka sidecars are compiled per architecture.
+    runs-on: [self-hosted, macOS, X64, cloudcastle-ci, cc-mac-intel]
+    # The macOS core carries OCCT/Polyhedral-FEA, and the two Nuitka
+    # sidecars are compiled on the Intel runner.
     timeout-minutes: 420
-    strategy:
-      # macbook-air-m2 (cc-mac-arm) is a laptop and is regularly asleep. GitHub
-      # queues its row until the runner comes back and auto-fails it after 24
-      # hours queued; that is accepted. imac-intel must publish regardless, so
-      # the rows are independent.
-      fail-fast: false
-      matrix:
-        include:
-          - {arch: arm64, runner_arch: ARM64, runner_label: cc-mac-arm, preset: macos-arm64, host_build_dir: host/build-macos-arm64}
-          - {arch: x86_64, runner_arch: X64, runner_label: cc-mac-intel, preset: macos-x86_64, host_build_dir: host/build-macos-x86_64}
     env:
       RELEASE_VERSION: ${{ needs.plan.outputs.version }}
       RELEASE_STABLE_VERSION: ${{ needs.plan.outputs.stable_version }}
       RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
       RELEASE_PLATFORM: macos
-      RELEASE_ARCH: ${{ matrix.arch }}
-      CORE_PRESET: ${{ matrix.preset }}
-      HOST_BUILD_DIR: ${{ matrix.host_build_dir }}
-      # Neither Mac can route to the gateway host's LAN address, so each holds
+      RELEASE_ARCH: x86_64
+      CORE_PRESET: macos-x86_64
+      HOST_BUILD_DIR: host/build-macos-x86_64
+      # The Mac cannot route to the gateway host's LAN address, so it holds
       # the release token itself and publishes over TLS to the public origin.
       GATEWAY_TOKEN: ${{ secrets.CHUDWARE_GATEWAY_RELEASE_TOKEN }}
     steps:
@@ -1625,7 +1612,7 @@ jobs:
             command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
           done
 
-          # Both Macs carry the Command Line Tools only, by design: nothing in
+          # The Mac carries the Command Line Tools only, by design: nothing in
           # this repository may reach for xcodebuild, so the compiler itself is
           # the assertion.
           if xcode-select -p >/dev/null 2>&1; then
@@ -1677,17 +1664,16 @@ jobs:
             exit 1
           fi
 
-          # A row labelled cc-mac-intel that answers arm64 would publish bytes
-          # under the wrong canonical name; build_app.sh names the zip from
-          # `uname -m`, so the two must agree before anything is built.
+          # The Intel runner must publish x86_64 bytes under the x86_64 name;
+          # build_app.sh names the zip from `uname -m`.
           if [ "$(uname -m)" != "${RELEASE_ARCH}" ]; then
-            echo "::error::this runner is $(uname -m) but the matrix row is ${RELEASE_ARCH}; the runner labels and the matrix disagree"
+            echo "::error::this runner is $(uname -m) but the release requires ${RELEASE_ARCH}; check cc-mac-intel runner labels"
             exit 1
           fi
           # Same sync as the Linux and Windows legs; see packaging/requirements-release.txt.
           if ! "${release_python}" -m pip install --quiet --disable-pip-version-check \
               -r packaging/requirements-release.txt; then
-            echo "::error::could not sync packaging/requirements-release.txt into ${release_python}; re-run runner-provision with runner_label=${{ matrix.runner_label }}"
+            echo "::error::could not sync packaging/requirements-release.txt into ${release_python}; re-run runner-provision with runner_label=cc-mac-intel"
             exit 1
           fi
           if ! "${release_python}" scripts/pin_chudcode.py verify \

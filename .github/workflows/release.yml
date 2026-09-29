@@ -41,7 +41,7 @@ jobs:
   # that cannot verify a paid plan, and the failure appears on customers'
   # machines rather than in CI.
   #
-  # It also costs ~40s against a 240-minute four-platform matrix, so gating is
+  # It also costs ~40s against a 240-minute three-platform matrix, so gating is
   # close to free. Reports NOT RUN without secrets.STRIPE_SANDBOX_ENV; see
   # .github/workflows/stripe-sandbox.yml.
   stripe-gate:
@@ -53,7 +53,7 @@ jobs:
   prepare:
     name: Prepare immutable ${{ matrix.platform }}-${{ matrix.arch }} payload
     if: ${{ github.event_name == 'push' || inputs.phase == 'prepare' }}
-    # Four platforms burn hours of runner time; find out the catalog is broken
+    # Three platforms burn hours of runner time; find out the catalog is broken
     # before committing any of it.
     needs: stripe-gate
     runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", cloudcastle-ci, "${{ matrix.runner_label }}"]
@@ -64,7 +64,6 @@ jobs:
         include:
           - {platform: linux, arch: x86_64, runner_os: Linux, runner_arch: X64, runner_label: cc-linux-build, preset: linux-core, host_build_dir: host/build-linux}
           - {platform: windows, arch: x86_64, runner_os: Windows, runner_arch: X64, runner_label: cc-win-package, preset: windows-occt, host_build_dir: host/build-windows}
-          - {platform: macos, arch: arm64, runner_os: macOS, runner_arch: ARM64, runner_label: cc-mac-arm, preset: macos-arm64, host_build_dir: host/build-macos-arm64}
           - {platform: macos, arch: x86_64, runner_os: macOS, runner_arch: X64, runner_label: cc-mac-intel, preset: macos-x86_64, host_build_dir: host/build-macos-x86_64}
     env:
       CHUDWARE_SIGN_IDENTITY: ${{ secrets.CHUDWARE_SIGN_IDENTITY }}

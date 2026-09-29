@@ -38,9 +38,7 @@ DEFAULT_NOTICE_DIR = DEFAULT_LOCK.parent
 SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
 SUPPORTED_TARGETS = (
     "linux-x86_64",
-    "linux-aarch64",
     "macos-x86_64",
-    "macos-arm64",
     "windows-x86_64",
 )
 CANONICAL_NAMES = {target: ("chud.exe" if target.startswith("windows-") else "chud") for target in SUPPORTED_TARGETS}

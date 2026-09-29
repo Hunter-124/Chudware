@@ -195,9 +195,12 @@ step:
   waiting out `CHUDWARE_WEBD_RESTART_MAX_WAIT` protects nobody.
 - Exit 0 restored, 1 failure, 2 usage error or no rollback target available.
 - Retained-release validation checks the Linux binary and both notices against
-  that release's artifact lock. Unavailable downloads for other architectures
+  that release's artifact lock. Unavailable downloads for macOS or Windows
   do not make a verified Linux release unrestorable. The global `check-lock`
-  publication gate still requires every target to be pinned.
+  publication gate still requires all three Chudcode-backed targets:
+  Linux x86_64, macOS x86_64 and Windows x86_64. The upcoming
+  `chudcode-v0.3.6` matrix has no Linux ARM or macOS ARM artifacts; the CAD
+  macOS ARM core-only preset does not alter the web release matrix.
 
 Rollback restores an already-built tree and never touches PostgreSQL. A
 promotion whose schema migration is not backward compatible is therefore not

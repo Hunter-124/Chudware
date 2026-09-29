@@ -54,11 +54,6 @@ jobs:
     env:
       # The whole point of this job. See the header block above.
       CHUDWARE_GATE_STRICT: '1'
-      # The runner's per-job temp is on disk. /tmp has a per-user quota shared
-      # with live CAD sessions and old simulation caches; filling it made every
-      # build/check subprocess fail while its redirected log remained empty.
-      TMPDIR: ${{ runner.temp }}
-      GATE_TMPDIR: ${{ runner.temp }}/chudware-gate
     steps:
       - name: Check runner capabilities
         shell: bash
@@ -100,6 +95,11 @@ jobs:
           cmake --version | head -n 1
           ninja --version
           df -h "${RUNNER_TEMP:-/tmp}" "$HOME"
+          # Keep gate logs and subprocess scratch on the per-job disk-backed
+          # runner temp; the shared /tmp user quota is already full of old
+          # simulation caches and must not make this gate fail silently.
+          echo "TMPDIR=${RUNNER_TEMP}" >> "$GITHUB_ENV"
+          echo "GATE_TMPDIR=${RUNNER_TEMP}/chudware-gate" >> "$GITHUB_ENV"
 
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

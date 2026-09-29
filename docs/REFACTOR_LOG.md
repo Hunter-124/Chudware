@@ -5254,3 +5254,24 @@ includes `browse_models`, `read_native_file` and `wait_job` — they had default
 which also let the progress watchdog count a listing or a job wait as modeling progress.
 Assemblies saved without `cache.aicm` (reference assemblies such as ME-490 Rover Review) get
 counts only, no bbox/thumbnail.
+
+## 2026-09-29 — model explorer: real labelled thumbnails replace the ASCII silhouettes
+
+The ASCII views were inaccurate and cost ~8 KB per dozen parts, so they are gone.
+`browse_models` now returns numbered contact sheets (`services/mcp/model_thumbs.py`): 4×3
+tiles, each the part's iso product shot trimmed to the part, with a caption (file name,
+kind, size mm, material, features/components/mates, volume, revision) and a red badge on
+failing features. The text rows shrink to `{n, file}` plus failures; a 12-model sheet is
+~1,320×890 px (~1.5k tokens). Thumbnails come from the file's own display mesh first
+(`services/mcp/mesh_preview.py`: numpy z-buffer with the engine's iso camera (1,1,0.8),
+flat Lambert shading in the body colour, silhouette/crease lines, 2× supersampling; 0.4–3 s
+per part, ~1 s for a 524k-triangle assembly) — no document session and no hostd traffic.
+The engine is the fallback for files without a mesh (STEP/IGES/reference assemblies):
+`doc_open(internal:true)` (hostd never announces it, so no GUI tab) → `doc_render_png` →
+`doc_bbox` → `doc_close`. The measured bbox is written to `<key>.json` beside the thumbnail
+so exchange-file tiles show their size. The cache is the GUI PLM grid's own
+(`<project>/.plm/thumbs/<content_key>.png`, key = blake2b-8 of document.json =
+cad_graph `meta.dh`), so either side's render is the other's hit. Renders beyond a 45 s
+per-call budget are `pending` and fill in on the next call. Live folders sort before
+archive/backup copies (in 6-axis, 70 of the 94 files are in archive folders). `fs_read` of a
+CAD file attaches one labelled tile.

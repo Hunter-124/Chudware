@@ -128,10 +128,14 @@ runtime's doctor command.
    demand or bypassed through bash) `inspect_native_files`, `read_native_file`, `get_job`,
    `wait_job`, `inspect_section`, `dfm_check`, `analyze_stl_geometry`, `list_world_bodies`,
    `interface_check` and `render_animation`, and `browse_models` — the model-facing thumbnail
-   explorer (`services/mcp/model_card.py`: each CAD file's card + shaded top/front/right ASCII
-   silhouettes, read from the `.step+` document/cache/mesh without importing; `fs_list` rows
-   carry the one-line summary and `fs_read` of a CAD file returns the card, `ok:true`, instead
-   of a failed redirect). Its system prompt carries the MORE TOOLS menu
+   explorer: labelled contact sheets (4×3 numbered tiles, ~1.5k image tokens per 12 models)
+   of real renders. `model_thumbs` renders the file's own display mesh (`cache.aicm`/STL,
+   `mesh_preview`: engine iso camera, no document session) and falls back to the engine's
+   silent `doc_open(internal)`→`doc_render_png`→`doc_close` for STEP/IGES/reference
+   assemblies, caching in `<project>/.plm/thumbs/<content_key>.png` — the GUI PLM grid's own
+   cache (key = cad_graph `meta.dh`). `fs_read` of a CAD file returns its card + one
+   labelled render (`ok:true`); `fs_list` rows carry the one-line summary. Its system prompt
+   carries the MORE TOOLS menu
    naming every other registered tool; `enable_tools(tools=[...])` and
    `enable_tools(categories=[group])` load the rest mid-turn through the single refresh
    callback `chudcode_roles._register_category_refresh` (re-runs `build_host_tools` and

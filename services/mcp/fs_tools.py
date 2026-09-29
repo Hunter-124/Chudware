@@ -14,7 +14,7 @@ Envelope: ``{ok:true, …}`` | ``{ok:false, reason, hint}`` — never a tracebac
 office_tools.py / plm_tools.py). A ``not_found`` also carries ``did_you_mean`` (near-miss
 suggestions, incl. the ``X`` vs ``X+`` native-container trap) and folds the top suggestion
 into ``hint``. CAD/geometry files (.step+, .step, .stl, …) are never dumped: fs_read returns
-their ``model_card`` preview (summary + ASCII thumbnail) and points at import_part +
+their ``model_card`` preview (summary + a labelled render) and points at import_part +
 describe_part/measure_part/inspect_part; ``browse_models`` is the thumbnail explorer.
 
 CONTEXT-SAFE READING (the point of fs_read): a raw file dump overflows a small model's
@@ -57,6 +57,7 @@ import os
 import re
 import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -332,12 +333,13 @@ CAD_EXTS = CAD_BINARY_EXTS | CAD_TEXT_EXTS
 
 
 def _cad_redirect(path: str, kind: str) -> dict:
-    """fs_read of a CAD file: its text thumbnail card plus the route to the real reader.
+    """fs_read of a CAD file: its card, a labelled thumbnail, and the route to the reader.
 
     fs_read serves text/documents; CAD geometry is edited and measured through
     import_part (returns a doc_id) and the describe/measure/inspect readers. The card
-    (model_card: name, kind, features, size, bbox, shaded ASCII silhouettes) is read
-    straight from the file, so a glance never costs an import. Only an unreadable file
+    (model_card: name, kind, features, size, bbox) is read straight from the file and a
+    native part's thumbnail is the engine's product shot (model_thumbs, shared with the
+    GUI's PLM thumbnail cache), so a glance never costs an import. Only an unreadable file
     is a failure; a preview is a successful read."""
     name = Path(path).name
     if kind == "dxf":
@@ -355,16 +357,51 @@ def _cad_redirect(path: str, kind: str) -> dict:
                 f"card, not its bytes; open it with import_part(path=\"{path}\") which "
                 "returns a doc_id, then read the model with describe_part / measure_part / "
                 "inspect_part")
-    from .model_card import VIEWS_LEGEND, model_card
+    from .model_card import model_card
 
     card = model_card(path)
     if card.get("ok") is False or card.get("error"):
         return {**_err("use_import_part", hint), "card": card}
     out = _ok(path=path, kind="cad_preview", is_document=False, open_with="import_part",
               card=card, hint=hint)
-    if card.get("thumbnail"):
-        out["legend"] = VIEWS_LEGEND
+    preview = _preview_image(name, card)
+    if preview:
+        out["preview"] = preview
     return out
+
+
+#: Wall-clock budget for rendering missing thumbnails in one call; the rest are marked
+#: pending (the renders already done are cached, so a repeat call continues).
+PREVIEW_RENDER_BUDGET_S = 45.0
+
+
+_ARCHIVE_DIRS = frozenset({"archive", "archives", "archived", "backup", "backups", "old",
+                           "deprecated", "depricated", "trash", "recovered", "autosave",
+                           "autosaves"})
+
+
+def _archived(rel: Path) -> bool:
+    """True when a folder on *rel*'s path reads as retired copies (archive/, backup/, …)."""
+    return any(part.lower() in _ARCHIVE_DIRS or "archive" in part.lower()
+               or "backup" in part.lower() for part in rel.parts[:-1])
+
+
+def _image_ref(path: str) -> dict:
+    """The reference the Chudcode adapter turns into an image block for the model."""
+    return {"kind": "image", "path": path, "mime": "image/png"}
+
+
+def _preview_image(label: str, card: dict) -> Optional[dict]:
+    try:
+        from .model_thumbs import build_tiles, single_tile, sheet_dir
+
+        tiles, _ = build_tiles([(label, card)], render=True,
+                               deadline=time.monotonic() + PREVIEW_RENDER_BUDGET_S)
+        if not tiles[0].get("thumb"):
+            return None
+        return _image_ref(single_tile(tiles[0], sheet_dir()))
+    except Exception:  # noqa: BLE001 - the card alone is still a useful preview
+        return None
 
 
 #: Cards are cheap (cached, read from the file) but a directory of large assemblies
@@ -662,7 +699,7 @@ def _list_dir(path: str, show_hidden: bool) -> dict:
     if geometry:
         out["note"] = (
             f"{len(geometry)} CAD/geometry file(s) here; each row's card summarises it. "
-            "browse_models(path) shows every model with an ASCII thumbnail; to edit or "
+            "browse_models(path) shows them as labelled thumbnail sheets; to edit or "
             'measure one, open it with import_part(path="...") for a doc_id'
         )
     return out
@@ -687,8 +724,8 @@ def register_fs_tools(mcp) -> None:
                  .xls/.ods/.csv) is extracted to text (via office_extract) and paginated
                  the same way. A CAD/geometry
                  file (.draw+/.step+/.step/.stp/.iges/.stl/.3mf/.obj/…) is NOT dumped —
-                 you get its preview card (kind, features, bbox, ASCII thumbnail, read from
-                 the file); open it with import_part(path=...) and read the model via
+                 you get its preview card (kind, features, bbox) and a labelled render,
+                 both read from the file; open it with import_part(path=...) and read the model via
                  describe_part / measure_part / inspect_part (plain-text formats honour
                  raw=True as an explicit escape).
         offset : 1-indexed start line when no selector is given (default: from the top).
@@ -769,19 +806,24 @@ def register_fs_tools(mcp) -> None:
         return out
 
     @mcp.tool()
-    def browse_models(path: str = ".", pattern: str = "**/*",
-                      thumbnails: Optional[bool] = None, limit: int = 40) -> dict:
-        """Browse the project's CAD files like a thumbnail explorer: one card per model with an ASCII preview.
+    def browse_models(path: str = ".", pattern: str = "**/*", sheets: bool = True,
+                      limit: int = 24) -> dict:
+        """Browse the project's CAD files like a thumbnail explorer: labelled contact sheets of real renders.
 
-        Each card is read straight from the file (no import): kind, name, material,
-        features/components/mates, bounding box, volume, revision, failing features, and
-        — for .step+ parts/assemblies and STL meshes — ``thumbnail`` top/front/right
-        shaded silhouettes (denser glyph = nearer the viewer). ``pattern`` is a glob under
-        ``path`` (default every file, hidden folders skipped). ``thumbnails`` defaults to
-        on for ≤12 models; ``limit`` caps the cards (max 200, the rest are only named).
+        Returns ``sheets`` — images of up to 12 numbered tiles each (4x3): the engine's
+        product shot of every .step+ part/assembly, trimmed to the part, captioned with
+        file name, kind, size (mm), material, features/components/mates, volume and
+        revision, with a red badge on failing features — and ``models``, the same tiles as
+        text (``n`` = tile number, file, one-line summary). Everything comes from the files
+        (no import); thumbnails are cached in <project>/.plm/thumbs (shared with the GUI),
+        and missing ones render within a time budget — ``pending`` tiles fill in on the
+        next call. STEP/STL/other formats get a captioned "no preview" tile.
+        ``pattern`` globs under ``path`` (hidden folders skipped); ``limit`` = tiles
+        (max 48, the rest are only named); ``sheets=False`` returns text only.
         Open one with import_part(path=...) to edit or measure it. Risk: read.
         """
-        from .model_card import VIEWS_LEGEND, model_card
+        from .model_card import model_card
+        from .model_thumbs import build_tiles, contact_sheets, sheet_dir
 
         base, blocked = _canonical_target(path, read=True)
         if blocked:
@@ -789,7 +831,7 @@ def register_fs_tools(mcp) -> None:
         assert base is not None
         if not base.is_dir():
             return _err("not_a_directory", f"{path} is not a directory")
-        cap = max(1, min(int(limit or 40), 200))
+        cap = max(1, min(int(limit or 24), 48))
         found: list[Path] = []
         try:
             for match in base.glob(pattern):
@@ -804,27 +846,44 @@ def register_fs_tools(mcp) -> None:
                 found.append(match)
         except Exception as exc:  # noqa: BLE001
             return _err("glob_failed", str(exc))
-        found.sort(key=lambda m: str(m.relative_to(base)).lower())
-        show_thumbs = thumbnails if thumbnails is not None else len(found) <= 12
+        # Live models first: an archive/backup folder full of autosaves would otherwise
+        # fill every tile before the parts anyone is working on (6-axis: 70 of 94 files).
+        found.sort(key=lambda m: (_archived(m.relative_to(base)),
+                                  len(m.relative_to(base).parts),
+                                  str(m.relative_to(base)).lower()))
+        shown = found[:cap]
+        entries = [(str(m.relative_to(base)), model_card(m)) for m in shown]
+        tiles, renders = build_tiles(
+            entries, render=bool(sheets),
+            deadline=time.monotonic() + PREVIEW_RENDER_BUDGET_S,
+        )
         models = []
-        for match in found[:cap]:
-            card = model_card(match, thumbnail=bool(show_thumbs))
-            # The summary already spells out kind/name/material/features/size/volume;
-            # a row adds only what it does not: where it sits, what is broken, the view.
-            row = {"file": str(match.relative_to(base)), "summary": card["summary"],
-                   "modified": card.get("modified")}
-            for key in ("bbox_min_mm", "failing_features", "geometry", "thumbnail"):
+        for tile in tiles:
+            card = tile["card"]
+            # With sheets, each tile's caption already shows kind/size/material/contents/
+            # volume/revision: the text row is only the key back to the file. Without
+            # sheets the one-line summary is the whole preview.
+            row: dict = {"n": tile["n"], "file": tile["label"]}
+            if not sheets:
+                row["summary"] = card["summary"]
+            for key in ("failing_features", "geometry"):
                 if card.get(key) is not None:
                     row[key] = card[key]
+            if sheets and not tile.get("thumb") and tile.get("reason"):
+                row["preview"] = f"{tile['status']}: {tile['reason']}"
             models.append(row)
         out = _ok(root=str(base), count=len(found), shown=len(models), models=models)
+        if sheets and tiles:
+            out["sheets"] = [_image_ref(p) for p in contact_sheets(tiles, sheet_dir())]
+            out["renders"] = renders
         if len(found) > cap:
             out["not_shown"] = [str(m.relative_to(base)) for m in found[cap:cap + 200]]
-        if show_thumbs and any(m.get("thumbnail") for m in models):
-            out["legend"] = VIEWS_LEGEND
-        elif found and not show_thumbs:
-            out["note"] = ("thumbnails are off for more than 12 models; pass thumbnails=True "
-                           "or narrow path/pattern to see the ASCII previews")
+            out["note"] = (f"{len(found) - cap} more model(s) not tiled; narrow path/pattern "
+                           "or raise limit (max 48)")
+        if renders.get("pending"):
+            out["note"] = (out.get("note", "") + " " if out.get("note") else "") + (
+                f"{renders['pending']} thumbnail(s) not rendered yet (time budget) — call "
+                "again to fill them in; finished renders are cached")
         return out
 
     @mcp.tool()

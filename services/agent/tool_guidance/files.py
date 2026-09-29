@@ -9,7 +9,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Windowed by design: after a fs_grep hit, jump straight there with "
             "a 'path:50-200' selector instead of paging from the top; binary "
             "files are refused, directories list entries; a CAD file returns "
-            "its preview card (summary + ASCII thumbnail), not its bytes."
+            "its card plus a labelled render (preview image), not its bytes."
         ),
     },
     "fs_list": {
@@ -21,10 +21,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "browse_models": {
         "prompt_note": (
-            "The thumbnail view of a project's CAD files, read from the files "
-            "without importing: use it to find the right part before import_part, "
-            "never unzip/jq. Narrow with path/pattern (e.g. 'parts/*') to get "
-            "ASCII previews for more than 12 models."
+            "Labelled contact sheets (12 numbered renders each) of a project's "
+            "CAD files, read from the files without importing: find the right part "
+            "here before import_part, never unzip/jq. Tile numbers key the text "
+            "rows; narrow path/pattern (e.g. 'parts/*') for more than 24 models."
         ),
     },
     "fs_glob": {

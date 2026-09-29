@@ -255,20 +255,25 @@ jobs:
           }
           '@
           try {
+            $stage = 'write protected token'
             # WriteAllText avoids printing the token or putting it in a child
             # process command line. Child files inherit the restricted ACL.
             [IO.File]::WriteAllText($tokenPath, $env:CHUDCODE_RUNNER_REG_TOKEN)
+            $stage = 'write bootstrap script'
             Set-Content -LiteralPath $script -Value $body -Encoding Ascii
+            $stage = 'create task definition'
             $action = New-ScheduledTaskAction `
               -Execute (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
               -Argument "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script`""
             $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2)
             $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+            $stage = 'register elevated task'
             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal | Out-Null
+            $stage = 'write task pointer'
             Set-Content -LiteralPath (Join-Path $root 'last-run.txt') -Value $env:GITHUB_RUN_ID -Encoding Ascii
             Write-Host 'Scheduled elevated runner installation after this job exits. Dispatch inspect mode after several minutes for sanitized outcome.'
           } catch {
             $reason = $_.Exception.Message.Replace($env:CHUDCODE_RUNNER_REG_TOKEN, '[redacted]')
             Remove-Item -LiteralPath $tokenPath -Force -ErrorAction SilentlyContinue
-            throw "Unable to schedule secure runner installation; no token retained: $reason"
+            throw "Unable to schedule secure runner installation at $stage; no token retained: $reason"
           }

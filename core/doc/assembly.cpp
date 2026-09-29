@@ -428,9 +428,12 @@ void ensure_component_topology(const LoadedComponent& lc, const std::string& kin
 std::string component_file_stamp(const std::string& abspath) {
     std::error_code ec;
     const auto time = std::filesystem::last_write_time(abspath, ec);
-    const auto mtime = ec ? 0 : time.time_since_epoch().count();
+    // Explicit widths: file_time_type's rep and uintmax_t are `long long`/`unsigned long long`
+    // on libc++ but not always the exact types std::to_string overloads on (ambiguous there).
+    const long long mtime = ec ? 0 : static_cast<long long>(time.time_since_epoch().count());
     const auto bytes = std::filesystem::file_size(abspath, ec);
-    return std::to_string(mtime) + ":" + std::to_string(ec ? 0 : bytes);
+    return std::to_string(mtime) + ":" +
+           std::to_string(ec ? 0ULL : static_cast<unsigned long long>(bytes));
 }
 
 // Cache only the parsed source, never a traversal result: every fingerprint request

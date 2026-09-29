@@ -1734,19 +1734,20 @@ void flip_region(pm::fea::NodalMesh &nodal,
       if (!cell_has(neighbour, tri[0]) || !cell_has(neighbour, tri[1]) ||
           !cell_has(neighbour, tri[2]))
         continue;  // stale census entry
-      std::uint32_t far = neighbour.nodes[0];
+      // Not `far`: <windows.h> defines near/far as empty macros, which breaks MSVC.
+      std::uint32_t opposite = neighbour.nodes[0];
       for (const std::uint32_t node : neighbour.nodes)
-        if (node != tri[0] && node != tri[1] && node != tri[2]) far = node;
-      if (far == apex) continue;
+        if (node != tri[0] && node != tri[1] && node != tri[2]) opposite = node;
+      if (opposite == apex) continue;
       const Tet neighbour_cell = cell_nodes(neighbour);
       const std::vector<double> before{here_quality,
                                        tet_quality_of(nodal, neighbour_cell)};
       const double volume = tet_abs_volume(nodal, cell) +
                             tet_abs_volume(nodal, neighbour_cell);
       const std::array<Tet, 3> made{
-          oriented(nodal, Tet{apex, far, tri[0], tri[1]}),
-          oriented(nodal, Tet{apex, far, tri[1], tri[2]}),
-          oriented(nodal, Tet{apex, far, tri[2], tri[0]})};
+          oriented(nodal, Tet{apex, opposite, tri[0], tri[1]}),
+          oriented(nodal, Tet{apex, opposite, tri[1], tri[2]}),
+          oriented(nodal, Tet{apex, opposite, tri[2], tri[0]})};
       std::vector<double> after;
       double made_volume = 0.0;
       for (const Tet &tet : made) {

@@ -129,7 +129,7 @@ jobs:
           done
           # A configured target must belong to the intended repository and
           # runner. Never reset credentials or reconfigure a working instance.
-          python3 -c 'import json,sys; r=json.load(open(".runner")); sys.exit(0 if r.get("agentName")==sys.argv[1] and r.get("gitHubUrl", "").rstrip("/")=="https://github.com/Hunter-124/chudcode" else 1)' "${runner_name}" || {
+          python3 -c 'import json,sys; r=json.load(open(".runner", encoding="utf-8-sig")); sys.exit(0 if r.get("agentName")==sys.argv[1] and r.get("gitHubUrl", "").rstrip("/")=="https://github.com/Hunter-124/chudcode" else 1)' "${runner_name}" || {
             echo '::error::Target directory belongs to a different runner or repository'
             exit 1
           }

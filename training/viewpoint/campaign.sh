@@ -7,7 +7,9 @@
 #   training/viewpoint/campaign.sh [stage...]     stages: render trials observer (= obs_crossfit
 #                         obs_independent obs_report) observe utility round2 ab   (default: all)
 # Env: CHUDWARE_VIEWNET_DATA (default ~/.cache/chudware/viewnet), VIEWNET_WORKERS (default 10),
-#      VIEWNET_OBS_EPOCHS (default 12). Run it detached (setsid/nohup): it outlives the shell.
+#      VIEWNET_OBS_EPOCHS (default 12). Launch it as its own unit so it outlives the shell:
+#      systemd-run --user --unit=viewnet-campaign --collect -p WorkingDirectory=$PWD \
+#        -E HOME=$HOME -E PATH=$PATH training/viewpoint/campaign.sh [stage...]
 # Engine: always a private in-process libchudware — never the user's running hostd.
 set -euo pipefail
 cd "$(dirname "$0")/../.."

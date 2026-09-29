@@ -24,7 +24,8 @@ attribution.
   HTML and the fixed-name JS/WASM/data files revalidate (`no-cache`); portal
   assets with content hashes are immutable for one year. Production's
   authenticated `/app` assets require a session to measure remotely; compare
-  local delivery with `Webservice/gateway/tests/web_asset_probe.py` and
+  local delivery with `Webservice/gateway/tests/web_asset_probe.py` via
+  `pytest -m perf` (isolated DB and entitled probe account), then
   `scripts/check_web_parity.py --bundle <staged-app-dir>`. The production
   `MinSizeRel` WASM link disables runtime assertions and stack-overflow probes;
   Debug builds retain both. `Release` is not the deploy default: its `wasm-opt

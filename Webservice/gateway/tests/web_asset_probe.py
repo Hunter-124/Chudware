@@ -6,9 +6,9 @@ static route (via FastAPI TestClient, no running server) against the REAL staged
 bundle and records the on-the-wire transfer size per Accept-Encoding, proving the
 brotli/gzip precompression (appserve._negotiate) stays live and effective.
 
-Standalone:   python web_asset_probe.py            # print the report
-Pytest:       pytest -m perf web_asset_probe.py     # asserts ratios (skips if
-                                                    # no staged bundle present)
+Standalone:   CHUDWARE_DB_URL=<dev DB> CHUDWARE_WEB_ASSET_PROBE_EMAIL=<active Studio email> python web_asset_probe.py
+Pytest:       pytest -m perf web_asset_probe.py  # isolated DB and probe account;
+                                                    # skips when no staged bundle exists
 """
 
 from __future__ import annotations
@@ -66,7 +66,8 @@ def _transfer_size(client, name: str, accept: str) -> tuple[int, str | None]:
     which httpx would have transparently decompressed."""
     r = client.get(
         f"/app/{name}",
-        headers={"X-Dev-User": "haedmonds69@gmail.com", "Accept-Encoding": accept},
+        headers={"X-Dev-User": os.environ.get("CHUDWARE_WEB_ASSET_PROBE_EMAIL", "asset-probe@example.test"),
+                 "Accept-Encoding": accept},
     )
     assert r.status_code == 200, f"{name} -> {r.status_code}"
     cl = r.headers.get("content-length")
@@ -117,11 +118,15 @@ def report() -> dict[str, dict[str, Any]]:
 
 
 @pytest.mark.perf
-def test_web_asset_compression() -> None:
+def test_web_asset_compression(activate, monkeypatch) -> None:
     """Assert the staged bundle is served compressed at the expected ratios."""
     if _staged_dir() is None:
         pytest.skip("no staged web bundle (Chudware.wasm) — run ./build.sh wasm first")
-    m = measure()
+    from gateway.config import settings
+
+    monkeypatch.setattr(settings, "dev_mode", True)
+    activate(os.environ.get("CHUDWARE_WEB_ASSET_PROBE_EMAIL", "asset-probe@example.test"))
+    m = report()
     for name, floor in _ASSETS.items():
         s = m[name]
         assert s["br_enc"] == "br", f"{name}: expected brotli, got {s['br_enc']}"
@@ -132,4 +137,6 @@ def test_web_asset_compression() -> None:
 
 
 if __name__ == "__main__":
+    if not os.environ.get("CHUDWARE_DB_URL") or not os.environ.get("CHUDWARE_WEB_ASSET_PROBE_EMAIL"):
+        raise SystemExit("Set CHUDWARE_DB_URL to a dev database and CHUDWARE_WEB_ASSET_PROBE_EMAIL to an active Studio account")
     report()

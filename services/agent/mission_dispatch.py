@@ -189,8 +189,8 @@ def _actionable_delegate_failure(node: dict) -> dict:
     ).strip()
     runtime_unavailable = stop_reason == "provider_error" and detail.startswith(
         (
-            "Chudcode RPC support is unavailable",
-            "Chudcode executable not found",
+            "Agent service RPC support is unavailable",
+            "Agent service executable not found",
         )
     )
     if runtime_unavailable:
@@ -1046,7 +1046,7 @@ class MissionDispatch:
                                 "run_id": str(getattr(self, "run_id", "") or ""),
                                 "why": (
                                     "delegate called on a mission with no tree; "
-                                    "Chudcode will run the approved child"
+                                    "the agent service will run the approved child"
                                 ),
                             },
                         )
@@ -1688,7 +1688,7 @@ class MissionDispatch:
                     "success": False,
                     "stop_reason": "provider_error",
                     "result": {
-                        "error": "Chudcode delegated role returned a non-object result"
+                        "error": "Agent service delegated role returned a non-object result"
                     },
                     "tokens_used": 0,
                     "provider_usage_recorded": False,
@@ -1799,7 +1799,7 @@ class MissionDispatch:
             return {
                 "ok": False,
                 "subagent_status": child_status,
-                "error": nested_error or "Chudcode delegated role turn failed",
+                "error": nested_error or "Agent service delegated role turn failed",
                 **common,
             }
         except Exception as exc:  # noqa: BLE001 - execution error is result data

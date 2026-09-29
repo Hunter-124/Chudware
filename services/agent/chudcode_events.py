@@ -852,7 +852,7 @@ def _unknown(
         "error": "fail",
     }.get(status, status)
     payload = {
-        "purpose": _cap("Chudcode · " + label.replace("_", " "), 120),
+        "purpose": _cap("Agent · " + label.replace("_", " "), 120),
         "status": status,
         "rpc_event": _cap(label, 120),
         "detail": _cap(_canonical(data), _MAX_DETAIL),

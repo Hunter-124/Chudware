@@ -1418,7 +1418,7 @@ static void pollOmpProviderList(AppState& st, bool force) {
         }
         if (ompRpcAbsent(r)) {
             s_omp.available = false;
-            s_omp.lastError = "Chudcode provider service unavailable in this runtime.";
+            s_omp.lastError = "Agent provider service unavailable in this runtime.";
             s_omp.listPartial.clear();
             return;
         }
@@ -1432,7 +1432,7 @@ static void pollOmpProviderList(AppState& st, bool force) {
             s_omp.listFailed = true;
             s_omp.listPartial.clear();
             s_omp.lastError =
-                "Could not read the provider list from the Chudcode service (" + why +
+                "Could not read the provider list from the agent service (" + why +
                 "). This is a failed service call, not an empty provider set" +
                 (s_omp.rows.empty() ? "." : " \xe2\x80\x94 the providers below are the last "
                                             "state this panel successfully read.");
@@ -1825,7 +1825,7 @@ static void removeOmpCredential(AppState& st, const std::string& provider,
             std::string why = !r.ok ? r.err : optionalJsonString(r.result, "error");
             if (why.empty()) why = optionalJsonString(r.result, "reason");
             s_omp.lastError =
-                why.empty() ? "The Chudcode service refused to remove that credential." : why;
+                why.empty() ? "The agent service refused to remove that credential." : why;
         } else {
             s_omp.lastError.clear();
         }
@@ -1938,7 +1938,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             beginOmpOAuth(st, prov.id);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Browser OAuth (PKCE loopback or device code, whichever the "
-                              "provider supports). The Chudcode service runs the whole "
+                              "provider supports). The agent service runs the whole "
                               "exchange; this panel opens the approval URL and reports "
                               "the final state.");
     };
@@ -3748,7 +3748,7 @@ struct HarnessModeInfo {
     const char* description; // one-line what it does
 };
 static const HarnessModeInfo kHarnessModes[] = {
-    {"Agent",    "one Chudcode agent turn",
+    {"Agent",    "one agent-service turn",
      "Full CAD tool loadout; the agent decides inline vs subagents vs mission."},
     {"Plan",     "read-only planning",
      "Inspect and draft a plan; no mutation."},
@@ -4697,7 +4697,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     // apply to the ACTIVE chat session immediately (chudcode_set_auto_compaction /
     // chudcode_set_auto_retry) and read honestly: with no active session there is nothing
     // to switch, so the rows disable instead of pretending.
-    settingsSectionHeader("Active session (Chudcode)");
+    settingsSectionHeader("Active agent session");
     {
         static std::string s_sessFor;       // session the cached toggle values belong to
         static bool s_sessAutoCompaction = true;   // Chudcode defaults both on
@@ -4735,7 +4735,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
                         if (s_sessStatus.empty())
                             s_sessStatus = optionalJsonString(r.result, "reason");
                         if (s_sessStatus.empty())
-                            s_sessStatus = "The Chudcode service refused the change.";
+                            s_sessStatus = "The agent service refused the change.";
                         return;
                     }
                     s_sessStatusErr = false;
@@ -4746,13 +4746,13 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
             if (ImGui::Checkbox("Auto-compaction", &s_sessAutoCompaction))
                 applySessionFlag("chudcode_set_auto_compaction", s_sessAutoCompaction,
                                  &s_sessAutoCompaction, !s_sessAutoCompaction);
-            helpMarker("Chudcode compacts this session's transcript automatically as the "
+            helpMarker("The agent service compacts this session's transcript automatically as the "
                        "context window fills. Applies to the active chat session now.");
             ImGui::SameLine(0, 16.0f * sc);
             if (ImGui::Checkbox("Auto-retry", &s_sessAutoRetry))
                 applySessionFlag("chudcode_set_auto_retry", s_sessAutoRetry,
                                  &s_sessAutoRetry, !s_sessAutoRetry);
-            helpMarker("Chudcode retries transient provider failures (rate limits, "
+            helpMarker("The agent service retries transient provider failures (rate limits, "
                        "disconnects) inside the turn. Applies to the active chat "
                        "session now.");
             if (s_sessInFlight) ImGui::EndDisabled();
@@ -7857,7 +7857,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     if (s_ccFor != ccSess) return;
                                     if (ompRpcAbsent(r)) {
                                         s_ccUnavailable = true;
-                                        s_ccError = "Chudcode tool state is not served by "
+                                        s_ccError = "Agent tool state is not served by "
                                                     "this runtime.";
                                         return;
                                     }
@@ -7885,8 +7885,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                                     s_ccLoaded = true;
                                 }, 15000);
                             }
-                            settingsSectionHeader("Chudcode built-ins");
-                            dimText("Run inside the Chudcode service alongside the CAD "
+                            settingsSectionHeader("Agent service built-ins");
+                            dimText("Run inside the agent service alongside the CAD "
                                     "tools \xe2\x80\x94 browser/computer sessions live "
                                     "there, not in Chudware's embedded CEF.");
                             if (ccSess.empty()) {

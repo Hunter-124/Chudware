@@ -617,13 +617,13 @@ void drawChudcodeManageCard(AppState& st, const Conversation& c, bool running) {
                                   : hc == 1 ? ui::kit::Tone::Warn : ui::kit::Tone::Neutral,
                           /*dot=*/true, "Last session-file health verdict (persisted).");
             if (link && !link->sessionId.empty())
-                ui::kit::keyValueRow("Chudcode session", link->sessionId.c_str(),
+                ui::kit::keyValueRow("Agent session", link->sessionId.c_str(),
                                      ui::kit::Tone::Neutral, /*copyable=*/true);
             if (link && !link->sessionFile.empty())
                 ui::kit::keyValueRow("Session file", link->sessionFile.c_str(),
                                      ui::kit::Tone::Neutral, /*copyable=*/true);
             if (!link || (link->sessionId.empty() && link->sessionFile.empty()))
-                ui::kit::dimText("No Chudcode session recorded yet \xe2\x80\x94 send a message "
+                ui::kit::dimText("No agent session recorded yet \xe2\x80\x94 send a message "
                                  "in this session first.");
 
             // ---- actions --------------------------------------------------------------------

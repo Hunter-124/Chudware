@@ -890,14 +890,14 @@ class Overseer:
             return AuditResult(
                 audit={},
                 advisory=_empty_advisory(scope),
-                error=f"provider error: {reason or 'Chudcode overseer turn failed'}",
+                error=f"provider error: {reason or 'agent overseer turn failed'}",
             )
         reply = _role_turn_reply(turn)
         if not reply:
             return AuditResult(
                 audit={},
                 advisory=_empty_advisory(scope),
-                error="provider error: Chudcode overseer returned no audit",
+                error="provider error: agent overseer returned no audit",
             )
 
         try:

@@ -271,7 +271,7 @@ static void drawWebProviderKeyForm(AppState& st) {
     const std::string provider = ui::webProviderKeyName(s.provider, s.baseUrl);
     if (provider.empty()) {
         dimText("There is no per-account credential for this provider in the browser: it is either "
-                "a subscription or Chudcode-service grant held by the shared engine, or a service the "
+                "a subscription or agent-service grant held by the shared engine, or a service the "
                 "server has no validation endpoint for. Anthropic, OpenAI, Gemini, xAI, OpenRouter "
                 "and Moonshot take your own key \xe2\x80\x94 add it under Settings \xe2\x86\x92 "
                 "Providers.");
@@ -751,7 +751,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             changed = true;
         drawValidatedCredentialHint(
             st, bridgeAuth
-                    ? "This service uses the Chudcode credential store. Add or replace its credential under Settings \xe2\x86\x92 Providers."
+                    ? "This service uses the agent credential store. Add or replace its credential under Settings \xe2\x86\x92 Providers."
                     : "API keys are no longer pasted into the AI tab. Add one under Settings \xe2\x86\x92 Providers; it is saved only after the provider validates it.");
     } else if (s.provider == ui::PROV_FREELLMAPI) {
         if (drawFreeAiProviderCard(st)) changed = true;
@@ -915,14 +915,14 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     } else if (s.provider == ui::PROV_CURSOR || s.provider == ui::PROV_KIMISUB) {
         // Subscription-only providers: no API key field — the credential is an OAuth grant.
         if (s.provider == ui::PROV_KIMISUB) {
-            dimText("Kimi Code (Chudcode service). Sign in under Settings \xe2\x86\x92 Providers; "
+            dimText("Kimi Code (agent service). Sign in under Settings \xe2\x86\x92 Providers; "
                     "the service resolves the credential from its own auth store — no Moonshot "
                     "API key required for this path.");
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
             ImGui::TextUnformatted("Wire provider: kimi-code \xc2\xb7 model: k3 (default)");
             ImGui::PopStyleColor();
         } else {
-            dimText("Cursor (Chudcode service). Sign in under Settings \xe2\x86\x92 Providers; "
+            dimText("Cursor (agent service). Sign in under Settings \xe2\x86\x92 Providers; "
                     "the service resolves the credential from its own auth store — no API key.");
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
             ImGui::TextUnformatted("Wire provider: cursor \xc2\xb7 model: composer-2.5 (default)");
@@ -932,7 +932,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     } else if (s.provider == ui::PROV_ZENMUX) {
         // Chudcode-service provider — the credential lives in the service's own auth store,
         // wired up via Settings → Providers sign-in (drawOmpProviderManager), not config.json.
-        dimText("ZenMux (Chudcode service). Sign in under Settings \xe2\x86\x92 Providers; no API "
+        dimText("ZenMux (agent service). Sign in under Settings \xe2\x86\x92 Providers; no API "
                 "key field here — the service resolves the credential from its own auth store.");
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
         ImGui::TextUnformatted("Wire provider: zenmux \xc2\xb7 model: x-ai/grok-4.5-free (default)");
@@ -1856,7 +1856,7 @@ std::string bridgeModelCostDetail(const ui::BridgeModelMeta& m) {
     } else if (bridgeProviderIsLocalFree(m.provider)) {
         out = "runs locally \xe2\x80\x94 no per-token charge";
     } else {
-        out = "no price in the Chudcode catalog \xe2\x80\x94 spend can't be computed for this model";
+        out = "no price in the model catalog \xe2\x80\x94 spend can't be computed for this model";
     }
     if (m.maxTokens > 0) {
         char buf[24];
@@ -2007,7 +2007,7 @@ void drawSessionCostStrip(AppState& st) {
         if (incomplete) {
             tip = "This is a FLOOR, not a bill: only " + std::to_string(s_costPricedModels) +
                   " of " + std::to_string(s_costTotalModels) +
-                  " models that spent tokens have a price in the Chudcode catalog.\n"
+                  " models that spent tokens have a price in the model catalog.\n"
                   "No price data for: ";
             const size_t kShow = 6;
             for (size_t i = 0; i < s_costUnpriced.size() && i < kShow; ++i) {
@@ -2018,13 +2018,13 @@ void drawSessionCostStrip(AppState& st) {
                 tip += ", +" + std::to_string(s_costUnpriced.size() - kShow) + " more";
             tip += ".\nTheir tokens are counted in the token total but add $0 to the dollar "
                    "figure, so real spend is higher by an unknown amount.\n"
-                   "The priced part is Chudcode session accounting.\n"
+                   "The priced part is agent session accounting.\n"
                    "Click for the per-model breakdown.";
         } else if (!s_costHasUsd) {
-            tip = "Chudcode reported this session's token movement but no dollar figure.\n"
+            tip = "The agent service reported this session's token movement but no dollar figure.\n"
                   "Click for the per-model breakdown.";
         } else {
-            tip = "Chudcode session accounting \xe2\x80\x94 what this session's turns "
+            tip = "Agent session accounting \xe2\x80\x94 what this session's turns "
                   "actually cost, not a bill.\nClick for the per-model breakdown.";
         }
         ImGui::SetTooltip("%s", tip.c_str());

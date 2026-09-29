@@ -873,7 +873,7 @@ def run_role_turn(
             return _failure(
                 role_name,
                 "provider_error",
-                "Chudcode session host returned a non-object response",
+                "Agent session host returned a non-object response",
                 run_id=effective_run_id,
                 session_id=child_session,
                 parent_id=lineage_parent,
@@ -883,7 +883,7 @@ def run_role_turn(
             return _failure(
                 role_name,
                 "cancelled" if host_result.get("cancelled") else "provider_error",
-                _text(host_result.get("reason")) or "Chudcode role turn failed",
+                _text(host_result.get("reason")) or "Agent role turn failed",
                 run_id=effective_run_id,
                 session_id=child_session,
                 parent_id=lineage_parent,

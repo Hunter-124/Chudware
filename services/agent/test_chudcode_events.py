@@ -896,7 +896,7 @@ class ChudcodeEventMapperTests(unittest.TestCase):
         ]:
             kind, payload = one(frame)
             self.assertEqual(kind, "status", frame["type"])
-            self.assertNotIn("Chudcode ·", json.dumps(payload))
+            self.assertNotIn("Agent ·", json.dumps(payload))
         self.assertEqual(one({"type": "thinking_level_change", "thinkingLevel": "xhigh"})[1]["thinking"], "xhigh")
         self.assertEqual(one({"type": "title_change", "title": "Design 6-axis arm"})[1]["title"], "Design 6-axis arm")
         self.assertEqual(one({"type": "notice", "text": "Session signed in"})[1]["text"], "Session signed in")

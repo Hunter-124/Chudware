@@ -482,7 +482,7 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
         if (key.empty())
             return refusal(
                 "Claude is not configured for native local execution. Use "
-                "agent_admin_turn/Chudcode for online providers.");
+                "agent_admin_turn (agent service) for online providers.");
         // Global cfg.model may be a Grok id when the active provider is xAI — never send
         // a non-Claude model id to the Anthropic Messages API.
         std::string model = py_or(cfg_str(cfg, "model"), "claude-opus-5-5");
@@ -595,7 +595,7 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
     } else if (name == "cursor" || name == "cursor-sub") {
         return refusal(
             "Cursor has no native local completions transport. Use "
-            "agent_admin_turn/Chudcode for online providers.");
+            "agent_admin_turn (agent service) for online providers.");
     } else if (name == "llamacpp" || name == "llama.cpp" || name == "llama-cpp") {
         desc = json{
             {"name", "llamacpp"},

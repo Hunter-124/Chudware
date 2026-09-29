@@ -232,7 +232,7 @@ def _run_one_shot_role(
     if not parent_session:
         if not local:
             raise SessionCommandUnavailable(
-                f"{command} requires a live Chudcode session_id"
+                f"{command} requires a live agent session_id"
             )
         parent_session = f"offline-{command}"
     settings: dict[str, Any] = {}
@@ -287,7 +287,7 @@ def _chudcode_session_call(
     key = str(session_id or "").strip()
     if not key:
         raise SessionCommandUnavailable(
-            f"{command} requires a live Chudcode session_id; "
+            f"{command} requires a live agent session_id; "
             "pass standalone=True only for explicit local/offline use"
         )
     try:
@@ -298,16 +298,16 @@ def _chudcode_session_call(
         result = get_default_chudcode_host().session_call(key, command, params)
     except Exception as exc:  # noqa: BLE001 - process boundary
         raise SessionCommandUnavailable(
-            f"Chudcode session {command} unavailable: {exc}"
+            f"Agent session {command} unavailable: {exc}"
         ) from exc
     if not isinstance(result, dict):
         raise SessionCommandUnavailable(
-            f"Chudcode session {command} returned a non-object response"
+            f"Agent session {command} returned a non-object response"
         )
     if result.get("ok") is False:
         reason = str(result.get("reason") or result.get("error") or "request failed")
         raise SessionCommandUnavailable(
-            f"Chudcode session {command} unavailable: {reason}"
+            f"Agent session {command} unavailable: {reason}"
         )
     return result
 
@@ -376,7 +376,7 @@ def handoff_document(
                 if isinstance(nested, str) and nested.strip():
                     return nested.strip()
     raise SessionCommandUnavailable(
-        "Chudcode session handoff returned no document text"
+        "Agent session handoff returned no document text"
     )
 
 
@@ -487,7 +487,7 @@ def shake_session(
     """Mechanically elide a transcript only for explicit offline/standalone use."""
     if not _local_compaction(standalone):
         raise SessionCommandUnavailable(
-            "local session shake is unavailable for online Chudcode sessions"
+            "local session shake is unavailable for online agent sessions"
         )
     msgs = _snapshot_messages(messages)
     comp = importlib.import_module("services.agent.compaction")

@@ -142,16 +142,16 @@ def _memory_call(command: str, params: dict[str, Any]) -> dict[str, Any]:
         result = _default_host().memory_call(command, params)
     except Exception as exc:  # noqa: BLE001 - host/process boundary
         raise ProjectMemoryUnavailable(
-            f"Chudcode project memory unavailable: {exc}"
+            f"Agent project memory unavailable: {exc}"
         ) from exc
     if not isinstance(result, Mapping):
         raise ProjectMemoryUnavailable(
-            f"Chudcode project memory returned a non-object for {command}"
+            f"Agent project memory returned a non-object for {command}"
         )
     out = dict(result)
     if out.get("ok") is False:
         reason = str(out.get("reason") or out.get("error") or "request failed")
-        raise ProjectMemoryUnavailable(f"Chudcode project memory unavailable: {reason}")
+        raise ProjectMemoryUnavailable(f"Agent project memory unavailable: {reason}")
     return out
 
 

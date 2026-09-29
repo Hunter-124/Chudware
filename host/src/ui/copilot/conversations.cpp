@@ -1650,7 +1650,7 @@ static bool adoptChudcodeSessionJsonl(AppState& st, const std::filesystem::path&
     }
     ChatMsg note;
     note.fromUser = false;
-    note.text = "Adopted from an external Chudcode session; tool activity lives in the "
+    note.text = "Adopted from an external agent session; tool activity lives in the "
                 "session file";
     c.msgs.reserve(msgs.size() + 1);
     c.msgs.push_back(std::move(note));

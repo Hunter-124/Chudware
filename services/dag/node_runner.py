@@ -431,7 +431,7 @@ class _RoleTurnAgentResult:
             else {
                 "success": False,
                 "stop_reason": "provider_error",
-                "result": {"error": "Chudcode role turn returned a non-object result"},
+                "result": {"error": "Agent role turn returned a non-object result"},
             }
         )
         self.success = bool(payload.get("success"))

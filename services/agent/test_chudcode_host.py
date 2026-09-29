@@ -1138,7 +1138,7 @@ def test_set_model_refusal_names_the_signed_out_provider_or_the_catalog():
     host = ChudcodeSessionHost(client_factory=factory)
     stale, _ = run(host, "stale", provider="anthropic", model="claude-sonnet-5")
     assert stale["ok"] is False
-    assert "claude-sonnet-5 is not in Chudcode's anthropic catalog" in stale["reason"]
+    assert "claude-sonnet-5 is not in the agent service's anthropic catalog" in stale["reason"]
     assert "claude" in stale["reason"]
 
 

@@ -2046,7 +2046,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                         jstr(resolved, "error", "provider resolution failed");
                     const std::string error =
                         "Native agent_run could not resolve an offline-safe local provider: " +
-                        detail + ". Use agent_admin_turn/Chudcode for online providers.";
+                        detail + ". Use agent_admin_turn (agent service) for online providers.";
                     return emit(json{{"ok", false},
                                      {"status", "failed"},
                                      {"stop_reason", "provider_error"},
@@ -2060,7 +2060,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             if (!native_provider_offline_safe(provider)) {
                 const std::string error =
                     "Native agent_run supports only deterministic offline-safe local providers; "
-                    "use agent_admin_turn/Chudcode for online providers.";
+                    "use agent_admin_turn (agent service) for online providers.";
                 return emit(json{{"ok", false},
                                  {"status", "failed"},
                                  {"stop_reason", "provider_error"},
@@ -2268,7 +2268,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     const std::string error =
                         "Native agent_mission_v1 could not resolve an offline-safe local "
                         "provider: " + detail +
-                        ". Use agent_admin_turn/Chudcode for online providers.";
+                        ". Use agent_admin_turn (agent service) for online providers.";
                     return emit(json{{"ok", false},
                                      {"status", "failed"},
                                      {"stop_reason", "provider_error"},
@@ -2282,7 +2282,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             if (!native_provider_offline_safe(provider)) {
                 const std::string error =
                     "Native agent_mission_v1 supports only deterministic offline-safe local "
-                    "providers; use agent_admin_turn/Chudcode for online providers.";
+                    "providers; use agent_admin_turn (agent service) for online providers.";
                 return emit(json{{"ok", false},
                                  {"status", "failed"},
                                  {"stop_reason", "provider_error"},

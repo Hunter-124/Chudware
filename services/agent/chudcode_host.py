@@ -299,13 +299,13 @@ def _describe_model_rejection(client: Any, provider: str, model: str, exc: Excep
             else " No provider is signed in."
         )
         return (
-            f"{provider} is not signed in to Chudcode, so {provider}/{model} cannot run. "
+            f"{provider} is not signed in to the agent service, so {provider}/{model} cannot run. "
             f"Sign in under Settings -> Providers, or pick a model from a signed-in "
             f"provider in the composer's model chip.{others}"
         )
     hints = ", ".join(sorted(m for m in same_provider if m)[:_MAX_MODEL_HINTS])
     return (
-        f"{model} is not in Chudcode's {provider} catalog. Pick a listed {provider} model "
+        f"{model} is not in the agent service's {provider} catalog. Pick a listed {provider} model "
         f"(e.g. {hints})."
     )
 
@@ -992,7 +992,7 @@ class ChudcodeSessionHost:
                     )
                     if exported is None or not exported.is_file():
                         raise RuntimeError(
-                            "Chudcode export_html did not create the requested file"
+                            "Agent service export_html did not create the requested file"
                         )
                     if (
                         exported.is_symlink()
@@ -1000,7 +1000,7 @@ class ChudcodeSessionHost:
                         or exported.resolve().parent != target.parent.resolve()
                     ):
                         raise RuntimeError(
-                            "Chudcode export_html returned an unexpected output path"
+                            "Agent service export_html returned an unexpected output path"
                         )
                     os.replace(exported, target)
                     temporary = None
@@ -1037,7 +1037,7 @@ class ChudcodeSessionHost:
                 dispose = True
                 normalized = _json_value(raw)
                 if not isinstance(normalized, Mapping):
-                    raise TypeError("Chudcode branch returned a non-object response")
+                    raise TypeError("Agent session branch returned a non-object response")
                 if normalized.get("cancelled"):
                     dispose = False
                     return {"ok": False, "reason": "branch_cancelled"}
@@ -1050,7 +1050,7 @@ class ChudcodeSessionHost:
                 )
                 if child_id is None or child_file is None:
                     raise RuntimeError(
-                        "Chudcode branch returned no child session metadata"
+                        "Agent session branch returned no child session metadata"
                     )
                 return {
                     "ok": True,
@@ -1125,7 +1125,7 @@ class ChudcodeSessionHost:
         command_name = _nonempty_string(command)
         if command_name not in _TRANSIENT_SHAPES:
             raise ValueError(
-                f"unsupported Chudcode transient command: {command_name!r}"
+                f"unsupported agent-service transient command: {command_name!r}"
             )
         payload = _validated_payload(
             command_name,
@@ -1134,26 +1134,26 @@ class ChudcodeSessionHost:
         )
         _validate_service_payload(command_name, payload)
         if emit is not None and not callable(emit):
-            raise TypeError("Chudcode transient emit callback must be callable")
+            raise TypeError("Agent-service transient emit callback must be callable")
         return self._transient_call(command_name, payload, emit=emit)
 
     def auth_call(self, command, params):
         command_name = _nonempty_string(command)
         if command_name not in _AUTH_SHAPES:
-            raise ValueError(f"unsupported Chudcode auth command: {command_name!r}")
+            raise ValueError(f"unsupported agent-service auth command: {command_name!r}")
         return self.transient_call(command_name, params)
 
     def memory_call(self, command, params):
         command_name = _nonempty_string(command)
         if command_name not in _MEMORY_SHAPES:
-            raise ValueError(f"unsupported Chudcode memory command: {command_name!r}")
+            raise ValueError(f"unsupported agent-service memory command: {command_name!r}")
         return self.transient_call(command_name, params)
 
     def session_call(self, session_id, command, params=None) -> dict[str, Any]:
         """Call one named live session; these calls never create or resume sessions."""
         command_name = _nonempty_string(command)
         if command_name not in _SESSION_SHAPES:
-            raise ValueError(f"unsupported Chudcode session command: {command_name!r}")
+            raise ValueError(f"unsupported agent-session command: {command_name!r}")
         payload = _validated_payload(
             command_name,
             params if params is not None else {},
@@ -1198,7 +1198,7 @@ class ChudcodeSessionHost:
                     normalized = {"ok": True}
                 if not isinstance(normalized, dict):
                     raise TypeError(
-                        f"Chudcode {command_name} returned a non-object response"
+                        f"Agent service {command_name} returned a non-object response"
                     )
                 normalized.setdefault("ok", True)
                 if command_name in {"set_auto_compaction", "set_auto_retry"}:
@@ -1287,7 +1287,7 @@ class ChudcodeSessionHost:
                             resume_path = Path(resume_file).expanduser()
                             if not resume_path.is_file():
                                 raise RuntimeError(
-                                    f"persisted Chudcode session file does not exist: {resume_path}"
+                                    f"persisted agent session file does not exist: {resume_path}"
                                 )
                             client.switch_session(str(resume_path))
                         with self._lock:
@@ -1326,9 +1326,9 @@ class ChudcodeSessionHost:
         if existing is None:
             return None
         if existing.closed:
-            raise RuntimeError("chudcode RPC session is closing")
+            raise RuntimeError("agent RPC session is closing")
         if existing.credential_identity != credential_identity:
-            raise RuntimeError("cannot change Chudcode credential identity on a live session")
+            raise RuntimeError("cannot change agent credential identity on a live session")
         if (
             resume_file
             and existing.resume_file
@@ -1355,7 +1355,7 @@ class ChudcodeSessionHost:
             None,
         )
         if victim_key is None:
-            raise RuntimeError("all bounded Chudcode RPC sessions are currently active")
+            raise RuntimeError("all bounded agent sessions are currently active")
         victim = self._sessions.pop(victim_key)
         victim.closed = True
         victim.dispose_started = True
@@ -1374,7 +1374,7 @@ class ChudcodeSessionHost:
                 from chudcode_rpc import RpcClient  # type: ignore
             except ImportError as exc:
                 raise RuntimeError(
-                    "Chudcode RPC support is unavailable; install the managed "
+                    "Agent service RPC support is unavailable; install the managed "
                     "chudcode-rpc==0.2.0 runtime dependency"
                 ) from exc
             factory = RpcClient
@@ -1480,7 +1480,7 @@ class ChudcodeSessionHost:
         if not required:
             return None
         raise RuntimeError(
-            "Chudcode executable not found; set CHUDWARE_CHUDCODE_BIN, install the "
+            "Agent service executable not found; set CHUDWARE_CHUDCODE_BIN, install the "
             "signed-payload-adjacent chud binary, or put chud on PATH in developer mode"
         )
 
@@ -1718,7 +1718,7 @@ class ChudcodeSessionHost:
                         )
             normalized = _json_value(result)
             if not isinstance(normalized, dict):
-                raise TypeError(f"Chudcode {command} returned a non-object response")
+                raise TypeError(f"Agent service {command} returned a non-object response")
             return normalized
 
 
@@ -1794,10 +1794,10 @@ def _bounded_doctor_count(value: Any) -> int:
 def _sanitize_doctor_summary(raw: Mapping[str, Any], *, repair: bool) -> dict[str, Any]:
     status = _nonempty_string(raw.get("status"))
     if status not in _DOCTOR_STATUSES:
-        raise ValueError("Chudcode session doctor returned an invalid status")
+        raise ValueError("Agent session doctor returned an invalid status")
     raw_findings = raw.get("findings")
     if not isinstance(raw_findings, list):
-        raise ValueError("Chudcode session doctor returned invalid findings")
+        raise ValueError("Agent session doctor returned invalid findings")
     findings: list[dict[str, Any]] = []
     for value in raw_findings[:_MAX_DOCTOR_FINDINGS]:
         if not isinstance(value, Mapping):
@@ -1882,14 +1882,14 @@ def _run_session_doctor(client: Any, repair: bool) -> dict[str, Any]:
             else None
         )
         if response_invoked is True:
-            raise RuntimeError("Chudcode session doctor unexpectedly invoked a model")
+            raise RuntimeError("Agent session doctor unexpectedly invoked a model")
         if response_invoked is not False and not prompt_results:
             completed.wait(5.0)
         if prompt_results and prompt_results[-1].get("agentInvoked") is not False:
-            raise RuntimeError("Chudcode session doctor unexpectedly invoked a model")
+            raise RuntimeError("Agent session doctor unexpectedly invoked a model")
         if response_invoked is not False and not prompt_results:
             raise RuntimeError(
-                "Chudcode session doctor did not report local completion"
+                "Agent session doctor did not report local completion"
             )
     finally:
         try:
@@ -1906,7 +1906,7 @@ def _run_session_doctor(client: Any, repair: bool) -> dict[str, Any]:
             continue
         if isinstance(value, Mapping):
             return _sanitize_doctor_summary(value, repair=repair)
-    raise RuntimeError("Chudcode session doctor returned no valid summary")
+    raise RuntimeError("Agent session doctor returned no valid summary")
 
 
 def _invoke_canonical(client: Any, command: str, payload: Mapping[str, Any]) -> Any:
@@ -2322,7 +2322,7 @@ def _start_client(client: Any) -> None:
     )
     if protocol_version is not None and protocol_version != 2:
         raise RuntimeError(
-            f"Chudcode RPC protocol v2 is required (runtime negotiated v{protocol_version})"
+            f"Agent service RPC protocol v2 is required (runtime negotiated v{protocol_version})"
         )
 
 

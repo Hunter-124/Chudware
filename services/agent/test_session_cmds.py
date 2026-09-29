@@ -285,7 +285,7 @@ class TestCompactShakeDelegation(unittest.TestCase):
         from services.agent import session_cmds as sc
 
         with self.assertRaisesRegex(
-            sc.SessionCommandUnavailable, "requires a live Chudcode session_id"
+            sc.SessionCommandUnavailable, "requires a live agent session_id"
         ):
             sc.compact_session(_history(), strategy="summary")
 
@@ -365,7 +365,7 @@ class TestCompactShakeDelegation(unittest.TestCase):
         from services.agent import session_cmds as sc
 
         with self.assertRaisesRegex(
-            sc.SessionCommandUnavailable, "unavailable for online Chudcode"
+            sc.SessionCommandUnavailable, "unavailable for online agent"
         ):
             sc.shake_session(_history())
 

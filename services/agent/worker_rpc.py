@@ -420,7 +420,7 @@ def _session_shake(params: dict, _emit: Callable) -> dict:
         ):
             return {
                 "ok": False,
-                "reason": "session_shake is unavailable for online Chudcode sessions",
+                "reason": "session_shake is unavailable for online agent sessions",
                 "owner": "chudcode",
                 "hint": "use chudcode_compact for the named live session",
             }
@@ -1814,20 +1814,20 @@ def chudcode_agent_turn(params: dict, emit: Callable) -> dict:
         if not isinstance(result, dict):
             return {
                 "ok": False,
-                "reason": "Chudcode session host returned a non-object response",
+                "reason": "Agent session host returned a non-object response",
             }
         return result
     except Exception as exc:  # noqa: BLE001 - never cross the worker boundary
         return {
             "ok": False,
-            "reason": f"Chudcode session host failed: {type(exc).__name__}: {exc}",
+            "reason": f"Agent session host failed: {type(exc).__name__}: {exc}",
         }
 
 
 def chudcode_control(action: str, params: dict) -> dict:
     """Dispatch a bounded control request to the process-global session host."""
     if not isinstance(params, Mapping):
-        return {"ok": False, "reason": "Chudcode control params must be an object"}
+        return {"ok": False, "reason": "Agent control params must be an object"}
     command = str(action or "").strip().lower()
     try:
         if command == "cancel":
@@ -1842,12 +1842,12 @@ def chudcode_control(action: str, params: dict) -> dict:
             )
         return {
             "ok": False,
-            "reason": f"unsupported Chudcode control action: {command}",
+            "reason": f"unsupported agent control action: {command}",
         }
     except Exception as exc:  # noqa: BLE001 - control is an RPC boundary
         return {
             "ok": False,
-            "reason": f"Chudcode {command or 'control'} failed: "
+            "reason": f"Agent {command or 'control'} failed: "
             f"{type(exc).__name__}: {exc}",
         }
 
@@ -1950,7 +1950,7 @@ def _chudcode_transient_call(
     try:
         result = get_default_chudcode_host().transient_call(command, params, emit=emit)
         if not isinstance(result, dict):
-            return {"ok": False, "reason": f"Chudcode {command} returned non-object"}
+            return {"ok": False, "reason": f"Agent service {command} returned non-object"}
         clean = _redact_sensitive_response(result)
         api_key = params.get("apiKey")
         if secret_input and isinstance(api_key, str):
@@ -1959,7 +1959,7 @@ def _chudcode_transient_call(
         return clean
     except Exception as exc:  # noqa: BLE001 - worker methods return clean refusals
         detail = type(exc).__name__ if secret_input else f"{type(exc).__name__}: {exc}"
-        return {"ok": False, "reason": f"Chudcode {command} failed: {detail}"}
+        return {"ok": False, "reason": f"Agent service {command} failed: {detail}"}
 
 
 def _chudcode_auth_call(command: str, params: dict, _emit: Callable) -> dict:
@@ -1974,13 +1974,13 @@ def _chudcode_memory_call(command: str, params: dict, _emit: Callable) -> dict:
     try:
         result = get_default_chudcode_host().memory_call(command, params)
         if not isinstance(result, dict):
-            return {"ok": False, "reason": f"Chudcode {command} returned non-object"}
+            return {"ok": False, "reason": f"Agent service {command} returned non-object"}
         result.setdefault("ok", True)
         return result
     except Exception as exc:  # noqa: BLE001 - Settings must get a clean refusal
         return {
             "ok": False,
-            "reason": f"Chudcode {command} failed: {type(exc).__name__}: {exc}",
+            "reason": f"Agent service {command} failed: {type(exc).__name__}: {exc}",
         }
 
 
@@ -2162,7 +2162,7 @@ def _chudcode_set_key(params: dict, emit: Callable) -> dict:
     provider_raw = raw.get("provider")
     provider = _auth_provider(provider_raw)
     if provider is None:
-        return {"ok": False, "reason": "Chudcode set_api_key returned no provider"}
+        return {"ok": False, "reason": "Agent service set_api_key returned no provider"}
     native_provider = {
         "providerId": provider["id"],
         "name": provider["name"],
@@ -2296,7 +2296,7 @@ def _chudcode_session_call(
     except Exception as exc:  # noqa: BLE001 - worker boundary
         return {
             "ok": False,
-            "reason": f"Chudcode {command} failed: {type(exc).__name__}: {exc}",
+            "reason": f"Agent service {command} failed: {type(exc).__name__}: {exc}",
         }
 
 
@@ -2316,25 +2316,25 @@ def _chudcode_export_session(params: dict, _emit: Callable) -> dict:
         if not isinstance(raw, Mapping):
             return {
                 "ok": False,
-                "reason": "Chudcode export_session returned non-object",
+                "reason": "Agent service export_session returned non-object",
             }
         if not raw.get("ok"):
             return {
                 "ok": False,
                 "reason": _bounded_text(raw.get("reason"), 4_096)
-                or "Chudcode export_session failed",
+                or "Agent service export_session failed",
             }
         path = _bounded_text(raw.get("path"), 4_096)
         if path is None:
             return {
                 "ok": False,
-                "reason": "Chudcode export_session returned no path",
+                "reason": "Agent service export_session returned no path",
             }
         return {"ok": True, "path": path}
     except Exception as exc:  # noqa: BLE001 - worker boundary
         return {
             "ok": False,
-            "reason": f"Chudcode export_session failed: {type(exc).__name__}",
+            "reason": f"Agent service export_session failed: {type(exc).__name__}",
         }
 
 
@@ -2352,20 +2352,20 @@ def _chudcode_branch_session(params: dict, _emit: Callable) -> dict:
         if not isinstance(raw, Mapping):
             return {
                 "ok": False,
-                "reason": "Chudcode branch_session returned non-object",
+                "reason": "Agent service branch_session returned non-object",
             }
         if not raw.get("ok"):
             return {
                 "ok": False,
                 "reason": _bounded_text(raw.get("reason"), 4_096)
-                or "Chudcode branch_session failed",
+                or "Agent service branch_session failed",
             }
         child_id = _bounded_text(raw.get("chudcode_session_id"), 256)
         child_file = _bounded_text(raw.get("chudcode_session_file"), 4_096)
         if child_id is None or child_file is None:
             return {
                 "ok": False,
-                "reason": "Chudcode branch_session returned no child metadata",
+                "reason": "Agent service branch_session returned no child metadata",
             }
         return {
             "ok": True,
@@ -2375,7 +2375,7 @@ def _chudcode_branch_session(params: dict, _emit: Callable) -> dict:
     except Exception as exc:  # noqa: BLE001 - worker boundary
         return {
             "ok": False,
-            "reason": f"Chudcode branch_session failed: {type(exc).__name__}",
+            "reason": f"Agent service branch_session failed: {type(exc).__name__}",
         }
 
 
@@ -2393,14 +2393,14 @@ def _chudcode_repair_session(params: dict, _emit: Callable) -> dict:
         if not isinstance(raw, Mapping):
             return {
                 "ok": False,
-                "reason": "Chudcode repair_session returned non-object",
+                "reason": "Agent service repair_session returned non-object",
             }
         clean = _redact_sensitive_response(raw)
         if not clean.get("ok"):
             return {
                 "ok": False,
                 "reason": _bounded_text(clean.get("reason"), 4_096)
-                or "Chudcode repair_session failed",
+                or "Agent service repair_session failed",
             }
         allowed = {
             "ok",
@@ -2420,7 +2420,7 @@ def _chudcode_repair_session(params: dict, _emit: Callable) -> dict:
     except Exception as exc:  # noqa: BLE001 - worker boundary
         return {
             "ok": False,
-            "reason": f"Chudcode repair_session failed: {type(exc).__name__}",
+            "reason": f"Agent service repair_session failed: {type(exc).__name__}",
         }
 
 
@@ -2438,7 +2438,7 @@ def _chudcode_close_session(params: dict, _emit: Callable) -> dict:
     except Exception as exc:  # noqa: BLE001 - worker boundary
         return {
             "ok": False,
-            "reason": f"Chudcode close_session failed: {type(exc).__name__}",
+            "reason": f"Agent service close_session failed: {type(exc).__name__}",
         }
 
 
@@ -2564,7 +2564,7 @@ def _chudcode_stt_failure(raw: Mapping[str, Any], command: str) -> dict:
     reason = _bounded_text(raw.get("reason") or raw.get("error"), 4_096)
     return {
         "ok": False,
-        "reason": reason or f"Chudcode {command} failed",
+        "reason": reason or f"Agent service {command} failed",
     }
 
 
@@ -3716,7 +3716,7 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         if not host_result.get("ok"):
             response = {
                 "ok": False,
-                "reason": str(host_result.get("reason") or "Chudcode turn failed"),
+                "reason": str(host_result.get("reason") or "Agent turn failed"),
             }
             # provider_error / turn_budget: without it the GUI labels every failure
             # provider_error (host/src/core/jobs.cpp normalizeAgentAdminTurnResult).

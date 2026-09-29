@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import queue
 import tempfile
@@ -784,6 +785,11 @@ _NEUTRAL_TOOL_OPTIONS = {
 }
 
 
+# The runtime venv carries chudcode_rpc (vendored Chudcode client); a bare service venv may not.
+_HAS_CHUDCODE_RPC = importlib.util.find_spec("chudcode_rpc") is not None
+
+
+@unittest.skipUnless(_HAS_CHUDCODE_RPC, "chudcode_rpc client not installed in this venv")
 class HostToolImageDeliveryTests(unittest.TestCase):
     """Render tools return FastMCP ``[Image, caption]``. c205/c213/c217: the RPC
     ``host_tool_result`` frame carried only ``"<mcp.server.fastmcp.utilities.types.

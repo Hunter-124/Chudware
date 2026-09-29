@@ -7,7 +7,8 @@ import types
 
 import numpy as np
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from training.viewpoint.observer import judge as J
 from training.viewpoint.observer import queries as Q

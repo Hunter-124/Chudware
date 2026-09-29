@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from training.viewpoint.observer.model import ModelConfig, ObserverNet, augment, query_loss
 from training.viewpoint.observer.queries import A_MAX, OPTION_MASKS, QD

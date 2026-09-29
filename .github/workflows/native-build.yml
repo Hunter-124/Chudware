@@ -56,9 +56,9 @@ jobs:
             runner_os: Windows
             runner_arch: X64
             runner_label: cc-win-package
-            # windows-core, not windows-occt: OCCT off is the self-contained
-            # fast per-push compile gate; the full geometry/FEA package builds separately.
-            preset: windows-core
+            # Exercise the shipping geometry paths (doc_view_metrics, sections,
+            # drawing provenance); windows-core disables OCCT and misses them.
+            preset: windows-occt
             build_host: true
             host_build_dir: host/build-windows
           - label: macOS arm64
@@ -270,6 +270,13 @@ jobs:
           set -euo pipefail
           cmake --preset ${{ matrix.preset }}
           cmake --build --preset ${{ matrix.preset }}
+
+      - name: Refresh Windows source junctions for OCCT
+        if: runner.os == 'Windows' && matrix.preset == 'windows-occt'
+        shell: powershell
+        run: |
+          & powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup_windows_links.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Configure and build core (${{ matrix.preset }}) (Windows)
         if: runner.os == 'Windows'

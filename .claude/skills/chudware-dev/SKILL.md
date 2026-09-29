@@ -134,12 +134,23 @@ judgment).
   existing body must record its history (`geom::op_history_record`, or index provenance via
   `op_provenance_encode`/`_record` across `isolate_shape_build`'s `sidecar`) — otherwise the
   owner map hands every rebuilt face to that feature (`core/geom/op_history.h`).
-- **Agent visual review is numbers first, then one perspective close-up (2026-09-27).**
-  `render_part(target=…)` is a 512×384 true-perspective shot (`cad_render_tools._closeup`,
-  `cad_viewpoint.perspective_camera`); with no `view` it aims at an attachment defect found by
-  engine `eval_feature_attachment` (floating / overhang / edge-only contact), which also feeds
-  `verify_battery` `feature_attachment` and `add_features` `attachment_warnings`. Don't draw
-  labels on the target or re-add "render after every mutation" guidance.
+- **Agent visual review is numbers first, then ONE planner grid (2026-09-28, ViewNet).**
+  `render_part` with no `view` (whole part or `target=`) returns one 2×2 grid of the 4 best
+  complementary perspective shots chosen by `services/mcp/shot_planner.py` from ~160–250
+  candidates measured by the native `doc_view_metrics` RPC (per-face visible true area, edge
+  crease contrast/silhouettes, normal entropy); hidden targets get x-ray (translucent occluders,
+  opaque target) or section tiles (`doc_render_view view.section`: hatch cap, cut outline,
+  ghosted removed half). Ranking = `services/viewpoint/utility` model when
+  `weights/utility_v1.npz` is shipped, else `features.hand_utility`; an attachment defect found by
+  `eval_feature_attachment` is pinned as one tile. Tiles carry SID face tags that tools accept
+  verbatim. Explicit `view=` stays a single shot. Before this, CAD tool images never reached the
+  online model at all (`services/agent/tool_images.py`: the Chudcode adapter stringified FastMCP
+  `Image` objects) — keep image blocks end to end. Don't re-add "render after every mutation".
+- **ViewNet learning is LLM-free (2026-09-28).** Labels come from `training/viewpoint/datasets`
+  (`chudware.geomlabel/1`: MFCAD MIT, MFCAD++ generator port, GSL), usefulness from the
+  from-scratch cross-fitted Observer CNN (`training/viewpoint/observer`), the utility model from
+  `training/viewpoint/utility`; `training/viewpoint/campaign.sh` runs it all resumably. No
+  VLM/LLM calls anywhere in that pipeline, by the owner's decision.
 
 ### Manufacturing rules that bind every change
 

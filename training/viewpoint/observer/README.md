@@ -37,6 +37,9 @@ value — and a stratum with one answer is dropped. qids are content hashes; the
 which queries balancing keeps. On the 2400-part manifest: 82.7k raw → 27.3k balanced queries
 (≈ 11 per part), in 1.6 s.
 
+On Windows, run the ViewNet campaign in WSL with a Linux `libchudware.so`; native
+Windows is supported for production rendering but not for campaign training.
+
 ## Rendering (`render.py`)
 
 `render_sets(record, [ViewSet], store=...)` / `render_many(jobs, store=..., workers=...)` /

@@ -1634,10 +1634,28 @@ _HANDOFF_FRAG_TTL_S = float(os.environ.get("CHUDWARE_HANDOFF_TTL_S", "1800") or 
 
 
 def _pid_alive(pid: int) -> bool:
-    """True if `pid` is a live process on this machine. os.kill(pid, 0) is the POSIX probe:
-    ESRCH -> dead, EPERM -> alive but not ours. Best-effort; assume alive if we can't tell."""
+    """True if `pid` is alive. Inaccessible owners are assumed alive."""
     if not pid or pid < 0:
         return True  # unknown owner (legacy fragment) — don't evict on liveness grounds
+    if os.name == "nt":
+        import ctypes  # noqa: PLC0415
+        from ctypes import wintypes  # noqa: PLC0415
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: PID no longer exists
+        try:
+            # WAIT_TIMEOUT = running; WAIT_OBJECT_0 = exited; WAIT_FAILED = unknown.
+            return kernel32.WaitForSingleObject(handle, 0) != 0
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -1645,7 +1663,7 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    except Exception:  # noqa: BLE001 — non-POSIX / can't tell -> fall back to mtime TTL
+    except Exception:  # noqa: BLE001 — can't tell -> fall back to mtime TTL
         return True
 
 
@@ -5040,11 +5058,14 @@ def _annot_font(size: int = 13):
     """A scalable font for overlay labels. Pillow's bundled default is scalable from 10.1;
     a system sans is preferred when present. Never raises."""
     from PIL import ImageFont  # noqa: PLC0415
-    for p in ("/usr/share/fonts/liberation-sans-fonts/LiberationSans-Bold.ttf",
-              "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-              "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-              "/usr/share/fonts/google-noto/NotoSans-Bold.ttf",
-              "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"):
+    paths = ("/usr/share/fonts/liberation-sans-fonts/LiberationSans-Bold.ttf",
+             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+             "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+             "/usr/share/fonts/google-noto/NotoSans-Bold.ttf",
+             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf")
+    if os.name == "nt":
+        paths = (str(Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "arialbd.ttf"),) + paths
+    for p in paths:
         try:
             return ImageFont.truetype(p, size)
         except Exception:  # noqa: BLE001
@@ -5056,12 +5077,23 @@ def _annot_font(size: int = 13):
 
 
 def _aicm_payload(handle: str) -> bytes:
-    """AICM bytes for an engine tess handle: an "aicm-shm:///name" POSIX shared-memory object
-    (8-byte little-endian size header + payload, core/util/aicm_handoff.cpp) or a plain file
-    path (older engine / Windows fallback)."""
+    """AICM bytes for an engine tess handle (8-byte little-endian size + payload).
+
+    Windows publishes ``aicm-shm://Local\\chudware_<key>`` as a named file mapping;
+    POSIX publishes ``aicm-shm:///chudware_<key>`` in shared memory. Older engine
+    versions may return an ordinary file path instead.
+    """
     prefix = "aicm-shm://"
     if handle.startswith(prefix):
-        name = handle[len(prefix):].lstrip("/")
+        name = handle[len(prefix):]
+        if os.name == "nt":
+            import mmap  # noqa: PLC0415
+
+            with mmap.mmap(-1, 8, tagname=name, access=mmap.ACCESS_READ) as header:
+                n = int.from_bytes(header[:8], "little")
+            with mmap.mmap(-1, 8 + n, tagname=name, access=mmap.ACCESS_READ) as mapping:
+                return mapping[8:8 + n]
+        name = name.lstrip("/")
         with open(os.path.join("/dev/shm", name), "rb") as f:
             raw = f.read()
         if len(raw) < 8:

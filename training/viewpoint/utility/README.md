@@ -22,6 +22,9 @@ geomlabel JSONL ──► trials: per part, candidates + native metrics (in-proc
       ab (fresh sets on held-out TEST parts, scored by the INDEPENDENT observer) ──► --ship
 ```
 
+On Windows, run the ViewNet campaign in WSL with a Linux `libchudware.so`; native
+Windows is supported for production inference but not for campaign training.
+
 ## Prerequisites
 
 - Labels: `chudware.geomlabel/1` manifest from `training.viewpoint.datasets.build_manifest`

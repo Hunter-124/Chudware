@@ -721,11 +721,11 @@ def test_nested_fields_dict_and_flattened_kwargs_still_merge():
 #   a=["bore","F6356a7"], b=["bore","F6356a7"]  -> "dimension point a must be [x,y] sheet mm"
 #   a=["bore","F6356a7"], b omitted             -> missing_argument: b
 #   a=["F6356a7","center"], b=["F6356a7","edge"]
-# The projected arcs carry no sid (HLR drops topological identity — core/doc/drawing.cpp:149-186),
-# so the resolution joins the sid's MODEL radius to this view's projected circle of the same
-# radius/scale and hands the engine a point ON that ring. The ring point matters for concentric
-# circles: picking their common centre makes the engine choose the smallest circle. Every test
-# below asserts the measured VALUE — a ⌀6 callout reading 10.0 is a wrong drawing that looks normal.
+# Every projected circle in drawing_get names the model edge (and faces) it was drawn from —
+# HLR provenance, core/doc/drawing.cpp — so a sid lands on exactly its own circle and the tool
+# hands the engine a point ON that ring. The ring point matters for concentric circles: picking
+# their common centre makes the engine choose the smallest circle. Every test below asserts the
+# measured VALUE or the anchor — a ⌀6 callout reading 10.0 is a wrong drawing that looks normal.
 
 BIG_D_MM, SMALL_D_MM = 10.0, 6.0
 
@@ -762,7 +762,7 @@ def _concentric_punch() -> str:
 
 
 def _plate_with_twin_bores() -> str:
-    """An 80x50x10 plate with TWO identical ⌀6 bores — the ambiguous case."""
+    """An 80x50x10 plate with TWO identical ⌀6 bores from ONE hole feature."""
     n = next(_PLATE_N)
     doc = _call("new_part", {"name": f"TwinBore{n}"})["doc_id"]
     r = _call("add_features", {"doc_id": doc, "ops": [
@@ -774,6 +774,49 @@ def _plate_with_twin_bores() -> str:
                  "points": [[-20.0, 0.0], [20.0, 0.0]]})]})
     assert r["ok"], r
     return doc
+
+
+CROSS_HOLE_XS = (-36.0, -12.0, 12.0, 36.0)
+
+
+def _plate_with_four_cross_holes(blind_third: bool = False) -> str:
+    """A 100x10x40 upright plate (thin in Y) with four identical ⌀6 holes drilled along Y at
+    x = -36/-12/12/36, so the FRONT and BACK views look straight down every hole. With
+    `blind_third`, hole #3 (x=12) is only 5 mm deep, open on the -Y face."""
+    n = next(_PLATE_N)
+    doc = _call("new_part", {"name": f"CrossHoles{n}"})["doc_id"]
+    ops = [cb.feat("box", "Plate", {"length": cb.dim(100), "width": cb.dim(10),
+                                    "height": cb.dim(40)})]
+    for i, x in enumerate(CROSS_HOLE_XS, start=1):
+        blind = blind_third and i == 3
+        ops.append(cb.feat("cylinder", f"Hole{i}", {
+            "radius": cb.dim(SMALL_D_MM / 2.0), "height": cb.dim(5.0 if blind else 20.0),
+            "at": [x, -2.5 if blind else 0.0, 0.0], "axis": [0, 1, 0], "mode": "cut"}))
+    r = _call("add_features", {"doc_id": doc, "ops": ops})
+    assert r["ok"], r
+    return doc
+
+
+def _cross_hole_sids(doc: str) -> list:
+    """The four hole walls' sids, ordered hole #1..#4 by model x."""
+    matches = cb.call("doc_query", {"doc_id": doc,
+                                    "query": {"of": "face", "surf": "cylinder"}})["matches"]
+    assert len(matches) == 4, matches
+    return [m["sid"] for m in sorted(matches, key=lambda m: m["centroid"][0])]
+
+
+def _circle_centres(dwg: str, view_id: str, diameter: float) -> list:
+    """Every distinct sheet-mm centre of a projected full circle of *diameter*, sorted by x."""
+    full = cb.call("drawing_get", {"doc_id": dwg})
+    out: set = set()
+    for view in full["sheets"][0]["views"]:
+        if view["view_id"] != view_id:
+            continue
+        scale = view.get("scale") or 1.0
+        for arc in view.get("arcs", []):
+            if arc.get("closed") and abs(2.0 * arc["radius"] / scale - diameter) < 1e-4:
+                out.add(tuple(round(x, 6) for x in arc["center"]))
+    return [list(c) for c in sorted(out)]
 
 
 def _round_sids(doc: str) -> dict:
@@ -827,21 +870,101 @@ def test_dimension_a_bore_by_sid_reads_its_real_diameter():
     # …and it is attached to that circle's own centre, not to some other sheet point.
     assert [round(x, 6) for x in ann["center"]] == _circle_center(dwg, top, HOLE_D_MM), ann
 
+
+def _views_showing(dwg: str, sid: str) -> set:
+    """Ids of the views in which the engine draws a VISIBLE full circle bounding face *sid*."""
+    full = cb.call("drawing_get", {"doc_id": dwg})
+    return {view["view_id"] for view in full["sheets"][0]["views"]
+            for arc in view.get("arcs", [])
+            if arc.get("closed") and arc.get("layer") == "visible"
+            and sid in ((arc.get("src") or {}).get("face_sids") or [])}
+
+
 def test_feature_dimensions_pick_the_requested_concentric_ring():
+    """⌀9.8 shank (z -40..40) under a ⌀20 head (z 72.5..87.5): both rings share one
+    projected centre. The BOTTOM view looks up +Z from below (contracts/doc_schema.md §8), so
+    both rims are visible there and each feature name must land on its OWN ring. From the
+    TOP the head hides the shank: the shank is refused as hidden and pointed at the bottom
+    view."""
     doc = _concentric_punch()
+    sids = _round_sids(doc)
+    shank_sid, head_sid = sids[4.9], sids[10.0]
     mk = _call("make_drawing", {
-        "doc_id": doc, "views": ["top"], "model_items": False,
+        "doc_id": doc, "views": ["top", "bottom"], "model_items": False,
         "hole_callouts": False})
     assert mk["ok"], mk
     dwg = mk["drawing_doc_id"]
-    top = next(iter(mk["views"]))
+    open_end = next(v for v, ori in mk["views"].items() if ori == "bottom")
+    head_end = next(v for v, ori in mk["views"].items() if ori == "top")
+    assert _views_showing(dwg, shank_sid) == {open_end}
+    assert _views_showing(dwg, head_sid) == {open_end, head_end}
+
     shank = _call("add_dimension", {
-        "doc_id": dwg, "view_id": top, "dtype": "diameter_dim", "a": "Shank"})
+        "doc_id": dwg, "view_id": open_end, "dtype": "diameter_dim", "a": "Shank"})
     head = _call("add_dimension", {
-        "doc_id": dwg, "view_id": top, "dtype": "diameter_dim", "a": "StrikeHead"})
-    assert shank["value"] == pytest.approx(9.8), shank
-    assert head["value"] == pytest.approx(20.0), head
+        "doc_id": dwg, "view_id": open_end, "dtype": "diameter_dim", "a": "StrikeHead"})
+    assert shank["ok"] and shank["value"] == pytest.approx(9.8), shank
+    assert head["ok"] and head["value"] == pytest.approx(20.0), head
+    assert shank["resolved"]["a"]["sids"] == [shank_sid], shank
+    assert head["resolved"]["a"]["sids"] == [head_sid], head
     assert shank["text"] != head["text"]
+
+    hidden = _call("add_dimension", {
+        "doc_id": dwg, "view_id": head_end, "dtype": "diameter_dim", "a": "Shank"})
+    assert not hidden["ok"], hidden
+    assert "HIDDEN" in hidden["error"] and open_end in hidden["error"], hidden
+    over = _call("add_dimension", {
+        "doc_id": dwg, "view_id": head_end, "dtype": "diameter_dim", "a": "StrikeHead"})
+    assert over["ok"] and over["value"] == pytest.approx(20.0), over
+
+
+#: contracts/doc_schema.md §8: each orientation's (sheet +x, sheet +y) as model axes.
+_CONTRACT_SHEET_AXES = {
+    "front": ((1, 0, 0), (0, 0, 1)), "back": ((-1, 0, 0), (0, 0, 1)),
+    "top": ((1, 0, 0), (0, 1, 0)), "bottom": ((1, 0, 0), (0, -1, 0)),
+    "right": ((0, 1, 0), (0, 0, 1)), "left": ((0, -1, 0), (0, 0, 1)),
+}
+
+
+def test_every_view_is_drawn_from_its_contract_side_the_right_way_up():
+    """A ⌀12 boss standing on a 100x60x10 plate at model (+30, +10, top). In every orthographic
+    view the boss must sit where the contract frame puts it relative to the view's centre — a
+    front view drawn from +Y came out upside down (boss BELOW the plate) and every top view
+    was really seen from underneath — and the boss's top rim is visible only from the top."""
+    n = next(_PLATE_N)
+    doc = _call("new_part", {"name": f"OrientBoss{n}"})["doc_id"]
+    r = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Plate", {"length": cb.dim(100), "width": cb.dim(60),
+                                 "height": cb.dim(10)}),
+        cb.feat("cylinder", "Boss", {"radius": cb.dim(6), "height": cb.dim(20),
+                                     "at": [30, 10, 15], "mode": "boss"})]})
+    assert r["ok"], r
+    boss_sid = _round_sids(doc)[6.0]
+    mk = _call("make_drawing", {"doc_id": doc, "views": list(_CONTRACT_SHEET_AXES),
+                                "model_items": False, "hole_callouts": False})
+    assert mk["ok"], mk
+    full = cb.call("drawing_get", {"doc_id": mk["drawing_doc_id"]})
+    by_orient = {v["orientation"]: v for v in full["sheets"][0]["views"]}
+    # The boss's offset from the part's bbox centre: +30 X, +10 Y, +10 Z (boss mid-height
+    # z=15 vs the part's z-centre of 10).
+    offset = (30.0, 10.0, 10.0)
+    for orient, (sx, sy) in _CONTRACT_SHEET_AXES.items():
+        view = by_orient[orient]
+        pts = [p for layer in ("visible", "hidden")
+               for pl, src in zip(view[layer], view[f"{layer}_src"])
+               if boss_sid in ((src or {}).get("face_sids") or []) for p in pl]
+        assert pts, orient
+        x0, y0, x1, y1 = view["bbox"]
+        dx = sum(p[0] for p in pts) / len(pts) - (x0 + x1) / 2.0
+        dy = sum(p[1] for p in pts) / len(pts) - (y0 + y1) / 2.0
+        want_x = sum(a * b for a, b in zip(sx, offset))
+        want_y = sum(a * b for a, b in zip(sy, offset))
+        assert dx * want_x > 0 and dy * want_y > 0, (orient, dx, dy, want_x, want_y)
+        top_rim_visible = any(
+            a.get("closed") and a.get("layer") == "visible"
+            and boss_sid in ((a.get("src") or {}).get("face_sids") or [])
+            for a in view.get("arcs", []))
+        assert top_rim_visible == (orient == "top"), (orient, view.get("arcs"))
 
 
 def test_the_verbatim_live_call_now_lands():
@@ -904,7 +1027,7 @@ def test_the_sid_picks_the_RIGHT_circle_when_the_part_has_two():
 
 def test_a_feature_name_resolves_like_a_sid():
     """The live call passed the feature NAME beside the sid ("bore"), so a bare name must work:
-    the hole feature's own diameter parameter is the model radius."""
+    it resolves to the round face that hole feature created."""
     doc = _plate_with_two_bores()
     dwg, top, _front = _plate_drawing(doc)
     r = _call("add_dimension", {"doc_id": dwg, "view_id": top, "dtype": "diameter",
@@ -914,19 +1037,81 @@ def test_a_feature_name_resolves_like_a_sid():
     assert "SmallBore" in " ".join(r["interpreted"]), r
 
 
-def test_identical_holes_report_which_one_was_dimensioned():
-    """Two ⌀6 bores share a radius, so the sid cannot tell them apart. The VALUE is the same
-    either way, but the position is not — so the reply must say how many matched and where the
-    others are instead of quietly picking one."""
+def test_identical_holes_each_land_on_their_own_circle():
+    """Two ⌀6 bores from one feature measure the same, but each wall has its own sid and the
+    projected circles carry it — so each sid dimensions its own circle, and the shared feature
+    NAME (two circles) is refused with both sids rather than guessed."""
     doc = _plate_with_twin_bores()
-    sid = next(iter(_round_sids(doc).values()))
+    matches = cb.call("doc_query", {"doc_id": doc,
+                                    "query": {"of": "face", "surf": "cylinder"}})["matches"]
+    sids = [m["sid"] for m in sorted(matches, key=lambda m: m["centroid"][0])]
+    assert len(sids) == 2, matches
     dwg, top, _front = _plate_drawing(doc)
-    r = _call("add_dimension", {"doc_id": dwg, "view_id": top, "dtype": "diameter", "a": sid})
+    centres = _circle_centres(dwg, top, SMALL_D_MM)
+    assert len(centres) == 2, centres
+    anchors = []
+    for sid in sids:
+        r = _call("add_dimension", {"doc_id": dwg, "view_id": top, "dtype": "diameter",
+                                    "a": sid})
+        assert r["ok"], (sid, r)
+        assert abs(r["value"] - SMALL_D_MM) < 1e-6, (sid, r)
+        assert r["resolved"]["a"]["sids"] == [sid], r
+        anchors.append([round(x, 6) for x in _the_annotation(dwg, top, r["annotation"])["center"]])
+    assert sorted(anchors) == centres, (anchors, centres)
+    both = _call("add_dimension", {"doc_id": dwg, "view_id": top, "dtype": "diameter",
+                                   "a": "Bores"})
+    assert both["ok"] is False, both
+    assert "2 separate" in both["error"], both
+    assert all(sid in both["error"] for sid in sids), both
+
+
+def test_hole_three_of_four_identical_holes_lands_on_hole_three_in_the_front_view():
+    """Four identical ⌀6 cross holes: dimensioning hole #3's sid must attach to hole #3's
+    projected centre — the third of four equal circles along the front view's +X — not to
+    whichever equal circle a size match would find first."""
+    doc = _plate_with_four_cross_holes()
+    hole3 = _cross_hole_sids(doc)[2]
+    mk = _call("make_drawing", {"doc_id": doc, "views": ["front", "top"],
+                                "model_items": False, "hole_callouts": False})
+    assert mk["ok"], mk
+    dwg = mk["drawing_doc_id"]
+    front = next(v for v, ori in mk["views"].items() if ori == "front")
+    centres = _circle_centres(dwg, front, SMALL_D_MM)
+    assert len(centres) == 4, centres
+    r = _call("add_dimension", {"doc_id": dwg, "view_id": front, "dtype": "diameter",
+                                "a": hole3})
     assert r["ok"], r
     assert abs(r["value"] - SMALL_D_MM) < 1e-6, r
-    note = " ".join(r["interpreted"])
-    assert "2 circles" in note, r
-    assert "the others are at" in note, r
+    assert r["resolved"]["a"]["sids"] == [hole3], r
+    ann = _the_annotation(dwg, front, r["annotation"])
+    assert [round(x, 6) for x in ann["center"]] == centres[2], (ann, centres)
+    spacing = _call("add_dimension", {"doc_id": dwg, "view_id": front, "dtype": "linear",
+                                      "a": _cross_hole_sids(doc)[1], "b": hole3})
+    assert spacing["ok"], spacing
+    assert abs(spacing["value"] - (CROSS_HOLE_XS[2] - CROSS_HOLE_XS[1])) < 1e-4, spacing
+
+
+def test_a_hidden_sid_is_refused_naming_the_views_where_it_is_visible():
+    """Blind hole #3 opens on one face only: looking at the other face it exists solely as
+    hidden lines. There the sid is refused BY NAME and the view where it is visible is named;
+    from the open side the same sid dimensions normally."""
+    doc = _plate_with_four_cross_holes(blind_third=True)
+    hole3 = _cross_hole_sids(doc)[2]
+    mk = _call("make_drawing", {"doc_id": doc, "views": ["front", "back"],
+                                "model_items": False, "hole_callouts": False})
+    assert mk["ok"], mk
+    dwg = mk["drawing_doc_id"]
+    replies = {vid: _call("add_dimension", {"doc_id": dwg, "view_id": vid,
+                                            "dtype": "diameter", "a": hole3})
+               for vid in mk["views"]}
+    shown = [vid for vid, r in replies.items() if r["ok"]]
+    hidden = [vid for vid, r in replies.items() if not r["ok"]]
+    assert len(shown) == 1 and len(hidden) == 1, replies
+    assert abs(replies[shown[0]]["value"] - SMALL_D_MM) < 1e-6, replies
+    error = replies[hidden[0]]["error"]
+    assert "HIDDEN" in error and hole3 in error, error
+    assert shown[0] in error, error
+    assert _stored_annotations(dwg, hidden[0]) == [], _stored_annotations(dwg, hidden[0])
 
 
 def test_a_view_that_does_not_show_the_circle_is_refused_and_names_one_that_does():

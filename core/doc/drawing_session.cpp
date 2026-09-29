@@ -397,7 +397,9 @@ json shift_to_position(const json& proj, std::array<double, 2> pos) {
 }
 
 // ----------------------------------------------------------- section cut-plane resolve
-// orientation -> (view_dir, screen_x, screen_y) unit vectors (drawing.py _orient_frame).
+// orientation -> (view_dir, screen_x, screen_y) unit vectors: the line of sight (eye -> model)
+// and the sheet +x/+y model axes of contracts/doc_schema.md §8 — exactly the frame
+// drawing.cpp's projector draws in (sheet +y = screen_x x view_dir).
 using Vec3 = std::array<double, 3>;
 Vec3 v_norm(Vec3 v) {
     double n = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
@@ -413,7 +415,7 @@ void orient_frame(const std::string& orientation, Vec3& d, Vec3& sx, Vec3& sy) {
     Vec3 view_dir, screen_x;
     if (orientation == "iso") {
         view_dir = v_norm({-1, -1, -1});
-        screen_x = v_norm(v_cross({0, 0, 1}, view_dir));
+        screen_x = v_norm(v_cross(view_dir, {0, 0, 1}));
     } else if (orientation == "front") { view_dir = {0, 1, 0}; screen_x = {1, 0, 0}; }
     else if (orientation == "back")   { view_dir = {0, -1, 0}; screen_x = {-1, 0, 0}; }
     else if (orientation == "top")    { view_dir = {0, 0, -1}; screen_x = {1, 0, 0}; }
@@ -425,7 +427,7 @@ void orient_frame(const std::string& orientation, Vec3& d, Vec3& sx, Vec3& sy) {
                       {{"reason", "bad orientation"}});
     d = v_norm(view_dir);
     sx = v_norm(screen_x);
-    sy = v_norm(v_cross(d, sx));
+    sy = v_norm(v_cross(sx, d));
 }
 
 // Resolve a section view's cut plane -> world {normal, point} json for project_section.
@@ -511,7 +513,10 @@ json resolve_section_plane(const json& view, const json& parent_view) {
     if (std::sqrt(v_dot(line, line)) < 1e-9)
         throw OpError("invalid_op", "section cut_line endpoints coincide", {{"reason", "degenerate"}});
     line = v_norm(line);
-    Vec3 plane_normal = v_cross(line, d);
+    // The section's eye looks along the cut-line arrows, which point to the sheet-LEFT of the
+    // a->b direction (host drawing_panel endArrow). Sheet-left of `line` is line x d, and the
+    // eye sits on the removed (+normal) side looking along -normal, so normal = d x line.
+    Vec3 plane_normal = v_cross(d, line);
     if (std::sqrt(v_dot(plane_normal, plane_normal)) < 1e-9)
         throw OpError("invalid_op", "section cut line is parallel to the view direction",
                       {{"reason", "degenerate"}});
@@ -533,9 +538,12 @@ json resolve_section_plane(const json& view, const json& parent_view) {
 // Project a single view. Dispatches on the view "type": section cuts + projects;
 // detail clips the parent's projected geometry; ortho/iso go through project_view.
 // (drawing.py::_project_one. The per-(rev,orient,scale,hidden) cache is omitted —
-// the C++ core recomputes; the OUTPUT is identical, only timing differs.)
+// the C++ core recomputes; the OUTPUT is identical, only timing differs.) `topology`
+// (index_source_topology of src_shapes) adds model sids to every line's provenance; the
+// internal pick resolvers that only read geometry pass none.
 json project_one(DrawingSession& s, const json& view,
-                 const std::vector<TopoDS_Shape>& src_shapes) {
+                 const std::vector<TopoDS_Shape>& src_shapes,
+                 const std::vector<SourceTopology>* topology = nullptr) {
     std::string vtype = view.value("type", std::string());
     double scale = view.value("scale", 1.0);
     bool show_hidden = view.value("show_hidden", true);
@@ -552,6 +560,7 @@ json project_one(DrawingSession& s, const json& view,
     auto derived_error = [&](const std::string& orient, const std::string& msg) -> json {
         return json{{"view_id", vid}, {"scale", scale}, {"orientation", orient},
                     {"visible", json::array()}, {"hidden", json::array()},
+                    {"visible_src", json::array()}, {"hidden_src", json::array()},
                     {"section_faces", json::array()}, {"arcs", json::array()},
                     {"bbox", json(nullptr)}, {"ms", 0.0}, {"error", msg}};
     };
@@ -562,7 +571,7 @@ json project_one(DrawingSession& s, const json& view,
                                  : nullptr;
         try {
             json plane = resolve_section_plane(view, parent ? *parent : json::object());
-            proj = project_section(src_shapes, plane, scale, pos, show_hidden, vid);
+            proj = project_section(src_shapes, plane, scale, pos, show_hidden, vid, topology);
         } catch (const OpError& e) {
             proj = derived_error("section", e.what());
         } catch (const std::exception& e) {
@@ -577,11 +586,12 @@ json project_one(DrawingSession& s, const json& view,
         if (!parent) {
             proj = {{"view_id", vid}, {"scale", scale}, {"orientation", "detail"},
                     {"visible", json::array()}, {"hidden", json::array()},
+                    {"visible_src", json::array()}, {"hidden_src", json::array()},
                     {"bbox", json(nullptr)}, {"ms", 0.0},
                     {"error", "detail view has no resolvable parent"}};
         } else {
             try {
-                json parent_geom = project_one(s, *parent, src_shapes);
+                json parent_geom = project_one(s, *parent, src_shapes, topology);
                 proj = project_detail(parent_geom, center, radius, scale, pos, vid);
             } catch (const OpError& e) {
                 proj = derived_error("detail", e.what());
@@ -592,7 +602,7 @@ json project_one(DrawingSession& s, const json& view,
     } else {
         std::string orient = view.value("orientation", std::string("front"));
         // Project at origin then translate (mirrors the cache+_shift_to_position path).
-        proj = project_view(src_shapes, orient, scale, {0.0, 0.0}, show_hidden, vid);
+        proj = project_view(src_shapes, orient, scale, {0.0, 0.0}, show_hidden, vid, topology);
         proj = shift_to_position(proj, pos);
     }
 
@@ -1265,6 +1275,8 @@ json drawing_get_locked_unsafe(const std::string& doc_id,
         return frozen;
     }
     auto shapes = source_shapes(s, components);
+    // Model identity for every projected line/arc, computed once for all views.
+    const auto topology = index_source_topology(shapes);
     json sheets_out = json::array();
     double total_ms = 0.0;
     if (s.doc.contains("sheets") && s.doc["sheets"].is_array())
@@ -1272,7 +1284,7 @@ json drawing_get_locked_unsafe(const std::string& doc_id,
             json views_out = json::array();
             if (sh.contains("views") && sh["views"].is_array())
                 for (const json& v : sh["views"]) {
-                    json geom = project_one(s, v, shapes);
+                    json geom = project_one(s, v, shapes, &topology);
                     total_ms += geom.value("ms", 0.0);
                     views_out.push_back(geom);
                 }
@@ -1476,7 +1488,8 @@ json drawing_add_view(const std::string& doc_id, const std::string& type,
     sheet["views"].push_back(view);
     s.revision += 1;
     auto shapes = source_shapes(s);
-    json geom = project_one(s, view, shapes);
+    const auto topology = index_source_topology(shapes);
+    json geom = project_one(s, view, shapes, &topology);
     return json{{"view_id", view["id"]}, {"revision", s.revision}, {"view", geom}};
 }
 
@@ -1575,7 +1588,8 @@ json drawing_add_section(const std::string& doc_id, const std::string& parent_vi
     sheet["views"].push_back(view);
     s.revision += 1;
     auto shapes = source_shapes(s);
-    json geom = project_one(s, view, shapes);
+    const auto topology = index_source_topology(shapes);
+    json geom = project_one(s, view, shapes, &topology);
     return json{{"view_id", view["id"]}, {"revision", s.revision}, {"view", geom}};
 }
 
@@ -1618,7 +1632,8 @@ json drawing_add_detail(const std::string& doc_id, const std::string& parent_vie
     sheet["views"].push_back(view);
     s.revision += 1;
     auto shapes = source_shapes(s);
-    json geom = project_one(s, view, shapes);
+    const auto topology = index_source_topology(shapes);
+    json geom = project_one(s, view, shapes, &topology);
     return json{{"view_id", view["id"]}, {"revision", s.revision}, {"view", geom}};
 }
 
@@ -1731,7 +1746,8 @@ json drawing_set_view(const std::string& doc_id, const std::string& view_id, con
     }
     s.revision += 1;
     auto shapes = source_shapes(s);
-    json geom = project_one(s, *view, shapes);
+    const auto topology = index_source_topology(shapes);
+    json geom = project_one(s, *view, shapes, &topology);
     if (geom.contains("annotations") && geom["annotations"].is_array())
         for (json& ann : geom["annotations"])
             if (ann.is_object()) ann["draw"] = compile_annotation(ann, doc_units(s.doc));

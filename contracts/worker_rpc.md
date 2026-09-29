@@ -322,6 +322,10 @@ section's HLR is run on the CUT solid (the half between the eye and the plane is
 OCCT `BRepAlgoAPI_Cut` against a large half-space box), so the visible polylines show the actual cut
 silhouette + the geometry behind it. A cut plane that misses the model sets `error` +
 empty `section_faces` (contained, not a raise).
+For a `cut_line` section the line of sight points to the sheet-LEFT of the line's first→last
+direction (where the host's cutting-line arrows point): the removed half is on the arrow tails'
+side, and the section is drawn as seen from there, in the same doc_schema.md §8 frame
+convention as the ortho views (sheet +y = sheet +x × line of sight).
 
 **Parent markers (attached by `drawing_get`).** Each PARENT view's geometry gains, when it has
 children: `section_lines:[{label, view_id, line:[[x,y],[x,y]]}]` (the cutting line to draw across the
@@ -1909,3 +1913,130 @@ rest are summarised as "(+N more picked item(s) not shown)". Engine read failure
 to "as picked (not re-verified)" / "unresolved pick" and never fail the turn.
 `scope.selection` face/edge entries whose sid is also a picked ref are omitted from
 "selected geometry".
+
+## `doc_view_metrics` + `doc_render_view` section (append-only, 2026-09-28, ViewNet)
+
+`ping.result.capabilities` adds `doc_view_metrics.v1` and `doc_render_view.section.v1`.
+
+### `doc_view_metrics` — exact per-camera visibility measurements
+
+Measures what each exact perspective camera sees of the document's display mesh. It uses the
+SAME tessellation (`tessellate_session_bodies`), perspective basis/focal length, six-plane
+frustum clip, section clip, edge-function raster and reciprocal-depth z rule as
+`doc_render_view` with `view.camera` (§17) — one renderer rule, factored into shared helpers.
+The doc lock is held only while tessellating; cameras are then measured in parallel
+(`std::thread`, bounded by `hardware_concurrency`).
+
+Request:
+
+```
+{ "doc_id": str,
+  "width": int = 192, "height": int = 144,          // integers, clamped 32..1024
+  "cameras": [ camera_pose.v1, ... ],               // the dict doc_render_view accepts at view.camera
+                                                    //   (projection/position/target/up/vertical_fov_deg/near/far);
+                                                    //   camera-level image size keys are ignored here
+  "section": {"point":[x,y,z], "normal":[x,y,z]} | null,   // optional; keeps dot(p-point, normal) <= 0
+  "sections": [ section|null, ... ]                 // optional per-camera override, len == len(cameras)
+}
+```
+
+Response:
+
+```
+{ "ok": true, "revision": int, "width": W, "height": H,
+  "faces": [ {"body": int (0-based body ordinal), "face_id": u32 (AICM/TopExp id, per body),
+              "surf_type": u8, "area_mm2": f, "centroid": [3], "normal": [3], "tri_count": n}, ... ],
+  "edges": [ {"body": int, "edge_id": u32, "curve_type": u8, "length_mm": f}, ... ],
+  "views": [ {
+      "face_vis": [[face_index, visible_px, visible_area_mm2, mean_abs_cos, projected_px], ...],
+      "edge_vis": [[edge_index, visible_frac, projected_len_px, contrast, silhouette_frac], ...],
+      "bg_px": int, "cap_px": int, "depth_edge_px": int, "normal_entropy": f,
+      "principal_align": f, "fg_px": int,
+      "section": {"point","normal","ghost","hatch"} | null } ... ],   // the section applied to this view
+  "section": {...} | null,                          // echo of the request-level section
+  "timing_ms": f }
+```
+
+- Face table: doc-wide, bodies in order then AICM FaceRec order; `face_index` indexes it. Area,
+  area-weighted centroid and area-weighted outward normal come from the display tessellation.
+  `normal` is `[0,0,0]` when the weighted sum is below 1e-4 of the area (full cylinder, sphere).
+  Triangle outward normals follow the index winding, flipped to agree with the body's shading
+  normals when present.
+- Edge table: every AICM EdgeRec (hidden seam edges have `length_mm` 0 and never appear in
+  `edge_vis`).
+- `face_vis` is sparse (faces with `projected_px > 0` or `visible_px > 0`). `projected_px` is the
+  analytic screen area of the face's front-facing triangles after frustum (= frame) and section
+  clipping, no depth test. `visible_px` counts z-buffer winners that are not caps.
+  `visible_area_mm2` sums, over those pixels, `(z/f)^2 / rho / max(|cos|, 0.02)` where `z` is the
+  exact pixel depth, `f` the focal length in px, `rho = |(x_c, y_c, 1)|` for the pixel-centre ray
+  and `cos` the ray/outward-normal cosine — the true surface area seen. `mean_abs_cos` is the mean
+  `|cos|` over those pixels.
+- `edge_vis` is sparse (edges with ≥1 in-frame sample). Each polyline segment is clipped to
+  near/far and the kept section half, then to the frame, and sampled ~1 per screen px
+  (reciprocal depth interpolated in screen space). A sample is visible when a pixel in its 3x3
+  neighbourhood is background or no nearer than `z - (0.005 z + 2 z / f)`. `contrast` is the mean
+  over visible samples of `|shade(left) - shade(right)|` 2 px either side, shade being the
+  renderer's Gouraud term `0.35 + 0.65|n·L|` (background and off-frame = 0.96, cap = the section
+  normal's term). `silhouette_frac` = fraction of visible samples where a side is background or
+  the two sides differ in depth by more than the view's depth threshold.
+- Caps: with a section, a winning back-face fragment is a cap pixel (closed-solid capping); its
+  depth is the section plane along the pixel ray and its normal the section normal.
+- `depth_edge_px`: foreground pixels with a 4-neighbour that is background or differs in depth by
+  more than 2% of the view's foreground depth range. `normal_entropy`: Shannon entropy (bits) of
+  foreground normals binned on the 20 faces of an icosahedron, rotated by a fixed Rx(7°) then
+  Rz(13°) so principal axes never lie on a bin boundary. `principal_align`: max |component| of
+  the camera forward vector. `fg_px = W*H - bg_px` (caps included).
+- Refusals `{ok:false, code, reason}`: `doc_id_invalid`, `unknown_doc`, `image_size_invalid`,
+  `cameras_invalid`, `cameras_too_many` (> 4096), any §17 camera code (`camera_invalid`,
+  `camera_zero_direction`, `camera_up_parallel`, `camera_fov_invalid`, ... with `camera_index`,
+  reason prefixed `cameras[i]:`), `section_invalid`, `sections_invalid`, `no_geometry`,
+  `metrics_failed`. Never falls back to ISO.
+
+### `doc_render_view` `view.section`
+
+Object-form views (legacy `dir`/`azimuth`/named-in-object and exact `camera`) accept
+`"section": {"point":[3], "normal":[3], "ghost": true, "hatch": true}` keeping
+`dot(p - point, normal) <= 0`. Kept geometry is shaded as usual; pixels whose nearest surviving
+fragment is a back face are the CAP (flat cut colour `[226,170,150]`, 45° screen hatch
+`[160,92,74]` every 7 px when `hatch`); a dark `[32,32,38]` 2 px outline straddles the cap
+boundary; with `ghost`, the removed half is drawn over the result as a translucent fill
+(`[150,165,190]`, alpha 40/255) plus its B-rep edge polylines as 1 px dashed `[150,162,186]`
+lines. Callouts anchored in the removed half are dropped and the header gains `SECTION`. The
+response echoes `section` (unit normal). A malformed section refuses with `section_invalid`.
+Absent or `null` `section` renders byte-identical legacy pixels.
+
+## ViewGeometry provenance — model identity on every projected edge (append-only, 2026-09-28, ViewNet)
+
+Additive to `ViewGeometry` (§ above): every drawn line and circle names the model edge it was
+projected from, so a model sid maps to its exact sheet geometry (four identical holes are four
+sids on four circles). Present in every view returned by `drawing_get`, `drawing_add_view`,
+`drawing_add_section`, `drawing_add_detail` and `drawing_set_view`.
+
+```json
+{
+  "visible_src": [ Src|null, … ],   // index-aligned with "visible"
+  "hidden_src":  [ Src|null, … ],   // index-aligned with "hidden"
+  "arcs": [ {"center":[x,y], "radius":r, "closed":b, "layer":"visible|hidden", …, "src": Src|null} ]
+}
+Src (model edge)      = {"kind":"edge", "body":b, "edge_id":e, "sid":"E…",
+                         "face_ids":[f,…], "face_sids":["F…",…]}   // faces the edge bounds
+Src (face silhouette) = {"kind":"outline", "body":b, "face_id":f, "sid":"F…",
+                         "face_ids":[f], "face_sids":["F…"]}
+```
+
+- `body` / `edge_id` / `face_id` are 1-based and equal `doc_query`'s `body` / `topo` for the same
+  entity; `sid` is byte-identical to the sid `doc_query` / `describe_part` / `query_geometry` hand
+  out (same `make_selector` fingerprint, computed once per `drawing_get`).
+- Source: HLR provenance, not a geometric join. Each piece is extracted from one `HLRBRep_Data`
+  edge (a port of `HLRBRep_HLRToShape`'s extraction that keeps the data-edge index); that edge is
+  the source edge itself, a piece of it (outliner `NewSOldS`), or a silhouette of a source face.
+  Section views route the cut body's rebuilt edges back through the section boolean's history.
+  Detail views copy the parent polyline's record onto every clipped piece.
+- `null` = drawn geometry with no model edge: the polygonal fallback outline of an all-curved
+  body, edges the section cut generated on its plane, and a half section's division line.
+- Section views carry no `arcs` (unchanged). Views frozen from a missing source and views cached
+  by older builds may lack `*_src` / `src`; consumers treat absence as "no provenance".
+- MCP `add_dimension(a=<sid or feature name>)` resolves through these records only: the target
+  view's VISIBLE circle whose `src.sid` or `src.face_sids` holds the sid. A target drawn there only
+  on the hidden layer is refused (`HIDDEN`, naming the views where it is visible); a feature name
+  spanning several separate circles is refused listing each circle's sid.

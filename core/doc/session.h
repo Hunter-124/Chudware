@@ -271,9 +271,22 @@ nlohmann::json doc_render_png(const std::string& doc_id, const std::string& out_
 // `annotate=false` suppresses the orientation tint, face callouts and axis triad for a clean
 // close-up (it was previously accepted by callers and silently ignored).
 // `background`: optional [r,g,b] 0-255 frame clear colour (see doc_render_png).
+// `view.section` (object form): {"point":[3],"normal":[3],"ghost":true,"hatch":true} keeps the
+// half-space dot(p-point, normal) <= 0 and draws a hatched cap, a 2 px cut outline and a ghost of
+// the removed half; echoed as `section`. Absent/null leaves the pixels byte-identical.
 nlohmann::json doc_render_view(const std::string& doc_id, const std::string& out_path,
                                const nlohmann::json& view, bool annotate = true,
                                const nlohmann::json& background = nlohmann::json());
+
+// doc_view_metrics: measure what each of N exact perspective cameras (camera_pose.v1, the dict
+// doc_render_view accepts at view.camera) actually sees of the doc's display mesh — per-face
+// visible px / true visible area / mean |cos| / projected px, per-B-rep-edge visibility,
+// contrast and silhouette, plus background/cap/depth-edge pixel counts and normal entropy.
+// `params`: {doc_id, width=192, height=144 (clamped 32..1024), cameras:[...], section?,
+// sections?}. Same projection/clipping/depth rule as doc_render_view; cameras measured in
+// parallel. Refuses by name ({ok:false, code, reason}); never falls back to a default view.
+// Contract: contracts/worker_rpc.md "doc_view_metrics".
+nlohmann::json doc_view_metrics(const nlohmann::json& params);
 
 // doc_render_contact_sheet: render SEVERAL views and tile them into one labelled PNG (task 03) —
 // the multi-view self-check artifact. `views` is an array of view specs (see doc_render_view);

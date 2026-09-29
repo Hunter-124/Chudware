@@ -185,11 +185,11 @@ bool prof_is_modeling_method(const std::string& m) {
     // INTERACTIVE read paths (open a doc, resolve a viewport pick, expand a face into its edges,
     // push-pull-probe a face) also do real kernel work — they were the slow paths reported when
     // clicking a surface / opening a big assembly — so sample them too by default.
-    static const std::array<const char*, 22> kModeling = {{
+    static const std::array<const char*, 23> kModeling = {{
         "doc_compile_cpp", "doc_apply_ops", "doc_dry_run_ops", "doc_rebuild", "doc_activate",
         "doc_solve_mates", "doc_tree", "doc_new", "doc_checkpoint", "doc_undo",
         "doc_redo", "doc_render_png", "doc_render_view", "doc_render_contact_sheet",
-        "doc_render_diff",
+        "doc_render_diff", "doc_view_metrics",
         "doc_export", "doc_import", "asm_world_bodies",
         "doc_open", "doc_resolve_pick", "doc_face_edges", "doc_push_pull"}};
     for (const char* k : kModeling)
@@ -1164,7 +1164,9 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             return emit(json{{"ok", true},
                              {"abi", chudware_abi_version()},
                              {"capabilities",
-                              json::array({"doc_render_view.camera_pose.v1"})},
+                              json::array({"doc_render_view.camera_pose.v1",
+                                           "doc_render_view.section.v1",
+                                           "doc_view_metrics.v1"})},
                              {"echo", params}},
                         out_json, 0);
         }
@@ -3263,6 +3265,10 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.contains("background") ? params.at("background")
                                                               : json(nullptr)),
                             out_json, 0);
+            // Exact per-camera visibility metrics for the shot planner (contracts/worker_rpc.md
+            // "doc_view_metrics"); the whole params object carries doc_id/size/cameras/sections.
+            if (m == "doc_view_metrics")
+                return emit(chudware::doc::doc_view_metrics(params), out_json, 0);
             // PLM graphical revision diff — the whole params object goes through (doc_a/doc_b,
             // body_a/body_b, out_path, view, width/height, mode).
             if (m == "doc_render_diff")

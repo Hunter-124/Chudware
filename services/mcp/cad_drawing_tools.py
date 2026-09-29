@@ -11,6 +11,7 @@ from .cad_common import (
     _doc,
     _dumps,
     _err,
+    _feature_owned_matches,
     _resolve_drawing_view_id,
     _tmp,
     cb,
@@ -354,48 +355,29 @@ def _canon_model_items(value: Any) -> tuple[Optional[bool], Optional[dict]]:
         "valid_model_items": ["true", "false"],
     }
 
-# ---------------------------------------------------------------- dimensioning a FEATURE
+# ---------------------------------------------------------------- dimensioning a MODEL target
 #
-# DESIGN gap measured live (2026-07-29, claude-sonnet-4-5) — three failures in ONE run, all the
-# same idea: the model held the stable sid of the hole it wanted called out and handed it
-# straight to add_dimension.
+# Live (2026-07-29, claude-sonnet-4-5): the model held the stable sid of the hole it wanted
+# called out and handed it straight to add_dimension —
 #   add_dimension(dtype="diameter", a=["bore","F6356a7"], b=["bore","F6356a7"], pos=[80,120])
-#       -> "dimension point a must be [x,y] sheet mm"   (the engine, drawing_session.cpp:1117)
-#   add_dimension(dtype="diameter", a=["bore","F6356a7"], pos=[80,120])
-#       -> missing_argument: b                          (this tool's own signature)
-#   add_dimension(a=["F6356a7","center"], b=["F6356a7","edge"])   (earlier pass, same run)
-# add_dimension speaks SHEET millimetres and nothing in the toolset converted a model sid into
-# them, so the model would have had to re-derive the projection (orientation frame x view scale
-# + view position) by hand. For a diameter/radius the two points are not even independent — the
-# projected ARC determines them.
+#   add_dimension(a=["F6356a7","center"], b=["F6356a7","edge"])
+# add_dimension speaks SHEET millimetres; the agent holds MODEL handles (the sid describe_part /
+# query_geometry hand out, or a feature name).
 #
-# WHAT THE ENGINE ALREADY GIVES US (read, not assumed):
-#   * drawing_get returns, per view, the projected analytic circles in SHEET mm:
-#     arcs[] = {center:[x,y], radius, closed, layer} (core/doc/drawing.cpp::compound_arcs
-#     :149-186, attached to every view by project_view :354-373), plus that view's `scale`. So
-#     model radius = radius/scale — exactly the arithmetic the engine's own auto-dimension pass
-#     uses (drawing_session.cpp:1655 and :1738).
-#   * doc_query {"of":"face"|"edge"} on the SOURCE part returns every entity's stable sid WITH
-#     its `radius` (the ⌀10 bore of a test plate reads radius 5.0, sid "F6356a7").
-#   * drawing_get["source_doc_id"] (drawing_session.cpp:783) names the part a drawing projects,
-#     so the two ends can be joined at all.
-# WHAT IT DOES NOT GIVE US: the projected arcs carry NO sid. HLR rebuilds the edges and
-# compound_arcs emits pure geometry, and drawing_model_items (:1690-1745) — the existing
-# "N x ⌀d" hole-callout pass — likewise identifies holes purely by projected geometry, never by
-# sid. There is therefore NO sid -> sheet-point projection to call, in C++ or from Python.
+# drawing_get joins the two natively. Every projected circle (`arcs[].src`) and polyline
+# (`visible_src` / `hidden_src`, index-aligned with `visible` / `hidden`) names the model edge it
+# was drawn from — source body, TopExp edge id, the edge's sid and the sids of the faces it
+# bounds — read off OCCT's HLR data structure (core/doc/drawing.cpp::hlr_project), not matched
+# by size. A target therefore resolves to the projected circle that IS its sid: four identical
+# holes are four sids on four circles. A feature name resolves to the round faces that feature
+# created (cad_common._feature_owned_matches); if those are several separate circles the call is
+# refused with each circle's sid, never guessed.
 #
-# The join we CAN make without inventing a projection is on the RADIUS, which is scale-exact at
-# both ends: resolve the sid/feature to its MODEL radius R, then keep this view's projected
-# circles whose radius/scale equals R, and hand the engine that circle's own centre. The engine
-# then snaps the dimension to the nearest arc itself (drawing_session.cpp:1034-1049) and reads
-# the value off THAT arc, so the reported number is the engine's, not one we computed. Nothing
-# here multiplies by a scale factor of our own.
-#
-# The residual ambiguity is REPORTED, never hidden: N identical holes project to N circles of
-# the same radius which all carry the same diameter VALUE but sit at different sheet positions,
-# so the reply says how many matched and which centre was used. Zero matches is a refusal that
-# names the diameters this view really has, and the views where the target does project as a
-# circle.
+# The engine snaps a radial/diameter/center-mark to the arc whose RING is nearest the pick
+# (drawing_session.cpp::nearest_arc) and reads the value off that arc, so the point handed over
+# sits ON the matched ring, where its distance is exactly zero. A dimension attaches to visible
+# geometry: a target drawn only as hidden lines in the asked view is refused, naming the views
+# where it IS a visible circle.
 
 #: A stable sid as doc_query / describe_part / hover hand them out: "F6356a7", "Ec2b379".
 _SID_RE = _re.compile(r"^[FE][0-9A-Fa-f]{4,}$")
@@ -411,10 +393,9 @@ _TARGET_QUALIFIERS = frozenset({
     "boundary", "perimeter", "outline", "axis", "vertex", "point", "outer", "inner",
 })
 
-#: |r_model - R| below this counts as the same circle. The two ends are the SAME number in the
-#: engine (a hole's cylindrical face radius and its projected circle's radius/scale), so this is
-#: a float-noise tolerance, not a fuzzy match.
-_CIRCLE_TOL = 1e-4
+#: Sheet-mm float noise below which two projected circles are the same drawn circle — a through
+#: hole's two rims project onto one ring (and one rim can be split into visible + hidden pieces).
+_SAME_CIRCLE_MM = 1e-4
 
 #: Dimension types whose geometry is fully determined by the picked ARC, so `b` is unused —
 #: build_ext_annotation (drawing_session.cpp:1034-1061) reads the nearest arc and never looks
@@ -496,98 +477,129 @@ def _param_number(params: Any, *names: str) -> Optional[float]:
     return None
 
 
-def _token_radius(source_doc_id: str, token: str) -> tuple[Optional[float], str, str]:
-    """(the target's MODEL radius, how it resolved, why it did not) for one target token."""
-    text = str(token).strip()
-    if _SID_RE.match(text):
-        ents = _source_entities(source_doc_id)
-        hit = next((m for m in ents if str(m.get("sid")) == text), None)
-        if hit is None:
-            hit = next((m for m in ents
-                        if str(m.get("sid")).casefold() == text.casefold()), None)
-        if hit is None:
-            return None, "", (f"{text!r} is not a face/edge sid of the source part "
+
+def _is_round(m: dict) -> bool:
+    r = m.get("radius")
+    return isinstance(r, (int, float)) and not isinstance(r, bool) and r > 0.0
+
+
+def _entity_label(m: dict) -> str:
+    """`F6ea1c6 (cylinder face, ⌀6 mm)` — what a sid names, in the words a refusal needs."""
+    size = f", ⌀{round(2.0 * float(m['radius']), 6)} mm" if _is_round(m) else ""
+    return f"{m.get('sid')} ({m.get('surf') or 'round'} {m.get('kind') or 'entity'}{size})"
+
+
+def _target_entities(source_doc_id: str, tokens: list, slot: str,
+                     notes: list) -> tuple[Optional[dict], Optional[dict]]:
+    """({"sids", "label"} for the round model entities *tokens* name, None) or (None, a refusal).
+
+    A sid names itself; a feature name names the round faces that feature created. An explicit
+    sid is the most specific handle, so beside a feature name it wins and the name is only
+    checked against it. Positional qualifiers ("center", "edge") carry nothing for a circle and
+    are dropped with a note. Appends what was read/ignored to *notes*.
+    """
+    what = tokens if len(tokens) > 1 else tokens[0]
+    sid_tokens: list = []
+    feature_tokens: list = []
+    for t in tokens:
+        text = str(t).strip()
+        if _SID_RE.match(text):
+            sid_tokens.append(text)
+        elif _canon_word(text) in _TARGET_QUALIFIERS:
+            notes.append(f"{slot}: ignored the qualifier {text!r} — the projected circle "
+                         f"determines the dimension's points")
+        else:
+            feature_tokens.append(text)
+    misses: list = []
+    picked: list = []
+    if sid_tokens:
+        by_sid = {str(m["sid"]).casefold(): m for m in _source_entities(source_doc_id)}
+        for text in sid_tokens:
+            hit = by_sid.get(text.casefold())
+            if hit is None:
+                misses.append(f"{text!r} is not a face/edge sid of the source part "
                               f"{source_doc_id} (sids are regenerated when the model rebuilds — "
                               f"call describe_part / query_geometry for the current ones)")
-        r = hit.get("radius")
-        if not isinstance(r, (int, float)) or r <= 0.0:
-            return None, "", (f"{text!r} is a {hit.get('surf') or 'non-round'} "
+            elif not _is_round(hit):
+                misses.append(f"{text!r} is a {hit.get('surf') or 'non-round'} "
                               f"{hit.get('kind') or 'entity'} — it has no radius, so it does not "
                               f"project as a circle. Pass the sid of a round face or circular "
                               f"edge (query_geometry(query={{'of':'face','surf':'cylinder'}})), "
                               f"or dimension it with two sheet-mm points")
-        return float(r), (f"{text} ({hit.get('surf')} {hit.get('kind')}, "
-                          f"r={round(float(r), 6)} mm)"), ""
-    feats = _source_features(source_doc_id)
-    hit = next((f for f in feats
-                if str(f.get("id")) == text
-                or str(f.get("name") or "").strip().casefold() == text.casefold()), None)
-    if hit is None:
-        roster = ", ".join(f'{f.get("id")} "{f.get("name") or ""}"' for f in feats) or "none"
-        return None, "", (f"{text!r} is neither a face/edge sid nor a feature of the source part "
-                          f"{source_doc_id} (its features are: {roster})")
-    params = hit.get("params")
-    dia = _param_number(params, "diameter", "dia", "hole_diameter", "bore_diameter")
-    rad = _param_number(params, "radius", "r", "hole_radius")
-    if dia is not None and dia > 0.0:
-        return dia / 2.0, (f"the feature {hit.get('name')!r} ({hit.get('id')}, "
-                           f"{hit.get('type')}, ⌀{round(dia, 6)} mm)"), ""
-    if rad is not None and rad > 0.0:
-        return rad, (f"the feature {hit.get('name')!r} ({hit.get('id')}, {hit.get('type')}, "
-                     f"r={round(rad, 6)} mm)"), ""
-    return None, "", (f"the feature {hit.get('name')!r} ({hit.get('id')}, {hit.get('type')}) "
-                      f"carries no diameter or radius parameter, so there is no circle to "
-                      f"match. Pass the sid of one of its round faces/edges "
-                      f"(query_geometry(query={{'of':'face','surf':'cylinder'}})) or two "
-                      f"sheet-mm points")
-
-
-def _resolve_target_radius(source_doc_id: str, tokens: list, slot: str,
-                           notes: list) -> tuple[Optional[float], Optional[dict]]:
-    """(the target's MODEL radius, a refusal). Appends what was read/ignored to *notes*."""
-    hits: list = []
-    misses: list = []
-    for t in tokens:
-        r, how, why = _token_radius(source_doc_id, t)
-        if r is None:
-            misses.append((t, why))
-        else:
-            hits.append((t, r, how))
-    if not hits:
-        detail = "; ".join(why for _t, why in misses) or "it named nothing resolvable"
+            else:
+                picked.append(hit)
+    by_feature: list = []
+    for text in feature_tokens:
+        try:
+            owned = _feature_owned_matches(source_doc_id, text)
+        except ValueError as exc:
+            misses.append(str(exc))
+            continue
+        rounds = [m for m in owned if isinstance(m, dict) and m.get("sid") and _is_round(m)]
+        if not rounds:
+            misses.append(f"the feature {text!r} created no round face or edge, so there is no "
+                          f"circle to dimension. Pass the sid of a round face/edge "
+                          f"(query_geometry(query={{'of':'face','surf':'cylinder'}})) or two "
+                          f"sheet-mm points")
+            continue
+        by_feature.append((text, rounds))
+    if not picked and not by_feature:
+        detail = "; ".join(misses) or "it named nothing resolvable"
         return None, {
             "ok": False,
-            "error": f"add_dimension: {slot}={tokens if len(tokens) > 1 else tokens[0]!r} did "
-                     f"not resolve to a model feature — {detail}. Nothing was added.",
+            "error": f"add_dimension: {slot}={what!r} did not resolve to a round model "
+                     f"feature — {detail}. Nothing was added.",
         }
-    radii = sorted({round(r, 6) for _t, r, _h in hits})
-    if len(radii) > 1:
-        return None, {
-            "ok": False,
-            "error": f"add_dimension: {slot}={tokens!r} names TWO different circles "
-                     f"(radii {radii} mm) — a dimension has one target, so nothing was added. "
-                     f"Pass the single sid/feature you meant.",
-        }
-    for t, why in misses:
-        if _canon_word(t) in _TARGET_QUALIFIERS:
-            notes.append(f"{slot}: ignored the qualifier {t!r} — the projected arc determines "
-                         f"the dimension's points")
-        else:
-            notes.append(f"{slot}: ignored {t!r} ({why}) because {hits[0][0]!r} resolved")
-    notes.append(f"{slot}={tokens if len(tokens) > 1 else tokens[0]!r} read as {hits[0][2]}")
-    return hits[0][1], None
+    if picked:
+        sids = {str(m["sid"]) for m in picked}
+        label = ", ".join(_entity_label(m) for m in picked)
+        for name, rounds in by_feature:
+            owned = {str(m["sid"]) for m in rounds}
+            if sids & owned:
+                notes.append(f"{slot}: {name!r} owns {', '.join(sorted(sids & owned))} — "
+                             f"consistent with the sid")
+            else:
+                notes.append(f"{slot}: {name!r} does not own {', '.join(sorted(sids))} (its "
+                             f"round faces are {', '.join(sorted(owned))}); the explicit sid "
+                             f"was used")
+    else:
+        sids = {str(m["sid"]) for _name, rounds in by_feature for m in rounds}
+        label = "; ".join(f"the feature {name!r} (round face(s) "
+                          f"{', '.join(_entity_label(m) for m in rounds)})"
+                          for name, rounds in by_feature)
+    for why in misses:
+        notes.append(f"{slot}: ignored — {why}")
+    notes.append(f"{slot}={what!r} read as {label}")
+    return {"sids": sids, "label": label}, None
 
 
-def _view_circles(view: dict) -> list:
-    """This view's projected circles as {center (sheet mm), model_radius, closed}, deduped.
-
-    A through hole projects its two rims onto coincident circles, and the same circle appears on
-    both the visible and the hidden layer, so identical (centre, radius, closed) entries collapse
-    — the same dedupe drawing_model_items does (drawing_session.cpp:1704-1710).
-    """
+def _view_scale(view: dict) -> float:
     scale = view.get("scale") or 1.0
     if not isinstance(scale, (int, float)) or scale == 0:
         scale = 1.0
+    return float(scale)
+
+
+def _src_sids(src: Any) -> set:
+    """Every sid one provenance record answers to: its own sid and the faces it bounds."""
+    if not isinstance(src, dict):
+        return set()
+    out = {s for s in (src.get("face_sids") or []) if isinstance(s, str)}
+    if isinstance(src.get("sid"), str):
+        out.add(src["sid"])
+    return out
+
+
+def _view_circles(view: dict, sids: Optional[set] = None,
+                  need_closed: bool = False) -> list:
+    """This view's projected circles, coincident rims collapsed, each as {center (sheet mm),
+    radius (sheet mm), model_radius, closed, visible, edge_sids, face_sids, matched}.
+
+    `visible` is True when any collapsed arc is on the visible layer. With *sids*, only arcs
+    whose provenance (drawing_get `arcs[].src`) answers to one of them are kept, and `matched`
+    lists which. Sorted by sheet position.
+    """
+    scale = _view_scale(view)
     out: list = []
     for arc in view.get("arcs") or []:
         if not isinstance(arc, dict):
@@ -598,15 +610,35 @@ def _view_circles(view: dict) -> list:
             continue
         if not isinstance(r_sheet, (int, float)) or r_sheet <= 0.0:
             continue
-        item = {"center": [float(c[0]), float(c[1])],
-                "model_radius": float(r_sheet) / float(scale),
-                "closed": bool(arc.get("closed"))}
-        if any(abs(o["center"][0] - item["center"][0]) < 1e-4
-               and abs(o["center"][1] - item["center"][1]) < 1e-4
-               and abs(o["model_radius"] - item["model_radius"]) < _CIRCLE_TOL
-               and o["closed"] == item["closed"] for o in out):
+        closed = bool(arc.get("closed"))
+        if need_closed and not closed:
             continue
-        out.append(item)
+        src = arc.get("src")
+        answers = _src_sids(src)
+        matched = answers & sids if sids is not None else set()
+        if sids is not None and not matched:
+            continue
+        center = [float(c[0]), float(c[1])]
+        item = next((o for o in out
+                     if abs(o["center"][0] - center[0]) < _SAME_CIRCLE_MM
+                     and abs(o["center"][1] - center[1]) < _SAME_CIRCLE_MM
+                     and abs(o["radius"] - float(r_sheet)) < _SAME_CIRCLE_MM
+                     and o["closed"] == closed), None)
+        if item is None:
+            item = {"center": center, "radius": float(r_sheet),
+                    "model_radius": float(r_sheet) / scale, "closed": closed,
+                    "visible": False, "edge_sids": [], "face_sids": [], "matched": []}
+            out.append(item)
+        item["visible"] = item["visible"] or arc.get("layer") == "visible"
+        if isinstance(src, dict):
+            if isinstance(src.get("sid"), str) and src["sid"] not in item["edge_sids"]:
+                item["edge_sids"].append(src["sid"])
+            for f in src.get("face_sids") or []:
+                if isinstance(f, str) and f not in item["face_sids"]:
+                    item["face_sids"].append(f)
+        for m in sorted(matched):
+            if m not in item["matched"]:
+                item["matched"].append(m)
     out.sort(key=lambda it: (round(it["center"][0], 6), round(it["center"][1], 6)))
     return out
 
@@ -620,63 +652,79 @@ def _views_of(full: dict) -> list:
     return out
 
 
-def _resolve_target_point(full: dict, view_id: str, radius: float, dtype: str,
-                          slot: str, notes: list) -> tuple[Optional[list], Optional[dict]]:
-    """Return the circle centre for spacing dims, or a point on its ring for arc dims."""
+def _drawn_as_lines(view: dict, sids: set) -> bool:
+    """True when *view* draws any polyline whose provenance answers to one of *sids*."""
+    for key in ("visible_src", "hidden_src"):
+        for src in view.get(key) or []:
+            if _src_sids(src) & sids:
+                return True
+    return False
+
+
+def _resolve_target_point(full: dict, view_id: str, target: dict, dtype: str,
+                          slot: str, notes: list) -> tuple[Optional[dict], Optional[dict]]:
+    """({"point", "circle"} for the ONE visible projected circle of *target* in *view_id*, None)
+    or (None, a refusal). `point` is the circle centre for spacing dims and a point on its ring
+    for arc-determined dims."""
     need_closed = dtype == "diameter_dim"          # engine: want_closed=1 only for diameter_dim
+    shape = "full circle" if need_closed else "circle or arc"
+    sids, label = target["sids"], target["label"]
     view = next((v for v in _views_of(full)
                  if view_id in (v.get("view_id"), v.get("id"))), None)
     if view is None:
         return None, {"ok": False, "error": f"add_dimension: no view {view_id!r} in this drawing"}
-    circles = [c for c in _view_circles(view)
-               if (c["closed"] or not need_closed)
-               and abs(c["model_radius"] - radius) <= _CIRCLE_TOL]
-    if not circles:
-        here = sorted({round(2.0 * c["model_radius"], 4) for c in _view_circles(view)
-                       if c["closed"] or not need_closed})
-        elsewhere = []
+    here = f"view {view_id} ({view.get('orientation') or view.get('type')})"
+    circles = _view_circles(view, sids, need_closed)
+    visible = [c for c in circles if c["visible"]]
+    if len(visible) > 1:
+        listing = "; ".join(
+            f"⌀{round(2.0 * c['model_radius'], 6)} at {[round(x, 3) for x in c['center']]} "
+            f"(sid {', '.join(c['matched'])}; edge {', '.join(c['edge_sids']) or '—'})"
+            for c in visible)
+        return None, {
+            "ok": False,
+            "error": f"add_dimension: {slot}={label} is {len(visible)} separate projected "
+                     f"{shape}s in {here}: {listing}. A dimension has one target — pass the "
+                     f"sid of the one you mean. Nothing was added.",
+        }
+    if not visible:
+        seen = []
         for v in _views_of(full):
             vid = v.get("view_id") or v.get("id")
             if vid == view_id:
                 continue
-            if any((c["closed"] or not need_closed)
-                   and abs(c["model_radius"] - radius) <= _CIRCLE_TOL for c in _view_circles(v)):
-                elsewhere.append(f'{vid} ({v.get("orientation") or v.get("type")})')
-        where = (f" It DOES project as a circle in view(s) {', '.join(elsewhere)} — dimension it "
-                 f"there." if elsewhere else
-                 " No view of this drawing shows it as a circle: add the view that looks down "
-                 "its axis with add_drawing_view(orientation=…), then dimension it there.")
-        shows = (f"the {'diameters' if need_closed else 'arc diameters'} it does show are "
-                 f"{here} mm." if here else
-                 f"it shows no {'full circles' if need_closed else 'arcs'} at all.")
+            if any(c["visible"] for c in _view_circles(v, sids, need_closed)):
+                seen.append(f'{vid} ({v.get("orientation") or v.get("type")})')
+        if circles:
+            why = (f"is HIDDEN in {here}: it is drawn there only as hidden lines, and a "
+                   f"dimension must attach to visible geometry.")
+        elif need_closed and _view_circles(view, sids):
+            why = (f"is only partly visible in {here}: hidden portions break its circle into "
+                   f"arcs, so there is no full circle to put a diameter on.")
+        elif _drawn_as_lines(view, sids):
+            why = f"is seen edge-on in {here}: it projects there as lines, not as a {shape}."
+        else:
+            why = f"does not appear in {here} at all."
+        where = (f" It is a visible {shape} in view(s) {', '.join(seen)} — dimension it there."
+                 if seen else
+                 f" No view of this drawing shows it as a visible {shape}: add the view that "
+                 f"looks down its axis with add_drawing_view(orientation=…), then dimension it "
+                 f"there.")
         return None, {
             "ok": False,
-            "error": f"add_dimension: {slot} resolved to a ⌀{round(2.0 * radius, 6)} mm circle, "
-                     f"but view {view_id} "
-                     f"({view.get('orientation') or view.get('type')}) projects no "
-                     f"{'full circle' if need_closed else 'arc'} of that size — {shows}"
-                     f"{where} Nothing was added.",
+            "error": f"add_dimension: {slot}={label} {why}{where} Nothing was added.",
         }
-    chosen = circles[0]
-    if len(circles) > 1:
-        notes.append(
-            f"{slot}: {len(circles)} circles of ⌀{round(2.0 * radius, 6)} mm project into view "
-            f"{view_id} (identical features measure the same); the dimension was placed on the "
-            f"one at {[round(x, 3) for x in chosen['center']]} — the others are at "
-            f"{[[round(x, 3) for x in c['center']] for c in circles[1:]]}, pass one of those as "
-            f"{slot}=[x,y] to move it")
-    else:
-        notes.append(f"{slot}: matched the projected ⌀{round(2.0 * radius, 6)} mm circle at "
-                     f"{[round(x, 3) for x in chosen['center']]} sheet mm in view {view_id}")
+    chosen = visible[0]
+    notes.append(f"{slot}: {', '.join(chosen['matched'])} is the projected "
+                 f"⌀{round(2.0 * chosen['model_radius'], 6)} mm {shape} at "
+                 f"{[round(x, 3) for x in chosen['center']]} sheet mm in view {view_id}")
     if dtype not in _ARC_DETERMINED:
-        return list(chosen["center"]), None
-    scale = view.get("scale") or 1.0
-    if not isinstance(scale, (int, float)) or scale == 0:
-        scale = 1.0
-    # The engine selects the arc whose RING is nearest the pick. Passing the centre makes every
-    # concentric ring equally located and the smallest one wins (live: ⌀9.8 and ⌀20 both became
-    # ⌀8.8). Pick the matched ring itself, where its distance metric is exactly zero.
-    return [chosen["center"][0] + radius * float(scale), chosen["center"][1]], None
+        return {"point": list(chosen["center"]), "circle": chosen}, None
+    # The engine selects the arc whose RING is nearest the pick. The centre would make every
+    # concentric ring equally near and the smallest would win; a point on the matched ring is
+    # at distance zero from it.
+    return {"point": [chosen["center"][0] + chosen["radius"], chosen["center"][1]],
+            "circle": chosen}, None
 
 
 # ---------------------------------------------------------------- drawing / view scale
@@ -991,6 +1039,10 @@ def _drawing_review_summary(full: dict, render: dict,
             "center": [round(x, 3) for x in circle["center"]],
             "diameter_mm": round(2.0 * circle["model_radius"], 6),
             "closed": circle["closed"],
+            "visible": circle["visible"],
+            # The model handles this circle was drawn from — add_dimension(a=<sid>) lands on it.
+            "edge_sids": circle["edge_sids"],
+            "face_sids": circle["face_sids"],
         } for circle in _view_circles(view)[:24]]
         views.append({
             "view_id": vid,
@@ -2879,11 +2931,14 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
 
         a, b name WHAT to dimension, either way round:
           * sheet-mm points  — a=[80,120] (read them off review_drawing / the view's arcs).
-          * a MODEL feature  — a="F6356a7" (the stable sid describe_part / query_geometry gave
-            you), or a="Bore" (the feature name), or a=["bore","F6356a7"]. The tool matches
-            that feature's circle in this view's projection and dimensions it, so you never
-            convert model geometry to sheet millimetres yourself. The reply says which circle
-            it landed on, and how many identical ones were there.
+          * a MODEL feature  — a="F6356a7" (the stable sid describe_part / query_geometry /
+            review_drawing's circles gave you), or a="Bore" (the feature name), or
+            a=["bore","F6356a7"]. Every projected circle carries the sid of the model edge and
+            faces it was drawn from, so the sid lands on exactly its own circle — one of four
+            identical holes is its own sid. You never convert model geometry to sheet mm
+            yourself. A target drawn only as hidden lines in this view is refused, naming the
+            views where it is visible; a feature name covering several circles is refused with
+            each circle's sid.
         pos is the optional text position (sheet mm). text is an optional verbatim display
         override; for dtype="note" it is REQUIRED and creates a single-leader free-text note.
 
@@ -2979,30 +3034,30 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 for slot, tokens in (("a", a_target), ("b", b_target)):
                     if not tokens:
                         continue
-                    radius, bad = _resolve_target_radius(src, tokens, slot, notes)
+                    target, bad = _target_entities(src, tokens, slot, notes)
                     if bad:
                         return _dumps(bad)
-                    point, bad = _resolve_target_point(full, view_id, radius, dtype, slot, notes)
+                    hit, bad = _resolve_target_point(full, view_id, target, dtype, slot, notes)
                     if bad:
                         return _dumps(bad)
+                    circle = hit["circle"]
                     resolved[slot] = {"from": tokens if len(tokens) > 1 else tokens[0],
-                                      "sheet_point": point,
-                                      "model_diameter": round(2.0 * radius, 6)}
+                                      "sids": circle["matched"],
+                                      "edge_sids": circle["edge_sids"],
+                                      "sheet_point": hit["point"],
+                                      "model_diameter": round(2.0 * circle["model_radius"], 6)}
                     if slot == "a":
-                        a_pt = point
+                        a_pt = hit["point"]
                     else:
-                        b_pt = point
+                        b_pt = hit["point"]
                 if (a_pt and b_pt and dtype not in _ARC_DETERMINED
                         and abs(a_pt[0] - b_pt[0]) < 1e-6 and abs(a_pt[1] - b_pt[1]) < 1e-6):
                     return _dumps({
                         "ok": False,
                         "error": f"add_dimension: a and b both resolved to the SAME circle at "
                                  f"{[round(x, 3) for x in a_pt]} sheet mm, so this {dtype} "
-                                 f"would measure zero. Identical features share a radius and "
-                                 f"cannot be told apart by it — pass the two circle centres as "
-                                 f"explicit sheet points (they are listed in the note above, or "
-                                 f"read them off the view's arcs), or dimension a different "
-                                 f"pair. Nothing was added.",
+                                 f"would measure zero — pass the sids of two different "
+                                 f"features. Nothing was added.",
                         "interpreted": notes})
             # SILENT-WRONG-OUTPUT guard, measured 2026-07-30 on the A3 plate drawing whose
             # `top` view occupies x 185..235, y 200.75..230.75 sheet mm:

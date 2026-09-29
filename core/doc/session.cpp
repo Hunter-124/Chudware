@@ -7549,6 +7549,294 @@ struct RenderFrame {
     bool clipped = false;
 };
 
+// Half-space section: keeps dot(p - point, normal) <= 0 (normal is unit). `ghost` draws the
+// removed half as a faint fill + dashed B-rep edges, `hatch` hatches the cap. Shared by
+// doc_render_view (`view.section`) and doc_view_metrics (`section` / `sections`).
+struct SectionSpec {
+    RV3 point{0, 0, 0};
+    RV3 normal{0, 0, 1};
+    bool ghost = true;
+    bool hatch = true;
+};
+
+// Parse a section object. Returns 0 for absent/null (no section), 1 when `out` was filled,
+// -1 on a malformed spec (reason written) — a bad section is a named refusal, never ignored.
+int parse_section_spec(const nlohmann::json& spec, SectionSpec& out, std::string& reason) {
+    if (spec.is_null()) return 0;
+    if (!spec.is_object()) {
+        reason = "section must be an object {point:[x,y,z], normal:[x,y,z]} or null";
+        return -1;
+    }
+    auto vec3 = [](const nlohmann::json& o, const char* key, RV3& v) {
+        const auto it = o.find(key);
+        if (it == o.end() || !it->is_array() || it->size() != 3) return false;
+        for (int i = 0; i < 3; ++i)
+            if (!(*it)[i].is_number() || !std::isfinite((*it)[i].get<double>())) return false;
+        v = {(*it)[0].get<double>(), (*it)[1].get<double>(), (*it)[2].get<double>()};
+        return true;
+    };
+    SectionSpec s;
+    RV3 n{0, 0, 0};
+    if (!vec3(spec, "point", s.point) || !vec3(spec, "normal", n)) {
+        reason = "section point and normal must be finite 3-vectors";
+        return -1;
+    }
+    const double scale = std::max({std::abs(n.x), std::abs(n.y), std::abs(n.z)});
+    if (!(scale > 0.0)) {
+        reason = "section normal must be non-zero";
+        return -1;
+    }
+    s.normal = rnorm({n.x / scale, n.y / scale, n.z / scale});
+    for (const char* key : {"ghost", "hatch"}) {
+        const auto it = spec.find(key);
+        if (it == spec.end() || it->is_null()) continue;
+        if (!it->is_boolean()) {
+            reason = std::string("section.") + key + " must be a boolean";
+            return -1;
+        }
+        (std::string(key) == "ghost" ? s.ghost : s.hatch) = it->get<bool>();
+    }
+    out = s;
+    return 1;
+}
+
+nlohmann::json section_spec_json(const SectionSpec& s) {
+    return nlohmann::json{{"point", nlohmann::json::array({s.point.x, s.point.y, s.point.z})},
+                          {"normal", nlohmann::json::array({s.normal.x, s.normal.y, s.normal.z})},
+                          {"ghost", s.ghost},
+                          {"hatch", s.hatch}};
+}
+
+// The camera the software rasterizer projects through — legacy orthographic auto-fit or an
+// exact perspective pose. r/u/depth_axis are orthonormal (depth_axis = forward for a pose, the
+// scene->camera `d` for orthographic), so a world point is exactly
+// c + pu*r + pv*u + pd*depth_axis; that is what lets a world half-space clip in camera space.
+struct ViewProjection {
+    bool perspective = false;
+    RV3 c{0, 0, 0}, r{1, 0, 0}, u{0, 1, 0}, d{0, 0, 1}, depth_axis{0, 0, 1};
+    double scale = 0, cu = 0, cv = 0;
+    int W = 0, H = 0;
+    double near_plane = 0, far_plane = 0;
+
+    void project(double x, double y, double z, double& pu, double& pv, double& pd) const {
+        RV3 p = rsub({x, y, z}, c);
+        pu = rdot(p, r);
+        pv = rdot(p, u);
+        pd = rdot(p, depth_axis);
+    }
+    void to_screen(double pu, double pv, double pd, double& sx, double& sy) const {
+        if (perspective) {
+            sx = pu * scale / pd + W / 2.0;
+            sy = H / 2.0 - pv * scale / pd;
+        } else {
+            sx = (pu - cu) * scale + W / 2.0;
+            sy = H / 2.0 - (pv - cv) * scale;
+        }
+    }
+};
+
+ViewProjection perspective_view_projection(const PerspectiveCamera& camera, int W, int H) {
+    ViewProjection vp;
+    vp.perspective = true;
+    vp.c = camera.position;
+    vp.d = RV3{-camera.forward.x, -camera.forward.y, -camera.forward.z};
+    vp.r = camera.right;
+    vp.u = camera.true_up;
+    vp.depth_axis = camera.forward;
+    vp.scale = (H * 0.5) / std::tan(camera.vertical_fov_deg * 3.14159265358979323846 / 360.0);
+    vp.W = W;
+    vp.H = H;
+    vp.near_plane = camera.near_plane;
+    vp.far_plane = camera.far_plane;
+    return vp;
+}
+
+// `lam` is the vertex's diffuse term, carried through clipping so a body that ships
+// per-vertex normals shades SMOOTHLY (Gouraud) instead of one flat tone per triangle.
+struct ProjectedVertex { double pu, pv, pd, lam; };
+
+template <class SignedDistance>
+std::vector<ProjectedVertex> clip_halfspace(const std::vector<ProjectedVertex>& input,
+                                            const SignedDistance& signed_distance) {
+    std::vector<ProjectedVertex> output;
+    if (input.empty()) return output;
+    ProjectedVertex previous = input.back();
+    double previous_distance = signed_distance(previous);
+    bool previous_inside = previous_distance >= 0.0;
+    for (const ProjectedVertex& current : input) {
+        const double current_distance = signed_distance(current);
+        const bool current_inside = current_distance >= 0.0;
+        if (current_inside != previous_inside) {
+            const double t = previous_distance /
+                             (previous_distance - current_distance);
+            output.push_back({
+                previous.pu + t * (current.pu - previous.pu),
+                previous.pv + t * (current.pv - previous.pv),
+                previous.pd + t * (current.pd - previous.pd),
+                previous.lam + t * (current.lam - previous.lam),
+            });
+        }
+        if (current_inside) output.push_back(current);
+        previous = current;
+        previous_distance = current_distance;
+        previous_inside = current_inside;
+    }
+    return output;
+}
+
+// True when a camera-space vertex lies inside all six planes of a perspective frustum.
+inline bool inside_frustum(const ViewProjection& vp, const ProjectedVertex& p) {
+    const double tan_y = 0.5 * vp.H / vp.scale;
+    const double tan_x = tan_y * vp.W / vp.H;
+    return p.pd - vp.near_plane >= 0.0 && vp.far_plane - p.pd >= 0.0 &&
+           p.pu + p.pd * tan_x >= 0.0 && p.pd * tan_x - p.pu >= 0.0 &&
+           p.pv + p.pd * tan_y >= 0.0 && p.pd * tan_y - p.pv >= 0.0;
+}
+
+// Clip a camera-space polygon to the perspective frustum: near, far, then the four side
+// planes through the frame edges, so integer raster bounds are formed only from on-frame
+// vertices. A polygon wholly inside skips the clipper (which would return it unchanged).
+void clip_to_frustum(const ViewProjection& vp, std::vector<ProjectedVertex>& polygon) {
+    bool all_inside = true;
+    for (const ProjectedVertex& p : polygon)
+        if (!inside_frustum(vp, p)) { all_inside = false; break; }
+    if (all_inside) return;
+    const double tan_y = 0.5 * vp.H / vp.scale;
+    const double tan_x = tan_y * vp.W / vp.H;
+    polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
+        return p.pd - vp.near_plane;
+    });
+    polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
+        return vp.far_plane - p.pd;
+    });
+    polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
+        return p.pu + p.pd * tan_x;
+    });
+    polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
+        return p.pd * tan_x - p.pu;
+    });
+    polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
+        return p.pv + p.pd * tan_y;
+    });
+    polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
+        return p.pd * tan_y - p.pv;
+    });
+}
+
+// A world section plane expressed in one camera's coordinates: signed distance
+// dot(p - point, normal) as an affine function of (pu, pv, pd). Positive = removed half.
+struct CameraSection {
+    double s0 = 0, kr = 0, ku = 0, kd = 0;
+    double at(const ProjectedVertex& p) const { return s0 + p.pu * kr + p.pv * ku + p.pd * kd; }
+    double at(double pu, double pv, double pd) const { return s0 + pu * kr + pv * ku + pd * kd; }
+};
+
+CameraSection camera_section(const ViewProjection& vp, const SectionSpec& s) {
+    CameraSection cs;
+    cs.s0 = rdot(rsub(vp.c, s.point), s.normal);
+    cs.kr = rdot(vp.r, s.normal);
+    cs.ku = rdot(vp.u, s.normal);
+    cs.kd = rdot(vp.depth_axis, s.normal);
+    return cs;
+}
+
+// Restrict segment parameter [t0,t1] to where the affine f(t) = fa + t*(fb-fa) is >= 0.
+inline bool clip_segment_param(double fa, double fb, double& t0, double& t1) {
+    if (fa < 0.0 && fb < 0.0) return false;
+    if (fa >= 0.0 && fb >= 0.0) return t0 <= t1;
+    const double t = fa / (fa - fb);
+    if (fa < 0.0) t0 = std::max(t0, t);
+    else t1 = std::min(t1, t);
+    return t0 <= t1;
+}
+
+// Triangle normal from the index winding, flipped to agree with the body's shading normals
+// when it carries them (tessellate.cpp writes outward-oriented normals per face orientation).
+RV3 outward_triangle_normal(const aicm::AicmBody& b, uint32_t i0, uint32_t i1, uint32_t i2,
+                            const RV3& fn) {
+    if (b.nrm.size() != b.pos.size()) return fn;
+    const RV3 s{(double)b.nrm[3 * i0] + b.nrm[3 * i1] + b.nrm[3 * i2],
+                (double)b.nrm[3 * i0 + 1] + b.nrm[3 * i1 + 1] + b.nrm[3 * i2 + 1],
+                (double)b.nrm[3 * i0 + 2] + b.nrm[3 * i1 + 2] + b.nrm[3 * i2 + 2]};
+    return rdot(fn, s) < 0.0 ? RV3{-fn.x, -fn.y, -fn.z} : fn;
+}
+
+// A triangle is back-facing when its outward normal points away from the eye (perspective)
+// or away from the scene->camera direction (orthographic).
+inline bool faces_away(const ViewProjection& vp, const RV3& outward, const RV3& centroid) {
+    return vp.perspective ? rdot(outward, rsub(vp.c, centroid)) < 0.0
+                          : rdot(outward, vp.d) < 0.0;
+}
+
+// The one edge-function/depth raster path for both camera kinds: perspective interpolates
+// reciprocal depth, orthographic its legacy linear depth. `plot(pixel_index, depth, a0, a1, a2)`
+// receives each covered pixel centre (barycentrics a0..a2); it owns the depth test.
+template <class Plot>
+void raster_projected_triangle(const ViewProjection& vp, const ProjectedVertex& p0,
+                               const ProjectedVertex& p1, const ProjectedVertex& p2,
+                               double clip_depth, Plot&& plot) {
+    const int W = vp.W, H = vp.H;
+    const bool perspective = vp.perspective;
+    double su0, sv0, su1, sv1, su2, sv2;
+    vp.to_screen(p0.pu, p0.pv, p0.pd, su0, sv0);
+    vp.to_screen(p1.pu, p1.pv, p1.pd, su1, sv1);
+    vp.to_screen(p2.pu, p2.pv, p2.pd, su2, sv2);
+    int minx = (int)std::floor(std::min({su0, su1, su2}));
+    int maxx = (int)std::ceil(std::max({su0, su1, su2}));
+    int miny = (int)std::floor(std::min({sv0, sv1, sv2}));
+    int maxy = (int)std::ceil(std::max({sv0, sv1, sv2}));
+    minx = std::max(minx, 0); miny = std::max(miny, 0);
+    maxx = std::min(maxx, W - 1); maxy = std::min(maxy, H - 1);
+    double area = (su1 - su0) * (sv2 - sv0) - (su2 - su0) * (sv1 - sv0);
+    if (std::abs(area) < 1e-9) return;
+    const double d0 = perspective ? 1.0 / p0.pd : p0.pd;
+    const double d1 = perspective ? 1.0 / p1.pd : p1.pd;
+    const double d2 = perspective ? 1.0 / p2.pd : p2.pd;
+    for (int py = miny; py <= maxy; ++py)
+        for (int px = minx; px <= maxx; ++px) {
+            double fx = px + 0.5, fy = py + 0.5;
+            double a0 = ((su1 - fx) * (sv2 - fy) - (su2 - fx) * (sv1 - fy)) / area;
+            double a1 = ((su2 - fx) * (sv0 - fy) - (su0 - fx) * (sv2 - fy)) / area;
+            double a2 = 1.0 - a0 - a1;
+            if (a0 < 0 || a1 < 0 || a2 < 0) continue;
+            double depth = a0 * d0 + a1 * d1 + a2 * d2;
+            if (!perspective && depth > clip_depth) continue;
+            plot((size_t)py * W + px, depth, a0, a1, a2);
+        }
+}
+
+// Thin ghost B-rep strokes: front edges are continuous; edges behind removed material
+// are dashed and faint. Clip before stepping so a near-plane edge stays bounded.
+void draw_dashed_segment(std::vector<unsigned char>& img, int W, int H, double x0, double y0,
+                         double x1, double y1, const unsigned char col[3], int& phase,
+                         bool dashed = true) {
+    double t0 = 0.0, t1 = 1.0;
+    if (!clip_segment_param(x0 + 1.0, x1 + 1.0, t0, t1) ||
+        !clip_segment_param(W - x0, W - x1, t0, t1) ||
+        !clip_segment_param(y0 + 1.0, y1 + 1.0, t0, t1) ||
+        !clip_segment_param(H - y0, H - y1, t0, t1))
+        return;
+    const double ax = x0 + t0 * (x1 - x0), ay = y0 + t0 * (y1 - y0);
+    const double bx = x0 + t1 * (x1 - x0), by = y0 + t1 * (y1 - y0);
+    const int steps = std::max(1, (int)std::ceil(std::max(std::abs(bx - ax), std::abs(by - ay))));
+    for (int i = 0; i < steps; ++i) {
+        const double t = (double)i / steps;
+        if (!dashed || (phase++ % 7) < 4)
+            put_px(img, W, H, (int)std::floor(ax + t * (bx - ax)),
+                   (int)std::floor(ay + t * (by - ay)), col[0], col[1], col[2]);
+    }
+}
+
+// The cap has sparse low-contrast hatch; cut contours are inked after the ghost.
+constexpr unsigned char kSectionCap[3] = {234, 199, 184};
+constexpr unsigned char kSectionHatch[3] = {207, 164, 149};
+constexpr unsigned char kSectionOutline[3] = {27, 31, 39};
+constexpr unsigned char kSectionGhostFill[3] = {163, 183, 204};
+constexpr unsigned char kSectionGhostEdge[3] = {112, 131, 151};
+constexpr unsigned char kSectionGhostHidden[3] = {187, 196, 206};
+constexpr int kSectionGhostAlpha = 67;
+constexpr int kSectionHatchPitch = 13;
+
 // Render the tessellated solids from an arbitrary camera direction into an RGB buffer (no file I/O),
 // labelled + colour-coded like the legacy iso render. `header`, when non-empty, is blitted top-left
 // (view name + units + bbox dims) so a multi-view contact sheet is self-describing. Returns false if
@@ -7575,6 +7863,10 @@ struct RenderFrame {
 //                    callouts and gizmo all carry their own dark halo/disc, so they stay
 //                    readable over a dark field — a caller wanting a film-dark plate passes
 //                    the colour instead of colour-keying the grey out afterwards.
+//   `section`      — half-space cut (see SectionSpec): kept geometry shaded as usual, pixels whose
+//                    nearest surviving fragment is a back face become the flat hatched CAP, a
+//                    dark 2 px outline traces the cap boundary, and the removed half is ghosted.
+//                    Null draws exactly the legacy pixels.
 bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                         const std::vector<RenderLabel>& labels, int W, int H, RV3 viewDir,
                         const std::string& header, std::vector<unsigned char>& outImg,
@@ -7585,7 +7877,8 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                         const RenderFocus* focus = nullptr,
                         RenderFrame* out_frame = nullptr,
                         const PerspectiveCamera* perspective_camera = nullptr,
-                        const unsigned char* background = nullptr) {
+                        const unsigned char* background = nullptr,
+                        const SectionSpec* section = nullptr) {
     const bool perspective = perspective_camera != nullptr;
     // Camera framing reference: the drawn set unless the caller supplied a stable frame set.
     const std::vector<aicm::AicmBody>& frame_bodies =
@@ -7600,29 +7893,32 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             any = true;
         }
     if (!any) return false;
-    RV3 c = perspective ? perspective_camera->position
-                        : (focus ? RV3{(focus->lo.x + focus->hi.x) / 2,
-                                      (focus->lo.y + focus->hi.y) / 2,
-                                      (focus->lo.z + focus->hi.z) / 2}
-                                 : RV3{(lo.x + hi.x) / 2, (lo.y + hi.y) / 2,
-                                       (lo.z + hi.z) / 2});
-    RV3 d = perspective
-                ? RV3{-perspective_camera->forward.x, -perspective_camera->forward.y,
-                      -perspective_camera->forward.z}
-                : rnorm(viewDir);  // legacy view dir (scene -> camera)
-    if (!perspective && rdot(d, d) < 0.5)
-        d = rnorm({1.0, 1.0, 0.8});  // degenerate legacy spec -> iso
-    // Legacy views retain their robust world-up choice byte-for-byte. An exact camera instead
-    // uses the requested up to derive the same right/true-up basis as CameraPose.
-    RV3 upRef = (std::abs(d.z) > 0.985) ? RV3{0, 1, 0} : RV3{0, 0, 1};
-    RV3 r = perspective ? perspective_camera->right : rnorm(rcross(upRef, d));
-    RV3 u = perspective ? perspective_camera->true_up : rcross(d, r);
+    ViewProjection vp;
+    if (perspective) {
+        // An exact camera uses the requested up to derive the same right/true-up basis as
+        // CameraPose; see perspective_view_projection.
+        vp = perspective_view_projection(*perspective_camera, W, H);
+    } else {
+        vp.W = W;
+        vp.H = H;
+        vp.c = focus ? RV3{(focus->lo.x + focus->hi.x) / 2,
+                           (focus->lo.y + focus->hi.y) / 2,
+                           (focus->lo.z + focus->hi.z) / 2}
+                     : RV3{(lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2};
+        RV3 legacy_dir = rnorm(viewDir);  // legacy view dir (scene -> camera)
+        if (rdot(legacy_dir, legacy_dir) < 0.5)
+            legacy_dir = rnorm({1.0, 1.0, 0.8});  // degenerate legacy spec -> iso
+        // Legacy views retain their robust world-up choice byte-for-byte.
+        const RV3 upRef = (std::abs(legacy_dir.z) > 0.985) ? RV3{0, 1, 0} : RV3{0, 0, 1};
+        vp.d = legacy_dir;
+        vp.depth_axis = legacy_dir;
+        vp.r = rnorm(rcross(upRef, legacy_dir));
+        vp.u = rcross(legacy_dir, vp.r);
+    }
+    const RV3 c = vp.c, d = vp.d, r = vp.r, u = vp.u;
     RV3 light = rnorm({0.4, 0.5, 1.0});
     auto proj = [&](double x, double y, double z, double& pu, double& pv, double& pd) {
-        RV3 p = rsub({x, y, z}, c);
-        pu = rdot(p, r);
-        pv = rdot(p, u);
-        pd = perspective ? rdot(p, perspective_camera->forward) : rdot(p, d);
+        vp.project(x, y, z, pu, pv, pd);
     };
     double minu = 1e30, maxu = -1e30, minv = 1e30, maxv = -1e30;
     // Perspective poses are authoritative and never enter either fitting loop.
@@ -7649,14 +7945,14 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                 minv = std::min(minv, pv); maxv = std::max(maxv, pv);
             }
     }
-    const double fit = focus ? 1.0 : 0.85;
-    double scale = perspective
-        ? (H * 0.5) / std::tan(perspective_camera->vertical_fov_deg *
-                               3.14159265358979323846 / 360.0)
-        : fit * std::min(W / std::max(maxu - minu, 1e-6),
-                         H / std::max(maxv - minv, 1e-6));
-    double cu = perspective ? 0.0 : (minu + maxu) / 2;
-    double cv = perspective ? 0.0 : (minv + maxv) / 2;
+    if (!perspective) {
+        const double fit = focus ? 1.0 : 0.85;
+        vp.scale = fit * std::min(W / std::max(maxu - minu, 1e-6),
+                                  H / std::max(maxv - minv, 1e-6));
+        vp.cu = (minu + maxu) / 2;
+        vp.cv = (minv + maxv) / 2;
+    }
+    const double scale = vp.scale, cu = vp.cu, cv = vp.cv;
     // Legacy focus cutaway depth. Perspective clipping is handled against near/far below.
     double clip_depth = 1e30;
     if (!perspective && focus && focus->clip_near) {
@@ -7674,13 +7970,7 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
         *out_frame = RenderFrame{c, r, u, d, scale, cu, cv, W, H, clip_depth,
                                  clip_depth < 1e29};
     auto toScreen = [&](double pu, double pv, double pd, double& sx, double& sy) {
-        if (perspective) {
-            sx = pu * scale / pd + W / 2.0;
-            sy = H / 2.0 - pv * scale / pd;
-        } else {
-            sx = (pu - cu) * scale + W / 2.0;
-            sy = H / 2.0 - (pv - cv) * scale;
-        }
+        vp.to_screen(pu, pv, pd, sx, sy);
     };
     // Clear to the requested background (default: the historical flat 245 light grey). A grey
     // triple still takes the single-value fill, so the common case allocates and writes once.
@@ -7700,66 +7990,24 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
     }
     std::vector<double> zbuf((size_t)W * H, -1e30);
     long painted = 0;
-    // `lam` is the vertex's diffuse term, carried through clipping so a body that ships
-    // per-vertex normals shades SMOOTHLY (Gouraud) instead of one flat tone per triangle.
-    struct ProjectedVertex { double pu, pv, pd, lam; };
-    auto clip_halfspace = [](const std::vector<ProjectedVertex>& input,
-                             const auto& signed_distance) {
-        std::vector<ProjectedVertex> output;
-        if (input.empty()) return output;
-        ProjectedVertex previous = input.back();
-        double previous_distance = signed_distance(previous);
-        bool previous_inside = previous_distance >= 0.0;
-        for (const ProjectedVertex& current : input) {
-            const double current_distance = signed_distance(current);
-            const bool current_inside = current_distance >= 0.0;
-            if (current_inside != previous_inside) {
-                const double t = previous_distance /
-                                 (previous_distance - current_distance);
-                output.push_back({
-                    previous.pu + t * (current.pu - previous.pu),
-                    previous.pv + t * (current.pv - previous.pv),
-                    previous.pd + t * (current.pd - previous.pd),
-                    previous.lam + t * (current.lam - previous.lam),
-                });
-            }
-            if (current_inside) output.push_back(current);
-            previous = current;
-            previous_distance = current_distance;
-            previous_inside = current_inside;
-        }
-        return output;
-    };
-    // Projection/clipping feeds this one edge-function/depth/blend raster path for both camera
-    // kinds. Perspective supplies reciprocal depth; orthographic supplies its legacy linear depth.
+    // Section cap and the nearest removed-half depth (for solid/dashed ghost edges).
+    CameraSection cut;
+    std::vector<unsigned char> cap_mask;
+    std::vector<double> ghost_depth;
+    if (section) {
+        cut = camera_section(vp, *section);
+        cap_mask.assign((size_t)W * H, 0);
+        if (section->ghost) ghost_depth.assign((size_t)W * H, -1e30);
+    }
+    bool triangle_faces_away = false;
+    // Projection/clipping feeds the one shared edge-function/depth raster path; this plot
+    // owns the depth test, Gouraud shade and alpha blend.
     auto raster_triangle = [&](const ProjectedVertex& p0, const ProjectedVertex& p1,
                                const ProjectedVertex& p2, double cr, double cg, double cb,
                                unsigned char balpha) {
-        double su0, sv0, su1, sv1, su2, sv2;
-        toScreen(p0.pu, p0.pv, p0.pd, su0, sv0);
-        toScreen(p1.pu, p1.pv, p1.pd, su1, sv1);
-        toScreen(p2.pu, p2.pv, p2.pd, su2, sv2);
-        int minx = (int)std::floor(std::min({su0, su1, su2}));
-        int maxx = (int)std::ceil(std::max({su0, su1, su2}));
-        int miny = (int)std::floor(std::min({sv0, sv1, sv2}));
-        int maxy = (int)std::ceil(std::max({sv0, sv1, sv2}));
-        minx = std::max(minx, 0); miny = std::max(miny, 0);
-        maxx = std::min(maxx, W - 1); maxy = std::min(maxy, H - 1);
-        double area = (su1 - su0) * (sv2 - sv0) - (su2 - su0) * (sv1 - sv0);
-        if (std::abs(area) < 1e-9) return;
-        const double d0 = perspective ? 1.0 / p0.pd : p0.pd;
-        const double d1 = perspective ? 1.0 / p1.pd : p1.pd;
-        const double d2 = perspective ? 1.0 / p2.pd : p2.pd;
-        for (int py = miny; py <= maxy; ++py)
-            for (int px = minx; px <= maxx; ++px) {
-                double fx = px + 0.5, fy = py + 0.5;
-                double a0 = ((su1 - fx) * (sv2 - fy) - (su2 - fx) * (sv1 - fy)) / area;
-                double a1 = ((su2 - fx) * (sv0 - fy) - (su0 - fx) * (sv2 - fy)) / area;
-                double a2 = 1.0 - a0 - a1;
-                if (a0 < 0 || a1 < 0 || a2 < 0) continue;
-                double depth = a0 * d0 + a1 * d1 + a2 * d2;
-                if (!perspective && depth > clip_depth) continue;
-                size_t pi = (size_t)py * W + px;
+        raster_projected_triangle(
+            vp, p0, p1, p2, clip_depth,
+            [&](size_t pi, double depth, double a0, double a1, double a2) {
                 if (depth > zbuf[pi]) {
                     zbuf[pi] = depth;
                     // Gouraud: the diffuse term is interpolated, the base colour is flat.
@@ -7775,9 +8023,10 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                         img[pi * 3 + 1] = (unsigned char)((a * G + ia * img[pi * 3 + 1]) / 255);
                         img[pi * 3 + 2] = (unsigned char)((a * B + ia * img[pi * 3 + 2]) / 255);
                     }
+                    if (section) cap_mask[pi] = triangle_faces_away ? 1 : 0;
                     ++painted;
                 }
-            }
+            });
     };
     for (size_t bi = 0; bi < bodies.size(); ++bi) {
         const aicm::AicmBody& b = bodies[bi];
@@ -7889,31 +8138,30 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             proj(w1.x, w1.y, w1.z, p1.pu, p1.pv, p1.pd);
             proj(w2.x, w2.y, w2.z, p2.pu, p2.pv, p2.pd);
             p0.lam = lam0; p1.lam = lam1; p2.lam = lam2;
-            if (!perspective) {
+            if (!perspective && !section) {
                 raster_triangle(p0, p1, p2, cr, cg, cb, balpha);
                 continue;
             }
             std::vector<ProjectedVertex> polygon{p0, p1, p2};
-            const double tan_y = 0.5 * H / scale;
-            const double tan_x = tan_y * W / H;
-            polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
-                return p.pd - perspective_camera->near_plane;
-            });
-            polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
-                return perspective_camera->far_plane - p.pd;
-            });
-            polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
-                return p.pu + p.pd * tan_x;
-            });
-            polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
-                return p.pd * tan_x - p.pu;
-            });
-            polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
-                return p.pv + p.pd * tan_y;
-            });
-            polygon = clip_halfspace(polygon, [&](const ProjectedVertex& p) {
-                return p.pd * tan_y - p.pv;
-            });
+            if (perspective) clip_to_frustum(vp, polygon);
+            if (section) {
+                if (section->ghost) {
+                    const std::vector<ProjectedVertex> removed = clip_halfspace(
+                        polygon, [&](const ProjectedVertex& p) { return cut.at(p); });
+                    for (size_t k = 1; k + 1 < removed.size(); ++k)
+                        raster_projected_triangle(
+                            vp, removed[0], removed[k], removed[k + 1], clip_depth,
+                            [&](size_t pi, double depth, double, double, double) {
+                                ghost_depth[pi] = std::max(ghost_depth[pi], depth);
+                            });
+                }
+                polygon = clip_halfspace(
+                    polygon, [&](const ProjectedVertex& p) { return -cut.at(p); });
+                const RV3 centroid{(w0.x + w1.x + w2.x) / 3.0, (w0.y + w1.y + w2.y) / 3.0,
+                                   (w0.z + w1.z + w2.z) / 3.0};
+                triangle_faces_away =
+                    faces_away(vp, outward_triangle_normal(b, i0, i1, i2, fn), centroid);
+            }
             for (size_t k = 1; k + 1 < polygon.size(); ++k)
                 raster_triangle(polygon[0], polygon[k], polygon[k + 1], cr, cg, cb, balpha);
         }
@@ -7921,12 +8169,93 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
     const long paint_floor = (min_painted >= 0) ? (long)min_painted : (long)(W * H) / 400;
     if (painted < paint_floor) return false;  // ~nothing drawn — treat as failed render
 
+    // ---- section overlay: cap fill + hatch, cut outline, then the ghosted removed half ------
+    if (section) {
+        for (int py = 0; py < H; ++py)
+            for (int px = 0; px < W; ++px) {
+                const size_t pi = (size_t)py * W + px;
+                if (!cap_mask[pi]) continue;
+                const bool hatch_px = section->hatch && (px + py) % kSectionHatchPitch == 0;
+                const unsigned char* col = hatch_px ? kSectionHatch : kSectionCap;
+                img[pi * 3] = col[0]; img[pi * 3 + 1] = col[1]; img[pi * 3 + 2] = col[2];
+            }
+        // Draw the cut boundary after the removed-half ghost so it remains the darkest
+        // continuous contour even where an outer ghost edge crosses the plane.
+        if (section->ghost) {
+            const int a = kSectionGhostAlpha, ia = 255 - kSectionGhostAlpha;
+            for (size_t pi = 0; pi < ghost_depth.size(); ++pi) {
+                if (ghost_depth[pi] <= -1e29) continue;
+                for (int ch = 0; ch < 3; ++ch)
+                    img[pi * 3 + ch] =
+                        (unsigned char)((a * kSectionGhostFill[ch] + ia * img[pi * 3 + ch]) / 255);
+            }
+            // Removed-half edges inherit the ghost's depth: its visible silhouette and
+            // B-rep boundaries are solid, edges occluded by removed material are dashed.
+            for (const aicm::AicmBody& b : bodies)
+                for (const aicm::EdgeRec& er : b.edges) {
+                    int phase = 0;
+                    for (uint32_t k = 0; k + 1 < er.pt_count; ++k) {
+                        const size_t ia3 = 3 * ((size_t)er.first_pt + k);
+                        const size_t ib3 = ia3 + 3;
+                        if (ib3 + 2 >= b.edge_pts.size()) break;
+                        double au, av, ad, bu, bv, bd;
+                        proj(b.edge_pts[ia3], b.edge_pts[ia3 + 1], b.edge_pts[ia3 + 2], au, av, ad);
+                        proj(b.edge_pts[ib3], b.edge_pts[ib3 + 1], b.edge_pts[ib3 + 2], bu, bv, bd);
+                        double t0 = 0.0, t1 = 1.0;
+                        if (!clip_segment_param(cut.at(au, av, ad), cut.at(bu, bv, bd), t0, t1))
+                            continue;
+                        if (perspective &&
+                            (!clip_segment_param(ad - vp.near_plane, bd - vp.near_plane, t0, t1) ||
+                             !clip_segment_param(vp.far_plane - ad, vp.far_plane - bd, t0, t1)))
+                            continue;
+                        if (!perspective && clip_depth < 1e29 &&
+                            !clip_segment_param(clip_depth - ad, clip_depth - bd, t0, t1))
+                            continue;
+                        double x0, y0, x1, y1;
+                        toScreen(au + t0 * (bu - au), av + t0 * (bv - av), ad + t0 * (bd - ad),
+                                 x0, y0);
+                        toScreen(au + t1 * (bu - au), av + t1 * (bv - av), ad + t1 * (bd - ad),
+                                 x1, y1);
+                        const double mid_depth = perspective
+                            ? 1.0 / std::max(0.5 * (1.0 / (ad + t0 * (bd - ad)) +
+                                                    1.0 / (ad + t1 * (bd - ad))), 1e-12)
+                            : 0.5 * ((ad + t0 * (bd - ad)) + (ad + t1 * (bd - ad)));
+                        const int mx = std::clamp((int)((x0 + x1) * 0.5), 0, W - 1);
+                        const int my = std::clamp((int)((y0 + y1) * 0.5), 0, H - 1);
+                        const double g = ghost_depth[(size_t)my * W + mx];
+                        const bool front = g <= -1e29 || (perspective
+                            ? 1.0 / mid_depth >= g * 0.993
+                            : mid_depth >= g - std::max(1e-5, (maxu - minu) * 0.003));
+                        draw_dashed_segment(img, W, H, x0, y0, x1, y1,
+                                            front ? kSectionGhostEdge : kSectionGhostHidden,
+                                            phase, !front);
+                    }
+                }
+        }
+            for (int py = 0; py < H; ++py)
+                for (int px = 0; px < W; ++px) {
+                    if (!cap_mask[(size_t)py * W + px]) continue;
+                    bool boundary = false;
+                    for (int oy = -1; oy <= 1 && !boundary; ++oy)
+                        for (int ox = -1; ox <= 1; ++ox) {
+                            const int qx = px + ox, qy = py + oy;
+                            if (qx >= 0 && qy >= 0 && qx < W && qy < H &&
+                                !cap_mask[(size_t)qy * W + qx]) boundary = true;
+                        }
+                    if (boundary)
+                        put_px(img, W, H, px, py, kSectionOutline[0],
+                               kSectionOutline[1], kSectionOutline[2]);
+                }
+    }
+
     // ---- annotation overlay (drawn ON TOP of the shaded mesh) ----------------------------
     // (a) named-face CALLOUTS: a coloured dot + leader + text at each visible principal face's
     //     screen position, using the SAME words the model addresses geometry with (TOP/FRONT
     //     /RIGHT/...). Back-facing labels (normal pointing away from the camera) are culled.
     for (const RenderLabel& lb : labels) {
         if (rdot(lb.normal, d) < 0.15) continue;  // face points away from camera -> skip
+        // A face whose anchor lies in the sectioned-away half is no longer there to label.
+        if (section && rdot(rsub(lb.anchor, section->point), section->normal) > 0.0) continue;
         double pu, pv, pd, sx, sy;
         proj(lb.anchor.x, lb.anchor.y, lb.anchor.z, pu, pv, pd);
         if (perspective) {
@@ -8202,6 +8531,10 @@ json doc_render_png(const std::string& doc_id, const std::string& out_path, bool
 // `annotate=false` drops orientation tint, face callouts, and the axis triad.
 // `background` is an optional [r,g,b] (0-255) the frame is cleared to; omitted/null keeps the
 // engine's flat 245 light grey, so every existing caller renders byte-identically.
+// `view.section` = {"point":[3], "normal":[3], "ghost":true, "hatch":true} (object form, either
+// camera kind) cuts the model at a half-space, keeping dot(p - point, normal) <= 0: closed-solid
+// cap (flat cut colour + 45° hatch), dark 2 px cut outline, and the removed half ghosted as a
+// faint fill plus dashed B-rep edges. Echoed as `section`; absent/null renders legacy pixels.
 json doc_render_view(const std::string& doc_id, const std::string& out_path,
                      const nlohmann::json& view, bool annotate,
                      const nlohmann::json& background) {
@@ -8216,6 +8549,16 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
             return json{{"ok", false}, {"code", "camera_focus_conflict"},
                         {"reason", "exact perspective camera cannot be combined with auto-fit focus"},
                         {"path", std::string()}};
+        SectionSpec section;
+        bool has_section = false;
+        if (view.is_object() && view.contains("section")) {
+            std::string section_reason;
+            const int parsed = parse_section_spec(view.at("section"), section, section_reason);
+            if (parsed < 0)
+                return json{{"ok", false}, {"code", "section_invalid"},
+                            {"reason", section_reason}, {"path", std::string()}};
+            has_section = parsed > 0;
+        }
 
         int W = 512, H = 400;
         json requested_W = W, requested_H = H;
@@ -8313,6 +8656,7 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
         } else if (!header.empty() && !dims.empty()) {
             header += "  " + dims;
         }
+        if (has_section && !header.empty()) header += "  SECTION";
         std::vector<RenderLabel> labels;
         if (annotate) labels = principal_face_labels(s);
         std::vector<unsigned char> img;
@@ -8325,7 +8669,8 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
                                      annotate, /*body_alpha=*/nullptr,
                                      /*frame_from=*/nullptr, min_painted,
                                      has_focus ? &fbox : nullptr, &frame, camera,
-                                     has_bg ? bg : nullptr);
+                                     has_bg ? bg : nullptr,
+                                     has_section ? &section : nullptr);
         if (ok) {
             std::string png = encode_png_rgb(W, H, img);
             std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
@@ -8334,6 +8679,7 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
         json out{{"ok", ok}, {"path", ok ? out_path : std::string()},
                  {"view", rv.name}, {"dims", dims},
                  {"dir", json::array({rv.dir.x, rv.dir.y, rv.dir.z})}};
+        if (has_section) out["section"] = section_spec_json(section);
         if (frame.W > 0 && camera) {
             const double tan_half_fov = std::tan(
                 camera->vertical_fov_deg * 3.14159265358979323846 / 360.0);
@@ -8386,6 +8732,625 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
         return json{{"ok", false}, {"reason", "render exception"}, {"error", e.what()}};
     } catch (...) {
         return json{{"ok", false}, {"reason", "render exception"}};
+    }
+}
+
+namespace {
+
+// doc_view_metrics works on a flattened copy of the display mesh: one entry per valid triangle
+// in exactly render_view_to_rgb's order and skip rule, so z-buffer ties resolve identically.
+struct MetricsTri {
+    RV3 w[3];
+    double lam[3];  // the renderer's per-vertex diffuse term (Gouraud)
+    RV3 n;          // outward unit geometric normal
+    int face;       // doc-wide face index; -1 for a raw-mesh triangle without a FaceRec
+};
+struct MetricsFace {
+    int body = 0;
+    uint32_t face_id = 0;
+    uint8_t surf_type = 0;
+    uint32_t tri_count = 0;
+    double area = 0;
+    RV3 centroid{0, 0, 0};
+    RV3 normal{0, 0, 0};
+};
+struct MetricsEdge {
+    int body = 0;
+    uint32_t edge_id = 0;
+    uint8_t curve_type = 0;
+    double length = 0;
+    size_t first = 0;  // into MetricsScene::edge_pts
+    size_t count = 0;
+};
+struct MetricsScene {
+    std::vector<MetricsTri> tris;
+    std::vector<MetricsFace> faces;
+    std::vector<MetricsEdge> edges;
+    std::vector<RV3> edge_pts;
+};
+
+MetricsScene build_metrics_scene(const std::vector<aicm::AicmBody>& bodies) {
+    MetricsScene scene;
+    const RV3 light = rnorm({0.4, 0.5, 1.0});
+    for (size_t bi = 0; bi < bodies.size(); ++bi) {
+        const aicm::AicmBody& b = bodies[bi];
+        const size_t ntri = b.idx.size() / 3;
+        const size_t face_base = scene.faces.size();
+        std::vector<int> face_of_tri(ntri, -1);
+        for (size_t fi = 0; fi < b.faces.size(); ++fi) {
+            const aicm::FaceRec& fr = b.faces[fi];
+            MetricsFace mf;
+            mf.body = (int)bi;
+            mf.face_id = fr.face_id;
+            mf.surf_type = fr.surf_type;
+            mf.tri_count = fr.tri_count;
+            scene.faces.push_back(mf);
+            const size_t last = std::min<size_t>((size_t)fr.first_tri + fr.tri_count, ntri);
+            for (size_t tri = fr.first_tri; tri < last; ++tri)
+                face_of_tri[tri] = (int)(face_base + fi);
+        }
+        const size_t nfaces = b.faces.size();
+        std::vector<RV3> centroid_sum(nfaces, RV3{0, 0, 0}), normal_sum(nfaces, RV3{0, 0, 0});
+        std::vector<RV3> vertex_sum(nfaces, RV3{0, 0, 0});
+        std::vector<size_t> vertex_count(nfaces, 0);
+        const bool smooth = b.nrm.size() == b.pos.size();
+        for (size_t t = 0; t + 2 < b.idx.size(); t += 3) {
+            const uint32_t i0 = b.idx[t], i1 = b.idx[t + 1], i2 = b.idx[t + 2];
+            if (3u * i0 + 2 >= b.pos.size() || 3u * i1 + 2 >= b.pos.size() ||
+                3u * i2 + 2 >= b.pos.size())
+                continue;
+            MetricsTri mt;
+            const uint32_t iv[3] = {i0, i1, i2};
+            for (int k = 0; k < 3; ++k)
+                mt.w[k] = RV3{b.pos[3 * iv[k]], b.pos[3 * iv[k] + 1], b.pos[3 * iv[k] + 2]};
+            const RV3 cr = rcross(rsub(mt.w[1], mt.w[0]), rsub(mt.w[2], mt.w[0]));
+            const RV3 fn = rnorm(cr);
+            for (int k = 0; k < 3; ++k) {
+                const RV3 n = smooth ? rnorm(RV3{b.nrm[3 * iv[k]], b.nrm[3 * iv[k] + 1],
+                                                 b.nrm[3 * iv[k] + 2]})
+                                     : fn;
+                mt.lam[k] = 0.35 + 0.65 * std::max(0.0, std::abs(rdot(n, light)));
+            }
+            mt.n = outward_triangle_normal(b, i0, i1, i2, fn);
+            mt.face = (t / 3 < face_of_tri.size()) ? face_of_tri[t / 3] : -1;
+            if (mt.face >= 0) {
+                const size_t lf = (size_t)mt.face - face_base;
+                const double area = 0.5 * std::sqrt(rdot(cr, cr));
+                scene.faces[(size_t)mt.face].area += area;
+                for (int k = 0; k < 3; ++k) {
+                    centroid_sum[lf].x += area * mt.w[k].x / 3.0;
+                    centroid_sum[lf].y += area * mt.w[k].y / 3.0;
+                    centroid_sum[lf].z += area * mt.w[k].z / 3.0;
+                    vertex_sum[lf].x += mt.w[k].x;
+                    vertex_sum[lf].y += mt.w[k].y;
+                    vertex_sum[lf].z += mt.w[k].z;
+                }
+                vertex_count[lf] += 3;
+                normal_sum[lf].x += area * mt.n.x;
+                normal_sum[lf].y += area * mt.n.y;
+                normal_sum[lf].z += area * mt.n.z;
+            }
+            scene.tris.push_back(mt);
+        }
+        for (size_t fi = 0; fi < nfaces; ++fi) {
+            MetricsFace& mf = scene.faces[face_base + fi];
+            if (mf.area > 0.0) {
+                mf.centroid = {centroid_sum[fi].x / mf.area, centroid_sum[fi].y / mf.area,
+                               centroid_sum[fi].z / mf.area};
+            } else if (vertex_count[fi] > 0) {
+                const double k = 1.0 / (double)vertex_count[fi];
+                mf.centroid = {vertex_sum[fi].x * k, vertex_sum[fi].y * k, vertex_sum[fi].z * k};
+            }
+            // A closed or nearly closed surface (full cylinder, sphere) has no mean facing.
+            const double len = std::sqrt(rdot(normal_sum[fi], normal_sum[fi]));
+            if (mf.area > 0.0 && len > 1e-4 * mf.area)
+                mf.normal = {normal_sum[fi].x / len, normal_sum[fi].y / len,
+                             normal_sum[fi].z / len};
+        }
+        for (size_t ei = 0; ei < b.edges.size(); ++ei) {
+            const aicm::EdgeRec& er = b.edges[ei];
+            MetricsEdge me;
+            me.body = (int)bi;
+            me.edge_id = er.edge_id;
+            me.curve_type = er.curve_type;
+            me.first = scene.edge_pts.size();
+            for (uint32_t k = 0; k < er.pt_count; ++k) {
+                const size_t p = 3 * ((size_t)er.first_pt + k);
+                if (p + 2 >= b.edge_pts.size()) break;
+                const RV3 v{b.edge_pts[p], b.edge_pts[p + 1], b.edge_pts[p + 2]};
+                if (me.count > 0) {
+                    const RV3 dv = rsub(v, scene.edge_pts.back());
+                    me.length += std::sqrt(rdot(dv, dv));
+                }
+                scene.edge_pts.push_back(v);
+                ++me.count;
+            }
+            scene.edges.push_back(me);
+        }
+    }
+    return scene;
+}
+
+// Normal-diversity bins: the 20 faces of an icosahedron (face centres = dodecahedron vertices),
+// rotated by a fixed Rx(7°) then Rz(13°) so the principal axes CAD faces favour never sit on a
+// bin boundary (unrotated, each axis ties two bins).
+const std::array<RV3, 20>& icosahedral_bins() {
+    static const std::array<RV3, 20> bins = [] {
+        const double phi = (1.0 + std::sqrt(5.0)) / 2.0, iphi = 1.0 / phi;
+        std::array<RV3, 20> raw{};
+        size_t n = 0;
+        for (int sx : {-1, 1})
+            for (int sy : {-1, 1})
+                for (int sz : {-1, 1}) raw[n++] = RV3{(double)sx, (double)sy, (double)sz};
+        for (int s1 : {-1, 1})
+            for (int s2 : {-1, 1}) {
+                raw[n++] = RV3{0.0, s1 * iphi, s2 * phi};
+                raw[n++] = RV3{s1 * iphi, s2 * phi, 0.0};
+                raw[n++] = RV3{s1 * phi, 0.0, s2 * iphi};
+            }
+        const double ax = 7.0 * 3.14159265358979323846 / 180.0;
+        const double az = 13.0 * 3.14159265358979323846 / 180.0;
+        std::array<RV3, 20> out{};
+        for (size_t i = 0; i < raw.size(); ++i) {
+            const RV3 v = rnorm(raw[i]);
+            const RV3 x{v.x, std::cos(ax) * v.y - std::sin(ax) * v.z,
+                        std::sin(ax) * v.y + std::cos(ax) * v.z};
+            out[i] = RV3{std::cos(az) * x.x - std::sin(az) * x.y,
+                         std::sin(az) * x.x + std::cos(az) * x.y, x.z};
+        }
+        return out;
+    }();
+    return bins;
+}
+
+int icosahedral_bin(const RV3& n) {
+    const std::array<RV3, 20>& bins = icosahedral_bins();
+    int best = 0;
+    double best_dot = -1e300;
+    for (int i = 0; i < 20; ++i) {
+        const double d = rdot(n, bins[(size_t)i]);
+        if (d > best_dot) { best_dot = d; best = i; }
+    }
+    return best;
+}
+
+double polygon_screen_area(const ViewProjection& vp, const ProjectedVertex* poly, size_t n) {
+    if (n < 3) return 0.0;
+    double twice = 0.0, x0, y0;
+    vp.to_screen(poly[n - 1].pu, poly[n - 1].pv, poly[n - 1].pd, x0, y0);
+    for (size_t k = 0; k < n; ++k) {
+        double x1, y1;
+        vp.to_screen(poly[k].pu, poly[k].pv, poly[k].pd, x1, y1);
+        twice += x0 * y1 - x1 * y0;
+        x0 = x1;
+        y0 = y1;
+    }
+    return 0.5 * std::abs(twice);
+}
+
+// Per-thread scratch, reused across the cameras a worker measures.
+struct MetricsBuffers {
+    std::vector<double> zbuf;          // reciprocal depth (the renderer's convention)
+    std::vector<int> winner;           // winning MetricsTri index, -1 = background
+    std::vector<float> shade;          // winner's interpolated Gouraud diffuse term
+    std::vector<unsigned char> cap;    // winner is a back face under an active section
+    std::vector<double> depth;         // linear camera depth of the visible surface
+    std::vector<long> vis_px;
+    std::vector<double> vis_area, cos_sum, proj_px;
+    std::vector<ProjectedVertex> polygon;
+};
+
+// Grazing pixels divide by |cos|; clamp at ~89° so one edge-on pixel cannot claim a huge area.
+constexpr double kMetricsMinCos = 0.02;
+constexpr double kMetricsBackgroundShade = 0.96;  // the renderer's 245/255 grey
+
+double metrics_round(double v, double q) { return std::round(v * q) / q; }
+
+json measure_view_metrics(const MetricsScene& scene, const PerspectiveCamera& camera,
+                          const SectionSpec* section, int W, int H, MetricsBuffers& buf) {
+    const ViewProjection vp = perspective_view_projection(camera, W, H);
+    const size_t N = (size_t)W * H;
+    const size_t nf = scene.faces.size();
+    buf.zbuf.assign(N, -1e30);
+    buf.winner.assign(N, -1);
+    buf.shade.assign(N, 0.0f);
+    buf.cap.assign(N, 0);
+    buf.depth.assign(N, 0.0);
+    buf.vis_px.assign(nf, 0);
+    buf.vis_area.assign(nf, 0.0);
+    buf.cos_sum.assign(nf, 0.0);
+    buf.proj_px.assign(nf, 0.0);
+    CameraSection cut;
+    if (section) cut = camera_section(vp, *section);
+    const RV3 light = rnorm({0.4, 0.5, 1.0});
+
+    // ---- raster: the renderer's projection, frustum clip, section clip and depth rule ----
+    for (size_t ti = 0; ti < scene.tris.size(); ++ti) {
+        const MetricsTri& t = scene.tris[ti];
+        ProjectedVertex p[3];
+        for (int k = 0; k < 3; ++k) {
+            vp.project(t.w[k].x, t.w[k].y, t.w[k].z, p[k].pu, p[k].pv, p[k].pd);
+            p[k].lam = t.lam[k];
+        }
+        const RV3 centroid{(t.w[0].x + t.w[1].x + t.w[2].x) / 3.0,
+                           (t.w[0].y + t.w[1].y + t.w[2].y) / 3.0,
+                           (t.w[0].z + t.w[1].z + t.w[2].z) / 3.0};
+        const bool away = faces_away(vp, t.n, centroid);
+        const bool is_cap = section && away;
+        auto raster = [&](const ProjectedVertex& a, const ProjectedVertex& b,
+                          const ProjectedVertex& c) {
+            raster_projected_triangle(
+                vp, a, b, c, 1e30, [&](size_t pi, double depth, double a0, double a1, double a2) {
+                    if (depth > buf.zbuf[pi]) {
+                        buf.zbuf[pi] = depth;
+                        buf.winner[pi] = (int)ti;
+                        buf.shade[pi] = (float)(a0 * a.lam + a1 * b.lam + a2 * c.lam);
+                        buf.cap[pi] = is_cap ? 1 : 0;
+                    }
+                });
+        };
+        bool unclipped = inside_frustum(vp, p[0]) && inside_frustum(vp, p[1]) &&
+                         inside_frustum(vp, p[2]);
+        if (unclipped && section)
+            unclipped = cut.at(p[0]) <= 0.0 && cut.at(p[1]) <= 0.0 && cut.at(p[2]) <= 0.0;
+        double screen_area = 0.0;
+        if (unclipped) {
+            raster(p[0], p[1], p[2]);
+            if (!away && t.face >= 0) screen_area = polygon_screen_area(vp, p, 3);
+        } else {
+            buf.polygon.assign(p, p + 3);
+            clip_to_frustum(vp, buf.polygon);
+            if (section)
+                buf.polygon = clip_halfspace(
+                    buf.polygon, [&](const ProjectedVertex& q) { return -cut.at(q); });
+            for (size_t k = 1; k + 1 < buf.polygon.size(); ++k)
+                raster(buf.polygon[0], buf.polygon[k], buf.polygon[k + 1]);
+            if (!away && t.face >= 0)
+                screen_area = polygon_screen_area(vp, buf.polygon.data(), buf.polygon.size());
+        }
+        if (screen_area > 0.0) buf.proj_px[(size_t)t.face] += screen_area;
+    }
+
+    // ---- per-pixel pass: depth, face coverage/area/cos, caps, normal bins ----------------
+    const double scale = vp.scale;
+    const double half_w = W / 2.0, half_h = H / 2.0;
+    const RV3 fwd = vp.depth_axis;
+    const double cap_shade =
+        section ? 0.35 + 0.65 * std::abs(rdot(section->normal, light)) : 0.0;
+    long bg_px = 0, cap_px = 0;
+    double zmin = 1e300, zmax = -1e300;
+    std::array<long, 20> bins{};
+    for (int py = 0; py < H; ++py)
+        for (int px = 0; px < W; ++px) {
+            const size_t pi = (size_t)py * W + px;
+            const int wi = buf.winner[pi];
+            if (wi < 0) { ++bg_px; continue; }
+            const MetricsTri& t = scene.tris[(size_t)wi];
+            double z = 1.0 / buf.zbuf[pi];
+            const double xc = (px + 0.5 - half_w) / scale, yc = (half_h - (py + 0.5)) / scale;
+            if (buf.cap[pi]) {
+                // The cap surface is the section plane itself, in front of the back face.
+                const double denom = xc * cut.kr + yc * cut.ku + cut.kd;
+                if (std::abs(denom) > 1e-12) {
+                    const double zp = -cut.s0 / denom;
+                    if (zp > 0.0 && zp < z) z = std::max(zp, vp.near_plane);
+                }
+                ++cap_px;
+                ++bins[(size_t)icosahedral_bin(section->normal)];
+            } else {
+                ++bins[(size_t)icosahedral_bin(t.n)];
+                if (t.face >= 0) {
+                    const RV3 ray{vp.r.x * xc + vp.u.x * yc + fwd.x,
+                                  vp.r.y * xc + vp.u.y * yc + fwd.y,
+                                  vp.r.z * xc + vp.u.z * yc + fwd.z};
+                    const double rho = std::sqrt(rdot(ray, ray));
+                    const double cosv = std::abs(rdot(t.n, ray)) / rho;
+                    // Pixel footprint perpendicular to the ray at depth z, then onto the surface.
+                    const double footprint = (z / scale) * (z / scale) / rho;
+                    const size_t f = (size_t)t.face;
+                    ++buf.vis_px[f];
+                    buf.vis_area[f] += footprint / std::max(cosv, kMetricsMinCos);
+                    buf.cos_sum[f] += cosv;
+                }
+            }
+            buf.depth[pi] = z;
+            zmin = std::min(zmin, z);
+            zmax = std::max(zmax, z);
+        }
+    const long fg_px = (long)N - bg_px;
+    const double depth_threshold =
+        fg_px > 0 ? std::max(0.02 * (zmax - zmin), 1e-9 * std::abs(zmax)) : 0.0;
+
+    long depth_edge_px = 0;
+    for (int py = 0; py < H; ++py)
+        for (int px = 0; px < W; ++px) {
+            const size_t pi = (size_t)py * W + px;
+            if (buf.winner[pi] < 0) continue;
+            const int nx[4] = {px - 1, px + 1, px, px};
+            const int ny[4] = {py, py, py - 1, py + 1};
+            for (int k = 0; k < 4; ++k) {
+                if (nx[k] < 0 || ny[k] < 0 || nx[k] >= W || ny[k] >= H) continue;
+                const size_t qi = (size_t)ny[k] * W + nx[k];
+                if (buf.winner[qi] < 0 ||
+                    std::abs(buf.depth[qi] - buf.depth[pi]) > depth_threshold) {
+                    ++depth_edge_px;
+                    break;
+                }
+            }
+        }
+
+    double normal_entropy = 0.0;
+    if (fg_px > 0)
+        for (long count : bins)
+            if (count > 0) {
+                const double pr = (double)count / (double)fg_px;
+                normal_entropy -= pr * std::log2(pr);
+            }
+
+    json face_vis = json::array();
+    for (size_t f = 0; f < nf; ++f) {
+        if (!(buf.proj_px[f] > 0.0) && buf.vis_px[f] == 0) continue;
+        const double mean_cos = buf.vis_px[f] > 0 ? buf.cos_sum[f] / buf.vis_px[f] : 0.0;
+        face_vis.push_back(json::array({(long)f, buf.vis_px[f],
+                                        metrics_round(buf.vis_area[f], 1e4),
+                                        metrics_round(mean_cos, 1e4),
+                                        metrics_round(buf.proj_px[f], 1e3)}));
+    }
+
+    // ---- B-rep edge sampling: ~1 sample per screen px along each clipped polyline ---------
+    struct Side { bool background; double shade; double depth; };
+    auto side_at = [&](double sx, double sy) -> Side {
+        const int ix = (int)std::floor(sx), iy = (int)std::floor(sy);
+        if (ix < 0 || iy < 0 || ix >= W || iy >= H) return {true, kMetricsBackgroundShade, 0.0};
+        const size_t qi = (size_t)iy * W + ix;
+        if (buf.winner[qi] < 0) return {true, kMetricsBackgroundShade, 0.0};
+        return {false, buf.cap[qi] ? cap_shade : (double)buf.shade[qi], buf.depth[qi]};
+    };
+    json edge_vis = json::array();
+    for (size_t ei = 0; ei < scene.edges.size(); ++ei) {
+        const MetricsEdge& e = scene.edges[ei];
+        if (e.count < 2) continue;
+        long in_frame = 0, visible = 0, silhouette = 0;
+        double len_px = 0.0, contrast_sum = 0.0;
+        for (size_t k = 0; k + 1 < e.count; ++k) {
+            const RV3& wa = scene.edge_pts[e.first + k];
+            const RV3& wb = scene.edge_pts[e.first + k + 1];
+            double au, av, ad, bu, bv, bd;
+            vp.project(wa.x, wa.y, wa.z, au, av, ad);
+            vp.project(wb.x, wb.y, wb.z, bu, bv, bd);
+            double t0 = 0.0, t1 = 1.0;
+            if (!clip_segment_param(ad - vp.near_plane, bd - vp.near_plane, t0, t1) ||
+                !clip_segment_param(vp.far_plane - ad, vp.far_plane - bd, t0, t1))
+                continue;
+            if (section &&
+                !clip_segment_param(-cut.at(au, av, ad), -cut.at(bu, bv, bd), t0, t1))
+                continue;
+            const double cu0 = au + t0 * (bu - au), cv0 = av + t0 * (bv - av),
+                         cd0 = ad + t0 * (bd - ad);
+            const double cu1 = au + t1 * (bu - au), cv1 = av + t1 * (bv - av),
+                         cd1 = ad + t1 * (bd - ad);
+            double x0, y0, x1, y1;
+            vp.to_screen(cu0, cv0, cd0, x0, y0);
+            vp.to_screen(cu1, cv1, cd1, x1, y1);
+            // Screen-space clip to the frame; reciprocal depth is affine in screen space.
+            double s0 = 0.0, s1 = 1.0;
+            if (!clip_segment_param(x0, x1, s0, s1) || !clip_segment_param(W - x0, W - x1, s0, s1) ||
+                !clip_segment_param(y0, y1, s0, s1) || !clip_segment_param(H - y0, H - y1, s0, s1))
+                continue;
+            const double dx = x1 - x0, dy = y1 - y0;
+            const double seg_len = std::sqrt(dx * dx + dy * dy);
+            const double span = seg_len * (s1 - s0);
+            const int n = std::max(1, (int)std::ceil(span));
+            const double step = span / n;
+            const bool has_dir = seg_len > 1e-9;
+            const double tx = has_dir ? dx / seg_len : 1.0, ty = has_dir ? dy / seg_len : 0.0;
+            const double inv0 = 1.0 / cd0, inv1 = 1.0 / cd1;
+            for (int i = 0; i < n; ++i) {
+                const double s = s0 + (i + 0.5) / n * (s1 - s0);
+                const double sx = x0 + s * dx, sy = y0 + s * dy;
+                const int ix = (int)std::floor(sx), iy = (int)std::floor(sy);
+                if (ix < 0 || iy < 0 || ix >= W || iy >= H) continue;
+                ++in_frame;
+                len_px += step;
+                const double zs = 1.0 / (inv0 + s * (inv1 - inv0));
+                const double tol = 0.005 * zs + 2.0 * zs / scale;
+                bool vis = false;
+                for (int oy = -1; oy <= 1 && !vis; ++oy)
+                    for (int ox = -1; ox <= 1 && !vis; ++ox) {
+                        const int qx = ix + ox, qy = iy + oy;
+                        if (qx < 0 || qy < 0 || qx >= W || qy >= H) continue;
+                        const size_t qi = (size_t)qy * W + qx;
+                        if (buf.winner[qi] < 0 || buf.depth[qi] >= zs - tol) vis = true;
+                    }
+                if (!vis) continue;
+                ++visible;
+                if (!has_dir) continue;
+                const Side left = side_at(sx - 2.0 * ty, sy + 2.0 * tx);
+                const Side right = side_at(sx + 2.0 * ty, sy - 2.0 * tx);
+                contrast_sum += std::abs(left.shade - right.shade);
+                if (left.background || right.background ||
+                    std::abs(left.depth - right.depth) > depth_threshold)
+                    ++silhouette;
+            }
+        }
+        if (in_frame == 0) continue;
+        edge_vis.push_back(json::array(
+            {(long)ei, metrics_round((double)visible / in_frame, 1e4), metrics_round(len_px, 1e3),
+             metrics_round(visible > 0 ? contrast_sum / visible : 0.0, 1e4),
+             metrics_round(visible > 0 ? (double)silhouette / visible : 0.0, 1e4)}));
+    }
+
+    const double principal_align =
+        std::max({std::abs(fwd.x), std::abs(fwd.y), std::abs(fwd.z)});
+    return json{{"face_vis", std::move(face_vis)},
+                {"edge_vis", std::move(edge_vis)},
+                {"bg_px", bg_px},
+                {"cap_px", cap_px},
+                {"depth_edge_px", depth_edge_px},
+                {"normal_entropy", metrics_round(normal_entropy, 1e4)},
+                {"principal_align", metrics_round(principal_align, 1e6)},
+                {"fg_px", fg_px},
+                {"section", section ? section_spec_json(*section) : json(nullptr)}};
+}
+
+}  // namespace
+
+// doc_view_metrics: exact per-camera visibility measurements through the SAME display mesh,
+// perspective projection, frustum/section clipping and depth rule as doc_render_view — the
+// shot planner's measured input. See contracts/worker_rpc.md "doc_view_metrics".
+json doc_view_metrics(const nlohmann::json& params) {
+    const auto t_start = std::chrono::steady_clock::now();
+    auto refuse = [](const std::string& code, const std::string& reason) {
+        return json{{"ok", false}, {"code", code}, {"reason", reason}};
+    };
+    try {
+        if (!params.is_object()) return refuse("params_invalid", "params must be an object");
+        const auto doc_it = params.find("doc_id");
+        if (doc_it == params.end() || !doc_it->is_string())
+            return refuse("doc_id_invalid", "doc_id must be a string");
+        const std::string doc_id = doc_it->get<std::string>();
+
+        int size[2] = {192, 144};
+        const char* size_keys[2] = {"width", "height"};
+        for (int i = 0; i < 2; ++i) {
+            const auto it = params.find(size_keys[i]);
+            if (it == params.end() || it->is_null()) continue;
+            if (!it->is_number_integer())
+                return refuse("image_size_invalid", std::string(size_keys[i]) +
+                                                        " must be an integer");
+            const long long raw = it->is_number_unsigned()
+                                      ? (long long)std::min<unsigned long long>(
+                                            it->get<unsigned long long>(), 1024ULL)
+                                      : it->get<long long>();
+            size[i] = (int)std::max(32LL, std::min(raw, 1024LL));
+        }
+        const int W = size[0], H = size[1];
+
+        const auto cams_it = params.find("cameras");
+        if (cams_it == params.end() || !cams_it->is_array() || cams_it->empty())
+            return refuse("cameras_invalid", "cameras must be a non-empty array of camera_pose.v1");
+        const json& cams = *cams_it;
+        constexpr size_t kMaxCameras = 4096;
+        if (cams.size() > kMaxCameras)
+            return refuse("cameras_too_many",
+                          "at most " + std::to_string(kMaxCameras) + " cameras per call");
+        std::vector<PerspectiveCamera> cameras;
+        cameras.reserve(cams.size());
+        for (size_t i = 0; i < cams.size(); ++i) {
+            const ResolvedView rv = resolve_view_spec(json{{"camera", cams[i]}});
+            if (!rv.refusal_code.empty() || !rv.camera) {
+                json out = refuse(rv.refusal_code.empty() ? "camera_invalid" : rv.refusal_code,
+                                  "cameras[" + std::to_string(i) + "]: " + rv.refusal_reason);
+                out["camera_index"] = (long)i;
+                return out;
+            }
+            cameras.push_back(*rv.camera);
+        }
+
+        std::string reason;
+        SectionSpec default_section;
+        bool has_default_section = false;
+        if (params.contains("section")) {
+            const int parsed = parse_section_spec(params.at("section"), default_section, reason);
+            if (parsed < 0) return refuse("section_invalid", "section: " + reason);
+            has_default_section = parsed > 0;
+        }
+        std::vector<SectionSpec> sections(cameras.size(), default_section);
+        std::vector<char> sectioned(cameras.size(), has_default_section ? 1 : 0);
+        if (params.contains("sections") && !params.at("sections").is_null()) {
+            const json& per = params.at("sections");
+            if (!per.is_array() || per.size() != cameras.size())
+                return refuse("sections_invalid",
+                              "sections must be an array the same length as cameras");
+            for (size_t i = 0; i < per.size(); ++i) {
+                SectionSpec spec;
+                const int parsed = parse_section_spec(per[i], spec, reason);
+                if (parsed < 0)
+                    return refuse("section_invalid",
+                                  "sections[" + std::to_string(i) + "]: " + reason);
+                sectioned[i] = parsed > 0 ? 1 : 0;
+                if (parsed > 0) sections[i] = spec;
+            }
+        }
+
+        // Tessellate + flatten under the doc lock, then measure without holding it: the scene
+        // is a private copy, so a 170-camera batch never blocks the document.
+        MetricsScene scene;
+        long revision = 0;
+        {
+            DocLock lk;
+            Session& s = require_session(doc_id);
+            revision = s.revision;
+            scene = build_metrics_scene(tessellate_session_bodies(s));
+        }
+        if (scene.tris.empty())
+            return refuse("no_geometry", "document has no tessellated geometry to measure");
+
+        std::vector<json> views(cameras.size());
+        std::atomic<size_t> next{0};
+        std::mutex error_mtx;
+        std::string error;
+        auto worker = [&] {
+            MetricsBuffers buf;
+            for (;;) {
+                const size_t i = next.fetch_add(1);
+                if (i >= cameras.size()) break;
+                try {
+                    views[i] = measure_view_metrics(scene, cameras[i],
+                                                    sectioned[i] ? &sections[i] : nullptr, W, H,
+                                                    buf);
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> g(error_mtx);
+                    if (error.empty()) error = "cameras[" + std::to_string(i) + "]: " + e.what();
+                }
+            }
+        };
+        const size_t threads = std::min<size_t>(
+            std::max(1u, std::thread::hardware_concurrency()), cameras.size());
+        std::vector<std::thread> pool;
+        pool.reserve(threads - 1);
+        for (size_t k = 1; k < threads; ++k) pool.emplace_back(worker);
+        worker();
+        for (std::thread& th : pool) th.join();
+        if (!error.empty()) return refuse("metrics_failed", error);
+
+        json faces = json::array();
+        for (const MetricsFace& f : scene.faces)
+            faces.push_back(json{
+                {"body", f.body},
+                {"face_id", f.face_id},
+                {"surf_type", (int)f.surf_type},
+                {"area_mm2", metrics_round(f.area, 1e4)},
+                {"centroid", json::array({f.centroid.x, f.centroid.y, f.centroid.z})},
+                {"normal", json::array({f.normal.x, f.normal.y, f.normal.z})},
+                {"tri_count", f.tri_count}});
+        json edges = json::array();
+        for (const MetricsEdge& e : scene.edges)
+            edges.push_back(json{{"body", e.body},
+                                 {"edge_id", e.edge_id},
+                                 {"curve_type", (int)e.curve_type},
+                                 {"length_mm", metrics_round(e.length, 1e4)}});
+        json views_json = json::array();
+        for (json& v : views) views_json.push_back(std::move(v));
+        const double timing_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - t_start)
+                                     .count();
+        return json{{"ok", true},
+                    {"revision", revision},
+                    {"width", W},
+                    {"height", H},
+                    {"faces", std::move(faces)},
+                    {"edges", std::move(edges)},
+                    {"views", std::move(views_json)},
+                    {"section", has_default_section ? section_spec_json(default_section)
+                                                    : json(nullptr)},
+                    {"timing_ms", metrics_round(timing_ms, 1e3)}};
+    } catch (const OpError& e) {
+        return json{{"ok", false}, {"error", e.what()}, {"code", e.code}, {"reason", e.what()}};
+    } catch (const std::exception& e) {
+        return refuse("metrics_failed", e.what());
+    } catch (...) {
+        return refuse("metrics_failed", "view metrics exception");
     }
 }
 

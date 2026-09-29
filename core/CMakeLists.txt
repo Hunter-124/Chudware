@@ -1900,6 +1900,22 @@ if(CHUDWARE_WITH_OCCT)
   set_tests_properties(render_camera PROPERTIES
     ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- ViewNet view metrics (doc_view_metrics) + doc_render_view section ---------------
+  # Drives the C ABI on a holed box: facing/back faces, true visible area vs the analytic face
+  # areas, principal-view normal entropy, edge silhouettes, section caps, and byte-identical
+  # renders when no section is requested.
+  add_executable(test_view_metrics
+    tests/test_view_metrics.cpp)
+  target_include_directories(test_view_metrics PRIVATE
+    ${doctest_SOURCE_DIR})
+  target_link_libraries(test_view_metrics PRIVATE
+    chudware chudware_miniz nlohmann_json::nlohmann_json)
+  set_target_properties(test_view_metrics PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME view_metrics COMMAND test_view_metrics)
+  set_tests_properties(view_metrics PROPERTIES
+    ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- Per-body appearance (task 04: set_appearance op + AICM colour/material bake) ---
   # Ports the set_appearance op into the C++ core and bakes doc["appearances"] onto tessellated
   # bodies; the test drives the op end to end (doc field + both tess paths + .step+ round-trip).
@@ -1967,6 +1983,21 @@ if(CHUDWARE_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME drawing_gdt COMMAND test_drawing_gdt)
   set_tests_properties(drawing_gdt PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- Drawing provenance: every projected edge/arc in drawing_get names its model edge ---
+  # (body ordinal, TopExp edge id, doc_query sid) via HLR data-edge provenance, including a
+  # section's cut pieces. Four identical cross holes = four equal circles, told apart by sid.
+  add_executable(test_drawing_provenance
+    tests/test_drawing_provenance.cpp)
+  target_include_directories(test_drawing_provenance PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_drawing_provenance PRIVATE
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
+  set_target_properties(test_drawing_provenance PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME drawing_provenance COMMAND test_drawing_provenance)
+  set_tests_properties(drawing_provenance PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- A3: pattern feature compilers — linear_pattern / circular_pattern ------
   # core/doc/document.cpp's pattern branches REPLICATE a referenced seed solid with

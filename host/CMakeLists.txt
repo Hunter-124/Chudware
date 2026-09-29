@@ -980,6 +980,20 @@ add_test(NAME test_switch_hold
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end async tab switch hold ---
 
+# --- Sketch consumption: header-only core/sketch_consumers.h (no GL / imgui / AppState).
+# One rule for the FeatureManager (nest a consumed sketch) and the viewport ghosts (don't draw
+# it). Guards the 2026-09-29 "extruded part still shows its sketch / looks unmerged".
+add_executable(test_sketch_consumers tests/test_sketch_consumers.cpp)
+target_include_directories(test_sketch_consumers PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_sketch_consumers PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(test_sketch_consumers PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_sketch_consumers
+  COMMAND test_sketch_consumers
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end sketch consumption ---
+
 # --- CEF metrics spool bound: links the REAL GL/CEF-free filesystem cleanup.
 # Exercises both exact Chromium spool directories without loading libcef or a GL context.
 add_executable(test_cef_spool_reaper

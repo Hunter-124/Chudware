@@ -41,6 +41,7 @@
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
+#include "../core/sketch_consumers.h"
 #include "../ui_theme.h"
 #include "../render/id_pass.h"
 #include "../renderer.h"   // C34: clearViewportForNewDoc resets meshes
@@ -5103,51 +5104,18 @@ void drawFeatureTreeBody(AppState& st,
                     bool barAtEnd = rollbackAfter.empty() || barPos >= (int)order.size() - 1;
 
                     // C37-E (item 5): sketch nesting. A sketch consumed by EXACTLY ONE downstream
-                    // feature (via a region ref {"kind":"region","sketch":"fX"} or positions_sketch)
-                    // nests under that consumer. Unconsumed / multiply-consumed sketches stay flat.
+                    // feature nests under that consumer; unconsumed / multiply-consumed sketches
+                    // stay flat. core::consumedSketches is the one definition of consumption,
+                    // shared with the viewport's ghost sketches so tree and view agree.
                     std::unordered_map<std::string, int> consumeCount;   // sketch fid -> #consumers
                     std::unordered_map<std::string, std::string> consumer;  // sketch fid -> consumer
                     std::unordered_map<std::string, std::vector<std::string>> childrenOf;  // consumer -> sketches
                     {
-                        std::unordered_set<std::string> sketchIds;
-                        for (const auto& f : *feat)
-                            if (f.is_object() && jfld(f, "type") == "sketch")
-                                sketchIds.insert(jfld(f, "id"));
-                        // Recursively scan a feature's refs for sketch references. A sketch is
-                        // "consumed" via (a) a region selector {"kind":"region","sketch":"fX"} or
-                        // (b) a bare sketch-id string under a *_sketch / sketch / profile key (e.g.
-                        // positions_sketch). We deliberately do NOT treat a bare sketch id under a
-                        // generic "features" list (pattern/mirror) as consumption — patterns don't
-                        // absorb sketches, and that would wrongly hide them.
-                        std::function<void(const nlohmann::json&, const std::string&,
-                                           std::unordered_set<std::string>&)> scan =
-                            [&](const nlohmann::json& node, const std::string& key,
-                                std::unordered_set<std::string>& seen) {
-                            if (node.is_object()) {
-                                if (jfld(node, "kind") == "region") {
-                                    std::string sk = jfld(node, "sketch");
-                                    if (!sk.empty() && sketchIds.count(sk)) seen.insert(sk);
-                                }
-                                for (auto it = node.begin(); it != node.end(); ++it)
-                                    scan(it.value(), it.key(), seen);
-                            } else if (node.is_array()) {
-                                for (const auto& e : node) scan(e, key, seen);
-                            } else if (node.is_string()) {
-                                bool keyImpliesSketch =
-                                    key.find("sketch") != std::string::npos || key == "profile";
-                                std::string v = node.get<std::string>();
-                                if (keyImpliesSketch && sketchIds.count(v)) seen.insert(v);
-                            }
-                        };
+                        const std::unordered_set<std::string> sketchIds = core::sketchIdsOf(*feat);
                         for (const auto& f : *feat) {
                             if (!f.is_object()) continue;
-                            std::string fid = jfld(f, "id");
-                            if (jfld(f, "type") == "sketch") continue;  // a sketch isn't a consumer
-                            auto refs = f.find("refs");
-                            if (refs == f.end()) continue;
-                            std::unordered_set<std::string> seen;
-                            scan(*refs, std::string(), seen);   // top-level refs object: no key yet
-                            for (const auto& sk : seen) {
+                            const std::string fid = jfld(f, "id");
+                            for (const auto& sk : core::consumedSketches(f, sketchIds)) {
                                 ++consumeCount[sk];
                                 consumer[sk] = fid;  // last writer; only meaningful when count==1
                             }

@@ -5128,8 +5128,8 @@ json sketch_params(const json& feat) {
 // now surfaces per-feature plane geometry — origin + x_dir/y_dir/normal). Only the
 // reserved factory frames are tried first; an unknown ref falls back to TOP. Throws on
 // no plane ref.
-chudware::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& feat,
-                                                  const CompileResult* pre) {
+static chudware::geom::SketchPlane resolve_sketch_plane_base(const json& doc, const json& feat,
+                                                             const CompileResult* pre) {
     json plane_ref;
     if (feat.contains("refs") && feat["refs"].is_object() && feat["refs"].contains("plane"))
         plane_ref = feat["refs"]["plane"];
@@ -5238,6 +5238,54 @@ chudware::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json
         }
     }
     return chudware::geom::SketchPlane::top();
+}
+
+// The sketch's optional `offset` (params.offset, or a top-level offset), evaluated against
+// the doc's global equations like every other dimension. 0 when absent or unevaluable.
+static double sketch_plane_offset(const json& doc, const json& feat) {
+    const json* v = nullptr;
+    if (feat.contains("params") && feat["params"].is_object() && feat["params"].contains("offset"))
+        v = &feat["params"]["offset"];
+    else if (feat.contains("offset"))
+        v = &feat["offset"];
+    if (v == nullptr || v->is_null()) return 0.0;
+    try {
+        if (v->is_number()) return v->get<double>();
+        std::string expr;
+        if (v->is_string()) {
+            expr = v->get<std::string>();
+        } else if (v->is_object()) {
+            auto e = v->find("expr");
+            if (e != v->end() && e->is_string() && !e->get<std::string>().empty()) {
+                expr = e->get<std::string>();
+            } else {
+                auto val = v->find("value");
+                return (val != v->end() && val->is_number()) ? val->get<double>() : 0.0;
+            }
+        } else {
+            return 0.0;
+        }
+        std::map<std::string, double> env;
+        for (const auto& [name, value] : env_from_doc(doc).items())
+            if (value.is_number()) env[name] = value.get<double>();
+        return chudware::util::evaluate(expr, env);
+    } catch (...) {
+        return 0.0;
+    }
+}
+
+// The plane a sketch actually lies on: its resolved reference plane shifted along the normal
+// by the sketch's `offset` — exactly what compile_document builds its profile on
+// (document.cpp sketch branch). Without the shift every session-side consumer (the ghost /
+// sketch-overview frame, the live sketch overlay, convert/project) drew an offset sketch on
+// the unshifted plane: an agent's raised emblem sketched 3.5 mm up on plane.top ghosted at
+// z = 0, through the bottom of its own extrusion (2026-09-29).
+chudware::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& feat,
+                                                  const CompileResult* pre) {
+    chudware::geom::SketchPlane plane = resolve_sketch_plane_base(doc, feat, pre);
+    const double offset = sketch_plane_offset(doc, feat);
+    if (offset != 0.0) plane.origin += plane.normal * offset;
+    return plane;
 }
 
 // Session convenience wrapper (the original entry point — all pre-T-BL43 callers).

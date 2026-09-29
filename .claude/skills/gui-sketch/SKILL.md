@@ -44,6 +44,15 @@ Before editing, grep *within this file* for the tool's cmd_id or label rather th
   contract gets an appended entry (integrator-owned — flag it to the orchestrator).
 - Scenario smoke tests exist: `CHUDWARE_SHOT=sketch` and `CHUDWARE_SHOT=sketch3d`
   (`host/src/ui/scenarios.cpp`) run scripted sketch sessions headlessly.
+- Inactive sketches ghost in the viewport (`SketchMode::drawGhosts`) unless a BUILT feature
+  consumes them. Consumption has one definition, `core::consumedSketches`
+  (`host/src/core/sketch_consumers.h`), shared with the FeatureManager's sketch nesting:
+  `refs.profile` as a list/single id/region selectors, `*sketch*` keys, sweep `path`/`guides`,
+  loft `sections`; never a pattern `features` list. Ghosts draw with no depth test, so a missed
+  consumer makes the finished solid look see-through (2026-09-29, `refs.profile:["f11"]`).
+  Ghost frames come from engine `doc_sketch_overview`; the engine's
+  `resolve_sketch_plane_doc` applies the sketch's `params.offset` exactly as
+  `compile_document` does, so never add the offset again in the host.
 
 ## Build & verify
 

@@ -5275,3 +5275,59 @@ cad_graph `meta.dh`), so either side's render is the other's hit. Renders beyond
 per-call budget are `pending` and fill in on the next call. Live folders sort before
 archive/backup copies (in 6-axis, 70 of the 94 files are in archive folders). `fs_read` of a
 CAD file attaches one labelled tile.
+
+## 2026-09-28/29 — ViewNet: the agent finally sees its geometry, from the right angles
+
+**Root cause first.** Every online CAD render the agent requested reached the model as the
+string `"<mcp.server.fastmcp.utilities.types.Image object at 0x…>"`: the Chudcode host-tool
+adapter (`chudcode_tools._json_safe`) stringified FastMCP `Image` objects, so render_part /
+contact_sheet / inspect_* were blind in every session (c205/c213/c217 and 17 placeholders in
+2026-09-28 sessions alone). `services/agent/tool_images.py` now turns them into image blocks
+(downscaled to 1568 px / <3 MiB, never dropped), for top-level, sub-agent and eval-nested calls.
+**Shot planner.** `render_part` with no `view` returns one 2x2 grid of the 4 best
+complementary perspective shots (`services/mcp/shot_planner.py`): ~160-250 candidates (icosphere
++ target-normal lattice + x-ray/section candidates) are measured in one native
+`doc_view_metrics` call (session.cpp; per-face visible true area/|cos|/occlusion, per-edge
+visibility + crease shade contrast + silhouettes, normal entropy, principal alignment; 170
+cameras in 0.3 s vs 1.2 s per camera in the old Python raster) and chosen greedily on a
+set-valued utility (trained `services/viewpoint/utility` model when `weights/utility_v1.npz`
+ships, else `features.hand_utility`: information-weighted legible coverage, crease
+crispness, anti-flattening, revolve-axis-stare penalty, redundancy dedupe). Hidden targets
+get x-ray tiles (translucent occluders, opaque target, dashed hidden edges) or section tiles
+(`doc_render_view view.section`: hatch cap, cut outline, ghosted removed half). Tiles carry
+SID face tags + a caption legend whose SIDs tools accept verbatim; the old
+`cad_viewpoint.ideal_view_dirs`/`score_view`/`_legibility_score` lattice is deleted.
+**Drawings.** HLR provenance gives every projected edge its model body/edge/SID so
+`add_dimension` hits the exact instance (radius join removed); every drawing view was
+projected from the opposite side of contracts/doc_schema.md (front upside-down, top seen
+from below) — fixed at the source. **Engine.** AICM shm names are pid-scoped
+(`p<pid>_<doc>_r<rev>`): concurrent engines were unlinking each other's live meshes.
+**Learning (LLM-free by the owner's decision).** Labels: `training/viewpoint/datasets`
+(`chudware.geomlabel/1`, geometry-matched faces; MFCAD MIT, an OCP port of the MIT MFCAD++
+generator with curved features, GSL; MFCAD++'s zip is Cloudflare-blocked and the HF mirror
+gated; Fusion 360 Gallery is non-commercial). Judge: a from-scratch cross-fitted Observer CNN
+(`training/viewpoint/observer`) that must read labelled facts (counts, opening side,
+through/blind, type) from exactly the agent's grids — its P(correct) is the usefulness label.
+Utility: DeepSets over face tokens predicting it; `training/viewpoint/campaign.sh` runs render
+→ trials → observer folds → labels → utility → convergence report → A/B, resumably.
+Gotchas: never relink `core/build-linux/bin/libchudware.so` mid-campaign (the render index
+keys on the library); `RenderPool` has a stall watchdog because a pool whose workers vanished
+hung the first campaign for 2 h. Windows: MSVC builds the whole windows-occt tree (native-build
+Windows row now uses the shipping preset); remaining Windows/macOS ctest reds are
+`mesher_advanced` (hours-long) and `sim_cache`/`fea_contact`, outside this work.
+
+## 2026-09-29 — extruded parts no longer show their sketches through the solid
+
+An agent's keychain (sketch → extrude, raised emblem sketched with `params.offset` 3.5 →
+extrude) showed both profile sketches over the finished part, drawn with no depth test, so
+the solid looked see-through and "not merged". There were two causes. (1) The viewport's ghost
+pass (`SketchMode::refreshGhosts`) counted a sketch as consumed only for a region selector
+`{"kind":"region","sketch":fid}`; the engine's list form `refs.profile:["f11"]` (what
+`add_features` writes) kept it drawn. Consumption is now one header-only rule,
+`host/src/core/sketch_consumers.h` (`core::consumedSketches`: profile lists/ids/regions,
+`*sketch*` keys, sweep `path`/`guides`, loft `sections`, never pattern `features`), shared with
+the FeatureManager's sketch nesting (`test_sketch_consumers`). (2) The engine's
+`resolve_sketch_plane_doc` ignored the sketch's `offset` that `compile_document` applies, so
+every session-side frame (ghost/overview, live sketch overlay, region picker, convert) sat on
+the unshifted plane; it now shifts by the evaluated offset (`test_sketch_on_face` "offset
+sketch"). Staged with `./build.sh stage`; the app picks it up on restart.

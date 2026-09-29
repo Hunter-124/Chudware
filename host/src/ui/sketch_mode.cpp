@@ -16,6 +16,7 @@
 #include "../../extern/mapbox/earcut.hpp"   // C56c: hole-aware region triangulation
 
 #include "../core/app_state.h"
+#include "../core/sketch_consumers.h"
 #include "../renderer.h"
 #include "../worker_client.h"
 #include "../ui_theme.h"
@@ -4579,33 +4580,33 @@ void SketchMode::refreshGhosts(AppState& st) {
     const nlohmann::json& tree = st.docMirror.tree();
     if (!tree.is_object() || !tree.contains("features") || !tree["features"].is_array()) return;
     const auto& feats = tree["features"];
-    // Per-sketch consumer scan: a sketch is consumed when a DIFFERENT feature references it
-    // ("sketch":"<fid>" inside a region selector) AND that consumer is actually built —
+    // Per-sketch consumer scan: a sketch is consumed when a DIFFERENT feature builds from it
+    // (core::consumedSketches — profile lists, region selectors, *_sketch/path/sections keys;
+    // the same rule the FeatureManager uses to nest it) AND that consumer is actually built —
     // sketches referenced by an errored or rolled-back feature still ghost (the user needs to
     // see them to fix things), as does the PM's exempt preview feature.
     const nlohmann::json& statusArr = st.docMirror.featureStatus();
-    auto consumerCounts = [&](const std::string& fid) -> bool {
-        const std::string needle = "\"sketch\":\"" + fid + "\"";
-        for (const auto& f : feats) {
-            if (!f.is_object() || f.value("type", std::string()) == "sketch") continue;
-            const std::string cid = f.value("id", std::string());
-            if (cid.empty() || cid == exemptFid) continue;
-            if (!f.contains("refs") || f["refs"].dump().find(needle) == std::string::npos)
-                continue;
-            // Consumer found — does it actually build? (missing status record = assume ok)
-            bool ok = true, rolledBack = false;
-            if (statusArr.is_array()) {
-                for (const auto& s : statusArr) {
-                    if (!s.is_object() || s.value("id", std::string()) != cid) continue;
-                    ok = s.value("ok", true);
-                    rolledBack = s.value("rolled_back", false);
-                    break;
-                }
+    const std::unordered_set<std::string> sketchIds = core::sketchIdsOf(feats);
+    std::unordered_set<std::string> consumed;
+    for (const auto& f : feats) {
+        if (!f.is_object()) continue;
+        const std::string cid = f.value("id", std::string());
+        if (cid.empty() || cid == exemptFid) continue;
+        std::unordered_set<std::string> used = core::consumedSketches(f, sketchIds);
+        if (used.empty()) continue;
+        // Consumer found — does it actually build? (missing status record = assume ok)
+        bool ok = true, rolledBack = false;
+        if (statusArr.is_array()) {
+            for (const auto& s : statusArr) {
+                if (!s.is_object() || s.value("id", std::string()) != cid) continue;
+                ok = s.value("ok", true);
+                rolledBack = s.value("rolled_back", false);
+                break;
             }
-            if (ok && !rolledBack) return true;
         }
-        return false;
-    };
+        if (ok && !rolledBack) consumed.insert(used.begin(), used.end());
+    }
+    auto consumerCounts = [&](const std::string& fid) -> bool { return consumed.count(fid) > 0; };
     for (const auto& f : feats) {
         if (!f.is_object() || f.value("type", std::string()) != "sketch") continue;
         if (f.value("suppressed", false)) continue;

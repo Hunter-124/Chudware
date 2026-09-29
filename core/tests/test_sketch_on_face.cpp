@@ -216,3 +216,43 @@ TEST_CASE("sketch-on-face: a REAL resolver (doc_query) face selector resolves on
         "a real resolver face selector must enter on the face (z=H=" << H
         << "), not the z=0 base-plane fallback; got " << oz);
 }
+
+TEST_CASE("offset sketch: overview + enter frames sit on the offset plane the profile is built on") {
+    // Live 2026-09-29: an agent sketched a raised emblem on plane.top with params.offset 3.5
+    // (the top of a 3.5 mm plate) and extruded it. The profile was built at z=3.5, but every
+    // session-side frame ignored the offset, so the GUI ghosted the sketch at z=0 — under the
+    // part, drawn through it. The frame must carry the SAME offset compile_document applies.
+    const double W = 40.0, D = 30.0, OFFSET = 3.5, H = 0.85;
+    json nr = doc_new("part", "OffsetSketchFrame");
+    const std::string doc_id = nr.at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op","add_feature"},{"feature",
+            json{{"type","sketch"},{"name","Raised"},
+                 {"params",{{"entities",rect_entities(W,D)},{"constraints",rect_constraints(W,D)},
+                            {"offset",OFFSET}}},
+                 {"refs",{{"plane","plane.top"}}}}}},
+        json{{"op","add_feature"},{"feature",
+            json{{"type","extrude"},{"name","Boss"},
+                 {"params",{{"mode","boss"},{"depth",dimv(H)}}},
+                 {"refs",{{"profile",json::array({"$0"})}}}}}},
+    });
+    json resp = doc_apply_ops(doc_id, -1, ops, false);
+    for (const auto& st : resp.at("rebuild").at("feature_status")) REQUIRE(st.value("ok", false));
+    const std::string sk = resp.at("id_map").at("$0").get<std::string>();
+
+    // The solid really starts at the offset plane (the modeling path honoured it)...
+    json bottom = doc_query(doc_id, json{{"of","face"},{"side","bottom"}});
+    REQUIRE(bottom.value("count", 0) >= 1);
+    CHECK(bottom.at("matches").at(0).at("centroid").at(2).get<double>() ==
+          doctest::Approx(OFFSET).epsilon(1e-6));
+
+    // ...and so do the frames the GUI draws the sketch with.
+    for (const json& r : {chudware::doc::doc_sketch_overview(doc_id, sk),
+                          doc_sketch_enter(doc_id, sk)}) {
+        REQUIRE_MESSAGE(r.contains("plane_frame"), r.dump());
+        const std::vector<double> frame = r.at("plane_frame").get<std::vector<double>>();
+        REQUIRE(frame.size() == 16);
+        CHECK_MESSAGE(frame[11] == doctest::Approx(OFFSET).epsilon(1e-9),
+                      "sketch frame origin z must be the offset " << OFFSET << ", got " << frame[11]);
+    }
+}

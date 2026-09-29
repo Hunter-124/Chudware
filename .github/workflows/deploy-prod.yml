@@ -27,13 +27,10 @@
 # metered, so every diagnostic in here goes to one of those two.
 name: deploy-prod
 on:
-  # Master pushes drive production directly. A workflow_run gate would be
-  # better in principle and was tried first; it cannot work on this fleet
-  # today. See "THE GATE" in the preflight step -- fast-gate and native-build
-  # both matrix onto cc-mac-arm, which is offline, so neither can ever conclude,
-  # and linux-gate has a standing backlog of failures unrelated to shipping.
-  # Gating on a workflow that cannot conclude is how production went stale in
-  # the first place, so the real gate runs inline below instead.
+  # Master pushes drive production directly. CI fan-out is reported but does
+  # not block it: native-build includes the offline ARM Mac, while linux-gate
+  # can take hours. The fast-gate now uses the online Intel Mac, but its queued
+  # runs can still lag; the source audits run inline before promotion instead.
   push:
     branches: [master]
   workflow_dispatch:
@@ -68,11 +65,9 @@ jobs:
   # It resolves sandbox credentials independently; never source production's
   # gateway.env into this job. The reusable workflow enforces test-only keys.
   #
-  # This IS a blocking gate, unlike the three advisory workflow states read in
-  # the preflight step. The distinction that makes it safe to block on is the one
-  # the header block draws: cc-linux-build is the runner linux-gate already
-  # concludes on, so this gate can actually reach a verdict. fast-gate and
-  # native-build cannot, because they matrix onto an offline mac.
+  # This IS a blocking gate, unlike the advisory CI workflow states read in
+  # preflight. It runs on the available cc-linux-build endpoint and reaches a
+  # verdict before promotion.
   #
   # Until secrets.STRIPE_SANDBOX_ENV exists it reports NOT RUN with a warning
   # annotation and does not block. require_credentials is left at its default
@@ -202,6 +197,17 @@ jobs:
             echo "XDG_RUNTIME_DIR=${runtime_dir}"
             echo "DBUS_SESSION_BUS_ADDRESS=unix:path=${runtime_dir}/bus"
           } >> "$GITHUB_ENV"
+          # The shared /tmp has an exhausted per-user quota from old simulation
+          # caches. Keep mktemp, Python scratch, and the WASM linker log in the
+          # job's disk-backed temporary directory instead of failing mid-deploy.
+          if [ ! -d "${RUNNER_TEMP}" ] || [ ! -w "${RUNNER_TEMP}" ]; then
+            echo "::error title=No writable runner temp::${RUNNER_TEMP:-unset} is unavailable"
+            exit 1
+          fi
+          {
+            echo "TMPDIR=${RUNNER_TEMP}"
+            echo "CHUDWARE_WEBD_WASM_LOG=${RUNNER_TEMP}/webd-wasm.log"
+          } >> "$GITHUB_ENV"
           echo "user session bus: ${runtime_dir}/bus"
 
           # The deploy tooling is NOT asserted here. It cannot be: update.sh,
@@ -224,24 +230,15 @@ jobs:
           # ---------------------------------------------------------------
           # THE GATE.
           #
-          # No CI workflow blocks this deploy, and that is a measured decision
-          # rather than a shortcut. On this fleet, today, not one of them CAN
-          # conclude:
+          # CI fan-out is reported, not a deploy prerequisite. native-build's
+          # core-only ARM Mac leg still waits for an offline runner. linux-gate
+          # can take hours and covers many non-web suites. fast-gate now runs on
+          # the online Intel Mac but can queue behind older runs; its source
+          # audits also run inline here at the commit being promoted.
           #
-          #   fast-gate    matrix row cc-mac-arm -> macbook-air-m2, OFFLINE.
-          #   native-build same, plus cc-mac-intel; concludes success only when
-          #                all four legs pass.
-          #   linux-gate   the only workflow that concludes at all, and it is
-          #                red on a standing backlog (~50 failures) that has
-          #                nothing to do with shipping a web bundle: agent
-          #                tool-guidance curation, MCP suites, torch, and DVC.
-          #
-          # Blocking on a workflow that cannot conclude does not make anything
-          # safer, it just stops production tracking master -- silently, behind
-          # a tree that looks green. That is precisely how production served a
-          # bundle linked 2026-08-07 for fifteen days. All three states are read
-          # and REPORTED below, so the run records the whole tree honestly, but
-          # none of them vetoes a release.
+          # Waiting for every unrelated CI job would leave production stale;
+          # these three states are read and REPORTED below, not silently
+          # assumed green. The actual promotion gate runs on this host.
           #
           # What gates instead is real, fast, and actually runs:
           #
@@ -341,8 +338,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
           # Reported, never blocking. The real gate is scripts/check.py in the
-          # next step plus install_webd.sh's pre-swap asserts; see the rationale
-          # block above for why none of these three can serve as one today.
+          # next step plus install_webd.sh's pre-swap asserts.
           for pair in "linux-gate:${linux_gate}" "native-build:${native_build}" "fast-gate:${fast_gate}"; do
             name="${pair%%:*}"; state="${pair#*:}"
             [ "${state}" = success ] && continue

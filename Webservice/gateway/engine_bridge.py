@@ -30,6 +30,7 @@ try:
     from . import authn
     from .accounts import get_account
     from .auth import AuthError, revalidate_websocket_user
+    from .providers import default_model_for
     from .credits import actor_for, reconcile_reservation, reserve_turn, usage_cost
     from .config import settings
     from .provider_keys import resolve_validated_key
@@ -43,6 +44,7 @@ except ImportError:  # uvicorn app:app from package dir
     from auth import AuthError, revalidate_websocket_user
     from credits import actor_for, reconcile_reservation, reserve_turn, usage_cost
     from config import settings
+    from providers import default_model_for
     from provider_keys import resolve_validated_key
     from provider_accounts import resolve_subscription_token
     from limits import user_slug
@@ -684,12 +686,11 @@ def _agent_provider(line: str) -> str:
 
 
 def _actor_for_turn(email: str, line: str) -> dict[str, Any]:
-    """Prefer this account's own credential for the selected provider.
+    """Prefer BYOK, then a supported own subscription, then trial sponsorship.
 
-    Order is deliberate: an explicitly pasted API key beats a subscription,
-    because the account chose it for this provider; a personal subscription
-    beats the operator's shared pool; the metered credit pool is the fallback.
-    Both self-supplied sources are unmetered, so neither reserves credits.
+    Active verified trial-domain users may run on an active admin's Claude
+    subscription without a pool reservation or spend cap. A matching BYOK key
+    always wins; only the metered pool falls through after subscription lookup.
     """
     actor = actor_for(email)
     provider = _agent_provider(line)
@@ -699,13 +700,24 @@ def _actor_for_turn(email: str, line: str) -> dict[str, Any]:
         actor["key_source"] = "byok"
         actor["_byok_api_key"] = key
         return actor
-    grant = resolve_subscription_token(email, provider) if provider else None
+    claude_provider = provider in ("anthropic", "anthropic-sub", "claude")
+    grant = resolve_subscription_token(
+        email, provider if claude_provider else "anthropic",
+        trial_provider_override=not claude_provider,
+    )
     if grant is not None:
         actor["key_source"] = "subscription"
         actor["_subscription"] = {
             "provider": grant["provider"],
             "access_token": grant["access_token"],
         }
+        if grant.get("sponsored"):
+            actor["_sponsor"] = {
+                "email": grant["owner_email"],
+                "scope": grant["scope"],
+            }
+        if grant.get("sponsored") or provider not in ("anthropic", "anthropic-sub", "claude"):
+            actor["_claude_provider_override"] = True
     if actor["key_source"] == "pool":
         actor["_pool"] = {
             "provider": os.environ.get("CHUDWARE_WEB_POOL_PROVIDER", "openrouter").strip().lower(),
@@ -806,6 +818,15 @@ def _sanitize_agent_rpc(line: str, actor: Mapping[str, Any]) -> str:
         params["provider"] = str(pool["provider"])
         if pool.get("model"):
             params["model"] = str(pool["model"])
+        options.pop("provider", None)
+        options.pop("model", None)
+    if method in _AGENT_TURN_PROVIDER_METHODS and actor.get("_claude_provider_override"):
+        params["provider"] = "anthropic"
+        selected_model = str(params.get("model") or options.get("model") or "").strip()
+        params["model"] = (
+            selected_model if selected_model.startswith("claude-")
+            else default_model_for("anthropic-sub")
+        )
         options.pop("provider", None)
         options.pop("model", None)
     params["options"] = options
@@ -1137,7 +1158,21 @@ async def engine_ws(ws: WebSocket) -> None:
                     request_message = json.loads(line)
                     request_id = request_message.get("id") if isinstance(request_message, dict) else None
                 except ValueError:
+                    request_message = None
                     request_id = None
+                if (
+                    method in _AGENT_TURN_PROVIDER_METHODS
+                    and active_actor is not None
+                    and active_actor.get("_sponsor")
+                    and isinstance(request_message, dict)
+                ):
+                    request_params = request_message.get("params")
+                    model = request_params.get("model", "") if isinstance(request_params, dict) else ""
+                    log.info(
+                        "sponsored_turn email=%s sponsor=%s scope=%s model=%s",
+                        user.email, active_actor["_sponsor"]["email"],
+                        active_actor["_sponsor"]["scope"], model,
+                    )
                 if request_id is not None:
                     pending_requests[request_id] = (method, request_doc_ids)
                 writer.write(line.encode("utf-8") + b"\n")
@@ -1162,6 +1197,13 @@ async def engine_ws(ws: WebSocket) -> None:
                     continue
                 line = authorized
                 usage = _provider_usage_payload(line)
+                if usage is not None and active_actor is not None and active_actor.get("_sponsor"):
+                    log.info(
+                        "sponsored_usage email=%s sponsor=%s model=%s prompt_tokens=%s completion_tokens=%s",
+                        user.email, active_actor["_sponsor"]["email"],
+                        str(usage.get("model") or ""),
+                        usage.get("prompt_tokens"), usage.get("completion_tokens"),
+                    )
                 if (
                     usage is not None
                     and active_actor is not None

@@ -1,17 +1,18 @@
 """Browser-driven AI subscription sign-in, scoped per account.
 
 `provider_keys.py` stores a customer's own API key. This module stores OAuth
-grants against subscriptions the account already pays for — Claude Pro/Max and
-ChatGPT Plus/Pro. Only personal grants can authenticate a customer turn;
-unsupported provider injection is refused downstream, never sent to ambient auth.
+grants against Claude Pro/Max and ChatGPT Plus/Pro subscriptions. A requester's
+personal link takes precedence; active, verified trial-domain accounts may use
+active admins' Claude links (personal or shared), without metered pool credits.
+Only Claude OAuth supports isolated web-worker injection; unsupported provider
+injection is refused downstream, never sent to ambient auth.
 
-Two scopes share one table:
+The scopes identify who linked a grant, not who may spend it:
 
-* ``personal`` — the linking account's own subscription, used only for its own
-  turns.
-* ``shared``   — a legacy operator-owned connection managed by an admin. Its
-  row keeps attribution, but it is never used for a customer's turn: managed
-  pool turns use a dedicated operator API key with metered credits instead.
+* ``personal`` — the linking account's own subscription, also eligible as a
+  Claude sponsor grant when the owner is an active admin.
+* ``shared`` — an admin-managed subscription, eligible only as a Claude sponsor
+  grant for verified, active trial-domain users.
 
 Why these flows remain web-service-local rather than using the packaged desktop
 Chudcode credential store: every login and grant is tenant-scoped here, while a
@@ -50,6 +51,7 @@ from fastapi import APIRouter, HTTPException, Request
 try:
     from .auth import get_current_user
     from .db import tx
+    from .credits import is_trial_domain
     from .limits import RateLimiter
 
     # Deliberately the same key material as BYOK: one operator secret to
@@ -58,6 +60,7 @@ try:
     from .provider_keys import _key_bytes
 except ImportError:  # uvicorn app:app from the package directory
     from auth import get_current_user  # type: ignore
+    from credits import is_trial_domain  # type: ignore
     from db import tx  # type: ignore
     from limits import RateLimiter  # type: ignore
     from provider_keys import _key_bytes  # type: ignore
@@ -753,17 +756,23 @@ def _usable_access_token(row: Any, owner_email: str) -> str | None:
         return str(fresh.get("access_token") or "") or None
 
 
-def resolve_subscription_token(email: str, wire_provider: str) -> dict[str, Any] | None:
-    """A usable personal subscription grant for this turn, or None.
-
-    Operator-owned shared OAuth accounts never authenticate customer turns:
-    the managed pool uses its dedicated API key and credit reservation.
+def resolve_subscription_token(
+    email: str, wire_provider: str, *, trial_provider_override: bool = False
+) -> dict[str, Any] | None:
+    """A usable own Claude subscription, or an active admin's Claude grant for
+    a verified trial-domain account. Own personal links win; sponsored grants
+    rotate least-recently-used across active admin owners and bypass pool billing.
+    For browser turns naming a non-Claude provider, the gateway may request a
+    trial-only Anthropic override: validate eligibility before looking up links.
+    Codex OAuth cannot run in an isolated web worker.
     """
     provider = _WIRE_TO_SUBSCRIPTION.get(str(wire_provider or "").strip().lower())
-    if provider is None:
+    if provider != "anthropic-sub":
         return None
     normalized_email = _email(email)
-
+    eligible = is_trial_domain(normalized_email) if trial_provider_override else None
+    if trial_provider_override and not eligible:
+        return None
     with tx() as cur:
         cur.execute(
             """
@@ -777,36 +786,57 @@ def resolve_subscription_token(email: str, wire_provider: str) -> dict[str, Any]
         )
         candidates = cur.fetchall()
 
-    for row in candidates:
-        owner_email = row["email"]
-        try:
-            access = _usable_access_token(row, owner_email)
-        except RuntimeError:
-            # An envelope that will not open is a storage fault, not a turn
-            # error: skip the row and let the next source answer.
-            log.warning(
-                "subscription envelope unreadable provider=%s scope=%s",
-                row["provider"],
-                row["scope"],
-            )
-            continue
-        if not access:
-            continue
-        with tx() as cur:
-            cur.execute(
-                """
-                UPDATE provider_accounts SET last_used_at = now()
-                 WHERE email = %s AND provider = %s AND account_key = %s
-                """,
-                (owner_email, row["provider"], row["account_key"]),
-            )
-        return {
-            "provider": row["provider"],
-            "account_key": row["account_key"],
-            "scope": row["scope"],
-            "access_token": access,
-        }
-    return None
+    def usable(rows: Any) -> dict[str, Any] | None:
+        for row in rows:
+            owner_email = row["email"]
+            try:
+                access = _usable_access_token(row, owner_email)
+            except RuntimeError:
+                # An unreadable envelope cannot silently become ambient auth.
+                log.warning(
+                    "subscription envelope unreadable provider=%s scope=%s",
+                    row["provider"],
+                    row["scope"],
+                )
+                continue
+            if not access:
+                continue
+            with tx() as cur:
+                cur.execute(
+                    """
+                    UPDATE provider_accounts SET last_used_at = now()
+                     WHERE email = %s AND provider = %s AND account_key = %s
+                    """,
+                    (owner_email, row["provider"], row["account_key"]),
+                )
+            return {
+                "provider": row["provider"],
+                "account_key": row["account_key"],
+                "scope": row["scope"],
+                "access_token": access,
+                "sponsored": owner_email != normalized_email,
+                "owner_email": owner_email,
+            }
+        return None
+
+    own = usable(candidates)
+    if own is not None:
+        return own
+    if eligible is None and not is_trial_domain(normalized_email):
+        return None
+    with tx() as cur:
+        cur.execute(
+            """
+            SELECT pa.email, pa.provider, pa.account_key, pa.scope, pa.encrypted_tokens
+              FROM provider_accounts pa JOIN accounts a ON a.email = pa.email
+             WHERE pa.provider = 'anthropic-sub'
+               AND pa.scope IN ('personal', 'shared')
+               AND a.role = 'admin' AND a.status = 'active'
+             ORDER BY pa.last_used_at NULLS FIRST, pa.email, pa.account_key
+            """
+        )
+        sponsors = cur.fetchall()
+    return usable(sponsors)
 
 
 # ---------------------------------------------------------------------------

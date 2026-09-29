@@ -80,6 +80,7 @@ class TestAppServe:
         assert r.headers.get("cache-control") == "no-cache"
         assert "text/html" in (r.headers.get("content-type") or "")
         assert "chudware" in r.text
+        assert r.headers["vary"].lower() == "accept-encoding"
 
     def test_desktop_plan_gets_upgrade_page_while_studio_opens_app(
         self, client, app_tree, dev_account
@@ -144,6 +145,7 @@ class TestAppServe:
         assert rw.headers["cross-origin-embedder-policy"] == "require-corp"
         # Unhashed bundle files must be no-cache so js/wasm never skew across deploys.
         assert rw.headers.get("cache-control") == "no-cache"
+        assert rw.headers["vary"].lower() == "accept-encoding"
 
         rd = client.get("/app/chudware.data", headers=DEV_HEADERS)
         assert rd.status_code == 200
@@ -263,4 +265,11 @@ class TestContentEncoding:
         assert r.headers.get("content-encoding") == "gzip"
         assert "accept-encoding" in (r.headers.get("vary", "").lower())
         assert r.headers.get("cache-control") == "no-cache"  # policy keys on original suffix
+        identity = client.get(
+            "/app/", headers={**DEV_HEADERS, "Accept-Encoding": "identity"}
+        )
+        assert identity.status_code == 200
+        assert "content-encoding" not in identity.headers
+        assert identity.headers["vary"].lower() == "accept-encoding"
+        assert identity.content == raw
         assert "chudware" in r.text  # decoded transparently

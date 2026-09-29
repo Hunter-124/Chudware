@@ -24,6 +24,8 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+import re
+from functools import lru_cache
 import copy
 from typing import Any, Iterable, Mapping, Optional
 from urllib.parse import urlparse
@@ -83,51 +85,25 @@ ROLE_MODEL_KEY_ALIASES: dict[str, str] = {
 }
 
 # Per-role reasoning / thinking effort levels (Settings → AI → Model roles).
-THINKING_LEVELS = ("auto", "low", "medium", "high")
+THINKING_LEVELS = ("auto", "low", "medium", "high", "xhigh", "max")
 DEFAULT_THINKING = "auto"
-# Concrete levels that pin provider reasoning_effort (excludes auto).
-CONCRETE_THINKING = frozenset({"low", "medium", "high"})
-
-# Hard ceiling on sub-agent reasoning effort (Hunter directive 2026-07-25):
-# NO subagent may ever dispatch above "high". Providers accept richer ladders
-# (anthropic_provider._EFFORTS has max/xhigh; gemini/moonshot expose "max"),
-# and a subagent inherits the user's global config via `dict(cfg)` — so a
-# Settings-level "max" silently rode into every spawned child whenever
-# resolve_role_thinking returned None. Clamp at the dispatch boundary.
-SUBAGENT_MAX_THINKING = "high"
-_ABOVE_HIGH_THINKING = frozenset({
-    "max", "maximum", "xhigh", "x-high", "extra_high", "extra-high",
-    "ultra", "highest",
-})
+CONCRETE_THINKING = frozenset(THINKING_LEVELS[1:])
 
 
 def clamp_subagent_effort(level: Any) -> str | None:
-    """Clamp *level* to the sub-agent effort ceiling ("high").
-
-    Returns None for an unset/blank level so callers can leave the provider
-    default alone. Anything above high collapses to high; every other value
-    passes through untouched (unknown ladders are the provider's business).
-    """
+    """Retain supported top rungs; model-specific clamping happens at the RPC boundary."""
     if level is None:
         return None
-    s = str(level).strip().lower()
-    if not s:
-        return None
-    if s == "med":
-        s = "medium"
-    return SUBAGENT_MAX_THINKING if s in _ABOVE_HIGH_THINKING else s
+    value = str(level).strip().lower()
+    return ("medium" if value == "med" else value) or None
 
 
 def clamp_provider_effort(provider: Any) -> Any:
-    """Return a child-safe provider without mutating the ambient provider.
+    """Normalize a legacy effort spelling on a child provider, preserving its parent.
 
-    Provider instances carry the effective ``reasoning_effort`` that reaches
-    the wire.  Session-default child dispatch reuses an already-constructed
-    parent provider, so clamping only the copied config does nothing on that
-    path.  Rebind a shallow copy only when the provider's effective value
-    changes; callers that are already safe keep object identity.  This boundary
-    is deliberately fail-open to the input object so provider implementations
-    with unusual copy/setattr behavior can never make dispatch raise.
+    Richer rungs must reach the chosen model: the online RPC clamps against the
+    catalog after selection, rather than capping every sub-agent at high.
+    Return the original instance when no normalization is needed.
     """
     try:
         raw = getattr(provider, "reasoning_effort", None)
@@ -291,6 +267,32 @@ def _load_shipped_rankings(path: Path | None = None) -> dict[str, ModelRank]:
             provider=str(raw.get("provider") or ""),
         )
     return out
+
+@lru_cache(maxsize=1)
+def _family_rank_rules() -> tuple[tuple[re.Pattern[str], int, str], ...]:
+    """Shipped family rules complement exact user/measured/shipped model rankings."""
+    try:
+        data = yaml.safe_load(_RANKINGS_YAML.read_text(encoding="utf-8")) or {}
+        return tuple(
+            (re.compile(str(row["pattern"])), _clamp_rank(row["rank"]), str(row.get("provider") or ""))
+            for row in data.get("families", [])
+            if isinstance(row, Mapping) and row.get("pattern") and row.get("rank")
+        )
+    except (OSError, ValueError, yaml.YAMLError, re.error) as exc:
+        log.warning("role_models: failed to load family rankings: %s", exc)
+        return ()
+
+
+def _rank_for(model: str, ranks: Mapping[str, ModelRank]) -> ModelRank | None:
+    """Exact rows win; future canonical aliases inherit a family rank."""
+    bare = model.rsplit("/", 1)[-1]
+    exact = ranks.get(model) or (ranks.get(bare) if bare != model else None)
+    if exact is not None:
+        return exact
+    for pattern, rank, provider in _family_rank_rules():
+        if pattern.fullmatch(bare):
+            return ModelRank(model, rank, "shipped", "catalog family rank", provider)
+    return None
 
 
 def _measured_rank_from_pass_rate(pass_rate: float) -> int:
@@ -472,8 +474,7 @@ def refusal_failover_candidates(
         model = str(entry.get("model") or "").strip()
         if not prov or not model or vendor_family(prov) in blocked:
             continue
-        mr = ranks.get(model) or (
-            ranks.get(model.split("/", 1)[-1]) if "/" in model else None)
+        mr = _rank_for(model, ranks)
         rank = mr.rank if mr is not None else 2
         if model.strip().lower() in _FRONTIER_RANK_FLOOR_IDS:
             rank = max(rank, _FRONTIER_MEASURED_FLOOR)
@@ -608,11 +609,17 @@ def load_rankings(
             # select xai-sub/grok-4.5 without per-run user pins.
             # mega-16: same floor for openrouter paid deepseek frontier.
             mid_l = str(mid).strip().lower()
-            if mid_l in _FRONTIER_RANK_FLOOR_IDS or any(
-                mid_l.startswith(stem) for stem in (
+            family_frontier = any(
+                rank_value == _FRONTIER_MEASURED_FLOOR and pattern.fullmatch(mid_l)
+                for pattern, rank_value, _provider in _family_rank_rules()
+            )
+            if (
+                family_frontier
+                or mid_l in _FRONTIER_RANK_FLOOR_IDS
+                or any(mid_l.startswith(stem) for stem in (
                     "grok-4", "claude-sonnet-4", "claude-opus-4", "gpt-5",
                     "gemini-2.5-pro", "deepseek/deepseek-chat", "deepseek-chat",
-                )
+                ))
             ):
                 if rank < _FRONTIER_MEASURED_FLOOR:
                     notes = (
@@ -1299,12 +1306,27 @@ def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
         ):
             _add("openrouter", mid)
 
+    # Legacy/native callers without Chudcode's live candidate list use its
+    # locally refreshed catalog snapshot, falling back only when offline.
+    def latest(provider: str, pattern: str, fallback: str) -> str:
+        from services.agent.model_catalog import models_dev_rows_for_provider
+        matches = (
+            (tuple(int(piece) for piece in re.findall(r"\d+", mid)), mid)
+            for mid in models_dev_rows_for_provider(provider)
+            if re.fullmatch(pattern, mid)
+        )
+        return max(matches, default=((), fallback))[1]
+
     if cfg.get("api_key") or (cfg.get("anthropic") or {}).get("api_key"):
-        _add("anthropic", str((cfg.get("anthropic") or {}).get("model") or "claude-sonnet-4"))
+        _add("anthropic", str((cfg.get("anthropic") or {}).get("model") or
+                              latest("anthropic", r"claude-sonnet-\d+(?:-\d+)?", "claude-sonnet-5-5")))
     if (cfg.get("openai") or {}).get("api_key") or cfg.get("openai_api_key"):
-        _add("openai", str((cfg.get("openai") or {}).get("model") or "gpt-5"))
+        _add("openai", str((cfg.get("openai") or {}).get("model") or
+                           latest("openai", r"gpt-\d+(?:\.\d+)?-sol", "gpt-4o")))
     if (cfg.get("gemini") or {}).get("api_key") or cfg.get("gemini_api_key"):
-        _add("gemini", str((cfg.get("gemini") or {}).get("model") or "gemini-2.5-pro"))
+        _add("gemini", str((cfg.get("gemini") or {}).get("model") or
+                           latest("google", r"gemini-\d+(?:\.\d+)?-pro(?:-preview)?",
+                                  "gemini-3.1-pro-preview")))
     if (cfg.get("xai") or {}).get("api_key") or cfg.get("xai_api_key"):
         _add("xai", str((cfg.get("xai") or {}).get("model") or "grok-4.5"))
     keys_map = cfg.get("keys") or {}
@@ -1954,9 +1976,7 @@ def auto_pick_model(
             prov, base_url=c.get("base_url"), cfg=cfg
         ):
             continue
-        mr = ranks.get(model)
-        if mr is None and "/" in model:
-            mr = ranks.get(model.split("/", 1)[-1])
+        mr = _rank_for(model, ranks)
         # Paid openrouter frontier ids get floor rank even if unranked.
         model_rank = mr.rank if mr is not None else 2
         mid_l = model.strip().lower()
@@ -2010,7 +2030,7 @@ def auto_pick_model(
         else:
             fallback.sort(key=lambda c: _cost_key(str(c["provider"]), str(c["model"])))
         pick = fallback[0]
-        mr = ranks.get(str(pick["model"]))
+        mr = _rank_for(str(pick["model"]), ranks)
         return RoleModelAssignment(
             role="auto",
             provider=str(pick["provider"]).lower(),
@@ -2231,7 +2251,7 @@ def _resolve_auto_seat(role, cfg, *, request, policy, rankings, enabled):
         raise RoleModelError("No available local model. Configure a loopback model in Accounts."
                              if local_only else "No authenticated model is available. Sign in to a provider in Accounts.")
     def rank(c):
-        row = ranks.get(str(c.get("model", "")))
+        row = _rank_for(str(c.get("model", "")), ranks)
         return row.rank if row else 2
     threshold = 1 if role == "worker" and policy.cheap_leaves else policy.min_rank
     capable = [c for c in candidates if rank(c) >= threshold]
@@ -2243,17 +2263,22 @@ def _resolve_auto_seat(role, cfg, *, request, policy, rankings, enabled):
         capable = [c for c in candidates if rank(c) == strongest]
     def cost(c):
         return _COST_CLASS.get(str(c["provider"]), 5)
+    def freshness(c):
+        model = str(c["model"])
+        match = re.search(r"(?:claude-(?:opus|sonnet)-|gpt-)(\d+)(?:[-.](\d+))?", model)
+        return (-int(match[1]), -int(match[2] or 0)) if match else (0, 0)
     if policy.priority == "fastest":
-        capable.sort(key=lambda c: (rank(c), cost(c), str(c["model"])))
+        capable.sort(key=lambda c: (rank(c), cost(c), freshness(c), str(c["model"])))
     else:
-        capable.sort(key=lambda c: (cost(c), rank(c), str(c["model"])))
+        capable.sort(key=lambda c: (cost(c), rank(c), freshness(c), str(c["model"])))
     chosen = capable[0]
     model, provider = str(chosen["model"]), str(chosen["provider"])
     reason = f"Auto chose {model} for {policy.task_kind.replace('_', ' ')} ({policy.thinking} thinking)."
     if rank(chosen) < threshold:
         reason += " No available model meets the requested capability; using the strongest available."
+    row = _rank_for(model, ranks)
     return RoleModelAssignment(role, provider, model, "auto", rank(chosen),
-                               ranks[model].source if model in ranks else "unranked", reason)
+                               row.source if row else "unranked", reason)
 
 
 def _auto_local_provider(provider, cfg, base_url=None):

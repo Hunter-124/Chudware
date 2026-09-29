@@ -796,10 +796,9 @@ set `CHUDWARE_WEB_SHARE_PROVIDER_KEYS=0`.
 
 With sharing disabled, `gateway/engine_bridge.py` must not inject keys from the
 host `config.json` or `~/chudware-web-data/ai_providers.env` into a customer
-request. A turn uses either that account's own stored provider credential or the
-metered managed-credit path. This is a financial boundary as well as a secrecy
-boundary: falling back to a host key lets any customer spend the host provider
-account outside the credit ledger.
+request. A turn uses a validated BYOK key, an own usable Claude OAuth link,
+an eligible trial-domain sponsor Claude link, or the metered managed-credit path.
+There is no ambient host-key fallback.
 
 Provider credentials are only attached server-side to a canonical,
 provider-matching endpoint. Client-supplied `api_key`, `base_url`, and
@@ -815,9 +814,21 @@ in a customer's settings or the hostd account:
 | `CHUDWARE_WEB_POOL_PROVIDER` | Provider for that key, defaults to `openrouter`; must be a supported Chudcode API-key provider. |
 | `CHUDWARE_WEB_POOL_MODEL` | Optional model override for pool turns; if unset, the web client must select a model supported by the pool provider. Billing rates apply to the effective model. |
 
-The gateway injects only its decrypted BYOK key, a **personal** subscription
-OAuth token, or this dedicated pool key into the private actor payload with a
-SHA-256 proof. The worker verifies the proof and runs each web actor in a
+The gateway injects only its decrypted BYOK key, a usable Claude subscription
+OAuth token, or the dedicated pool key into the private actor payload with a
+SHA-256 proof. An active account with a verified email or OAuth identity whose
+email domain matches a configured, unexpired `trial_domains` row (exactly or a
+true subdomain) can use an active admin account's Claude OAuth grant, personal
+or shared, after its own provider-matching BYOK and personal Claude grant.
+Admin links rotate least-recently-used. The gateway forces sponsored requests
+to Anthropic (keeping a selected Claude model, otherwise using the Anthropic
+default). Sponsored turns have no gateway token-spend cap, credit reservation,
+or credit-ledger debit; trial account expiry and provider-side rate limits still
+apply. The gateway logs sponsor, requester, model and reported token usage
+without logging token bytes. Unverified, pending, expired-domain and
+lookalike-domain accounts never get sponsor credentials.
+
+The worker verifies the token proof and runs each web actor in a
 credential-scoped Chudcode process with temporary private HOME/XDG/agent state;
 an absent/unknown source cannot use ambient host auth. Claude Pro/Max links use
 `ANTHROPIC_OAUTH_TOKEN` only inside that process. Chudcode 0.3.0 has no isolated
@@ -825,11 +836,10 @@ Codex OAuth-token injection surface; linked Codex turns refuse
 `subscription_isolation_unsupported` rather than spending the operator's login.
 The desktop (no web actor) continues to use its normal Chudcode login.
 
-`GET /api/providers` is likewise account-scoped: it advertises only validated
-BYOK, usable personal Claude subscription, and the configured credit-pool
-provider/model for an entitled account. It does not list operator config or
-hostd OAuth accounts (even to admins), shared operator OAuth links, or linked
-Codex subscriptions that cannot yet run in isolation.
+`GET /api/providers` is account-scoped: validated BYOK, own usable Claude
+subscription, sponsor Claude for eligible users, and the configured credit-pool
+provider/model for entitled accounts. It does not list operator host config or
+hostd OAuth accounts, or linked Codex subscriptions that cannot run in isolation.
 
 ## University of Alabama Box workspace
 

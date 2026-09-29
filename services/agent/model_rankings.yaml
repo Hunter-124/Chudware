@@ -9,6 +9,22 @@
 schema: aicad.model_rankings/1
 notes: public evals 2026-07 current catalog (Kimi K3 priority for CAD modeling)
 
+# New catalog aliases inherit rank without waiting for a shipped-ID table update.
+# Anchored patterns match only canonical family aliases, never dated previews.
+families:
+  - pattern: '^claude-(?:opus|sonnet)-[5-9](?:-\d+)?$'
+    rank: 5
+    provider: anthropic
+  - pattern: '^claude-(?:fable|mythos)-[5-9](?:-\d+)?$'
+    rank: 4
+    provider: anthropic
+  - pattern: '^gpt-(?:5\.6|[6-9](?:\.\d+)?)-(?:sol|luna|astra)$'
+    rank: 5
+    provider: openai-codex
+  - pattern: '^gemini-[3-9](?:\.\d+)?-pro(?:-preview)?$'
+    rank: 5
+    provider: google
+
 models:
   # Rank 5 — frontier band
   - id: grok-4.5
@@ -21,11 +37,11 @@ models:
     rank: 5
     source: shipped
     notes: "grok-4.5 alias (hyphen form used by gym tiers)"
-  - id: claude-opus-4-8
+  - id: claude-opus-5-5
     provider: anthropic
     rank: 5
     source: shipped
-    notes: "Claude Opus 4.8 flagship"
+    notes: "Claude Opus 5.5 offline fallback"
   - id: claude-sonnet-5
     provider: anthropic
     rank: 5

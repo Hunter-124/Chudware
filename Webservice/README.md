@@ -17,6 +17,18 @@ attribution.
   baseline in `Webservice/perf/baseline.json`, traces per git SHA in
   `Webservice/perf/traces/`; p95 regressions >15% (and >0.1 ms) fail. Run it
   before committing engine/gateway changes.
+- Asset delivery: `./build.sh wasm` (also run by `deploy/install_webd.sh` in a
+  private release stage) precompresses the WASM/JS/data bundle as Brotli and
+  gzip. `/app` negotiates those siblings with `Vary: Accept-Encoding`, serves
+  WASM as `application/wasm` for streaming compilation, and sends COOP/COEP.
+  HTML and the fixed-name JS/WASM/data files revalidate (`no-cache`); portal
+  assets with content hashes are immutable for one year. Production's
+  authenticated `/app` assets require a session to measure remotely; compare
+  local delivery with `Webservice/gateway/tests/web_asset_probe.py` and
+  `scripts/check_web_parity.py --bundle <staged-app-dir>`. The production
+  `MinSizeRel` WASM link disables runtime assertions and stack-overflow probes;
+  Debug builds retain both. `Release` is not the deploy default: its `wasm-opt
+  -O3` exceeded the 16 GiB deploy host's memory budget.
 - The streamed-container portal (`sessions.py`, `proxy.py`, `image/`) was **removed**
   on 2026-08-10. `/app` is the only client. `deploy/monitor.py` survives as a host
   RAM/disk/GPU sampler and disk-pressure flag.

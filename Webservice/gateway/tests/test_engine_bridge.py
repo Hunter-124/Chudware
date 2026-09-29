@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import asyncio
 import json
 import logging
@@ -21,7 +22,7 @@ os.environ.setdefault("CHUDWARE_WEB_DATA_ROOT", str(Path.home() / "chudware-web-
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway import accounts, app as app_mod, credits, db  # noqa: E402
+from gateway import accounts, app as app_mod, credits, db, provider_accounts, engine_bridge  # noqa: E402
 from gateway.config import Settings, settings  # noqa: E402
 from gateway.limits import user_slug  # noqa: E402
 
@@ -516,6 +517,82 @@ class TestEngineBridge:
             })
         assert response["error"]["code"] == -32601
         assert not any(call["method"] == method for call in daemon.calls)
+
+    def test_trial_sponsor_forces_claude_without_credit_reservation(
+        self, daemon, client, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(settings, "share_provider_keys", False)
+        caplog.set_level(logging.INFO, logger=engine_bridge.log.name)
+        monkeypatch.setattr(
+            engine_bridge, "default_model_for",
+            lambda provider: "claude-live-vetted" if provider == "anthropic-sub" else None,
+        )
+        monkeypatch.setattr(
+            settings, "provider_key_encryption_key",
+            base64.urlsafe_b64encode(b"S" * 32).decode().rstrip("="),
+        )
+        monkeypatch.setattr(
+            engine_bridge, "reserve_turn",
+            lambda *_args, **_kwargs: pytest.fail("sponsored turn reserved credits"),
+        )
+        with db.tx() as cur:
+            cur.execute(
+                "INSERT INTO credentials(email, password_hash, email_verified) "
+                "VALUES ('demo@example.com', 'unused', TRUE)"
+            )
+            cur.execute(
+                "INSERT INTO trial_domains(domain, trial_days, ai_credits) "
+                "VALUES ('example.com', 14, 0)"
+            )
+            cur.execute(
+                "UPDATE accounts SET ai_grant = TRUE, credit_balance = 0 "
+                "WHERE email = 'demo@example.com'"
+            )
+        provider_accounts._persist_account(
+            "admin@example.com", "anthropic-sub", "personal",
+            {
+                "account_key": "sponsor-claude",
+                "label": "admin Claude",
+                "plan": "max",
+                "tokens": {
+                    "access_token": "sponsor-secret",
+                    "refresh_token": "refresh-secret",
+                    "expires_at_ms": 4_000_000_000_000,
+                },
+            },
+        )
+        with client.websocket_connect("/engine", headers=DEV_HEADERS) as ws:
+            assert _rpc(ws, 80, "agent_ask_v2", {
+                "question": "bracket", "provider": "openrouter", "model": "other/model",
+                "_test_emit_usage": True,
+            })["result"]["ok"] is True
+            assert _rpc(ws, 81, "agent_ask_v2", {
+                "question": "bracket", "provider": "anthropic",
+                "model": "claude-sonnet-5",
+            })["result"]["ok"] is True
+        turns = [call["params"] for call in daemon.calls if call["method"] == "agent_ask_v2"]
+        assert len(turns) == 2
+        assert turns[0]["provider"] == "anthropic"
+        assert turns[0]["model"] == "claude-live-vetted"
+        assert turns[1]["provider"] == "anthropic"
+        assert turns[1]["model"] == "claude-sonnet-5"
+        for params in turns:
+            actor = params["options"]["_chudware_actor"]
+            assert actor["key_source"] == "subscription"
+            assert actor["_subscription"]["provider"] == "anthropic-sub"
+            assert "_reservation_credits" not in actor
+        with db.tx() as cur:
+            cur.execute(
+                "SELECT credit_balance FROM accounts WHERE email = 'demo@example.com'"
+            )
+            assert cur.fetchone()["credit_balance"] == 0
+            cur.execute(
+                "SELECT count(*) AS total FROM credit_ledger WHERE email = 'demo@example.com'"
+            )
+            assert cur.fetchone()["total"] == 0
+        assert "sponsored_usage email=demo@example.com sponsor=admin@example.com" in caplog.text
+        assert "prompt_tokens=100 completion_tokens=100" in caplog.text
+        assert "sponsor-secret" not in caplog.text
 
 
     def test_studio_pool_reserves_reconciles_and_stops_at_zero(

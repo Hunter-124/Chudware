@@ -309,9 +309,10 @@ static void drawWebProviderKeyForm(AppState& st) {
         if (ImGui::SmallButton("Remove##webkey")) ui::webProviderKeyDelete(provider);
         ImGui::EndDisabled();
     } else {
-        dimText("Paste your own API key. The server validates it with the provider, then stores it "
-                "encrypted against your account only \xe2\x80\x94 it is never shown again and "
-                "never reachable by another account on this server.");
+        dimText("Paste your own API key. The server validates it and stores it encrypted for "
+                "your account only; no other user can access that key. Eligible trial-domain "
+                "users may instead use an admin-linked Claude subscription, whose credentials "
+                "never reach their browsers.");
         ImGui::SetNextItemWidth(-1);
         const bool submitted = ImGui::InputText(
             "##webproviderkey", keyBuf, sizeof(keyBuf),
@@ -465,6 +466,44 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     bool changed = false;
     refreshModelAvailability(st, false);
 
+    // Explicit provider switches choose the newest non-dated flagship in the live catalog.
+    // A model already saved by the user is never migrated behind their back.
+    auto newest = [](const char* provider, const char* family, const char* fallback) {
+        std::string selected;
+        int bestMajor = -1, bestMinor = -1;
+        const size_t stemLen = std::strlen(family);
+        for (const auto& row : ui::bridgeModelCatalog()) {
+            if (row.provider != provider || row.deprecated ||
+                row.id.compare(0, stemLen, family) != 0) continue;
+            const char* pos = row.id.c_str() + stemLen;
+            if (!std::isdigit(static_cast<unsigned char>(*pos))) continue;
+            char* end = nullptr;
+            const long major = std::strtol(pos, &end, 10);
+            long minor = 0;
+            if ((*end == '-' || *end == '.') &&
+                std::isdigit(static_cast<unsigned char>(end[1]))) {
+                pos = end + 1;
+                minor = std::strtol(pos, &end, 10);
+            }
+            // Exclude dated/specialized IDs; the canonical alias is stable across refreshes.
+            if (std::strcmp(family, "gpt-") == 0) {
+                if (std::strcmp(end, "-sol") != 0) continue;
+            } else if (std::strcmp(family, "gemini-") == 0) {
+                if (std::strcmp(end, "-pro-preview") != 0 &&
+                    std::strcmp(end, "-pro") != 0) continue;
+            } else if (*end != '\0') continue;
+            if (major > 100 || minor > 100) continue;
+            if (major > bestMajor || (major == bestMajor && minor > bestMinor)) {
+                selected = row.id; bestMajor = static_cast<int>(major);
+                bestMinor = static_cast<int>(minor);
+            }
+        }
+        return selected.empty() ? std::string(fallback) : selected;
+    };
+    auto selectModel = [&](const std::string& model) {
+        std::strncpy(s.model, model.c_str(), sizeof(s.model) - 1);
+        s.model[sizeof(s.model) - 1] = '\0';
+    };
     auto drawProviderModel = [&]() {
     // ---- provider ----
     ImGui::TextUnformatted("Provider");
@@ -476,13 +515,12 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         s.provider != prevProvider) {
         changed = true;
         // Set sensible per-provider defaults on switch.
-        if (s.provider == ui::PROV_GEMINI && (!s.model[0] || std::strstr(s.model, "gpt") ||
-                                              std::strstr(s.model, "claude")))
-            std::strncpy(s.model, "gemini-2.5-pro", sizeof(s.model) - 1);
+        if (s.provider == ui::PROV_GEMINI)
+            selectModel(newest("google", "gemini-", "gemini-3.1-pro-preview"));
         else if (s.provider == ui::PROV_ANTHROPIC)
-            std::strncpy(s.model, "claude-opus-4-8", sizeof(s.model) - 1);
+            selectModel(newest("anthropic", "claude-opus-", "claude-opus-5-5"));
         else if (s.provider == ui::PROV_OPENAI)
-            std::strncpy(s.model, "gpt-6-sol", sizeof(s.model) - 1);
+            selectModel(newest("openai", "gpt-", "gpt-4o"));
         else if (s.provider == ui::PROV_LOCAL) {
             std::strncpy(s.baseUrl, "http://localhost:1234/v1", sizeof(s.baseUrl) - 1);
             if (std::strstr(s.model, ".gguf") || std::strstr(s.model, "gemini") ||
@@ -928,29 +966,48 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     };
 
     auto drawGeneration = [&]() {
-    // ---- Generation: reasoning effort + token budgets ----
-    // Labels share the row with their widgets so scroll never orphans an InputInt.
+    // Wide panels keep label and control on one row. A narrow Settings modal
+    // stacks them: 180dp label + 160dp field otherwise overruns the 390px
+    // viewport, and the inline wrapped "0 = automatic" hint consumes ~200px
+    // of invisible height when its available width becomes negative.
     {
         const float labelW = 180.0f * S;
         const float fieldW = 160.0f * S;
+        const bool compact = ImGui::GetContentRegionAvail().x < labelW + fieldW + 16.0f * S;
         auto labeledField = [&](const char* label) {
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted(label);
-            ImGui::SameLine(labelW);
-            ImGui::SetNextItemWidth(fieldW);
+            if (!compact) ImGui::SameLine(labelW);
+            ImGui::SetNextItemWidth(compact ? -1.0f : fieldW);
         };
 
         const char* effLabels[8] = {};
         const char* effValues[8] = {};
-        int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
+        ui::ModelInfo probe;
+        const ui::ModelInfo* probeP = nullptr;
+        if (const ui::BridgeModelMeta* bm = ui::bridgeModelMetaForCad(s.provider, s.model,
+                                                                      s.baseUrl)) {
+            probe = ui::modelInfoFromProbe(s.provider, s.model, bm->name, bm->contextWindow,
+                                           bm->maxTokens, bm->vision, bm->tools,
+                                           bm->reasoningEfforts, "catalog");
+            probeP = &probe;
+        }
+        int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8, probeP);
         if (nEff > 0) {
             labeledField("Reasoning effort");
-            int effIdx = 0;
+            int effIdx = -1;
             for (int i = 0; i < nEff; ++i)
                 if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
-            if (ImGui::Combo("##effort", &effIdx, effLabels, nEff)) {
-                std::strncpy(s.reasoningEffort, effValues[effIdx], sizeof(s.reasoningEffort) - 1);
-                changed = true;
+            const char* selected = effIdx < 0 ? "Default" : effLabels[effIdx];
+            if (ImGui::BeginCombo("##effort", selected)) {
+                for (int i = 0; i < nEff; ++i) {
+                    if (ImGui::Selectable(effLabels[i], effIdx == i)) {
+                        std::strncpy(s.reasoningEffort, effValues[i],
+                                     sizeof(s.reasoningEffort) - 1);
+                        changed = true;
+                    }
+                }
+                ImGui::EndCombo();
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("How much hidden reasoning the model spends before answering.\n"
@@ -962,14 +1019,14 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             // letting the user conclude the search lied.
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted("Reasoning effort");
-            ImGui::SameLine(labelW);
+            if (!compact) ImGui::SameLine(labelW);
             ImGui::AlignTextToFramePadding();
             dimText("not offered by this model");
             ImGui::Dummy(ImVec2(0, 4 * S));
         }
 
-        // Max response tokens (0 = auto). Keep label on the same row as the InputInt so a scroll
-        // boundary can never leave a bare "0" field without its caption (Settings AI tab bug).
+        // Max response tokens (0 = auto). The field stays alongside its caption
+        // on wide panes and immediately underneath it on narrow panes.
         labeledField("Max response tokens");
         int mt = s.maxTokens;  // 0 = auto
         if (ImGui::InputInt("##maxtokens", &mt, 1024, 4096)) {
@@ -983,9 +1040,11 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             ImGui::SetTooltip("Output token cap per model call. 0 = automatic.\n"
                               "Raise this if the agent reports \"budget exhausted\" or \"no JSON ops\"\n"
                               "— a reasoning model spent its budget thinking before emitting the build.");
-        ImGui::SameLine(0.0f, 8.0f * S);
-        ImGui::AlignTextToFramePadding();
-        if (mt == 0) dimText("0 = automatic");
+        if (mt == 0) {
+            if (!compact) ImGui::SameLine(0.0f, 8.0f * S);
+            ImGui::AlignTextToFramePadding();
+            dimText("0 = automatic");
+        }
 
         ImGui::Dummy(ImVec2(0, 4 * S));
         labeledField("Model context window");
@@ -1001,9 +1060,11 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             ImGui::SetTooltip("The model's total token context window. 0 = automatic\n"
                               "(cloud large; local 8192). Set your LOCAL server's real window so the\n"
                               "agent trims the prompt to fit instead of overrunning it and breaking the run.");
-        ImGui::SameLine(0.0f, 8.0f * S);
-        ImGui::AlignTextToFramePadding();
-        if (cw == 0) dimText("0 = automatic");
+        if (cw == 0) {
+            if (!compact) ImGui::SameLine(0.0f, 8.0f * S);
+            ImGui::AlignTextToFramePadding();
+            dimText("0 = automatic");
+        }
     }
 
     };

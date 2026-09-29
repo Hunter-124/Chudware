@@ -484,8 +484,6 @@ if(EMSCRIPTEN)
     "SHELL:-sFULL_ES3=1"
     "SHELL:-sUSE_WEBGL2=1"
     "SHELL:-sEXIT_RUNTIME=0"
-    "SHELL:-sASSERTIONS=1"
-    "SHELL:-sSTACK_OVERFLOW_CHECK=1"
     "SHELL:-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap']"
     "SHELL:-sEXPORTED_FUNCTIONS=['_main','_malloc','_free']"
     "SHELL:--shell-file=${CMAKE_CURRENT_SOURCE_DIR}/wasm/shell.html"
@@ -498,6 +496,18 @@ if(EMSCRIPTEN)
     "SHELL:--preload-file=${_WASM_ASSETS}/logo_wordmark.png@/assets/logo_wordmark.png"
     "SHELL:--preload-file=${_WASM_ASSETS}/logo_wordmark_dark.png@/assets/logo_wordmark_dark.png"
   )
+  # Keep expensive runtime diagnostics for debug builds, not the MinSizeRel
+  # bundle shipped by install_webd.sh. Emscripten defaults vary by build type;
+  # explicitly turn them off on production links so this never regresses.
+  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_link_options(Chudware PRIVATE
+      "SHELL:-sASSERTIONS=1"
+      "SHELL:-sSTACK_OVERFLOW_CHECK=1")
+  else()
+    target_link_options(Chudware PRIVATE
+      "SHELL:-sASSERTIONS=0"
+      "SHELL:-sSTACK_OVERFLOW_CHECK=0")
+  endif()
   target_compile_options(Chudware PRIVATE
     "SHELL:--use-port=contrib.glfw3"
     "SHELL:-pthread")

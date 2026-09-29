@@ -25,7 +25,7 @@ from typing import Any
 
 from .base import Provider
 
-DEFAULT_MODEL = "claude-opus-4-8"
+DEFAULT_MODEL = "claude-opus-5-5"
 
 # Effort ladders accepted on the wire / by our config UI.
 _EFFORTS = frozenset({"low", "medium", "high", "max", "xhigh"})
@@ -44,7 +44,9 @@ def _normalize_effort(raw: str | None) -> str:
     effort = (raw or "high").strip().lower()
     if effort in ("med",):
         effort = "medium"
-    if effort in ("auto", "none", "off", ""):
+    if effort in ("off", "none", "minimal"):
+        effort = "low"
+    elif effort in ("auto", ""):
         effort = "high"
     if effort not in _EFFORTS:
         effort = "high"

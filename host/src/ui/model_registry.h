@@ -196,24 +196,20 @@ inline const std::vector<ModelInfo>& builtinModels() {
         {PROV_ZENMUX, "x-ai/grok-4.5-free", "Grok 4.5 (default, free via ZenMux)", true, true},
         {PROV_ZENMUX, "moonshotai/kimi-k3", "Kimi K3 (via ZenMux)", true, true},
         {PROV_ZENMUX, "moonshotai/kimi-k3-free", "Kimi K3 (free via ZenMux)", true, true},
-        // Google Gemini — vision + thinking (reasoning-effort) on 2.5; 2.0-flash has no knob.
-        {PROV_GEMINI, "gemini-2.5-pro", "Gemini 2.5 Pro", true, true},
-        {PROV_GEMINI, "gemini-2.5-flash", "Gemini 2.5 Flash", true, true},
-        {PROV_GEMINI, "gemini-2.0-flash", "Gemini 2.0 Flash", true, false},
-        // Anthropic fallback rows in live-API order (newest first). Chudcode catalog metadata
-        // wins when available; the native agent_list_models probe can also refresh API-key
-        // accounts directly. These rows keep the picker usable before either source answers.
+        // Google API wire ids (the catalog overrides these offline fallback rows).
+        {PROV_GEMINI, "gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview", true, true},
+        {PROV_GEMINI, "gemini-3.5-flash", "Gemini 3.5 Flash", true, true},
+        // Anthropic offline fallback; the live Chudcode catalog is authoritative online.
+        {PROV_ANTHROPIC, "claude-opus-5-5", "Claude Opus 5.5", true, true},
+        {PROV_ANTHROPIC, "claude-sonnet-5-5", "Claude Sonnet 5.5", true, true},
         {PROV_ANTHROPIC, "claude-opus-5", "Claude Opus 5", true, true},
         {PROV_ANTHROPIC, "claude-sonnet-5", "Claude Sonnet 5", true, true},
         {PROV_ANTHROPIC, "claude-fable-5", "Claude Fable 5", true, true},
-        {PROV_ANTHROPIC, "claude-opus-4-8", "Claude Opus 4.8", true, true},
-        {PROV_ANTHROPIC, "claude-opus-4-7", "Claude Opus 4.7", true, true},
-        {PROV_ANTHROPIC, "claude-sonnet-4-6", "Claude Sonnet 4.6", true, true},
-        {PROV_ANTHROPIC, "claude-opus-4-6", "Claude Opus 4.6", true, true},
-        {PROV_ANTHROPIC, "claude-haiku-4-5", "Claude Haiku 4.5", true, false},
+        {PROV_ANTHROPIC, "claude-mythos-5", "Claude Mythos 5", true, true},
+        {PROV_ANTHROPIC, "claude-haiku-4-5", "Claude Haiku 4.5", true, true},
         // OpenAI cloud (gpt-6-sol is current, 2026-09-22; older ≤ gpt-5.5 and o3 purged).
         {PROV_OPENAI, "gpt-6-sol", "GPT-6 Sol", true, true},
-        {PROV_OPENAI, "gpt-5.6-sol", "GPT-5.6 Sol", true, true},
+        {PROV_OPENAI, "gpt-6-luna", "GPT-6 Luna", true, true},
         // Cursor — Composer only. The proxied cursor/claude-* + cursor/gpt-* rows were
         // removed 2026-07-21: Cursor rejects those wire ids upstream
         // (ERROR_BAD_MODEL_NAME), and composer-1/1.5 are sunset — every pick failed.
@@ -356,6 +352,15 @@ inline bool modelSupportsReasoning(int provider, const std::string& id,
     }
     for (const auto& m : builtinModels())
         if (m.provider == provider && m.id == id) return m.reasoning;
+    // Unknown revisions inherit a family ladder until catalog metadata arrives.
+    // The catalog's explicit empty efforts list above always overrides this.
+    std::string family = id;
+    for (char& c : family) c = (char)std::tolower((unsigned char)c);
+    if (family.find("claude-") != std::string::npos ||
+        family.rfind("gpt-6", 0) == 0 || family.rfind("gpt-7", 0) == 0 ||
+        family.rfind("gpt-5.6", 0) == 0 || family.rfind("gemini-3", 0) == 0 ||
+        family.rfind("kimi-k3", 0) != std::string::npos)
+        return true;
     if (provider == PROV_LOCAL || provider == PROV_LLAMACPP) return true;  // gemma reasons
     return false;
 }
@@ -377,6 +382,7 @@ inline int defaultContextWindowForModel(int provider, const std::string& id,
     if (has("1.5-pro")) return 2097152;
     if (has("1.5-flash") || has("2.0") || has("2.5") || has("flash") || has("gemini"))
         return 1048576;
+    if (has("opus-5") || has("sonnet-5")) return 1000000;
     if (has("claude") || has("opus") || has("sonnet")) return 200000;
     if (has("gpt-4.1")) return 1047576;
     if (has("o1") || has("o3") || has("o4") || has("reasoner") || has("r1")) return 200000;
@@ -439,13 +445,19 @@ inline int reasoningEffortOptions(int provider, const std::string& id,
 
     if (!modelSupportsReasoning(provider, id, probe)) return 0;
     struct Opt { const char* label; const char* value; };
-    static const Opt kGemini[] = {{"Off", "off"}, {"Low", "low"}, {"Medium", "medium"},
-                                  {"High", "high"}, {"Max", "max"}};
-    // Current Claude scale (claude-opus-5/4-8 etc.).
-    static const Opt kAnthropic[] = {{"Low", "low"}, {"Medium", "medium"}, {"High", "high"},
-                                     {"Xhigh", "xhigh"}, {"Max", "max"}};
-    // Kimi K3's mandatory wire scale — there is NO off/medium rung (a medium pick 400s).
+    static const Opt kGeminiLevel[] = {{"Minimal", "minimal"}, {"Low", "low"},
+                                        {"Medium", "medium"}, {"High", "high"}};
+    static const Opt kGeminiPro[] = {{"Low", "low"}, {"High", "high"}};
+    static const Opt kClaudeAdaptive[] = {{"Low", "low"}, {"Medium", "medium"},
+                                           {"High", "high"}, {"Xhigh", "xhigh"}, {"Max", "max"}};
+    static const Opt kClaudeBudget[] = {{"Minimal", "minimal"}, {"Low", "low"},
+                                         {"Medium", "medium"}, {"High", "high"}, {"Xhigh", "xhigh"}};
+    static const Opt kClaude46[] = {{"Low", "low"}, {"Medium", "medium"},
+                                     {"High", "high"}, {"Max", "max"}};
+    static const Opt kClaudeSonnet46[] = {{"Low", "low"}, {"Medium", "medium"}, {"High", "high"}};
     static const Opt kKimiK3[] = {{"Low", "low"}, {"High", "high"}, {"Max", "max"}};
+    static const Opt kGptModern[] = {{"Low", "low"}, {"Medium", "medium"},
+                                      {"High", "high"}, {"Xhigh", "xhigh"}, {"Max", "max"}};
     static const Opt kGeneric[] = {{"Off", "off"}, {"Low", "low"}, {"Medium", "medium"},
                                    {"High", "high"}};
     std::string m = id;
@@ -453,12 +465,19 @@ inline int reasoningEffortOptions(int provider, const std::string& id,
     const Opt* src = kGeneric;
     int n = 4;
     if (provider == PROV_GEMINI || m.find("gemini") != std::string::npos) {
-        src = kGemini; n = 5;
+        if (m.find("3.1-pro") != std::string::npos) { src = kGeminiPro; n = 2; }
+        else { src = kGeminiLevel; n = 4; }
     } else if (provider == PROV_ANTHROPIC || m.find("claude") != std::string::npos) {
-        src = kAnthropic; n = 5;
+        if (m.find("-4-5") != std::string::npos) { src = kClaudeBudget; n = 5; }
+        else if (m.find("sonnet-4-6") != std::string::npos) { src = kClaudeSonnet46; n = 3; }
+        else if (m.find("-4-6") != std::string::npos) { src = kClaude46; n = 4; }
+        else { src = kClaudeAdaptive; n = 5; }
     } else if (m.find("kimi-k3") != std::string::npos || m == "k3" ||
                m.rfind("k3-", 0) == 0) {
         src = kKimiK3; n = 3;
+    } else if (m.rfind("gpt-6", 0) == 0 || m.rfind("gpt-7", 0) == 0 ||
+               m.rfind("gpt-5.6", 0) == 0) {
+        src = kGptModern; n = 5;
     }
     int out = n < maxN ? n : maxN;
     for (int i = 0; i < out; ++i) {

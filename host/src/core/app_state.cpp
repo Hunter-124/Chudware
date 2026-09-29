@@ -985,11 +985,11 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         j.erase(k);
     if (s.provider == 4) {
         j["provider"] = "gemini";
-        j["model"] = s.model[0] ? s.model : "gemini-2.5-flash";
+        j["model"] = s.model[0] ? s.model : "gemini-3.5-flash";
         j["api_key"] = s.geminiKey;
     } else if (s.provider == 0) {
         j["provider"] = "anthropic";
-        j["model"] = s.model[0] ? s.model : "claude-opus-4-8";
+        j["model"] = s.model[0] ? s.model : "claude-opus-5-5";
         j["api_key"] = s.anthropicKey;
     } else if (s.provider == 1) {
         j["provider"] = "openai";

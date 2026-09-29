@@ -152,7 +152,7 @@ class MockVault:
             "message": message,
             "ai": {
                 "provider": "anthropic",
-                "model": "claude-sonnet-4-6",
+                "model": "claude-sonnet-5-5",
                 "run_id": run_id or "",
                 "artifact_id": effective_artifact,
                 "reversible": True,
@@ -244,7 +244,7 @@ def bridge_for_run(
     *,
     project_dir: str | os.PathLike | None = None,
     ledger: Any | None = None,
-    model_id: str = "claude-sonnet-4-6",
+    model_id: str = "claude-sonnet-5-5",
     provider: str = "anthropic",
     vault: VaultClient | None = None,
 ) -> "PLMBridge":
@@ -519,7 +519,7 @@ class PLMBridge:
         self,
         run_id: str,
         vault: VaultClient | None = None,
-        model_id: str = "claude-sonnet-4-6",
+        model_id: str = "claude-sonnet-5-5",
         provider: str = "anthropic",
         project_dir: str | os.PathLike | None = None,
     ) -> None:

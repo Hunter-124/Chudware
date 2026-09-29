@@ -280,7 +280,7 @@ static int composerEffortLadder(const Settings& s, const char** outLabels,
     ui::ModelInfo probe;
     const ui::ModelInfo* probeP = nullptr;
     if (const ui::BridgeModelMeta* bm = ui::bridgeModelMetaForCad(s.provider, s.model, s.baseUrl);
-        bm && !bm->reasoningEfforts.empty()) {
+        bm) {
         probe = ui::modelInfoFromProbe(s.provider, s.model, bm->name, bm->contextWindow,
                                        bm->maxTokens, bm->vision, bm->tools,
                                        bm->reasoningEfforts, "catalog");
@@ -309,7 +309,7 @@ nlohmann::json agentProviderOverride(const Settings& s) {
         const char* lv[8] = {};
         const char* vv[8] = {};
         const int n = composerEffortLadder(s, lv, vv, 8);
-        bool valid = n <= 0;  // ladder unknown → don't second-guess the saved value
+        bool valid = false;  // known model with no ladder never exposes a dial
         for (int i = 0; i < n; ++i)
             if (std::strcmp(s.reasoningEffort, vv[i]) == 0) valid = true;
         if (valid) j["reasoning_effort"] = s.reasoningEffort;
@@ -3139,18 +3139,11 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, chipHov);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, chipAct);
 
-    // Thinking effort — ALWAYS present. Show just the level (no "Thinking: " prefix)
-    // so the model label has room to extend left.
+    // The catalog can explicitly report no dial; do not invent one.
     Settings& s = st.settings;
     const char* effLabels[8] = {};
     const char* effValues[8] = {};
     int nEff = composerEffortLadder(s, effLabels, effValues, 8);
-    if (nEff <= 0) {
-        static const char* kFbLabels[] = {"Low", "Medium", "High"};
-        static const char* kFbValues[] = {"low", "medium", "high"};
-        for (int i = 0; i < 3; ++i) { effLabels[i] = kFbLabels[i]; effValues[i] = kFbValues[i]; }
-        nEff = 3;
-    }
     int effIdx = -1;
     for (int i = 0; i < nEff; ++i)
         if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
@@ -3220,10 +3213,14 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     // ---- 2/6 thinking effort (level only; bigger than New) ----
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    if (ImGui::Button(effBtn, ImVec2(thinkW, segH))) ImGui::OpenPopup("##cmpeffort");
+    if (nEff <= 0) ImGui::BeginDisabled();
+    if (ImGui::Button(nEff > 0 ? effBtn : "No dial", ImVec2(thinkW, segH)))
+        ImGui::OpenPopup("##cmpeffort");
+    if (nEff <= 0) ImGui::EndDisabled();
     ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Thinking effort for the selected model.");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip(nEff > 0 ? "Thinking effort for the selected model."
+                                  : "This model has no thinking-effort dial.");
     if (ImGui::BeginPopup("##cmpeffort")) {
         for (int i = 0; i < nEff; ++i) {
             if (ImGui::Selectable(effLabels[i], effIdx == i)) {

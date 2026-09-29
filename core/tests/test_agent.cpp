@@ -148,11 +148,11 @@ TEST_CASE("anthropic body shape is model-aware") {
     json messages = json::array();
     messages.push_back(user_message(json::array({text_part("hello")})));
 
-    // Default / adaptive (opus-4-8): thinking adaptive + effort (default high).
+    // Current adaptive flagship: request shape and default effort.
     {
-        BuiltRequest r = anthropic_build_request("claude-opus-4-8", "sys", messages, 8000);
+        BuiltRequest r = anthropic_build_request("claude-opus-5-5", "sys", messages, 8000);
         CHECK(r.url == "https://api.anthropic.com/v1/messages");
-        CHECK(r.body_json["model"] == "claude-opus-4-8");
+        CHECK(r.body_json["model"] == "claude-opus-5-5");
         CHECK(r.body_json["max_tokens"] == 8000);
         CHECK(r.body_json["system"] == "sys");
         CHECK(r.body_json["thinking"]["type"] == "adaptive");
@@ -212,6 +212,9 @@ TEST_CASE("anthropic body shape is model-aware") {
         CHECK(anthropic_thinking_mode_for_model("claude-sonnet-5") == "adaptive");
         CHECK(r.body_json["thinking"]["type"] == "adaptive");
         CHECK(r.body_json["output_config"]["effort"] == "low");
+        BuiltRequest off =
+            anthropic_build_request("claude-sonnet-5-5", "sys", messages, 8000, "off");
+        CHECK(off.body_json["output_config"]["effort"] == "low");
     }
 }
 
@@ -657,10 +660,21 @@ TEST_CASE("gemini thinking budget leaves room for the answer") {
     auto [cap_med, think_med] = out_cap("medium", 8192);
     CHECK(think_med == 8192);
     CHECK(cap_med > think_med);
-    // off/none disables thinking and must not inflate the cap.
+    // A saved "off" selects minimal budget (2.5 Pro cannot disable thinking).
     auto [cap_off, think_off] = out_cap("off", 8192);
-    CHECK(think_off == 0);
-    CHECK(cap_off == 8192);
+    CHECK(think_off == 128);
+    CHECK(cap_off > 8192);
+}
+
+TEST_CASE("gemini level models do not receive a legacy thinking budget") {
+    json messages = json::array({user_message(json::array({text_part("hi")}))});
+    BuiltRequest flash = gemini_build_request("gemini-3.5-flash", "sys", messages, 8192,
+                                               "medium");
+    CHECK(flash.body_json["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "MEDIUM");
+    CHECK_FALSE(flash.body_json["generationConfig"]["thinkingConfig"].contains("thinkingBudget"));
+    BuiltRequest pro = gemini_build_request("gemini-3.1-pro-preview", "sys", messages, 8192,
+                                             "medium");
+    CHECK(pro.body_json["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "HIGH");
 }
 
 TEST_CASE("openai message text-join branch") {
@@ -1268,6 +1282,10 @@ TEST_CASE("openai_reasoning_patch: per-provider/model reasoning-effort gating") 
     // OpenAI reasoning models pass low/medium/high; non-reasoning gpt-4* omit.
     CHECK(openai_reasoning_patch("openai", "gpt-5.6", "https://api.openai.com/v1", "high")
               .value("reasoning_effort", std::string()) == "high");
+    CHECK(openai_reasoning_patch("openai", "gpt-6-sol", "https://api.openai.com/v1", "max")
+              .value("reasoning_effort", std::string()) == "max");
+    CHECK(openai_reasoning_patch("openai", "gpt-5.6-sol", "", "xhigh")
+              .value("reasoning_effort", std::string()) == "xhigh");
     CHECK(openai_reasoning_patch("openai", "o3", "https://api.openai.com/v1", "medium")
               .value("reasoning_effort", std::string()) == "medium");
     CHECK(openai_reasoning_patch("openai", "gpt-4.1", "https://api.openai.com/v1", "high").empty());

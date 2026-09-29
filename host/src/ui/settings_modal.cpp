@@ -17,6 +17,7 @@
 #include <nlohmann/json.hpp>
 
 #include "imgui.h"
+#include "imgui_internal.h"  // FindWindowByName: clamp the saved dialog position before Begin
 
 #include "api/chudware_version.h"  // CHUDWARE_VERSION / _GIT_SHA in the About modal
 
@@ -2420,9 +2421,10 @@ static void drawWebAccountProviderManager(AppState& st) {
     static std::string s_keyFor;
 
     settingsGlassSectionBegin("##web_account_keys", "Your provider keys");
-    dimText("Keys you add here belong to your account alone: the server validates each one with "
-            "the provider, stores it encrypted, and never shows or shares it again. Turns that use "
-            "your own key spend no Chudware credits.");
+    dimText("Your own API keys are validated and stored encrypted for your account only; they "
+            "are never shown to another user. Eligible trial-domain users may instead be "
+            "sponsored by admin-linked Claude subscriptions; subscription credentials never "
+            "reach their browsers. Turns using your own key spend no Chudware credits.");
 
     const std::vector<ui::WebProviderKey>& stored = ui::webProviderKeys();
     for (const char* id : kProviders) {
@@ -3700,17 +3702,17 @@ static void drawModelRolesSection(AppState& st, float sc) {
             }
             if (ro) ImGui::EndDisabled();
 
-            // Thinking effort combo (Auto / Low / Medium / High).
+            // Runtime clamps each override to the chosen model's catalog ladder.
             ImGui::TableNextColumn();
-            static const char* kThinkLabels[] = {"Auto", "Low", "Medium", "High"};
-            static const char* kThinkValues[] = {"auto", "low", "medium", "high"};
+            static const char* kThinkLabels[] = {"Auto", "Low", "Medium", "High", "Xhigh", "Max"};
+            static const char* kThinkValues[] = {"auto", "low", "medium", "high", "xhigh", "max"};
             int thinkSel = 0;
-            for (int ti = 0; ti < 4; ++ti) {
+            for (int ti = 0; ti < 6; ++ti) {
                 if (a.thinking == kThinkValues[ti]) { thinkSel = ti; break; }
             }
             if (ro) ImGui::BeginDisabled();
             ImGui::SetNextItemWidth(-1);
-            if (settingsPopupRowCombo("##role_think", &thinkSel, kThinkLabels, 4)) {
+            if (settingsPopupRowCombo("##role_think", &thinkSel, kThinkLabels, 6)) {
                 RoleAssign next = a;
                 next.thinking = kThinkValues[thinkSel];
                 setRoleAssign(st, key, next);
@@ -3719,11 +3721,11 @@ static void drawModelRolesSection(AppState& st, float sc) {
                 if (std::strcmp(key, "default") == 0) {
                     ImGui::SetTooltip(
                         "Auto: chat classifier assigns effort per prompt.\n"
-                        "Low/Medium/High: force that level for Default-role calls.");
+                        "Low through Max: force that level when the model supports it.");
                 } else {
                     ImGui::SetTooltip(
                         "Auto: dispatcher assigns effort by task complexity.\n"
-                        "Low/Medium/High: force that level for this role's calls.");
+                        "Low through Max: force that level when the model supports it.");
                 }
             }
             if (ro) ImGui::EndDisabled();
@@ -6222,12 +6224,24 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 std::min(1280.0f * sc, maxW));
     const float winH = std::min(std::max(820.0f * sc, areaSize.y * 0.86f), maxH);
     if (s_settingsOpen) {
-        // Size tracks the band every frame (the dialog is NoResize), so a window/DPI change
-        // re-fits it; position centres in the band on open and is clamped back inside below.
+        // Begin() draws the title and background immediately. Moving the window AFTER Begin
+        // moves only its cursor (ImGui explicitly warns this smears content): on a resized
+        // browser viewport the title stayed put while the tabs jumped ~200px down. Clamp the
+        // saved position before Begin so decoration, tab row and hit boxes share one origin.
+        // The size tracks the band every frame; only correct position when it is outside it
+        // so normal dragging still works.
         ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Always);
-        ImGui::SetNextWindowPos(ImVec2((areaMin.x + areaMax.x) * 0.5f,
-                                       (areaMin.y + areaMax.y) * 0.5f),
-                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        const ImVec2 center((areaMin.x + areaMax.x) * 0.5f,
+                            (areaMin.y + areaMax.y) * 0.5f);
+        if (opening) {
+            ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        } else if (ImGuiWindow* saved = ImGui::FindWindowByName("Settings")) {
+            const ImVec2 clamped(
+                std::max(areaMin.x, std::min(saved->Pos.x, areaMax.x - winW)),
+                std::max(areaMin.y, std::min(saved->Pos.y, areaMax.y - winH)));
+            if (clamped.x != saved->Pos.x || clamped.y != saved->Pos.y)
+                ImGui::SetNextWindowPos(clamped, ImGuiCond_Always);
+        }
         // Opaque title strip — the global applyTheme sets TitleBg* to rgba(0,0,0,0) so floating
         // glass windows render transparently by default.  Override here so the Settings dialog
         // reads as a crisp native chrome dialog in both light and dark themes.
@@ -6254,16 +6268,7 @@ void drawSettingsModal(AppState& st, bool busy) {
         // widgets inside keep their normal frame borders.
         ImGui::PopStyleVar(2);    // FrameBorderSize, WindowBorderSize
         ImGui::PopStyleColor(3);  // TitleBg / TitleBgActive / TitleBgCollapsed
-        {
-            // Keep the title strip out of the chrome: a drag (or a band that shrank since the
-            // dialog opened) that leaves it past a band edge snaps it back inside.
-            const ImVec2 wp = ImGui::GetWindowPos();
-            const ImVec2 ws = ImGui::GetWindowSize();
-            const ImVec2 clamped(
-                std::max(areaMin.x, std::min(wp.x, areaMax.x - ws.x)),
-                std::max(areaMin.y, std::min(wp.y, areaMax.y - ws.y)));
-            if (clamped.x != wp.x || clamped.y != wp.y) ImGui::SetWindowPos(clamped);
-        }
+        // All placement is resolved above, before Begin paints the window decorations.
         if (settingsBegun) {
         // C22b: if a pending prompt role was requested, load prompts and jump to the Prompts tab.
         bool jumpToPrompts = false;
@@ -6336,6 +6341,10 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::BeginChild("##settabsarea", ImVec2(0, 0),
                           ImGuiChildFlags_None,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        // Keep every destination identifiable on a phone instead of letting ImGui
+        // squeeze four full labels to "Ap..." / "Ge..." / "Pr...". ### preserves
+        // tab IDs while the viewport crosses the compact-width threshold.
+        const bool compactTabs = ImGui::GetContentRegionAvail().x < 520.0f * sc;
         // Tab row inset: the window has zero horizontal padding (so tab bodies can reach the
         // right edge), so the row indents itself instead.
         ImGui::Indent(10.0f * sc);
@@ -6346,7 +6355,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             // stays a synced shortcut). The glass knobs edit Settings::glassCfg per group and
             // live-apply via ui::setGlassConfig + persist via saveSettings on every change —
             // so the persisted "appearance.glass" block is no longer a dead round-trip.
-            if (ImGui::BeginTabItem("Appearance", nullptr,
+            if (ImGui::BeginTabItem(compactTabs ? "Look###Appearance" : "Appearance", nullptr,
                                     (jumpToTab == 0) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
                 settingsTabBodyBegin("##tab_appearance");
@@ -8582,18 +8591,20 @@ void drawSettingsModal(AppState& st, bool busy) {
             }
 
 // ---- Providers tab: Chudcode two-pane provider manager -----------------------------
-            const char* providersTabLabel = s_omp.oauth.active
-                                                ? "Providers (sign-in active)###Providers"
-                                                : "Providers###Providers";
+            const char* providersTabLabel = compactTabs
+                ? (s_omp.oauth.active ? "Keys!###Providers" : "Keys###Providers")
+                : (s_omp.oauth.active ? "Providers (sign-in active)###Providers"
+                                      : "Providers###Providers");
             if (ImGui::BeginTabItem(providersTabLabel, nullptr,
                                     (jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
                 providerTabDrawn = true;
                 settingsTabBodyBegin("##tab_providers");
                 dimText(ui::webProviderKeysAvailable()
-                            ? "API providers and model routing. Keys are validated by the provider, "
-                              "then stored encrypted against your account on the server \xe2\x80\x94 "
-                              "never in this browser and never shared with another account."
+                            ? "Your own API keys stay private to your account and are stored "
+                              "encrypted on the server, never in this browser. Eligible trial-domain "
+                              "users may be sponsored by admin-linked Claude subscriptions; "
+                              "subscription credentials never reach their browsers."
                             : "API providers, sign-in, and model routing. Credentials are stored by "
                               "the auth bridge \xe2\x80\x94 never written to config.json.");
                 // Generation knobs (reasoning effort / max response tokens / model context
@@ -8654,8 +8665,9 @@ void drawSettingsModal(AppState& st, bool busy) {
             // Plain ASCII label: the tab strip is drawn with the UI font, and a glyph the
             // atlas has no cell for renders as '?' (scripts/gui_lint.py --rule glyph).
             {
-                const char* advLabel =
-                    st.settings.showAdvanced ? "Advanced: On" : "Advanced: Off";
+                const char* advLabel = compactTabs
+                    ? (st.settings.showAdvanced ? "Adv: On" : "Adv: Off")
+                    : (st.settings.showAdvanced ? "Advanced: On" : "Advanced: Off");
                 if (ImGui::TabItemButton(advLabel, ImGuiTabItemFlags_Trailing |
                                                        ImGuiTabItemFlags_NoTooltip)) {
                     st.settings.showAdvanced = !st.settings.showAdvanced;

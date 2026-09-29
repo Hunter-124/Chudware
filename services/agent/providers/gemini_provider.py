@@ -17,15 +17,16 @@ from pathlib import Path
 
 from .base import Provider
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.5-flash"
 _ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 
 def _thinking_budget(effort: str | None) -> int | None:
     """Map an effort string to a thinkingBudget, or None to let the model decide."""
     e = (effort or "").strip().lower()
-    return {"low": 1024, "medium": 8192, "med": 8192, "high": 24576,
-            "max": 24576, "off": 0, "none": 0}.get(e)
+    return {"minimal": 128, "off": 128, "none": 128,
+            "low": 1024, "medium": 8192, "med": 8192,
+            "high": 24576, "max": 24576, "xhigh": 24576}.get(e)
 
 
 class GeminiProvider(Provider):
@@ -57,9 +58,21 @@ class GeminiProvider(Provider):
             role = "model" if role in ("assistant", "model") else "user"
             contents.append({"role": role, "parts": [self._part(p) for p in m["content"]]})
         gen: dict = {"maxOutputTokens": max_tokens}
-        budget = _thinking_budget(self.reasoning_effort)
-        if budget is not None:
-            gen["thinkingConfig"] = {"thinkingBudget": budget}
+        if self.model.startswith("gemini-3"):
+            level = (self.reasoning_effort or "").strip().lower()
+            if level:
+                if level in ("off", "none", "minimal"):
+                    level = "minimal"
+                elif "pro" in self.model and level in ("medium", "med", "max", "xhigh"):
+                    level = "high"
+                elif level in ("max", "xhigh"):
+                    level = "high"
+                if level in ("minimal", "low", "medium", "high"):
+                    gen["thinkingConfig"] = {"thinkingLevel": level.upper()}
+        else:
+            budget = _thinking_budget(self.reasoning_effort)
+            if budget is not None:
+                gen["thinkingConfig"] = {"thinkingBudget": budget}
         body: dict = {"contents": contents, "generationConfig": gen}
         if system:
             body["system_instruction"] = {"parts": [{"text": system}]}

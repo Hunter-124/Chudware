@@ -1147,7 +1147,7 @@
     });
   })();
 
-  /* ---- AI subscription accounts: the shared Claude / ChatGPT sign-ins ---- */
+  /* ---- AI subscription accounts: admin-managed Claude and ChatGPT links ---- */
   (function initSubscriptionAccounts() {
     var flowHost = document.getElementById("sub-flow");
     var listEl = document.getElementById("sub-list");
@@ -1192,7 +1192,7 @@
 
     async function disconnect(account) {
       if (!window.confirm("Disconnect " + providerLabel(account.provider) +
-                          " from the shared pool?")) return;
+                          " from this admin account?")) return;
       setSubStatus("Disconnecting \u2026");
       await api(accountUrlFor(account.provider, account.account_key), { method: "DELETE" });
       setSubStatus(providerLabel(account.provider) + " disconnected.");
@@ -1202,7 +1202,7 @@
     function renderAccounts(accounts) {
       listEl.textContent = "";
       if (!accounts.length) {
-        listEl.innerHTML = "<p class='ac-dim'>No shared accounts connected yet.</p>";
+        listEl.innerHTML = "<p class='ac-dim'>No shared subscription links connected yet.</p>";
         return;
       }
       accounts.forEach(function (account) {

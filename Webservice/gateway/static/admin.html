@@ -792,7 +792,7 @@
         <div class="admin-card">
           <h2>AI subscription accounts</h2>
           <p class="card-note">
-            The shared Claude and ChatGPT sign-ins every managed turn can draw on.
+            Linked Claude accounts (including personal links on active admins) sponsor verified trial-domain users. ChatGPT links can be managed here but do not fund web AI turns: Codex OAuth cannot run in an isolated worker.
           </p>
           <div class="ac-actions sub-actions" id="sub-connect">
             <button type="button" class="btn ghost" data-provider="anthropic-sub">Connect Claude</button>
@@ -811,7 +811,7 @@
         <div class="admin-card">
           <h2>Trial domains</h2>
           <p class="card-note">
-            One verified email domain per line. These domains are eligible for trial access.
+            One email domain per line. Active users with a verified email or OAuth identity on these domains (including true subdomains) run Claude AI on active admins' linked Claude accounts, without a token-spend cap or pooled-credit charge. Trial expiry still applies.
           </p>
           <label for="trial-domains" class="ac-dim">Domains</label>
           <textarea id="trial-domains" spellcheck="false" placeholder="example.edu"></textarea>
@@ -894,13 +894,8 @@
     </div>
   </div>
 </div>
-<!-- admin.js goes to v=14: the release tables gained a format column, the
-     accounts table dropped two columns, and the host browser rows changed
-     shape — a browser holding v=13 would render against the old markup. This
-     query-string bump is the only cache-busting these unhashed admin assets
-     have; see the note in this file's header about the three separate
-     mechanisms in play across the app. -->
-<script src="/static/admin.js?v=14"></script>
+<!-- admin.js is unhashed; bump this version when its copy or behavior changes. -->
+<script src="/static/admin.js?v=15"></script>
 <!-- Loaded AFTER admin.js because each guards on a mount id that lives in the
      markup above, not on anything admin.js creates; the ordering is for
      determinism when reading the file, not a dependency. Both files are served

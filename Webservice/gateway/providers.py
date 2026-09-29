@@ -10,6 +10,12 @@ from __future__ import annotations
 import asyncio
 import os
 import logging
+import json
+import re
+import subprocess
+import threading
+import time
+from urllib.request import Request as UrlRequest, urlopen
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -44,24 +50,28 @@ _KEY_PROVIDERS: dict[str, str] = {
 # builtins / cloud presets so the web picker has something without probing live.
 _MODEL_PRESETS: dict[str, list[dict[str, str]]] = {
     "gemini": [
-        {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
-        {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
-        {"id": "gemini-2.0-flash", "label": "Gemini 2.0 Flash"},
+        {"id": "gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro Preview"},
+        {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash"},
     ],
     "anthropic": [
-        {"id": "claude-opus-4-8", "label": "Claude Opus 4.8"},
+        {"id": "claude-opus-5-5", "label": "Claude Opus 5.5"},
+        {"id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5"},
+        {"id": "claude-opus-5", "label": "Claude Opus 5"},
         {"id": "claude-sonnet-5", "label": "Claude Sonnet 5"},
         {"id": "claude-fable-5", "label": "Claude Fable 5"},
         {"id": "claude-haiku-4-5", "label": "Claude Haiku 4.5"},
     ],
     "anthropic-sub": [
-        {"id": "claude-opus-4-8", "label": "Claude Opus 4.8"},
+        {"id": "claude-opus-5-5", "label": "Claude Opus 5.5"},
+        {"id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5"},
+        {"id": "claude-opus-5", "label": "Claude Opus 5"},
         {"id": "claude-sonnet-5", "label": "Claude Sonnet 5"},
         {"id": "claude-fable-5", "label": "Claude Fable 5"},
         {"id": "claude-haiku-4-5", "label": "Claude Haiku 4.5"},
     ],
     "openai": [
-        {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"},
+        {"id": "gpt-6-sol", "label": "GPT-6 Sol"},
+        {"id": "gpt-6-luna", "label": "GPT-6 Luna"},
     ],
     "xai": [
         {"id": "grok-4.5", "label": "Grok 4.5 (default, 500k)"},
@@ -80,9 +90,7 @@ _MODEL_PRESETS: dict[str, list[dict[str, str]]] = {
     ],
 }
 
-# Only Claude's personal subscription bearer has a supported isolated
-# Chudcode injection path. Linked Codex is intentionally absent from this
-# picker until it can run without the operator's ambient login.
+# Only Claude OAuth has supported isolated Chudcode injection; Codex is absent.
 _SUB_LABELS = {"anthropic-sub": "Anthropic Claude (Pro/Max)"}
 
 # Secret-bearing keys that must never appear in a response payload.
@@ -92,6 +100,142 @@ _SECRET_KEYS = frozenset({
     "authorization", "bearer",
 })
 
+
+
+_CATALOG_TTL = 2 * 60 * 60
+_catalog_lock = threading.Lock()
+_catalog_next_refresh = 0.0
+_catalog_rows: dict[str, list[dict[str, str]]] = {}
+
+
+def _version_key(model: str) -> tuple[int, int, int, int, str]:
+    if model.startswith("claude-"):
+        family = 0 if model.startswith("claude-opus-") else 1
+    elif model.startswith("gemini-"):
+        family = 0 if "-pro" in model else 1
+    elif model.startswith("gpt-"):
+        family = 0
+    else:
+        family = 2
+    version = re.search(r"(\d+)(?:[.-](\d+))?", model)
+    subtype = (0 if model.endswith("-sol") else
+               1 if model.endswith("-luna") else 2 if model.endswith("-astra") else 3)
+    return (family, -int(version[1]) if version else 0,
+            -int(version[2] or 0) if version else 0, subtype, model)
+
+
+_PUBLIC_CHAT_FAMILIES = {
+    "anthropic": re.compile(r"claude-(?:opus|sonnet|haiku|fable|mythos)-\d+(?:-\d+)*(?:-preview)?$"),
+    "google": re.compile(r"gemini-\d+(?:\.\d+)?-(?:pro|flash)(?:-[a-z0-9.-]+)?$"),
+    "openai": re.compile(r"(?:gpt-\d+(?:\.\d+)?(?:-[a-z0-9.-]+)?|o[1-9]\d*(?:-[a-z0-9.-]+)?)$"),
+    "xai": re.compile(r"grok-(?:\d|build-)[a-z0-9.-]*$"),
+}
+_NON_CHAT_SLUG = re.compile(
+    r"(?:^|[-_/])(?:image|images|live|audio|tts|embedding|embeddings|"
+    r"speech|transcrib[a-z]*|whisper|moderation|dall-e|sora|video|realtime)"
+    r"(?:$|[-_.:/])"
+)
+
+
+def _chat_model_id(model_id: str) -> bool:
+    return bool(model_id) and len(model_id) <= 96 and not _NON_CHAT_SLUG.search(model_id.lower())
+
+
+def _public_chat_model(provider: str, model_id: str, detail: dict[str, Any]) -> bool:
+    """Public discovery only supplements known Chudcode chat families."""
+    family = _PUBLIC_CHAT_FAMILIES.get(provider)
+    if family is None or family.fullmatch(model_id) is None or not _chat_model_id(model_id):
+        return False
+    if "tool_call" in detail and detail["tool_call"] is not True:
+        return False
+    modalities = detail.get("modalities")
+    if "modalities" in detail and not isinstance(modalities, dict):
+        return False
+    if modalities is not None and "output" in modalities:
+        output = modalities["output"]
+        if not isinstance(output, list) or "text" not in output:
+            return False
+    return True
+
+
+def _live_catalog_rows(cli: dict[str, Any], public: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
+    """Use Chudcode discovery; supplement providers not signed in on the shared
+    host with the public models.dev catalog Chudcode itself refreshes from."""
+    by_provider: dict[str, dict[str, str]] = {p: {} for p in _KEY_PROVIDERS}
+    for provider, block in public.items():
+        key = "gemini" if provider == "google" else provider
+        if key not in by_provider or not isinstance(block, dict):
+            continue
+        models = block.get("models")
+        if not isinstance(models, dict):
+            continue
+        for mid, detail in models.items():
+            if (isinstance(mid, str) and isinstance(detail, dict)
+                    and not detail.get("deprecated")
+                    and _public_chat_model(provider, mid, detail)):
+                by_provider[key][mid] = str(detail.get("name") or mid)
+    for row in cli.get("models", []):
+        if not isinstance(row, dict):
+            continue
+        provider = "gemini" if row.get("provider") == "google" else row.get("provider")
+        mid = row.get("id")
+        if provider in by_provider and isinstance(mid, str) and _chat_model_id(mid):
+            by_provider[provider][mid] = str(row.get("name") or mid)
+    result: dict[str, list[dict[str, str]]] = {}
+    for provider, models in by_provider.items():
+        visible = (mid for mid in models if _chat_model_id(mid))
+        rows = [{"id": mid, "label": models[mid][:128]}
+                for mid in sorted(visible, key=_version_key)[:80]]
+        if rows:
+            result[provider] = rows
+    if "anthropic" in result:
+        result["anthropic-sub"] = result["anthropic"]
+    return result
+
+
+def _refresh_live_catalog() -> None:
+    global _catalog_rows
+    try:
+        binary = os.environ.get("CHUDWARE_CHUDCODE_BIN", "chud")
+        proc = subprocess.run([binary, "models", "--json"], capture_output=True,
+                              text=True, timeout=8, check=True)
+        cli = json.loads(proc.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        log.info("Chudcode model catalog unavailable: %s", type(exc).__name__)
+        cli = {}
+    try:
+        request = UrlRequest("https://models.dev/api.json",
+                             headers={"User-Agent": "chudware-web-catalog/1"})
+        with urlopen(request, timeout=8) as response:
+            public = json.loads(response.read(24_000_001).decode("utf-8"))
+        if not isinstance(public, dict):
+            public = {}
+    except (OSError, ValueError) as exc:
+        log.info("Public model catalog unavailable: %s", type(exc).__name__)
+        public = {}
+    rows = _live_catalog_rows(cli, public)
+    if rows:
+        _catalog_rows = rows
+
+
+def _presets(provider: str) -> list[dict[str, str]]:
+    """Never wait for network/process discovery in a /api/providers request."""
+    global _catalog_next_refresh
+    now = time.monotonic()
+    if now >= _catalog_next_refresh and _catalog_lock.acquire(blocking=False):
+        try:
+            if now >= _catalog_next_refresh:
+                _catalog_next_refresh = now + _CATALOG_TTL
+                threading.Thread(target=_refresh_live_catalog, daemon=True,
+                                 name="web-model-catalog").start()
+        finally:
+            _catalog_lock.release()
+    return list(_catalog_rows.get(provider) or _MODEL_PRESETS.get(provider, []))
+
+def default_model_for(provider: str) -> str | None:
+    """Current catalog default with a static offline fallback."""
+    rows = _presets(provider)
+    return rows[0]["id"] if rows else None
 
 
 def _account_subscriptions(email: str) -> dict[str, dict[str, Any]]:
@@ -145,19 +289,19 @@ def list_available_providers(*, email: str | None = None) -> dict[str, Any]:
         entries.append({
             "id": provider, "name": provider,
             "label": _KEY_PROVIDERS[provider], "auth": "api_key",
-            "models": list(_MODEL_PRESETS.get(provider, [])),
+            "models": _presets(provider),
         })
 
-    # Only personal Claude OAuth can be injected into an isolated Chudcode
-    # process. A linked Codex bearer and every host/operator OAuth account are
-    # deliberately absent: those turns refuse rather than use ambient auth.
-    for wire in _account_subscriptions(normalized):
+    # Linked Codex OAuth cannot be isolated. Admin Claude links are advertised
+    # only to active verified trial-domain accounts by the resolver.
+    for wire, grant in _account_subscriptions(normalized).items():
         if wire in seen:
             continue
         seen.add(wire)
         entries.append({
-            "id": wire, "name": wire, "label": _SUB_LABELS[wire],
-            "auth": "subscription", "models": list(_MODEL_PRESETS[wire]),
+            "id": wire, "name": wire,
+            "label": "Claude (sponsored)" if grant.get("sponsored") else _SUB_LABELS[wire],
+            "auth": "subscription", "models": _presets(wire),
         })
 
     try:
@@ -171,7 +315,7 @@ def list_available_providers(*, email: str | None = None) -> dict[str, Any]:
     if pool_granted and pool_key and pool_provider in _KEY_PROVIDERS and pool_provider not in seen:
         models = (
             [{"id": pool_model, "label": pool_model}]
-            if pool_model else list(_MODEL_PRESETS.get(pool_provider, []))
+            if pool_model else _presets(pool_provider)
         )
         entries.append({
             "id": pool_provider, "name": pool_provider,

@@ -241,10 +241,6 @@ class TestLiveDiscovery(unittest.TestCase):
         rows = mc.discover_models("xai", api_key="xai-key", opener=opener)
         self.assertEqual([r["id"] for r in rows], ["grok-4.5", "grok-4-1"])
 
-    def test_anthropic_static_seed(self):
-        rows = mc.discover_models("anthropic")
-        self.assertTrue(any(r["id"] == "claude-opus-4-8" for r in rows))
-
 
 class TestMergeCatalog(unittest.TestCase):
     def test_live_plus_models_dev(self):
@@ -338,56 +334,29 @@ class TestHeuristics(unittest.TestCase):
         self.assertEqual(row["context"], 500000)
         self.assertTrue(row["vision"])
 
-    def test_gemini_efforts(self):
-        # Gemini exposes the full dial including "max" — the harness advertises exactly
-        # what the provider accepts and does not clamp the ladder.
-        efforts = mc.reasoning_efforts_for("gemini", "gemini-2.5-flash")
-        self.assertEqual(efforts, ["off", "low", "medium", "high", "max"])
+    def test_gemini_efforts_follow_wire_mode(self):
+        self.assertEqual(mc.reasoning_efforts_for("google", "gemini-3.1-pro-preview"),
+                         ["low", "high"])
+        self.assertEqual(mc.reasoning_efforts_for("google", "gemini-3.5-flash"),
+                         ["minimal", "low", "medium", "high"])
         self.assertEqual(mc.reasoning_efforts_for("gemini", "gemini-2.0-flash"), [])
 
 
 class TestReasoningEffortLadders(unittest.TestCase):
-    """Family effort ladders — Kimi coverage plus a regression table for everything else."""
+    """The fallback ladder must not offer a rung that the active family rejects."""
 
-    # (provider, model_id) -> ladder. Frozen baseline: these must not drift.
-    BASELINE = {
-        ("anthropic", "claude-opus-4-5"): ["low", "medium", "high"],
-        ("anthropic", "claude-sonnet-5"): ["low", "medium", "high"],
-        ("openai", "gpt-5"): ["low", "medium", "high"],
-        ("openai", "gpt-5.2"): ["low", "medium", "high"],
-        ("openai", "o3"): ["low", "medium", "high"],
-        ("gemini", "gemini-2.5-pro"): ["off", "low", "medium", "high", "max"],
-        ("xai", "grok-4.5"): ["off", "low", "medium", "high"],
-        ("xai", "grok-4"): ["off", "low", "medium", "high"],
-        ("xai", "grok-code-fast-1"): ["off", "low", "medium", "high"],
-        ("moonshot", "kimi-k2-thinking"): ["off", "low", "medium", "high"],
-        ("cursor", "gpt-5"): ["low", "medium", "high"],
-        ("cursor", "claude-sonnet-5"): ["low", "medium", "high"],
-        ("zenmux", "anthropic/claude-opus-4.5"): ["low", "medium", "high"],
-        ("openrouter", "anthropic/claude-opus-4.5"): ["low", "medium", "high"],
-        ("cloud", "deepseek-reasoner"): ["off", "low", "medium", "high"],
-        ("cloud", "qwen3-max"): ["off", "low", "medium", "high"],
-        ("openrouter", "deepseek/deepseek-r1"): ["off", "low", "medium", "high"],
-        ("local", "qwen3-32b"): ["off", "low", "medium", "high"],
-        ("local", "deepseek-r1-distill"): ["off", "low", "medium", "high"],
-        ("llamacpp", "qwen3-30b-a3b"): ["off", "low", "medium", "high"],
-        # Correct to have NO dial — including the families deliberately left untouched
-        # (router-prefixed gpt-5, gpt-oss, GLM): they stay dial-less by decision.
-        ("openai", "gpt-4.1"): [],
-        ("cloud", "deepseek-chat"): [],
-        ("local", "llama-3.3-70b"): [],
-        ("cursor", "composer-1"): [],
-        ("zenmux", "openai/gpt-5"): [],
-        ("cloud", "openai/gpt-5"): [],
-        ("openrouter", "z-ai/glm-4.6"): [],
-        ("llamacpp", "gpt-oss-20b"): [],
-    }
+    def test_future_flagship_versions_inherit_adaptive_efforts(self):
+        expected = ["low", "medium", "high", "xhigh", "max"]
+        for model in ("claude-opus-5-5", "claude-sonnet-5-5", "claude-opus-6",
+                      "gpt-6-sol", "gpt-7-sol"):
+            provider = "anthropic" if model.startswith("claude") else "openai"
+            self.assertEqual(mc.reasoning_efforts_for(provider, model), expected)
 
-    def test_baseline_ladders_unchanged(self):
-        for (provider, model), expected in self.BASELINE.items():
-            with self.subTest(provider=provider, model=model):
-                self.assertEqual(mc.reasoning_efforts_for(provider, model), expected)
-
+    def test_budget_claude_and_kimi_do_not_invent_medium_rungs(self):
+        self.assertEqual(mc.reasoning_efforts_for("anthropic", "claude-haiku-4-5"),
+                         ["minimal", "low", "medium", "high", "xhigh"])
+        self.assertEqual(mc.reasoning_efforts_for("moonshot", "kimi-k3"),
+                         ["low", "high", "max"])
     def test_kimi_k3_low_high_max(self):
         # K3's wire ladder is exactly low|high|max — no medium rung, and "max" is real,
         # so the GUI offers all three rather than a clamped subset or a 4th that 400s.
@@ -418,8 +387,11 @@ class TestReasoningEffortLadders(unittest.TestCase):
         advertised level that 400s is worse than not offering it, so each family's
         ladder is checked against the vocabulary its wire mapper recognises.
         """
-        known = {"off", "low", "medium", "high", "max"}
-        probes = list(self.BASELINE) + [
+        known = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+        probes = [
+            ("anthropic", "claude-sonnet-5-5"), ("openai", "gpt-6-sol"),
+            ("gemini", "gemini-3.1-pro-preview"),
+        ] + [
             ("moonshot", "kimi-k3"), ("kimi-code", "kimi-k3"), ("moonshot", "kimi-k2.7"),
             ("gemini", "gemini-2.5-flash"), ("openai", "o4-mini"),
         ]

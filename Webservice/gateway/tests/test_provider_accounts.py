@@ -47,6 +47,28 @@ def _seed(email: str, *, plan: str = "studio", ai_grant: bool = True) -> None:
             (plan, ai_grant, email),
         )
 
+def _verified(email: str, *, via_oauth: bool = False) -> None:
+    with db.tx() as cur:
+        if via_oauth:
+            cur.execute(
+                "INSERT INTO oauth_identities(provider, subject, email) VALUES ('google', %s, %s)",
+                (f"test-{email}", email),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO credentials(email, password_hash, email_verified) VALUES (%s, 'unused', TRUE)",
+                (email,),
+            )
+
+
+def _trial_domain(domain: str = "example.com") -> None:
+    with db.tx() as cur:
+        cur.execute(
+            "INSERT INTO trial_domains(domain, trial_days, ai_credits) VALUES (%s, 14, 0)",
+            (domain,),
+        )
+
+
 
 def _client_for(email: str, role: str = "user") -> TestClient:
     app = FastAPI()
@@ -429,12 +451,14 @@ def test_only_an_admin_can_connect_or_see_a_shared_account(vendor: VendorStub) -
     assert user_view["accounts"] == []
 
 
-def test_customer_without_personal_grant_uses_dedicated_pool_not_operator_oauth(
+def test_nontrial_customer_never_gets_admin_claude_link(
     vendor: VendorStub, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _seed(A)
     _seed(OPERATOR)
+    accounts.set_role(OPERATOR, "admin")
     _connect_claude(OPERATOR, role="admin", scope="shared")
+    _verified(A)
     monkeypatch.setenv("CHUDWARE_WEB_POOL_API_KEY", "dedicated-pool-key")
 
     assert provider_accounts.resolve_subscription_token(A, "anthropic") is None
@@ -445,15 +469,105 @@ def test_customer_without_personal_grant_uses_dedicated_pool_not_operator_oauth(
     assert actor["_pool"] == {"provider": "openrouter", "api_key": "dedicated-pool-key"}
 
 
-def test_a_personal_link_wins_over_the_shared_pool(vendor: VendorStub) -> None:
+def test_trial_customer_gets_admin_claude_but_not_lookalike_or_unverified(
+    vendor: VendorStub,
+) -> None:
+    _seed(OPERATOR)
+    accounts.set_role(OPERATOR, "admin")
+    _connect_claude(OPERATOR, role="admin", scope="shared")
+    _trial_domain()
+    eligible = "learner@dept.example.com"
+    lookalike = "learner@notexample.com"
+    pending = "pending@example.com"
+    for email in (eligible, lookalike, pending):
+        _seed(email)
+        _verified(email, via_oauth=email == eligible)
+    unverified = "unverified@example.com"
+    _seed(unverified)
+    accounts.set_status(pending, "pending", decided_by="test")
+
+    grant = provider_accounts.resolve_subscription_token(eligible, "anthropic")
+    assert grant is not None
+    assert grant["owner_email"] == OPERATOR
+    assert grant["sponsored"] is True
+    assert grant["scope"] == "shared"
+    for email in (lookalike, pending, unverified):
+        assert provider_accounts.resolve_subscription_token(email, "anthropic") is None
+    with db.tx() as cur:
+        cur.execute(
+            "UPDATE trial_domains SET expires_at = now() - interval '1 day'"
+        )
+    assert provider_accounts.resolve_subscription_token(eligible, "anthropic") is None
+
+
+def test_own_personal_link_wins_over_trial_sponsor(vendor: VendorStub) -> None:
     _seed(A)
     _seed(OPERATOR)
+    accounts.set_role(OPERATOR, "admin")
+    _verified(A)
+    _trial_domain()
     _connect_claude(OPERATOR, role="admin", scope="shared")
     _connect_claude(A)
 
     grant = provider_accounts.resolve_subscription_token(A, "anthropic")
     assert grant is not None
     assert grant["scope"] == "personal"
+    assert grant["owner_email"] == A
+    assert grant["sponsored"] is False
+    overridden = provider_accounts.resolve_subscription_token(
+        A, "anthropic", trial_provider_override=True
+    )
+    assert overridden["owner_email"] == A
+    unverified_own = "other@outside.net"
+    _seed(unverified_own)
+    _connect_claude(unverified_own)
+    assert provider_accounts.resolve_subscription_token(
+        unverified_own, "anthropic", trial_provider_override=True
+    ) is None
+
+def test_sponsor_links_rotate_and_only_active_admins_qualify(vendor: VendorStub) -> None:
+    student = "student@example.com"
+    second_admin = "second-admin@elsewhere.net"
+    _seed(student)
+    _verified(student)
+    _trial_domain()
+    for admin in (OPERATOR, second_admin):
+        _seed(admin)
+        accounts.set_role(admin, "admin")
+    _connect_claude(OPERATOR, role="admin", scope="shared")
+    provider_accounts._persist_account(
+        second_admin, "anthropic-sub", "personal",
+        {
+            "account_key": "second-claude",
+            "label": "second",
+            "plan": "Max",
+            "tokens": {
+                "access_token": "second-access",
+                "refresh_token": "second-refresh",
+                "expires_at_ms": 4_000_000_000_000,
+            },
+        },
+    )
+    first = provider_accounts.resolve_subscription_token(student, "anthropic")
+    second = provider_accounts.resolve_subscription_token(student, "anthropic")
+    assert first is not None and second is not None
+    assert {first["owner_email"], second["owner_email"]} == {OPERATOR, second_admin}
+    accounts.set_status(second_admin, "suspended", decided_by="test")
+    assert provider_accounts.resolve_subscription_token(student, "anthropic")["owner_email"] == OPERATOR
+
+
+def test_sponsor_refresh_uses_admin_owner_aad(vendor: VendorStub) -> None:
+    _seed(A)
+    _verified(A)
+    _trial_domain()
+    _seed(OPERATOR)
+    accounts.set_role(OPERATOR, "admin")
+    _connect_claude(OPERATOR, role="admin", scope="shared")
+    _expire_stored_token(OPERATOR)
+    grant = provider_accounts.resolve_subscription_token(A, "anthropic")
+    assert grant is not None
+    assert grant["owner_email"] == OPERATOR
+    assert grant["access_token"] == f"{CLAUDE_ACCESS}-refreshed-1"
 
 
 def test_an_unrelated_provider_never_resolves(vendor: VendorStub) -> None:
@@ -673,6 +787,23 @@ def test_a_validated_api_key_still_outranks_a_subscription(
     assert injected["key_source"] == "byok"
     assert params["api_key"] == "sk-explicit-choice"
     assert "_subscription" not in injected
+
+
+def test_byok_beats_trial_domain_sponsor(vendor: VendorStub, monkeypatch: pytest.MonkeyPatch) -> None:
+    _seed(A)
+    _verified(A)
+    _trial_domain()
+    _seed(OPERATOR)
+    accounts.set_role(OPERATOR, "admin")
+    _connect_claude(OPERATOR, role="admin", scope="shared")
+    monkeypatch.setattr(
+        engine_bridge, "resolve_validated_key", lambda _email, _provider: "own-api-key"
+    )
+
+    params = _sanitized_params(A, _turn_line("anthropic"))
+    assert params["api_key"] == "own-api-key"
+    assert params["options"]["_chudware_actor"]["key_source"] == "byok"
+    assert "_subscription" not in params["options"]["_chudware_actor"]
 
 
 def test_no_link_leaves_the_metered_pool_untouched(vendor: VendorStub) -> None:

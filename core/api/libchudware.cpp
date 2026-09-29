@@ -1445,7 +1445,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 else if (has("1.5-flash") || has("2.0") || has("2.5") || has("flash") || has("gemini"))
                     context = 1048576;
                 else if (has("claude") || has("opus") || has("sonnet") || has("haiku"))
-                    context = 200000;
+                    context = (has("opus-5") || has("sonnet-5")) ? 1000000 : 200000;
                 else if (has("gpt-4.1")) context = 1047576;
                 else if (has("o1") || has("o3") || has("o4") || has("reasoner") || has("r1"))
                     context = 200000;
@@ -1465,18 +1465,28 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     vision = true;
 
                 if (provider == "gemini" || has("gemini")) {
-                    if (!(has("2.0") && has("flash")))
-                        efforts = json::array({"off", "low", "medium", "high", "max"});
+                    if (!(has("2.0") && has("flash"))) {
+                        if (has("3.1-pro"))
+                            efforts = json::array({"low", "high"});
+                        else efforts = json::array({"minimal", "low", "medium", "high"});
+                    }
                 } else if (provider == "anthropic" || has("claude")) {
-                    efforts = json::array({"low", "medium", "high"});
+                    if (has("-4-5"))
+                        efforts = json::array({"minimal", "low", "medium", "high", "xhigh"});
+                    else if (has("sonnet-4-6"))
+                        efforts = json::array({"low", "medium", "high"});
+                    else if (has("-4-6"))
+                        efforts = json::array({"low", "medium", "high", "max"});
+                    else efforts = json::array({"low", "medium", "high", "xhigh", "max"});
                 } else if (provider == "xai" || has("grok")) {
                     if (!has("build") && !has("non-reasoning"))
                         efforts = json::array({"off", "low", "medium", "high"});
-                } else if (has("o1") || has("o3") || has("o4") || has("gpt-5") || has("reason") ||
-                           has("r1") || has("think") || has("qwen3")) {
+                } else if (has("gpt-6") || has("gpt-7") || has("gpt-5.6")) {
+                    efforts = json::array({"low", "medium", "high", "xhigh", "max"});
+                } else if (has("o1") || has("o3") || has("o4") || has("gpt-5")) {
+                    efforts = json::array({"low", "medium", "high"});
+                } else if (has("reason") || has("r1") || has("think") || has("qwen3")) {
                     efforts = json::array({"off", "low", "medium", "high"});
-                    if (has("o1") || has("o3") || has("o4") || has("gpt-5"))
-                        efforts = json::array({"low", "medium", "high"});
                 }
                 return json{{"context", context},
                             {"max_output", 0},
@@ -1687,13 +1697,12 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 }
                 if (models.empty()) {
                     static const std::pair<const char*, const char*> kStatic[] = {
+                        {"claude-opus-5-5", "Claude Opus 5.5"},
+                        {"claude-sonnet-5-5", "Claude Sonnet 5.5"},
                         {"claude-opus-5", "Claude Opus 5"},
                         {"claude-sonnet-5", "Claude Sonnet 5"},
                         {"claude-fable-5", "Claude Fable 5"},
-                        {"claude-opus-4-8", "Claude Opus 4.8"},
-                        {"claude-opus-4-7", "Claude Opus 4.7"},
-                        {"claude-sonnet-4-6", "Claude Sonnet 4.6"},
-                        {"claude-opus-4-6", "Claude Opus 4.6"},
+                        {"claude-mythos-5", "Claude Mythos 5"},
                         {"claude-haiku-4-5", "Claude Haiku 4.5"}};
                     for (const auto& sm : kStatic) {
                         json meta = heuristic_meta(sm.first);

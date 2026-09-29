@@ -102,6 +102,21 @@ class TestRankingsMerge:
         assert "qwen3-4b" in ranks
         assert ranks["qwen3-4b"].rank == 1
 
+    def test_unseen_live_family_alias_inherits_rank_but_user_override_wins(self):
+        future = "claude-opus-6-2"
+        assert rm._rank_for(future, rm.load_rankings(include_measured=False)).rank == 5
+        override = rm.load_rankings(
+            {"model_rankings": {future: {"rank": 2}}}, include_measured=False
+        )
+        assert rm._rank_for(future, override).rank == 2
+        chosen = rm.auto_pick_model(
+            min_rank=5,
+            enabled=[{"provider": "anthropic", "model": future},
+                     {"provider": "llamacpp", "model": "local"}],
+            rankings=rm.load_rankings(include_measured=False),
+        )
+        assert chosen.model == future
+
     def test_user_overrides_shipped(self, tmp_path):
         shipped = tmp_path / "rankings.yaml"
         shipped.write_text(yaml.safe_dump({

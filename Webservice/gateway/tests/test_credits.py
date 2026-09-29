@@ -341,6 +341,17 @@ def test_cancelled_stream_still_debits_usage_already_reported():
     assert _balance() == 97
 
 
+def test_native_claude_charge_uses_published_rate_not_unrelated_catalog_maximum():
+    _account(balance=100)
+    _rates(("vendor/expensive", "0.000100", "0.000200"))
+    charged = credits.record_spend(
+        credits.actor_for("buyer@example.com"),
+        model="claude-opus-5-5", prompt_tokens=1_000, completion_tokens=1_000,
+    )
+    assert charged == 24
+    assert _balance() == 76
+
+
 def test_unknown_model_uses_most_expensive_cached_rates():
     _account(balance=100)
     _rates(

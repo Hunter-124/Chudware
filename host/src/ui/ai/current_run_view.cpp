@@ -669,7 +669,9 @@ static void drawInspector(AppState& st) {
         std::snprintf(cs.modelBuf, sizeof(cs.modelBuf), "%s", cs.cur.modelOverride.c_str());
         cs.effortIdx = cs.cur.effortOverride == "low" ? 1 :
                        cs.cur.effortOverride == "medium" ? 2 :
-                       cs.cur.effortOverride == "high" ? 3 : 0;
+                       cs.cur.effortOverride == "high" ? 3 :
+                       cs.cur.effortOverride == "xhigh" ? 4 :
+                       cs.cur.effortOverride == "max" ? 5 : 0;
         cs.runtimeSeeded = true;
     }
     kit::chip(cs.cur.status.empty() ? "unknown" : cs.cur.status.c_str(),
@@ -746,7 +748,7 @@ static void drawInspector(AppState& st) {
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.50f);
         ImGui::InputTextWithHint("##agent_model", "Model override", cs.modelBuf, sizeof(cs.modelBuf));
         ImGui::SameLine();
-        static const char* efforts[] = {"Default", "low", "medium", "high"};
+        static const char* efforts[] = {"Default", "low", "medium", "high", "xhigh", "max"};
         ImGui::SetNextItemWidth(ui::metrics::px(94.0f));
         ImGui::Combo("##agent_effort", &cs.effortIdx, efforts, IM_ARRAYSIZE(efforts));
         ImGui::SameLine();

@@ -4544,19 +4544,24 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       if (s_wasmFrames == 3)
         wasmBootReady();
     }
-    // Self-healing canvas sync: the drawing buffer MUST equal the ACTUAL
-    // displayed CSS size, or the canvas is stretched. In element-fullscreen the
-    // UA `:fullscreen{width:100% !important}` rule (important user-agent —
-    // outranks the port's important-author inline width) stretches the canvas
-    // ELEMENT to fill the screen; if the GLFW logical size lagged at the
-    // windowed value the backing store stays small and is upscaled to the
-    // screen — the "zoomed / wrong-resolution / squished" fullscreen bug. Force
-    // the GLFW logical size to the real rendered CSS size each frame:
-    // glfwSetWindowSize -> setCanvasSize resizes the backing (bypasses the
-    // resize() fullscreen guard), so backing == display in every state. No-op
-    // in windowed mode (the port already keeps them equal); a 1px deadband
-    // prevents sub-pixel resize thrash; self-heals ESC exits and any
-    // resize-event timing race.
+    // The GLFW port normally refreshes its content scale through a resolution
+    // media-query event. Browser zoom / moving between monitors usually fires it,
+    // but some Chromium device-scale changes do not. A CSS-size-only check below
+    // then leaves the old DPR backing store in place indefinitely: canvas CSS
+    // pixels, GLFW framebuffer metrics and ImGui draw coordinates diverge.
+    // Reuse the port's scale-change path (which updates all three) rather than
+    // setting canvas.width ourselves and leaving GLFW's framebuffer size stale.
+    const double browserDpr = emscripten_get_device_pixel_ratio();
+    float glfwDpr = 1.0f, glfwDprY = 1.0f;
+    glfwGetWindowContentScale(win, &glfwDpr, &glfwDprY);
+    if (std::isfinite(browserDpr) && browserDpr > 0.0 &&
+        std::fabs(browserDpr - glfwDpr) > 0.01) {
+      EM_ASM({ GLFW3.onScaleChange(); });
+    }
+    // Self-healing CSS-size sync: fullscreen and visualViewport changes can
+    // resize the displayed canvas without changing the GLFW logical size.
+    // The port's setCanvasSize supplies the DPR-scaled backing store.
+    // A 1px deadband avoids subpixel resize thrash.
     {
       double cssW = 0.0, cssH = 0.0;
       if (emscripten_get_element_css_size("#canvas", &cssW, &cssH) ==

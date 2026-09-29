@@ -231,6 +231,47 @@ _CHUDCODE_PROVIDER_ALIASES: dict[str, str] = {
 _MAX_MODEL_HINTS = 6
 
 
+_EFFORT_ORDER = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def _catalog_effort(client: Any, provider: str | None, model: str | None,
+                    requested: str) -> str | None:
+    """Clamp an inherited or explicit effort to the selected catalog model's ladder.
+
+    No matching row means the catalog is unavailable: leave the user's value
+    untouched. A matching empty ladder means no thinking dial, so send nothing.
+    """
+    if not provider or not model:
+        return requested
+    try:
+        rows = client.get_available_models()
+    except Exception:  # noqa: BLE001 - optional catalog read, not a turn failure
+        return requested
+    for row in rows:
+        value = row if isinstance(row, Mapping) else {
+            key: getattr(row, key, None) for key in
+            ("provider", "id", "thinking", "reasoningEfforts")
+        }
+        if value.get("provider") != provider or value.get("id") != model:
+            continue
+        thinking = value.get("thinking")
+        efforts = (thinking.get("efforts") if isinstance(thinking, Mapping)
+                   else thinking if isinstance(thinking, list) else
+                   value.get("reasoningEfforts"))
+        if not isinstance(efforts, list):
+            return requested
+        ladder = [v for v in efforts if isinstance(v, str)]
+        if not ladder:
+            return None
+        if requested in ladder:
+            return requested
+        index = _EFFORT_ORDER.index(requested) if requested in _EFFORT_ORDER else 4
+        return min(ladder, key=lambda v: (abs(
+            (_EFFORT_ORDER.index(v) if v in _EFFORT_ORDER else 4) - index),
+            -(_EFFORT_ORDER.index(v) if v in _EFFORT_ORDER else 4)))
+    return requested
+
+
 def _describe_model_rejection(client: Any, provider: str, model: str, exc: Exception) -> str:
     """Turn a bare ``set_model`` refusal into the user's next move.
 
@@ -1480,11 +1521,15 @@ class ChudcodeSessionHost:
                 raise RuntimeError(
                     _describe_model_rejection(client, provider, model, exc)
                 ) from exc
-        thinking = _nonempty_string(settings.get("thinking")) or _nonempty_string(
-            settings.get("reasoning_effort")
-        )
+        # The composer is a per-turn user choice; stale role/Auto `thinking` must
+        # never override it. Only clamp against a matching live catalog ladder.
+        thinking = (_nonempty_string(params.get("reasoning_effort")) or
+                    _nonempty_string(settings.get("reasoning_effort")) or
+                    _nonempty_string(settings.get("thinking")))
         if thinking and thinking != "auto":
-            client.set_thinking_level(thinking)
+            thinking = _catalog_effort(client, provider, model, thinking)
+            if thinking:
+                client.set_thinking_level(thinking)
         steering = _nonempty_string(settings.get("steering_mode"))
         if steering:
             client.set_steering_mode(steering)

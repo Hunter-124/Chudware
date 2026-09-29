@@ -28,10 +28,8 @@ DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback"
 DEVICE_AUTH_URL = "https://auth.openai.com/codex/device"
 PROVIDER_ID = "openai-codex"
 ORIGINATOR = "chudware"
-# NOTE: verify the valid model id for chatgpt.com/backend-api/responses on first live
-# call — the Codex backend expects codex/o-series ids, not necessarily "gpt-4o". Override
-# via config.json "model".
-DEFAULT_MODEL = "gpt-5-codex"
+# Codex subscription models come from the Chudcode catalog for online turns.
+DEFAULT_MODEL = "gpt-6-sol"
 
 # Raised when an injected (caller-owned) bearer is refused: this process holds no
 # refresh token for it and must never write one, so the connection has to be

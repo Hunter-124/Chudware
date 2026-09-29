@@ -81,6 +81,7 @@ def test_portal_has_ordinary_csp_and_hashed_assets_are_immutable(pg, monkeypatch
     assert "worker-src" not in portal_csp
     assert "cross-origin-embedder-policy" not in page.headers
     assert page.headers["cache-control"] == "no-cache"
+    assert page.headers["vary"].lower() == "accept-encoding"
 
     # Derived from the page, not hardcoded: the filename embeds a content hash,
     # so any edit to the portal script renames it. Pinning the literal name made
@@ -97,6 +98,7 @@ def test_portal_has_ordinary_csp_and_hashed_assets_are_immutable(pg, monkeypatch
     assert asset.headers["cache-control"] == "public, max-age=31536000, immutable"
     assert asset.headers["content-type"].startswith("application/javascript")
     assert hashlib.sha256(asset.content).hexdigest().startswith(digest)
+    assert asset.headers["vary"].lower() == "accept-encoding"
 
 
 def test_every_portal_asset_reference_is_hashed_served_and_digest_true(pg, monkeypatch):

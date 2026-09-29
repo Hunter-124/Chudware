@@ -23,7 +23,7 @@ from .base import Provider
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gpt-5-codex"
+DEFAULT_MODEL = "gpt-6-sol"
 DEFAULT_BINARY = "codex"
 DEFAULT_TIMEOUT_S = 300.0
 MISSING_CLI_MSG = (

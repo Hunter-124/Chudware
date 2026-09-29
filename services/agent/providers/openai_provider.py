@@ -98,7 +98,10 @@ def wire_reasoning_effort(name: str, model: str, base_url: str | None,
     if "aliyuncs" in b or "dashscope" in b:  # Qwen (DashScope): hybrid thinking bool, no level
         return {"extra_body": {"enable_thinking": True}}
     if "openai.com" in b:
-        return {"reasoning_effort": lmh()} if m.startswith(("gpt-5", "o1", "o3", "o4")) else {}
+        if m.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4")):
+            modern = m.startswith(("gpt-5.6", "gpt-6"))
+            return {"reasoning_effort": lvl if modern and lvl in ("xhigh", "max") else lmh()}
+        return {}
     # No endpoint match: fall back to model-name heuristics (bare provider name / empty base).
     if m.startswith("kimi"):
         return {"reasoning_effort": kimi_k3()} if "kimi-k3" in m else {}
@@ -110,8 +113,9 @@ def wire_reasoning_effort(name: str, model: str, base_url: str | None,
         return {}
     if m.startswith("qwen"):
         return {"extra_body": {"enable_thinking": True}}
-    if p == "openai" and not b and m.startswith(("gpt-5", "o1", "o3", "o4")):
-        return {"reasoning_effort": lmh()}
+    if p == "openai" and not b and m.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4")):
+        modern = m.startswith(("gpt-5.6", "gpt-6"))
+        return {"reasoning_effort": lvl if modern and lvl in ("xhigh", "max") else lmh()}
     return {}
 
 

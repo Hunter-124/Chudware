@@ -78,8 +78,9 @@ the Cloudflare Access edge into the gateway itself (`gateway/authn.py`,
   2026-08-19, not to `/admin` either. `/admin` takes a `chudware_sid` session whose
   account row carries `role = 'admin'` (`python -m authn grant-admin`). Access is
   only a fallback credential the gateway accepts from a caller with no session, and
-  there is no domain auto-approval knob anywhere — the only paths to `active` are
-  email verification and an admin approval.
+  there is no domain auto-approval knob: only email verification and admin
+  approval activate accounts. Configured trial domains sponsor Claude AI for
+  already active, verified users; they never approve signups.
 - **The Access application itself is now deleted** (verified 2026-09-02). The
   self-hosted app "Billet Web" — id `a5c88ac6-8364-4fa1-9610-c2ab5dcf9fa8`, the one
   every hostname used to share so that a single `CHUDWARE_WEB_CF_AUD` validated all of
@@ -315,17 +316,24 @@ equally to customers, administrators, and the operator's own web account.
 For `key_source: "byok"`, the gateway first verifies that this account has a
 validated credential for the selected provider; the worker decrypts that
 account-scoped credential server-side and the turn bypasses the credit ledger.
-Selecting another provider without an attached key does not reuse it: an
-account with `ai_grant` takes the managed pool path, while an account without
-either a matching key or a grant is refused before the shared daemon. It never
-falls back to the operator's ambient profile.
+Selecting another provider without an attached key does not reuse that key:
+eligible trial-domain users can take the isolated Claude sponsor path, other
+accounts with `ai_grant` take the managed pool path, and accounts with neither
+usable source are refused before the shared daemon. None falls back to the
+operator's ambient profile.
 
-Managed access is separate from host-profile sharing. An account with
-`ai_grant`, an eligible cloud plan, and a positive credit balance is asserted
-server-side as `key_source: "pool"`; the gateway reserves its estimated cost,
-writes the credit-ledger spend row, and only then forwards the turn. Zero
-balance is a hard refusal. Administrators receive no bypass: they need either
-their own validated provider key or the same pooled grant and credits.
+Managed access is separate from host-profile sharing. After an account's own
+matching BYOK key and personal Claude link, an active user with a verified email
+or OAuth identity on a configured, unexpired trial domain (or true subdomain)
+can use active admins' linked personal/shared Claude OAuth subscriptions.
+Sponsored turns run in an isolated worker with Anthropic forced, no gateway
+token-spend cap and no credit reservation or balance debit; trial expiry and
+upstream provider limits remain. Other domains, pending/unverified users, and
+lookalike domain suffixes cannot use those credentials. Linked Codex OAuth
+still cannot run in isolation. The metered fallback is distinct: `ai_grant`,
+eligible cloud plan, and a positive credit balance yield `key_source: "pool"`;
+the gateway reserves estimated cost and writes a credit-ledger spend row.
+Zero balance refuses pooled turns. Admins have no automatic pool bypass.
 
 Set `CHUDWARE_WEB_SHARE_PROVIDER_KEYS=1` only for a personal or single-tenant
 deployment where the operator genuinely is every web user. That compatibility

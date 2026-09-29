@@ -485,12 +485,12 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
                 "agent_admin_turn/Chudcode for online providers.");
         // Global cfg.model may be a Grok id when the active provider is xAI — never send
         // a non-Claude model id to the Anthropic Messages API.
-        std::string model = py_or(cfg_str(cfg, "model"), "claude-opus-4-8");
+        std::string model = py_or(cfg_str(cfg, "model"), "claude-opus-5-5");
         {
             std::string ml = lower(model);
             if (ml.find("claude") == std::string::npos && ml.find("opus") == std::string::npos &&
                 ml.find("sonnet") == std::string::npos && ml.find("haiku") == std::string::npos)
-                model = "claude-opus-4-8";
+                model = "claude-opus-5-5";
         }
         desc = json{
             {"name", oauth ? "anthropic-sub" : "anthropic"},
@@ -506,7 +506,7 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
         if (key.empty()) key = env_get(env, "GOOGLE_API_KEY").value_or("");
         desc = json{
             {"name", "gemini"},
-            {"model", py_or(cfg_str(cfg, "model"), "gemini-2.5-flash")},
+            {"model", py_or(cfg_str(cfg, "model"), "gemini-3.5-flash")},
             {"base_url", nullptr},
             {"supports_vision", true},
             {"api_key", key},

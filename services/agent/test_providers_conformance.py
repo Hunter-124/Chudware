@@ -91,6 +91,18 @@ def test_gemini_parts_text_and_image(tmp_path):
     assert isinstance(img["inline_data"]["data"], str) and img["inline_data"]["data"]
 
 
+def test_current_openai_effort_reaches_wire_without_downgrade():
+    from services.agent.providers.openai_provider import wire_reasoning_effort
+
+    assert wire_reasoning_effort("openai", "gpt-6-sol",
+                                 "https://api.openai.com/v1", "max") == {
+        "reasoning_effort": "max"}
+    assert wire_reasoning_effort("openai", "gpt-5.6-sol", None, "xhigh") == {
+        "reasoning_effort": "xhigh"}
+    assert wire_reasoning_effort("openai", "gpt-4o",
+                                 "https://api.openai.com/v1", "high") == {}
+
+
 # ------------------------------------------------------------------ openai-family (§1, needs SDK)
 def test_openai_wire_shape(tmp_path):
     pytest.importorskip("openai")

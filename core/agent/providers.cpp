@@ -159,8 +159,8 @@ void set_provider_cancel_flag(const std::atomic<bool>* flag) {
 const std::atomic<bool>* provider_cancel_flag() { return g_provider_cancel; }
 
 
-const char* kAnthropicDefaultModel = "claude-opus-4-8";
-const char* kOpenAIDefaultModel = "gpt-4o";
+const char* kAnthropicDefaultModel = "claude-opus-5-5";
+const char* kOpenAIDefaultModel = "gpt-4o";  // API-key endpoint; GPT-6 Sol is Codex-only
 
 // --------------------------------------------------------------------------- base.py
 json text_part(const std::string& text) { return json{{"type", "text"}, {"text", text}}; }
@@ -440,7 +440,9 @@ std::string normalize_effort(const std::string& raw) {
     auto b = effort.find_last_not_of(" \t\r\n");
     effort = (a == std::string::npos) ? "" : effort.substr(a, b - a + 1);
     if (effort == "med") effort = "medium";
-    if (effort == "auto" || effort == "none" || effort == "off" || effort.empty())
+    if (effort == "off" || effort == "none" || effort == "minimal")
+        effort = "low";
+    else if (effort == "auto" || effort.empty())
         effort = "high";
     if (effort != "low" && effort != "medium" && effort != "high" && effort != "max" &&
         effort != "xhigh")
@@ -740,10 +742,13 @@ json openai_reasoning_patch(const std::string& provider, const std::string& mode
     }
     if (has(b, "aliyuncs") || has(b, "dashscope"))  // Qwen (DashScope): hybrid thinking is a
         return json{{"enable_thinking", true}};      // top-level bool (no low/med/high level)
-    if (has(b, "openai.com")) {  // OpenAI proper: only gpt-5+/o-series accept reasoning_effort
-        if (m.rfind("gpt-5", 0) == 0 || m.rfind("o1", 0) == 0 || m.rfind("o3", 0) == 0 ||
-            m.rfind("o4", 0) == 0)
-            return json{{"reasoning_effort", lmh()}};
+    if (has(b, "openai.com")) {
+        if (m.rfind("gpt-5", 0) == 0 || m.rfind("gpt-6", 0) == 0 ||
+            m.rfind("o1", 0) == 0 || m.rfind("o3", 0) == 0 || m.rfind("o4", 0) == 0) {
+            bool modern = m.rfind("gpt-6", 0) == 0 || m.rfind("gpt-5.6", 0) == 0;
+            return json{{"reasoning_effort", modern && (lvl == "xhigh" || lvl == "max")
+                                                ? lvl : lmh()}};
+        }
         return json::object();
     }
     // --- No endpoint match: fall back to MODEL-NAME heuristics (bare provider name / empty base). ---
@@ -763,9 +768,12 @@ json openai_reasoning_patch(const std::string& provider, const std::string& mode
     if (m.rfind("qwen", 0) == 0)
         return json{{"enable_thinking", true}};
     if (p == "openai" && b.empty() &&
-        (m.rfind("gpt-5", 0) == 0 || m.rfind("o1", 0) == 0 || m.rfind("o3", 0) == 0 ||
-         m.rfind("o4", 0) == 0))
-        return json{{"reasoning_effort", lmh()}};
+        (m.rfind("gpt-5", 0) == 0 || m.rfind("gpt-6", 0) == 0 ||
+         m.rfind("o1", 0) == 0 || m.rfind("o3", 0) == 0 || m.rfind("o4", 0) == 0)) {
+        bool modern = m.rfind("gpt-6", 0) == 0 || m.rfind("gpt-5.6", 0) == 0;
+        return json{{"reasoning_effort", modern && (lvl == "xhigh" || lvl == "max")
+                                            ? lvl : lmh()}};
+    }
     return json::object();  // unknown OpenAI-compatible endpoint: omit (safe)
 }
 
@@ -795,7 +803,7 @@ ParsedReply openai_parse_response(const json& resp) {
 
 // --------------------------------------------------------------------------- gemini
 // Google Gemini (generativelanguage REST: models/{model}:generateContent).
-const char* kGeminiDefaultModel = "gemini-2.5-flash";
+const char* kGeminiDefaultModel = "gemini-3.5-flash";
 
 // One content part -> a Gemini part: text -> {text}; image -> {inline_data:{mime_type,data}}.
 json gemini_part(const json& part) {
@@ -806,15 +814,15 @@ json gemini_part(const json& part) {
     return json{{"inline_data", {{"mime_type", "image/png"}, {"data", data}}}};
 }
 
-// effort -> thinkingConfig.thinkingBudget. Empty/"off" -> omit (model default).
-// 2.5-pro cannot disable thinking (budget 0 is rejected), so we never send 0 by default.
+// Budget-mode models support minimal thinking, not zero on Gemini 2.5 Pro.
+// Empty leaves the model default; a saved "off" selects the lowest valid rung.
 static bool gemini_thinking_budget(const std::string& effort, int* out) {
     std::string e;
     for (char c : effort) e.push_back(static_cast<char>(std::tolower((unsigned char)c)));
+    if (e == "minimal" || e == "off" || e == "none") { *out = 128; return true; }
     if (e == "low") { *out = 1024; return true; }
     if (e == "medium" || e == "med") { *out = 8192; return true; }
-    if (e == "high" || e == "max") { *out = 24576; return true; }
-    if (e == "off" || e == "none") { *out = 0; return true; }
+    if (e == "high" || e == "max" || e == "xhigh") { *out = 24576; return true; }
     return false;  // unknown/empty -> let the model decide (dynamic)
 }
 
@@ -831,16 +839,22 @@ BuiltRequest gemini_build_request(const std::string& model, const std::string& s
         contents.push_back(json{{"role", role}, {"parts", parts}});
     }
     json gen = json{{"maxOutputTokens", max_tokens}};
-    int budget = 0;
-    if (gemini_thinking_budget(reasoning_effort, &budget)) {
-        gen["thinkingConfig"] = json{{"thinkingBudget", budget}};
-        // Gemini 2.5 counts thinking tokens against maxOutputTokens. If the thinking budget
-        // meets or exceeds the output cap, the model spends the whole cap thinking and returns
-        // EMPTY content (finishReason MAX_TOKENS) -> the caller sees "no JSON ops in reply" and
-        // every stage fails. At "medium" (8192) the budget equalled the cap and at "high" (24576)
-        // it dwarfed it. Give the actual answer room ON TOP of the thinking budget: max_tokens is
-        // the intended answer size, so the real cap is thinking + answer.
-        if (budget > 0) gen["maxOutputTokens"] = budget + max_tokens;
+    if (model.rfind("gemini-3", 0) == 0) {
+        std::string level = lower_copy(reasoning_effort);
+        if (level == "off" || level == "none" || level == "minimal") level = "minimal";
+        else if (level == "max" || level == "xhigh" || level == "med") level = "high";
+        if (model.find("pro") != std::string::npos && level == "medium") level = "high";
+        if (level == "minimal" || level == "low" || level == "medium" || level == "high") {
+            for (char& c : level) c = static_cast<char>(std::toupper((unsigned char)c));
+            gen["thinkingConfig"] = json{{"thinkingLevel", level}};
+        }
+    } else {
+        int budget = 0;
+        if (gemini_thinking_budget(reasoning_effort, &budget)) {
+            gen["thinkingConfig"] = json{{"thinkingBudget", budget}};
+            // Budget thinking counts against the output limit on Gemini 2.5.
+            if (budget > 0) gen["maxOutputTokens"] = budget + max_tokens;
+        }
     }
     json body = {{"contents", contents}, {"generationConfig", gen}};
     if (!system.empty()) {

@@ -164,10 +164,10 @@ def _file_response(target: Path, request: Request, *, immutable: bool) -> FileRe
     headers = {
         "Content-Security-Policy": _csp_for_html(target) if target.suffix.lower() in {".html", ".htm"} else _PORTAL_CSP,
         "Cache-Control": "public, max-age=31536000, immutable" if immutable else "no-cache",
+        "Vary": "Accept-Encoding",
     }
     if encoding:
         headers["Content-Encoding"] = encoding
-        headers["Vary"] = "Accept-Encoding"
     return FileResponse(str(served), media_type=_media_type(target), headers=headers)
 
 

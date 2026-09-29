@@ -332,18 +332,22 @@ def discover_gemini(
 
 
 def discover_anthropic_static() -> list[ModelRow]:
-    """Anthropic has no public list API — seed a minimal allowlist (enriched by models.dev)."""
+    """Minimal offline seed; the refreshed Chudcode catalog owns live availability."""
     return [
         ModelRow.make(
-            id="claude-opus-4-8",
-            label="Claude Opus 4.8",
-            context=200000,
-            max_output=32000,
-            reasoning_efforts=["low", "medium", "high"],
+            id=model,
+            label=label,
+            context=1000000,
+            max_output=128000,
+            reasoning_efforts=reasoning_efforts_for("anthropic", model, reasoning=True),
             vision=True,
             tools=True,
             auto_source="heuristic",
-        ),
+        )
+        for model, label in (
+            ("claude-opus-5-5", "Claude Opus 5.5"),
+            ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+        )
     ]
 
 
@@ -555,12 +559,22 @@ def reasoning_efforts_for(provider: str, model_id: str, *, reasoning: bool | Non
     # Explicit non-reasoning ids.
     if "non-reasoning" in m or m.endswith("-tts") or "tts" in m:
         return []
-    if p == "gemini" or "gemini" in m:
+    if p in ("gemini", "google") or "gemini" in m:
         if "2.0" in m and "flash" in m:
-            return []  # 2.0-flash has no thinking knob in our UI today
-        return ["off", "low", "medium", "high", "max"]
-    if p == "anthropic" or "claude" in m:
-        return ["low", "medium", "high"]
+            return []
+        if "3.1-pro" in m:
+            return ["low", "high"]
+        if re.search(r"gemini-3(?:\.|-\d)", m):
+            return ["minimal", "low", "medium", "high"]
+        return ["minimal", "low", "medium", "high"]
+    if p in ("anthropic", "anthropic-sub") or "claude" in m:
+        if "-4-5" in m:
+            return ["minimal", "low", "medium", "high", "xhigh"]
+        if "sonnet-4-6" in m:
+            return ["low", "medium", "high"]
+        if "-4-6" in m:
+            return ["low", "medium", "high", "max"]
+        return ["low", "medium", "high", "xhigh", "max"]
     if p == "xai" or "grok" in m:
         # Only effort-capable Grok variants expose the dial; others think natively.
         if re.search(r"reasoning|grok-4\.5|grok-4-5|grok-4\.20", m):
@@ -586,8 +600,10 @@ def reasoning_efforts_for(provider: str, model_id: str, *, reasoning: bool | Non
             return ["low", "high", "max"]
         # K2.x (k2.6 / k2.7 / -code) think by default and expose no effort dial.
         return []
-    if p == "openai" or m.startswith("gpt") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4"):
-        if re.match(r"o[0-9]", m) or "gpt-5" in m or "o1" in m or "o3" in m or "o4" in m:
+    if p in ("openai", "openai-codex") or m.startswith(("gpt", "o1", "o3", "o4")):
+        if re.match(r"gpt-(?:6|[7-9]|5\.6)", m):
+            return ["low", "medium", "high", "xhigh", "max"]
+        if re.match(r"gpt-5|o[134]", m):
             return ["low", "medium", "high"]
         return []
     if reasoning is True:
@@ -610,7 +626,7 @@ def heuristic_row(provider: str, model_id: str) -> ModelRow:
     elif (p == "gemini" or "gemini" in m) and any(x in m for x in ("1.5-flash", "2.0", "2.5", "flash")):
         context = 1048576
     elif any(x in m for x in ("claude", "opus", "sonnet", "haiku")):
-        context = 200000
+        context = 1000000 if re.search(r"(?:opus|sonnet)-5(?:-|$)", m) else 200000
     elif "gpt-4.1" in m:
         context = 1047576
     elif any(x in m for x in ("o1", "o3", "o4", "reasoner", "r1")):

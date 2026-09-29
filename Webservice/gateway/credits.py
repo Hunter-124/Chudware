@@ -31,6 +31,18 @@ log = logging.getLogger("chudware.gateway.credits")
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 CREDIT_CEILING_UNLIMITED = 0
 _RATE_TTL_SECONDS = 24 * 60 * 60
+# Native wire IDs are not OpenRouter slugs and never arrive in its price refresh.
+# Source: upstream oh-my-pi catalog (Opus 5.5 $4/$20) and Anthropic's Sonnet 5.5
+# model overview ($2/$10); units are USD per million input/output tokens.
+_DIRECT_MODEL_RATES: dict[str, tuple[Decimal, Decimal]] = {
+    "claude-opus-5-5": (Decimal("4"), Decimal("20")),
+    "claude-sonnet-5-5": (Decimal("2"), Decimal("10")),
+    "claude-opus-5": (Decimal("5"), Decimal("25")),
+    "claude-sonnet-5": (Decimal("2"), Decimal("10")),
+    "claude-fable-5": (Decimal("10"), Decimal("50")),
+    "claude-mythos-5": (Decimal("10"), Decimal("50")),
+    "claude-haiku-4-5": (Decimal("1"), Decimal("5")),
+}
 _RECONCILE_SECONDS = 24 * 60 * 60
 _reconcile_task: asyncio.Task[None] | None = None
 
@@ -186,6 +198,9 @@ def model_rate(
     now: float | None = None,
 ) -> tuple[Decimal, Decimal]:
     """Return prompt/completion USD-per-MTok, failing unknown models expensive."""
+    direct = _DIRECT_MODEL_RATES.get(str(model or "").strip())
+    if direct is not None:
+        return direct
     current = float(time.time() if now is None else now)
     if refresh and _rates_stale(current):
         try:
@@ -797,6 +812,35 @@ async def admin_controls(
     if row is None:
         raise HTTPException(status_code=404, detail="account not found")
     return {"ok": True, "email": normalized, **dict(row)}
+
+
+def is_trial_domain(email: str) -> bool:
+    """An active, verified account on a configured, unexpired trial domain."""
+    normalized = _email(email)
+    if normalized.count("@") != 1:
+        return False
+    domain = normalized.rsplit("@", 1)[1]
+    # Domain boundaries are dots, not arbitrary suffixes: x.example.com may
+    # match example.com, but notexample.com never can.
+    labels = domain.split(".")
+    candidates = [".".join(labels[i:]) for i in range(len(labels) - 1)]
+    if not candidates:
+        return False
+    with tx() as cur:
+        cur.execute(
+            """SELECT 1 FROM trial_domains td
+               WHERE td.domain = ANY(%s)
+                 AND (td.expires_at IS NULL OR td.expires_at > now())
+                 AND EXISTS (
+                   SELECT 1 FROM accounts a WHERE a.email = %s AND a.status = 'active'
+                     AND (EXISTS (SELECT 1 FROM credentials c
+                                  WHERE c.email = a.email AND c.email_verified = TRUE)
+                       OR EXISTS (SELECT 1 FROM oauth_identities i
+                                  WHERE i.email = a.email))
+                 ) LIMIT 1""",
+            (candidates, normalized),
+        )
+        return cur.fetchone() is not None
 
 
 def _normalize_domains(value: Any) -> list[str]:

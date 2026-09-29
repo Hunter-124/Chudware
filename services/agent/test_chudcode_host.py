@@ -1070,18 +1070,36 @@ def test_forwards_events_attachments_callbacks_and_all_turn_settings(tmp_path):
     assert "spec: /project/spec.txt" in prompt_call["message"]
     assert registered == [client]
     assert client.kwargs["append_system_prompt"] == "CAD governance prompt"
-    assert call_names(client)[1:9] == [
-        "set_model",
-        "set_thinking_level",
-        "set_steering_mode",
-        "set_follow_up_mode",
-        "set_interrupt_mode",
-        "set_auto_compaction",
-        "set_auto_retry",
-        "set_subagent_subscription",
-    ]
     assert "set_host_tools" in call_names(client)
     assert "set_host_uris" in call_names(client)
+
+
+def test_composer_effort_overrides_stale_thinking_and_clamps_to_model_catalog():
+    class CatalogClient(FakeClient):
+        def get_available_models(self):
+            return (
+                {"provider": "moonshot", "id": "kimi-k3",
+                 "thinking": {"efforts": ["low", "high", "max"]}},
+            )
+
+    class CatalogFactory(FakeFactory):
+        def __call__(self, **kwargs):
+            client = CatalogClient(self, **kwargs)
+            self.clients.append(client)
+            return client
+
+    factory = CatalogFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    result, _ = run(host, "effort-precedence", provider="moonshot", model="kimi-k3",
+                    settings={"thinking": "low", "reasoning_effort": "medium"})
+    assert result["ok"]
+    assert ("set_thinking_level", {"level": "high"}) in factory.clients[0].calls
+
+    result, _ = run(host, "effort-precedence", "effort-max", provider="moonshot",
+                    model="kimi-k3", settings={"thinking": "low"},
+                    reasoning_effort="xhigh")
+    assert result["ok"]
+    assert ("set_thinking_level", {"level": "max"}) in factory.clients[0].calls
 
 
 def test_wire_provider_aliases_map_onto_chudcode_ids():

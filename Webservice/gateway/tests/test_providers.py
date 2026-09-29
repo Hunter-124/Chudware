@@ -71,6 +71,60 @@ def _client(email: str, role: str = "user") -> TestClient:
     return TestClient(app)
 
 
+def test_live_chudcode_catalog_overrides_static_presets_without_waiting(monkeypatch) -> None:
+    cli = {"models": [
+        {"provider": "anthropic", "id": "claude-opus-6",
+         "name": "Claude Opus 6"},
+        {"provider": "anthropic", "id": "claude-opus-5-5",
+         "name": "Claude Opus 5.5"},
+    ]}
+    catalog = providers._live_catalog_rows(cli, {})
+    assert catalog["anthropic-sub"][0]["id"] == "claude-opus-6"
+    monkeypatch.setattr(providers, "_catalog_rows", catalog)
+    monkeypatch.setattr(providers, "_catalog_next_refresh", float("inf"))
+    assert providers.default_model_for("anthropic-sub") == "claude-opus-6"
+    assert providers.default_model_for("openai") == providers._MODEL_PRESETS["openai"][0]["id"]
+
+
+def test_public_discovery_keeps_chat_models_and_drops_non_chat_capabilities() -> None:
+    chat = {"name": "Claude Sonnet 5.5", "tool_call": True,
+            "modalities": {"input": ["text", "image"], "output": ["text"]}}
+    public = {
+        "anthropic": {"models": {
+            "claude-sonnet-5-5": chat,
+            "claude-sonnet-5-6": {"name": "Claude Sonnet 5.6"},  # older feed: family fallback
+            "claude-sonnet-5-7": {**chat, "tool_call": False},
+            "claude-opus-6-image": chat,
+            "claude-opus-6": {**chat, "modalities": {"output": ["image"]}},
+            "claude-opus-7": {**chat, "deprecated": True},
+        }},
+        "openai": {"models": {
+            "gpt-6-sol": {"tool_call": True, "modalities": {"output": ["text"]}},
+            "gpt-6-audio-preview": {"tool_call": True, "modalities": {"output": ["text"]}},
+            "gpt-image-1": {"tool_call": True, "modalities": {"output": ["image"]}},
+            "text-embedding-4": {"tool_call": True, "modalities": {"output": ["text"]}},
+            "gpt-6-moderation": {"tool_call": True, "modalities": {"output": ["text"]}},
+        }},
+        "google": {"models": {
+            "gemini-3.5-flash": {"tool_call": True, "modalities": {"output": ["text"]}},
+            "gemini-3.5-flash-live": {"tool_call": True, "modalities": {"output": ["text"]}},
+        }},
+        "unsupported-provider": {"models": {"chat-model-1": chat}},
+    }
+    cli = {"models": [
+        {"provider": "anthropic", "id": "claude-opus-5-5", "name": "Claude Opus 5.5"},
+        {"provider": "openai", "id": "gpt-6-tts", "name": "Speech synthesis"},
+    ]}
+    rows = providers._live_catalog_rows(cli, public)
+    assert {row["id"] for row in rows["anthropic"]} == {
+        "claude-opus-5-5", "claude-sonnet-5-5", "claude-sonnet-5-6",
+    }
+    assert [row["id"] for row in rows["openai"]] == ["gpt-6-sol"]
+    assert [row["id"] for row in rows["gemini"]] == ["gemini-3.5-flash"]
+    assert rows["anthropic-sub"] == rows["anthropic"]
+    assert "unsupported-provider" not in rows
+
+
 def test_ambient_host_credentials_are_never_web_availability(monkeypatch) -> None:
     _account(CUSTOMER)
     monkeypatch.setenv("OPENAI_API_KEY", "operator-secret")
@@ -115,6 +169,30 @@ def test_only_usable_personal_isolated_oauth_is_advertised() -> None:
     )
     assert "customer-claude" not in json.dumps(listed)
     assert "customer-codex" not in json.dumps(listed)
+
+
+def test_verified_trial_domain_advertises_sponsored_claude_without_token_bytes() -> None:
+    trial_user = "student@dept.example.com"
+    _account(trial_user)
+    _account(OPERATOR)
+    accounts.set_role(OPERATOR, "admin")
+    with db.tx() as cur:
+        cur.execute(
+            "INSERT INTO credentials(email, password_hash, email_verified) "
+            "VALUES (%s, 'unused', TRUE)", (trial_user,),
+        )
+        cur.execute(
+            "INSERT INTO trial_domains(domain, trial_days, ai_credits) "
+            "VALUES ('example.com', 14, 0)"
+        )
+    _link(OPERATOR, "anthropic-sub", "personal", "admin-claude")
+    with _client(trial_user) as client:
+        listed = client.get("/api/providers").json()
+    assert [(entry["id"], entry["auth"], entry["label"])
+            for entry in listed["providers"]] == [
+        ("anthropic-sub", "subscription", "Claude (sponsored)")
+    ]
+    assert "access-admin-claude-secret" not in json.dumps(listed)
 
 
 def test_pool_catalogue_follows_grant_credential_and_model_override(monkeypatch) -> None:

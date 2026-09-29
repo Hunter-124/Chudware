@@ -92,3 +92,36 @@ def test_model_name_fallback_when_base_url_unknown():
     assert w("moonshot", "kimi-k2.7", "", "high") == {}
     assert w("xai", "grok-4.5", "", "low") == {"reasoning_effort": "low"}
     assert w("openai", "gpt-5.6", "", "high") == {"reasoning_effort": "high"}
+
+
+def test_google_level_models_do_not_receive_legacy_budget(monkeypatch):
+    import json
+    from services.agent.providers import gemini_provider
+
+    bodies = []
+
+    class Reply:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}'
+
+    def fake_urlopen(request, timeout):
+        bodies.append(json.loads(request.data))
+        return Reply()
+
+    monkeypatch.setattr(gemini_provider.urllib.request, "urlopen", fake_urlopen)
+    messages = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+    assert gemini_provider.GeminiProvider(api_key="k", model="gemini-3.5-flash",
+                                           reasoning_effort="medium").complete("sys", messages) == "ok"
+    assert bodies[-1]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "MEDIUM"}
+    assert gemini_provider.GeminiProvider(api_key="k", model="gemini-2.5-flash",
+                                           reasoning_effort="medium").complete("sys", messages) == "ok"
+    assert bodies[-1]["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 8192}
+    assert gemini_provider.GeminiProvider(api_key="k", model="gemini-2.5-pro",
+                                           reasoning_effort="off").complete("sys", messages) == "ok"
+    assert bodies[-1]["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 128}

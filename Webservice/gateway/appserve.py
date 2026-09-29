@@ -182,10 +182,9 @@ def _resolve_under_app(rel: str) -> Path:
     return target
 
 
-# Precompressed-variant negotiation. build.sh stages .br/.gz siblings next to the
-# big bundle files; serving them cuts the wasm first-load from ~9.4 MB to ~2.1 MB
-# (brotli) over the wire. The variant carries the ORIGINAL media type + a
-# Content-Encoding header; Vary: Accept-Encoding keeps shared caches correct.
+# Precompressed-variant negotiation. build.sh stages .br/.gz siblings next to
+# the bundle files. Preserve the ORIGINAL media type and vary on Accept-Encoding
+# so shared caches cannot mix variants.
 def _fresh_variant(target: Path, suffix: str) -> Path | None:
     """A precompressed sibling, but only if it isn't stale w.r.t. the original.
     Guards the js/wasm-skew failure mode: a restaged bundle whose .br/.gz wasn't
@@ -213,9 +212,11 @@ def _negotiate(target: Path, request: Request) -> tuple[Path, str | None]:
 def _file_response(target: Path, request: Request) -> FileResponse:
     served, encoding = _negotiate(target, request)
     headers = _coop_headers(target)  # cache policy keys on the ORIGINAL suffix
+    # Even the identity response varies: a CDN must not reuse it for a later
+    # Brotli-capable client (nor serve compressed bytes to an identity client).
+    headers["Vary"] = "Accept-Encoding"
     if encoding:
         headers["Content-Encoding"] = encoding
-        headers["Vary"] = "Accept-Encoding"
     return FileResponse(
         path=str(served),
         media_type=_media_type(target),  # original type, not .br/.gz

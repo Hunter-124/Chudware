@@ -330,8 +330,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "contact_sheet": {
         "prompt_note": (
-            "Whole-part multi-angle sheet (4 tiles, ~4x a close-up's image tokens) — only "
-            "when one render_part(target=...) close-up cannot settle the question."
+            "Same planner 2x2 grid as render_part without a view; pass views=[...] only "
+            "when you need specific named angles."
         ),
     },
     "design_review": {
@@ -434,14 +434,14 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "inspect_feature": {
         "prompt_note": (
-            "4-panel sheet (hero/alt/cutaway/context) of one feature — ~4x a single "
-            "render_part(target=...) close-up; use it only when that close-up is ambiguous."
+            "Planner close-ups (hero/alt/alt2, a section for internal features) + whole-part "
+            "context of one feature — only when render_part(target=...)'s grid is ambiguous."
         ),
     },
     "inspect_part": {
         "prompt_note": (
-            "render_part(target=...) plus framing knobs (zoom_factor, margin, cutaway); same "
-            "perspective close-up, target and view vocabulary."
+            "Single close-up = render_part(target=..., view=\"auto\") plus framing knobs "
+            "(zoom_factor, margin, cutaway); same target and view vocabulary."
         ),
     },
     "inspect_section": {
@@ -506,8 +506,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "look_around": {
         "prompt_note": (
-            "Tiled close-ups of ONE target from separated angles — only when a single "
-            "render_part(target=...) close-up leaves the shape ambiguous."
+            "Tiled close-ups of ONE target (planner set, or ranked=False for an even orbit) — "
+            "only when render_part(target=...)'s grid leaves the shape ambiguous."
         ),
     },
     "make_drawing": {
@@ -685,9 +685,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "render_part": {
         "prompt_note": (
-            "Check numbers first; to LOOK at what you changed, target= the feature id "
-            "for one cheap perspective close-up (auto best angle, view={distance,fov,"
-            "azimuth,elevation} to steer); no target = whole part, once at the end."
+            "Check numbers first; don't render after every mutation. One call = a 2x2 grid of "
+            "the 4 most useful complementary shots (measured, SID-tagged, caption lists what "
+            "each tile shows and faces no tile sees); target= the feature id to frame it; "
+            "view= only for one specific single shot."
         ),
     },
     "render_sketch": {
@@ -705,15 +706,15 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "cases on the same faces are different figures. fixtures/load are "
             "EXACTLY run_fea_static's dialect and are resolved by the same gates, so pass "
             "the identical arguments and draw this BEFORE the solve — a refusal here is "
-            "the setup error the solver would have raised. Omit view to let the occlusion "
-            "scorer pick the camera that sees the most of those faces; save_path also "
+            "the setup error the solver would have raised. Omit view to let the shot "
+            "planner pick the camera that shows the most of those faces; save_path also "
             "writes the embeddable PNG."
         ),
     },
     "render_views": {
         "prompt_note": (
-            "Full 6-ortho+iso grid (7 tiles) — drawing-style coverage of back/bottom faces; "
-            "far heavier than one render_part(target=...) close-up."
+            "Planner set of 7 complementary views (or views=[...] for a fixed drawing set) "
+            "— heavier than render_part's 4-tile grid; only when four views leave a face unseen."
         ),
     },
     "req_create": {

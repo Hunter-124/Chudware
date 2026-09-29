@@ -2426,9 +2426,9 @@ def test_check_interference_include_coincident_contacts():
 
 
 def test_render_part_caption_pairs_image_with_text():
-    """render_part returns [ImageContent, TextContent]: the PNG plus the deterministic
-    scene caption (mcp's _convert_to_content flattens the [Image, str] return), so a
-    non-vision model reading the transcript still gets signal from the render."""
+    """render_part returns [ImageContent, TextContent]: the PNG plus the self-sufficient
+    caption of the planner's shot grid (mcp's _convert_to_content flattens the [Image, str]
+    return), so a non-vision model reading the transcript still knows what each tile shows."""
     doc = _new_plate_with_hole()
     from services.mcp import server
 
@@ -2442,9 +2442,14 @@ def test_render_part_caption_pairs_image_with_text():
     texts = [c for c in content if getattr(c, "type", "") == "text"]
     assert texts, f"no TextContent caption in {content!r}"
     caption = texts[0].text
-    assert "iso view of a" in caption, caption
-    assert "60x40x10 mm" in caption, caption
-    assert "occlusion not modeled" in caption, caption
+    # Every tile is described, the part's size is stated, what no tile sees is accounted
+    # for, the SID tags drawn on the tiles are keyed, and the overlay did not silently fail.
+    for letter in "ABCD":
+        assert f"{letter}: dir [" in caption, caption
+    assert "60 x 40 x 10 mm" in caption, caption
+    assert "Faces NO tile sees" in caption or "Every face is visible" in caption, caption
+    assert "Tags (" in caption, caption
+    assert "OVERLAY FAILED" not in caption, caption
 
 
 # ================================================================ T-BL16 motion/kinematics

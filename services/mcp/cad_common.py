@@ -3217,14 +3217,30 @@ _APPEARANCE_PRESETS = {
     "titanium":  {"color": [0.62, 0.61, 0.60], "metallic": 0.85, "roughness": 0.42},
     "nylon":     {"color": [0.90, 0.89, 0.85], "metallic": 0.0,  "roughness": 0.55},
     "black":     {"color": [0.09, 0.10, 0.12], "metallic": 0.0,  "roughness": 0.50},
+    # Non-metal families a hobby/robotics build names in chat (live 2026-09-28: a
+    # plywood rover's `set_material("birch plywood")` failed outright). Looks only:
+    # engineering identity/density still come from the registry or stay unset.
+    "wood":      {"color": [0.72, 0.51, 0.28], "metallic": 0.0,  "roughness": 0.65},
+    "dark wood": {"color": [0.36, 0.24, 0.15], "metallic": 0.0,  "roughness": 0.60},
+    "mdf":       {"color": [0.63, 0.50, 0.36], "metallic": 0.0,  "roughness": 0.80},
+    "clear":     {"color": [0.85, 0.90, 0.95], "metallic": 0.0,  "roughness": 0.10},
+    "rubber":    {"color": [0.12, 0.12, 0.13], "metallic": 0.0,  "roughness": 0.85},
 }
 _APPEARANCE_ALIASES = {
     "aluminium": "aluminum", "al": "aluminum", "ss": "stainless",
     "stainless steel": "stainless", "pla": "plastic", "petg": "plastic",
-    "abs plastic": "abs",
+    "asa": "plastic", "resin": "plastic", "abs plastic": "abs",
     "dark metal": "black", "ti": "titanium", "pa": "nylon", "nylon 6": "nylon",
     "polyamide": "nylon", "mild steel": "steel", "carbon steel": "steel",
     "tool steel": "steel",
+    "plywood": "wood", "birch": "wood", "birch plywood": "wood", "baltic birch": "wood",
+    "oak": "wood", "pine": "wood", "maple": "wood", "beech": "wood", "bamboo": "wood",
+    "hardwood": "wood", "softwood": "wood", "lumber": "wood", "timber": "wood",
+    "walnut": "dark wood", "mahogany": "dark wood",
+    "hardboard": "mdf", "particleboard": "mdf",
+    "acrylic": "clear", "pmma": "clear", "plexiglass": "clear",
+    "polycarbonate": "clear", "lexan": "clear",
+    "tpu": "rubber", "tpe": "rubber", "silicone": "rubber",
 }
 
 # Engineering ALLOY DESIGNATIONS -> the appearance family they belong to. Consulted BEFORE the
@@ -5015,7 +5031,8 @@ _SIDE_PALETTE_LEGEND = (
 )
 _MAX_CALLOUTS = 5                 # legibility cap; omitted ones are named in the caption
 _CALLOUT_MIN_PIXEL_FRAC = 0.003   # a feature must hold >=0.3% of the frame to earn a callout
-_HLR_TRI_BUDGET = 45000           # above this the depth pass is skipped (caption says so)
+_HLR_TRI_BUDGET = 2_000_000       # above this the depth pass is skipped (caption says so)
+_RASTER_BATCH_PX = 1 << 17        # candidate pixels per vectorised raster batch (cache-sized)
 _MESH_CACHE: dict = {}            # doc_id -> (aicm_handle, mesh)
 
 
@@ -5305,7 +5322,8 @@ def _render_view_png(doc_id: str, view_dir, out_png: str, *,
                      W: int = _RENDER_W, H: int = _RENDER_H,
                      annotate: bool = True,
                      background: Optional[Sequence] = None,
-                     camera: Optional[dict] = None) -> tuple:
+                     camera: Optional[dict] = None,
+                     section: Optional[dict] = None) -> tuple:
     """One engine render along `view_dir`, optionally FRAMED on a world AABB.
 
     `focus` is a bbox dict ({"min","max"} — what _target_bbox returns). With it the engine fits
@@ -5319,6 +5337,11 @@ def _render_view_png(doc_id: str, view_dir, out_png: str, *,
     `camera` is an exact perspective pose (cad_viewpoint.perspective_camera): it replaces the
     direction/focus camera entirely — the engine refuses the two together — and the returned
     frame is then a perspective frame every overlay helper projects through.
+
+    `section` ({"point", "normal"}) renders the engine's section view (doc_render_view
+    `view.section`): the half-space dot(p - point, normal) <= 0 is kept, its cut face is
+    capped and hatched, and the removed half is drawn as a ghost with its edges. The returned
+    frame carries the plane so every overlay clips the tessellation the same way.
 
     Returns (png_path, frame, resp). `frame` is the engine's own projection record — pass it
     straight to _annotate_render so the overlay lands on the right pixels. Raises ValueError
@@ -5334,6 +5357,11 @@ def _render_view_png(doc_id: str, view_dir, out_png: str, *,
         view["focus"] = {"min": [float(x) for x in _v3(focus["min"])],
                          "max": [float(x) for x in _v3(focus["max"])],
                          "margin": float(margin), "clip_near": bool(clip_near)}
+    plane = None
+    if section:
+        plane = {"point": [float(x) for x in _v3(section["point"])],
+                 "normal": [float(x) for x in _vnorm(section["normal"])]}
+        view["section"] = dict(plane, ghost=True, hatch=True)
     params = {"doc_id": doc_id, "out_path": out_png, "view": view,
               "annotate": bool(annotate)}
     bg = render_background(background)
@@ -5343,7 +5371,10 @@ def _render_view_png(doc_id: str, view_dir, out_png: str, *,
     if not r.get("ok") or not os.path.exists(out_png):
         raise ValueError(
             f"Render failed: {r.get('reason', r.get('error', 'no bodies to render'))}")
-    return out_png, _frame_from_rpc(r), r
+    frame = _frame_from_rpc(r)
+    if frame is not None and plane is not None:
+        frame["section"] = plane
+    return out_png, frame, r
 
 
 def _target_mesh_tris(mesh: Optional[dict], doc_id: str, matches: list):
@@ -5376,164 +5407,257 @@ def _target_mesh_tris(mesh: Optional[dict], doc_id: str, matches: list):
     return sel if hit else None
 
 
-def _ideal_views(doc_id: str, matches: list, target_bbox: dict, *,
-                 n: int = 1, hint=None, mesh: Optional[dict] = None,
-                 min_sep_deg: float = 50.0, clip_near: bool = False) -> list:
-    """The deterministic idealized camera direction(s) for a target, best first.
+def _ideal_views(doc_id: str, matches: list, target_bbox: dict, *, n: int = 1) -> list:
+    """The planner's best `n` complementary camera(s) for a target, best first:
+    [{"dir", "label", "section", "score", "visible_frac"}] (shot_planner.plan_shots — the
+    engine-measured, set-ranked choice every render tool uses).
 
-    Scores a fixed candidate lattice by how much of the target each direction actually SEES
-    (occlusion-tested against the tessellation) and how legibly (foreshortening), instead of
-    the old mean-face-normal guess that happily picked a direction looking straight down a
-    bore axis or into a wall. Each entry is {"dir", "label", "score", "visible_frac",
-    "screen_frac", "foreshorten", ...}.
+    Degrades to the plain mean-normal / iso direction when the planner cannot measure (no
+    geometry, an engine without doc_view_metrics) — a measurement figure is never lost to a
+    camera-choice problem."""
+    fallback = [{"dir": _camera_dir_for_target(matches, "auto"), "label": "auto",
+                 "section": None, "score": None, "visible_frac": None}]
+    try:
+        from . import shot_planner as _sp  # noqa: PLC0415
+        plan = _sp.plan_shots(doc_id, target={"matches": list(matches or []),
+                                              "bbox": target_bbox, "label": "target"},
+                              k=max(1, int(n)))
+    except Exception:  # noqa: BLE001
+        return fallback
+    return [{"dir": tuple(v["dir"]), "label": v.get("label") or "auto",
+             "section": v.get("section"), "score": v.get("utility"),
+             "visible_frac": (v.get("summary") or {}).get("target_visible")}
+            for v in plan["views"]] or fallback
 
-    Degrades to the plain mean-normal / iso direction when the tessellation, numpy, or the
-    viewpoint module is unavailable — a close-up is never lost to a scoring problem."""
-    fallback = [{"dir": _camera_dir_for_target(matches, hint if hint is not None else "auto"),
-                 "label": "auto", "score": None, "visible_frac": None,
-                 "screen_frac": None, "foreshorten": None}]
-    try:
-        from . import cad_viewpoint as _vp  # noqa: PLC0415
-    except Exception:  # noqa: BLE001
-        return fallback[:max(1, n)]
-    try:
-        mesh = mesh if mesh is not None else _doc_mesh(doc_id)
-        tris = _target_mesh_tris(mesh, doc_id, matches)
-        normals = [m.get("normal") for m in (matches or [])
-                   if isinstance(m.get("normal"), (list, tuple))]
-        # A revolved target (bore, boss, fillet, chamfer) has an AXIS, and looking down it is
-        # the one view that shows a filled circle and nothing else. Hand it over so the scorer
-        # can penalise that; planar targets pass None and rely on the foreshorten term.
-        axis = None
-        for m in (matches or []):
-            if str(m.get("surf") or "") in ("cylinder", "cone", "torus") and m.get("axis"):
-                axis = m.get("axis")
-                break
-        out = _vp.ideal_view_dirs(mesh, target_bbox, target_tris=tris, normals=normals,
-                                  axis=axis, n=max(1, int(n)), hint=hint,
-                                  clip_near=bool(clip_near),
-                                  min_sep_deg=float(min_sep_deg))
-        return out or fallback[:max(1, n)]
-    except Exception:  # noqa: BLE001
-        return fallback[:max(1, n)]
+
+def _clip_mesh_halfspace(pos, idx, tri_face, point, normal) -> tuple:
+    """The tessellation clipped to the kept half-space dot(p - point, normal) <= 0 — the same
+    half a section render keeps. Triangles wholly kept pass through; straddling ones are
+    Sutherland-Hodgman clipped against the plane and fanned, winding preserved, so back-face
+    tests still see outward normals. Returns (pos, idx, tri_face)."""
+    import numpy as np  # noqa: PLC0415
+    p = np.asarray(_v3(point), dtype=np.float64)
+    n = np.asarray(_vnorm(normal), dtype=np.float64)
+    s = (pos - p) @ n
+    st = s[idx]
+    kept = (st <= 0.0).all(axis=1)
+    straddle = ~kept & (st <= 0.0).any(axis=1)
+    new_pts: list = []
+    new_tris: list = []
+    new_face: list = []
+    base = pos.shape[0]
+    for t in np.flatnonzero(straddle).tolist():
+        ids = idx[t]
+        poly: list = []
+        for k in range(3):
+            a, b = int(ids[k]), int(ids[(k + 1) % 3])
+            sa, sb = float(s[a]), float(s[b])
+            if sa <= 0.0:
+                poly.append(pos[a])
+            if (sa <= 0.0) != (sb <= 0.0):
+                poly.append(pos[a] + (pos[b] - pos[a]) * (sa / (sa - sb)))
+        if len(poly) < 3:
+            continue
+        first = base + len(new_pts)
+        new_pts.extend(poly)
+        for k in range(1, len(poly) - 1):
+            new_tris.append((first, first + k, first + k + 1))
+            new_face.append(int(tri_face[t]))
+    out_pos = np.concatenate([pos, np.asarray(new_pts, dtype=np.float64).reshape(-1, 3)])
+    out_idx = np.concatenate([idx[kept], np.asarray(new_tris, dtype=idx.dtype).reshape(-1, 3)])
+    out_face = np.concatenate([tri_face[kept],
+                               np.asarray(new_face, dtype=tri_face.dtype).reshape(-1)])
+    return out_pos, out_idx, out_face
 
 
 def _mesh_depth_buffer(mesh: dict, frame: dict) -> Optional[tuple]:
     """Rasterize the mesh into (depth, face_index) buffers matching the engine's render.
 
     Reproduces render_view_to_rgb's barycentric span fill and `depth > zbuf` test exactly,
-    so a pixel's winning triangle here is the pixel the engine shaded. Back-facing triangles
-    are culled first (AICM guarantees outward winding, so for a closed solid this is exact
-    and halves the work). Returns (Z, FI, S) or None when the mesh is over the triangle
-    budget — the caller then reports that edges were skipped rather than lying about them.
+    so a pixel's winning triangle here is the pixel the engine shaded. Like the engine, every
+    triangle is rasterized, back faces included: on a closed solid they never win, and on an
+    open shell (an imported sheet body, a tube with no end face) the engine SHOWS the inside
+    of the surface, so the overlay must attribute those pixels to the same face. Returns
+    (Z, FI, S) or None when the mesh is over the triangle budget — the caller then reports
+    that edges were skipped rather than lying about them.
 
     When `frame` carries the engine's near-clip (`clip_near` + `clip_depth`, a focused cutaway),
     the same fragments are dropped here. Skipping that is not a cosmetic mismatch: the cut-away
     material would win this z-test, and the feature the cutaway was made to expose would come
     back reported as invisible. A perspective frame instead clips each triangle against the
     near/far planes in camera space (as the engine does) and interpolates reciprocal depth,
-    and back-faces are judged against the ray from the eye, not a single view direction."""
+    and back-faces (for the section cap) are judged against the ray from the eye.
+
+    A frame carrying a `section` plane (a section render) gets the engine's section rule: the
+    tessellation is clipped to the kept half-space, back faces are rasterized too, and a pixel
+    whose nearest fragment is a back face is the CAP (FI = -2) — without that the far wall of
+    a bore would show through the solid cut face and be reported visible."""
     import numpy as np  # noqa: PLC0415
     idx = mesh["idx"]
     if idx.shape[0] > _HLR_TRI_BUDGET:
         return None
     W, H = int(frame["W"]), int(frame["H"])
     pos = mesh["pos"]
+    tri_face = mesh["tri_face"]
+    section = frame.get("section")
+    if section:
+        pos, idx, tri_face = _clip_mesh_halfspace(pos, idx, tri_face, section["point"],
+                                                  section["normal"])
     S = _screen_xyz(pos, frame)
-    p0, p1, p2 = pos[idx[:, 0]], pos[idx[:, 1]], pos[idx[:, 2]]
     persp = frame.get("projection") == "perspective"
-    if persp:
-        eye = np.asarray(frame["position"], dtype=np.float64)
-        front = np.einsum("ij,ij->i", np.cross(p1 - p0, p2 - p0), eye[None, :] - p0) > 0.0
-    else:
-        front = np.cross(p1 - p0, p2 - p0) @ np.asarray(frame["d"]) > 0.0
-    tri_ids = np.nonzero(front)[0]
+    tri_ids = np.arange(idx.shape[0])
+    if section:
+        p0, p1, p2 = pos[idx[:, 0]], pos[idx[:, 1]], pos[idx[:, 2]]
+        if persp:
+            eye = np.asarray(frame["position"], dtype=np.float64)
+            front = np.einsum("ij,ij->i", np.cross(p1 - p0, p2 - p0), eye[None, :] - p0) > 0.0
+        else:
+            front = np.cross(p1 - p0, p2 - p0) @ np.asarray(frame["d"]) > 0.0
+        tri_face = np.where(front, tri_face, -2).astype(np.int32)
     clip = (float(frame["clip_depth"])
             if not persp and frame.get("clip_near") and frame.get("clip_depth") is not None
             else None)
-    tri_face = mesh["tri_face"]
 
-    Z = np.full((H, W), -1e30, dtype=np.float64)
-    FI = np.full((H, W), -1, dtype=np.int32)
-
-    def _raster(s0, s1, s2, face: int) -> None:
-        lo_x, hi_x = min(s0[0], s1[0], s2[0]), max(s0[0], s1[0], s2[0])
-        lo_y, hi_y = min(s0[1], s1[1], s2[1]), max(s0[1], s1[1], s2[1])
-        if hi_x < 0.0 or lo_x > W or hi_y < 0.0 or lo_y > H:
-            return
-        minx = max(int(math.floor(lo_x)), 0)
-        maxx = min(int(math.ceil(hi_x)), W - 1)
-        miny = max(int(math.floor(lo_y)), 0)
-        maxy = min(int(math.ceil(hi_y)), H - 1)
-        if maxx < minx or maxy < miny:
-            return
-        area = (s1[0] - s0[0]) * (s2[1] - s0[1]) - (s2[0] - s0[0]) * (s1[1] - s0[1])
-        if abs(area) < 1e-9:
-            return
-        fx = np.arange(minx, maxx + 1, dtype=np.float64)[None, :] + 0.5
-        fy = np.arange(miny, maxy + 1, dtype=np.float64)[:, None] + 0.5
-        a0 = ((s1[0] - fx) * (s2[1] - fy) - (s2[0] - fx) * (s1[1] - fy)) / area
-        a1 = ((s2[0] - fx) * (s0[1] - fy) - (s0[0] - fx) * (s2[1] - fy)) / area
-        a2 = 1.0 - a0 - a1
-        inside = (a0 >= 0) & (a1 >= 0) & (a2 >= 0)
-        if not inside.any():
-            return
-        dep = a0 * s0[2] + a1 * s1[2] + a2 * s2[2]
-        if clip is not None:
-            inside = inside & (dep <= clip)
-            if not inside.any():
-                return
-        zs = Z[miny:maxy + 1, minx:maxx + 1]
-        upd = inside & (dep > zs)
-        if not upd.any():
-            return
-        zs[upd] = dep[upd]
-        FI[miny:maxy + 1, minx:maxx + 1][upd] = face
-
+    order = np.arange(tri_ids.shape[0], dtype=np.int64)
     if not persp:
-        for t in tri_ids:
-            _raster(S[idx[t, 0]], S[idx[t, 1]], S[idx[t, 2]], tri_face[t])
-        return Z, FI, S
+        t_idx = idx[tri_ids]
+        return (*_raster_tris(S[t_idx[:, 0]], S[t_idx[:, 1]], S[t_idx[:, 2]],
+                              tri_face[tri_ids], order * 8, W, H, clip), S)
 
     from . import cad_viewpoint as _vp  # noqa: PLC0415
     C = _vp.camera_space(pos, frame)
     near, far = float(frame["near"]), float(frame["far"])
     focal, cx, cy = float(frame["focal"]), float(frame["cx"]), float(frame["cy"])
-
-    def _proj(p) -> tuple:
-        return (cx + focal * p[0] / p[2], cy - focal * p[1] / p[2], 1.0 / p[2])
-
-    for t in tri_ids:
-        zs3 = C[idx[t], 2]
-        if zs3.min() >= near and zs3.max() <= far:
-            _raster(S[idx[t, 0]], S[idx[t, 1]], S[idx[t, 2]], tri_face[t])
-            continue
-        if zs3.max() < near or zs3.min() > far:
-            continue
-        poly = _vp.clip_polygon_depth([tuple(C[i]) for i in idx[t]], near, far)
+    t_idx = idx[tri_ids]
+    zs3 = C[t_idx, 2]
+    whole = (zs3.min(axis=1) >= near) & (zs3.max(axis=1) <= far)
+    gone = (zs3.max(axis=1) < near) | (zs3.min(axis=1) > far)
+    A, B, Cc = S[t_idx[whole, 0]], S[t_idx[whole, 1]], S[t_idx[whole, 2]]
+    face, key = tri_face[tri_ids][whole], order[whole] * 8
+    # Triangles crossing the near/far planes are clipped in camera space exactly as the engine
+    # does and fanned; the fan keeps its parent's draw order so depth ties resolve the same.
+    fan_a, fan_b, fan_c, fan_f, fan_k = [], [], [], [], []
+    for j in np.flatnonzero(~whole & ~gone).tolist():
+        poly = _vp.clip_polygon_depth([tuple(C[i]) for i in t_idx[j]], near, far)
         if len(poly) < 3:
             continue
-        sp = [_proj(p) for p in poly]
+        sp = [(cx + focal * p[0] / p[2], cy - focal * p[1] / p[2], 1.0 / p[2]) for p in poly]
         for k in range(1, len(sp) - 1):
-            _raster(sp[0], sp[k], sp[k + 1], tri_face[t])
-    return Z, FI, S
+            fan_a.append(sp[0]); fan_b.append(sp[k]); fan_c.append(sp[k + 1])
+            fan_f.append(int(tri_face[tri_ids[j]])); fan_k.append(int(order[j]) * 8 + k)
+    if fan_a:
+        A = np.concatenate([A, np.asarray(fan_a, dtype=np.float64)])
+        B = np.concatenate([B, np.asarray(fan_b, dtype=np.float64)])
+        Cc = np.concatenate([Cc, np.asarray(fan_c, dtype=np.float64)])
+        face = np.concatenate([face, np.asarray(fan_f, dtype=face.dtype)])
+        key = np.concatenate([key, np.asarray(fan_k, dtype=np.int64)])
+    return (*_raster_tris(A, B, Cc, face, key, W, H, None), S)
 
 
-def _dilate_max3(Z):
-    """3x3 maximum of a depth buffer — the half-pixel slack an edge lying exactly ON a face
-    needs to survive the depth test at a silhouette."""
+def _raster_tris(A, B, C, face, key, W: int, H: int, clip: Optional[float]) -> tuple:
+    """Z-buffer screen triangles (rows of (sx, sy, depth)) into (Z, FI), vectorised.
+
+    Same fill rule as the engine's span fill: pixel centres (x + 0.5, y + 0.5) whose three
+    barycentrics are >= 0 inside the clamped bounding box, depth interpolated linearly, and a
+    strictly nearer (larger) depth wins — so on an exact tie the triangle drawn FIRST (smallest
+    `key`, its draw order) keeps the pixel. Triangles are bucketed by power-of-two bounding-box
+    size and evaluated in batches of at most _RASTER_BATCH_PX candidate pixels."""
     import numpy as np  # noqa: PLC0415
-    P = np.pad(Z, 1, mode="edge")
+    Z = np.full(H * W, -1e30, dtype=np.float64)
+    FI = np.full(H * W, -1, dtype=np.int32)
+    if A.shape[0] == 0:
+        return Z.reshape(H, W), FI.reshape(H, W)
+    xs = np.stack((A[:, 0], B[:, 0], C[:, 0]))
+    ys = np.stack((A[:, 1], B[:, 1], C[:, 1]))
+    lo_x, hi_x = xs.min(axis=0), xs.max(axis=0)
+    lo_y, hi_y = ys.min(axis=0), ys.max(axis=0)
+    area = (B[:, 0] - A[:, 0]) * (C[:, 1] - A[:, 1]) - (C[:, 0] - A[:, 0]) * (B[:, 1] - A[:, 1])
+    ok = (np.isfinite(lo_x) & np.isfinite(hi_x) & np.isfinite(lo_y) & np.isfinite(hi_y)
+          & ~((hi_x < 0.0) | (lo_x > W) | (hi_y < 0.0) | (lo_y > H)) & (np.abs(area) >= 1e-9))
+    sel = np.flatnonzero(ok)
+    minx = np.maximum(np.floor(lo_x[sel]), 0).astype(np.int64)
+    maxx = np.minimum(np.ceil(hi_x[sel]), W - 1).astype(np.int64)
+    miny = np.maximum(np.floor(lo_y[sel]), 0).astype(np.int64)
+    maxy = np.minimum(np.ceil(hi_y[sel]), H - 1).astype(np.int64)
+    keep = (maxx >= minx) & (maxy >= miny)
+    sel, minx, maxx, miny, maxy = sel[keep], minx[keep], maxx[keep], miny[keep], maxy[keep]
+    if sel.size == 0:
+        return Z.reshape(H, W), FI.reshape(H, W)
+    bw = np.ceil(np.log2(maxx - minx + 1)).astype(np.int64)
+    bh = np.ceil(np.log2(maxy - miny + 1)).astype(np.int64)
+    bucket = bw * 64 + bh
+    by = np.argsort(bucket, kind="stable")
+    starts = np.flatnonzero(np.r_[True, bucket[by][1:] != bucket[by][:-1]])
+    ends = np.r_[starts[1:], by.size]
+    frag_p, frag_d, frag_k = [], [], []
+    for s0, s1 in zip(starts.tolist(), ends.tolist()):
+        grp = by[s0:s1]
+        gw = int((maxx[grp] - minx[grp]).max()) + 1
+        gh = int((maxy[grp] - miny[grp]).max()) + 1
+        per = max(1, _RASTER_BATCH_PX // (gw * gh))
+        ox = np.arange(gw, dtype=np.int64)[None, None, :]
+        oy = np.arange(gh, dtype=np.int64)[None, :, None]
+        for c0 in range(s0, s1, per):
+            m = by[c0:min(c0 + per, s1)]
+            t = sel[m]
+            px = minx[m][:, None, None] + ox
+            py = miny[m][:, None, None] + oy
+            fx = px.astype(np.float64) + 0.5
+            fy = py.astype(np.float64) + 0.5
+            s0x, s0y, s0z = (A[t, k][:, None, None] for k in range(3))
+            s1x, s1y, s1z = (B[t, k][:, None, None] for k in range(3))
+            s2x, s2y, s2z = (C[t, k][:, None, None] for k in range(3))
+            ar = area[t][:, None, None]
+            a0 = ((s1x - fx) * (s2y - fy) - (s2x - fx) * (s1y - fy)) / ar
+            a1 = ((s2x - fx) * (s0y - fy) - (s0x - fx) * (s2y - fy)) / ar
+            a2 = 1.0 - a0 - a1
+            inside = ((a0 >= 0) & (a1 >= 0) & (a2 >= 0)
+                      & (px <= maxx[m][:, None, None]) & (py <= maxy[m][:, None, None]))
+            dep = a0 * s0z + a1 * s1z + a2 * s2z
+            if clip is not None:
+                inside &= dep <= clip
+            if not inside.any():
+                continue
+            frag_p.append(np.broadcast_to(py * W + px, inside.shape)[inside])
+            frag_d.append(dep[inside])
+            frag_k.append(np.broadcast_to(key[t][:, None, None], inside.shape)[inside])
+    if not frag_p:
+        return Z.reshape(H, W), FI.reshape(H, W)
+    p = np.concatenate(frag_p)
+    d = np.concatenate(frag_d)
+    k = np.concatenate(frag_k)
+    np.maximum.at(Z, p, d)
+    win = d == Z[p]
+    first = np.full(H * W, np.iinfo(np.int64).max, dtype=np.int64)
+    np.minimum.at(first, p[win], k[win])
+    hit = first != np.iinfo(np.int64).max
+    face_of_key = dict(zip(key.tolist(), face.tolist()))
+    uk, inv = np.unique(first[hit], return_inverse=True)
+    FI[hit] = np.asarray([face_of_key[x] for x in uk.tolist()], dtype=np.int32)[inv]
+    return Z.reshape(H, W), FI.reshape(H, W)
+
+
+def _edge_depth_ref(Z):
+    """Per pixel, the FARTHEST covered depth in its 3x3 neighbourhood (background ignored;
+    -1e30 where all nine pixels are background) — the depth an edge sample there must reach.
+
+    An edge lies ON the faces it bounds, so a one-pixel screen offset on a face sloping in
+    depth already puts the surface nearer than the edge (in perspective the reciprocal-depth
+    slope across a pixel is about the 0.4 % tolerance itself), and at a silhouette the sample
+    sits half a pixel off the face. The farthest covered neighbour absorbs both, while a real
+    occluder covers the whole neighbourhood with nearer depth and still hides the edge."""
+    import numpy as np  # noqa: PLC0415
+    P = np.pad(np.where(Z > -1e29, Z, np.inf), 1, mode="constant", constant_values=np.inf)
     h, w = Z.shape
     out = P[0:h, 0:w].copy()
     for a in range(3):
         for c in range(3):
-            np.maximum(out, P[a:a + h, c:c + w], out=out)
-    return out
+            np.minimum(out, P[a:a + h, c:c + w], out=out)
+    return np.where(np.isinf(out), -1e30, out)
 
 
-def _visible_runs(pts, frame: dict, Zmax, eps: float) -> list:
-    """Split a world polyline into the screen-space runs that survive the depth test.
+def _visible_runs(pts, frame: dict, Zref, eps: float, *, hidden: bool = False) -> list:
+    """Split a world polyline into visible or hidden screen-space runs against `Zref`.
 
     Each run is a list of (x, y) floats ready for ImageDraw.line. Points are resampled to
     ~2 px so a long edge disappearing behind a boss is cut at the right place."""
@@ -5541,36 +5665,30 @@ def _visible_runs(pts, frame: dict, Zmax, eps: float) -> list:
     S = _screen_xyz(pts, frame)
     if S.shape[0] < 2:
         return []
-    H, W = Zmax.shape
-    runs: list = []
-    run: list = []
-    for k in range(S.shape[0] - 1):
-        a, b = S[k], S[k + 1]
-        seg_len = math.hypot(b[0] - a[0], b[1] - a[1])
-        if not math.isfinite(seg_len):
-            # Perspective: an endpoint behind the near plane has no screen position.
-            if len(run) > 1:
-                runs.append(run)
-            run = []
-            continue
-        n = max(2, int(seg_len / 2.0) + 2)
-        ts = np.linspace(0.0, 1.0, n)[:, None]
-        seg = a[None, :] * (1.0 - ts) + b[None, :] * ts
-        xi = np.clip(seg[:, 0].astype(np.int64), 0, W - 1)
-        yi = np.clip(seg[:, 1].astype(np.int64), 0, H - 1)
-        onscreen = ((seg[:, 0] >= -2) & (seg[:, 0] < W + 2)
-                    & (seg[:, 1] >= -2) & (seg[:, 1] < H + 2))
-        vis = onscreen & (seg[:, 2] >= Zmax[yi, xi] - eps)
-        for j, v in enumerate(vis):
-            if v:
-                run.append((float(seg[j, 0]), float(seg[j, 1])))
-            elif run:
-                if len(run) > 1:
-                    runs.append(run)
-                run = []
-    if len(run) > 1:
-        runs.append(run)
-    return runs
+    H, W = Zref.shape
+    a, b = S[:-1], S[1:]
+    seg_len = np.hypot(b[:, 0] - a[:, 0], b[:, 1] - a[:, 1])
+    fin = np.isfinite(seg_len)
+    # A segment with an endpoint behind the near plane (perspective) has no screen position:
+    # it contributes one invisible sample, which ends the run in progress.
+    n = np.where(fin, np.maximum(2, (np.where(fin, seg_len, 0.0) / 2.0).astype(np.int64) + 2), 1)
+    seg = np.repeat(np.arange(a.shape[0]), n)
+    j = np.arange(seg.size) - np.repeat(np.cumsum(n) - n, n)
+    t = (j / np.maximum(n - 1, 1)[seg])[:, None]
+    smp = a[seg] * (1.0 - t) + b[seg] * t
+    ok = fin[seg] & np.isfinite(smp[:, 0]) & np.isfinite(smp[:, 1])
+    sx = np.where(ok, smp[:, 0], -1e9)
+    sy = np.where(ok, smp[:, 1], -1e9)
+    xi = np.clip(sx.astype(np.int64), 0, W - 1)
+    yi = np.clip(sy.astype(np.int64), 0, H - 1)
+    vis = (ok & (sx >= -2) & (sx < W + 2) & (sy >= -2) & (sy < H + 2)
+           & ((smp[:, 2] < Zref[yi, xi] - eps) if hidden
+              else (smp[:, 2] >= Zref[yi, xi] - eps)))
+    edge = np.diff(np.concatenate(([0], vis.astype(np.int8), [0])))
+    starts, ends = np.flatnonzero(edge == 1), np.flatnonzero(edge == -1)
+    xy = np.stack((sx, sy), axis=1)
+    return [list(map(tuple, xy[s:e].tolist())) for s, e in zip(starts.tolist(), ends.tolist())
+            if e - s > 1]
 
 
 def _mask_anchor(mask) -> Optional[tuple]:
@@ -5594,18 +5712,108 @@ def _mask_outline(draw, mask, rgb: tuple, width: int = 2) -> None:
     b[:-1, :] |= m[:-1, :] & ~m[1:, :]
     b[:, 1:] |= m[:, 1:] & ~m[:, :-1]
     b[:, :-1] |= m[:, :-1] & ~m[:, 1:]
-    ys, xs = np.nonzero(b)
+    if not b.any():
+        return
     r = max(1, width) - 1
-    for x, y in zip(xs.tolist(), ys.tolist()):
-        draw.ellipse([x - r, y - r, x + r, y + r], fill=rgb)
+    if r:
+        # The disc of radius r around each boundary pixel, as one point list.
+        grown = b.copy()
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if dx * dx + dy * dy > r * r + r:
+                    continue
+                src = b[max(0, -dy):b.shape[0] - max(0, dy), max(0, -dx):b.shape[1] - max(0, dx)]
+                grown[max(0, dy):b.shape[0] - max(0, -dy),
+                      max(0, dx):b.shape[1] - max(0, -dx)] |= src
+        b = grown
+    ys, xs = np.nonzero(b)
+    draw.point(list(zip(xs.tolist(), ys.tolist())), fill=rgb)
+
+
+# render_view_to_rgb's orientation tint (orient_tint + its annotate blend): a PLANAR face whose
+# averaged triangle normal is within ~23 deg of a principal axis is mixed 55 % toward that side's
+# hue before the Lambert shade 0.35 + 0.65|n.L| is applied. Reproduced here from the face-index
+# buffer so an exact-camera tile gets the side colours without the engine's TOP/FRONT text
+# callouts, triad and header (which the planner's own tags, triad and badge replace).
+_ORIENT_MIX = 0.55
+_ORIENT_LIGHT = (0.4, 0.5, 1.0)
+
+
+def _orient_hue(n) -> Optional[tuple]:
+    ax, ay, az = abs(n[0]), abs(n[1]), abs(n[2])
+    if max(ax, ay, az) < 0.92:
+        return None
+    if az >= ax and az >= ay:
+        return (90, 140, 225) if n[2] > 0 else (70, 175, 185)
+    if ax >= ay and ax >= az:
+        return (220, 80, 80) if n[0] > 0 else (225, 140, 70)
+    return (95, 185, 95) if n[1] > 0 else (215, 200, 70)
+
+
+def _orientation_tints(mesh: dict) -> tuple:
+    """(has[F] bool, rgb[F,3], lam[F]) per mesh face, cached on the (revision-keyed) mesh."""
+    import numpy as np  # noqa: PLC0415
+    cached = mesh.get("_orient_tints")
+    if cached is not None:
+        return cached
+    F = len(mesh["faces"])
+    pos, idx, tf = mesh["pos"], mesh["idx"], mesh["tri_face"]
+    n = np.cross(pos[idx[:, 1]] - pos[idx[:, 0]], pos[idx[:, 2]] - pos[idx[:, 0]])
+    ln = np.linalg.norm(n, axis=1, keepdims=True)
+    n = np.where(ln > 0.0, n / np.maximum(ln, 1e-300), 0.0)
+    acc = np.zeros((F, 3))
+    ok = tf >= 0
+    np.add.at(acc, tf[ok], n[ok])
+    light = np.asarray(_ORIENT_LIGHT) / np.linalg.norm(_ORIENT_LIGHT)
+    has = np.zeros(F, dtype=bool)
+    rgb = np.zeros((F, 3))
+    lam = np.ones(F)
+    for fi, fr in enumerate(mesh["faces"]):
+        a = acc[fi]
+        la = float(np.linalg.norm(a))
+        if int(fr.get("surf_type", 0)) != 0 or la <= 0.0:
+            continue
+        u = a / la
+        hue = _orient_hue(u)
+        if hue is None:
+            continue
+        has[fi] = True
+        rgb[fi] = hue
+        lam[fi] = 0.35 + 0.65 * abs(float(u @ light))
+    mesh["_orient_tints"] = (has, rgb, lam)
+    return mesh["_orient_tints"]
+
+
+def _apply_orientation_tint(arr, FI, mesh: dict) -> int:
+    """Blend the engine's side hue into every visible pixel of a principal planar face, in
+    place on the float RGB `arr`. The shaded pixel is base * 255 * lam, so the engine's tinted
+    pixel ((1 - mix) * base + mix * hue) * lam is (1 - mix) * pixel + mix * hue * lam.
+    Returns the number of pixels tinted."""
+    import numpy as np  # noqa: PLC0415
+    has, rgb, lam = _orientation_tints(mesh)
+    if not has.any():
+        return 0
+    vis = FI >= 0
+    fi = FI[vis]
+    sel = has[fi]
+    if not sel.any():
+        return 0
+    ys, xs = np.nonzero(vis)
+    ys, xs, f = ys[sel], xs[sel], fi[sel]
+    arr[ys, xs] = np.minimum(255.0, (1.0 - _ORIENT_MIX) * arr[ys, xs]
+                             + _ORIENT_MIX * rgb[f] * lam[f][:, None])
+    return int(sel.sum())
 
 
 def _place_label(draw, font, anchor: tuple, text: str, rgb: tuple,
-                 W: int, H: int, taken: list) -> tuple:
+                 W: int, H: int, taken: list, strict: bool = False,
+                 forbidden=None) -> Optional[tuple]:
     """Draw a leader line from `anchor` to a non-overlapping text chip and record its rect.
 
     Candidate offsets fan out from the anchor; the first that fits the frame and clears every
-    rect in `taken` wins, so N callouts never stack on top of each other."""
+    rect in `taken` wins, so N callouts never stack on top of each other. When none clears,
+    the chip is forced next to the anchor — or, with `strict`, nothing is drawn and None is
+    returned."""
     try:
         tb = draw.textbbox((0, 0), text, font=font)
     except Exception:  # noqa: BLE001
@@ -5625,11 +5833,15 @@ def _place_label(draw, font, anchor: tuple, text: str, rgb: tuple,
             if any(not (rect[2] < o[0] or rect[0] > o[2]
                         or rect[3] < o[1] or rect[1] > o[3]) for o in taken):
                 continue
+            if forbidden is not None and forbidden[y:y + bh, x:x + bw].any():
+                continue
             best = rect
             break
         if best:
             break
     if best is None:
+        if strict:
+            return None
         best = (max(2, min(ax + 26, W - bw - 2)), max(2, min(ay - 26, H - bh - 2)))
         best = (best[0], best[1], best[0] + bw, best[1] + bh)
     lx = best[0] if best[0] > ax else best[2]
@@ -5641,6 +5853,128 @@ def _place_label(draw, font, anchor: tuple, text: str, rgb: tuple,
     draw.text((best[0] + pad - tb[0], best[1] + pad - tb[1]), text, font=font, fill=rgb)
     taken.append(best)
     return best
+
+
+def _largest_cluster_anchor(mask) -> Optional[tuple]:
+    """The most interior pixel of `mask`'s LARGEST 4-connected region (ties: nearest that
+    region's centroid).
+
+    A face split by an occluder (a plate seen either side of a boss) has its whole-mask
+    centroid in the occluder; a leader landing there points at the wrong surface. The same
+    holds inside one region: a plate pierced by a bore has its centroid in the hole, and the
+    region pixel nearest it sits on the hole's rim, so a leader there reads as naming the bore.
+    Interior = the largest distance to the region's edge along its row and column. Regions
+    come from a run-length scan (row runs unioned with overlapping runs of the row above)."""
+    import numpy as np  # noqa: PLC0415
+    runs: list = []
+    parent: list = []
+
+    def _find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    prev: list = []
+    for y in range(mask.shape[0]):
+        row = mask[y]
+        if not row.any():
+            prev = []
+            continue
+        d = np.diff(np.concatenate(([0], row.astype(np.int8), [0])))
+        cur = []
+        for x0, x1 in zip(np.flatnonzero(d == 1).tolist(), (np.flatnonzero(d == -1) - 1).tolist()):
+            i = len(runs)
+            runs.append((y, x0, x1))
+            parent.append(i)
+            for j in prev:
+                if runs[j][1] <= x1 and x0 <= runs[j][2]:
+                    a, b = _find(i), _find(j)
+                    if a != b:
+                        parent[max(a, b)] = min(a, b)
+            cur.append(i)
+        prev = cur
+    if not runs:
+        return None
+    groups: dict = {}
+    for i, (y, x0, x1) in enumerate(runs):
+        n = x1 - x0 + 1
+        g = groups.setdefault(_find(i), [0, 0.0, 0.0, []])
+        g[0] += n
+        g[1] += n * (x0 + x1) * 0.5
+        g[2] += n * y
+        g[3].append((y, x0, x1))
+    n, sx, sy, members = max(groups.values(), key=lambda g: g[0])
+    cx, cy = sx / n, sy / n
+    y0 = min(m[0] for m in members)
+    y1 = max(m[0] for m in members)
+    xa = min(m[1] for m in members)
+    xb = max(m[2] for m in members)
+    reg = np.zeros((y1 - y0 + 1, xb - xa + 1), dtype=bool)
+    for y, x0, x1 in members:
+        reg[y - y0, x0 - xa:x1 - xa + 1] = True
+    depth = np.minimum(np.minimum(_run_length(reg, 1, False), _run_length(reg, 1, True)),
+                       np.minimum(_run_length(reg, 0, False), _run_length(reg, 0, True)))
+    ys, xs = np.nonzero(depth == depth.max())
+    k = int(np.argmin((xs + xa - cx) ** 2 + (ys + y0 - cy) ** 2))
+    return (int(xs[k] + xa), int(ys[k] + y0))
+
+
+def _run_length(mask, axis: int, reverse: bool):
+    """Per True pixel, how many consecutive True pixels lead up to it (itself included) along
+    `axis`, scanning forward or in `reverse`; 0 on False pixels."""
+    import numpy as np  # noqa: PLC0415
+    m = np.flip(mask, axis=axis) if reverse else mask
+    n = m.shape[axis]
+    shape = [1, 1]
+    shape[axis] = n
+    idx = np.arange(n).reshape(shape)
+    last_off = np.maximum.accumulate(np.where(m, -1, idx), axis=axis)
+    run = np.where(m, idx - last_off, 0)
+    return np.flip(run, axis=axis) if reverse else run
+
+
+def _draw_face_tags(draw, font, FI, mesh: dict, face_by_topo: dict, topo: dict,
+                    spec: dict, W: int, H: int, taken: list, forbidden=None) -> list:
+    """SID tags for up to spec["max"] faces: role order first (spec["priority"]: topo ->
+    0 target, 1 fixture/load, 2 context ring), then visible pixels; faces under spec["min_px"]
+    pixels get none. Each tag is a leader to the face's largest visible pixel cluster and a
+    chip that overlaps no other chip (a tag with no free spot is dropped, not stacked).
+    The text is the face's doc_query `sid` — the handle query_geometry / add_features refs
+    and describe_part use. Returns [{"sid", "topo", "px", "role", "anchor"}]."""
+    import numpy as np  # noqa: PLC0415
+    prio = spec.get("priority") or {}
+    limit = int(spec.get("max") or 8)
+    min_px = max(int(spec.get("min_px") or 0), 1)
+    counts = np.bincount(FI[FI >= 0].ravel(), minlength=len(mesh["faces"]))
+    topo_of = {fi: t for t, fi in face_by_topo.items()}
+    cands = []
+    for fi, n in enumerate(counts.tolist()):
+        t = topo_of.get(fi)
+        if n >= min_px and t is not None:
+            cands.append((int(prio.get(t, 3)), -int(n), t, fi))
+    cands.sort()
+    out: list = []
+    roles = ("target", "bc", "context", "other")
+    for rank, neg_px, t, fi in cands:
+        if len(out) >= limit:
+            break
+        m = topo["face"][t - 1] if 0 < t <= len(topo["face"]) else {}
+        sid = m.get("sid")
+        if not sid:
+            continue
+        anchor = _largest_cluster_anchor(FI == fi)
+        if anchor is None:
+            continue
+        ax = max(2, min(int(anchor[0]), W - 3))
+        ay = max(2, min(int(anchor[1]), H - 3))
+        rgb = _EMPHASIS_GLOW if rank == 0 else _CALLOUT_RGB
+        if _place_label(draw, font, (ax, ay), str(sid), rgb, W, H, taken,
+                        strict=True, forbidden=forbidden) is None:
+            continue
+        out.append({"sid": str(sid), "topo": int(t), "px": -neg_px, "role": roles[rank],
+                    "anchor": [ax, ay]})
+    return out
 
 
 def _nice_step(v: float) -> float:
@@ -5655,38 +5989,59 @@ def _nice_step(v: float) -> float:
     return base
 
 
-def _draw_scale_bar(draw, font, frame: dict, size_mm: tuple, W: int, H: int) -> float:
-    """Bottom-right scale bar + exact bbox readout, so the image itself carries scale.
+def _scale_bar_layout(draw, font, frame: dict, size_mm: tuple, W: int, H: int) -> dict:
+    """Where the bottom-right scale plate goes: {"mm", "rect", "bar", "label", "dims"}.
 
-    Returns the bar's length in mm (also reported in the caption)."""
+    Two rows on one dark plate, both measured with the real font so nothing is clipped at the
+    frame edge: the part bbox readout on top, and the bar with its length written to its LEFT
+    below. `rect` is what other chips must stay clear of."""
     mm = _nice_step((0.22 * W) / max(frame["scale"], 1e-9))
     px = int(round(mm * frame["scale"]))
     px = max(24, min(px, W // 2))
-    x1, y1 = W - 12, H - 16
-    x0 = x1 - px
     # "part bbox", not "bbox": on a close-up this sits next to a 5 mm scale bar while quoting
     # the WHOLE part's 120 mm, and the unqualified word reads as the size of what is in frame.
     dims = f"part bbox {size_mm[0]:.4g} x {size_mm[1]:.4g} x {size_mm[2]:.4g} mm"
     # A perspective bar is true only at the look-at depth; say so in the image itself.
     label = f"{mm:.4g} mm" + (" @ target" if frame.get("projection") == "perspective" else "")
 
-    def _text_w(text: str) -> int:
+    def _tb(text: str) -> tuple:
         try:
-            bb = draw.textbbox((0, 0), text, font=font)
-            return int(bb[2] - bb[0])
+            return tuple(int(v) for v in draw.textbbox((0, 0), text, font=font))
         except Exception:  # noqa: BLE001
-            return 7 * len(text)
+            return (0, 0, 7 * len(text), 12)
 
-    # The plate grows to hold the label and the bbox line, so neither spills onto the render.
-    lx = min(x0, x1 - _text_w(label))
-    dx = W - 8 - _text_w(dims)
-    draw.rectangle([max(0, min(x0, lx, dx) - 8), y1 - 30, W - 4, H - 4], fill=(24, 26, 32))
-    draw.line([(x0, y1), (x1, y1)], fill=(240, 242, 248), width=2)
+    tl, td = _tb(label), _tb(dims)
+    th = max(tl[3] - tl[1], td[3] - td[1], 10)
+    pad = 5
+    right, bottom = W - 4, H - 4
+    row2 = bottom - pad - th            # top of the bar row
+    row1 = row2 - 4 - th                # top of the bbox row
+    x1 = right - pad - 2
+    x0 = x1 - px
+    lx = x0 - 8 - (tl[2] - tl[0])
+    dx = right - pad - (td[2] - td[0])
+    rect = (max(0, min(lx, dx) - pad), row1 - pad, right, bottom)
+    return {"mm": mm, "rect": rect, "bar": (x0, x1, row2 + th // 2),
+            "label": (lx - tl[0], row2 - tl[1], label),
+            "dims": (dx - td[0], row1 - td[1], dims)}
+
+
+def _draw_scale_bar(draw, font, frame: dict, size_mm: tuple, W: int, H: int,
+                    layout: Optional[dict] = None) -> float:
+    """Bottom-right scale bar + exact bbox readout, so the image itself carries scale.
+
+    Returns the bar's length in mm (also reported in the caption)."""
+    lay = layout or _scale_bar_layout(draw, font, frame, size_mm, W, H)
+    draw.rectangle(list(lay["rect"]), fill=(24, 26, 32))
+    x0, x1, y = lay["bar"]
+    draw.line([(x0, y), (x1, y)], fill=(240, 242, 248), width=2)
     for x in (x0, x1):
-        draw.line([(x, y1 - 5), (x, y1 + 5)], fill=(240, 242, 248), width=2)
-    draw.text((lx, y1 + 2), label, font=font, fill=(240, 242, 248))
-    draw.text((dx, y1 - 26), dims, font=font, fill=(196, 202, 214))
-    return mm
+        draw.line([(x, y - 4), (x, y + 4)], fill=(240, 242, 248), width=2)
+    lx, ly, label = lay["label"]
+    draw.text((lx, ly), label, font=font, fill=(240, 242, 248))
+    dx, dy, dims = lay["dims"]
+    draw.text((dx, dy), dims, font=font, fill=(196, 202, 214))
+    return lay["mm"]
 
 
 # ---------------------------------------------------------------- load vectors on a figure
@@ -5787,20 +6142,38 @@ def _draw_bottom_banner(draw, font, lines: list, W: int, H: int, rgb: tuple,
     return rect
 
 
+_TOPO_CACHE: dict = {}            # doc_id -> (aicm_handle, _doc_topo_maps result)
+
+
 def _doc_topo_maps(doc_id: str) -> dict:
     """{"face": [match,...], "edge": [match,...]} in doc_query enumeration order, so index i
     is topo id i+1 — the id the whole document is addressed by. On a multi-body doc that is
     NOT the AICM per-body face_id/edge_id; _mesh_topo_index does that join. Also gives
-    sid -> topo lookups."""
+    sid -> topo lookups. Cached per revision the way _doc_mesh is (the tessellation handle
+    carries it): one planner grid asks for these maps once per tile, and the doc_query pair
+    costs ~40 ms on a dense part. Callers must treat the result as read-only."""
+    try:
+        handle = ((cb.call("doc_rebuild", {"doc_id": doc_id}) or {}).get("tess")
+                  or {}).get("aicm_path") or ""
+    except Exception:  # noqa: BLE001 — no revision to key on: never serve a stale map
+        handle = ""
+    cached = _TOPO_CACHE.get(doc_id)
+    if handle and cached and cached[0] == handle:
+        return cached[1]
     out = {"face": [], "edge": [], "face_sid": {}, "edge_sid": {}}
+    complete = True
     for of in ("face", "edge"):
         try:
             ms = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": of}})
                   or {}).get("matches") or []
         except Exception:  # noqa: BLE001
             ms = []
+            complete = False
         out[of] = ms
         out[of + "_sid"] = {str(m.get("sid")): i + 1 for i, m in enumerate(ms) if m.get("sid")}
+    if handle and complete:
+        _TOPO_CACHE.clear()       # one document at a time, like _MESH_CACHE
+        _TOPO_CACHE[doc_id] = (handle, out)
     return out
 
 
@@ -5869,23 +6242,34 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                      out_png: Optional[str] = None,
                      emphasis: Optional[dict] = None,
                      arrows: Optional[list] = None,
-                     banner: Optional[list] = None) -> tuple:
+                     banner: Optional[list] = None,
+                     face_tags: Optional[dict] = None,
+                     reserved: Optional[list] = None,
+                     tint: bool = False) -> tuple:
     """Overlay B-rep edges, highlights, feature callouts and a scale bar onto a render.
 
     src_png MUST be the engine render taken along `view_dir` (this reprojects the SAME
     camera). Pass `frame` — the engine's own projection record from _render_view_png — whenever
     you have it; it is required for a FOCUSED close-up, where the Python guess is meaningless.
 
-    `emphasis`, when given, is {"matches": [...], "mode": "emphasis"|"per_face",
-    "label": str, "palette": dict|None}: the target's faces are painted in the emphasis
-    palette with their shading preserved, every other pixel is desaturated toward grey, and
-    info["emphasis"] reports MEASURED coverage — which target sids the camera can actually see
-    and how much of the frame they hold. This is the one emphasis implementation; it uses the
-    same exact visible-face masks as `highlight`, not a splat of projected sample points.
+    `emphasis` paints visible target faces in their palette with shading preserved,
+    desaturates context, and reports measured target coverage. `xray=True` renders
+    the occluding shell at 35% opacity and re-rasterizes target triangles in front
+    of it, opaque with their own surface normals/depth and solid/dashed B-rep edges.
+    Without x-ray, hidden target pixels are not painted through opaque context.
 
     `arrows` draws world force/direction vectors through the SAME reprojection
     (_draw_load_arrows), and `banner` burns caption lines into a band at the bottom of the
     frame (_draw_bottom_banner), so a figure carries its own numbers into a report.
+
+    `face_tags` ({"max", "priority": {topo: rank}, "min_px"}) draws SID tags on the most
+    important visible faces (_draw_face_tags); info["tags"] lists them. `reserved` rects
+    (x0, y0, x1, y1) are kept clear of every chip. info["seen_topos"] is the sorted doc_query
+    topo ids with at least one visible pixel (None when the depth pass did not run).
+
+    `tint` blends the engine's orientation hues into principal planar faces
+    (_apply_orientation_tint) — for an exact-camera render taken with annotate=False, which
+    has no tints of its own; info["tinted_px"] counts the pixels.
 
     Returns (path, info) where `info` feeds _render_annotation_caption. On any failure the
     ORIGINAL png path is returned with info["available"] False — the caller's render is never
@@ -5893,7 +6277,8 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
     info: dict = {"available": False, "edges": False, "hlr": False, "highlights": [],
                   "callouts": [], "callouts_omitted": [], "hidden_features": [],
                   "hidden_faces": 0, "scale_bar_mm": None, "bbox_mm": None,
-                  "note": None, "part_name": None, "emphasis": None, "arrows": []}
+                  "note": None, "part_name": None, "emphasis": None, "arrows": [],
+                  "tags": [], "seen_topos": None}
     try:
         import numpy as np  # noqa: PLC0415
         from PIL import Image as PILImage, ImageDraw  # noqa: PLC0415
@@ -5947,6 +6332,8 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
             info["hlr"] = True
 
         arr = np.asarray(im, dtype=np.float64)
+        if tint and FI is not None:
+            info["tinted_px"] = _apply_orientation_tint(arr, FI, mesh)
         topo = _doc_topo_maps(doc_id)
         face_by_topo, edge_by_topo = _mesh_topo_index(mesh)
 
@@ -5960,13 +6347,13 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                     etop.add(topo["edge_sid"][sid])
             return ftop, etop
 
-        # ---- EMPHASIS: exact visible-face masks, shading preserved, context desaturated ----
-        # The target is painted in its palette colour MODULATED by the pixel's own luminance,
-        # so a bore still reads as a curved surface instead of a flat sticker; everything else
-        # is pulled toward grey. Coverage is measured, not assumed — a target the camera cannot
-        # see is reported as such rather than silently producing a picture of nothing.
+        # Exact visible masks; an explicit x-ray uses a second target-only depth pass
+        # so hidden surfaces retain their own material shading rather than taking on
+        # the occluder's grey luminance.
         emp_draw: list = []
-        emp_ghost = None   # occluded target pixels, tinted through the occluder
+        emp_ghost = None
+        xray_depth = None
+        xray_face_idx: set = set()
         if emphasis:
             emp_matches = list(emphasis.get("matches") or [])
             emp_mode = emphasis.get("mode") or "emphasis"
@@ -6001,41 +6388,62 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                     per_target.append({"sid": sid, "mask": mask if mask.any() else None,
                                        "edge_idx": eidx, "rgb": rgb,
                                        "label": sid})
-                # Context first, so the emphasis paint below is never desaturated with it.
+                xray = bool(emphasis.get("xray")) and not frame.get("section")
+                # In x-ray mode draw the occluding shell as a pale, desaturated
+                # translucent skin over the background, not a red blend through grey.
+                # The target's own z-buffer wins every pixel of its silhouette.
                 ctx = ~target_any
                 g = (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2])
                 for ch in range(3):
                     arr[..., ch] = np.where(
                         ctx, g * (1.0 - _CONTEXT_DESAT) + arr[..., ch] * _CONTEXT_DESAT,
                         arr[..., ch])
+                if xray:
+                    skin = (FI >= 0) & ctx
+                    arr[skin] = arr[skin] * 0.35 + 245.0 * 0.65
                 for t in per_target:
                     if t["mask"] is None:
                         continue
                     shade = 0.45 + 0.85 * lum[t["mask"]]
                     for ch in range(3):
                         arr[..., ch][t["mask"]] = np.clip(t["rgb"][ch] * shade, 0, 255)
-                # GHOST: the target's own triangles rasterized ALONE give its whole silhouette;
-                # the part of it that lost the depth test above sits behind other material.
-                # Tint that through the occluder (half-strength, thin outline below) so a rib
-                # half-hidden behind a boss still reads as one shape, and SAY how much it was.
                 if all_fidx:
                     tsel = np.isin(mesh["tri_face"], np.asarray(sorted(all_fidx), dtype=np.int32))
-                    tbuf = (_mesh_depth_buffer({"pos": mesh["pos"], "idx": mesh["idx"][tsel],
-                                                "tri_face": mesh["tri_face"][tsel]}, frame)
-                            if tsel.any() else None)
+                    tri_ids = np.flatnonzero(tsel)
+                    target_mesh = {"pos": mesh["pos"], "idx": mesh["idx"][tsel],
+                                   "tri_face": np.arange(len(tri_ids), dtype=np.int32)}
+                    tbuf = _mesh_depth_buffer(target_mesh, frame) if tsel.any() else None
                     if tbuf is not None:
                         ghost = (tbuf[1] >= 0) & ~target_any
                         if ghost.any():
-                            grgb = np.asarray(per_target[0]["rgb"] if per_target
-                                              else _EMPHASIS_PALETTE[0], dtype=np.float64)
-                            arr[ghost] = arr[ghost] * 0.55 + grgb * 0.45
-                            emp_ghost = ghost
+                            if xray:
+                                # The winning target triangle supplies real surface
+                                # normals/depth, including a distinct bore floor. Its
+                                # material is opaque: the skin must never muddy the colour.
+                                p = mesh["pos"][mesh["idx"][tri_ids]]
+                                n = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
+                                n /= np.maximum(np.linalg.norm(n, axis=1)[:, None], 1e-12)
+                                light = np.asarray((0.4, 0.5, 1.0))
+                                light /= np.linalg.norm(light)
+                                shades = 0.5 + 0.5 * np.abs(n @ light)
+                                grgb = np.asarray(per_target[0]["rgb"] if per_target
+                                                  else _EMPHASIS_PALETTE[0], dtype=np.float64)
+                                entire = tbuf[1] >= 0
+                                arr[entire] = grgb * shades[tbuf[1][entire], None]
+                                emp_ghost = ghost
+                                rec["xray"] = True
                         n_ghost = int(ghost.sum())
                         rec["occluded_px"] = n_ghost
                         rec["occluded_frac"] = round(
                             n_ghost / float(max(n_ghost + int(target_any.sum()), 1)), 4)
-                rec["target_px"] = int(target_any.sum())
-                rec["coverage"] = round(rec["target_px"] / float(W * H), 4)
+                        if xray:
+                            rec["target_px"] = int((tbuf[1] >= 0).sum())
+                            rec["coverage"] = round(rec["target_px"] / float(W * H), 4)
+                            xray_depth = tbuf[0]
+                            xray_face_idx = all_fidx
+                if not xray:
+                    rec["target_px"] = int(target_any.sum())
+                    rec["coverage"] = round(rec["target_px"] / float(W * H), 4)
                 emp_draw = per_target
             else:
                 rec["note"] = "mesh over the depth budget — emphasis mask unavailable"
@@ -6068,34 +6476,59 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
             zr = Z[Z > -1e29]
             span = float(zr.max() - zr.min()) if zr.size else 1.0
             eps = max(1e-9, span * 0.004)
-            Zmax = _dilate_max3(Z)
+            Zref = _edge_depth_ref(Z)
             hl_edge_ids = {i for h in hl_draw for i in h["edge_idx"]}
             hl_edge_ids |= {i for t in emp_draw for i in t["edge_idx"]}
             n_runs = 0
             for ei, e in enumerate(mesh["edges"]):
                 if ei in hl_edge_ids:
                     continue
-                for run in _visible_runs(e["pts"], frame, Zmax, eps):
-                    draw.line(run, fill=_EDGE_RGB, width=1)
+                for run in _visible_runs(e["pts"], frame, Zref, eps):
+                    draw.line(run, fill=(112, 125, 139) if (emphasis and emphasis.get("xray"))
+                              else _EDGE_RGB, width=1)
                     n_runs += 1
             info["edges"] = n_runs > 0
+            if xray_depth is not None and xray_face_idx:
+                # Target boundaries compare to its OWN depth, not opaque occluder depth.
+                target_tris = mesh["idx"][np.isin(mesh["tri_face"], list(xray_face_idx))]
+                target_vertices = {tuple(p) for p in
+                                   np.round(mesh["pos"][np.unique(target_tris)], 4)}
+                target_zref = _edge_depth_ref(xray_depth)
+                covered = xray_depth[xray_depth > -1e29]
+                target_eps = max(eps, float(np.ptp(covered)) * 0.004) if covered.size else eps
+                for e in mesh["edges"]:
+                    pts = e["pts"]
+                    if (tuple(np.round(pts[0], 4)) not in target_vertices or
+                            tuple(np.round(pts[-1], 4)) not in target_vertices):
+                        continue
+                    for run in _visible_runs(pts, frame, target_zref, target_eps):
+                        draw.line(run, fill=(105, 19, 30), width=2)
+                    for run in _visible_runs(pts, frame, target_zref, target_eps, hidden=True):
+                        for q in range(0, len(run) - 1, 4):
+                            draw.line(run[q:q + 3], fill=(180, 86, 91), width=1)
             # Highlighted EDGE targets are drawn last, fat, in their reserved colour.
             for h in hl_draw:
                 for ei in h["edge_idx"]:
-                    for run in _visible_runs(mesh["edges"][ei]["pts"], frame, Zmax, eps):
+                    for run in _visible_runs(mesh["edges"][ei]["pts"], frame, Zref, eps):
                         draw.line(run, fill=h["rec"]["colour"], width=3)
             # An emphasized EDGE target (a fillet edge, a chamfer) has no face mask to paint —
             # stroke it fat in its palette colour instead so it is unmissable.
             for t in emp_draw:
                 for ei in t["edge_idx"]:
-                    for run in _visible_runs(mesh["edges"][ei]["pts"], frame, Zmax, eps):
+                    for run in _visible_runs(mesh["edges"][ei]["pts"], frame, Zref, eps):
                         draw.line(run, fill=tuple(t["rgb"]), width=4)
 
         # ---- emphasis outlines + leader labels ----------------------------------------
         # Drawn before the highlight chips so an explicit `highlight` still wins the top layer.
-        emp_taken: list = []
+        emp_taken: list = [tuple(r) for r in (reserved or [])]
+        # The scale plate is drawn last but laid out now, so every chip routes around it.
+        bar = (_scale_bar_layout(draw, _annot_font(12), frame, info["bbox_mm"], W, H)
+               if scale and info["bbox_mm"] else None)
+        if bar is not None:
+            emp_taken.append(bar["rect"])
         if emp_ghost is not None:
-            _mask_outline(draw, emp_ghost, (150, 150, 160), width=1)
+            _mask_outline(draw, emp_ghost, (140, 26, 36) if (emphasis and emphasis.get("xray"))
+                          else (150, 150, 160), width=1)
         # Shared-colour emphasis names the TARGET once (on its largest visible face); a chip
         # per sid ("Fc51694", "F3bae34") only says something in per_face mode, where each
         # colour needs its key.
@@ -6106,7 +6539,9 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
             biggest = max(sized, key=lambda t: int(t["mask"].sum())) if sized else None
         for t in emp_draw:
             if t["mask"] is not None:
-                _mask_outline(draw, t["mask"], _EMPHASIS_GLOW, width=2)
+                _mask_outline(draw, t["mask"], (140, 26, 36) if (emphasis and
+                              emphasis.get("xray")) else _EMPHASIS_GLOW,
+                              width=1 if (emphasis and emphasis.get("xray")) else 2)
             if emphasis.get("draw_label") is False:
                 continue   # the caller places its own label clear of the target
             if one_label and t is not biggest and not (biggest is None and t is emp_draw[0]):
@@ -6130,7 +6565,7 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
         # arrow) and before the highlight/callout chips, which then route around both.
         band = _draw_bottom_banner(draw, _annot_font(12), banner, W, H,
                                    tuple((arrows or [{}])[0].get("rgb") or (240, 242, 248)),
-                                   H - (48 if scale else 4))
+                                   bar["rect"][1] - 2 if bar is not None else H - 4)
         if band:
             emp_taken.append(band)
         info["arrows"] = _draw_load_arrows(draw, font, arrows, frame, W, H, emp_taken)
@@ -6166,6 +6601,20 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                              f"* {rec['label']}", rec["colour"], W, H, taken)
                 entry["visible"] = h["mask"] is not None or bool(h["edge_idx"])
             info["highlights"].append(entry)
+
+        # Ghost material is a context reference, not a place to put an ID chip.
+        if face_tags and FI is not None:
+            forbidden = None
+            if frame.get("section"):
+                opposite = dict(frame)
+                plane = frame["section"]
+                opposite["section"] = {
+                    "point": plane["point"], "normal": [-x for x in plane["normal"]]}
+                removed = _mesh_depth_buffer(mesh, opposite)
+                if removed is not None:
+                    forbidden = removed[1] >= 0
+            info["tags"] = _draw_face_tags(draw, _annot_font(12), FI, mesh, face_by_topo,
+                                           topo, face_tags, W, H, taken, forbidden)
 
         # ---- feature callouts (id + name on a leader, largest-first, capped) -----------
         # A feature that already carries a highlight chip — or IS the emphasis target — is
@@ -6229,10 +6678,11 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                 hidden.append(f"{tag}" + (f" ({'/'.join(bits)})" if bits else ""))
             info["hidden_faces"] = len(hidden)
             info["hidden_face_list"] = hidden[:8]
+            info["seen_topos"] = sorted(t for t, fi in face_by_topo.items() if fi in seen)
 
-        if scale and info["bbox_mm"]:
+        if bar is not None:
             info["scale_bar_mm"] = _draw_scale_bar(draw, _annot_font(12), frame,
-                                                   info["bbox_mm"], W, H)
+                                                   info["bbox_mm"], W, H, layout=bar)
 
         out_png = out_png or _tmp(".png")
         im.save(out_png, format="PNG")

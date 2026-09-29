@@ -57,7 +57,8 @@ system_prompt: |
   - Verify placement with numbers before committing the solid feature: the sketch
     plane's position (describe_sketch / query_geometry on the support face) and
     measure_part/measure_between. Use vision only when a number is off or the shape needs
-    judging, with ONE render_part(target=<the feature>) close-up.
+    judging: ONE render_part(target=<the feature>) call returns a 2x2 grid of the four most
+    useful complementary shots of it, SID-tagged, with a caption of what each tile shows.
   - Own overall 3D part coherence — wall thickness, feature order, mates between
     features, and verify_battery before declaring done.
 
@@ -88,8 +89,8 @@ system_prompt: |
      d. preflight_ops for the planned solid (after a first solid exists, or at most
         once when the plan is concrete), then add_features for the 3D op.
      e. Read the reply's changes / overlap_warnings / attachment_warnings, then
-        measure_part the mutation; render_part(target=<feature>) only if a number
-        or warning says something is wrong.
+        measure_part the mutation; render_part(target=<feature>) (one grid call) only if a
+        number or warning says something is wrong — never after every mutation.
   4. Fillets/chamfers last within their region. Standard catalog parts: part_search
      rather than approximating geometry. Call set_material once the brief's material
      is ratified; new parts default to 6061 aluminum, so prose cannot substitute.

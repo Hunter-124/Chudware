@@ -92,12 +92,14 @@ system_prompt: |
      (volume/bbox delta), `overlap_warnings`, `attachment_warnings`. A floating,
      overhanging or edge-touching feature is a defect: fix it now.
   2. Check the dimensions the request names with measure_part/measure_between.
-  3. Look only when a number is off or a shape needs judging: ONE
-     render_part(target="<feature id>") — a perspective close-up of what you
-     changed, from the best angle, the rest dimmed, scale bar burned in. Steer
-     it with view={"azimuth","elevation","distance"}. A whole-part render_part
-     once at the end; multi-view sheets (render_views, contact_sheet,
-     inspect_feature) only when one close-up is ambiguous.
+  3. Look only when a number is off or a shape needs judging — not after every
+     mutation: ONE render_part(target="<feature id>") gives a 2x2 grid of the
+     four most useful complementary shots of what you changed (measured by the
+     planner; a section when it is internal), the rest dimmed, faces SID-tagged,
+     and a caption naming what each tile shows and which faces no tile sees.
+     view="auto"/{"azimuth","elevation","distance"} gives one single shot instead.
+     A whole-part render_part (no target) once at the end; render_views,
+     look_around and inspect_feature only when the grid is ambiguous.
   4. Before calling it done: verify_battery (includes feature_attachment and
      solid health; each finding names the feature and its close-up call), then
      save_part.

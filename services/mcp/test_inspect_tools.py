@@ -45,6 +45,10 @@ def _extract_palette(caption: str) -> dict:
 from services.mcp import cad_tools as ct  # noqa: E402
 from services.mcp import cad_common as cc  # noqa: E402  _resolve_highlight_specs/_feature_roster
 from services.mcp import cad_render_tools as ct_render  # noqa: E402  T-RF8: inspect/render tools moved
+from services.mcp.test_shot_planner import (  # noqa: E402  the planner's engine fake
+    faces_from_matches,
+    fake_view_metrics,
+)
 
 
 # --------------------------------------------------------------------------- fixtures / fakes
@@ -596,6 +600,8 @@ class TestInspectToolsE2E:
                 _fake_png(params["out_path"])
                 return {"ok": True, "path": params["out_path"],
                         "view": "front", "dir": [0, -1, 0]}
+            if method == "doc_view_metrics":
+                return fake_view_metrics(params, faces_from_matches(matches))
             if method == "doc_render_contact_sheet":
                 # Labeled multi-view grid (engine default 4 tiles; we accept any list).
                 views = params.get("views") or ["front", "back", "left", "right",
@@ -713,27 +719,16 @@ class TestInspectToolsE2E:
         assert os.path.exists(png_path)
         from PIL import Image as PILImage
         with PILImage.open(png_path) as im:
-            # Default 7 views (6 ortho + iso) tiled — wider than a single render.
-            assert im.size[0] >= 512 and im.size[1] >= 400
+            # 7 planner tiles in 3 columns: wider and taller than a single render.
+            assert im.size[0] >= 3 * 512 and im.size[1] >= 3 * 400
         assert "render_views" in caption
-        # Annotated default (annotate=True) renders view-BY-view, because the engine's
-        # doc_render_contact_sheet tiles internally and leaves no per-tile image to draw the
-        # B-rep edge outline / callouts / scale bar onto.
+        # The default set is the planner's: measured once, rendered view-by-view so every
+        # tile carries its overlay — never the engine's fixed internal sheet.
+        assert sum(1 for m, _ in calls if m == "doc_view_metrics") >= 1
         assert not any(m == "doc_render_contact_sheet" for m, _ in calls)
-        assert sum(1 for m, _ in calls if m == "doc_render_view") >= 7
-        # Caption names the standard views.
-        for name in ("front", "back", "top", "iso"):
-            assert name in caption.lower()
-
-    def test_render_views_unannotated_uses_native_sheet(
-            self, monkeypatch, top_face_match, part_bbox, tmp_path):
-        """annotate=False keeps the one-RPC engine sheet — no overlay to draw, no reason to
-        pay for a render per view."""
-        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
-        tool_fn = self._tool("render_views")
-        tool_fn(doc_id="doc-test", annotate=False)
-        assert any(m == "doc_render_contact_sheet" for m, _ in calls)
-        assert not any(m == "doc_render_view" for m, _ in calls)
+        assert sum(1 for m, _ in calls if m == "doc_render_view") == 7
+        for letter in "ABCDEFG":
+            assert f" {letter}: dir [" in caption
 
     def test_render_views_custom_list(
             self, monkeypatch, top_face_match, part_bbox, tmp_path):
@@ -966,6 +961,8 @@ class TestRenderSavePath:
             if method in ("doc_render_view", "doc_render_png"):
                 _fake_png(params["out_path"])
                 return {"ok": True, "path": params["out_path"]}
+            if method == "doc_view_metrics":
+                return fake_view_metrics(params, faces_from_matches([top, bot]))
             if method == "doc_tree":
                 return {"owner_map": {}, "tree": {"features": [
                     {"id": "f1", "name": "Box", "type": "box"}]}}

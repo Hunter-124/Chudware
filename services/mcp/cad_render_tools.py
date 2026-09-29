@@ -3,13 +3,14 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from mcp.server.fastmcp import Image
-from typing import Optional
+from typing import Callable, Optional
 from typing import Union
 import hashlib
 import os
 import math
 
 from . import cad_viewpoint as _vp
+from . import shot_planner as _sp
 from .cad_common import (
     _CLOSEUP_H,
     _CLOSEUP_MARGIN,
@@ -26,10 +27,10 @@ from .cad_common import (
     _describe_part_excerpt,
     _doc,
     _doc_mesh,
+    _doc_topo_maps,
     _orbit_view_dirs,
     _frame_from_rpc,
     _handoff_doc_name,
-    _ideal_views,
     _inspect_caption,
     _match_point_cloud,
     _normalize_view_list,
@@ -41,7 +42,6 @@ from .cad_common import (
     _sanitize_output_path,
     _target_bbox,
     _target_is_internal,
-    _target_mesh_tris,
     _tile_pngs_grid,
     _tmp,
     _vnorm,
@@ -146,7 +146,8 @@ def _closeup(d: str, matches: list, target_bb: dict, view_dir, *, label: str,
              highlight=None, background: Optional[list] = None,
              projection: str = "perspective", fov_deg: Optional[float] = None,
              distance: Optional[float] = None, scene_bbox: Optional[dict] = None,
-             point: Optional[tuple] = None, defect: Optional[dict] = None) -> tuple:
+             point: Optional[tuple] = None, defect: Optional[dict] = None,
+             section: Optional[dict] = None) -> tuple:
     """ONE idealized close-up: engine-framed render + exact-mask emphasis overlay.
 
     This is the single close-up implementation every inspect/render tool goes through.
@@ -160,6 +161,9 @@ def _closeup(d: str, matches: list, target_bb: dict, view_dir, *, label: str,
     reprojects through the engine's echoed frame; occluded target pixels are ghosted.
     `defect` (an eval_feature_attachment entry) paints its evidence: the unsupported base
     patch hatched orange, or the gap to the part as a cyan dimension.
+    `section` ({"point", "normal"}, a planner section view) renders the engine's cut with the
+    removed half ghosted; the Python hidden-line edge overlay is skipped there because the
+    engine already draws the ghost's edges.
     Returns (png_path, info) — `info["emphasis"]` carries the palette and the MEASURED
     coverage/occlusion, `info["camera"]` the pose used. The palette is always reported, even
     when the tessellation is missing and the mask could not be painted."""
@@ -169,7 +173,7 @@ def _closeup(d: str, matches: list, target_bb: dict, view_dir, *, label: str,
     if margin is None:
         margin = _PERSP_MARGIN if persp else _CLOSEUP_MARGIN
     if persp:
-        fit_pts = _target_points(d, matches)
+        fit_pts = _sp.target_points(d, matches)
         if fit_pts is not None:
             for key in ("nearest_point", "nearest_point_on_part", "location"):
                 if defect and defect.get(key):
@@ -182,14 +186,14 @@ def _closeup(d: str, matches: list, target_bb: dict, view_dir, *, label: str,
     png, frame, _r = _render_view_png(d, view_dir, png, name=label.upper()[:28],
                                       focus=target_bb, margin=margin, clip_near=clip_near,
                                       W=W, H=H, annotate=bool(annotate) and not persp,
-                                      background=background, camera=camera)
+                                      background=background, camera=camera, section=section)
     palette = (_build_emphasis_palette(matches or [], mode=emphasis_mode)
                if emphasis_mode and matches else None)
     emphasis = ({"matches": list(matches or []), "mode": emphasis_mode, "label": label,
                  "palette": palette, "draw_label": not persp}
                 if palette is not None else None)
     png, info = _annotate_render(png, d, view_dir, highlight=highlight,
-                                 edges=True, callouts=False, scale=True,
+                                 edges=not section, callouts=False, scale=True,
                                  frame=frame, emphasis=emphasis,
                                  out_png=render_output_path(stem, ".png"))
     if palette is not None and not (info.get("emphasis") or {}).get("palette"):
@@ -204,22 +208,6 @@ def _closeup(d: str, matches: list, target_bb: dict, view_dir, *, label: str,
     _draw_closeup_chip(png, frame, label, target_bb, camera, point,
                        show_text=bool(annotate), defect=defect)
     return png, info
-
-
-def _target_points(d: str, matches: list) -> Optional[list]:
-    """World vertices of the target's own triangles (what a tight fit must enclose)."""
-    if not matches:
-        return None
-    try:
-        import numpy as np  # noqa: PLC0415
-        mesh = _doc_mesh(d)
-        sel = _target_mesh_tris(mesh, d, matches)
-        if sel is None:
-            return None
-        ids = np.unique(mesh["idx"][sel].reshape(-1))
-        return mesh["pos"][ids].tolist()
-    except Exception:  # noqa: BLE001
-        return None
 
 
 def _attachment_defect(d: str, resolved: dict) -> Optional[dict]:
@@ -300,26 +288,23 @@ def _clearest_bearing(d: Optional[str], h: tuple, g: tuple, a, b) -> tuple:
 
 
 def _auto_view(d: str, resolved: dict, matches: list, target_bb: dict, part_bb: dict,
-               clip: bool, point: Optional[tuple]) -> tuple:
-    """(view_dir, label, defect, clip) for view="auto": a defect-showing camera (never cut
-    away) when the target feature fails eval_feature_attachment, else the occlusion-scored
-    ideal direction. A cutaway is kept only when the target cannot be seen uncut: a rib
-    whose box sits inside the part's box is not "internal", and cutting the plate in front
-    of it made a close-up of a seated rib look broken."""
+               point: Optional[tuple]) -> tuple:
+    """(view_dir, label, defect, section) for an explicit view="auto" single shot: a
+    defect-showing camera when the target feature fails eval_feature_attachment, else the
+    planner's single best view of the target (shot_planner.plan_shots, k=1) — which is a
+    section through the target when no exterior camera shows it well."""
     defect = _attachment_defect(d, resolved)
     if defect:
         return (_defect_view_dir(defect, part_bb, d), f"shows-{defect.get('verdict')}",
-                defect, False)
+                defect, None)
     if matches:
-        if clip:
-            open_pick = _ideal_views(d, matches, target_bb, n=1, clip_near=False)[0]
-            if (open_pick.get("visible_frac") or 0.0) >= 0.5:
-                return open_pick["dir"], open_pick.get("label") or "auto", None, False
-        pick = _ideal_views(d, matches, target_bb, n=1, clip_near=clip)[0]
-        return pick["dir"], pick.get("label") or "auto", None, clip
+        best = _sp.plan_shots(d, target={"matches": matches, "bbox": target_bb,
+                                         "label": resolved.get("label") or "target",
+                                         "kind": resolved.get("kind")}, k=1)["views"][0]
+        return tuple(best["dir"]), best.get("label") or "auto", None, best.get("section")
     if point is not None:
-        return _point_view_dir(point, part_bb), "outside-in", None, clip
-    return _vnorm((1.0, 1.0, 0.8)), "iso", None, clip
+        return _point_view_dir(point, part_bb), "outside-in", None, None
+    return _vnorm((1.0, 1.0, 0.8)), "iso", None, None
 
 
 def _defect_lines(defect: Optional[dict]) -> list:
@@ -397,18 +382,6 @@ def _draw_defect(im, draw, frame: dict, defect: dict) -> None:
             draw.ellipse([x - 10, y - 10, x + 10, y + 10], outline=cyan, width=3)
 
 
-def _draw_triad(draw, frame: dict, H: int) -> None:
-    """World X/Y/Z triad bottom-left, through the render's own camera basis."""
-    ox, oy, L = 26, H - 26, 18
-    for axis, rgb, name in (((1, 0, 0), (220, 80, 80), "X"), ((0, 1, 0), (95, 185, 95), "Y"),
-                            ((0, 0, 1), (90, 140, 225), "Z")):
-        su = sum(axis[i] * frame["r"][i] for i in range(3))
-        sv = sum(axis[i] * frame["u"][i] for i in range(3))
-        ex, ey = ox + su * L, oy - sv * L
-        draw.line([(ox, oy), (ex, ey)], fill=rgb, width=2)
-        draw.text((ex + (3 if su >= 0 else -9), ey - 6), name, fill=rgb)
-
-
 def _draw_closeup_chip(png: str, frame: Optional[dict], label: str, target_bb: dict,
                        camera: Optional[dict], point: Optional[tuple], *,
                        show_text: bool = True, defect: Optional[dict] = None) -> None:
@@ -450,16 +423,22 @@ def _draw_closeup_chip(png: str, frame: Optional[dict], label: str, target_bb: d
         draw.text((7, y), line, font=font, fill=rgb)
         y += th + 6
     if show_text and camera and frame is not None and frame.get("r"):
-        _draw_triad(draw, frame, im.size[1])
+        _sp.draw_triad(draw, frame, im.size[1])
     if point is not None and frame is not None:
-        s = _screen_xyz([point], frame)[0]
-        if math.isfinite(float(s[0])) and math.isfinite(float(s[1])):
-            x, yy = int(round(float(s[0]))), int(round(float(s[1])))
-            rgb = _HIGHLIGHT_PALETTE[0][0]
-            draw.ellipse([x - 8, yy - 8, x + 8, yy + 8], outline=rgb, width=2)
-            draw.line([(x - 13, yy), (x + 13, yy)], fill=rgb, width=2)
-            draw.line([(x, yy - 13), (x, yy + 13)], fill=rgb, width=2)
+        _draw_crosshair(draw, frame, point)
     im.save(png, format="PNG")
+
+
+def _draw_crosshair(draw, frame: dict, point: tuple) -> None:
+    """Ringed crosshair on a world-point target, through the render's own camera."""
+    s = _screen_xyz([point], frame)[0]
+    if math.isfinite(float(s[0])) and math.isfinite(float(s[1])):
+        x, yy = int(round(float(s[0]))), int(round(float(s[1])))
+        rgb = _HIGHLIGHT_PALETTE[0][0]
+        draw.ellipse([x - 8, yy - 8, x + 8, yy + 8], outline=rgb, width=2)
+        draw.line([(x - 13, yy), (x + 13, yy)], fill=rgb, width=2)
+        draw.line([(x, yy - 13), (x, yy + 13)], fill=rgb, width=2)
+
 
 
 def _split_view(view) -> tuple:
@@ -536,6 +515,22 @@ def _resolve_camera_target(d: str, target, part_bb: Optional[dict]) -> tuple:
           "size": (2 * r,) * 3, "center": p}
     label = f"point [{p[0]:.4g}, {p[1]:.4g}, {p[2]:.4g}]"
     return {"matches": [], "label": label, "kind": "point"}, bb, p
+
+
+def _render_target(d: str, spec, part_bb: dict) -> tuple:
+    """(resolved, target_bb, point) for render_part's target/emphasize argument. A list of
+    feature/face specs is a union target (AABB union, kind "emphasis"); a 3-number list is a
+    point. A single spec keeps its resolver record (feature_id feeds the defect lookup)."""
+    specs = spec if isinstance(spec, list) and _point_of(spec) is None else [spec]
+    parts = [_resolve_camera_target(d, sp, part_bb) for sp in specs]
+    if len(parts) == 1:
+        return dict(parts[0][0]), parts[0][1], parts[0][2]
+    matches = [m for rs, _bb, _p in parts for m in (rs.get("matches") or [])]
+    resolved = {"matches": matches,
+                "label": ", ".join(str(rs.get("label") or sp)
+                                   for (rs, _bb, _p), sp in zip(parts, specs)),
+                "kind": "emphasis"}
+    return resolved, _union_bbox([bb for _rs, bb, _p in parts]), None
 
 
 def _point_view_dir(point: tuple, part_bb: Optional[dict]) -> tuple:
@@ -706,6 +701,41 @@ def _with_save_note(result, note: str):
     return [result, note]
 
 
+# ------------------------------------------------------------------- planner shot grids
+def _tile_decorator(point: Optional[tuple]) -> Callable:
+    """Per-tile evidence for render_shot_grid: an attachment defect painted on the tile aimed
+    at it (the pinned view carries "defect"), and a crosshair on a world-point target."""
+    def _decorate(png: str, frame: Optional[dict], view: dict) -> None:
+        defect = view.get("defect")
+        if frame is None or (not defect and point is None):
+            return
+        from PIL import Image as PILImage, ImageDraw  # noqa: PLC0415
+        with PILImage.open(png) as im0:
+            im = im0.convert("RGB")
+        draw = ImageDraw.Draw(im)
+        if defect:
+            try:
+                _draw_defect(im, draw, frame, defect)
+            except Exception:  # noqa: BLE001 — evidence paint must never cost the render
+                pass
+            draw = ImageDraw.Draw(im)
+        if point is not None:
+            _draw_crosshair(draw, frame, point)
+        im.save(png, format="PNG")
+    return _decorate
+
+
+def _shot_grid(d: str, plan: dict, *, stem: str, highlight=None,
+               emphasis_mode: Optional[str] = "emphasis", annotate: bool = True,
+               background: Optional[list] = None, point: Optional[tuple] = None) -> tuple:
+    """(png, caption) for a plan: the lettered grid and its self-sufficient caption, plus the
+    emphasis palette block when a target is painted."""
+    png, info = _sp.render_shot_grid(d, plan, highlight=highlight, emphasis_mode=emphasis_mode,
+                                     annotate=annotate, background=background,
+                                     decorate=_tile_decorator(point), stem=stem)
+    return png, info["caption"] + _palette_caption_block(info.get("palette"))
+
+
 # ------------------------------------------------------------------- study-setup figure
 # The FIXTURE/LOAD figure an evidence document needs. Every face selection goes through
 # cad_sim_tools' own resolver stack — _norm_bc_list, _sim_face_points, _build_load_specs,
@@ -863,35 +893,40 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                     save_path: Optional[str] = None) -> list:
         """Render the part and return [image, caption] so you can SEE it.
 
-        WITHOUT target: whole-part annotated iso (or `view`). Flat faces are tinted by
-        direction (TOP +Z blue, BOTTOM -Z teal, FRONT -Y yellow, BACK +Y green, RIGHT +X red,
-        LEFT -X orange; curved faces grey); B-rep edges are hidden-line removed; feature
-        callouts (id + name) and a scale bar are drawn.
+        DEFAULT (no `view`): ONE image holding the FOUR most useful complementary shots, a
+        2x2 grid of 512x384 perspective tiles lettered A-D. The shot planner measures ~200
+        candidate cameras in the engine (exact visible area, edge contrast, occlusion) and
+        picks the SET that together shows the most — so the back, the underside or a cut
+        through an internal feature is in the grid when that is where the information is.
+        Each tile carries SID tags on its most important visible faces (the same sids
+        query_geometry / add_features refs accept) and a world X/Y/Z triad. The caption
+        lists per tile the camera direction, whether it is a SECTION (cut face hatched,
+        removed half ghosted), how much of the target it shows and which faces/features read
+        best there; the union coverage; every face NO tile sees, by sid; the tag legend
+        ("F58db6d — plane, +Z, 40x20 mm, f3 Boss"); and the ranking model used.
 
-        WITH target — the CLOSE-UP you should use to check the feature you just changed: a
-        true PERSPECTIVE camera aimed at that one thing, framed tightly on it, from the
-        direction that sees the most of it unoccluded (measured), with the rest of the part
-        dimmed for context, the target painted, any part of it hidden behind other material
-        ghosted through, a scale bar (true at the target's depth) and its world extents/Z range
-        burned in. 512x384, so it is cheap. target may be a feature id or name ("f5", "Rib"),
-        a face/edge sid or geometry query ({"of":"face","side":"top"}), or a world point
-        [x, y, z] / {"point": [x, y, z], "radius": mm} (e.g. a `location` a check reported).
+        target: frame the grid on ONE thing — a feature id or name ("f5", "Rib"), a face/edge
+        sid or geometry query ({"of":"face","side":"top"}), a list of those, or a world point
+        [x, y, z] / {"point": [x, y, z], "radius": mm}. The target is painted (shading kept),
+        the rest dimmed, occluded parts of it ghosted; an attachment defect found by
+        eval_feature_attachment gets tile A aimed at it with its evidence painted.
         emphasize is an alias; emphasis_mode "per_face" colours each face distinctly.
 
-        view: "auto" (default with target), "front"/"back"/"top"/"bottom"/"left"/"right"/"iso",
-        or a dict: {"azimuth": deg, "elevation": deg} (az 0 = front, 90 = right) or
-        {"dir": [x, y, z]} (scene -> camera), plus optional "distance" (mm, camera to target),
-        "fov" (deg, default 30) and "projection" ("perspective" default for close-ups,
-        "ortho" for a drawing-like framed view; {"projection": "perspective"} alone gives a
-        perspective shot of the whole part).
+        view: ONE single shot instead of the grid — "auto" (the planner's best single view),
+        "front"/"back"/"top"/"bottom"/"left"/"right"/"iso", or a dict: {"azimuth": deg,
+        "elevation": deg} (az 0 = front, 90 = right) or {"dir": [x, y, z]} (scene -> camera),
+        plus optional "distance" (mm, camera to target), "fov" (deg, default 30) and
+        "projection" ("perspective" default for close-ups, "ortho" for a drawing-like framed
+        view; {"projection": "perspective"} alone gives a perspective shot of the whole part).
         highlight: paint + label targets WITHOUT reframing (same vocabulary, list allowed).
-        annotate=False: clean product shot. display_quality "draft"|"standard"|"fine"
-        re-tessellates the display mesh (persists on the doc). background: [r,g,b] or
-        "#rrggbb". save_path: also write the exact PNG to an absolute path inside the project.
+        annotate=False: clean product shots (no edges, tags or scale bar). display_quality
+        "draft"|"standard"|"fine" re-tessellates the display mesh (persists on the doc).
+        background: [r,g,b] or "#rrggbb". save_path: also write the exact PNG to an absolute
+        path inside the project.
 
-        The caption says what was framed, how much of it the camera actually saw, the camera
-        pose, key dims, and what it cannot see. Check numbers first (verify_battery,
-        measure_*); use a close-up when a number is off or a shape needs judging."""
+        Check numbers first (verify_battery, measure_*); render when a number is off or a
+        shape needs judging — one call already gives four angles, so do not render after
+        every mutation."""
         # Validate the destination BEFORE any engine work: a refused path must not cost a
         # render (and must be reported as the argument error it is, not as a render failure).
         save_to = _render_save_target(save_path)
@@ -903,9 +938,54 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             cb.call("doc_set_display_quality",
                     {"doc_id": d, "quality": str(display_quality).strip().lower()})
         view_spec, cam_opts = _split_view(view)
-        view_name = view if isinstance(view, str) else ("iso" if view is None else "custom")
-
+        view_name = view if isinstance(view, str) else "custom"
         emp_spec = emphasize if emphasize is not None else target
+
+        if view is None:
+            part_bb = cb.call("doc_bbox", {"doc_id": d}) or {}
+            if not part_bb.get("size"):
+                # A drawing document has no solid to plan cameras around; its sheet is the
+                # picture.
+                png = render_output_path(_render_stem(d, "drawing"), ".png")
+                try:
+                    rd = cb.call("drawing_render_png", {"doc_id": d, "out_path": png})
+                except Exception:  # noqa: BLE001
+                    rd = {"ok": False}
+                if rd.get("ok") and os.path.exists(png):
+                    return _with_save_note(_captioned_render(png, d, ["drawing"]),
+                                           _render_save_note(png, save_to))
+                raise ValueError("Render failed: no bodies to render")
+            if emp_spec is None:
+                plan = _sp.plan_shots(d, k=4, part_bbox=part_bb)
+                png, caption = _shot_grid(d, plan, stem=_render_stem(d, "shots"),
+                                          highlight=highlight, emphasis_mode=None,
+                                          annotate=bool(annotate), background=bg)
+                return _with_save_note([Image(path=png), caption],
+                                       _render_save_note(png, save_to))
+            _sp.prime_face_clouds(d)
+            resolved, target_bb, point = _render_target(d, emp_spec, part_bb)
+            label = str(resolved.get("label") or "target")
+            defect = _attachment_defect(d, resolved)
+            pinned = None
+            if defect:
+                pinned = [{"dir": list(_defect_view_dir(defect, part_bb, d)),
+                           "label": f"shows-{defect.get('verdict')}", "defect": defect,
+                           "fit_points": [defect[k] for k in ("nearest_point",
+                                                              "nearest_point_on_part",
+                                                              "location") if defect.get(k)]}]
+            plan = _sp.plan_shots(d, target={"matches": resolved["matches"], "label": label,
+                                             "bbox": target_bb, "kind": resolved.get("kind")},
+                                  k=4, pinned=pinned, part_bbox=part_bb)
+            png, caption = _shot_grid(d, plan, stem=_render_stem(d, f"shots-{label}"),
+                                      highlight=highlight,
+                                      emphasis_mode=emphasis_mode or "emphasis",
+                                      annotate=bool(annotate), background=bg, point=point)
+            if defect:
+                caption += (f" ATTACHMENT DEFECT ({defect.get('verdict')}): "
+                            f"{defect.get('detail')} — tile A is aimed to show it, with the "
+                            f"evidence painted.")
+            return _with_save_note([Image(path=png), caption], _render_save_note(png, save_to))
+
         whole_persp = emp_spec is None and isinstance(view, dict) and (
             cam_opts["projection"] == "perspective" or cam_opts["distance"] is not None)
         if emp_spec is not None or whole_persp:
@@ -917,42 +997,29 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                 resolved = {"matches": [], "label": "whole part", "kind": "part"}
                 target_bb = part_bb
             else:
-                # A list of feature/face specs is a union target; a 3-number list is a point.
-                specs = (emp_spec if isinstance(emp_spec, list) and _point_of(emp_spec) is None
-                         else [emp_spec])
-                parts = [_resolve_camera_target(d, sp, part_bb) for sp in specs]
-                matches = [m for rs, _bb, _p in parts for m in (rs.get("matches") or [])]
-                point = parts[0][2] if len(parts) == 1 else None
-                resolved = {"matches": matches,
-                            "label": ", ".join(str(rs.get("label") or sp)
-                                               for (rs, _bb, _p), sp in zip(parts, specs)),
-                            "kind": parts[0][0].get("kind") if len(parts) == 1 else "emphasis"}
-                target_bb = (parts[0][1] if len(parts) == 1 else
-                             _union_bbox([bb for _rs, bb, _p in parts]))
-                if len(parts) == 1:
-                    resolved = dict(parts[0][0])   # keeps feature_id for the defect lookup
+                resolved, target_bb, point = _render_target(d, emp_spec, part_bb)
             matches = resolved["matches"]
             internal = bool(matches) and _target_is_internal(matches, part_bb)
-            defect = None
-            if view_spec == "auto" or (isinstance(view_spec, str)
-                                        and view_spec.lower() == "auto"):
-                view_dir, view_label, defect, internal = _auto_view(
-                    d, resolved if not whole_persp else {}, matches, target_bb, part_bb,
-                    internal, point)
+            section = None
+            if isinstance(view_spec, str) and view_spec.lower() == "auto":
+                view_dir, view_label, defect, section = _auto_view(
+                    d, resolved if not whole_persp else {}, matches, target_bb, part_bb, point)
+                clip = False
             else:
                 view_dir = _camera_dir_for_target(matches, view_spec)
                 view_label = view_spec if isinstance(view_spec, str) else "custom"
                 defect = _attachment_defect(d, resolved)
+                clip = internal
             projection = cam_opts["projection"] or "perspective"
             label = str(resolved.get("label") or "target")
             png, ann_info = _closeup(
                 d, matches, target_bb, view_dir, label=label,
                 stem=_render_stem(d, f"closeup-{view_label}"),
                 emphasis_mode=emphasis_mode or "emphasis",
-                clip_near=internal, annotate=bool(annotate), highlight=highlight,
+                clip_near=clip, annotate=bool(annotate), highlight=highlight,
                 background=bg, projection=projection, fov_deg=cam_opts["fov"],
                 distance=cam_opts["distance"], scene_bbox=part_bb, point=point,
-                defect=defect)
+                defect=defect, section=section)
             cam = ann_info.get("camera") or {}
             size = target_bb.get("size") or (0, 0, 0)
             caption_extra = (
@@ -964,7 +1031,9 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                 + (f", perspective fov {cam['vertical_fov_deg']:.0f} deg at "
                    f"{cam['distance']:.4g} mm from the target centre (scale bar true at that "
                    f"depth)" if cam.get("distance") else ", orthographic")
-                + (", near-plane cutaway (internal target)" if internal else "") + "."
+                + (", near-plane cutaway (internal target)" if clip else "")
+                + (", SECTION through the target (cut face hatched, removed half ghosted)"
+                   if section else "") + "."
             ) + _visibility_note(ann_info)
             if defect:
                 caption_extra += (f" ATTACHMENT DEFECT ({defect.get('verdict')}, camera chosen to "
@@ -983,7 +1052,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         png = render_output_path(_render_stem(d, view_name), ".png")
         ann_info = None
         view_dir = None
-        if view is not None and view_spec != "auto":
+        if view_spec != "auto":
             try:
                 view_dir = _camera_dir_for_target([], view_spec)
             except Exception:  # noqa: BLE001
@@ -1031,26 +1100,23 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                       save_path: Optional[str] = None) -> list:
         """Render SEVERAL labelled views tiled into ONE image — the fastest multi-angle self-check.
 
-        Each tile is colour-coded, headed with its view name and the part's bounding-box
-        dimensions, and (with annotate=True) carries the B-rep EDGE outline with hidden lines
-        removed, feature CALLOUTS and a SCALE BAR — so you can read orientation, scale and
-        which feature is which at a glance, and catch a feature that's right from one side but
-        wrong from another.
+        Default (no `views`): the planner's 4 most useful complementary views of the whole part
+        — the same measured, SID-tagged 2x2 grid render_part returns without a view, with its
+        per-tile caption, union coverage and the faces no tile sees (by sid).
 
-        views: a list of view specs, each either a named view ("front"/"back"/"top"/"bottom"/
-        "left"/"right"/"iso") or a custom-camera dict ({"azimuth","elevation"} or {"dir":[x,y,z]} —
-        see render_part). Omit for the standard set: front + right + top + iso.
-        Prefer render_views() for the full manufacturing 6-ortho+iso grid.
+        views: a list of view specs instead, each either a named view ("front"/"back"/"top"/
+        "bottom"/"left"/"right"/"iso") or a custom-camera dict ({"azimuth","elevation"} or
+        {"dir":[x,y,z]} — see render_part). Each such tile is headed with its view name and
+        (with annotate=True) carries the B-rep EDGE outline with hidden lines removed, feature
+        CALLOUTS and a SCALE BAR.
 
         highlight: same target vocabulary as render_part — a feature NAME ("Boss"), a feature id
         ("f2"), a sid ("F58db6d"), a geometry-query dict, or a list of those. The target is
         painted in a reserved emphasis colour and labelled IN EVERY TILE, which is the fastest
         way to see which views actually show it.
 
-        annotate=False falls back to the engine's own tiled sheet with no overlay.
-
-        VERIFY LOOP: use after mutations when a single iso is not enough to confirm a feature
-        on a back/bottom face. Pair with verify_battery before declaring done.
+        annotate=False with explicit `views` falls back to the engine's own tiled sheet with no
+        overlay; without `views` it gives the planner grid with no edges, tags or scale bar.
 
         background (optional): [r, g, b] 0-255 or "#rrggbb" — the clear colour every tile is
         rendered onto (see render_part). The inter-tile gutters are already dark.
@@ -1063,16 +1129,21 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         `saved: <path> (<bytes> B, sha256 <first 12>)`.
 
         Returns [image, caption]: the tiled PNG followed by a SELF-SUFFICIENT text caption —
-        views, part name and bbox, features seen across the sheet, what is highlighted and in
-        what colour, the side-palette colour key, and what no tile could see.
+        what each tile shows, part name and bbox, what is highlighted and in what colour, and
+        what no tile could see.
         """
         save_to = _render_save_target(save_path)
         bg = render_background(background)
         d = _doc(doc_id)
-        view_list = views or ["front", "right", "top", "iso"]
+        if not views:
+            plan = _sp.plan_shots(d, k=4)
+            png, caption = _shot_grid(d, plan, stem=_render_stem(d, "contact-sheet"),
+                                      highlight=highlight, emphasis_mode=None,
+                                      annotate=bool(annotate), background=bg)
+            return _with_save_note([Image(path=png), caption], _render_save_note(png, save_to))
         if not annotate and highlight is None:
             png = render_output_path(_render_stem(d, "contact-sheet"), ".png")
-            params = {"doc_id": d, "out_path": png, "views": views or []}
+            params = {"doc_id": d, "out_path": png, "views": views}
             if bg is not None:
                 params["background"] = bg
             r = cb.call("doc_render_contact_sheet", params)
@@ -1080,10 +1151,10 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                 raise ValueError(
                     f"Contact sheet failed: "
                     f"{r.get('reason', r.get('error', 'no bodies to render'))}")
-            return _with_save_note(_captioned_render(png, d, view_list),
+            return _with_save_note(_captioned_render(png, d, views),
                                    _render_save_note(png, save_to))
 
-        tiles, labels, infos = _annotated_view_tiles(d, view_list, highlight=highlight,
+        tiles, labels, infos = _annotated_view_tiles(d, views, highlight=highlight,
                                                      annotate=annotate, background=bg)
         if not tiles:
             raise ValueError("Contact sheet failed: no bodies to render")
@@ -1107,46 +1178,65 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                      annotate: bool = True,
                      background: Optional[Union[list, str]] = None,
                      save_path: Optional[str] = None) -> list:
-        """Multi-view contact sheet — 6 orthographic + iso by default, each tile labelled.
+        """Multi-view sheet — by default the planner's 7 most useful complementary views.
 
-        The VLM-standard multi-view set for manufacturing feature recognition (holes, bosses,
-        undercuts on back/bottom faces a single iso never shows). Default views:
-          front, back, left, right, top, bottom, iso
-        Override with `views=[...]` (named views and/or custom {"azimuth","elevation"} /
-        {"dir":[x,y,z]} specs — same vocabulary as render_part).
+        Default (no `views`): the shot planner measures ~200 candidate cameras in the engine
+        and picks the 7-view SET that together shows the most of the part (or of `target`) —
+        the angular coverage for manufacturing feature recognition (holes, bosses, undercuts
+        on back/bottom faces), without the flat, redundant tiles of a fixed ortho set. Tiles
+        are 512x384 perspective shots lettered A-G, SID-tagged, with a caption per tile (camera
+        direction, section or not, target visible %, best-seen faces), union coverage, the
+        faces no tile sees (by sid), the tag legend and the ranking model.
+        views=[...]: exactly those views instead (named views and/or custom
+        {"azimuth","elevation"} / {"dir":[x,y,z]} specs — same vocabulary as render_part), e.g.
+        ["front","back","left","right","top","bottom","iso"] for the 6-ortho+iso drawing set.
 
-        target (optional): when set, each tile is framed/cropped to the target AABB + margin
-        (feature-focused multi-view). Plain-word face/edge query or feature id ("f2").
+        target (optional): frame every tile on the target (feature id "f2", sid, or a
+        plain-word face/edge query); it is painted in the emphasis colour in every tile.
 
         highlight (optional): same target vocabulary as render_part — a feature NAME ("Boss"),
         a feature id ("f2"), a sid ("F58db6d"), a query dict, or a list of those. Painted in a
         reserved emphasis colour and labelled in EVERY tile, so you can see at a glance which
-        of the seven views actually show it. Unlike `target` it does not change the framing.
+        views actually show it. Unlike `target` it does not change the framing.
 
-        annotate (default True): face labels / triad in the engine render, PLUS the B-rep edge
-        outline (hidden lines removed), feature callouts and a scale bar on every tile.
-        annotate=False gives the engine's plain tiled sheet.
+        annotate (default True): B-rep edge outline (hidden lines removed), SID tags or
+        feature callouts, and a scale bar on every tile. annotate=False with explicit `views`
+        gives the engine's plain tiled sheet.
 
-        VERIFY LOOP: call after mutations when you need full angular coverage; pair with
-        inspect_feature for a single emphasized close-up and verify_battery before done.
+        Heavier than render_part's 4-tile grid: use it when four views leave a face unseen.
 
         background (optional): [r, g, b] 0-255 or "#rrggbb" — the clear colour every tile is
         rendered onto (see render_part).
 
-        save_path (optional): ALSO write the finished GRID to this absolute .png path — the
-        6-ortho+iso (or target-framed) tiled image with its tile labels and overlays,
+        save_path (optional): ALSO write the finished GRID to this absolute .png path —
         byte-identical to the image returned inline (one flat RGB PNG, not one file per
         view). Same rules as render_part: absolute, inside the project/workspace dir unless
         CHUDWARE_RENDER_SAVE_ANYWHERE=1, and the caption gains
         `saved: <path> (<bytes> B, sha256 <first 12>)`.
 
-        Returns [image, caption]. The caption is self-sufficient: resolved views, part name and
-        bbox, the features seen across the sheet, what is highlighted and in what colour, the
-        side-palette colour key, and what no view could see plus the tool to call for it.
+        Returns [image, caption]. The caption is self-sufficient: what each tile shows, what
+        is highlighted and in what colour, and what no view could see plus the tool for it.
         """
         save_to = _render_save_target(save_path)
         bg = render_background(background)
         d = _doc(doc_id)
+        if not views:
+            plan_target = None
+            label = "views"
+            if target is not None:
+                resolved = _resolve_inspect_target(d, target)
+                label = str(resolved.get("label") or "target")
+                plan_target = {"matches": resolved["matches"], "label": label,
+                               "bbox": _target_bbox(d, resolved["matches"]),
+                               "kind": resolved.get("kind")}
+            plan = _sp.plan_shots(d, target=plan_target, k=7)
+            png, caption = _shot_grid(
+                d, plan, stem=_render_stem(d, f"{label}-views" if plan_target else "views"),
+                highlight=highlight, emphasis_mode="emphasis" if plan_target else None,
+                annotate=bool(annotate), background=bg)
+            return _with_save_note([Image(path=png), f"render_views grid. {caption}"],
+                                   _render_save_note(png, save_to))
+
         view_list = _normalize_view_list(views)
         if target is None:
             # Native engine sheet only when there is nothing to overlay (it tiles internally,
@@ -1181,9 +1271,9 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                                         + ", ".join(labels) + ")."),
                 _render_save_note(out, save_to))
 
-        # Target-framed path: the ENGINE frames each tile on the target AABB (a real close-up
-        # per view), and every tile carries the exact-mask emphasis so you can tell at a glance
-        # which of the seven cameras actually sees the feature.
+        # Target-framed explicit views: the ENGINE frames each tile on the target AABB (a real
+        # close-up per view), and every tile carries the exact-mask emphasis so you can tell at
+        # a glance which of the requested cameras actually sees the feature.
         resolved = _resolve_inspect_target(d, target)
         matches = resolved["matches"]
         target_bb = _target_bbox(d, matches)
@@ -1204,13 +1294,16 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         _tile_pngs_grid(tile_paths, out, labels=labels, cols=3)
         seen = [labels[i] for i, inf in enumerate(infos)
                 if ((inf or {}).get("emphasis") or {}).get("target_px")]
+        try:
+            first_dir = _camera_dir_for_target(matches, view_list[0])
+        except ValueError:
+            first_dir = _vnorm((1.0, 1.0, 0.8))
         caption = (
             f"render_views of {resolved.get('label')!r}: {len(tile_paths)} labelled tiles "
             f"({', '.join(labels)}), each FRAMED on the target by the engine. "
             f"Views that actually show the target: "
             f"{', '.join(seen) if seen else 'none — try inspect_section'}. "
-            + _inspect_caption(d, resolved, target_bb,
-                               _ideal_views(d, matches, target_bb, n=1)[0]["dir"],
+            + _inspect_caption(d, resolved, target_bb, first_dir,
                                method="focus", n_matches=len(matches))
         )
         ann = _merge_annotation_infos(infos)
@@ -1253,8 +1346,8 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
 
         view (optional): a named view ("front"/"top"/"iso"/...) or a custom camera dict
           ({"azimuth","elevation"} or {"dir":[x,y,z]}) — same vocabulary as render_part.
-          Omit it and the camera is chosen by the occlusion scorer as the one direction that
-          actually SEES the most of the fixture + load faces.
+          Omit it and the shot planner picks the whole-part camera that shows the most of the
+          fixture + load faces legibly (measured in the engine, BC faces weighted).
 
         save_path (optional): ALSO write this figure to your own absolute .png path. The
           file contains exactly the bytes returned inline — one flat RGB PNG of the shaded
@@ -1336,10 +1429,12 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             "glow_rgb": list(_EMPHASIS_GLOW),
         }
 
-        target_bb = _target_bbox(d, all_matches)
         if view is None:
-            pick = _ideal_views(d, all_matches, target_bb, n=1)[0]
-            view_dir = pick["dir"]
+            face_sid = _doc_topo_maps(d)["face_sid"]
+            bc = sorted({face_sid[s] - 1 for g in fix_groups + load_groups
+                         for s in g["sids"] if s in face_sid})
+            pick = _sp.plan_shots(d, roles={"bc": bc}, k=1)["views"][0]
+            view_dir = tuple(pick["dir"])
             view_name = f"study-{pick.get('label') or 'auto'}"
         else:
             view_dir = _camera_dir_for_target(all_matches, view)
@@ -1439,12 +1534,14 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                      emphasize: bool = True,
                      emphasis_mode: str = "emphasis",
                      cutaway: Optional[bool] = None) -> list:
-        """CLOSE-UP of one face/edge/feature/point with framing controls — render_part(target=)
-        plus zoom_factor (>1 tighter), margin (context padding per side, default 0.22), cutaway
-        (None = auto for internal bores/pockets, True/False force) and emphasize=False (no
-        paint). Same target and view vocabulary as render_part, including "distance", "fov"
-        and "projection" in a view dict; perspective by default. Returns [image, caption]
-        with what is framed, key dims, how much of the target the camera saw, and the camera.
+        """CLOSE-UP of one face/edge/feature/point with framing controls — render_part(target=,
+        view="auto") plus zoom_factor (>1 tighter), margin (context padding per side, default
+        0.22), cutaway (None = auto: the planner's best single view, which is a SECTION through
+        the target when no exterior camera shows it well; True forces a near-plane cutaway,
+        False forces an uncut view) and emphasize=False (no paint). Same target and view
+        vocabulary as render_part, including "distance", "fov" and "projection" in a view dict;
+        perspective by default. Returns [image, caption] with what is framed, key dims, how
+        much of the target the camera saw, and the camera.
         """
         d = _doc(doc_id)
         try:
@@ -1458,16 +1555,18 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         view_spec, cam_opts = _split_view(view)
 
         internal = bool(matches) and _target_is_internal(matches, part_bb)
-        clip = internal if cutaway is None else bool(cutaway)
+        section = None
         if view_spec is None or (isinstance(view_spec, str) and view_spec.lower() == "auto"):
-            # Score the picture that will actually be rendered — cutaway included.
-            view_dir, view_label, defect, auto_clip = _auto_view(
-                d, resolved, matches, target_bb, part_bb, clip, point)
-            clip = auto_clip if cutaway is None else bool(cutaway)
+            view_dir, view_label, defect, section = _auto_view(
+                d, resolved, matches, target_bb, part_bb, point)
+            clip = bool(cutaway)
+            if cutaway is not None:
+                section = None
         else:
             view_dir, view_label = _camera_dir_for_target(matches, view_spec), (
                 view_spec if isinstance(view_spec, str) else "custom")
             defect = _attachment_defect(d, resolved)
+            clip = internal if cutaway is None else bool(cutaway)
 
         label = str(resolved.get("label") or "target")
         png_out, info = _closeup(
@@ -1479,7 +1578,8 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                     / max(float(zoom_factor), 0.25)),
             clip_near=clip, annotate=bool(annotate),
             projection=cam_opts["projection"] or "perspective", fov_deg=cam_opts["fov"],
-            distance=cam_opts["distance"], scene_bbox=part_bb, point=point, defect=defect)
+            distance=cam_opts["distance"], scene_bbox=part_bb, point=point, defect=defect,
+            section=section)
 
         caption = _inspect_caption(d, resolved, target_bb, view_dir,
                                    method="focus", n_matches=len(matches))
@@ -1490,6 +1590,9 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         if clip:
             caption += (" Near-clip CUTAWAY: material between the camera and the target has been"
                         " cut away so you can see into it.")
+        if section:
+            caption += (" SECTION through the target: the cut face is hatched and the removed "
+                        "half is drawn as a ghost outline.")
         caption += _visibility_note(info)
         if internal:
             sec = _auto_section_for_target(d, matches, target_bb)
@@ -1517,14 +1620,16 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         carries the exact-mask emphasis, so you can see at a glance which angles show the
         feature and which do not.
 
-        ranked=True (default): the angles are the top-N IDEALIZED cameras — scored by how much
-          of the target each actually sees and how legibly, and forced apart from each other so
-          four tiles carry four different pieces of information.
-        ranked=False: a plain 360°/N orbit around the target's own normal (the legacy sweep) —
-          use when you specifically want even angular coverage rather than the best views.
+        ranked=True (default): the angles are the planner's best complementary SET of N
+          cameras — measured in the engine (visible target area, legibility, edge contrast)
+          and chosen greedily on marginal utility, so N tiles carry N different pieces of
+          information; an internal target may get a SECTION tile (cut face hatched, removed
+          half ghosted).
+        ranked=False: a plain 360°/N orbit around the planner's best direction (near-plane
+          cutaway for an internal target) — use when you specifically want even angular
+          coverage rather than the best views.
 
-        VERIFY LOOP: use after mutations when a single close-up is ambiguous; pair with
-        inspect_feature for the one-call sheet + dims, and verify_battery before done.
+        Use when render_part's grid leaves the shape ambiguous; check numbers first.
 
         Returns [image, caption]. The caption ranks the angles by measured target visibility.
         """
@@ -1537,23 +1642,23 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             raise ValueError("no part bounding box — build geometry first")
 
         n = max(int(n_views), 1)
-        # An internal target is invisible from every exterior angle, so a walk-around of a bore
-        # without the cutaway is four pictures of a plate. Cut, and score the cut picture.
-        clip = _target_is_internal(matches, part_bb)
-        if ranked:
-            # A walk-around wants coverage, so it accepts closer angles than the 3-panel
-            # inspect sheet does; at 75 deg the lattice only admits three mutually separated
-            # axes and n_views=4 would silently come back as three tiles.
-            picks = _ideal_views(d, matches, target_bb, n=n, clip_near=clip,
-                                 min_sep_deg=35.0)
-        else:
-            base = _ideal_views(d, matches, target_bb, n=1, clip_near=clip)[0]["dir"]
-            step = 360 // n
-            picks = [{"dir": vd, "label": f"orbit {i * step}deg"}
-                     for i, vd in enumerate(_orbit_view_dirs(base, n=n))]
-
         label = str(resolved.get("label") or "target")
-        tiles, labels, infos = [], [], []
+        plan_target = {"matches": matches, "label": label, "bbox": target_bb,
+                       "kind": resolved.get("kind")}
+        clip = False
+        if ranked:
+            picks = [{"dir": v["dir"], "label": v.get("label"), "section": v.get("section")}
+                     for v in _sp.plan_shots(d, target=plan_target, k=n)["views"]]
+        else:
+            # An internal target is invisible from most of an even orbit; cut the near
+            # material away so every tile of the sweep shows it.
+            clip = _target_is_internal(matches, part_bb)
+            base = _sp.plan_shots(d, target=plan_target, k=1)["views"][0]["dir"]
+            step = 360 // n
+            picks = [{"dir": vd, "label": f"orbit {i * step}deg", "section": None}
+                     for i, vd in enumerate(_orbit_view_dirs(tuple(base), n=n))]
+
+        tiles, labels, infos, dirs = [], [], [], []
         for i, p in enumerate(picks):
             try:
                 png, info = _closeup(
@@ -1561,14 +1666,16 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                     stem=_render_stem(d, f"{label}-view{i + 1}"),
                     emphasis_mode="emphasis" if emphasize else None,
                     margin=float(margin) / max(float(zoom_factor), 0.25),
-                    clip_near=clip, annotate=bool(annotate))
+                    clip_near=clip, annotate=bool(annotate), section=p.get("section"))
             except ValueError:
                 continue
             vis = ((info or {}).get("emphasis") or {}).get("coverage")
             tiles.append(png)
             labels.append(f"{p.get('label') or f'view {i + 1}'}"
+                          + ("  SECTION" if p.get("section") else "")
                           + (f"  {vis * 100:.1f}% target" if vis else "  target hidden"))
             infos.append(info)
+            dirs.append(p["dir"])
         if not tiles:
             raise ValueError("look_around: every close-up render failed")
         out = render_output_path(_render_stem(d, f"{label}-look-around"), ".png")
@@ -1577,9 +1684,9 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                    key=lambda i: ((infos[i] or {}).get("emphasis") or {}).get("coverage") or 0)
         caption = (
             f"Look-around of {label!r}: {len(tiles)} engine-framed close-ups"
-            f"{' (idealized, ranked)' if ranked else ' (even orbit)'} — "
+            f"{' (planner set, ranked)' if ranked else ' (even orbit)'} — "
             + "; ".join(labels) + f". Best angle: {labels[best]}. "
-            + _inspect_caption(d, resolved, target_bb, picks[best]["dir"],
+            + _inspect_caption(d, resolved, target_bb, dirs[best],
                                method="focus", n_matches=len(matches))
         )
         return [Image(path=out), caption]
@@ -1597,36 +1704,30 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
 
         This is the tool to reach for when you want to KNOW what a feature looks like. It
         resolves `target` (plain-word face/edge query or feature id "f2") and returns ONE image
-        built from deterministically chosen panels, so a single call answers "what is it, what
-        does it look like from a useful angle, and where is it on the part":
+        built from measured, complementary panels, so a single call answers "what is it, what
+        does it look like from useful angles, and where is it on the part":
 
-          1. HERO      — the idealized camera: of all candidate directions, the one that
-                         actually SEES the most of the target (occlusion-tested against the
-                         tessellation) at a legible angle. Engine-framed on the target AABB, so
-                         these are real close-up pixels rather than an upscaled crop.
-          2. ALT       — the best camera at least 75° away from the hero (measured on the
-                         undirected axis, so the mirror-image view does not count), so the
-                         second panel carries new information instead of repeating the first.
-          3. CUTAWAY / AS-BUILT — an INTERNAL target (bore, pocket, counterbore) is invisible
-                         from outside, so HERO and ALT are already rendered with a near-clip
-                         that removes everything between the camera and the feature, and this
-                         third panel is the SAME camera uncut: what the part actually looks
-                         like from there. For an external target it is a third idealized angle.
-          4. CONTEXT   — the WHOLE part with the target highlighted and labelled, so the
-                         close-ups above are placeable on the model.
+          1-3. HERO / ALT / ALT2 — the shot planner's best complementary SET of close-ups of
+                         the target: the engine measures ~200 candidate cameras (exact visible
+                         target area, legibility, edge contrast) and the set is chosen greedily
+                         on marginal utility, so each panel shows something the others do not.
+                         For an INTERNAL target (bore, pocket, counterbore) — or one no exterior
+                         camera sees well — a panel may be a SECTION through the target: cut face
+                         hatched, the removed half ghosted so its outline stays readable.
+          4. CONTEXT   — the WHOLE part from the planner's best camera for seeing the target,
+                         target highlighted and labelled, so the close-ups are placeable.
 
         In every close-up panel the target's exact visible faces are painted in the emphasis
         palette (shading preserved, so curvature still reads), everything else is desaturated,
         and the boundary is outlined. `emphasis_mode="per_face"` gives each face its own colour.
-        `panels` trims the sheet (1 = hero only, 2 = hero+alt, 3 = +cutaway/alt2, 4 = +context).
-        `view` pins the HERO camera instead of letting the scorer choose.
+        `panels` trims the sheet (1 = hero only, 2 = hero+alt, 3 = +alt2, 4 = +context).
+        `view` pins the HERO camera; the planner fills the other panels around it.
 
         The caption already carries: key dims of the target (area/length/radius), a describe_part
         outline EXCERPT, the emphasis palette metadata, and — per panel — how much of the target
         that camera could actually see. A panel that shows nothing SAYS it shows nothing.
 
-        VERIFY LOOP: call after add_features/edit that touched this feature; then
-        verify_battery(doc_id) before declaring the design done.
+        Use it when render_part's grid leaves a feature's shape ambiguous; check numbers first.
 
         Returns [image, caption].
         """
@@ -1644,49 +1745,42 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         mode = emphasis_mode or "emphasis"
 
         hint = None if (view is None or (isinstance(view, str) and view.lower() == "auto")) else view
-        # An internal target is only visible through a cutaway, so for a bore or a pocket the
-        # close-up panels ARE cut and the scorer measures them cut; the as-built exterior is
-        # kept as its own panel rather than wasted on the hero. 75 deg of separation, not the
-        # 50 deg default: two panels 50 deg apart look like the same picture, and the point of
-        # a second panel is that it says something new.
-        picks = _ideal_views(d, matches, target_bb, n=3, min_sep_deg=75.0, clip_near=internal)
-        if hint is not None:
-            picks = [{"dir": _camera_dir_for_target(matches, hint),
-                      "label": hint if isinstance(hint, str) else "custom"}] + picks
-
-        panels_spec: list = [("HERO", picks[0], internal)]
-        if want >= 2 and len(picks) > 1:
-            panels_spec.append(("ALT", picks[1], internal))
-        if want >= 3:
-            if internal:
-                # Same camera, uncut: what the part actually looks like from there.
-                panels_spec.append(("AS-BUILT", picks[0], False))
-            elif len(picks) > 2:
-                panels_spec.append(("ALT2", picks[2], False))
+        pinned = ([{"dir": list(_camera_dir_for_target(matches, hint)),
+                    "label": hint if isinstance(hint, str) else "custom"}]
+                  if hint is not None else None)
+        plan = _sp.plan_shots(d, target={"matches": matches, "label": label, "bbox": target_bb,
+                                         "kind": resolved.get("kind")},
+                              k=min(want, 3), pinned=pinned)
+        panels_spec = list(zip(("HERO", "ALT", "ALT2"), plan["views"][:min(want, 3)]))
 
         tiles, labels, infos = [], [], []
-        for i, (tag, pick, clip) in enumerate(panels_spec):
+        for tag, pick in panels_spec:
             try:
                 png, info = _closeup(
                     d, matches, target_bb, pick["dir"], label=label,
                     stem=_render_stem(d, f"{label}-{tag.lower()}"),
-                    emphasis_mode=mode, clip_near=clip, annotate=bool(annotate))
+                    emphasis_mode=mode, annotate=bool(annotate), section=pick.get("section"))
             except ValueError:
                 continue
             cov = ((info or {}).get("emphasis") or {}).get("coverage") or 0.0
             tiles.append(png)
-            labels.append(f"{tag}  {pick.get('label') or ''}  {cov * 100:.1f}% target")
+            labels.append(f"{tag}  {pick.get('label') or ''}"
+                          + ("  SECTION" if pick.get("section") else "")
+                          + f"  {cov * 100:.1f}% target")
             infos.append(info)
 
-        # CONTEXT: the whole part with the target highlighted, so the close-ups are placeable.
+        # CONTEXT: the whole part from the camera that best shows the target within it.
         if want >= 4:
             try:
+                ctx_view = _sp.plan_shots(d, roles={"target": plan["roles"]["target"],
+                                                    "context": plan["roles"]["context"]},
+                                          k=1)["views"][0]
+                cam = dict(ctx_view["camera"], width=_CLOSEUP_TOKEN_W, height=_CLOSEUP_TOKEN_H)
                 ctx = _tmp(".png")
                 ctx, ctx_frame, _r = _render_view_png(
-                    d, _vnorm((1.0, 1.0, 0.8)), ctx, name="CONTEXT",
-                    W=_CLOSEUP_TOKEN_W, H=_CLOSEUP_TOKEN_H, annotate=bool(annotate))
+                    d, ctx_view["dir"], ctx, name="CONTEXT", annotate=False, camera=cam)
                 ctx, ctx_info = _annotate_render(
-                    ctx, d, _vnorm((1.0, 1.0, 0.8)), highlight=target, frame=ctx_frame,
+                    ctx, d, tuple(ctx_view["dir"]), highlight=target, frame=ctx_frame,
                     edges=True, callouts=False, scale=True,
                     out_png=render_output_path(_render_stem(d, f"{label}-context"), ".png"))
                 tiles.append(ctx)
@@ -1707,7 +1801,8 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         caption = _inspect_caption(d, resolved, target_bb, panels_spec[0][1]["dir"],
                                    method="focus", n_matches=len(matches))
         caption += (f" Sheet: {len(tiles)} panel{'s' if len(tiles) != 1 else ''} — "
-                    + "; ".join(labels) + ".")
+                    + "; ".join(labels) + f". Panels ranked by {plan['model']}"
+                    + (f" ({plan['model_note']})" if plan.get("model_note") else "") + ".")
         caption += _visibility_note(infos[0] if infos else None)
         caption += f" describe_part excerpt: {_describe_part_excerpt(d)}"
         if internal:

@@ -18,7 +18,7 @@ import torch
 from services.viewpoint.utility.features import DG, FEATURE_SCHEMA
 from training.viewpoint.durable import durable_replace
 
-from .train import NORM_KEYS, WEIGHT_KEYS, UtilityNet, set_logits
+from .train import NORM_KEYS, WEIGHT_KEYS, UtilityNet, set_hand, set_logits
 
 PARITY_ATOL = 1e-5
 
@@ -37,6 +37,8 @@ def npz_arrays(net: UtilityNet, *, trained_on: str, report_sha: str) -> dict:
     arrays = {k: getattr(net, k).detach().cpu().numpy().astype(np.float32)
               for k in WEIGHT_KEYS + NORM_KEYS}
     arrays["kind_bias"] = net.kind_bias.detach().cpu().numpy().astype(np.float32)
+    arrays["hand_slope"] = net.hand_slope.detach().cpu().numpy().astype(np.float32)
+    arrays["hand_intercept"] = net.hand_intercept.detach().cpu().numpy().astype(np.float32)
     arrays["feature_schema"] = np.array(FEATURE_SCHEMA)
     arrays["trained_on"] = np.array(str(trained_on))
     arrays["report_sha"] = np.array(str(report_sha))
@@ -69,6 +71,10 @@ def weights_digest(path) -> str:
             h.update(str(a.dtype).encode())
             h.update(str(a.shape).encode())
             h.update(a.tobytes())
+        for k in ("hand_slope", "hand_intercept"):
+            if k in z.files:
+                h.update(k.encode())
+                h.update(np.ascontiguousarray(z[k]).tobytes())
         h.update(str(z["feature_schema"][()]).encode())
     return h.hexdigest()
 
@@ -85,7 +91,8 @@ def verify_parity(npz_path, net: UtilityNet, ds, set_ids, *, atol: float = PARIT
     if not set_ids:
         raise ParityError("parity check needs at least one view set")
     model = UtilityModel.load(str(npz_path))
-    np_logits = model.score_batch([ds.token_dict(s, DG) for s in set_ids])
+    np_logits = model.score_batch([ds.token_dict(s, DG) for s in set_ids],
+                                 hand=set_hand(ds)[set_ids])
     cpu = torch.device("cpu")
     t64 = set_logits(copy.deepcopy(net).double().cpu(), ds, set_ids, device=cpu,
                      dtype=torch.float64)

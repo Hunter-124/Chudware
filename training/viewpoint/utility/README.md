@@ -79,6 +79,52 @@ Every stage resumes: `trials` skips parts already complete under the same config
 (strategies, k, seed, tile, targets, weights sha) and the observer's render index skips grids
 already rendered; `observe` labels only pairs without a label (`--relabel` after retraining
 the observer; the newest row wins). `--budget-minutes` / `--limit-parts` cap a run.
+`train` saves `seed_<n>.pt` after every epoch (model, optimizer, best epoch and RNG states)
+with fsync-before-rename. A rerun with the same config, train/val pair IDs, soft labels,
+query kinds and observer digests resumes those checkpoints; relabelled data or a changed
+training configuration requires a separate run directory.
+
+### Within-query ranking and conservative residuals
+
+Pointwise log-loss mixes view usefulness with query/part difficulty. Compare sets for the
+same `(part_id, qid)` before selecting a planner utility:
+
+```bash
+python3 -m training.viewpoint.utility train --run-dir ~/.cache/chudware/viewnet/utility/ranking_run \
+    --no-sweep --rank-weight 1 --rank-temperature 0.1 --hand-residual \
+    --selection-metric pairwise
+python3 -m training.viewpoint.utility evaluate --ranking-only \
+    --run-dir ~/.cache/chudware/viewnet/utility/ranking_run
+```
+
+The conditional-logit objective compares distinct sets within `(part_id, qid, k)` so
+query difficulty and cardinality cannot provide the ranking signal. One comparison per
+group is sampled each epoch, alongside endpoint pointwise BCE. The target is
+`sigmoid((p_correct_left - p_correct_right) / rank_temperature)`. Pairwise early stopping
+and seed/regularisation selection use group-macro conditional loss on VAL only.
+`--hand-residual` initializes the correction head to zero over a TRAIN-calibrated hand
+logit. The frozen hand slope/intercept are scalar NPZ metadata; the original feature
+tensors and `viewutil.features/1` are unchanged. Numpy inference receives the actual hand
+score from `shot_planner.set_scorer`, and export parity includes the residual.
+`--correction-scale` (default 1) shrinks only the learned head after fitting, leaving
+calibrated hand and kind intercepts unchanged. Select this scale on VAL; epoch checkpoints
+are reusable because shrinkage does not alter training gradients. Exported weights already
+include the scale, so production scoring needs no separate shrinkage convention.
+
+Both evaluation modes report group-macro pairwise accuracy (true ties excluded, predicted
+ties count one half), Kendall tau-b (undefined constant rankings excluded) and top-1 regret
+(oracle observer probability minus the mean probability across tied predicted maxima),
+with whole-PART bootstrap intervals. All-cardinality and k=4-only tables are separate:
+the latter cannot look good just by distinguishing one-shot from four-shot sets.
+`--ranking-only` loads TRAIN/VAL, never TEST, does not retrain or claim convergence, and
+records VAL pointwise evidence separately from the final independent-observer TEST A/B.
+Freeze the variant using VAL before running `ab --ship` once.
+
+A/B arm memberships now live in `sets_ab_<weights_digest>.jsonl`; new weights must be
+re-planned rather than inheriting stale `model_greedy` memberships. Exact unchanged sets
+still reuse content-addressed tokens, rendered images and independent labels. The
+evaluation report's digest must match the weights before an A/B can run.
+
 
 ## Wall clock (this box: 12 threads, RTX 3080 Ti)
 
@@ -114,8 +160,9 @@ set record carries the qids of its part's queries that match its mode and target
 
 ## Store (`store.py`)
 
-`$CHUDWARE_VIEWNET_DATA/utility/store/`: `sets.jsonl` / `sets_ab.jsonl` (view-set records per
-namespace: part, split, strategies, k, views, hand_utility, image, tokens path, qids),
+`$CHUDWARE_VIEWNET_DATA/utility/store/`: `sets.jsonl` / `sets_ab_<weights_digest>.jsonl`
+(view-set records per namespace: part, split, strategies, k, views, hand_utility, image,
+tokens path, qids),
 `labels_crossfit.jsonl` / `labels_independent.jsonl` (p_correct, correct, fold, observer
 digest per (set_key, qid)), `tokens/<set>.npz` (`features.build_set_tokens`),
 `images/<sha>.png`, `parts_<namespace>.jsonl` (resume markers), and the observer's own files
@@ -142,17 +189,47 @@ under `observer/` (queries, observer-only sets, checkpoints).
 - **Converged** iff the last doubling of train parts improves mean val log-loss by < 1 %
   relative, seed std at full data < total improvement over the curve, and the shuffled-label
   control is not below the prior by > 1 % (leakage).
-- **Ship** iff the model beats calibrated hand_utility on held-out (test) log-loss AND, on
-  held-out test parts, the independent observer's P(correct) for model-greedy@4 minus
-  hand-greedy@4 has a 95 % whole-part bootstrap CI excluding 0 (iso@1, fixed4, random@4 are
-  reported alongside). Otherwise the reports say so and the planner stays on hand_utility.
+- **Ship** iff the model beats calibrated hand_utility on its reported evaluation split
+  (TEST for convergence reports, VAL for ranking-only selection reports) AND, on held-out
+  TEST parts, the independent observer's P(correct) for model-greedy@4 minus hand-greedy@4
+  has a 95 % whole-part bootstrap CI entirely above 0 (iso@1, fixed4, random@4 are reported
+  alongside). VAL selection evidence is not a claim of TEST success. Otherwise the reports
+  say so and the planner stays on hand_utility.
 
 ## Tests
 
 ```bash
-python3 -m pytest training/viewpoint/utility -q -p no:cacheprovider
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    python3 -m pytest training/viewpoint/utility training/viewpoint/observer -q -p no:cacheprovider
 ```
 
-The trainer recovering a planted signal from soft targets with the shipped regularisation
-while the shuffled control stays at the prior (small CPU run), train-only normalisation,
-metric edges, the part bootstrap, and numpy/torch export parity.
+The trainer recovering a planted signal from soft targets while the shuffled control stays
+at the prior, train-only normalisation, ranking ties/group isolation/regret, part-bootstrap
+statistics, hand-residual numpy/torch export parity and digest provenance, exactly resumed
+optimizer/RNG state after an interrupted epoch, correction shrinkage and isolated A/B arm
+membership. The service tests additionally exercise the actual greedy scorer.
+
+On a busy box, the repository's solver-oriented `resguard` virtual-address-space backstop
+can reject small PyTorch allocations despite low RSS. In a `systemd-run` unit bounded by
+`MemoryMax=24G`, set `SIMSUITE_RLIMIT=0` to keep the RSS watchdog/cgroup bound without that
+virtual-address-space backstop; no `ulimit` adjustment is needed.
+
+## Measured conditional-ranking experiment
+
+On 561 VAL parts (2,885 multi-set `(part, query)` groups), the round-2 pointwise model
+had k=4 pairwise accuracy 0.56518 and top-1 regret 0.05937, versus hand's 0.55924 and
+0.05681: improved average ordering did not mean a better maximizer. Conditional-logit
+training plus a calibrated-hand residual, shrunk to 0.25 on VAL, achieved 0.56665 and
+0.05653. Its independent-observer online VAL delta was −0.000403
+[−0.004421, 0.003453], stronger than scale 0.5's −0.002767 [−0.007480, 0.001621],
+but neither was a demonstrated VAL win.
+
+The frozen scale-0.25 variant was evaluated once on 548 TEST parts / 2,794 paired
+queries, with fresh model-arm planning in its weights-specific namespace. Independent
+P(correct): model 0.515249, hand 0.519352, iso 0.382389, fixed4 0.442684, random
+0.487522. Model − hand = −0.004103 [−0.008128, −0.000259] (2,000 whole-part
+bootstrap draws): **DO NOT SHIP**. No production weights were installed. This is a
+measured negative result for the tested variants, not a claim that no future utility can
+beat hand. Full VAL tables and the single TEST A/B are stored under
+`$CHUDWARE_VIEWNET_DATA/utility/selection_r3.json` and
+`utility/run_r3_residual_a0.25/ab_report.{json,md}`.

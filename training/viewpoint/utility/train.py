@@ -72,6 +72,8 @@ class UtilityNet(nn.Module):
         self.register_buffer("norm_face_std", torch.ones(DF))
         self.register_buffer("norm_ctx_mean", torch.zeros(DCTX))
         self.register_buffer("norm_ctx_std", torch.ones(DCTX))
+        self.register_buffer("hand_slope", torch.zeros(()))
+        self.register_buffer("hand_intercept", torch.zeros(()))
 
     def set_norm(self, face_mean, face_std, ctx_mean, ctx_std) -> None:
         for name, val in (("norm_face_mean", face_mean), ("norm_face_std", face_std),
@@ -79,6 +81,7 @@ class UtilityNet(nn.Module):
             getattr(self, name).copy_(torch.as_tensor(np.asarray(val), dtype=getattr(self, name).dtype))
 
     def base_logit(self, ft: torch.Tensor, fm: torch.Tensor, ctx: torch.Tensor, *,
+                   hand: Optional[torch.Tensor] = None,
                    face_dropout: float = 0.0) -> torch.Tensor:
         """Set utility logit. ft [B,F,DF], fm bool [B,F], ctx [B,DG+DC] -> [B].
         `face_dropout` (inverted dropout on each face token's first-layer embedding) acts
@@ -103,7 +106,12 @@ class UtilityNet(nn.Module):
         # m = 0 for an empty mask — the numpy rule.
         m = (h * maskf.unsqueeze(-1)).max(dim=1).values
         z = relu(torch.cat([p, m, c], dim=1) @ self.out_w0 + self.out_b0)
-        return (z @ self.out_w1 + self.out_b1).squeeze(-1)
+        result = (z @ self.out_w1 + self.out_b1).squeeze(-1) + self.hand_intercept
+        if self.hand_slope.item() != 0.0:
+            if hand is None:
+                raise ValueError("hand-residual utility requires hand scores")
+            result = result + self.hand_slope * hand
+        return result
 
 
 # ---------------------------------------------------------------------------- data
@@ -138,17 +146,26 @@ def collate(ds: TrialDataset, set_ids, device, dtype=torch.float32) -> tuple:
             torch.as_tensor(ctx, dtype=dtype, device=device))
 
 
+
+def set_hand(ds: TrialDataset) -> np.ndarray:
+    """One hand score per distinct set; query labels cannot change the set's score."""
+    out = np.zeros(len(ds.set_keys), np.float64)
+    out[ds.set_index] = ds.hand
+    return out
+
 @torch.no_grad()
 def set_logits(net: UtilityNet, ds: TrialDataset, set_ids, *, device=None,
                chunk: int = 256, dtype=torch.float32) -> np.ndarray:
     device = device or next(net.parameters()).device
     set_ids = [int(s) for s in set_ids]
     out = np.zeros(len(set_ids), np.float64)
+    hand = set_hand(ds)
     order = sorted(range(len(set_ids)), key=lambda i: ds.face_tokens[set_ids[i]].shape[0])
     for start in range(0, len(order), chunk):
         sel = order[start:start + chunk]
         ft, fm, ctx = collate(ds, [set_ids[i] for i in sel], device, dtype)
-        out[sel] = net.base_logit(ft, fm, ctx).double().cpu().numpy()
+        out[sel] = net.base_logit(ft, fm, ctx, hand=torch.as_tensor(
+            hand[[set_ids[i] for i in sel]], dtype=dtype, device=device)).double().cpu().numpy()
     return out
 
 
@@ -250,6 +267,11 @@ class TrainConfig:
     patience: int = 12
     min_delta: float = 1e-4
     device: str = "auto"
+    rank_weight: float = 0.0
+    rank_temperature: float = 0.1
+    hand_residual: bool = False
+    selection_metric: str = "logloss"
+    correction_scale: float = 1.0  # post-fit shrinkage toward calibrated hand (VAL-selected)
 
 
 # Regularisation candidates (AdamW weight_decay, face_dropout), chosen on val log-loss.
@@ -268,12 +290,14 @@ class FitResult:
     train_logloss: float
     epochs_run: int
     shuffled: bool
+    val_pairwise_loss: Optional[float] = None
     history: list = field(default_factory=list)
 
     def summary(self) -> dict:
         return {"seed": self.seed, "best_epoch": self.best_epoch,
                 "val_logloss": self.val_logloss, "train_logloss": self.train_logloss,
-                "epochs_run": self.epochs_run, "shuffled": self.shuffled}
+                "epochs_run": self.epochs_run, "shuffled": self.shuffled,
+                "val_pairwise_loss": self.val_pairwise_loss}
 
 
 def _kind_rates(kind: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -289,15 +313,60 @@ def _logit(p):
     return np.log(p / (1 - p))
 
 
+def comparison_pairs(ds: TrialDataset, idx) -> tuple:
+    """All distinct set pairs within (part, query, k), never across query difficulty."""
+    groups = {}
+    for i in np.asarray(idx, np.int64):
+        key = (str(ds.part_ids[i]), ds.rows[i]["qid"], int(ds.ks[i]))
+        groups.setdefault(key, {})[int(ds.set_index[i])] = int(i)
+    left, right, offsets = [], [], [0]
+    for members in groups.values():
+        members = list(members.values())
+        if len(members) < 2:
+            continue
+        a, b = np.triu_indices(len(members), 1)
+        left.extend(members[j] for j in a)
+        right.extend(members[j] for j in b)
+        offsets.append(len(left))
+    return np.asarray(left, np.int64), np.asarray(right, np.int64), np.asarray(offsets)
+
+
+def conditional_loss(logit_diff, target_diff, temperature: float):
+    """Soft conditional-logit loss: group intercepts cancel from both sides."""
+    return nn.functional.binary_cross_entropy_with_logits(
+        logit_diff, torch.sigmoid(target_diff / temperature))
+
+
+def pairwise_logloss(logits, y, pairs, temperature: float) -> float:
+    left, right, offsets = pairs
+    if not len(left):
+        raise ValueError("ranking objective needs at least two sets in a part/query/k group")
+    delta = np.asarray(logits)[left] - np.asarray(logits)[right]
+    target = sigmoid((np.asarray(y)[left] - np.asarray(y)[right]) / temperature)
+    losses = np.logaddexp(0.0, delta) - target * delta
+    return float(np.mean(np.add.reduceat(losses, offsets[:-1]) / np.diff(offsets)))
+
+
 def fit_utility(ds: TrialDataset, train_idx, val_idx, *, seed: int, cfg: TrainConfig,
-                shuffle_labels: bool = False, verbose: bool = False) -> FitResult:
-    """AdamW + soft-target BCE with early stopping on val log-loss; best-epoch weights are
-    returned. The shuffled control permutes the val targets it stops on too (its
-    val_logloss is on those)."""
+                shuffle_labels: bool = False, verbose: bool = False,
+                checkpoint_path: Optional[Path] = None) -> FitResult:
+    """Pointwise BCE plus optional within-query conditional-logit loss.
+
+    Ranking batches sample one comparison per (part,query,k) group. Early stopping can
+    use group-macro conditional loss, which removes query/part difficulty. Checkpoints
+    persist optimizer, best epoch and RNG states so GPU faults do not erase progress."""
     train_idx = np.asarray(train_idx, np.int64)
     val_idx = np.asarray(val_idx, np.int64)
     if len(train_idx) == 0 or len(val_idx) == 0:
         raise ValueError("fit_utility needs non-empty train and val pairs")
+    if cfg.rank_weight < 0 or cfg.rank_temperature <= 0:
+        raise ValueError("rank_weight must be nonnegative and rank_temperature positive")
+    if cfg.selection_metric not in ("logloss", "pairwise"):
+        raise ValueError("selection_metric must be logloss or pairwise")
+    if not 0.0 <= cfg.correction_scale <= 1.0:
+        raise ValueError("correction_scale must be between zero and one")
+    if cfg.correction_scale != 1.0 and not cfg.hand_residual:
+        raise ValueError("correction shrinkage requires hand_residual")
     device = resolve_device(cfg.device)
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -309,6 +378,15 @@ def fit_utility(ds: TrialDataset, train_idx, val_idx, *, seed: int, cfg: TrainCo
     with torch.no_grad():
         net.kind_bias.copy_(torch.as_tensor(
             _logit(_kind_rates(ds.kind[train_idx], y_all[train_idx])), dtype=torch.float32))
+        if cfg.hand_residual:
+            hand_model = LogisticBaseline(1e-6).fit(
+                ds.hand[train_idx, None], ds.kind[train_idx], y_all[train_idx])
+            slope = float(hand_model.w[0] / hand_model.std[0])
+            net.hand_slope.fill_(slope)
+            net.hand_intercept.fill_(-slope * float(hand_model.mean[0]))
+            net.kind_bias.copy_(torch.as_tensor(hand_model.b, dtype=torch.float32))
+            net.out_w1.zero_()
+            net.out_b1.zero_()
     net.to(device)
     decay = [p for n, p in net.named_parameters() if n.endswith(("_w0", "_w1", "_wq"))]
     no_decay = [p for n, p in net.named_parameters() if not n.endswith(("_w0", "_w1", "_wq"))]
@@ -321,46 +399,120 @@ def fit_utility(ds: TrialDataset, train_idx, val_idx, *, seed: int, cfg: TrainCo
         # labels keeps whichever random function happens to line up with the truth, so the
         # control would beat the prior by selection alone. Callers judge the net on truth.
         y_val = y_val[rng.permutation(len(y_val))]
+    hand = set_hand(ds)
+    training_pairs = comparison_pairs(ds, train_idx) if cfg.rank_weight else None
+    val_pairs = None
+    if cfg.selection_metric == "pairwise":
+        # Pair indices are local to the val prediction vector.
+        subset = replace(ds, set_index=ds.set_index[val_idx], part_ids=ds.part_ids[val_idx],
+                            ks=ds.ks[val_idx], rows=[ds.rows[i] for i in val_idx],
+                            y=ds.y[val_idx])
+        val_pairs = comparison_pairs(subset, np.arange(len(val_idx)))
+    if training_pairs is not None and not len(training_pairs[0]):
+        raise ValueError("ranking training needs within-query comparisons")
     best = (float("inf"), -1, None, float("nan"))
     history: list = []
     bad = 0
-    epoch = 0
-    for epoch in range(1, cfg.max_epochs + 1):
+    start_epoch = 1
+    training_config = asdict(cfg)
+    training_config.pop("correction_scale")  # export-only choice; epoch checkpoints are reusable
+    label_hash = hashlib.sha256()
+    for indices in (train_idx, val_idx):
+        label_hash.update(np.ascontiguousarray(ds.y[indices]).tobytes())
+        label_hash.update(np.ascontiguousarray(ds.kind[indices]).tobytes())
+        label_hash.update(json.dumps(observer_digests(ds, indices)).encode())
+    signature = (training_config, seed, data_digest(ds, train_idx), data_digest(ds, val_idx),
+                 shuffle_labels, label_hash.hexdigest())
+    if checkpoint_path is not None and Path(checkpoint_path).exists():
+        state = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        if state["signature"] != signature:
+            raise ValueError("checkpoint belongs to a different configuration or dataset")
+        net.load_state_dict(state["net"])
+        opt.load_state_dict(state["optimizer"])
+        best, history, bad = state["best"], state["history"], state["bad"]
+        rng.bit_generator.state = state["numpy_rng"]
+        torch.set_rng_state(state["torch_rng"].cpu())
+        if device.type == "cuda":
+            torch.cuda.set_rng_state(state["cuda_rng"].cpu(), device=device)
+        start_epoch = state["epoch"] + 1
+    epoch = start_epoch - 1
+    if bad >= cfg.patience:
+        start_epoch = cfg.max_epochs + 1
+    for epoch in range(start_epoch, cfg.max_epochs + 1):
         net.train()
-        perm = train_idx[rng.permutation(len(train_idx))]
+        if training_pairs is None:
+            perm = train_idx[rng.permutation(len(train_idx))]
+            batches = [perm[s:s + cfg.batch_trials] for s in range(0, len(perm), cfg.batch_trials)]
+        else:
+            left, right, offsets = training_pairs
+            draws = offsets[:-1] + (rng.random(len(offsets) - 1) * np.diff(offsets)).astype(int)
+            draws = draws[rng.permutation(len(draws))]
+            batches = [np.concatenate([left[d], right[d]]) for s in
+                       range(0, len(draws), max(1, cfg.batch_trials // 2))
+                       for d in [draws[s:s + max(1, cfg.batch_trials // 2)]]]
         total, count = 0.0, 0
-        for start in range(0, len(perm), cfg.batch_trials):
-            b = perm[start:start + cfg.batch_trials]
+        for b in batches:
             uniq, inv = np.unique(ds.set_index[b], return_inverse=True)
             ft, fm, ctx = collate(ds, uniq, device)
-            base = net.base_logit(ft, fm, ctx, face_dropout=cfg.face_dropout)
+            base = net.base_logit(ft, fm, ctx, hand=torch.as_tensor(
+                hand[uniq], dtype=ft.dtype, device=device), face_dropout=cfg.face_dropout)
             logits = base[torch.as_tensor(inv, device=device)] + \
                 net.kind_bias[torch.as_tensor(ds.kind[b], device=device)]
             target = torch.as_tensor(y_all[b], device=device)
             loss = loss_fn(logits, target)
+            if training_pairs is not None:
+                half = len(b) // 2
+                loss = loss + cfg.rank_weight * conditional_loss(
+                    logits[:half] - logits[half:], target[:half] - target[half:],
+                    cfg.rank_temperature)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             total += float(loss.detach()) * len(b)
             count += len(b)
         net.eval()
-        val_ll = logloss(y_val, sigmoid(trial_logits(net, ds, val_idx)))
-        history.append({"epoch": epoch, "train_logloss": total / max(count, 1),
-                        "val_logloss": val_ll})
+        val_logits = trial_logits(net, ds, val_idx)
+        val_ll = logloss(y_val, sigmoid(val_logits))
+        val_rank = (pairwise_logloss(val_logits, y_val, val_pairs, cfg.rank_temperature)
+                    if val_pairs is not None else None)
+        metric = val_rank if cfg.selection_metric == "pairwise" else val_ll
+        history.append({"epoch": epoch, "train_objective": total / max(count, 1),
+                        "val_logloss": val_ll, "val_pairwise_loss": val_rank})
         if verbose:
             print(f"  seed {seed} epoch {epoch}: train {total / max(count, 1):.4f} "
                   f"val {val_ll:.4f}")
-        if val_ll < best[0] - cfg.min_delta:
-            best = (val_ll, epoch, copy.deepcopy(net.state_dict()), total / max(count, 1))
+        if metric < best[0] - cfg.min_delta:
+            best = (metric, epoch, copy.deepcopy(net.state_dict()), total / max(count, 1))
             bad = 0
         else:
             bad += 1
-            if bad >= cfg.patience:
-                break
+        if checkpoint_path is not None:
+            from training.viewpoint.durable import durable_replace
+            path = Path(checkpoint_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            torch.save({"signature": signature, "net": net.state_dict(),
+                        "optimizer": opt.state_dict(), "best": best, "history": history,
+                        "bad": bad, "epoch": epoch, "numpy_rng": rng.bit_generator.state,
+                        "torch_rng": torch.get_rng_state(),
+                        "cuda_rng": torch.cuda.get_rng_state(device) if device.type == "cuda"
+                        else None}, tmp)
+            durable_replace(tmp, path)
+        if bad >= cfg.patience:
+            break
     net.load_state_dict(best[2])
     net.eval()
-    return FitResult(net=net.cpu(), seed=seed, best_epoch=best[1], val_logloss=best[0],
-                     train_logloss=best[3], epochs_run=epoch, shuffled=shuffle_labels,
+    with torch.no_grad():
+        net.out_w1.mul_(cfg.correction_scale)
+        net.out_b1.mul_(cfg.correction_scale)
+    return FitResult(net=net.cpu(), seed=seed, best_epoch=best[1],
+                     val_logloss=logloss(y_val, sigmoid(trial_logits(net.cpu(), ds, val_idx))),
+                     train_logloss=logloss(y_all[train_idx],
+                                          sigmoid(trial_logits(net, ds, train_idx))),
+                     epochs_run=epoch, shuffled=shuffle_labels,
+                     val_pairwise_loss=(pairwise_logloss(
+                         trial_logits(net, ds, val_idx), y_val, val_pairs, cfg.rank_temperature)
+                         if val_pairs is not None else None),
                      history=history)
 
 
@@ -465,7 +617,7 @@ def observer_digests(ds: TrialDataset, idx) -> list:
 def select_regularisation(ds: TrialDataset, train_idx, val_idx, cfg: TrainConfig, *,
                           grid: Sequence[tuple] = REG_GRID, seed: int = 0,
                           verbose: bool = False) -> tuple:
-    """(cfg with the (weight_decay, face_dropout) of lowest val log-loss, sweep table)."""
+    """Pick regularisation on the configured VAL criterion, never TEST."""
     table = []
     for wd, drop in grid:
         trial = replace(cfg, weight_decay=float(wd), face_dropout=float(drop))
@@ -473,10 +625,12 @@ def select_regularisation(ds: TrialDataset, train_idx, val_idx, cfg: TrainConfig
         table.append({"weight_decay": float(wd), "face_dropout": float(drop),
                       "val_logloss": fit.val_logloss, "train_logloss": fit.train_logloss,
                       "best_epoch": fit.best_epoch})
+        table[-1]["val_pairwise_loss"] = fit.val_pairwise_loss
         if verbose:
             print(f"[train] wd {wd:g} face_dropout {drop:g}: val {fit.val_logloss:.4f} "
                   f"train {fit.train_logloss:.4f} (epoch {fit.best_epoch})")
-    best = min(table, key=lambda r: r["val_logloss"])
+    best = min(table, key=lambda r: r["val_pairwise_loss"]
+               if cfg.selection_metric == "pairwise" else r["val_logloss"])
     return replace(cfg, weight_decay=best["weight_decay"],
                    face_dropout=best["face_dropout"]), table
 
@@ -484,7 +638,7 @@ def select_regularisation(ds: TrialDataset, train_idx, val_idx, cfg: TrainConfig
 def train_final(store: TrialStore, out_dir, *, seeds: int = 5, cfg: Optional[TrainConfig] = None,
                 sweep: bool = True, verbose: bool = False) -> dict:
     """Choose regularisation on val (seed 0), fit `seeds` models on all train pairs with it,
-    keep the lowest val log-loss, export + verify.
+    keep the best configured VAL criterion, export + verify.
 
     Writes ``train_report.json`` (whose sha is stamped into the NPZ until evaluate replaces
     it with the convergence report's; its ``config`` is what evaluate re-fits with),
@@ -494,7 +648,7 @@ def train_final(store: TrialStore, out_dir, *, seeds: int = 5, cfg: Optional[Tra
     cfg = cfg or TrainConfig()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    ds = load_dataset(store, judge="crossfit", splits=("train", "val", "test"))
+    ds = load_dataset(store, judge="crossfit", splits=("train", "val"))
     tr, va, _te = split_indices(ds)
     if len(tr) == 0 or len(va) == 0:
         raise ValueError(f"store {store.root} has {len(tr)} train / {len(va)} val labelled "
@@ -503,8 +657,10 @@ def train_final(store: TrialStore, out_dir, *, seeds: int = 5, cfg: Optional[Tra
     sweep_table = None
     if sweep:
         cfg, sweep_table = select_regularisation(ds, tr, va, cfg, verbose=verbose)
-    fits = [fit_utility(ds, tr, va, seed=s, cfg=cfg, verbose=verbose) for s in range(seeds)]
-    best = min(fits, key=lambda f: f.val_logloss)
+    fits = [fit_utility(ds, tr, va, seed=s, cfg=cfg, verbose=verbose,
+                       checkpoint_path=out_dir / f"seed_{s}.pt") for s in range(seeds)]
+    best = min(fits, key=lambda f: f.val_pairwise_loss
+               if cfg.selection_metric == "pairwise" else f.val_logloss)
     observers = observer_digests(ds, tr)
     trained_on = (f"viewnet store {store.root}: {len(set(ds.part_ids[tr]))} train parts / "
                   f"{len(tr)} pairs, {len(set(ds.part_ids[va]))} val parts / {len(va)} pairs; "

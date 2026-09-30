@@ -681,10 +681,12 @@ def greedy_select(metrics: dict, score_set: Callable, k: int = 4, *,
 
 
 def set_scorer(metrics: dict, roles: Optional[dict], context: dict, model=None) -> Callable:
-    """score(view_indices) -> float: the model's logit when `model` is given, else
-    features.hand_utility."""
+    """Score view sets with hand utility, or a model plus its optional hand residual."""
     if model is None:
         return lambda S: _uf.hand_utility(metrics, S, roles)
+    if model.hand_slope != 0.0:
+        return lambda S: model.score(_uf.build_set_tokens(metrics, S, roles, context),
+                                     hand=_uf.hand_utility(metrics, S, roles))
     return lambda S: model.score(_uf.build_set_tokens(metrics, S, roles, context))
 
 

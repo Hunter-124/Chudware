@@ -22,7 +22,7 @@ total improvement over the curve, and the shuffled control shows no leakage.
 Ship rule: the exported model must beat calibrated hand_utility on held-out log-loss (test
 split; val when no test pairs exist) AND on held-out TEST parts the INDEPENDENT observer's
 expected accuracy on the model-greedy@4 grid minus the hand-greedy@4 grid must have a 95 %
-whole-part bootstrap CI excluding 0.
+whole-part bootstrap CI entirely above 0.
 """
 from __future__ import annotations
 
@@ -78,6 +78,76 @@ def part_bootstrap(part_ids, values, *, n_boot: int = 2000, seed: int = 0) -> di
             "n": int(values.size), "n_parts": int(P)}
 
 
+
+def within_group_ranking(ds: TrialDataset, idx, scores, *, k: Optional[int] = None,
+                         n_boot: int = 2000, seed: int = 0) -> dict:
+    """Rank DISTINCT labelled sets within each (part_id, qid), never across queries.
+
+    Scores are aligned with ``idx``. Each eligible group has at least two distinct sets
+    after the optional k filter. Metrics are means of group metrics, with whole-PART
+    bootstrap CIs (not pair/set bootstrap). Exact predicted ties receive half credit in
+    pairwise accuracy; exact target ties are excluded. Tau-b is undefined if either
+    ranking is constant, so those groups are excluded only from that metric. Top-1
+    regret averages the targets of ALL tied score maxima. ``n_boot=0`` skips CIs for
+    validation-only variant selection. ``sets`` counts unique sets across eligible
+    groups; ``labelled_sets`` counts distinct (set, query) entries in those groups.
+    """
+    idx = np.asarray(idx, np.int64)
+    scores = np.asarray(scores, np.float64)
+    if idx.ndim != 1 or scores.shape != idx.shape:
+        raise ValueError("scores must be a one-dimensional sequence aligned with idx")
+    if not np.all(np.isfinite(scores)):
+        raise ValueError("ranking scores must be finite")
+    groups: dict = {}
+    for pos, i in enumerate(idx):
+        if k is not None and ds.ks[i] != k:
+            continue
+        key = (str(ds.part_ids[i]), str(ds.rows[i]["qid"]))
+        groups.setdefault(key, {}).setdefault(int(ds.set_index[i]), (int(i), pos))
+
+    parts, sets = set(), set()
+    metric_parts = {name: [] for name in ("pairwise_accuracy", "kendall_tau_b", "top1_regret")}
+    values = {name: [] for name in metric_parts}
+    n_groups = labelled_sets = comparable_pairs = 0
+    for (part, _qid), members in groups.items():
+        if len(members) < 2:
+            continue
+        n_groups += 1
+        labelled_sets += len(members)
+        parts.add(part)
+        sets.update(members)
+        ii, pos = np.asarray(list(members.values()), np.int64).T
+        target, predicted = ds.y[ii].astype(np.float64), scores[pos]
+        a, b = np.triu_indices(len(ii), 1)
+        true_order = np.sign(target[a] - target[b])
+        pred_order = np.sign(predicted[a] - predicted[b])
+        comparable = true_order != 0
+        n_comparable = int(comparable.sum())
+        comparable_pairs += n_comparable
+        if n_comparable:
+            credit = ((true_order[comparable] == pred_order[comparable]).astype(np.float64)
+                      + 0.5 * (pred_order[comparable] == 0))
+            values["pairwise_accuracy"].append(float(credit.mean()))
+            metric_parts["pairwise_accuracy"].append(part)
+        denominator = math.sqrt(n_comparable * int(np.count_nonzero(pred_order)))
+        if denominator:
+            values["kendall_tau_b"].append(float(np.sum(true_order * pred_order) / denominator))
+            metric_parts["kendall_tau_b"].append(part)
+        regret = target.max() - target[predicted == predicted.max()].mean()
+        values["top1_regret"].append(float(regret))
+        metric_parts["top1_regret"].append(part)
+
+    result = {"k": k, "groups": n_groups, "parts": len(parts), "sets": len(sets),
+              "labelled_sets": labelled_sets, "comparable_pairs": comparable_pairs}
+    for name, vals in values.items():
+        if n_boot and vals:
+            result[name] = part_bootstrap(metric_parts[name], vals, n_boot=n_boot, seed=seed)
+        else:
+            result[name] = {"estimate": float(np.mean(vals)) if vals else float("nan"),
+                            "ci95": [float("nan"), float("nan")], "n": len(vals),
+                            "n_parts": len(set(metric_parts[name]))}
+    return result
+
 def _excludes_zero_positive(b: dict) -> bool:
     return bool(np.isfinite(b["ci95"][0]) and b["ci95"][0] > 0.0)
 
@@ -94,8 +164,9 @@ def artifact_probs(npz_path, ds: TrialDataset, idx) -> np.ndarray:
     model = UtilityModel.load(str(npz_path))
     with np.load(Path(npz_path), allow_pickle=False) as z:
         kind_bias = np.asarray(z["kind_bias"], np.float64)
-    uniq, inv = np.unique(ds.set_index[idx], return_inverse=True)
-    base = model.score_batch([ds.token_dict(int(s), DG) for s in uniq])
+    uniq, first, inv = np.unique(ds.set_index[idx], return_index=True, return_inverse=True)
+    base = model.score_batch([ds.token_dict(int(s), DG) for s in uniq],
+                             hand=ds.hand[idx[first]])
     return sigmoid(base[inv] + kind_bias[ds.kind[idx]])
 
 
@@ -155,6 +226,78 @@ def observer_noise(store: TrialStore, ds: TrialDataset, idx, *, n_boot: int) -> 
 
 
 # ---------------------------------------------------------------------------- report
+
+def ranking_report(store: TrialStore, run_dir, *, n_boot: int = 2000) -> dict:
+    """VAL-only selection report for existing weights, with no utility-model retraining.
+
+    Hand calibration and kind priors use TRAIN labels only. TEST pairs are not loaded.
+    This report does not claim convergence or replace the independent held-out A/B.
+    """
+    from .export import stamp_report, weights_digest  # noqa: PLC0415
+
+    run_dir = Path(run_dir)
+    npz = run_dir / "utility_v1.npz"
+    if not npz.exists():
+        raise FileNotFoundError(f"{npz} not found — run `train` first")
+    ds = load_dataset(store, judge="crossfit", splits=("train", "val"))
+    tr, va, _ = split_indices(ds)
+    if len(tr) == 0 or len(va) == 0:
+        raise ValueError(f"need train and val labelled pairs; have {len(tr)} / {len(va)}")
+    hand = fit_hand_calibration(ds, tr)
+    preds = {
+        "model": artifact_probs(npz, ds, va),
+        "hand_utility_calibrated": sigmoid(hand.logits(ds.hand[va, None], ds.kind[va])),
+        "prior": prior_probs(ds, tr, va),
+    }
+    y, hard = ds.y[va].astype(np.float64), ds.correct[va]
+    model_ll = per_trial_logloss(y, preds["model"])
+    deltas = {name: part_bootstrap(ds.part_ids[va], per_trial_logloss(y, p) - model_ll,
+                                   n_boot=n_boot)
+              for name, p in preds.items() if name != "model"}
+    evaluation = {
+        "entropy_floor": entropy_floor(y),
+        "metrics": {name: binary_metrics(y, p, hard) for name, p in preds.items()},
+        "delta_logloss_vs_model": deltas,
+        "within_group_ranking": {
+            name: {"all_k": within_group_ranking(ds, va, p, n_boot=n_boot),
+                   "k4": within_group_ranking(ds, va, p, k=4, n_boot=n_boot)}
+            for name, p in (preds | {"hand_utility_raw": ds.hand[va]}).items()},
+    }
+    delta = deltas["hand_utility_calibrated"]
+    report = {
+        "schema": "viewnet.utility_ranking_report/1",
+        "weights_digest": weights_digest(npz),
+        "n_boot": n_boot,
+        "labels": {"judge": "crossfit",
+                   "observer_digests": sorted({str(row.get("observer_digest")) for row in ds.rows
+                                               if row.get("observer_digest")})},
+        "data": {split: {"pairs": len(idx), "parts": len(set(ds.part_ids[idx].astype(str)))}
+                 for split, idx in (("train", tr), ("val", va))},
+        "evaluation": {"val": evaluation},
+        "verdict": {"heldout_logloss": {
+            "split": "val", "delta_hand_minus_model": delta,
+            "pass": _excludes_zero_positive(delta),
+            "rule": "95% part-bootstrap CI of (hand - model) VAL log-loss > 0; "
+                    "selection evidence only, not an independent held-out A/B"}},
+    }
+    lines = ["# ViewNet utility — VAL ranking selection report", "",
+             "Existing artifact evaluated without utility-model retraining. Hand calibration "
+             "and priors fit TRAIN only; TEST labels are not loaded. No convergence claim.", "",
+             f"VAL log-loss: hand − model = {_ci(delta)} → "
+             f"{'PASS' if report['verdict']['heldout_logloss']['pass'] else 'FAIL'}.", "",
+             "| predictor | log-loss | AUC | Brier | ECE |", "|---|---|---|---|---|"]
+    for name, metrics in evaluation["metrics"].items():
+        lines.append(f"| {name} | {_f(metrics['logloss'])} | {_f(metrics['auc'], 3)} | "
+                     f"{_f(metrics['brier'])} | {_f(metrics['ece'])} |")
+    lines += _ranking_markdown(evaluation["within_group_ranking"])
+    report_path = run_dir / "report.json"
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True, default=_json_default))
+    (run_dir / "report.md").write_text("\n".join(lines) + "\n")
+    report_sha = hashlib.sha256(report_path.read_bytes()).hexdigest()
+    stamp_report(npz, report_sha)
+    report["report_sha"] = report_sha
+    return report
+
 
 def convergence_report(store: TrialStore, run_dir, *, seeds: int = 5,
                        fractions: Sequence[float] = FRACTIONS, cfg: Optional[TrainConfig] = None,
@@ -228,6 +371,10 @@ def convergence_report(store: TrialStore, run_dir, *, seeds: int = 5,
         evals[name] = {
             "entropy_floor": entropy_floor(y),
             "metrics": {k: binary_metrics(y, p, hard) for k, p in preds.items()},
+            "within_group_ranking": {
+                k: {"all_k": within_group_ranking(ds, idx, p, n_boot=n_boot),
+                    "k4": within_group_ranking(ds, idx, p, k=4, n_boot=n_boot)}
+                for k, p in (preds | {"hand_utility_raw": ds.hand[idx]}).items()},
             "delta_logloss_vs_model": {
                 k: part_bootstrap(ds.part_ids[idx], per_trial_logloss(y, p) - model_ll,
                                   n_boot=n_boot)
@@ -318,6 +465,24 @@ def _ci(b: dict, nd: int = 4) -> str:
     return f"{_f(b['estimate'], nd)} [{_f(b['ci95'][0], nd)}, {_f(b['ci95'][1], nd)}]"
 
 
+def _ranking_markdown(rankings: dict) -> list:
+    lines = ["", "Within-(part, query) ranking against observer P(correct): group-macro "
+             "metrics, whole-part bootstrap 95 % CIs. Groups require ≥2 distinct labelled "
+             "sets. Pairwise accuracy ignores true ties and gives predicted ties 0.5; "
+             "tau-b omits constant rankings; top-1 regret averages all tied maxima.", "",
+             "| predictor | sets filter | groups | parts | unique sets | labelled sets | "
+             "comparable pairs | pairwise accuracy [95 % CI] | tau-b [95 % CI] | "
+             "top-1 regret [95 % CI] |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
+    for name, filters in rankings.items():
+        for subset, ranking in filters.items():
+            lines.append(f"| {name} | {subset} | {ranking['groups']} | {ranking['parts']} | "
+                         f"{ranking['sets']} | {ranking['labelled_sets']} | "
+                         f"{ranking['comparable_pairs']} | {_ci(ranking['pairwise_accuracy'])} | "
+                         f"{_ci(ranking['kendall_tau_b'])} | {_ci(ranking['top1_regret'])} |")
+    return lines
+
+
 def render_markdown(r: dict) -> str:
     v = r["verdict"]
     L = ["# ViewNet utility model — convergence report", "",
@@ -362,6 +527,7 @@ def render_markdown(r: dict) -> str:
         L += ["", "Δ log-loss (predictor − model), part-bootstrap 95 % CI:", ""]
         for name, b in ev["delta_logloss_vs_model"].items():
             L.append(f"- {name}: {_ci(b)}")
+        L += _ranking_markdown(ev["within_group_ranking"])
         L += ["", "Calibration (model):", "", "| predicted | n | mean predicted | mean target |",
               "|---|---|---|---|"]
         for b in ev["calibration"]:
@@ -383,7 +549,7 @@ def render_markdown(r: dict) -> str:
 # ---------------------------------------------------------------------------- A/B
 
 def ab_arm_table(store: TrialStore, *, judge: str = "independent", n_boot: int = 2000,
-                 arms: Sequence[tuple] = None) -> dict:
+                 arms: Sequence[tuple] = None, split: str = "test") -> dict:
     """Per-arm expected accuracy of `judge` on the store's sets, and paired deltas of the
     reference arm against every other arm over the queries both answered."""
     from .trials import AB_ARMS  # noqa: PLC0415
@@ -394,11 +560,11 @@ def ab_arm_table(store: TrialStore, *, judge: str = "independent", n_boot: int =
     by_arm: dict = {a: {} for a in arms}
     for (sk, qid), row in labels.items():
         rec = sets.get(sk)
-        if rec is None or rec["split"] != "test":
+        if rec is None or rec["split"] != split:
             continue
         for a, (s, k) in arms.items():
             if s in rec["strategies"] and int(rec["k"]) == k:
-                by_arm[a][qid] = {"part_id": str(rec["part_id"]),
+                by_arm[a][(str(rec["part_id"]), qid)] = {"part_id": str(rec["part_id"]),
                                   "p": float(row["p_correct"]),
                                   "correct": 1.0 if row["correct"] else 0.0}
     accuracy = {a: {"p_correct": part_bootstrap([r["part_id"] for r in d.values()],
@@ -433,9 +599,16 @@ def ab_report(labels_path, store_root, run_dir, trial_cfg, *, n_boot: int = 2000
     if not npz.exists() or not rep_path.exists():
         raise FileNotFoundError(f"need {npz} and {rep_path} — run `train` and `evaluate` first")
     offline = json.loads(rep_path.read_text())
-    cfg = replace(trial_cfg, namespace="ab", ab_arms=AB_ARMS, splits=("test",),
+    from .export import weights_digest
+    digest = weights_digest(npz)
+    if offline["weights_digest"] != digest:
+        raise ValueError("evaluation report does not match the current utility weights")
+    # Arm membership is experiment-specific, although tokens/images/labels remain
+    # content-addressed and shared. Old model choices must never leak into a new A/B.
+    namespace = f"ab_{digest[:16]}"
+    cfg = replace(trial_cfg, namespace=namespace, ab_arms=AB_ARMS, splits=("test",),
                   weights=str(npz))
-    store = TrialStore(store_root, name="ab")
+    store = TrialStore(store_root, name=namespace)
     run = run_trials(labels_path, store, cfg)
     labelled = observe(store, judge="independent", splits=("test",))
     table = ab_arm_table(store, judge="independent", n_boot=n_boot)
@@ -448,15 +621,15 @@ def ab_report(labels_path, store_root, run_dir, trial_cfg, *, n_boot: int = 2000
         reasons.append("held-out log-loss does not beat calibrated hand_utility with CI > 0")
     if not online_pass:
         reasons.append("independent-observer P(correct) delta model_greedy@4 − hand_greedy@4: "
-                       "CI does not exclude 0")
+                       "95% CI is not entirely above 0")
     result = {
-        "schema": AB_SCHEMA, "judge": "independent", "weights_digest": offline["weights_digest"],
+        "schema": AB_SCHEMA, "judge": "independent", "weights_digest": digest,
         "run": run, "observe": labelled, **table,
         "verdict": {"ship": ship_ok, "offline_pass": offline_pass, "online_pass": online_pass,
                     "reasons": reasons,
                     "rule": ("ship iff held-out log-loss beats hand_utility (CI > 0) AND the "
                              "independent observer's P(correct) on model_greedy@4 − "
-                             "hand_greedy@4 has a 95 % part-bootstrap CI excluding 0")},
+                             "hand_greedy@4 has a 95 % part-bootstrap CI entirely above 0")},
     }
     dest = Path(weights_dest) if weights_dest else DEFAULT_WEIGHTS
     if ship:
@@ -486,7 +659,7 @@ def render_ab_markdown(r: dict) -> str:
                  f"{b['n_parts']} |")
     L += ["", "Paired P(correct) deltas (same queries, part-bootstrap 95 % CI):", ""]
     for name, b in r["paired_deltas"].items():
-        L.append(f"- {name}: {_ci(b, 3)} over {b['n']} queries")
+        L.append(f"- {name}: {_ci(b, 4)} over {b['n']} queries")
     if "shipped_to" in r:
         L += ["", f"Shipped to: {r['shipped_to'] or 'not shipped (verdict failed)'}"]
     return "\n".join(L) + "\n"

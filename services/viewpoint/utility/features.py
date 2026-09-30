@@ -243,6 +243,75 @@ def _redundancy(shown, dirs) -> float:
     return tot / (n - 1)
 
 
+def _hand_static(d: dict, roles: Optional[dict]) -> dict:
+    """Cache role-dependent weights and per-view terms for this immutable dense revision.
+
+    Candidate sets change hundreds of times during greedy ranking; their geometry and
+    roles do not. Key role contents, not identity, so mutating a role list is safe.
+    """
+    key = tuple(tuple(int(o) for o in (roles or {}).get(k) or ())
+                for k in ("target", "context", "bc"))
+    cache = d.setdefault("hand_static", {})
+    if key in cache:
+        return cache[key]
+    t, c, b = _role_masks(d, roles)
+    has_t = bool(t.any())
+    w = 0.08 + 0.92 * t + 0.27 * c + 0.52 * b if has_t else 1.0 + 0.6 * b
+    scale = max(float(np.median(d["area"][d["area"] > 0])) if (d["area"] > 0).any()
+                else 1.0, 1e-9)
+    area_weight = np.power(np.minimum(d["area"], scale * 2.0) / scale, 0.25)
+    detail = np.where(d["surf"] == 0, 1.0, 1.8)
+    if d["pe"].size:
+        perimeter = np.zeros(d["F"])
+        np.add.at(perimeter, d["pf"], d["edge_len"][d["pe"]])
+        detail *= 1.0 + 0.45 * np.clip(perimeter / np.maximum(np.sqrt(d["area"]), 1e-9)
+                                        / 5.0, 0.0, 1.0)
+    wa = w * area_weight * detail
+    ew = np.sqrt(d["edge_len"])
+    if has_t and d["pe"].size:
+        touch = np.zeros(d["E"], dtype=bool)
+        touch[d["pe"][t[d["pf"]]]] = True
+        ew = ew * (1.0 + 2.0 * touch)
+    frac = np.clip(d["legible_front"] / np.maximum(d["area"], 1e-9), 0.0, 1.0)
+    stare = _stare(d, list(range(d["V"])),
+                   t.astype(np.float64) if has_t else np.ones(d["F"]))
+    target = missing = np.zeros(d["V"])
+    if has_t:
+        s = d["vis_front"][:, t].sum(axis=1) / d["frame_px"]
+        target = np.minimum(s / 0.06, 1.0) - np.clip((s - 0.55) / 0.3, 0.0, 1.0)
+        shown = (frac[:, t] * wa[t]).sum(axis=1) / max(float(wa[t].sum()), 1e-12)
+        missing = 1.0 - np.clip(shown / 0.3, 0.0, 1.0)
+    h = {"wa": wa, "wa_sum": max(float(wa.sum()), 1e-12),
+         "ew": ew, "ew_sum": max(float(ew.sum()), 1e-12), "frac": frac,
+         "shown": frac * wa, "pixels": d["vis_front"] / max(d["frame_px"], 1.0) * wa,
+         "flat": np.clip((d["palign"] - 0.95) / 0.035, 0.0, 1.0),
+         "means": np.asarray([0.6 * (d["entropy"] / _ENTROPY_MAX) - 0.8 * stare,
+                              target, np.clip(d["fg"] / d["frame_px"] / 0.35, 0.0, 1.0),
+                              d["is_sec"], missing, stare]),
+         "pairs": {}}
+    if len(cache) >= 4:
+        cache.pop(next(iter(cache)))
+    cache[key] = h
+    return h
+
+
+def _hand_pair_row(h: dict, d: dict, i: int) -> tuple:
+    """Lazily compute overlap against all candidates for each chosen prefix view."""
+    pairs = h["pairs"]
+    if i not in pairs:
+        rows = []
+        for key in ("shown", "pixels"):
+            shown = h[key]
+            lo = np.minimum(shown[i], shown).sum(axis=1)
+            hi = np.maximum(shown[i], shown).sum(axis=1)
+            overlap = lo / np.maximum(hi, 1e-12)
+            if key == "shown":
+                overlap *= np.maximum(d["dirs"] @ d["dirs"][i], 0.0)
+            rows.append(overlap)
+        pairs[i] = tuple(rows)
+    return pairs[i]
+
+
 def hand_utility(metrics: dict, view_indices, roles: Optional[dict]) -> float:
     """Deterministic set utility — the planner's fallback and the trainer's baseline.
 
@@ -256,59 +325,27 @@ def hand_utility(metrics: dict, view_indices, roles: Optional[dict]) -> float:
     S = _views(d, view_indices)
     if not S or d["F"] == 0:
         return 0.0
-    t, c, b = _role_masks(d, roles)
-    has_t = bool(t.any())
-    if has_t:
-        w = 0.08 + 0.92 * t + 0.27 * c + 0.52 * b
-    else:
-        w = 1.0 + 0.6 * b
-    # Square millimetres overwhelmingly favour a featureless stock face on a block.
-    # Saturate planar area and raise small/curved features and boundary-rich faces.
-    scale = max(float(np.median(d["area"][d["area"] > 0])) if (d["area"] > 0).any()
-                else 1.0, 1e-9)
-    area_weight = np.power(np.minimum(d["area"], scale * 2.0) / scale, 0.25)
-    detail = np.where(d["surf"] == 0, 1.0, 1.8)
-    if d["pe"].size:
-        perimeter = np.zeros(d["F"])
-        np.add.at(perimeter, d["pf"], d["edge_len"][d["pe"]])
-        detail *= 1.0 + 0.45 * np.clip(perimeter / np.maximum(np.sqrt(d["area"]), 1e-9)
-                                        / 5.0, 0.0, 1.0)
-    wa = w * area_weight * detail
-    cov = _face_coverage(d, S, "legible_front")
-    C = float((wa * cov).sum() / max(float(wa.sum()), 1e-12))
-
+    h = _hand_static(d, roles)
+    frac = h["frac"][S]
+    best = frac.max(axis=0)
+    union = 1.0 - np.prod(1.0 - frac, axis=0)
+    cov = best + 0.25 * (union - best)
+    C = float((h["wa"] * cov).sum() / h["wa_sum"])
     E = 0.0
     if d["E"]:
-        eq = d["edge_q"][S].max(axis=0)
-        ew = np.sqrt(d["edge_len"])
-        if has_t and d["pe"].size:
-            touch = np.zeros(d["E"], dtype=bool)
-            touch[d["pe"][t[d["pf"]]]] = True
-            ew = ew * (1.0 + 2.0 * touch)
-        E = float((ew * eq).sum() / max(float(ew.sum()), 1e-12))
-
-    ent = d["entropy"][S] / _ENTROPY_MAX
-    stare = _stare(d, S, t.astype(np.float64) if has_t else np.ones(d["F"]))
-    Q = float(np.mean(0.6 * ent - 0.8 * stare))
-    F = float(np.clip((d["palign"][S] - 0.95) / 0.035, 0.0, 1.0).sum())
-
-    frac = np.clip(d["legible_front"][S] / np.maximum(d["area"], 1e-9), 0.0, 1.0)
-    R = _redundancy(frac * wa, d["dirs"][S])
-
-    T = M = 0.0
-    if has_t:
-        s = _target_screen_frac(d, S, t, "vis_front")
-        T = float(np.mean(np.minimum(s / 0.06, 1.0) - np.clip((s - 0.55) / 0.3, 0.0, 1.0)))
-        shown = (frac[:, t] * wa[t]).sum(axis=1) / max(float(wa[t].sum()), 1e-12)
-        M = float(np.mean(1.0 - np.clip(shown / 0.3, 0.0, 1.0)))
-    O = float(np.mean(np.clip(d["fg"][S] / d["frame_px"] / 0.35, 0.0, 1.0)))
-    X = float(np.mean(d["is_sec"][S]))
-    # Matching projected pixel distributions still waste a tile when the cameras differ
-    # by more than the hard angular threshold (including mirrored-looking cuts).
-    pixels = d["vis_front"][S] / np.maximum(d["frame_px"], 1.0)
-    pixel_overlap = _redundancy(pixels * wa, None)
-    return (3.8 * C + 1.2 * E + 0.6 * Q + 0.8 * T + 1.0 * O - 0.12 * X - 1.0 * F
-            - 0.5 * R - 1.3 * pixel_overlap - 2.2 * M - 3.0 * float(np.mean(stare)))
+        E = float((h["ew"] * d["edge_q"][S].max(axis=0)).sum() / h["ew_sum"])
+    Q, T, O, X, M, stare = h["means"][:, S].mean(axis=1)
+    F = float(h["flat"][S].sum())
+    R = pixel_overlap = 0.0
+    if len(S) > 1:
+        for j, i in enumerate(S[:-1]):
+            geometric, pixels = _hand_pair_row(h, d, i)
+            R += float(geometric[S[j + 1:]].sum())
+            pixel_overlap += float(pixels[S[j + 1:]].sum())
+        R /= len(S) - 1
+        pixel_overlap /= len(S) - 1
+    return float(3.8 * C + 1.2 * E + 0.6 * Q + 0.8 * T + 1.0 * O - 0.12 * X - 1.0 * F
+                 - 0.5 * R - 1.3 * pixel_overlap - 2.2 * M - 3.0 * stare)
 
 
 def context_from(metrics: dict, *, roles: Optional[dict] = None, target_kind: str = "part",

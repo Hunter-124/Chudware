@@ -11,6 +11,11 @@ set-global and context vectors:
     p   = sum_i softmax_i h_i ; m = max_i h_i over masked faces
     logit = relu(concat(p, m, c) @ out_w0 + out_b0) @ out_w1 + out_b1  # 192 -> 64 -> 1
 
+Optional paired scalar arrays `hand_slope` and `hand_intercept` make this a residual model:
+    score = logit + hand_slope * hand + hand_intercept
+Legacy artifacts omit both scalars and retain the network-only logit. A nonzero slope
+requires the caller's measured hand utility; it is never inferred from feature tokens.
+
 Two edge rules the trainer mirrors: an EMPTY face mask gives p = m = 0, and a normalisation
 std entry <= 1e-12 divides by 1. Compute is float64.
 """
@@ -58,6 +63,15 @@ class UtilityModel:
 
     def __init__(self, arrays: dict, *, name: str, trained_on: str = "",
                  report_sha: str = "") -> None:
+        residual_keys = ("hand_slope", "hand_intercept")
+        present = [k in arrays for k in residual_keys]
+        if any(present) and not all(present):
+            raise ValueError("hand_slope and hand_intercept must both be present or absent")
+        for k in residual_keys:
+            value = np.asarray(arrays[k] if all(present) else 0.0, dtype=np.float64)
+            if value.shape != () or not np.isfinite(value):
+                raise ValueError(f"{k} must be a finite scalar")
+            setattr(self, k, float(value))
         self.w = {k: np.asarray(arrays[k], dtype=np.float64) for k in _SHAPES}
         self.w["norm_face_std"] = _safe_std(self.w["norm_face_std"])
         self.w["norm_ctx_std"] = _safe_std(self.w["norm_ctx_std"])
@@ -87,6 +101,8 @@ class UtilityModel:
             if missing:
                 raise ValueError(f"{path}: missing weight arrays {', '.join(missing)}")
             arrays = {k: np.asarray(z[k]) for k in _SHAPES}
+            arrays.update({k: np.asarray(z[k]) for k in ("hand_slope", "hand_intercept")
+                           if k in files})
             meta = {k: (str(z[k][()]) if k in files else "")
                     for k in ("trained_on", "report_sha")}
         for k, shape in _SHAPES.items():
@@ -95,8 +111,16 @@ class UtilityModel:
                                  f"expected {shape}")
         return cls(arrays, name=f"utility_v1@{sha8}", **meta)
 
-    def score(self, tokens: dict) -> float:
-        """The logit for one tokenised view set (features.build_set_tokens output)."""
+    def score(self, tokens: dict, *, hand=None) -> float:
+        """One view-set logit plus the optional calibrated hand-utility residual."""
+        residual = 0.0
+        if self.hand_slope != 0.0:
+            if hand is None:
+                raise ValueError("nonzero hand_slope requires hand utility")
+            value = np.asarray(hand, dtype=np.float64)
+            if value.shape != () or not np.isfinite(value):
+                raise ValueError("hand utility must be a finite scalar")
+            residual = self.hand_slope * float(value)
         w = self.w
         ft = np.asarray(tokens["face_tokens"], dtype=np.float64).reshape(-1, DF)
         mask = np.asarray(tokens["face_mask"], dtype=bool).reshape(-1)
@@ -115,10 +139,20 @@ class UtilityModel:
             p = np.zeros(HIDDEN)
             m = np.zeros(HIDDEN)
         z = _relu(np.concatenate([p, m, c]) @ w["out_w0"] + w["out_b0"])
-        return float((z @ w["out_w1"] + w["out_b1"])[0])
+        return float((z @ w["out_w1"] + w["out_b1"])[0]) + residual + self.hand_intercept
 
-    def score_batch(self, tokens_list) -> np.ndarray:
-        return np.asarray([self.score(t) for t in tokens_list], dtype=np.float64)
+    def score_batch(self, tokens_list, *, hand=None) -> np.ndarray:
+        """Score view sets with one aligned hand utility per set when supplied."""
+        if hand is None:
+            if self.hand_slope != 0.0:
+                raise ValueError("nonzero hand_slope requires hand utility")
+            return np.asarray([self.score(t) for t in tokens_list], dtype=np.float64)
+        tokens_list = list(tokens_list)
+        values = np.asarray(hand, dtype=np.float64)
+        if values.shape != (len(tokens_list),):
+            raise ValueError("hand batch must contain one scalar per token set")
+        return np.asarray([self.score(t, hand=h) for t, h in zip(tokens_list, values)],
+                          dtype=np.float64)
 
 
 _LOADED: dict = {}

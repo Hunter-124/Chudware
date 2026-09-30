@@ -65,3 +65,17 @@ def test_stamp_report_changes_only_the_report_sha(trained, tmp_path):
     assert weights_digest(npz) == before
     assert UtilityModel.load(str(npz)).report_sha == "2" * 64
     verify_parity(npz, net, ds, range(10))
+
+
+def test_hand_residual_export_preserves_scores_and_provenance(trained, tmp_path):
+    import copy
+    ds, trained_net = trained
+    net = copy.deepcopy(trained_net)
+    net.hand_slope.fill_(0.75)
+    net.hand_intercept.fill_(-0.2)
+    npz = export_npz(net, tmp_path / "residual.npz", trained_on="synthetic", report_sha="1" * 64)
+    verify_parity(npz, net, ds, range(20))
+    before = weights_digest(npz)
+    net.hand_slope.fill_(0.25)
+    changed = export_npz(net, tmp_path / "changed.npz", trained_on="synthetic", report_sha="1" * 64)
+    assert weights_digest(changed) != before

@@ -59,6 +59,15 @@ def _add_train_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--batch", type=int, default=None, help="pairs per batch")
     p.add_argument("--max-epochs", type=int, default=None)
     p.add_argument("--patience", type=int, default=None)
+    p.add_argument("--rank-weight", type=float, default=None,
+                   help="within-(part,query,k) conditional-logit loss weight")
+    p.add_argument("--rank-temperature", type=float, default=None)
+    p.add_argument("--hand-residual", action="store_true", default=None,
+                   help="start from train-calibrated hand utility and learn corrections")
+    p.add_argument("--selection-metric", choices=("logloss", "pairwise"), default=None,
+                   help="VAL early-stopping/seed-selection criterion")
+    p.add_argument("--correction-scale", type=float, default=None,
+                   help="post-fit hand-residual correction shrinkage [0,1]; choose on VAL")
     p.add_argument("--verbose", action="store_true")
 
 
@@ -104,6 +113,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fractions", default="0.125,0.25,0.5,1")
     p.add_argument("--n-boot", type=int, default=2000)
     p.add_argument("--control-seeds", type=int, default=3)
+    p.add_argument("--ranking-only", action="store_true",
+                   help="VAL-only within-query ranking/pointwise report, without refitting "
+                        "convergence learning curves")
 
     p = sub.add_parser("ab", help="held-out A/B scored by the independent observer; --ship "
                                   "installs on pass")
@@ -117,7 +129,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 _CFG_FLAGS = {"lr": "lr", "weight_decay": "weight_decay", "face_dropout": "face_dropout",
-              "batch": "batch_trials", "max_epochs": "max_epochs", "patience": "patience"}
+              "batch": "batch_trials", "max_epochs": "max_epochs", "patience": "patience",
+              "rank_weight": "rank_weight", "rank_temperature": "rank_temperature",
+              "hand_residual": "hand_residual", "selection_metric": "selection_metric",
+              "correction_scale": "correction_scale"}
 
 
 def _train_cfg(a, base: dict = None):
@@ -163,15 +178,18 @@ def main(argv=None) -> int:
         out = train_final(TrialStore(a.store), a.run_dir, seeds=a.seeds, cfg=_train_cfg(a),
                           sweep=not a.no_sweep, verbose=a.verbose)
     elif a.cmd == "evaluate":
-        from .evaluate import convergence_report  # noqa: PLC0415
+        from .evaluate import convergence_report, ranking_report  # noqa: PLC0415
         from .store import TrialStore  # noqa: PLC0415
         trained = Path(a.run_dir) / "train_report.json"
         base = json.loads(trained.read_text())["config"] if trained.exists() else None
-        rep = convergence_report(
-            TrialStore(a.store), a.run_dir, seeds=a.seeds, fractions=tuple(
-                float(f) for f in _csv(a.fractions)),
-            cfg=_train_cfg(a, base), n_boot=a.n_boot, control_seeds=a.control_seeds,
-            verbose=a.verbose)
+        if a.ranking_only:
+            rep = ranking_report(TrialStore(a.store), a.run_dir, n_boot=a.n_boot)
+        else:
+            rep = convergence_report(
+                TrialStore(a.store), a.run_dir, seeds=a.seeds, fractions=tuple(
+                    float(f) for f in _csv(a.fractions)),
+                cfg=_train_cfg(a, base), n_boot=a.n_boot, control_seeds=a.control_seeds,
+                verbose=a.verbose)
         out = {"report": str(Path(a.run_dir) / "report.json"),
                "markdown": str(Path(a.run_dir) / "report.md"), "verdict": rep["verdict"]}
     else:

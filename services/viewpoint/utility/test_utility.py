@@ -150,3 +150,124 @@ def test_a_model_trained_on_another_feature_schema_is_refused(tmp_path, monkeypa
 def test_missing_weights_are_reported_not_invented(tmp_path):
     model, note = load_default(tmp_path / "absent.npz")
     assert model is None and "absent.npz" in note
+
+
+@pytest.mark.parametrize("slope", [2.5, -2.5])
+def test_residual_hand_changes_rankings_and_matches_scalar_batch_scores(tmp_path, slope):
+    arrays = _tiny_model(np.random.default_rng(21))
+    legacy = UtilityModel(arrays, name="legacy")
+    arrays.update(hand_slope=np.array(slope), hand_intercept=np.array(-1.75))
+    path = tmp_path / "residual.npz"
+    np.savez(path, **arrays)
+    model = UtilityModel.load(path)
+    metrics = _metrics([(1, 1, 1), (-1, -1, -1)])
+    tokens = [build_set_tokens(metrics, [i], {"target": [5]}, {}) for i in (0, 1)]
+    logits = legacy.score_batch(tokens)
+    hand_gain = abs(logits[1] - logits[0]) + 1.0
+    for hands, winner in (([0.0, hand_gain], 1), ([hand_gain, 0.0], 0)):
+        expected = logits + slope * np.asarray(hands) - 1.75
+        scores = model.score_batch(tokens, hand=hands)
+        np.testing.assert_allclose(scores, expected, rtol=0, atol=1e-12)
+        assert int(scores.argmax()) == (winner if slope > 0 else 1 - winner)
+        for token, hand, score in zip(tokens, hands, scores):
+            assert model.score(token, hand=hand) == score
+
+
+def test_residual_requires_hand_even_for_an_empty_batch():
+    arrays = _tiny_model(np.random.default_rng(22))
+    arrays.update(hand_slope=np.array(-0.5), hand_intercept=np.array(3.0))
+    model = UtilityModel(arrays, name="residual")
+    tokens = build_set_tokens(_metrics([(1, 1, 1)]), [0], None, {})
+    with pytest.raises(ValueError, match="requires hand"):
+        model.score(tokens)
+    for batch in ([tokens], []):
+        with pytest.raises(ValueError, match="requires hand"):
+            model.score_batch(batch)
+    assert model.score_batch([], hand=[]).shape == (0,)
+
+
+def test_legacy_artifacts_match_zero_residual_and_intercept_only_models(tmp_path):
+    arrays = _tiny_model(np.random.default_rng(23))
+    path = tmp_path / "legacy.npz"
+    np.savez(path, **arrays)
+    legacy = UtilityModel.load(path)
+    arrays.update(hand_slope=np.array(0.0), hand_intercept=np.array(0.0))
+    zero = UtilityModel(arrays, name="zero")
+    metrics = _metrics([(1, 1, 1), (-1, -1, -1)])
+    tokens = [build_set_tokens(metrics, S, None, {}) for S in ([], [0], [0, 1])]
+    expected = legacy.score_batch(tokens)
+    np.testing.assert_array_equal(zero.score_batch(tokens), expected)
+    np.testing.assert_array_equal(legacy.score_batch(tokens, hand=[100, -100, 50]), expected)
+    arrays["hand_intercept"] = np.array(-3.5)
+    intercept = UtilityModel(arrays, name="intercept")
+    np.testing.assert_array_equal(intercept.score_batch(tokens), expected - 3.5)
+
+
+@pytest.mark.parametrize("hands", [[], [1.0], [1.0, 2.0, 3.0], 1.0, [[1.0], [2.0]]])
+def test_hand_batch_must_align_with_token_sets(hands):
+    arrays = _tiny_model(np.random.default_rng(24))
+    arrays.update(hand_slope=np.array(1.0), hand_intercept=np.array(0.0))
+    model = UtilityModel(arrays, name="residual")
+    tokens = build_set_tokens(_metrics([(1, 1, 1)]), [0], None, {})
+    with pytest.raises(ValueError, match="one scalar per token set"):
+        model.score_batch([tokens, tokens], hand=hands)
+
+
+@pytest.mark.parametrize("metadata, message", [
+    ({"hand_slope": np.array(1.0)}, "both be present"),
+    ({"hand_intercept": np.array(1.0)}, "both be present"),
+    ({"hand_slope": np.array([1.0]), "hand_intercept": np.array(0.0)}, "hand_slope"),
+    ({"hand_slope": np.array(1.0), "hand_intercept": np.array([0.0])}, "hand_intercept"),
+    ({"hand_slope": np.array(np.nan), "hand_intercept": np.array(0.0)}, "hand_slope"),
+    ({"hand_slope": np.array(np.inf), "hand_intercept": np.array(0.0)}, "hand_slope"),
+    ({"hand_slope": np.array(1.0), "hand_intercept": np.array(np.nan)}, "hand_intercept"),
+    ({"hand_slope": np.array(1.0), "hand_intercept": np.array(-np.inf)}, "hand_intercept"),
+])
+def test_residual_metadata_is_paired_finite_scalars(tmp_path, metadata, message):
+    arrays = _tiny_model(np.random.default_rng(25))
+    arrays.update(metadata)
+    path = tmp_path / "invalid.npz"
+    np.savez(path, **arrays)
+    with pytest.raises(ValueError, match=message):
+        UtilityModel.load(path)
+    with pytest.raises(ValueError, match=message):
+        UtilityModel(arrays, name="invalid")
+    model, note = load_default(path)
+    assert model is None and message in note
+
+
+@pytest.mark.parametrize("hand", [np.nan, np.inf, [1.0]])
+def test_nonzero_residual_requires_a_finite_scalar_hand(hand):
+    arrays = _tiny_model(np.random.default_rng(26))
+    arrays.update(hand_slope=np.array(1.0), hand_intercept=np.array(0.0))
+    model = UtilityModel(arrays, name="residual")
+    tokens = build_set_tokens(_metrics([(1, 1, 1)]), [0], None, {})
+    with pytest.raises(ValueError, match="finite scalar"):
+        model.score(tokens, hand=hand)
+
+
+def test_hand_ranking_tracks_mutated_target_roles():
+    metrics = _metrics([(1, 1, 1), (-1, -1, -1)])
+    roles = {"target": [5]}
+    assert hand_utility(metrics, [1], roles) > hand_utility(metrics, [0], roles)
+    roles["target"][:] = [4]
+    assert hand_utility(metrics, [0], roles) > hand_utility(metrics, [1], roles)
+
+
+def test_hand_ranking_includes_newly_appended_views():
+    metrics = _metrics([(1, 1, 1)])
+    roles = {"target": [5]}
+    hidden = hand_utility(metrics, [0], roles)
+    metrics["views"].append(_metrics([(-1, -1, -1)])["views"][0])
+    assert hand_utility(metrics, [1], roles) > hidden + 1.0
+    assert hand_utility(metrics, [0, 1], roles) > hidden + 1.0
+
+
+def test_residual_intercept_is_added_after_network_and_hand_cancel():
+    arrays = {k: np.zeros(shape) for k, shape in _SHAPES.items()}
+    arrays["out_b1"][:] = 1e16
+    arrays.update(hand_slope=np.array(1.0), hand_intercept=np.array(1.0))
+    model = UtilityModel(arrays, name="cancellation")
+    tokens = build_set_tokens(_metrics([(1, 1, 1)]), [0], None, {})
+    assert model.score(tokens, hand=-1e16) == 1.0
+    np.testing.assert_array_equal(model.score_batch([tokens], hand=[-1e16]), [1.0])

@@ -68,12 +68,12 @@ EOF
     if [ ${#todo[@]} -eq 0 ]; then stage "obs_$judge" echo "$judge: all folds on disk"; return; fi
     local csv; csv=$(IFS=,; echo "${todo[*]}")
     stage "obs_$judge" $PY -m training.viewpoint.observer train --judge "$judge" \
-        --epochs "$ep" --folds "$csv"
+        --epochs "$ep" --folds "$csv" --workers "$WORKERS"
 }
 run_obs_crossfit()    { run_judge crossfit; }
 run_obs_independent() { run_judge independent; }
 # Learning curve over 1/8..1 of the training parts × 2 seeds + controls at 8 epochs ≈ 3 h.
-run_obs_report() { stage obs_report $PY -m training.viewpoint.observer report --seeds 0,1 --epochs 8; }
+run_obs_report() { stage obs_report $PY -m training.viewpoint.observer report --seeds 0,1 --epochs 8 --workers "$WORKERS"; }
 run_observer() { run_obs_crossfit; run_obs_independent; run_obs_report; }
 run_observe() {
     stage observe_crossfit    $PY -m training.viewpoint.utility observe --judge crossfit

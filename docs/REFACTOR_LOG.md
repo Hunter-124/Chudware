@@ -5315,6 +5315,17 @@ keys on the library); `RenderPool` has a stall watchdog because a pool whose wor
 hung the first campaign for 2 h. Windows: MSVC builds the whole windows-occt tree (native-build
 Windows row now uses the shipping preset); remaining Windows/macOS ctest reds are
 `mesher_advanced` (hours-long) and `sim_cache`/`fea_contact`, outside this work.
+**Observer must read pixels (2026-09-29 evening).** The first observer report showed ~90%
+of its accuracy came from the query vector (blind .530 vs full .577): queries carried
+centroids/axes/location flags. Query schema v2 (`observer/queries.py`, `requery` migration,
+qvec-only probe in the report) removed the leak, after which the CNN learned nothing from
+pixels (full ≈ blind ≈ .28). Fix: dense per-pixel supervision (`observer/dense.py`) —
+CANON class + feature/depth edge masks rasterised from the cached grids' reconstructed
+cameras (no RGB re-render; a silhouette-registration check refuses misaligned masks, which
+caught a trial fixed-camera index offset) and a joint decoder head. Held-out probe (788
+parts, 8 epochs): full .524 vs blind .385; type .529 vs .133; per-pixel mIoU .42. The box's
+GPU occasionally hard-resets (hardware), so `campaign.sh service` installs a reboot-surviving
+user unit with per-run stage done markers; fold training resumes per epoch.
 
 ## 2026-09-29 — extruded parts no longer show their sketches through the solid
 

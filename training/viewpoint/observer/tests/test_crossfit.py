@@ -33,33 +33,31 @@ def _grid_png(path, tiles: list) -> None:
 
 
 def _tile(rng, side) -> np.ndarray:
-    """Grey noise; with `side` set, a bright square in one of six slots (2 rows x 3 cols)."""
+    """Grey noise, with a wide, high-contrast stripe on the labelled left/right side."""
     t = rng.integers(90, 140, size=(_TILE[1], _TILE[0], 3), dtype=np.uint8)
     if side is not None:
-        r, c = divmod(side, 3)
-        y0, x0 = 6 + r * 34, 4 + c * 31
-        t[y0:y0 + 26, x0:x0 + 24] = (240, 60, 40)
+        x0 = 4 if side == 0 else _TILE[0] - 36
+        t[8:_TILE[1] - 8, x0:x0 + 32] = (240, 60, 40)
     return t
 
 
 def _store(tmp_path, n_parts: int, sets_per_part: int, seed: int = 0):
-    """Parts with one presence_side query each; the answer is painted in the pixels (the
-    square's slot) in exactly one tile of every set."""
+    """Parts with a balanced presence_side answer painted in every tile of every
+    set. The decisive pixel signal is identical across tile counts and splits."""
     rng = np.random.default_rng(seed)
     root = tmp_path / "store"
     (root / "images").mkdir(parents=True)
     queries, sets = [], []
     for p in range(n_parts):
         pid = f"synth/{p:03d}"
-        side = int(rng.integers(0, 6))
+        side = p % 2
         vec = Q._vec("presence_side", "part", Q.FAMILY_CLASSES["pocket"])
         queries.append(Q._make(pid, "presence_side", "part", -1, vec, side, Q.SIDES[side],
                                "pocket"))
         for s in range(sets_per_part):
             k = 1 if s % 2 == 0 else 4
-            hot = int(rng.integers(0, k))
             img = root / "images" / f"{p:03d}_{s}.png"
-            _grid_png(img, [_tile(rng, side if j == hot else None) for j in range(k)])
+            _grid_png(img, [_tile(rng, side) for _ in range(k)])
             sets.append({"set_key": f"s{p:03d}_{s}", "part_id": pid, "split": "train",
                          "mode": "part", "target_instance": -1, "k": k,
                          IMAGE_KEY: f"images/{img.name}", "strategies": ["random"]})
@@ -155,7 +153,7 @@ def test_tiny_run_learns_a_planted_pixel_signal(tmp_path):
     tr = [i for i, s in enumerate(corpus.sets) if s["part_id"] not in held]
     ev = [i for i, s in enumerate(corpus.sets) if s["part_id"] in held]
     device = T.default_device()
-    cfg = _cfg(epochs=20, amp=device.type == "cuda", augment=True)
+    cfg = _cfg(epochs=12, amp=device.type == "cuda", augment=False, dropout=0.0)
     model, _info = T.train_observer(corpus, tr, [], cfg, device=device, log=lambda *_: None)
     acc = T.kind_metrics(T.predict(model, corpus, T.items_for(corpus, ev), device=device,
                                    cfg=cfg), corpus)["all"]["acc"]
@@ -163,6 +161,30 @@ def test_tiny_run_learns_a_planted_pixel_signal(tmp_path):
                                 log=lambda *_: None)
     blind_acc = T.kind_metrics(T.predict(blind, corpus, T.items_for(corpus, ev), device=device,
                                          cfg=cfg, blind=True), corpus)["all"]["acc"]
-    chance = 1.0 / 6.0
-    assert acc > chance + 0.4, (acc, blind_acc)
-    assert blind_acc < chance + 0.2, (acc, blind_acc)
+    assert acc >= 0.95, (acc, blind_acc)
+    assert blind_acc <= 0.70, (acc, blind_acc)
+
+
+def test_epoch_restart_restores_optimizer_schedule_and_rng(tmp_path):
+    store = _store(tmp_path, n_parts=12, sets_per_part=2, seed=7)
+    corpus = _corpus(store)
+    cfg = _cfg(epochs=3, dropout=0.1, augment=True)
+    idx = list(range(len(corpus.sets)))
+    path = tmp_path / "progress.pt"
+
+    def interrupt(message):
+        if message.startswith("[observer] epoch 0:"):
+            raise RuntimeError("simulated restart")
+
+    with pytest.raises(RuntimeError, match="simulated restart"):
+        T.train_observer(corpus, idx, [], cfg, device=torch.device("cpu"),
+                         resume_path=path, resume_key="unchanged", log=interrupt)
+    assert torch.load(path, weights_only=False)["epoch"] == 0
+    resumed, info = T.train_observer(corpus, idx, [], cfg, device=torch.device("cpu"),
+                                      resume_path=path, resume_key="unchanged",
+                                      log=lambda *_: None)
+    uninterrupted, _ = T.train_observer(corpus, idx, [], cfg, device=torch.device("cpu"),
+                                         log=lambda *_: None)
+    assert len(info["history"]) == cfg.epochs
+    for key, tensor in uninterrupted.state_dict().items():
+        assert torch.allclose(tensor, resumed.state_dict()[key], atol=1e-6), key

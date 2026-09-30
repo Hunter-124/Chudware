@@ -24,6 +24,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .queries import A_MAX, QD
+from training.viewpoint.datasets.importers import CANON
 
 NEG = -1e9
 VARIANTS = {
@@ -83,7 +84,7 @@ def _grid(n: int, strides: int) -> int:
 
 
 class _TileEncoder(nn.Module):
-    """stride 2 stem + four stride-2 stages -> [N, d, H/32, W/32]."""
+    """Shared stride-32 query features and stride-8 features for dense supervision."""
 
     def __init__(self, width: int, mult: tuple, blocks: tuple, d: int):
         super().__init__()
@@ -91,18 +92,24 @@ class _TileEncoder(nn.Module):
                                   nn.GroupNorm(_groups(width), width), nn.ReLU(inplace=True),
                                   nn.Conv2d(width, width, 3, 1, 1, bias=False),
                                   nn.GroupNorm(_groups(width), width), nn.ReLU(inplace=True))
-        layers = []
+        self.stages = nn.ModuleList()
         cin = width
         for m, nb in zip(mult, blocks):
             cout = width * m
-            layers.append(_Block(cin, cout, 2))
-            layers += [_Block(cout, cout, 1) for _ in range(nb - 1)]
+            self.stages.append(nn.Sequential(
+                _Block(cin, cout, 2), *[_Block(cout, cout, 1) for _ in range(nb - 1)]))
             cin = cout
-        self.stages = nn.Sequential(*layers)
         self.proj = nn.Conv2d(cin, d, 1)
+        self.dense_channels = width * mult[1]
 
-    def forward(self, x):
-        return self.proj(self.stages(self.stem(x)))
+    def forward(self, x, *, dense=False):
+        x = self.stem(x)
+        features = None
+        for j, stage in enumerate(self.stages):
+            x = stage(x)
+            if j == 1 and dense:
+                features = x
+        return (self.proj(x), features) if dense else self.proj(x)
 
 
 class _CrossBlock(nn.Module):
@@ -130,10 +137,15 @@ class ObserverNet(nn.Module):
         self.cfg = cfg
         d = cfg.d
         self.encoder = _TileEncoder(cfg.width or v["width"], v["mult"], v["blocks"], d)
+        self.dense_head = nn.Sequential(nn.Conv2d(self.encoder.dense_channels, 64, 3, padding=1),
+                                        nn.GroupNorm(8, 64), nn.ReLU(inplace=True),
+                                        nn.Conv2d(64, len(CANON) + 3, 1))
         gh, gw = _grid(cfg.tile_hw[0], 5), _grid(cfg.tile_hw[1], 5)
         self.n_tok = gh * gw
         self.pos = nn.Parameter(torch.randn(1, 1, self.n_tok, d) * 0.02)
         self.slot = nn.Parameter(torch.randn(1, cfg.max_tiles, 1, d) * 0.02)
+        self.sem_pos = nn.Parameter(torch.randn(1, 1, 4, d) * 0.02)
+        self.sem_proj = nn.Linear(len(CANON) + 3, d)
         self.self_attn = nn.ModuleList(
             nn.TransformerEncoderLayer(d, v["heads"], 2 * d, cfg.dropout, activation="gelu",
                                        batch_first=True, norm_first=True)
@@ -146,24 +158,31 @@ class ObserverNet(nn.Module):
         self.head = nn.Sequential(nn.LayerNorm(hin), nn.Linear(hin, d), nn.GELU(),
                                   nn.Dropout(cfg.dropout), nn.Linear(d, A_MAX))
 
-    def tokens(self, tiles: torch.Tensor, tile_mask: torch.Tensor) -> tuple:
-        """Image tokens [B, T*n_tok, d] and their padding mask [B, T*n_tok] (True = pad)."""
+    def tokens(self, tiles: torch.Tensor, tile_mask: torch.Tensor, *, dense=False) -> tuple:
+        """Image tokens plus 2x2 semantic summaries derived solely from image pixels."""
         B, T = tiles.shape[:2]
         x = tiles.reshape(B * T, *tiles.shape[2:])
         if x.dtype == torch.uint8:
             x = x.float() / 255.0
         x = (x - 0.5) / 0.25
-        f = self.encoder(x.contiguous(memory_format=torch.channels_last))
-        f = f.flatten(2).transpose(1, 2).reshape(B, T, self.n_tok, -1)
+        coarse, detail = self.encoder(x.contiguous(memory_format=torch.channels_last), dense=True)
+        dense_logits = self.dense_head(detail)
+        class_prob = dense_logits[:, :-1].softmax(1)
+        edge_prob = dense_logits[:, -1:].sigmoid()
+        semantic = F.adaptive_avg_pool2d(torch.cat((class_prob, edge_prob), 1), (2, 2))
+        semantic = semantic.flatten(2).transpose(1, 2)
+        semantic = self.sem_proj(semantic).reshape(B, T, 4, -1)
+        semantic = semantic + self.sem_pos + self.slot[:, :T]
+        f = coarse.flatten(2).transpose(1, 2).reshape(B, T, self.n_tok, -1)
         f = f + self.pos + self.slot[:, :T]
-        mem = f.reshape(B, T * self.n_tok, -1)
-        pad = (~tile_mask.bool()).repeat_interleave(self.n_tok, dim=1)
+        mem = torch.cat((f, semantic), dim=2).reshape(B, T * (self.n_tok + 4), -1)
+        pad = (~tile_mask.bool()).repeat_interleave(self.n_tok + 4, dim=1)
         for layer in self.self_attn:
             mem = layer(mem, src_key_padding_mask=pad)
-        return mem, pad
+        return mem, pad, dense_logits if dense else None
 
-    def forward(self, tiles, tile_mask, qvec, opt_mask):
-        mem, pad = self.tokens(tiles, tile_mask)
+    def forward(self, tiles, tile_mask, qvec, opt_mask, *, dense=False):
+        mem, pad, dense_logits = self.tokens(tiles, tile_mask, dense=dense)
         q0 = self.qmlp(qvec.to(mem.dtype) if qvec.dtype != mem.dtype else qvec)
         q = q0
         for blk in self.cross:
@@ -174,7 +193,8 @@ class ObserverNet(nn.Module):
             mean = (mem * keep).sum(1) / keep.sum(1).clamp_min(1.0)
             feats.append(mean.unsqueeze(1).expand(-1, q.shape[1], -1))
         logits = self.head(torch.cat(feats, -1)).float()
-        return logits.masked_fill(~opt_mask.bool(), NEG)
+        answers = logits.masked_fill(~opt_mask.bool(), NEG)
+        return (answers, dense_logits) if dense else answers
 
 
 def p_answer(logits: torch.Tensor, answer: torch.Tensor) -> torch.Tensor:

@@ -1,6 +1,7 @@
-"""CLI: python3 -m training.viewpoint.observer {render,requery,train,label,report}
+"""CLI: python3 -m training.viewpoint.observer {render,dense,requery,train,label,report}
 
 render   plan + render the Observer's own random-ish training view sets (engine workers)
+dense    rasterize cached RGB grids' geometry masks (no RGB rendering)
 requery  remap existing rendered sets to the current query schema (no engine needed)
 train    fit a judge's K fold models (part cross-fitting)                          (torch)
 label    label every (view set, query) pair of a store namespace with a judge      (torch)
@@ -93,6 +94,15 @@ def cmd_render(args) -> int:
                                    store=store, cfg=cfg, workers=args.workers)
     print(json.dumps(summary, indent=1))
     return 0 if summary["errors"] == 0 else 1
+
+def cmd_dense(args) -> int:
+    from .dense import prepare_dense  # noqa: PLC0415
+    result = prepare_dense(args.store, None, args.tile_hw, labels=args.labels,
+                           workers=args.workers, limit_parts=args.limit_parts)
+    # Isolated raster refusals are tolerated (training drops those sets); a systemic
+    # failure rate means masks are wrong and must stop the campaign.
+    from .train import DENSE_MISSING_MAX  # noqa: PLC0415
+    return 1 if len(result["errors"]) > DENSE_MISSING_MAX * max(result["total"], 1) else 0
 
 
 def cmd_requery(args) -> int:
@@ -191,6 +201,14 @@ def main(argv=None) -> int:
     p.add_argument("--tile", type=_hw, default=(512, 384), help="render tile WxH")
     p.add_argument("--seed", type=int, default=0)
     p.set_defaults(fn=cmd_render)
+
+    p = sub.add_parser("dense", help="rasterize class/instance-edge labels for cached grids")
+    _add_store(p)
+    p.add_argument("--labels", type=Path, default=None)
+    p.add_argument("--tile-hw", type=_hw, default=(192, 256))
+    p.add_argument("--workers", type=int, default=None)
+    p.add_argument("--limit-parts", type=int, default=None)
+    p.set_defaults(fn=cmd_dense)
 
     p = sub.add_parser("requery", help="rebuild query bank and remap old sets without rendering")
     _add_store(p)

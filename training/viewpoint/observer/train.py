@@ -31,8 +31,11 @@ from torch.utils.data import DataLoader, Dataset
 from .model import ModelConfig, ObserverNet, augment, p_answer, param_count, query_loss
 from .queries import A_MAX, QD, QUERY_SCHEMA, load_queries, queries_path
 from .render import IMAGE_KEY, load_observer_sets
+from .dense import dense_path, N_CLASSES
+from training.viewpoint.datasets.importers import CANON
 
-OBSERVER_SCHEMA = "viewnet.observer/1"
+OBSERVER_SCHEMA = "viewnet.observer/3"
+DENSE_MISSING_MAX = 0.02          # tolerated fraction of sets whose dense raster failed
 TILE_GAP = 4                      # shot_planner._compose's gutter between tiles
 
 
@@ -148,6 +151,7 @@ class Corpus:
     queries: dict
     set_qids: list
     tile_hw: tuple
+    dense: bool = False
 
     def parts(self, idx: Optional[Iterable] = None) -> list:
         rng = range(len(self.sets)) if idx is None else idx
@@ -156,6 +160,13 @@ class Corpus:
     def tiles(self, i: int) -> np.ndarray:
         s = self.sets[i]
         return np.load(tile_cache_path(self.root, s[IMAGE_KEY], self.tile_hw))
+
+    def labels(self, i: int) -> np.ndarray:
+        path = dense_path(self.root, self.sets[i][IMAGE_KEY], self.tile_hw)
+        if path.suffix == ".npz":
+            with np.load(path) as compressed:
+                return compressed["labels"]
+        return np.load(path)
 
 
 def _index_queries(queries: dict) -> dict:
@@ -167,7 +178,7 @@ def _index_queries(queries: dict) -> dict:
 
 def build_corpus(root, set_records: Iterable, queries: dict, tile_hw: tuple, *,
                  prepare: bool = True, workers: Optional[int] = None,
-                 log: Callable = print) -> Corpus:
+                 dense: Optional[bool] = None, log: Callable = print) -> Corpus:
     root = Path(root).expanduser()
     index = _index_queries(queries)
     sets, set_qids = [], []
@@ -186,8 +197,23 @@ def build_corpus(root, set_records: Iterable, queries: dict, tile_hw: tuple, *,
             bad = {e.split(":", 1)[0] for e in res["errors"]}
             keep = [i for i, s in enumerate(sets) if s[IMAGE_KEY] not in bad]
             sets, set_qids = [sets[i] for i in keep], [set_qids[i] for i in keep]
+    if dense is False:
+        have_dense = False
+    else:
+        has = [dense_path(root, s[IMAGE_KEY], tile_hw).exists() for s in sets]
+        n_dense = sum(has)
+        # A few sets can legitimately lack masks (raster budget, silhouette-registration
+        # refusal); training drops those. More than DENSE_MISSING_MAX means the stage never ran.
+        if dense is not False and n_dense and len(sets) - n_dense <= DENSE_MISSING_MAX * len(sets):
+            if n_dense < len(sets):
+                log(f"[observer] dropping {len(sets) - n_dense}/{len(sets)} sets without dense labels")
+                sets = [s for s, h in zip(sets, has) if h]
+                set_qids = [q for q, h in zip(set_qids, has) if h]
+        elif 0 < n_dense or dense:
+            raise ValueError(f"dense labels incomplete ({n_dense}/{len(sets)}); run observer dense")
+        have_dense = bool(n_dense)
     return Corpus(root=root, sets=sets, queries=queries, set_qids=set_qids,
-                  tile_hw=tuple(tile_hw))
+                  tile_hw=tuple(tile_hw), dense=have_dense)
 
 
 def training_sets(store) -> list:
@@ -205,7 +231,7 @@ def load_corpus(store, tile_hw: tuple, *, workers: Optional[int] = None,
         raise FileNotFoundError(f"no Observer queries at {queries_path(store.root)} "
                                 f"(run `python3 -m training.viewpoint.observer render`)")
     return build_corpus(store.root, training_sets(store), queries, tile_hw, workers=workers,
-                        log=log)
+                        dense=True, log=log)
 
 
 # ---------------------------------------------------------------------------- data
@@ -223,11 +249,14 @@ class _SetData(Dataset):
     def __getitem__(self, item):
         i, qids = item
         qs = [self.c.queries[q] for q in qids]
-        return {"tiles": self.c.tiles(i),                 # uint8 [k, H, W, 3] (NHWC)
-                "qvec": np.stack([q.vec for q in qs]).astype(np.float32),
-                "mask": np.stack([q.option_mask for q in qs]),
-                "ans": np.asarray([self.override.get(q.qid, q.answer) for q in qs], np.int64),
-                "set": i, "qids": list(qids)}
+        result = {"tiles": self.c.tiles(i),          # uint8 [k, H, W, 3] (NHWC)
+                  "qvec": np.stack([q.vec for q in qs]).astype(np.float32),
+                  "mask": np.stack([q.option_mask for q in qs]),
+                  "ans": np.asarray([self.override.get(q.qid, q.answer) for q in qs], np.int64),
+                  "set": i, "qids": list(qids)}
+        if self.c.dense:
+            result["dense"] = self.c.labels(i)
+        return result
 
 
 def _collate(items: list) -> dict:
@@ -252,10 +281,16 @@ def _collate(items: list) -> dict:
         mask[b, :n] = it["mask"]
         ans[b, :n] = it["ans"]
         qvalid[b, :n] = True
-    return {"tiles": torch.from_numpy(tiles), "tmask": torch.from_numpy(tmask),
-            "qvec": torch.from_numpy(qvec), "mask": torch.from_numpy(mask),
-            "ans": torch.from_numpy(ans), "qvalid": torch.from_numpy(qvalid),
-            "sets": [it["set"] for it in items], "qids": [it["qids"] for it in items]}
+    out = {"tiles": torch.from_numpy(tiles), "tmask": torch.from_numpy(tmask),
+           "qvec": torch.from_numpy(qvec), "mask": torch.from_numpy(mask),
+           "ans": torch.from_numpy(ans), "qvalid": torch.from_numpy(qvalid),
+           "sets": [it["set"] for it in items], "qids": [it["qids"] for it in items]}
+    if "dense" in items[0]:
+        labels = np.zeros((B, T, *t0.shape[1:3], 2), np.uint8)
+        for b, it in enumerate(items):
+            labels[b, :it["dense"].shape[0]] = it["dense"]
+        out["dense"] = torch.from_numpy(labels)
+    return out
 
 
 class _Batches:
@@ -327,6 +362,7 @@ class TrainConfig:
     augment: bool = True
     amp: bool = True
     workers: int = 6
+    dense_weight: float = 1.5
     seed: int = 0
 
     def model_config(self) -> ModelConfig:
@@ -364,7 +400,9 @@ def _inputs(batch: dict, device, *, train: bool, gen, cfg: TrainConfig, blind: b
     B, T = tiles.shape[:2]
     x = tiles.reshape(B * T, *tiles.shape[2:]).permute(0, 3, 1, 2).float().div_(255.0)
     if train and cfg.augment:
-        x = augment(x, gen)
+        # Pixel supervision must remain registered to the source RGB. Photometric
+        # jitter is safe; geometric zoom/shift without warping masks is not.
+        x = augment(x, gen, scale=(1.0, 1.0), shift=0.0) if cfg.dense_weight else augment(x, gen)
     if blind:
         x = torch.zeros_like(x)
     return (x.reshape(B, T, *x.shape[1:]), batch["tmask"].to(device),
@@ -422,11 +460,65 @@ def items_for(corpus: Corpus, set_idx: Iterable) -> list:
     return [(i, list(corpus.set_qids[i])) for i in set_idx]
 
 
+
+def _dense_loss(logits, labels, mask):
+    n, _, h, w = logits.shape
+    targets = labels.reshape(n, *labels.shape[2:]).permute(0, 3, 1, 2).float()
+    classes = torch.nn.functional.interpolate(targets[:, :1], size=(h, w), mode="nearest")[:, 0].long()
+    edge = torch.nn.functional.adaptive_max_pool2d(targets[:, 1:2], (h, w))[:, 0]
+    keep = mask.reshape(n, 1, 1).float()
+    # Background occupies most pixels. Inverse-square-root frequencies prevent a
+    # trivial all-background predictor from winning while bounding tiny-class weights.
+    counts = torch.bincount(classes.flatten(), minlength=N_CLASSES).float()
+    weights = counts.clamp_min(128).rsqrt()
+    weights = (weights / weights[0].clamp_min(1e-8)).clamp(max=12)
+    pixel_weight = weights[classes] * keep
+    per_class = torch.nn.functional.cross_entropy(logits[:, :N_CLASSES].float(), classes,
+                                                   reduction="none")
+    class_loss = (per_class * pixel_weight).sum() / pixel_weight.sum().clamp_min(1)
+    per_edge = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits[:, N_CLASSES].float(), edge, reduction="none", pos_weight=torch.tensor(4.0, device=logits.device))
+    edge_loss = (per_edge * keep).sum() / (keep.sum() * h * w).clamp_min(1)
+    return class_loss + 0.25 * edge_loss
+
+
+@torch.no_grad()
+def dense_metrics(model, corpus, indices, device, cfg, limit=512):
+    """Held-out mean IoU over classes present in ground truth, at decoder resolution."""
+    if not corpus.dense or not indices:
+        return None
+    model.eval()
+    intersection = np.zeros(N_CLASSES, np.int64)
+    union = np.zeros(N_CLASSES, np.int64)
+    take = sorted(indices, key=lambda i: _h("dense-eval", corpus.sets[i]["set_key"]))[:limit]
+    loader = _loader(corpus, _Batches(corpus, items_for(corpus, take),
+                                      cfg.tiles_per_batch, train=False,
+                                      q_per_set=cfg.q_per_set, seed=0), 0)
+    for batch in loader:
+        tiles, mask, qvec, options = _inputs(batch, device, train=False, gen=None,
+                                              cfg=cfg, blind=False)
+        with _autocast(device, cfg.amp):
+            _, dense = model(tiles, mask, qvec, options, dense=True)
+        n, _, h, w = dense.shape
+        actual = batch["dense"].to(device).reshape(n, *batch["dense"].shape[2:])
+        actual = torch.nn.functional.interpolate(actual[..., 0].unsqueeze(1).float(),
+                                                  size=(h, w), mode="nearest").long()[:, 0]
+        pred = dense[:, :N_CLASSES].argmax(1)
+        valid = mask.reshape(n, 1, 1)
+        for c in range(N_CLASSES):
+            intersection[c] += int(((pred == c) & (actual == c) & valid).sum())
+            union[c] += int((((pred == c) | (actual == c)) & valid).sum())
+    return {"miou": float(np.mean(intersection[union > 0] / union[union > 0])),
+            "n_sets": len(take), "per_class": {
+                ("background" if c == 0 else "cap" if c == N_CLASSES-1 else CANON[c-1]):
+                float(intersection[c] / union[c]) for c in range(N_CLASSES) if union[c]}}
+
+
 def train_observer(corpus: Corpus, train_idx: list, val_idx: list, cfg: TrainConfig, *,
                    device=None, override: Optional[dict] = None, blind: bool = False,
-                   log: Callable = print) -> tuple:
-    """Fit one ObserverNet; early-stops on val log-loss (fixed epochs when val_idx is empty).
-    Returns (model with the best weights, info)."""
+                   log: Callable = print, resume_path: Optional[Path] = None,
+                   resume_key: Optional[str] = None) -> tuple:
+    """Fit one ObserverNet; persist a resumable training state after each completed epoch."""
     device = device or default_device()
     torch.manual_seed(cfg.seed)
     gen = torch.Generator(device=device)
@@ -455,7 +547,25 @@ def train_observer(corpus: Corpus, train_idx: list, val_idx: list, cfg: TrainCon
     history = []
     t_start = time.time()
     bad = 0
-    for epoch in range(cfg.epochs):
+    first_epoch = 0
+    if resume_path is not None and resume_path.exists():
+        state = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if state["key"] != resume_key:
+            raise ValueError(f"{resume_path}: training configuration/data changed")
+        model.load_state_dict(state["model"])
+        opt.load_state_dict(state["optimizer"])
+        sched.load_state_dict(state["scheduler"])
+        best, history, bad = state["best"], state["history"], state["bad"]
+        first_epoch = state["epoch"] + 1
+        sampler.epoch = first_epoch
+        torch.set_rng_state(state["torch_rng"])
+        if device.type == "cuda":
+            torch.cuda.set_rng_state(state["cuda_rng"], device)
+        gen.set_state(state["augment_rng"])
+        if val_idx and first_epoch >= cfg.min_epochs and bad >= cfg.patience:
+            first_epoch = cfg.epochs
+        log(f"[observer] resumed {resume_path} at epoch {first_epoch}/{cfg.epochs}")
+    for epoch in range(first_epoch, cfg.epochs):
         model.train()
         t0 = time.time()
         tot, n_q, n_sets, n_tiles = torch.zeros((), device=device), 0, 0, 0
@@ -464,9 +574,17 @@ def train_observer(corpus: Corpus, train_idx: list, val_idx: list, cfg: TrainCon
                                                blind=blind)
             ans = batch["ans"].to(device)
             qvalid = batch["qvalid"].to(device)
+            use_dense = corpus.dense and cfg.dense_weight > 0 and not blind
             with _autocast(device, cfg.amp):
-                logits = model(tiles, tmask, qvec, mask)
+                out = model(tiles, tmask, qvec, mask, dense=use_dense)
+            logits, dense = out if use_dense else (out, None)
             loss = query_loss(logits, ans, qvalid, cfg.label_smoothing)
+            if use_dense:
+                aux = _dense_loss(dense, batch["dense"].to(device, non_blocking=True), tmask)
+                # Decay dense supervision only after the encoder learns surfaces. The
+                # query objective remains active throughout, including the first epoch.
+                weight = cfg.dense_weight * (0.35 + 0.65 * (1 - epoch / max(cfg.epochs - 1, 1)))
+                loss = loss + weight * aux
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
@@ -499,6 +617,17 @@ def train_observer(corpus: Corpus, train_idx: list, val_idx: list, cfg: TrainCon
             else:
                 bad += 1
         history.append(rec)
+        if resume_path is not None:
+            resume_path.parent.mkdir(parents=True, exist_ok=True)
+            state = {"key": resume_key, "epoch": epoch, "model": model.state_dict(),
+                     "optimizer": opt.state_dict(), "scheduler": sched.state_dict(),
+                     "best": best, "history": history, "bad": bad,
+                     "torch_rng": torch.get_rng_state(),
+                     "cuda_rng": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
+                     "augment_rng": gen.get_state()}
+            tmp = resume_path.with_name(resume_path.name + ".tmp")
+            torch.save(state, tmp)
+            os.replace(tmp, resume_path)
         log(f"[observer] epoch {epoch}: " + " ".join(
             f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in rec.items()
             if k != "epoch"))
@@ -574,8 +703,8 @@ def fit_folds(store, *, k: int = 5, judge: str = "crossfit", folds: Optional[Ite
     part_fold = {p: fold_of(p, k, spec.salt) for p in corpus.parts()}
     meta_path = folds_meta_path(store.root, judge)
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-    if meta and (meta.get("k") != k or meta.get("salt") != spec.salt or
-                 meta.get("query_schema") != QUERY_SCHEMA):
+    if meta and (meta.get("schema") != OBSERVER_SCHEMA or meta.get("k") != k or
+                 meta.get("salt") != spec.salt or meta.get("query_schema") != QUERY_SCHEMA):
         meta = {}
     meta.update(schema=OBSERVER_SCHEMA, query_schema=QUERY_SCHEMA, judge=judge, k=k,
                 salt=spec.salt, variant=spec.variant)
@@ -593,22 +722,34 @@ def fit_folds(store, *, k: int = 5, judge: str = "crossfit", folds: Optional[Ite
         log(f"[observer] {judge} fold {f}/{k}: train {len(tr)} sets "
             f"({len(train_parts) - len(val_parts)} parts), early-stop {len(va)} sets, "
             f"held-out {len(oof)} sets ({len(held)} parts)")
-        model, info = train_observer(corpus, tr, va, cfg, device=device, log=log)
+        path = judge_dir(store.root, judge) / f"fold{f}.pt"
+        resume_key = hashlib.sha256(json.dumps(
+            [OBSERVER_SCHEMA, QUERY_SCHEMA, judge, f, cfg.to_dict(),
+             [[corpus.sets[i]["set_key"], corpus.sets[i][IMAGE_KEY], corpus.set_qids[i]]
+              for i in tr],
+             [[corpus.sets[i]["set_key"], corpus.sets[i][IMAGE_KEY], corpus.set_qids[i]]
+              for i in va]], sort_keys=True).encode()).hexdigest()[:16]
+        progress = path.with_name(f"fold{f}.{resume_key}.progress.pt")
+        model, info = train_observer(corpus, tr, va, cfg, device=device, log=log,
+                                     resume_path=progress, resume_key=resume_key)
         t0 = time.time()
         rows = predict(model, corpus, items_for(corpus, oof), device=device, cfg=cfg)
         oof_m = kind_metrics(rows, corpus) if rows else {}
+        dense_m = dense_metrics(model, corpus, oof, device, cfg) if corpus.dense else None
         info["oof_predict_seconds"] = round(time.time() - t0, 2)
         path = judge_dir(store.root, judge) / f"fold{f}.pt"
         digest = save_checkpoint(path, model, {
             "judge": judge, "fold": f, "k": k, "salt": spec.salt,
             "trained_parts": train_parts, "train_config": cfg.to_dict(), "info": info,
-            "oof": oof_m, "created": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+            "oof": oof_m, "dense": dense_m, "created": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
         meta["folds"][str(f)] = {"path": path.name, "digest": digest, "oof": oof_m,
+                                 "dense": dense_m,
                                  "n_train_parts": len(train_parts),
                                  "n_heldout_parts": len(held), "info": info}
         tmp = meta_path.with_name("folds.json.tmp")
         tmp.write_text(json.dumps(meta, indent=1, sort_keys=True))
         os.replace(tmp, meta_path)
+        progress.unlink(missing_ok=True)
         log(f"[observer] {judge} fold {f} out-of-fold: " + ", ".join(
             f"{kk} {v['acc']:.3f} (chance {v['chance']:.3f}, n {v['n']})"
             for kk, v in oof_m.items()))
@@ -673,20 +814,40 @@ def learning_report(store, *, fractions=(0.125, 0.25, 0.5, 1.0), seeds=(0, 1, 2)
     va = [i for i, s in enumerate(corpus.sets) if s["part_id"] in val_parts]
     ev = [i for i, s in enumerate(corpus.sets) if s["part_id"] in held]
     ev_items = items_for(corpus, ev)
+    identity = hashlib.sha256(json.dumps(
+        [OBSERVER_SCHEMA, QUERY_SCHEMA, cfg.to_dict(), k, fold,
+         [[s["set_key"], s[IMAGE_KEY], corpus.set_qids[i]]
+          for i, s in enumerate(corpus.sets)]], sort_keys=True).encode()).hexdigest()[:16]
+    run_dir = observer_dir(store.root) / "report_runs" / identity
 
     def run(frac: float, seed: int, **kw) -> dict:
         n = max(1, int(round(frac * len(order))))
         chosen = set(order[:n])
         tr = [i for i, s in enumerate(corpus.sets) if s["part_id"] in chosen]
         c = TrainConfig(**{**asdict(cfg), "seed": seed})
-        tag = " shuffled-label" if kw.get("override") else " blind" if kw.get("blind") else ""
-        log(f"[observer] report run frac={frac} seed={seed}{tag}: {n} parts, {len(tr)} sets")
-        model, info = train_observer(corpus, tr, va, c, device=device, log=log, **kw)
+        tag = f"frac{frac:g}_seed{seed}" + (
+            "_shuffled" if kw.get("override") else "_blind" if kw.get("blind") else "")
+        path = run_dir / f"{tag}.json"
+        if path.exists():
+            log(f"[observer] report resumed {tag} from {path}")
+            return json.loads(path.read_text())
+        log(f"[observer] report run {tag}: {n} parts, {len(tr)} sets")
+        progress = run_dir / f"{tag}.progress.pt"
+        model, info = train_observer(corpus, tr, va, c, device=device, log=log, **kw,
+                                     resume_path=progress, resume_key=f"{identity}/{tag}")
         rows = predict(model, corpus, ev_items, device=device, cfg=c, blind=kw.get("blind", False))
-        return {"fraction": frac, "seed": seed, "train_parts": n, "train_sets": len(tr),
-                "metrics": kind_metrics(rows, corpus), "best_epoch": info["best_epoch"],
-                "train_seconds": info["train_seconds"],
-                "tiles_per_s": float(np.mean([h["tiles_per_s"] for h in info["history"]]))}
+        dense_m = dense_metrics(model, corpus, ev, device, c) if corpus.dense and not kw.get("blind") else None
+        result = {"fraction": frac, "seed": seed, "train_parts": n, "train_sets": len(tr),
+                  "metrics": kind_metrics(rows, corpus), "dense": dense_m,
+                  "best_epoch": info["best_epoch"], "history": info["history"],
+                  "train_seconds": info["train_seconds"],
+                  "tiles_per_s": float(np.mean([h["tiles_per_s"] for h in info["history"]]))}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(result, sort_keys=True))
+        os.replace(tmp, path)
+        progress.unlink(missing_ok=True)
+        return result
 
     t0 = time.time()
     curve = [run(f, seeds[0]) for f in fractions]
@@ -717,7 +878,9 @@ def learning_report(store, *, fractions=(0.125, 0.25, 0.5, 1.0), seeds=(0, 1, 2)
     out["seconds"] = round(time.time() - t0, 2)
     path = observer_dir(store.root) / "report.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(out, indent=1, sort_keys=True))
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(out, indent=1, sort_keys=True))
+    os.replace(tmp, path)
     out["path"] = str(path)
     return out
 
@@ -745,6 +908,10 @@ def format_report(rep: dict) -> str:
     for name in ("shuffled_label", "blind"):
         if name in rep:
             row(name, {k: v["acc"] for k, v in rep[name]["metrics"].items()})
+    for r in rep["learning_curve"]:
+        if r.get("dense"):
+            lines.append(f"dense mIoU (frac {r['fraction']:.3g}, {r['dense']['n_sets']} sets): "
+                         f"{r['dense']['miou']:.3f}")
     return "\n".join(lines)
 
 

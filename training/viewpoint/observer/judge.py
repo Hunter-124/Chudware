@@ -108,7 +108,7 @@ def label(store, set_keys: list, qids: list, *, judge: str = "crossfit", device=
         cfg.tile_hw = tuple(cfg.tile_hw)
         cfg.tiles_per_batch = tiles_per_batch
         recs = [dict(sets[sk], set_key=sk) for sk in sorted(pairs)]
-        corpus = build_corpus(store.root, recs, queries, cfg.tile_hw, log=log)
+        corpus = build_corpus(store.root, recs, queries, cfg.tile_hw, dense=False, log=log)
         index = {s["set_key"]: i for i, s in enumerate(corpus.sets)}
         missing = [sk for sk in pairs if sk not in index]
         if missing:

@@ -89,3 +89,78 @@ def test_augment_keeps_layout_orientation():
     left, right = y[..., : _HW[1] // 3].mean(), y[..., -_HW[1] // 3:].mean()
     assert left > 0.7 and right < 0.3
     assert y.min() >= 0 and y.max() <= 1
+
+
+def test_dense_raster_joins_manifest_ordinals_and_marks_feature_boundary():
+    import numpy as np
+    from services.mcp.cad_viewpoint import perspective_camera
+    from training.viewpoint.datasets.importers import CANON
+    from training.viewpoint.observer.dense import raster_labels
+
+    # Two adjacent feature instances occupy opposite halves of a planar rectangle;
+    # the face-array order is reversed relative to the manifest's doc_query ordinals.
+    pos = np.array([[-1., -1., 0.], [0., -1., 0.], [0., 1., 0.],
+                    [-1., 1., 0.], [1., -1., 0.], [1., 1., 0.]])
+    mesh = {"pos": pos, "idx": np.array([[0, 1, 2], [0, 2, 3],
+                                         [1, 4, 5], [1, 5, 2]], np.int32),
+            "tri_face": np.array([0, 0, 1, 1], np.int32),
+            "faces": [{"body": 1, "face_id": 2}, {"body": 1, "face_id": 1}],
+            "edges": []}
+    rec = {"faces": [{"ordinal": 0, "class": "rib", "instance": 2},
+                     {"ordinal": 1, "class": "pocket", "instance": 3}]}
+    box = {"min": [-1, -1, -0.1], "max": [1, 1, 0.1]}
+    view = {"camera": perspective_camera(box, (0, 0, 1), 64, 64),
+            "section": None}
+    labels = raster_labels(mesh, rec, view, (64, 64))
+    assert labels.shape == (64, 64, 2)
+    assert labels[32, 20, 0] == CANON.index("pocket") + 1
+    assert labels[32, 44, 0] == CANON.index("rib") + 1
+    assert labels[32, 31:33, 1].any()
+    assert labels[0, 0, 0] == 0
+
+
+def test_xray_labels_the_occluded_target_not_the_translucent_shell():
+    import numpy as np
+    from services.mcp.cad_viewpoint import perspective_camera
+    from training.viewpoint.datasets.importers import CANON
+    from training.viewpoint.observer.dense import raster_labels
+
+    xy = np.array([[-1., -1.], [1., -1.], [1., 1.], [-1., 1.]])
+    pos = np.concatenate((np.column_stack((xy, np.zeros(4))),
+                          np.column_stack((xy, np.ones(4)))), axis=0)
+    mesh = {"pos": pos, "idx": np.array([[0, 1, 2], [0, 2, 3],
+                                         [4, 5, 6], [4, 6, 7]], np.int32),
+            "tri_face": np.array([0, 0, 1, 1], np.int32),
+            "faces": [{"body": 1, "face_id": 1}, {"body": 1, "face_id": 2}],
+            "edges": []}
+    rec = {"faces": [{"ordinal": 0, "class": "pocket", "instance": 1},
+                     {"ordinal": 1, "class": "rib", "instance": 2}]}
+    box = {"min": [-1, -1, 0], "max": [1, 1, 1]}
+    camera = perspective_camera(box, (0, 0, 1), 64, 64)
+    opaque = raster_labels(mesh, rec, {"camera": camera}, (64, 64))
+    xray = raster_labels(mesh, rec, {"camera": camera, "xray": True,
+                                     "target_faces": (0,)}, (64, 64))
+    assert opaque[32, 32, 0] == CANON.index("rib") + 1
+    assert xray[32, 32, 0] == CANON.index("pocket") + 1
+
+
+def test_dense_cache_migrates_losslessly_and_rebuilds_truncated_files(tmp_path):
+    import numpy as np
+    from training.viewpoint.observer.dense import compress_dense, dense_path
+    from training.viewpoint.observer.train import Corpus
+
+    folder = tmp_path / "observer" / "dense" / "64x96"
+    folder.mkdir(parents=True)
+    labels = np.zeros((4, 64, 96, 2), np.uint8)
+    labels[:, 10:30, 15:44, 0] = 5
+    labels[:, 10:30, 15, 1] = 1
+    np.save(folder / "good.npy", labels)
+    (folder / "corrupt.npy").write_bytes(b"\\x93NUMPY")
+    result = compress_dense(tmp_path, (64, 96), workers=1, log=lambda *_: None)
+    assert result == {"converted": 1, "corrupt": 1}
+    assert not (folder / "good.npy").exists()
+    assert not (folder / "corrupt.npy").exists()
+    corpus = Corpus(tmp_path, [{"image": "images/good.png"}], {}, [[]], (64, 96), dense=True)
+    assert np.array_equal(corpus.labels(0), labels)
+    assert dense_path(tmp_path, "images/good.png", (64, 96)).suffix == ".npz"
+    assert compress_dense(tmp_path, (64, 96), workers=1, log=lambda *_: None)["converted"] == 0

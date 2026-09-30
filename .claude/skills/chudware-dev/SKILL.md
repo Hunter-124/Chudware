@@ -150,7 +150,14 @@ judgment).
   (`chudware.geomlabel/1`: MFCAD MIT, MFCAD++ generator port, GSL), usefulness from the
   from-scratch cross-fitted Observer CNN (`training/viewpoint/observer`), the utility model from
   `training/viewpoint/utility`; `training/viewpoint/campaign.sh` runs it all resumably. No
-  VLM/LLM calls anywhere in that pipeline, by the owner's decision.
+  VLM/LLM calls anywhere in that pipeline, by the owner's decision. Observer queries must not
+  carry geometry (centroids/axes/flags) — the report's `blind` and `qvec_probe` rows must sit at
+  majority; the observer reads pixels only because of dense per-pixel class/edge supervision
+  (`observer/dense.py`). Launch the campaign with `campaign.sh service [stages]` (reboot-surviving
+  unit; the box's GPU can hard-reset), never edit `campaign.sh` while it runs (bash reads it
+  incrementally), and write artifacts via `training/viewpoint/durable.py` (fsync before rename).
+  `shot_planner.candidate_cameras`/`section_candidates` enumeration is replayed by index from
+  stored trial sets — append new candidate kinds inside `plan_shots`, not in those generators.
 
 ### Manufacturing rules that bind every change
 

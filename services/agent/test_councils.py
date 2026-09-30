@@ -783,12 +783,15 @@ def test_diagnosis_preserves_first_seat_when_second_seat_provider_call_fails():
     assert artifacts[0]["payload"]["council"]["status"] == "incomplete"
 
 
-def test_council_clamps_provider_reasoning_effort_without_mutating_ambient_provider():
-    """Every seat and chair call observes the provider effort ceiling."""
+def test_council_normalizes_provider_reasoning_effort_without_mutating_ambient_provider():
+    """Seat and chair calls see a normalized effort on a copy; the caller's provider is untouched.
+
+    Top rungs (max/xhigh) pass through since 7fda58df0; the RPC boundary clamps per model.
+    """
     observed: list[str] = []
 
     class Provider:
-        reasoning_effort = "max"
+        reasoning_effort = "med"
 
         def complete(self, system: str, messages: list[dict],
                      max_tokens: int = 8000, **kwargs) -> str:
@@ -802,8 +805,8 @@ def test_council_clamps_provider_reasoning_effort_without_mutating_ambient_provi
         kind="build_strategy", topic="effort", inputs={}, provider=provider)
 
     assert record["status"] == "complete"
-    assert observed == ["high"] * 9
-    assert provider.reasoning_effort == "max"
+    assert observed == ["medium"] * 9
+    assert provider.reasoning_effort == "med"
 
 
 

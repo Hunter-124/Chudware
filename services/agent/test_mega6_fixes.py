@@ -405,7 +405,7 @@ def test_role_settings_resolution_failure_falls_back_to_injected_identity(monkey
     assert settings == {
         "provider": "xai-sub",
         "model": "grok-4.5",
-        "reasoning_effort": "high",
+        "reasoning_effort": "max",
     }
 
 

@@ -355,7 +355,7 @@ def test_proactive_uses_bounded_one_shot_role_turn(monkeypatch):
     assert captured["options"]["settings"] == {
         "provider": "mock",
         "model": "mock-model",
-        "reasoning_effort": "high",
+        "reasoning_effort": "max",
     }
 
 

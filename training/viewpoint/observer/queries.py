@@ -17,6 +17,7 @@ from typing import Iterable, Optional
 import numpy as np
 
 from training.viewpoint.datasets.importers import CANON
+from training.viewpoint.durable import append_jsonl, read_jsonl
 
 QUERY_SCHEMA = "viewnet.query/2"
 KINDS = ("count", "presence_side", "through_blind", "type")
@@ -244,17 +245,7 @@ def queries_path(store_root) -> Path:
 
 def load_queries(path) -> dict:
     """{qid: Query}; {} when the file does not exist yet."""
-    p = Path(path)
-    if not p.exists():
-        return {}
-    out: dict = {}
-    with open(p, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                q = Query.from_dict(json.loads(line))
-                out[q.qid] = q
-    return out
+    return {q.qid: q for q in map(Query.from_dict, read_jsonl(path))}
 
 
 def save_queries(path, queries: Iterable) -> int:
@@ -265,9 +256,7 @@ def save_queries(path, queries: Iterable) -> int:
     have = set(load_queries(p))
     new = [q for q in queries if q.qid not in have]
     if new:
-        with open(p, "a", encoding="utf-8") as fh:
-            for q in new:
-                fh.write(json.dumps(q.to_dict(), sort_keys=True) + "\n")
+        append_jsonl(p, [q.to_dict() for q in new])
     return len(new)
 
 

@@ -16,7 +16,6 @@ run resumes by simply running again.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import shutil
 import threading
@@ -25,6 +24,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 import numpy as np
+
+from training.viewpoint.durable import append_jsonl, durable_replace, nonempty, read_jsonl
 
 JUDGES = ("crossfit", "independent")
 
@@ -49,18 +50,6 @@ def sha256_file(path) -> str:
     return h.hexdigest()
 
 
-def _read_jsonl(path: Path) -> list:
-    if not path.exists():
-        return []
-    rows = []
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
-
-
 class TrialStore:
     def __init__(self, root, name: str = "trials"):
         self.root = Path(root).expanduser()
@@ -83,32 +72,27 @@ class TrialStore:
         return self.root / f"labels_{judge}.jsonl"
 
     def _append(self, path: Path, rows: Iterable[dict]) -> None:
-        text = "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows)
-        if not text:
-            return
         with self._lock:
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(text)
-                fh.flush()
+            append_jsonl(path, rows)
 
     # ---- images / tokens ----
     def save_image(self, png_path) -> tuple:
         """Copy a rendered grid into the content-addressed image dir -> (sha, stored path)."""
         sha = sha256_file(png_path)
         dest = self.root / "images" / f"{sha}.png"
-        if not dest.exists():
+        if not nonempty(dest):
             tmp = dest.with_suffix(".tmp")
             shutil.copyfile(png_path, tmp)
-            os.replace(tmp, dest)
+            durable_replace(tmp, dest)
         return sha, dest
 
     def save_tokens(self, set_key: str, tokens: dict) -> str:
         """Write a set's build_set_tokens arrays; returns the path relative to the root."""
         path = self.root / "tokens" / f"{set_key}.npz"
-        if not path.exists():
+        if not nonempty(path):
             tmp = path.with_name(path.stem + ".tmp.npz")
             np.savez_compressed(tmp, **{k: np.asarray(v) for k, v in tokens.items()})
-            os.replace(tmp, path)
+            durable_replace(tmp, path)
         return str(path.relative_to(self.root))
 
     def load_tokens(self, rel_path: str) -> dict:
@@ -120,13 +104,13 @@ class TrialStore:
         self._append(self.sets_path, records)
 
     def load_sets(self) -> dict:
-        return {r["set_key"]: r for r in _read_jsonl(self.sets_path)}
+        return {r["set_key"]: r for r in read_jsonl(self.sets_path)}
 
     def mark_part_done(self, part_id: str, config_sha: str) -> None:
         self._append(self.parts_path, [{"part_id": part_id, "config": config_sha}])
 
     def done_parts(self, config_sha: str) -> set:
-        return {r["part_id"] for r in _read_jsonl(self.parts_path) if r.get("config") == config_sha}
+        return {r["part_id"] for r in read_jsonl(self.parts_path) if r.get("config") == config_sha}
 
     # ---- queries (owned by the observer package; the store only locates them) ----
     @property
@@ -152,7 +136,7 @@ class TrialStore:
 
     def load_labels(self, judge: str) -> dict:
         """{(set_key, qid): row}; a later row for the same pair replaces an earlier one."""
-        return {(r["set_key"], r["qid"]): r for r in _read_jsonl(self.labels_path(judge))}
+        return {(r["set_key"], r["qid"]): r for r in read_jsonl(self.labels_path(judge))}
 
 
 def pair_id(set_key: str, qid: str) -> str:

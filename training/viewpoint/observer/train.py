@@ -33,6 +33,7 @@ from .queries import A_MAX, QD, QUERY_SCHEMA, load_queries, queries_path
 from .render import IMAGE_KEY, load_observer_sets
 from .dense import dense_path, N_CLASSES
 from training.viewpoint.datasets.importers import CANON
+from training.viewpoint.durable import durable_replace, nonempty
 
 OBSERVER_SCHEMA = "viewnet.observer/3"
 DENSE_MISSING_MAX = 0.02          # tolerated fraction of sets whose dense raster failed
@@ -106,7 +107,7 @@ def tile_cache_path(root, image_rel: str, tile_hw: tuple) -> Path:
 def _build_tile(args) -> Optional[str]:
     root, image_rel, k, tile_hw = args
     dest = tile_cache_path(root, image_rel, tile_hw)
-    if dest.exists():
+    if nonempty(dest):
         return None
     try:
         arr = tile_array(Path(root).expanduser() / image_rel, k, tile_hw)
@@ -115,7 +116,7 @@ def _build_tile(args) -> Optional[str]:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(f".{dest.stem}.{os.getpid()}.npy")
     np.save(tmp, arr)
-    os.replace(tmp, dest)
+    durable_replace(tmp, dest)
     return None
 
 
@@ -123,7 +124,7 @@ def prepare_tiles(root, items: Iterable, tile_hw: tuple, *, workers: Optional[in
                   log: Callable = print) -> dict:
     """Decode + cut + downsample every (image_rel, k) not cached yet, in parallel."""
     todo = sorted({(rel, int(k)) for rel, k in items
-                   if not tile_cache_path(root, rel, tile_hw).exists()})
+                   if not nonempty(tile_cache_path(root, rel, tile_hw))})
     t0 = time.time()
     errors: list = []
     if todo:
@@ -200,7 +201,7 @@ def build_corpus(root, set_records: Iterable, queries: dict, tile_hw: tuple, *,
     if dense is False:
         have_dense = False
     else:
-        has = [dense_path(root, s[IMAGE_KEY], tile_hw).exists() for s in sets]
+        has = [nonempty(dense_path(root, s[IMAGE_KEY], tile_hw)) for s in sets]
         n_dense = sum(has)
         # A few sets can legitimately lack masks (raster budget, silhouette-registration
         # refusal); training drops those. More than DENSE_MISSING_MAX means the stage never ran.
@@ -548,8 +549,13 @@ def train_observer(corpus: Corpus, train_idx: list, val_idx: list, cfg: TrainCon
     t_start = time.time()
     bad = 0
     first_epoch = 0
-    if resume_path is not None and resume_path.exists():
-        state = torch.load(resume_path, map_location="cpu", weights_only=False)
+    state = None
+    if resume_path is not None and nonempty(resume_path):
+        try:
+            state = torch.load(resume_path, map_location="cpu", weights_only=False)
+        except Exception as exc:  # noqa: BLE001 — a crash-damaged progress file costs one run
+            log(f"[observer] discarding unreadable progress {resume_path}: {exc}")
+    if state is not None:
         if state["key"] != resume_key:
             raise ValueError(f"{resume_path}: training configuration/data changed")
         model.load_state_dict(state["model"])
@@ -627,7 +633,7 @@ def train_observer(corpus: Corpus, train_idx: list, val_idx: list, cfg: TrainCon
                      "augment_rng": gen.get_state()}
             tmp = resume_path.with_name(resume_path.name + ".tmp")
             torch.save(state, tmp)
-            os.replace(tmp, resume_path)
+            durable_replace(tmp, resume_path)
         log(f"[observer] epoch {epoch}: " + " ".join(
             f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in rec.items()
             if k != "epoch"))
@@ -663,7 +669,7 @@ def save_checkpoint(path: Path, model: ObserverNet, meta: dict) -> str:
     torch.save({**meta, "schema": OBSERVER_SCHEMA, "query_schema": QUERY_SCHEMA, "QD": QD,
                 "A_MAX": A_MAX, "model_config": model.cfg.to_dict(),
                 "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()}}, tmp)
-    os.replace(tmp, path)
+    durable_replace(tmp, path)
     return _file_digest(path)
 
 
@@ -702,7 +708,7 @@ def fit_folds(store, *, k: int = 5, judge: str = "crossfit", folds: Optional[Ite
         raise ValueError(f"no renderable view sets with queries in {store.root}")
     part_fold = {p: fold_of(p, k, spec.salt) for p in corpus.parts()}
     meta_path = folds_meta_path(store.root, judge)
-    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    meta = json.loads(meta_path.read_text()) if nonempty(meta_path) else {}
     if meta and (meta.get("schema") != OBSERVER_SCHEMA or meta.get("k") != k or
                  meta.get("salt") != spec.salt or meta.get("query_schema") != QUERY_SCHEMA):
         meta = {}
@@ -748,7 +754,7 @@ def fit_folds(store, *, k: int = 5, judge: str = "crossfit", folds: Optional[Ite
                                  "n_heldout_parts": len(held), "info": info}
         tmp = meta_path.with_name("folds.json.tmp")
         tmp.write_text(json.dumps(meta, indent=1, sort_keys=True))
-        os.replace(tmp, meta_path)
+        durable_replace(tmp, meta_path)
         progress.unlink(missing_ok=True)
         log(f"[observer] {judge} fold {f} out-of-fold: " + ", ".join(
             f"{kk} {v['acc']:.3f} (chance {v['chance']:.3f}, n {v['n']})"
@@ -828,7 +834,7 @@ def learning_report(store, *, fractions=(0.125, 0.25, 0.5, 1.0), seeds=(0, 1, 2)
         tag = f"frac{frac:g}_seed{seed}" + (
             "_shuffled" if kw.get("override") else "_blind" if kw.get("blind") else "")
         path = run_dir / f"{tag}.json"
-        if path.exists():
+        if nonempty(path):
             log(f"[observer] report resumed {tag} from {path}")
             return json.loads(path.read_text())
         log(f"[observer] report run {tag}: {n} parts, {len(tr)} sets")
@@ -845,7 +851,7 @@ def learning_report(store, *, fractions=(0.125, 0.25, 0.5, 1.0), seeds=(0, 1, 2)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(result, sort_keys=True))
-        os.replace(tmp, path)
+        durable_replace(tmp, path)
         progress.unlink(missing_ok=True)
         return result
 
@@ -880,7 +886,7 @@ def learning_report(store, *, fractions=(0.125, 0.25, 0.5, 1.0), seeds=(0, 1, 2)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(out, indent=1, sort_keys=True))
-    os.replace(tmp, path)
+    durable_replace(tmp, path)
     out["path"] = str(path)
     return out
 

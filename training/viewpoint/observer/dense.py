@@ -17,6 +17,7 @@ import numpy as np
 from training.viewpoint.datasets.importers import CANON
 from training.viewpoint.datasets.build_manifest import default_manifest_path
 from training.viewpoint.utility.trials import load_labels
+from training.viewpoint.durable import durable_replace, nonempty
 from .render import RenderPool, _open_part, _W
 
 N_CLASSES = len(CANON) + 2
@@ -32,7 +33,7 @@ def dense_output_path(root, image, tile_hw):
 
 def dense_path(root, image, tile_hw):
     compressed = dense_output_path(root, image, tile_hw)
-    return compressed if compressed.exists() else compressed.with_suffix(".npy")
+    return compressed if nonempty(compressed) else compressed.with_suffix(".npy")
 
 
 def compress_dense(root, tile_hw=(192, 256), *, workers=8, log=print):
@@ -51,10 +52,10 @@ def compress_dense(root, tile_hw=(192, 256), *, workers=8, log=print):
         except (OSError, ValueError, EOFError):
             src.unlink()
             return "corrupt"
-        if not dest.exists():
+        if not nonempty(dest):
             tmp = dest.with_name(f".{dest.stem}.{os.getpid()}.{id(src)}.npz")
             np.savez_compressed(tmp, labels=arr)
-            os.replace(tmp, dest)
+            durable_replace(tmp, dest)
         src.unlink()
         return "converted"
 
@@ -208,7 +209,7 @@ def _job_dense(record, sets, root, tile_hw):
         for group in groups.values():
             for s, views in _views(record, group):
                 try:
-                    if dense_path(root, s["image"], tile_hw).exists():
+                    if nonempty(dense_path(root, s["image"], tile_hw)):
                         continue
                     dest = dense_output_path(root, s["image"], tile_hw)
                     with Image.open(Path(root) / s["image"]) as im:
@@ -234,7 +235,7 @@ def _job_dense(record, sets, root, tile_hw):
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     tmp = dest.with_name(f".{dest.stem}.{os.getpid()}.npz")
                     np.savez_compressed(tmp, labels=arr)
-                    os.replace(tmp, dest)
+                    durable_replace(tmp, dest)
                     out["built"] += 1
                 except Exception as exc:
                     out["errors"].append(f"{record['part_id']}/{s['set_key']}: {exc}")
@@ -255,7 +256,7 @@ def prepare_dense(root, sets, tile_hw=(192, 256), *, labels=None, workers=None,
                                                        ("train", "val", "test"))}
     groups = defaultdict(list)
     for s in sets:
-        if s.get("image") and not dense_path(root, s["image"], tile_hw).exists():
+        if s.get("image") and not nonempty(dense_path(root, s["image"], tile_hw)):
             groups[s["part_id"]].append(s)
     if limit_parts is not None:
         groups = dict(list(sorted(groups.items()))[:limit_parts])

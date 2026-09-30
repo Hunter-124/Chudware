@@ -30,6 +30,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Optional
 
+from training.viewpoint.durable import append_jsonl, durable_replace, nonempty, read_jsonl
+
 RENDER_SCHEMA = "viewnet.render/1"
 IMAGE_KEY = "image"                 # set-record field: grid path relative to the store root
 TILE = (512, 384)
@@ -108,17 +110,17 @@ def _index_path(root: Path, key: str) -> Path:
 
 def _cached(root: Path, key: str) -> Optional[Path]:
     idx = _index_path(root, key)
-    if not idx.exists():
+    if not nonempty(idx):
         return None
     img = root / "images" / f"{idx.read_text().strip()}.png"
-    return img if img.exists() else None
+    return img if nonempty(img) else None
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_bytes(data)
-    os.replace(tmp, path)
+    durable_replace(tmp, path)
 
 
 def _store_image(root: Path, key: str, png: str) -> Path:
@@ -126,7 +128,7 @@ def _store_image(root: Path, key: str, png: str) -> Path:
     data = Path(png).read_bytes()
     sha = hashlib.sha256(data).hexdigest()
     dest = root / "images" / f"{sha}.png"
-    if not dest.exists():
+    if not nonempty(dest):
         _atomic_write(dest, data)
     _atomic_write(_index_path(root, key), sha.encode())
     return dest
@@ -541,17 +543,7 @@ def observer_sets_path(store_root) -> Path:
 
 
 def load_observer_sets(store_root) -> dict:
-    p = observer_sets_path(store_root)
-    if not p.exists():
-        return {}
-    out = {}
-    with open(p, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                r = json.loads(line)
-                out[r["set_key"]] = r
-    return out
+    return {r["set_key"]: r for r in read_jsonl(observer_sets_path(store_root))}
 
 
 def render_observer_sets(records: list, targets: dict, *, store, cfg: ObserverSetConfig,
@@ -570,7 +562,7 @@ def render_observer_sets(records: list, targets: dict, *, store, cfg: ObserverSe
     path = observer_sets_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     failures = []
-    with RenderPool(workers) as pool, open(path, "a", encoding="utf-8") as fh:
+    with RenderPool(workers) as pool:
         summary["workers"] = pool.workers
         jobs = [(r, list(targets.get(r["part_id"], [])), cfg, str(root)) for r in todo]
         for job, res in pool.run(_job_observer, jobs):
@@ -578,12 +570,9 @@ def render_observer_sets(records: list, targets: dict, *, store, cfg: ObserverSe
                 failures.append({"part_id": job[0]["part_id"],
                                  "error": f"{type(res).__name__}: {res}"})
                 continue
-            for s in res["sets"]:
-                if s["set_key"] not in have:
-                    have[s["set_key"]] = s
-                    fh.write(json.dumps(s, sort_keys=True) + "\n")
-                    summary["sets"] += 1
-            fh.flush()
+            fresh = [s for s in res["sets"] if s["set_key"] not in have]
+            have.update((s["set_key"], s) for s in fresh)
+            summary["sets"] += append_jsonl(path, fresh)
             summary["rendered"] += res["rendered"]
             summary["cached"] += res["cached"]
             failures += [{"part_id": job[0]["part_id"], "error": e} for e in res["errors"]]

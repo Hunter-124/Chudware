@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import os
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from services.viewpoint.utility.features import DG, FEATURE_SCHEMA
+from training.viewpoint.durable import durable_replace
 
 from .train import NORM_KEYS, WEIGHT_KEYS, UtilityNet, set_logits
 
@@ -30,7 +30,7 @@ class ParityError(AssertionError):
 def _save_atomic(path: Path, arrays: dict) -> None:
     tmp = path.with_name(path.stem + ".tmp.npz")
     np.savez(tmp, **arrays)
-    os.replace(tmp, path)
+    durable_replace(tmp, path)
 
 
 def npz_arrays(net: UtilityNet, *, trained_on: str, report_sha: str) -> dict:

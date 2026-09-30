@@ -245,12 +245,18 @@ def section_candidates(part_bbox: dict, target_bbox: dict, target_normals=None, 
     dot(p - point, normal) <= 0, so the other sign keeps the other half — and for each the
     camera sits on the removed (+normal) side, 45 deg off the plane normal at four azimuths,
     looking at the kept half's cut face; the engine draws the removed half as a ghost."""
-    center = _bbox_center(target_bbox)
-    subject = _subject(target_points, target_bbox)
     planes: list = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
     dom = _dominant_normal(target_normals)
     if dom is not None:
         planes += list(_tangents(dom))
+    return _section_planes(part_bbox, target_bbox, planes, target_points=target_points,
+                           width=width, height=height)
+
+
+def _section_planes(part_bbox: dict, target_bbox: dict, planes: list, *,
+                    target_points=None, width: int = TILE_W, height: int = TILE_H) -> list:
+    center = _bbox_center(target_bbox)
+    subject = _subject(target_points, target_bbox)
     unique: list = []
     lim = math.cos(math.radians(10.0))
     for n in planes:
@@ -272,6 +278,20 @@ def section_candidates(part_bbox: dict, target_bbox: dict, target_normals=None, 
                                 "normal": [float(c) for c in nn]},
                 })
     return out
+
+
+def _diagonal_section_candidates(part_bbox: dict, target_bbox: dict, target_normals,
+                                 target_points) -> list:
+    """Planner-only profiles: keep the training pool's saved indices unchanged."""
+    dom = _dominant_normal(target_normals)
+    if dom is None:
+        return []
+    t0, t1 = _tangents(dom)
+    existing = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), t0, t1]
+    lim = math.cos(math.radians(10.0))
+    planes = [_unit(tuple(t0[i] + sign * t1[i] for i in range(3))) for sign in (-1, 1)]
+    planes = [n for n in planes if all(abs(_dot(n, u)) < lim for u in existing)]
+    return _section_planes(part_bbox, target_bbox, planes, target_points=target_points)
 
 
 def candidate_cameras(part_bbox: dict, *, target_bbox: Optional[dict] = None,
@@ -370,14 +390,14 @@ def _measure(doc_id: str, candidates: list, width: int, height: int) -> dict:
     return out
 
 
-def _join_topology(doc_id: str, metrics: dict) -> None:
+def _join_topology(doc_id: str, metrics: dict, *, topo=None) -> None:
     """Stamp every face/edge row with its doc_query running ordinal, topo id and SID.
 
     The engine's (body, face_id) is per-body 1-based (AICM/TopExp); doc_query numbers the
     whole document with one counter. cad_common._mesh_topo_index is that per-body offset."""
     face_by_topo, edge_by_topo = cc._mesh_topo_index({"faces": metrics.get("faces") or [],
                                                       "edges": metrics.get("edges") or []})
-    topo = cc._doc_topo_maps(doc_id)
+    topo = cc._doc_topo_maps(doc_id) if topo is None else topo
     for rows, by_topo, matches in ((metrics.get("faces") or [], face_by_topo, topo["face"]),
                                    (metrics.get("edges") or [], edge_by_topo, topo["edge"])):
         topo_of = {i: t for t, i in by_topo.items()}
@@ -392,13 +412,13 @@ def _join_topology(doc_id: str, metrics: dict) -> None:
                     row[key] = m.get(key)
 
 
-def _edge_faces(doc_id: str, metrics: dict) -> Optional[list]:
+def _edge_faces(doc_id: str, metrics: dict, *, mesh=None) -> Optional[list]:
     """edge index -> adjacent face indices, from the tessellation: the display mesh shares the
     edge discretisation with both faces it bounds, so the faces an edge touches are the faces
     owning a vertex at EVERY point of its polyline (endpoints alone also touch the faces
     meeting at the corner; intersecting over the whole polyline leaves the two neighbours).
     None when the tessellation is unreadable."""
-    mesh = cc._doc_mesh(doc_id)
+    mesh = cc._doc_mesh(doc_id) if mesh is None else mesh
     if mesh is None:
         return None
     import numpy as np  # noqa: PLC0415
@@ -475,9 +495,65 @@ def _section_key(section) -> Optional[tuple]:
             round(_dot(n, section["point"]), 3))
 
 
+def _symmetry(metrics: dict, target_faces=None) -> tuple:
+    """Recover only supported symmetries from face geometry, never from camera scores.
+
+    Coaxial revolved surfaces and perpendicular end planes describe a body of revolution.
+    A target can have that symmetry while its surroundings do not. Reflection is accepted
+    only when every face has a same-area, same-type reflected counterpart.
+    """
+    import numpy as np  # noqa: PLC0415
+    d = _uf._dense(metrics)
+    ids = list(target_faces) if target_faces else list(range(d["F"]))
+    axes = []
+    for fi in ids:
+        a = _unit(d["axis"][fi])
+        if a is None or any(abs(_dot(a, old)) > 0.99 for old in axes):
+            continue
+        curved = [j for j in ids if d["revolved"][j]]
+        if not curved or any(abs(_dot(a, d["axis"][j])) < 0.99 for j in curved):
+            continue
+        center = d["centroid"][curved[0]]
+        scale = max(d["diag"], 1.0)
+        supported = True
+        for j in ids:
+            delta = d["centroid"][j] - center
+            radial = delta - np.dot(delta, a) * np.asarray(a)
+            if d["surf"][j] == 0:
+                supported &= abs(_dot(a, d["normal"][j])) > 0.99
+            elif not d["revolved"][j]:
+                supported = False
+            # The centroid of a complete revolution lies on its axis.
+            supported &= float(np.linalg.norm(radial)) < scale * 0.015
+        if supported:
+            axes.append(a)
+    mirrors = []
+    if len(ids) >= 2:
+        P, N = d["centroid"][ids], d["normal"][ids]
+        center = (P.min(axis=0) + P.max(axis=0)) * 0.5
+        tol = max(d["diag"] * 0.005, 1e-5)
+        for axis in np.eye(3):
+            reflected = P - 2 * ((P - center) @ axis)[:, None] * axis
+            normals = N - 2 * (N @ axis)[:, None] * axis
+            supported = True
+            for q, j in enumerate(ids):
+                matched = [r for r, f in enumerate(ids)
+                           if d["surf"][f] == d["surf"][j] and
+                           abs(d["area"][f] - d["area"][j]) <= max(d["area"][j] * 0.02, 1e-6)
+                           and np.linalg.norm(P[r] - reflected[q]) <= tol and
+                           (d["revolved"][j] or np.linalg.norm(N[r] - normals[q]) < 0.05)]
+                if not matched:
+                    supported = False
+                    break
+            if supported:
+                mirrors.append(tuple(axis))
+    return axes, mirrors
+
+
 def greedy_select(metrics: dict, score_set: Callable, k: int = 4, *,
                   dedupe_deg: float = DEDUPE_DEG, pinned=None, eligible=None,
-                  uninformative=None, target_faces=None) -> list:
+                  uninformative=None, target_faces=None, eligibility_tiers=None,
+                  guarantee_k: bool = True) -> list:
     """Greedy marginal utility, excluding cameras or target footprints that repeat a tile.
 
     The face-pixel histogram is a proxy for the target's screen mask: the metrics RPC
@@ -488,7 +564,6 @@ def greedy_select(metrics: dict, score_set: Callable, k: int = 4, *,
     views = metrics.get("views") or []
     dirs = [_unit(v.get("dir")) or (0.0, 0.0, 1.0) for v in views]
     keys = [_section_key(v.get("section")) for v in views]
-    reveal = [v.get("reveal_key") for v in views]
     lim = math.cos(math.radians(max(0.0, float(dedupe_deg))))
     import numpy as np  # noqa: PLC0415
     dense = _uf._dense(metrics)
@@ -497,8 +572,39 @@ def greedy_select(metrics: dict, score_set: Callable, k: int = 4, *,
     target = np.asarray(list(target_faces or ()), dtype=np.int64)
     target = target[(target >= 0) & (target < dense["F"])]
     pixels = dense["vis_front"][:, target] if target.size else dense["vis_front"]
+    symmetry_axes, mirror_planes = _symmetry(metrics, target.tolist())
+    if target.size:
+        whole_axes, _ = _symmetry(metrics)
+        symmetry_axes += [a for a in whole_axes
+                          if all(abs(_dot(a, b)) < 0.99 for b in symmetry_axes)]
+    tiers = (list(eligibility_tiers) if eligibility_tiers is not None else
+             [0 if eligible is None or eligible[i] else 1 for i in range(len(views))])
+
+    def symmetric(i: int, j: int) -> bool:
+        if bool(views[i].get("section")) != bool(views[j].get("section")) or (
+                bool(views[i].get("xray")) != bool(views[j].get("xray"))):
+            return False
+        for axis in symmetry_axes:
+            if abs(_dot(dirs[i], axis) - _dot(dirs[j], axis)) < 0.16:
+                if keys[i] is None or (
+                        abs(abs(_dot(keys[i][0], axis)) - abs(_dot(keys[j][0], axis))) < 0.1):
+                    return True
+        for normal in mirror_planes:
+            reflected = tuple(dirs[i][q] - 2 * _dot(dirs[i], normal) * normal[q]
+                              for q in range(3))
+            if _dot(reflected, dirs[j]) > math.cos(math.radians(12)):
+                if keys[i] is None:
+                    return True
+                cut = tuple(keys[i][0][q] - 2 * _dot(keys[i][0], normal) * normal[q]
+                            for q in range(3))
+                if abs(_dot(cut, keys[j][0])) > 0.98:
+                    return True
+        return False
 
     def looks_same(i: int, j: int) -> bool:
+        if keys[i] is not None and keys[j] is not None:
+            if abs(_dot(keys[i][0], keys[j][0])) < math.cos(math.radians(30.0)):
+                return False
         a, b = coverage[i], coverage[j]
         face_overlap = float(np.minimum(a, b).sum()) / max(
             float(np.maximum(a, b).sum()), 1e-9)
@@ -514,9 +620,7 @@ def greedy_select(metrics: dict, score_set: Callable, k: int = 4, *,
             return False
         overlap = float(np.minimum(a, b).sum()) / max(
             float(np.maximum(a, b).sum()), 1e-9)
-        return overlap > 0.8 and (bool(views[i].get("xray")) and
-                                   bool(views[j].get("xray")) or
-                                   _dot(dirs[i], dirs[j]) > math.cos(math.radians(70.0)))
+        return overlap > 0.8 and _dot(dirs[i], dirs[j]) > math.cos(math.radians(70.0))
 
     chosen: list = []
     out: list = []
@@ -532,19 +636,42 @@ def greedy_select(metrics: dict, score_set: Callable, k: int = 4, *,
         best = None
         taken = set(chosen)
         already_blank = uninformative is not None and any(uninformative[j] for j in chosen)
-        for i in range(len(views)):
-            if already_blank and uninformative[i]:
-                continue
-            if (eligible is not None and not eligible[i]) or i in taken or any(
-                _dot(dirs[i], dirs[j]) > lim or
-                (keys[i] is not None and keys[i] == keys[j]) or
-                (reveal[i] is not None and reveal[i] == reveal[j] and
-                 views[i].get("xray") and views[j].get("xray")) or
-                looks_same(i, j) for j in chosen):
-                continue
-            u = float(score_set(chosen + [i]))
-            if best is None or u > best[1] + 1e-12:
-                best = (i, u)
+        # Eligibility and deduplication are preferences, not a reason to return a
+        # two- or three-tile grid. Exhaust the readable unique pool before relaxing.
+        stages = (0, 1, 2) if guarantee_k else (0,)
+        for stage in stages:
+            pool = []
+            for i in range(len(views)):
+                if i in taken or (stage == 0 and already_blank and uninformative[i]):
+                    continue
+                if not guarantee_k and eligible is not None and not eligible[i]:
+                    continue
+                if stage < 2 and any(
+                        _dot(dirs[i], dirs[j]) > lim or
+                        (keys[i] is not None and keys[i] == keys[j]) or
+                        symmetric(i, j) or (stage == 0 and looks_same(i, j))
+                        for j in chosen):
+                    continue
+                if stage == 2 and any(
+                        _dot(dirs[i], dirs[j]) > 0.999999 and keys[i] == keys[j] and
+                        bool(views[i].get("xray")) == bool(views[j].get("xray"))
+                        for j in chosen):
+                    continue
+                pool.append(i)
+            rank = min((tiers[i] if guarantee_k else 0 for i in pool), default=5)
+            if best is None or rank <= best[2]:
+                # Find the best eligibility class before invoking the learned
+                # model or hand scorer; weaker classes cannot win this round.
+                for i in pool:
+                    if guarantee_k and tiers[i] != rank:
+                        continue
+                    u = float(score_set(chosen + [i]))
+                    if best is None or rank < best[2] or u > best[1] + 1e-12:
+                        best = (i, u, rank)
+            if best is not None and (
+                    (stage == 0 and best[2] <= 1) or (stage == 1 and best[2] < 4) or
+                    stage == 2 or not guarantee_k):
+                break
         if best is None:
             break
         out.append({"index": best[0], "utility": best[1], "marginal_gain": best[1] - cur})
@@ -777,9 +904,9 @@ def _xray_candidates(doc_id: str, metrics: dict, candidates: list, roles: dict,
         c = dict(candidates[i], section=None, xray=True, reveal_key="target",
                  label=f"x-ray {_az_el(candidates[i]['dir'])}")
         c["camera"] = _fit_camera(target_subject, c["dir"], TILE_W, TILE_H,
-                                  0.33, part_bb)
+                                  0.45, part_bb)
         result.append(c)
-        if len(result) >= 2:
+        if len(result) >= 4:
             break
     if not result:
         return [], []
@@ -793,6 +920,96 @@ def _xray_candidates(doc_id: str, metrics: dict, candidates: list, roles: dict,
                 row[1] = max(row[1], row[4] * 0.7)
                 row[2] = max(row[2], float(faces[int(row[0])]["area_mm2"]) * 0.55)
     return result, measured
+
+
+def _readability_tiers(metrics: dict, candidates: list, roles: dict, subject,
+                       matches=(), *, targeted: bool = False) -> tuple:
+    """Progressively relaxed, mode-independent readable footprints.
+
+    Pixels alone admit a foreshortened wall; true area alone admits a sub-pixel
+    sliver. Both must pass, and a section cap never substitutes for a real surface.
+    """
+    import numpy as np  # noqa: PLC0415
+    d = _uf._dense(metrics)
+    face_ids = [d["ord_index"][o] for o in roles.get("target", ()) if o in d["ord_index"]]
+    ids = face_ids if targeted and face_ids else list(range(d["F"]))
+    px = d["vis_front"][:, ids].sum(axis=1) / d["frame_px"]
+    area = d["legible_front"][:, ids].sum(axis=1) / max(float(d["area"][ids].sum()), 1e-9)
+    projected = d["proj_px"][:, ids].sum(axis=1)
+    visible = d["vis_front"][:, ids].sum(axis=1) / np.maximum(projected, 1.0)
+    axis_ids = set(ids)
+    if targeted:
+        axis_ids.update(d["ord_index"][o] for o in roles.get("context", ())
+                        if o in d["ord_index"])
+    axes = [_unit(d["axis"][fi]) for fi in axis_ids if d["revolved"][fi]]
+    axes += [_unit(m.get("axis")) for m in matches
+             if m.get("kind") == "edge" and m.get("radius") is not None]
+    axes = [a for a in axes if a is not None]
+    stare = np.asarray([max((abs(_dot(c["dir"], a)) for a in axes), default=0.0)
+                        for c in candidates])
+    mean_cos = (d["vis_front"][:, ids] * d["cos"][:, ids]).sum(axis=1) / np.maximum(
+        d["vis_front"][:, ids].sum(axis=1), 1.0)
+    section_stare = np.asarray([
+        max((abs(_dot(c["section"]["normal"], a)) for a in axes), default=0.0)
+        if c.get("section") else 0.0 for c in candidates])
+    # Project the actual subject: a plate's box must not earn a full-size
+    # footprint when its own vertices are seen edge-on.
+    P = np.asarray(subject, dtype=np.float64)
+    extents, major_extents = [], []
+    for c in candidates:
+        cam = c["camera"]
+        forward = _unit(np.subtract(cam["target"], cam["position"]))
+        right = _unit(_cross(forward, cam["up"]))
+        up = _cross(right, forward)
+        Q = P - np.asarray(cam["position"])
+        z = np.maximum(Q @ np.asarray(forward), 1e-9)
+        scale = TILE_H / (2 * math.tan(math.radians(cam["vertical_fov_deg"]) * 0.5))
+        spans = (float(np.ptp((Q @ right) / z) * scale),
+                 float(np.ptp((Q @ up) / z) * scale))
+        extents.append(min(spans))
+        major_extents.append(max(spans))
+    # A partially occluded target may have a broad projected box but only a
+    # hairline of visible pixels. Area divided by its long extent bounds the
+    # average visible thickness, catching caps that hide all but a narrow band.
+    extent = np.minimum(np.asarray(extents), px * TILE_W * TILE_H /
+                        np.maximum(np.asarray(major_extents), 1.0))
+    cap_share = d["cap"] / np.maximum(d["fg"], 1.0)
+    tiers = np.full(len(candidates), 4, dtype=np.int64)
+    needs_profile = targeted and any(
+        metrics["faces"][fi].get("concavity") == "bore" for fi in ids)
+    plain = np.asarray([not c.get("section") and not c.get("xray") for c in candidates])
+    wall_cap = None
+    if targeted and len(ids) == 1 and d["surf"][ids[0]] == 0:
+        normal = _unit(d["normal"][ids[0]])
+        if normal is not None:
+            # A cut coincident with a planar target paints a cap over the very
+            # wall being inspected. Prefer cuts crossing that wall, not along it.
+            wall_cap = np.asarray([
+                abs(_dot(c["section"]["normal"], normal)) if c.get("section") else 0.0
+                for c in candidates])
+    for level, (min_px, min_area, min_extent, max_stare, max_align, max_cap) in enumerate((
+            (0.02 if targeted else 0.07, 0.18 if targeted else 0.12, 28, 0.65, 0.95, 0.65),
+            (0.012 if targeted else 0.04, 0.10 if targeted else 0.08, 20, 0.77, 0.97, 0.8),
+            (0.005 if targeted else 0.02, 0.04, 16, 0.88, 0.99, 0.9),
+            (0.001, 0.01, 8, 0.95, 1.01, 0.98))):
+        ok = ((px >= min_px) & (area >= min_area) & (extent >= min_extent) &
+              (stare <= max_stare) & (d["palign"] <= max_align) &
+              (cap_share <= max_cap) & (mean_cos >= (0.40 if level < 2 else 0.30)) &
+              ((section_stare <= (0.3 if level < 2 else 0.85)) if targeted else True))
+        if not targeted and level < 2:
+            # A thin part can exceed an absolute pixel floor edge-on. Compare
+            # geometric spans here: a cut legitimately keeps less exterior,
+            # whose visible thickness is already bounded by min_extent.
+            spans = np.asarray(extents)
+            ok &= spans >= float(spans.max()) * (0.35 if level == 0 else 0.25)
+        if wall_cap is not None:
+            ok &= wall_cap <= (0.8 if level < 2 else 0.98)
+        if targeted:
+            ok &= visible >= 0.18
+            if needs_profile and level < 2:
+                ok &= ~plain | ((stare <= (0.4 if level == 0 else 0.55)) & (visible >= 0.55))
+        tiers[ok & (tiers == 4)] = level
+    return tiers.tolist(), face_ids
 
 
 def plan_shots(doc_id: str, *, target=None, roles: Optional[dict] = None, k: int = 4,
@@ -823,8 +1040,9 @@ def plan_shots(doc_id: str, *, target=None, roles: Optional[dict] = None, k: int
     matches = tgt["matches"] if tgt else []
     internal = bool(matches) and cc._target_is_internal(matches, part_bb)
     fit_bb = tgt["bbox"] if tgt else part_bb
-    normals = [m.get("normal") or m.get("axis") for m in matches
-               if isinstance(m.get("normal") or m.get("axis"), (list, tuple))]
+    normals = [(m.get("axis") if m.get("surf") in ("cylinder", "cone", "torus")
+                else m.get("normal")) or m.get("axis") for m in matches]
+    normals = [n for n in normals if isinstance(n, (list, tuple))]
     pts = target_points(doc_id, matches)
     whole = None if tgt else part_points(doc_id)
     subject = _subject(pts, fit_bb) if tgt else _subject(whole, part_bb)
@@ -833,14 +1051,40 @@ def plan_shots(doc_id: str, *, target=None, roles: Optional[dict] = None, k: int
     cands = pins + candidate_cameras(part_bb, target_bbox=tgt["bbox"] if tgt else None,
                                      target_normals=normals, target_points=pts,
                                      part_points=whole, internal=internal)
+    if internal and tgt:
+        cands += _diagonal_section_candidates(part_bb, tgt["bbox"], normals, pts)
     metrics = view_metrics(doc_id, cands)
     roles = _roles(metrics, matches, roles)
     sectioned = internal
     if tgt and not internal and roles["target"]:
         seen = max((_uf.target_visible_fraction(metrics, v, roles) or 0.0)
                    for v in range(len(cands)))
-        if seen < _SEE_ENOUGH:
+        whole_axes, _ = _symmetry(metrics)
+        planar_cap = bool(whole_axes) and all(
+            m.get("surf") == "plane" and any(
+                abs(_dot(_unit(m.get("normal")) or (0, 0, 0), a)) > 0.99
+                for a in whole_axes) for m in matches)
+        if seen < _SEE_ENOUGH or planar_cap:
             extra = section_candidates(part_bb, tgt["bbox"], normals, target_points=pts)
+            extra += _diagonal_section_candidates(part_bb, tgt["bbox"], normals, pts)
+            if planar_cap:
+                # Rotating around an end cap cannot create four different
+                # profiles. A shallower cut complements the existing 45-degree
+                # cut with a different cap/wall proportion.
+                t0, t1 = _tangents(whole_axes[0])
+                a = math.radians(22.5)
+                n = tuple(math.cos(a) * t0[q] + math.sin(a) * t1[q] for q in range(3))
+                face_normal = _unit(matches[0].get("normal"))
+                direction = _unit(tuple(math.sqrt(0.75) * n[q] + 0.5 * face_normal[q]
+                                        for q in range(3)))
+                extra.append({
+                    "camera": _fit_camera(subject, direction, TILE_W, TILE_H,
+                                          _SECTION_FILL, part_bb),
+                    "dir": list(direction),
+                    "label": f"section cap profile {_az_el(direction)}",
+                    "section": {"point": list(_bbox_center(tgt["bbox"])),
+                                "normal": list(n)},
+                })
             _extend(doc_id, metrics, extra)
             cands += extra
             sectioned = True
@@ -858,6 +1102,8 @@ def plan_shots(doc_id: str, *, target=None, roles: Optional[dict] = None, k: int
             _extend(doc_id, metrics, extra)
             cands += extra
             sectioned = True
+    tiers, face_ids = _readability_tiers(metrics, cands, roles, subject, matches,
+                                        targeted=bool(tgt))
     uninformative = None
     mandatory = list(range(len(pins)))
     if not tgt and sectioned:
@@ -877,47 +1123,18 @@ def plan_shots(doc_id: str, *, target=None, roles: Optional[dict] = None, k: int
                 section_scores = [
                     float((d["legible"][i, hidden] / np.maximum(d["area"][hidden], 1e-9)
                            * (1 - plain[hidden])).sum()) for i in secs]
-                best_pos = int(np.argmax(section_scores))
-                if section_scores[best_pos] > 0.05:
-                    mandatory.append(secs[best_pos])
+                readable_sections = [p for p, i in enumerate(secs) if tiers[i] <= 1]
+                if readable_sections:
+                    best_pos = max(readable_sections, key=lambda p: section_scores[p])
+                    if section_scores[best_pos] > 0.05:
+                        mandatory.append(secs[best_pos])
     context = _uf.context_from(metrics, roles=roles,
                                target_kind=tgt["kind"] if tgt else "part",
                                internal=internal, part_bbox=part_bb)
     score = set_scorer(metrics, roles, context, model)
-    eligible = None
-    if tgt and roles["target"]:
-        import numpy as np  # noqa: PLC0415
-        d = _uf._dense(metrics)
-        face_ids = [d["ord_index"][o] for o in roles["target"] if o in d["ord_index"]]
-        if face_ids:
-            target_px = d["vis_front"][:, face_ids].sum(axis=1)
-            projected_px = d["proj_px"][:, face_ids].sum(axis=1)
-            eligible = [(bool(c.get("section")) or bool(c.get("xray")) or
-                         target_px[i] / max(projected_px[i], 1.0) >= 0.18)
-                        for i, c in enumerate(cands)]
-            axes = [_unit(metrics["faces"][fi].get("axis")) for fi in face_ids
-                    if int(metrics["faces"][fi].get("surf_type") or 0) in (1, 2, 4)]
-            axes += [_unit(m.get("axis")) for m in matches
-                     if m.get("kind") == "edge" and
-                     ("circle" in str(m.get("curve") or m.get("curve_type") or "").lower()
-                      or m.get("radius") is not None)]
-            axes = [a for a in axes if a is not None]
-            if axes:
-                axis_limit = math.cos(math.radians(40.0))
-                oblique = [i for i, c in enumerate(cands) if eligible[i] and
-                           all(abs(_dot(c["dir"], a)) <= axis_limit for a in axes)]
-                if oblique:
-                    eligible = [ok and all(abs(_dot(c["dir"], a)) <= axis_limit for a in axes)
-                                for ok, c in zip(eligible, cands)]
-            if sum(eligible) < int(k) and not axes:
-                eligible = None
     picks = greedy_select(metrics, score, max(int(k), len(mandatory)),
-                          pinned=mandatory, eligible=eligible,
+                          pinned=mandatory, eligibility_tiers=tiers, guarantee_k=True,
                           uninformative=uninformative, target_faces=face_ids if tgt else None)
-    if len(picks) < max(int(k), len(mandatory)) and uninformative is not None:
-        picks = greedy_select(metrics, score, max(int(k), len(mandatory)),
-                              pinned=mandatory, eligible=eligible,
-                              target_faces=face_ids if tgt else None)
     chosen = [p["index"] for p in picks]
     views = [dict(cands[p["index"]], utility=p["utility"], marginal_gain=p["marginal_gain"],
                   metrics_index=p["index"], summary=_view_summary(metrics, p["index"], roles))
@@ -1257,7 +1474,7 @@ def render_shot_grid(doc_id: str, plan: dict, tile: tuple = (TILE_W, TILE_H), *,
             bits.append(f"target visible {r['target_visible'] * 100:.0f}%")
         if r["best_faces"]:
             bits.append("best seen: " + ", ".join(_owned(s) for s in r["best_faces"][:4]))
-        tags = [t["sid"] for t in r["tags"]]
+        tags = [t.get("text", t["sid"]) for t in r["tags"]]
         if tags:
             bits.append("tagged: " + ", ".join(tags))
         parts.append(f"{r['letter']}: " + "; ".join(bits) + ".")
@@ -1271,17 +1488,19 @@ def render_shot_grid(doc_id: str, plan: dict, tile: tuple = (TILE_W, TILE_H), *,
 
     legend: list = []
     tagged: list = []
+    tag_text = {}
     for r in records:
         for t in r["tags"]:
             if t["sid"] not in tagged:
                 tagged.append(t["sid"])
+            tag_text[t["sid"]] = t.get("text", t["sid"])
     if tagged:
         mesh = cc._doc_mesh(doc_id)
         face_by_topo = cc._mesh_topo_index(mesh)[0] if mesh is not None else {}
         for sid in tagged:
             t = face_sid_topo.get(sid)
             m = topo["face"][t - 1] if t else {}
-            legend.append(_legend_line(sid, m, _face_dims(mesh, face_by_topo, t, m),
+            legend.append(_legend_line(tag_text[sid], m, _face_dims(mesh, face_by_topo, t, m),
                                        owners.get(t, "")))
         parts.append("Tags (the SIDs query_geometry / add_features refs accept): "
                      + " | ".join(legend) + ".")

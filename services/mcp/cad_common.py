@@ -5117,7 +5117,8 @@ def _doc_mesh(doc_id: str) -> Optional[dict]:
     Returns {"pos": (N,3) float64, "idx": (M,3) int32, "tri_face": (M,) int32 (index into
     "faces", -1 for raw-mesh triangles), "faces": [{body, face_id, first_tri, tri_count,
     surf_type}] with GLOBAL triangle indices, "edges": [{body, edge_id, pts (K,3)}],
-    "last_body": int}. `face_id`/`edge_id` are the OCCT topo ids, which are exactly the
+    "last_body": int, "body_components": {body_id: assembly_component}}.
+    `face_id`/`edge_id` are the OCCT topo ids, which are exactly the
     1-based doc_query enumeration index on that body (the same join doc_tree.owner_map and
     _feature_owned_matches use), so a sid or a feature id maps straight onto mesh geometry.
     Cached per (doc_id, aicm handle) — the handle carries the revision, so an edit
@@ -5186,7 +5187,10 @@ def _doc_mesh(doc_id: str) -> Optional[dict]:
     for fi, fr in enumerate(faces):
         tri_face[fr["first_tri"]:fr["first_tri"] + fr["tri_count"]] = fi
     mesh = {"pos": pos, "idx": idx, "tri_face": tri_face, "faces": faces,
-            "edges": edges, "last_body": last_body}
+            "edges": edges, "last_body": last_body,
+            "body_components": {int(b["body_id"]): b["component"]
+                                for b in (rb.get("tess") or {}).get("bodies") or []
+                                if b.get("component")}}
     _MESH_CACHE.clear()  # one doc's mesh at a time — these arrays are the big allocation
     _MESH_CACHE[doc_id] = (handle, mesh)
     return mesh
@@ -5850,9 +5854,9 @@ def _place_label(draw, font, anchor: tuple, text: str, rgb: tuple,
     """Draw a leader line from `anchor` to a non-overlapping text chip and record its rect.
 
     Candidate offsets fan out from the anchor; the first that fits the frame and clears every
-    rect in `taken` wins, so N callouts never stack on top of each other. When none clears,
-    the chip is forced next to the anchor — or, with `strict`, nothing is drawn and None is
-    returned."""
+    rect in `taken` and every `forbidden` pixel wins. The chip is forced next to the anchor
+    when no candidate clears — or, with `strict`, nothing is drawn and None is returned.
+    A chip too large for the frame is always omitted."""
     try:
         tb = draw.textbbox((0, 0), text, font=font)
     except Exception:  # noqa: BLE001
@@ -5860,9 +5864,11 @@ def _place_label(draw, font, anchor: tuple, text: str, rgb: tuple,
     tw, th = tb[2] - tb[0], tb[3] - tb[1]
     pad = 3
     bw, bh = tw + 2 * pad, th + 2 * pad
+    if bw + 4 > W or bh + 4 > H:
+        return None
     ax, ay = anchor
     best = None
-    for dist in (26, 46, 70, 96, 124):
+    for dist in (26, 46, 70, 96, 124, 168, 208, 256, 320):
         for dx, dy in ((1, -1), (1, 1), (-1, -1), (-1, 1), (1, 0), (-1, 0), (0, -1), (0, 1)):
             x = ax + dx * dist - (bw if dx < 0 else 0)
             y = ay + dy * dist - (bh // 2 if dy == 0 else (bh if dy < 0 else 0))
@@ -5872,7 +5878,8 @@ def _place_label(draw, font, anchor: tuple, text: str, rgb: tuple,
             if any(not (rect[2] < o[0] or rect[0] > o[2]
                         or rect[3] < o[1] or rect[1] > o[3]) for o in taken):
                 continue
-            if forbidden is not None and forbidden[y:y + bh, x:x + bw].any():
+            # PIL rectangle endpoints are inclusive: its outline also clears the mask.
+            if forbidden is not None and forbidden[y:y + bh + 1, x:x + bw + 1].any():
                 continue
             best = rect
             break
@@ -5979,10 +5986,11 @@ def _draw_face_tags(draw, font, FI, mesh: dict, face_by_topo: dict, topo: dict,
     0 target, 1 fixture/load, 2 context ring), then visible pixels; faces under spec["min_px"]
     pixels get none. Each tag is a leader to the face's largest visible pixel cluster and a
     chip that overlaps no other chip (a tag with no free spot is dropped, not stacked).
-    The text is the face's doc_query `sid` — the handle query_geometry / add_features refs
-    and describe_part use. Returns [{"sid", "topo", "px", "role", "anchor"}]."""
+    Highlighted SIDs use spec["labels"] (topo -> {"text", "rgb"}) instead of a second chip.
+    Returns [{"sid", "text", "topo", "px", "role", "anchor"}]."""
     import numpy as np  # noqa: PLC0415
     prio = spec.get("priority") or {}
+    labels = spec.get("labels") or {}
     limit = int(spec.get("max") or 8)
     min_px = max(int(spec.get("min_px") or 0), 1)
     counts = np.bincount(FI[FI >= 0].ravel(), minlength=len(mesh["faces"]))
@@ -5994,25 +6002,28 @@ def _draw_face_tags(draw, font, FI, mesh: dict, face_by_topo: dict, topo: dict,
             cands.append((int(prio.get(t, 3)), -int(n), t, fi))
     cands.sort()
     out: list = []
+    drawn_sids: set = set()
     roles = ("target", "bc", "context", "other")
     for rank, neg_px, t, fi in cands:
         if len(out) >= limit:
             break
         m = topo["face"][t - 1] if 0 < t <= len(topo["face"]) else {}
         sid = m.get("sid")
-        if not sid:
+        if not sid or str(sid) in drawn_sids:
             continue
         anchor = _largest_cluster_anchor(FI == fi)
         if anchor is None:
             continue
-        ax = max(2, min(int(anchor[0]), W - 3))
-        ay = max(2, min(int(anchor[1]), H - 3))
-        rgb = _EMPHASIS_GLOW if rank == 0 else _CALLOUT_RGB
-        if _place_label(draw, font, (ax, ay), str(sid), rgb, W, H, taken,
+        ax, ay = anchor
+        label = labels.get(t) or {}
+        text = str(label.get("text") or sid)
+        rgb = label.get("rgb") or (_EMPHASIS_GLOW if rank == 0 else _CALLOUT_RGB)
+        if _place_label(draw, font, (ax, ay), text, rgb, W, H, taken,
                         strict=True, forbidden=forbidden) is None:
             continue
-        out.append({"sid": str(sid), "topo": int(t), "px": -neg_px, "role": roles[rank],
-                    "anchor": [ax, ay]})
+        drawn_sids.add(str(sid))
+        out.append({"sid": str(sid), "text": text, "topo": int(t), "px": -neg_px,
+                    "role": roles[rank], "anchor": [ax, ay]})
     return out
 
 
@@ -6302,9 +6313,12 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
     frame (_draw_bottom_banner), so a figure carries its own numbers into a report.
 
     `face_tags` ({"max", "priority": {topo: rank}, "min_px"}) draws SID tags on the most
-    important visible faces (_draw_face_tags); info["tags"] lists them. `reserved` rects
-    (x0, y0, x1, y1) are kept clear of every chip. info["seen_topos"] is the sorted doc_query
-    topo ids with at least one visible pixel (None when the depth pass did not run).
+    important visible faces (_draw_face_tags); info["tags"] lists only chips actually drawn.
+    Chips avoid emphasized target pixels and removed-half ghosts. Every SID chip anchors on
+    its own winning depth/x-ray pixels; hidden faces get none, and a highlighted SID replaces
+    its plain chip. `reserved` rects (x0, y0, x1, y1) are kept clear of every chip.
+    info["seen_topos"] lists doc_query topo ids with at least one opaque-render visible pixel
+    (None when the depth pass did not run).
 
     `tint` blends the engine's orientation hues into principal planar faces
     (_apply_orientation_tint) — for an exact-camera render taken with annotate=False, which
@@ -6393,6 +6407,8 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
         emp_ghost = None
         xray_depth = None
         xray_face_idx: set = set()
+        emphasis_mask = None
+        tag_faces = FI
         if emphasis:
             emp_matches = list(emphasis.get("matches") or [])
             emp_mode = emphasis.get("mode") or "emphasis"
@@ -6427,6 +6443,7 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                     per_target.append({"sid": sid, "mask": mask if mask.any() else None,
                                        "edge_idx": eidx, "rgb": rgb,
                                        "label": sid})
+                emphasis_mask = target_any
                 xray = bool(emphasis.get("xray")) and not frame.get("section")
                 # In x-ray mode draw the occluding shell as a pale, desaturated
                 # translucent skin over the background, not a red blend through grey.
@@ -6476,6 +6493,12 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                         rec["occluded_frac"] = round(
                             n_ghost / float(max(n_ghost + int(target_any.sum()), 1)), 4)
                         if xray:
+                            entire = tbuf[1] >= 0
+                            emphasis_mask = entire
+                            # This pass stores target-local triangle IDs for shading.
+                            # All face labels need the global face of the winning triangle.
+                            tag_faces = FI.copy()
+                            tag_faces[entire] = mesh["tri_face"][tri_ids[tbuf[1][entire]]]
                             rec["target_px"] = int((tbuf[1] >= 0).sum())
                             rec["coverage"] = round(rec["target_px"] / float(W * H), 4)
                             xray_depth = tbuf[0]
@@ -6487,6 +6510,12 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
             else:
                 rec["note"] = "mesh over the depth budget — emphasis mask unavailable"
             info["emphasis"] = rec
+        sid_labels: dict = {}
+        for h in hl_specs:
+            t = topo["face_sid"].get(str(h["label"]))
+            if t is not None:
+                sid_labels.setdefault(t, {"text": f"* {h['label']}", "rgb": h["colour"]})
+        drawn_sids: set = set()
 
         # ---- highlight fills (tint the exact visible pixels of each target face) --------
         hl_draw: list = []
@@ -6494,8 +6523,8 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
             ftop, etop = _topos_for(h["matches"])
             fidx = [face_by_topo[t] for t in sorted(ftop) if t in face_by_topo]
             mask = None
-            if FI is not None and fidx:
-                mask = np.isin(FI, np.asarray(fidx, dtype=np.int32))
+            if tag_faces is not None and fidx:
+                mask = np.isin(tag_faces, np.asarray(fidx, dtype=np.int32))
                 if mask.any():
                     rgb = np.asarray(h["colour"], dtype=np.float64)
                     arr[mask] = arr[mask] * 0.42 + rgb * 0.58
@@ -6571,6 +6600,11 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
         # Shared-colour emphasis names the TARGET once (on its largest visible face); a chip
         # per sid ("Fc51694", "F3bae34") only says something in per_face mode, where each
         # colour needs its key.
+        for t in emp_draw:
+            if tag_faces is not None and t["sid"] in topo["face_sid"]:
+                fi = face_by_topo.get(topo["face_sid"][t["sid"]])
+                winning = tag_faces == fi if fi is not None else None
+                t["mask"] = winning if winning is not None and winning.any() else None
         one_label = (emphasis or {}).get("label") if (
             emphasis and (emphasis.get("mode") or "emphasis") == "emphasis") else None
         if one_label:
@@ -6583,9 +6617,12 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                               width=1 if (emphasis and emphasis.get("xray")) else 2)
             if emphasis.get("draw_label") is False:
                 continue   # the caller places its own label clear of the target
+            sid_topo = topo["face_sid"].get(t["sid"])
+            if sid_topo is not None and (face_tags or sid_topo in sid_labels):
+                continue  # SID chips are drawn once; highlighted form takes precedence.
             if one_label and t is not biggest and not (biggest is None and t is emp_draw[0]):
                 continue
-            anchor = _mask_anchor(t["mask"]) if t["mask"] is not None else None
+            anchor = _largest_cluster_anchor(t["mask"]) if t["mask"] is not None else None
             if anchor is None and t["edge_idx"]:
                 pts = mesh["edges"][t["edge_idx"][0]]["pts"]
                 S = _screen_xyz(pts, frame)
@@ -6594,10 +6631,13 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                     anchor = (int(mid[0]), int(mid[1]))
             if anchor is None:
                 continue
-            ax = max(2, min(int(anchor[0]), W - 3))
-            ay = max(2, min(int(anchor[1]), H - 3))
-            _place_label(draw, font, (ax, ay), str(one_label or t["label"]), tuple(t["rgb"]),
-                         W, H, emp_taken)
+            ax, ay = anchor
+            text = str(one_label or t["label"])
+            if text in drawn_sids:
+                continue
+            if _place_label(draw, font, (ax, ay), text, tuple(t["rgb"]),
+                            W, H, emp_taken) is not None and text in topo["face_sid"]:
+                drawn_sids.add(text)
 
         # ---- load vectors + burned-in banner -------------------------------------------
         # After the emphasis paint (an arrow the desaturation pass could grey out is no
@@ -6621,29 +6661,25 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
             anchor = None
             if h["mask"] is not None:
                 _mask_outline(draw, h["mask"], rec["colour"], width=2)
-                anchor = _mask_anchor(h["mask"])
+                anchor = _largest_cluster_anchor(h["mask"])
             if anchor is None and h["edge_idx"]:
                 pts = mesh["edges"][h["edge_idx"][0]]["pts"]
                 mid = _screen_xyz(pts, frame)[len(pts) // 2]
                 if np.isfinite(mid[0]) and np.isfinite(mid[1]):   # perspective: behind near
                     anchor = (int(mid[0]), int(mid[1]))
-            if anchor is None and rec["matches"]:
-                c = rec["matches"][0].get("centroid")
-                if isinstance(c, (list, tuple)) and len(c) >= 3:
-                    S = _screen_xyz([c], frame)
-                    if np.isfinite(S[0, 0]) and np.isfinite(S[0, 1]):
-                        anchor = (int(S[0, 0]), int(S[0, 1]))
-            if anchor is not None:
-                ax = max(2, min(int(anchor[0]), W - 3))
-                ay = max(2, min(int(anchor[1]), H - 3))
-                _place_label(draw, font, (ax, ay),
-                             f"* {rec['label']}", rec["colour"], W, H, taken)
-                entry["visible"] = h["mask"] is not None or bool(h["edge_idx"])
+            sid = str(rec["label"])
+            defer_sid = bool(face_tags) and sid in topo["face_sid"]
+            if anchor is not None and not defer_sid and sid not in drawn_sids:
+                if _place_label(draw, font, anchor, f"* {sid}", rec["colour"],
+                                W, H, taken) is not None:
+                    if sid in topo["face_sid"]:
+                        drawn_sids.add(sid)
+            entry["visible"] = h["mask"] is not None or bool(h["edge_idx"])
             info["highlights"].append(entry)
 
-        # Ghost material is a context reference, not a place to put an ID chip.
+        # Keep SID chips off both emphasized surfaces and removed-half context ghosts.
         if face_tags and FI is not None:
-            forbidden = None
+            forbidden = emphasis_mask
             if frame.get("section"):
                 opposite = dict(frame)
                 plane = frame["section"]
@@ -6651,9 +6687,11 @@ def _annotate_render(src_png: str, doc_id: str, view_dir: tuple,
                     "point": plane["point"], "normal": [-x for x in plane["normal"]]}
                 removed = _mesh_depth_buffer(mesh, opposite)
                 if removed is not None:
-                    forbidden = removed[1] >= 0
-            info["tags"] = _draw_face_tags(draw, _annot_font(12), FI, mesh, face_by_topo,
-                                           topo, face_tags, W, H, taken, forbidden)
+                    ghost_mask = removed[1] >= 0
+                    forbidden = (ghost_mask if forbidden is None else forbidden | ghost_mask)
+            tag_spec = dict(face_tags, labels=sid_labels)
+            info["tags"] = _draw_face_tags(draw, _annot_font(12), tag_faces, mesh, face_by_topo,
+                                           topo, tag_spec, W, H, taken, forbidden)
 
         # ---- feature callouts (id + name on a leader, largest-first, capped) -----------
         # A feature that already carries a highlight chip — or IS the emphasis target — is

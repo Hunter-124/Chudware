@@ -6,6 +6,7 @@ from mcp.server.fastmcp import Image
 from typing import Callable, Optional
 from typing import Union
 import hashlib
+import json
 import os
 import math
 
@@ -18,6 +19,8 @@ from .cad_common import (
     _CONTEXT_DESAT,
     _EMPHASIS_GLOW,
     _HIGHLIGHT_PALETTE,
+    _SID_RE,
+    _as_face_query,
     _annot_font,
     _annotate_render,
     _auto_section_for_target,
@@ -62,6 +65,186 @@ from .cad_sim_tools import (
     _sim_face_points,
 )
 from .tool_registry import RISK_WRITE, is_risk_denied
+
+def _study_face_refs(study: dict):
+    """The persisted MCP queries and GUI selectors, not solver node/point sets."""
+    for key in ("fixtures", "loads", "hot_faces", "cold_faces"):
+        for item in study.get(key) or ():
+            if isinstance(item, dict) and "face" in item:
+                yield item["face"]
+            elif isinstance(item, dict) and "faces" in item:
+                faces = item["faces"]
+                yield from faces if isinstance(faces, list) else [faces]
+            elif key == "fixtures":
+                yield item
+
+
+def _mate_face_matches(ref: dict, components: dict, topo: dict, *,
+                       metrics: Optional[dict] = None,
+                       body_components: Optional[dict] = None) -> list:
+    """Join mate picks by component-local topology, independent of solved placement.
+
+    Native assembly tessellation preserves each component's local topology indices. Its
+    body/component table disambiguates coincident faces, even when their SIDs coincide.
+    Without this table only an unambiguous exact geometric selector can be joined.
+    """
+    component = components.get(ref.get("component"))
+    sel = ref.get("selector") or {}
+    if component is None or component.get("suppressed") or not isinstance(sel, dict):
+        return []
+    kind = sel.get("kind")
+    if kind not in ("face", "edge") or not sel.get("centroid"):
+        return []
+    if metrics is not None and body_components is not None:
+        local = sel.get("hint_index")
+        if not isinstance(local, int):
+            return []
+        table = metrics["faces" if kind == "face" else "edges"]
+        id_key = "face_id" if kind == "face" else "edge_id"
+        for row in table:
+            if (body_components.get(row.get("body")) == ref.get("component")
+                    and row.get(id_key) == local + 1 and row.get("ordinal") is not None):
+                match = topo[kind][int(row["ordinal"])]
+                if (match.get("surf") == sel.get("surf")
+                        and math.isclose(float(match.get("area_or_len") or 0),
+                                         float(sel.get("area_or_len") or 0),
+                                         rel_tol=1e-5, abs_tol=1e-4)):
+                    return [match]
+        return []
+    transform = component.get("transform") or [1, 0, 0, 0, 0, 1, 0, 0,
+                                               0, 0, 1, 0, 0, 0, 0, 1]
+    if len(transform) != 16:
+        return []
+    c = sel["centroid"]
+    world = [sum(float(transform[4 * i + j]) * float(c[j]) for j in range(3))
+             + float(transform[4 * i + 3]) for i in range(3)]
+    direction = sel.get("axis") if sel.get("surf") == "cylinder" else sel.get("normal")
+    world_direction = (_vnorm([sum(float(transform[4 * i + j]) * float(direction[j])
+                                  for j in range(3)) for i in range(3)])
+                       if direction else None)
+    candidates = []
+    for match in topo[kind]:
+        mc = match.get("centroid")
+        if not mc or match.get("surf") != sel.get("surf"):
+            continue
+        if math.dist(world, mc) > 1e-4:
+            continue
+        md = match.get("axis") if sel.get("surf") == "cylinder" else match.get("normal")
+        if world_direction and md:
+            alignment = sum(a * b for a, b in zip(world_direction, _vnorm(md)))
+            if (abs(alignment) if sel.get("surf") == "cylinder" else alignment) < .99999:
+                continue
+        area = sel.get("area_or_len")
+        if area is not None and not math.isclose(
+                float(area), float(match.get("area_or_len") or 0), rel_tol=1e-5, abs_tol=1e-4):
+            continue
+        candidates.append(match)
+    return candidates if len(candidates) == 1 else []
+
+def _planning_face_ordinals(metrics: dict, matches: list) -> list:
+    """Resolve live query ordinals, not SID-only joins (assembly SIDs can coincide)."""
+    faces = metrics.get("faces") or []
+    edges = metrics.get("edges") or []
+    adjacency = metrics.get("edge_faces") or []
+    out = set()
+    for match in matches:
+        kind = match.get("kind")
+        table = edges if kind == "edge" else faces
+        ordinal = match.get("hint_index")
+        # Filtered doc_query replies can renumber hint_index; accept it only when
+        # the SID agrees with the whole-document roster, otherwise join that SID.
+        rows = [(i, row) for i, row in enumerate(table)
+                if row.get("ordinal") == ordinal and row.get("sid") == match.get("sid")]
+        if not rows:
+            rows = [(i, row) for i, row in enumerate(table)
+                    if row.get("sid") == match.get("sid")]
+        if len(rows) != 1:
+            continue
+        i, row = rows[0]
+        if kind == "edge" and i < len(adjacency):
+            out.update(int(faces[fi]["ordinal"]) for fi in adjacency[i]
+                       if faces[fi].get("ordinal") is not None)
+        elif kind != "edge" and row.get("ordinal") is not None:
+            out.add(int(row["ordinal"]))
+    return sorted(out)
+
+
+
+def _planning_roles(doc_id: str, matches: Optional[list] = None) -> dict:
+    """Use one tree read for studies/mates and the planner's existing topology/adjacency.
+
+    SID/GUI-selector BCs join locally. Legacy query BCs use the canonical engine resolver
+    once per distinct query (the engine has no batch geometry-query RPC). Missing setup or
+    stale references must never prevent a geometry render.
+    """
+    matches = matches or []
+    try:
+        tree = (cb.call("doc_tree", {"doc_id": doc_id}) or {}).get("tree") or {}
+    except Exception:  # noqa: BLE001 — a document without setup is still renderable
+        tree = {}
+    studies = [s for s in tree.get("studies") or () if isinstance(s, dict)]
+    mates = [m for m in tree.get("mates") or ()
+             if isinstance(m, dict) and not m.get("suppressed")]
+    if not matches and not studies and not mates:
+        return {"bc": []}
+    topo = _doc_topo_maps(doc_id)
+    mesh = _doc_mesh(doc_id)
+    metrics = {"faces": [dict(f) for f in (mesh or {}).get("faces") or ()],
+               "edges": [dict(e) for e in (mesh or {}).get("edges") or ()]}
+    if mesh is not None:
+        _sp._join_topology(doc_id, metrics, topo=topo)
+        metrics["edge_faces"] = _sp._edge_faces(doc_id, metrics, mesh=mesh)
+    else:
+        metrics["faces"] = [dict(f, ordinal=i) for i, f in enumerate(topo["face"])]
+    roles = _sp._roles(metrics, [], {"target": _planning_face_ordinals(metrics, matches)})
+    bc_matches = []
+    resolved = {}
+    for study in studies:
+        if study.get("suppressed"):
+            continue
+        for ref in _study_face_refs(study):
+            try:
+                key = json.dumps(ref, sort_keys=True)
+                if key not in resolved:
+                    sid = ref.get("sid") if isinstance(ref, dict) else ref
+                    if isinstance(sid, str) and sid in topo["face_sid"]:
+                        resolved[key] = [topo["face"][topo["face_sid"][sid] - 1]]
+                    elif isinstance(ref, dict) and ref.get("kind") == "face":
+                        # GUI pick selectors can predate SID stamping; join their exact
+                        # geometry, never treat a readback selector as an all-face query.
+                        resolved[key] = ([] if sid else _mate_face_matches(
+                            {"component": "document", "selector": ref},
+                            {"document": {}}, topo))
+                    elif isinstance(sid, str) and _SID_RE.fullmatch(sid):
+                        resolved[key] = []
+                    else:
+                        result = cb.call("doc_query", {"doc_id": doc_id,
+                                                       "query": _as_face_query(ref)}) or {}
+                        resolved[key] = [m for m in result.get("matches") or ()
+                                         if m.get("kind") == "face"]
+                bc_matches.extend(resolved[key])
+            except Exception:  # noqa: BLE001 — old/stale studies are best effort
+                continue
+    components = {c.get("id"): c for c in tree.get("components") or ()
+                  if isinstance(c, dict)}
+    target_bodies = {f.get("body") for f in metrics["faces"]
+                     if f.get("ordinal") in roles["target"]}
+    for mate in mates:
+        try:
+            refs = [_mate_face_matches(r, components, topo, metrics=metrics,
+                                       body_components=(mesh or {}).get("body_components"))
+                    for r in mate.get("refs") or () if isinstance(r, dict)]
+            mate_matches = [m for group in refs for m in group]
+            mate_roles = _planning_face_ordinals(metrics, mate_matches)
+            if not target_bodies or any(f.get("body") in target_bodies
+                                       and f.get("ordinal") in mate_roles
+                                       for f in metrics["faces"]):
+                bc_matches.extend(mate_matches)
+        except Exception:  # noqa: BLE001 — an unresolved mate cannot break rendering
+            continue
+    roles["bc"] = _planning_face_ordinals(metrics, bc_matches)
+    return roles if matches else {"bc": roles["bc"]}
+
 
 
 def _render_stem(doc_id: str, label: str = "") -> str:
@@ -300,7 +483,8 @@ def _auto_view(d: str, resolved: dict, matches: list, target_bb: dict, part_bb: 
     if matches:
         best = _sp.plan_shots(d, target={"matches": matches, "bbox": target_bb,
                                          "label": resolved.get("label") or "target",
-                                         "kind": resolved.get("kind")}, k=1)["views"][0]
+                                         "kind": resolved.get("kind")},
+                              roles=_planning_roles(d, matches), k=1)["views"][0]
         return tuple(best["dir"]), best.get("label") or "auto", None, best.get("section")
     if point is not None:
         return _point_view_dir(point, part_bb), "outside-in", None, None
@@ -904,6 +1088,9 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         removed half ghosted), how much of the target it shows and which faces/features read
         best there; the union coverage; every face NO tile sees, by sid; the tag legend
         ("F58db6d — plane, +Z, 40x20 mm, f3 Boss"); and the ranking model used.
+        Persisted simulation fixture/load faces and assembly-mate contact faces contribute
+        boundary-condition coverage to the ranking; a target also includes its adjacent
+        faces as surrounding context. Documents without studies or mates need no setup.
 
         target: frame the grid on ONE thing — a feature id or name ("f5", "Rib"), a face/edge
         sid or geometry query ({"of":"face","side":"top"}), a list of those, or a world point
@@ -956,7 +1143,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                                            _render_save_note(png, save_to))
                 raise ValueError("Render failed: no bodies to render")
             if emp_spec is None:
-                plan = _sp.plan_shots(d, k=4, part_bbox=part_bb)
+                plan = _sp.plan_shots(d, k=4, part_bbox=part_bb, roles=_planning_roles(d))
                 png, caption = _shot_grid(d, plan, stem=_render_stem(d, "shots"),
                                           highlight=highlight, emphasis_mode=None,
                                           annotate=bool(annotate), background=bg)
@@ -975,7 +1162,8 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                                                               "location") if defect.get(k)]}]
             plan = _sp.plan_shots(d, target={"matches": resolved["matches"], "label": label,
                                              "bbox": target_bb, "kind": resolved.get("kind")},
-                                  k=4, pinned=pinned, part_bbox=part_bb)
+                                  k=4, pinned=pinned, part_bbox=part_bb,
+                                  roles=_planning_roles(d, resolved["matches"]))
             png, caption = _shot_grid(d, plan, stem=_render_stem(d, f"shots-{label}"),
                                       highlight=highlight,
                                       emphasis_mode=emphasis_mode or "emphasis",

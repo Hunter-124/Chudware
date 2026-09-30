@@ -168,7 +168,8 @@ def test_a_complementary_set_beats_four_near_duplicate_views():
     dirs = dups + others
     m = fake_view_metrics({"cameras": [{"position": (100 * _unit(d)).tolist(),
                                         "target": [0, 0, 0]} for d in dirs]},
-                          faces_from_matches(_box()))
+                          faces_from_matches(_box(_face(
+                              "AsymmetricDetail", "", (7, 3, 11), (-1, -.7, .6), 90))))
     for i, f in enumerate(m["faces"]):
         f["ordinal"] = i
     for v, d in zip(m["views"], dirs):
@@ -279,7 +280,7 @@ def test_mirrored_sections_do_not_repeat_a_cut_but_xray_can_add_context():
              {"dir": [0, -1, 0], "section": mirrored, "reveal_key": "bore"},
              {"dir": [0, 0, 1], "section": None, "xray": True, "reveal_key": "bore"},
              {"dir": [0, 0, -1], "section": None}]
-    picks = sp.greedy_select({"views": views}, lambda selected: len(selected), k=4,
+    picks = sp.greedy_select({"views": views}, lambda selected: len(selected), k=3,
                              pinned=[0])
     assert [p["index"] for p in picks] == [0, 2, 3]
 
@@ -293,7 +294,7 @@ def test_nearby_cameras_and_same_target_footprint_cannot_share_a_grid():
     for v, direction in zip(metrics["views"], directions):
         v["dir"] = _unit(direction).tolist()
     metrics["views"][2]["face_vis"] = list(metrics["views"][0]["face_vis"])
-    picks = sp.greedy_select(metrics, lambda selected: len(selected), k=5, target_faces=[0])
+    picks = sp.greedy_select(metrics, lambda selected: len(selected), k=2, target_faces=[0])
     chosen = {p["index"] for p in picks}
     assert 0 in chosen and 1 not in chosen  # 16-degree duplicate
     assert 2 not in chosen                   # 45-degree view, same target footprint
@@ -378,6 +379,86 @@ def test_cross_drilled_whole_part_reveals_its_intersecting_passages():
         cb.call("doc_close", {"doc_id": d})
 
 
+def test_strict_eligibility_relaxes_without_dropping_the_fourth_tile():
+    dirs = [(1, 1, 1), (-1, -1, 1), (1, -1, -1), (-1, 1, -1)]
+    metrics = {"views": [{"dir": _unit(d).tolist()} for d in dirs]}
+    picks = sp.greedy_select(metrics, lambda selected: len(selected), k=4,
+                             eligible=[True, False, False, False])
+    assert [p["index"] for p in picks] == [0, 1, 2, 3]
+    # Even a single readable symmetry class is preferable to a missing tile.
+    picks = sp.greedy_select(metrics, lambda selected: len(selected), k=4,
+                             eligibility_tiers=[0, 2, 3, 4])
+    assert len({p["index"] for p in picks}) == 4
+
+
+def test_readable_relaxed_views_precede_same_camera_in_another_reveal_mode():
+    metrics = {"views": [
+        {"dir": [1, 0, 0]},
+        {"dir": [1, 0, 0], "xray": True},
+        {"dir": [0, 1, 0]},
+        {"dir": [0, 0, 1]},
+    ]}
+    picks = sp.greedy_select(metrics, lambda selected: len(selected), k=3,
+                             pinned=[0], eligibility_tiers=[0, 0, 2, 3])
+    assert [p["index"] for p in picks] == [0, 2, 3]
+
+
+def test_complementary_xrays_precede_an_unreadable_ordinary_view():
+    metrics = {"views": [
+        {"dir": [1, 0, 0], "xray": True, "reveal_key": "target"},
+        {"dir": [0, 1, 0], "xray": True, "reveal_key": "target"},
+        {"dir": [-1, 0, 0]},
+    ]}
+    picks = sp.greedy_select(metrics, lambda selected: len(selected), k=2,
+                             pinned=[0], eligibility_tiers=[0, 0, 3])
+    assert [p["index"] for p in picks] == [0, 1]
+
+
+def test_rotated_revolved_targets_do_not_spend_two_tiles_on_the_same_profile():
+    directions = [(1, 0, .5), (0, 1, .5), (1, 0, -.5), (1, 0, 0), (1, 0, 1.8)]
+    metrics = {"faces": [{"surf_type": 1, "area_mm2": 100, "axis": [0, 0, 1],
+                          "centroid": [0, 0, 0], "normal": [1, 0, 0]}],
+               "views": [{"dir": _unit(d).tolist(),
+                          "face_vis": [[0, 100, 40, .7, 100]]} for d in directions]}
+    picks = sp.greedy_select(metrics, lambda selected: len(selected), k=4, target_faces=[0])
+    chosen = [p["index"] for p in picks]
+    assert len(chosen) == 4
+    assert 0 in chosen and 1 not in chosen
+    assert set(chosen) == {0, 2, 3, 4}
+
+
+def test_detected_mirror_planes_reject_a_reflected_camera_when_other_detail_exists():
+    metrics = {"faces": faces_from_matches(_box()),
+               "views": [{"dir": _unit(d).tolist()} for d in
+                         [(1, 1, .4), (-1, 1, .4), (1, .3, 1), (1, .7, -.8)]]}
+    picks = sp.greedy_select(metrics, lambda selected: len(selected), k=2)
+    assert [p["index"] for p in picks] == [0, 2]
+
+
+def test_sections_and_xrays_must_show_screen_pixels_and_legible_true_target_area():
+    direction = _unit((1, 1, 1)).tolist()
+    subject = [(-20, -15, 0), (20, -15, 0), (20, 15, 0), (-20, 15, 0)]
+    camera = sp._fit_camera(subject, direction, 512, 384, .62, _BOX_BB)
+    section = {"point": [0, 0, 0], "normal": [1, 0, 0]}
+    candidates = [
+        {"dir": direction, "camera": camera},
+        {"dir": direction, "camera": camera, "section": section},
+        {"dir": direction, "camera": camera, "xray": True},
+        {"dir": direction, "camera": camera, "section": section},
+        {"dir": direction, "camera": camera, "section": section},
+    ]
+    metrics = {"faces": [{"ordinal": 0, "surf_type": 0, "area_mm2": 100,
+                          "centroid": [0, 0, 0], "normal": [0, 0, 1]}],
+               "views": [dict(c, face_vis=[[0, px, area, .6, px]], fg_px=px)
+                         for c, px, area in zip(candidates, (5, 5, 5, 5000, 5000),
+                                                (50, 50, 50, 50, 0))]}
+    tiers, _ = sp._readability_tiers(metrics, candidates, {"target": [0]},
+                                    subject, targeted=True)
+    assert tiers[:3] == [4, 4, 4]  # Reveal modes cannot excuse a tiny target footprint.
+    assert tiers[3] == 0
+    assert tiers[4] == 4            # A large footprint is not legible true surface area.
+
+
 # ---------------------------------------------------------------------------------- model
 def test_a_model_with_a_mismatched_feature_schema_is_refused_for_hand(monkeypatch, tmp_path):
     _install(monkeypatch, _box(), _BOX_BB)
@@ -426,3 +507,121 @@ def test_an_explicit_view_is_still_one_single_shot(monkeypatch):
     render_part(doc_id="doc-box", view="front", target={"of": "face", "side": "top"})
     assert sum(1 for m, _p in calls if m == "doc_render_view") == 2
     assert not any(m == "doc_view_metrics" for m, _p in calls)
+
+
+@pytest.mark.parametrize("xray", [False, True])
+def test_sid_chips_clear_the_emphasized_surface_and_anchor_winning_faces(
+        monkeypatch, tmp_path, xray):
+    """An opaque cover must not steal the SID of the target painted in x-ray."""
+    from PIL import Image
+    from services.mcp import cad_common as cc
+
+    W, H = 512, 384
+    positions, triangles, triangle_faces = [], [], []
+    # The cover hides both targets only in the x-ray case. The nearer target wins
+    # the central patch; the larger, farther target still owns the surrounding ring.
+    for fi, (extent, depth) in enumerate(((10, 2 if xray else -2), (7, 0), (3, 1))):
+        offset = len(positions)
+        positions.extend([[-extent, -extent, depth], [extent, -extent, depth],
+                          [extent, extent, depth], [-extent, extent, depth]])
+        triangles.extend([[offset, offset + 1, offset + 2],
+                          [offset, offset + 2, offset + 3]])
+        triangle_faces.extend([fi, fi])
+    mesh = {"pos": np.asarray(positions, dtype=float),
+            "idx": np.asarray(triangles, dtype=np.int32),
+            "tri_face": np.asarray(triangle_faces, dtype=np.int32),
+            "faces": [{}, {}, {}], "edges": []}
+    matches = [{"sid": sid} for sid in ("Fcover", "Fouter", "Finner")]
+    topo = {"face": matches, "face_sid": {m["sid"]: i + 1 for i, m in enumerate(matches)},
+            "edge_sid": {}}
+    monkeypatch.setattr(cc, "_doc_mesh", lambda _doc: mesh)
+    monkeypatch.setattr(cc, "_doc_topo_maps", lambda _doc: topo)
+    monkeypatch.setattr(cc, "_mesh_topo_index", lambda _mesh: ({1: 0, 2: 1, 3: 2}, {}))
+    monkeypatch.setattr(cc, "_resolve_highlight_specs", lambda *_args: [])
+    monkeypatch.setattr(cc, "_handoff_doc_name", lambda _doc: "Tag coverage")
+    frame = cc._mesh_render_frame(mesh, (0, 0, 1), W, H)
+    target_mesh = dict(mesh, idx=mesh["idx"][2:], tri_face=mesh["tri_face"][2:])
+    _, winning_faces, _ = cc._mesh_depth_buffer(target_mesh, frame)
+    target_mask = winning_faces >= 0
+    rectangles = {}
+    place = cc._place_label
+
+    def record_chip(draw, font, anchor, text, *args, **kwargs):
+        rect = place(draw, font, anchor, text, *args, **kwargs)
+        if rect is not None and text in topo["face_sid"]:
+            rectangles[text] = rect
+        return rect
+
+    monkeypatch.setattr(cc, "_place_label", record_chip)
+    source = tmp_path / "source.png"
+    Image.new("RGB", (W, H), (180, 190, 200)).save(source)
+    rendered, info = cc._annotate_render(
+        str(source), "tag-doc", (0, 0, 1), frame=frame, out_png=str(tmp_path / "tags.png"),
+        callouts=False, edges=False, scale=False,
+        emphasis={"matches": matches[1:], "xray": xray, "draw_label": False},
+        face_tags={"max": 3, "priority": {2: 0, 3: 0}, "min_px": 8})
+    assert info["available"], info["note"]
+    by_sid = {tag["sid"]: tag for tag in info["tags"]}
+    assert {"Fouter", "Finner"} <= by_sid.keys()
+    for sid, rect in rectangles.items():
+        x0, y0, x1, y1 = rect
+        assert 0 <= x0 <= x1 < W and 0 <= y0 <= y1 < H
+        # PIL draws rectangle endpoints inclusively, including its outline.
+        assert not target_mask[y0:y1 + 1, x0:x1 + 1].any(), (sid, rect)
+    with Image.open(rendered) as image:
+        for sid, fi in (("Fouter", 1), ("Finner", 2)):
+            tag = by_sid[sid]
+            ax, ay = tag["anchor"]
+            assert winning_faces[ay, ax] == fi
+            assert tag["role"] == "target"
+            x0, y0, _x1, _y1 = rectangles[sid]
+            assert image.getpixel((x0, y0)) == cc._EMPHASIS_GLOW
+
+
+def test_sid_chip_keepout_includes_its_bottom_and_right_outline_pixels():
+    from PIL import Image, ImageDraw
+    from services.mcp import cad_common as cc
+
+    W, H = 400, 300
+    font = cc._annot_font(12)
+    draw = ImageDraw.Draw(Image.new("RGB", (W, H)))
+    first = cc._place_label(draw, font, (180, 150), "Fedge", cc._EMPHASIS_GLOW,
+                            W, H, [], strict=True)
+    x0, y0, x1, y1 = first
+    forbidden = np.zeros((H, W), dtype=bool)
+    forbidden[y1, x0:x1 + 1] = True
+    forbidden[y0:y1 + 1, x1] = True
+    placed = cc._place_label(draw, font, (180, 150), "Fedge", cc._EMPHASIS_GLOW,
+                             W, H, [], strict=True, forbidden=forbidden)
+    assert placed is not None
+    x0, y0, x1, y1 = placed
+    assert not forbidden[y0:y1 + 1, x0:x1 + 1].any()
+
+
+def test_sid_chips_that_cannot_fit_inside_the_tile_are_omitted():
+    from PIL import Image, ImageDraw
+    from services.mcp import cad_common as cc
+
+    image = Image.new("RGB", (32, 24), (255, 255, 255))
+    before = image.tobytes()
+    taken = []
+    placed = cc._place_label(ImageDraw.Draw(image), cc._annot_font(12), (16, 12),
+                             "F123456789", cc._EMPHASIS_GLOW, 32, 24, taken, strict=True)
+    assert placed is None and taken == []
+    assert image.tobytes() == before
+
+
+def test_sid_tag_on_tile_boundary_keeps_its_face_winning_anchor():
+    from PIL import Image, ImageDraw
+    from services.mcp import cad_common as cc
+
+    W, H = 160, 120
+    winners = np.full((H, W), -1, dtype=np.int32)
+    winners[0, :20] = 0
+    tags = cc._draw_face_tags(
+        ImageDraw.Draw(Image.new("RGB", (W, H))), cc._annot_font(12), winners,
+        {"faces": [{}]}, {1: 0}, {"face": [{"sid": "Frim"}]},
+        {"max": 1, "min_px": 1}, W, H, [])
+    assert [tag["sid"] for tag in tags] == ["Frim"]
+    ax, ay = tags[0]["anchor"]
+    assert winners[ay, ax] == 0

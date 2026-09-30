@@ -181,16 +181,16 @@ its runner service environment.
 
 | Runner | Lock target | Expected release asset | Where to install the file | Prerequisite |
 |---|---|---|---|---|
-| `livingroom-pc` | `linux-x86_64` | `chudcode-linux-x64` (v0.4.0) | `/home/liveuser/chudware-web-data/chud` (shared with `deploy-prod.yml`) | Installed and verified against the committed lock. |
-| `imac-intel` | `macos-x86_64` | `chudcode-darwin-x64` (v0.4.0) | `/Users/apple/chudware-ci-tools/chudcode/chud` | Install the pinned binary and configure `CHUDWARE_CHUD_BIN`; installation has not been verified. |
-| `ryzen-7900x3d` | `windows-x86_64` | none: the v0.4.0 lock has no Windows pin | `%USERPROFILE%\chudware-ci-tools\chudcode\chud.exe` | The Windows release leg fails closed until a runtime release is pinned for Windows. |
+| `livingroom-pc` | `linux-x86_64` | `chudcode-linux-x64` (v0.4.1) | `/home/liveuser/chudware-web-data/chud` (shared with `deploy-prod.yml`) | Installed and verified against the committed lock. |
+| `imac-intel` | `macos-x86_64` | `chudcode-darwin-x64` (v0.4.1) | `/Users/apple/chudware-ci-tools/chudcode/chud` | Install the pinned binary and configure `CHUDWARE_CHUD_BIN`; installation has not been verified. |
+| `ryzen-7900x3d` | `windows-x86_64` | none: the v0.4.1 lock has no Windows pin | `%USERPROFILE%\chudware-ci-tools\chudcode\chud.exe` | The Windows release leg fails closed until a runtime release is pinned for Windows. |
 
 The runner reads `.env` in its install directory only when it starts, so every
 change needs a runner restart. On a Mac, as the runner's login user:
 
 1. Get `chudcode-darwin-x64` for the locked version from a machine that can
    read `Hunter-124/chudcode`, for example `gh release download
-   chudcode-v0.4.0 -R Hunter-124/chudcode -p chudcode-darwin-x64`. Move it to
+   chudcode-v0.4.1 -R Hunter-124/chudcode -p chudcode-darwin-x64`. Move it to
    the Mac by hand: the Macs are not reachable over SSH from the workstation.
 2. Install it: `mkdir -p ~/chudware-ci-tools/chudcode`, copy it to
    `~/chudware-ci-tools/chudcode/chud`, `chmod 755` it, and

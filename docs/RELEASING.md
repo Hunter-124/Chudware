@@ -346,7 +346,7 @@ identity string); engine provenance is never accepted as or appended to it.
 
 ### Current pin status (2026-09-30)
 
-The lock pins `chudcode-v0.4.0` (the thin fork on upstream oh-my-pi 18.4.4,
+The lock pins `chudcode-v0.4.1` (the thin fork on upstream oh-my-pi 18.4.4,
 `engine_version` 18.4.4). Linux x86_64 and macOS x86_64 are pinned; Windows
 x86_64 is unpinned because the cross-compiled Windows CLI crashes inside Bun
 1.4.0 at startup, so Windows installer legs fail closed. `pin` requires all

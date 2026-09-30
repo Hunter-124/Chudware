@@ -13,7 +13,7 @@ import time
 from collections import defaultdict
 from typing import Callable
 
-from .queries import load_queries, queries_path
+from .queries import QUERY_SCHEMA, load_queries, queries_path
 from .render import IMAGE_KEY, load_observer_sets
 from .train import (JUDGES, OBSERVER_SCHEMA, TrainConfig, build_corpus, default_device,
                     fold_of, folds_meta_path, judge_dir, load_checkpoint, predict)
@@ -36,8 +36,10 @@ def judge_meta(root, judge: str) -> dict:
                                 f"(run `python3 -m training.viewpoint.observer train "
                                 f"--judge {judge}`)")
     meta = json.loads(path.read_text())
-    if meta.get("schema") != OBSERVER_SCHEMA:
-        raise ValueError(f"{path}: schema {meta.get('schema')!r} != {OBSERVER_SCHEMA}")
+    if meta.get("schema") != OBSERVER_SCHEMA or meta.get("query_schema") != QUERY_SCHEMA:
+        raise ValueError(f"{path}: schemas {meta.get('schema')!r}/"
+                         f"{meta.get('query_schema')!r} != "
+                         f"{OBSERVER_SCHEMA}/{QUERY_SCHEMA}")
     return meta
 
 

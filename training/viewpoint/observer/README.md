@@ -14,28 +14,34 @@ utility trials ─► store/sets.jsonl (strategy sets, rendered through render.p
                  judge.label(): P(correct) from the fold that never saw the part ─► utility observe
 ```
 
-## Queries (`queries.py`, schema `viewnet.query/1`)
+## Queries (`queries.py`, schema `viewnet.query/2`)
 
 Derived only from `chudware.geomlabel/1` records; no text. Kinds and answer spaces (one
 shared `A_MAX = 21` logit vector, invalid options masked):
 
 | kind | modes | answer | chance |
 |---|---|---|---|
-| count | part | instances of a family / variant, bins 0,1,2,3,4,5+ | 1/6 |
-| presence_side | part, target | opening side ±X ±Y ±Z | 1/6 |
-| through_blind | part, target | through / blind | 1/2 |
-| type | part, target | CANON class (all but stock/other) | 1/19 |
+| count | part | instances of a family / variant over the whole part, bins 0,1,2,3,4,5+ | 1/6 |
+| presence_side | target | opening side ±X ±Y ±Z | 1/6 |
+| through_blind | target | through / blind | 1/2 |
+| type | target | CANON class (all but stock/other) | 1/19 |
 
-`vec` (QD = 34): kind one-hot, mode one-hot, subject multi-hot over CANON, bbox-normalised
-centroid + has-location flag, opening-axis one-hot. Nothing in `vec` gives the answer away:
-presence_side zeroes the axis (it would halve six sides to two), through_blind names the
-subject by FAMILY (both variants set), type leaves the subject empty. A part-mode located query
-exists only when no other candidate lies within 0.2 (bbox-normalised) of its centroid; in
-target mode the render's emphasis overlay paints the feature. Answers are balanced within
-every (mode, kind, subject) stratum — each value capped at 1.5× the rarest well-supported
-value — and a stratum with one answer is dropped. qids are content hashes; the seed only picks
-which queries balancing keeps. On the 2400-part manifest: 82.7k raw → 27.3k balanced queries
-(≈ 11 per part), in 1.6 s.
+`vec` (QD = 27) contains only kind one-hot, mode one-hot, and subject class multi-hot.
+It has **no** bbox-normalised centroid, has-location flag, opening axis, or instance ID:
+those were answer-correlated even after answer balancing. Part mode asks only whole-part
+count questions with no location. Target mode identifies the feature through the render's
+emphasis overlay; presence_side and through_blind name its family (both through/blind
+variants), while type leaves the subject empty. Answers are balanced within every
+(mode, kind, subject) stratum — each value capped at 1.5× the rarest supported value —
+and a stratum with one supported answer is dropped.
+
+`queries.qvec_probe(bank, split_fn)` fits a numpy ridge multiclass predictor to the **entire
+query vector** on training parts and scores unseen parts once per query, alongside the
+training majority per (mode, kind, subject). This catches leaks hidden by marginal balance;
+the real bank must pass `probe accuracy <= majority + 0.03` for **every** kind. `observer
+report` includes this control, in addition to the more demanding pixel-blind Observer.
+qids include the schema and are content hashes; the balancing seed chooses surviving queries.
+The 5399-part manifest generated 76,372 balanced v2 queries.
 
 On Windows, run the ViewNet campaign in WSL with a Linux `libchudware.so`; native
 Windows is supported for production rendering but not for campaign training.
@@ -100,11 +106,19 @@ fold and raises on any part found in that model's training list; rows are
 ## Report (`observer report`)
 
 On fold 0 of the crossfit split (held-out parts never trained on): per-kind accuracy /
-mean P / log-loss vs train-part fraction (1/8 … 1), seed spread at full data, chance per kind
-(uniform over valid options), the majority-per-stratum baseline (what a query-only reader
-gets), the shuffled-label control (answers permuted within each stratum across training
-queries; must sit near the majority baseline) and the blind control (pixels zeroed; the gap
-to it is what the pixels contribute). Written to `observer/report.json`, printed as a table.
+mean P / log-loss vs train-part fraction (1/8 … 1), seed spread at full data, chance per kind,
+the majority-per-stratum baseline, `qvec_probe` (fit only on training-part vectors), the
+shuffled-label control (answers permuted within each training stratum), and the blind
+control (pixels zeroed; the gap to it measures what the pixels contribute). Written to
+`observer/report.json`, printed as a table. Query-only probe scores on the 5399-part v2
+bank, fold 0 (once per query, **not** weighted by the number of grids):
+
+| kind | qvec probe | majority | held-out queries |
+|---|---:|---:|---:|
+| count | 0.242 | 0.236 | 3833 |
+| presence_side | 0.174 | 0.174 | 4915 |
+| through_blind | 0.536 | 0.536 | 4093 |
+| type | 0.080 | 0.080 | 3477 |
 
 ## Recipe
 
@@ -112,18 +126,38 @@ to it is what the pixels contribute). Written to `observer/report.json`, printed
 export CHUDWARE_ENGINE_DAEMON=0 CHUDWARE_LIBCHUDWARE=$PWD/core/build-linux/bin/libchudware.so
 python3 -m training.viewpoint.observer render                       # own training sets (engine)
 python3 -m training.viewpoint.utility trials                        # strategy sets (see its README)
+python3 -m training.viewpoint.observer requery                     # after query-schema changes; no render
 python3 -m training.viewpoint.observer train --judge crossfit       # 5 folds
 python3 -m training.viewpoint.observer train --judge independent    # 5 folds
 python3 -m training.viewpoint.observer report                       # convergence evidence
 python3 -m training.viewpoint.observer label --namespace observer   # Observer-set labels (diagnostics)
 ```
 
-`train` reads the store's training namespace (`sets.jsonl`, never the A/B sets) plus
-`observer/sets.jsonl`; `--folds 0,1` trains a subset (`label --trained-folds-only` then labels
-what those folds may). The utility pipeline labels its own pairs with `utility observe`.
-`render` skips parts already present in `observer/sets.jsonl`.
+`requery` rebuilds `observer/queries.jsonl` and remaps qids in existing
+`observer/sets.jsonl`, `sets.jsonl`, and `sets_ab.jsonl` when present. Images/tokens and
+set keys remain unchanged; it moves stale query rows, labels, report and fold checkpoints
+into `query_archive/<timestamp>/` instead of allowing stale labels to be reused. Judge
+checkpoint loading checks `query_schema` and rejects old versions. `train` reads the store's
+training namespace (`sets.jsonl`, never A/B) plus `observer/sets.jsonl`; `--folds 0,1`
+trains a subset (`label --trained-folds-only` then labels what those folds may). The
+utility pipeline labels its pairs with `utility observe`. `render` skips parts already
+present in `observer/sets.jsonl`.
 
-## Smoke run (measured)
+## Query-v2 three-epoch GPU sanity (measured, RTX 3080 Ti)
+
+Fold 0 held-out parts, one run with pixels and one with all pixels zeroed, each from
+scratch for three epochs. The 750-part deterministic subset used 21,711 train sets and
+6,787 held-out sets (17,262 held-out pairs); full/blind accuracy: overall
+0.2810/0.2813, count 0.2574/0.2626, presence_side 0.2494/0.2631,
+through_blind 0.6254/0.6070, type 0.0989/0.0734. A second target-only 2000-part
+subset (33,103 train, 8,666 held-out sets; lr 0.002) reached overall
+0.2919/0.2906, presence_side 0.2102/0.2004, through_blind 0.5970/0.5970,
+type 0.0751/0.0852. **Three epochs did not establish an aggregate visual gain.**
+Low query-only leakage does not by itself prove that this from-scratch visual reader
+learns the pixel task in three epochs; cross-fit labels must be evaluated with the
+full report's blind control before treating them as view usefulness.
+
+## Historical pre-v2 smoke run (measured; not evidence for current schema)
 
 80 parts (`render --limit-parts 80`): 1498 grids; 1071 balanced queries. `train --folds 0
 --epochs 8` (56 train parts, 1038 sets): 25 s wall (first epoch 11.5 s incl. loader spawn and
@@ -135,9 +169,8 @@ out-of-fold report. `report --fractions 0.25,0.5,1 --seeds 0,1 --epochs 4`: 7 fi
 (4 epochs is too few at this size: the curve is flat and the blind control scores the same as
 the full runs — exactly the failure the controls exist to expose).
 
-Full-scale estimate from those rates (not a measured full run): ≈ 90k sets (utility trials
-≈ 48k + observer ≈ 42k) → ≈ 170k training tiles per epoch per fold ≈ 1.5 min per epoch; early
-stop at 10–20 epochs → ≈ 15–30 min per fold, ≈ 1.5–2.5 h per judge; `report` ≈ 8 full fits.
+The following pre-v2 scale estimate does not account for the expanded 5399-part manifest.
+The actual run size and pixel gap must be re-measured under schema v2.
 
 ## Tests
 
@@ -146,7 +179,9 @@ python3 -m pytest training/viewpoint/observer -q -p no:cacheprovider
 ```
 
 Answer balance per stratum and dropped single-answer strata, determinism by seed,
-option masks and no answer leak in `vec`, query upsert; model shapes for k = 1/4 and both
+option masks, geometry-free query vectors, a synthetic injected-field leak caught by
+`qvec_probe`, idempotent rerender-free set migration/label invalidation, query upsert;
+model shapes for k = 1/4 and both
 variants, masked options at probability 0, queries not influencing each other, padded tiles
 ignored; the grid split matching the shot-grid layout; cross-fitting never labelling a part
 with a model that saw it (and refusing a checkpoint that claims to); a tiny run learning a

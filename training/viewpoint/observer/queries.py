@@ -1,19 +1,8 @@
-"""Structured geometry queries derived from `chudware.geomlabel/1` records (no text).
+"""Structured, answer-balanced geometry queries from `chudware.geomlabel/1` records.
 
-A query is what the Observer is asked about a rendered view set: a kind (count /
-presence_side / through_blind / type), the subject (a multi-hot over CANON classes), where the
-subject sits (bbox-normalised centroid + opening-axis one-hot) and, in target mode, the target
-is ALSO painted by the render's emphasis overlay. The answer is an index into the kind's answer
-space; ``option_mask`` marks the valid options inside the shared ``A_MAX`` logit vector.
-
-Nothing in ``vec`` may give the answer away, otherwise the Observer answers from the query and
-the pixels stop mattering:
-- presence_side zeroes the axis one-hot (knowing the axis halves the six sides to two);
-- through_blind names the subject by FAMILY (hole_through and hole_blind both set) because the
-  CANON class alone would say which;
-- type leaves the subject empty (the class IS the answer).
-Answers are then balanced within each (mode, kind, subject) stratum, and a stratum with a
-single answer value is dropped: its answer would be a constant of the query vector.
+Part queries ask for counts of named families over the entire part. Target queries identify
+their feature only through the render's emphasis overlay; the vector never carries feature
+position, orientation, or identity. The query-only baseline is thus the per-stratum majority.
 """
 from __future__ import annotations
 
@@ -29,7 +18,7 @@ import numpy as np
 
 from training.viewpoint.datasets.importers import CANON
 
-QUERY_SCHEMA = "viewnet.query/1"
+QUERY_SCHEMA = "viewnet.query/2"
 KINDS = ("count", "presence_side", "through_blind", "type")
 MODES = ("part", "target")
 SIDES = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")
@@ -57,19 +46,13 @@ COUNT_GROUPS = tuple(
     + [(c, (c,)) for c in ("hole_through", "hole_blind", "slot_through", "slot_blind",
                            "step_through", "step_blind")])
 
-# Query vector layout.
+# Query vector: kind, mode, and subject class multi-hot only. Instance geometry (including
+# bbox-relative position and opening axis) belongs in the pixels, never the query.
 _K0 = 0
 _M0 = _K0 + len(KINDS)
 _C0 = _M0 + len(MODES)
-_L0 = _C0 + len(CANON)
-_H0 = _L0 + 3
-_A0 = _H0 + 1
-QD = _A0 + 3
+QD = _C0 + len(CANON)
 A_MAX = max(COUNT_BINS, len(SIDES), len(THROUGH_BLIND), len(CANON))
-
-# A located part-mode query names its subject by position only, so no other candidate may sit
-# within this bbox-normalised distance of it.
-LOCATE_RADIUS = 0.2
 BALANCE_RATIO = 1.5                  # cap per answer value = ratio x rarest supported value
 
 
@@ -136,43 +119,12 @@ def _h(*parts) -> str:
     return hashlib.sha1(json.dumps([str(p) for p in parts]).encode()).hexdigest()
 
 
-def _bbox(record: dict) -> tuple:
-    bb = (record.get("stats") or {}).get("bbox") or {}
-    return [float(v) for v in bb["min"][:3]], [float(v) for v in bb["max"][:3]]
-
-
-def _norm_loc(centroid, lo, hi) -> Optional[np.ndarray]:
-    if centroid is None:
-        return None
-    out = np.zeros(3, np.float32)
-    for k in range(3):
-        ext = hi[k] - lo[k]
-        t = 0.5 if ext <= 1e-9 else (float(centroid[k]) - lo[k]) / ext
-        out[k] = min(1.0, max(0.0, t)) - 0.5
-    return out
-
-
-def _axis_onehot(axis) -> np.ndarray:
-    out = np.zeros(3, np.float32)
-    if axis is not None and len(axis) >= 3:
-        a = np.abs(np.asarray(axis[:3], np.float64))
-        if a.max() > 1e-9:
-            out[int(np.argmax(a))] = 1.0
-    return out
-
-
-def _vec(kind: str, mode: str, classes: Iterable[str], loc: Optional[np.ndarray],
-         axis: Optional[np.ndarray]) -> np.ndarray:
+def _vec(kind: str, mode: str, classes: Iterable[str]) -> np.ndarray:
     v = np.zeros(QD, np.float32)
     v[_K0 + KINDS.index(kind)] = 1.0
     v[_M0 + MODES.index(mode)] = 1.0
     for c in classes:
         v[_C0 + CANON.index(c)] = 1.0
-    if loc is not None:
-        v[_L0:_L0 + 3] = loc
-        v[_H0] = 1.0
-    if axis is not None:
-        v[_A0:_A0 + 3] = axis
     return v
 
 
@@ -191,18 +143,6 @@ def _make(part_id: str, kind: str, mode: str, target_instance: int, vec: np.ndar
                  subject=subject, target_faces=tuple(target_faces), target_class=target_class)
 
 
-def _isolated(f: dict, pool: list, locs: dict) -> bool:
-    """No other pool member lies within LOCATE_RADIUS of f (so a location names it)."""
-    me = locs.get(f["instance"])
-    if me is None:
-        return False
-    for g in pool:
-        if g["instance"] == f["instance"]:
-            continue
-        other = locs.get(g["instance"])
-        if other is not None and float(np.linalg.norm(other - me)) < LOCATE_RADIUS:
-            return False
-    return True
 
 
 def build_queries(record: dict, *, seed: int = 0) -> list:
@@ -212,11 +152,8 @@ def build_queries(record: dict, *, seed: int = 0) -> list:
     labels; the seed only selects which ones balancing keeps (build_query_bank)."""
     del seed
     part_id = str(record["part_id"])
-    lo, hi = _bbox(record)
     feats = [f for f in (record.get("features") or [])
              if f.get("class") in FAMILY and f.get("faces")]
-    locs = {f["instance"]: _norm_loc(f.get("centroid"), lo, hi) for f in feats}
-    locs = {k: v for k, v in locs.items() if v is not None}
     out: list = []
 
     # count: whole part, one query per counted group.
@@ -224,40 +161,30 @@ def build_queries(record: dict, *, seed: int = 0) -> list:
         n = sum(1 for f in feats if f["class"] in classes)
         b = min(n, COUNT_BINS - 1)
         out.append(_make(part_id, "count", "part", -1,
-                         _vec("count", "part", classes, None, None), b,
+                         _vec("count", "part", classes), b,
                          str(b) if b < COUNT_BINS - 1 else f"{COUNT_BINS - 1}+", group))
 
-    by_family = defaultdict(list)
+    # A target is selected by the emphasis overlay, not by coordinates in the query.
     for f in feats:
-        by_family[FAMILY[f["class"]]].append(f)
 
-    for f in feats:
         cls, inst = f["class"], int(f["instance"])
         fam = FAMILY[cls]
         fam_classes = FAMILY_CLASSES[fam]
         side = f.get("opening_side")
         through = f.get("through")
-        loc = locs.get(inst)
-        axis = _axis_onehot(f.get("axis"))
         faces = tuple(int(o) for o in f["faces"])
-        fam_ok = _isolated(f, by_family[fam], locs)
-        any_ok = _isolated(f, feats, locs)
-        for mode in MODES:
-            located = mode == "target" or fam_ok
-            tkw = ({"target_faces": faces, "target_class": cls} if mode == "target" else {})
-            ti = inst if mode == "target" else -1
-            if side in SIDES and located:
-                out.append(_make(part_id, "presence_side", mode, ti,
-                                 _vec("presence_side", mode, fam_classes, loc, None),
-                                 SIDES.index(side), side, fam, **tkw))
-            if through is not None and located:
-                a = 0 if through else 1
-                out.append(_make(part_id, "through_blind", mode, ti,
-                                 _vec("through_blind", mode, fam_classes, loc, axis),
-                                 a, THROUGH_BLIND[a], fam, **tkw))
-            if mode == "target" or any_ok:
-                out.append(_make(part_id, "type", mode, ti, _vec("type", mode, (), loc, None),
-                                 CANON.index(cls), cls, "", **tkw))
+        tkw = {"target_faces": faces, "target_class": cls}
+        if side in SIDES:
+            out.append(_make(part_id, "presence_side", "target", inst,
+                             _vec("presence_side", "target", fam_classes),
+                             SIDES.index(side), side, fam, **tkw))
+        if through is not None:
+            a = 0 if through else 1
+            out.append(_make(part_id, "through_blind", "target", inst,
+                             _vec("through_blind", "target", fam_classes),
+                             a, THROUGH_BLIND[a], fam, **tkw))
+        out.append(_make(part_id, "type", "target", inst, _vec("type", "target", ()),
+                         CANON.index(cls), cls, "", **tkw))
     uniq = {q.qid: q for q in out}
     return [uniq[k] for k in sorted(uniq)]
 
@@ -350,3 +277,47 @@ def chance_by_kind(queries: Iterable) -> dict:
     for q in queries:
         acc[q.kind].append(q.chance)
     return {k: float(np.mean(v)) for k, v in sorted(acc.items())}
+
+
+def qvec_probe(bank: Iterable[Query], split_fn) -> dict:
+    """Held-out-part linear probe of the entire vector, with train-part majority control.
+
+    ``split_fn(part_id)`` is true for held-out parts. One query is counted once even when it
+    appears in many view sets. Ridge one-vs-rest classification is deterministic and needs
+    only numpy; it detects fields correlated with answers that stratum balancing cannot see.
+    """
+    by_kind = defaultdict(lambda: ([], []))
+    for q in bank:
+        by_kind[q.kind][bool(split_fn(q.part_id))].append(q)
+    out = {}
+    for kind, (train, held) in sorted(by_kind.items()):
+        if not train or not held:
+            continue
+        counts = defaultdict(lambda: defaultdict(int))
+        for q in train:
+            counts[(q.mode, q.kind, q.subject)][q.answer] += 1
+        fallback = defaultdict(int)
+        for q in train:
+            fallback[q.answer] += 1
+        default = max(sorted(fallback), key=lambda a: fallback[a])
+        majority = np.asarray(
+            [max(sorted(counts[(q.mode, q.kind, q.subject)]),
+                 key=lambda a: counts[(q.mode, q.kind, q.subject)][a])
+             if counts[(q.mode, q.kind, q.subject)] else default for q in held])
+        x = np.stack([q.vec for q in train]).astype(np.float64)
+        z = np.stack([q.vec for q in held]).astype(np.float64)
+        if x.shape[1] != z.shape[1]:
+            raise ValueError("train/held-out query vector dimensions differ")
+        x = np.column_stack((x, np.ones(len(x))))
+        z = np.column_stack((z, np.ones(len(z))))
+        choices = sorted({q.answer for q in train})
+        target = np.asarray([q.answer for q in train])
+        y = (target[:, None] == np.asarray(choices)[None, :]).astype(np.float64)
+        reg = np.eye(x.shape[1]) * 1e-4
+        reg[-1, -1] = 0
+        weights = np.linalg.solve(x.T @ x + reg, x.T @ y)
+        pred = np.asarray(choices)[(z @ weights).argmax(axis=1)]
+        actual = np.asarray([q.answer for q in held])
+        out[kind] = {"n": len(held), "acc": float(np.mean(pred == actual)),
+                     "majority": float(np.mean(majority == actual))}
+    return out

@@ -574,10 +574,11 @@ def fit_folds(store, *, k: int = 5, judge: str = "crossfit", folds: Optional[Ite
     part_fold = {p: fold_of(p, k, spec.salt) for p in corpus.parts()}
     meta_path = folds_meta_path(store.root, judge)
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-    if meta and (meta.get("k") != k or meta.get("salt") != spec.salt):
+    if meta and (meta.get("k") != k or meta.get("salt") != spec.salt or
+                 meta.get("query_schema") != QUERY_SCHEMA):
         meta = {}
-    meta.update(schema=OBSERVER_SCHEMA, judge=judge, k=k, salt=spec.salt,
-                variant=spec.variant)
+    meta.update(schema=OBSERVER_SCHEMA, query_schema=QUERY_SCHEMA, judge=judge, k=k,
+                salt=spec.salt, variant=spec.variant)
     meta.setdefault("folds", {})
     wanted = sorted(set(range(k)) if folds is None else {int(f) for f in folds})
     t_all = time.time()
@@ -659,7 +660,7 @@ def learning_report(store, *, fractions=(0.125, 0.25, 0.5, 1.0), seeds=(0, 1, 2)
                     log: Callable = print) -> dict:
     """Held-out (fold `fold` of the crossfit assignment) per-kind accuracy vs train-part
     fraction, seed spread at the full fraction, shuffled-label and blind (no pixels)
-    controls, chance and majority baselines."""
+    controls, chance, majority and a held-out-part query-vector-only leak probe."""
     spec = JUDGES["crossfit"]
     cfg = cfg or TrainConfig(variant=spec.variant, seed=spec.seed)
     device = device or default_device()
@@ -701,6 +702,9 @@ def learning_report(store, *, fractions=(0.125, 0.25, 0.5, 1.0), seeds=(0, 1, 2)
                corpus, [i for i, s in enumerate(corpus.sets) if s["part_id"] in set(order)]),
                ev_items),
            "learning_curve": curve, "seeds": spread}
+    from .queries import qvec_probe  # noqa: PLC0415
+    out["qvec_probe"] = qvec_probe(corpus.queries.values(),
+                                    lambda p: fold_of(p, k, spec.salt) == fold)
     kinds = sorted(curve[-1]["metrics"])
     out["seed_spread"] = {kk: {"mean": float(np.mean([r["metrics"][kk]["acc"] for r in spread])),
                                "std": float(np.std([r["metrics"][kk]["acc"] for r in spread]))}
@@ -728,7 +732,9 @@ def format_report(rep: dict) -> str:
             (f"{vals[k]:.3f}" if k in vals else "-").rjust(14) for k in kinds))
 
     row("chance (uniform)", rep["chance"])
-    row("majority (query only)", rep["majority"])
+    row("majority (set pairs)", rep["majority"])
+    row("majority (unique qids)", {k: v["majority"] for k, v in rep["qvec_probe"].items()})
+    row("qvec_probe", {k: v["acc"] for k, v in rep["qvec_probe"].items()})
     for r in rep["learning_curve"]:
         row(f"frac {r['fraction']:.3g} ({r['train_parts']}p)",
             {k: v["acc"] for k, v in r["metrics"].items()})

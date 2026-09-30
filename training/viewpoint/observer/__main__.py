@@ -1,9 +1,10 @@
-"""CLI: python3 -m training.viewpoint.observer {render,train,label,report}
+"""CLI: python3 -m training.viewpoint.observer {render,requery,train,label,report}
 
-render  plan + render the Observer's own random-ish training view sets (engine workers)
-train   fit a judge's K fold models (part cross-fitting)                          (torch)
-label   label every (view set, query) pair of a store namespace with a judge      (torch)
-report  learning curves per kind vs train fraction, seed spread, controls         (torch)
+render   plan + render the Observer's own random-ish training view sets (engine workers)
+requery  remap existing rendered sets to the current query schema (no engine needed)
+train    fit a judge's K fold models (part cross-fitting)                          (torch)
+label    label every (view set, query) pair of a store namespace with a judge      (torch)
+report   learning curves per kind vs train fraction, seed spread, controls         (torch)
 See README.md in this directory.
 """
 from __future__ import annotations
@@ -94,6 +95,17 @@ def cmd_render(args) -> int:
     return 0 if summary["errors"] == 0 else 1
 
 
+def cmd_requery(args) -> int:
+    from training.viewpoint.datasets.build_manifest import default_manifest_path  # noqa: PLC0415
+    from training.viewpoint.utility.trials import load_labels  # noqa: PLC0415
+    from .requery import requery_store  # noqa: PLC0415
+
+    records = load_labels(args.labels or default_manifest_path(), args.splits)
+    summary = requery_store(args.store, records, seed=args.seed)
+    print(json.dumps(summary, indent=1))
+    return 0
+
+
 def cmd_train(args) -> int:
     from .train import fit_folds  # noqa: PLC0415
 
@@ -179,6 +191,14 @@ def main(argv=None) -> int:
     p.add_argument("--tile", type=_hw, default=(512, 384), help="render tile WxH")
     p.add_argument("--seed", type=int, default=0)
     p.set_defaults(fn=cmd_render)
+
+    p = sub.add_parser("requery", help="rebuild query bank and remap old sets without rendering")
+    _add_store(p)
+    p.add_argument("--labels", type=Path, default=None,
+                   help="geomlabel JSONL (default: the DatasetsLabels manifest)")
+    p.add_argument("--splits", type=_csv, default=("train", "val", "test"))
+    p.add_argument("--seed", type=int, default=0)
+    p.set_defaults(fn=cmd_requery)
 
     p = sub.add_parser("train", help="fit a judge's cross-fitted fold models")
     _add_store(p)

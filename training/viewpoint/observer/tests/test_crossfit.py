@@ -52,8 +52,7 @@ def _store(tmp_path, n_parts: int, sets_per_part: int, seed: int = 0):
     for p in range(n_parts):
         pid = f"synth/{p:03d}"
         side = int(rng.integers(0, 6))
-        vec = Q._vec("presence_side", "part", Q.FAMILY_CLASSES["pocket"],
-                     np.zeros(3, np.float32), None)
+        vec = Q._vec("presence_side", "part", Q.FAMILY_CLASSES["pocket"])
         queries.append(Q._make(pid, "presence_side", "part", -1, vec, side, Q.SIDES[side],
                                "pocket"))
         for s in range(sets_per_part):
@@ -118,10 +117,23 @@ def test_crossfit_never_labels_a_part_with_a_model_that_saw_it(tmp_path):
         assert r["fold"] == T.fold_of(r["part_id"], k, salt)
         assert 0.0 <= r["p_correct"] <= 1.0
         assert r["observer_digest"] == J.observer_digest(meta)
+    meta_path = T.folds_meta_path(store.root, "crossfit")
+    bad_meta = json.loads(meta_path.read_text())
+    bad_meta["query_schema"] = "viewnet.query/1"
+    meta_path.write_text(json.dumps(bad_meta))
+    with pytest.raises(ValueError, match="query/1"):
+        J.judge_meta(store.root, "crossfit")
+    bad_meta["query_schema"] = Q.QUERY_SCHEMA
+    meta_path.write_text(json.dumps(bad_meta))
 
     # A checkpoint that claims to have trained on a part of its own fold must be refused.
     path = T.judge_dir(store.root, "crossfit") / "fold0.pt"
     ck = torch.load(path, weights_only=False)
+    ck["query_schema"] = "viewnet.query/1"
+    torch.save(ck, path)
+    with pytest.raises(ValueError, match="query/1"):
+        T.load_checkpoint(path, torch.device("cpu"))
+    ck["query_schema"] = Q.QUERY_SCHEMA
     victim = next(p for p in corpus.parts() if T.fold_of(p, k, salt) == 0)
     ck["trained_parts"] = sorted(ck["trained_parts"] + [victim])
     torch.save(ck, path)

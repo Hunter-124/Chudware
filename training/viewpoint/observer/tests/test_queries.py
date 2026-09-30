@@ -1,6 +1,7 @@
 """Queries: answer balance, determinism, option masks, and no answer leaking into the vector."""
 from __future__ import annotations
 
+import json
 import random
 from collections import Counter, defaultdict
 
@@ -90,19 +91,35 @@ def test_option_masks_and_chance():
             assert not q.option_mask[CANON.index("other")]
 
 
-def test_query_vector_does_not_give_the_answer_away():
+def test_query_vector_names_only_the_subject_and_never_locates_it():
     cls = slice(Q._C0, Q._C0 + len(CANON))
-    axis = slice(Q._A0, Q._A0 + 3)
     for q in Q.build_query_bank(_records(300), seed=0):
-        if q.kind == "presence_side":
-            assert not q.vec[axis].any()
-        if q.kind == "type":
-            assert not q.vec[cls].any()
-        if q.kind == "through_blind":
-            named = {CANON[i] for i in np.flatnonzero(q.vec[cls])}
-            assert named == set(Q.FAMILY_CLASSES[q.subject])
-            assert len(named) == 2      # both the through and the blind variant
+        if q.mode == "part":
+            assert q.kind == "count" and q.target_instance == -1
+        else:
+            assert q.target_instance >= 0
+            if q.kind == "type":
+                assert not q.vec[cls].any()
+            else:
+                named = {CANON[i] for i in np.flatnonzero(q.vec[cls])}
+                assert named == set(Q.FAMILY_CLASSES[q.subject])
+        assert q.vec.shape == (len(Q.KINDS) + len(Q.MODES) + len(CANON),)
 
+
+def test_qvec_probe_catches_a_hidden_answer_field():
+    from dataclasses import replace
+
+    bank = Q.build_query_bank(_records(400, seed=7))
+    split = lambda p: int(p.split("/")[-1]) % 5 == 0
+    clean = Q.qvec_probe(bank, split)
+    for kind, row in clean.items():
+        assert row["acc"] <= row["majority"] + 0.03, (kind, row)
+    # A field omitted from the balancing key may appear harmless in marginal counts,
+    # but a trained query-only classifier must discover that it encodes the answer.
+    leaky = [replace(q, vec=np.r_[q.vec, float(q.answer == 0)].astype(np.float32))
+             for q in bank]
+    probed = Q.qvec_probe(leaky, split)
+    assert probed["through_blind"]["acc"] > probed["through_blind"]["majority"] + 0.2
 
 def test_target_mode_carries_the_painted_faces():
     for q in Q.build_query_bank(_records(100), seed=0):
@@ -132,3 +149,49 @@ def test_pick_targets_is_seeded_and_bounded():
     a = Q.pick_targets(qs, 2, seed=0)
     assert a == Q.pick_targets(list(reversed(qs)), 2, seed=0)
     assert len(a) == min(2, len(insts)) and set(a) <= insts
+
+
+def test_requery_remaps_all_namespaces_and_archives_stale_labels(tmp_path):
+    from training.viewpoint.observer.requery import requery_store
+
+    records = _records(100)
+    sample = Q.build_query_bank(records)
+    target = next(q for q in sample if q.mode == "target")
+    part = next(q for q in sample if q.mode == "part")
+    (tmp_path / "observer").mkdir()
+    (tmp_path / "images").mkdir()
+    img = tmp_path / "images" / "unchanged.png"
+    img.write_bytes(b"original render")
+    old = {"schema": "viewnet.query/1", "qid": "old"}
+    Q.queries_path(tmp_path).write_text(json.dumps(old) + "\n")
+    (tmp_path / "labels_crossfit.jsonl").write_text('{"stale":true}\n')
+    (tmp_path / "observer" / "labels_crossfit.jsonl").write_text('{"stale":true}\n')
+    (tmp_path / "observer" / "crossfit").mkdir()
+    (tmp_path / "observer" / "crossfit" / "fold0.pt").write_bytes(b"stale checkpoint")
+    for path, q in ((tmp_path / "observer" / "sets.jsonl", target),
+                    (tmp_path / "sets.jsonl", part),
+                    (tmp_path / "sets_ab.jsonl", target)):
+        path.write_text(json.dumps({"set_key": path.stem, "part_id": q.part_id,
+                                    "mode": q.mode, "target_instance": q.target_instance,
+                                    "image": "images/unchanged.png", "qids": ["old"]}) + "\n")
+    result = requery_store(tmp_path, records)
+    assert result["changed"] and result["queries"] == len(sample)
+    assert result["sets"] == {"observer/sets.jsonl": 1, "sets.jsonl": 1,
+                               "sets_ab.jsonl": 1}
+    for name, q in (("observer/sets.jsonl", target), ("sets.jsonl", part),
+                    ("sets_ab.jsonl", target)):
+        row = json.loads((tmp_path / name).read_text())
+        assert row["image"] == "images/unchanged.png"
+        assert set(row["qids"]) == {x.qid for x in sample if
+                                   (x.part_id, x.mode, x.target_instance) ==
+                                   (q.part_id, q.mode, q.target_instance)}
+    assert img.read_bytes() == b"original render"
+    assert not (tmp_path / "labels_crossfit.jsonl").exists()
+    assert not (tmp_path / "observer" / "crossfit" / "fold0.pt").exists()
+    archive = next((tmp_path / "query_archive").iterdir())
+    assert (archive / "observer" / "queries.jsonl").exists()
+    assert (archive / "labels_crossfit.jsonl").exists()
+    assert (archive / "observer" / "labels_crossfit.jsonl").exists()
+    assert (archive / "observer" / "crossfit" / "fold0.pt").exists()
+    second = requery_store(tmp_path, records)
+    assert not second["changed"] and second["archived"] == []

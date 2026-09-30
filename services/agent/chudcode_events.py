@@ -880,6 +880,8 @@ def _message_update(
             if key in message and key not in child:
                 child[key] = message[key]
     for key in (
+        "messageId",
+        "message_id",
         "runId",
         "run_id",
         "sessionId",
@@ -1030,13 +1032,18 @@ def map_rpc_frame(
     if event == "message_update":
         return _message_update(data, ctx, state)
 
-    # Persistent-session bookkeeping is not user activity.
+    # RPC control snapshots and prompt correlations are not agent feed activity.
+    # In particular, prompt_result follows agent_end and must not create a
+    # second completion row; session_settled can arrive after background jobs.
     if event in {
         "available_commands_update",
         "available_commands_updated",
         "credential_pin",
         "credential_unpin",
         "eager_todo_prelude",
+        "prompt_result",
+        "session_settled",
+        "queue_update",
     }:
         return []
     if event == "session_exit":

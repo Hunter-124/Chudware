@@ -56,8 +56,8 @@ _CATALOG_COMMAND_TIMEOUT_SECONDS = 90
 #: (set_custom_tools), which this list does not restrict. Memory tools are added per the
 #: session's memory backend (``_CAD_MEMORY_TOOLS``).
 CAD_SESSION_TOOLS = (
-    "read", "bash", "edit", "write", "glob", "grep", "eval", "task", "hub", "todo",
-    "web_search", "browser", "computer",
+    "read", "bash", "edit", "write", "glob", "grep", "eval", "task", "wait", "todo",
+    "web_search",
 )
 
 _LOG = logging.getLogger(__name__)
@@ -151,7 +151,7 @@ def _credential_client_scope(
     # RpcClient merges env into os.environ: blank inherited credentials/config
     # before restoring process essentials and the one selected provider secret.
     clean = {name: "" for name in os.environ}
-    for name in ("PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "CHUDCODE_PACKAGE_DIR"):
+    for name in ("PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "PI_PACKAGE_DIR"):
         if name in os.environ:
             clean[name] = os.environ[name]
     clean.update({
@@ -159,7 +159,7 @@ def _credential_client_scope(
         "XDG_CONFIG_HOME": str(xdg),
         "XDG_DATA_HOME": str(home / "data"),
         "XDG_CACHE_HOME": str(home / "cache"),
-        "CHUDCODE_CODING_AGENT_DIR": str(agent),
+        "PI_CODING_AGENT_DIR": str(agent),
         env_name: secret,
     })
     return tempdir, str(scoped), clean
@@ -371,6 +371,7 @@ class ChudcodeSessionHost:
         # so spawn-per-call was what made "loading providers" take 30 s+. Calls are
         # serialized on the process; a dead process is replaced on the next call.
         self._service_client: Any = None
+        self._service_memory_backend: str | None = None
         self._service_lock = threading.Lock()
         self._shutdown = False
         self._catalog_refresh_lock = threading.Lock()
@@ -1103,6 +1104,7 @@ class ChudcodeSessionHost:
             service_client = self._service_client
             self._sessions.clear()
             self._service_client = None
+            self._service_memory_backend = None
             for session in sessions:
                 session.closed = True
                 session.dispose_started = True
@@ -1375,7 +1377,7 @@ class ChudcodeSessionHost:
             except ImportError as exc:
                 raise RuntimeError(
                     "Agent service RPC support is unavailable; install the managed "
-                    "chudcode-rpc==0.2.0 runtime dependency"
+                    "chudcode-rpc==0.3.0 runtime dependency"
                 ) from exc
             factory = RpcClient
 
@@ -1397,6 +1399,16 @@ class ChudcodeSessionHost:
             # retains terminal and provider-recovery frames.
             "max_event_history": _event_history_limit_from_env(),
         }
+        if no_session:
+            from services.agent.config import memory_backend
+
+            memory = memory_backend()
+            if binary is not None and not _binary_has_memory_backend(binary, memory):
+                memory = "mnemo"
+            if binary is not None and _binary_supports_flag(binary, "--config"):
+                overlay = _cad_session_overlay(memory)
+                if overlay is not None:
+                    kwargs["extra_args"] = ("--config", overlay)
         if clean_env is not None:
             kwargs["env"] = clean_env
         if binary is not None:
@@ -1417,14 +1429,12 @@ class ChudcodeSessionHost:
             # 106 KB of prompt + tool schema, 72 KB after (measured with get_state).
             kwargs["no_skills"] = True
             # The user's Chudcode MCP servers (stripe, graphify ...) are not CAD tools.
-            # The pinned release chud predates --no-mcp and rejects unknown flags.
             extra: tuple[str, ...] = ("--no-lsp",)
             if binary is not None and _binary_supports_flag(binary, "--no-mcp"):
                 extra += ("--no-mcp",)
             memory = _session_memory_backend(params, workspace)
             if binary is not None and not _binary_has_memory_backend(binary, memory):
-                # A chud that predates the backend exits at startup on its name; the
-                # conversation keeps project-scoped recall instead.
+                # Older binaries lacking sharpshooter still have project-scoped Mnemopi.
                 _LOG.warning("chud at %s lacks memory backend %r; using mnemo", binary, memory)
                 memory = "mnemo"
             overlay = (
@@ -1567,7 +1577,7 @@ class ChudcodeSessionHost:
                         from chudcode_rpc import host_tool  # type: ignore
                     except ImportError as exc:
                         raise RuntimeError(
-                            "chudcode-rpc==0.2.0 is required to register CAD host tools"
+                            "chudcode-rpc==0.3.0 is required to register CAD host tools"
                         ) from exc
                     binding = converter(host_tool)
                 converted_tools.append(binding)
@@ -1580,18 +1590,25 @@ class ChudcodeSessionHost:
             registrar(client)
 
     def _service_client_locked(self) -> Any:
-        """Return the live shared service process, spawning it when absent or dead.
+        """Return the shared no-session process for the current GUI memory backend.
 
-        Caller holds ``_service_lock``.
+        Caller holds ``_service_lock``. Recycle on a settings change so explicit-root
+        memory commands and conversations use the same selected backend; auth/catalog
+        calls continue to share this single service process.
         """
+        from services.agent.config import memory_backend
+
+        backend = memory_backend()
         client = self._service_client
-        if client is not None and getattr(client, "_closed_error", None) is None:
+        if (client is not None and getattr(client, "_closed_error", None) is None
+                and self._service_memory_backend == backend):
             return client
         if client is not None:
             _stop_client(client)
             with self._lock:
                 if self._service_client is client:
                     self._service_client = None
+                    self._service_memory_backend = None
         client = self._make_client({}, no_session=True)
         _start_client(client)
         with self._lock:
@@ -1599,6 +1616,7 @@ class ChudcodeSessionHost:
                 _stop_client(client)
                 raise RuntimeError("chudcode session host is shut down")
             self._service_client = client
+            self._service_memory_backend = backend
         return client
 
     def refresh_catalog_if_stale(self) -> bool:
@@ -2179,12 +2197,13 @@ def _binary_supports_flag(path: str, flag: str) -> bool:
 def _binary_has_memory_backend(path: str, backend: str) -> bool:
     """Whether ``chud`` knows ``backend``: it exits at startup on an unknown one.
 
-    Only the built-ins "off"/"mnemo" predate the setting listing; a newer backend is
-    recognized by its own settings in ``chud config list --json``.
+    Only "off" predates the setting listing. CAD's "mnemo" is named "mnemopi"
+    by Chudcode; probe its settings just like sharpshooter's.
     """
-    if backend in ("off", "mnemo"):
+    if backend == "off":
         return True
-    return f'"{backend}.' in _binary_probe(path, ("config", "list", "--json"))
+    runtime_backend = "mnemopi" if backend == "mnemo" else backend
+    return f'"{runtime_backend}.' in _binary_probe(path, ("config", "list", "--json"))
 
 
 #: Chudcode settings every CAD conversation process runs with (``--config`` overlay).
@@ -2200,13 +2219,15 @@ _CAD_SESSION_SETTINGS = (
     "  - context-file:user:CLAUDE.md\n"
     "  - context-file:user:GEMINI.md\n"
     "  - context-file:user:copilot-instructions.md\n"
+    "browser.enabled: true\n"
+    "computer.enabled: true\n"
 )
 #: Per-backend memory settings. Chudcode keys every backend's store by the process cwd,
-#: which is the CAD project folder, so memory never crosses projects; mnemo's scoping is
-#: pinned so a user-level `global` setting cannot pool all projects into one bank.
+#: which is the CAD project folder, so memory never crosses projects; Mnemopi's scoping
+#: is pinned so a user-level `global` setting cannot pool all projects into one bank.
 _CAD_MEMORY_SETTINGS = {
     "off": "memory:\n  backend: \"off\"\n",
-    "mnemo": "memory:\n  backend: mnemo\nmnemo:\n  scoping: per-project\n",
+    "mnemo": "memory:\n  backend: mnemopi\nmnemopi:\n  scoping: per-project\n",
     "sharpshooter": "memory:\n  backend: sharpshooter\n",
 }
 #: The Chudcode tools each backend provides. chud refuses to start when --tools names a

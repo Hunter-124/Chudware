@@ -184,7 +184,7 @@ class FakeClient:
             "sessionFile": self.session_file,
             "dumpTools": [
                 {"name": "read", "description": "Read", "parameters": {}},
-                {"name": "browser", "description": "Browse", "parameters": {}},
+                {"name": "eval", "description": "Evaluate", "parameters": {}},
             ],
         }
 
@@ -376,7 +376,7 @@ def test_byok_process_isolated_and_live_session_rejects_credential_switch(
     assert Path(client.kwargs["session_dir"]).stat().st_mode & 0o777 == 0o700
     home = Path(child_env["HOME"])
     assert home.is_dir()
-    assert child_env["CHUDCODE_CODING_AGENT_DIR"].startswith(str(home))
+    assert child_env["PI_CODING_AGENT_DIR"].startswith(str(home))
 
     repeat, _ = run(host, "shared-id", "alice-2", **scoped)
     other, _ = run(host, "shared-id", "bob-1", **{**scoped, "byok_tenant": "bob@example.com"})
@@ -1194,24 +1194,25 @@ def test_cad_session_process_drops_chudcode_dev_prompt_but_keeps_cad_tools(tmp_p
     session_kwargs = factory.clients[0].kwargs
     argv = RpcClient(**{**session_kwargs, "executable": "chud"})._build_command()
     tools = argv[argv.index("--tools") + 1].split(",")
-    for needed in ("read", "write", "edit", "bash", "eval", "task", "hub", "todo",
-                   "web_search", "browser"):
+    for needed in ("read", "write", "edit", "bash", "eval", "task", "wait", "todo",
+                   "web_search"):
         assert needed in tools
-    for dropped in ("lsp", "security_scan", "debug", "firmware", "cpp_static", "github"):
+    for dropped in ("lsp", "security_scan", "debug", "firmware", "cpp_static", "github",
+                    "hub", "browser", "computer"):
         assert dropped not in tools
     assert "--no-skills" in argv and "--no-lsp" in argv
     service = next(c for c in factory.clients if c.kwargs.get("no_session"))
-    assert not {"tools", "no_skills", "extra_args"} & set(service.kwargs)
+    assert not {"tools", "no_skills"} & set(service.kwargs)
     host.shutdown()
 
 
 @pytest.mark.parametrize(("help_text", "expected"), [
     ("  --no-lsp  Disable LSP\n  --no-mcp  Disable MCP discovery\n", True),
-    ("  --no-lsp  Disable LSP\n  --no-mcp-cache  unrelated\n", False),  # pinned 0.3.0 shape
+    ("  --no-lsp  Disable LSP\n  --no-mcp-cache  unrelated\n", False),
 ])
 def test_no_mcp_reaches_only_a_chud_that_accepts_it(tmp_path, help_text, expected):
-    """The pinned release chud rejects unknown flags, so --no-mcp is passed only when the
-    resolved binary's --help lists it — probed once per binary identity."""
+    """Pass --no-mcp only when the resolved binary advertises it; probe once
+    per binary identity so incompatible developer binaries can still start."""
     fake = tmp_path / "chud"
     calls = tmp_path / "help-calls"
     fake.write_text(f"#!/bin/sh\necho x >> {calls}\ncat <<'EOF'\n{help_text}EOF\n")
@@ -1234,12 +1235,12 @@ _MNEMO_TOOLS = {"retain", "recall", "reflect"}
 
 @pytest.mark.parametrize(("workspace", "backend", "knows_ss", "expected", "memory_tools"), [
     (True, "sharpshooter", True, "sharpshooter", set()),
-    (True, "mnemo", True, "mnemo", _MNEMO_TOOLS),
+    (True, "mnemo", True, "mnemopi", _MNEMO_TOOLS),
     (True, "off", True, "\"off\"", set()),
     (True, None, True, "sharpshooter", set()),  # no setting sent: the default backend
     (False, "mnemo", True, "\"off\"", set()),  # no project folder: no memory at all
     # A chud that predates sharpshooter exits at startup on its name.
-    (True, "sharpshooter", False, "mnemo", _MNEMO_TOOLS),
+    (True, "sharpshooter", False, "mnemopi", _MNEMO_TOOLS),
 ])
 def test_memory_is_the_projects_and_its_tools_match_the_backend(
     tmp_path, monkeypatch, workspace, backend, knows_ss, expected, memory_tools
@@ -1251,7 +1252,7 @@ def test_memory_is_the_projects_and_its_tools_match_the_backend(
 
     monkeypatch.setattr(paths, "ROOT", tmp_path / "data")
     fake = tmp_path / "chud"
-    settings = '"sharpshooter.model"' if knows_ss else '"mnemo.bank"'
+    settings = '"sharpshooter.model"' if knows_ss else '"mnemopi.bank"'
     fake.write_text(
         "#!/bin/sh\n"
         f"if [ \"$1\" = config ]; then echo '{{{settings}: null}}'; exit 0; fi\n"
@@ -1270,8 +1271,74 @@ def test_memory_is_the_projects_and_its_tools_match_the_backend(
     overlay = Path(args[args.index("--config") + 1]).read_text()
     assert f"memory:\n  backend: {expected}\n" in overlay
     assert "context-file:user:CLAUDE.md" in overlay
+    assert "browser.enabled: true" in overlay
+    assert "computer.enabled: true" in overlay
     assert set(client.kwargs["tools"]) & _MNEMO_TOOLS == memory_tools
     host.shutdown()
+
+def test_gui_memory_backend_configures_shared_service_and_tracks_selection(
+    tmp_path, monkeypatch
+):
+    from services import paths
+    from services.agent import config
+
+    selected = ["mnemo"]
+    monkeypatch.setattr(config, "memory_backend", lambda: selected[0])
+    monkeypatch.setattr(paths, "ROOT", tmp_path / "data")
+    fake = tmp_path / "chud"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = config ]; then echo '{\"mnemopi.bank\":null,\"sharpshooter.model\":null}'; exit 0; fi\n"
+        "echo '  --config=<value> y'\n"
+    )
+    fake.chmod(0o755)
+    factory = FakeFactory()
+    host = ChudcodeSessionHost(client_factory=factory, binary=fake)
+    try:
+        host.memory_call("memory_stats", {"root": str(tmp_path)})
+        first = factory.clients[0]
+        assert first.kwargs["no_session"]
+        args = first.kwargs["extra_args"]
+        assert "backend: mnemopi\nmnemopi:\n  scoping: per-project" in Path(
+            args[args.index("--config") + 1]
+        ).read_text()
+        host.memory_call("memory_stats", {"root": str(tmp_path)})
+        assert len(factory.clients) == 1
+        selected[0] = "sharpshooter"
+        host.memory_call("memory_stats", {"root": str(tmp_path)})
+        assert first.stop_count == 1
+        second = factory.clients[1]
+        args = second.kwargs["extra_args"]
+        assert "backend: sharpshooter" in Path(
+            args[args.index("--config") + 1]
+        ).read_text()
+    finally:
+        host.shutdown()
+
+
+def test_cad_tool_list_starts_with_runtime_when_available(tmp_path, monkeypatch):
+    """A real Chudcode rejects unknown --tools names before answering get_state."""
+    import os
+    from services import paths
+
+    binary = os.environ.get("CHUDWARE_CHUDCODE_BIN")
+    if not binary:
+        pytest.skip("set CHUDWARE_CHUDCODE_BIN to exercise the installed runtime")
+    monkeypatch.setattr(paths, "ROOT", tmp_path / "data")
+    host = ChudcodeSessionHost(binary=binary)
+    try:
+        for backend in ("mnemo", "sharpshooter"):
+            client = host._make_client(
+                {"workspace_dir": str(tmp_path), "memory_backend": backend},
+                no_session=False,
+            )
+            try:
+                client.start()
+                assert client.get_state().session_id
+            finally:
+                client.stop()
+    finally:
+        host.shutdown()
 
 
 def test_missing_dependency_and_binary_are_actionable(monkeypatch, tmp_path):
@@ -1281,7 +1348,7 @@ def test_missing_dependency_and_binary_are_actionable(monkeypatch, tmp_path):
         {"request": "hi", "session_id": "s", "run_id": "r"}, lambda _frame: None
     )
     assert result["ok"] is False
-    assert "chudcode-rpc==0.2.0" in result["reason"]
+    assert "chudcode-rpc==0.3.0" in result["reason"]
 
     missing_binary = ChudcodeSessionHost(
         client_factory=FakeFactory(), binary=tmp_path / "missing-chud"
@@ -1519,6 +1586,12 @@ def test_upgraded_binary_is_rediscovered_before_the_refresh_ttl(monkeypatch, tmp
             return 0
 
     monkeypatch.setattr(chudcode_host_module.subprocess, "Popen", Refresh)
+    # The fake catalog Popen is not an executable; keep memory/flag probes
+    # independent of the refresh-specific process double.
+    monkeypatch.setattr(
+        chudcode_host_module, "_binary_probe",
+        lambda _path, args: '"sharpshooter.model"' if args[0] == "config" else "--config",
+    )
     assert host.refresh_catalog_if_stale() is True
     host._catalog_refresh_thread.join(timeout=2)
     clock[0] += 60
@@ -1989,10 +2062,12 @@ def test_real_rpc_client_protocol_covers_transient_and_live_session_calls(tmp_pa
                     print(json.dumps({"type": "extension_ui_request", "id": "oauth", "method": "open_url", "url": "https://login.example/authorize"}), flush=True)
                     respond(request_id, kind, {"providerId": command["providerId"]})
                 elif kind == "prompt":
-                    respond(request_id, kind, {})
+                    respond(request_id, kind, {"agentInvoked": True})
                     time.sleep(0.02)
                     print(json.dumps({"type": "agent_start"}), flush=True)
-                    print(json.dumps({"type": "agent_end", "messages": []}), flush=True)
+                    print(json.dumps({"type": "agent_end", "messages": [], "isTerminal": True, "yielded": True}), flush=True)
+                    print(json.dumps({"type": "prompt_result", "id": request_id, "agentInvoked": True, "status": "completed", "sessionSettled": True}), flush=True)
+                    print(json.dumps({"type": "session_settled"}), flush=True)
                 elif kind == "get_state":
                     respond(request_id, kind, {
                         "model": model(),
@@ -2008,7 +2083,7 @@ def test_real_rpc_client_protocol_covers_transient_and_live_session_calls(tmp_pa
                         "autoCompactionEnabled": True,
                         "messageCount": 2,
                         "queuedMessageCount": 0,
-                        "dumpTools": [{"name": "browser", "description": "Browse", "parameters": {"type": "object"}}],
+                        "dumpTools": [{"name": "eval", "description": "Evaluate", "parameters": {"type": "object"}}],
                     })
                 elif kind == "get_last_assistant_text":
                     respond(request_id, kind, {"text": "done"})
@@ -2065,7 +2140,7 @@ def test_real_rpc_client_protocol_covers_transient_and_live_session_calls(tmp_pa
     assert host.session_call("live", "compact")["summary"] == "trimmed"
     assert host.session_call("live", "set_auto_compaction", {"enabled": False})["ok"]
     assert host.session_call("live", "set_auto_retry", {"enabled": True})["ok"]
-    assert host.session_call("live", "get_state")["dumpTools"][0]["name"] == "browser"
+    assert host.session_call("live", "get_state")["dumpTools"][0]["name"] == "eval"
     assert host.session_call("live", "handoff")["document"] == "protocol handoff"
     assert host.session_call("live", "stt_status")["progress"] == 42
     assert host.session_call("live", "stt_start")["state"] == "recording"

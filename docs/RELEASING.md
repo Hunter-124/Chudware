@@ -344,13 +344,14 @@ source provenance only; it never changes executable identity. Every artifact
 must report exactly `Chudcode vX.Y.Z` from `--version` (the executable's own
 identity string); engine provenance is never accepted as or appended to it.
 
-### Current pin status (2026-09-29)
+### Current pin status (2026-09-30)
 
-Chudcode is retired as a product: no further releases, distribution or
-marketing. The runtime stays in use internally, pinned at `v0.3.0`
-(Linux x86_64 and macOS x86_64 pinned; Windows x86_64 unpinned, so Windows
-installer legs fail closed). `chudcode-v0.3.6` was never published and its tag
-was removed. Locks written before the x64-only matrix also list
+The lock pins `chudcode-v0.4.0` (the thin fork on upstream oh-my-pi 18.4.4,
+`engine_version` 18.4.4). Linux x86_64 and macOS x86_64 are pinned; Windows
+x86_64 is unpinned because the cross-compiled Windows CLI crashes inside Bun
+1.4.0 at startup, so Windows installer legs fail closed. `pin` requires all
+three targets, so this lock was written directly and validated with
+`verify-notices`, `verify` and `stage`. Locks written before the x64-only matrix also list
 `linux-aarch64`/`macos-arm64`; `load_lock` still accepts those so rollback can
 verify retained releases, but `pin` and `check-lock` require the exact
 supported set. No Linux ARM or macOS ARM artifact is planned; the CAD

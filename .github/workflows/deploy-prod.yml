@@ -122,7 +122,7 @@ jobs:
       # install_webd.sh stages the Chudcode runtime from this local file and
       # verifies it against vendor/chudcode/CHUDCODE_ARTIFACT.lock (sha256 +
       # `--version`). It lives outside the checkout, next to gateway.env, and
-      # is the chudcode-v0.3.0 linux-x64 release asset. Deployment never fetches.
+      # is the chudcode-v0.4.0 linux-x64 release asset. Deployment never fetches.
       CHUDWARE_CHUD_BIN: /home/liveuser/chudware-web-data/chud
       # The commit whose gates are being checked and which must still be
       # master's tip at deploy time. A manual dispatch uses its selected ref.

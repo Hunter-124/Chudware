@@ -291,7 +291,7 @@ class _FakeHost:
                 "_hostToolNames": ["cad_tool"],
                 "dumpTools": [
                     {"name": "read", "description": "Read files", "parameters": {}},
-                    {"name": "browser", "description": "Browse", "parameters": {}},
+                    {"name": "eval", "description": "Run browser/desktop preludes", "parameters": {}},
                     {"name": "cad_tool", "description": "CAD", "parameters": {}},
                 ],
             }
@@ -999,10 +999,9 @@ def test_live_session_management_is_isolated_bounded_and_capability_honest(onlin
     assert auto_retry["ok"] is True
 
     by_name = {tool["name"]: tool for tool in tools["tools"]}
-    assert by_name["browser"]["available"] is True
-    assert by_name["browser"]["loadMode"] == "discoverable"
-    assert by_name["computer"]["available"] is False
-    assert by_name["computer"]["loadMode"] == "essential"
+    assert by_name["eval"]["available"] is True
+    assert by_name["eval"]["loadMode"] == "essential"
+    assert "browser" not in by_name and "computer" not in by_name
     assert "cad_tool" not in by_name
     assert missing == {"ok": False, "reason": "session_not_live"}
     assert set(online_lane.host.sessions) == {"live"}

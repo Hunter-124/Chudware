@@ -17,7 +17,7 @@ provenance; only its 2026-08-31 superseding section is operational.
 
 - Chudcode owns every online top-level and nested provider call, auth, model catalog/selection,
   persistent session history, branching, memory, compaction, retry/cache behavior,
-  browser/computer tools, and STT.
+  browser/computer eval preludes, and STT.
 - Chudware owns CAD tools and schemas, documents/workspaces, roles, councils, mission/DAG
   policy, delegation governance, approvals, guardrails, PLM, event presentation, and the
   offline-safe native local-modeling fallback.
@@ -169,22 +169,31 @@ runtime's doctor command.
    serialized on `_service_lock`; a dead process is replaced on the next call; `shutdown()`
    stops it. Never reintroduce a per-call spawn.
 8b. **Session processes are lean (2026-09-27).** `_make_client` spawns conversation clients
-   with `--tools <CAD_SESSION_TOOLS> --no-skills --no-lsp`, plus `--no-mcp` only when the
-   binary's `--help` lists it (`_binary_supports_flag`, probed once per binary identity — the
-   pinned v0.3.0 artifact rejects it). Sub-agents inherit that ceiling (Chudcode `6b1e705d2e`).
-   Baseline per request 106k → 68k chars. The service client stays unrestricted.
+   with `--tools <CAD_SESSION_TOOLS> --no-skills --no-lsp`, plus `--no-mcp` when the
+   binary's `--help` lists it (`_binary_supports_flag`, probed once per binary identity;
+   Chudcode 0.4.0 supports it). Sub-agents inherit that ceiling. The shared
+   service client stays unrestricted.
 8c. **CAD session overlay (2026-09-28).** `_make_client` passes
    `--config <data>/chudcode/cad-session-<backend>.yml` (`_cad_session_overlay`, gated on
    `--help`). It disables user-level context files (`context-file:user:*` — Hunter's
    `~/.claude/CLAUDE.md` dev brief made gpt-6-sol pull/commit/push a firmware repo) and pins
    memory: the GUI's "Project memory" (`agent.memory_backend` = off | sharpshooter |
-   mnemo, default sharpshooter) arrives as host param `memory_backend`; every backend is keyed
-   by the process cwd = the project folder, and a no-workspace session gets `off`.
-   `--tools` carries only that backend's tools (`_CAD_MEMORY_TOOLS`; chud exits on one it
-   lacks). A chud without sharpshooter (no `sharpshooter.*` in `chud config list --json`)
-   exits on its name, so it falls back to mnemo. Project context files still load.
+   mnemo, default sharpshooter) arrives as host param `memory_backend`; `mnemo` is
+   translated only at the runtime boundary to `memory.backend: mnemopi` and
+   `mnemopi.scoping: per-project`. Each backend is keyed by the process cwd =
+   project folder, and a no-workspace session gets `off`. `--tools` carries only
+   that backend's tools (`_CAD_MEMORY_TOOLS`; chud exits on one it lacks). A
+   binary without sharpshooter settings falls back to Mnemopi. Project context
+   files still load. The shared no-session client also takes a backend-configured
+   overlay and is recycled when the GUI selection changes, so explicit-root
+   memory commands do not silently use Chudcode's default `off`.
    Chudcode's `<active-repo-context>` (a nested repo = "Active project") cannot be switched
    off; `general_agent.yaml` HOW TO WORK 7 overrides it.
+   The lean builtins use `task`/`wait` for orchestration (`history://`, `agent://`,
+   `proc://` via read/write), not the removed `hub` tool. Browser/desktop automation
+   is available inside `eval` through `browser` and `computer` preludes; the CAD
+   overlay pins `browser.enabled: true` and `computer.enabled: true`, not
+   standalone `--tools` entries.
 8d. **CAD calls made inside eval get feed rows (2026-09-28).** eval's `tool.write("xd://…")`
    reaches the host under an eval-bridge id (`js-write-…`) no tool frame owns, so the feed
    showed only "eval". `run_turn` binds `host_call_observer` on the run context
@@ -297,8 +306,13 @@ runtime's doctor command.
   alone never ran when hostd died mid-turn, so a 2-hour session (c217) had no resume key.
 - Preserve correlation (`run_id`, `session_id`, node/span/parent/subagent ids), but synthesize
   only deterministic digest ids when the source omitted one.
-- Unknown frames remain visible as bounded deterministic `sub_run` rows. Never drop them or
-  guess a stronger semantic event.
+- Unknown frames remain visible as bounded deterministic `sub_run` rows. The new
+  `prompt_result` (request id, `agentInvoked`, status, `sessionSettled`),
+  `session_settled`, and `queue_update` steering/follow-up snapshots are RPC
+  bookkeeping, not feed activity; ignore them. `agent_end.isTerminal:false`
+  remains nonterminal even when `yielded` is present. `messageId` and nested
+  `subagent_event.payload.event` retain their message/tool lineage.
+  Never drop genuinely unknown frames or guess a stronger semantic event.
 - Provider usage maps to both `agent.provider_usage` and `agent.context`; todos, retry,
   compaction, fallback, spawn/subagent, and terminal events retain their existing feed shapes.
 - **The context meter (`agent.context`) speaks the frozen `{used, window, window_source}`
@@ -314,8 +328,11 @@ runtime's doctor command.
 
 Service-level auth/model/memory calls use the shared, serialized no-session client
 `ChudcodeSessionHost._service_client` (through `transient_call`); it is replaced after death
-and disposed on shutdown, not spawned per request. Use `session_call` only for an already-live
-session: stats/state, compact/handoff, auto-compaction/auto-retry, and STT. A status/settings
+or when the selected memory backend changes, and disposed on shutdown, not spawned per
+request. Its `--config` overlay pins the GUI-selected backend rather than the runtime's
+default `off`, so `memory_remember`/`memory_recall`/`memory_stats` operate on the same
+project-root backend as sessions. Use `session_call` only for an already-live session:
+stats/state, compact/handoff, auto-compaction/auto-retry, and STT. A status/settings
 request must not silently create or resume a conversation.
 
 Secrets stay in typed `chudcode_rpc` wrappers. UI responses may expose state, account labels,
@@ -326,11 +343,12 @@ safe web URLs before they enter Chudware's `extension_ui_request` event.
 and `vision` (from `inputModalities`). The composer's effort menu reads that ladder; without
 it an id missing from `model_registry.h`'s static table fell back to Low/Medium/High.
 Anthropic OAuth requests present Chudcode's Claude Code fingerprint
-(`packages/ai/src/providers/claude-code-fingerprint.ts`). A `400 claude_code_version_too_old`
-on a new model means that version must be bumped and `chud` rebuilt.
-The Codex model list is gated by `CODEX_CLIENT_VERSION` (`packages/catalog/src/wire/codex.ts`):
-a stale pin silently hides new models (0.144.1 hid GPT-6). If a released Codex model is absent,
-probe `/backend-api/codex/models?client_version=<latest @openai/codex>` before anything else.
+(`packages/ai/src/providers/claude-code-fingerprint.ts`). Upstream self-heals its
+`DEFAULT_CLAUDE_CODE_VERSION`; `PI_AI_CLAUDE_CODE_VERSION` explicitly overrides
+it when necessary. The Codex model list is gated by `CODEX_CLIENT_VERSION`
+(`packages/catalog/src/wire/codex.ts`, currently 0.159.0). If a released Codex
+model is absent, probe `/backend-api/codex/models?client_version=<latest @openai/codex>`
+before anything else.
 `refresh_catalog_if_stale` re-discovers immediately when the `chud` binary's stat identity
 changes, not only after its 2-hour TTL.
 

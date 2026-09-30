@@ -49,17 +49,28 @@ class ChudcodeEventMapperTests(unittest.TestCase):
                 {"type": "turn_end", "message": {"content": "already streamed"}},
                 "turn_end",
             ),
-            ({"type": "prompt_result", "content": "already streamed"}, "prompt_result"),
         ]:
             out_kind, payload = one(frame)
             self.assertEqual(out_kind, "status")
             self.assertEqual(payload["phase"], expected_phase)
             self.assertNotIn("already streamed", json.dumps(payload))
+        for frame in (
+            {"type": "prompt_result", "id": "req_1", "agentInvoked": True,
+             "status": "completed", "sessionSettled": True},
+            {"type": "session_settled"},
+            {"type": "queue_update", "steering": ["change axis"], "followUp": []},
+        ):
+            self.assertEqual(map_rpc_frame(frame, CTX), [])
         self.assertEqual(
             one({"type": "message_end", "message": {"id": "m1", "content": "done"}})[1][
                 "id"
             ],
             "m1",
+        )
+        self.assertEqual(
+            one({"type": "message_update", "messageId": "msg-new",
+                 "assistantMessageEvent": {"type": "text_delta", "delta": "now"}})[1]["id"],
+            "msg-new",
         )
 
     def test_message_update_unwraps_assistant_event_and_preserves_message_id(self):
@@ -620,6 +631,7 @@ class ChudcodeEventMapperTests(unittest.TestCase):
             {
                 "type": "agent_end",
                 "isTerminal": False,
+                "yielded": False,
                 "agentId": "maintenance",
                 "status": "completed",
                 "purpose": "Compaction maintenance",

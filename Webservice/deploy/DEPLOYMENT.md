@@ -199,8 +199,8 @@ step:
   do not make a verified Linux release unrestorable, and locks written before
   the x64-only matrix (which also list Linux ARM/macOS ARM) still verify. The
   global `check-lock` publication gate requires exactly the three supported
-  targets: Linux x86_64, macOS x86_64 and Windows x86_64. Chudcode is retired
-  as a product; the committed lock stays on the internal `v0.3.0` runtime.
+  targets: Linux x86_64, macOS x86_64 and Windows x86_64. The committed lock
+  pins the `v0.4.0` runtime (Windows unpinned).
 
 Rollback restores an already-built tree and never touches PostgreSQL. A
 promotion whose schema migration is not backward compatible is therefore not

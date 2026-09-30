@@ -384,7 +384,7 @@ def _register_category_refresh(
                 from chudcode_rpc import host_tool  # type: ignore
             except ImportError as exc:
                 raise RuntimeError(
-                    "chudcode-rpc==0.2.0 is required to refresh CAD host tools"
+                    "chudcode-rpc==0.3.0 is required to refresh CAD host tools"
                 ) from exc
             client.set_custom_tools(
                 [binding.to_host_tool(host_tool) for binding in refreshed]

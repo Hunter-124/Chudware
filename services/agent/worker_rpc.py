@@ -1909,10 +1909,9 @@ _CHUDCODE_ESSENTIAL_TOOLS = frozenset(
         "bash",
         "edit",
         "glob",
-        "computer",
         "eval",
         "task",
-        "hub",
+        "wait",
         "learn",
         "manage_skill",
     }
@@ -2543,19 +2542,8 @@ def _chudcode_tool_state(params: dict, _emit: Callable) -> dict:
                     "available": True,
                 }
             )
-    for capability in ("browser", "computer"):
-        if capability not in seen:
-            tools.append(
-                {
-                    "name": capability,
-                    "loadMode": "essential"
-                    if capability in _CHUDCODE_ESSENTIAL_TOOLS
-                    else "discoverable",
-                    "description": "",
-                    "builtin": True,
-                    "available": False,
-                }
-            )
+    # Browser and desktop automation are eval preludes, not standalone tools in
+    # Chudcode 0.4.0; advertise only actual builtin tools from dumpTools.
     tools.sort(key=lambda item: item["name"])
     return {"ok": True, "tools": tools[:_CHUDCODE_MAX_TOOLS]}
 

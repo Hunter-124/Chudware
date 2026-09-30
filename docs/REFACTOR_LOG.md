@@ -5326,6 +5326,21 @@ caught a trial fixed-camera index offset) and a joint decoder head. Held-out pro
 parts, 8 epochs): full .524 vs blind .385; type .529 vs .133; per-pixel mIoU .42. The box's
 GPU occasionally hard-resets (hardware), so `campaign.sh service` installs a reboot-surviving
 user unit with per-run stage done markers; fold training resumes per epoch.
+**Readable grids (2026-09-29 night).** A visual audit of 13 real parts × whole/visible/hidden
+modes (`scratch/planner_qa/`) found 29/39 grids with flattened, edge-on, axis-stare or
+cap-obscured tiles and SID chips painted over the target in every target grid. Fixes:
+`shot_planner` prefers true revolve/cylinder axes, applies one readability ladder (screen
+footprint, visible thickness, legible area, cap/axis-stare) to ordinary, section and x-ray
+candidates but relaxes it rather than ever returning <4 tiles, and dedupes rotational/mirror
+symmetric cameras; diagonal sections are appended inside `plan_shots` only, so the public
+candidate enumeration that stored training indices (`observer/dense.py`) replay is unchanged.
+`_annotate_render` anchors every chip on its face's winning pixels (x-ray uses the target
+pass), one chip per face, never on the target mask. `render_part` now passes boundary
+conditions to the planner: study fixtures/loads (queries, SIDs, GUI selectors, thermal
+faces) and assembly mate faces as `bc`, the target's adjacent faces as `context`. Sim
+contacts are transient body-pair interfaces with no persisted face refs, so they are not a
+BC source yet. Result: profile criterion 36/39 (was 10/39), tags 38/39 (was 13/39), 4 tiles
+39/39, plan latency −10%.
 
 ## 2026-09-29 — extruded parts no longer show their sketches through the solid
 

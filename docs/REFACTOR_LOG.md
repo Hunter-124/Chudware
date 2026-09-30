@@ -5341,6 +5341,22 @@ faces) and assembly mate faces as `bc`, the target's adjacent faces as `context`
 contacts are transient body-pair interfaces with no persisted face refs, so they are not a
 BC source yet. Result: profile criterion 36/39 (was 10/39), tags 38/39 (was 13/39), 4 tiles
 39/39, plan latency −10%.
+**Campaign results and ship decision (2026-09-30).** Full-data observer (5-fold cross-fit +
+independent judge, 10 epochs, dense heads): held-out fold 0 full .489 vs blind .267 vs
+shuffled .261 (majority .256), type .639 vs .074; learning curve .352→.419→.441→.484 over
+1/8→1 of 3,827 train parts, still rising (more parts would pay); seed std .006; mIoU .52.
+Utility (DeepSets, 263k labelled pairs, two rounds): CONVERGED (last doubling −0.38% val
+log-loss, seed std .0005, shuffled control at prior) and beats calibrated hand_utility
+offline (test log-loss Δ .096 [.084, .111]). Online A/B, 548 held-out test parts,
+independent observer P(correct): hand_greedy@4 .519, model_greedy@4 .512, random@4 .488,
+fixed4 .443, iso@1 .382. A ranking-objective + hand-residual retrain (within-(part,query)
+conditional logit, selected on val only, one test A/B) still lost: model−hand −.004
+[−.008, −.0003]. **Not shipped**; the planner stays on `hand_utility`, which measures +.137
+over a single ISO view and +.077 over a fixed 4-view set. The learned-utility path
+(`weights/utility_v1.npz`, residual-on-hand inference) stays wired and gated by `ab --ship`.
+Gotcha: the repo conftest's simsuite resguard sets `RLIMIT_AS`, which breaks torch CPU
+backward in the observer tests on a busy box — run them with `SIMSUITE_RLIMIT=0` under a
+cgroup cap.
 
 ## 2026-09-29 — extruded parts no longer show their sketches through the solid
 

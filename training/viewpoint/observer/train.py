@@ -703,7 +703,7 @@ def fit_folds(store, *, k: int = 5, judge: str = "crossfit", folds: Optional[Ite
     if cfg.variant != spec.variant:
         raise ValueError(f"judge {judge!r} uses variant {spec.variant!r}, got {cfg.variant!r}")
     device = device or default_device()
-    corpus = corpus or load_corpus(store, cfg.tile_hw, log=log)
+    corpus = corpus or load_corpus(store, cfg.tile_hw, workers=cfg.workers, log=log)
     if not corpus.sets:
         raise ValueError(f"no renderable view sets with queries in {store.root}")
     part_fold = {p: fold_of(p, k, spec.salt) for p in corpus.parts()}
@@ -811,7 +811,7 @@ def learning_report(store, *, fractions=(0.125, 0.25, 0.5, 1.0), seeds=(0, 1, 2)
     spec = JUDGES["crossfit"]
     cfg = cfg or TrainConfig(variant=spec.variant, seed=spec.seed)
     device = device or default_device()
-    corpus = corpus or load_corpus(store, cfg.tile_hw, log=log)
+    corpus = corpus or load_corpus(store, cfg.tile_hw, workers=cfg.workers, log=log)
     parts = corpus.parts()
     held = {p for p in parts if fold_of(p, k, spec.salt) == fold}
     pool = [p for p in parts if p not in held]

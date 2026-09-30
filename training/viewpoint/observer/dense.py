@@ -90,9 +90,12 @@ def _candidates(record, group):
             offsets = {int(i) - len(cands) - list(FIXED_DIRS).index(name)
                        for s in group for name, i in zip(s["view_labels"], s["view_indices"])
                        if name in FIXED_DIRS}
-            if len(offsets) != 1:
+            if len(offsets) > 1:
                 raise ValueError(f"{record['part_id']}: inconsistent fixed-camera offsets {offsets}")
-            include_sections = next(iter(offsets)) > 0
+            # Resume may contain only non-fixed cameras: their base indices do not
+            # depend on whether unselected section candidates were appended.
+            include_sections = (next(iter(offsets)) > 0 if offsets else
+                                any(any(s.get("sections", ())) for s in group))
         else:
             include_sections = any(any(s.get("sections", ())) for s in group)
         if include_sections:

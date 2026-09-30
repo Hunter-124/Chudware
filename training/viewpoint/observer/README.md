@@ -79,6 +79,8 @@ For every existing grid, its source camera is reconstructed from the part/target
 candidates (trial-set `view_indices`, or Observer-set `view_labels` and sections).
 Trials and Observer grids have separate camera pools: fixed-camera indices in trials
 determine whether section candidates were inserted *even when no section was picked*.
+If a resumed group has no missing fixed view, base-camera indices remain valid;
+selected section flags determine whether the section-camera suffix is needed.
 Conflating those pools once produced misregistered labels for fixed views. Each
 engine worker imports a part once and reuses the annotation mesh. The same
 `cad_common._mesh_depth_buffer` that places visible face tags assigns each tile pixel
@@ -116,6 +118,10 @@ On a synthetic dataset with no dense files the model still trains its query head
 without auxiliary loss. For real training, a partially built dense cache raises
 an error instead of silently mixing labelled and unlabelled sets. The held-out
 report includes class mIoU alongside accuracy, blind and shuffled controls.
+
+`train --workers N` and `report --workers N` bound both tile-cache preprocessing
+and training data loaders. When labelling new grids, the judge uses the worker
+count recorded in its fold checkpoint for tile-cache preprocessing too.
 
 Fold training writes an atomic `foldN.<config-and-set-hash>.progress.pt` at every
 completed epoch (network, optimizer, LR schedule, best validation model, RNG and

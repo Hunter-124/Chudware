@@ -840,7 +840,7 @@ json contact_resolution_json(const ContactResolution& r) {
             {"note", "Clearance was not resolved: initially closed, compression-only "
                      "and frictionless; the bearing pressure distribution is the "
                      "conformal-fit upper bound, not clearance-resolved contact."}};
-    if (r.criterion == kCriterionPatchArea) {
+    if (criterion_is(r.criterion, kCriterionPatchArea)) {
         out["max_h_interface_mm"] = round_nd(r.max_h_interface_mm, 4);
         out["min_elements_across_patch"] = kContactMinPatchElems;
     } else {
@@ -3487,7 +3487,7 @@ static nlohmann::json fea_run_static_impl(
             contact_resolution = fea_contact_resolution(contact_set);
             {
                 char text[448];
-                if (contact_resolution.criterion == kCriterionPatchArea)
+                if (criterion_is(contact_resolution.criterion, kCriterionPatchArea))
                     std::snprintf(
                         text, sizeof(text),
                         "contact interface element size %.4g mm on a %.4g mm^2 "

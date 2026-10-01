@@ -15,6 +15,7 @@
 #pragma once
 
 #include <array>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <vector>
@@ -338,6 +339,11 @@ inline constexpr double kSeatMinAbsMm = 1e-4;
 // The two a-priori criteria, reported verbatim in the resolution block.
 inline constexpr const char* kCriterionClearance = "h_over_clearance";
 inline constexpr const char* kCriterionPatchArea = "elements_across_patch";
+// Compare criteria by text, never by pointer: across shared-library boundaries (the macOS
+// release test binaries vs libchudware) the same literal has distinct addresses.
+inline bool criterion_is(const char* criterion, const char* expected) {
+    return criterion != nullptr && expected != nullptr && std::strcmp(criterion, expected) == 0;
+}
 // ── The load-path bar ──────────────────────────────────────────────────────────
 // Half the applied resultant. A contact interface that carries less than this of
 // what is applied to the body it is supposed to hold is a parallel stiffness path,

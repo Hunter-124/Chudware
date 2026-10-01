@@ -779,7 +779,7 @@ void fea_contact_resolution_after_solve(ContactResolution& resolution,
         // number to compare against, two touching faces do not (printing
         // "clearance 0 mm" told a reader to resolve a gap that does not exist).
         char interface_facts[288];
-        if (resolution.criterion == kCriterionPatchArea)
+        if (criterion_is(resolution.criterion, kCriterionPatchArea))
             std::snprintf(interface_facts, sizeof(interface_facts),
                           "%.4g mm interface element size on a %.4g mm^2 candidate "
                           "patch (the faces touch, so there is no clearance to "

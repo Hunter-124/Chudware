@@ -773,7 +773,7 @@ TEST_CASE("contact: touching faces are judged on the patch, not on a 0 mm cleara
 
     const chudware::sim::ContactResolution res =
         chudware::sim::fea_contact_resolution(cand);
-    CHECK(res.criterion == chudware::sim::kCriterionPatchArea);
+    CHECK(chudware::sim::criterion_is(res.criterion, chudware::sim::kCriterionPatchArea));
     CHECK(res.gap_mm == 0.0);
     CHECK(res.ratio == 0.0);      // undefined, and reported as such
     CHECK(res.max_ratio == 0.0);  // the clearance limit does not apply
@@ -836,7 +836,7 @@ TEST_CASE("contact: a touching seat coarser than its own patch is refused") {
 
     const chudware::sim::ContactResolution res =
         chudware::sim::fea_contact_resolution(cand);
-    CHECK(res.criterion == chudware::sim::kCriterionPatchArea);
+    CHECK(chudware::sim::criterion_is(res.criterion, chudware::sim::kCriterionPatchArea));
     CHECK_FALSE(res.resolved);
     CHECK(res.h_interface_mm > res.max_h_interface_mm);
     CHECK(res.seatable_pairs < chudware::sim::kContactMinActivePairs);
@@ -1313,7 +1313,7 @@ TEST_CASE("contact: a pin in a bore reports the CAD clearance, not the facet one
     // ── The guard now judges the clearance that exists ──────────────────────────
     const auto cad_res = chudware::sim::fea_contact_resolution(cad);
     const auto facet_res = chudware::sim::fea_contact_resolution(facet);
-    CHECK(cad_res.criterion == chudware::sim::kCriterionClearance);
+    CHECK(chudware::sim::criterion_is(cad_res.criterion, chudware::sim::kCriterionClearance));
     CHECK(cad_res.gap_mm == doctest::Approx(clearance).epsilon(0.017));
     CHECK(cad_res.gap_analytic);
     CHECK(cad_res.ratio ==
@@ -1339,7 +1339,7 @@ TEST_CASE("contact: a pin in a bore reports the CAD clearance, not the facet one
     // INTERFERING (closest approach −0.247 mm), so the guard loses the clearance
     // criterion altogether and judges a patch that does not exist. That is the
     // defect: not a conservative number, a wrong one.
-    CHECK(facet_res.criterion == chudware::sim::kCriterionPatchArea);
+    CHECK(chudware::sim::criterion_is(facet_res.criterion, chudware::sim::kCriterionPatchArea));
     CHECK(facet_res.gap_mm == 0.0);
     CHECK_FALSE(facet_res.gap_analytic);
     CHECK(facet_res.ratio == 0.0);

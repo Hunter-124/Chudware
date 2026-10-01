@@ -1372,7 +1372,9 @@ if(CHUDWARE_WITH_OCCT)
     set_target_properties(test_mesher_advanced PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     add_test(NAME mesher_advanced COMMAND test_mesher_advanced)
-    set_tests_properties(mesher_advanced PROPERTIES RUN_SERIAL TRUE
+    # TIMEOUT overrides `ctest --timeout 900` in the release legs: the contact cases mesh and
+    # solve 150k-420k element models, which the 2017 Intel iMac runner cannot finish in 900 s.
+    set_tests_properties(mesher_advanced PROPERTIES RUN_SERIAL TRUE TIMEOUT 3600
       ENVIRONMENT_MODIFICATION "${_fea_envmod}")
 
     # Thin-wall tet10: mid-edge projection folds elements when the element size

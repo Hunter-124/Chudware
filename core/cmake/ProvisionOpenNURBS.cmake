@@ -34,30 +34,29 @@ set(_on_hdr "${_on_dir}/opennurbs.h")
 set(_on_cml "${_on_dir}/CMakeLists.txt")
 
 # --- auto-provision the source if absent -------------------------------------
-# Shallow clone the pinned tag WITH submodules (opennurbs + its bundled zlib are
-# submodules of rhino3dm). We only need src/lib/opennurbs, but a recursive shallow
-# clone is the simplest robust way to land it. If a partial/older checkout is
-# present without the opennurbs CMakeLists, re-fetch the submodule.
+# Shallow clone the pinned tag, then init ONLY the src/lib/opennurbs submodule (its
+# bundled zlib is plain files inside it). A recursive clone also pulled draco's Eigen
+# from GitLab, and a GitLab outage failed the Windows release build for a dependency
+# opennurbs never uses. A partial checkout (e.g. an interrupted clone) takes the
+# submodule-update branch.
 if(NOT EXISTS "${_on_hdr}" OR NOT EXISTS "${_on_cml}")
   find_package(Git REQUIRED)
   if(NOT EXISTS "${OPENNURBS_ROOT}/.git")
-    message(STATUS "[opennurbs] cloning rhino3dm ${OPENNURBS_RHINO3DM_TAG} (+submodules) …")
+    message(STATUS "[opennurbs] cloning rhino3dm ${OPENNURBS_RHINO3DM_TAG} …")
     execute_process(
       COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${OPENNURBS_RHINO3DM_TAG}
-              --recurse-submodules --shallow-submodules
               https://github.com/mcneel/rhino3dm.git "${OPENNURBS_ROOT}"
       RESULT_VARIABLE _git_rc)
     if(NOT _git_rc EQUAL 0)
       message(FATAL_ERROR "[opennurbs] git clone of rhino3dm ${OPENNURBS_RHINO3DM_TAG} failed (rc=${_git_rc})")
     endif()
-  else()
-    message(STATUS "[opennurbs] checkout present — ensuring opennurbs submodule …")
-    execute_process(
-      COMMAND ${GIT_EXECUTABLE} -C "${OPENNURBS_ROOT}" submodule update --init --depth 1 src/lib/opennurbs
-      RESULT_VARIABLE _git_rc)
-    if(NOT _git_rc EQUAL 0)
-      message(FATAL_ERROR "[opennurbs] submodule update for src/lib/opennurbs failed (rc=${_git_rc})")
-    endif()
+  endif()
+  message(STATUS "[opennurbs] ensuring the opennurbs submodule …")
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} -C "${OPENNURBS_ROOT}" submodule update --init --depth 1 src/lib/opennurbs
+    RESULT_VARIABLE _git_rc)
+  if(NOT _git_rc EQUAL 0)
+    message(FATAL_ERROR "[opennurbs] submodule update for src/lib/opennurbs failed (rc=${_git_rc})")
   endif()
 endif()
 if(NOT EXISTS "${_on_hdr}" OR NOT EXISTS "${_on_cml}")

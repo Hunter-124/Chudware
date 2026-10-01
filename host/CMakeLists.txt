@@ -784,6 +784,7 @@ add_executable(test_splat_renderer
   ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/src/gl.c)  # glad fn-ptr globals (GL never invoked here)
 target_include_directories(test_splat_renderer PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../core
   ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/include)
 set_target_properties(test_splat_renderer PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

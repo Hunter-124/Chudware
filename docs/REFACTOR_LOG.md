@@ -5430,3 +5430,20 @@ loop `detach()`ed itself (std::system_error → SIGABRT core). Threads are now m
 or completed soft drain now pushes `{"event":"daemon.exiting","reason":"idle"|"drained"}`, and
 `DaemonClient.call` reconnects on such an announced close instead of failing the next call as a
 lost session (unannounced closes — crash, kill, hard drain — stay loud; never replayed).
+
+## 2026-10-01 — linux-gate builds host test binaries before CTest
+
+`scripts/gate.sh` now builds the native host default target set rather than only
+`Chudware`: the latter produced a valid GUI and CTest configuration but none of
+the host test executables on clean CI checkouts, so the following linux-gate
+CTest step reported missing binaries (`test_img_tex` first, then `test_updater`
+and the rest). Updated `.github/workflows/linux-gate.yml` comments to describe
+the build/run boundary. The first real default-target smoke also exposed
+`test_splat_renderer`'s missing core include directory for
+`device/numeric_parse.h`; corrected that target in `host/CMakeLists.txt`.
+The real host build stage ran with `CHUDWARE_GATE_STRICT=1`, Release, and CEF
+enabled in a fresh scratch tree (reused dependency source downloads; four build
+jobs), then host CTest passed all 30 tests, including the splat and HTTPS updater
+tests. The live `host/build-linux` tree and open application sessions were not
+touched. Run 36793532370 separately stopped before host CTest because training
+pytest collection exited 2; its step log does not contain the collection traceback.

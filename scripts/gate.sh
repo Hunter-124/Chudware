@@ -8,7 +8,7 @@
 #   2. core CMake/Ninja build  — libchudware with -DCHUDWARE_WITH_OCCT=ON + ctest. SKIPPED with a
 #                                 clear reason if the system OCCT cmake config is not found
 #                                 (the gate does NOT fail just because OCCT is absent on a box).
-#   2b. host GUI build         — cmake -S host -B host/build-linux + ninja Chudware.
+#   2b. host GUI + test build  — cmake -S host -B host/build-linux + ninja (default targets).
 #                                 The ui/imgui / ui/abstract (AI-CAD2) app is retired;
 #                                 host/ is the single cross-platform GUI target.
 #   2c. WASM build smoke       — ./build.sh wasm into a scratch dir (CHUDWARE_WEB_APP override).
@@ -265,11 +265,11 @@ stage_core_build() {
     CORE_BUILD_OK=1
 }
 
-# ---- Stage 2b: host GUI build (ninja Chudware) --------------------------------
-# ui/abstract is deleted (retired with ui/imgui in refactor(unify)). This stage
-# now builds the host/ GUI — the single cross-platform GUI target.
+# ---- Stage 2b: host GUI + test build (default native targets) ------------------
+# host/ is the single cross-platform GUI target. Build the default target set:
+# Chudware alone does not build the host tests that linux-gate.yml runs with ctest.
 stage_ui_abstract() {
-    echo "=== [2b/6] host GUI build (ninja Chudware) ==="
+    echo "=== [2b/6] host GUI + test build (ninja default targets) ==="
     if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
         skip_stage env "host build" "cmake or ninja not on PATH" "cmake/ninja missing"
         return 0
@@ -288,13 +288,13 @@ stage_ui_abstract() {
         fail_fatal=1
         return 0
     fi
-    if ! ninja -C "$host_build" Chudware > ${GATE_TMP}/host_build.out 2>&1; then
-        record "host build          FAIL    ninja Chudware (see ${GATE_TMP}/host_build.out)"
+    if ! ninja -C "$host_build" > ${GATE_TMP}/host_build.out 2>&1; then
+        record "host build          FAIL    ninja default targets (see ${GATE_TMP}/host_build.out)"
         echo "  FAIL: build"; tail -n 20 ${GATE_TMP}/host_build.out | sed 's/^/    /'
         fail_fatal=1
         return 0
     fi
-    record "host build          PASS    host/build-linux/bin/Chudware built"
+    record "host build          PASS    host/build-linux GUI + test binaries built"
     echo "  PASS"
     HOST_BUILD_OK=1
 }

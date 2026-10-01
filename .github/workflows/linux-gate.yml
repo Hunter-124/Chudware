@@ -20,8 +20,8 @@
 #
 # Two suites gate.sh has never invoked run here explicitly:
 #   * ctest --test-dir host/build-linux — the host GUI tree's own tests. gate.sh
-#     builds host/build-linux but only ctests the core tree, so these have never
-#     gated anything.
+#     builds the native default targets, including these test binaries, but only
+#     ctests the core tree; this step runs the host suite.
 #   * pytest Webservice/gateway/tests — the FastAPI gateway suite. It lives
 #     outside the paths gate.sh sweeps and needs the gateway's own venv.
 #
@@ -164,9 +164,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # gate.sh builds host/build-linux but never ctests it, so these tests
-          # have gated nothing until now. A missing build tree here means the
-          # host build stage silently did not produce one.
+          # gate.sh builds the native default targets (GUI + test binaries), but
+          # only ctests the core tree. Run the host suite in that same build tree.
           if [ ! -f host/build-linux/CTestTestfile.cmake ]; then
             echo "::error::host/build-linux has no CTest configuration; the host build stage did not complete"
             exit 1

@@ -12,6 +12,8 @@ import difflib
 import sys
 from typing import Any
 
+from services.mcp.tool_registry import model_selectors
+
 
 def _current_doc_id() -> str:
     """The document this process is pointed at, or "" — never raises.
@@ -37,6 +39,7 @@ def register_workspace_tools(mcp) -> None:
     """Register workspace tools under the ``workspace`` family."""
 
     @mcp.tool()
+    @model_selectors("run_id")
     def workspace_status(run_id: str = "") -> dict:
         """Return the full workspace snapshot for *run_id*.
 
@@ -134,6 +137,7 @@ def register_workspace_tools(mcp) -> None:
         return {"ok": True, **session.workspace_status()}
 
     @mcp.tool()
+    @model_selectors("run_id")
     def workspace_doc_events(
         run_id: str,
         doc_id: str,

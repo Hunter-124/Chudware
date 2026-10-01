@@ -1886,7 +1886,7 @@ def _default_deliverable_path(doc_id: str, suffix: str) -> str:
         for entry in (cb.call("doc_list", {}) or {}).get("docs", []):
             if isinstance(entry, dict) and entry.get("doc_id") == doc_id:
                 name = entry.get("name") or ""
-                current = entry.get("path")
+                current = entry.get("path") or entry.get("native_source_path")
                 break
     except Exception:  # noqa: BLE001 — the doc_id remains a stable filename fallback
         pass
@@ -1932,6 +1932,11 @@ def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional
         entry = next((e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
                       if isinstance(e, dict) and e.get("doc_id") == doc_id), {})
         current = entry.get("path")
+        if not current:
+            # A detached native import is an independent session, not a new design.
+            # Preserve the source destination even if authored edits invalidate its
+            # reproducibility; recovery snapshots must still get a real project path.
+            current = entry.get("native_source_path")
         chosen_by_harness = False
         if (isinstance(current, str) and current.lower().endswith(".step+")
                 and not _is_recovery_path(current)):
@@ -2064,9 +2069,9 @@ def _needs_project_save(entry: dict) -> bool:
 def _reproducible_import_sources(entry: dict) -> Optional[list]:
     """Source files that rebuild this doc exactly, or None when it holds authored work.
 
-    The engine lists them in `reproducible_from` only while every feature is an
-    unmodified import (core/doc/session.cpp doc_list: any later edit, material change or
-    undo empties it). Such a doc is scratch — an agent's body-roster probe import — and
+    The engine lists native source paths for unchanged detached opens, and neutral
+    source paths while every feature remains an unmodified import. Any authored
+    change empties it. Such a doc is scratch — an agent's body-roster probe import — and
     writing it into the project root duplicated a source file the user already has
     (2026-09-24, `_frame624_2026-09-07.step+`). hostd applies the same test and simply
     closes it at GC instead of retiring it to the recovery tier (hostd/autosave.cpp
@@ -2078,6 +2083,8 @@ def _reproducible_import_sources(entry: dict) -> Optional[list]:
     for src in sources:
         if not (isinstance(src, str) and os.path.isabs(src) and os.path.isfile(src)):
             return None
+        if entry.get("native_source_path") == src and _is_recovery_path(src):
+            return None  # a recovered snapshot still needs a real project deliverable
     return list(sources)
 
 

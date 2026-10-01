@@ -36,6 +36,8 @@ import logging
 import threading
 from typing import Any, Callable, Optional
 
+from services.mcp.tool_registry import model_selectors
+
 # Ledger section / kind vocabulary lives in ONE place (services.agent.ledger_vocab)
 # so this mission-scoped shadow and services/mcp/ledger_tools.py cannot drift —
 # they had already drifted (plan_ruling existed only here), and a model that
@@ -1855,6 +1857,7 @@ class MissionDispatch:
                 "hint": "Check that services/parts (the parts hub) is importable.",
             }
 
+    @model_selectors("node_id")
     def parts_taxonomy(
         self,
         node_id: str = "",

@@ -127,6 +127,20 @@ def classify_risk(name: str) -> str:
     return RISK_WRITE
 
 
+def model_selectors(*names: str):
+    """Declare parameters that select model resources, not harness context.
+
+    Apply below ``@mcp.tool()`` (or to a mission handler). Omitted selectors
+    retain the callable's own defaults/required-argument behavior; explicit
+    model values still pass through. No wrapper is introduced, and the shared
+    registry guard preserves this metadata through ``functools.wraps``.
+    """
+    def declare(fn):
+        fn._cad_model_selectors = frozenset(names)
+        return fn
+    return declare
+
+
 # --------------------------------------------------------------------------- catalog
 # Process-wide tag catalog: tool name -> {"family": str, "risk": str}.
 _CATALOG: dict[str, dict] = {}

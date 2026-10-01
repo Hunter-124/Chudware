@@ -4232,3 +4232,151 @@ def test_assembly_transform_and_suppression_use_component_ids(transform_part, tm
             assert not refused["ok"] and wrong_id in json.dumps(refused), refused
     finally:
         M.cb.call("doc_close", {"doc_id": assembly})
+
+
+@enginetest
+def test_sketch_replacement_normalizes_strings_without_rebinding_canonical_handles():
+    """Replacement and partial edits preserve the sketch frame and handle identities."""
+    from services.agent.agent_turn import _bind_tool
+    add = _bind_tool("add_features")
+    doc = _cb.call("doc_new", {"name": "sketch_replacement_handles"})["doc_id"]
+    try:
+        initial = json.loads(add(doc_id=doc, ops=[
+            {"type": "sketch", "refs": {"plane": "plane.front"}, "params": {
+                "offset": 3, "entities": [{"id": "e7", "type": "circle", "center": [0, 0],
+                                          "radius": 5, "construction": False}],
+                "constraints": [{"id": "c11", "type": "fix", "refs": ["e7"]}]}},
+            {"type": "extrude", "refs": {"profile": "$0"}, "params": {"depth": 4}}]))
+        assert initial["ok"], initial
+        sketch, body = initial["id_map"]["$0"], initial["id_map"]["$1"]
+        replacement = json.loads(add(doc_id=doc, ops=[{
+            "op": "edit_feature", "id": sketch, "params": {
+                "entities": json.dumps([
+                    {"id": "e7", "type": "circle", "center": [0, 0], "radius": 6},
+                    {"id": "bore", "type": "circle", "center": [0, 0], "radius": 2}]),
+                "constraints": json.dumps([
+                    {"id": "locked", "type": "fixed", "refs": ["e7"]},
+                    {"id": "c1", "type": "fix", "refs": ["bore"]}])}},
+            {"op": "edit_feature", "id": body, "refs": {"profile": sketch}}]))
+        assert replacement["ok"], replacement
+        # add_features' mass readback is tessellation-based for curved profiles.
+        assert replacement["volume_mm3"] == pytest.approx(128 * math.pi, rel=1e-3)
+        feature = _cb.call("doc_tree", {"doc_id": doc})["tree"]["features"][0]
+        assert feature["refs"]["plane"] == "plane.front"
+        assert feature["params"]["offset"] == 3
+        entities, constraints = feature["params"]["entities"], feature["params"]["constraints"]
+        assert entities[0]["id"] == "e7"
+        assert all(e["construction"] is False for e in entities)
+        assert {c["refs"][0] for c in constraints} == {e["id"] for e in entities}
+        assert len({c["id"] for c in constraints}) == 2
+
+        # Only replace constraints: creation defaults must not clear the entity list.
+        partial = json.loads(add(doc_id=doc, ops=[{"op": "edit_feature", "id": sketch,
+            "params": {"constraints": json.dumps([
+                {"type": "fix", "refs": [e["id"]]} for e in entities])}}]))
+        assert partial["ok"] and partial["volume_mm3"] == pytest.approx(replacement["volume_mm3"]), partial
+        after = _cb.call("doc_tree", {"doc_id": doc})["tree"]["features"][0]
+        assert after["params"]["entities"] == entities
+        assert after["refs"] == feature["refs"]
+
+        # Only replace entities: retained constraints must still refer to the same circles.
+        changed = [{**e, "radius": 7 if e["id"] == "e7" else 2} for e in entities]
+        for e in changed:
+            e.pop("construction")
+        edited = json.loads(add(doc_id=doc, ops=[{"op": "edit_feature", "id": sketch,
+            "params": {"entities": json.dumps(changed)}}]))
+        assert edited["ok"] and edited["volume_mm3"] == pytest.approx(180 * math.pi, rel=1e-3), edited
+        before = _cb.call("eval_mass", {"doc_id": doc})["com"]
+        moved = json.loads(add(doc_id=doc, ops=[{"op": "edit_feature", "id": sketch,
+            "params": {"offset": json.dumps({"expr": None, "value": -8.5}),
+                       "constraints": json.dumps(after["params"]["constraints"])}}]))
+        assert moved["ok"], moved
+        final = _cb.call("eval_mass", {"doc_id": doc})
+        assert final["volume_mm3"] == pytest.approx(180 * math.pi)
+        assert math.dist(before, final["com"]) == pytest.approx(11.5)
+    finally:
+        _cb.call("doc_close", {"doc_id": doc})
+
+
+@enginetest
+@pytest.mark.parametrize("replace", [False, True])
+def test_compound_sketch_fix_pins_all_segments_for_creation_and_replacement(replace):
+    from services.agent.agent_turn import _bind_tool
+    add = _bind_tool("add_features")
+    doc = _cb.call("doc_new", {"name": "compound_sketch_fix"})["doc_id"]
+    params = {"entities": [{"id": "e1", "type": "rectangle", "center": [0, 0],
+                            "width": 20, "height": 12}],
+              "constraints": [{"type": "fix", "refs": ["e1"]}]}
+    try:
+        first = json.loads(add(doc_id=doc, ops=[{
+            "type": "sketch", "refs": {"plane": "plane.top"},
+            "params": {"entities": [], "constraints": []} if replace else params}]))
+        assert first["ok"], first
+        sketch = first["id_map"]["$0"]
+        if replace:
+            result = json.loads(add(doc_id=doc, ops=[{"op": "edit_feature", "id": sketch,
+                "params": {k: json.dumps(v) for k, v in params.items()}}]))
+            assert result["ok"], result
+        feature = _cb.call("doc_tree", {"doc_id": doc})["tree"]["features"][0]
+        entities = feature["params"]["entities"]
+        assert {c["refs"][0] for c in feature["params"]["constraints"]} == {e["id"] for e in entities}
+        extruded = json.loads(add(doc_id=doc, ops=[{
+            "type": "extrude", "refs": {"profile": sketch}, "params": {"depth": 3}}]))
+        assert extruded["ok"] and extruded["volume_mm3"] == pytest.approx(720), extruded
+
+        refused = json.loads(add(doc_id=doc, ops=[{"op": "edit_feature", "id": sketch,
+            "params": {"entities": params["entities"], "constraints": [
+                {"type": "length", "refs": ["e1"], "value": 30}]}}]))
+        assert not refused["ok"] and "ambiguous" in refused["error"], refused
+        assert _cb.call("eval_mass", {"doc_id": doc})["volume_mm3"] == pytest.approx(720)
+    finally:
+        _cb.call("doc_close", {"doc_id": doc})
+
+
+@enginetest
+def test_same_batch_reorder_resolves_new_feature_and_before_placeholders():
+    from services.agent.agent_turn import _bind_tool
+    add = _bind_tool("add_features")
+    doc = _cb.call("doc_new", {"name": "reorder_batch_handles"})["doc_id"]
+    try:
+        seeded = json.loads(add(doc_id=doc, ops=[_CANON_BOX]))
+        assert seeded["ok"], seeded
+        original = seeded["id_map"]["$0"]
+        result = json.loads(add(doc_id=doc, ops=[
+            {"type": "sketch", "name": "First", "refs": {"plane": "plane.top"},
+             "params": {"entities": [], "constraints": []}},
+            {"type": "sketch", "name": "Second", "refs": {"plane": "plane.front"},
+             "params": {"entities": [], "constraints": []}},
+            {"op": "reorder_feature", "id": "$0", "before": original},
+            {"op": "reorder_feature", "id": "$1", "before": "$0"}]))
+        assert result["ok"], result
+        tree = _cb.call("doc_tree", {"doc_id": doc})["tree"]
+        assert [f["id"] for f in tree["features"]] == [
+            result["id_map"]["$1"], result["id_map"]["$0"], original]
+        assert result["volume_mm3"] == pytest.approx(24000)
+    finally:
+        _cb.call("doc_close", {"doc_id": doc})
+
+
+@enginetest
+def test_sketch_convert_accepts_stringified_sid_only_ref_and_keeps_a_closed_profile():
+    from services.agent.agent_turn import _bind_tool
+    add = _bind_tool("add_features")
+    doc = _cb.call("doc_new", {"name": "convert_sid_readback"})["doc_id"]
+    try:
+        initial = json.loads(add(doc_id=doc, ops=[{
+            "type": "box", "params": {"length": 10, "width": 10, "height": 10}}]))
+        assert initial["ok"], initial
+        sid = _cb.call("doc_query", {"doc_id": doc,
+            "query": {"of": "face", "side": "top"}})["matches"][0]["sid"]
+        result = json.loads(add(doc_id=doc, ops=[
+            {"type": "sketch", "refs": {"plane": "plane.top"},
+             "params": {"entities": [], "constraints": [], "offset": 10}},
+            {"op": "sketch_convert", "sketch": "$0", "fix": True,
+             "refs": [json.dumps({"kind": "face", "selector": {"sid": sid}})]},
+            {"type": "extrude", "refs": {"profile": "$0"},
+             "params": {"depth": 2, "merge": False}}]))
+        assert result["ok"], result
+        assert result["body_count"] == 2 and result["volume_mm3"] == pytest.approx(1200)
+    finally:
+        _cb.call("doc_close", {"doc_id": doc})

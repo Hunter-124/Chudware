@@ -7,6 +7,8 @@ from pathlib import Path as _Path
 import json as _json
 import shutil as _shutil
 
+from services.mcp.tool_registry import model_selectors
+
 from .reveng_common import (
     _DATASHEET_NODE_STAGE,
     _SCAN_NODE_STAGE,
@@ -269,6 +271,7 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
         return rec, None
 
     @mcp.tool()
+    @model_selectors("run_id")
     def reveng_gate_status(session_id: str = "", run_id: str = "") -> str:
         """Report a reveng mission's status and the human gate it is waiting on.
 
@@ -315,6 +318,7 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
+    @model_selectors("run_id")
     def reveng_resolve_gate(
         session_id: str,
         decision: str,

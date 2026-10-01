@@ -5373,3 +5373,53 @@ the FeatureManager's sketch nesting (`test_sketch_consumers`). (2) The engine's
 every session-side frame (ghost/overview, live sketch overlay, region picker, convert) sat on
 the unshifted plane; it now shifts by the evaluated offset (`test_sketch_on_face` "offset
 sketch"). Staged with `./build.sh stage`; the app picks it up on restart.
+
+## 2026-09-30 — 6-axis redesign turn failures: selector injection, sketch edits, sections, import copies
+
+Triage of every failed call in the two latest 6-axis turns (c237 redesign, 73 failures incl.
+nested subagents; c239 slicing). Fixed: (1) `workspace_status({})` failed in BOTH turns because
+`chudcode_tools._document_args` injected the live GUI run id into a declared-but-omitted
+`run_id`; tools now declare model-facing selectors with `tool_registry.model_selectors(...)`
+(workspace_*, dag_*, buildgraph_status, list_artifacts, piping/reveng/mfg run selectors,
+graph/taxonomy `node_id`) and omitted selectors stay omitted; ledger/mission tools keep
+context injection. (2) `edit_feature` replacing sketch entities/constraints skipped the
+creation normalizer (construction default, c<N>/e<N> ids, `fixed`→`fix`, rectangle/polygon
+expansion, scalar `refs.profile`); creation and edit now share
+`normalize_inline_sketch_entities` (`core/doc/session.cpp`), a `fix` on an expanded compound
+pins every emitted segment and other relations on a compound fail by name;
+`reorder_feature` resolves same-batch `$N` in `id`/`before`; `sketch_convert` SID refs use the
+SID-aware resolver (was `measure ref kind ''`). No cache-key bump: stored documents compile
+identically (these inputs previously failed validation). (3) `inspect_section` reported
+"open contour" on valid solids whose plane hits coplanar steps (degree-3 vertices); sections
+are now `BRepAlgoAPI_Common(plane face, solid)` per solid; the open-surface path reports
+`open_locations`. A retired measure SID stays a refusal but names `live_selectors`.
+(4) describe_part on the wrist took 38–84 s: `doc_face_points` re-described every face per
+sampled selector; descriptors + bbox diag are cached per (revision, exact shape). (5) c239's
+`import_part(parts/redesign/base.step+)` minted a root `base_revD.step+` at the terminal sweep:
+detached native opens now carry `doc_list.native_source_path` (contracts/worker_rpc.md),
+are `reproducible_import` while unedited, and save back in place after edits. Also
+`read_native_file` names only the unknown sections with `did_you_mean`. Deferred: the
+process-wide `daemon_bridge` client serializes all subagents' engine RPCs; a pool is unsafe
+because hostd ties rw attachment/CAS to the connection (`doc_registry.cpp` postCall/preCall) —
+needs a logical-client identity seam. Chudcode-owned, report-only: unloaded `xd://` reads say
+"No such tool" without an `enable_tools` hint; Wayland `computer.screenshot` lacks pipewire.
+The stray `~/Desktop/6-axis/base_revD.step+` from c239 was left in place.
+
+## 2026-10-01 — nightly release runtime provisioning and deterministic contact admission
+
+Nightly capability checks now use `scripts/pin_chudcode.py ensure` to verify an
+explicit installation or fetch a digest-keyed runtime cache from the private
+CAD repository's `chudcode-runtime-v<locked version>` release, authenticated by
+the existing read-only job token. The mirror never changes the authoritative
+lock digest; the API token is not forwarded to GitHub's signed release CDN,
+and format/hash checks precede native version execution. Linux cold fetch and
+offline cache reuse were exercised; the macOS mirror's hash and Mach-O target
+were checked on Linux (native execution remains a macOS CI check). The Linux
+nightly's actual failure was an incidental error-text assertion in
+`core/tests/test_mesher_advanced.cpp`: a legitimate 3.1 GiB direct-solve
+estimate exceeded the runner's 3 GiB study budget. The bore regression now
+replays deterministic 3 GiB refusal and 8 GiB delivery cases and checks
+structured admission evidence plus the original contact-resolution invariants.
+`docs/reference/CI_RUNNERS.md` documents the mirror and Windows build/pin
+prerequisite; Windows remains fail-closed until real Windows bytes are built
+and pinned. No desktop release was published during these local checks.

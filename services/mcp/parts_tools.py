@@ -69,6 +69,7 @@ if str(_REPO) not in sys.path:
 
 
 from services.mcp import result_serving as _rs
+from services.mcp.tool_registry import model_selectors
 from .cad_common import coerce_json_or_repr
 
 def _ok(payload) -> str:
@@ -1678,6 +1679,7 @@ def register_parts_tools(mcp: FastMCP) -> None:
         return _rs.dumps(out)
 
     @mcp.tool()
+    @model_selectors("node_id")
     def parts_taxonomy(node_id: str = "", depth: int = 2,
                        include_facets: bool = True,
                        **kwargs: _VarKw) -> str:

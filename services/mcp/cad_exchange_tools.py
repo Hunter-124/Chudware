@@ -156,6 +156,9 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         Imports create a NEW document by default, even when the source file is already open.
         `resume=True` explicitly reuses the open document at that path (reply `reused:true`).
         `into=<doc_id>` adds geometry to that document instead of opening or resuming one.
+        A pristine native import is reproducible from its source and is not copied into
+        the project root at turn end. Native saves and automatic saves after edits use
+        that source path; pass save_part(path=...) to choose a different destination.
 
         DXF/DWG are 2D vector drawings: they import as planar wires + faces (closed loops become
         faces) — reference/profile geometry to extrude or dimension, not a solid. DWG needs a

@@ -183,3 +183,70 @@ def test_cyclic_native_references_refuse_without_waiting_on_the_cache(tmp_path, 
     assert refused["ok"] is False
     assert "cyclic component reference" in json.dumps(refused)
     assert not (tmp_path / "cycle.step").exists()
+
+
+def test_detached_native_import_is_reproducible_and_saves_edits_in_place(
+        tmp_path, docs, monkeypatch):
+    from services.mcp import cad_common as C
+
+    # Exercise the daemon's no-handoff publishing behavior in the in-process engine.
+    monkeypatch.setattr(cb, "active_daemon_mode", lambda: True)
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    source = new_doc(docs)
+    box(source)
+    destination = tmp_path / "parts" / "base.step+"
+    destination.parent.mkdir()
+    cb.call("doc_set_name", {"doc_id": source, "name": "base_revD"})
+    cb.call("doc_save", {"doc_id": source, "path": str(destination)})
+    cb.call("doc_close", {"doc_id": source})
+    docs.remove(source)
+
+    imported, _ = _call("import_part", {"path": str(destination)})
+    did = imported["doc_id"]
+    docs.append(did)
+    monkeypatch.setattr(C, "_TOUCHED_DOCS", [did])
+    before = destination.read_bytes()
+    cb.call("eval_mass", {"doc_id": did})
+    _call("verify_battery", {"doc_id": did})
+    row = next(e for e in cb.call("doc_list", {})["docs"] if e["doc_id"] == did)
+    assert row["path"] is None
+    assert row["reproducible_from"] == [str(destination)]
+    swept = C.save_touched_docs()
+    assert any(e["doc_id"] == did and e["reason"] == "reproducible_import"
+               for e in swept["skipped"])
+    assert destination.read_bytes() == before
+    assert not list(tmp_path.glob("*.step+"))
+    saved, _ = _call("save_part", {"doc_id": did})
+    assert saved["path"] == str(destination)
+
+    # Reimport independently, then mutate: automatic saves must also stay in place.
+    again, _ = _call("import_part", {"path": str(destination)})
+    edited = again["doc_id"]
+    docs.append(edited)
+    original_com = cb.call("eval_mass", {"doc_id": edited})["com"]
+    moved, _ = _call("add_features", {"doc_id": edited, "ops": [
+        {"type": "transform", "body": "f1", "translate": [40, 0, 0]}]})
+    assert moved["ok"], moved
+    assert moved["saved_path"] == str(destination)
+    assert not list(tmp_path.glob("*.step+"))
+    reopened = cb.call("doc_open", {"path": str(destination)})["doc_id"]
+    docs.append(reopened)
+    assert cb.call("eval_mass", {"doc_id": reopened})["com"] == pytest.approx(
+        [original_com[0] + 40, *original_com[1:]])
+
+
+def test_face_sampling_re_resolves_after_a_geometry_edit(docs):
+    did = new_doc(docs)
+    box(did)
+    selector = cb.call("doc_query", {"doc_id": did, "query": {
+        "of": "face", "side": "top", "pick": "largest"}})["matches"][0]
+    first = cb.call("doc_face_points", {"doc_id": did, "selector": selector})
+    repeated = cb.call("doc_face_points", {"doc_id": did, "selector": selector})
+    assert repeated == first
+    cb.call("doc_apply_ops", {"doc_id": did, "ops": [
+        cb.feat("transform", "Move", {"body": "f1", "translate": [40, 0, 0]})]})
+    new_selector = cb.call("doc_query", {"doc_id": did, "query": {
+        "of": "face", "side": "top", "pick": "largest"}})["matches"][0]
+    moved = cb.call("doc_face_points", {"doc_id": did, "selector": new_selector})
+    assert sorted(p[0] for p in moved["points"]) == pytest.approx(
+        sorted(p[0] + 40 for p in first["points"]))

@@ -1259,7 +1259,8 @@ def _accepts(fn: Callable[..., Any], name: str) -> bool:
     add_features is unusable through this device and I need to find an
     alternative route to apply document operations" — after which it spent
     thirteen minutes writing STEP files by hand through `eval`. A tool that
-    wants run context asks for it by name.
+    wants run context asks for it by name; resource selectors mark the same
+    names with ``model_selectors`` so omission remains meaningful.
     """
     try:
         sig = inspect.signature(fn)
@@ -1281,9 +1282,13 @@ def _document_args(
     out = dict(args)
     if not callable(fn):
         return out
+    selectors = getattr(fn, "_cad_model_selectors", ())
     for name in ("doc_id", "actor", "run_id", "node_id", "parent_id", "subagent_id"):
         value = _ctx(context, name, None)
-        if value is not None and name not in out and _accepts(fn, name):
+        if (
+            value is not None and name not in out and name not in selectors
+            and _accepts(fn, name)
+        ):
             out[name] = value
     return out
 

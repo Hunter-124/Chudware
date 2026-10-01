@@ -18,6 +18,7 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 
 from services.mcp._envelopes import compact_err as _err, stringly_dumps as _dumps
+from services.mcp.tool_registry import model_selectors
 
 # token guard — cap the node/edge payload so a huge project can't blow the context.
 _MAX_NODES = 400
@@ -30,6 +31,7 @@ def register_graph_tools(mcp: FastMCP) -> None:
     """Register the CAD-graph traversal + planning tools onto *mcp*."""
 
     @mcp.tool()
+    @model_selectors("node_id")
     def cad_graph(query_kind: str = "get", node_id: str = "",
                   src: str = "", dst: str = "", project_dir: str = "") -> str:
         """Traverse the CAD project graph — dimensional links + assembly structure.
@@ -217,6 +219,7 @@ def register_graph_tools(mcp: FastMCP) -> None:
             return _err("plm_graph_search_failed", str(exc))
 
     @mcp.tool()
+    @model_selectors("node_id")
     def plm_graph_neighbors(project_dir: str = "", node_id: str = "",
                             depth: int = 1, linked: bool = False) -> str:
         """Ego graph: `node_id` plus everything within `depth` hops (undirected).
@@ -282,6 +285,7 @@ def register_graph_tools(mcp: FastMCP) -> None:
             return _err("plm_graph_links_failed", str(exc))
 
     @mcp.tool()
+    @model_selectors("node_id")
     def plm_graph_watch(path: str, op: str = "list", keyword: str = "",
                         node_id: str = "", note: str = "",
                         entry_id: str = "") -> str:
@@ -419,6 +423,7 @@ def register_graph_tools(mcp: FastMCP) -> None:
             return _err("plm_graph_configure_failed", str(exc))
 
     @mcp.tool()
+    @model_selectors("node_id")
     def plm_graph_suggest(project_dir: str = "", node_id: str = "",
                           limit: int = 10) -> str:
         """Heuristic overlay-link suggestions over the project graph.
@@ -548,6 +553,7 @@ def register_graph_tools(mcp: FastMCP) -> None:
             return _err("plm_graph_suggest_failed", str(exc))
 
     @mcp.tool()
+    @model_selectors("node_id")
     def plm_graph_brief(project_dir: str = "", node_id: str = "") -> str:
         """One-node dossier: identity, degree, edge-kind histogram, neighbors.
 

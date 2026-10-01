@@ -295,6 +295,26 @@ def test_a_pristine_import_of_an_existing_file_is_not_written_to_the_project(
     assert out["persistence_failure"] is None
 
 
+def test_detached_recovery_snapshot_still_gets_a_real_deliverable(
+        sweep, tmp_path, monkeypatch):
+    recovery = tmp_path / "hostd_autosave"
+    recovery.mkdir()
+    source = recovery / "base.step+"
+    source.write_text("recovery snapshot")
+    monkeypatch.setenv("CHUDWARE_AUTOSAVE_DIR", str(recovery))
+    fake = sweep([{
+        "doc_id": "d-recovered", "name": "base", "kind": "part",
+        "feature_count": 2, "revision": 0, "dirty": False, "path": None,
+        "native_source_path": str(source), "reproducible_from": [str(source)],
+        "origin_kind": "agent",
+    }])
+    out = C.save_touched_docs()
+    assert out["saved"][0]["doc_id"] == "d-recovered"
+    assert fake.saves == [("d-recovered", str(
+        tmp_path / "Projects" / "Testing" / "base.step+"))]
+    assert source.read_text() == "recovery snapshot"
+
+
 
 def test_an_agent_origin_doc_this_process_never_touched_is_still_swept(sweep):
     """The worker is forked per turn, so a doc built by an earlier turn's worker is not

@@ -644,6 +644,10 @@ judgment).
   handlers from the live MCP/mission registries. Do not advertise unbound or async-only
   entries. Chudcode builtin names (`read`, `edit`, `bash`, `browser`, `computer`, `task`,
   etc.) remain Chudcode-owned unless a CAD entry explicitly claims ownership.
+  Model-facing resource selectors that share a harness context name (e.g. workspace/DAG
+  `run_id`, graph/taxonomy `node_id`) declare `@model_selectors("run_id")` from
+  `services.mcp.tool_registry` below `@mcp.tool()` or on the mission handler. Omission
+  keeps the tool's own semantics; ledger/mission context parameters stay injectable.
 - **Every host call still crosses CAD's chokepoints.** Before execution:
   policy refusal → cancellation → mission/run dispatcher → scaffold and guardrail checks →
   `agent_turn._dispatch_tool` loop guard/accounting. Preserve document context injection,

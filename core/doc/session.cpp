@@ -272,6 +272,9 @@ struct Session {
     std::vector<std::string> redo_stack;
     bool dirty = false;
     std::string path;                                  // current .step+ path (or empty)
+    // Detached native imports retain their source for reproducibility and in-place
+    // automatic saving without sharing the source's live session.
+    std::string native_source_path;
     std::map<std::string, std::string> extra_entries;  // unknown .step+ entries (verbatim)
     std::map<std::string, std::string> checkpoints;    // PM-cancel snapshots: id -> doc JSON
     std::optional<SketchState> active_sketch;          // C18 sketch-edit lifecycle
@@ -284,6 +287,13 @@ struct Session {
     // on every click (measured ~190 ms/click on a modest part before this cache).
     std::shared_ptr<CompileResult> compiled;
     long compiled_rev = -1;
+    // Sampling many faces must not re-describe the entire shape for every selector.
+    // Retain only the last shape; revision and exact identity protect rebuilt,
+    // transformed, and assembly geometry even when a view rebuild keeps the revision.
+    TopoDS_Shape face_info_shape;
+    long face_info_revision = -1;
+    std::vector<TopoInfo> face_infos;
+    double face_info_diag = 0.0;
     // Previous integrity call only, under the same DocLock as compilation. Failed
     // or incomplete calls leave no memo; only valid solids and complete distance +
     // non-destructive Common evidence can be published.
@@ -1012,6 +1022,80 @@ void expand_standard_part(json& doc, const json& feat, std::size_t idx,
     if (!exposed.empty()) id_map["$" + std::to_string(idx)] = exposed;
 }
 
+// Creation and full-entity sketch edits share expansion and local handle remapping.
+// A convenience shape is several entities: fixing it pins ALL emitted segments;
+// other relations must name a segment explicitly rather than silently bind the first.
+void normalize_inline_sketch_entities(json& feat, IdGen& gen, json& id_map) {
+    if (feat.value("type", std::string()) != "sketch" || !feat["params"].is_object() ||
+        !feat["params"].contains("entities") || !feat["params"]["entities"].is_array())
+        return;
+    json& params = feat["params"];
+    for (const json& e : params["entities"])
+        if (e.is_object() && e.contains("id") && e["id"].is_string())
+            gen.note(e["id"].get<std::string>());
+    std::map<std::string, std::vector<std::string>> aliases;
+    json entities = json::array();
+    for (const json& e : params["entities"]) {
+        if (!e.is_object()) { entities.push_back(e); continue; }
+        std::vector<json> expanded = expand_sketch_entity(e, gen);
+        const std::string original = e.value("id", std::string());
+        const bool remap = !original.empty() &&
+            (expanded.size() != 1 || expanded.front().value("id", std::string()) != original);
+        std::vector<std::string> ids;
+        if (remap) ids.reserve(expanded.size());
+        for (json& x : expanded) {
+            if (remap) ids.push_back(x.value("id", std::string()));
+            if (x.contains("_alias") && x["_alias"].is_string()) {
+                id_map[x["_alias"].get<std::string>()] = x["id"];
+                x.erase("_alias");
+            }
+            entities.push_back(std::move(x));
+        }
+        if (remap) aliases[original] = std::move(ids);
+    }
+    params["entities"] = std::move(entities);
+    if (!params.contains("constraints") || !params["constraints"].is_array()) return;
+    for (const json& c : params["constraints"])
+        if (c.is_object() && c.contains("id") && c["id"].is_string())
+            gen.note(c["id"].get<std::string>());
+    json constraints = json::array();
+    for (json c : params["constraints"]) {
+        if (!c.is_object() || !c.contains("refs") || !c["refs"].is_array()) {
+            constraints.push_back(std::move(c));
+            continue;
+        }
+        const std::vector<std::string>* compound = nullptr;
+        for (json& ref : c["refs"]) {
+            if (!ref.is_string()) continue;
+            const std::string handle = ref.get<std::string>();
+            const auto dot = handle.find('.');
+            const std::string base = handle.substr(0, dot);
+            const auto it = aliases.find(base);
+            if (it == aliases.end()) continue;
+            if (it->second.size() == 1) {
+                ref = it->second.front() + (dot == std::string::npos ? "" : handle.substr(dot));
+            } else {
+                if (c.value("type", std::string()) != "fix" || dot != std::string::npos ||
+                    c["refs"].size() != 1)
+                    throw OpError("invalid_op", "constraint on expanded sketch entity '" + base +
+                        "' is ambiguous; name an emitted segment/endpoint, or fix the whole shape");
+                compound = &it->second;
+            }
+        }
+        if (!compound) {
+            constraints.push_back(std::move(c));
+            continue;
+        }
+        for (std::size_t i = 0; i < compound->size(); ++i) {
+            json pinned = c;
+            pinned["refs"] = json::array({(*compound)[i]});
+            if (i) pinned["id"] = gen.next("c");
+            constraints.push_back(std::move(pinned));
+        }
+    }
+    params["constraints"] = std::move(constraints);
+}
+
 void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json feat;
     if (op.contains("feature") && op["feature"].is_object()) {
@@ -1078,62 +1162,7 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
             if (!env["params"].contains(k)) env["params"][k] = it.value();
         }
     }
-    // Normalize inline sketch entities the SAME way sketch_add_entity does, so a hexagon /
-    // airfoil / {value:N} scalar authored INLINE (grok emits sketches this way ~half the time)
-    // expands + validates identically — instead of reaching the geometry kernel as a raw
-    // "hexagon" entity that builds no region and fails the extrude.
-    if (env["type"] == "sketch" && env["params"].is_object() &&
-        env["params"].contains("entities") && env["params"]["entities"].is_array()) {
-        // Reserve every canonical id the caller ALREADY wrote before expanding
-        // anything. A multi-entity expansion (rectangle/polygon/slot/airfoil)
-        // mints one e<N> per emitted segment, and IdGen is seeded only from the
-        // stored document — so a batch of [rectangle, circle{id:e2}] minted
-        // e1..e4 for the rectangle and then hit "duplicate 'e2'" on the circle.
-        // Live probe-holster-3: two consecutive add_features calls lost to it.
-        for (const json& e : env["params"]["entities"]) {
-            if (e.is_object() && e.contains("id") && e["id"].is_string())
-                gen.note(e["id"].get<std::string>());
-        }
-        json norm = json::array();
-        for (json& e : env["params"]["entities"]) {
-            if (!e.is_object()) { norm.push_back(e); continue; }
-            for (json& x : expand_sketch_entity(e, gen)) {
-                // Register modeler aliases so same-batch constraints (and later
-                // sketch_add_constraint) can resolve "l0"/"l5" etc.
-                if (x.contains("_alias") && x["_alias"].is_string() &&
-                    x.contains("id") && x["id"].is_string()) {
-                    id_map[x["_alias"].get<std::string>()] = x["id"].get<std::string>();
-                    x.erase("_alias");
-                }
-                norm.push_back(std::move(x));
-            }
-        }
-        env["params"]["entities"] = std::move(norm);
-        // Remap any inline constraints that still name the modeler aliases.
-        if (env["params"].contains("constraints") && env["params"]["constraints"].is_array()) {
-            std::map<std::string, std::string> aliases;
-            // Prefer id_map bare-alias entries (just registered above).
-            for (auto it = id_map.begin(); it != id_map.end(); ++it) {
-                if (!it.key().empty() && it.key()[0] != '$' && it.value().is_string())
-                    aliases[it.key()] = it.value().get<std::string>();
-            }
-            for (json& c : env["params"]["constraints"]) {
-                if (!c.is_object() || !c.contains("refs") || !c["refs"].is_array()) continue;
-                for (json& rref : c["refs"]) {
-                    if (!rref.is_string()) continue;
-                    std::string s = rref.get<std::string>();
-                    std::string base = s, sub;
-                    auto dot = s.find('.');
-                    if (dot != std::string::npos) {
-                        base = s.substr(0, dot);
-                        sub = s.substr(dot);
-                    }
-                    auto ait = aliases.find(base);
-                    if (ait != aliases.end()) rref = ait->second + sub;
-                }
-            }
-        }
-    }
+    normalize_inline_sketch_entities(env, gen, id_map);
     // NO SILENT DROPS, part 2. The total hoist above guarantees nothing is discarded, but a
     // key the compiler doesn't read still does nothing — and for the PRIMITIVES that is the
     // difference between the part the model asked for and a solid centred on the origin. A
@@ -1222,9 +1251,12 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
     id_map["$" + std::to_string(idx)] = fid;
 }
 
-void op_edit_feature(json& doc, const json& op, const json& id_map) {
-    json* f = find_feature(doc, op.value("id", std::string()));
-    if (!f) throw OpError("invalid_op", "edit_feature: no feature '" + op.value("id", std::string()) + "'");
+void op_edit_feature(json& doc, const json& op, IdGen& gen, json& id_map) {
+    json target = op.value("id", std::string());
+    resolve_placeholders_deep(target, id_map);
+    const std::string id = target.get<std::string>();
+    json* f = find_feature(doc, id);
+    if (!f) throw OpError("invalid_op", "edit_feature: no feature '" + id + "'");
     if (op.contains("params")) {
         json p = op["params"];
         resolve_placeholders_deep(p, id_map);
@@ -1237,6 +1269,9 @@ void op_edit_feature(json& doc, const json& op, const json& id_map) {
         if (!f->contains("refs")) (*f)["refs"] = json::object();
         patch((*f)["refs"], r);
     }
+    if (op.contains("params") && op["params"].is_object() && op["params"].contains("entities"))
+        normalize_inline_sketch_entities(*f, gen, id_map);
+    normalize_feature_shape(*f);
     if (op.contains("name") && op["name"].is_string()) (*f)["name"] = op["name"];
 }
 
@@ -1270,8 +1305,10 @@ void op_delete_feature(json& doc, const json& op) {
     feats = kept;
 }
 
-void op_reorder_feature(json& doc, const json& op) {
-    const std::string id = op.value("id", std::string());
+void op_reorder_feature(json& doc, const json& op, const json& id_map) {
+    json target = op.value("id", std::string());
+    resolve_placeholders_deep(target, id_map);
+    const std::string id = target.get<std::string>();
     json& feats = doc["features"];
     json moved;
     json rest = json::array();
@@ -1283,7 +1320,9 @@ void op_reorder_feature(json& doc, const json& op) {
     if (!found) throw OpError("invalid_op", "reorder_feature: no feature '" + id + "'");
     std::size_t pos = rest.size();
     if (op.contains("before") && op["before"].is_string()) {
-        const std::string before = op["before"].get<std::string>();
+        json target_before = op["before"];
+        resolve_placeholders_deep(target_before, id_map);
+        const std::string before = target_before.get<std::string>();
         for (std::size_t i = 0; i < rest.size(); ++i)
             if (rest[i].value("id", std::string()) == before) { pos = i; break; }
     }
@@ -3900,9 +3939,9 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
     const std::string k = op["op"].get<std::string>();
 
     if (k == "add_feature")              op_add_feature(doc, op, idx, gen, id_map);
-    else if (k == "edit_feature")        op_edit_feature(doc, op, id_map);
+    else if (k == "edit_feature")        op_edit_feature(doc, op, gen, id_map);
     else if (k == "delete_feature")      op_delete_feature(doc, op);
-    else if (k == "reorder_feature")     op_reorder_feature(doc, op);
+    else if (k == "reorder_feature")     op_reorder_feature(doc, op, id_map);
     else if (k == "set_suppressed") {
         const std::string id = op.value("id", std::string());
         if (doc.value("schema", std::string()) == "aicad.asm/1") {
@@ -6519,16 +6558,16 @@ json doc_list() {
                 mate_count = (int)sp->doc["mates"].size();
             empty = feature_count == 0 && component_count == 0 && mate_count == 0;
         }
-        // Pristine import (2026-09-24): every feature is an `import` of an absolute
-        // source_path and nothing was authored since. Each import commits exactly one
-        // revision, so any later edit_feature / material / undo / other op pushes the
-        // revision past the feature count and the list goes empty. Consumers (hostd
-        // doc-GC + autosave, the agent terminal save sweep) treat the doc as reproducible
-        // scratch — not saved, not retired — while those source files still exist. Only a
-        // never-saved doc qualifies: opening a file resets the revision to 0, so the
-        // revision count proves nothing about edits made before it was saved.
+        // Pristine imports are scratch while their source files still exist.
+        // A detached native open carries an editable feature tree (not import-only
+        // features), so its source and unchanged revision prove reproducibility.
+        // Neutral imports instead commit one revision per import feature.
         json reproducible_from = json::array();
-        if (!isAsm && sp->path.empty() && feature_count > 0 && sp->revision <= feature_count) {
+        if (sp->path.empty() && !sp->native_source_path.empty() &&
+            sp->revision == 0 && !sp->dirty) {
+            reproducible_from.push_back(sp->native_source_path);
+        } else if (!isAsm && sp->path.empty() && sp->native_source_path.empty() &&
+                   feature_count > 0 && sp->revision <= feature_count) {
             for (const json& f : sp->doc["features"]) {
                 if (!f.is_object() || f.value("type", std::string()) != "import") {
                     reproducible_from.clear();
@@ -6551,6 +6590,8 @@ json doc_list() {
             {"name", sp->doc.is_object() ? sp->doc.value("name", sp->doc_id) : sp->doc_id},
             {"kind", isAsm ? "assembly" : "part"},
             {"path", sp->path.empty() ? json(nullptr) : json(sp->path)},
+            {"native_source_path", sp->native_source_path.empty()
+                                       ? json(nullptr) : json(sp->native_source_path)},
             {"revision", sp->revision},
             {"dirty", sp->dirty},
             {"feature_count", feature_count},
@@ -10063,10 +10104,18 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
         CompileResult rr_fail = compile_session(s);
         throw_no_bodies(doc_id, rr_fail, "evaluate");
     }
-    const double diag = sim_bbox_diag(shape);
 
-    std::vector<TopoInfo> infos = describe_faces(shape);
-    ResolveResult rr = resolve(selector, infos, diag);
+    if (s.face_info_revision != s.revision || s.face_info_shape.IsNull() ||
+        !s.face_info_shape.IsEqual(shape)) {
+        auto infos = describe_faces(shape);
+        const double diag = sim_bbox_diag(shape);
+        s.face_infos = std::move(infos);
+        s.face_info_diag = diag;
+        s.face_info_shape = shape;
+        s.face_info_revision = s.revision;
+    }
+    const double diag = s.face_info_diag;
+    ResolveResult rr = resolve(selector, s.face_infos, diag);
     if (!rr.index.has_value())
         throw OpError("invalid_op",
                       "face selector dangling: " +
@@ -12202,9 +12251,9 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
 }
 
 // Section each world-placed solid independently so an unrelated nested body never becomes
-// another body's hole. Preserve even/odd loop nesting within each solid, then integrate
-// all material faces together: areas are additive (not a Boolean union), centroid is
-// area-weighted, and the plane-local inertia includes the parallel-axis contributions.
+// another body's hole. Intersect the plane face with material, letting OCCT classify
+// coplanar/tangent boundaries and holes instead of chaining a branching edge graph.
+// Areas are additive, with area-weighted centroid and parallel-axis inertia.
 // An empty intersection is zero; failed section/loop/face construction is an OpError,
 // never a plausible-looking zero or a partial document result.
 json doc_eval_section_props(const std::string& doc_id, const json& plane_ref) {
@@ -12227,6 +12276,26 @@ json doc_eval_section_props(const std::string& doc_id, const json& plane_ref) {
     cb.MakeCompound(sec_comp);
     bool any_face = false;
     auto append_section = [&](const TopoDS_Shape& shape) {
+        if (shape.ShapeType() == TopAbs_SOLID) {
+            // Section() includes edges internal to coplanar patches: at a step or
+            // tangent face its graph has degree-three vertices, not closed wires.
+            // Common(face, solid) builds the actual filled regions, including holes,
+            // and discards zero-area edge/point tangencies without perturbing the plane.
+            BRepBuilderAPI_MakeFace plane_face(pln);
+            BRepAlgoAPI_Common common(shape, plane_face.Face());
+            common.Build();
+            if (!common.IsDone())
+                throw OpError("section_failed", "cutting-plane material intersection failed",
+                              {{"doc_id", doc_id}});
+            for (TopExp_Explorer face(common.Shape(), TopAbs_FACE); face.More(); face.Next()) {
+                if (!BRepCheck_Analyzer(face.Current()).IsValid())
+                    throw OpError("section_failed", "section material face construction failed",
+                                  {{"doc_id", doc_id}});
+                cb.Add(sec_comp, face.Current());
+                any_face = true;
+            }
+            return;
+        }
         BRepAlgoAPI_Section section(shape, pln, Standard_False);
         section.Build();
         if (!section.IsDone())
@@ -12258,9 +12327,27 @@ json doc_eval_section_props(const std::string& doc_id, const json& plane_ref) {
         loops.reserve(wires->Length());
         for (int wi = 1; wi <= wires->Length(); ++wi) {
             const TopoDS_Shape& ws = wires->Value(wi);
-            if (ws.ShapeType() != TopAbs_WIRE || !BRep_Tool::IsClosed(ws))
-                throw OpError("section_failed", "section contains an open contour",
-                              {{"doc_id", doc_id}});
+            if (ws.ShapeType() != TopAbs_WIRE || !BRep_Tool::IsClosed(ws)) {
+                json locations = json::array();
+                TopTools_IndexedMapOfShape vertices;
+                TopExp::MapShapes(ws, TopAbs_VERTEX, vertices);
+                for (int vi = 1; vi <= vertices.Extent(); ++vi) {
+                    int degree = 0;
+                    for (TopExp_Explorer edge(ws, TopAbs_EDGE); edge.More(); edge.Next()) {
+                        TopoDS_Vertex first, last;
+                        TopExp::Vertices(TopoDS::Edge(edge.Current()), first, last);
+                        degree += !first.IsNull() && first.IsSame(vertices(vi));
+                        degree += !last.IsNull() && last.IsSame(vertices(vi));
+                    }
+                    if (degree == 2) continue;
+                    const gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(vertices(vi)));
+                    locations.push_back({{"point", {p.X(), p.Y(), p.Z()}}, {"degree", degree}});
+                }
+                throw OpError("section_failed", "section contains an open contour; unmatched "
+                              "or branching endpoints: " + locations.dump(),
+                              {{"doc_id", doc_id}, {"contour_index", wi},
+                               {"open_locations", locations}, {"join_tolerance_mm", join_tol}});
+            }
             BRepBuilderAPI_MakeFace fm(pln, TopoDS::Wire(ws));
             if (!fm.IsDone())
                 throw OpError("section_failed", "section contour face construction failed",
@@ -13810,8 +13897,54 @@ static TopoDS_Shape measure_resolve_ref(const json& ref, const TopoDS_Shape& bod
             if (!found.IsNull()) return found;
         }
     }
-    throw OpError("invalid_op", "measure selector does not match live geometry on the requested owner",
-                  {{"reason", "dangling selector"}});
+    // A SID hashes a geometry fingerprint, not a persistent face identity. Never
+    // substitute a nearby face after a rebuild; give the caller live choices instead.
+    std::string wanted_kind = kind;
+    if (wanted_kind.empty() && !sid.empty())
+        wanted_kind = sid.front() == 'F' ? "face" : sid.front() == 'E' ? "edge" : "vertex";
+    const bool located = ref.contains("centroid") && ref["centroid"].is_array() &&
+                         ref["centroid"].size() == 3 &&
+                         std::all_of(ref["centroid"].begin(), ref["centroid"].end(),
+                                     [](const json& v) { return v.is_number(); });
+    std::vector<std::pair<double, json>> candidates;
+    for (const char* domain : {"face", "edge", "vertex"}) {
+        if (!wanted_kind.empty() && wanted_kind != domain) continue;
+        std::vector<json> selectors;
+        if (std::string(domain) == "vertex") {
+            for (const auto& info : describe_vertices(body)) selectors.push_back(make_selector(info));
+        } else {
+            selectors = resolve_geom_query(body, json{{"of", domain}}).selectors;
+        }
+        for (auto& selector : selectors) {
+            double distance = 0.0;
+            if (located) {
+                for (int axis = 0; axis < 3; ++axis) {
+                    const double delta = selector["centroid"][axis].get<double>() -
+                                         ref["centroid"][axis].get<double>();
+                    distance += delta * delta;
+                }
+            }
+            candidates.emplace_back(distance, std::move(selector));
+        }
+    }
+    if (located)
+        std::stable_sort(candidates.begin(), candidates.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+    json choices = json::array();
+    std::string names;
+    for (std::size_t i = 0; i < std::min<std::size_t>(8, candidates.size()); ++i) {
+        choices.push_back(candidates[i].second);
+        if (!names.empty()) names += ", ";
+        names += candidates[i].second.value("sid", std::string());
+    }
+    throw OpError("invalid_op", "measure selector " + ref.dump() +
+                  " does not match live geometry on the requested owner. " +
+                  (located ? "Nearest live selectors by centroid: " : "Live selector examples: ") +
+                  names + ". Geometry edits can retire SIDs; re-run query_geometry and select "
+                  "from its current reply. A SID alone contains no location to find a nearest face.",
+                  {{"reason", "dangling selector"}, {"requested_selector", ref},
+                   {"live_selectors", choices},
+                   {"candidate_basis", located ? "centroid_distance" : "live_examples"}});
 }
 
 // Pick refs are {body_id: AICM identity, selector: local selector}. Legacy plain
@@ -15326,6 +15459,7 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     sp->doc = std::move(loaded.doc);
     sp->revision = 0;
     sp->path = detach_path ? std::string() : path;
+    if (detach_path) sp->native_source_path = std::filesystem::absolute(path).string();
     // Detached imports must retain relative component references without retaining
     // the source's save destination. Resolve against the container, not process cwd.
     if (detach_path && sp->is_assembly())
@@ -17100,6 +17234,10 @@ json project_external_refs(const json& doc, const chudware::geom::SketchPlane& p
         const double diag = projection_diag;
         json sel = ref.contains("selector") ? ref["selector"] : json(nullptr);
         std::string kind = ref.value("kind", std::string());
+        if (!sel.is_object())
+            throw OpError("invalid_op", "sketch projection: '" + kind +
+                "' ref requires a selector object (use a query_geometry SID or selector)");
+        if (!sel.contains("kind") && !is_geom_query(sel)) sel["kind"] = kind;
 
         // STRICT (associative refresh) resolution: the scored best-match with the
         // contracts/selectors.md accept thresholds (best < 0.35, margin > 0.05), so a
@@ -17108,7 +17246,11 @@ json project_external_refs(const json& doc, const chudware::geom::SketchPlane& p
         // resolution (strict=false) keeps eval_resolve_ref's forgiving centroid-near pick
         // (the selector was minted seconds ago from live geometry).
         auto resolve_sub = [&](const json& s, const std::string& k) -> TopoDS_Shape {
-            if (!strict) return eval_resolve_ref(s, body, diag);
+            if (!strict) {
+                // A SID-only conversion is an exact readback, not a centroid-near query.
+                if (s.contains("sid")) return measure_resolve_ref(s, body, false);
+                return eval_resolve_ref(s, body, diag);
+            }
             auto dangle = [&](const ResolveResult& rr) -> OpError {
                 return OpError("dangling_ref",
                                "external ref no longer resolves" +

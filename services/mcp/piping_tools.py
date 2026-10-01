@@ -37,6 +37,8 @@ import json
 import os
 from typing import Any, Optional, Union
 
+from services.mcp.tool_registry import model_selectors
+
 # The bore-extraction leg (OCCT sweep) stays Python until a kernel leaf ports it —
 # engine_oracle/piping/cfd_handoff.py is NOT deleted in this round.
 from services.piping import cfd_handoff as piping_cfd_mod
@@ -404,6 +406,7 @@ def register_piping_tools(mcp) -> None:
             return _dumps(_err(f"core engine unavailable: {exc}"))
 
     @mcp.tool()
+    @model_selectors("run_id")
     def piping_internal_volume(doc: Union[str, dict],
                                out_path: Optional[str] = None,
                                run_id: Optional[str] = None) -> str:
@@ -461,6 +464,7 @@ def register_piping_tools(mcp) -> None:
         return _dumps(result)
 
     @mcp.tool()
+    @model_selectors("run_id")
     def piping_cfd_handoff(doc: Union[str, dict],
                            boundary: Union[str, list],
                            fluid: Union[str, dict, None] = None,
@@ -646,6 +650,7 @@ def register_piping_tools(mcp) -> None:
                              vol_res.get("volume_mm3"), bore_doc_id)))
 
     @mcp.tool()
+    @model_selectors("run_id")
     def piping_verify_cfd(solve_result: Union[str, dict],
                           cfd_result: Union[str, dict],
                           tolerance_pct: float = 20.0,

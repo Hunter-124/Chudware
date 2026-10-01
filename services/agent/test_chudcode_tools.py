@@ -490,6 +490,56 @@ class HostToolDispatchTests(unittest.TestCase):
         self.assertEqual(seen["run_id"], "gui-2")
         self.assertIs(seen["cancel"], cancel)
 
+    def test_model_selectors_preserve_omission_but_ledger_keeps_run_context(self):
+        from mcp.server.fastmcp import FastMCP
+        from services.agent import ledger, workspace
+        from services.mcp import tool_registry
+        from services.mcp.ledger_tools import register_ledger_tools
+        from services.mcp.workspace_tools import register_workspace_tools
+
+        mcp = FastMCP("selector-regression")
+        with mock.patch.dict(tool_registry._CATALOG, {}, clear=True):
+            register_workspace_tools(tool_registry.view(mcp, "workspace"))
+            register_ledger_tools(tool_registry.view(mcp, "ledger"))
+        entries = mcp._tool_manager._tools
+        context = _context(entries, run_id="gui-orientation", actor="modeler")
+        bindings = {b.name: b for b in build_host_tools(context)}
+
+        def call(name, args):
+            return dispatch_host_tool(bindings[name], args, None, None)
+
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(
+            ledger, "cache_root", return_value=Path(root)
+        ), mock.patch.dict(workspace._session_registry, {}, clear=True):
+            empty = call("workspace_status", {})
+            self.assertTrue(empty["ok"])
+            self.assertEqual(empty["run_id"], "")
+            self.assertEqual(empty["docs"], [])
+            unknown = call("workspace_status", {"run_id": "not-a-workspace"})
+            self.assertFalse(unknown["ok"])
+            self.assertEqual(unknown["run_id"], "not-a-workspace")
+            self.assertIn("describe_project()", unknown["do_instead"])
+
+            session = workspace.WorkspaceSession(run_id="workspace-alpha")
+            session.open_assembly_doc("assembly-doc", "orchestrator")
+            workspace.register_session(session)
+            ambient = call("workspace_status", {})
+            self.assertTrue(ambient["ok"])
+            self.assertEqual(ambient["run_id"], "workspace-alpha")
+            self.assertEqual(ambient["docs"][0]["doc_id"], "assembly-doc")
+            unknown = call("workspace_status", {"run_id": "workspace-alpho"})
+            self.assertFalse(unknown["ok"])
+            self.assertEqual(unknown["did_you_mean"], "workspace-alpha")
+            self.assertEqual(unknown["known_run_ids"], ["workspace-alpha"])
+
+            written = call("ledger_note", {"kind": "note", "payload": {"text": "orient"}})
+            self.assertTrue(written["ok"])
+            self.assertEqual(written["run_id"], "gui-orientation")
+            events = call("ledger_events", {})
+            self.assertEqual(events["events"][0]["payload"], {"text": "orient"})
+            self.assertEqual(events["events"][0]["actor"], "modeler")
+            self.assertEqual(events["run_id"], "gui-orientation")
+
     def test_tool_error_propagates_unchanged(self):
         error = RuntimeError("CAD rejected feature")
 

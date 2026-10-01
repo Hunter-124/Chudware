@@ -116,6 +116,11 @@ def test_native_invalid_sections_and_corrupt_files(tools, native_file, tmp_path)
     assert result["ok"] is False and result["code"] == "unknown_section"
     assert "not_a_section" in result["error"]
     assert {"features", "meta", "studies"} <= set(result["valid_sections"])
+    # Live failure shape: two valid sections plus one near-miss — only the
+    # near-miss is unknown, and the reply names the section it meant.
+    mixed = _read(tools, path=str(native_file), sections=["components", "mates", "metadata"])
+    assert mixed["ok"] is False and mixed["unknown_sections"] == ["metadata"]
+    assert mixed["did_you_mean"] == {"metadata": "meta"}
     bad = tmp_path / "plain.step+"
     bad.write_text("not zip")
     assert _read(tools, path=str(bad))["code"] == "invalid_zip"

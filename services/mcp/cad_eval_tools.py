@@ -1271,6 +1271,10 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         Each query must resolve to exactly ONE face/edge. If it matches several (e.g. "all the
         vertical edges"), narrow it with a predicate ("pick":"largest"/"side":"top"/…) — call
         query_geometry(query) first to see the candidates. Returns a readable `summary` line.
+        Engine readback SIDs are accepted verbatim, but geometry edits can retire them.
+        A dangling-selector error names live alternatives; when a selector also supplies
+        its old centroid, alternatives are ranked by that location. Never treat those
+        suggestions as automatic replacements: query the current geometry before retrying.
 
         ACCEPTED SPELLINGS (echoed in `interpreted`): a= / from= / first= / target= for
         a_query=, b= / to= / second= for b_query=, and the pair given as one list —
@@ -1757,9 +1761,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                         **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Cut the part with a plane and report the CROSS-SECTION area + section moments.
 
-        This is the "section the part to inspect its internals" probe. It slices the active
-        body and computes the real properties of the resulting cut face — the cross-section a
-        draftsman would dimension.
+        This is the "section the part to inspect its internals" probe. It slices every
+        world-placed body independently and sums the material cut faces (outer regions
+        minus holes), with an area-weighted centroid and centroidal section moments.
 
         plane : "top" (XY, normal +Z), "front" (XZ, normal -Y), or "right" (YZ, normal +X) —
                 the reserved Chudware datum planes (Z-up). Spellable as "XY"/"XZ"/"YZ", a
@@ -1776,6 +1780,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
           * centroid — the area centroid of the section, in world coordinates.
           * Ixx/Iyy/Ixy — centroidal section second moments (mm^4) in the cutting-plane frame.
         A plane that misses the body (empty cut) returns area 0.
+        Coplanar steps/floors belong to the exact-plane material section; tangent edges
+        or points alone have zero area. A genuinely open surface contour is an error
+        with world-space `detail.open_locations`, not a partial section or a false zero.
         """
         d = None
         try:

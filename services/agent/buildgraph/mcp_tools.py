@@ -31,6 +31,8 @@ import uuid
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
+from services.mcp.tool_registry import model_selectors
+
 # FastMCP's func_metadata does not special-case VAR_KEYWORD: a bare ``**kwargs``
 # becomes a REQUIRED pydantic field literally named "kwargs", so every FastMCP
 # call (including the canonical one) fails with "kwargs Field required". An
@@ -573,6 +575,7 @@ def register_buildgraph_tools(mcp, runs_dir: Optional[Path] = None) -> None:
         return _dumps(out)
 
     @mcp.tool()
+    @model_selectors("run_id")
     def buildgraph_status(
         run_id: str,
         runs_dir_override: Optional[str] = None,

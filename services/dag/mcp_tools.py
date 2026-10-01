@@ -39,6 +39,7 @@ from pydantic import Field
 from services.dag import session
 from services.dag.executor import default_runs_dir as _runs_dir
 from services.dag.run_ids import validate_run_id
+from services.mcp.tool_registry import model_selectors
 
 # Var-keyword parameters below are annotated ``Annotated[Any, Field(default=None)]``
 # rather than left bare.  FastMCP's func_metadata turns a bare ``**kwargs`` into a
@@ -566,6 +567,7 @@ def register_dag_tools(mcp) -> None:
         return _dumps(out)
 
     @mcp.tool()
+    @model_selectors("run_id")
     def dag_run(
         graph_json: Any = None,
         run_id: Optional[str] = None,
@@ -780,6 +782,7 @@ def register_dag_tools(mcp) -> None:
         return _dumps(out)
 
     @mcp.tool()
+    @model_selectors("run_id")
     def dag_status(
         run_id: Optional[str] = None,
         runs_dir: Optional[str] = None,
@@ -929,6 +932,7 @@ def register_dag_tools(mcp) -> None:
         return _dumps(out)
 
     @mcp.tool()
+    @model_selectors("run_id")
     def dag_approve(
         run_id: Optional[str] = None,
         graph_json: Any = None,
@@ -1018,6 +1022,7 @@ def register_dag_tools(mcp) -> None:
         return _dumps(out)
 
     @mcp.tool()
+    @model_selectors("run_id")
     def dag_abort(
         run_id: Optional[str] = None,
         graph_json: Any = None,
@@ -1105,6 +1110,7 @@ def register_dag_replan_tools(mcp) -> None:
     """
 
     @mcp.tool()
+    @model_selectors("run_id")
     def dag_replan(
         run_id: Optional[str] = None,
         splice_nodes: Optional[list] = None,

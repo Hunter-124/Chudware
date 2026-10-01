@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from services.mcp.tool_registry import model_selectors
+
 from . import api
 
 
@@ -79,6 +81,7 @@ def register_deliverables_tools(mcp) -> None:
         return api.render_document(path)
 
     @mcp.tool()
+    @model_selectors("run_id")
     def list_artifacts(run_id: str | None = None) -> dict:
         """Read the artifact registry (newest first); optional run_id filters to one agent run.
 

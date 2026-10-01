@@ -8,6 +8,7 @@ validator. Daemon success and refusal dictionaries are returned unchanged.
 from __future__ import annotations
 
 from . import daemon_bridge
+from .tool_registry import model_selectors
 
 
 def _call(method: str, **params) -> dict:
@@ -66,6 +67,7 @@ def register_mfg_tools(mcp) -> None:
         return _call("mfg_run_list", device_id=device_id, state=state, limit=limit)
 
     @mcp.tool()
+    @model_selectors("run_id")
     def mfg_run_describe(run_id: str) -> dict:
         """Read one run's state, artifact, gate, approval, and initiator history."""
         return _call("mfg_run_describe", run_id=run_id)
@@ -103,6 +105,7 @@ def register_mfg_tools(mcp) -> None:
                      device_id=device_id, artifact=artifact)
 
     @mcp.tool()
+    @model_selectors("run_id")
     def mfg_preflight_run(lease_id: str, artifact_id: str,
                           run_id: str | None = None,
                           job: dict | None = None,
@@ -117,6 +120,7 @@ def register_mfg_tools(mcp) -> None:
                      snapshot=snapshot)
 
     @mcp.tool()
+    @model_selectors("run_id")
     def mfg_approval_propose(lease_id: str, run_id: str,
                              exercisable_by: str | None = None,
                              expiry_ttl_ms: int | None = None,
@@ -134,6 +138,7 @@ def register_mfg_tools(mcp) -> None:
                      spindle_authority=spindle_authority)
 
     @mcp.tool()
+    @model_selectors("run_id")
     def request_mfg_run_start(lease_id: str, run_id: str, approval_id: str,
                               agent_identity: str = "mcp-agent",
                               seat: str | None = None,
@@ -150,6 +155,7 @@ def register_mfg_tools(mcp) -> None:
         )
 
     @mcp.tool()
+    @model_selectors("run_id")
     def request_mfg_hold(lease_id: str, run_id: str,
                          kind: str = "feed_hold",
                          agent_identity: str = "mcp-agent",
@@ -162,6 +168,7 @@ def register_mfg_tools(mcp) -> None:
         )
 
     @mcp.tool()
+    @model_selectors("run_id")
     def request_mfg_abort(lease_id: str, run_id: str,
                           agent_identity: str = "mcp-agent",
                           seat: str | None = None,

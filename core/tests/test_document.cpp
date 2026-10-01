@@ -4196,6 +4196,62 @@ TEST_CASE("eval_section_props preserves annular holes and an independent island 
     std::filesystem::remove(path);
 }
 
+TEST_CASE("eval_section_props classifies coplanar step branches as material with a hole") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "SectionCoplanarStep").at("doc_id");
+    const auto path = std::filesystem::temp_directory_path() / (id + ".brep");
+    // At z=0 the pocket floor meets the outer wall in degree-three section
+    // vertices. Those extra coplanar edges are not an open material boundary.
+    BRepAlgoAPI_Cut step(
+        BRepPrimAPI_MakeBox(gp_Pnt(-5.0, -5.0, -5.0), 10.0, 10.0, 10.0).Shape(),
+        BRepPrimAPI_MakeBox(gp_Pnt(0.0, -3.0, 0.0), 5.0, 6.0, 5.0).Shape());
+    REQUIRE(step.IsDone());
+    BRepAlgoAPI_Cut bored(step.Shape(),
+        BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(-2.5, 0.0, -5.0), gp_Dir(0, 0, 1)),
+                                1.0, 10.0).Shape());
+    REQUIRE(bored.IsDone());
+    REQUIRE(BRepCheck_Analyzer(bored.Shape()).IsValid());
+    REQUIRE(BRepTools::Write(bored.Shape(), path.string().c_str()));
+    const json built = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "import"}, {"name", "Step"},
+            {"params", {{"source_path", path.string()}, {"format", "brep"}}}}}}
+    }), false);
+    for (const auto& status : built.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+    for (double z : {-1.0, 0.0, 1.0}) {
+        const json section = doc_eval_section_props(id,
+            {{"origin", {0.0, 0.0, z}}, {"normal", {0.0, 0.0, 1.0}}});
+        CHECK(section.at("area_mm2").get<double>() ==
+              doctest::Approx((z > 0.0 ? 70.0 : 100.0) - PI));
+        CHECK(section.at("centroid")[2].get<double>() == doctest::Approx(z).epsilon(1e-8));
+    }
+    CHECK(doc_close(id));
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("eval_measure refuses a retired selector and names nearest live geometry") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "MeasureRetiredSid").at("doc_id");
+    const json built = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+            {"params", {{"length", 4.0}, {"width", 6.0}, {"height", 10.0}}}}}}
+    }), false);
+    for (const auto& status : built.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+    try {
+        (void)doc_eval_measure(id, json::array({
+            {{"sid", "F000000"}, {"kind", "face"}, {"centroid", {0.0, 0.0, 5.0}}}}));
+        FAIL("retired SID must not silently measure a neighbouring face");
+    } catch (const OpError& error) {
+        CHECK(error.detail.at("candidate_basis") == "centroid_distance");
+        const auto& nearest = error.detail.at("live_selectors").at(0);
+        CHECK(nearest.at("centroid") == json::array({0.0, 0.0, 5.0}));
+        const json measured = doc_eval_measure(id, json::array({nearest}));
+        CHECK(measured.at("area").get<double>() == doctest::Approx(24.0));
+    }
+    CHECK(doc_close(id));
+}
+
 TEST_CASE("eval_section_props uses rotated nested assembly world geometry") {
     using namespace chudware::doc;
     const std::string part = doc_new("part", "SectionNestedSource").at("doc_id");
@@ -4268,6 +4324,13 @@ TEST_CASE("eval_section_props refuses an open contour instead of returning a par
         FAIL("open section contour must not produce a partial area or a successful zero");
     } catch (const OpError& error) {
         CHECK(error.code == "section_failed");
+        REQUIRE(error.detail.at("open_locations").size() == 2);
+        for (const auto& location : error.detail.at("open_locations")) {
+            CHECK(location.at("degree") == 1);
+            CHECK(location.at("point")[0].get<double>() == doctest::Approx(30.0));
+            CHECK(std::abs(location.at("point")[1].get<double>()) == doctest::Approx(10.0));
+            CHECK(location.at("point")[2].get<double>() == doctest::Approx(0.0).epsilon(1e-8));
+        }
     }
     CHECK(doc_close(id));
     std::filesystem::remove(path);

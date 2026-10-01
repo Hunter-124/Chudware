@@ -8,6 +8,7 @@ from typing import Optional
 from typing import Union
 
 from pydantic import Field  # noqa: TC002 — runtime-read by FastMCP's schema builder
+import difflib
 import json
 import math
 import os
@@ -1271,6 +1272,9 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     id_map: dict[str, str] = {}
     norm_ents: list = []
     eid = 0
+    reserved_eids = {e["id"] for e in ents_in if isinstance(e, dict)
+                     and isinstance(e.get("id"), str) and _EID_RE.fullmatch(e["id"])}
+    expanded_ids: dict[str, list[str]] = {}
     # Flat shorthand a model writes instead of the engine's canonical entity fields
     # (cx/cy for center, r/d/dia/diameter for radius, x1/y1/x2/y2 for a line's
     # endpoints, x/y for a lone point) — tracked here so a 29-circle lattice sketch
@@ -1287,11 +1291,13 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             e = {"type": e[alias], **{k: v for k, v in e.items() if k != alias}}
             used_alias_keys.add(alias)
         if _slug(e.get("type")) in _POLYLINE_TYPES:
-            seg = _expand_polyline(e, eid)
+            # Expansion must not consume a canonical id belonging to another entity.
+            start = max([eid] + [int(x[1:]) for x in reserved_eids])
+            seg = _expand_polyline(e, start)
             if seg:
                 if isinstance(e.get("id"), str) and e["id"]:
-                    id_map[e["id"]] = seg[0]["id"]
-                eid += len(seg)
+                    expanded_ids[e["id"]] = [x["id"] for x in seg]
+                eid = start + len(seg)
                 norm_ents.extend(seg)
                 sink.append(
                     f'{_feat_label(feat, "sketch")}: expanded the polyline into '
@@ -1301,9 +1307,18 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             # < 2 distinct points, or a point that is not [x,y]: nothing unambiguous to
             # expand. Fall through and let the engine name what is wrong with it.
         eid += 1
-        new_id = f"e{eid}"
-        if isinstance(e.get("id"), str) and e["id"]:
-            id_map[e["id"]] = new_id
+        raw_id = e.get("id")
+        if isinstance(raw_id, str) and _EID_RE.fullmatch(raw_id):
+            new_id = raw_id
+        else:
+            while f"e{eid}" in reserved_eids:
+                eid += 1
+            new_id = f"e{eid}"
+            reserved_eids.add(new_id)
+        if isinstance(raw_id, str) and raw_id:
+            if raw_id in id_map:
+                raise ValueError(f'sketch "{_feat_label(feat, "sketch")}": duplicate entity id {raw_id!r}')
+            id_map[raw_id] = new_id
         ne = dict(e)
         ne["id"] = new_id
         if _slug(ne.get("type")) in _CONSTRUCTION_TYPES:
@@ -1469,22 +1484,36 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     etypes = {e["id"]: e.get("type") for e in norm_ents
               if isinstance(e, dict) and isinstance(e.get("id"), str)}
     norm_cons = []
+    all_cons = list(cons_in) + list(dims_in)
+    reserved_cids = {c["id"] for c in all_cons if isinstance(c, dict)
+                     and isinstance(c.get("id"), str) and _CID_RE.fullmatch(c["id"])}
     cn = 0
     con_rewrites: set = set()
-    for c in list(cons_in) + list(dims_in):
+    for c in all_cons:
         if not isinstance(c, dict):
             norm_cons.append(c)
             continue
         nc = _normalize_one_constraint(c, _remap, etypes,
                                        f'sketch "{_feat_label(feat, "sketch")}"',
                                        con_rewrites)
-        cid = nc.get("id")
-        if isinstance(cid, str) and _CID_RE.match(cid):
-            cn = max(cn, int(cid[1:]))
-        else:
-            cn += 1
-            nc["id"] = f"c{cn}"
-        norm_cons.append(_norm_dim_value(nc))
+        copies = [nc]
+        for ref in nc.get("refs", []):
+            if isinstance(ref, str) and ref.partition(".")[0] in expanded_ids:
+                if nc.get("type") != "fix" or "." in ref or len(nc["refs"]) != 1:
+                    raise ValueError(
+                        f"constraint on expanded polyline {ref!r} is ambiguous; name "
+                        "the emitted line entity/endpoint, or fix the whole polyline")
+                copies = [{**nc, "refs": [eid]} for eid in expanded_ids[ref]]
+                break
+        for index, nc in enumerate(copies):
+            cid = nc.get("id")
+            if index or not (isinstance(cid, str) and _CID_RE.fullmatch(cid)):
+                cn += 1
+                while f"c{cn}" in reserved_cids:
+                    cn += 1
+                nc["id"] = f"c{cn}"
+                reserved_cids.add(nc["id"])
+            norm_cons.append(_norm_dim_value(nc))
     if con_rewrites:
         sink.append(
             f'{_feat_label(feat, "sketch")}: rewrote relations/dimensions onto the engine\'s '
@@ -1544,25 +1573,65 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     return new_feat
 
 
-def _normalize_sketch_ops(ops: Any, notes: Optional[list] = None) -> Any:
-    """Normalize any sketch add_feature ops in-place-safe; return a new list."""
+def _normalize_sketch_ops(ops: Any, notes: Optional[list] = None,
+                          doc_id: Optional[str] = None) -> Any:
+    """Normalize creation and replacement geometry with one sketch convention.
+
+    An edit is a patch, not a new sketch: merge the current feature first so omitted
+    entities, constraints, plane and offset cannot be reset by creation defaults.
+    """
     if not isinstance(ops, list):
         return ops
+    edits_geometry = any(isinstance(op, dict) and op.get("op") == "edit_feature"
+                         and isinstance(op.get("params"), dict)
+                         and any(k in op["params"] for k in ("entities", "constraints", "dimensions"))
+                         for op in ops)
+    features = {}
+    if edits_geometry and doc_id:
+        tree = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
+        features = {f["id"]: f for f in tree.get("features", []) if isinstance(f, dict)}
     out = []
-    for op in ops:
-        try:
-            if (isinstance(op, dict) and op.get("op") == "add_feature"
-                    and isinstance(op.get("feature"), dict)
-                    and op["feature"].get("type") == "sketch"):
-                op = {**op, "feature": _normalize_sketch_feature(op["feature"], notes)}
-        except ValueError:
-            # A TEACHABLE rejection the normalizer proved (same contract as
-            # _normalize_boolean_feature): the call cannot build and the message says how
-            # to fix it. Swallowing it here would create the empty sketch anyway and hand
-            # the model an unrelated error two features later.
-            raise
-        except Exception:  # noqa: BLE001 — never let normalization break a valid call
-            pass
+    for index, op in enumerate(ops):
+        if not isinstance(op, dict):
+            out.append(op)
+            continue
+        feat = op.get("feature")
+        if op.get("op") == "add_feature" and isinstance(feat, dict):
+            if feat.get("type") == "sketch":
+                feat = _normalize_sketch_feature(feat, notes)
+                op = {**op, "feature": feat}
+            features[f"${index}"] = feat
+        elif op.get("op") == "edit_feature":
+            current = features.get(op.get("id"))
+            params = op.get("params")
+            if (isinstance(current, dict) and current.get("type") == "sketch"
+                    and isinstance(params, dict)
+                    and any(k in params for k in ("entities", "constraints", "dimensions"))):
+                for key in ("entities", "constraints", "dimensions"):
+                    if key in params and not isinstance(params[key], list):
+                        raise ValueError(
+                            f"edit_feature {op.get('id')}: params.{key} must be a JSON "
+                            "array; omit the field to keep its current value")
+                merged = {**current,
+                          "params": {**current.get("params", {}), **params},
+                          "refs": {**current.get("refs", {}), **op.get("refs", {})}}
+                normalized = _normalize_sketch_feature(merged, notes)
+                normalized_params = normalized["params"]
+                # Read the current sketch for context, but send only the caller's patch
+                # and handles the normalizer actually rewrote. Unrelated live parameters
+                # must not be copied back from this earlier readback.
+                patch = {key: normalized_params[key] for key in params
+                         if key in normalized_params}
+                for key in ("entities", "constraints"):
+                    if normalized_params[key] != merged["params"].get(key):
+                        patch[key] = normalized_params[key]
+                op = {**op, "params": patch}
+                if "plane" in params or "plane" in op.get("refs", {}):
+                    op["refs"] = {**op.get("refs", {}), "plane": normalized["refs"]["plane"]}
+                features[op["id"]] = normalized
+            elif isinstance(current, dict):
+                features[op["id"]] = {**current,
+                    "params": {**current.get("params", {}), **(params or {})}}
         out.append(op)
     return out
 
@@ -2239,6 +2308,15 @@ def _convert_units(val: Any, notes: list, label: str, key: str = "", depth: int 
     where = f"{label}{key}" if key else label.rstrip(".")
 
     if isinstance(val, str):
+        if val.lstrip().startswith("{"):
+            try:
+                dimension = json.loads(val)
+            except (json.JSONDecodeError, ValueError):
+                dimension = None
+            if _is_dim_object(dimension):
+                notes.append(f"{where}: decoded the JSON dimension object")
+                converted, _ = _convert_units(dimension, notes, label, key, depth + 1)
+                return converted, True
         mm = _dim_mm(val)
         if mm is None:
             return val, False
@@ -3257,6 +3335,16 @@ def _decode_embedded_structures(v: Any, notes: list, _depth: int = 0) -> Any:
                     f'decoded "{k}" from a string into the object it encodes — a '
                     f"structure slot takes real JSON, not a quoted dict")
                 val = decoded
+            if k == "refs" and isinstance(val, list):
+                decoded_items = [_decode_one_structure(x) for x in val]
+                if decoded_items != val:
+                    notes.append('decoded stringified refs[] selectors into JSON objects')
+                    val = decoded_items
+            elif k == "refs" and isinstance(val, dict):
+                decoded_slots = {slot: _decode_one_structure(item) for slot, item in val.items()}
+                if decoded_slots != val:
+                    notes.append('decoded stringified refs slots into JSON selectors')
+                    val = decoded_slots
         out[k] = _decode_embedded_structures(val, notes, _depth + 1)
     return out
 
@@ -6704,13 +6792,26 @@ def _native_read_rows(rows: Any, keys: tuple[str, ...],
 def _native_read_file(path: str, sections: Optional[list[str]],
                       feature_ids: Optional[list[str]], component_ids: Optional[list[str]],
                       include_params: bool) -> str:
-    if sections is not None and (
-            not isinstance(sections, list) or
-            any(not isinstance(section, str) or section not in _NATIVE_READ_SECTIONS
-                for section in sections)):
+    if sections is not None and not isinstance(sections, list):
         return _dumps({"ok": False, "code": "unknown_section",
-                       "error": f"Unknown section(s): {sections!r}. "
+                       "error": f"sections must be a list of section names, got {sections!r}. "
                                 f"Valid sections: {', '.join(_NATIVE_READ_SECTIONS)}",
+                       "valid_sections": list(_NATIVE_READ_SECTIONS)})
+    unknown = [section for section in sections or ()
+               if not isinstance(section, str) or section not in _NATIVE_READ_SECTIONS]
+    if unknown:
+        suggestions = {
+            str(section): close[0]
+            for section in unknown
+            if (close := difflib.get_close_matches(str(section), _NATIVE_READ_SECTIONS,
+                                                   n=1, cutoff=0.5))
+        }
+        return _dumps({"ok": False, "code": "unknown_section",
+                       "error": f"Unknown section(s): {unknown!r}"
+                                + (f" (did you mean {suggestions!r}?)" if suggestions else "")
+                                + f". Valid sections: {', '.join(_NATIVE_READ_SECTIONS)}",
+                       "unknown_sections": unknown,
+                       "did_you_mean": suggestions,
                        "valid_sections": list(_NATIVE_READ_SECTIONS)})
     try:
         if isinstance(path, str) and path.strip() and not Path(path).is_absolute():
@@ -7328,6 +7429,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
           "size":[l,w,h] on a box -> length/width/height; "size":40 -> a 40 cube.
         These forms work on any add_feature params and on edit_feature params (the unit
         conversion; the per-type diameter alias needs the feature type, so it is add-only).
+        A JSON-encoded {"value":N,"expr":null} dimension from a tree readback is decoded
+        before evaluation too; literal text fields and ordinary expressions stay text.
         Every rewrite this tool performs comes back as `interpreted`:[…] beside the result.
 
         SCHEMA DEFAULTS the engine requires and you may omit (all echoed in `interpreted`):
@@ -7338,10 +7441,15 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     refs.face defaults to {"of":"face","side":"top"} (a bore has to be
                     entered SOMEWHERE) — a direction vector picks the face instead. A world
                     [x,y,z] under origin/position/at becomes FACE-LOCAL positions=[[u,v]].
-          sketch    entities get sequential e1..eN ids and every constraint/dimension handle
-                    that referenced the old id is rewritten with them; params.constraints
-                    defaults to []; refs.plane accepts XY/XZ/YZ/top/front/right (any case)
-                    and becomes the reserved datum plane.top/plane.front/plane.right.
+          sketch    missing/noncanonical entity ids become e<N>; canonical ids are retained,
+                    with constraint handles remapped. Missing construction defaults to false.
+                    Creation AND edit_feature replacements use the same entity/constraint
+                    dialect normalizer; omitted edit fields keep their current values.
+                    params.constraints defaults to [] on creation only. refs.plane accepts
+                    XY/XZ/YZ/top/front/right -> plane.top/plane.front/plane.right.
+                    A fix on a rectangle/polygon/polyline pins every expanded segment;
+                    other relations on a whole expanded shape are ambiguous and refuse.
+                    reorder_feature accepts same-batch "$N" in both id and before.
           boolean   params.op accepts union/add/join -> "fuse", subtract/difference -> "cut",
                     intersect -> "common"; targets/bodies/operands become params.a and .b.
           extrude / revolve / loft / sweep
@@ -7617,7 +7725,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # Model-robustness: accept the natural/flat sketch shape LLMs emit
             # (L1 ids, start/end, dimensions[], top-level plane) by normalizing it
             # to the engine's canonical schema before validation.
-            ops = _normalize_sketch_ops(ops, interpreted)
+            ops = _normalize_sketch_ops(ops, interpreted, d)
             # …and the 2D EDITING ops beside it (trim/extend/offset/fillet/chamfer/
             # mirror/pattern/move/rotate), whose key names session.cpp reads verbatim and
             # whose ignored flags silently destroyed or stacked geometry.
@@ -8428,7 +8536,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         """Read a saved .step+ file's feature tree, components, mates, materials and metadata WITHOUT opening it.
 
         Path may be absolute or relative to CHUDWARE_FS_ROOT, but must remain inside it.
-        Choose sections or feature_ids/component_ids to narrow the reply. Large strings
+        Choose sections or feature_ids/component_ids to narrow the reply. sections:
+        features, components, mates, explode, material, body_materials, appearances,
+        face_appearances, meta, equations, configurations, rollback_after, studies. Large strings
         (including embedded BREP) are omitted; the saved file is never modified.
         """
         return _native_read_file(path, sections, feature_ids, component_ids, include_params)

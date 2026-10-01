@@ -209,9 +209,18 @@ Server::~Server() {
     // on the fd; otherwise fall back to the historical unlink-on-close behavior.
     listener_.close(/*unlink_path=*/true);
     std::vector<std::shared_ptr<ClientConn>> live;
+    std::vector<std::thread> threads;
     {
+        // Take the client threads out under the same lock clientLoop's disconnect tail
+        // detaches under. Checking joinable() and then joining raced that detach: a loop
+        // woken by the shutdown below detached itself between the two, join() threw
+        // std::system_error and every idle exit with a client still connected aborted
+        // with a core dump (live: a headless agent turn's MCP socket).
         std::lock_guard<std::mutex> lk(clientsMtx_);
-        for (auto& [id, c] : clients_) live.push_back(c);
+        for (auto& [id, c] : clients_) {
+            live.push_back(c);
+            if (c->thread.joinable()) threads.push_back(std::move(c->thread));
+        }
     }
     // Interrupt any thread parked in readLine()'s poll() BEFORE joining. A bare close()
     // does NOT wake a thread already blocked in poll() on Linux, so the join below hung
@@ -219,8 +228,7 @@ Server::~Server() {
     // other end" restart hang). shutdown() delivers POLLHUP so readLine returns at once;
     // close() after the join reclaims the fd.
     for (auto& c : live) c->conn.shutdown();
-    for (auto& c : live)
-        if (c->thread.joinable()) c->thread.join();
+    for (auto& t : threads) t.join();
     for (auto& c : live) c->conn.close();
 }
 
@@ -336,14 +344,16 @@ void Server::run(int lingerSecs) {
             }
             auto c = std::make_shared<ClientConn>();
             {
+                // Start the loop under the lock its disconnect tail takes, so that tail can
+                // never observe a not-yet-assigned (non-joinable) thread object.
                 std::lock_guard<std::mutex> lk(clientsMtx_);
                 c->id = nextClientId_++;
                 c->conn = std::move(conn);
                 c->lastRpcMs = monoMs();
                 clients_[c->id] = c;
+                ++status_.clients;
+                c->thread = std::thread([this, c] { clientLoop(c); });
             }
-            ++status_.clients;
-            c->thread = std::thread([this, c] { clientLoop(c); });
             log().line("client #%d connected (%d total)", c->id, status_.clients.load());
         }
         // Expire stale edit-holds + emit doc.lease_change; docs whose GC grace
@@ -364,12 +374,20 @@ void Server::run(int lingerSecs) {
                     log().line("drain deadline reached with %d client(s) still connected — "
                                "dropping them and exiting", status_.clients.load());
                     disconnectAllClients();
+                } else if (!expired) {
+                    // Nothing pins (see pinningClients): any socket left is parked, so the
+                    // same clean-exit notice as an idle exit applies.
+                    sendEventToAll(json{{"event", "daemon.exiting"}, {"reason", "drained"}}.dump());
                 }
                 break;
             }
         } else if (idleExpired(lingerSecs)) {
             log().line("idle for %ds with nothing to serve — exiting",
                        guiDetached_ ? guiExitGraceSecs_ : lingerSecs);
+            // A parked client (no attachments, nothing in flight) may still hold its socket.
+            // Tell it this was a clean idle exit so its next call reconnects instead of
+            // reporting a lost session; a crash sends nothing, keeping that path loud.
+            sendEventToAll(json{{"event", "daemon.exiting"}, {"reason", "idle"}}.dump());
             break;
         }
     }
@@ -565,7 +583,9 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c) {
     try {
         {
             std::lock_guard<std::mutex> lk(clientsMtx_);
-            c->thread.detach();  // we're on this thread; the map drop releases the struct
+            // We're on this thread; the map drop releases the struct. During teardown
+            // ~Server already owns (and joins) the thread object, so it is not joinable.
+            if (c->thread.joinable()) c->thread.detach();
             clients_.erase(c->id);
             // Last GUI gone: switch idle-exit to the short grace (see guiDetached_).
             if (c->kind == "gui") {

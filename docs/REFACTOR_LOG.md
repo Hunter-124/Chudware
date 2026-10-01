@@ -5423,3 +5423,10 @@ structured admission evidence plus the original contact-resolution invariants.
 `docs/reference/CI_RUNNERS.md` documents the mirror and Windows build/pin
 prerequisite; Windows remains fail-closed until real Windows bytes are built
 and pinned. No desktop release was published during these local checks.
+Follow-up from the headless rerun: hostd idle-exited (120 s) under the worker's parked MCP socket
+and its teardown aborted — `~Server` checked `joinable()` then `join()`ed while the woken client
+loop `detach()`ed itself (std::system_error → SIGABRT core). Threads are now moved out under
+`clientsMtx_` (and started under it); the tail detaches only a joinable thread. A clean idle exit
+or completed soft drain now pushes `{"event":"daemon.exiting","reason":"idle"|"drained"}`, and
+`DaemonClient.call` reconnects on such an announced close instead of failing the next call as a
+lost session (unannounced closes — crash, kill, hard drain — stay loud; never replayed).

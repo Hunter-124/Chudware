@@ -598,11 +598,54 @@ class DaemonClient:
                     return err
                 return {"_is_error": True, "message": str(err)}
 
+    def _peer_closed_idle(self) -> bool:
+        """True only when hostd announced a clean exit (idle / soft drain) and then closed this socket.
+
+        Non-blocking: whatever the daemon pushed meanwhile (events) is appended to the
+        read buffer, so _read_msg still sees it in order. An idle exit happens only when
+        this client had nothing attached and nothing in flight, so reconnecting loses no
+        session state. A close WITHOUT that announcement (crash, kill, hard drain) keeps
+        the loud path: the next call reports the lost session and is never replayed.
+        Windows named pipes have no cheap probe and keep the loud path too.
+        """
+        sock = self._sock
+        if not isinstance(sock, socket.socket):
+            return False
+        closed = False
+        try:
+            while True:
+                chunk = sock.recv(65536, socket.MSG_DONTWAIT)
+                if not chunk:
+                    closed = True
+                    break
+                self._buf += chunk
+        except (BlockingIOError, InterruptedError):
+            return False
+        except OSError:
+            closed = True
+        if not closed:
+            return False
+        for line in self._buf.split(b"\n"):
+            try:
+                msg = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if (isinstance(msg, dict) and msg.get("event") == "daemon.exiting"
+                    and msg.get("reason") in ("idle", "drained")):
+                return True
+        return False
+
     # ---------------------------------------------------------------- public
 
     def call(self, method: str, params: Optional[dict] = None) -> dict:
         """Blocking RPC; only an explicit loading refusal permits redispatch."""
         with self._lock:
+            if self._sock is not None and self._peer_closed_idle():
+                # hostd idle-exited (or drained) while this connection sat between
+                # calls. Nothing of this call was sent, so reconnecting is not a
+                # replay; without this the next request dies on a dead socket as
+                # "outcome unknown" (live: a headless turn read files for 2 min).
+                self._disconnect()
             if self._sock is None:
                 self.connect()
             outcome = "unknown"

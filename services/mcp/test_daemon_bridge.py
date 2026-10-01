@@ -82,6 +82,29 @@ def test_reconnect_after_daemon_sigkill(scratch_daemon):
     c.close()
 
 
+def test_idle_exit_under_a_parked_client_reconnects_cleanly(scratch_daemon):
+    """hostd idle-exits under a connected client that holds nothing (a headless agent
+    reading files for minutes). That clean exit is announced, so the client's next
+    call reconnects instead of failing as a lost session — and the daemon's teardown
+    with that socket still open must not abort."""
+    c = DaemonClient()
+    c.connect()
+    pid = _pid(c)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.2)
+    else:
+        pytest.fail("hostd did not idle-exit under a parked client")
+    st = c.call("daemon_status")
+    assert st["pid"] != pid
+    scratch_daemon.append(st["pid"])
+    c.close()
+
+
 def test_rpc_error_maps_to_is_error(scratch_daemon):
     c = DaemonClient()
     c.connect()

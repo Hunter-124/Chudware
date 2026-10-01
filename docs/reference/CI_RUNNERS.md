@@ -164,62 +164,55 @@ be invisible until someone reboots the box. So:
 
 ### Pinned Chudcode artifact (`CHUDWARE_CHUD_BIN`)
 
-Chudcode-backed releases target Linux x86_64, macOS x86_64 and Windows
-x86_64. The macOS ARM64 runner has a CAD core-only preset, but no Chudcode
-release artifact or available Mac ARM Chudcode build host; it is not a
-Chudcode-backed release leg. Every release leg embeds the compiled `chud`
-binary. The job never downloads it: its capability step runs
-`scripts/pin_chudcode.py verify` on the file named by `CHUDWARE_CHUD_BIN`
-(executable format and architecture, SHA-256 against
-`vendor/chudcode/CHUDCODE_ARTIFACT.lock`, and `--version` reporting exactly
-`Chudcode v<lock version>`), and packaging later `stage`s that same file.
-No workflow provisions it, deliberately: the Chudcode repository is private,
-so its release assets need a credential, and `pin_chudcode.py fetch` accepts
-only unauthenticated, non-redirecting URLs. Each release builder needs one
-local copy, outside `_work` so checkout cleaning never removes it, named in
-its runner service environment.
+Desktop releases target Linux x86_64, macOS x86_64 and Windows x86_64. Every
+release embeds the compiled `chud` runtime. The nightly capability step uses
+`scripts/pin_chudcode.py ensure`: an explicit `CHUDWARE_CHUD_BIN` is verified
+offline; otherwise a digest-keyed cache under the runner account's
+`~/chudware-ci-tools/chudcode/<sha256>/chud` (`chud.exe` on Windows) is verified,
+or populated from this repository's release mirror. Packaging still uses the
+strictly offline `stage` command.
 
-| Runner | Lock target | Expected release asset | Where to install the file | Prerequisite |
-|---|---|---|---|---|
-| `livingroom-pc` | `linux-x86_64` | `chudcode-linux-x64` (v0.4.1) | `/home/liveuser/chudware-web-data/chud` (shared with `deploy-prod.yml`) | Installed and verified against the committed lock. |
-| `imac-intel` | `macos-x86_64` | `chudcode-darwin-x64` (v0.4.1) | `/Users/apple/chudware-ci-tools/chudcode/chud` | Install the pinned binary and configure `CHUDWARE_CHUD_BIN`; installation has not been verified. |
-| `ryzen-7900x3d` | `windows-x86_64` | none: the v0.4.1 lock has no Windows pin | `%USERPROFILE%\chudware-ci-tools\chudcode\chud.exe` | The Windows release leg fails closed until a runtime release is pinned for Windows. |
+The mirror tag is `chudcode-runtime-v<lock version>` in `Hunter-124/Chudware`.
+Its assets keep the filenames from `vendor/chudcode/CHUDCODE_ARTIFACT.lock`:
 
-The runner reads `.env` in its install directory only when it starts, so every
-change needs a runner restart. On a Mac, as the runner's login user:
+| Runner | Lock target | Mirror asset |
+|---|---|---|
+| `livingroom-pc` | `linux-x86_64` | `chudcode-linux-x64` |
+| `imac-intel` | `macos-x86_64` | `chudcode-darwin-x64` |
+| `ryzen-7900x3d` | `windows-x86_64` | `chudcode-windows-x64.exe` (must be built and pinned before the Windows nightly can pass) |
 
-1. Get `chudcode-darwin-x64` for the locked version from a machine that can
-   read `Hunter-124/chudcode`, for example `gh release download
-   chudcode-v0.4.1 -R Hunter-124/chudcode -p chudcode-darwin-x64`. Move it to
-   the Mac by hand: the Macs are not reachable over SSH from the workstation.
-2. Install it: `mkdir -p ~/chudware-ci-tools/chudcode`, copy it to
-   `~/chudware-ci-tools/chudcode/chud`, `chmod 755` it, and
-   `xattr -d com.apple.quarantine ~/chudware-ci-tools/chudcode/chud` if it
-   arrived through a browser or AirDrop.
-3. Prove it from any CAD checkout, for instance the runner's own
-   `~/actions-runner-cad/_work/CAD/CAD`:
-   `~/chudware-ci-tools/release-python/bin/python3 scripts/pin_chudcode.py verify
-   --target macos-x86_64 --input ~/chudware-ci-tools/chudcode/chud` must print
-   a JSON line whose `version_output` is `Chudcode v<lock version>`.
-4. Append `CHUDWARE_CHUD_BIN=/Users/<user>/chudware-ci-tools/chudcode/chud` to
-   `~/actions-runner-cad/.env` (absolute path: `.env` does not expand `~`), then
-   `cd ~/actions-runner-cad && ./svc.sh stop && ./svc.sh start`.
-5. Re-dispatch `nightly-release`.
+Only the capability step receives the CAD repository's `github.token`
+(`contents: read`). No private-runtime PAT, runner environment change, Mac SSH
+connection or runner service restart is needed. The downloader resolves the
+asset through the authenticated GitHub API and follows its signed HTTPS release
+CDN URL **without** forwarding Authorization. The checked-in lock remains
+authoritative: format/architecture and SHA-256 are checked before execution,
+then native `--version` must report exactly `Chudcode v<lock version>`. A wrong
+mirror asset, corrupt cache, wrong explicit installation or unpinned target
+fails closed; none can bypass verification. Remove a damaged cache entry
+deliberately before trying again.
 
-On `ryzen-7900x3d` there is nothing to install while the lock has no Windows
-pin (Chudcode is retired as a product and publishes no new releases). If a
-Windows runtime is pinned later, install it as `chud.exe` in the runner service
-account's profile (`NETWORK SERVICE` uses
-`C:\Windows\ServiceProfiles\NetworkService`), verify it with
-`scripts/pin_chudcode.py verify --target windows-x86_64 --input <absolute path
-to chud.exe>`, add `CHUDWARE_CHUD_BIN=<absolute path>` to
-`C:\actions-runner-cad\.env`, and restart the runner service from an elevated
-prompt, since that account cannot restart its own service.
+For a new runtime pin, mirror the verified bytes in the private CAD release
+before dispatching nightly. `ensure` derives the tag from the locked version,
+so builders fetch the new digest without manual installation. Do not commit
+binaries or use metered Actions artifacts.
 
-Repinning the lock to a new Chudcode release means replacing the file on every
-builder before the next nightly, or each leg fails at its capability check.
-Never commit the binary, attach it to an Actions artifact, or copy it anywhere
-public.
+The v0.4.1 upstream release contains no Windows binary. Build the exact locked
+commit on the existing Ryzen runner using
+`.github/workflows/chudcode-runtime-windows-build.yml`, not
+`chudcode-runner-windows-provision.yml` (the latter registers another Actions
+service; it does not build the runtime). Upload an authenticated source tarball
+to the same CAD mirror as
+`chudcode-source-<full locked repository_commit>.tar.gz`, with the archive root
+`Hunter-124-chudcode-<full locked repository_commit>/`, and supply its SHA-256
+as the builder's `source_archive_sha256` dispatch input. The builder verifies
+the archive, builds the Windows native addon and compiled CLI, smoke-checks
+the runtime, and retains the resulting bytes outside `_work`. Its explicit
+`publish` input defaults to false; when enabled, the separate upload job receives
+`contents: write` and publishes the Windows binary to the CAD runtime mirror.
+After obtaining and verifying those bytes, pin the Windows lock row's URL and
+SHA-256 and re-dispatch nightly. Never invent a digest or substitute a Linux
+binary for the Windows runtime.
 
 ### PowerShell step bodies are ASCII-only
 

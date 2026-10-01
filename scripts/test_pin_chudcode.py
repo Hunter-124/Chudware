@@ -357,3 +357,40 @@ def test_committed_lock_loads_and_pins_the_production_target() -> None:
     lock = pin.load_lock(pin.DEFAULT_LOCK, require_pinned=False)
     assert lock["artifacts"]["linux-x86_64"]["sha256"]
     pin.verify_notices(lock_path=pin.DEFAULT_LOCK, require_pinned=False)
+
+
+def test_ensure_rejects_a_tampered_cache_before_execution_or_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path, binaries = _lock(tmp_path)
+    lock = pin.load_lock(lock_path)
+    cached = (tmp_path / "cache" /
+              lock["artifacts"]["linux-x86_64"]["sha256"] / "chud")
+    cached.parent.mkdir(parents=True)
+    tampered = binaries["linux-x86_64"].read_bytes() + b"tampered"
+    cached.write_bytes(tampered)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unverified cache must not execute or fetch replacement bytes")
+
+    monkeypatch.setattr(pin, "_verify_executable_version", forbidden)
+    monkeypatch.setattr(pin, "fetch_artifact", forbidden)
+    with pytest.raises(pin.ArtifactLockError, match="sha256 mismatch"):
+        pin.ensure_artifact(tmp_path / "cache", "linux-x86_64", lock_path=lock_path)
+    assert cached.read_bytes() == tampered
+
+
+def test_ensure_an_explicit_wrong_target_never_falls_back_to_the_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path, binaries = _lock(tmp_path)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("an explicit invalid installation must fail closed")
+
+    monkeypatch.setattr(pin, "fetch_artifact", forbidden)
+    with pytest.raises(pin.ArtifactLockError, match="wrong-target"):
+        pin.ensure_artifact(
+            tmp_path / "cache", "linux-x86_64",
+            source=binaries["windows-x86_64"], lock_path=lock_path,
+        )

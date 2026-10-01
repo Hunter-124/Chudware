@@ -228,8 +228,8 @@ fails at its capability check with an explicit message otherwise):
 * `cmake`, `ninja`, `ctest`, `python3`, `curl`, `tar`, `file`, `ldd`,
   `sha256sum`, `strip`, `rsync`
 * `xvfb-run` for the headless screenshot
-* `CHUDWARE_CHUD_BIN` naming the local Linux x86_64 `chud` artifact pinned by
-  `vendor/chudcode/CHUDCODE_ARTIFACT.lock` (per-machine procedure:
+* the pinned Linux x86_64 `chud` artifact in the CAD runtime release mirror,
+  or an explicit verified `CHUDWARE_CHUD_BIN` (see
   `docs/reference/CI_RUNNERS.md`, "Pinned Chudcode artifact")
 * Nuitka and the rest of `packaging/requirements-release.txt` in the release
   Python (the AppImage compiles the Python sidecars)
@@ -252,11 +252,11 @@ fails at its capability check with an explicit message otherwise):
   `--assume-yes-for-downloads`, so the first release build fetches it into
   `%LOCALAPPDATA%\Nuitka` and later builds reuse the cache. That runner
   therefore needs outbound HTTPS beyond app.chudware.com on its first build.
-* `CHUDWARE_CHUD_BIN` naming a locally installed Windows x86_64 `chud.exe`
-  matching `vendor/chudcode/CHUDCODE_ARTIFACT.lock`. Publishing and pinning
-  the Windows release asset do not install it on this runner: verify it and
-  configure the runner service environment as described in
-  `docs/reference/CI_RUNNERS.md`.
+* a pinned Windows x86_64 `chud.exe` in the CAD runtime release mirror, or an
+  explicit verified `CHUDWARE_CHUD_BIN`. The nightly job fetches and verifies
+  its digest-keyed cache with the CAD job token; no runner service environment
+  change is required. Build missing Windows bytes with
+  `chudcode-runtime-windows-build.yml`, then pin their real SHA-256.
 * `CHUDWARE_SIGN_IDENTITY` if you want Authenticode on the installer; without it
   the installer is unsigned and SmartScreen will warn (see `docs/SIGNING.md`)
 * outbound HTTPS to `app.chudware.com`. This runner cannot reach the gateway's
@@ -281,10 +281,10 @@ fails at its capability check with an explicit message otherwise):
   capability: `~/chudware-ci-tools/release-python/bin/python3` first, then
   `python3.14`..`python3` from `PATH`, and the first one that imports both
   `cryptography` and `nuitka` wins.
-* `CHUDWARE_CHUD_BIN` naming the local macOS x86_64 `chud` artifact pinned
-  by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`. Release packaging verifies
-  and copies it without a source checkout or network fetch. Installation
-  and runner environment configuration are still prerequisites; see
+* the pinned macOS x86_64 `chud` artifact in the CAD runtime release mirror,
+  or an explicit verified `CHUDWARE_CHUD_BIN`. The nightly capability step
+  downloads and verifies it before packaging, without a private-runtime PAT
+  or manual Mac installation. Packaging itself stays offline; see
   `docs/reference/CI_RUNNERS.md`, "Pinned Chudcode artifact".
 * outbound HTTPS to `app.chudware.com`, for the same reason as the Windows
   builder: the Intel Mac cannot route to `192.168.0.183`.
@@ -357,17 +357,19 @@ verify retained releases, but `pin` and `check-lock` require the exact
 supported set. No Linux ARM or macOS ARM artifact is planned; the CAD
 `macos-arm64` core-only preset is not a Chudcode-backed release target.
 
-The Chudcode repository is private, so release asset URLs need authentication.
-Offline `stage` with a local `CHUDWARE_CHUD_BIN` is unaffected; `fetch` needs a
-public release or a credentialed mirror, which is why runners carry a local
-copy instead (`docs/reference/CI_RUNNERS.md`). The global `check-lock` and
-`pin` require all three release targets.
+The runtime repository is private. Nightly uses the CAD repository's
+`chudcode-runtime-v<lock version>` release mirror and its own ephemeral
+`github.token` (`contents: read`), not a broad OAuth token or a new PAT secret.
+`pin_chudcode.py ensure` verifies an explicit input or a digest-keyed cache,
+and authenticates a cold download through the GitHub API without forwarding
+Authorization to its signed release CDN. The locked digest remains
+authoritative. The global `check-lock` and `pin` require all three targets.
 
 The `stage` command used by packaging is offline and accepts only a local
 `CHUDWARE_CHUD_BIN`; it verifies the executable format/architecture, SHA-256,
 and `--version` product identity before copying it as canonical `chud` or
-`chud.exe`. Network retrieval is available only through an explicit `fetch`
-invocation.
+`chud.exe`. Network retrieval is available only through explicit `fetch` or
+`ensure` invocations before packaging.
 
 ### Artifact-lock operating rules
 
@@ -389,9 +391,10 @@ python3 scripts/pin_chudcode.py stage --target linux-x86_64 \
 ```
 
 `stage` re-verifies before and after copying and atomically publishes only canonical
-`chud`/`chud.exe`. It never downloads. `fetch` is the only networked command and must be an
-explicit pre-packaging step; redirects are refused so the lock continues to name immutable
-bytes.
+`chud`/`chud.exe`. It never downloads. Only explicit `fetch` or `ensure` steps
+perform network I/O. Anonymous redirects remain refused; authenticated
+GitHub release downloads allow only GitHub's HTTPS release CDN and never
+forward credentials there. Mirror bytes must match the committed lock.
 
 The packaged services worker resolves the signed-payload-adjacent canonical binary. Developer
 runs may override it with `CHUDWARE_CHUDCODE_BIN`; release jobs use `CHUDWARE_CHUD_BIN` only

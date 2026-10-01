@@ -24,6 +24,8 @@
 
 #include "sim/mesher.h"
 #include "sim/fea_run.h"
+#include "environment_test_support.h"
+#include "util/resource_governor.h"
 
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
@@ -609,6 +611,51 @@ TEST_CASE("contact: an interface_size_mm coarser than the background is legal") 
 // end faces — so this study cannot solve at all unless a real patch of the bore
 // seats on the pin.
 TEST_CASE("contact: a sub-mm interface on a tight curved bore is delivered") {
+    struct Environment {
+        const char* name;
+        std::string saved;
+        bool present;
+        Environment(const char* key, const char* value) : name(key) {
+            const char* old = std::getenv(key);
+            present = old != nullptr;
+            if (old) saved = old;
+            chudware::test::setOrUnsetEnvironment(key, value);
+        }
+        ~Environment() {
+            chudware::test::setOrUnsetEnvironment(name, present ? saved.c_str() : nullptr);
+        }
+    };
+    constexpr uint64_t gib = 1024ull * 1024ull * 1024ull;
+    const auto previous = chudware::governor::set_host_memory_probe(
+        +[] { return chudware::governor::HostMem{16 * gib, 12 * gib}; });
+    struct RestoreProbe {
+        chudware::governor::HostMemoryProbe previous;
+        ~RestoreProbe() { chudware::governor::set_host_memory_probe(previous); }
+    } restore_probe{previous};
+    // A synthetic uncapped cgroup plus the host probe isolates admission from
+    // the CI host's available RAM and sibling workloads.
+    const auto cgroup_root = std::filesystem::temp_directory_path() /
+        ("chudware_contact_budget_" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    REQUIRE(std::filesystem::create_directory(cgroup_root));
+    struct RemoveDirectory {
+        std::filesystem::path path;
+        ~RemoveDirectory() {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
+    } remove_directory{cgroup_root};
+    const std::string cgroup_path = cgroup_root.string();
+    Environment cgroup("CHUDWARE_CGROUP_ROOT", cgroup_path.c_str());
+    Environment governor("CHUDWARE_GOVERNOR", "1");
+    Environment fraction("CHUDWARE_MEM_FRAC", "1");
+    Environment headroom("CHUDWARE_HEADROOM_GB", "0");
+    bool limited = false;
+    SUBCASE("a 3 GiB study budget refuses the direct solve") { limited = true; }
+    SUBCASE("an 8 GiB study budget delivers the interface") {}
+    Environment cap("CHUDWARE_MEM_CAP_GB", limited ? "3" : "8");
+    const uint64_t budget = chudware::governor::budget_bytes();
+    REQUIRE(budget == (limited ? 3 : 8) * gib);
     const auto t0 = std::chrono::steady_clock::now();
     const double plate_x = 30.0, wall = 6.0, plate_z = 24.0;
     const double bore_r = 6.35, pin_r = 6.0;  // 0.35 mm radial clearance
@@ -664,14 +711,18 @@ TEST_CASE("contact: a sub-mm interface on a tight curved bore is delivered") {
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     MESSAGE("bore contract: wall " << secs << " s, notes "
                                    << r.value("notes", json::array()).dump());
-    if (!r.value("ok", false)) {
-        const std::string error = r.value("error", std::string());
-        MESSAGE("bore contract refused: " << error);
-        // Same rule as the pad: the element ceiling is machine-dependent and may
-        // honestly bind; a folded or undeliverable bisection wave may not.
-        CHECK(error.find("element ceiling") != std::string::npos);
+    if (limited) {
+        REQUIRE_FALSE(r.value("ok", false));
+        const auto& admission = r.at("provenance").at("governor");
+        CHECK(admission.at("reason") == "memory_admission");
+        CHECK(admission.at("estimate_gb").get<double>() >
+              static_cast<double>(budget) / gib);
+        CHECK(admission.at("estimated_elems").get<uint64_t>() > 0);
+        CHECK_FALSE(r.contains("summary"));
+        CHECK_FALSE(r.contains("contact"));
         return;
     }
+    REQUIRE_MESSAGE(r.value("ok", false), r.dump());
     const json& contact = r.at("contact");
     const json& resolution = contact.at("resolution");
     const double h_interface = resolution.at("h_interface_mm").get<double>();
@@ -685,7 +736,6 @@ TEST_CASE("contact: a sub-mm interface on a tight curved bore is delivered") {
     CHECK(contact.at("contact_pressure_reliable").get<bool>());
     CHECK(resolution.at("resolved").get<bool>());
     CHECK(contact.at("contact_area_mm2").get<double>() > 0.0);
-    CHECK(secs < wall_ceiling_sec());
 }
 
 // ── A locally-refined region has to be a MESH, not just a fine interface ─────

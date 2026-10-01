@@ -229,6 +229,8 @@ jobs:
           fetch-depth: 0
 
       - name: Check runner capabilities and open the gateway loopback
+        env:
+          CHUDWARE_RUNTIME_RELEASE_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -255,9 +257,19 @@ jobs:
           else
             missing+=("release-python-with-packaging/requirements-release.txt")
           fi
-          if [ -z "${CHUDWARE_CHUD_BIN:-}" ] || ! "${release_python}" scripts/pin_chudcode.py \
-              verify --target linux-x86_64 --input "${CHUDWARE_CHUD_BIN:-/missing}"; then
-            missing+=("verified-CHUDWARE_CHUD_BIN")
+          set -- ensure --target linux-x86_64 \
+            --cache-dir "${HOME}/chudware-ci-tools/chudcode" \
+            --github-token-env CHUDWARE_RUNTIME_RELEASE_TOKEN \
+            --github-mirror-repository "${GITHUB_REPOSITORY}"
+          if [ -n "${CHUDWARE_CHUD_BIN:-}" ]; then
+            set -- "$@" --input "${CHUDWARE_CHUD_BIN}"
+          fi
+          if [ -x "${release_python}" ] && "${release_python}" scripts/pin_chudcode.py \
+              "$@" > "${RUNNER_TEMP}/chudcode.json"; then
+            chud_bin="$("${release_python}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "${RUNNER_TEMP}/chudcode.json")"
+            echo "CHUDWARE_CHUD_BIN=${chud_bin}" >> "$GITHUB_ENV"
+          else
+            missing+=("verified-pinned-Chudcode-see-docs/reference/CI_RUNNERS.md")
           fi
           if [ "${#missing[@]}" -ne 0 ]; then
             echo "::error::runner ${RUNNER_NAME:-unknown} is missing required tools: ${missing[*]}. Run runner-provision (provision-linux) against this label and re-dispatch."
@@ -969,6 +981,8 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Check runner capabilities and enter the MSVC environment
+        env:
+          CHUDWARE_RUNTIME_RELEASE_TOKEN: ${{ github.token }}
         # Windows PowerShell 5.1 - these hosts have no pwsh and their `bash` is an
         # empty WSL shim. ASCII only: 5.1 reads the runner's BOM-less UTF-8 script
         # as the ANSI code page.
@@ -999,12 +1013,14 @@ jobs:
             Write-Host '::error::vendor/chudcode/CHUDCODE_ARTIFACT.lock pins no windows-x86_64 Chudcode artifact; no Windows chud.exe exists yet (docs/RELEASING.md, Chudcode artifact pin). This leg cannot pass until that row is pinned.'
             exit 1
           }
-          if (-not $env:CHUDWARE_CHUD_BIN) {
-            Write-Host '::error::CHUDWARE_CHUD_BIN is required; install the pinned chud.exe per docs/reference/CI_RUNNERS.md (Pinned Chudcode artifact)'
-            exit 1
-          }
-          & python scripts\pin_chudcode.py verify --target windows-x86_64 --input $env:CHUDWARE_CHUD_BIN
+          $chudArgs = @('scripts\pin_chudcode.py', 'ensure', '--target', 'windows-x86_64',
+            '--cache-dir', (Join-Path $tools 'chudcode'), '--github-token-env', 'CHUDWARE_RUNTIME_RELEASE_TOKEN',
+            '--github-mirror-repository', $env:GITHUB_REPOSITORY)
+          if ($env:CHUDWARE_CHUD_BIN) { $chudArgs += @('--input', $env:CHUDWARE_CHUD_BIN) }
+          $chudEvidence = & python @chudArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:CHUDWARE_CHUD_BIN = ($chudEvidence | ConvertFrom-Json).path
+          "CHUDWARE_CHUD_BIN=$env:CHUDWARE_CHUD_BIN" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           # Inno Setup is REQUIRED: the product ships an .exe installer, and a zip
           # is not a substitute. Fail here rather than after an hour of building.
@@ -1584,6 +1600,8 @@ jobs:
           # reads tags for provenance and build_app.sh sources build.sh.
           fetch-depth: 0
       - name: Check runner capabilities and select the release Python
+        env:
+          CHUDWARE_RUNTIME_RELEASE_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1676,11 +1694,20 @@ jobs:
             echo "::error::could not sync packaging/requirements-release.txt into ${release_python}; re-run runner-provision with runner_label=cc-mac-intel"
             exit 1
           fi
-          if ! "${release_python}" scripts/pin_chudcode.py verify \
-              --target "macos-${RELEASE_ARCH}" --input "${CHUDWARE_CHUD_BIN:-/missing}"; then
-            echo "::error::CHUDWARE_CHUD_BIN is missing or does not match the pinned ${RELEASE_ARCH} artifact; install it per docs/reference/CI_RUNNERS.md (Pinned Chudcode artifact)"
+          set -- ensure --target "macos-${RELEASE_ARCH}" \
+            --cache-dir "${HOME}/chudware-ci-tools/chudcode" \
+            --github-token-env CHUDWARE_RUNTIME_RELEASE_TOKEN \
+            --github-mirror-repository "${GITHUB_REPOSITORY}"
+          if [ -n "${CHUDWARE_CHUD_BIN:-}" ]; then
+            set -- "$@" --input "${CHUDWARE_CHUD_BIN}"
+          fi
+          if ! "${release_python}" scripts/pin_chudcode.py "$@" \
+              > "${RUNNER_TEMP}/chudcode.json"; then
+            echo "::error::could not obtain the pinned Chudcode artifact from this repository's chudcode-runtime release mirror; verify the mirror assets or provide a verified CHUDWARE_CHUD_BIN"
             exit 1
           fi
+          chud_bin="$("${release_python}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "${RUNNER_TEMP}/chudcode.json")"
+          echo "CHUDWARE_CHUD_BIN=${chud_bin}" >> "$GITHUB_ENV"
 
           {
             echo "RELEASE_PYTHON=${release_python}"

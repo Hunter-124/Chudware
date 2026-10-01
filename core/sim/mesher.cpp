@@ -861,7 +861,7 @@ struct LocalContract {
   double aspect_max_after = 0.0;
   std::size_t cells_below_floor_before = 0;
   std::size_t cells_below_floor_after = 0;
-  int quality_passes = 0;      // per-wave passes plus the final bounded loop
+  int quality_passes = 0;      // per-wave passes plus the final convergent loop
   int flips_23 = 0;            // interior faces re-tiled around a new edge
   int edge_removals = 0;       // interior edges removed (3-2 and its 4-4/5-6 kin)
   int collapsed_slivers = 0;
@@ -1179,9 +1179,16 @@ StarTopology build_star_topology(const pm::fea::NodalMesh &nodal,
     }
   }
   std::vector<std::vector<Eigen::Vector3d>> normals(count);
-  for (const auto &entry : faces) {
-    if (entry.second.uses != 1) continue;
-    const std::array<std::uint32_t, 3> &tri = entry.second.tri;
+  // The normal fan is consumed greedily and boundary-ring sums are ordered
+  // floating-point reductions. Neither may inherit a hash table's iteration
+  // order (libc++ and libstdc++ enumerate this census differently).
+  std::vector<const FaceUse *> boundary_faces;
+  for (const auto &entry : faces)
+    if (entry.second.uses == 1) boundary_faces.push_back(&entry.second);
+  std::sort(boundary_faces.begin(), boundary_faces.end(),
+            [](const FaceUse *a, const FaceUse *b) { return a->tri < b->tri; });
+  for (const FaceUse *face : boundary_faces) {
+    const std::array<std::uint32_t, 3> &tri = face->tri;
     const Eigen::Vector3d &p0 = nodal.nodes[tri[0]];
     const Eigen::Vector3d &p1 = nodal.nodes[tri[1]];
     const Eigen::Vector3d &p2 = nodal.nodes[tri[2]];
@@ -1202,7 +1209,7 @@ StarTopology build_star_topology(const pm::fea::NodalMesh &nodal,
     if (length > 0.0) {
       normal /= length;
       // Away from the owner's fourth corner: that is outward, exactly.
-      if (normal.dot((p0 + p1 + p2) / 3.0 - nodal.nodes[entry.second.apex]) < 0.0)
+      if (normal.dot((p0 + p1 + p2) / 3.0 - nodal.nodes[face->apex]) < 0.0)
         normal = -normal;
     }
     for (int a = 0; a < 3; ++a) {
@@ -1619,10 +1626,8 @@ bool retiles(double replacement_volume, double original_volume) {
 // because a neighbour in the same star stayed at 0.022. This is the standard
 // aggressive-improvement criterion, and since each accepted edit strictly
 // raises a bounded, lexicographically-ordered vector it cannot cycle.
-bool lexicographically_better(std::vector<double> before,
-                              std::vector<double> after) {
-  std::sort(before.begin(), before.end());
-  std::sort(after.begin(), after.end());
+bool sorted_qualities_better(const std::vector<double> &before,
+                            const std::vector<double> &after) {
   const std::size_t common = std::min(before.size(), after.size());
   for (std::size_t i = 0; i < common; ++i) {
     // Relative, because these are quality ratios spanning several decades and
@@ -1632,6 +1637,13 @@ bool lexicographically_better(std::vector<double> before,
     if (after[i] < before[i] - slack) return false;
   }
   return after.size() < before.size();
+}
+
+bool lexicographically_better(std::vector<double> before,
+                              std::vector<double> after) {
+  std::sort(before.begin(), before.end());
+  std::sort(after.begin(), after.end());
+  return sorted_qualities_better(before, after);
 }
 
 // Cells whose connectivity a pass has already rewritten. Every lookup below
@@ -2333,10 +2345,9 @@ RegionQuality region_quality(const pm::fea::NodalMesh &nodal,
 // a node move is the cheapest fix and often the only one needed, a flip retiles
 // what no move can, and a collapse removes what neither can save.
 //
-// Returns whether it CHANGED anything. Every operation is accepted only on a
-// strict improvement, so a pass that changed nothing will change nothing next
-// time either, and the loop above stops instead of spending its budget on a
-// mesh it cannot help.
+// Returns connectivity progress, which can unlock a repair on the next pass
+// even when the deficient quality multiset tied. The caller measures smoothing
+// progress directly: its counters cover only the first internal sweep.
 bool quality_pass(const pm::geom::TriSurface *surface, pm::fea::NodalMesh &nodal,
                   const std::function<double(const Eigen::Vector3d &)>
                       &boundary_edge_limit,
@@ -2351,7 +2362,9 @@ bool quality_pass(const pm::geom::TriSurface *surface, pm::fea::NodalMesh &nodal
       poor.push_back(e);
   }
   if (poor.empty()) return false;
-  const LocalContract mark = contract;
+  const int flips_before = contract.flips_23;
+  const int removals_before = contract.edge_removals;
+  const int collapses_before = contract.collapsed_slivers;
   ++contract.quality_passes;
   std::vector<std::uint32_t> movable;
   movable.reserve(poor.size() * 4);
@@ -2378,11 +2391,9 @@ bool quality_pass(const pm::geom::TriSurface *surface, pm::fea::NodalMesh &nodal
                    contract.collapsed_slivers);
   compact_dead_cells(nodal, edits.dead, in_region);
   in_region.resize(nodal.elements.size(), 1);
-  return contract.reprojected_nodes != mark.reprojected_nodes ||
-         contract.smoothed_nodes != mark.smoothed_nodes ||
-         contract.flips_23 != mark.flips_23 ||
-         contract.edge_removals != mark.edge_removals ||
-         contract.collapsed_slivers != mark.collapsed_slivers;
+  return contract.flips_23 != flips_before ||
+         contract.edge_removals != removals_before ||
+         contract.collapsed_slivers != collapses_before;
 }
 
 // Projection can create a short-edge sliver without any requested local band.
@@ -2583,9 +2594,17 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
     core_faces.reserve(faces.size() / 8 + 8);
     std::unordered_map<std::uint32_t, NodeEdges> per_node;
     per_node.reserve(faces.size() / 2 + 8);
-    for (const auto &entry : faces) {
-      const BoundaryFace &face = entry.second;
-      if (face.uses != 1) continue;
+    // Canonical face order also fixes the accumulation order of each node's
+    // mean. Sorting owners later cannot undo rounding in those means.
+    std::vector<const BoundaryFace *> boundary_faces;
+    for (const auto &entry : faces)
+      if (entry.second.uses == 1) boundary_faces.push_back(&entry.second);
+    std::sort(boundary_faces.begin(), boundary_faces.end(),
+              [](const BoundaryFace *a, const BoundaryFace *b) {
+                return a->tri < b->tri;
+              });
+    for (const BoundaryFace *boundary_face : boundary_faces) {
+      const BoundaryFace &face = *boundary_face;
       std::array<double, 3> length{};
       std::array<double, 3> distance{};
       double nearest = std::numeric_limits<double>::infinity();
@@ -2852,26 +2871,41 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
   if (contract.waves > 0) {
     const double achieved_before_pass =
         fidelity_round(nodes_of_poor_cells(nodal));
-    // ── The bounded loop over the WHOLE refined region ──────────────────────
-    // Each per-wave pass only saw the cells its own wave touched; the union of
-    // the waves is a shell whose transition layer no single wave owns, and it
-    // is where the packet's aspect_max 263 lived. The loop stops as soon as
-    // the region meets the reported floors, when a pass finds nothing left to
-    // act on, or after kQualityPasses — never on a target it is not reaching,
-    // because a pass that cannot help also cannot hurt (every move, flip and
-    // collapse is accepted only on a strict improvement) but it does cost
-    // time.
+    // ── Convergence over the WHOLE refined region ───────────────────────────
+    // A fixed five-pass cap can stop before the floors are met: the macOS
+    // pin-in-bore run reported two sub-floor cells after 14 total quality passes.
+    // Continue while the deficient quality multiset improves, using the same
+    // relative resolution as the connectivity edits. Qualities at/above the
+    // target are irrelevant: fidelity may spend that surplus without hurting
+    // the contract. Measure mesh-wide because a movable star reaches outside
+    // the region, and progress in a tied neighbour can unlock the next repair.
+    // A connectivity edit also earns another pass: rebuilding the stars can
+    // unlock a previously blocked move even when the deficient qualities tie.
+    const auto deficient_qualities = [&](std::vector<double> &qualities) {
+      qualities.clear();
+      for (const auto &element : nodal.elements) {
+        if (!is_tet4(element)) continue;
+        const double quality = tet_quality_of(nodal, cell_nodes(element));
+        if (quality < kQualityTarget) qualities.push_back(quality);
+      }
+      std::sort(qualities.begin(), qualities.end());
+    };
     std::vector<char> in_region = refined_region(nodal, nodes_before_waves);
-    const auto bounded_loop = [&](std::vector<char> &region) {
-      for (int pass = 0; pass < kQualityPasses; ++pass) {
-        report_fill_phase("interface band quality pass", pass + 1, kQualityPasses);
-        if (region_quality(nodal, region).met())
-          break;
-        if (!quality_pass(cad_surface, nodal, boundary_edge_limit, region, contract))
-          break;
+    std::vector<double> qualities_before, qualities_after;
+    const auto converge_quality = [&](std::vector<char> &region) {
+      if (region_quality(nodal, region).met()) return;
+      deficient_qualities(qualities_before);
+      for (int pass = 0; !region_quality(nodal, region).met(); ++pass) {
+        report_fill_phase("interface band quality pass", pass + 1);
+        const bool retiled =
+            quality_pass(cad_surface, nodal, boundary_edge_limit, region, contract);
+        deficient_qualities(qualities_after);
+        if (!retiled && !sorted_qualities_better(qualities_before, qualities_after))
+          break;  // numerical stationarity, not an arbitrary pass budget
+        qualities_before.swap(qualities_after);
       }
     };
-    bounded_loop(in_region);
+    converge_quality(in_region);
     // ── The delivery is RE-MEASURED, and re-split ONCE if the pass lost it ──
     // Smoothing moves nodes, and a node pulled back onto the CAD surface
     // lengthens the interface faces the contract is measured on. A delivered
@@ -2892,7 +2926,7 @@ void deliver_local_contract(const LoadedModel &loaded, const MeshOptions &option
       if (run_wave(marks, wave_error)) {
         contract.resplit = true;
         in_region = refined_region(nodal, nodes_before_waves);
-        bounded_loop(in_region);
+        converge_quality(in_region);
       }
     }
     const RegionQuality after = region_quality(nodal, in_region);

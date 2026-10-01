@@ -5474,3 +5474,8 @@ CHOLMOD on those platforms is an open owner decision (its Supernodal module is G
 now builds the host default targets. Runner contention: `livingroom-pc` is the only
 `cc-linux-build` runner, so linux-gate, the Stripe gate of deploy-prod and the nightly Linux leg
 serialize on it.
+macOS follow-up: the LEB-region quality pass stopped after a fixed 5 passes even with cells under
+its own 0.05 floor, and processed boundary faces in `unordered_map` order (libc++ ≠ libstdc++),
+so the pin-in-bore region shipped jacobian_min 0.0479 on macOS. `core/sim/mesher.cpp` now walks
+faces in canonical sorted order and iterates to convergence (floors met, or no repair and no
+improvement of the deficient-quality multiset); `chudware-simcache/7`.

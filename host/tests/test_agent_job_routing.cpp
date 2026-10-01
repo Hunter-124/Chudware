@@ -1,11 +1,27 @@
 #include "core/app_state.h"
 #include "core/jobs.h"
+#include "worker_client.h"
 
 #include <iostream>
 #include <memory>
 #include <string>
 
 #include <nlohmann/json.hpp>
+
+// jobs.cpp's job launchers call into WorkerClient; this test only exercises route
+// building and never launches a job. GNU ld / Apple ld drop those launchers
+// (--gc-sections / -dead_strip), but MSVC resolves every referenced symbol before
+// /OPT:REF and failed the Windows release build with LNK2019. Inert definitions keep
+// the test self-contained on every linker without pulling the real IPC client in.
+bool WorkerClient::call(const std::string&, const nlohmann::json&, nlohmann::json&,
+                        std::string& err, int, const EventFn&) {
+    err = "WorkerClient is not available in test_agent_job_routing";
+    return false;
+}
+bool WorkerClient::callAgentCancel(const std::string&, nlohmann::json&, std::string& err) {
+    err = "WorkerClient is not available in test_agent_job_routing";
+    return false;
+}
 
 namespace {
 

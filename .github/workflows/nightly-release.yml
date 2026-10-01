@@ -1291,8 +1291,11 @@ jobs:
 
           $hostBin = "$env:HOST_BUILD_DIR/bin/chudware.exe"
           $hostdBin = "build/$env:CORE_PRESET/bin/chudware-hostd.exe"
+          # The canonical engine is the core build's: CMake stages its polymesh-advisor package
+          # beside it, while the copy next to chudware.exe arrives without one.
           & powershell -NoProfile -ExecutionPolicy Bypass -File packaging\windows\build_sidecars.ps1 `
-            -OutputDir $sidecars -HostBinary $hostBin -HostdBinary $hostdBin
+            -OutputDir $sidecars -HostBinary $hostBin -HostdBinary $hostdBin `
+            -EngineBinary "build/$env:CORE_PRESET/bin/libchudware.dll"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           & python -m services.installer.build_release --prepare-signing --payload-only `

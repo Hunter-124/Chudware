@@ -1,7 +1,9 @@
 import pytest
 
-from training.viewpoint.utility.evaluate import ab_arm_table
-from training.viewpoint.utility.store import TrialStore
+pytest.importorskip("torch")
+
+from training.viewpoint.utility.evaluate import ab_arm_table  # noqa: E402
+from training.viewpoint.utility.store import TrialStore  # noqa: E402
 
 
 def test_changed_model_arm_uses_isolated_membership_with_shared_cached_labels(tmp_path):

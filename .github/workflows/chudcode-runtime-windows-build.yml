@@ -102,11 +102,30 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: '1.4.0'
+      # dtolnay/rust-toolchain is a bash composite action, and `bash` on this
+      # runner is an empty WSL shim ("bash: command not found"). Bootstrap
+      # rustup natively instead; the toolchain is pinned by the source archive.
       - name: Install locked Rust toolchain and bootstrap rustup when absent
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
-        with:
-          toolchain: ${{ steps.source.outputs.toolchain }}
-          targets: x86_64-pc-windows-msvc
+        env:
+          RUST_TOOLCHAIN: ${{ steps.source.outputs.toolchain }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUST_TOOLCHAIN -notmatch '^nightly-\d{4}-\d{2}-\d{2}$') { throw 'Invalid pinned Rust toolchain' }
+          $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+          $rustup = Join-Path $cargoBin 'rustup.exe'
+          if (-not (Test-Path $rustup)) {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $init = Join-Path $env:RUNNER_TEMP 'rustup-init.exe'
+            Invoke-WebRequest -UseBasicParsing -Uri 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe' -OutFile $init
+            & $init -y --no-modify-path --profile minimal --default-toolchain none
+            if ($LASTEXITCODE -ne 0) { throw "rustup-init failed ($LASTEXITCODE)" }
+          }
+          & $rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed ($LASTEXITCODE)" }
+          & $rustup default $env:RUST_TOOLCHAIN
+          if ($LASTEXITCODE -ne 0) { throw "rustup default failed ($LASTEXITCODE)" }
+          $cargoBin | Out-File $env:GITHUB_PATH -Encoding ascii -Append
+          & (Join-Path $cargoBin 'rustc.exe') --version --verbose
       - name: Build, smoke, verify and retain canonical runtime
         id: binary
         env:

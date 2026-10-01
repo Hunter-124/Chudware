@@ -1,6 +1,6 @@
 # Commands Reference
 
-Every ribbon command (359 total), grouped by tab and ribbon group.
+Every ribbon command (361 total), grouped by tab and ribbon group.
 
 ## Annotation
 
@@ -359,6 +359,10 @@ _Available from the Features ▸ Assembly ribbon group._
 _Available from the Features ▸ Assembly ribbon group._
 
 #### Mate
+
+_Available from the Features ▸ Assembly ribbon group._
+
+#### Motion Study
 
 _Available from the Features ▸ Assembly ribbon group._
 
@@ -1127,6 +1131,10 @@ _Available from the Simulation ▸ Study ribbon group._
 _Available from the Simulation ▸ Study ribbon group._
 
 #### Modal Study
+
+_Available from the Simulation ▸ Study ribbon group._
+
+#### Motion Study
 
 _Available from the Simulation ▸ Study ribbon group._
 

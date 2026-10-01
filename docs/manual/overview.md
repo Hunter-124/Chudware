@@ -19,23 +19,24 @@ WORKFLOW
                                             doc. Returns aicad.preflight/1 with advisory_items.
                                             A fail verdict is advisory (never blocks); add_features
                                             runs preflight automatically (CHUDWARE_PREFLIGHT=1).
-  3. render_part()                          SEE it — an annotated, colour-coded image (faces
-                                            tinted + labelled TOP/FRONT/RIGHT...). Self-review
-                                            against the request; iterate add_features to fix.
-                                            render_part(view="right" | {"azimuth":30,"elevation":20})
-                                            for a specific angle; render_part(emphasize="f2") for
-                                            feature EMPHASIS — the engine FRAMES that feature and
-                                            paints its exact visible faces high-contrast against
-                                            desaturated context. render_views() for the full
-                                            6-ortho+iso labelled grid; contact_sheet() for a
-                                            smaller multi-angle sheet. inspect_feature(target) is
-                                            the one-call CLOSE-UP: a multi-panel sheet (idealized
-                                            camera + alternate angle + cutaway for anything
-                                            internal + whole-part context) with dims, a
-                                            describe_part excerpt and MEASURED visibility;
-                                            inspect_part(target) for a single framed close-up,
-                                            look_around(target) for N ranked angles.
-                                            VERIFY LOOP after every mutation.
+  3. render_part()                          SEE it — ONE call returns a 2x2 grid of the four
+                                            most useful complementary shots (the planner
+                                            measures ~200 cameras in the engine and picks the
+                                            set that shows the most), faces SID-tagged, and a
+                                            caption: what each tile shows, faces NO tile sees
+                                            (by sid), tag legend. render_part(target="f2")
+                                            frames the grid on that feature (painted, rest
+                                            dimmed; a SECTION tile with ghosted outline when it
+                                            is internal). render_part(view="right" |
+                                            {"azimuth":30,"elevation":20} | "auto") = one
+                                            single shot instead. render_views() = the planner's
+                                            7-view set (views=[...] for a fixed drawing set);
+                                            contact_sheet() = the 4-view grid or named views.
+                                            inspect_feature(target): planner close-ups +
+                                            whole-part context with dims and a describe_part
+                                            excerpt; inspect_part(target) one framed close-up;
+                                            look_around(target) N planner angles. Numbers
+                                            first — do not render after every mutation.
   4. measure_part() / query_geometry(q)     check mass/bbox, or explore faces/edges.
      set_material("aluminum" | {color,...})  store a named engineering material + matching
                                             appearance (explicit colour dicts are visual-only).

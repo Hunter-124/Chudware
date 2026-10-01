@@ -32,16 +32,16 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
   inspect_part(target)   CLOSE-UP of a face/edge/feature (plain-word query or feature id fN):
                          the ENGINE frames the target's own bbox, so a 5 mm hole in a 120 mm
                          plate is RENDERED at 5 mm scale, not cropped out of a whole-part shot.
-                         view="auto" is a MEASURED camera — every candidate is rasterized and
-                         the one that actually sees the most of the target, most legibly, wins.
-                         An internal target (bore/pocket) is auto-CUTAWAY so you see inside it.
-  inspect_feature(target) ONE-CALL multi-panel sheet: hero (idealized camera) + a >=75-degree
-                         alternate + cutaway/as-built + whole-part CONTEXT with the target
-                         highlighted, plus describe_part excerpt + dims. Prefer after mutations.
-  render_views(views?)   6-ortho+iso labelled contact sheet (or a custom view list); optional
-                         target= frames AND cuts every tile to the feature, and the caption
-                         names which views can actually see it.
-  look_around(target)    N close-ups of one target tiled: the top-ranked idealized angles by
+                         view="auto" is the shot planner's single best MEASURED camera (every
+                         candidate is measured in the engine); for an internal target that is
+                         a SECTION through it, cut face hatched and the removed half ghosted.
+  inspect_feature(target) planner close-ups (hero + complementary alternates, a section for
+                         anything internal) + whole-part CONTEXT with the target highlighted,
+                         plus describe_part excerpt + dims. Use when the grid is ambiguous.
+  render_views(views?)   the planner's 7 complementary views (or a custom view list, e.g. the
+                         6-ortho+iso drawing set); optional target= frames every tile on the
+                         feature, and the caption names what each view shows.
+  look_around(target)    N close-ups of one target tiled: the planner's complementary set by
                          default (ranked=False for an even orbit), each labelled with how much
                          of the target it shows.
   Every emphasis render paints the target's EXACT visible faces (shading kept so curvature

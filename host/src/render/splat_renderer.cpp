@@ -1,6 +1,7 @@
 #include "splat_renderer.h"
 #include "gl_compat.h"
 #include "ui/viewport/glsl_compat.h"
+#include "device/numeric_parse.h"
 
 #include <algorithm>
 #include <array>
@@ -77,8 +78,9 @@ bool scalar(const char*& p, const char* end, bool binary, const Property& prop, 
         const char* start = p;
         while (p != end && !space(*p)) ++p;
         if (p == start || p - start > 128) return false;
-        auto result = std::from_chars(start, p, value);
-        if (result.ec != std::errc() || result.ptr != p) return false;
+        // Not std::from_chars: Apple's libc++ deletes the floating-point overloads.
+        if (!chudware::device::parseFiniteDouble(std::string_view(start, size_t(p - start)), value))
+            return false;
         static const double lo[] = {-128,0,-32768,0,-2147483648.0,0,
             -double(std::numeric_limits<float>::max()),-std::numeric_limits<double>::max()};
         static const double hi[] = {127,255,32767,65535,2147483647.0,4294967295.0,

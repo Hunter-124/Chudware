@@ -625,7 +625,8 @@ TEST_CASE("contact: a sub-mm interface on a tight curved bore is delivered") {
             chudware::test::setOrUnsetEnvironment(name, present ? saved.c_str() : nullptr);
         }
     };
-    constexpr uint64_t gib = 1024ull * 1024ull * 1024ull;
+    // static: MSVC (C3493) refuses to use a non-static local inside the captureless lambda.
+    static constexpr uint64_t gib = 1024ull * 1024ull * 1024ull;
     const auto previous = chudware::governor::set_host_memory_probe(
         +[] { return chudware::governor::HostMem{16 * gib, 12 * gib}; });
     struct RestoreProbe {

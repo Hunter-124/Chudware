@@ -50,7 +50,9 @@ jobs:
     # tens of minutes and must never land on the production gateway host. Hosted
     # runners are billed on this private repository; the fleet is free.
     runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
-    timeout-minutes: 120
+    # The strict gate alone now takes ~2 h on livingroom-pc (host test binaries are built and
+    # run since 2026-10-01); 120 min cancelled the trailing Webservice pytest step.
+    timeout-minutes: 180
     env:
       # The whole point of this job. See the header block above.
       CHUDWARE_GATE_STRICT: '1'

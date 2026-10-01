@@ -25,7 +25,7 @@ if (Test-Path (Join-Path $pinnedBun 'bun.exe')) { $env:PATH = "$pinnedBun;$env:P
 foreach ($tool in @('bun', 'rustup', 'cargo', 'python', 'tar.exe')) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "Required build dependency missing: $tool" }
 }
-& python -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ required"'
+& python -c 'import sys; assert sys.version_info >= (3, 11)'
 if ($LASTEXITCODE -ne 0) { throw 'Python 3.11+ is required' }
 $bunVersion = ((& bun --version) | Select-Object -First 1).ToString().Trim()
 if ($bunVersion -ne '1.4.0') {
@@ -84,8 +84,14 @@ Push-Location $source
 try {
     & bun install --frozen-lockfile
     if ($LASTEXITCODE -ne 0) { throw 'Locked Bun dependency installation failed' }
-    $version = & bun -e 'import {PRODUCT_VERSION} from "./packages/coding-agent/src/brand.ts"; process.stdout.write(PRODUCT_VERSION)'
-    if ($LASTEXITCODE -ne 0 -or $version -ne "Chudcode v$($lock.version)") { throw 'Locked product version differs from source brand' }
+    # Windows PowerShell 5.1 strips embedded double quotes from native-command
+    # arguments, so `bun -e '...import "..."...'` arrives unparsable; run a file.
+    $probe = Join-Path $source 'chudware-version-probe.ts'
+    Set-Content -Path $probe -Encoding ascii -Value 'import { PRODUCT_VERSION } from "./packages/coding-agent/src/brand.ts"; process.stdout.write(PRODUCT_VERSION);'
+    $version = & bun $probe
+    $probeExit = $LASTEXITCODE
+    Remove-Item $probe
+    if ($probeExit -ne 0 -or $version -ne "Chudcode v$($lock.version)") { throw "Locked product version differs from source brand (got '$version')" }
     & cargo "+$toolchain" build --locked --profile ci --target x86_64-pc-windows-msvc -p pi-natives
     if ($LASTEXITCODE -ne 0) { throw 'Windows native addon build failed' }
     $addon = Join-Path $source 'packages\natives\native\pi_natives.win32-x64-baseline.node'

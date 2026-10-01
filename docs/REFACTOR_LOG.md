@@ -5464,6 +5464,8 @@ criteria were compared by pointer (`sim::criterion_is` now); `test_worker_long_r
 developer-build only (production clients ignore the fake hostd override by design); native
 relocation compared ancestor spellings (`C:\WINDOWS` vs `C:\Windows`) and refused its own temp
 dir — paths are long-name/drive-normalized and ancestors compared by `fs::equivalent`.
+It also refused every stored Windows absolute dependency (`C:\...`) as foreign-platform syntax;
+`native_reference` now classifies paths by host platform (drive-relative/root-only still refused).
 Windows and macOS release builds have NO CHOLMOD (scalar SimplicialLDLT, ~50x slower on big
 contact solves): the bore contract's success case runs a reduced same-radius model there
 (`CHUDWARE_WITH_CHOLMOD` define on the test), and `mesher_advanced` has TIMEOUT 3600. Shipping

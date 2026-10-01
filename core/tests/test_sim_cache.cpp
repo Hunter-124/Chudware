@@ -704,6 +704,15 @@ TEST_CASE("stepplus native relocation preserves models and rebases mapped and re
     bool absolute_sources = false;
     SUBCASE("originally relative mapped sources") {}
     SUBCASE("originally absolute mapped sources") { absolute_sources = true; }
+    fs::path referenced_part_path = part_path;
+    SUBCASE("absolute mapped component source uses a directory alias") {
+        absolute_sources = true;
+        const auto alias = fixture.root / "OLD";
+        if (!fs::exists(alias))
+            REQUIRE_NOTHROW(fs::create_directory_symlink(old_dir, alias));
+        REQUIRE(fs::equivalent(old_dir, alias));
+        referenced_part_path = alias / part_path.filename();
+    }
     const json pose = json::array({1.0, 0.0, 0.0, 12.123456789012345,
                                   0.0, 1.0, 0.0, -3.25, 0.0, 0.0, 1.0, 9.75,
                                   0.0, 0.0, 0.0, 1.0});
@@ -711,7 +720,7 @@ TEST_CASE("stepplus native relocation preserves models and rebases mapped and re
         {"schema", "aicad.asm/1"}, {"id", "stable-assembly"}, {"name", "Old assembly"},
         {"components", json::array({
             {{"id", "k1"}, {"name", "Old bearing"},
-             {"source", {{"path", absolute_sources ? part_path.string() : "part.step+"}}},
+             {"source", {{"path", absolute_sources ? referenced_part_path.string() : "part.step+"}}},
              {"transform", pose}, {"fixed", true}},
             {{"id", "k2"}, {"name", "Retained vendor"}, {"source", {{"path", "../vendor/retained.step"}}},
              {"transform", pose}, {"fixed", false}}})},
@@ -830,6 +839,34 @@ TEST_CASE("stepplus native relocation accepts an existing directory's alternate 
                                   {"destination", (alias / "copy.step+").string()}}})}});
     REQUIRE_MESSAGE(result.value("ok", false), result.dump());
     CHECK(chudware::doc::stepplus_open((parent / "copy.step+").string()).doc == doc);
+    CHECK(native_file_bytes(source) == bytes);
+}
+
+TEST_CASE("stepplus native relocation refuses foreign or unqualified dependency roots") {
+    using chudware::doc::native_file_operations;
+    NativeFileFixture fixture;
+    const auto source = fixture.root / "assembly.step+";
+    const auto destination = fixture.root / "copy.step+";
+#if defined(_WIN32)
+    const std::string dependency = R"(C:drive-relative.step+)";
+#else
+    const std::string dependency = R"(C:\foreign\part.step+)";
+#endif
+    const json doc{{"schema", "aicad.asm/1"}, {"id", "unsupported-path"},
+        {"components", json::array({{{"id", "p1"},
+                                      {"source", {{"path", dependency}}}}})}};
+    chudware::doc::stepplus_save(doc, source.string(), {});
+    const auto bytes = native_file_bytes(source);
+    const auto inspected = native_file_operations({{"action", "inspect"},
+        {"paths", json::array({source.string()})}});
+    REQUIRE_MESSAGE(inspected.value("ok", false), inspected.dump());
+    const auto& reference = inspected.at("files").at(0).at("dependencies").at(0);
+    CHECK(reference.at("supported") == false);
+    CHECK_FALSE(reference.contains("resolved_path"));
+    const auto relocated = native_file_operations({{"action", "relocate"},
+        {"entries", json::array({{{"path", source.string()}, {"destination", destination.string()}}})}});
+    CHECK_FALSE(relocated.value("ok", true));
+    CHECK_FALSE(fs::exists(destination));
     CHECK(native_file_bytes(source) == bytes);
 }
 

@@ -683,17 +683,29 @@ void native_reference(NativeReferences& refs, const json& value,
             row["format"] = "uri";
             row["rewrite"] = false;
         } else if (literal.size() > kMaxNativePathBytes || literal.find('\0') != std::string::npos ||
-                   literal.find("://") != std::string::npos || literal.find('\\') != std::string::npos ||
-                   (literal.size() > 1 && literal[1] == ':')) {
+                   literal.find("://") != std::string::npos) {
             row["supported"] = false;
             row["reason"] = "unsupported URI or foreign-platform path";
         } else if (supported) {
             const fs::path path(literal);
-            const auto resolved = native_canonical(path.is_absolute() ? path : parent / path);
-            row["resolved_path"] = resolved.string();
-            row["exists"] = fs::exists(resolved);
-            row["format"] = "filesystem";
-            row["rewrite"] = true;
+#if defined(_WIN32)
+            // Drive-qualified/UNC absolute paths and backslash separators are
+            // native here. Drive-relative or root-only paths lack a stable base.
+            const bool foreign = path.has_root_path() && !path.is_absolute();
+#else
+            const bool foreign = literal.find('\\') != std::string::npos ||
+                                 (literal.size() > 1 && literal[1] == ':');
+#endif
+            if (foreign) {
+                row["supported"] = false;
+                row["reason"] = "unsupported URI or foreign-platform path";
+            } else {
+                const auto resolved = native_canonical(path.is_absolute() ? path : parent / path);
+                row["resolved_path"] = resolved.string();
+                row["exists"] = fs::exists(resolved);
+                row["format"] = "filesystem";
+                row["rewrite"] = true;
+            }
         }
     }
     refs.dependencies.push_back(std::move(row));

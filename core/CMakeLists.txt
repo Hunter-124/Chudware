@@ -1371,6 +1371,11 @@ if(CHUDWARE_WITH_OCCT)
       chudware_mesh chudware_geom_occt)
     set_target_properties(test_mesher_advanced PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    # The bore contract's full-size success case needs the supernodal solver; scalar-LDLT
+    # builds (Windows/macOS releases ship without CHOLMOD) run a reduced model instead.
+    if(CHUDWARE_WITH_CHOLMOD AND CHOLMOD_INCLUDE_DIR AND CHOLMOD_LIBRARY)
+      target_compile_definitions(test_mesher_advanced PRIVATE CHUDWARE_WITH_CHOLMOD)
+    endif()
     add_test(NAME mesher_advanced COMMAND test_mesher_advanced)
     # TIMEOUT overrides `ctest --timeout 900` in the release legs: the contact cases mesh and
     # solve 150k-420k element models, which the 2017 Intel iMac runner cannot finish in 900 s.

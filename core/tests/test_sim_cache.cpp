@@ -809,6 +809,30 @@ TEST_CASE("stepplus native relocation preserves models and rebases mapped and re
     CHECK(chudware::doc::stepplus_open(new_assembly.string()).extra.at("future/payload.bin") == unknown);
 }
 
+TEST_CASE("stepplus native relocation accepts an existing directory's alternate identity spelling") {
+    using chudware::doc::native_file_operations;
+    NativeFileFixture fixture;
+    const auto source = fixture.root / "source.step+";
+    const auto parent = fixture.root / "models";
+    const auto alias = fixture.root / "MODELS";
+    REQUIRE(fs::create_directory(parent));
+    // On a case-sensitive volume, an alias replays the two spellings of one
+    // Windows/macOS directory. A distinct directory still genuinely collides.
+    if (!fs::exists(alias))
+        REQUIRE_NOTHROW(fs::create_directory_symlink(parent, alias));
+    REQUIRE(fs::equivalent(parent, alias));
+    const json doc{{"schema", "aicad.part/1"}, {"id", "same-parent"},
+                   {"name", "Preserved"}, {"features", json::array()}};
+    chudware::doc::stepplus_save(doc, source.string(), {});
+    const auto bytes = native_file_bytes(source);
+    const auto result = native_file_operations({{"action", "relocate"},
+        {"entries", json::array({{{"path", source.string()},
+                                  {"destination", (alias / "copy.step+").string()}}})}});
+    REQUIRE_MESSAGE(result.value("ok", false), result.dump());
+    CHECK(chudware::doc::stepplus_open((parent / "copy.step+").string()).doc == doc);
+    CHECK(native_file_bytes(source) == bytes);
+}
+
 TEST_CASE("stepplus native preflight refuses missing and colliding targets before any writes") {
     using chudware::doc::native_file_operations;
     NativeFileFixture fixture;
@@ -854,6 +878,16 @@ TEST_CASE("stepplus native preflight refuses missing and colliding targets befor
     }
     SUBCASE("case-colliding existing destination") {
         entries[0]["destination"] = (fixture.root / "SOURCE.step+").string();
+    }
+    SUBCASE("case-colliding existing destination directory") {
+        REQUIRE(fs::create_directory(fixture.root / "Models"));
+        entries[0]["destination"] = (fixture.root / "models" / "copy.step+").string();
+        // On a case-insensitive volume these ancestors are one directory;
+        // the leaf is what must not be overwritten.
+        if (fs::exists(fixture.root / "models")) {
+            std::ofstream occupied(fixture.root / "Models" / "copy.step+");
+            occupied << "keep";
+        }
     }
     SUBCASE("path map disagrees with plan") {
         path_map[source.string()] = (fixture.root / "wrong.step+").string();

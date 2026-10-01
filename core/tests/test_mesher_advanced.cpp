@@ -651,6 +651,16 @@ TEST_CASE("contact: a sub-mm interface on a tight curved bore is delivered") {
     Environment governor("CHUDWARE_GOVERNOR", "1");
     Environment fraction("CHUDWARE_MEM_FRAC", "1");
     Environment headroom("CHUDWARE_HEADROOM_GB", "0");
+    Environment threads("CHUDWARE_SIM_THREADS", "2");
+    Environment fea_threads("CHUDWARE_FEA_THREADS", "2");
+    bool scalar_direct = true;
+#if defined(CHUDWARE_WITH_CHOLMOD)
+    const char* requested_solver = std::getenv("CHUDWARE_FEA_SOLVER");
+    scalar_direct = requested_solver &&
+        (std::string(requested_solver) == "ldlt" || std::string(requested_solver) == "simplicial");
+#endif
+    // Pin a DIRECT solver: ambient ICCG would bypass the direct-memory refusal.
+    Environment solver("CHUDWARE_FEA_SOLVER", scalar_direct ? "ldlt" : "cholmod");
     bool limited = false;
     SUBCASE("a 3 GiB study budget refuses the direct solve") { limited = true; }
     SUBCASE("an 8 GiB study budget delivers the interface") {}
@@ -658,9 +668,16 @@ TEST_CASE("contact: a sub-mm interface on a tight curved bore is delivered") {
     const uint64_t budget = chudware::governor::budget_bytes();
     REQUIRE(budget == (limited ? 3 : 8) * gib);
     const auto t0 = std::chrono::steady_clock::now();
-    const double plate_x = 30.0, wall = 6.0, plate_z = 24.0;
+    // Admission is a memory policy, not a time bound. Scalar LDLT's repeated
+    // numeric factors on the full 3-D bore hit the Windows one-hour timeout.
+    // Keep the original admission fixture, but reduce the successful scalar
+    // fixture's plate envelope and axial extent; radius, clearance, curvature
+    // and sub-mm delivery stay unchanged. CHUDWARE_FEA_SOLVER=ldlt replays it on Linux.
+    const bool compact = scalar_direct && !limited;
+    const double plate_x = compact ? 22.0 : 30.0;
+    const double wall = compact ? 1.0 : 6.0, plate_z = compact ? 16.0 : 24.0;
     const double bore_r = 6.35, pin_r = 6.0;  // 0.35 mm radial clearance
-    const double bore_x = 9.0, bore_z = 12.0;
+    const double bore_x = compact ? 8.0 : 9.0, bore_z = plate_z / 2.0;
     TopoDS_Shape plate =
         BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), plate_x, wall, plate_z).Shape();
     const TopoDS_Shape bore =
@@ -674,7 +691,8 @@ TEST_CASE("contact: a sub-mm interface on a tight curved bore is delivered") {
     // instead of a clearance nothing is resolving. Coaxial, the two surfaces are
     // 0.35 mm apart everywhere and the "closest approach" a node pair reports
     // shrinks with h, which no element size can ever resolve.
-    const double pin_y0 = -5.0, pin_len = wall + 10.0;
+    const double pin_y0 = compact ? -1.0 : -5.0;
+    const double pin_len = wall - 2.0 * pin_y0;
     const double pin_z = bore_z - (bore_r - pin_r);
     const TopoDS_Shape pin =
         BRepPrimAPI_MakeCylinder(
@@ -710,8 +728,9 @@ TEST_CASE("contact: a sub-mm interface on a tight curved bore is delivered") {
     json r = fea_run_static(study);
     const double secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    MESSAGE("bore contract: wall " << secs << " s, notes "
-                                   << r.value("notes", json::array()).dump());
+    MESSAGE("bore contract: compact_scalar=" << compact
+            << ", wall " << secs << " s, notes "
+            << r.value("notes", json::array()).dump());
     if (limited) {
         REQUIRE_FALSE(r.value("ok", false));
         const auto& admission = r.at("provenance").at("governor");
@@ -724,6 +743,9 @@ TEST_CASE("contact: a sub-mm interface on a tight curved bore is delivered") {
         return;
     }
     REQUIRE_MESSAGE(r.value("ok", false), r.dump());
+    // Unlike the single-factor advanced parts, contact refactors at every
+    // active-set iteration; allow three part ceilings, still far below 3600 s.
+    CHECK(secs < 3.0 * wall_ceiling_sec());
     const json& contact = r.at("contact");
     const json& resolution = contact.at("resolution");
     const double h_interface = resolution.at("h_interface_mm").get<double>();

@@ -5447,3 +5447,28 @@ jobs), then host CTest passed all 30 tests, including the splat and HTTPS update
 tests. The live `host/build-linux` tree and open application sessions were not
 touched. Run 36793532370 separately stopped before host CTest because training
 pytest collection exited 2; its step log does not contain the collection traceback.
+
+## 2026-10-01 — nightly release unblocked on Linux / Windows / macOS
+
+`nightly-release` had failed every leg for 5 days. Chudcode runtime: legs now fetch the pinned
+binary from this repo's `chudcode-runtime-v<ver>` release mirror with the job token
+(`pin_chudcode.py ensure --github-mirror-repository`, sha from `CHUDCODE_ARTIFACT.lock`), so no
+runner pre-install or PAT; Windows `chud.exe` is built natively on the Ryzen runner by
+`chudcode-runtime-windows-build.yml` (source = mirrored archive of the locked commit; smoke +
+RPC v2 verified, then pinned). PowerShell 5.1 gotchas hit there: `bash` is a WSL shim (no
+bash composite actions), native args lose embedded `"`, `ConvertTo-Json` is not canonical.
+Platform fixes surfaced once the legs compiled: libc++ has no floating `from_chars`
+(splat PLY parse → `device::parseFiniteDouble`); MSVC needs a static constexpr in a captureless
+lambda and resolves symbols in unreferenced COMDATs (`test_agent_job_routing` stubs); contact
+criteria were compared by pointer (`sim::criterion_is` now); `test_worker_long_run` is
+developer-build only (production clients ignore the fake hostd override by design); native
+relocation compared ancestor spellings (`C:\WINDOWS` vs `C:\Windows`) and refused its own temp
+dir — paths are long-name/drive-normalized and ancestors compared by `fs::equivalent`.
+Windows and macOS release builds have NO CHOLMOD (scalar SimplicialLDLT, ~50x slower on big
+contact solves): the bore contract's success case runs a reduced same-radius model there
+(`CHUDWARE_WITH_CHOLMOD` define on the test), and `mesher_advanced` has TIMEOUT 3600. Shipping
+CHOLMOD on those platforms is an open owner decision (its Supernodal module is GPL).
+`linux-gate` built only the `Chudware` target, so its host ctest step found no binaries; gate.sh
+now builds the host default targets. Runner contention: `livingroom-pc` is the only
+`cc-linux-build` runner, so linux-gate, the Stripe gate of deploy-prod and the nightly Linux leg
+serialize on it.

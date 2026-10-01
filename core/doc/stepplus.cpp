@@ -23,6 +23,13 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
+
 #include <BinTools.hxx>
 #include <BinTools_FormatVersion.hxx>
 #include <DESTEP_Parameters.hxx>
@@ -567,10 +574,42 @@ std::string native_string(const json& value, const char* field) {
     return text;
 }
 
+fs::path native_canonical(const fs::path& path) {
+    auto canonical = fs::weakly_canonical(path);
+#if defined(_WIN32)
+    // MSVC's weakly_canonical keeps the spelling of existing components:
+    // C:\WINDOWS and C:\Windows, and 8.3 aliases, can name the same directory.
+    // Expand the existing prefix; GetLongPathName cannot expand a new leaf.
+    fs::path existing = canonical, suffix;
+    while (!fs::exists(existing) && existing != existing.root_path()) {
+        suffix = suffix.empty() ? existing.filename() : existing.filename() / suffix;
+        existing = existing.parent_path();
+    }
+    const auto spelling = existing.native();
+    const DWORD size = GetLongPathNameW(spelling.c_str(), nullptr, 0);
+    if (!size)
+        throw fs::filesystem_error("native path normalization", existing,
+                                  std::error_code(GetLastError(), std::system_category()));
+    std::wstring expanded(size, L'\0');
+    const DWORD written = GetLongPathNameW(spelling.c_str(), expanded.data(), size);
+    if (!written || written >= size)
+        throw fs::filesystem_error("native path normalization", existing,
+                                  std::error_code(GetLastError(), std::system_category()));
+    expanded.resize(written);
+    // GetLongPathName preserves the caller's drive-letter case.
+    if (expanded.size() >= 2 && expanded[1] == L':' &&
+        expanded[0] >= L'a' && expanded[0] <= L'z')
+        expanded[0] += L'A' - L'a';
+    canonical = fs::path(expanded);
+    if (!suffix.empty()) canonical /= suffix;
+#endif
+    return canonical;
+}
+
 fs::path native_absolute(const json& value, const char* field) {
     fs::path path(native_string(value, field));
     if (!path.is_absolute()) native_invalid(std::string(field) + " must be absolute");
-    return fs::weakly_canonical(path);
+    return native_canonical(path);
 }
 
 std::string native_fold(std::string text) {
@@ -587,8 +626,18 @@ void native_destination_available(const fs::path& destination) {
             const auto folded = native_fold(component.string());
             for (const auto& sibling : fs::directory_iterator(parent)) {
                 const auto name = sibling.path().filename().string();
-                if (native_fold(name) == folded && name != component.string())
+                if (native_fold(name) == folded && name != component.string()) {
+                    // An existing ancestor's alternate spelling is not a second
+                    // destination (Windows system/temp paths commonly use it).
+                    // Leaves remain occupied, and distinct case-sensitive
+                    // directories still collide for portable relocation.
+                    std::error_code ec;
+                    const auto requested = parent / component;
+                    if (requested != destination && fs::is_directory(requested) &&
+                        fs::equivalent(requested, sibling.path(), ec) && !ec)
+                        continue;
                     native_invalid("case-colliding destination: " + destination.string());
+                }
             }
         }
         parent /= component;
@@ -640,7 +689,7 @@ void native_reference(NativeReferences& refs, const json& value,
             row["reason"] = "unsupported URI or foreign-platform path";
         } else if (supported) {
             const fs::path path(literal);
-            const auto resolved = fs::weakly_canonical(path.is_absolute() ? path : parent / path);
+            const auto resolved = native_canonical(path.is_absolute() ? path : parent / path);
             row["resolved_path"] = resolved.string();
             row["exists"] = fs::exists(resolved);
             row["format"] = "filesystem";

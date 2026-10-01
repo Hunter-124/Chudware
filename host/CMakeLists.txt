@@ -928,7 +928,11 @@ add_test(NAME test_async_rpc
 # Guards the 2026-09-27 starvation: an hours-long agent_admin_turn held callMtx_, so a
 # worker-routed call on the GUI's single-FIFO st.rpc lane — and every tab-switch doc_activate
 # queued behind it — waited out the whole turn. Also: two long runs still never overlap.
-if(UNIX)
+# Developer builds only: the fake hostd is reached through CHUDWARE_HOSTD_SOCKET/_BIN, which a
+# production client (CHUDWARE_DEVELOPER_BUILD=OFF, the release legs) deliberately ignores in
+# favour of the manifest-owned hostd — there it fails "canonical manifest-owned hostd binary
+# unavailable" by design. The strict linux-gate (developer build) keeps running it.
+if(UNIX AND CHUDWARE_DEVELOPER_BUILD)
   add_executable(test_worker_long_run
     tests/test_worker_long_run.cpp
     src/core/async_rpc.cpp

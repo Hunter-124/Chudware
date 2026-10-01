@@ -120,10 +120,24 @@ $digest = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
 if ($digest -ne $evidence.sha256) { throw 'Runtime digest changed after smoke' }
 # Exercise CAD's exact verify contract against a prospective pin, never alter
 # the tracked lock or invent a digest before the binary exists.
-$lock.artifacts.'windows-x86_64'.sha256 = $digest
-$lock.artifacts.'windows-x86_64'.url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/chudcode-runtime-v$($lock.version)/chudcode-windows-x64.exe"
+# pin_chudcode accepts only canonical JSON (sorted keys, compact, trailing LF); a
+# ConvertTo-Json rendering is rejected, so the prospective lock is written by Python.
 $prospectiveLock = Join-Path $retained 'CHUDCODE_ARTIFACT.lock'
-$lock | ConvertTo-Json -Depth 30 | Set-Content -Encoding Ascii $prospectiveLock
+$windowsUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/chudcode-runtime-v$($lock.version)/chudcode-windows-x64.exe"
+$writer = Join-Path $retained 'write_prospective_lock.py'
+Set-Content -Path $writer -Encoding ascii -Value @'
+import json, sys
+src, dst, sha, url = sys.argv[1:5]
+with open(src, encoding="ascii") as f:
+    lock = json.load(f)
+lock["artifacts"]["windows-x86_64"].update(sha256=sha, url=url)
+data = json.dumps(lock, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+with open(dst, "w", encoding="ascii", newline="\n") as f:
+    f.write(data)
+'@
+& python $writer $lockPath $prospectiveLock $digest $windowsUrl
+if ($LASTEXITCODE -ne 0) { throw 'Cannot write prospective CAD pin' }
+Remove-Item $writer
 & python (Join-Path $PSScriptRoot 'pin_chudcode.py') --lock $prospectiveLock verify --target windows-x86_64 --input $binary
 if ($LASTEXITCODE -ne 0) { throw 'CAD prospective Windows pin verification failed' }
 $cache = Join-Path (Join-Path $tools 'chudcode') $digest

@@ -620,6 +620,10 @@ def register_print_tools(mcp: FastMCP) -> None:
             import numpy as np  # noqa: PLC0415
             rotation = frame_for_build_dir(orient["build_dir"], orient["yaw_deg"])
             oriented = np.asarray(vertices, dtype=np.float64) @ np.asarray(rotation).T
+            # Origin-centred, resting on z=0: PrusaSlicer's --duplicate arrange fails with
+            # "No outline can be derived" on a mesh that sits far from the origin.
+            low, high = oriented.min(axis=0), oriented.max(axis=0)
+            oriented = oriented - np.array([(low[0] + high[0]) / 2, (low[1] + high[1]) / 2, low[2]])
             oriented_stl = work_dir / f"{stem}.oriented.stl"
             _write_binary_stl(oriented_stl, oriented, triangles)
 

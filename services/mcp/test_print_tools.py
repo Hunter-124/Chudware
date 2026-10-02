@@ -131,3 +131,12 @@ def test_verify_gcode_flags_a_temperature_the_user_did_not_ask_for(tmp_path):
                   material="PLA", nozzle_temp_c=230, bed_temp_c=60)
     rows = {row["check"]: row for row in wrong["checks"]}
     assert wrong["ok"] is False and rows["temperatures"]["status"] == "fail", wrong
+
+
+def test_copies_arrange_a_part_modelled_far_from_the_origin(tmp_path):
+    doc = _part([cb.feat("box", "Far", {"length": cb.dim(9), "width": cb.dim(9),
+                                        "height": cb.dim(8), "at": [400, -300, 250]})])
+    result = _call("slice_part", doc_id=doc, printer="ender 3", copies=3,
+                   output_dir=str(tmp_path), name="far")
+    assert result["ok"], result
+    assert result["print_ready"] is True, result

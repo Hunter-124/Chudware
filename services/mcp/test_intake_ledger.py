@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 
 import pytest
@@ -326,8 +327,8 @@ def test_dfm_overhang_sub_one_square_millimeter_is_not_a_failure(minted_document
     result = _real_dfm(doc)
     check = _overhang(result)
     assert check["status"] == "pass", result
-    assert check["unsupported_area_mm2"] == pytest.approx(0.8, abs=0.05), result
-    assert check["unsupported_face_count"] >= 1, result
+    # A 0.04 mm ledge is narrower than half an extrusion line: nothing to support.
+    assert check["unsupported_area_mm2"] <= 1.0, result
 
 
 def _real_dfm(doc_id: str, **options) -> dict:
@@ -362,9 +363,9 @@ def test_dfm_fdm_box_on_plate_passes_and_recommends_zero_support(minted_document
     check = _overhang(result)
     assert check["status"] == "pass" and check["ok"] is True, result
     assert check["unsupported_area_mm2"] == 0 and check["unsupported_face_count"] == 0
-    assert len(check["orientation"]) == 6
-    assert check["orientation"][0]["unsupported_area_mm2"] == 0
-    assert check["orientation"][0]["base_contact_area_mm2"] > 0
+    best = result["orientation"][0]
+    assert best["metrics"]["support_volume_mm3"] == 0, result["orientation"]
+    assert best["metrics"]["contact_area_mm2"] > 0, result["orientation"]
     assert result["dfm_pass"] is True, result
 
 
@@ -381,7 +382,12 @@ def test_dfm_fdm_cantilever_support_area_and_flipped_plate(minted_documents):
     assert check["unsupported_area_mm2"] == pytest.approx(400, rel=0.05), check
     assert check["unsupported_face_count"] >= 1
     assert all(face["face"] and len(face["centroid"]) == 3 for face in check["worst"])
-    assert check["orientation"][0]["unsupported_area_mm2"] == 0, check
+    support = next(row for row in result["checks"] if row["check"] == "support")
+    # Two 10x20 shelves (cap underside z=10) over a plate at the stem foot (z=-10).
+    assert support["metrics"]["support_volume_mm3"] == pytest.approx(2 * 10 * 20 * 20,
+                                                                     rel=0.1), support
+    # Cap down, stem up: the T stands on its own flat top with nothing to support.
+    assert result["orientation"][0]["metrics"]["support_volume_mm3"] == 0, result
     flipped = _real_dfm(doc, build_dir=[0, 0, -3])
     assert _overhang(flipped)["status"] == "pass", flipped
     assert _overhang(flipped)["build_dir"] == [0.0, 0.0, -1.0]
@@ -472,9 +478,12 @@ def test_dfm_fdm_horizontal_cylinder_supports_lower_arc(minted_documents):
     ])
     result = _real_dfm(doc)
     check = _overhang(result)
-    expected = 0.5 * 3.141592653589793 * radius * length
+    # Lower arc beyond 45° from vertical, minus the strip within one 0.2 mm layer of the
+    # bed (the first layer lies there; nothing below it to support).
+    layer = 0.2
+    expected = 2 * radius * length * (math.pi / 4 - math.acos(1 - layer / radius))
     assert check["status"] == "fail", result
-    assert check["unsupported_area_mm2"] == pytest.approx(expected, rel=0.08), result
+    assert check["unsupported_area_mm2"] == pytest.approx(expected, rel=0.05), result
 
 
 def test_dfm_fdm_support_counts_first_of_multiple_bodies(minted_documents):

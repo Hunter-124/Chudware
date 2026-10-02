@@ -181,4 +181,38 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "returns the same value alongside cutting data."
         ),
     },
+    # ------------------------------------------------------------------ additive (3D print)
+    "slice_part": {
+        "prompt_note": (
+            "The only way to make G-code: never download a slicer or hand-write "
+            ".ini keys. Run dfm_check and fix fails first; report print_ready and "
+            "gcode_check issues honestly. One call per part; copies= for repeats."
+        ),
+    },
+    "optimize_print_orientation": {
+        "prompt_note": (
+            "Measured ranking (support, time, tip risk, bed fit). Pass "
+            "strength_dir for loaded parts and preserve_faces for cosmetic or "
+            "precision faces; slice_part(orientation='auto') uses the same scorer."
+        ),
+    },
+    "verify_gcode": {
+        "prompt_note": (
+            "Run on any G-code before it goes to a printer (slice_part already "
+            "does); floating_extrusion fails mean mid-air plastic — reorient, "
+            "enable supports, or redesign, never ship it."
+        ),
+    },
+    "list_print_profiles": {
+        "prompt_note": (
+            "Resolve the user's printer words to a vendor preset and see layer "
+            "heights/filaments; pin names via slice_part print_preset/filament_preset."
+        ),
+    },
+    "slicer_status": {
+        "prompt_note": (
+            "If no slicer is installed, give the user the returned install "
+            "command (Linux: per-user flatpak) instead of improvising one."
+        ),
+    },
 }

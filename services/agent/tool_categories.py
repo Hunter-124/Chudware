@@ -253,6 +253,19 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "describe_toolpaths",
         "cam_cost_estimate",  # named by the parts/quoting playbook; was in no pack
     ],
+    # Additive CAM: the only supported path from a part to printer G-code (stock
+    # PrusaSlicer, vendor presets) plus the deterministic checks around it.
+    "print": [
+        "dfm_check",
+        "optimize_print_orientation",
+        "slice_part",
+        "verify_gcode",
+        "list_print_profiles",
+        "slicer_status",
+        "wall_thickness",
+        "check_geometry_health",
+        "export_part",
+    ],
     # ECAD is fully curated: no `family:ecad` token. The explicit pack is deliberately
     # comprehensive because this discipline spans schematic authoring/readback/export,
     # board layout, SI/PI, thermal, power, and antennas. Keep it under the 64-tool category
@@ -706,6 +719,7 @@ _CATEGORY_DESCS: dict[str, str] = {
     "requirements": "Layout plan, requirements capture and auto-verification",
     "office": "PDF/DOCX read, extract, edit and render",
     "sheetmetal": "Sheet-metal flanges/bends via add_features + bend calcs",
+    "print": "3D printing: printability checks, orientation, slicing to G-code, G-code proof",
 }
 
 
@@ -871,9 +885,13 @@ MAIN_CHAT_CORE_TOOLS: tuple[str, ...] = (
     "inspect_section",
     "check_geometry_health",
     "check_interference",
-    # Printability: every "optimize for 3D printing" turn loaded these on demand.
+    # Printability: every "optimize for 3D printing" turn loaded these on demand. Slicing
+    # is part of the main chat because "print this for my Ender 3" is an ordinary ask.
     "dfm_check",
     "analyze_stl_geometry",
+    "optimize_print_orientation",
+    "slice_part",
+    "verify_gcode",
     # assembly
     "asm_add_component",
     "asm_mate",
@@ -1012,7 +1030,8 @@ _MENU_GROUPS: tuple[_MenuGroup, ...] = (
     _MenuGroup("sim", ("sim",), (),
                "FEA (static/modal/fatigue), CFD, motion, thermal, fluid/piping circuits"),
     _MenuGroup("cam", ("cam",), (),
-               "CAM jobs, ops, toolpaths, post, feeds & speeds, cost"),
+               "CAM jobs, ops, toolpaths, post, feeds & speeds, cost; 3D-print slicing, "
+               "print orientation, G-code verification"),
     _MenuGroup("ecad", ("ecad", "em"), (),
                "Schematic/PCB place-wire-board, ERC/DRC, simulation, antenna/EM, firmware"),
     _MenuGroup("reveng", ("reveng", "recon"), (),

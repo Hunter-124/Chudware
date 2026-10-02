@@ -56,7 +56,8 @@ The repo has a knowledge graph at `graphify-out/` (skill: `.claude/skills/graphi
 | `services/mcp/` | MCP server exposing the engine to external agents (Claude Code etc.) |
 | `services/worker/` | Engine routing seam: WorkerClient / DocMirror / bootstrap |
 | `services/installer/` | Provisioning, MCP self-registration, packaging |
-| `services/manufacturing/**` | Gateway transports + allowlist, printer adapters, slicer, monitor, metrology, notification, PnP, and robot services |
+| `services/manufacturing/**` | Gateway transports + allowlist, printer adapters, slicer (stock-PrusaSlicer adapter, vendor presets, G-code verifier), monitor, metrology, notification, PnP, and robot services |
+| `services/dfam/` | Deterministic design-for-additive analysis (numpy/scipy): wall thickness, overhang/bridges, support + trapped support, holes, internal voids, bed adhesion, bed fit, orientation ranking |
 | `services/perception/**`, `training/perception/**` | Perception model/runtime and reproducible training pipeline |
 | `contracts/` | **Frozen interface contracts — THE seams. Append-only.** `worker_rpc.md`, `doc_ops.md`, `feature_params.md`, `icons.md`, `parts.md`, `ecad/`, … (`contracts/README.md`) |
 | `corpora/` | Consolidated test fixtures (sketch/render/sw_parity), referenced by canonical paths |
@@ -166,6 +167,19 @@ judgment).
 - `FreshValue<T>` is the sole external freshness shape, and the journal is the sole source of durable `seq`.
 - Nothing may advertise physical `execute` or `safety_integration` before the E4–E6 pilot.
 - `mfg_run_resume` exists only to refuse.
+- **3D printing goes through `slice_part` (2026-10-01).** `services/mcp/print_tools.py` (family
+  `cam`, NOT the gated `manufacture` family — it only writes files): stock PrusaSlicer found by
+  `services/manufacturing/slicer/prusaslicer.discover()` (CHUDWARE_SLICER_BIN → per-user flatpak
+  `com.prusa3d.PrusaSlicer`, always `--command=prusa-slicer` because the default entrypoint dies
+  headless → system flatpak → standard paths; `scripts/provision_slicer.py --install`), vendor
+  presets read at runtime from the install's profile bundles (`vendor_bundle.ProfileCatalog`,
+  never copied into the repo), orientation/supports/brim from the deterministic DFAM package
+  `services/dfam` (also behind `dfm_check`'s FDM rows), then `gcode_check.verify_gcode`.
+  `print_ready` requires a passing G-code check — its `floating_extrusion` scan is what catches
+  mid-air perimeters; old hand-rolled arm slices had 225 mm unsupported overhang-perimeter runs.
+  2.9.6 CLI facts: no `--arrange`; bare `--merge` segfaults headless (use `--dont-arrange
+  --merge`); `--duplicate N` arranges copies. Never let an agent download a slicer or write
+  slicer keys by hand again.
 
 ## Daemon / mission lifecycle (don't regress these)
 

@@ -79,7 +79,10 @@ _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tr
               "mfg_run_describe", "mfg_journal_query", "mfg_approval_inspect",
               # Research tools (research_tools.py): read-only lookups, not mutators —
               # no "research_" prefix in _READ_PREFIXES so classify explicitly.
-              "research_web_search", "research_fetch_page"}
+              "research_web_search", "research_fetch_page",
+              # Deterministic printability / G-code analysis (print_tools.py, dfm_check):
+              # they measure a part or a file and touch no document.
+              "dfm_check", "optimize_print_orientation", "verify_gcode"}
 
 # Explicit overrides for names the classifier would mislabel. name -> risk.
 _RISK_OVERRIDES: dict[str, str] = {

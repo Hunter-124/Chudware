@@ -209,7 +209,12 @@
    "cam_undo",
    "cam_update_operation",
    "feeds_speeds",
-   "tap_drill"
+   "list_print_profiles",
+   "optimize_print_orientation",
+   "slice_part",
+   "slicer_status",
+   "tap_drill",
+   "verify_gcode"
   ],
   "ecad": [
    "board_from_schematic",
@@ -826,6 +831,7 @@
   "list_configurations": "List the part's configurations (parametric variants) and which one is active.",
   "list_drawing_sheets": "List every drawing sheet and the active sheet id.",
   "list_parts": "List all open part/drawing documents in this engine session.",
+  "list_print_profiles": "Printer / print / filament presets from the installed slicer's vendor bundles.",
   "list_reveng_dims": "Return the dimension ledger the Review stage confirms against.",
   "list_reveng_sessions": "List all reverse engineering sessions in the session store.",
   "list_spec_templates": "List the parametric templates the AI spec-sheet path (`spec_sheet_match`) can fill.",
@@ -887,6 +893,7 @@
   "office_read_pdf": "pypdfium2 text extraction. ``page_range`` is 1-based (\"1-3,5\"; empty = all pages). Returns ``{ok, pages:[{index, text}], page_count}`` …",
   "office_read_pptx": "Structured slide read. Returns ``{ok, slides:[{index, title, text_runs, notes}]}``.",
   "office_read_xlsx": "Returns ``{ok, sheets:[{name, rows}]}``, or a single sheet if *sheet* is given. ``keep_vba`` is auto-detected from a ``.xlsm`` extension.",
+  "optimize_print_orientation": "Rank FDM print orientations by measurement (deterministic; no slicer needed).",
   "part_get": "Retrieve a single PartRecord by its stable part_id (aicad.parts/1).",
   "part_place": "Place a standard part into a document — universal insertion across all domains (T-P3).",
   "part_search": "Search the unified standard-parts library (all domains federated), with V2 taxonomy routing + faceted filtering.",
@@ -1058,6 +1065,8 @@
   "sketch_auto_constrain": "Stitch a sketch's near-touching endpoints closed by adding coincident constraints — the cheap way to close chains before dimensioning.",
   "sketch_health": "The single narrated read of a sketch's constraint state — solve it and get back WHY it is under/over-defined plus an ordered plan to reach …",
   "sketch_preview_text": "Full TEXT description of a 2D sketch — entities, constraints, DOF, regions, health.",
+  "slice_part": "Slice a part to printer-ready G-code with STOCK PrusaSlicer and prove the result.",
+  "slicer_status": "Which slicer slice_part will run (PrusaSlicer, subprocess only), or how to install it.",
   "solve_mates": "Solve the mate constraints of an ASSEMBLY document (positions its components).",
   "spec_sheet_match": "AI-path spec-sheet matching: datasheet text/URL -> parametric model -> VendorPart.",
   "stackup_analyze": "1D tolerance stack-up analysis: worst-case and/or RSS over a dimension chain.",
@@ -1081,6 +1090,7 @@
   "vendor_status": "Return the login status of all registered vendor source adapters.",
   "vendors_health": "Run a canary health check across the vendor source adapters.",
   "verify_battery": "Run deterministic checks on one explicit document.",
+  "verify_gcode": "Deterministically check a G-code file before it goes to a printer.",
   "verify_packet": "Check ONE evidence-packet folder for mutual consistency BEFORE citing it.",
   "wait_job": "Block until a background job (get_job id) finishes or timeout_s passes — use instead of sleep/poll loops.",
   "wall_thickness": "How THIN is the thinnest wall? Inward ray-cast wall-thickness over the whole part.",
@@ -1411,7 +1421,7 @@
    "timeout_s": 300
   },
   "dfm_check": {
-   "prompt_note": "Run before export; uses the process bound by set_process unless you pass process=. Returns a pass/fail list with the offending values."
+   "prompt_note": "Run before export or slicing; uses the process bound by set_process unless you pass process=. For FDM it measures walls, overhangs, bridges, support (incl. trapped), holes, internal voids, bed adhesion and bed fit (printer=); rows name faces/features to fix."
   },
   "doc_diff_tool": {
    "prompt_note": "Both args are full-document JSON STRINGS (e.g. get_part output), not doc_ids; µm-level float noise is suppressed so unchanged rebuilds diff empty."
@@ -1898,6 +1908,9 @@
   "list_parts": {
    "prompt_note": "Open docs in this session; after a server restart this is empty — recover_parts reloads the autosaved docs (with fresh doc_ids)."
   },
+  "list_print_profiles": {
+   "prompt_note": "Resolve the user's printer words to a vendor preset and see layer heights/filaments; pin names via slice_part print_preset/filament_preset."
+  },
   "list_reveng_dims": {
    "prompt_note": "Read before a dimension gate: rows arrive strongest-evidence-first and `key` is what the confirm ledger expects back. Empty list means nothing measured yet."
   },
@@ -2087,6 +2100,9 @@
   },
   "office_read_xlsx": {
    "prompt_note": "Returns cached values (data_only=True) — a formula cell shows its last calculated value or None if never calculated; the formula text itself is not visible here."
+  },
+  "optimize_print_orientation": {
+   "prompt_note": "Measured ranking (support, time, tip risk, bed fit). Pass strength_dir for loaded parts and preserve_faces for cosmetic or precision faces; slice_part(orientation='auto') uses the same scorer."
   },
   "part_get": {
    "prompt_note": "Fetch the full PartRecord after a part_search hit — summary rows omit the params/specs you need before part_place or cam_tool_import."
@@ -2635,6 +2651,12 @@
   "sketch_preview_text": {
    "prompt_note": "No-vision full text of a 2D sketch (entities/constraints/regions/DOF) — the readable alternative to render_sketch; 3D → sketch3d_preview."
   },
+  "slice_part": {
+   "prompt_note": "The only way to make G-code: never download a slicer or hand-write .ini keys. Run dfm_check and fix fails first; report print_ready and gcode_check issues honestly. One call per part; copies= for repeats."
+  },
+  "slicer_status": {
+   "prompt_note": "If no slicer is installed, give the user the returned install command (Linux: per-user flatpak) instead of improvising one."
+  },
   "solve_mates": {
    "prompt_note": "Assembly docs only ('not an assembly' on a part); asm_mate already solves by default — call after bulk edits, then list_world_bodies."
   },
@@ -2709,6 +2731,9 @@
   },
   "verify_battery": {
    "prompt_note": "Deterministic checks for THIS doc; the default set includes feature_attachment (floating / overhanging / edge-touching features, each with its close-up call) and solid health. PASS covers only keys in scores; drawings, fits, loads, tolerances and manufacturability need their own checks."
+  },
+  "verify_gcode": {
+   "prompt_note": "Run on any G-code before it goes to a printer (slice_part already does); floating_extrusion fails mean mid-air plastic — reorient, enable supports, or redesign, never ship it."
   },
   "verify_packet": {
    "prompt_note": "Read a packet folder back and check its files describe one run (same input hash, same engine build, result.json matching the hash convergence.md cites, reduction fields present). Run it before citing a packet; ok:false means do not cite it."

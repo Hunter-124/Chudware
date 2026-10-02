@@ -390,6 +390,10 @@ from services.mcp.cam_tools import register_cam_tools
 register_cam_tools(_reg.view(mcp, "cam"))
 from services.mcp.cam_audit import register_cam_audit_tools
 register_cam_audit_tools(_reg.view(mcp, "cam"))
+# Additive CAM: deterministic printability/orientation, stock-PrusaSlicer slicing (subprocess
+# only, vendor presets read from the installed slicer) and G-code verification.
+from services.mcp.print_tools import register_print_tools
+register_print_tools(_reg.view(mcp, "cam"))
 
 # Manufacture gateway: read/propose/request-only surface over chudware-hostd's
 # single-owner lane. The family is known but default-off; no approval-create,

@@ -19,9 +19,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "dfm_check": {
         "prompt_note": (
-            "Run before export; uses the process bound by set_process unless "
-            "you pass process=. Returns a pass/fail list with the offending "
-            "values."
+            "Run before export or slicing; uses the process bound by set_process "
+            "unless you pass process=. For FDM it measures walls, overhangs, "
+            "bridges, support (incl. trapped), holes, internal voids, bed adhesion "
+            "and bed fit (printer=); rows name faces/features to fix."
         ),
     },
     "fit_report": {

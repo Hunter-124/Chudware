@@ -596,128 +596,86 @@ def _dfm_build_direction(value: Optional[list[float]]) -> list[float]:
     return [x / magnitude for x in components]
 
 
-def _dfm_overhang(doc_id: str, limit, build_dir: list[float],
-                  suggest_orientation: bool) -> dict:
-    threshold = _dfm_number(limit)
-    result = {
-        "check": "overhang", "status": "not_evaluated", "ok": None,
-        "limit_deg": threshold, "build_dir": build_dir,
-        "unsupported_area_mm2": None, "unsupported_face_count": None,
-        "worst": [],
-    }
-    if threshold is None or not 0 <= threshold <= 90:
-        result["note"] = "ProcessProfile has no valid overhang.max_deg threshold"
-        return result
+# Rows the DFAM battery adds to an FDM dfm_check (services/dfam). min_wall replaces the
+# engine vertex-sampled reading for FDM with an area-sampled, face-attributed one.
+_DFAM_ROWS = ("min_wall", "overhang", "bridges", "support", "small_holes", "internal_voids",
+              "bed_adhesion", "build_volume")
+
+
+def _dfam_overhang_legacy(row: dict, build_dir: list[float], limit) -> dict:
+    """Keep the overhang row's long-standing keys (unsupported_area_mm2, worst[], …)
+    beside the DFAM fields, so earlier consumers read the same numbers."""
+    metrics = row.get("metrics") or {}
+    worst = []
+    for region in row.get("regions") or []:
+        faces = region.get("faces") or []
+        entry = {"face": faces[0] if faces else None,
+                 "area_mm2": region.get("area_mm2"),
+                 "overhang_deg": region.get("max_angle_deg"),
+                 "centroid": region.get("centroid")}
+        built_by = region.get("built_by") or []
+        if built_by:
+            entry["built_by"] = {"id": built_by[0]}
+        worst.append(entry)
+    area = metrics.get("area_mm2")
+    return {**row, "limit_deg": _dfm_number(limit), "build_dir": build_dir,
+            "unsupported_area_mm2": round(float(area), 3) if area is not None else None,
+            "unsupported_face_count": metrics.get("face_count", len(worst)),
+            "worst": worst[:5]}
+
+
+def _dfm_additive(doc_id: str, params: dict, build_dir: list[float], *,
+                  suggest_orientation: bool, printer: Optional[str], detail: bool,
+                  wanted: Optional[set]) -> tuple[list[dict], dict]:
+    """DFAM rows for an FDM part plus extras {estimate, orientation, printer}.
+
+    A geometry failure turns every requested DFAM row into not_evaluated carrying the
+    original error — never a silent pass."""
+    names = [name for name in _DFAM_ROWS if wanted is None or name in wanted]
+    extras: dict = {}
+    if not names and not suggest_orientation:
+        return [], extras
     try:
-        import numpy as np
+        from services.dfam import analyze_printability, optimize_orientation
+        from services.mcp import print_tools as pt
 
-        from services.mcp.cad_common import _doc_mesh
-
-        faces = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}})["matches"]
-        by_key = {(int(face["body"]), int(face["topo"])): face for face in faces
-                  if face.get("kind") == "face" and face.get("sid")
-                  and face.get("body") is not None and face.get("topo") is not None}
-        if not by_key:
-            raise ValueError("geometry query returned no identifiable solid faces")
-        mesh = _doc_mesh(doc_id)
-        if mesh is None:
-            raise ValueError("current display tessellation unavailable")
-        face_rows = []
-        face_index = np.full(len(mesh["idx"]), -1, dtype=np.int32)
-        for rec in mesh["faces"]:
-            first, count = int(rec["first_tri"]), int(rec["tri_count"])
-            if count <= 0:
-                continue
-            body_id = int(rec["body"])
-            match = by_key.get((body_id, int(rec["face_id"])))
-            if match is None:
-                raise ValueError(f"body {body_id} face {rec['face_id']} has no sid")
-            face_index[first:first + count] = len(face_rows)
-            face_rows.append(match)
-        if (not len(face_index) or np.any(face_index < 0) or
-                {body_id for body_id, _ in by_key} !=
-                {int(rec["body"]) for rec in mesh["faces"] if rec["tri_count"] > 0}):
-            raise ValueError("display tessellation omits identifiable solid faces or bodies")
-        points = np.asarray(mesh["pos"], dtype=np.float64)[mesh["idx"]]
-        indices = face_index
-        if np.unique(indices).size != len(face_rows):
-            raise ValueError("one or more solid faces have no tessellated triangles")
-        edges = np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0])
-        twice_area = np.linalg.norm(edges, axis=1)
-        if not np.all(np.isfinite(points)) or not np.all(np.isfinite(twice_area)):
-            raise ValueError("tessellation has non-finite coordinates")
-        valid = twice_area > 1e-12
-        normals = np.zeros_like(edges)
-        normals[valid] = edges[valid] / twice_area[valid, None]
-        triangle_area = twice_area * 0.5
-        centroids = np.mean(points, axis=1)
-        n_faces = len(face_rows)
-
-        def evaluate(direction: list[float]) -> tuple[list[dict], float]:
-            axis = np.asarray(direction, dtype=np.float64)
-            plate = float(np.min(points.reshape(-1, 3) @ axis))
-            downward = -(normals @ axis)
-            heights = points @ axis
-            contact = (valid & (downward >= 1 - 1e-6)
-                       & (np.max(heights, axis=1) - plate <= 0.05))
-            degrees = np.degrees(np.arcsin(np.clip(downward, -1, 1)))
-            bad = valid & ~contact & (degrees > threshold + 1e-6)
-            weights = triangle_area * bad
-            area_by_face = np.bincount(indices, weights=weights, minlength=n_faces)
-            counts = np.flatnonzero(area_by_face > 0)
-            if len(counts):
-                maxima = np.full(n_faces, -90.0)
-                np.maximum.at(maxima, indices[bad], degrees[bad])
-                centers = [np.bincount(indices, weights=weights * centroids[:, i],
-                                       minlength=n_faces) for i in range(3)]
-            unsupported = []
-            for face_i in counts:
-                face = face_rows[int(face_i)]
-                area = float(area_by_face[face_i])
-                row = {"face": face["sid"], "area_mm2": area,
-                       "overhang_deg": round(float(maxima[face_i]), 3),
-                       "centroid": [round(float(c[face_i] / area), 3) for c in centers]}
-                if face.get("owner_feature"):
-                    row["built_by"] = {"id": face["owner_feature"]}
-                unsupported.append(row)
-            return unsupported, float(triangle_area[contact].sum())
-
-        unsupported, _contact = evaluate(build_dir)
-        area = sum(face["area_mm2"] for face in unsupported)
-        result.update({
-            "status": "fail" if area > 1.0 else "pass", "ok": area <= 1.0,
-            "unsupported_area_mm2": round(area, 3),
-            "unsupported_face_count": len(unsupported),
-            "worst": sorted(unsupported, key=lambda face: -face["area_mm2"])[:5],
-            "note": "support recommended for downward faces above the overhang limit"
-                    if area > 1.0 else "no significant unsupported downward faces",
-        })
+        resolved = None
+        if printer:
+            install, catalog = pt.slicer_session()
+            if install is None:
+                raise ValueError(catalog.get("content") or "slicer not installed")
+            best, _ = pt.pick_printer(catalog, printer, None)
+            if best is None:
+                raise ValueError(f"no vendor printer preset matches {printer!r}")
+            resolved = catalog.resolve(best["name"])
+            extras["printer"] = best["name"]
+        mesh, _label, _source = pt.load_doc(doc_id)
+        print_params = pt.print_params(resolved=resolved, dfm=params)
+        analysis = analyze_printability(mesh, print_params, build_dir,
+                                        checks=names or None, detail=detail)
+        rows = []
+        for row in analysis["checks"]:
+            if row.get("check") == "overhang":
+                row = _dfam_overhang_legacy(
+                    row, build_dir, (params.get("overhang") or {}).get("max_deg"))
+            rows.append(row)
+        extras["estimate"] = analysis.get("estimate")
         if suggest_orientation:
-            orientations = []
-            for axis in range(3):
-                for sign in (1, -1):
-                    direction = [float(sign if i == axis else 0) for i in range(3)]
-                    bad, base = evaluate(direction)
-                    orientations.append({
-                        "build_dir": direction,
-                        "unsupported_area_mm2": round(sum(f["area_mm2"] for f in bad), 3),
-                        "base_contact_area_mm2": round(base, 3),
-                    })
-            result["orientation"] = sorted(
-                orientations,
-                key=lambda row: (row["unsupported_area_mm2"], -row["base_contact_area_mm2"]),
-            )
+            extras["orientation"] = optimize_orientation(mesh, print_params, top_k=3)
+        return rows, extras
     except Exception as exc:  # noqa: BLE001
-        result.update({"status": "not_evaluated", "ok": None,
-                       "unsupported_area_mm2": None, "unsupported_face_count": None,
-                       "worst": [], "note": f"overhang geometry unavailable: {exc}"})
-    return result
+        return [{"check": name, "status": "not_evaluated", "ok": None,
+                 "note": f"printability geometry unavailable: {exc}", "error": str(exc)}
+                for name in names], extras
 
 
 def _dfm_verdict(checks: list[dict]) -> tuple[str, Optional[bool]]:
-    if any(check.get("status") == "fail" for check in checks):
+    """fail > not_evaluated > pass. ``warn`` rows pass (they carry advice, not a defect)
+    and ``not_applicable`` rows do not count as evaluated checks."""
+    applicable = [check for check in checks if check.get("status") != "not_applicable"]
+    if any(check.get("status") == "fail" for check in applicable):
         return "fail", False
-    if not checks or any(check.get("status") == "not_evaluated" for check in checks):
+    if not applicable or any(check.get("status") == "not_evaluated" for check in applicable):
         return "not_evaluated", None
     return "pass", True
 
@@ -805,15 +763,36 @@ def register_intake_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def dfm_check(process: Optional[str] = None, doc_id: Optional[str] = None,
                   build_dir: Optional[list] = None,
-                  suggest_orientation: bool = False) -> str:
+                  suggest_orientation: bool = False, printer: Optional[str] = None,
+                  checks: Optional[list] = None, detail: bool = False) -> str:
         """Evaluate DfM as pass, fail, or not_evaluated against the ProcessProfile.
 
-        Checks wall and declared minimum feature size, molding draft, FDM overhang/support,
-        machining blind-hole depth/diameter, and thread strategy. ``build_dir`` is the
-        normalized print-up vector (default [0,0,1]); ``suggest_orientation`` ranks six
-        axis-aligned print directions by unsupported area and base contact. ``dfm_pass`` is
-        true only when every applicable check ran and passed; evaluation gaps/errors are
-        returned as ``not_evaluated`` with ``dfm_pass:null`` and the original error.
+        Every process: wall thickness, declared minimum feature size, machining blind-hole
+        depth/diameter, thread strategy, molding draft. FDM adds the deterministic
+        printability battery, measured on the part at the build direction:
+          min_wall      area-sampled ray thickness per face (fail below the process minimum
+                        or the nozzle; warn when only one perimeter pair fits; thin skins)
+          overhang      downward faces steeper than the limit that are neither bed contact,
+                        bridges nor small self-supporting horizontal holes (unsupported area,
+                        worst faces, fixes such as bed-edge fillet -> 45° chamfer, teardrop)
+          bridges       anchored horizontal spans vs the bridge limit
+          support       estimated support volume, support landing on the model, and support
+                        trapped where no tool can reach it (enclosed/narrow-access cavities)
+          small_holes   vertical holes below the printable diameter, horizontal holes that
+                        need a teardrop
+          internal_voids sealed internal cavities (internal geometry) and floating bodies
+          bed_adhesion  first-layer contact, tip ratio, centre of mass over the footprint
+          build_volume  fit on `printer`'s bed (any vendor preset name, e.g. "ender 3")
+        Every failing/warning row names faces (sids) and the features that built them, a
+        model-frame centroid and concrete fixes. ``estimate`` gives a deterministic material /
+        time / support-share model to compare design revisions (slice_part gives slicer truth).
+
+        ``build_dir`` is the print-up vector (default [0,0,1]); ``suggest_orientation`` adds
+        the top-3 measured orientations (optimize_print_orientation has the full ranking).
+        ``checks`` limits the rows (names above plus min_feature, hole_depth_diameter,
+        thread_strategy, draft); ``detail`` lists up to 50 regions per row instead of 5.
+        ``dfm_pass`` is true only when every applicable check ran and passed (warn rows pass);
+        evaluation gaps/errors are ``not_evaluated`` with ``dfm_pass:null`` and the error.
         """
         try:
             direction = _dfm_build_direction(build_dir)
@@ -821,61 +800,70 @@ def register_intake_tools(mcp: FastMCP) -> None:
             proc = _canon_process(process) or _process_id(d)
             prof = _dfm("dfm_get_profile", {"process": proc})
             params = prof.get("params", {})
-            checks = []
+            wanted = ({str(name).strip() for name in checks if str(name).strip()}
+                      if checks else None)
+            rows = []
+            extras: dict = {}
 
             minwall = _dfm_number(params.get("min_wall_mm"))
-            try:
-                thickness = cb.call("eval_thickness", {"doc_id": d})
-                measured = _dfm_number((thickness or {}).get("min_thickness_mm"))
-                if measured is None or minwall is None:
-                    checks.append({
-                        "check": "min_wall", "status": "not_evaluated", "ok": None,
-                        "limit_mm": minwall,
-                        "error": "eval_thickness returned no numeric min_thickness_mm"
-                                 if measured is None else
-                                 "ProcessProfile has no numeric min_wall_mm threshold",
-                    })
-                else:
-                    passed = measured >= minwall
-                    checks.append({
-                        "check": "min_wall", "status": "pass" if passed else "fail",
-                        "value_mm": round(measured, 3), "limit_mm": minwall, "ok": passed,
-                        "note": f"thinnest wall {measured:.2f}mm vs "
-                                f"{proc} minimum {minwall:g}mm",
-                    })
-            except Exception as exc:  # noqa: BLE001
-                checks.append({
-                    "check": "min_wall", "status": "not_evaluated", "ok": None,
-                    "limit_mm": minwall, "error": str(exc),
-                })
-
-            features = None
-            tree_error = None
-            try:
-                features = _dfm_features(cb.call("doc_tree", {"doc_id": d}))
-            except Exception as exc:  # noqa: BLE001
-                tree_error = str(exc)
-            if features is None:
-                for check_name in ("min_feature", "hole_depth_diameter", "thread_strategy"):
-                    checks.append({
-                        "check": check_name, "status": "not_evaluated", "ok": None,
-                        "error": tree_error,
-                    })
-            else:
-                checks.append(_dfm_min_feature(features, params.get("min_feature_mm")))
-                checks.append(_dfm_hole_aspect(features, proc))
-                checks.append(_dfm_thread_strategy(
-                    features, proc,
-                    params.get("thread") if isinstance(params.get("thread"), dict) else {},
-                ))
-
             if proc == "fdm":
-                overhang = params.get("overhang") if isinstance(params.get("overhang"), dict) else {}
-                checks.append(_dfm_overhang(
-                    d, overhang.get("max_deg"), direction, suggest_orientation,
-                ))
+                rows, extras = _dfm_additive(
+                    d, params, direction, suggest_orientation=suggest_orientation,
+                    printer=printer, detail=detail, wanted=wanted)
+            elif wanted is None or "min_wall" in wanted:
+                try:
+                    thickness = cb.call("eval_thickness", {"doc_id": d})
+                    measured = _dfm_number((thickness or {}).get("min_thickness_mm"))
+                    if measured is None or minwall is None:
+                        rows.append({
+                            "check": "min_wall", "status": "not_evaluated", "ok": None,
+                            "limit_mm": minwall,
+                            "error": "eval_thickness returned no numeric min_thickness_mm"
+                                     if measured is None else
+                                     "ProcessProfile has no numeric min_wall_mm threshold",
+                        })
+                    else:
+                        passed = measured >= minwall
+                        rows.append({
+                            "check": "min_wall", "status": "pass" if passed else "fail",
+                            "value_mm": round(measured, 3), "limit_mm": minwall, "ok": passed,
+                            "note": f"thinnest wall {measured:.2f}mm vs "
+                                    f"{proc} minimum {minwall:g}mm",
+                        })
+                except Exception as exc:  # noqa: BLE001
+                    rows.append({
+                        "check": "min_wall", "status": "not_evaluated", "ok": None,
+                        "limit_mm": minwall, "error": str(exc),
+                    })
+            tree_rows = [name for name in ("min_feature", "hole_depth_diameter",
+                                           "thread_strategy")
+                         if wanted is None or name in wanted]
+            if tree_rows:
+                features = None
+                tree_error = None
+                try:
+                    features = _dfm_features(cb.call("doc_tree", {"doc_id": d}))
+                except Exception as exc:  # noqa: BLE001
+                    tree_error = str(exc)
+                for check_name in tree_rows:
+                    if features is None:
+                        rows.append({
+                            "check": check_name, "status": "not_evaluated", "ok": None,
+                            "error": tree_error,
+                        })
+                    elif check_name == "min_feature":
+                        rows.append(_dfm_min_feature(features, params.get("min_feature_mm")))
+                    elif check_name == "hole_depth_diameter":
+                        rows.append(_dfm_hole_aspect(features, proc))
+                    else:
+                        rows.append(_dfm_thread_strategy(
+                            features, proc,
+                            params.get("thread") if isinstance(params.get("thread"), dict)
+                            else {},
+                        ))
+
             draft = params.get("draft") if isinstance(params.get("draft"), dict) else {}
-            if draft.get("required"):
+            if draft.get("required") and (wanted is None or "draft" in wanted):
                 minimum_draft = _dfm_number(draft.get("min_deg"))
                 try:
                     result = cb.call("eval_draft", {
@@ -884,28 +872,31 @@ def register_intake_tools(mcp: FastMCP) -> None:
                     })
                     below = result.get("n_faces_below_threshold")
                     if not isinstance(below, int):
-                        checks.append({
+                        rows.append({
                             "check": "draft", "status": "not_evaluated", "ok": None,
                             "limit_deg": minimum_draft,
                             "error": "eval_draft returned no integer n_faces_below_threshold",
                         })
                     else:
                         passed = below == 0
-                        checks.append({
+                        rows.append({
                             "check": "draft", "status": "pass" if passed else "fail",
                             "faces_below": below, "limit_deg": minimum_draft, "ok": passed,
                             "note": f"{proc} needs >= {minimum_draft:g}deg draft",
                         })
                 except Exception as exc:  # noqa: BLE001
-                    checks.append({
+                    rows.append({
                         "check": "draft", "status": "not_evaluated", "ok": None,
                         "limit_deg": minimum_draft, "error": str(exc),
                     })
 
-            status, dfm_pass = _dfm_verdict(checks)
+            status, dfm_pass = _dfm_verdict(rows)
+            warnings = [row["check"] for row in rows if row.get("status") == "warn"]
             return _dumps({
                 "ok": True, "process": proc, "status": status,
-                "dfm_pass": dfm_pass, "checks": checks,
+                "dfm_pass": dfm_pass, "build_dir": direction, "checks": rows,
+                **({"warnings": warnings} if warnings else {}),
+                **{key: value for key, value in extras.items() if value is not None},
             })
         except Exception as e:  # noqa: BLE001
             return _err(e)

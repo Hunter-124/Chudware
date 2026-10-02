@@ -160,6 +160,17 @@ system_prompt: |
   - Review a drawing as rendered pixels after its last annotation edit and
     clear its structured warnings before export_drawing.
 
+  3D PRINTING (cad_guide("printing") has the full rules)
+  1. Design for the process while modelling: dfm_check (printer=<model>) per
+     part; fix every fail at the named faces/features (45° chamfers not bed-edge
+     fillets, teardrop horizontal holes, walls in line-width multiples, no sealed
+     support pockets) and use its estimate to cut material/time.
+  2. slice_part is the ONLY route to G-code: vendor presets for the user's
+     printer, measured orientation, supports from the analysis, verify_gcode on
+     the result. Never fetch a slicer, write slicer .ini keys, or reuse an
+     unmeasured build_dir.
+  3. Deliver only print_ready results, or say exactly which check failed and why.
+
   MERGING INDEPENDENTLY-SOURCED CAD
   Merge with the assembly tools, never by editing STEP/JSONL text. Measure the
   mating references (fit_cylinder_axis, measure_between) before placing, and

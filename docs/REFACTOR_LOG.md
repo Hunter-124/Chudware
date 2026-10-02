@@ -5479,3 +5479,55 @@ its own 0.05 floor, and processed boundary faces in `unordered_map` order (libc+
 so the pin-in-bore region shipped jacobian_min 0.0479 on macOS. `core/sim/mesher.cpp` now walks
 faces in canonical sorted order and iterates to convergence (floors met, or no repair and no
 improvement of the deficient-quality multiset); `chudware-simcache/7`.
+
+## 2026-10-01 — real slicing pipeline, deterministic DFAM checks, G-code floating-extrusion proof
+
+Trigger: an agent sliced the 17-part 6-axis arm for an Ender 3 with no slicer integration —
+it extracted a Fedora PrusaSlicer RPM into /tmp, hand-wrote ~100 slicer keys (sheathless
+snug supports at 3 mm spacing, invented start G-code, 0..220 bed), reused design-time
+`build_dir` vectors that stood tall parts upright, and "verified" only bounds and
+temperatures. The prints failed. The new `verify_gcode` on those 17 files fails 5 of them on
+mid-air extrusion (overhang perimeters floating 12–18 mm, a 52 mm unbacked bridge on
+upper_arm) and warns on 3 more.
+
+New: `services/dfam/` (numpy/scipy only) — `PrintMesh` (engine tessellation joined to face
+sids/owner features), uniform-grid Möller–Trumbore ray caster, depth peeling, signed-winding
+voxels; checks `min_wall` (area-sampled, knife-edge wedges warn instead of failing),
+`overhang` (>1 mm² needing support fails, bed-contact/one-layer strip/bridges/small horizontal
+holes excluded), `bridges` (two-sided anchors; >limit warn, >2×limit fail), `support`
+(envelope volume, landing on model, trapped support ≥10 mm³ behind a <3 mm opening fails),
+`small_holes`, `internal_voids` (sealed cavities, floating bodies), `bed_adhesion`,
+`build_volume` (searches yaw), a deterministic material/time estimate, and
+`optimize_orientation` scored by absolute terms (support/part volume, time excess,
+overhang/surface, contact/tip stability, strength, preserved faces) — min-max scaling picked
+an edge-balanced pose for forearm_lower. `services/manufacturing/slicer/{prusaslicer,
+vendor_bundle,gcode_check}.py`: stock-PrusaSlicer discovery (CHUDWARE_SLICER_BIN → user/system
+flatpak with `--command=prusa-slicer` → standard paths), private datadir, flatpak filesystem
+grants, bounded process group; vendor INI bundles resolved at runtime (inherits, compatibility
+condition parser, "ender 3" ranks the plain Ender-3 above V2/Pro/S1/BLTouch/Max); G-code
+checks incl. role-aware floating extrusion (hard: perimeters/support unanchored >2 mm fail;
+anchored: overhang perimeters / one-ended bridges >10 mm fail; two-ended bridge or support
+spans are backed, >25 mm warn; infill/interface spans informational; support may start
+within 1.5 mm above lower strata). `scripts/provision_slicer.py --check|--install`.
+`services/mcp/print_tools.py` (family `cam`): `slicer_status`, `list_print_profiles`,
+`optimize_print_orientation`, `slice_part`, `verify_gcode`. `slice_part` takes vendor presets,
+goal settings, measured orientation, organic supports when needed (and support under bridges
+the analysis measured past 2× the limit), `overhangs=1`, brim on tip risk, writes
+gcode + 3MF + `.print.json` manifest, and sets `print_ready` only when the G-code check passes
+and no non-support printability row fails. `dfm_check` FDM now runs the DFAM rows (legacy
+overhang keys kept; `printer=`, `checks=`, `detail=`); `warn` rows pass the verdict.
+Exposure: `print` category pack, main-chat core tools, tool guidance, `cad_guide("printing")`
+cheatsheet, general_agent 3D PRINTING block, read-risk entries, regenerated GUI tool tables.
+
+Verification: dfam/slicer unit suites 105 passed; `test_print_tools.py` (real engine + real
+flatpak slicer) 7 passed; `test_intake_ledger.py` 24 passed after updating dfm assertions that
+pinned the old implementation (sub-1 mm² ledge area, 6-axis orientation list, horizontal
+cylinder now excludes the first-layer strip). Live: all 17 arm STEP parts imported and run
+through dfm_check + slice_part (Ender-3, PLA 220/60): 39.9 h / 326 g vs the old 46.9 h /
+361 g, every G-code passes the floating scan (old: 5 fail), 9/17 print_ready; the other 8
+are blocked by real geometry (0.001–0.86 mm walls, support trapped in servo pockets) that
+dfm_check names by face. Gotchas: PrusaSlicer 2.9.6 headless flatpak has no `--arrange` and
+segfaults on bare `--merge` (use `--dont-arrange --merge`); vendor Creality presets ship
+`overhangs=0` and `dont_support_bridges=1`; `;HEIGHT:` after `;TYPE:` is extrudate height,
+not plane pitch. Deferred: SLA/SLS process profiles in `core/dfm` (DFAM already supports them),
+per-project remembered printer, GUI surfacing of print jobs.

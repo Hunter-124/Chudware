@@ -38,6 +38,35 @@ _MAX_DOCTOR_OUTPUT_CHARS = 2_097_152
 _MAX_DOCTOR_FINDINGS = 128
 _MAX_DOCTOR_MESSAGE_CHARS = 4_096
 
+# Rewinding an edited user message: bounds for the GUI's typed text / repeat index, and
+# how long to wait for a brief state/stats call holding the session's turn lock.
+_MAX_REWIND_TEXT_CHARS = 1_000_000
+_MAX_REWIND_OCCURRENCE = 100_000
+_REWIND_LOCK_WAIT_SECONDS = 10.0
+# worker_rpc._bounded_history_seed + online_turn.compose_request_text: a fresh
+# conversation's first request leads with the migrated GUI history (JSON rows, so these
+# delimiter lines cannot occur inside it); the typed request follows.
+_MIGRATION_PREFIX = "<<<CHUDWARE_HISTORY_MIGRATION_V1_CONTEXT_ONLY>>>\n"
+_MIGRATION_REQUEST_MARKER = (
+    "\n<<<END_CHUDWARE_HISTORY_MIGRATION_V1_CONTEXT_ONLY>>>\n\nCURRENT USER REQUEST\n"
+)
+# The only blocks appended after the typed text (each after a blank line): composer.cpp
+# consumeAttachments, plan_board planBoardTakeEditsForTurn, context_ref
+# contextRefsPromptText (steers), worker_rpc _resumed_documents_block /
+# _editor_context_block / _picked_context_block, and _prompt_payload's file list.
+_APPENDED_BLOCK_HEADERS = (
+    "[Attached image: ",
+    "[Attached file: ",
+    "[Attached file (",
+    "[Attached document: ",
+    "The user edited the plan since the last run.\n",
+    "Context references (picked by the user in the model):",
+    "RESUMED CONVERSATION\n",
+    "ACTIVE DOCUMENT (what the user is looking at)\n",
+    "PICKED CONTEXT \u2014 the user attached ",
+    "Attached workspace files:\n",
+)
+
 # Default turn budget when the caller sends no `timeout` (the GUI and run_mission.py both
 # send one). When it expires the run is ABORTED, not abandoned: see
 # ChudcodeSessionHost._stop_budget_exhausted_run.
@@ -1095,6 +1124,138 @@ class ChudcodeSessionHost:
         finally:
             self._release_live_session(session)
 
+    def rewind_session(
+        self, session_id, user_text, occurrence, session_file=None, workspace_dir=None
+    ) -> dict[str, Any]:
+        """Fork the conversation just BEFORE one of its user messages (an edited prompt).
+
+        The target is the ``occurrence``-th (zero-based) user message on the runtime's
+        active branch whose request is ``user_text``, resolved against Chudcode's own
+        persisted entry ids (``get_entries``). Chudcode ``branch`` writes a new session
+        file holding the path up to that message's parent and leaves the parent file
+        untouched; the mutated process is retired so the next turn resumes the child.
+        A session that is not live resumes only the explicit ``session_file`` (no provider
+        call); that process is always retired afterwards because it was spawned without
+        the turn's prompt, tools, and credentials.
+        """
+        key = _nonempty_string(session_id)
+        typed = user_text.strip() if isinstance(user_text, str) else ""
+        if key is None:
+            return {"ok": False, "reason": "invalid_params: session_id is required"}
+        if not typed or len(typed) > _MAX_REWIND_TEXT_CHARS:
+            return {"ok": False, "reason": "invalid_params: user_text must be non-empty text"}
+        if (
+            isinstance(occurrence, bool)
+            or not isinstance(occurrence, int)
+            or not 0 <= occurrence <= _MAX_REWIND_OCCURRENCE
+        ):
+            return {
+                "ok": False,
+                "reason": "invalid_params: occurrence must be a non-negative integer",
+            }
+        resume_file = _nonempty_string(session_file)
+        with self._lock:
+            if self._shutdown:
+                return {"ok": False, "reason": "chudcode session host is shut down"}
+            if any(run.session_id == key for run in self._runs.values()):
+                return {"ok": False, "reason": "session_busy"}
+        session = self._claim_live_session(key)
+        spawned = False
+        if session is None:
+            if resume_file is None:
+                return {"ok": False, "reason": "session_not_live"}
+            try:
+                session = self._get_or_create_session(
+                    key, {"workspace_dir": workspace_dir}, resume_file
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                return {"ok": False, "reason": str(exc)}
+            spawned = True
+        retire = spawned
+        try:
+            if not session.turn_lock.acquire(timeout=_REWIND_LOCK_WAIT_SECONDS):
+                return {"ok": False, "reason": "session_busy"}
+            try:
+                with self._lock:
+                    if session.closed:
+                        return {"ok": False, "reason": "session_not_live"}
+                    if any(run.session_id == key for run in self._runs.values()):
+                        return {"ok": False, "reason": "session_busy"}
+                client = session.client
+                state = _json_value(client.get_state())
+                if not isinstance(state, Mapping):
+                    raise TypeError("Agent session get_state returned a non-object response")
+                if any(
+                    state.get(flag) for flag in ("isStreaming", "isCompacting")
+                ):
+                    return {"ok": False, "reason": "session_busy"}
+                parent_file = _nonempty_string(
+                    state.get("sessionFile") or state.get("session_file")
+                )
+                if parent_file is None:
+                    raise RuntimeError("Agent session has no persisted history to rewind")
+                if resume_file is not None and not _same_path(resume_file, parent_file):
+                    return {"ok": False, "reason": "session_file_mismatch"}
+                listing = _json_value(client.request_raw("get_entries"))
+                if not isinstance(listing, Mapping):
+                    raise TypeError("Agent session get_entries returned a non-object response")
+                target = _rewind_target(
+                    _active_branch(listing.get("entries"), listing.get("leafId")),
+                    typed,
+                    occurrence,
+                )
+                if target is None:
+                    return {"ok": False, "reason": "target_not_found"}
+                # From here the runtime may have switched files even if the call fails.
+                retire = True
+                raw = _json_value(
+                    _invoke_session_canonical(client, "branch", {"entryId": target})
+                )
+                if not isinstance(raw, Mapping):
+                    raise TypeError("Agent session branch returned a non-object response")
+                if raw.get("cancelled"):
+                    retire = spawned
+                    return {"ok": False, "reason": "branch_cancelled"}
+                child = _json_value(client.get_state())
+                child = child if isinstance(child, Mapping) else {}
+                child_id = _nonempty_string(
+                    child.get("sessionId") or child.get("session_id")
+                )
+                child_file = _nonempty_string(
+                    child.get("sessionFile") or child.get("session_file")
+                )
+                if (
+                    child_id is None
+                    or child_file is None
+                    or _same_path(child_file, parent_file)
+                    or not Path(child_file).expanduser().is_file()
+                ):
+                    raise RuntimeError(
+                        "Agent session branch returned no new persisted session"
+                    )
+                if not Path(parent_file).expanduser().is_file():
+                    raise RuntimeError("Agent session branch lost the parent session file")
+                return {
+                    "ok": True,
+                    "chudcode_session_id": child_id,
+                    "chudcode_session_file": child_file,
+                }
+            finally:
+                # Close THIS process before any turn queued on its lock can run in it;
+                # _claim_existing_session_locked refuses a closed session from here on.
+                if retire:
+                    with self._lock:
+                        session.closed = True
+                session.turn_lock.release()
+        except Exception as exc:  # noqa: BLE001 - RPC errors are runtime-specific classes
+            return {"ok": False, "reason": str(exc) or type(exc).__name__}
+        finally:
+            if retire:
+                with self._lock:
+                    session.closed = True
+            # The last holder disposes it, and only while it is still the registered one.
+            self._release_live_session(session)
+
     def shutdown(self):
         with self._lock:
             if self._shutdown:
@@ -1765,6 +1926,91 @@ def _project_export_path(
     except ValueError as exc:
         raise ValueError("export path must stay inside the project") from exc
     return target
+
+
+def _same_path(left: str, right: str) -> bool:
+    return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
+
+
+def _active_branch(entries: Any, leaf_id: Any) -> list[Mapping[str, Any]]:
+    """Root-to-leaf path of a runtime ``get_entries`` listing; abandoned siblings excluded."""
+    if not isinstance(entries, list):
+        raise TypeError("Agent session get_entries returned no entry list")
+    by_id = {
+        entry["id"]: entry
+        for entry in entries
+        if isinstance(entry, Mapping) and isinstance(entry.get("id"), str)
+    }
+    path: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    current = leaf_id if isinstance(leaf_id, str) else None
+    while current is not None and current not in seen and current in by_id:
+        seen.add(current)
+        entry = by_id[current]
+        path.append(entry)
+        parent = entry.get("parentId")
+        current = parent if isinstance(parent, str) else None
+    path.reverse()
+    return path
+
+
+def _user_entry_text(entry: Mapping[str, Any]) -> str | None:
+    """Chudcode's own user-message text extraction (string or joined text parts)."""
+    message = entry.get("message")
+    if entry.get("type") != "message" or not isinstance(message, Mapping):
+        return None
+    if message.get("role") != "user":
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part["text"]
+            for part in content
+            if isinstance(part, Mapping)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
+    return None
+
+
+def _is_typed_request(stored: str, typed: str) -> bool:
+    """Whether a persisted request is the user's typed text plus host-added blocks.
+
+    Only a genuine migration prefix is stripped, and only a recognized appended block
+    may follow the typed text: a distinct prompt that merely starts with the same words
+    ("hello" vs "hello\\n\\nchange the other part") is a different message.
+    """
+    if stored.startswith(_MIGRATION_PREFIX):
+        _, marker, request = stored.partition(_MIGRATION_REQUEST_MARKER)
+        if marker:
+            stored = request
+    stored = stored.strip()
+    if not stored.startswith(typed):
+        return False
+    rest = stored[len(typed):]
+    if not rest:
+        return True
+    block = rest.lstrip()
+    return "\n\n" in rest[: len(rest) - len(block)] and block.startswith(
+        _APPENDED_BLOCK_HEADERS
+    )
+
+
+def _rewind_target(
+    path: Sequence[Mapping[str, Any]], typed: str, occurrence: int
+) -> str | None:
+    """Persisted entry id of the ``occurrence``-th user message carrying ``typed``."""
+    seen = 0
+    for entry in path:
+        text = _user_entry_text(entry)
+        if text is None or not _is_typed_request(text, typed):
+            continue
+        if seen == occurrence:
+            return entry["id"]
+        seen += 1
+    return None
 
 
 _DOCTOR_STATUSES = frozenset({"healthy", "issues", "repaired", "repaired_with_issues"})

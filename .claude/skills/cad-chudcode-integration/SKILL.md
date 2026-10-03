@@ -104,6 +104,15 @@ log the token or move control back onto the serialized stdio lane.
   returns `{ok,path}`. Without `output_path`, use the project's `chat-exports` directory.
 - `chudcode_branch_session {session_id,entry_id}` creates a real branch at the specified entry
   and returns `{ok,chudcode_session_id,chudcode_session_file}`.
+- `chudcode_rewind_session {session_id,user_text,occurrence,session_file?,workspace_dir?}`
+  forks **before** an edited user message on the active runtime branch. Resolve the
+  zero-based occurrence through the runtime's `get_entries`, never an append-order JSONL
+  scan. The original file is preserved; success returns the child session identity/file
+  and retires that exact process before a queued turn can claim it. A closed runtime
+  resumes only the explicit file, without a provider call. The GUI stops and waits for
+  the actual terminal, rewinds runtime then geometry, parks the old visible tail, persists
+  the new link, and only then dispatches one edited turn. Failure keeps the original
+  transcript/link; an asynchronous rollback must never race the replacement turn.
 - `chudcode_repair_session {session_id,repair:false}` returns a bounded doctor summary.
   `repair:true` invokes Chudcode `/session doctor --repair`, including its backup workflow.
 - `chudcode_close_session {session_id}` disposes runtime state without deleting the persisted

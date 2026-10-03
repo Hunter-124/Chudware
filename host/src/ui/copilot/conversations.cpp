@@ -2123,6 +2123,9 @@ static void pollChudcodeSessionHealth(AppState& st) {
         }
         ChudcodeDoctorSummary summary;
         if (!parseChudcodeDoctorSummary(r.result, summary)) return;
+        // An edit transaction of this conversation owns its link (it adopts the rewind branch
+        // at commit); a dry-run of the session being rewound must not stamp the old file back.
+        if (editStageHoldsConversation(convId)) return;
         applyChudcodeDoctor(chudcodeSessionLinkEnsure(convId), summary);
         markChatHistoryDirty();   // resume key + health reach disk on the debounced flush
     }, 30000);
@@ -2226,6 +2229,10 @@ static bool discardActiveConversationIfFresh(AppState& st) {
 
 void parkActiveConversation(AppState& st) {
     if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
+    // A merely staged edit dies with the view (its composer text restored while this is still
+    // the viewed conversation, so the draft saved below is the pre-edit one); an in-flight or
+    // committed edit transaction continues for ITS conversation by id.
+    editStageBeforeConversationPark(st);
     // Keep in-progress prompt + chips for this session on disk before parking.
     savePromptDraft(st, /*force=*/true);
     Conversation& c = st.conversations[st.activeConv];

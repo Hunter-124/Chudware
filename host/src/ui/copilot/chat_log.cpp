@@ -422,7 +422,13 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
             }
             if (clicked) beginEditStage(st, msgIdx);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Edit this message — Esc cancels without changing the part.");
+                ImGui::SetTooltip("%s",
+                    editStageInFlight()
+                        ? "An edit is being applied \xe2\x80\x94 wait for it to finish."
+                    : activeConversationRunning(st)
+                        ? "Stop the run and edit this message \xe2\x80\x94 Esc cancels the "
+                          "edit without changing the part."
+                        : "Edit this message \xe2\x80\x94 Esc cancels without changing the part.");
         }
     }
 
@@ -1068,7 +1074,12 @@ void drawChatLogWindowed(AppState& st) {
     ui::Fonts& fonts = st.fonts;
     drawAiVcRollbackConfirm(st);   // pre-rollback confirmation modal (warning ladder)
     const float logW    = ImGui::GetContentRegionAvail().x;
-    if (st.chat.empty()) { chatDrawEmptyState(); return; }
+    // A staged edit HIDES the tail it would replace — the messages stay in st.chat (and on
+    // disk) untouched until the edit commits; the hide is never applied to a running tail.
+    const int hideFrom = editStageHideFrom(st);
+    const size_t shown = hideFrom >= 0 && hideFrom < (int)st.chat.size() ? (size_t)hideFrom
+                                                                         : st.chat.size();
+    if (shown == 0) { chatDrawEmptyState(); return; }
     const float viewTop = ImGui::GetScrollY();
     const float viewBot = viewTop + ImGui::GetWindowSize().y;
     const float slack   = ImGui::GetWindowSize().y;   // one extra viewport of buffer each side
@@ -1077,16 +1088,15 @@ void drawChatLogWindowed(AppState& st) {
     // The LATEST assistant turn is the state the user is already at — offering a restore
     // there is a no-op button. Find it once so drawAssistantTurn can suppress its bar.
     int lastAssistantIdx = -1;
-    for (size_t k = 0; k < st.chat.size(); ++k)
+    for (size_t k = 0; k < shown; ++k)
         if (!st.chat[k].fromUser) lastAssistantIdx = (int)k;
-    for (size_t mi = 0; mi < st.chat.size(); ++mi) {
+    for (size_t mi = 0; mi < shown; ++mi) {
         ChatMsg& m = st.chat[mi];
         ImGui::PushID((int)mi);
         const float y = ImGui::GetCursorPosY();
         const bool cacheValid = m.uiCachedH > 0.0f && std::fabs(m.uiCachedW - logW) < 0.5f;
         const bool interactive = m.running || m.clarify.active || m.clarify.awaiting ||
-                                 (s_aiVc.confirmMsgIdx == (int)mi) ||
-                                 (s_edit.active && s_edit.msgIdx == (int)mi);
+                                 (s_aiVc.confirmMsgIdx == (int)mi);
         // Pre-count mutating assistant turns even when the row is off-screen (stable turn nums).
         int thisTurn = 0;
         if (!m.fromUser && chatMsgMutatedDoc(m)) {

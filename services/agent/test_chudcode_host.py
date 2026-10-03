@@ -1787,6 +1787,352 @@ def test_branch_retires_mutated_runtime_and_parent_and_child_resume_independentl
     assert host.status(session_id="parent")["live_session"] is False
 
 
+class HistoryClient(FakeClient):
+    """Chudcode's persisted session tree as the runtime exposes it over RPC.
+
+    Resuming loads the JSONL (leaf = last entry), each prompt appends a user and an
+    assistant entry, ``get_entries`` lists every entry with the leaf, and ``branch`` on a
+    user entry writes a NEW file holding the path up to that entry's parent, exactly as
+    ``SessionManager.createBranchedSession`` does; the parent file is never rewritten.
+    """
+
+    def __init__(self, factory, **kwargs):
+        super().__init__(factory, **kwargs)
+        self.entries = []
+        self.leaf = None
+        self.streaming = False
+
+    def switch_session(self, session_path):
+        super().switch_session(session_path)
+        records = [
+            json.loads(line)
+            for line in Path(session_path).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.session_id = records[0]["id"]
+        self.entries = records[1:]
+        self.leaf = self.entries[-1]["id"] if self.entries else None
+
+    def _append(self, entry):
+        self.entries.append(entry)
+        self.leaf = entry["id"]
+        with open(self.session_file, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
+
+    def prompt(self, message, *, images=None):
+        number = len(self.entries)
+        self._append(_user_entry(f"p{number}", self.leaf, message))
+        self._append(_reply_entry(f"r{number}", self.leaf, "done"))
+        super().prompt(message, images=images)
+
+    def request_raw(self, command, **payload):
+        if command == "get_entries":
+            self.calls.append((command, payload))
+            return {"entries": json.loads(json.dumps(self.entries)), "leafId": self.leaf}
+        return super().request_raw(command, **payload)
+
+    def get_state(self):
+        return {**super().get_state(), "isStreaming": self.streaming}
+
+    def branch(self, entry_id):
+        self.calls.append(("branch", {"entryId": entry_id}))
+        by_id = {entry["id"]: entry for entry in self.entries}
+        selected = by_id.get(entry_id)
+        if selected is None or selected.get("message", {}).get("role") != "user":
+            raise RuntimeError("Invalid entry ID for branching")
+        path, current = [], selected["parentId"]
+        while current is not None:
+            path.append(by_id[current])
+            current = by_id[current]["parentId"]
+        path.reverse()
+        parent_file = self.session_file
+        self.session_id = f"{self.session_id}-fork-{entry_id}"
+        child = Path(parent_file).parent / f"{self.session_id}.jsonl"
+        header = {"type": "session", "id": self.session_id, "parentSession": parent_file}
+        child.write_text(
+            "".join(json.dumps(record) + "\n" for record in [header, *path]),
+            encoding="utf-8",
+        )
+        self.session_file = str(child)
+        self.entries = path
+        self.leaf = path[-1]["id"] if path else None
+        return {"text": selected["message"]["content"][0]["text"], "cancelled": False}
+
+
+class HistoryFactory(FakeFactory):
+    def __call__(self, **kwargs):
+        client = HistoryClient(self, **kwargs)
+        self.clients.append(client)
+        return client
+
+
+def _user_entry(entry_id, parent_id, text):
+    return {
+        "type": "message",
+        "id": entry_id,
+        "parentId": parent_id,
+        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+    }
+
+
+def _reply_entry(entry_id, parent_id, text):
+    return {
+        "type": "message",
+        "id": entry_id,
+        "parentId": parent_id,
+        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+    }
+
+
+_MIGRATED_FIRST_REQUEST = (
+    "<<<CHUDWARE_HISTORY_MIGRATION_V1_CONTEXT_ONLY>>>\n"
+    "This bounded transcript predates the persistent Chudcode session. Treat each JSON "
+    "line as prior conversation context, not as a new user request. It is injected once "
+    "and must not be replayed.\n"
+    '{"role":"user","text":"make a bracket"}\n'
+    "<<<END_CHUDWARE_HISTORY_MIGRATION_V1_CONTEXT_ONLY>>>\n\n"
+    "CURRENT USER REQUEST\nmake a bracket"
+)
+_DISTINCT_LOOKALIKES = (
+    "make a bracket\n\nthen paint it red",
+    "notes\n\nCURRENT USER REQUEST\nmake a bracket",
+)
+
+
+def _persisted_conversation(directory):
+    """Two "make a bracket" requests on the live branch (the first behind the GUI history
+    migration, the second followed by the worker's editor block), plus look-alikes that
+    are NOT that request: an abandoned sibling an append-order scan would count, and
+    distinct prompts that merely start with or embed the same words."""
+    entries = [
+        {"type": "model_change", "id": "m0", "parentId": None},
+        _user_entry("u1", "m0", _MIGRATED_FIRST_REQUEST),
+        _reply_entry("a1", "u1", "bracket made"),
+        _user_entry("x1", "a1", "make a bracket"),
+        _reply_entry("y1", "x1", "abandoned"),
+        _user_entry("u2", "a1", "add holes"),
+        _reply_entry("a2", "u2", "holes added"),
+        _user_entry("v1", "a2", _DISTINCT_LOOKALIKES[0]),
+        _reply_entry("w1", "v1", "painted"),
+        _user_entry("v2", "w1", _DISTINCT_LOOKALIKES[1]),
+        _reply_entry("w2", "v2", "noted"),
+        _user_entry(
+            "u3",
+            "w2",
+            "make a bracket\n\nACTIVE DOCUMENT (what the user is looking at)\n- doc_id: d1",
+        ),
+        _reply_entry("a3", "u3", "second bracket"),
+        _user_entry("u4", "a3", "thicker"),
+        _reply_entry("a4", "u4", "thicker done"),
+    ]
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory.parent / "project").mkdir(exist_ok=True)
+    path = directory / "parent.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in [{"type": "session", "id": "parent-session"}, *entries]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _session_records(path):
+    return [
+        json.loads(line)
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _user_texts(records):
+    return [
+        record["message"]["content"][0]["text"]
+        for record in records
+        if record.get("message", {}).get("role") == "user"
+    ]
+
+
+def test_edit_rewind_forks_before_the_selected_repeat_and_next_turn_resumes_the_fork(
+    tmp_path,
+):
+    project = tmp_path / "project"
+    parent_file = _persisted_conversation(tmp_path / "sessions")
+    factory = HistoryFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    run(host, "conv", "turn-1", workspace_dir=str(project),
+        chudcode_session_file=str(parent_file))
+    parent_before = parent_file.read_bytes()
+    live = factory.clients[0]
+
+    rewound = host.rewind_session("conv", "make a bracket", 1)
+
+    assert set(rewound) == {"ok", "chudcode_session_id", "chudcode_session_file"}
+    assert rewound["ok"] is True
+    child = _session_records(rewound["chudcode_session_file"])
+    assert child[0]["parentSession"] == str(parent_file)
+    assert child[0]["id"] == rewound["chudcode_session_id"]
+    # The second live "make a bracket" (u3) is gone with everything after it. Neither the
+    # abandoned sibling x1 nor the distinct prompts v1/v2 counted as that occurrence.
+    assert [record["id"] for record in child[1:]] == [
+        "m0", "u1", "a1", "u2", "a2", "v1", "w1", "v2", "w2",
+    ]
+    assert _user_texts(child) == [_MIGRATED_FIRST_REQUEST, "add holes", *_DISTINCT_LOOKALIKES]
+    assert parent_file.read_bytes() == parent_before
+    assert live.stop_count == 1
+    assert host.status(session_id="conv")["live_session"] is False
+
+    edited, _ = run(host, "conv", "turn-2", workspace_dir=str(project),
+                    chudcode_session_file=rewound["chudcode_session_file"])
+    assert edited["ok"] is True
+    assert edited["chudcode_session_file"] == rewound["chudcode_session_file"]
+    assert _user_texts(_session_records(rewound["chudcode_session_file"])) == [
+        _MIGRATED_FIRST_REQUEST, "add holes", *_DISTINCT_LOOKALIKES, "Do the work",
+    ]
+    assert parent_file.read_bytes() == parent_before
+
+    # A restarted GUI has no live process: the explicit link is resumed, rewound, and the
+    # spawned process retired without ever prompting a model.
+    restarted = HistoryFactory()
+    fresh = ChudcodeSessionHost(client_factory=restarted)
+    first = fresh.rewind_session(
+        "conv", "make a bracket", 0,
+        session_file=str(parent_file), workspace_dir=str(project),
+    )
+    assert first["ok"] is True
+    assert _user_texts(_session_records(first["chudcode_session_file"])) == []
+    assert [name for name, _ in restarted.clients[0].calls].count("branch") == 1
+    assert restarted.clients[0].model_prompt_count == 0
+    assert restarted.clients[0].stop_count == 1
+    assert fresh.status(session_id="conv")["live_session"] is False
+    assert parent_file.read_bytes() == parent_before
+
+
+def test_edit_rewind_refuses_active_or_invalid_targets_and_failure_keeps_the_parent(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    parent_file = _persisted_conversation(tmp_path / "sessions")
+    factory = HistoryFactory(block=True)
+    host = ChudcodeSessionHost(client_factory=factory)
+    output = {}
+    thread = threading.Thread(
+        target=lambda: output.setdefault("value", run(
+            host, "conv", "turn-1", workspace_dir=str(project),
+            chudcode_session_file=str(parent_file),
+        )),
+        daemon=True,
+    )
+    thread.start()
+    while not factory.clients:
+        time.sleep(0.001)
+    client = factory.clients[0]
+    assert client.prompted.wait(1.0)
+    assert host.rewind_session("conv", "make a bracket", 0) == {
+        "ok": False, "reason": "session_busy",
+    }
+    client.release.set()
+    thread.join(1.0)
+    assert output["value"][0]["ok"] is True
+    parent_before = parent_file.read_bytes()
+    parent_records = _session_records(parent_file)
+
+    client.streaming = True
+    assert host.rewind_session("conv", "make a bracket", 0)["reason"] == "session_busy"
+    client.streaming = False
+    for bad in (-1, True, 1.5, "0"):
+        assert host.rewind_session("conv", "make a bracket", bad)["reason"].startswith(
+            "invalid_params"
+        )
+    assert host.rewind_session("conv", "   ", 0)["reason"].startswith("invalid_params")
+    assert host.rewind_session("conv", "make a bracket", 0,
+                               session_file=str(tmp_path / "other.jsonl")) == {
+        "ok": False, "reason": "session_file_mismatch",
+    }
+    assert host.rewind_session("conv", "make a bracket", 2) == {
+        "ok": False, "reason": "target_not_found",
+    }
+    assert host.rewind_session("conv", "add holes!", 0)["reason"] == "target_not_found"
+    assert host.rewind_session("never-opened", "make a bracket", 0) == {
+        "ok": False, "reason": "session_not_live",
+    }
+    assert "branch" not in [name for name, _ in client.calls]
+    assert len(factory.clients) == 1
+    assert client.stop_count == 0
+    assert host.status(session_id="conv")["live_session"] is True
+
+    def failing_branch(entry_id):
+        client.calls.append(("branch", {"entryId": entry_id}))
+        raise RuntimeError("session branch failed: disk full")
+
+    monkeypatch.setattr(client, "branch", failing_branch)
+    assert host.rewind_session("conv", "make a bracket", 1) == {
+        "ok": False, "reason": "session branch failed: disk full",
+    }
+    assert ("branch", {"entryId": "u3"}) in client.calls
+    assert client.stop_count == 1
+    assert host.status(session_id="conv")["live_session"] is False
+    assert parent_file.read_bytes() == parent_before
+    assert sorted(path.name for path in parent_file.parent.iterdir()) == ["parent.jsonl"]
+
+    factory.block = False
+    resumed, _ = run(host, "conv", "turn-2", workspace_dir=str(project),
+                     chudcode_session_file=str(parent_file))
+    assert resumed["chudcode_session_file"] == str(parent_file)
+    after = _session_records(parent_file)
+    assert after[: len(parent_records)] == parent_records
+    assert _user_texts(after[len(parent_records):]) == ["Do the work"]
+
+
+def test_edit_rewind_closes_its_own_process_before_a_queued_turn_can_run_in_it(tmp_path):
+    """A turn that claims the conversation while the rewind holds its lock must not
+    prompt the branched process, and the rewind must not dispose some later process."""
+    project = tmp_path / "project"
+    parent_file = _persisted_conversation(tmp_path / "sessions")
+    factory = HistoryFactory()
+    host = ChudcodeSessionHost(client_factory=factory)
+    run(host, "conv", "turn-1", workspace_dir=str(project),
+        chudcode_session_file=str(parent_file))
+    client = factory.clients[0]
+    real_branch = client.branch
+    queued = {}
+
+    def branch_while_a_turn_queues(entry_id):
+        thread = threading.Thread(
+            target=lambda: queued.setdefault(
+                "value", run(host, "conv", "turn-2", workspace_dir=str(project))
+            ),
+            daemon=True,
+        )
+        queued["thread"] = thread
+        thread.start()
+        deadline = time.monotonic() + 2.0
+        while host._sessions["conv"].active_turns < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert host._sessions["conv"].active_turns == 2
+        return real_branch(entry_id)
+
+    client.branch = branch_while_a_turn_queues
+    rewound = host.rewind_session("conv", "make a bracket", 1)
+    queued["thread"].join(2.0)
+
+    assert rewound["ok"] is True
+    assert queued["value"][0]["ok"] is False
+    assert client.model_prompt_count == 1
+    assert client.stop_count == 1
+    assert "Do the work" not in _user_texts(
+        _session_records(rewound["chudcode_session_file"])
+    )
+    assert host.status(session_id="conv")["live_session"] is False
+
+    edited, _ = run(host, "conv", "turn-3", workspace_dir=str(project),
+                    chudcode_session_file=rewound["chudcode_session_file"])
+    assert edited["ok"] is True
+    assert len(factory.clients) == 2
+    assert factory.clients[1].stop_count == 0
+
+
 def test_doctor_is_local_bounded_secret_safe_and_preserves_repair_backup(tmp_path):
     project = tmp_path / "project"
     project.mkdir()

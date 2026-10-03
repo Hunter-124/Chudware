@@ -24,6 +24,9 @@ inline constexpr char kChudcodeExportSessionMethod[] = "chudcode_export_session"
 inline constexpr char kChudcodeBranchSessionMethod[] = "chudcode_branch_session";
 inline constexpr char kChudcodeRepairSessionMethod[] = "chudcode_repair_session";
 inline constexpr char kChudcodeCloseSessionMethod[]  = "chudcode_close_session";
+// Edit-message rewind: branch the conversation's runtime session to just BEFORE one of its
+// user messages (the runtime resolves the real entry id; the parent file is never touched).
+inline constexpr char kChudcodeRewindSessionMethod[] = "chudcode_rewind_session";
 
 // ---- per-conversation Chudcode session link ---------------------------------------------------
 // What the copilot knows about the Chudcode runtime session behind one Chudware conversation.
@@ -74,6 +77,29 @@ nlohmann::json chudcodeBranchSessionParams(const std::string& sessionId,
                                            const std::string& entryId);
 nlohmann::json chudcodeRepairSessionParams(const std::string& sessionId, bool repair);
 nlohmann::json chudcodeCloseSessionParams(const std::string& sessionId);
+// chudcode_rewind_session {session_id, user_text, occurrence, session_file?, workspace_dir?}.
+// session_file/workspace_dir let the service recover an idle, not-live session from its bound
+// file (fresh app restart); both are omitted when empty. Reply is the branch envelope —
+// parse with parseChudcodeBranchResult.
+nlohmann::json chudcodeRewindSessionParams(const std::string& sessionId,
+                                           const std::string& userText, int occurrence,
+                                           const std::string& sessionFile = std::string(),
+                                           const std::string& workspaceDir = std::string());
+
+// ---- edit-message rewind target ---------------------------------------------------------------
+// The runtime matches the TYPED text of a user message: its persisted prompt is exactly the
+// typed text, or the typed text + a blank line + one of the blocks the app/worker appends
+// (attachments, context refs, plan edits, editor context). The GUI bubble is the typed text
+// plus marker lines ("\n[attached image: …]", "\n[attached: …]"). These helpers are the GUI
+// half of that rule.
+// Typed text of a user bubble: trailing attachment marker lines stripped, then trimmed.
+std::string chudcodeEditTypedText(const std::string& bubbleText);
+// Typed texts match when equal after trimming. An empty target matches nothing.
+bool chudcodeEditTextMatches(const std::string& candidate, const std::string& target);
+// Zero-based occurrence of `target` among the typed texts of the user messages BEFORE the
+// edited one (the count of earlier matches under chudcodeEditTextMatches).
+int chudcodeEditOccurrence(const std::vector<std::string>& earlierTypedTexts,
+                           const std::string& target);
 
 // ---- response envelopes -----------------------------------------------------------------------
 // Human-readable failure text from a worker refusal ({ok:false, reason|error}) or a

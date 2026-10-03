@@ -3652,7 +3652,7 @@ static void appendSteerToTranscript(AppState& st, const std::string& text,
     maybePersistChatHistoryDebounced(st, /*force=*/true);
 }
 
-static void requestStopRun(AppState& st) {
+void requestStopRun(AppState& st) {
     // Stop only ever acts on the VIEWED conversation's run — a background run in another
     // conversation keeps streaming (that is the point of per-conversation runs).
     auto* run = st.runIfExists(st.activeConvId());
@@ -3713,6 +3713,22 @@ static void requestStopRun(AppState& st) {
     markChatHistoryDirty();
     s_chatHistoryLastPersist = -1e9;
     maybePersistChatHistoryDebounced(st, /*force=*/true);
+}
+
+// After a send the backing buffer is cleared while the InputText is still ACTIVE — ImGui
+// keeps its own edit state for the active widget and ignores the external clear, so the
+// prompt stayed in the box. Bump a generation into the widget id on send so the widget
+// restarts from the (empty) buffer; refocus it so the user can keep typing.
+static int  s_composerGen = 0;
+static bool s_refocusComposer = false;
+
+void composerSetText(AppState& st, const std::string& text) {
+    if (st.prompt.size() < text.size() + 1) st.prompt.resize(text.size() + 256, 0);
+    std::memset(st.prompt.data(), 0, st.prompt.size());
+    std::memcpy(st.prompt.data(), text.data(), text.size());
+    if (text.empty()) clearPromptDraft(st);
+    ++s_composerGen;
+    s_refocusComposer = true;
 }
 
 // The composer buffer, unwrapped and trimmed — the ONE definition of "is there a message".
@@ -3848,28 +3864,39 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
             s_slash.open = false;
             s_slash.matches.clear();
             g_slashMenuActive = false;
-        } else if (s_edit.active) {
+        } else if (editStageHoldsConversation(st.activeConvId())) {
             cancelEditStage(st);
         } else if (st.contextPickActive) {
             st.contextPickActive = false;
         }
     }
 
+    // Staged edit transaction: start a requested edit once the run has truly settled, and
+    // launch a committed edit's single turn when its conversation is the viewed one.
+    if (canRun) editStageTick(st);
+
     // Drain the message queue: once the assistant is free, auto-send the next queued message
     // (Claude-Code-style). Done before computing `active` so the new turn shows as running now.
     // Also require the viewed conversation's run to be idle: after Stop, aiTurnActive is false
     // (stopRequested terminal) but the cancelled run may still be unwinding — don't launch a
-    // queued turn on top of it. Another conversation's run is irrelevant here.
+    // queued turn on top of it. Another conversation's run is irrelevant here. A staged edit
+    // of this conversation holds the queue: nothing may append under the edit point, and an
+    // in-flight checkpoint restore truncates the chat when it lands, so no turn starts under it.
     if (!aiTurnActive(st) && !st.convRunning(st.activeConvId()) && !st.queuedPrompts.empty() &&
-        canRun) {
+        canRun && !s_aiVc.busy && !editStageHoldsConversation(st.activeConvId())) {
         std::string next = st.queuedPrompts.front();
         st.queuedPrompts.erase(st.queuedPrompts.begin());
-        // Queued sends never commit a staged edit (stage should already be cleared).
         submitTurn(st, next);
     }
 
     const bool active = aiTurnActive(st);
-    bool canStart = canRun && !composerText(st).empty() && !active;  // start now only when idle
+    // A staged edit whose send is pending or being applied owns the composer: its text IS the
+    // edit, so the box is read-only and nothing else can be sent from it meanwhile.
+    const bool editFrozen = editStageHoldsConversation(st.activeConvId()) &&
+                            (editStageInFlight() || s_edit.sendRequested ||
+                             s_edit.phase == EditStage::Phase::AwaitSubmit);
+    bool canStart = canRun && !composerText(st).empty() && !active &&  // start only when idle
+                    !editFrozen && !s_aiVc.busy;
     bool submit   = false;   // send / queue requested this frame
     bool stopReq  = false;   // stop requested this frame
 
@@ -4103,15 +4130,16 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
     // Minimal top pad so the Design dropdown + context meter sit close to the input.
     ImGui::Dummy(ImVec2(0, ui::metrics::U(0.25f)));
+    // Staged edit of THIS conversation: say what Enter / Esc do, or what the transaction is
+    // waiting on. The box is read-only while the edit is being applied (editFrozen above).
+    if (const char* editStatus = editStageStatus(st)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("%s", editStatus);
+        ImGui::PopStyleColor();
+    }
     // Reserve the in-box send button's footprint on the input's right so text never runs under it.
     const float sendSz    = ImGui::GetFrameHeight();
     const float sendInset = 6.0f * ui::uiScale;
-    // After a send the backing buffer is cleared while the InputText is still ACTIVE — ImGui
-    // keeps its own edit state for the active widget and ignores the external clear, so the
-    // prompt stayed in the box. Bump a generation into the widget id on send so the widget
-    // restarts from the (empty) buffer; refocus it so the user can keep typing.
-    static int  s_composerGen = 0;
-    static bool s_refocusComposer = false;
     if (s_refocusComposer) {
         ImGui::SetKeyboardFocusHere();
         s_refocusComposer = false;
@@ -4157,9 +4185,14 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
 
     char inputId[32];
     std::snprintf(inputId, sizeof(inputId), "##aiprompt%d", s_composerGen);
+    if (editFrozen) ImGui::BeginDisabled();
     bool submitInput = drawChatInput(inputId, st.prompt, placeholder,
                                      ui::metrics::copilotInputMaxLines(),
                                      sendSz + sendInset * 2.0f);
+    if (editFrozen) {
+        ImGui::EndDisabled();
+        submitInput = false;
+    }
     s_composerInputActive = ImGui::IsItemActive();
     const ImVec2 inputMin = ImGui::GetItemRectMin();
     const ImVec2 inputMax = ImGui::GetItemRectMax();
@@ -4196,17 +4229,26 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
 
     // ---- stop / submit / queue ----
     if (stopReq) requestStopRun(st);
-    auto clearComposerBox = [&]() {
-        clearPromptDraft(st);
-        st.prompt[0] = 0;
-        ++s_composerGen;          // fresh InputText state (active widget ignores external clears)
-        s_refocusComposer = true; // keep typing without re-clicking
-    };
+    // Fresh InputText state (an active widget ignores external clears) + refocus to keep typing.
+    auto clearComposerBox = [&]() { composerSetText(st, std::string()); };
     if (submit || submitInput) {
         const std::string text = composerText(st);   // flattened + trimmed; empty = no message
         const bool slash = !text.empty() && text[0] == '/';
         const SlashItem* slashCmd = slash ? slashCommandFor(text) : nullptr;
-        if (active && slashCmd && slashCmd->needsIdle) {
+        if (editStageHoldsConversation(st.activeConvId())) {
+            // A staged edit owns Enter: never a steer or a plain turn. The transaction (stop →
+            // runtime rewind → geometry rollback → commit → ONE turn) keeps the text in the box
+            // until it succeeds; a failure leaves it there with the original tail intact.
+            if (editFrozen || !canRun || text.empty()) {
+                // Pending/applying, or nothing to send: the status line says what is happening.
+            } else if (slash) {
+                st.toast(ui::ToastLevel::Info,
+                         "A command can't replace a message \xe2\x80\x94 press Esc to stop "
+                         "editing first.");
+            } else {
+                editStageSubmit(st, text);
+            }
+        } else if (active && slashCmd && slashCmd->needsIdle) {
             // Commands that need the service a run holds are refused, never steered into the
             // run; the text stays in the box so it can be sent once the run finishes.
             st.toast(ui::ToastLevel::Info, slashCmd->label + ": " + kAvailableAfterRun);
@@ -4253,8 +4295,6 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
                 requestStopRun(st);
             }
         } else if (canStart) {
-            // Stage the rollback only on send (Esc cancelled without this).
-            if (s_edit.active) commitEditStageOnSend(st);
             submitTurn(st, text);
             clearComposerBox();
         }

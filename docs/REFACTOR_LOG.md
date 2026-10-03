@@ -5545,3 +5545,26 @@ Final desktop checks made baseline/final metrics, constraint limits and manufact
 Final affected model/job regression sweep: 176 passed across `test_cad_sim_tools`, `test_topology_tools`, `test_compiled_sim_jobs` and `sim/test_jobs`. A second interactive desktop reopen into native document `doc-cpp00000002` retained the result overlay and enabled artifact exports; clicking Export produced the same 2,610,122-byte VTU and recorded SHA-256. Verification processes used private HOME/runtime/socket paths and never controlled the user's daemon.
 
 The full repository gate is **not wholly green**: it built native/desktop/WASM, passed core CTest, hostd and web-parity smoke, and completed the service/tools/training sweep, but its 3,600-second command deadline expired during the unrelated FIN25 sensor-node demo. The sweep recorded one live-preview event timeout (`test_ro_gui_sees_mcp_edits_and_can_upgrade`; all three live-preview tests passed afterward in an isolated native daemon) and two flywheel DVC round-trip failures at `dvc init`. The initial audit/manual/packaging interpreter failures were resolved by the separately passing provisioned-interpreter checks above. No failure was suppressed or reclassified as a full-gate pass.
+
+## 2026-10-03 — transactional chat message editing and runtime rewind
+
+Message editing now retains the original transcript while stopping the existing run,
+forks the runtime session before the selected user message, waits for any geometry
+rollback, then parks the replaced tail and dispatches one replacement turn. The
+transaction belongs to its conversation; switching views or receiving stale callbacks
+cannot truncate a different chat or a new running reply. Cancellation and RPC refusal
+keep the original transcript and session link.
+
+`chudcode_rewind_session` resolves repeated prompts on the runtime's active entry
+branch, excludes abandoned siblings, preserves the parent history, and retires the
+exact branched process before a queued turn can acquire it. A saved session can be
+resumed solely for rewind without making a provider call. Worker contract and
+integration guidance document the new method.
+
+Verification: `./build.sh`; native chat-session helper suite; Python runtime/worker
+regressions (83 passed, one skipped); GUI lint and all nine source-audit gates.
+Real-runtime smoke on a copy of the affected session verified branching before the
+edited message, unchanged source history, and process retirement. An isolated native
+smoke reproduced the old loss of the live chat tail and confirmed its preservation;
+another exercised rewind refusal, rollback failure, cancellation, background commit,
+branch preservation, and stale callbacks.

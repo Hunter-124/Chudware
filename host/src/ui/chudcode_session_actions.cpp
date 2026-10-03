@@ -130,6 +130,59 @@ nlohmann::json chudcodeCloseSessionParams(const std::string& sessionId) {
     return {{"session_id", sessionId}};
 }
 
+nlohmann::json chudcodeRewindSessionParams(const std::string& sessionId,
+                                           const std::string& userText, int occurrence,
+                                           const std::string& sessionFile,
+                                           const std::string& workspaceDir) {
+    nlohmann::json p = {{"session_id", sessionId},
+                        {"user_text", userText},
+                        {"occurrence", occurrence < 0 ? 0 : occurrence}};
+    if (!sessionFile.empty()) p["session_file"] = sessionFile;
+    if (!workspaceDir.empty()) p["workspace_dir"] = workspaceDir;
+    return p;
+}
+
+// ---- edit-message rewind target ---------------------------------------------------------------
+
+static std::string trimWs(const std::string& s) {
+    const char* ws = " \t\r\n";
+    const size_t b = s.find_first_not_of(ws);
+    if (b == std::string::npos) return {};
+    return s.substr(b, s.find_last_not_of(ws) - b + 1);
+}
+
+std::string chudcodeEditTypedText(const std::string& bubbleText) {
+    std::string t = bubbleText;
+    // userBubbleText appends one "\n[attached image: name]" line per image, then at most one
+    // "\n[attached: a b]" roster — strip those marker lines from the end only.
+    for (;;) {
+        const size_t nl = t.rfind('\n');
+        if (nl == std::string::npos) break;
+        const std::string line = t.substr(nl + 1);
+        const bool marker = !line.empty() && line.back() == ']' &&
+                            (line.rfind("[attached image: ", 0) == 0 ||
+                             line.rfind("[attached:", 0) == 0);
+        if (!marker) break;
+        t.erase(nl);
+    }
+    return trimWs(t);
+}
+
+bool chudcodeEditTextMatches(const std::string& candidate, const std::string& target) {
+    // GUI typed texts carry none of the runtime-appended blocks, so the runtime's rule
+    // ("exact, or exact + a known appended block") reduces to trimmed equality here.
+    const std::string tgt = trimWs(target);
+    return !tgt.empty() && trimWs(candidate) == tgt;
+}
+
+int chudcodeEditOccurrence(const std::vector<std::string>& earlierTypedTexts,
+                           const std::string& target) {
+    int n = 0;
+    for (const auto& t : earlierTypedTexts)
+        if (chudcodeEditTextMatches(t, target)) ++n;
+    return n;
+}
+
 // ---- response envelopes -----------------------------------------------------------------------
 
 std::string chudcodeActionError(const nlohmann::json& r, const char* fallback) {

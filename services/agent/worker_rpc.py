@@ -2378,6 +2378,53 @@ def _chudcode_branch_session(params: dict, _emit: Callable) -> dict:
         }
 
 
+def _chudcode_rewind_session(params: dict, _emit: Callable) -> dict:
+    allowed = frozenset(
+        {"session_id", "user_text", "occurrence", "session_file", "workspace_dir"}
+    )
+    if _has_unknown_params(params, allowed):
+        return {"ok": False, "reason": "chudcode_rewind_session has unknown params"}
+    session_id = _bounded_text(params.get("session_id"), 256)
+    if session_id is None:
+        return {"ok": False, "reason": "session_id is required"}
+    user_text = params.get("user_text")
+    if not isinstance(user_text, str) or not user_text.strip() or len(user_text) > 1_000_000:
+        return {"ok": False, "reason": "user_text is required"}
+    occurrence = params.get("occurrence")
+    if type(occurrence) is not int or not 0 <= occurrence <= 100_000:
+        return {"ok": False, "reason": "occurrence must be a nonnegative integer"}
+    resume = {}
+    for key in ("session_file", "workspace_dir"):
+        if key in params:
+            value = _bounded_text(params[key], 4_096)
+            if value is None:
+                return {"ok": False, "reason": f"{key} must be a nonempty path"}
+            resume[key] = value
+    try:
+        raw = get_default_chudcode_host().rewind_session(
+            session_id, user_text, occurrence, **resume
+        )
+        if not isinstance(raw, Mapping):
+            return {"ok": False, "reason": "Agent service rewind returned non-object"}
+        if not raw.get("ok"):
+            return {
+                "ok": False,
+                "reason": _bounded_text(raw.get("reason"), 4_096)
+                or "Agent service rewind failed",
+            }
+        child_id = _bounded_text(raw.get("chudcode_session_id"), 256)
+        child_file = _bounded_text(raw.get("chudcode_session_file"), 4_096)
+        if child_id is None or child_file is None:
+            return {"ok": False, "reason": "Agent service rewind returned no child metadata"}
+        return {
+            "ok": True,
+            "chudcode_session_id": child_id,
+            "chudcode_session_file": child_file,
+        }
+    except Exception as exc:  # noqa: BLE001 - worker boundary
+        return {"ok": False, "reason": f"Agent service rewind failed: {type(exc).__name__}"}
+
+
 def _chudcode_repair_session(params: dict, _emit: Callable) -> dict:
     if _has_unknown_params(params, frozenset({"session_id", "repair"})):
         return {"ok": False, "reason": "chudcode_repair_session has unknown params"}
@@ -3823,6 +3870,7 @@ ADMIN_METHODS: dict[str, Callable] = {
     "chudcode_session_stats": _chudcode_session_stats,
     "chudcode_export_session": _chudcode_export_session,
     "chudcode_branch_session": _chudcode_branch_session,
+    "chudcode_rewind_session": _chudcode_rewind_session,
     "chudcode_repair_session": _chudcode_repair_session,
     "chudcode_close_session": _chudcode_close_session,
     "chudcode_compact": _chudcode_compact,

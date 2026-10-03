@@ -339,13 +339,41 @@ struct AiVcUi {
 };
 extern AiVcUi s_aiVc;
 
-// Staged "Edit message" — rollback is deferred until the user actually sends. Esc restores
-// the pre-edit chat tail + composer without any plm_rollback.
+// Staged "Edit message" — a conversation-scoped transaction. Nothing in the transcript moves
+// while the edit is staged: the tail [msgIdx..) is only HIDDEN by the chat log (and only once
+// the conversation's run is truly over), so a running reply, the run's chat indices and the
+// persisted history are never touched by staging. Esc / switching sessions just drops the
+// stage and restores the composer.
+// Sending runs, strictly in order and never concurrently with a turn:
+//   1. wait for the conversation's run to reach its actual terminal (editing during a run
+//      stops it first);
+//   2. chudcode_rewind_session — branch the runtime session to before the edited message;
+//   3. plm_rollback msg:<idx> — geometry (a missing checkpoint is a legitimate chat-only edit);
+//   4. commit: adopt the branch link, park the old tail as a ChatBranch, truncate, persist;
+//   5. exactly one submitTurn of the edited text (deferred until the conversation is viewed).
+// Any failure before 4 adopts nothing, keeps the tail and the edited composer text, launches no
+// run and says why.
 struct EditStage {
-    bool active = false;
-    int  msgIdx = -1;
-    std::string savedPrompt;                 // composer contents before edit
-    std::vector<ChatMsg> chatTail;           // messages [msgIdx..) parked for Esc restore
+    enum class Phase {
+        Off,
+        Staged,       // composer prefilled; sendRequested = waiting for the run to settle
+        Rewinding,    // chudcode_rewind_session in flight
+        RollingBack,  // plm_rollback msg:<idx> in flight
+        AwaitSubmit,  // committed; edited turn launches when its conversation is viewed
+    };
+    Phase phase = Phase::Off;
+    uint64_t gen = 0;             // transaction generation; stale callbacks compare it
+    std::string convId;           // the conversation being edited — never "whatever is viewed"
+    int  msgIdx = -1;             // edited user message index in that conversation
+    std::string targetText;       // typed text of the edited message (runtime match key)
+    int  occurrence = 0;          // earlier matching user messages (runtime match ordinal)
+    std::string savedPrompt;      // composer contents before edit (Esc restores)
+    bool sendRequested = false;   // Enter pressed; transaction starts once the run settled
+    std::string editedText;       // composer text frozen at send
+    std::string docId;            // document whose AI-VC chain rolls back
+    std::string newSessionId;     // rewind result, adopted only at commit
+    std::string newSessionFile;
+    bool geometryRolledBack = false;
 };
 extern EditStage s_edit;
 
@@ -380,9 +408,35 @@ HeaderBtnHit headerTextButtonHit(const char* id, float w);
 // `withLabel=false` paints an icon-only pill (narrow column); the tooltip carries the name.
 void headerTextButtonPaint(const HeaderBtnHit& h, const char* label, bool active,
                            const char* iconName = nullptr, bool withLabel = true);
-void cancelEditStage(AppState& st);
+// ---- staged edit transaction (cards.cpp; see EditStage) ----
+bool editStageInFlight();                    // rewind/rollback RPC outstanding (not cancellable)
+// The stage belongs to convId: its queue drain must not launch a turn under the edit.
+bool editStageHoldsConversation(const std::string& convId);
+// First message index the chat log hides for the viewed conversation, or -1. Only a staged
+// edit of a SETTLED conversation hides anything — a running tail always stays visible.
+int  editStageHideFrom(AppState& st);
+// Start editing user message msgIdx of the viewed conversation: prefill the composer. When
+// that conversation's run is live this also stops it (Stop-and-edit); nothing is hidden until
+// the run's actual terminal.
 void beginEditStage(AppState& st, int msgIdx);
-void commitEditStageOnSend(AppState& st);
+// Esc: drop the stage and restore the composer (staged only — an in-flight transaction cannot
+// be abandoned halfway). Returns false when it refused.
+bool cancelEditStage(AppState& st);
+// Called before the viewed conversation is parked (switch / new session): a merely staged edit
+// is cancelled while its conversation is still the viewed one, so its composer text and draft
+// are restored; an in-flight or committed transaction keeps running for ITS conversation.
+void editStageBeforeConversationPark(AppState& st);
+// Enter while staged: freeze `text` and start the transaction once the run has settled.
+void editStageSubmit(AppState& st, const std::string& text);
+// Per-frame driver (composer): starts a requested transaction once the run settled, and
+// launches a committed edit when its conversation is the viewed one.
+void editStageTick(AppState& st);
+// One-line composer status for the viewed conversation's edit, or nullptr.
+const char* editStageStatus(AppState& st);
+// RPC completions of the two transaction steps. Public so a harness can drive the exact
+// transaction with synthetic replies; a stale gen is ignored.
+void editStageOnRewindResult(AppState& st, uint64_t gen, const core::RpcResult& r);
+void editStageOnRollbackResult(AppState& st, uint64_t gen, const core::RpcResult& r);
 // Restore/rewind actions for an assistant turn. alwaysShow=true draws them as a bottom
 // action row (the chat-log default, matching the user bubble's own meta bar); false keeps
 // the hover-latched variant that anchors on a preceding label item.
@@ -489,6 +543,12 @@ void drawRuntimeBanner(AppState& st);
 void agentControlDispatch(AppState& st, const std::string& runId, const std::string& steer,
                           nlohmann::json attachments = nlohmann::json::array());
 bool aiTurnActive(AppState& st);
+// Stop the VIEWED conversation's run (agent_cancel + soft-finalize its bubble). The run's
+// JobState stays running until the worker's actual terminal drains.
+void requestStopRun(AppState& st);
+// Replace the composer text from outside the InputText (fresh widget state so an active
+// widget does not keep its stale buffer). Empty text also drops the session's saved draft.
+void composerSetText(AppState& st, const std::string& text);
 void drawComposer(AppState& st, bool busy, bool canRun);
 
 // ---- sessions/tasks/artifacts panels (panel) ----

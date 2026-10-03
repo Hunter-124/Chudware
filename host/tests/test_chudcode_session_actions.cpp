@@ -291,6 +291,24 @@ void test_registry_rekey_erase_and_ensure() {
     ui::chudcodeSessionLinksClear();
 }
 
+// ---- edit-message rewind ----------------------------------------------------------------------
+
+
+void test_edit_typed_text_and_occurrence() {
+    // Bubble markers are GUI-only; the runtime holds the typed text (+ appended blocks).
+    assert(ui::chudcodeEditTypedText("look at this\n[attached image: a.png]\n[attached: b.txt]") ==
+           "look at this");
+    assert(ui::chudcodeEditTypedText("  plain  ") == "plain");
+    assert(ui::chudcodeEditTypedText("line1\nline2") == "line1\nline2");
+    assert(ui::chudcodeEditTextMatches("slice", " slice "));
+    assert(!ui::chudcodeEditTextMatches("slice\n\nmore", "slice"));
+    assert(!ui::chudcodeEditTextMatches("slice it", "slice"));
+    assert(!ui::chudcodeEditTextMatches("anything", ""));
+    // Occurrence counts EARLIER exact matches only — the ordinal the runtime resolves.
+    assert(ui::chudcodeEditOccurrence({"go", "stop", "go\n\nmore", " go", "goal"}, "go") == 2);
+    assert(ui::chudcodeEditOccurrence({}, "go") == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -311,6 +329,7 @@ int main() {
     test_link_json_round_trip_and_empty_elision();
     test_persist_adds_only_the_chudcode_key();
     test_registry_rekey_erase_and_ensure();
+    test_edit_typed_text_and_occurrence();
     std::printf("test_chudcode_session_actions: all tests passed\n");
     return 0;
 }

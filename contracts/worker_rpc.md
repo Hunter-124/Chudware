@@ -2094,3 +2094,25 @@ Brinkman heat leakage. Thermomechanical coupling is steady and one-way. Manufact
 filter/overhang intent is distinct from measured geometry and DFAM checks. Topology
 does not slice and never establishes print readiness: `slice_part` must produce and
 validate the G-code.
+
+## Chat message edit rewind (append-only, 2026-10-03)
+
+`chudcode_rewind_session` runs on the agent worker lane. Parameters:
+`{session_id, user_text, occurrence, session_file?, workspace_dir?}`. `occurrence`
+is the zero-based occurrence of the original typed user text on the active runtime
+branch. It excludes abandoned sibling branches and distinguishes ordinary multiline
+requests from harness-appended document, attachment and picked-context blocks.
+
+The session must be idle. A closed runtime may be resumed only from the explicit
+`session_file`; this does not invoke a provider. The service resolves an actual
+Chudcode entry ID through `get_entries`, then uses the runtime's `branch` operation
+to fork **before** that user message. It never rewrites session JSONL.
+Success returns `{ok:true,chudcode_session_id,chudcode_session_file}` for the child.
+The original persisted history is retained, and the mutated process is retired.
+The next turn must bind the returned child file.
+
+Failure returns `{ok:false,reason}`; examples include `session_busy`,
+`session_not_live`, `session_file_mismatch`, `target_not_found`, and
+`branch_cancelled`. An edit must not submit a replacement turn or discard the
+visible tail until runtime rewind and any required geometry rollback complete.
+Conversation switches and failed rollback must preserve the original transcript.

@@ -7,6 +7,7 @@
 // timeline that hosts them lives in activity_timeline.cpp.
 
 #include "copilot_internal.h"
+#include "ui/chudcode_session_actions.h"  // chudcode_rewind_session + per-conversation link
 #include <algorithm>
 #include <iterator>
 #include "util/time_local.h"
@@ -2091,6 +2092,34 @@ static void aiVcRefreshMirror(AppState& st, const nlohmann::json& res,
     });
 }
 
+// Move msgs[truncateTo..) of convId into a new ChatBranch (persisted with the session, so the
+// discarded tail stays recoverable) and truncate. No-op when nothing lies past truncateTo.
+// False only when the conversation no longer exists.
+static bool parkConversationTail(AppState& st, const std::string& convId, int truncateTo,
+                                 const std::string& label) {
+    std::vector<ChatMsg>* msgs = conversationMsgs(st, convId);
+    if (!msgs) return false;
+    if (truncateTo < 0) truncateTo = 0;
+    if (truncateTo >= (int)msgs->size()) return true;
+    auto conv = std::find_if(st.conversations.begin(), st.conversations.end(),
+                             [&convId](const Conversation& c) { return c.id == convId; });
+    if (conv == st.conversations.end()) return false;
+    ChatBranch br;
+    br.id = "b" + std::to_string(conv->branches.size() + 1);
+    br.when = (double)std::time(nullptr);
+    br.fromMsgIdx = truncateTo;
+    br.label = label;
+    br.msgs.assign(std::make_move_iterator(msgs->begin() + truncateTo),
+                   std::make_move_iterator(msgs->end()));
+    freeChatTextures(br.msgs);
+    for (auto& m : br.msgs) m.uiCachedH = -1.0f;
+    conv->branches.push_back(std::move(br));
+    msgs->erase(msgs->begin() + truncateTo, msgs->end());
+    for (auto& m : *msgs) m.uiCachedH = -1.0f;
+    markChatHistoryDirty();
+    return true;
+}
+
 static bool aiVcApplyChatTruncate(AppState& st, const std::string& convId,
                                   const nlohmann::json& res) {
     // Prefer explicit chat_truncate_to (msg index); fall back to msg:N targets only.
@@ -2106,30 +2135,22 @@ static bool aiVcApplyChatTruncate(AppState& st, const std::string& convId,
     std::vector<ChatMsg>* msgs = conversationMsgs(st, convId);
     if (!msgs) return false;
     if (truncateTo > (int)msgs->size()) truncateTo = (int)msgs->size();
-    if (truncateTo < (int)msgs->size()) {
-        auto conv = std::find_if(st.conversations.begin(), st.conversations.end(),
-                                 [&convId](const Conversation& c) { return c.id == convId; });
-        if (conv == st.conversations.end()) return false;
-        ChatBranch br;
-        br.id = "b" + std::to_string(conv->branches.size() + 1);
-        br.when = (double)std::time(nullptr);
-        br.fromMsgIdx = truncateTo;
-        br.label = "reverted to message " + std::to_string(truncateTo) + " — " +
-                   std::to_string((int)msgs->size() - truncateTo) + " message(s) parked";
-        br.msgs.assign(std::make_move_iterator(msgs->begin() + truncateTo),
-                       std::make_move_iterator(msgs->end()));
-        freeChatTextures(br.msgs);
-        for (auto& m : br.msgs) m.uiCachedH = -1.0f;
-        conv->branches.push_back(std::move(br));
-        msgs->erase(msgs->begin() + truncateTo, msgs->end());
-        for (auto& m : *msgs) m.uiCachedH = -1.0f;
-        markChatHistoryDirty();
-    }
-    return true;
+    return parkConversationTail(
+        st, convId, truncateTo,
+        "reverted to message " + std::to_string(truncateTo) + " \xe2\x80\x94 " +
+            std::to_string((int)msgs->size() - truncateTo) + " message(s) parked");
 }
 
 void aiVcRollback(AppState& st, const std::string& to, const std::string& okToast) {
     if (!s_aiVc.available || s_aiVc.busy || to.empty()) return;
+    // A rewind truncates the chat when it lands: never start one under a live turn, whose
+    // running reply the truncation would erase. New turns wait on s_aiVc.busy (composer).
+    if (activeConversationRunning(st) || editStageHoldsConversation(st.activeConvId())) {
+        st.toast(ui::ToastLevel::Info, editStageHoldsConversation(st.activeConvId())
+                                           ? "Finish or cancel the message edit first."
+                                           : kAvailableAfterRun);
+        return;
+    }
     s_aiVc.busy = true;
     s_aiVc.confirmMsgIdx = -1;
     s_aiVc.confirmKind = 0;
@@ -2775,66 +2796,323 @@ void headerTextButtonPaint(const HeaderBtnHit& h, const char* label, bool active
     dl->AddText(ImVec2(x, midY - ImGui::GetTextLineHeight() * 0.5f), ink, label);
 }
 
-// Cancel staged edit: restore chat tail + composer, NO plm_rollback.
-void cancelEditStage(AppState& st) {
-    if (!s_edit.active) return;
-    // Drop any messages that replaced the parked tail (UI-only truncation during edit).
-    if (s_edit.msgIdx >= 0 && s_edit.msgIdx <= (int)st.chat.size()) {
-        if (s_edit.msgIdx < (int)st.chat.size()) {
-            std::vector<ChatMsg> drop(st.chat.begin() + s_edit.msgIdx, st.chat.end());
-            freeChatTextures(drop);
-            st.chat.erase(st.chat.begin() + s_edit.msgIdx, st.chat.end());
-        }
-        for (auto& m : s_edit.chatTail) st.chat.push_back(std::move(m));
+// ---- staged edit transaction (see EditStage in copilot_internal.h) ----------------------------
+
+static uint64_t s_editGen = 0;   // monotonically increasing; a stale RPC reply never matches
+
+using EditPhase = EditStage::Phase;
+
+bool editStageInFlight() {
+    return s_edit.phase == EditPhase::Rewinding || s_edit.phase == EditPhase::RollingBack;
+}
+
+bool editStageHoldsConversation(const std::string& convId) {
+    return s_edit.phase != EditPhase::Off && !convId.empty() && convId == s_edit.convId;
+}
+
+// The conversation's run has reached its ACTUAL terminal: no job running, no result waiting
+// to drain, no stop still unwinding, and no live bubble left in its transcript.
+static bool editRunSettled(AppState& st, const std::string& convId) {
+    if (JobState* run = st.runIfExists(convId)) {
+        if (run->running.load() || run->ready.load() || run->stopRequested.load()) return false;
     }
-    // Restore composer contents.
-    if (st.prompt.size() < s_edit.savedPrompt.size() + 1)
-        st.prompt.resize(s_edit.savedPrompt.size() + 64, 0);
-    std::memset(st.prompt.data(), 0, st.prompt.size());
-    if (!s_edit.savedPrompt.empty()) {
-        const size_t n = std::min(s_edit.savedPrompt.size(), st.prompt.size() - 1);
-        std::memcpy(st.prompt.data(), s_edit.savedPrompt.data(), n);
-        st.prompt[n] = 0;
+    const std::vector<ChatMsg>* msgs = conversationMsgs(st, convId);
+    if (!msgs) return false;
+    for (const ChatMsg& m : *msgs)
+        if (!m.fromUser && m.running) return false;
+    return true;
+}
+
+int editStageHideFrom(AppState& st) {
+    if (s_edit.phase != EditPhase::Staged && !editStageInFlight()) return -1;
+    if (st.activeConvId() != s_edit.convId) return -1;
+    if (!editRunSettled(st, s_edit.convId)) return -1;   // a live tail is never hidden
+    return s_edit.msgIdx;
+}
+
+// Back to Staged with the edited text still in the box: nothing was adopted, the transcript
+// never moved, no turn was launched. Says why in user terms.
+static void editStageFail(AppState& st, const std::string& why) {
+    s_edit.phase = EditPhase::Staged;
+    s_edit.sendRequested = false;
+    s_edit.newSessionId.clear();
+    s_edit.newSessionFile.clear();
+    s_edit.geometryRolledBack = false;
+    st.toast(ui::ToastLevel::Error,
+             "Edit not applied: " + why + " The original conversation is unchanged; your "
+             "edited text is still in the box (Esc cancels).");
+}
+
+bool cancelEditStage(AppState& st) {
+    if (s_edit.phase == EditPhase::Off) return true;
+    if (s_edit.phase != EditPhase::Staged) {
+        st.toast(ui::ToastLevel::Info, "The edit is being applied \xe2\x80\x94 it can't be "
+                                       "cancelled halfway.");
+        return false;
     }
+    const bool viewed = st.activeConvId() == s_edit.convId;
+    const std::string saved = std::move(s_edit.savedPrompt);
     s_edit = EditStage{};
+    if (viewed) composerSetText(st, saved);
+    return true;
 }
 
-// Begin staged edit of user message at msgIdx: park tail, prefill composer, no rollback yet.
+void editStageBeforeConversationPark(AppState& st) {
+    // Only a merely staged edit of the outgoing conversation is cancelled; a requested send
+    // (waiting on the run's terminal) or an in-flight/committed transaction keeps going.
+    if (s_edit.phase == EditPhase::Staged && !s_edit.sendRequested &&
+        s_edit.convId == st.activeConvId())
+        cancelEditStage(st);
+}
+
 void beginEditStage(AppState& st, int msgIdx) {
-    if (msgIdx < 0 || msgIdx >= (int)st.chat.size()) return;
-    if (!st.chat[msgIdx].fromUser) return;
-    if (s_edit.active) cancelEditStage(st);
-    s_edit.active = true;
+    if (msgIdx < 0 || msgIdx >= (int)st.chat.size() || !st.chat[msgIdx].fromUser) return;
+    const std::string convId = st.activeConvId();
+    if (convId.empty()) return;
+    if (s_edit.phase != EditPhase::Off) {
+        if (s_edit.convId != convId) {
+            st.toast(ui::ToastLevel::Info,
+                     "Finish or cancel the message edit in your other session first.");
+            return;
+        }
+        if (s_edit.phase != EditPhase::Staged || s_edit.sendRequested) {
+            st.toast(ui::ToastLevel::Info,
+                     "The edit is being applied \xe2\x80\x94 wait for it to finish.");
+            return;
+        }
+        if (!cancelEditStage(st)) return;
+    }
+    const std::string target = chudcodeEditTypedText(st.chat[msgIdx].text);
+    if (target.empty()) {
+        st.toast(ui::ToastLevel::Info, "This message has no text to edit.");
+        return;
+    }
+    std::vector<std::string> earlier;
+    for (int i = 0; i < msgIdx; ++i)
+        if (st.chat[i].fromUser) earlier.push_back(chudcodeEditTypedText(st.chat[i].text));
+    // Stop-and-edit: a live turn is stopped first; the transcript stays as it is (the stopped
+    // reply keeps its rows) and the tail is hidden only once the run's actual terminal lands.
+    if (aiTurnActive(st) || activeConversationRunning(st)) requestStopRun(st);
+    s_edit = EditStage{};
+    s_edit.phase = EditPhase::Staged;
+    s_edit.convId = convId;
     s_edit.msgIdx = msgIdx;
-    // Snapshot composer.
-    s_edit.savedPrompt = st.prompt.data() ? std::string(st.prompt.data()) : std::string();
-    // Park [msgIdx..) and drop from live chat (UI-only).
-    s_edit.chatTail.assign(st.chat.begin() + msgIdx, st.chat.end());
-    st.chat.erase(st.chat.begin() + msgIdx, st.chat.end());
-    for (auto& m : st.chat) m.uiCachedH = -1.0f;
-    // Prefill composer with the edited message text.
-    const std::string& t = s_edit.chatTail.empty() ? std::string() : s_edit.chatTail.front().text;
-    if (st.prompt.size() < t.size() + 1) st.prompt.resize(t.size() + 256, 0);
-    std::memset(st.prompt.data(), 0, st.prompt.size());
-    if (!t.empty()) {
-        const size_t n = std::min(t.size(), st.prompt.size() - 1);
-        std::memcpy(st.prompt.data(), t.data(), n);
-        st.prompt[n] = 0;
+    s_edit.targetText = target;
+    s_edit.occurrence = chudcodeEditOccurrence(earlier, target);
+    s_edit.savedPrompt = st.prompt.empty() ? std::string() : std::string(st.prompt.data());
+    composerSetText(st, target);
+}
+
+static void editStageStartRollback(AppState& st);
+
+// Step 2: branch the runtime session to before the edited message. A conversation with no
+// runtime history at all (never ran online) has nothing to branch; its next turn seeds a fresh
+// session from the truncated transcript.
+static void editStageStart(AppState& st) {
+    std::vector<ChatMsg>* msgs = conversationMsgs(st, s_edit.convId);
+    if (!msgs) { s_edit = EditStage{}; return; }
+    if (s_edit.msgIdx >= (int)msgs->size() || !(*msgs)[s_edit.msgIdx].fromUser ||
+        chudcodeEditTypedText((*msgs)[s_edit.msgIdx].text) != s_edit.targetText) {
+        editStageFail(st, "the conversation changed while you were editing.");
+        return;
+    }
+    if (s_aiVc.busy) {
+        editStageFail(st, "a checkpoint restore is still finishing \xe2\x80\x94 try again in a "
+                          "moment.");
+        return;
+    }
+    s_edit.gen = ++s_editGen;
+    s_edit.phase = EditPhase::Rewinding;
+    const ChudcodeSessionLink* link = chudcodeSessionLink(s_edit.convId);
+    if (!link || (link->sessionFile.empty() && !link->runtimeLive)) {
+        editStageStartRollback(st);
+        return;
+    }
+    std::string workspace;
+    for (const Conversation& c : st.conversations)
+        if (c.id == s_edit.convId) { workspace = c.projectDir; break; }
+    if (workspace.empty()) workspace = st.workspaceDir;
+    const uint64_t gen = s_edit.gen;
+    st.rpc.call(kChudcodeRewindSessionMethod,
+                chudcodeRewindSessionParams(s_edit.convId, s_edit.targetText,
+                                            s_edit.occurrence, link->sessionFile, workspace),
+                [&st, gen](const core::RpcResult& r) { editStageOnRewindResult(st, gen, r); },
+                120000);
+}
+
+// Refusal reasons from chudcode_rewind_session, in user terms (never raw runtime text).
+static std::string editRewindRefusalText(const std::string& reason) {
+    if (reason.find("session_busy") != std::string::npos)
+        return "the agent is still finishing its last step \xe2\x80\x94 try again in a moment.";
+    if (reason.find("target_not_found") != std::string::npos)
+        return "the agent's session history has no matching message to rewind to.";
+    if (reason.find("session_file_mismatch") != std::string::npos)
+        return "the agent session changed underneath this conversation.";
+    if (reason.find("session_not_live") != std::string::npos)
+        return "the agent session for this conversation isn't available.";
+    return "the agent session couldn't be rewound.";
+}
+
+void editStageOnRewindResult(AppState& st, uint64_t gen, const core::RpcResult& r) {
+    if (gen != s_edit.gen || s_edit.phase != EditPhase::Rewinding) return;
+    if (chudcodeSessionRpcAbsent(r.ok, r.err, r.result)) {
+        editStageFail(st, "this agent service can't rewind a conversation yet.");
+        return;
+    }
+    if (core::workerLaneBusy(r)) {
+        editStageFail(st, "the agent service is busy with a run \xe2\x80\x94 try again when it "
+                          "finishes.");
+        return;
+    }
+    if (!r.ok) {
+        editStageFail(st, userFacingRpcError(r, "the agent service did not respond."));
+        return;
+    }
+    ChudcodeBranchResult br;
+    if (!parseChudcodeBranchResult(r.result, br)) {
+        editStageFail(st, editRewindRefusalText(chudcodeActionError(r.result, "")));
+        return;
+    }
+    // The service retired the conversation's process; the parent file is untouched, so the
+    // old link stays valid until commit adopts the branch.
+    chudcodeSessionLinkEnsure(s_edit.convId).runtimeLive = false;
+    s_edit.newSessionId = br.sessionId;
+    s_edit.newSessionFile = br.sessionFile;
+    editStageStartRollback(st);
+}
+
+static void editStageCommit(AppState& st);
+
+// Step 3: geometry back to before the edited message.
+static void editStageStartRollback(AppState& st) {
+    s_edit.phase = EditPhase::RollingBack;
+    if (!s_aiVc.available) {   // no AI checkpoints on this service: chat + runtime edit only
+        editStageCommit(st);
+        return;
+    }
+    s_aiVc.busy = true;
+    nlohmann::json p = {{"to", "msg:" + std::to_string(s_edit.msgIdx)}};
+    if (!s_edit.docId.empty()) p["doc_id"] = s_edit.docId;
+    const uint64_t gen = s_edit.gen;
+    st.rpc.call("plm_rollback", p, [&st, gen](const core::RpcResult& r) {
+        s_aiVc.busy = false;
+        editStageOnRollbackResult(st, gen, r);
+    });
+}
+
+void editStageOnRollbackResult(AppState& st, uint64_t gen, const core::RpcResult& r) {
+    if (gen != s_edit.gen || s_edit.phase != EditPhase::RollingBack) return;
+    s_aiVc.busy = false;
+    s_aiVc.lastFetch = 0.0;   // timeline changed (or is confirmed): refresh on next open
+    if (aiVcIsAbsent(r)) {
+        s_aiVc.available = false;          // checkpoints unavailable: a chat-only edit
+    } else if (aiVcIsNoCheckpoint(r)) {
+        // Legitimate: no geometry checkpoint at that message, the part stays as it is.
+    } else {
+        std::string hint;
+        if (!aiVcOk(r, hint)) {
+            editStageFail(st, "the part couldn't be rolled back (" + hint + ").");
+            return;
+        }
+        s_edit.geometryRolledBack = true;
+        aiVcRefreshMirror(st, r.result, s_edit.docId);
+    }
+    editStageCommit(st);
+}
+
+static void editStageLaunchIfViewed(AppState& st);
+
+// Step 4: adopt the branch link, park the old tail as a ChatBranch, truncate, persist — all
+// before any turn exists, so nothing async can land on a new reply afterwards.
+static void editStageCommit(AppState& st) {
+    std::vector<ChatMsg>* msgs = conversationMsgs(st, s_edit.convId);
+    if (!msgs || s_edit.msgIdx > (int)msgs->size()) {
+        s_edit = EditStage{};
+        st.toast(ui::ToastLevel::Error,
+                 "The edited conversation no longer exists \xe2\x80\x94 nothing was sent.");
+        return;
+    }
+    if (!s_edit.newSessionFile.empty()) {
+        ChudcodeSessionLink& link = chudcodeSessionLinkEnsure(s_edit.convId);
+        link.sessionId = s_edit.newSessionId;
+        link.sessionFile = s_edit.newSessionFile;
+        link.health.clear();       // a new file: its doctor verdict is unknown
+        link.runtimeLive = false;  // the next turn resumes the branch from its file
+    }
+    const int parked = (int)msgs->size() - s_edit.msgIdx;
+    parkConversationTail(st, s_edit.convId, s_edit.msgIdx,
+                         "edited message " + std::to_string(s_edit.msgIdx) + " \xe2\x80\x94 " +
+                             std::to_string(parked) + " message(s) parked");
+    persistChatHistory(st);
+    s_edit.phase = EditPhase::AwaitSubmit;
+    editStageLaunchIfViewed(st);
+}
+
+// Step 5: exactly one turn with the edited text, in its own conversation.
+static void editStageLaunchIfViewed(AppState& st) {
+    if (s_edit.phase != EditPhase::AwaitSubmit || st.activeConvId() != s_edit.convId) return;
+    if (st.convRunning(s_edit.convId)) return;
+    const std::string text = s_edit.editedText;
+    const bool geometry = s_edit.geometryRolledBack;
+    s_edit = EditStage{};   // release the composer before submitting
+    const size_t before = st.chat.size();
+    submitTurn(st, text);
+    if (st.chat.size() > before) {
+        composerSetText(st, std::string());
+        st.toast(ui::ToastLevel::Success,
+                 geometry ? "Message edited \xe2\x80\x94 the part was rolled back to before it."
+                          : "Message edited \xe2\x80\x94 no geometry checkpoint there, so the "
+                            "part was left unchanged.");
+    } else {
+        // The turn was refused (entitlement / runtime): the conversation is already rewound and
+        // the edited text stays in the box, so Send runs it.
+        st.toast(ui::ToastLevel::Warn,
+                 "The conversation was rewound, but the edited message wasn't sent \xe2\x80\x94 "
+                 "press Send to run it.");
     }
 }
 
-// Commit staged edit on send: fire msg:N rollback, discard parked tail, clear stage.
-void commitEditStageOnSend(AppState& st) {
-    if (!s_edit.active) return;
-    const int msgIdx = s_edit.msgIdx;
-    // Discard parked tail (textures free) — the new send rebuilds the conversation.
-    freeChatTextures(s_edit.chatTail);
-    s_edit.chatTail.clear();
-    s_edit.active = false;
-    s_edit.msgIdx = -1;
-    s_edit.savedPrompt.clear();
-    if (msgIdx >= 0 && s_aiVc.available)
-        aiVcRollback(st, "msg:" + std::to_string(msgIdx), "Rewound to edit");
+void editStageSubmit(AppState& st, const std::string& text) {
+    if (s_edit.phase != EditPhase::Staged || s_edit.sendRequested ||
+        st.activeConvId() != s_edit.convId || text.empty())
+        return;
+    s_edit.editedText = text;
+    s_edit.sendRequested = true;
+    s_edit.docId = aiVcActiveDocId(st);
+    if (aiTurnActive(st)) requestStopRun(st);
+    if (editRunSettled(st, s_edit.convId)) editStageStart(st);
+}
+
+void editStageTick(AppState& st) {
+    if (s_edit.phase == EditPhase::Off) return;
+    if (!conversationMsgs(st, s_edit.convId)) {   // its conversation was deleted
+        s_edit = EditStage{};
+        return;
+    }
+    if (s_edit.phase == EditPhase::Staged && s_edit.sendRequested &&
+        editRunSettled(st, s_edit.convId))
+        editStageStart(st);
+    else if (s_edit.phase == EditPhase::AwaitSubmit)
+        editStageLaunchIfViewed(st);
+}
+
+const char* editStageStatus(AppState& st) {
+    if (!editStageHoldsConversation(st.activeConvId())) return nullptr;
+    switch (s_edit.phase) {
+        case EditPhase::Staged:
+            if (!editRunSettled(st, s_edit.convId))
+                return s_edit.sendRequested
+                    ? "Waiting for the run to stop, then applying the edit\xe2\x80\xa6"
+                    : "Stopping the run so this message can be edited\xe2\x80\xa6 "
+                      "Esc cancels the edit.";
+            return "Editing an earlier message \xe2\x80\x94 Enter replaces it and everything "
+                   "after it (kept as a branch); Esc cancels.";
+        case EditPhase::Rewinding:   return "Applying the edit: rewinding the agent session\xe2\x80\xa6";
+        case EditPhase::RollingBack: return "Applying the edit: rolling the part back\xe2\x80\xa6";
+        case EditPhase::AwaitSubmit: return "Sending the edited message\xe2\x80\xa6";
+        case EditPhase::Off:         break;
+    }
+    return nullptr;
 }
 
 // 0 = no checkpoint resolves msg:<idx> (backend would refuse -> chat-only rewind),

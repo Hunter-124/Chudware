@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <cmath>
 #include <string>
 #include <thread>
 
@@ -63,22 +64,21 @@ std::string jsonString(const nlohmann::json& value, const char* key) {
     return value[key].get<std::string>();
 }
 
-// The online turn budget is the caller's (chudware-dev SKILL.md, 2026-09-07): it rides to
-// agent_admin_turn as `timeout` (seconds) and bounds chudcode_host.wait_for_idle, so the
-// worker reports a structured timeout first. The client wait is the same budget plus slack.
-// The old fixed 900 000 ms client deadline predated Chudcode and killed a healthy turn at
-// 15:00 mid-tool-call, then "auto-cancelled the orphan" and blamed the provider (2026-09-24).
-constexpr double kOnlineTurnBudgetS = 7200.0;
+// The online turn budget is the caller's: an explicit positive `timeout` (seconds) rides to
+// agent_admin_turn and bounds chudcode_host's wait (abort + stop_reason "turn_budget" when it
+// expires); the client wait is that budget plus slack so the worker's structured reply arrives
+// first. An ordinary GUI turn sends NO budget and has no wall-clock stop: the old fixed
+// 900 000 ms client deadline (2026-09-24), then the 7200 s default, both ended healthy turns
+// mid-build. Stop, worker/daemon loss and app teardown still end an unbudgeted wait.
 constexpr int kOnlineTurnSlackS = 120;
 constexpr int kOfflineRunWaitMs = 900000;
+// WorkerClient/engine_backend: a negative timeout waits for the response itself.
+constexpr int kWaitForResponseMs = -1;
 
-int agentJobWaitMs(const AgentJobRpcRoute& route) {
-    if (!route.online) return kOfflineRunWaitMs;
-    double budget = kOnlineTurnBudgetS;
-    const auto it = route.params.find("timeout");
-    if (it != route.params.end() && it->is_number()) budget = it->get<double>();
-    const double ms = (budget + kOnlineTurnSlackS) * 1000.0;
-    return ms >= 2147483647.0 ? 2147483647 : (int)ms;
+bool positiveTurnBudget(const nlohmann::json& value) {
+    if (!value.is_number()) return false;
+    const double seconds = value.get<double>();
+    return std::isfinite(seconds) && seconds > 0;
 }
 
 // A client-side wait expiring is not a provider failure: name it for what it is.
@@ -87,6 +87,14 @@ std::string transportStopReason(const std::string& err) {
 }
 
 }  // namespace
+
+int agentJobWaitMs(const AgentJobRpcRoute& route) {
+    if (!route.online) return kOfflineRunWaitMs;
+    const auto it = route.params.find("timeout");
+    if (it == route.params.end() || !positiveTurnBudget(*it)) return kWaitForResponseMs;
+    const double ms = (it->get<double>() + kOnlineTurnSlackS) * 1000.0;
+    return ms >= 2147483647.0 ? 2147483647 : (int)ms;
+}
 
 AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::string& docId,
                                       const std::string& convId, bool cam,
@@ -144,9 +152,11 @@ AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::st
     if (sessionId.empty()) sessionId = convId;
     if (sessionId.empty()) sessionId = runId;
     route.params["session_id"] = sessionId;
+    // No default budget: an absent/zero/invalid `timeout` means the turn has no wall-clock
+    // stop, so never forward a non-budget value the worker would have to second-guess.
     const auto timeout = route.params.find("timeout");
-    if (timeout == route.params.end() || !timeout->is_number() || timeout->get<double>() <= 0)
-        route.params["timeout"] = kOnlineTurnBudgetS;
+    if (timeout != route.params.end() && !positiveTurnBudget(*timeout))
+        route.params.erase(timeout);
     return route;
 }
 

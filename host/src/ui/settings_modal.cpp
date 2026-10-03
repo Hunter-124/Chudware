@@ -4589,7 +4589,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
 
     static bool s_loaded = false;
     // Unified compaction control maps only to agent.compaction_strategy.
-    // 0 Off | 1 Snapcompact | 2 Shake | 3 Summary
+    // 0 Automatic | 1 Off | 2 Snapcompact | 3 Shake | 4 Summary
     static int s_compMode = 0;
     static bool s_supersedeReads = true;  // agent.compaction.supersede_reads
     static bool s_dropUseless = true;     // agent.compaction.drop_useless
@@ -4599,13 +4599,15 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     if (!s_loaded) {
         s_loaded = true;
         {
-            const std::string cs = loadAgentConfigString("compaction_strategy", "off");
-            if (cs == "snapcompact")
+            const std::string cs = loadAgentConfigString("compaction_strategy", "auto");
+            if (cs == "off")
                 s_compMode = 1;
-            else if (cs == "shake")
+            else if (cs == "snapcompact")
                 s_compMode = 2;
-            else if (cs == "summary")
+            else if (cs == "shake")
                 s_compMode = 3;
+            else if (cs == "summary")
+                s_compMode = 4;
             else
                 s_compMode = 0;
         }
@@ -4633,6 +4635,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         return;
     }
     static const char* kCompModes[] = {
+        "Automatic",
         "Off",
         "Snapcompact",
         "Shake",
@@ -4640,12 +4643,13 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     };
 
     auto saveCompMode = [&](int mode) {
-        const char* strategy = "off";
+        const char* strategy = "auto";
         switch (mode) {
-        case 1: strategy = "snapcompact"; break;
-        case 2: strategy = "shake"; break;
-        case 3: strategy = "summary"; break;
-        default: strategy = "off"; break;
+        case 1: strategy = "off"; break;
+        case 2: strategy = "snapcompact"; break;
+        case 3: strategy = "shake"; break;
+        case 4: strategy = "summary"; break;
+        default: strategy = "auto"; break;
         }
         saveAgentConfigValue("compaction_strategy", strategy);
     };
@@ -4660,13 +4664,19 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         ImGui::TableNextColumn();
         {
             settingsLabelLead("Compaction",
-                              "How long transcripts are compacted. Off = truncate only. "
-                              "Snapcompact = snapshot-style archive. Shake = drop low-value "
-                              "turns. Summary = model-written recap. Writes "
+                              "How the agent service compacts a chat when its context window "
+                              "fills. Automatic = the agent service's own method order. "
+                              "Off = never compact automatically (a full context fails the "
+                              "turn). Snapcompact = archive history as images (image-capable "
+                              "models only; others do not compact). Shake = drop recoverable "
+                              "heavy tool output, no model call. Summary = the model writes "
+                              "a summary that replaces older history. Only the chosen method "
+                              "runs; if it cannot free enough room nothing else is tried. "
+                              "Applies to each chat from its next turn. Writes "
                               "agent.compaction_strategy.",
                               memLabelColW);
             ImGui::SetNextItemWidth(-1.0f);
-            if (settingsPopupRowCombo("##comp_mode", &s_compMode, kCompModes, 4))
+            if (settingsPopupRowCombo("##comp_mode", &s_compMode, kCompModes, 5))
                 saveCompMode(s_compMode);
         }
 
@@ -4680,14 +4690,15 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         ImGui::TableNextColumn();
         if (ImGui::Checkbox("Supersede stale reads", &s_supersedeReads))
             saveAgentConfigNestedBool("compaction", "supersede_reads", s_supersedeReads);
-        helpMarker("When a file or artifact is re-read after it changed, the stale "
-                   "earlier read is superseded in the compacted transcript "
-                   "(agent.compaction.supersede_reads, default on).");
+        helpMarker("When the agent reads the same file again, the older read result is "
+                   "pruned from the context every turn (cache-aware). Applies to each "
+                   "chat from its next turn (agent.compaction.supersede_reads, default on).");
         ImGui::TableNextColumn();
         if (ImGui::Checkbox("Drop useless turns", &s_dropUseless))
             saveAgentConfigNestedBool("compaction", "drop_useless", s_dropUseless);
-        helpMarker("Compaction drops turns that contributed nothing (failed no-op "
-                   "tool calls, empty replies) instead of archiving them "
+        helpMarker("Tool results that carried nothing (no matches, timed-out waits) are "
+                   "pruned from the context once the agent has seen them (cache-aware). "
+                   "Applies to each chat from its next turn "
                    "(agent.compaction.drop_useless, default on).");
         ImGui::EndTable();
     }
@@ -4746,8 +4757,10 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
             if (ImGui::Checkbox("Auto-compaction", &s_sessAutoCompaction))
                 applySessionFlag("chudcode_set_auto_compaction", s_sessAutoCompaction,
                                  &s_sessAutoCompaction, !s_sessAutoCompaction);
-            helpMarker("The agent service compacts this session's transcript automatically as the "
-                       "context window fills. Applies to the active chat session now.");
+            helpMarker("Switches automatic compaction on or off for the active chat session "
+                       "now, overriding the Compaction setting above for this session. The "
+                       "Compaction setting still chooses the method (with Off or Automatic, "
+                       "the agent service's own method order).");
             ImGui::SameLine(0, 16.0f * sc);
             if (ImGui::Checkbox("Auto-retry", &s_sessAutoRetry))
                 applySessionFlag("chudcode_set_auto_retry", s_sessAutoRetry,

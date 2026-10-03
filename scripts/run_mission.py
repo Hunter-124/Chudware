@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import socket
@@ -372,9 +373,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log", default="", help="JSONL event log (default: <sessions-dir>/<session>.events.jsonl)")
     parser.add_argument("--instance-key", default="")
     parser.add_argument("--hostd-bin", default="")
-    parser.add_argument("--timeout-s", type=float, default=3600.0)
+    parser.add_argument(
+        "--timeout-s", type=float, default=3600.0,
+        help="turn budget in seconds; the run is aborted when it expires. 0 = no budget "
+             "(the turn ends at its own finish, Ctrl-C, or worker death)",
+    )
     parser.add_argument("--quiet-worker", action="store_true", help="hide worker stderr")
     args = parser.parse_args(argv)
+    if not math.isfinite(args.timeout_s) or args.timeout_s < 0:
+        parser.error("--timeout-s must be a finite number >= 0 (0 = no budget)")
+    budget_s = args.timeout_s or None
 
     workspace = Path(args.workspace).expanduser().resolve()
     if not workspace.is_dir():
@@ -450,10 +458,11 @@ def main(argv: list[str] | None = None) -> int:
         previous = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, on_sigint)
 
-        # `timeout` is the host's turn budget (chudcode_host.wait_for_idle); without it the
-        # host applies its 2-hour absolute cap and a long convergence turn dies with
-        # "Timed out waiting for agent_end" well inside --timeout-s. The RPC wait below is
-        # the same number plus slack, so the host always reports first.
+        # `timeout` is the host's turn budget (chudcode_host aborts the run when it
+        # expires and reports stop_reason "turn_budget"). The RPC wait below is the same
+        # number plus slack, so the host always reports first. With --timeout-s 0 neither
+        # is sent: the turn has no wall-clock stop and Ctrl-C (cancel over the control
+        # lane) or worker death ends the wait.
         params: dict[str, Any] = {
             "request": prompt,
             "role": args.role,
@@ -462,8 +471,9 @@ def main(argv: list[str] | None = None) -> int:
             "session_id": session_id,
             "workspace_dir": str(workspace),
             "sessions_dir": str(sessions_dir),
-            "timeout": args.timeout_s,
         }
+        if budget_s is not None:
+            params["timeout"] = budget_s
         if args.provider:
             params["provider"] = args.provider
         if args.model:
@@ -476,7 +486,10 @@ def main(argv: list[str] | None = None) -> int:
         result: dict = {}
         failure = ""
         try:
-            result = worker.call("agent_admin_turn", params, timeout=args.timeout_s + 60.0)
+            result = worker.call(
+                "agent_admin_turn", params,
+                timeout=None if budget_s is None else budget_s + 60.0,
+            )
         except WorkerError as exc:
             failure = str(exc)
         except KeyboardInterrupt:

@@ -106,13 +106,35 @@ def resolve_model_and_effort(
 
 
 def resolve_settings(
-    raw_params: Mapping[str, Any], preferences: Any, provider_name: str, model_name: str
+    raw_params: Mapping[str, Any],
+    preferences: Any,
+    provider_name: str,
+    model_name: str,
+    cfg: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
+    """Assemble the Chudcode session settings for one online turn.
+
+    Compaction is the persisted user choice (``agent.compaction_strategy``), carried as
+    ``compaction_strategy`` plus ``compaction_settings`` (Chudcode ``compaction.*``
+    sub-keys) for the conversation process configuration. A request cannot replace
+    it: the process configuration is shared by every turn of the session.
+    ``auto_compaction`` stays a session switch — sent only when the request names it,
+    or for ``auto`` when the turn policy asks for compaction — so a turn never resets
+    the user's per-session Auto-compaction choice. Raises :class:`ValueError` for an
+    unrecognized strategy.
+    """
+    from services.agent.config import online_compaction_settings
+
     value = raw_params.get("settings")
     settings = dict(value) if isinstance(value, Mapping) else {}
+    for key in ("compaction_strategy", "compaction_settings"):
+        settings.pop(key, None)
+    strategy, compaction = online_compaction_settings(dict(cfg) if cfg is not None else None)
+    settings["compaction_strategy"] = strategy
+    settings["compaction_settings"] = compaction
     if not any(key in raw_params or key in settings for key in ("thinking", "reasoning_effort")):
         settings["thinking"] = preferences.thinking
-    if preferences.schedule_compaction:
+    if preferences.schedule_compaction and strategy == "auto":
         settings.setdefault("auto_compaction", True)
     if provider_name:
         settings["provider"] = provider_name

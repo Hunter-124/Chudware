@@ -104,20 +104,34 @@ void testRunAndSessionIds() {
           "conversation id supplies missing session id");
 }
 
-// Every online turn carries an explicit budget the worker enforces, so a long healthy turn is
-// bounded by the worker's structured timeout rather than a silent client socket deadline.
+// An ordinary online turn has no wall-clock stop: no budget is stamped and the client waits for
+// the worker's reply (Stop, worker/daemon loss and teardown still end it). The old 7200 s
+// default stopped healthy turns at two hours. An explicit caller budget still bounds the turn
+// and the client waits past it so the worker's structured "turn_budget" reply arrives first.
 void testOnlineTurnBudget() {
     const AgentJobRpcRoute route =
         buildAgentJobRpcRoute("fix the brakes", "doc", "conv", false, nlohmann::json::object(), false);
-    check(route.params.contains("timeout") && route.params["timeout"].is_number() &&
-              route.params["timeout"].get<double>() >= 3600.0,
-          "online turn gets an hours-scale budget, not the old 15-minute ceiling");
+    check(!route.params.contains("timeout"), "ordinary online turn carries no default budget");
+    check(agentJobWaitMs(route) < 0, "ordinary online turn waits for its reply, not a clock");
+
+    for (const nlohmann::json& bad : {nlohmann::json(0), nlohmann::json(-5),
+                                      nlohmann::json("7200"), nlohmann::json(nullptr)}) {
+        const AgentJobRpcRoute r =
+            buildAgentJobRpcRoute("go", "doc", "conv", false, {{"timeout", bad}}, false);
+        check(!r.params.contains("timeout"), "non-budget timeout is dropped, not forwarded");
+        check(agentJobWaitMs(r) < 0, "non-budget timeout leaves the wait unbounded");
+    }
+
     const AgentJobRpcRoute explicitBudget = buildAgentJobRpcRoute(
         "fix the brakes", "doc", "conv", false, {{"timeout", 14400}}, true);
     check(explicitBudget.params.value("timeout", 0.0) == 14400.0, "explicit budget preserved");
+    check(agentJobWaitMs(explicitBudget) > 14400 * 1000,
+          "explicit budget: client waits past it for the worker's turn_budget reply");
+
     const AgentJobRpcRoute offline = buildAgentJobRpcRoute(
         "local build", "doc", "conv", false, {{"options", {{"offline", true}}}}, false);
     check(!offline.params.contains("timeout"), "offline native route gets no worker budget");
+    check(agentJobWaitMs(offline) > 0, "offline native route keeps its bounded wait");
 }
 
 // The composer's user-picked mode is authoritative for a normal (non-mission) turn: the route

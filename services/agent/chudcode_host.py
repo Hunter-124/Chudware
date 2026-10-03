@@ -11,6 +11,7 @@ import dataclasses
 import json
 import hashlib
 import logging
+import math
 import mimetypes
 import os
 import shutil
@@ -67,14 +68,19 @@ _APPENDED_BLOCK_HEADERS = (
     "Attached workspace files:\n",
 )
 
-# Default turn budget when the caller sends no `timeout` (the GUI and run_mission.py both
-# send one). When it expires the run is ABORTED, not abandoned: see
-# ChudcodeSessionHost._stop_budget_exhausted_run.
-_TURN_ABSOLUTE_CAP_SECONDS = 2 * 60 * 60.0
-# After the budget expires the host aborts the run and waits this long for its terminal
-# agent_end. It must stay under hostd's bridge slack (budget + 60 s) so the GUI still
-# receives this result instead of its own transport timeout.
+# A turn whose caller sent no positive `timeout` has NO wall-clock limit: it ends at its
+# terminal agent_end, on Stop/close (abort), or when the Chudcode process dies. The old
+# 2-hour default stopped healthy GUI turns mid-build. chudcode_rpc's
+# `wait_for_idle(timeout=None)` means its own 60 s short-wait default, never "forever", so
+# an unbudgeted turn waits in finite slices and re-checks cancel/close between them.
+_UNBOUNDED_WAIT_SLICE_SECONDS = 30.0
+# After an explicit budget expires the host aborts the run and waits this long for its
+# terminal agent_end. It must stay under hostd's bridge slack (budget + 60 s) so the GUI
+# still receives this result instead of its own transport timeout. An unbudgeted turn
+# whose Stop was delivered gets the same grace to settle before it reports cancelled.
 _BUDGET_ABORT_GRACE_SECONDS = 30.0
+# Clock for that post-cancel grace (tests substitute a controlled clock).
+_monotonic = time.monotonic
 # The shared RPC service keeps its model registry in memory. A catalog RPC alone never
 # re-discovers models; refresh Chudcode's own cache periodically, off the worker call lane.
 _CATALOG_REFRESH_SECONDS = 2 * 60 * 60.0
@@ -351,6 +357,10 @@ class _Session:
     closed: bool = False
     dispose_started: bool = False
     host_tool_names: set[str] = field(default_factory=set)
+    compaction_settings: dict[str, Any] = field(default_factory=dict)
+    auto_compaction: bool | None = None
+    auto_retry: bool | None = None
+    launch_params: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -526,6 +536,7 @@ class ChudcodeSessionHost:
         try:
             session = self._get_or_create_session(session_id, params, resume_file)
             with session.turn_lock:
+                self._refresh_compaction(session, params)
                 with self._lock:
                     if session.closed:
                         raise RuntimeError("chudcode RPC session was closed")
@@ -643,31 +654,19 @@ class ChudcodeSessionHost:
                         with self._lock:
                             run.steers.add(text)
                             run.pending_steers.remove((text, steer_images))
-                # `wait_for_idle(timeout=None)` inherits the RPC client's own 60s default,
-                # which is a short-wait default and not a turn budget: nothing in CAD ever
-                # set `timeout`, so EVERY online turn was killed at 60 seconds with
-                # `provider_error - Timed out waiting for agent_end` and an empty stderr,
-                # mid-build, while the agent was still healthy and working. The caller owns
-                # the budget (GUI 7200 s, run_mission.py --timeout-s); the default matches
-                # the old absolute cap. When it expires the run is aborted, because a
-                # Chudcode run nobody waits for keeps editing documents unseen.
-                timeout = params.get("timeout")
-                budget_s = (
-                    float(timeout) if timeout is not None else _TURN_ABSOLUTE_CAP_SECONDS
-                )
-                try:
-                    session.client.wait_for_idle(timeout=budget_s)
-                except Exception as exc:  # noqa: BLE001 - classified below
-                    if not _is_wait_timeout(exc):
-                        raise
-                    # The caller stopped waiting, but Chudcode would keep running this
-                    # run: every later CAD tool call mutates documents with the turn's
-                    # context torn down and no event reaching any UI. Live 2026-09-25: a
-                    # GUI turn hit its 2 h budget and the agent kept editing, saving and
-                    # checkpointing the user's assembly for two more unseen hours.
+                # The caller owns the budget (`timeout`, seconds): run_mission.py sends
+                # --timeout-s, an explicit GUI/RPC caller may send one. Absent, zero or
+                # non-finite means no wall-clock stop. When an explicit budget expires
+                # the run is aborted, because a Chudcode run nobody waits for keeps
+                # editing documents unseen (live 2026-09-25: two more unseen hours).
+                budget_s = _turn_budget_seconds(params.get("timeout"))
+                outcome = self._await_turn_idle(run, session, budget_s)
+                if outcome == "budget" and budget_s is not None:
                     return self._stop_budget_exhausted_run(
                         run, session, budget_s, lambda: terminal
                     )
+                if outcome == "cancel_unsettled":
+                    return self._cancelled_without_terminal(run, session)
                 for thread in progress_threads:
                     thread.join(timeout=1)
 
@@ -756,6 +755,73 @@ class ChudcodeSessionHost:
             if dispose:
                 _stop_client(session.client)
 
+    def _await_turn_idle(self, run: _Run, session: _Session, budget_s: float | None) -> str:
+        """Wait for the prompt to settle: ``"idle"``, ``"budget"`` or ``"cancel_unsettled"``.
+
+        An explicit budget is one bounded wait. Without one there is no deadline, only
+        finite slices: Stop (abort) or close makes Chudcode answer ``prompt_result``,
+        process death raises from ``wait_for_idle``, and a delivered Stop that still has
+        not settled after ``_BUDGET_ABORT_GRACE_SECONDS`` is reported as cancelled
+        instead of holding the worker lane forever.
+        """
+        if budget_s is not None:
+            try:
+                session.client.wait_for_idle(timeout=budget_s)
+            except Exception as exc:  # noqa: BLE001 - classified below
+                if not _is_wait_timeout(exc):
+                    raise
+                return "budget"
+            return "idle"
+        cancel_deadline: float | None = None
+        while True:
+            wait_s = _UNBOUNDED_WAIT_SLICE_SECONDS
+            if cancel_deadline is not None:
+                wait_s = max(0.0, min(wait_s, cancel_deadline - _monotonic()))
+            try:
+                session.client.wait_for_idle(timeout=wait_s)
+                return "idle"
+            except Exception as exc:  # noqa: BLE001 - classified below
+                if not _is_wait_timeout(exc):
+                    raise
+            with self._lock:
+                closed = session.closed
+                cancel_sent = run.cancel_sent
+            if closed:
+                raise RuntimeError("chudcode RPC session was closed")
+            if cancel_sent:
+                now = _monotonic()
+                if cancel_deadline is None:
+                    cancel_deadline = now + _BUDGET_ABORT_GRACE_SECONDS
+                elif now >= cancel_deadline:
+                    return "cancel_unsettled"
+
+    def _cancelled_without_terminal(self, run: _Run, session: _Session) -> dict:
+        """Report a Stop whose abort Chudcode never confirmed with a terminal frame."""
+        _LOG.warning(
+            "Chudcode run %s did not settle within %.0fs of its abort",
+            run.run_id,
+            _BUDGET_ABORT_GRACE_SECONDS,
+        )
+        # An unacknowledged abort is not evidence the agent stopped. Dispose this
+        # connection on release so no work survives after its CAD context is gone.
+        with self._lock:
+            session.closed = True
+        result: dict[str, Any] = {
+            "ok": True,
+            "run_id": run.run_id,
+            "session_id": run.session_id,
+            "cancelled": True,
+            "terminal": None,
+            "result": _safe_last_assistant_text(session.client),
+        }
+        state = _safe_client_state(session.client)
+        if state:
+            result["chudcode_session_id"] = state.get("sessionId") or state.get("session_id")
+            result["chudcode_session_file"] = state.get("sessionFile") or state.get(
+                "session_file"
+            )
+        return result
+
     def _stop_budget_exhausted_run(
         self,
         run: _Run,
@@ -779,6 +845,9 @@ class ChudcodeSessionHost:
             session.client.wait_for_idle(timeout=_BUDGET_ABORT_GRACE_SECONDS)
         except Exception as exc:  # noqa: BLE001 - the abort is already on its way
             _LOG.warning("Chudcode run did not settle after budget abort (%s)", exc)
+        if terminal_seen() is None:
+            with self._lock:
+                session.closed = True
         minutes = max(1, round(budget_s / 60.0))
         hours, mins = divmod(minutes, 60)
         budget_text = (
@@ -1312,7 +1381,7 @@ class ChudcodeSessionHost:
             raise ValueError(f"unsupported agent-service memory command: {command_name!r}")
         return self.transient_call(command_name, params)
 
-    def session_call(self, session_id, command, params=None) -> dict[str, Any]:
+    def session_call(self, session_id, command, params=None, *, compaction_settings=None) -> dict[str, Any]:
         """Call one named live session; these calls never create or resume sessions."""
         command_name = _nonempty_string(command)
         if command_name not in _SESSION_SHAPES:
@@ -1350,9 +1419,16 @@ class ChudcodeSessionHost:
         if session is None:
             return {"ok": False, "reason": "session_not_live"}
         try:
-            with session.turn_lock:
+            if not session.turn_lock.acquire(blocking=command_name != "compact"):
+                return {"ok": False, "reason": "session_busy"}
+            try:
                 if session.closed:
                     return {"ok": False, "reason": "session_not_live"}
+                if command_name == "compact" and compaction_settings is not None:
+                    self._refresh_compaction(session, {
+                        **session.launch_params,
+                        "settings": {"compaction_settings": compaction_settings},
+                    })
                 result = _invoke_session_canonical(
                     session.client, command_name, payload
                 )
@@ -1366,11 +1442,29 @@ class ChudcodeSessionHost:
                 normalized.setdefault("ok", True)
                 if command_name in {"set_auto_compaction", "set_auto_retry"}:
                     normalized.setdefault("enabled", payload["enabled"])
+                    if command_name == "set_auto_compaction":
+                        session.auto_compaction = payload["enabled"]
+                    else:
+                        session.auto_retry = payload["enabled"]
+                if command_name == "compact":
+                    listing = _json_value(session.client.request_raw("get_entries"))
+                    if isinstance(listing, Mapping) and isinstance(listing.get("entries"), list):
+                        branch = _active_branch(listing["entries"], listing.get("leafId"))
+                        entry = next((row for row in reversed(branch) if row.get("type") == "compaction"), None)
+                        if entry is not None and entry.get("method"):
+                            normalized["method"] = entry["method"]
                 if command_name == "get_state":
                     normalized["_hostToolNames"] = sorted(
                         _session_host_tool_names(session)
                     )
                 return normalized
+            finally:
+                session.turn_lock.release()
+        except Exception as exc:
+            if command_name == "compact" and _is_wait_timeout(exc):
+                with self._lock:
+                    session.closed = True
+            raise
         finally:
             self._release_live_session(session)
 
@@ -1463,6 +1557,8 @@ class ChudcodeSessionHost:
                                 workspace_dir,
                                 credential_identity=credential_identity,
                                 active_turns=1,
+                                compaction_settings=_turn_compaction_settings(params),
+                                launch_params=_client_launch_params(params),
                             )
                             self._sessions[session_id] = session
                             self._reserved_creations -= 1
@@ -1583,6 +1679,9 @@ class ChudcodeSessionHost:
         if system_prompt is not None:
             kwargs["append_system_prompt"] = system_prompt
         if not no_session:
+            # Synchronous maintenance (notably a GPT-written summary) can exceed
+            # RpcClient's 30 s default. Leave 30 s before the worker bridge's bound.
+            kwargs["request_timeout"] = 90.0
             # A CAD conversation re-reads Chudcode's prompt on every request. Without
             # these, a session carried the user's own Chudcode skills catalog (18 KB of
             # repo-dev skills; CAD skills come from cad_skill), LSP docs, and a dozen
@@ -1599,10 +1698,12 @@ class ChudcodeSessionHost:
                 _LOG.warning("chud at %s lacks memory backend %r; using mnemo", binary, memory)
                 memory = "mnemo"
             overlay = (
-                _cad_session_overlay(memory)
+                _cad_session_overlay(memory, _turn_compaction_settings(params))
                 if binary is not None and _binary_supports_flag(binary, "--config")
                 else None
             )
+            if overlay is None and _turn_compaction_settings(params) and self._client_factory is None:
+                raise RuntimeError("Cannot apply the selected compaction settings: runtime --config support is required")
             tools = list(CAD_SESSION_TOOLS)
             if overlay is not None:
                 extra += ("--config", overlay)
@@ -1654,6 +1755,47 @@ class ChudcodeSessionHost:
             "Agent service executable not found; set CHUDWARE_CHUDCODE_BIN, install the "
             "signed-payload-adjacent chud binary, or put chud on PATH in developer mode"
         )
+
+    def _refresh_compaction(self, session: _Session, params: Mapping[str, Any]) -> None:
+        """Apply changed policy at an idle turn boundary, preserving durable history.
+
+        RPC v2 cannot acknowledge a live method-order change. Immutable overlays and
+        a new connection avoid racing its config watcher or changing another run.
+        """
+        settings = _turn_compaction_settings(params)
+        if settings == session.compaction_settings:
+            return
+        state = _safe_client_state(session.client)
+        if state.get("isStreaming") or state.get("hasPendingAsyncWork"):
+            raise RuntimeError("Cannot change compaction while the session has active work")
+        resume_file = state.get("sessionFile") or state.get("session_file")
+        if not isinstance(resume_file, str) or not Path(resume_file).is_file():
+            raise RuntimeError("Cannot change compaction without the persisted session history")
+        replacement = self._make_client(params, no_session=False, resume_file=resume_file)
+        try:
+            _start_client(replacement)
+        except Exception:
+            _stop_client(replacement)
+            raise
+        with self._lock:
+            if session.closed or self._shutdown:
+                _stop_client(replacement)
+                raise RuntimeError("chudcode RPC session was closed")
+            old_client = session.client
+            session.client = replacement
+        _stop_client(old_client)
+        try:
+            replacement.switch_session(resume_file)
+            if settings.get("enabled", True) and session.auto_compaction is not None:
+                replacement.set_auto_compaction(session.auto_compaction)
+            if session.auto_retry is not None:
+                replacement.set_auto_retry(session.auto_retry)
+            session.compaction_settings = settings
+            session.launch_params = _client_launch_params(params)
+        except Exception:
+            with self._lock:
+                session.closed = True
+            raise
 
     def _configure_turn(self, session: _Session, params: Mapping[str, Any]) -> None:
         client = session.client
@@ -1712,8 +1854,10 @@ class ChudcodeSessionHost:
             client.set_interrupt_mode(interrupt)
         if isinstance(settings.get("auto_compaction"), bool):
             client.set_auto_compaction(settings["auto_compaction"])
+            session.auto_compaction = settings["auto_compaction"]
         if isinstance(settings.get("auto_retry"), bool):
             client.set_auto_retry(settings["auto_retry"])
+            session.auto_retry = settings["auto_retry"]
         subscription = _nonempty_string(settings.get("subagent_subscription"))
         if subscription:
             client.request_raw("set_subagent_subscription", level=subscription)
@@ -2501,16 +2645,30 @@ def _session_memory_backend(params: Mapping[str, Any], workspace: str | None) ->
     return DEFAULT_MEMORY_BACKEND
 
 
-def _cad_session_overlay(memory: str) -> str | None:
-    """Path of the CAD session settings overlay, (re)written when its content differs.
+def _client_launch_params(params: Mapping[str, Any]) -> dict[str, Any]:
+    # Retain process identity, not a turn's prompt, callbacks, or CAD tool bindings.
+    return {key: params[key] for key in (
+        "workspace_dir", "chudcode_session_dir", "system_prompt", "memory_backend",
+        "web_actor", "web_key_source", "web_tenant", "web_provider", "web_credential",
+        "byok_key", "byok_tenant", "byok_provider",
+    ) if key in params}
 
-    Returns ``None`` when the file cannot be written; the session then starts without it
-    rather than not at all.
-    """
+
+def _turn_compaction_settings(params: Mapping[str, Any]) -> dict[str, Any]:
+    settings = params.get("settings")
+    value = settings.get("compaction_settings") if isinstance(settings, Mapping) else None
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _cad_session_overlay(memory: str, compaction: Mapping[str, Any] | None = None) -> str | None:
+    """Immutable policy overlay: one session must never rewrite another's settings."""
     from services import paths
 
     content = _CAD_SESSION_SETTINGS + _CAD_MEMORY_SETTINGS[memory]
-    target = Path(paths.ROOT) / "chudcode" / f"cad-session-{memory}.yml"
+    if compaction:
+        content += "compaction: " + json.dumps(dict(compaction), sort_keys=True) + "\n"
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+    target = Path(paths.ROOT) / "chudcode" / f"cad-session-{memory}-{digest}.yml"
     try:
         if target.is_file() and target.read_text(encoding="utf-8") == content:
             return str(target)
@@ -2520,6 +2678,8 @@ def _cad_session_overlay(memory: str) -> str | None:
             handle.write(content)
         os.replace(tmp, target)
     except OSError as exc:
+        if compaction:
+            raise RuntimeError("Cannot write the selected compaction settings") from exc
         _LOG.warning("CAD session settings overlay unavailable: %s", exc)
         return None
     return str(target)
@@ -2813,6 +2973,17 @@ def _provider_error_detail(raw: Any) -> str:
     if isinstance(text, str) and text.strip():
         return f"{status} {text.strip()}" if status.isdigit() else text.strip()
     return head
+
+
+def _turn_budget_seconds(timeout: Any) -> float | None:
+    """The caller's explicit turn budget, or ``None`` for a turn with no wall-clock stop."""
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float, str)):
+        return None
+    try:
+        budget = float(timeout)
+    except ValueError:
+        return None
+    return budget if math.isfinite(budget) and budget > 0 else None
 
 
 def _is_wait_timeout(exc: BaseException) -> bool:

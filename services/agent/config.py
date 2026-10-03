@@ -1201,11 +1201,13 @@ def autolearn_min_tool_calls(cfg: dict | None = None) -> int:
     return max(1, n)
 
 
-# --------------------------------------------------------------------------- offline compaction
-# These knobs are consumed only by explicit offline/standalone text compaction.
-# Online sessions delegate compaction, retry, and cache policy to Chudcode.
+# --------------------------------------------------------------------------- compaction
+# agent.compaction_strategy is the user's compaction choice (Settings → AI → Compaction).
+# Online sessions hand it to Chudcode as `compaction.*` settings of the conversation
+# process (online_compaction_settings); explicit offline/standalone text compaction
+# reads the same keys.
 #
-#   agent.compaction_strategy ∈ "off"|"snapcompact"|"shake"|"summary"
+#   agent.compaction_strategy ∈ "auto"|"off"|"snapcompact"|"shake"|"summary"
 #   agent.compaction.supersede_reads bool (default true)
 #   agent.compaction.drop_useless bool (default true)
 #   agent.compaction.keep_recent_tokens int (default 20000)
@@ -1213,11 +1215,22 @@ def autolearn_min_tool_calls(cfg: dict | None = None) -> int:
 COMPACTION_STRATEGY_KEY = "compaction_strategy"
 COMPACTION_KEY = "compaction"
 
-DEFAULT_COMPACTION_STRATEGY: str = "off"
-VALID_COMPACTION_STRATEGIES = frozenset({"off", "snapcompact", "shake", "summary"})
+DEFAULT_COMPACTION_STRATEGY: str = "auto"
+VALID_COMPACTION_STRATEGIES = frozenset({"auto", "off", "snapcompact", "shake", "summary"})
 DEFAULT_COMPACTION_SUPERSEDE_READS: bool = True
 DEFAULT_COMPACTION_DROP_USELESS: bool = True
 DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: int = 20_000
+#: Chudcode `compaction.methodOrder` for each explicit strategy. One method each: the
+#: runtime walks the order and falls through to the next entry when a method is
+#: unusable or fails, so a longer list would silently run a strategy the user did not
+#: pick (a GPT session with the user's global [shake, remote, soft] ran shake under
+#: "Summary"). "summary" is Chudcode's `soft` method — an in-place, model-written
+#: summary; `remote` (provider-native server compaction) is not a readable recap.
+ONLINE_COMPACTION_METHODS: dict[str, tuple[str, ...]] = {
+    "snapcompact": ("snapcompact",),
+    "shake": ("shake",),
+    "summary": ("soft",),
+}
 
 
 def _agent_block(cfg: dict | None = None) -> dict:
@@ -1229,15 +1242,23 @@ def _agent_block(cfg: dict | None = None) -> dict:
 
 
 def get_compaction_strategy(cfg: dict | None = None) -> str:
-    """Return ``agent.compaction_strategy`` (default ``\"off\"``).
+    """Return ``agent.compaction_strategy`` (default ``\"auto\"``).
 
-    Values: ``off`` | ``snapcompact`` | ``shake`` | ``summary``.
-    Unknown values fall back to :data:`DEFAULT_COMPACTION_STRATEGY`.
+    Values: ``auto`` | ``off`` | ``snapcompact`` | ``shake`` | ``summary``. A missing
+    or empty value is the default. Any other value raises :class:`ValueError`: an
+    unrecognized choice is never silently replaced by a different strategy.
     """
     agent = _agent_block(cfg)
-    raw = agent.get(COMPACTION_STRATEGY_KEY, DEFAULT_COMPACTION_STRATEGY)
-    s = str(raw or DEFAULT_COMPACTION_STRATEGY).strip().lower()
-    return s if s in VALID_COMPACTION_STRATEGIES else DEFAULT_COMPACTION_STRATEGY
+    raw = agent.get(COMPACTION_STRATEGY_KEY)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return DEFAULT_COMPACTION_STRATEGY
+    strategy = raw.strip().lower() if isinstance(raw, str) else None
+    if strategy not in VALID_COMPACTION_STRATEGIES:
+        raise ValueError(
+            f"agent.{COMPACTION_STRATEGY_KEY} {raw!r} is not one of "
+            + ", ".join(sorted(VALID_COMPACTION_STRATEGIES))
+        )
+    return strategy
 
 
 def get_compaction_config(cfg: dict | None = None) -> dict:
@@ -1268,6 +1289,30 @@ def get_compaction_config(cfg: dict | None = None) -> dict:
         "drop_useless": _bool("drop_useless", DEFAULT_COMPACTION_DROP_USELESS),
         "keep_recent_tokens": keep,
     }
+
+
+def online_compaction_settings(cfg: dict | None = None) -> tuple[str, dict]:
+    """Return ``(strategy, chudcode_settings)`` for an online conversation process.
+
+    ``chudcode_settings`` holds Chudcode ``compaction.*`` sub-keys (``compaction.<key>``
+    in its config): the exposed read-pruning switches always, plus for an explicit
+    strategy ``enabled`` and (unless ``off``) a one-method ``methodOrder``. ``auto``
+    leaves enablement and method order to the agent service's own configuration.
+    Raises :class:`ValueError` for an unrecognized ``agent.compaction_strategy``.
+    """
+    strategy = get_compaction_strategy(cfg)
+    nested = get_compaction_config(cfg)
+    settings: dict = {
+        "supersedeReads": nested["supersede_reads"],
+        "dropUseless": nested["drop_useless"],
+        "keepRecentTokens": nested["keep_recent_tokens"],
+    }
+    if strategy == "off":
+        settings["enabled"] = False
+    elif strategy != "auto":
+        settings["enabled"] = True
+        settings["methodOrder"] = list(ONLINE_COMPACTION_METHODS[strategy])
+    return strategy, settings
 
 
 BUG_REPORTS_KEY = "bug_reports"

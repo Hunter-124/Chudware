@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <ctime>
 #include <exception>
@@ -1025,19 +1026,21 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                     sendAgentEvent(requester, encoded.c_str());
                 };
             }
-            // An online turn's budget is the caller's `timeout` (seconds; the GUI's jobs.cpp
-            // always sends it). The bridge wait is an IDLE bound (each streamed
-            // line restarts WorkerBridge::readLine), sized past that budget so the worker's
-            // structured "turn timed out" reply always arrives first. Everything else keeps
-            // the ordinary 120 s bound.
+            // An online turn's budget is the caller's optional `timeout` (seconds). The
+            // bridge wait is an IDLE bound (each streamed line restarts
+            // WorkerBridge::readLine), sized past that budget so the worker's structured
+            // "turn_budget" reply always arrives first. A turn without a budget has no
+            // wall-clock stop (-1): it ends on its reply, Stop over the control lane,
+            // worker death or bridge stop. Everything else keeps the ordinary 120 s bound.
             int workerTimeoutMs = 120000;
             if (method == "agent_admin_turn") {
-                double budgetS = 7200.0;
+                workerTimeoutMs = -1;
                 const auto t = p.find("timeout");
-                if (t != p.end() && t->is_number() && t->get<double>() > 0)
-                    budgetS = t->get<double>();
-                const double ms = (budgetS + 60.0) * 1000.0;
-                workerTimeoutMs = ms >= 2147483647.0 ? 2147483647 : (int)ms;
+                if (t != p.end() && t->is_number() && std::isfinite(t->get<double>()) &&
+                    t->get<double>() > 0) {
+                    const double ms = (t->get<double>() + 60.0) * 1000.0;
+                    workerTimeoutMs = ms >= 2147483647.0 ? 2147483647 : (int)ms;
+                }
             }
             const bool workerOk =
                 WorkerBridge::forMethod(method).call(method, p, wresult, werr,
@@ -1135,7 +1138,7 @@ bool Server::agentWorkInFlight() const {
 }
 
 // Background watchdog bounds engine calls that cannot be interrupted in-process.
-// Agent turns use their own streaming silence/absolute caps, not this wall-clock tier.
+// Agent turns end on their caller's optional budget, Stop, or worker death, not this tier.
 void Server::watchdogLoop() {
     const long long longCeilingMs = engineWatchdogLongMs();
     while (!stopping_.load()) {

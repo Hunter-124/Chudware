@@ -888,12 +888,10 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
     // reported to the user as `non_modeling_request` — "nothing was changed" — while the
     // part sat in the feature tree. The worker STREAMS every event onto this run's stream
     // (the notification branch below), so bytes on its stdout are proof of liveness: time
-    // out on SILENCE, not on duration. The absolute cap remains only as a backstop
-    // against a worker that streams forever without ever answering; the Stop button,
-    // polled every iteration, stays the user's real escape hatch.
+    // out on SILENCE, not on duration. There is no absolute wall-clock cap: a 2 h one
+    // stopped healthy long turns mid-build. A worker that streams without answering is
+    // ended by the Stop button, polled every iteration, or by its own death.
     constexpr auto kIdleTimeout = std::chrono::minutes(5);
-    constexpr auto kAbsoluteCap = std::chrono::hours(2);
-    const auto hard_deadline = std::chrono::steady_clock::now() + kAbsoluteCap;
     auto idle_deadline = std::chrono::steady_clock::now() + kIdleTimeout;
     std::string read_buf;
     constexpr size_t kMaxWorkerLine = 64u * 1024u * 1024u;
@@ -922,11 +920,8 @@ bool call_admin_worker_turn(const std::string& request, const std::string& run_i
         }
         scan_from = read_buf.size();
         if (nl == std::string::npos) {
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= idle_deadline || now >= hard_deadline) {
-                err = (now >= hard_deadline)
-                          ? "admin worker never answered within the 2h absolute cap"
-                          : "timeout waiting for admin worker response (no output for 5 min)";
+            if (std::chrono::steady_clock::now() >= idle_deadline) {
+                err = "timeout waiting for admin worker response (no output for 5 min)";
                 timed_out = true;
                 break;
             }

@@ -247,6 +247,8 @@ public:
     // Send {method, params}; block until the matching response. Returns the "result"
     // object on success; fills err and returns false on transport/rpc error. While
     // waiting, any matching "event" notification lines are delivered to onEvent (if set).
+    // timeoutMs < 0 has no deadline (daemon socket and local pipe alike): the call ends on
+    // its response, peer/child loss or teardown abort.
     bool call(const std::string& method, const nlohmann::json& params,
               nlohmann::json& result, std::string& err, int timeoutMs = 120000,
               const EventFn& onEvent = {});

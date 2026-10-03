@@ -1614,7 +1614,7 @@ WorkerClient::ReadLineResult WorkerClient::readLine(std::string &line,
       readBuf_.erase(0, nl + 1);
       return ReadLineResult::Line;
     }
-    if ((int)(GetTickCount64() - start) > timeoutMs)
+    if (timeoutMs >= 0 && (int)(GetTickCount64() - start) > timeoutMs)
       return ReadLineResult::Timeout;
 
     DWORD avail = 0;
@@ -1663,7 +1663,7 @@ WorkerClient::ReadLineResult WorkerClient::readLine(std::string &line,
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::steady_clock::now() - start)
                        .count();
-    if ((int)elapsed > timeoutMs)
+    if (timeoutMs >= 0 && (int)elapsed > timeoutMs)
       return ReadLineResult::Timeout;
 
     struct pollfd pfd;

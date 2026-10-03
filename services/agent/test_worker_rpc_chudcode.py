@@ -615,8 +615,8 @@ def test_persistent_reuse_one_time_history_seed_and_mapped_streaming(online_lane
     assert "Earlier question" in online_lane.host.turns[0]["request"]
     assert online_lane.host.turns[1]["request"] == "Continue"
     assert online_lane.host.turns[0]["system_prompt"] == "RESOLVED ROLE PROMPT"
-    # The turn budget is the caller's (mission driver --timeout-s); an absent one leaves
-    # the host's absolute cap in force rather than inventing a number.
+    # The turn budget is the caller's (mission driver --timeout-s); an absent one means no
+    # wall-clock stop rather than an invented number.
     assert "timeout" not in online_lane.host.turns[0]
     assert online_lane.host.turns[1]["timeout"] == 14400.0
     assert [tool.name for tool in online_lane.host.turns[0]["host_tools"]] == [
@@ -632,6 +632,13 @@ def test_persistent_reuse_one_time_history_seed_and_mapped_streaming(online_lane
         "auto_retry": False,
         # Sub-agent CAD calls reach the trace/watchdog only via subagent_event frames.
         "subagent_subscription": "events",
+        # No agent.compaction_strategy configured: the agent service's own order.
+        "compaction_strategy": "auto",
+        "compaction_settings": {
+            "supersedeReads": True,
+            "dropUseless": True,
+            "keepRecentTokens": 20000,
+        },
     }
     assert online_lane.host.turns[0]["attachments"] == [
         {"path": "/tmp/image.png", "kind": "image", "mime": "image/png"}
@@ -1166,11 +1173,13 @@ def test_legacy_session_adapters_never_rewrite_online_chudcode_history(monkeypat
         shake_session=lambda *args, **kwargs: shake_calls.append((args, kwargs)),
     )
     monkeypatch.setattr(worker_rpc, "_cmds", lambda: commands)
+    monkeypatch.setattr(
+        config, "load_config", lambda: {"agent": {"compaction_strategy": "summary"}}
+    )
 
     compact = worker_rpc.SESSION_METHODS["session_compact"](
         {
             "session_id": "live",
-            "strategy": "off",
             "messages": [{"role": "user", "content": "must survive"}],
             "provider": "removed-provider",
             "instructions": "Keep decisions",
@@ -1189,9 +1198,11 @@ def test_legacy_session_adapters_never_rewrite_online_chudcode_history(monkeypat
         "ok": True,
         "summary": "trimmed",
         "short_summary": "short",
+        "strategy": "summary",
         "firstKeptEntryId": "entry-3",
         "tokensBefore": 400,
     }
+    assert compact_calls[0][2]["compaction_settings"]["methodOrder"] == ["soft"]
     assert compact_calls[0][1] == "chudcode"
     assert compact_calls[0][2]["session_id"] == "live"
     assert compact_calls[0][2]["instructions"] == "Keep decisions"
@@ -1217,3 +1228,53 @@ def test_online_registration_uses_only_chudcode(online_lane, monkeypatch):
     assert result["ok"] is True
     assert worker_rpc.ADMIN_METHODS["agent_admin_turn"] is worker_rpc._agent_admin_turn
     assert worker_rpc._agent_admin_turn is not forbidden
+
+
+@pytest.mark.parametrize("budget", [None, 600.0])
+def test_auto_rate_limit_fallback_keeps_the_callers_budget_or_none(
+    online_lane, monkeypatch, budget
+):
+    """The Auto cost-class fallback used to share an invented 7200 s budget, so a GUI turn
+    that fell back got a hidden two-hour stop. No caller budget means none on the
+    fallback either; an explicit one is shared across the fallbacks."""
+    from services.agent import role_models
+
+    first = role_models.RoleModelAssignment(
+        role="chat", provider="anthropic-sub", model="claude-sub", mode="auto"
+    )
+    fallback = role_models.RoleModelAssignment(
+        role="chat", provider="openai", model="gpt-test", mode="auto"
+    )
+    real_resolve = worker_rpc.resolve_model_and_effort
+
+    def auto_resolve(*args, **kwargs):
+        preferences, provider, model, _assignment, _candidates = real_resolve(*args, **kwargs)
+        return preferences, provider, model, first, [{"provider": "openai", "model": "gpt-test"}]
+
+    monkeypatch.setattr(worker_rpc, "resolve_model_and_effort", auto_resolve)
+    monkeypatch.setattr(role_models, "resolve_role_model", lambda *a, **k: fallback)
+
+    real_run_turn = online_lane.host.run_turn
+    turn_budgets: list[object] = []
+
+    def rate_limited_once(params, emit):
+        turn_budgets.append(params.get("timeout", "absent"))
+        if len(turn_budgets) == 1:
+            online_lane.host.turns.append(params)
+            return {"ok": False, "reason": "429 rate limit exceeded after retries"}
+        return real_run_turn(params, emit)
+
+    monkeypatch.setattr(online_lane.host, "run_turn", rate_limited_once)
+    extra = {} if budget is None else {"timeout": budget}
+
+    result = worker_rpc._agent_admin_turn(
+        _params(online_lane, run_id=f"auto-{budget}", **extra), lambda _event: None
+    )
+
+    assert result["ok"] is True, result
+    assert len(turn_budgets) == 2
+    if budget is None:
+        assert turn_budgets == ["absent", "absent"]
+    else:
+        assert turn_budgets[0] == budget
+        assert 0 < turn_budgets[1] <= budget

@@ -283,6 +283,7 @@ def _chudcode_session_call(
     session_id: str | None,
     command: str,
     params: dict[str, Any] | None = None,
+    **host_options: Any,
 ) -> dict[str, Any]:
     key = str(session_id or "").strip()
     if not key:
@@ -295,7 +296,9 @@ def _chudcode_session_call(
             get_default_chudcode_host,
         )
 
-        result = get_default_chudcode_host().session_call(key, command, params)
+        result = get_default_chudcode_host().session_call(
+            key, command, params, **host_options
+        )
     except Exception as exc:  # noqa: BLE001 - process boundary
         raise SessionCommandUnavailable(
             f"Agent session {command} unavailable: {exc}"
@@ -424,10 +427,13 @@ def compact_session(
     session_id: str | None = None,
     instructions: str | None = None,
     standalone: bool = False,
+    compaction_settings: dict[str, Any] | None = None,
 ) -> dict:
     """Compact one session without creating a second compaction authority.
 
-    A live online session delegates to Chudcode's ``compact`` command. Local
+    A live online session delegates to Chudcode's ``compact`` command, run with
+    ``compaction_settings`` (Chudcode ``compaction.*`` sub-keys of the persisted
+    Compaction setting) so the method is the user's current choice. Local
     transcript rewriting is available only with ``standalone=True`` or when
     Chudware is explicitly offline.
     """
@@ -444,7 +450,11 @@ def compact_session(
         note = str(instructions or "").strip()
         if note:
             payload["customInstructions"] = note
-        return _chudcode_session_call(session_id, "compact", payload)
+        if compaction_settings is None:
+            return _chudcode_session_call(session_id, "compact", payload)
+        return _chudcode_session_call(
+            session_id, "compact", payload, compaction_settings=compaction_settings
+        )
 
     comp = importlib.import_module("services.agent.compaction")
     if strat == "shake":

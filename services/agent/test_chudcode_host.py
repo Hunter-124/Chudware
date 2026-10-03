@@ -14,7 +14,6 @@ from services.agent import chudcode_host as chudcode_host_module
 
 from services.agent.chudcode_host import (
     ChudcodeSessionHost,
-    _TURN_ABSOLUTE_CAP_SECONDS,
     _WIRE_NAME_OVERRIDES,
     _camel,
     _set_default_chudcode_host_for_tests,
@@ -2280,22 +2279,184 @@ def test_shutdown_cancels_an_inflight_transient_login_once():
     assert "result" in outcome
 
 
-def test_turn_budget_is_explicit_and_not_the_rpc_client_short_wait_default():
-    """Passing no timeout inherits chudcode-rpc's 60s `_wait_for_agent_end` default, which
-    killed every real modeling turn mid-build with `Timed out waiting for agent_end` and an
-    empty stderr. The host must name its own budget; a caller-supplied timeout still wins."""
-    factory = FakeFactory()
-    host = ChudcodeSessionHost(client_factory=factory)
-    try:
-        result, _events = run(host, "budget")
-        assert result["ok"] is True
-        assert factory.clients[0].idle_timeouts == [_TURN_ABSOLUTE_CAP_SECONDS]
-        assert _TURN_ABSOLUTE_CAP_SECONDS > 60.0
 
-        run(host, "budget", run_id="run-budget-2", timeout=12)
-        assert factory.clients[0].idle_timeouts[-1] == 12.0
+
+class _ControlledClock:
+    def __init__(self) -> None:
+        self.now = 10_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _long_turn_host(monkeypatch, *, needs_s, settles_on_abort=True, on_slice=None):
+    """A host whose Chudcode run needs `needs_s` of controlled time to settle.
+
+    Each `wait_for_idle(timeout)` slice that ends before the run settles advances the
+    clock by `timeout` and raises the RPC client's wait timeout, exactly like a real
+    chudcode_rpc wait on a healthy, still-working run.
+    """
+    clock = _ControlledClock()
+    monkeypatch.setattr(chudcode_host_module, "_monotonic", clock)
+    factory = FakeFactory()
+
+    class LongTurn(FakeClient):
+        prompted_at = 0.0
+
+        def prompt(self, message, *, images=None):
+            super().prompt(message, images=images)
+            self.prompted_at = clock.now
+
+        def wait_for_idle(self, timeout=None):
+            self.idle_timeouts.append(timeout)
+            assert timeout is not None, "None is chudcode_rpc's 60 s default, not a turn wait"
+            assert len(self.idle_timeouts) < 10_000, "the turn wait never ended"
+            if on_slice is not None:
+                on_slice(self, clock)
+            aborted = "abort" in call_names(self)
+            elapsed = clock.now - self.prompted_at
+            if aborted and settles_on_abort:
+                return super().wait_for_idle(timeout)
+            if not aborted and elapsed + timeout >= needs_s:
+                clock.now += needs_s - elapsed
+                return super().wait_for_idle(timeout)
+            clock.now += timeout
+            raise TimeoutError("Timed out waiting for prompt_result. Stderr: ")
+
+    def make_client(**kwargs):
+        client = LongTurn(factory, **kwargs)
+        factory.clients.append(client)
+        return client
+
+    return ChudcodeSessionHost(client_factory=make_client), factory, clock
+
+
+_OLD_TWO_HOUR_STOP_S = 2 * 60 * 60.0
+
+
+def test_unbudgeted_turn_runs_past_the_old_two_hour_stop(monkeypatch):
+    """A GUI turn sends no budget. It used to inherit a 2 h default and get aborted as
+    `turn_budget` while the agent was healthy and still building (user report,
+    2026-10-03). Without a budget the run ends only at its own terminal agent_end."""
+    host, factory, clock = _long_turn_host(monkeypatch, needs_s=3 * _OLD_TWO_HOUR_STOP_S)
+    try:
+        start = clock.now
+        result, emitted = run(host, "marathon", run_id="r-marathon")
+        client = factory.clients[0]
+
+        assert clock.now - start >= 3 * _OLD_TWO_HOUR_STOP_S
+        assert result["ok"] is True, result
+        assert result.get("stop_reason") is None
+        assert result["cancelled"] is False
+        assert result["terminal"]["isTerminal"] is True
+        assert "abort" not in call_names(client)
+        assert any(f.get("type") == "agent_end" for f in emitted)
+        assert sum(client.idle_timeouts) >= 3 * _OLD_TWO_HOUR_STOP_S
     finally:
         host.shutdown()
+
+
+def test_explicit_budget_still_aborts_a_long_turn_exactly_once(monkeypatch):
+    host, factory, clock = _long_turn_host(monkeypatch, needs_s=3 * _OLD_TWO_HOUR_STOP_S)
+    try:
+        start = clock.now
+        result, emitted = run(host, "budgeted", run_id="r-budgeted", timeout=5400)
+        client = factory.clients[0]
+
+        assert result["ok"] is False
+        assert result["stop_reason"] == "turn_budget"
+        assert "1 h 30 min" in result["reason"]
+        assert client.idle_timeouts[0] == 5400.0
+        assert clock.now - start == 5400.0
+        assert call_names(client).count("abort") == 1
+        assert result["terminal"]["aborted"] is True
+        assert any(f.get("type") == "agent_end" and f.get("aborted") for f in emitted)
+        assert host.cancel("r-budgeted")["active"] is False
+        assert call_names(client).count("abort") == 1
+    finally:
+        host.shutdown()
+
+
+def test_stop_ends_an_unbudgeted_turn_past_two_hours(monkeypatch):
+    host_ref: dict[str, ChudcodeSessionHost] = {}
+    stops: list[dict] = []
+
+    def stop_after_three_hours(client, clock):
+        if not stops and clock.now - client.prompted_at > 1.5 * _OLD_TWO_HOUR_STOP_S:
+            stops.append(host_ref["host"].cancel("r-stop"))
+
+    host, factory, _clock = _long_turn_host(
+        monkeypatch, needs_s=10 * _OLD_TWO_HOUR_STOP_S, on_slice=stop_after_three_hours
+    )
+    host_ref["host"] = host
+    try:
+        result, emitted = run(host, "stop", run_id="r-stop")
+        client = factory.clients[0]
+
+        assert stops == [{"ok": True, "run_id": "r-stop", "cancelled": True, "active": True}]
+        assert result["ok"] is True
+        assert result["cancelled"] is True
+        assert result["terminal"]["aborted"] is True
+        assert call_names(client).count("abort") == 1
+        assert any(f.get("type") == "agent_end" and f.get("aborted") for f in emitted)
+        assert host.status(run_id="r-stop")["active"] is False
+    finally:
+        host.shutdown()
+
+
+def test_stop_that_never_settles_still_releases_an_unbudgeted_turn(monkeypatch):
+    """Unbounded waiting must stay cancellable even if Chudcode never confirms the abort:
+    after the abort grace the turn reports cancelled instead of holding the lane forever."""
+    host_ref: dict[str, ChudcodeSessionHost] = {}
+    stopped_at: list[int] = []
+
+    def stop_on_third_slice(client, _clock):
+        if not stopped_at and len(client.idle_timeouts) == 3:
+            stopped_at.append(len(client.idle_timeouts))
+            host_ref["host"].cancel("r-stuck")
+
+    host, factory, clock = _long_turn_host(
+        monkeypatch,
+        needs_s=10 * _OLD_TWO_HOUR_STOP_S,
+        settles_on_abort=False,
+        on_slice=stop_on_third_slice,
+    )
+    host_ref["host"] = host
+    try:
+        result, _emitted = run(host, "stuck", run_id="r-stuck")
+        client = factory.clients[0]
+
+        assert result["ok"] is True
+        assert result["cancelled"] is True
+        assert result["terminal"] is None
+        assert call_names(client).count("abort") == 1
+        # Bounded by the abort grace, not by another long clock.
+        slices_after_stop = client.idle_timeouts[stopped_at[0]:]
+        assert sum(slices_after_stop) <= 2 * chudcode_host_module._BUDGET_ABORT_GRACE_SECONDS
+        assert host.status(run_id="r-stuck")["active"] is False
+        assert client.stop_count == 1
+    finally:
+        host.shutdown()
+
+
+def test_process_death_ends_an_unbudgeted_turn(monkeypatch):
+    def die_after_two_hours(client, clock):
+        if clock.now - client.prompted_at > _OLD_TWO_HOUR_STOP_S:
+            raise RuntimeError("chudcode RPC process exited (code 137)")
+
+    host, factory, _clock = _long_turn_host(
+        monkeypatch, needs_s=10 * _OLD_TWO_HOUR_STOP_S, on_slice=die_after_two_hours
+    )
+    try:
+        result, _emitted = run(host, "dies", run_id="r-dies")
+
+        assert result["ok"] is False
+        assert "process exited" in result["reason"]
+        assert "abort" not in call_names(factory.clients[0])
+    finally:
+        host.shutdown()
+
+
 
 
 def test_budget_expiry_stops_the_run_instead_of_orphaning_it():
@@ -2431,6 +2592,8 @@ def test_real_rpc_client_protocol_covers_transient_and_live_session_calls(tmp_pa
                         "queuedMessageCount": 0,
                         "dumpTools": [{"name": "eval", "description": "Evaluate", "parameters": {"type": "object"}}],
                     })
+                elif kind == "get_entries":
+                    respond(request_id, kind, {"entries": [], "leafId": None})
                 elif kind == "get_last_assistant_text":
                     respond(request_id, kind, {"text": "done"})
                 elif kind == "get_session_stats":

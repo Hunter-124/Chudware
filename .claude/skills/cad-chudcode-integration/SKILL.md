@@ -80,10 +80,12 @@ log the token or move control back onto the serialized stdio lane.
   idempotent. Pre-start steering queues until immediately after `prompt()`.
 - A turn must observe terminal `agent_end` after `wait_for_idle`; idle without it is a protocol
   error. Event-forwarding errors fail the result rather than hiding a broken UI boundary.
-- The caller's `timeout` bounds the RUN, not just the wait: on `wait_for_idle` timeout
-  `run_turn` aborts the run once, waits `_BUDGET_ABORT_GRACE_SECONDS` (30 s, below hostd's
-  +60 s bridge slack) for its terminal frame, and returns `stop_reason:"turn_budget"` with
-  the session left live for "continue". Never return from a timed-out wait without aborting.
+- Online turns have no implicit time limit. Missing/zero `timeout` waits in 30 s slices:
+  `RpcClient.wait_for_idle(None)` is a 60 s default, not an unlimited wait. A positive
+  caller `timeout` bounds the RUN: expiry aborts once, waits 30 s for the terminal,
+  then returns `stop_reason:"turn_budget"`. A confirmed abort leaves history live for
+  continue; an unconfirmed abort disposes the connection so unseen work cannot survive.
+  `run_mission.py --timeout-s 0` is unbounded; native transport timeout `-1` is unbounded.
 - `agent_end` is not success. `chudcode_host._unrecovered_provider_failure` returns
   `ok:false, stop_reason:"provider_error"` when the turn's last assistant record is a failure:
   a failed retry (`auto_retry_end success:false`) or a non-retryable rejection, which Chudcode
@@ -183,7 +185,7 @@ runtime's doctor command.
    Chudcode 0.4.0 supports it). Sub-agents inherit that ceiling. The shared
    service client stays unrestricted.
 8c. **CAD session overlay (2026-09-28).** `_make_client` passes
-   `--config <data>/chudcode/cad-session-<backend>.yml` (`_cad_session_overlay`, gated on
+   `--config <data>/chudcode/cad-session-<backend>-<content-hash>.yml` (`_cad_session_overlay`, gated on
    `--help`). It disables user-level context files (`context-file:user:*` — Hunter's
    `~/.claude/CLAUDE.md` dev brief made gpt-6-sol pull/commit/push a firmware repo) and pins
    memory: the GUI's "Project memory" (`agent.memory_backend` = off | sharpshooter |
@@ -203,6 +205,16 @@ runtime's doctor command.
    is available inside `eval` through `browser` and `computer` preludes; the CAD
    overlay pins `browser.enabled: true` and `computer.enabled: true`, not
    standalone `--tools` entries.
+8e. **The Compaction choice governs online sessions (2026-10-03).** `online_turn`
+   translates Summary to `methodOrder: [soft]`, Shake to `[shake]`, Snapcompact to
+   `[snapcompact]`, Off to `enabled: false`, and Automatic leaves runtime policy intact.
+   Supersede/drop/keep-recent options accompany the choice. Overlays are immutable and
+   content-keyed; never rewrite a shared watched overlay for a different session.
+   Chudcode 0.4.1 has no acknowledged method-setting RPC. A changed choice refreshes
+   only an idle connection at the next turn or manual compact, resuming the exact saved
+   history; unchanged connections stay persistent. Eval scratch state resets on that
+   refresh. Explicit auto-compaction/retry switches survive. Manual compact names the
+   committed entry's actual method, never a guessed default.
 8d. **CAD calls made inside eval get feed rows (2026-09-28).** eval's `tool.write("xd://…")`
    reaches the host under an eval-bridge id (`js-write-…`) no tool frame owns, so the feed
    showed only "eval". `run_turn` binds `host_call_observer` on the run context

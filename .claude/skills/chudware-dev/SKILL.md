@@ -297,14 +297,12 @@ judgment).
   and the reply's `size_delivery` names legs outside 0.8–1.25× — the `.vtu` name still
   carries the REQUESTED `h`. `min_size_mm` on `run_fea_static|convergence|contact` lowers
   the size-band floor when a feature-resolution refusal names a size below it.
-- **The turn budget is the caller's (2026-09-07).** `agent_admin_turn` forwards `timeout`
-  to `chudcode_host.wait_for_idle`; without it the host's 2-hour absolute cap kills a long
-  turn with `Timed out waiting for agent_end` regardless of `run_mission.py --timeout-s`
-  (the driver now sends it and waits `--timeout-s + 60`). The GUI does the same since
-  2026-09-24: `buildAgentJobRpcRoute` stamps `timeout` (default 7200 s), `jobs.cpp` waits
-  budget + 120 s and hostd's bridge budget + 60 s; the old fixed 900 000 ms client deadline
-  killed a healthy 15-minute turn mid-tool-call and labelled it `provider_error` (a client
-  wait expiring is now `client_timeout`). An agent-opened doc never takes viewport focus
+- **Online turns have no implicit wall-clock cap (2026-10-03).** The GUI sends no
+  `timeout`; jobs, hostd and worker transports use `-1` for an unbounded reply wait.
+  Python waits in finite slices so Stop and process death remain observable. A caller's
+  explicit positive timeout still bounds the run; clients allow abort/reporting slack
+  (GUI +120 s, hostd +60 s). `run_mission.py --timeout-s 0` runs without a budget.
+  An agent-opened doc never takes viewport focus
   from a user's own tab (`openMirrorTab`); the error card lists only tool failures the turn
   never got past, parsed through `splitToolRowDetail`. OAuth account balancing is
   sticky on the **Chudware session id**, not the resumed Chudcode history: a session id

@@ -7,7 +7,6 @@ T-RF5 with the loop itself.)
 from __future__ import annotations
 
 from services.agent import compaction as compact
-from services.agent import config as agent_config
 
 
 # ---------------------------------------------------------------------------
@@ -266,32 +265,6 @@ def test_reinject_archive() -> None:
     assert injected2[0]["role"] == "user"
 
 
-def test_strategy_config_defaults() -> None:
-    assert agent_config.get_compaction_strategy({}) == "off"
-    assert (
-        agent_config.get_compaction_strategy(
-            {"agent": {"compaction_strategy": "snapcompact"}}
-        )
-        == "snapcompact"
-    )
-    assert (
-        agent_config.get_compaction_strategy({"agent": {"compaction_strategy": "nope"}})
-        == "off"
-    )
-    cc = agent_config.get_compaction_config({})
-    assert cc["supersede_reads"] is True
-    assert cc["drop_useless"] is True
-    assert cc["keep_recent_tokens"] == 20_000
-    for removed in (
-        "compaction_backend",
-        "compaction_snap_frames",
-        "compaction_snap_dir",
-        "compaction_snap_max_frames",
-        "prewalk_enabled",
-        "get_prewalk_target",
-        "handoff_save_to_disk",
-    ):
-        assert not hasattr(agent_config, removed)
 
 
 # ---------------------------------------------------------------------------

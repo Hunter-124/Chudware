@@ -350,12 +350,53 @@ def _as_list(value) -> list:
     return []
 
 
+def _online_manual_compaction_refusal(requested: str | None, configured: str) -> str | None:
+    """Why an online manual compaction cannot honour the requested strategy, if it can't.
+
+    Chudcode's ``compact`` command has no per-call method: it runs the session process's
+    configured ``compaction.methodOrder``, which is the persisted Compaction setting
+    (``agent.compaction_strategy``), and its manual pass never runs ``shake``.
+    """
+    if requested is not None and requested != configured:
+        return (
+            f"compaction_strategy_mismatch: this session compacts with the "
+            f"'{configured}' Compaction setting; set Compaction to '{requested}' in "
+            "Settings → AI to compact with it (applies from the next turn)"
+        )
+    if configured == "shake":
+        return (
+            "manual_shake_unavailable: the agent service runs Shake only as automatic "
+            "compaction; a manual compaction needs Summary or Snapcompact"
+        )
+    if configured == "off":
+        return "compaction_off: Compaction is Off in Settings → AI"
+    return None
+
+
 def _session_compact(params: dict, _emit: Callable) -> dict:
-    """Route live compaction to Chudcode; local rewriting is explicit offline only."""
+    """Route live compaction to Chudcode; local rewriting is explicit offline only.
+
+    Without an explicit ``strategy`` the persisted Compaction setting applies. Online,
+    the result reports ``strategy`` (the setting the session ran with) and ``method``
+    only when the agent service reported the method it actually used.
+    """
     try:
         p = params or {}
         messages = _as_list(p.get("messages"))
-        requested_strategy = str(p.get("strategy") or "off")
+        from services.agent import config as agent_config
+
+        try:
+            configured_strategy, compaction_settings = (
+                agent_config.online_compaction_settings()
+            )
+        except ValueError as exc:
+            return {"ok": False, "reason": f"invalid_compaction_strategy: {exc}", "hint": ""}
+        raw_requested = p.get("strategy")
+        requested_strategy = (
+            raw_requested.strip().lower()
+            if isinstance(raw_requested, str) and raw_requested.strip()
+            else None
+        )
         keep = p.get("keep_recent_tokens", 20000)
         try:
             keep_i = int(keep)
@@ -370,18 +411,27 @@ def _session_compact(params: dict, _emit: Callable) -> dict:
             getattr(commands, "_offline_enabled", lambda: False)()
         )
         local = explicit_local or configured_offline
-        strategy = requested_strategy if local else "chudcode"
-        result = commands.compact_session(
-            messages,
-            strategy,
-            keep_recent_tokens=keep_i,
-            supersede_reads=bool(p.get("supersede_reads", True)),
-            drop_useless=bool(p.get("drop_useless", True)),
-            prior_archive=prior,
-            session_id=str(p.get("session_id") or "") or None,
-            instructions=p.get("instructions"),
-            standalone=explicit_local,
-        )
+        if local:
+            strategy = requested_strategy or configured_strategy
+        else:
+            refusal = _online_manual_compaction_refusal(
+                requested_strategy, configured_strategy
+            )
+            if refusal:
+                return {"ok": False, "reason": refusal, "hint": ""}
+            strategy = "chudcode"
+        compact_kwargs: dict[str, Any] = {
+            "keep_recent_tokens": keep_i,
+            "supersede_reads": bool(p.get("supersede_reads", True)),
+            "drop_useless": bool(p.get("drop_useless", True)),
+            "prior_archive": prior,
+            "session_id": str(p.get("session_id") or "") or None,
+            "instructions": p.get("instructions"),
+            "standalone": explicit_local,
+        }
+        if not local:
+            compact_kwargs["compaction_settings"] = compaction_settings
+        result = commands.compact_session(messages, strategy, **compact_kwargs)
         out = {
             "ok": True,
             "summary": result.get("summary") or "",
@@ -389,6 +439,13 @@ def _session_compact(params: dict, _emit: Callable) -> dict:
             or result.get("shortSummary")
             or "",
         }
+        if not local:
+            out["strategy"] = configured_strategy
+            # The method the agent service recorded on the compaction entry; never
+            # derived from the request or the setting.
+            method = result.get("method")
+            if isinstance(method, str) and method:
+                out["method"] = method
         passthrough_keys = (
             "archive",
             "cut_index",
@@ -3540,6 +3597,13 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             f"agent_admin_turn: prompt assembly failed: {type(exc).__name__}: {exc}"
         )
 
+    try:
+        settings = resolve_settings(
+            raw_params, turn_preferences, provider_name, model_name, cfg
+        )
+    except ValueError as exc:
+        return refuse_before_run(f"invalid_compaction_strategy: {exc}")
+
     categories = _turn_tool_categories(session_id, raw_params.get("categories"))
     tool_context: dict[str, Any] = {
         "role_card": card,
@@ -3582,8 +3646,6 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         return refuse_before_run(
             f"agent_admin_turn: host tool assembly failed: {type(exc).__name__}: {exc}"
         )
-
-    settings = resolve_settings(raw_params, turn_preferences, provider_name, model_name)
 
     migration, claimed_history_seed = _claim_history_seed(
         session_id,
@@ -3635,8 +3697,8 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         host_params["images"] = raw_params["images"][:_ATTACH_MAX]
     if isinstance(raw_params.get("host_uris"), list):
         host_params["host_uris"] = raw_params["host_uris"]
-    # Turn budget. Without it the host waits on its 2-hour absolute cap, which killed
-    # ME 490 convergence turns mid-solve while the mission driver had asked for 4 h.
+    # Turn budget: only an explicit positive finite `timeout` bounds the turn
+    # (run_mission.py --timeout-s). Without one the host has no wall-clock stop.
     raw_timeout = raw_params.get("timeout")
     if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool):
         if math.isfinite(raw_timeout) and raw_timeout > 0:
@@ -3719,7 +3781,9 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             _emit({"kind": "sub_run", **event_context, "id": f"{run_id}:auto",
                    "purpose": assignment.reason, "status": "done"})
         started = time.monotonic()
-        total_timeout = host_params.get("timeout", 7200.0)
+        # None = the caller set no budget: the turn and any Auto fallback have no
+        # wall-clock stop. An explicit budget is shared across the fallbacks.
+        total_timeout = host_params.get("timeout")
         host_result = chudcode_agent_turn(host_params, raw_emit)
         # Chudcode owns retry-after waiting. Only after its retries end in a
         # rate-limit failure may Auto move to the next authenticated cost class.
@@ -3733,8 +3797,11 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             current_class = _COST_CLASS.get(assignment.provider, 5)
             later = [row for row in (auto_candidates or [])
                      if _COST_CLASS.get(row["provider"], 5) > current_class]
-            remaining = total_timeout - (time.monotonic() - started)
-            if not later or remaining <= 0:
+            remaining = (
+                None if total_timeout is None
+                else total_timeout - (time.monotonic() - started)
+            )
+            if not later or (remaining is not None and remaining <= 0):
                 break
             next_class = min(_COST_CLASS.get(row["provider"], 5) for row in later)
             later = [row for row in later if _COST_CLASS.get(row["provider"], 5) == next_class]
@@ -3745,7 +3812,8 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
                    "id": f"{run_id}:auto:{next_class}", "status": "done",
                    "purpose": f"{previous_provider} is still rate-limited after waiting; switching to {assignment.model}."})
             host_params["settings"].update(provider=assignment.provider, model=assignment.model)
-            host_params["timeout"] = remaining
+            if remaining is not None:
+                host_params["timeout"] = remaining
             host_params["request"] = "Continue the current request from the saved state; do not repeat completed actions."
             host_result = chudcode_agent_turn(host_params, raw_emit)
         if not host_result.get("ok"):

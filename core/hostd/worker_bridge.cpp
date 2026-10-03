@@ -717,7 +717,7 @@ bool WorkerBridge::readLine(std::string& line, int timeoutMs) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - start)
                            .count();
-        if ((int)elapsed > timeoutMs) return false;
+        if (timeoutMs >= 0 && (int)elapsed > timeoutMs) return false;
 
         struct pollfd pfd;
         pfd.fd = childStdoutRd_;
@@ -906,10 +906,13 @@ bool WorkerBridge::call(const std::string& method, const json& params, json& res
     // _Exit'ed hostd with the live session's docs (2026-09-27). A non-turn call behind a
     // running turn fails at once — the GUI's single async RPC lane must not sit out its
     // whole timeout per poll — and any other wait ends at the call's own timeout.
-    if (timeoutMs <= 0) timeoutMs = 120000;
+    // timeoutMs < 0 (an agent_admin_turn without a caller budget) has no deadline: the
+    // turn ends on its reply, Stop over the control lane, child death or stop().
+    if (timeoutMs == 0) timeoutMs = 120000;
     const bool longAgentTurn = method == "agent_admin_turn";
+    const bool unbounded = timeoutMs < 0;
     const auto laneDeadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(unbounded ? 0 : timeoutMs);
     std::unique_lock<std::timed_mutex> lk(mtx_, std::defer_lock);
     while (!lk.try_lock_for(std::chrono::milliseconds(50))) {
         bool turnActive = false;
@@ -917,8 +920,12 @@ bool WorkerBridge::call(const std::string& method, const json& params, json& res
             std::lock_guard<std::mutex> controlLock(controlMtx_);
             turnActive = !activeWorkerRunId_.empty();
         }
+        if (stopping_.load(std::memory_order_acquire)) {
+            err = "worker bridge stopping";
+            return false;
+        }
         if ((turnActive && !longAgentTurn) ||
-            std::chrono::steady_clock::now() >= laneDeadline) {
+            (!unbounded && std::chrono::steady_clock::now() >= laneDeadline)) {
             err = turnActive ? "worker lane busy (agent turn in progress)"
                              : "worker lane busy";
             result = json{{"code", "worker_lane_busy"}, {"message", err}};

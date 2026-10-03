@@ -1126,7 +1126,7 @@ static bool tryHandleSkillsListCommand(AppState& st) {
 
 static const SlashItem kSessionSlashItems[] = {
     {SlashKind::Session, "/compact ", "/compact",
-     "Compact conversation [snapcompact|shake|summary]", "ai_panel", true},
+     "Compact conversation with the Compaction setting [summary|snapcompact]", "ai_panel", true},
     {SlashKind::Session, "/shake ", "/shake",
      "Shake loose tokens [elide|images]", "ai_panel", true},
     {SlashKind::Session, "/handoff ", "/handoff",
@@ -1593,7 +1593,10 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
 
     if (cmd == "/compact") {
         if (!needIdle()) return true;
-        std::string strategy = "snapcompact";
+        // No argument = the Compaction setting (Settings > AI). An explicit argument is
+        // sent as-is; the worker refuses one the session cannot honour rather than
+        // compacting with a different method.
+        std::string strategy;
         if (!rest.empty()) {
             std::string arg = rest;
             for (char& c : arg) c = (char)std::tolower((unsigned char)c);
@@ -1606,7 +1609,7 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
         }
         nlohmann::json params = nlohmann::json::object();
         params["messages"] = chatMsgsToWireMessages(st.chat);
-        params["strategy"] = strategy;
+        if (!strategy.empty()) params["strategy"] = strategy;
         // Honor Agents-tab agent.compaction.* (defaults match shared contract).
         int keepRecent = 20000;
         bool supersedeReads = true;
@@ -1649,7 +1652,7 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
                 !st.conversations[st.activeConv].id.empty())
                 params["session_id"] = st.conversations[st.activeConv].id;
         }
-        st.rpc.call("session_compact", params, [&st, strategy](const core::RpcResult& r) {
+        st.rpc.call("session_compact", params, [&st](const core::RpcResult& r) {
             if (slashRpcFailed(st, r, "Couldn't compact this session.")) return;
             if (!r.result.is_object()) {
                 st.toast(ui::ToastLevel::Error, "Couldn't compact this session.");
@@ -1667,9 +1670,20 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
                 notice = r.result["short_summary"].get<std::string>();
             else if (r.result.contains("summary") && r.result["summary"].is_string())
                 notice = r.result["summary"].get<std::string>();
-            if (notice.empty()) notice = "Compacted (" + strategy + ").";
+            // Name only the method the agent service reports it used (the runtime's
+            // compaction entry), never the requested or configured one.
+            const auto methodIt = r.result.find("method");
+            const std::string method = (methodIt != r.result.end() && methodIt->is_string())
+                                           ? methodIt->get<std::string>()
+                                           : std::string();
+            std::string methodLabel = method;
+            if (method == "soft") methodLabel = "summary";
+            else if (method == "remote") methodLabel = "provider-native compaction";
+            if (notice.empty())
+                notice = methodLabel.empty() ? "Compacted." : "Compacted (" + methodLabel + ").";
             pushSessionNotice(st, notice);
-            st.addLog("[..] /compact " + strategy + " ok");
+            st.addLog("[..] /compact ok" + (methodLabel.empty() ? std::string()
+                                                                : " (" + methodLabel + ")"));
         }, 180000);
         st.toast(ui::ToastLevel::Info, "Compacting...");
         return true;
@@ -1780,7 +1794,7 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
     // only when it is not one of our known commands. Known-prefix typos get a usage hint.
     if (cmd == "/help") {
         st.toast(ui::ToastLevel::Info,
-                 "/compact [snapcompact|shake|summary]  /shake [elide|images]  "
+                 "/compact [summary|snapcompact]  /shake [elide|images]  "
                  "/handoff [focus]  /btw <q>  /prewalk  /skills  "
                  "/rule <words> -> <context>  (type / for autocomplete)");
         return true;

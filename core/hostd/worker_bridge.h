@@ -28,7 +28,9 @@ public:
     using EventFn = std::function<void(const nlohmann::json&)>;
 
     // Send {method, params} to the services worker; block until the matching
-    // response (default 120 s — plm_overview on a large project is 10–30 s).
+    // response (default 120 s — plm_overview on a large project is 10–30 s; 0 means that
+    // default). timeoutMs bounds the silence between response lines; < 0 waits without a
+    // deadline (an agent turn with no caller budget) until the reply, child death or stop().
     //
     // Returns true on ok:true (result filled). Returns false on transport
     // failure or ok:false; err is always set on false, and result may hold a
@@ -65,7 +67,7 @@ private:
     bool spawn(std::string& err);
     void reap();  // close fds, waitpid; leaves running_=false
     bool writeLine(const std::string& line);
-    bool readLine(std::string& line, int timeoutMs);
+    bool readLine(std::string& line, int timeoutMs);  // timeoutMs < 0: no deadline
     // One attempt: ensure child, write request, read id-matched response.
     // On write-fail/EOF sets err and returns false (caller may reap+retry).
     bool callOnce(const std::string& method, const nlohmann::json& params,

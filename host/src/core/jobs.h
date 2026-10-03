@@ -37,6 +37,11 @@ struct AgentJobRpcRoute {
 AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::string& docId,
                                       const std::string& convId, bool cam,
                                       const nlohmann::json& extra, bool mission);
+// Client-side wait for a launched route (WorkerClient::call timeoutMs). An online turn with
+// an explicit positive `timeout` budget waits that budget plus slack; one without a budget
+// waits for its response (-1: ends on the terminal reply, Stop, worker/daemon loss or app
+// teardown, never on a wall clock). Explicit offline core runs keep their fixed bound.
+int agentJobWaitMs(const AgentJobRpcRoute& route);
 nlohmann::json normalizeAgentAdminTurnResult(const nlohmann::json& result, bool mission);
 void consumeAgentJobEvent(const std::shared_ptr<JobState>& job, const nlohmann::json& data,
                           bool mission);

@@ -61,6 +61,10 @@ the frame loop in `host/src/app.cpp`.
   saved docs instead use their file path to establish project ownership. The first
   agent mirror may take focus from a pristine, empty active CAD tab
   (`activeOwnDocIsPristine`), not from user work.
+- Sent image thumbnails use `ChatMsg::imagePaths`, copied from the exact model attachment
+  payload on send/steer and persisted by `conversations.cpp` (`images` in compact messages,
+  `imagePaths` in raw archives). Never resolve a marker's basename across paste-cache days:
+  names repeat daily. Legacy records lacking paths keep their marker without a guessed image.
 
 ### CAM / Manufacture internals (native viewport cutover)
 

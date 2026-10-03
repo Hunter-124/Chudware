@@ -5568,3 +5568,9 @@ edited message, unchanged source history, and process retirement. An isolated na
 smoke reproduced the old loss of the live chat tail and confirmed its preservation;
 another exercised rewind refusal, rollback failure, cancellation, background commit,
 branch preservation, and stale callbacks.
+
+## 2026-10-03 — exact sent-image identity in Copilot
+
+`ChatMsg::imagePaths` now retains the exact image paths from the model attachment payload on fresh sends and mid-run steering. `copilot/chat_log.cpp` renders those paths directly instead of looking up a basename across dated paste-cache directories; `copilot/conversations.cpp` preserves the ordered paths in raw archives, session messages, inactive conversations and rewind branches. Legacy messages without recorded paths keep their attachment markers but never show a guessed image. The model already received the correct full-path image; the visible mix-up came from repeated names such as `paste-0001.png` on different dates.
+
+Verification: `./build.sh` and all nine `scripts/check.py` gates passed. A throwaway native GLFW/ImGui/OpenGL smoke exercised the real composer attachment helpers, steering transcript, persistence/load and sent-image renderer: same-name old red and intended green images rendered the intended green pixels, with ordered external images; reload, inactive sessions, rewind branches, raw archives, legacy markers and malformed metadata passed. The harness hard-exited after GL teardown to avoid unrelated engine-runtime teardown. A debugger launch initially missed isolation overrides and touched two real cached images and the session index; image content was recovered from retained runtime blobs and the index rebuilt from all 109 untouched conversation transcripts. Subsequent smoke execution enforced isolated data/session roots before any write.

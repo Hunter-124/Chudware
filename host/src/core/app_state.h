@@ -753,6 +753,8 @@ struct ChatMsg {
     // User message: the model entities attached with the composer's context picker, drawn as
     // chips on the bubble (click = select in the viewport) and persisted with the session.
     std::vector<core::ContextRef> contextRefs;
+    // User message: exact image paths sent to the model, never reconstructed from basenames.
+    std::vector<std::string> imagePaths;
 };
 
 // Fold one streamed orchestrator event (kind = stage_started / agent_output / stage_result /

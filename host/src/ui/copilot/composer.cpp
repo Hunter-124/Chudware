@@ -777,6 +777,14 @@ static std::string userBubbleText(const std::string& text, const nlohmann::json&
     return out;
 }
 
+static std::vector<std::string> userImagePaths(const nlohmann::json& attachments) {
+    std::vector<std::string> paths;
+    for (const auto& a : attachments)
+        if (a.value("kind", std::string("file")) == "image")
+            paths.push_back(a.at("path").get<std::string>());
+    return paths;
+}
+
 // Create a fresh part document if needed and launch the v2 orchestrator for `request`. The
 // current doc is replaced only when it already has features (so an empty new part is reused).
 // Centralized so both the direct Design path and the post-clarify "Build it" path share it.
@@ -1879,6 +1887,7 @@ void submitTurn(AppState& st, const std::string& text) {
     {
         ChatMsg u; u.fromUser = true;
         u.text = userBubbleText(text, attachments);
+        u.imagePaths = userImagePaths(attachments);
         u.contextRefs = std::move(contextRefs);
         u.copilotMode = mode;  // stamp composer mode for colored border
         st.chat.push_back(std::move(u));
@@ -3620,6 +3629,7 @@ static void finalizeStoppedTurnActivity(ChatMsg& m) {
 // with nothing live below. Close the current bubble and open a fresh running one under the
 // steer instead. Append-only: AI-VC msg_idx anchors must never shift.
 static void appendSteerToTranscript(AppState& st, const std::string& text,
+                                    const nlohmann::json& attachments,
                                     std::vector<core::ContextRef> contextRefs) {
     ChatMsg* live = nullptr;
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
@@ -3634,6 +3644,7 @@ static void appendSteerToTranscript(AppState& st, const std::string& text,
         live->uiCachedH = -1.0f;
     }
     ChatMsg u; u.fromUser = true; u.text = text;
+    u.imagePaths = userImagePaths(attachments);
     u.contextRefs = std::move(contextRefs);
     u.copilotMode = mode;
     st.chat.push_back(std::move(u));
@@ -4279,7 +4290,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
                         !ctx.empty())
                         sendText += "\n\n" + ctx;
                     appendSteerToTranscript(st, userBubbleText(text, attachments),
-                                            std::move(contextRefs));
+                                            attachments, std::move(contextRefs));
                     agentControlDispatch(st, runId, sendText, std::move(attachments));
                 } else if (!text.empty()) {
                     // Auto-sends when the assistant frees up (drain at the top of drawComposer);

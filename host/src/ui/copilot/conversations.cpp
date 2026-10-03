@@ -802,6 +802,7 @@ static nlohmann::json rawMessageToJson(const ChatMsg& m) {
         {"fromUser", m.fromUser},
         {"ts", m.ts},
         {"text", m.text},
+        {"imagePaths", m.imagePaths},
         {"running", m.running},
         {"model", m.model},
         {"errKind", m.errKind},
@@ -1176,7 +1177,7 @@ void persistChatHistory(AppState& st) {
             // path can render a subdued note), keeping save/load a position-preserving
             // bijection across restarts.
             const bool emptyTurn = body.empty() && !m.planState.present && !m.running &&
-                                   !m.steerSplit && m.contextRefs.empty();
+                                   !m.steerSplit && m.contextRefs.empty() && m.imagePaths.empty();
             nlohmann::json entry = {{"u", m.fromUser}, {"t", body}, {"e", m.errKind}};
             if (emptyTurn) entry["empty"] = true;
             if (m.steerSplit) entry["split"] = true;
@@ -1194,6 +1195,8 @@ void persistChatHistory(AppState& st) {
             // The context chips a user message carried, so they still draw after a reload.
             if (m.fromUser && !m.contextRefs.empty())
                 entry["ctx"] = core::contextRefsToJson(m.contextRefs);
+            // Exact sent-image paths: the bubble renders these, never a basename guess.
+            if (m.fromUser && !m.imagePaths.empty()) entry["images"] = m.imagePaths;
             // Error card fields — the humanized headline and the raw failure text (capped like
             // an activity detail). Without these a reloaded error turn loses its guidance.
             if (!m.errorHuman.empty()) entry["eh"] = m.errorHuman;
@@ -1502,6 +1505,11 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
             cm.steerSplit = !cm.fromUser && m.value("split", false);
             if (cm.fromUser && m.contains("ctx"))
                 cm.contextRefs = core::contextRefsFromJson(m["ctx"]);
+            if (cm.fromUser && m.contains("images") && m["images"].is_array()) {
+                for (const auto& p : m["images"])
+                    if (p.is_string() && !p.get_ref<const std::string&>().empty())
+                        cm.imagePaths.push_back(p.get<std::string>());
+            }
             cm.running = false;
             // Placeholder for a turn that produced no visible output (persisted as
             // "empty" so message ORDINALS survive the round trip — AI-VC msg_idx

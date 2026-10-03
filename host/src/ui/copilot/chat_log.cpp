@@ -5,7 +5,6 @@
 
 #include "copilot_internal.h"
 #include "agent_text.h"
-#include "ui/clipboard_image.h"   // isImageAttachment / pastedImagePath — resolve sent attachments
 #include "image_lightbox.h"       // attachmentThumbnail / openImageLightbox
 #include "util/time_local.h"
 #include "ui/copilot/context_chips.h"  // context-picker chips on the sent bubble
@@ -151,96 +150,18 @@ static void drawMsgMetaRow(const ui::Fonts& fonts, const char* name, const ImVec
 }
 
 // ---- images that rode along with a SENT user message --------------------------
-// SHIPPED CASE: option 2 (marker re-parse). ChatMsg carries no structured attachment
-// list — it has `text` plus card/plan/activity state and nothing else — and app_state.h
-// is out of scope here, so the only source of truth available at this render site is the
-// trailing marker block composer.cpp appends in submitTurn: one "[attached image: NAME]"
-// line per image, then an optional "[attached: ...]" line for non-image files (transcripts
-// saved before 2026-09-27 may end with a "[context: ...]" line; context chips now ride on
-// ChatMsg::contextRefs). NAME is a basename, so a thumbnail can only be drawn
-// for names that resolve to a real file inside the pasted-image cache; anything else
-// (a paperclip-attached picture from elsewhere on disk, a deleted file) draws nothing and
-// keeps its text marker rather than fabricating a path or showing a broken tile.
-
-// Root of the pasted-image cache (the parent of the per-day buckets). pastedImagePath()
-// mkdirs the bucket it names, so probe it ONCE with a throwaway stamp and delete the empty
-// bucket again — never per frame.
-static const std::filesystem::path& pastedImagesRoot() {
-    static const std::filesystem::path root = [] {
-        const std::filesystem::path probe(ui::pastedImagePath(0, "0000-00-00"));
-        std::error_code ec;
-        std::filesystem::remove(probe.parent_path(), ec);   // no-op unless the bucket is empty
-        return probe.parent_path().parent_path();
-    }();
-    return root;
-}
-
-// Basename -> absolute path inside the pasted-image cache; "" when there is no such file.
-// Scans the day buckets rather than assuming the message's own date, so a paste that
-// crossed midnight (or came from an earlier session in a restored log) still resolves.
-// Names are never reused, so the answer can't change under us — cache it and this costs
-// one directory walk per attachment name, not one per frame.
-static const std::string& resolveSentImage(const std::string& name) {
-    static std::unordered_map<std::string, std::string> cache;
-    auto it = cache.find(name);
-    if (it != cache.end()) return it->second;
-    std::string hit;
-    // A name lifted out of message text is a basename and nothing else — never a path.
-    const bool safe = !name.empty() && name.size() < 128 &&
-                      name.find('/') == std::string::npos &&
-                      name.find('\\') == std::string::npos &&
-                      name.find("..") == std::string::npos;
-    if (safe && ui::isImageAttachment(name)) {
-        std::error_code ec;
-        for (const auto& day : std::filesystem::directory_iterator(pastedImagesRoot(), ec)) {
-            if (!day.is_directory(ec)) continue;
-            const std::filesystem::path cand = day.path() / name;
-            if (std::filesystem::is_regular_file(cand, ec)) { hit = cand.string(); break; }
-        }
-    }
-    return cache.emplace(name, std::move(hit)).first->second;
-}
-
-// Image names from the TRAILING marker block only: walking back from the end of the text,
-// each line must exactly match one of the three markers submitTurn emits, and the walk stops
-// at the first line that doesn't. Prose is never scanned, so typing "see foo.png" mid-message
-// cannot sprout a thumbnail. On an image line the name is everything between the prefix and
-// the closing bracket — filenames may contain spaces, so it is never split on whitespace.
-static std::vector<std::string> sentImageNames(const std::string& text) {
-    static const std::string kImg = "[attached image: ";
-    std::vector<std::string> out;
-    size_t end = text.size();
-    while (end > 0 && (text[end - 1] == '\n' || text[end - 1] == '\r')) --end;
-    while (end > 0) {
-        const size_t nl = text.rfind('\n', end - 1);
-        const size_t bol = (nl == std::string::npos) ? 0 : nl + 1;
-        std::string line = text.substr(bol, end - bol);
-        while (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty() || line.back() != ']') break;
-        if (line.compare(0, kImg.size(), kImg) == 0 && line.size() > kImg.size() + 1) {
-            out.push_back(line.substr(kImg.size(), line.size() - kImg.size() - 1));
-        } else if (line.rfind("[attached: ", 0) != 0 && line.rfind("[context: ", 0) != 0) {
-            break;
-        }
-        if (bol == 0) break;
-        end = bol - 1;
-    }
-    std::reverse(out.begin(), out.end());   // walked backwards; restore attach order
-    return out;
-}
+// ChatMsg::imagePaths holds the exact absolute path of each image attachment, recorded at
+// send time from the RPC attachment — the only source of truth. Nothing is ever resolved
+// from the "[attached image: NAME]" marker text: basenames repeat across day buckets, so
+// guessing could show the wrong picture. Legacy messages with no recorded paths keep their
+// text marker and draw no thumbnail. A missing/unreadable file is handled by
+// attachmentThumbnail itself.
 
 // Wrapping strip of clickable thumbnails under the sent message's text. Drawn inside the
 // user bubble's child window, so it inherits the bubble inset and needs no extra indent.
 static void drawSentImageStrip(const ChatMsg& m) {
-    const std::vector<std::string> names = sentImageNames(m.text);
-    if (names.empty()) return;
-    std::vector<std::string> paths;
-    paths.reserve(names.size());
-    for (const auto& n : names) {
-        const std::string& p = resolveSentImage(n);
-        if (!p.empty()) paths.push_back(p);
-    }
-    if (paths.empty()) return;   // nothing resolved -> this message renders exactly as before
+    const std::vector<std::string>& paths = m.imagePaths;
+    if (paths.empty()) return;   // legacy / text-only message -> renders exactly as before
 
     constexpr size_t kMaxThumbs = 6;
     const float lineH = ImGui::GetTextLineHeight();

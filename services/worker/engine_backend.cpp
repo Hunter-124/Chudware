@@ -38,8 +38,9 @@ bool g_daemon = false;
 bool g_daemonUnavailable = false;
 std::once_flag g_once;
 
-chudware_ipc::EngineClient* g_runClient = nullptr;  // dedicated conn for long streaming runs
-std::mutex g_runClientMtx;                          // guards g_runClient creation
+chudware_ipc::EngineClient* g_runClient = nullptr;     // dedicated conn for long agent runs
+chudware_ipc::EngineClient* g_simRunClient = nullptr;  // dedicated conn for long sim solves
+std::mutex g_runClientMtx;                             // guards both run clients' creation
 
 // The long streaming agent methods stream for minutes and EngineClient::call holds that
 // connection's mutex for the whole call. Running them on the shared g_client starved the
@@ -49,10 +50,9 @@ std::mutex g_runClientMtx;                          // guards g_runClient creati
 // keeps holding g_client until it actually returns, so the UI stays wedged. Give the long
 // run its OWN connection instead; hostd serves each connection on its own thread and its
 // doc registry gates multi-writer overlap (same rationale as the cancel/steer side
-// sockets), so concurrent edits are safe. Agent and simulation WorkerClient
-// instances have separate call mutexes; if two long runs overlap, EngineClient
-// serializes them on this reserved connection instead of starving the GUI
-// connection.
+// sockets), so concurrent edits are safe. Agent and simulation runs take separate lanes
+// (engine::runLane); WorkerClient serializes each lane's runs among themselves instead of
+// starving the GUI connection.
 //
 // Both naming variants must match: the host RPC names (agent_run_v2 / agent_mission_v1)
 // reach engine::call directly when the C++ agent is OFF, but with it ON WorkerClient's
@@ -63,41 +63,81 @@ std::mutex g_runClientMtx;                          // guards g_runClient creati
 // WorkerClient::callImpl already classifies it as a long run for its own long-run mutex, and
 // omitting it here put multi-minute turns back on the shared GUI connection — exactly the
 // starvation this dedicated connection exists to prevent.
-bool isLongRunMethod(const std::string& method) {
+//
+// Long simulation solves get a SECOND reserved connection rather than sharing the agent one.
+// EngineClient serializes a connection for the whole call, so on a shared run connection a
+// chat turn that streams for hours would hold a Run click (a topology optimization, which is
+// itself long) until the turn ended, and a running optimization would hold the next chat turn
+// the same way. SimClient runs one solve at a time, so one simulation connection suffices; a
+// sim_mesh preview borrows it only while no solve holds it (WorkerClient sends a preview that
+// would queue behind a solve over a short-lived side connection instead).
+// Nothing drains that connection's push queue (the GUI drains only g_client), so it discards
+// every push its caller does not consume live (EngineClient::Options::discardUnconsumedEvents):
+// a topology solve streaming progress for hours, plus hostd's broadcasts to every connection,
+// would otherwise accumulate there for the whole solve. Unlike the agent lane, a simulation
+// solve never falls back to g_client: holding the GUI connection for the length of a solve is
+// exactly the starvation this connection prevents, so the call fails instead.
+bool isAgentLongRunMethod(const std::string& method) {
     return method == "agent_run" || method == "agent_run_v2" ||
            method == "agent_mission" || method == "agent_mission_v1" ||
-           method == "agent_admin_turn" ||
-           method == "sim_mesh" || method == "sim_run_static" ||
-           method == "sim_run_modal" || method == "sim_run_fatigue" ||
-           method == "sim_run_buckling" ||
-           method == "sim_run_thermal" || method == "sim_run_flow";
+           method == "agent_admin_turn";
 }
 
-// Lazily open (and reuse) the dedicated long-run connection. nullptr on connect failure —
-// the caller then falls back to the shared client (correctness over the anti-freeze
-// optimization). EngineClient reconnects itself on EOF, so one connect is reused forever.
-chudware_ipc::EngineClient* runClient() {
+bool isSimLongRunMethod(const std::string& method) {
+    return method == "sim_mesh" || method == "sim_run_static" ||
+           method == "sim_run_modal" || method == "sim_run_fatigue" ||
+           method == "sim_run_buckling" || method == "sim_run_thermal" ||
+           method == "sim_run_flow" || method == "sim_run_topology";
+}
+
+// Lazily open (and reuse) a dedicated long-run connection. nullptr + err on connect failure.
+// EngineClient reconnects itself on EOF, so one connect is reused forever.
+chudware_ipc::EngineClient* openRunClient(chudware_ipc::EngineClient*& slot,
+                                          bool discardUnconsumedEvents, std::string& err) {
     std::lock_guard<std::mutex> lk(g_runClientMtx);
-    if (g_runClient) return g_runClient;
+    if (slot) return slot;
     auto* c = new chudware_ipc::EngineClient();
     chudware_ipc::EngineClient::Options opts;
     opts.hostdBin = hostdBinHint();
     opts.clientKind = "gui";
-    std::string err;
+    opts.discardUnconsumedEvents = discardUnconsumedEvents;
     if (!c->connectOrSpawn(opts, err)) {
-        std::fprintf(stderr,
-                     "[engine] run-connection connect failed (%s) — long runs share the "
-                     "GUI connection\n",
-                     err.c_str());
         delete c;
         return nullptr;
     }
-    return g_runClient = c;
+    return slot = c;
+}
+
+// The agent run connection buffers like g_client; on connect failure long agent runs fall
+// back to the shared GUI connection (correctness over the anti-freeze optimization) and
+// WorkerClient keeps its call mutex for them (runConnectionReady(RunLane::Agent)).
+chudware_ipc::EngineClient* runClient() {
+    std::string err;
+    auto* c = openRunClient(g_runClient, /*discardUnconsumedEvents=*/false, err);
+    if (!c)
+        std::fprintf(stderr,
+                     "[engine] agent run-connection connect failed (%s) — long runs share the "
+                     "GUI connection\n",
+                     err.c_str());
+    return c;
+}
+
+// The simulation connection discards unconsumed pushes and has no shared fallback.
+chudware_ipc::EngineClient* simRunClient(std::string& err) {
+    return openRunClient(g_simRunClient, /*discardUnconsumedEvents=*/true, err);
 }
 
 std::string selfExePath() { return chudware::platform::executablePath(); }
 
 }  // namespace
+
+RunLane runLane(const std::string& method) {
+    if (isAgentLongRunMethod(method)) return RunLane::Agent;
+    if (isSimLongRunMethod(method)) return RunLane::Sim;
+    return RunLane::None;
+}
+
+bool isSimLanePreview(const std::string& method) { return method == "sim_mesh"; }
 
 // Production accepts only the adjacent daemon selected and verified by resolveHostdBin().
 // Developer builds additionally search the familiar repository build tree.
@@ -310,12 +350,21 @@ bool call(const std::string& method, const json& params, json& result, std::stri
     // pre-initialization nullptr into callDispatch even though initOnce then armed daemon mode.
     // Long streaming runs go on a dedicated connection so they never hold the shared GUI
     // client's call mutex (needed by the GL thread for attach_doc / doc_discard / event
-    // drains) — otherwise a live run freezes the UI until it unwinds. Fall back to the
-    // initialized shared client if the dedicated connection can't be established.
+    // drains) — otherwise a live run freezes the UI until it unwinds. An agent run falls back
+    // to the initialized shared client if its connection can't be established; a simulation
+    // solve fails instead (see isSimLongRunMethod).
     const bool useDaemon = daemonMode();
     chudware_ipc::EngineClient* cl = useDaemon ? g_client : nullptr;
-    if (useDaemon && isLongRunMethod(method)) {
+    const RunLane lane = useDaemon ? runLane(method) : RunLane::None;
+    if (lane == RunLane::Agent) {
         if (auto* rc = runClient()) cl = rc;
+    } else if (lane == RunLane::Sim) {
+        std::string cerr;
+        cl = simRunClient(cerr);
+        if (!cl) {
+            err = "simulation connection to hostd unavailable (" + cerr + ")";
+            return false;
+        }
     }
     bool ok = callDispatch(cl, method, params, result, err, timeoutMs, onEvent);
     // Compat shim: doc_activate (cheap tab-switch activation, cached-serve) is served by
@@ -335,16 +384,30 @@ bool call(const std::string& method, const json& params, json& result, std::stri
     return ok;
 }
 
-// Wake a blocked long run on its dedicated connection at teardown (mirror of
+// Wake blocked long runs on their dedicated connections at teardown (mirror of
 // EngineClient::abortPending on the shared client) so app quit / AsyncRpc shutdown never
-// hangs on a multi-minute modeling call. No-op if the run connection was never opened.
-// Safe from any thread.
+// hangs on a multi-minute modeling call or simulation solve. No-op for a connection that was
+// never opened. Safe from any thread.
 void abortRunClient() {
     std::lock_guard<std::mutex> lk(g_runClientMtx);
     if (g_runClient) g_runClient->abortPending();
+    if (g_simRunClient) g_simRunClient->abortPending();
 }
 
-bool runConnectionReady() { return daemonMode() && runClient() != nullptr; }
+bool runConnectionReady(RunLane lane) {
+    if (!daemonMode()) return false;
+    switch (lane) {
+        case RunLane::Agent:
+            return runClient() != nullptr;
+        case RunLane::Sim: {
+            std::string err;
+            return simRunClient(err) != nullptr;
+        }
+        case RunLane::None:
+            break;
+    }
+    return false;
+}
 
 bool available() {
     if (daemonMode()) {

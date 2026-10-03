@@ -35,6 +35,24 @@ def fea_timeout_s(legs: int = 1) -> int:
 _FEA_TIMEOUT_S = fea_timeout_s()
 
 ENTRIES: dict[str, dict[str, Any]] = {
+    "topology_capabilities": {
+        "prompt_note": (
+            "Read-only. Call FIRST to learn the supported topology methods, "
+            "physics, constraints and limits before configuring a study; never "
+            "assume a method or constraint that it does not list."
+        ),
+    },
+    "run_topology_optimization": {
+        "prompt_note": (
+            "Mutating (writes study, jobs, artifacts). Query topology_capabilities first, then "
+            "run the same persisted UI study: run_topology_optimization(study=..., doc_id=..., "
+            "background=True). Poll with get_job/wait_job; stop with sim_cancel. Report "
+            "computation, convergence and feasibility separately — a finished run is not a "
+            "converged or feasible one. Inspect the density fields, thresholded surface, "
+            "actual-domain reanalysis and manufacturing checks; the source CAD stays editable. "
+            "Geometry/DFAM checks alone are not print-ready: slice_part must validate the G-code."
+        ),
+    },
     "sim_cancel": {
         "prompt_note": (
             "job_id from sim_run. Really terminates the solver process, not "

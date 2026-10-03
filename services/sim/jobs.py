@@ -34,7 +34,10 @@ pipeline be split into *setup* (parent, needs the live doc) -> *solve* (child, p
 * ``core_rpc`` — one engine solve RPC from :data:`CORE_RPC_METHODS`. A doc-shaped method
   (``sim_run_flow`` tessellates a document) additionally names ``open_step``: the parent
   exported the solid, and the child re-opens that ONE file, because it shares no document
-  table with the server that started it.
+  table with the server that started it. ``sim_run_topology`` carries a self-contained
+  topology envelope (exported STEP or inline tet4 mesh + resolved facesets) and is
+  validated by :func:`services.sim.topology.validate_run_envelope`, never as a static
+  or modal study.
 * ``modal_rpc`` — ``sim_run_modal`` plus the free-free rigid-mode subspace widening, so an
   asynchronous modal answer is the same physics as the synchronous one.
 * ``openfoam_tunnel`` — a steady-RANS wind tunnel over an exported STL. Every OpenFOAM
@@ -219,7 +222,7 @@ def _resolve_tokens(value: Any, progress_path: str) -> Any:
 #: The engine solve entry points a ``core_rpc`` payload may name. A payload names a
 #: METHOD from this closed list — never an import path, a module or a callable.
 CORE_RPC_METHODS = ("sim_run_static", "sim_run_modal", "sim_run_adaptive",
-                    "sim_run_fatigue", "sim_run_flow")
+                    "sim_run_fatigue", "sim_run_flow", "sim_run_topology")
 
 #: Methods whose params carry a self-contained ``study`` (an exported STEP path + JSON),
 #: i.e. everything the child needs is already on disk.
@@ -231,6 +234,9 @@ _STATIC_SHAPED = ("sim_run_static", "sim_run_adaptive", "sim_run_fatigue")
 #: Methods that tessellate a DOCUMENT rather than a study file, so the child has to open
 #: the parent's exported solid first.
 _DOC_SHAPED_METHODS = ("sim_run_flow",)
+
+#: Methods whose params carry their own self-contained envelope with its own schema.
+_TOPOLOGY_METHODS = ("sim_run_topology",)
 
 #: The only params key a geometry prelude is allowed to fill.
 _DOC_PARAM = "doc_id"
@@ -650,6 +656,19 @@ def _validate_core_rpc_payload(payload: dict) -> None:
     params = payload.get("params")
     if not isinstance(params, dict):
         raise ValueError("core_rpc payload needs a params object")
+    if method in _TOPOLOGY_METHODS:
+        if payload.get("open_step") is not None:
+            raise ValueError(
+                f"{method} carries its geometry in study.step_path (or an inline tet4 "
+                "mesh); open_step is not accepted")
+        extra = sorted(set(params) - {"study"})
+        if extra:
+            raise ValueError(f"{method} params accept only study, got {extra}")
+        from services.sim.topology import validate_run_envelope  # noqa: PLC0415
+
+        validate_run_envelope(params.get("study"))
+        _probe_backend(method)
+        return
     step = payload.get("open_step")
     if step is None:
         if method in _DOC_SHAPED_METHODS:
@@ -734,6 +753,14 @@ def _prune(conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM jobs WHERE job_id=?", (r["job_id"],))
 
 
+def _module_command(module: str) -> list[str]:
+    """Re-enter a Python module: ``-m`` under an interpreter, the compiled sidecar's own
+    ``--module`` dispatcher (services/compiled_entry.py) when frozen. A compiled sidecar
+    is not a Python interpreter, so it is never handed ``-m``."""
+    flag = "--module" if "__compiled__" in globals() or getattr(sys, "frozen", False) else "-m"
+    return [sys.executable, flag, module]
+
+
 def start(kind: str, stage: str, payload: dict, meta: Optional[dict] = None) -> dict:
     """Validate setup, spawn one stage process, and return its durable job id."""
     job_id = "sim-" + uuid.uuid4().hex[:12]
@@ -766,7 +793,7 @@ def start(kind: str, stage: str, payload: dict, meta: Optional[dict] = None) -> 
         log = open(d / "worker.log", "wb")
         try:
             proc = subprocess.Popen(
-                [sys.executable, "-m", "services.sim.job_worker", job_id],
+                [*_module_command("services.sim.job_worker"), job_id],
                 cwd=str(repo_root), env=env, stdout=log, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, start_new_session=True)
         finally:
@@ -968,6 +995,21 @@ def refusal_result(job_id: str) -> Optional[dict]:
     return result if isinstance(result, dict) and result.get("ok") is False else None
 
 
+def terminal_result(job_id: str) -> Optional[dict]:
+    """The stage result a FAILED or CANCELLED job's worker actually wrote, else None.
+
+    None is the honest answer for a worker that failed before its stage returned or was
+    killed (``sim_cancel``): nothing was replied, so nothing may be invented. A cancel that
+    raced a finished stage keeps that stage's own reply; the job is still CANCELLED.
+    """
+    row = _row(job_id)
+    if row is None or _reconcile(row).get("state") not in (FAILED, CANCELLED):
+        return None
+    finished = _read_json(job_dir(job_id) / "result.json")
+    result = finished.get("result") if isinstance(finished, dict) else None
+    return result if isinstance(result, dict) else None
+
+
 # ---------------------------------------------------------------- collect (exactly once)
 # The stage result is raw solver output; the COLLECT stage that turns it into the tool's
 # reply envelope runs back in the parent, because that is where the live document is and
@@ -1030,6 +1072,29 @@ def save_collected(job_id: str, value: dict) -> dict:
     except OSError:
         pass
     return value
+
+
+def collect_evidence(job_id: str) -> Optional[dict]:
+    """Evidence a previous, unfinished collect already wrote for `job_id`, or None.
+
+    A collect whose document write failed retryably releases its claim WITHOUT caching a
+    reply. The files it had already written stay recorded here, so the retry persists the
+    same evidence instead of writing a second copy of every artifact.
+    """
+    return _read_json(job_dir(job_id) / "collect_evidence.json")
+
+
+def save_collect_evidence(job_id: str, value: dict) -> bool:
+    """Record a collect's written evidence; False when the spool cannot hold it."""
+    d = job_dir(job_id)
+    try:
+        text = json.dumps(value, allow_nan=False)
+        tmp = d / "collect_evidence.json.tmp"
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, d / "collect_evidence.json")
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
 
 
 def list_jobs(limit: int = 20) -> list:

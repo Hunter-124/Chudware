@@ -366,6 +366,8 @@ _ARTIFACT_PRODUCER_TOOLS = frozenset({
     # Office document writers
     "office_edit_doc", "office_edit_docx", "office_edit_pdf",
     "office_edit_pptx", "office_edit_xlsx", "office_edit_csv",
+    # Topology optimization study/job artifacts
+    "run_topology_optimization",
 })
 
 

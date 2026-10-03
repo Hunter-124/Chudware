@@ -96,6 +96,7 @@
 #include "sim/fea_adaptive.h"
 #include "sim/fea_fatigue.h"
 #include "sim/fea_run.h"
+#include "sim/topopt_run.h"
 #include "sim/mesher.h"
 #endif
 #include "dfm/process_profiles.h"
@@ -2745,6 +2746,13 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                         out_json, 0);
         }
 #ifdef CHUDWARE_WITH_POLYMESH  // Polyhedral-FEA mesh and meshing-study RPCs
+        if (m == "topology_capabilities") {
+            return emit(chudware::sim::topology_capabilities(), out_json, 0);
+        }
+        if (m == "sim_run_topology") {
+            const json& study = params.contains("study") ? params["study"] : json::object();
+            return emit(chudware::sim::fea_run_topology(study), out_json, 0);
+        }
     if (m == "sim_mesh") {
       // Params: {step_path, fineness?, order|mesh_order?, target_size_mm?,
       // min_size_mm?, max_size_mm?, learned_advisor?, advisor_max_dof?}.

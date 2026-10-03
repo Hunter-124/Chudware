@@ -72,6 +72,9 @@ _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tr
               # without these they defaulted to WRITE, which also made the progress
               # watchdog count a file listing or a job wait as modeling progress.
               "browse_models", "read_native_file", "wait_job",
+              # Topology capability discovery is a pure catalog query; run_topology_optimization
+              # writes study/jobs/artifacts and stays unclassified -> RISK_WRITE.
+              "topology_capabilities",
               # Manufacturing observations. Their mfg_* namespace deliberately
               # carries no lexical authority; read access is exact-membership.
               "mfg_device_list", "mfg_device_describe", "mfg_device_capability",

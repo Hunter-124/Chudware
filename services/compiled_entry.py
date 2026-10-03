@@ -9,6 +9,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Start a compiled Chudware service sidecar.")
     parser.add_argument("--module", required=True, choices=(
         "worker", "mcp", "services.reveng.gaussian_jobs", "services.vision.gaussian_pipeline",
+        "services.sim.job_worker",
     ))
     args, remaining = parser.parse_known_args()
     if args.module == "services.reveng.gaussian_jobs":
@@ -20,6 +21,12 @@ def main() -> None:
         from services.vision.gaussian_pipeline import main as reconstruct
 
         raise SystemExit(reconstruct(remaining))
+    if args.module == "services.sim.job_worker":
+        from services.sim.job_worker import main as run_job
+
+        # job_worker.main takes a full argv (program name, then the job id), exactly as
+        # ``python -m services.sim.job_worker <job_id>`` hands it sys.argv.
+        raise SystemExit(run_job(["services.sim.job_worker", *remaining]))
     if remaining:
         parser.error("unrecognized arguments: " + " ".join(remaining))
 

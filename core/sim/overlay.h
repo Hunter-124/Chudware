@@ -14,6 +14,7 @@
 // vectors are passed in as plain doubles, so there is no link dep on the mesher libs.
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -62,7 +63,8 @@ std::vector<double> map_to_surface(const std::vector<double>& surf_xyz,
 // field. The study still returns its scalar summary + narration; only the spatial contour
 // is withheld, and the UI falls back to the editable model mesh. Hitting the cap means the
 // mesh is pathologically fine — lower mesh_fineness or use draft (order 1) meshing.
-//
+inline constexpr std::size_t kMaxOverlayTris = 1500000;
+
 // Build the static-result overlay AICM and write it to a temp .aicm; returns the
 // absolute path (empty string on any failure — best-effort, never throws).
 // Input stress fields/yield are MPa and displacement fields/coordinates are mm;

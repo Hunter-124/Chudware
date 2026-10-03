@@ -36,7 +36,8 @@ namespace {
 // means the mesh is pathologically fine and the user should lower mesh_fineness (or use
 // mesh_order 1 / draft) to get a contour. ~1.5M boundary tris ≈ 750k surface verts ≈
 // 45 MB of f32 positions + normals + 15 scalar fields, an interactive-render ceiling.
-constexpr size_t kMaxOverlayTris = 1500000;
+// The cap itself, kMaxOverlayTris, is declared in sim/overlay.h so every AICM result
+// surface writer (FEA overlays, topology surfaces) enforces the same render budget.
 
 // True when the built boundary surface is within the render/upload budget. `where` is a
 // short label for the diagnostic log (best-effort, cap breach is rare).

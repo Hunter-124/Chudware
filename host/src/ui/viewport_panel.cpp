@@ -2622,6 +2622,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const bool flowSetup = inSimulation && st.simManager->flowSetupActive(st);
             const bool flowResult = inSimulation && st.simManager->flowResultLinesActive(st);
             std::vector<uint64_t> fix, load;
+            std::vector<uint64_t> topoPreserve, topoExclude, topoPorts;
+            std::vector<float> topoPreserveBox, topoExcludeBox;
             std::vector<float> loadSegs, fixSegs, loadTris, fixTris;
             std::vector<float> arrowSegs, domainSegs, inletSegs, arrowTris;
             std::vector<ui::SimManager::FlowLineBatch> flowBatches;
@@ -2629,6 +2631,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (simPreview) {
                 st.simManager->collectFixtureFaces(fix);
                 st.simManager->collectLoadFaces(load);
+                st.simManager->collectTopologyPreview(topoPreserve, topoExclude, topoPorts,
+                                                      topoPreserveBox, topoExcludeBox);
                 st.simManager->collectIndicatorSegments(st, loadSegs, fixSegs,
                                                         &loadTris, &fixTris);
                 meshPreview = st.simManager->hasMeshPreview(st);
@@ -2669,6 +2673,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             constexpr uint64_t kSimFlowArrowSegments = 8;
             constexpr uint64_t kSimFlowArrowTriangles = 9;
             constexpr uint64_t kSimFlowResultBase = 0x100;
+            constexpr uint64_t kSimTopoPreserveBox = 10;
+            constexpr uint64_t kSimTopoExcludeBox = 11;
 
             // Simulation pre-run previews: paint the selected study's fixture faces green and its
             // load faces red so the setup reads at a glance before solving (gated off while a result
@@ -2677,6 +2683,27 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 const auto& vpal = ui::palette;
                 if (!fix.empty())  st.overlays->drawFaceWash(renderer.camera(), fix, vpal.simFixture);
                 if (!load.empty()) st.overlays->drawFaceWash(renderer.camera(), load, vpal.simLoad);
+                // Topology keep-in (accent) / keep-out (domain slate) / flow-port (inlet teal)
+                // washes, drawn translucent from existing palette roles.
+                auto washOf = [](const float role[4], float alpha, float out[4]) {
+                    out[0] = role[0]; out[1] = role[1]; out[2] = role[2]; out[3] = alpha;
+                };
+                float preserveWash[4], excludeWash[4], portWash[4];
+                washOf(vpal.accent, 0.45f, preserveWash);
+                washOf(vpal.flowDomain, 0.60f, excludeWash);
+                washOf(vpal.flowInlet, 0.45f, portWash);
+                if (!topoPreserve.empty())
+                    st.overlays->drawFaceWash(renderer.camera(), topoPreserve, preserveWash);
+                if (!topoExclude.empty())
+                    st.overlays->drawFaceWash(renderer.camera(), topoExclude, excludeWash);
+                if (!topoPorts.empty())
+                    st.overlays->drawFaceWash(renderer.camera(), topoPorts, portWash);
+                if (!topoPreserveBox.empty())
+                    st.overlays->drawSimulationSegments(renderer.camera(), kSimTopoPreserveBox,
+                                                        topoPreserveBox, vpal.accent, 2.0f);
+                if (!topoExcludeBox.empty())
+                    st.overlays->drawSimulationSegments(renderer.camera(), kSimTopoExcludeBox,
+                                                        topoExcludeBox, vpal.flowDomain, 2.0f);
                 // On-demand indicator batches use content fingerprints because SimManager's
                 // generation intentionally covers only its retained mesh/flow geometry.
                 if (!loadSegs.empty())

@@ -1613,6 +1613,190 @@ def test_a_failed_durable_job_is_reported_as_an_error_not_an_empty_result(
     assert "result" not in snapshot
 
 
+# ------------------------------------- terminal topology jobs through sim_status/sim_results
+# Topology registers a terminal hook, so a failed or cancelled run is collected EXACTLY ONCE
+# into its study whichever polling API reaches it first. get_job/wait_job did; these two
+# pollers did not: sim_status dropped the job meta before anything could collect, and
+# sim_results refused failed/cancelled jobs outright — an agent that only polled them left
+# the study's last_job "running" forever. A finished but iteration-limited run is ok:true
+# and converged:false; sim_results used to overwrite that with converged = ok.
+
+from services.mcp.test_topology_tools import (  # noqa: E402
+    _died,
+    _finish,
+    _native_child,
+    _native_result,
+    _submitted,
+)
+from services.mcp.test_topology_tools import h as topology_harness  # noqa: E402,F401
+from services.sim import topology as topo  # noqa: E402
+
+
+def _jsonable(value):
+    return json.loads(json.dumps(value))
+
+
+@pytest.mark.parametrize("state", [simjobs.FAILED, simjobs.CANCELLED])
+def test_terminal_topology_job_polled_only_by_sim_tools_reaches_its_study_once(
+        topology_harness, tools, state):
+    h = topology_harness
+    out, meta = _submitted(h)
+    jid = out["job_id"]
+    _died(meta, jid, cancel_requested=state == simjobs.CANCELLED)
+    edits_before = h.doc.edits
+
+    status = json.loads(tools["sim_status"](job_id=jid))
+    assert status["state"] == state and status["ok"] is False, status
+    assert "meta" not in status, status
+    assert status["code"] == f"solve_{state}", status
+    detail = status["detail"]
+    assert detail["ok"] is False and detail["state"] == state, detail
+    assert detail["saved_to_study"] is True and detail["run_id"] == out["run_id"], detail
+    assert detail["converged"] is False and detail["feasible"] is None, detail
+    assert detail["print_ready"] is False, detail
+    assert h.doc.edits == edits_before + 1, "the terminal job persists exactly one update"
+    stored = h.doc.stored("study-00000001")
+    assert stored["last_job"]["state"] == state and stored["last_job"]["job_id"] == jid
+    assert [r["run_id"] for r in stored["runs"]] == ["older", out["run_id"]]
+    assert stored["runs"][-1]["result"]["ok"] is False
+
+    full = json.loads(tools["sim_results"](job_id=jid))
+    assert full["ok"] is False and full["state"] == state, full
+    assert full["converged"] is False and full["saved_to_study"] is True, full
+    assert full["run_id"] == out["run_id"] and full["result"] == detail["result"], full
+    assert full["result"]["termination"] == (
+        "cancelled" if state == simjobs.CANCELLED else "failed")
+    for invented in ("summary", "history", "density", "fields"):
+        assert invented not in full and invented not in full["result"], invented
+
+    # Every later poll, through any API, replays the one collected envelope.
+    for _ in range(2):
+        assert json.loads(tools["sim_status"](job_id=jid))["detail"] == detail
+        assert json.loads(tools["sim_results"](job_id=jid))["result"] == detail["result"]
+    assert _jsonable(cad_common.durable_job_snapshot(jid)["detail"]) == detail
+    assert _jsonable(simjobs.collected(jid)) == detail
+    assert h.doc.edits == edits_before + 1
+
+
+def test_native_topology_failure_reaches_sim_results_with_its_evidence_not_as_success(
+        topology_harness, tools):
+    h = topology_harness
+    out, meta = _submitted(h)
+    jid = out["job_id"]
+    child = _native_child(pathlib.Path(out["artifact_dir"]))
+    (child / "checkpoint.json").write_text('{"schema": "x"}')
+    raw = {"ok": False, "converged": False, "feasible": True, "termination": "failed",
+           "error": "singular stiffness", "error_code": "physics_failed",
+           "method": "simp", "physics": "structural", "result_dir": str(child),
+           "summary": {"iterations": 3}, "density": [0.5] * 8,
+           "manufacturing": {"geometry_valid": True, "print_ready": True},
+           "artifacts": {"checkpoint": {
+               "path": str(child / "checkpoint.json"), "format": "json",
+               "sha256": topo.sha256_file(child / "checkpoint.json")}}}
+    _finish(meta, raw, jid)
+    edits_before = h.doc.edits
+
+    res = json.loads(tools["sim_results"](job_id=jid))
+    assert res["ok"] is False and res["state"] == simjobs.FAILED, res
+    assert res["converged"] is False and res["feasible"] is None, res
+    assert res["print_ready"] is False and res["saved_to_study"] is True, res
+    assert res["error"] == "singular stiffness", res
+    # The last iterate's numbers are evidence inside the retained result, never promoted
+    # to a top-level answer.
+    assert "summary" not in res and "density" not in res, res
+    result = res["result"]
+    assert result["error_code"] == "physics_failed" and result["termination"] == "failed"
+    assert result["summary"] == {"iterations": 3}
+    assert result["artifacts"]["checkpoint"]["sha256"] == topo.sha256_file(
+        child / "checkpoint.json")
+    assert result["manufacturing"]["print_ready"] is False
+    assert h.doc.edits == edits_before + 1
+    stored = h.doc.stored("study-00000001")
+    assert stored["last_job"]["state"] == simjobs.FAILED
+    assert stored["runs"][-1]["result"]["error_code"] == "physics_failed"
+
+    status = json.loads(tools["sim_status"](job_id=jid))
+    assert status["code"] == "solve_failed", status
+    assert status["detail"]["run_id"] == res["run_id"], status
+    assert status["detail"]["result"] == res["result"], status
+    assert h.doc.edits == edits_before + 1
+
+
+def test_partial_poll_of_a_cancelled_topology_job_collects_it_without_finalizing(
+        topology_harness, tools):
+    h = topology_harness
+    out, meta = _submitted(h)
+    jid = out["job_id"]
+    _died(meta, jid, cancel_requested=True)
+    (simjobs.job_dir(jid) / "partial.json").write_text(json.dumps(
+        {"partial": True, "phase": "optimize", "iteration": 7, "objective": 4.2}))
+    edits_before = h.doc.edits
+
+    part = json.loads(tools["sim_results"](job_id=jid, partial=True))
+    assert part["partial"] is True and part["converged"] is False, part
+    assert part["state"] == simjobs.CANCELLED, part
+    assert part["snapshot"]["iteration"] == 7, part
+    terminal = part["terminal"]
+    assert terminal["ok"] is False and terminal["state"] == simjobs.CANCELLED, terminal
+    assert terminal["saved_to_study"] is True and terminal["run_id"] == out["run_id"]
+    assert terminal["converged"] is False, terminal
+    for finalized in ("result", "summary", "fields", "density"):
+        assert finalized not in terminal and finalized not in part, finalized
+    assert h.doc.edits == edits_before + 1
+    assert h.doc.stored("study-00000001")["last_job"]["state"] == simjobs.CANCELLED
+
+    full = json.loads(tools["sim_results"](job_id=jid))
+    assert full["run_id"] == terminal["run_id"] and full["ok"] is False, full
+    assert h.doc.edits == edits_before + 1
+
+
+def test_iteration_limited_topology_stays_ok_but_unconverged_through_sim_results(
+        topology_harness, tools):
+    h = topology_harness
+    out, meta = _submitted(h)
+    jid = out["job_id"]
+    run_dir = pathlib.Path(out["artifact_dir"])
+    _finish(meta, _native_result(run_dir, converged=False, termination="max_iterations"),
+            jid)
+
+    assert json.loads(tools["sim_status"](job_id=jid))["state"] == "done"
+    res = json.loads(tools["sim_results"](job_id=jid))
+    assert res["ok"] is True and res["state"] == "done", res
+    assert res["converged"] is False, res
+    assert res["termination"] == "max_iterations" and res["outcome"]["converged"] is False
+    assert res["result"]["converged"] is False, res["result"]
+    assert h.doc.stored("study-00000001")["runs"][-1]["result"]["converged"] is False
+    assert json.loads(tools["sim_results"](job_id=jid)) == res
+
+
+def test_legacy_kinds_keep_their_sim_status_and_sim_results_semantics(
+        tmp_path, monkeypatch, registry, tools):
+    persisted: list = []
+    monkeypatch.setattr(sim_tools, "_persist_study",
+                        lambda doc, record: persisted.append(record) or "study-1")
+    done = _finished_job("fea_static", {"analysis": "fea_static", "doc": "doc-9",
+                                        "material": _MATERIAL, "material_arg": "steel",
+                                        "notes": []}, _STATIC_RAW)
+    res = json.loads(tools["sim_results"](job_id=done))
+    assert res["ok"] is True and res["converged"] is True and res["state"] == "done", res
+    assert res["summary"]["min_fos"] == 20.0 and len(persisted) == 1
+
+    refusal = {"ok": False, "error": "mesh rejected", "n_elems": 12,
+               "mesh_quality": {"min_jacobian": 0.01}, "summary": {"min_fos": 99.0}}
+    failed = _finished_job("fea_static", {"analysis": "fea_static", "doc": "doc-10",
+                                          "notes": []}, refusal)
+    simjobs._set(failed, state=simjobs.FAILED, error="the solver process exited")
+    status = json.loads(tools["sim_status"](job_id=failed))
+    assert status["state"] == simjobs.FAILED and "meta" not in status, status
+    assert "code" not in status and "detail" not in status, status
+    out = json.loads(tools["sim_results"](job_id=failed))
+    assert out["ok"] is False and out["state"] == simjobs.FAILED, out
+    assert out["solver_error"] == "mesh rejected", out
+    assert out["n_elems"] == 12 and out["mesh_quality"] == {"min_jacobian": 0.01}, out
+    assert "summary" not in out and "converged" not in out, out
+    assert simjobs.collected(failed) is None and len(persisted) == 1
+
+
 # ------------------------------------------------------- the convergence ladder is SEQUENTIAL
 # Measured live: a three-leg ladder started its legs as three simultaneous durable jobs, and
 # four ladders launched back-to-back put twelve solves on the machine at once. The memory

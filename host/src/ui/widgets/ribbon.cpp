@@ -56,10 +56,14 @@ static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulatio
                                     // ECAD split: the old single "PCB" tab (index 7, now "PCB Design")
                                     // was split — this is the second half. Appended at index 20 to keep
                                     // the sim per-type tab indices 13..19 stable (append-only).
-                                    "Schematic"};
-static constexpr int kRibbonTabCount = 21;  // + W17 contextual "View Layout"/"Annotation" (drawings)
+                                    "Schematic",
+                                    // Topology optimization study tab (index 21, Simulate workspace
+                                    // only — see ribbon_tabVisible). Appended to keep every index stable.
+                                    "Topology"};
+static constexpr int kRibbonTabCount = 22;  // + W17 contextual "View Layout"/"Annotation" (drawings)
                                             //   + "Appearance" (index 11) + "Manufacture" (CAM, 12)
                                             //   + sim-gui per-type tabs (13..19, Simulate only)
+                                            //   + "Topology" (21, Simulate only)
 
 // W-overhaul: per-workspace tab icon, parallel to kRibbonTabs[]. The eight true workspace tabs use
 // the dedicated ws_* atlas glyphs from the icon contract; the four tabs that have no ws_* glyph
@@ -90,6 +94,7 @@ static const char* kTabIcons[] = {
     "mate",           // Motion
     "relations",      // EM (placeholder)
     "sketch",         // Schematic (index 20 — reuse sketch glyph; no ws_schematic glyph yet)
+    "study_static",   // Topology (index 21 — structural study glyph until a study_topology ships)
 };
 static_assert(sizeof(kTabIcons) / sizeof(kTabIcons[0]) == kRibbonTabCount,
               "kTabIcons must stay parallel to kRibbonTabs");
@@ -125,7 +130,8 @@ static bool ribbon_cmdEnabled(const ui::RibbonCmd* c) {
 //
 // Tab index → name map (matches kRibbonTabs):
 //   0=Features, 1=Sketch, 2=Evaluate, 3=Simulation, 4=Assembly, 5=Sheet Metal,
-//   6=Weldments, 7=PCB, 8=Surfaces, 9=View Layout, 10=Annotation, 11=Appearance, 12=Manufacture
+//   6=Weldments, 7=PCB, 8=Surfaces, 9=View Layout, 10=Annotation, 11=Appearance, 12=Manufacture,
+//   13..19=Static/Modal/Flow/Thermal/Fatigue/Motion/EM, 20=Schematic, 21=Topology
 //
 // Workspace enum (AppState::Workspace): Model=0, Drawing=1, Simulate=2, Electronics=3,
 //   Manufacture=4, PLM=5, PartsLibrary=6, AI=7
@@ -146,10 +152,11 @@ static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbToo
     }
 
     // Simulate workspace (sim-gui rework): the per-simulation-type tabs ONLY (Static / Modal /
-    // Flow / Thermal / Fatigue / Motion / EM, indices 13..19). Each carries only the tools for
-    // its study type + the shared Reference group. The legacy all-in-one Simulation tab (3) is
-    // retired from this workspace (its rows stay in ribbon_def for append-only compat).
-    if (s_workspace == 2 /*Simulate*/) return tab >= 13 && tab <= 19;
+    // Flow / Thermal / Fatigue / Motion / EM, indices 13..19, plus Topology at 21). Each carries
+    // only the tools for its study type + the shared Reference group. The legacy all-in-one
+    // Simulation tab (3) is retired from this workspace (its rows stay in ribbon_def for
+    // append-only compat).
+    if (s_workspace == 2 /*Simulate*/) return (tab >= 13 && tab <= 19) || tab == 21;
 
     // Electronics workspace: both ECAD tabs — PCB Design (7) and Schematic (20).
     if (s_workspace == 3 /*Electronics*/) return tab == 7 || tab == 20;
@@ -165,7 +172,7 @@ static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbToo
     if (tab == 7) return showPcbTools;         // PCB Design: legacy bool
     if (tab == 20) return showPcbTools;        // Schematic: same legacy ECAD bool as PCB Design
     if (tab == 12) return false;               // Manufacture: only in Manufacture workspace
-    if (tab >= 13) return false;               // sim-gui per-type tabs: Simulate workspace only
+    if (tab >= 13) return false;               // sim-gui per-type tabs + Topology: Simulate only
     return true;
 }
 
@@ -811,6 +818,21 @@ static const char* ribbon_tipFor(const char* cmd_id) {
         // --- Simulation: extended study types ---
         {"sim_new_thermal",   "Create a steady-state or transient thermal study."},
         {"sim_new_fatigue",   "Estimate fatigue life from a static stress result."},
+        // --- Simulation: topology optimization (Topology tab) ---
+        {"sim_new_topology",  "Create a topology optimization study: find the best material layout "
+                              "inside the part for a volume budget."},
+        {"sim_topology_setup", "Choose the physics, optimization method, objective, volume budget "
+                               "and response limits the solver supports."},
+        {"sim_topology_boundaries", "Edit the study's boundary faces: thermal temperatures, heat "
+                                    "loads and convection, or flow inlets, outlets and walls."},
+        {"sim_topology_preserve", "Keep the selected faces solid to a set depth (mounting faces, "
+                                  "bosses) — the optimizer never removes this material."},
+        {"sim_topology_exclude", "Keep the selected faces or region empty (clearances, keep-outs) "
+                                 "— the optimizer never places material there."},
+        {"sim_topology_manufacturing", "Set symmetry, extrusion, build direction, overhang and "
+                                       "enclosed-void rules for the optimized shape."},
+        {"sim_topology_compare", "Compare retained optimization runs: objective, volume, "
+                                 "constraints and convergence against a baseline run."},
         // --- Assembly ---
         {"asm_parts_library", "Insert a standard hardware part from the library."},
         // --- Evaluate: drawing entry point + profiler ---

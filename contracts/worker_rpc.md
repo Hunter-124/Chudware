@@ -477,6 +477,8 @@ against the native and Python implementations on 2026-08-15.
 | `sim_study_add` | `{doc_id, study}` → `{studies:[…], revision, study_id}`; the core assigns an id when absent. |
 | `sim_study_edit` | `{doc_id, study_id, study}` → `{studies:[…], revision}`; the addressed id is preserved. |
 | `sim_study_delete` | `{doc_id, study_id}` → `{studies:[…], revision}`. |
+| `topology_capabilities` | `{}` → `{ok,methods,physics,combinations,manufacturing,…}`. Read-only native capability matrix; each combination declares support, objectives, response limits, parameters, defaults, volume phase, formulation and validity. |
+| `sim_run_topology` | `{study}` → `{ok,converged,feasible?,termination,method,physics,summary,history,constraints,manufacturing,provenance,mesh_quality,artifacts,density?,fields?,reconstruction?,overlay_aicm?}`. Native-only topology solve; computation success is distinct from convergence, feasibility, reconstruction validity and print readiness. See the topology addendum below. |
 | `shutdown` | |
 
 All `sim_run_*`/`sim_mesh` stream `sim_progress` events (events.md). The sim worker receives
@@ -2041,3 +2043,54 @@ Src (face silhouette) = {"kind":"outline", "body":b, "face_id":f, "sid":"F…",
   view's VISIBLE circle whose `src.sid` or `src.face_sids` holds the sid. A target drawn there only
   on the hidden layer is refused (`HIDDEN`, naming the views where it is visible); a feature name
   spanning several separate circles is refused listing each circle's sid.
+
+## Topology optimization (append-only, 2026-10-03)
+
+`topology_capabilities` and `sim_run_topology` are native-only routes. SIMP and RAMP
+support structural, thermal, modal, buckling, flow, thermomechanical and CHT studies;
+BESO and reaction-diffusion level set support structural/thermal volume-budget studies.
+The live combination matrix is authoritative for objectives, limits and parameters;
+unsupported combinations and unknown numerical settings refuse before meshing.
+
+`study.type` is `"topology"`, with `study.topology` holding method, physics, objective,
+volume budget, optimizer settings, response limits and manufacturing intent. Geometry
+is `step_path` or inline flat `points`/`tets` with tet4 order. Shared/per-case mechanical
+fixtures and force/pressure loads, thermal fixtures/flux/power/convection, flow
+inlets/outlets/walls, preserve/exclude regions and custom material properties use the
+same persisted study on the GUI and model-tool surfaces. The service resolves saved face
+selectors before dispatch. Public lengths are mm, forces N, stress/pressure MPa,
+temperatures C, thermal loads W or W/m2; flow uses m/s, Pa, Pa*s and kg/m3. Numerical
+internals are SI. Density 1 always means solid; `volume_fraction` budgets fluid for
+flow/CHT and solid for the other physics.
+
+The hostd run connection streams native `sim.progress` packets with `phase`, `elapsed_s`,
+`elements` and optional `iteration:{index,max,objective,objective_change,volume_fraction,
+design_change,max_constraint,constraints?,metrics?}`. Simulation and agent runs use
+separate connections; control/cancellation and document interaction do not wait behind
+the run. Same-lane solves serialize. Silence, not total elapsed run time, drives the
+daemon watchdog. `sim_cancel` requests cooperative native cancellation; the durable
+model-job tool additionally owns and can terminate its separate solver process.
+
+A numerical failure/cancellation is a normal native reply (`ok:false`, C API return
+code 0), preserving whatever evidence was actually written. `ok:true` at an iteration
+limit is not `converged:true`. Final fields and constraints are evaluated at the final
+design. Thresholded geometry and its conforming clipped volume are validated and
+reanalysed separately; a failed reanalysis is never replaced by the relaxed-density
+answer. STL export requires validated geometry. Original editable CAD is not replaced.
+
+Each run owns a fresh `native-<utc>-<physics>-<method>-<suffix>` child directory.
+Artifacts carry path, format, size and SHA-256. `run.json`, `study.json`,
+`normalized_spec.json`, `history.jsonl`, and atomic `checkpoint.json` retain evidence
+when a worker dies; final outputs also include field VTU, AICM, valid-surface STL and
+result JSON as applicable. Checkpoints contain optimizer state but this RPC currently
+accepts no resume input. Model collection persists exactly one compact run record into
+the same study, including failed/cancelled outcomes, without resurrecting a deleted
+study or overwriting later edits. Full density/field arrays remain artifacts.
+
+Flow/CHT is low-Reynolds Stokes-Brinkman, not Navier-Stokes or turbulence: both inlet
+admission and a bound on the solved MINI velocity must satisfy Re <= 1. CHT transports
+constant fluid volumetric heat capacity on the superficial velocity and reports
+Brinkman heat leakage. Thermomechanical coupling is steady and one-way. Manufacturing
+filter/overhang intent is distinct from measured geometry and DFAM checks. Topology
+does not slice and never establishes print readiness: `slice_part` must produce and
+validate the G-code.

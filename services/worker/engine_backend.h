@@ -66,21 +66,36 @@ std::string hostdBinHint();
 // surfaces as a transport failure: false + err, no {code} in result). Ignored
 // on the in-process backend — a call into the loaded DLL can't be timed out.
 // `onEvent`, when set, streams {"event":"agent.event",...} pushes LIVE (mid-call) to the callback
-// instead of buffering them for drainEvents() — used by the agent path so a blocking run's events
+// instead of buffering them for drainEvents() — used by agent and topology runs so their events
 // surface as they happen on the daemon backend. No-op on the in-process backend (which streams via
 // the cpp_core event sink set by the caller).
 bool call(const std::string& method, const nlohmann::json& params,
           nlohmann::json& result, std::string& err, int timeoutMs = -1,
           const std::function<void(const nlohmann::json&)>& onEvent = {});
 
-// Teardown-only: wake a blocked long agent/mission run on its dedicated connection so app
-// quit / AsyncRpc shutdown never hangs on a multi-minute call. No-op if never opened.
+// Teardown-only: wake blocked agent/mission and simulation runs on their separate dedicated
+// connections so app quit / AsyncRpc shutdown never hangs. No-op for unopened connections.
 void abortRunClient();
 
-// True when daemon-mode long runs will stream on the dedicated run connection (opening it
-// lazily if needed), i.e. engine::call of a long-run method will NOT occupy the shared GUI
-// connection. WorkerClient only lets a long run off its call mutex when this holds.
-bool runConnectionReady();
+// The dedicated daemon connection a method streams on. Agent runs (agent_admin_turn,
+// agent_run[_v2], agent_mission[_v1]) take the agent run connection, which falls back to the
+// shared GUI connection when it cannot open; simulation solves and sim_mesh take the private
+// simulation connection, which never falls back (the call fails instead). Everything else uses
+// the shared GUI connection. The two lanes are independent: a chat turn never waits for a solve.
+enum class RunLane { None, Agent, Sim };
+RunLane runLane(const std::string& method);
+
+// A simulation-lane call that is not a solve (sim_mesh, the mesh preview). It may borrow the
+// simulation connection while it is idle, but must never queue behind a solve holding it:
+// WorkerClient sends it over a short-lived side connection while the lane is busy.
+bool isSimLanePreview(const std::string& method);
+
+// True when daemon-mode calls on `lane` will stream on that lane's dedicated connection
+// (opening it lazily if needed), i.e. engine::call will NOT occupy the shared GUI connection.
+// WorkerClient only lets a long run off its call mutex when this holds for the run's own lane;
+// one lane's readiness says nothing about the other's. False for RunLane::None and off daemon
+// mode.
+bool runConnectionReady(RunLane lane);
 
 // Backend availability probes with InProcCore semantics (routing predicates in
 // worker_client.cpp use these instead of core::cpp_core() directly). In daemon

@@ -63,6 +63,7 @@
 
 #include "sim/fea_contact.h"
 #include "sim/fea_buckling.h"
+#include "sim/fea_prepare.h"
 #include "sim/fea_modal.h"
 #include "sim/fea_selection.h"
 #include "sim/fea_static.h"
@@ -472,30 +473,6 @@ double round_nd(double v, int nd) {
     double scale = std::pow(10.0, nd);
     return std::round(v * scale) / scale;
 }
-
-class SimJobScope {
-public:
-    explicit SimJobScope(const json& study,
-                         const SimCancelToken& inherited_token = {})
-        : id_(study.is_object() && study.contains("job_id") &&
-                      study["job_id"].is_string()
-                  ? study["job_id"].get<std::string>()
-                  : std::string()),
-          token_(inherited_token ? inherited_token : sim_job_register(id_)),
-          owns_registration_(!inherited_token) {}
-    ~SimJobScope() {
-        if (owns_registration_) sim_job_unregister(id_, token_);
-    }
-    const SimCancelToken& token() const { return token_; }
-    bool cancelled() const {
-        return token_ && token_->load(std::memory_order_relaxed);
-    }
-
-private:
-    std::string id_;
-    SimCancelToken token_;
-    bool owns_registration_ = false;
-};
 
 bool finite3(const json& v) {
     if (!v.is_array() || v.size() != 3) return false;
@@ -1308,25 +1285,30 @@ bool tri6_face_weights(const std::vector<double>& points, const int* el,
     return std::isfinite(area) && area > 0.0;
 }
 
-// Accumulate the consistent boundary integral over every element face whose CORNER nodes
-// are ALL in `node_set`. For each loaded face it adds, per node:
-//   • node_w[i]   += ∫ N_i dA                  (scalar tributary, for the force split)
-//   • node_nw[3i] += (∫ N_i dA) · n̂_face       (vector pressure weight ∫ N_i n̂ dA — the
-//                                               per-face outward normal so a CURVED loaded
-//                                               surface gets the right directional load).
-// Returns the loaded boundary area. Handles tet4/tet10/hex8. Tet10 uses mapped tri6
-// quadrature so curved midside geometry contributes the correct scalar and vector surface
-// Jacobians; tet4/hex8 retain their linear equal-per-corner rule.
+// Visit every exterior element face whose CORNER nodes are ALL in `node_set`, in
+// element/face order, as one BoundaryFacet (fea_prepare.h) carrying the consistent
+// boundary integrals of that face:
+//   • weights[i]           = ∫ N_i dA
+//   • normal_weights[i][c] = ∫ N_i n̂_c dA   (outward)
+// Tet10 uses mapped tri6 quadrature so curved midside geometry contributes the correct
+// scalar and vector surface Jacobians; tet4/hex8 use the linear equal-per-corner rule
+// (A/n per corner, flat fan normal). Returns the visited boundary area. Handles
+// tet4/tet10/hex8.
+//
+// kFull=false fills only what accumulate_face_weights consumes (tet10: nodes, weights,
+// normal_weights; linear: nodes, weights, unit normal); kFull=true also completes the
+// linear normal_weights and the tet10 unit normal for prepared boundary selections.
 //
 // A tet10 face whose projected mid nodes still fold it after the mesher's element-local
 // straight-edge fallback (detail::repair_folded_quadratic) is unusable: the surface
 // Jacobian reverses inside the face, so the integral is meaningless. That returns NaN and
 // fills `fold_detail` with the offending element index and its location, because "somewhere
 // in your mesh a face is folded" is not an actionable diagnostic on a 200k-element frame.
-double accumulate_face_weights(const std::vector<double>& points, const std::vector<int>& tets,
-                               int nodes_per_elem, const std::unordered_set<int>& node_set,
-                               std::vector<double>& node_w, std::vector<double>& node_nw,
-                               std::string& fold_detail) {
+template <bool kFull, class Visit>
+double visit_selected_boundary_faces(const std::vector<double>& points,
+                                     const std::vector<int>& tets, int nodes_per_elem,
+                                     const std::unordered_set<int>& node_set,
+                                     std::string& fold_detail, Visit&& visit) {
     // P5: a boundary face needs ALL 3 (tet) / 4 (hex) corners in the set — under 3 nodes
     // no face can qualify, so the loaded area is exactly 0 and the whole element sweep is
     // a no-op. Exact short-circuit (the caller's w_sum fallback branch fires, as before);
@@ -1353,6 +1335,7 @@ double accumulate_face_weights(const std::vector<double>& points, const std::vec
         }
     }
     double total_area = 0.0;
+    BoundaryFacet facet;
     for (size_t e = 0; e < m; ++e) {
         const int* el = &tets[e * stride];
         for (int f = 0; f < n_faces; ++f) {
@@ -1366,10 +1349,12 @@ double accumulate_face_weights(const std::vector<double>& points, const std::vec
                 if (!node_set.count(cn[i])) { all_in = false; break; }
             }
             if (!all_in) continue;
+            facet.element = static_cast<int>(e);
+            facet.face = f;
             if (tet10) {
-                double weights[6], normal_weights[6][3], curved_area = 0.0;
+                double curved_area = 0.0;
                 const FaceTab& ft = kTetFaces[f];
-                if (!tri6_face_weights(points, el, ft, weights, normal_weights,
+                if (!tri6_face_weights(points, el, ft, facet.weights, facet.normal_weights,
                                        curved_area)) {
                     double centroid[3] = {0.0, 0.0, 0.0};
                     for (int i = 0; i < 4; ++i)
@@ -1385,12 +1370,21 @@ double accumulate_face_weights(const std::vector<double>& points, const std::vec
                 }
                 const int fn[6] = {cn[0], cn[1], cn[2], el[ft.mid[0]],
                                    el[ft.mid[1]], el[ft.mid[2]]};
-                for (int i = 0; i < 6; ++i) {
-                    node_w[static_cast<size_t>(fn[i])] += weights[i];
+                for (int i = 0; i < 6; ++i) facet.nodes[static_cast<size_t>(i)] = fn[i];
+                facet.node_count = 6;
+                facet.area_mm2 = curved_area;
+                if constexpr (kFull) {
+                    // Σ_i ∫ N_i n̂ dA = ∫ n̂ dA (partition of unity): the area-averaged
+                    // outward direction of the curved face.
+                    double sum[3] = {0.0, 0.0, 0.0};
+                    for (int i = 0; i < 6; ++i)
+                        for (int c = 0; c < 3; ++c) sum[c] += facet.normal_weights[i][c];
+                    const double norm =
+                        std::sqrt(sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]);
                     for (int c = 0; c < 3; ++c)
-                        node_nw[static_cast<size_t>(fn[i]) * 3 + c] +=
-                            normal_weights[i][c];
+                        facet.normal[static_cast<size_t>(c)] = norm > 0.0 ? sum[c] / norm : 0.0;
                 }
+                visit(static_cast<const BoundaryFacet&>(facet));
                 total_area += curved_area;
                 continue;
             }
@@ -1434,19 +1428,61 @@ double accumulate_face_weights(const std::vector<double>& points, const std::vec
                     nx = -nx; ny = -ny; nz = -nz;
                 }
             }
-            auto add = [&](int node, double w) {
-                node_w[static_cast<size_t>(node)] += w;
-                node_nw[static_cast<size_t>(node) * 3 + 0] += w * nx;
-                node_nw[static_cast<size_t>(node) * 3 + 1] += w * ny;
-                node_nw[static_cast<size_t>(node) * 3 + 2] += w * nz;
-            };
+            facet.normal = {nx, ny, nz};
+            facet.node_count = fk;
+            facet.area_mm2 = area;
             // tri3 (tet4) / quad (hex8): equal A/fk per corner.
-            for (int i = 0; i < fk; ++i)
-                add(cn[i], area / static_cast<double>(fk));
+            for (int i = 0; i < fk; ++i) {
+                const double w = area / static_cast<double>(fk);
+                facet.nodes[static_cast<size_t>(i)] = cn[i];
+                facet.weights[i] = w;
+                if constexpr (kFull) {
+                    facet.normal_weights[i][0] = w * nx;
+                    facet.normal_weights[i][1] = w * ny;
+                    facet.normal_weights[i][2] = w * nz;
+                }
+            }
+            visit(static_cast<const BoundaryFacet&>(facet));
             total_area += area;
         }
     }
     return total_area;
+}
+
+// Accumulate the consistent boundary integral over every element face whose CORNER nodes
+// are ALL in `node_set`. For each loaded face it adds, per node:
+//   • node_w[i]   += ∫ N_i dA                  (scalar tributary, for the force split)
+//   • node_nw[3i] += (∫ N_i dA) · n̂_face       (vector pressure weight ∫ N_i n̂ dA — the
+//                                               per-face outward normal so a CURVED loaded
+//                                               surface gets the right directional load).
+// Returns the loaded boundary area, or NaN with `fold_detail` on a folded tet10 face
+// (visit_selected_boundary_faces above owns the face rules).
+double accumulate_face_weights(const std::vector<double>& points, const std::vector<int>& tets,
+                               int nodes_per_elem, const std::unordered_set<int>& node_set,
+                               std::vector<double>& node_w, std::vector<double>& node_nw,
+                               std::string& fold_detail) {
+    const bool tet10 = (nodes_per_elem == 10);
+    return visit_selected_boundary_faces<false>(
+        points, tets, nodes_per_elem, node_set, fold_detail,
+        [&](const BoundaryFacet& facet) {
+            if (tet10) {
+                for (int i = 0; i < 6; ++i) {
+                    const size_t node = static_cast<size_t>(facet.nodes[static_cast<size_t>(i)]);
+                    node_w[node] += facet.weights[i];
+                    for (int c = 0; c < 3; ++c)
+                        node_nw[node * 3 + c] += facet.normal_weights[i][c];
+                }
+                return;
+            }
+            for (int i = 0; i < facet.node_count; ++i) {
+                const size_t node = static_cast<size_t>(facet.nodes[static_cast<size_t>(i)]);
+                const double w = facet.weights[i];
+                node_w[node] += w;
+                node_nw[node * 3 + 0] += w * facet.normal[0];
+                node_nw[node * 3 + 1] += w * facet.normal[1];
+                node_nw[node * 3 + 2] += w * facet.normal[2];
+            }
+        });
 }
 
 // Complete a tet10 loaded-face node set with its MID-SIDE (mid-edge) nodes.
@@ -2230,104 +2266,121 @@ namespace {
 
 // Shared mechanical study gates and load deposition: static and buckling must
 // use the same exterior faces, tet10 work-equivalent weights and pressure sign.
-json validate_mechanical_boundary_conditions(const json& study) {
-    if (!study.contains("fixtures") || !study["fixtures"].is_array() ||
-        study["fixtures"].empty())
+// The list gates are shared with the prepared-problem seams (fea_prepare.h);
+// `ctx` is the error prefix, "fea_static" for every study route.
+json validate_mechanical_fixture_list(const json& fixtures, const std::string& ctx) {
+    if (!fixtures.is_array() || fixtures.empty())
         return json{{"ok", false},
-                    {"error", "fea_static: at least one fixture is required"}};
-    for (size_t i = 0; i < study["fixtures"].size(); ++i) {
-        const auto& fixture = study["fixtures"][i];
+                    {"error", ctx + ": at least one fixture is required"}};
+    for (size_t i = 0; i < fixtures.size(); ++i) {
+        const auto& fixture = fixtures[i];
         if (!fixture.is_object())
             return json{{"ok", false},
-                        {"error", "fea_static: fixture " + std::to_string(i) +
+                        {"error", ctx + ": fixture " + std::to_string(i) +
                                       " must be an object"}};
         std::string faceset_error;
         if (!validate_faceset_input(fixture, faceset_error))
             return json{{"ok", false},
-                        {"error", "fea_static: fixture " + std::to_string(i) +
+                        {"error", ctx + ": fixture " + std::to_string(i) +
                                       ": " + faceset_error}};
         if (fixture.contains("tol_mm") && !fixture["tol_mm"].is_number())
             return json{{"ok", false},
-                        {"error", "fea_static: fixture " + std::to_string(i) +
+                        {"error", ctx + ": fixture " + std::to_string(i) +
                                       " has non-numeric tol_mm"}};
         const double tol = fixture.value("tol_mm", 1.0);
         if (!std::isfinite(tol) || !(tol > 0.0))
             return json{{"ok", false},
-                        {"error", "fea_static: fixture " + std::to_string(i) +
+                        {"error", ctx + ": fixture " + std::to_string(i) +
                                       " has invalid tol_mm"}};
     }
-    if (!study.contains("loads") || !study["loads"].is_array() ||
-        study["loads"].empty())
+    return nullptr;
+}
+
+json validate_mechanical_load_list(const json& loads, const std::string& ctx) {
+    if (!loads.is_array() || loads.empty())
         return json{{"ok", false},
-                    {"error", "fea_static: at least one non-zero load is required"}};
+                    {"error", ctx + ": at least one non-zero load is required"}};
     bool have_nonzero_load = false;
-    for (size_t i = 0; i < study["loads"].size(); ++i) {
-        const auto& load = study["loads"][i];
+    for (size_t i = 0; i < loads.size(); ++i) {
+        const auto& load = loads[i];
         if (!load.is_object() || !load.contains("faces") ||
             !load["faces"].is_object())
             return json{{"ok", false},
-                        {"error", "fea_static: load " + std::to_string(i) +
+                        {"error", ctx + ": load " + std::to_string(i) +
                                       " requires a faces object"}};
         if (load["faces"].contains("tol_mm") &&
             !load["faces"]["tol_mm"].is_number())
             return json{{"ok", false},
-                        {"error", "fea_static: load " + std::to_string(i) +
+                        {"error", ctx + ": load " + std::to_string(i) +
                                       " has non-numeric tol_mm"}};
         const double tol = load["faces"].value("tol_mm", 1.0);
         std::string faceset_error;
         if (!validate_faceset_input(load["faces"], faceset_error))
             return json{{"ok", false},
-                        {"error", "fea_static: load " + std::to_string(i) +
+                        {"error", ctx + ": load " + std::to_string(i) +
                                       ": " + faceset_error}};
         if (!std::isfinite(tol) || !(tol > 0.0))
             return json{{"ok", false},
-                        {"error", "fea_static: load " + std::to_string(i) +
+                        {"error", ctx + ": load " + std::to_string(i) +
                                       " has invalid tol_mm"}};
         if (!load.contains("type") || !load["type"].is_string())
             return json{{"ok", false},
-                        {"error", "fea_static: load " + std::to_string(i) +
+                        {"error", ctx + ": load " + std::to_string(i) +
                                       " requires a string type"}};
         const std::string type = load.value("type", std::string());
         if (type == "force") {
             if (!load.contains("vector") || !finite3(load["vector"]))
                 return json{{"ok", false},
-                            {"error", "fea_static: force load " + std::to_string(i) +
+                            {"error", ctx + ": force load " + std::to_string(i) +
                                           " requires a finite 3-vector"}};
             have_nonzero_load = have_nonzero_load || nonzero3(load["vector"]);
         } else if (type == "pressure") {
             if (!load.contains("magnitude") || !load["magnitude"].is_number()) {
                 return json{{"ok", false},
-                            {"error", "fea_static: pressure load " + std::to_string(i) +
+                            {"error", ctx + ": pressure load " + std::to_string(i) +
                                           " requires a finite magnitude"}};
             }
             const double magnitude = load["magnitude"].get<double>();
             if (!std::isfinite(magnitude))
                 return json{{"ok", false},
-                            {"error", "fea_static: pressure load " + std::to_string(i) +
+                            {"error", ctx + ": pressure load " + std::to_string(i) +
                                           " requires a finite magnitude"}};
             have_nonzero_load = have_nonzero_load || magnitude != 0.0;
         } else {
             return json{{"ok", false},
-                        {"error", "fea_static: unsupported load type '" + type + "'"}};
+                        {"error", ctx + ": unsupported load type '" + type + "'"}};
         }
     }
     if (!have_nonzero_load)
         return json{{"ok", false},
-                    {"error", "fea_static: at least one non-zero load is required"}};
+                    {"error", ctx + ": at least one non-zero load is required"}};
     return nullptr;
 }
 
-json resolve_mechanical_loads(
-    const json& study, const std::vector<double>& points,
+json validate_mechanical_boundary_conditions(const json& study) {
+    static const std::string kContext = "fea_static";
+    static const json kAbsent;
+    const json& fixtures = study.contains("fixtures") ? study["fixtures"] : kAbsent;
+    if (json failure = validate_mechanical_fixture_list(fixtures, kContext);
+        !failure.is_null())
+        return failure;
+    return validate_mechanical_load_list(
+        study.contains("loads") ? study["loads"] : kAbsent, kContext);
+}
+
+// Deposit a validated load list (study.loads syntax) into `nodal_forces`.
+json deposit_mechanical_load_list(
+    const json& loads, const std::vector<double>& points,
     const std::vector<int>& tets, int nodes_per_elem,
     std::vector<double>& nodal_forces, std::vector<std::string>& notes,
-    std::vector<std::pair<std::string, std::vector<int>>>* load_selections = nullptr) {
+    std::vector<std::pair<std::string, std::vector<int>>>* load_selections,
+    const std::string& ctx) {
     const int n_nodes = static_cast<int>(points.size() / 3);
     const int n_dof = n_nodes * 3;
     nodal_forces.assign(static_cast<size_t>(n_dof), 0.0);
     std::size_t loads_seen = 0;
-    if (study.contains("loads") && study["loads"].is_array()) {
-        for (const auto& load : study["loads"]) {
+    if (loads.is_array()) {
+        for (const auto& load : loads) {
             const std::size_t load_ordinal = loads_seen++;
             const json faces = load.contains("faces") ? load["faces"] : json::object();
             const double tol = faces.value("tol_mm", 1.0);
@@ -2351,7 +2404,7 @@ json resolve_mechanical_loads(
                 boundary_faceset_membership(faces, points, tets, nodes_per_elem);
             if (node_ids.empty())
                 return json{{"ok", false},
-                            {"error", "fea_static: load faces resolved to 0 mesh nodes "
+                            {"error", ctx + ": load faces resolved to 0 mesh nodes "
                                       "(tol=" +
                                           std::to_string(tol) + " mm)"}};
             // Consistent boundary-load weights w_i = ∫ N_i dA over the loaded faces.
@@ -2385,7 +2438,7 @@ json resolve_mechanical_loads(
                                                       fold_detail);
                 if (!std::isfinite(loaded_area))
                     return json{{"ok", false},
-                                {"error", "fea_static: invalid or folded quadratic "
+                                {"error", ctx + ": invalid or folded quadratic "
                                           "boundary face" + fold_detail}};
             }
             double w_sum = 0.0;
@@ -2450,13 +2503,24 @@ json resolve_mechanical_loads(
                                     " mm2 (work-consistent, +p acts inward)");
                 } else {
                     return json{{"ok", false},
-                                {"error", "fea_static: pressure selection contains no "
+                                {"error", ctx + ": pressure selection contains no "
                                           "complete exterior boundary face"}};
                 }
             }
         }
     }
     return nullptr;
+}
+
+json resolve_mechanical_loads(
+    const json& study, const std::vector<double>& points,
+    const std::vector<int>& tets, int nodes_per_elem,
+    std::vector<double>& nodal_forces, std::vector<std::string>& notes,
+    std::vector<std::pair<std::string, std::vector<int>>>* load_selections = nullptr) {
+    static const json kAbsent;
+    return deposit_mechanical_load_list(
+        study.contains("loads") ? study["loads"] : kAbsent, points, tets,
+        nodes_per_elem, nodal_forces, notes, load_selections, "fea_static");
 }
 
 // CAD-only load-path preflight. The normal envelope is over WHOLE analytic
@@ -5141,6 +5205,417 @@ std::vector<int> resolve_face_nodes(const json& faces, const std::vector<double>
 }
 
 }  // namespace
+
+// ── Prepared-problem seams (fea_prepare.h) ──────────────────────────────────────
+// Thin wrappers over the SAME resolution the study routes above run: resolve_mesh,
+// boundary_faceset_membership / resolve_face_nodes, visit_selected_boundary_faces and
+// deposit_mechanical_load_list. Nothing here re-derives a face rule or a load rule.
+namespace {
+
+bool prepare_refuse(std::string& error, std::string message) {
+    error = std::move(message);
+    return false;
+}
+
+// Inline arrays are validated BEFORE resolve_mesh: its quality probe indexes points
+// through tets, so an out-of-range index must never reach it.
+bool validate_inline_mesh_arrays(const json& study, const std::string& ctx,
+                                 std::string& error) {
+    const json& points = study["points"];
+    const json& tets = study["tets"];
+    if (points.size() % 3 != 0)
+        return prepare_refuse(error, ctx + ": inline points must be a flat n*3 array of "
+                                           "mm coordinates");
+    for (const auto& x : points)
+        if (!x.is_number() || !std::isfinite(x.get<double>()))
+            return prepare_refuse(error, ctx + ": inline points must be finite numbers");
+    if (study.contains("nodes_per_elem") && !study["nodes_per_elem"].is_number_integer())
+        return prepare_refuse(error, ctx + ": inline nodes_per_elem must be an integer");
+    const int npe = study.value("nodes_per_elem", 4);
+    if (npe != 4 && npe != 8 && npe != 10)
+        return prepare_refuse(error, ctx + ": inline nodes_per_elem must be 4 (tet4), "
+                                           "10 (tet10) or 8 (hex8), got " +
+                                           std::to_string(npe));
+    if (tets.size() % static_cast<std::size_t>(npe) != 0)
+        return prepare_refuse(error, ctx + ": inline tets length " +
+                                         std::to_string(tets.size()) +
+                                         " is not a multiple of nodes_per_elem " +
+                                         std::to_string(npe));
+    const long long n_nodes = static_cast<long long>(points.size() / 3);
+    for (const auto& id : tets)
+        if (!id.is_number_integer() || id.get<long long>() < 0 ||
+            id.get<long long>() >= n_nodes)
+            return prepare_refuse(error, ctx + ": inline tets must hold 0-based integer "
+                                               "node indices below " +
+                                               std::to_string(n_nodes));
+    return true;
+}
+
+// Rank of the six rigid-body modes (3 translations, 3 rotations about the centroid
+// of the referenced nodes, coordinates scaled by the bounding-box diagonal)
+// restricted to the fixed DOFs: 6 means no rigid motion survives the constraints.
+// Pivoted elimination of the 6x6 Gram matrix with a trace-relative tolerance, so a
+// collinear or single-point support (an exact zero rotation) reads rank-deficient.
+int rigid_body_rank(const PreparedMesh& mesh, const std::vector<std::uint8_t>& fixed_dof) {
+    const std::size_t n = mesh.n_nodes();
+    double lo[3] = {std::numeric_limits<double>::infinity(),
+                    std::numeric_limits<double>::infinity(),
+                    std::numeric_limits<double>::infinity()};
+    double hi[3] = {-lo[0], -lo[1], -lo[2]};
+    double centroid[3] = {0.0, 0.0, 0.0};
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!mesh.referenced[i]) continue;
+        for (int c = 0; c < 3; ++c) {
+            const double x = mesh.points[i * 3 + c];
+            centroid[c] += x;
+            lo[c] = std::min(lo[c], x);
+            hi[c] = std::max(hi[c], x);
+        }
+        ++count;
+    }
+    if (count == 0) return 0;
+    for (double& c : centroid) c /= static_cast<double>(count);
+    double scale = std::sqrt((hi[0] - lo[0]) * (hi[0] - lo[0]) +
+                             (hi[1] - lo[1]) * (hi[1] - lo[1]) +
+                             (hi[2] - lo[2]) * (hi[2] - lo[2]));
+    if (!(scale > 0.0) || !std::isfinite(scale)) scale = 1.0;
+    double gram[6][6] = {};
+    for (std::size_t i = 0; i < n; ++i) {
+        for (int d = 0; d < 3; ++d) {
+            if (!fixed_dof[i * 3 + static_cast<std::size_t>(d)]) continue;
+            double x[3];
+            for (int c = 0; c < 3; ++c) x[c] = (mesh.points[i * 3 + c] - centroid[c]) / scale;
+            // Component d of each mode: translations e_d, rotations (e_a × x)_d.
+            double row[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+            row[d] = 1.0;
+            if (d == 0) { row[4] = x[2]; row[5] = -x[1]; }
+            if (d == 1) { row[3] = -x[2]; row[5] = x[0]; }
+            if (d == 2) { row[3] = x[1]; row[4] = -x[0]; }
+            for (int a = 0; a < 6; ++a)
+                for (int b = 0; b < 6; ++b) gram[a][b] += row[a] * row[b];
+        }
+    }
+    double trace = 0.0;
+    for (int a = 0; a < 6; ++a) trace += gram[a][a];
+    if (!(trace > 0.0)) return 0;
+    const double tol = 1e-10 * trace;
+    bool used[6] = {false, false, false, false, false, false};
+    int rank = 0;
+    for (int step = 0; step < 6; ++step) {
+        int pivot_index = -1;
+        double best = tol;
+        for (int a = 0; a < 6; ++a)
+            if (!used[a] && gram[a][a] > best) {
+                best = gram[a][a];
+                pivot_index = a;
+            }
+        if (pivot_index < 0) break;
+        used[pivot_index] = true;
+        ++rank;
+        const double pivot = gram[pivot_index][pivot_index];
+        for (int a = 0; a < 6; ++a) {
+            if (used[a]) continue;
+            for (int b = 0; b < 6; ++b)
+                if (!used[b])
+                    gram[a][b] -= gram[a][pivot_index] * gram[pivot_index][b] / pivot;
+        }
+    }
+    return rank;
+}
+
+}  // namespace
+
+std::shared_ptr<const PreparedMesh> prepare_fea_mesh(const json& study, std::string& error,
+                                                     const PrepareMeshOptions& options) {
+    error.clear();
+    const std::string& ctx = options.context;
+    try {
+        if (!study.is_object()) {
+            error = ctx + ": study must be an object";
+            return nullptr;
+        }
+        if (!has_mesh_source(study)) {
+            error = ctx + ": study needs a step_path or inline points/tets";
+            return nullptr;
+        }
+        if (declares_body_interfaces(study) ||
+            (study.contains("bond_gap_mm") && study["bond_gap_mm"] != 0.0)) {
+            error = ctx + ": contact, interfaces and bond_gap_mm are not supported — a "
+                          "prepared problem is one conforming continuum and cannot couple "
+                          "separate bodies; remove the block, or analyse one (fused) body";
+            return nullptr;
+        }
+        const bool has_step = study.contains("step_path") && study["step_path"].is_string() &&
+                              !study["step_path"].get<std::string>().empty();
+        if (!has_step && !validate_inline_mesh_arrays(study, ctx, error)) return nullptr;
+
+        report_progress("mesh.begin", 0);
+        auto prepared = std::make_shared<PreparedMesh>();
+        PreparedMesh& mesh = *prepared;
+        std::string note, mesh_error;
+        std::optional<MeshAdvisor> advisor;
+        detail::MeshQualityFacts quality;
+        if (!resolve_mesh(study, mesh.points, mesh.tets, mesh.nodes_per_elem,
+                          mesh.mesh_type_used, note, advisor, quality, mesh_error,
+                          options.iterative_solver)) {
+            error = ctx + ": " + mesh_error;
+            return nullptr;
+        }
+        const int npe = mesh.nodes_per_elem;
+        if ((npe != 4 && npe != 8 && npe != 10) || mesh.points.empty() ||
+            mesh.points.size() % 3 != 0 || mesh.tets.empty() ||
+            mesh.tets.size() % static_cast<std::size_t>(npe) != 0) {
+            error = ctx + ": resolved mesh is malformed (" +
+                    std::to_string(mesh.points.size()) + " coordinates, " +
+                    std::to_string(mesh.tets.size()) + " connectivity entries, " +
+                    std::to_string(npe) + " nodes per element)";
+            return nullptr;
+        }
+        for (double x : mesh.points)
+            if (!std::isfinite(x)) {
+                error = ctx + ": resolved mesh has non-finite coordinates";
+                return nullptr;
+            }
+        const int n_nodes = static_cast<int>(mesh.n_nodes());
+        for (int id : mesh.tets)
+            if (id < 0 || id >= n_nodes) {
+                error = ctx + ": resolved mesh references node " + std::to_string(id) +
+                        " outside 0.." + std::to_string(n_nodes - 1);
+                return nullptr;
+            }
+
+        // Components over the elements, ignoring nodes no element references (the
+        // same rule as fea_run_static's mechanism gate: repair keeps numbering).
+        std::vector<int> parent(static_cast<std::size_t>(n_nodes));
+        for (int i = 0; i < n_nodes; ++i) parent[static_cast<std::size_t>(i)] = i;
+        auto find = [&](int x) {
+            while (parent[static_cast<std::size_t>(x)] != x) {
+                parent[static_cast<std::size_t>(x)] =
+                    parent[static_cast<std::size_t>(parent[static_cast<std::size_t>(x)])];
+                x = parent[static_cast<std::size_t>(x)];
+            }
+            return x;
+        };
+        const std::size_t stride = static_cast<std::size_t>(npe);
+        for (std::size_t base = 0; base < mesh.tets.size(); base += stride) {
+            for (std::size_t k = 1; k < stride; ++k) {
+                const int a = find(mesh.tets[base]);
+                const int b = find(mesh.tets[base + k]);
+                if (a != b) parent[static_cast<std::size_t>(std::max(a, b))] = std::min(a, b);
+            }
+        }
+        mesh.referenced.assign(static_cast<std::size_t>(n_nodes), 0);
+        for (int id : mesh.tets) mesh.referenced[static_cast<std::size_t>(id)] = 1;
+        int components = 0;
+        for (int i = 0; i < n_nodes; ++i) {
+            if (!mesh.referenced[static_cast<std::size_t>(i)]) {
+                ++mesh.unreferenced_nodes;
+                continue;
+            }
+            if (find(i) == i) ++components;
+        }
+        if (components != 1) {
+            std::string bodies_text;
+            if (!quality.bodies.empty()) {
+                std::map<int, std::set<int>> ordinals_by_component;
+                for (const auto& body : quality.bodies)
+                    for (int i = std::max(0, body.node_begin);
+                         i < std::min(body.node_end, n_nodes); ++i)
+                        if (mesh.referenced[static_cast<std::size_t>(i)])
+                            ordinals_by_component[find(i)].insert(
+                                body.source_ordinals.begin(), body.source_ordinals.end());
+                bodies_text = " (STEP solid ordinals per component:";
+                for (const auto& [root, ordinals] : ordinals_by_component)
+                    bodies_text += " " + json(ordinals).dump();
+                bodies_text += ")";
+            }
+            error = ctx + ": the mesh is " + std::to_string(components) +
+                    " disconnected components" + bodies_text +
+                    "; a prepared problem is one conforming continuum and nothing here "
+                    "couples separate bodies (no contact or bonded interfaces). Merge the "
+                    "bodies into one solid, or isolate the body to analyse";
+            return nullptr;
+        }
+        if (quality.lonely_nodes_remaining > 0) {
+            error = ctx + ": the mesh has " +
+                    std::to_string(quality.lonely_nodes_remaining) +
+                    " node(s) on element fragment(s) that touch the rest of the body at "
+                    "two corners or fewer; such a fragment moves at zero strain energy, so "
+                    "the stiffness matrix is singular. " +
+                    (has_step ? "Repair the sliver feature or re-mesh with another size"
+                              : "Remove the hanging elements from the inline mesh");
+            return nullptr;
+        }
+
+        mesh.connected_components = components;
+        quality.connected_components = components;
+        mesh.mesh_quality = detail::mesh_quality_json(quality, mesh.n_nodes(), mesh.n_elems(),
+                                                      npe);
+        mesh.governor = std::move(quality.governor);
+        mesh.advisor = advisor ? detail::mesh_advisor_json(*advisor) : json(nullptr);
+        mesh.bodies = std::move(quality.bodies);
+        if (!note.empty()) mesh.notes.push_back("mesh: " + note);
+        if (mesh.unreferenced_nodes > 0)
+            mesh.notes.push_back(
+                std::to_string(mesh.unreferenced_nodes) +
+                " node(s) reference no element (left behind by mesh repair, which "
+                "preserves node numbering); they carry no stiffness and are eliminated");
+        report_progress("setup", mesh.n_elems());
+        return prepared;
+    } catch (const json::exception& e) {
+        error = ctx + ": invalid study: " + e.what();
+    } catch (const std::exception& e) {
+        error = ctx + ": mesh preparation failed: " + e.what();
+    }
+    return nullptr;
+}
+
+bool resolve_boundary_selection(const json& faceset, const PreparedMesh& mesh,
+                                const std::string& label, BoundarySelection& out,
+                                std::string& error) {
+    out = BoundarySelection{};
+    out.label = label;
+    error.clear();
+    try {
+        std::string faceset_error;
+        if (!validate_faceset_input(faceset, faceset_error))
+            return prepare_refuse(error, label + ": " + faceset_error);
+        out.nodes = resolve_face_nodes(faceset, mesh.points, mesh.tets, mesh.nodes_per_elem);
+        if (out.nodes.empty())
+            return prepare_refuse(
+                error, label + ": faces resolved to 0 exterior mesh nodes (tol=" +
+                           std::to_string(faceset.value("tol_mm", 1.0)) + " mm)");
+        out.node_area_mm2.assign(out.nodes.size(), 0.0);
+        const std::unordered_set<int> node_set(out.nodes.begin(), out.nodes.end());
+        std::string fold_detail;
+        bool consistent = true;
+        const double area = visit_selected_boundary_faces<true>(
+            mesh.points, mesh.tets, mesh.nodes_per_elem, node_set, fold_detail,
+            [&](const BoundaryFacet& facet) {
+                out.facets.push_back(facet);
+                for (int i = 0; i < facet.node_count; ++i) {
+                    const int node = facet.nodes[static_cast<std::size_t>(i)];
+                    const auto it =
+                        std::lower_bound(out.nodes.begin(), out.nodes.end(), node);
+                    if (it == out.nodes.end() || *it != node) {
+                        consistent = false;
+                        continue;
+                    }
+                    out.node_area_mm2[static_cast<std::size_t>(it - out.nodes.begin())] +=
+                        facet.weights[i];
+                }
+            });
+        if (!std::isfinite(area))
+            return prepare_refuse(error, label + ": invalid or folded quadratic boundary "
+                                                 "face" + fold_detail);
+        if (!consistent)
+            return prepare_refuse(error, label + ": a selected boundary facet carries a "
+                                                 "node outside the resolved selection");
+        out.area_mm2 = area;
+        return true;
+    } catch (const json::exception& e) {
+        return prepare_refuse(error, label + ": invalid faceset: " + e.what());
+    }
+}
+
+bool resolve_mechanical_fixtures(const json& fixtures, const PreparedMesh& mesh,
+                                 MechanicalFixtureSet& out, std::string& error,
+                                 const std::string& context) {
+    out = MechanicalFixtureSet{};
+    error.clear();
+    try {
+        if (json failure = validate_mechanical_fixture_list(fixtures, context);
+            !failure.is_null())
+            return prepare_refuse(error, failure["error"].get<std::string>());
+        const std::size_t n = mesh.n_nodes();
+        out.fixed_dof.assign(n * 3, 0);
+        for (std::size_t i = 0; i < fixtures.size(); ++i) {
+            const json& fixture = fixtures[i];
+            const std::string label = selector_label(fixture, "fixtures", i);
+            bool fixed[3] = {true, true, true};
+            if (fixture.contains("dofs")) {
+                const json& dofs = fixture["dofs"];
+                if (!dofs.is_array() || dofs.empty() || dofs.size() > 3)
+                    return prepare_refuse(error, context + ": fixture " + label +
+                                                     " dofs must be a non-empty subset of "
+                                                     "[0,1,2]");
+                fixed[0] = fixed[1] = fixed[2] = false;
+                for (const auto& dof : dofs) {
+                    const long long d = dof.is_number_integer() ? dof.get<long long>() : -1;
+                    if (d < 0 || d > 2 || fixed[d])
+                        return prepare_refuse(error, context + ": fixture " + label +
+                                                         " dofs must list distinct "
+                                                         "integers 0 (x), 1 (y), 2 (z)");
+                    fixed[d] = true;
+                }
+            }
+            ResolvedSelection selection;
+            selection.label = label;
+            selection.nodes = boundary_faceset_membership(fixture, mesh.points, mesh.tets,
+                                                          mesh.nodes_per_elem);
+            if (selection.nodes.empty())
+                return prepare_refuse(
+                    error, context + ": fixture " + label +
+                               " resolved to 0 mesh nodes (tol=" +
+                               std::to_string(fixture.value("tol_mm", 1.0)) + " mm)");
+            for (int node : selection.nodes)
+                for (int d = 0; d < 3; ++d)
+                    if (fixed[d])
+                        out.fixed_dof[static_cast<std::size_t>(node) * 3 +
+                                      static_cast<std::size_t>(d)] = 1;
+            out.selections.push_back(std::move(selection));
+        }
+        for (std::size_t node = 0; node < n; ++node) {
+            const int count = out.fixed_dof[node * 3] + out.fixed_dof[node * 3 + 1] +
+                              out.fixed_dof[node * 3 + 2];
+            if (count == 0) continue;
+            out.fixed_dof_count += static_cast<std::size_t>(count);
+            out.constrained_nodes.push_back(static_cast<int>(node));
+            if (count == 3) out.fixed_nodes.push_back(static_cast<int>(node));
+        }
+        if (const int rank = rigid_body_rank(mesh, out.fixed_dof); rank < 6)
+            return prepare_refuse(
+                error, context + ": the fixtures leave " + std::to_string(6 - rank) +
+                           " of 6 rigid-body modes free (" +
+                           std::to_string(out.fixed_dof_count) + " fixed DOFs on " +
+                           std::to_string(out.constrained_nodes.size()) +
+                           " nodes): the part can move without strain, so the stiffness "
+                           "matrix is singular. Fix more DOFs, or faces that are not a "
+                           "single point or line");
+        return true;
+    } catch (const json::exception& e) {
+        return prepare_refuse(error, context + ": invalid fixtures: " + e.what());
+    }
+}
+
+bool resolve_mechanical_load_case(const json& loads, const PreparedMesh& mesh,
+                                  MechanicalLoadVector& out, std::string& error,
+                                  const std::string& context) {
+    out = MechanicalLoadVector{};
+    error.clear();
+    try {
+        if (json failure = validate_mechanical_load_list(loads, context); !failure.is_null())
+            return prepare_refuse(error, failure["error"].get<std::string>());
+        std::vector<std::pair<std::string, std::vector<int>>> selections;
+        if (json failure = deposit_mechanical_load_list(
+                loads, mesh.points, mesh.tets, mesh.nodes_per_elem, out.forces, out.notes,
+                &selections, context);
+            !failure.is_null()) {
+            out = MechanicalLoadVector{};
+            return prepare_refuse(error, failure["error"].get<std::string>());
+        }
+        out.selections.reserve(selections.size());
+        for (auto& [label, nodes] : selections)
+            out.selections.push_back(ResolvedSelection{std::move(label), std::move(nodes)});
+        for (std::size_t i = 0; i < out.forces.size(); ++i)
+            out.resultant_n[i % 3] += out.forces[i];
+        return true;
+    } catch (const json::exception& e) {
+        out = MechanicalLoadVector{};
+        return prepare_refuse(error, context + ": invalid loads: " + e.what());
+    }
+}
 
 namespace {
 

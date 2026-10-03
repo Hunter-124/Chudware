@@ -250,6 +250,8 @@ set(CHUDWARE_CORE_SOURCES
   # --- C19: simulation + flow + evaluate UI ---
   src/core/sim_client.cpp
   src/ui/sim_manager.cpp
+  src/ui/sim_topology.cpp
+  src/ui/sim_topology_bc.cpp
   src/ui/legend.cpp
   src/ui/evaluate_dialogs.cpp
   # --- end C19 ---
@@ -1153,6 +1155,17 @@ add_test(NAME test_cam_mirror
   COMMAND test_cam_mirror
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end CAM mirror parsing/timing + simulation-field mesh conversion ---
+
+add_executable(test_sim_topology
+  src/ui/sim_topology.cpp
+  tests/test_sim_topology.cpp)
+target_compile_definitions(test_sim_topology PRIVATE CHUDWARE_SIM_TOPOLOGY_MODEL_ONLY=1)
+target_include_directories(test_sim_topology PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_sim_topology PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(test_sim_topology PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_sim_topology COMMAND test_sim_topology
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET Chudware POST_BUILD

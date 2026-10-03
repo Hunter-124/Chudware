@@ -58,6 +58,12 @@ struct LiveRoute {
 std::mutex g_liveRoutesMtx;
 std::shared_mutex g_liveDispatchMtx;
 std::unordered_map<std::string, LiveRoute> g_liveRoutes;
+// Serializes daemon-mode simulation-lane calls (engine::RunLane::Sim) across EVERY
+// WorkerClient in the process: engine_backend has ONE simulation connection per process, so a
+// solve on SimClient's client and a sim_mesh preview on the GUI's client contend for the same
+// lane. Holding this instead of callMtx_ keeps a solve from parking the client's other calls,
+// and lets a preview see a busy lane (try_lock) rather than queue behind the solve.
+std::mutex g_simLaneMtx;
 
 std::string liveString(const json &value, const char *key) {
   if (!value.is_object())
@@ -540,10 +546,21 @@ bool cppSimFlag() {
   return true;
 }
 
+// Native-only simulation RPCs: libchudware is their sole implementation (no
+// services-worker/CalculiX/Python counterpart exists). Claim them even when the
+// engine cannot load, so an unavailable engine surfaces as an error instead of
+// a proxy to an unrelated services method of the same name.
+bool isNativeOnlySimMethod(const std::string &method) {
+  return method == "sim_run_buckling" || method == "sim_run_topology" ||
+         method == "topology_capabilities";
+}
+
+bool isTopologyMethod(const std::string &method) {
+  return method == "sim_run_topology" || method == "topology_capabilities";
+}
+
 bool routeSimToCpp(const std::string &method, const json & /*params*/) {
-  // Buckling has no services-worker/CalculiX implementation. Claim it even if
-  // engine loading fails, so an unavailable engine is an error, never a proxy.
-  if (method == "sim_run_buckling")
+  if (isNativeOnlySimMethod(method))
     return true;
   if (!cppSimFlag())
     return false;
@@ -1923,31 +1940,47 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   const bool isCppSimCancel =
       (method == "sim_cancel" && routeSimToCpp(method, params));
   const bool bypassCallMutex = isAgentControl || isCppSimCancel;
-  // The long streaming runs keep full serialization among themselves: two runs
-  // must never overlap (they would interleave ops on the same doc in the daemon).
-  const bool isLongRun = (method == "agent_run_v2" ||
-                          method == "agent_mission_v1" ||
-                          method == "agent_admin_turn");
-  // In daemon mode a long run needs nothing callMtx_ guards: it streams on
-  // engine_backend's dedicated run connection (isLongRunMethod), and its
-  // worker-control state has its own mutex. Holding callMtx_ for a turn that
-  // lives for hours parked EVERY other call on this client behind it — any
-  // worker-routed call (subscription_*, chudcode_*, plm_*) queued on the GUI's
-  // single-FIFO st.rpc lane blocked in lk.lock() below, and every later
+  // The long streaming runs keep full serialization among themselves, per lane:
+  // two agent runs must never overlap (they would interleave ops on the same doc
+  // in the daemon), and simulation solves share engine_backend's single
+  // simulation connection. engine::runLane is the one classifier both layers use.
+  const engine::RunLane lane = engine::runLane(method);
+  const bool isLongRun = lane != engine::RunLane::None;
+  // In daemon mode a long run needs nothing callMtx_ guards: it streams on its
+  // lane's dedicated connection, and an agent run's worker-control state has its
+  // own mutex. Holding callMtx_ for a turn or a solve that lives for hours parked
+  // EVERY other call on this client behind it — any worker-routed call
+  // (subscription_*, chudcode_*, plm_*) queued on the GUI's single-FIFO st.rpc
+  // lane blocked in lk.lock() below, and every later
   // doc_activate/doc_tree/doc_snapshot waited behind that one forever: a tab
   // click showed "Loading" for the whole turn (2026-09-27). So a daemon-mode
-  // long run serializes on longRunMtx_ only. Pipe mode keeps callMtx_: the
-  // Python stdio pipe carries one request at a time. So does a run that could
-  // not get the dedicated connection (it would hold the shared one instead,
-  // and the engine-bound side-channel below only engages behind callMtx_).
-  const bool daemonLongRun =
-      isLongRun && engine::daemonMode() && engine::runConnectionReady();
-  std::unique_lock<std::mutex> lk(daemonLongRun ? longRunMtx_ : callMtx_,
+  // agent run serializes on longRunMtx_ only, and a simulation-lane call on the
+  // process-wide g_simLaneMtx only: separate mutexes, so a chat turn and a solve
+  // never wait for each other. Pipe mode keeps callMtx_: the Python stdio pipe
+  // carries one request at a time. So does a run whose OWN lane connection could
+  // not open (an agent run would hold the shared connection instead; a simulation
+  // call fails at once), which is also why such a run never takes the engine-bound
+  // side channel below.
+  const bool daemonLongRun = isLongRun && engine::daemonMode() &&
+                             engine::runConnectionReady(lane);
+  std::mutex &laneMtx =
+      lane == engine::RunLane::Sim ? g_simLaneMtx : longRunMtx_;
+  std::unique_lock<std::mutex> lk(daemonLongRun ? laneMtx : callMtx_,
                                   std::defer_lock);
   if (isCppSimCancel && engine::daemonMode()) {
     // The shared EngineClient serializes socket calls internally, so it is
     // blocked behind the solve even after bypassing callMtx_. Use the same
     // short-lived daemon side channel as agent Stop/Steer.
+    return callViaSideClient(method, params, result, err, timeoutMs, onEvent);
+  }
+  if (daemonLongRun && lane == engine::RunLane::Sim &&
+      engine::isSimLanePreview(method) && !lk.try_lock()) {
+    // A mesh preview arrives on the GUI's single-FIFO st.rpc lane while a solve
+    // (SimClient's own WorkerClient, possibly hours of topology optimization)
+    // holds the process's simulation lane. Waiting for the lane parked that
+    // whole FIFO — and every doc_activate behind it — for the entire solve, so
+    // take the same short-lived side connection engine-bound calls use. Only the
+    // preview does this: solves still wait for the lane, one at a time.
     return callViaSideClient(method, params, result, err, timeoutMs, onEvent);
   }
   if (!bypassCallMutex && !isLongRun && engine::daemonMode()) {
@@ -2186,7 +2219,21 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   if (routeSimToCpp(method, params)) {
     std::string cerr;
     json cppResult;
-    if (engine::call(method, params, cppResult, cerr, timeoutMs)) {
+    // The native topology solve streams sim.progress (phase + per-iteration
+    // metrics) live to onEvent: daemon mode over hostd's agent.event push on
+    // engine_backend's dedicated simulation run connection, in-process through
+    // the thread-local cpp_core event sink. Its result carries no batched event
+    // copy, so there is nothing to replay. Other sim methods keep their
+    // existing non-streaming call.
+    bool callOk = false;
+    if (method == "sim_run_topology") {
+      bool streamedLive = false;
+      callOk = callAgentStreaming(method, params, cppResult, cerr, timeoutMs,
+                                  onEvent, streamedLive);
+    } else {
+      callOk = engine::call(method, params, cppResult, cerr, timeoutMs);
+    }
+    if (callOk) {
       result =
           std::move(cppResult); // ok: result holds {summary, overlay_aicm, ...}
       return true;
@@ -2207,16 +2254,53 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     if (cppResult.is_object()) {
       const std::string cppErr = cppResult.value("error", std::string());
       if (cppErr.rfind("unknown method", 0) == 0) {
-        err = "This engine build has no FEA mesher, so '" + method +
-              "' is unavailable. Rebuild the core with "
-              "-DCHUDWARE_WITH_POLYMESH=ON.";
+        if (isTopologyMethod(method))
+          err = "This engine build has no native topology optimizer, so '" +
+                method + "' is unavailable. Update the engine to a build "
+                         "that dispatches it.";
+        else
+          err = "This engine build has no FEA mesher, so '" + method +
+                "' is unavailable. Rebuild the core with "
+                "-DCHUDWARE_WITH_POLYMESH=ON.";
         if (errorSink_)
           errorSink_(method, err);
         return false;
       }
     }
-    if (method == "sim_run_buckling") {
-      err = cerr.empty() ? "Engine linear buckling is unavailable" : cerr;
+    if (isNativeOnlySimMethod(method)) {
+      // A native failure that still carries its payload — a cancelled or failed
+      // topology run answers with its partial design, history and termination —
+      // is a METHOD failure: hand the payload to the caller (SimClient keeps it)
+      // normalized the way hostd normalizes engine errors (message + code always
+      // present), so the daemon and in-process backends report it identically.
+      // Only a payload-less failure is a transport error.
+      if (cppResult.is_object() && !cppResult.empty()) {
+        std::string message;
+        for (const char *k : {"message", "error", "termination_detail"}) {
+          const auto it = cppResult.find(k);
+          if (it != cppResult.end() && it->is_string() &&
+              !it->get_ref<const std::string &>().empty()) {
+            message = it->get<std::string>();
+            break;
+          }
+        }
+        if (message.empty())
+          message = !cerr.empty() ? cerr : method + " failed in the engine";
+        const auto msgIt = cppResult.find("message");
+        if (msgIt == cppResult.end() || !msgIt->is_string())
+          cppResult["message"] = message;
+        if (!cppResult.contains("code"))
+          cppResult["code"] = "engine_error";
+        result = std::move(cppResult);
+        err = std::move(message);
+        return true;
+      }
+      if (!cerr.empty())
+        err = cerr;
+      else if (method == "sim_run_buckling")
+        err = "Engine linear buckling is unavailable";
+      else
+        err = "Engine topology optimization is unavailable";
       if (errorSink_)
         errorSink_(method, err);
       return false;

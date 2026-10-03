@@ -149,7 +149,9 @@ void Server::sendEventTo(int clientId, const std::string& line) {
 // Live callback contexts. They live on the dispatch stack for the duration of the synchronous
 // engine call; both C sinks are thread-local and cleared before these objects leave scope.
 namespace {
-struct StreamCtx { hostd::Server* srv; int clientId; };
+// renewWatchdog: each streamed progress event restarts the call's long-tier watchdog clock,
+// turning that wall-clock ceiling into a silence bound for a solve that reports progress.
+struct StreamCtx { hostd::Server* srv; int clientId; bool renewWatchdog = false; };
 struct DocPublishCtx {
     hostd::Server* srv;
     int clientId;
@@ -168,7 +170,16 @@ void Server::sendAgentEvent(int clientId, const char* eventJson) {
 
 void Server::streamThunk(const char* eventJson, void* ud) {
     auto* ctx = static_cast<StreamCtx*>(ud);
-    if (ctx && ctx->srv) ctx->srv->sendAgentEvent(ctx->clientId, eventJson);
+    if (!ctx || !ctx->srv) return;
+    if (ctx->renewWatchdog) {
+        // A bounded optimization legitimately runs past the long tier's wall-clock ceiling;
+        // what proves it is not hung is that it keeps emitting progress. A solve that falls
+        // silent for the whole ceiling is still reclaimed exactly as before.
+        std::lock_guard<std::mutex> lk(ctx->srv->inflightMtx_);
+        auto it = ctx->srv->inflight_.find(ctx->clientId);
+        if (it != ctx->srv->inflight_.end()) it->second.startMs = monoMs();
+    }
+    ctx->srv->sendAgentEvent(ctx->clientId, eventJson);
 }
 
 void Server::docPublishThunk(const char* method, const char* paramsJson,
@@ -953,11 +964,18 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     // Live streaming (transparency): agent events go back to the requesting client while nested
     // document commits enter the shared registry and fan out to every subscribed GUI. Both
     // thread-local sinks fire synchronously on this dispatch thread and are cleared by RAII.
-    const bool streamThis = method.rfind("agent_", 0) == 0 ||
-                            method.rfind("chudcode_", 0) == 0 ||
-                            method == "session_btw" || method == "session_handoff";
+    const bool agentStream = method.rfind("agent_", 0) == 0 ||
+                             method.rfind("chudcode_", 0) == 0 ||
+                             method == "session_btw" || method == "session_handoff";
+    // The native topology solve streams its sim.progress phases and per-iteration metrics to
+    // the requester only, over the same push frame. It runs on the caller's own connection
+    // thread, so sim_cancel and every other control call reach the engine on other
+    // connections while it streams. Only this one simulation method is armed: the other sim_*
+    // routes keep their non-streaming replies.
+    const bool topologyStream = method == "sim_run_topology";
+    const bool streamThis = agentStream || topologyStream;
     const bool publishDocsThis = method.rfind("agent_", 0) == 0;
-    StreamCtx sctx{this, c.id};
+    StreamCtx sctx{this, c.id, topologyStream};
     DocPublishCtx dctx{this, c.id, c.userId, c.userDisplay};
     // Contexts are declared before the guard so they outlive its destructor on every exit.
     struct SinkGuard {
@@ -983,6 +1001,19 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
             err.rfind("unknown method:", 0) == 0 ||
             (result.is_object() && result.contains("error") && result["error"].is_string() &&
              result["error"].get<std::string>().rfind("unknown method:", 0) == 0);
+        // Native-only topology RPCs have no services-worker implementation; an engine build
+        // that does not dispatch them is reported as such rather than proxied to a worker
+        // method that merely shares the name.
+        const bool nativeOnly =
+            method == "sim_run_topology" || method == "topology_capabilities";
+        if (unknown && nativeOnly) {
+            isError = true;
+            json e = result.is_object() ? result : json::object();
+            e["code"] = "engine_unsupported";
+            e["message"] = "This engine build has no native topology optimizer, so '" + method +
+                           "' is unavailable. Update the engine to a build that dispatches it.";
+            return e;
+        }
         if (unknown) {
             json wresult;
             std::string werr;
@@ -1046,7 +1077,8 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     // Live-streamed above (streamThis) -> the batched result["events"] copy is now redundant.
     // Drop it so a streaming client (which renders the live agent.event push) never double-
     // renders the run. (Same-build deploy: every client understands the push.)
-    if (streamThis && core::cpp_core().hasEventSink() && result.is_object()) result.erase("events");
+    // The topology result has no batched copy; its payload is left untouched.
+    if (agentStream && core::cpp_core().hasEventSink() && result.is_object()) result.erase("events");
     // Revision sniff, minted-doc implicit attach, event fanout, _foreign_edits.
     registry_.postCall(c.id, c.kind, c.userId, c.userDisplay, method, p, result);
     // Stamp origin_kind onto each doc_list entry so a GUI that connected after a

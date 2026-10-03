@@ -93,7 +93,8 @@
       "research_standard_section",
       "research_thread_spec",
       "research_unit_convert",
-      "research_web_search"
+      "research_web_search",
+      "topology_capabilities"
     ],
     "edit": [
       "activate_configuration",
@@ -269,7 +270,8 @@
       "verify_battery",
       "wait_job",
       "wall_thickness",
-      "workspace_status"
+      "workspace_status",
+      "topology_capabilities"
     ]
   },
   "mutating_tools": [
@@ -297,7 +299,8 @@
     "import_part",
     "new_assembly",
     "new_part",
-    "solve_mates"
+    "solve_mates",
+    "run_topology_optimization"
   ],
   "edit_denied": [
     "relocate_native_files",

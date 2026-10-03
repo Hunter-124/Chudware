@@ -1711,6 +1711,9 @@ struct AppState {
         // doc tab MUST select RT_Schematic — selecting RT_PCB for both kinds was why a new
         // schematic surfaced board commands.
         RT_Schematic = 20,
+        // Topology optimization study tab (Simulate workspace only). Appended after Schematic so
+        // every existing index stays stable; kRibbonTabs[21] in widgets/ribbon.cpp.
+        RT_Topology = 21,
     };
     bool showRibbon = true;        // View > Ribbon visibility toggle
     bool profilerRunning = false;  // Evaluate > Profiler: sampling profiler active (libchudware prof_*)

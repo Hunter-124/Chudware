@@ -222,8 +222,14 @@ build_python_sidecar() {
     echo "==> compiling $name"
     # pycolmap is a bundled runtime package declared in packaging/requirements-release.txt;
     # forcing it makes a release Python without it fail here instead of shipping without it.
+    # Both sidecars re-enter compiled_entry as `--module services.sim.job_worker <job_id>`
+    # for background simulation jobs (services/sim/jobs.py), and the topology tool/study
+    # modules back those jobs; forcing them fails the build if any is missing.
     local -a includes=("--include-module=chudware_protected_assets" "--include-module=services.$module"
-                       "--include-package=pycolmap")
+                       "--include-package=pycolmap"
+                       "--include-module=services.sim.job_worker"
+                       "--include-module=services.sim.topology"
+                       "--include-module=services.mcp.topology_tools")
     if [ "$module" = "worker_main" ]; then
         includes+=(
             --include-module=services.parts.vendor_parts

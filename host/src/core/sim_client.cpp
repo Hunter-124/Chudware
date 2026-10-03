@@ -2,7 +2,10 @@
 // events drained on the main thread; lazy spawn + restart-on-crash of the second worker process.
 #include "sim_client.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <limits>
 #include <thread>
 #include <exception>
 #include <utility>
@@ -12,6 +15,131 @@
 #include "engine_backend.h"  // daemonMode — WASM/desktop hostd path (no child sim worker)
 
 namespace core {
+
+namespace {
+
+constexpr double kUnmeasured = std::numeric_limits<double>::quiet_NaN();
+
+// A native metric: finite number, else NaN (the wire sends null for "not measured").
+double measured(const nlohmann::json& obj, const char* key) {
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_number()) return kUnmeasured;
+    const double v = it->get<double>();
+    return std::isfinite(v) ? v : kUnmeasured;
+}
+
+void readNamedValues(const nlohmann::json& obj, const char* key,
+                     std::vector<std::pair<std::string, double>>& out) {
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_object()) return;
+    out.reserve(it->size());
+    for (const auto& [name, value] : it->items()) {
+        double v = kUnmeasured;
+        if (value.is_number()) {
+            v = value.get<double>();
+            if (!std::isfinite(v)) v = kUnmeasured;
+        }
+        out.emplace_back(name, v);
+    }
+}
+
+// "mesh.begin" -> "Mesh begin", "setup" -> "Setup".
+std::string phaseLabel(const std::string& phase) {
+    std::string out = phase;
+    for (char& ch : out)
+        if (ch == '.' || ch == '_') ch = ' ';
+    if (!out.empty() && out[0] >= 'a' && out[0] <= 'z') out[0] = static_cast<char>(out[0] - 32);
+    return out;
+}
+
+void appendMetric(std::string& text, const char* label, double v) {
+    if (!std::isfinite(v)) return;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%s%s %.4g", text.empty() ? "" : ", ", label, v);
+    text += buf;
+}
+
+// Native core/sim/progress.h event: {type:"sim.progress", phase, elapsed_s, elements,
+// probe?, iteration?}. Always relevant: it names a phase even before anything is measured.
+void parseNativeProgress(const nlohmann::json& d, SimProgress& ev) {
+    const std::string phase = jstr(d, "phase");
+    ev.stage = phase;
+    const double elapsed = measured(d, "elapsed_s");
+    if (std::isfinite(elapsed) && elapsed >= 0.0) ev.elapsedS = elapsed;
+    if (auto el = d.find("elements"); el != d.end() && el->is_number_integer()) {
+        const long long n = el->get<long long>();
+        if (n >= 0) ev.elements = n;
+    }
+
+    auto itIt = d.find("iteration");
+    if (itIt != d.end() && itIt->is_object()) {
+        const auto& j = *itIt;
+        SimIteration& it = ev.iteration;
+        it.index = jint(j, "index");
+        it.maxIterations = std::max(0, jint(j, "max"));
+        it.objective = measured(j, "objective");
+        it.objectiveChange = measured(j, "objective_change");
+        it.volumeFraction = measured(j, "volume_fraction");
+        it.designChange = measured(j, "design_change");
+        it.maxConstraint = measured(j, "max_constraint");
+        readNamedValues(j, "constraints", it.constraints);
+        readNamedValues(j, "metrics", it.metrics);
+        ev.hasIteration = true;
+
+        if (it.maxIterations > 0) {
+            const long long pct = static_cast<long long>(it.index) * 100 / it.maxIterations;
+            ev.pct = static_cast<int>(std::clamp<long long>(pct, 0, 100));
+        }
+        char head[64];
+        if (it.maxIterations > 0)
+            std::snprintf(head, sizeof(head), "Iteration %d/%d", it.index, it.maxIterations);
+        else
+            std::snprintf(head, sizeof(head), "Iteration %d", it.index);
+        std::string metrics;
+        appendMetric(metrics, "objective", it.objective);
+        appendMetric(metrics, "rel. change", it.objectiveChange);
+        appendMetric(metrics, "volume", it.volumeFraction);
+        appendMetric(metrics, "design change", it.designChange);
+        appendMetric(metrics, "max constraint", it.maxConstraint);
+        ev.text = metrics.empty() ? std::string(head) : std::string(head) + ": " + metrics;
+        return;
+    }
+
+    ev.text = phase.empty() ? std::string("Working") : phaseLabel(phase);
+    if (auto probe = d.find("probe"); probe != d.end() && probe->is_object()) {
+        const std::string sub = jstr(*probe, "sub_phase");
+        if (!sub.empty()) ev.text += " (" + sub + ")";
+        if (auto done = probe->find("cells_done"), total = probe->find("cells_total");
+            done != probe->end() && total != probe->end() && done->is_number_integer() &&
+            total->is_number_integer() && total->get<long long>() > 0) {
+            ev.text += " " + std::to_string(done->get<long long>()) + "/" +
+                       std::to_string(total->get<long long>()) + " cells";
+        }
+    }
+    if (ev.elements >= 0) ev.text += ", " + std::to_string(ev.elements) + " elements";
+}
+
+// Maps one streamed event onto SimProgress. False = not progress (other stream kinds the same
+// sink may carry); the caller then queues nothing.
+bool parseSimEvent(const nlohmann::json& d, SimProgress& ev) {
+    if (!d.is_object()) return false;
+    if (jstr(d, "type") == "sim.progress") {
+        parseNativeProgress(d, ev);
+        return true;
+    }
+    // Legacy sim_progress (events.md): {job_id, stage, pct, text, trace_point?}.
+    ev.stage = jstr(d, "stage");
+    ev.pct = jint(d, "pct");
+    ev.text = jstr(d, "text");
+    if (auto it = d.find("trace_point"); it != d.end() && it->is_object()) {
+        ev.hasTrace = true;
+        ev.traceStep = jint(*it, "step");
+        ev.traceDrag = jnum(*it, "drag");
+    }
+    return !ev.stage.empty() || !ev.text.empty() || ev.pct != 0 || ev.hasTrace;
+}
+
+}  // namespace
 
 SimClient::~SimClient() {
     stop();
@@ -214,6 +342,25 @@ float SimClient::elapsedSeconds() const {
     return static_cast<float>(static_cast<double>(nowNs - launch) * 1e-9);
 }
 
+std::vector<SimIteration> SimClient::iterationHistory() const {
+    std::lock_guard<std::mutex> lk(progMtx_);
+    return iterations_;
+}
+
+void SimClient::recordIterationLocked(SimIteration it) {
+    const std::size_t n = iterations_.size();
+    if (n >= kMaxIterationHistory) {
+        // Thin 2:1: keep even positions, plus the newest entry when its position is odd.
+        std::size_t w = 0;
+        for (std::size_t r = 0; r < n; r += 2, ++w)
+            if (w != r) iterations_[w] = std::move(iterations_[r]);
+        if ((n - 1) % 2 != 0) iterations_[w++] = std::move(iterations_[n - 1]);
+        iterations_.resize(w);
+    }
+    iterations_.push_back(std::move(it));
+    iterationRevision_.fetch_add(1);
+}
+
 bool SimClient::launch(const std::string& method, nlohmann::json params,
                        std::string& consoleNote, const std::string& ownerDocId,
                        std::uint64_t reservationToken) {
@@ -316,6 +463,8 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
         std::lock_guard<std::mutex> lk(progMtx_);
         progStage_ = "Starting";
         progLog_.clear();
+        iterations_.clear();
+        iterationRevision_.fetch_add(1);
     }
     launchNs_.store(static_cast<long long>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -334,24 +483,25 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
         launchThread_ = std::thread(
             [this, method, params = std::move(params)]() mutable {
                 WorkerClient::EventFn onEvent = [this](const nlohmann::json& d) {
-                    // Only sim_progress carries the fields we care about; tolerate unknown kinds.
+                    // Legacy sim_progress and native sim.progress both map onto SimProgress;
+                    // anything else the stream carries is not progress and is not queued.
                     SimProgress ev;
-                    ev.stage = jstr(d, "stage");
-                    ev.pct = jint(d, "pct");
-                    ev.text = jstr(d, "text");
-                    if (auto it = d.find("trace_point");
-                        it != d.end() && it->is_object()) {
-                        ev.hasTrace = true;
-                        ev.traceStep = jint(*it, "step");
-                        ev.traceDrag = jnum(*it, "drag");
-                    }
+                    if (!parseSimEvent(d, ev)) return;
                     // Update the live progress display (read before ev is moved into the queue).
                     {
                         std::lock_guard<std::mutex> lk(progMtx_);
                         if (!ev.stage.empty()) progStage_ = ev.stage;
                         if (!ev.text.empty()) progLog_ = ev.text;
+                        if (ev.hasIteration) recordIterationLocked(ev.iteration);
                     }
                     std::lock_guard<std::mutex> lk(job_.evMtx);
+                    // An owner that is not drawing never drains: drop the oldest quarter rather
+                    // than grow for the whole solve (iterations survive in iterations_).
+                    if (job_.events.size() >= SimJobResult::kMaxQueuedEvents)
+                        job_.events.erase(
+                            job_.events.begin(),
+                            job_.events.begin() + static_cast<std::ptrdiff_t>(
+                                                      SimJobResult::kMaxQueuedEvents / 4));
                     job_.events.push_back(std::move(ev));
                 };
 
@@ -361,7 +511,12 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
                 try {
                     // No host-side timeout for sim (cancel is explicit) — use a very large cap
                     // (worker_rpc §4). stop() aborts the daemon transport before joining.
-                    ok = worker_.call(method, params, result, err, 3'600'000, onEvent);
+                    // A topology optimization may legitimately outlast that cap; its liveness
+                    // is the streamed per-iteration progress (hostd reclaims a solve that falls
+                    // silent), so it waits without a transport deadline instead of abandoning
+                    // a still-running solve at the hour mark.
+                    const int timeoutMs = method == "sim_run_topology" ? -1 : 3'600'000;
+                    ok = worker_.call(method, params, result, err, timeoutMs, onEvent);
                 } catch (const std::exception& ex) {
                     err = ex.what();
                 } catch (...) {
@@ -390,11 +545,14 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
                         const std::string messageText = stringField("message");
                         const std::string& cancelText =
                             !errorText.empty() ? errorText : messageText;
+                        // A native topology run stopped by sim_cancel answers with its partial
+                        // design and termination "cancelled", which is never a success.
                         const bool cancelled =
                             (result.contains("cancelled") &&
                              result["cancelled"].is_boolean() &&
                              result["cancelled"].get<bool>()) ||
                             stringField("code") == "cancelled" ||
+                            stringField("termination") == "cancelled" ||
                             cancelText.find("cancelled") != std::string::npos ||
                             cancelText.find("canceled") != std::string::npos;
                         if (cancelled) {
@@ -403,7 +561,10 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
                             job_.errorCode = "cancelled";
                             job_.error = messageText;
                             if (job_.error.empty()) job_.error = errorText;
+                            if (job_.error.empty()) job_.error = stringField("termination_detail");
                             if (job_.error.empty()) job_.error = "cancelled";
+                            // Keep the partial reply for its owner (job_.ok stays false).
+                            job_.result = std::move(result);
                         } else if (result.contains("code") ||
                                    !result.value("ok", true)) {
                             // Both engine-style {code,message} and worker-style
@@ -415,6 +576,8 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
                                 if (!job_.error.empty()) break;
                             }
                             if (job_.error.empty()) job_.error = "simulation error";
+                            // Keep the refusal/diagnostic reply for its owner.
+                            job_.result = std::move(result);
                         } else {
                             job_.ok = true;
                             job_.result = std::move(result);

@@ -25,7 +25,7 @@ the frame loop in `host/src/app.cpp`.
 | **Reverse Eng.** | `host/src/ui/reveng/`: `reveng_workspace.cpp` (shell), `reveng_widgets.h/.cpp` (shared visual kit), `sources_panel.cpp`, `webcam_capture.cpp`, `stage_panels.cpp`, `dim_review.cpp`, `image_gallery.cpp`, `img_tex.cpp` | Native live/video Gaussian reconstruction plus the separate six-stage measured-CAD wizard (`contracts/reveng.md` §13). **Every panel draws with `ui::reveng::kit`** and uses `ui::metrics::re*()`. Camera seam: `host/src/platform/camera.h` v2. Native splat/point rendering reads `kit::previewSlotRect` and `previewSlotClip`. Full breakdown below. |
 | **AI / Activity** | `host/src/ui/ai/ai_workspace.cpp/.h` shell/nav + `ai/agent_dag.cpp/.h` execution graph, `ai/current_run_view.cpp/.h` roster/single docked inspector, `ai/{plan_board,docs_panel,active_work,metrics_view,activity_view,insights_view}.cpp`, plus `host/src/ui/copilot/` chat modules (reuse hooks in `copilot.h`; `legacy_chat.cpp` is gone) | Current Run / Plan / Activity / Sessions / Insights / Options, project chip; project scoping via `convProjectDir(st)`; events per `contracts/agent_events.md` |
 | **Drawing** | `host/src/ui/drawing_panel.cpp` | Sheet layout, views, DXF export |
-| **Simulation** | `host/src/ui/sim_manager.cpp`, `host/src/ui/evaluate_dialogs.cpp` | Study tree, fixtures/loads, results; Evaluate dialogs (measure, mass props, …) |
+| **Simulation** | `host/src/ui/sim_manager.cpp/.h`, `host/src/ui/evaluate_dialogs.cpp`; topology: `host/src/ui/sim_topology.cpp/.h`, `host/src/ui/sim_topology_bc.cpp/.h` | Study tree, fixtures/loads, results; Evaluate dialogs (measure, mass props, …). The **Topology** ribbon tab (Simulate only, `ribbon_def.cpp` `sim_new_topology`/`sim_topology_*`) drives topology studies; see "Simulation: Topology tab" below |
 | **Firmware** | `host/src/ui/firmware/fw_workspace.cpp/.h` | T-FIN5: project rail + sources, build console (parsed warnings), emulation + UART console, GPIO trace viewer (`contracts/firmware_rpc.md` §7/§8); fw_status-gated Flash/Debug; tab is progressively disclosed (`ui::firmwareTabVisible`); shot: `CHUDWARE_SHOT=firmware` |
 | **Manufacture** | `host/src/ui/manufacture/{manufacture_panel,device_panel,run_panel,approval_dialog,attention_panel,mfg_mirror}.cpp/.h` | Capability-truth chips, gate-report rendering. **No floating operator surface**: Devices / Run / Attention are rail tabs 3–5 of the pinned left column (`layout.cpp`), and the Offline/Live mode strip is chrome under the ribbon. All three bodies draw with `ui::kit` — cards, tone chips, `keyValueRow`, `emptyState`/`blockedState`, `inlineStatus` — never bespoke text dumps. **Tone convention: Offline Simulation is the SAFE state and reads calm (`Tone::Ok` dot chip on neutral glass); LIVE MACHINE is the hazardous one and is the only state that gets the `statusErr` wash + danger button.** Shot: `CHUDWARE_SHOT=manufacture` (the rail opens on Attention for that shot only — `layout.cpp` resolves the shot tab ONCE from `CHUDWARE_SHOT`, so `cam` keeps the Job Manager default) |
 
@@ -217,6 +217,37 @@ and `hint`, never a bare "failed".
 `reveng` (empty shell), `reveng_capture` (Source stage, canned session), `reveng_scale`,
 `reveng_recon` (mid-run at 45 %), `reveng_review` (canned dims + deviation), `reveng_model`,
 `reveng_deliver`. All but the first seed a canned session via `seedRevengCanned` in `app.cpp`.
+
+### Simulation: Topology tab
+
+- **Ownership split.** `sim_topology.*` owns the scalar `topology{}` editor (method, physics,
+  objective, scalar keys), run gating (`validateTopology`), and the results/compare panel
+  (`drawTopologyResults` → `ResultsAction` ShowRun / ExportArtifact / ApplyRunSettings).
+  `sim_topology_bc.*` owns everything outside `topology{}`: face wells (fixtures, loads,
+  load cases, preserve/exclude faces or boxes, thermal fixtures/flux/power/convection,
+  flow inlets/outlets/walls), the material and mesh checks (`validateBoundaries`), and
+  `buildRunEnvelope`. Neither TU issues an RPC or touches files. `SimManager` handles the
+  async `topology_capabilities` probe, one STEP export plus `doc_face_points` per unique
+  selector, the `sim_run_topology` launch through SimClient (no timeout), retained runs,
+  artifact missing/stale checks, the off-thread export copy, and viewport overlays.
+- **One canonical study, shared with the model tools** (`services/mcp/topology_tools.py`,
+  `services/sim/topology.py`). Editors change only the keys they display. Agent-authored
+  keys, `runs`, `last_job` and sections the current physics does not use are kept, and a
+  cleared field erases its key. Selectors carry viewport identity under `_pick`, which is
+  stripped before resolution. Do not add a GUI-only dialect.
+- **Capability truth.** Every method/physics/objective/limit/parameter offered comes from
+  the native matrix. Unsupported pairs show the native `reason` and cannot run. Do not
+  hard-code a pair list (SIMP/RAMP × 7 physics; BESO/level set × structural/thermal,
+  volume only).
+- **Results honesty.** Show `ok`/`converged`/`feasible`/`termination` separately. Surface
+  exports (stl/3mf/obj) are offered only when `manufacturing.geometry_valid`. Runs on other
+  geometry are `source_stale`; model-tool runs without the editor's geometry digest are
+  `source_unverified`. The panel reports recorded DFAM checks (GUI runs report "not run"),
+  but never promotes topology output to print-ready, including legacy records claiming it:
+  only `slice_part`'s passing G-code check establishes that. It never rewrites a retained run.
+- **Shot:** `CHUDWARE_SHOT=topology` (`scenarios.cpp` `runTopology`) builds a 120×40×40 mm
+  domain and runs the study for real, writing `scratch/topology_shots/topology_report.json`
+  plus captures.
 
 ## Auxiliary panels
 

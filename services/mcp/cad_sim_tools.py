@@ -32,6 +32,7 @@ from .cad_common import (
     _sid_match,
     _start_job,
     collect_durable,
+    collect_durable_terminal,
     register_durable_collector,
     solve_durable_or_handoff,
     _tmp,
@@ -4594,15 +4595,23 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         since counters/phase advanced, independent of 30-second heartbeats.
         stalled means running with >120 seconds without advancement. Cancel for
         lack of progress only when stalled is true, not for healthy long probes.
+        A failed/cancelled run of a kind that retains them (topology) is persisted to
+        its study once and returned as `detail` under `code` solve_failed|solve_cancelled.
         """
         try:
             st = simjobs.status(job_id)
             if st.get("state") == "unknown":
                 return _dumps(st)
+            state = st["state"]
+            # Collect a failed/cancelled job of a kind that keeps one (topology) BEFORE the
+            # meta goes: its terminal hook reads the run's setup from it.
+            terminal = collect_durable_terminal(job_id, st)
             st.pop(
                 "meta", None
             )  # the resolved study setup is bulky and not useful here
-            state = st["state"]
+            if terminal is not None:
+                st["code"] = f"solve_{state}"
+                st["detail"] = terminal
             if state == "done":
                 st["next_actions"] = [f"sim_results('{job_id}')"]
             elif state == "running":
@@ -4645,7 +4654,10 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
         partial=False (default): the full converged result, in exactly the shape the
         synchronous tool returns. On a job that has NOT finished this REFUSES — it will not
-        hand back half a solution dressed as an answer.
+        hand back half a solution dressed as an answer. A failed/cancelled run of a kind
+        that retains them (topology) returns its persisted ok:false, converged:false
+        envelope with the solver's own evidence. `converged` is the solve's own verdict:
+        a finished topology run that hit its iteration limit is ok:true, converged:false.
 
         partial=True: the last progress or solver-intermediate snapshot, always tagged
         `partial: true, converged: false`. A phase-only record can have no percentage or
@@ -4673,6 +4685,11 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "converged": False,
                     "elapsed_s": st.get("elapsed_s"),
                 }
+                terminal = collect_durable_terminal(job_id, st)
+                if terminal is not None:
+                    # The run's terminal outcome is now persisted; its retained (last
+                    # iterate) numbers stay out of a partial reply.
+                    base["terminal"] = {k: v for k, v in terminal.items() if k != "result"}
                 if progress:
                     base["progress"] = progress
                 if not snap:
@@ -4700,6 +4717,18 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                         f"sim_results('{job_id}') for the converged result"
                     )
                 return _dumps(base)
+            if state in (simjobs.FAILED, simjobs.CANCELLED):
+                terminal = collect_durable_terminal(job_id, st)
+                if terminal is not None:
+                    # The kind keeps its failed/cancelled runs: return that persisted
+                    # envelope with its evidence, never as a converged answer.
+                    out = dict(terminal)
+                    out.update(ok=False, job_id=job_id, state=state, converged=False,
+                               elapsed_s=st.get("elapsed_s"))
+                    out.setdefault("error", st.get("error") or f"solve {state}")
+                    if st.get("progress"):
+                        out["progress"] = st["progress"]
+                    return _dumps(out)
             if state != "done":
                 out = {
                     "ok": False,
@@ -4733,10 +4762,12 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                             out["solver_error"] = refusal["error"]
                 return _dumps(out)
             out = dict(collect_durable(job_id, st))
+            # A collector that reports its own convergence (topology: ok yet iteration-
+            # limited) keeps it; other kinds converge exactly when they collected ok.
+            out.setdefault("converged", bool(out.get("ok")))
             out.update(
                 job_id=job_id,
                 state="done",
-                converged=bool(out.get("ok")),
                 elapsed_s=st.get("elapsed_s"),
             )
             if st.get("progress"):

@@ -7,8 +7,9 @@
 //
 // Threading: call() is serialized by an internal mutex (one outstanding request
 // per connection, matching the daemon's v1 contract). Event lines that arrive
-// while waiting for a response are queued; drainEvents() also does a 0 ms poll
-// so pushes arrive even when the client is idle.
+// while waiting for a response are queued (or dropped, on a connection opened with
+// Options::discardUnconsumedEvents); drainEvents() also does a 0 ms poll so pushes
+// arrive even when the client is idle.
 #pragma once
 
 #include <atomic>
@@ -35,6 +36,13 @@ public:
         std::string userDisplay;
         int spawnBudgetMs = 15000;        // total connect-or-spawn budget
         bool allowSpawn = true;           // false = attach-only (never spawn)
+        // Private lanes nobody drains (engine_backend's simulation connection): drop every
+        // push the caller does not consume live instead of queueing it for drainEvents().
+        // agent.event payloads still reach a call()'s onEvent; everything else (doc.*,
+        // broadcasts, agent.event without onEvent) is read and discarded on every receive
+        // path, so the queue stays empty however long a call streams. Default false keeps
+        // ordinary GUI/agent buffering unchanged.
+        bool discardUnconsumedEvents = false;
     };
 
     // Connect to the daemon for this instance key, spawning one if absent (and
@@ -44,11 +52,13 @@ public:
     bool connected() const { return conn_.valid() && !conn_.eof(); }
     void disconnect() { conn_.close(); }
     // Teardown abort: flip a flag the in-flight readResponse loop polls, then
-    // close the socket so a blocked agent_run wakes immediately (EOF) instead of
+    // half-close and close the socket so a blocked agent_run or solve wakes at once
+    // (shutdown wakes a thread parked in poll(); close alone does not) instead of
     // hanging app quit until the multi-minute run finishes. One-way; next call()
     // reconnects. Safe from any thread.
     void abortPending() {
         abort_.store(true, std::memory_order_release);
+        conn_.shutdown();
         conn_.close();
     }
 
@@ -58,14 +68,17 @@ public:
     // Blocking JSON-RPC round trip; same contract as CppCore::call. Returns true
     // iff the daemon answered with "result"; err carries transport or RPC errors
     // ("error" payloads are also copied into result for callers that inspect them).
-    // timeoutMs < 0 blocks forever; >= 0 bounds the wait for the response. A
-    // timeout is a transport failure (false, err only, no {code} in result) and
-    // invalidates the connection (the response is still in flight on the wire) —
-    // the next call() reconnects, mirroring daemon_bridge.py's reconnect-on-EOF.
+    // timeoutMs < 0 waits as long as the response takes: silence (a solver factorizing
+    // for minutes) never fails it; only abortPending() or peer EOF ends it. >= 0 bounds
+    // the WHOLE wait (pushes on the way do not extend it). A timeout is a transport
+    // failure (false, err only, no {code} in result) and invalidates the connection
+    // (the response is still in flight on the wire) — the next call() reconnects,
+    // mirroring daemon_bridge.py's reconnect-on-EOF, so a stale reply is never consumed.
     // `onEvent`, when set, is invoked LIVE (on the calling thread, mid-call) for each
     // {"event":"agent.event",...} push that arrives while awaiting the response — so a blocking
     // agent run streams its events instead of buffering them until the call returns. Other event
-    // kinds (doc.*) still queue for drainEvents(). Empty = today's buffer-only behavior.
+    // kinds (doc.*) still queue for drainEvents() unless Options::discardUnconsumedEvents.
+    // Empty = today's buffer-only behavior.
     bool call(const std::string& method, const nlohmann::json& params,
               nlohmann::json& result, std::string& err, int timeoutMs = -1,
               const std::function<void(const nlohmann::json&)>& onEvent = {});
@@ -119,11 +132,14 @@ private:
     // Re-establish a connection invalidated by a timeout/EOF (mtx_ held by the
     // caller). Connect-only — never spawns — plus an inline hello re-handshake.
     bool reconnectLocked(std::string& err);
-    // Read lines until a response with `id` arrives; queue event lines seen on
-    // the way. timeoutMs bounds the whole wait; on timeout the connection is
-    // closed (mid-response, unusable) and false/err returned.
+    // Read lines until a response with `id` arrives; queue (or, on a discarding
+    // lane, drop) event lines seen on the way. timeoutMs >= 0 bounds the whole
+    // wait; on timeout the connection is closed (mid-response, unusable) and
+    // false/err returned. timeoutMs < 0 waits until the response, EOF or abort.
     bool readResponse(int id, nlohmann::json& out, std::string& err, int timeoutMs,
                       const std::function<void(const nlohmann::json&)>& onEvent = {});
+    // Queue an unconsumed push for drainEvents(), or drop it on a discarding lane.
+    void retainEvent(nlohmann::json&& msg);
 
     IpcConn conn_;
     std::mutex mtx_;                     // serialize call()s + event queue access
@@ -133,6 +149,7 @@ private:
     std::string clientKind_;             // saved for the reconnect re-handshake
     std::string userId_;                 // saved with clientKind_ for reconnect hello
     std::string userDisplay_;
+    bool discardEvents_ = false;         // Options::discardUnconsumedEvents
     int nextId_ = 1;
     std::atomic<bool> abort_{false};     // set by abortPending(); readResponse returns fast
     std::atomic<uint64_t> reconnectGen_{0};  // bumped by reconnectLocked (see accessor)

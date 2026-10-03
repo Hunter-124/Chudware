@@ -211,6 +211,8 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "sim_cancel",
         "sim_results",
         "sim_jobs",
+        "topology_capabilities",
+        "run_topology_optimization",
         # The closed-form tier cad_guide sends the model to BEFORE meshing anything
         # ("struct_estimate/struct_check first", bearing_life + gear_check for
         # mechanical sizing) plus the motion->FEA bridge. All advertised in the

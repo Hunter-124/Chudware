@@ -2771,9 +2771,27 @@ from services.sim import jobs as _simjobs  # noqa: E402
 #: calls ``durable_job_snapshot`` outside the thread-job lock for reconnect-safe lookup.
 _DURABLE_COLLECTORS: dict = {}
 
+#: Durable job kind -> terminal(status_dict, stage_result_or_None) -> reply envelope, for
+#: the kinds that OPT IN to persisting FAILED/CANCELLED jobs. Separate from the collectors
+#: on purpose: every success collector reads the raw fields of a converged solve, and a
+#: failed or killed job has none of them.
+_DURABLE_TERMINALS: dict = {}
+
 #: How long a poller that lost the collect race waits for the winner's artifact before
 #: collecting itself. Collect is an engine round-trip on an open document, not a solve.
 _COLLECT_WAIT_S = 10.0
+
+
+class DurableCollectRetry(Exception):
+    """Raised by a collector or terminal hook whose document write failed RETRYABLY.
+
+    ``envelope`` is returned to this caller as-is (plus ``retryable: true``); nothing is
+    cached and the collect claim is released, so the next poll runs the collect again.
+    """
+
+    def __init__(self, envelope: dict):
+        super().__init__(str(envelope.get("study_not_saved_reason") or "collect will retry"))
+        self.envelope = envelope
 
 
 def register_durable_collector(kind: str, fn) -> None:
@@ -2781,9 +2799,46 @@ def register_durable_collector(kind: str, fn) -> None:
     _DURABLE_COLLECTORS[str(kind)] = fn
 
 
+def register_durable_terminal(kind: str, fn) -> None:
+    """Opt a durable job kind into collecting its FAILED and CANCELLED jobs.
+
+    ``fn(status, stage_result)`` runs under the same exactly-once claim/cache as the
+    success collector. ``status`` is the reconciled job status (``state`` is ``failed`` or
+    ``cancelled``); ``stage_result`` is the result the worker actually wrote, or None when
+    it failed before replying or was killed. It returns an ``ok: false`` envelope carrying
+    ``job_id``, ``state`` and ``error``, or raises :class:`DurableCollectRetry`.
+    """
+    _DURABLE_TERMINALS[str(kind)] = fn
+
+
 def _durable_kind(st: dict) -> str:
     meta = st.get("meta") or {}
     return str(meta.get("analysis") or st.get("kind") or "")
+
+
+def _acquire_collect(job_id: str) -> Optional[dict]:
+    """None when this caller now HOLDS the collect claim; otherwise the reply to return."""
+    deadline = time.time() + _COLLECT_WAIT_S
+    while True:
+        cached = _simjobs.collected(job_id)
+        if cached is not None:
+            return cached
+        # Retried every turn: a holder whose write failed retryably released the claim.
+        if _simjobs.claim_collect(job_id):
+            return None
+        if time.time() >= deadline:
+            break
+        time.sleep(0.05)
+    # The claim holder died mid-collect (or was killed with the server). Break its stale
+    # claim and take it over WITH a claim, so every exit below releases or fulfils ours.
+    _simjobs.release_collect(job_id)
+    if _simjobs.claim_collect(job_id):
+        return None
+    cached = _simjobs.collected(job_id)
+    if cached is not None:
+        return cached
+    return {"ok": False, "job_id": job_id, "retryable": True,
+            "error": f"another poller is collecting job {job_id}; poll it again"}
 
 
 def collect_durable(job_id: str, st: Optional[dict] = None) -> dict:
@@ -2793,37 +2848,65 @@ def collect_durable(job_id: str, st: Optional[dict] = None) -> dict:
     running it per poll would grow one study record per poll in the feature tree. The spool
     arbitrates with an atomic claim file, so concurrent pollers — including pollers in
     DIFFERENT processes after a restart — all read the one envelope the winner wrote.
+    A FAILED/CANCELLED job is collected the same way only when its kind registered a
+    terminal hook (:func:`register_durable_terminal`).
     """
     cached = _simjobs.collected(job_id)
     if cached is not None:
         return cached
     if st is None:
         st = _simjobs.status(job_id)
-    if not _simjobs.claim_collect(job_id):
-        deadline = time.time() + _COLLECT_WAIT_S
-        while time.time() < deadline:
-            cached = _simjobs.collected(job_id)
-            if cached is not None:
-                return cached
-            time.sleep(0.05)
-        # The claim holder died mid-collect (or was killed with the server). Take over
-        # rather than strand a finished solve behind a stale lock file.
+    state = st.get("state")
+    kind = _durable_kind(st)
+    terminal = None
+    if state in (_simjobs.FAILED, _simjobs.CANCELLED):
+        terminal = _DURABLE_TERMINALS.get(kind)
+        if terminal is None:
+            return {"ok": False, "job_id": job_id, "state": state,
+                    "error": st.get("error") or f"solve {state}"}
+    held = _acquire_collect(job_id)
+    if held is not None:
+        return held
+    fulfilled = False
     try:
-        raw = _simjobs.raw_result(job_id)
-        if raw is None:
-            return {"ok": False, "job_id": job_id, "state": st.get("state"),
-                    "error": "the job finished but its result artifact could not be read — "
-                             "nothing can be reported honestly. Re-run the solve."}
-        collector = _DURABLE_COLLECTORS.get(_durable_kind(st))
-        if collector is None:
+        try:
+            if terminal is not None:
+                out = terminal(st, _simjobs.terminal_result(job_id))
+            else:
+                raw = _simjobs.raw_result(job_id)
+                if raw is None:
+                    return {"ok": False, "job_id": job_id, "state": st.get("state"),
+                            "error": "the job finished but its result artifact could not be "
+                                     "read — nothing can be reported honestly. Re-run the "
+                                     "solve."}
+                collector = _DURABLE_COLLECTORS.get(kind)
+                if collector is None:
+                    return {"ok": False, "job_id": job_id,
+                            "error": f"no result collector for job kind {kind!r}"}
+                out = collector(st, raw)
+        except DurableCollectRetry as retry:
+            return {**retry.envelope, "job_id": job_id, "retryable": True}
+        except Exception as exc:  # noqa: BLE001 — a broken collect must not strand the job
             return {"ok": False, "job_id": job_id,
-                    "error": f"no result collector for job kind {_durable_kind(st)!r}"}
-        out = collector(st, raw)
-    except Exception as exc:  # noqa: BLE001 — a broken collect must not strand the job
-        _simjobs.release_collect(job_id)
-        return {"ok": False, "job_id": job_id,
-                "error": f"collecting job {job_id} failed: {exc}"}
+                    "error": f"collecting job {job_id} failed: {exc}"}
+        fulfilled = True
+    finally:
+        if not fulfilled:
+            _simjobs.release_collect(job_id)
     return _simjobs.save_collected(job_id, out)
+
+
+def collect_durable_terminal(job_id: str, st: dict) -> Optional[dict]:
+    """A FAILED/CANCELLED job's terminal envelope, or None when its kind keeps none.
+
+    Collects (exactly once) for a kind with a registered terminal hook, and otherwise
+    only replays an envelope another process already collected.
+    """
+    if st.get("state") not in (_simjobs.FAILED, _simjobs.CANCELLED):
+        return None
+    if _durable_kind(st) in _DURABLE_TERMINALS:
+        return collect_durable(job_id, st)
+    return _simjobs.collected(job_id)
 
 
 def durable_job_snapshot(job_id: str) -> Optional[dict]:
@@ -2831,7 +2914,9 @@ def durable_job_snapshot(job_id: str) -> Optional[dict]:
 
     The caller must not hold ``_JOB_LOCK``: a DONE snapshot collects and persists the
     solved study exactly once, which can wait on another process's collect claim and call
-    back into the document engine.
+    back into the document engine. A FAILED/CANCELLED job of a kind with a terminal hook
+    is collected the same way; its envelope is the error's ``detail``, under ``code``
+    ``solve_failed`` / ``solve_cancelled``.
     """
     try:
         st = _simjobs.status(job_id)
@@ -2849,6 +2934,10 @@ def durable_job_snapshot(job_id: str) -> Optional[dict]:
     elif state in (_simjobs.FAILED, _simjobs.CANCELLED):
         rec["status"] = "error"
         rec["error"] = st.get("error") or f"solve {state}"
+        detail = collect_durable_terminal(job_id, st)
+        if detail is not None:
+            rec["code"] = f"solve_{state}"
+            rec["detail"] = detail
     else:
         rec["status"] = "running"
         rec["progress"].setdefault("elapsed_s", st.get("elapsed_s"))
@@ -2875,6 +2964,8 @@ def solve_durable_or_handoff(kind: str, stage: str, payload: dict,
     A fast solve returns its collected envelope inline — byte-identical to what the
     synchronous tool always returned. A slow one is LEFT RUNNING in its own process and the
     call returns the job id in time, so the transport never times out and kills the session.
+    A failed or cancelled solve of a kind with a terminal hook returns that hook's
+    (exactly-once, persisted) envelope.
     """
     job = _simjobs.start(kind, stage, payload, meta)
     jid = job["job_id"]
@@ -2888,6 +2979,9 @@ def solve_durable_or_handoff(kind: str, stage: str, payload: dict,
         if state == _simjobs.DONE:
             return collect_durable(jid, st)
         if state in (_simjobs.FAILED, _simjobs.CANCELLED):
+            terminal = collect_durable_terminal(jid, st)
+            if terminal is not None:
+                return terminal
             return {"ok": False, "job_id": jid, "state": state,
                     "error": st.get("error") or f"solve {state}"}
         time.sleep(interval)

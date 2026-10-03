@@ -202,6 +202,30 @@ private:
     std::string mtAsmDoc;                // assembly doc id
     std::string mtK1, mtK2;               // grounded base and moving arm component ids
     bool mtRunOk = false;                // motion solve succeeded
+
+    // ---------- topology optimization scenario (CHUDWARE_SHOT=topology) ----------
+    // Self-contained (reads CHUDWARE_SHOT itself, no AppState want-flag): a real box design
+    // domain -> Topology ribbon tab + "+ New Study" picker -> topology study with picked
+    // fixture / force / preserve faces and an exclude keep-out box -> real coarse tet4 solve with
+    // two methods -> result + comparison panels -> save, reopen a copy through the engine and
+    // verify the retained runs/artifacts -> thermal and flow boundary editors on real configs.
+    // Any failed prerequisite or check logs "topology: FAILED [<code>]", captures
+    // topology_FAILED.png, writes topology_report.json {ok:false} and exits non-zero.
+    void runTopology(AppState& st);
+    void topoFail(const std::string& code, const std::string& detail);
+    bool topoVerifyRun(const nlohmann::json& run, const std::string& tag, std::string& why);
+    void topoWriteReport();
+    bool topoInit = false, topoWant = false, topoDone = false, topoFailed = false;
+    int  topoStep = 0, topoSettle = 0, topoIdleFrames = 0, topoCaptureWait = 0;
+    bool topoDirReady = false, topoProgressShot = false;
+    double topoWaitStart = 0.0;            // steady-clock seconds when the current wait began
+    std::string topoSavePath, topoCapture;
+    std::string topoShotQueued;            // capture taken once the current settle elapses
+    std::string topoStudyId, topoMethodA, topoMethodB;
+    int  topoRunsBefore = 0;
+    nlohmann::json topoFaces;              // role -> {tid, sel} resolved box faces
+    nlohmann::json topoRunIds = nlohmann::json::array();
+    nlohmann::json topoReport = nlohmann::json::object();
 };
 
 }  // namespace ui

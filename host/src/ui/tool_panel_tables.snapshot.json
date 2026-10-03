@@ -558,6 +558,7 @@
    "run_fea_modal",
    "run_fea_static",
    "run_fea_thermal",
+   "run_topology_optimization",
    "sim_cancel",
    "sim_evidence_packet",
    "sim_jobs",
@@ -570,6 +571,7 @@
    "struct_check",
    "struct_estimate",
    "sweep_envelope",
+   "topology_capabilities",
    "verify_packet"
   ],
   "workspace": [
@@ -1024,6 +1026,7 @@
   "run_fea_static": "Linear-static stress FEA on the current part. Returns max stress, displacement, and FoS.",
   "run_fea_thermal": "Thermal conduction on the real part tet mesh using the C++ engine.",
   "run_shell": "Run a shell command and capture combined stdout+stderr (byte-capped).",
+  "run_topology_optimization": "Mutating. Run topology optimization on the active part as a persisted, GUI-visible study.",
   "save_part": "Save the part as Chudware's NATIVE .step+ — the editable, reopenable format. PREFER THIS.",
   "scrape_enqueue": "Enqueue a vendor search + CAD-model download in the background queue.",
   "scrape_queue_status": "Return the current state of all scrape/download queue jobs.",
@@ -1084,6 +1087,7 @@
   "sweep_envelope": "SWEPT ENVELOPE of a moving mechanism — the volume its parts need to be given.",
   "tap_drill": "Return the standard tap drill diameter for a thread designation (aicad.calc/1, contracts/advisor.md §7).",
   "task_list": "Publish the LIVE task list shown in the copilot's Task list panel.",
+  "topology_capabilities": "Read-only. The native topology-optimization capability matrix — call FIRST.",
   "undo": "Undo the last edit on the current part.",
   "vendor_login": "Open a HEADED browser window so the user can log into a vendor site.",
   "vendor_part_register": "Register scraped price/availability for bom_price; import_artifact handles geometry.",
@@ -2527,6 +2531,9 @@
   "run_shell": {
    "prompt_note": "Use for builds/tests/scripts; prefer fs_read/fs_grep/fs_glob/fs_write for plain file work. Stateless per call — pass cwd each time; pipe noisy output through head; check exit_code/timed_out."
   },
+  "run_topology_optimization": {
+   "prompt_note": "Mutating (writes study, jobs, artifacts). Query topology_capabilities first, then run the same persisted UI study: run_topology_optimization(study=..., doc_id=..., background=True). Poll with get_job/wait_job; stop with sim_cancel. Report computation, convergence and feasibility separately — a finished run is not a converged or feasible one. Inspect the density fields, thresholded surface, actual-domain reanalysis and manufacturing checks; the source CAD stays editable. Geometry/DFAM checks alone are not print-ready: slice_part must validate the G-code."
+  },
   "save_part": {
    "prompt_note": "Native editable Chudware document only (.step+ ZIP); it is NOT ISO STEP and a machine shop cannot treat it as .step. Save it for project history, and for external manufacturing also call export_part(fmt='step', path='...step')."
   },
@@ -2711,6 +2718,9 @@
   "task_list": {
    "max_calls_per_turn": 40,
    "prompt_note": "Publish the FULL list every call (omitted items disappear from the panel) — same order, updated statuses, after each step."
+  },
+  "topology_capabilities": {
+   "prompt_note": "Read-only. Call FIRST to learn the supported topology methods, physics, constraints and limits before configuring a study; never assume a method or constraint that it does not list."
   },
   "undo": {
    "prompt_note": "Usually denied for agents (undo_denied) — roll the doc back with plm_timeline then plm_rollback instead; if it does run, render_part to confirm the rolled-back state."

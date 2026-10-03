@@ -2630,3 +2630,101 @@ add_test(NAME fea_buckling COMMAND test_fea_buckling)
 
 # Mixed-interface evidence/refusal regressions exercise the real study glue.
 target_link_libraries(test_fea_contact PRIVATE chudware_mesh)
+
+# Topology problem geometry, boundary validation and design-variable mappings.
+target_sources(chudware_sim PRIVATE
+  sim/topopt_model.cpp
+  sim/topopt_thermal.cpp
+  sim/topopt_elastic.cpp
+  sim/topopt_spectral.cpp
+  sim/topopt_surface.cpp
+  sim/topopt_flow.cpp
+  sim/topopt_cht.cpp
+  sim/topopt_thermomechanical.cpp
+  sim/topopt_optimizer.cpp
+  sim/topopt_manufacturing.cpp)
+target_link_libraries(chudware_sim PUBLIC chudware_aicm)
+add_executable(test_topopt_model tests/test_topopt_model.cpp)
+target_include_directories(test_topopt_model PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_topopt_model PRIVATE chudware_sim)
+set_target_properties(test_topopt_model PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME topopt_model COMMAND test_topopt_model)
+
+add_executable(test_topopt_thermal tests/test_topopt_thermal.cpp)
+target_include_directories(test_topopt_thermal PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_topopt_thermal PRIVATE chudware_sim)
+set_target_properties(test_topopt_thermal PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME topopt_thermal COMMAND test_topopt_thermal)
+
+add_executable(test_topopt_elastic tests/test_topopt_elastic.cpp)
+target_include_directories(test_topopt_elastic PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_topopt_elastic PRIVATE chudware_sim)
+set_target_properties(test_topopt_elastic PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME topopt_elastic COMMAND test_topopt_elastic)
+
+add_executable(test_topopt_spectral tests/test_topopt_spectral.cpp)
+target_include_directories(test_topopt_spectral PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_topopt_spectral PRIVATE chudware_sim)
+set_target_properties(test_topopt_spectral PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME topopt_spectral COMMAND test_topopt_spectral)
+
+add_executable(test_topopt_surface tests/test_topopt_surface.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
+target_include_directories(test_topopt_surface PRIVATE ${doctest_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
+target_link_libraries(test_topopt_surface PRIVATE chudware_sim)
+set_target_properties(test_topopt_surface PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME topopt_surface COMMAND test_topopt_surface)
+
+add_executable(test_topopt_flow tests/test_topopt_flow.cpp)
+target_include_directories(test_topopt_flow PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_topopt_flow PRIVATE chudware_sim)
+set_target_properties(test_topopt_flow PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME topopt_flow COMMAND test_topopt_flow)
+
+add_executable(test_topopt_cht tests/test_topopt_cht.cpp)
+target_include_directories(test_topopt_cht PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_topopt_cht PRIVATE chudware_sim)
+set_target_properties(test_topopt_cht PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME topopt_cht COMMAND test_topopt_cht)
+
+add_executable(test_topopt_thermomechanical tests/test_topopt_thermomechanical.cpp)
+target_include_directories(test_topopt_thermomechanical PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_topopt_thermomechanical PRIVATE chudware_sim)
+set_target_properties(test_topopt_thermomechanical PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME topopt_thermomechanical COMMAND test_topopt_thermomechanical)
+
+add_executable(test_topopt_optimizer tests/test_topopt_optimizer.cpp)
+target_include_directories(test_topopt_optimizer PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_topopt_optimizer PRIVATE chudware_sim)
+set_target_properties(test_topopt_optimizer PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME topopt_optimizer COMMAND test_topopt_optimizer)
+
+if(TARGET chudware_mesh)
+  target_sources(chudware_mesh PRIVATE
+    sim/topopt_run.cpp
+    sim/topopt_reanalysis.cpp)
+  add_executable(test_topopt_run tests/test_topopt_run.cpp)
+  target_include_directories(test_topopt_run PRIVATE ${doctest_SOURCE_DIR})
+  target_compile_features(test_topopt_run PRIVATE cxx_std_20)
+  target_link_libraries(test_topopt_run PRIVATE chudware_mesh)
+  set_target_properties(test_topopt_run PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME topopt_run COMMAND test_topopt_run)
+
+  add_executable(test_fea_prepare tests/test_fea_prepare.cpp)
+  target_include_directories(test_fea_prepare PRIVATE ${doctest_SOURCE_DIR})
+  target_link_libraries(test_fea_prepare PRIVATE chudware_mesh)
+  set_target_properties(test_fea_prepare PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME fea_prepare COMMAND test_fea_prepare)
+endif()

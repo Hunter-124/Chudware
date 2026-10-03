@@ -9,9 +9,12 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 #include <thread>
 
@@ -23,19 +26,45 @@
 
 namespace core {
 
-// One streamed sim_progress event (events.md): stage + pct + text, plus an optional CFD drag
-// trace point. Drained on the main thread for the progress bar + the live drag sparkline.
+// One optimizer iteration from the native sim.progress `iteration` object (core/sim/progress.h
+// IterationProgress). NaN = the solver did not measure that value this iteration (the wire
+// carries null, never a plausible zero).
+struct SimIteration {
+    int index = 0;
+    int maxIterations = 0;  // 0 = not reported (unbounded or omitted)
+    double objective = std::numeric_limits<double>::quiet_NaN();
+    double objectiveChange = std::numeric_limits<double>::quiet_NaN();  // relative
+    double volumeFraction = std::numeric_limits<double>::quiet_NaN();
+    double designChange = std::numeric_limits<double>::quiet_NaN();     // max |delta rho|
+    double maxConstraint = std::numeric_limits<double>::quiet_NaN();    // max g, g <= 0 feasible
+    std::vector<std::pair<std::string, double>> constraints;  // {name, g}; g <= 0 feasible
+    std::vector<std::pair<std::string, double>> metrics;      // {name with units, value}
+};
+
+// One streamed progress event, drained on the main thread for the progress bar, the live drag
+// sparkline and the topology convergence view. Two wire shapes map onto it:
+//   * legacy sim_progress {stage, pct, text, trace_point?} (events.md), field for field;
+//   * native {type:"sim.progress", phase, elapsed_s, elements, iteration?}: stage = phase,
+//     pct from iteration.index / iteration.max, text a human line built from the metrics.
+// Events carrying none of these (other stream kinds) are never queued.
 struct SimProgress {
-    std::string stage;   // voxelize|mesh|assemble|solve|stream|post
+    std::string stage;   // voxelize|mesh|assemble|solve|stream|post, or a native phase
     int pct = 0;         // 0..100 (omit -> last)
     std::string text;
     bool hasTrace = false;
     int traceStep = 0;
     double traceDrag = 0.0;
+    double elapsedS = -1.0;   // native: seconds since the solve armed progress; < 0 unreported
+    long long elements = -1;  // native: mesh element count; < 0 unreported
+    bool hasIteration = false;
+    SimIteration iteration;   // valid when hasIteration
 };
 
 // A finished sim job's outcome. `result` is the worker's result object (overlay_aicm, summary,
-// freqs_hz, slice_pngs, lines_aicm, …) verbatim; ok=false leaves error/errorCode set.
+// freqs_hz, slice_pngs, lines_aicm, …) verbatim. ok=false leaves error/errorCode set; when the
+// method itself answered (a structured refusal, or a cancelled run whose native reply carries
+// the partial design and its history), `result` keeps that reply so the owner can show it —
+// it is never reported as success. Transport failures leave `result` an empty object.
 struct SimJobResult {
     std::atomic<bool> running{false};
     std::atomic<bool> ready{false};       // a result is waiting to be consumed on the main thread
@@ -48,8 +77,12 @@ struct SimJobResult {
     std::string error;
     std::string errorCode;                // structured-error code (worker envelope) if any
 
+    // Streamed progress, drained on the main thread. Bounded: while no owner drains it (the
+    // originating tab is not drawing) the oldest entries are dropped beyond kMaxQueuedEvents.
+    // The full iteration series is retained separately (SimClient::iterationHistory).
+    static constexpr std::size_t kMaxQueuedEvents = 256;
     std::mutex evMtx;
-    std::vector<SimProgress> events;      // streamed progress, drained on the main thread
+    std::vector<SimProgress> events;
 };
 
 class SimClient {
@@ -84,6 +117,17 @@ public:
     std::string stage() const;
     std::string recentLog() const;
     float       elapsedSeconds() const;
+
+    // Iteration series of the current or most recent job, retained until the next launch so a
+    // live convergence view never depends on draining job().events. Bounded at
+    // kMaxIterationHistory: when full, older entries are thinned 2:1 (each entry keeps its own
+    // iteration index, so a thinned series still plots on true iteration numbers; the newest
+    // entry is always kept). iterationRevision() is monotonic across jobs and advances whenever
+    // the history changes (an appended iteration, or the reset at launch); 0 = never had one.
+    // A per-frame caller copies the history only when the revision differs from its last copy.
+    static constexpr std::size_t kMaxIterationHistory = 2000;
+    std::uint64_t iterationRevision() const { return iterationRevision_.load(); }
+    std::vector<SimIteration> iterationHistory() const;
 
     // Atomically reserve the one global solver slot for asynchronous study preparation.
     // Tokens are scoped to this client and must be presented by the same owner at launch.
@@ -150,6 +194,11 @@ private:
     std::string            progStage_;        // current solver phase
     std::string            progLog_;          // last human-readable event text
     std::atomic<long long> launchNs_{0LL};   // steady_clock ns at launch; 0 when idle
+
+    // Bounded iteration series (see iterationHistory); guarded by progMtx_.
+    std::vector<SimIteration> iterations_;
+    std::atomic<std::uint64_t> iterationRevision_{0};
+    void recordIterationLocked(SimIteration it);  // progMtx_ held
 };
 
 }  // namespace core

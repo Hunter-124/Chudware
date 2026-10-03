@@ -3,16 +3,21 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
+#include <ctime>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
 #include <sstream>
+#include <thread>
 #include <utility>
 #include <unordered_set>
 
@@ -30,6 +35,7 @@
 #include "engine_backend.h" // engine::daemonMode — server-owned export paths
 #include "feature_tree.h" // fmRowPill/fmTreeIcon/fmSectionDivider — FM-grade row styling
 #include "icons.h"
+#include "file_dialog.h" // saveFileDialog / afterFileWritten — topology artifact export
 #include "layout.h"    // ui::overlayColumnEdge — the study picker flies out beside the column
 #include "metrics.h"
 #include "property_manager.h" // PropertyManager::active() — mutual-exclusion pick guard
@@ -52,6 +58,8 @@ static void simTip(const char *tip) {
 // Index of the "Motion" per-type tab in ribbon.cpp's kRibbonTabs[] (the Simulate-workspace sim
 // tabs are append-only at 13..19, so the index is stable).
 static constexpr int kRibbonTabMotion = 18;
+// Topology ribbon tab (append-only tab index; app_state RibbonTab::RT_Topology).
+static constexpr int kRibbonTabTopology = 21;
 
 static bool activeDocIsAssembly(const AppState &st) {
   return st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
@@ -204,6 +212,8 @@ static const char *studyTypeKey(StudyType t) {
     return "contact";
   case StudyType::FreqResponse:
     return "freq_response";
+  case StudyType::Topology:
+    return "topology";
   default:
     return "static";
   }
@@ -227,6 +237,8 @@ static StudyType studyTypeFromKey(const std::string &k) {
     return StudyType::Contact;
   if (k == "freq_response")
     return StudyType::FreqResponse;
+  if (k == "topology")
+    return StudyType::Topology;
   return StudyType::Static;
 }
 static const char *studyTypeLabel(StudyType t) {
@@ -249,6 +261,8 @@ static const char *studyTypeLabel(StudyType t) {
     return "Contact";
   case StudyType::FreqResponse:
     return "Vibration";
+  case StudyType::Topology:
+    return "Topology";
   default:
     return "Static";
   }
@@ -279,6 +293,8 @@ static const char *studyTypeIcon(StudyType t) {
     return "study_static";
   case StudyType::FreqResponse:
     return "study_modal";
+  case StudyType::Topology:
+    return "study_static"; // no dedicated study_topology sprite yet (gui-icons task)
   default:
     return "study_static";
   }
@@ -720,8 +736,8 @@ static std::string docMaterialKey(const AppState &st) {
 // (which then set_material's the part). Call before run / material UI so the
 // study tracks the one shared part material.
 static void resolveStudyMaterialFromDoc(AppState &st, Study &s) {
-  if (isFlowFamily(s.type))
-    return; // Flow/Thermal never consume materialKey
+  if (isFlowFamily(s.type) || s.type == StudyType::Topology)
+    return; // Flow/Thermal never consume materialKey; topology owns its material record
   s.materialKey = docMaterialKey(st);
 }
 
@@ -1150,12 +1166,137 @@ struct SimManager::StaticModalPrep {
   nlohmann::json thermalMaterial;
   nlohmann::json thermalTransient;
   float thermFixTempC = 0.0f;
+  // Topology: the canonical study snapshot taken at Run, its normalized material, every
+  // unique document selector to resolve (doc_face_points) and the resolutions (same order).
+  nlohmann::json topoStudy;
+  nlohmann::json topoMaterial;
+  std::vector<nlohmann::json> topoSelectors;
+  std::vector<nlohmann::json> topoResolved;
+  std::string topoGeometryKey; // source geometry digest at Run (checked before launch)
   std::size_t facesRemaining = 0;
 };
 
 // ---------------------------------------------------------------- ctor
 
 SimManager::SimManager() {}
+
+// ---------------------------------------------------------------- topology study helpers
+static SimSel selFromJson(const nlohmann::json &selector);
+namespace {
+// Mesh keys a topology study persists, mirrored onto the Study's mesh fields so the shared
+// Mesh form / preview edit them (topology meshes are always tet4).
+void topologyMeshFromJson(Study &s, const nlohmann::json &j) {
+  auto num = [&](const char *key, float fallback) {
+    const auto it = j.find(key);
+    return it != j.end() && it->is_number() ? it->get<float>() : fallback;
+  };
+  s.meshOrder = 1;
+  s.meshFineness = num("mesh_fineness", 0.5f);
+  s.meshTargetMm = num("mesh_target_mm", 0.0f);
+  s.meshMinMm = num("mesh_min_mm", 0.0f);
+}
+
+// Read-only mirror of a topology study's STRUCTURAL wells into Study::fixtures/loads for the
+// shared indicator glyphs; the study JSON stays the only persisted source.
+void mirrorTopologyWells(Study &s) {
+  s.fixtures.picks.clear();
+  s.loads.clear();
+  const nlohmann::json &mat = s.topo.contains("material") ? s.topo["material"]
+                                                          : nlohmann::json();
+  s.materialKey = mat.is_string() ? mat.get<std::string>()
+                  : (mat.is_object() && mat.contains("key") && mat["key"].is_string())
+                      ? mat["key"].get<std::string>()
+                      : std::string();
+  const std::string physics = topology::studyPhysics(s.topo);
+  if (!topology::usesStructuralBoundary(physics))
+    return;
+  auto addFixtures = [&](const nlohmann::json &arr) {
+    if (!arr.is_array())
+      return;
+    for (const auto &e : arr) {
+      if (e.is_object() && e.contains("faces") && e["faces"].is_array()) {
+        for (const auto &sel : e["faces"])
+          s.fixtures.picks.push_back(selFromJson(sel));
+      } else if (e.is_object()) {
+        s.fixtures.picks.push_back(selFromJson(e));
+      }
+    }
+  };
+  auto addLoads = [&](const nlohmann::json &arr) {
+    if (!arr.is_array())
+      return;
+    for (const auto &e : arr) {
+      if (!e.is_object())
+        continue;
+      SimLoad l;
+      l.pressure = e.contains("type") && e["type"] == "pressure";
+      const nlohmann::json &v = e.contains("vec") ? e["vec"]
+                                : e.contains("vector") ? e["vector"]
+                                                       : nlohmann::json();
+      if (l.pressure) {
+        l.pressureMpa = e.contains("magnitude") && e["magnitude"].is_number()
+                            ? e["magnitude"].get<float>()
+                            : 0.0f;
+      } else {
+        for (int k = 0; k < 3; ++k)
+          l.vec[k] = v.is_array() && v.size() == 3 && v[k].is_number()
+                         ? v[k].get<float>()
+                         : 0.0f;
+      }
+      if (e.contains("faces") && e["faces"].is_array())
+        for (const auto &sel : e["faces"])
+          l.faces.picks.push_back(selFromJson(sel));
+      s.loads.push_back(std::move(l));
+    }
+  };
+  addFixtures(s.topo.value("fixtures", nlohmann::json()));
+  if (topology::usesStructuralLoads(physics)) {
+    addLoads(s.topo.value("loads", nlohmann::json()));
+    const nlohmann::json cases = s.topo.value("load_cases", nlohmann::json());
+    if (cases.is_array())
+      for (const auto &c : cases) {
+        if (!c.is_object())
+          continue;
+        addFixtures(c.value("fixtures", nlohmann::json()));
+        addLoads(c.value("loads", nlohmann::json()));
+      }
+  }
+}
+
+// configureActiveTopology merge: objects merge recursively, everything else replaces, null
+// erases.
+void mergeTopologyPatch(nlohmann::json &dst, const nlohmann::json &patch) {
+  for (auto it = patch.begin(); it != patch.end(); ++it) {
+    if (it.value().is_null()) {
+      dst.erase(it.key());
+    } else if (it.value().is_object() && dst.contains(it.key()) &&
+               dst[it.key()].is_object()) {
+      mergeTopologyPatch(dst[it.key()], it.value());
+    } else {
+      dst[it.key()] = it.value();
+    }
+  }
+}
+
+double unixNow() {
+  return std::chrono::duration<double>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+// Artifact descriptor format, normalized to the sim_topology.h vocabulary for display
+// ("aicm_v1" -> "aicm", "stl_binary" -> "stl"); the persisted record is never rewritten.
+std::string topoArtifactFormat(const nlohmann::json &a) {
+  std::string f = a.is_object() && a.contains("format") && a["format"].is_string()
+                      ? a["format"].get<std::string>()
+                      : std::string();
+  if (f.rfind("aicm", 0) == 0)
+    return "aicm";
+  if (f.rfind("stl", 0) == 0)
+    return "stl";
+  return f;
+}
+} // namespace
 
 // ---------------------------------------------------------------- JSON <->
 // Study
@@ -1344,6 +1485,30 @@ kit::Tone motionCheckTone(const Study &s) {
 } // namespace
 
 nlohmann::json SimManager::studyToJson(const Study &s) {
+  if (s.type == StudyType::Topology) {
+    // Raw ownership: the record goes back verbatim (unknown/agent keys, runs, last_job and
+    // other physics' sections included); only identity and the shared Mesh form's keys are
+    // refreshed. A mesh key is written only when it was already present or edited away from
+    // the form's unset value, so opening the form never injects values.
+    nlohmann::json j = s.topo.is_object() ? s.topo : nlohmann::json::object();
+    if (!s.id.empty())
+      j["id"] = s.id;
+    j["type"] = "topology";
+    j["name"] = s.name;
+    if (!j.contains("mesh_order"))
+      j["mesh_order"] = 1; // tet4; an authored other order is kept and blocks the run
+    if (j.contains("mesh_fineness") || s.meshFineness != 0.5f)
+      j["mesh_fineness"] = s.meshFineness;
+    if (s.meshTargetMm > 0.0f)
+      j["mesh_target_mm"] = s.meshTargetMm;
+    else
+      j.erase("mesh_target_mm");
+    if (s.meshMinMm > 0.0f)
+      j["mesh_min_mm"] = s.meshMinMm;
+    else
+      j.erase("mesh_min_mm");
+    return j;
+  }
   nlohmann::json fixtures = nlohmann::json::array();
   for (const auto &p : s.fixtures.picks)
     fixtures.push_back(p.selector);
@@ -1460,7 +1625,17 @@ Study SimManager::studyFromJson(const nlohmann::json &j) {
   s.id = j.value("id", std::string());
   s.type = studyTypeFromKey(j.value("type", std::string("static")));
   s.name = j.value("name", std::string("Study"));
-  s.materialKey = j.value("material", std::string());
+  if (s.type == StudyType::Topology) {
+    s.topo = j.is_object() ? j : nlohmann::json::object();
+    topologyMeshFromJson(s, j);
+    mirrorTopologyWells(s);
+    s.hasResult = s.topo.contains("runs") && s.topo["runs"].is_array() &&
+                  !s.topo["runs"].empty();
+    return s;
+  }
+  s.materialKey = j.contains("material") && j["material"].is_string()
+                      ? j["material"].get<std::string>()
+                      : std::string();
   s.meshFineness = j.value("mesh_fineness", 0.5f);
   s.meshOrder = j.value("mesh_order", 2);
   s.meshTargetMm = j.value("mesh_target_mm", 0.0f);
@@ -1637,6 +1812,20 @@ void SimManager::refresh(AppState &st) {
           s.solverNotes = p.solverNotes;
           if (!p.summary.empty())
             s.summary = p.summary;
+          if (s.type == StudyType::Topology && p.type == StudyType::Topology) {
+            // Runs come from the document; the overlay/status/artifact checks are local.
+            s.hasResult = p.hasResult || (s.topo.contains("runs") && s.topo["runs"].is_array() &&
+                                          !s.topo["runs"].empty());
+            s.topoStatus = p.topoStatus;
+            s.topoStatusKind = p.topoStatusKind;
+            s.topoFieldLabel = p.topoFieldLabel;
+            s.topoFieldUnit = p.topoFieldUnit;
+            s.topoFieldFromSI = p.topoFieldFromSI;
+            if (s.topo.value("runs", nlohmann::json()) == p.topo.value("runs", nlohmann::json())) {
+              s.topoRunsView = p.topoRunsView;
+              s.topoRunsCheckKey = p.topoRunsCheckKey;
+            }
+          }
           // Motion transient result
           if (s.type == StudyType::Motion && motionSettingsJson(s) != motionSettingsJson(p)) {
             s.motionGeneration = p.motionGeneration + 1;
@@ -1680,19 +1869,24 @@ void SimManager::persist(AppState &st, Study &s) {
 void SimManager::persist(AppState &st, const std::string &docId, Study &s) {
   if (s.id.empty() || docId.empty())
     return;
-  if (s.type == StudyType::Motion) {
+  if (s.type == StudyType::Topology)
+    mirrorTopologyWells(s); // keep the indicator mirror in step with the edited record
+  if (s.type == StudyType::Motion || s.type == StudyType::Topology) {
     const std::string studyId = s.id;
+    const bool topo = s.type == StudyType::Topology;
     st.rpc.call("sim_study_edit",
                 {{"doc_id", docId}, {"study_id", studyId}, {"study", studyToJson(s)}},
-                [this, &st, docId, studyId](const core::RpcResult &r) {
+                [this, &st, docId, studyId, topo](const core::RpcResult &r) {
       if (!simDocOpen(st, docId))
         return;
       if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
           !simJsonBool(r.result, "ok", true)) {
-        st.addLog("[motion] could not save " + studyId + ": " +
-                  simJsonText(r.result, "message", "error", r.err));
+        st.addLog(std::string(topo ? "[topology]" : "[motion]") + " could not save " +
+                  studyId + ": " + simJsonText(r.result, "message", "error", r.err));
         if (simOriginActive(st, this, docId))
-          st.toast(ui::ToastLevel::Error, "Could not save Motion setup; retry the edit.");
+          st.toast(ui::ToastLevel::Error,
+                   topo ? "Could not save the topology study; retry the edit."
+                        : "Could not save Motion setup; retry the edit.");
         return;
       }
       markSimDocDirty(st, docId);
@@ -1753,6 +1947,32 @@ void SimManager::newStudy(AppState &st, StudyType t) {
   if (t == StudyType::Thermal) {
     s.flowSolver = 1;
     s.flowThermal = true;
+  }
+  if (t == StudyType::Topology) {
+    // A topology study optimizes ONE part's design domain: assemblies (several bodies to
+    // couple) and documents without a solid are refused rather than approximated.
+    if (activeDocIsAssembly(st)) {
+      st.toast(ui::ToastLevel::Warn,
+               "Topology optimization runs on a part's design domain. Open the part.");
+      return;
+    }
+    if (!hasSimulationGeometry(st)) {
+      st.toast(ui::ToastLevel::Warn,
+               "Model a solid design domain before creating a topology study.");
+      return;
+    }
+    s.topo = nlohmann::json::object();
+    s.topo["mesh_order"] = 1;
+    nlohmann::json config;
+    if (topoCaps_.state == topology::Capabilities::State::Ready)
+      config = topology::newTopologyConfig(topoCaps_, "structural");
+    if (!config.is_object() || config.empty())
+      config = {{"physics", "structural"}}; // method/objective chosen once caps arrive
+    s.topo["topology"] = std::move(config);
+    const std::string partMaterial = docMaterialKey(st);
+    if (!partMaterial.empty())
+      s.topo["material"] = partMaterial;
+    s.meshOrder = 1;
   }
   nlohmann::json res;
   std::string err;
@@ -1901,6 +2121,22 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
     return newAndOpen(StudyType::Contact);
   if (cmdId == "sim_new_freqresp")
     return newAndOpen(StudyType::FreqResponse);
+  if (cmdId == "sim_new_topology") {
+    st.activeWorkspace = AppState::Workspace::Simulate;
+    st.leftPaneTab = AppState::LP_Simulation;
+    st.showRibbon = true;
+    st.ribbonTab = kRibbonTabTopology;
+    if (topoCaps_.state == topology::Capabilities::State::Unavailable) {
+      st.toast(ui::ToastLevel::Warn, topoCaps_.error);
+      return true;
+    }
+    newAndOpen(StudyType::Topology); // before the probe: newStudy refuses while rpc is busy
+    if (sel_ >= 0 && sel_ < (int)studies_.size() &&
+        studies_[sel_].type == StudyType::Topology)
+      syncTopologyViews(studies_[sel_]);
+    probeTopologyCaps(st);
+    return true;
+  }
   // The one obvious way into Motion: Features > Assembly "Motion Study", the Simulation
   // tab's Study group and the assembly empty state all land here. It opens this assembly's
   // saved Motion study (an agent's simulate_motion sweep persists as one) on its playback
@@ -1961,6 +2197,81 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
     panelOpen_ = true;
     return true;
   }
+  // ---- Topology tab tools ----------------------------------------------------------------
+  const bool topoCmd = cmdId.rfind("sim_topology_", 0) == 0;
+  if (topoCmd) {
+    st.leftPaneTab = AppState::LP_Simulation;
+    if (!selectStudyOfType(StudyType::Topology)) {
+      st.toast(ui::ToastLevel::Warn,
+               "Create a Topology study first (\"New Study\" on the Topology tab).");
+      return true;
+    }
+    Study &ts = studies_[sel_];
+    syncTopologyViews(ts);
+    probeTopologyCaps(st);
+    loadIdx_ = -1;
+    panelOpen_ = true;
+    if (cmdId == "sim_topology_setup") {
+      node_ = SimNode::Study;
+      armedWell_ = -1;
+      return true;
+    }
+    if (cmdId == "sim_topology_boundaries") {
+      node_ = SimNode::Boundaries;
+      armedWell_ = topoBcView_.armedPointer.empty() ? -1 : kArmTopology;
+      return true;
+    }
+    if (cmdId == "sim_topology_manufacturing") {
+      node_ = SimNode::Regions;
+      topoSettingsView_.focusManufacturing = true;
+      armedWell_ = -1;
+      return true;
+    }
+    if (cmdId == "sim_topology_compare") {
+      node_ = SimNode::Results;
+      topoResultsView_.focusCompare = false;
+      armedWell_ = -1;
+      const nlohmann::json runs = ts.topo.value("runs", nlohmann::json::array());
+      if (!runs.is_array() || runs.size() < 2) {
+        st.toast(ui::ToastLevel::Info,
+                 "Compare needs two runs of this study; run it again with other settings.");
+        return true;
+      }
+      auto runId = [&](std::size_t i) {
+        const auto &r = runs[i];
+        return r.is_object() && r.contains("run_id") && r["run_id"].is_string()
+                   ? r["run_id"].get<std::string>()
+                   : "#" + std::to_string(i);
+      };
+      topoResultsView_.selectedRunId = runId(runs.size() - 1);
+      topoResultsView_.baselineRunId = runId(runs.size() - 2);
+      topoResultsView_.focusCompare = true;
+      return true;
+    }
+    if (cmdId == "sim_topology_preserve" || cmdId == "sim_topology_exclude") {
+      if (topologyRunActive()) {
+        st.toast(ui::ToastLevel::Info, "Wait for the topology run before editing regions.");
+        return true;
+      }
+      const bool preserve = cmdId == "sim_topology_preserve";
+      const std::string ptr = topology::addEntry(
+          ts.topo, preserve ? topology::EntryKind::PreserveFaces
+                            : topology::EntryKind::ExcludeFaces);
+      std::vector<nlohmann::json> picked;
+      SimWell scratch;
+      captureSelectionInto(st, scratch);
+      for (const auto &p : scratch.picks)
+        picked.push_back(p.selector);
+      topology::appendFaces(ts.topo, ptr, picked);
+      persist(st, ts);
+      st.selection.clear();
+      node_ = SimNode::Regions;
+      topoBcView_.armedPointer = ptr;
+      armedWell_ = kArmTopology;
+      return true;
+    }
+    return false;
+  }
   const bool haveStudy = sel_ >= 0 && sel_ < (int)studies_.size();
   // Material / Results / Mesh: open the pane on the matching sub-node of the
   // active study. Mesh also actually MESHES the part and shows the element
@@ -1995,6 +2306,58 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
     return true;
   }
   Study &s = studies_[sel_];
+  if (s.type == StudyType::Topology &&
+      (cmdId == "sim_fixture" || cmdId == "sim_load_force" ||
+       cmdId == "sim_load_pressure")) {
+    st.leftPaneTab = AppState::LP_Simulation;
+    syncTopologyViews(s);
+    if (topologyRunActive()) {
+      st.toast(ui::ToastLevel::Info, "Wait for the topology run before editing its setup.");
+      return true;
+    }
+    const std::string physics = topology::studyPhysics(s.topo);
+    std::string ptr;
+    if (cmdId == "sim_fixture") {
+      ptr = topology::addEntry(s.topo, topology::fixtureKindFor(physics));
+    } else {
+      if (!topology::usesStructuralLoads(physics)) {
+        st.toast(ui::ToastLevel::Warn,
+                 physics.empty()
+                     ? "Choose the topology physics first (Topology Setup)."
+                     : topology::physicsLabel(physics) +
+                           " takes no force/pressure loads; set its heat or flow "
+                           "boundaries under Boundaries.");
+        node_ = physics.empty() ? SimNode::Study : SimNode::Boundaries;
+        panelOpen_ = true;
+        return true;
+      }
+      // With load cases, a new load lands in the case selected in the editor (else case 1).
+      int loadCase = -1;
+      const nlohmann::json &cases = s.topo.contains("load_cases") ? s.topo["load_cases"]
+                                                                  : nlohmann::json();
+      if (cases.is_array() && !cases.empty())
+        loadCase = topoBcView_.loadCase >= 0 && topoBcView_.loadCase < (int)cases.size()
+                       ? topoBcView_.loadCase
+                       : 0;
+      ptr = topology::addEntry(s.topo,
+                               cmdId == "sim_load_force" ? topology::EntryKind::ForceLoad
+                                                         : topology::EntryKind::PressureLoad,
+                               loadCase);
+    }
+    SimWell scratch;
+    captureSelectionInto(st, scratch);
+    std::vector<nlohmann::json> picked;
+    for (const auto &p : scratch.picks)
+      picked.push_back(p.selector);
+    topology::appendFaces(s.topo, ptr, picked);
+    persist(st, s);
+    st.selection.clear();
+    node_ = SimNode::Boundaries;
+    topoBcView_.armedPointer = ptr;
+    armedWell_ = ptr.empty() ? -1 : kArmTopology;
+    panelOpen_ = true;
+    return true;
+  }
   // Frequency (modal) eigenvalue solves ignore loads entirely — a load added
   // here would be silently discarded on run (runStaticOrModal never sends modal
   // loads). Block the load commands with a teaching toast so the user learns to
@@ -2865,6 +3228,882 @@ void SimManager::configureActiveFlow(AppState &st, int fluid, float aoaDeg,
   persist(st, s);
 }
 
+// ================================================================ topology studies
+//
+// The canonical study JSON (Study::topo) is edited by ui::topology editors; this section owns
+// the glue: the async capability probe, the run gate, preparation (one export + one
+// doc_face_points per unique selector, reusing beginExportPrep), the native sim_run_topology
+// launch through SimClient, the retained run history, artifact checks and actions that must
+// stay off the draw path, and the scenario API.
+
+namespace {
+std::string topoRunIdOf(const nlohmann::json &run, std::size_t index) {
+  return run.is_object() && run.contains("run_id") && run["run_id"].is_string()
+             ? run["run_id"].get<std::string>()
+             : "#" + std::to_string(index);
+}
+
+const nlohmann::json *topoFindRun(const nlohmann::json &runs, const std::string &runId) {
+  if (!runs.is_array())
+    return nullptr;
+  for (std::size_t i = 0; i < runs.size(); ++i)
+    if (topoRunIdOf(runs[i], i) == runId)
+      return &runs[i];
+  return nullptr;
+}
+
+// Type-tolerant readers: run records may be authored by other tools (model tools, older
+// versions); a wrong-typed member reads as absent instead of throwing mid-frame.
+const nlohmann::json &topoObj(const nlohmann::json &j, const char *key) {
+  static const nlohmann::json kEmpty = nlohmann::json::object();
+  if (!j.is_object())
+    return kEmpty;
+  const auto it = j.find(key);
+  return it != j.end() && it->is_object() ? *it : kEmpty;
+}
+std::string topoStr(const nlohmann::json &j, const char *key) {
+  if (!j.is_object())
+    return {};
+  const auto it = j.find(key);
+  return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
+}
+bool topoTrue(const nlohmann::json &j, const char *key) {
+  if (!j.is_object())
+    return false;
+  const auto it = j.find(key);
+  return it != j.end() && it->is_boolean() && it->get<bool>();
+}
+
+// The overlay artifact of a (decorated) run: {path, arrays} or null.
+nlohmann::json topoOverlayArtifact(const nlohmann::json &run) {
+  const nlohmann::json &result = topoObj(run, "result");
+  const nlohmann::json &arts = topoObj(result, "artifacts");
+  for (auto it = arts.begin(); it != arts.end(); ++it) {
+    const auto &a = it.value();
+    if (topoStr(a, "path").empty())
+      continue;
+    if (topoArtifactFormat(a) != "aicm" && it.key() != "overlay_aicm")
+      continue;
+    if (topoTrue(a, "missing") || topoTrue(a, "stale"))
+      return nullptr;
+    return a;
+  }
+  const std::string direct = topoStr(result, "overlay_aicm");
+  if (!direct.empty())
+    return {{"path", direct}};
+  return nullptr;
+}
+
+// Field descriptors the overlay can colour by: the AICM artifact's own scalar arrays when it
+// lists them, else the result's field descriptors.
+std::vector<nlohmann::json> topoOverlayFields(const nlohmann::json &run,
+                                              const nlohmann::json &overlay) {
+  std::vector<nlohmann::json> out;
+  auto take = [&](const nlohmann::json &arr) {
+    if (!arr.is_array())
+      return;
+    for (const auto &f : arr) {
+      if (topoStr(f, "name").empty())
+        continue;
+      const auto comps = f.find("components");
+      if (comps != f.end() && !(comps->is_number_integer() && comps->get<int>() == 1))
+        continue; // vector fields are not a scalar colormap
+      out.push_back(f);
+    }
+  };
+  if (overlay.is_object() && overlay.contains("arrays"))
+    take(overlay["arrays"]);
+  const nlohmann::json &result = topoObj(run, "result");
+  if (out.empty() && result.contains("fields"))
+    take(result["fields"]);
+  return out;
+}
+
+void topoFieldMeta(const AppState &st, const nlohmann::json &desc, std::string &label,
+                   std::string &unit, double &fromSI) {
+  const SimManager::UnitSys u = SimManager::unitSys(st);
+  const std::string name = topoStr(desc, "name");
+  const std::string raw = topoStr(desc, "unit");
+  label = topoStr(desc, "label");
+  if (label.empty()) {
+    label = name;
+    for (char &c : label)
+      if (c == '_')
+        c = ' ';
+    if (!label.empty())
+      label[0] = (char)std::toupper((unsigned char)label[0]);
+  }
+  fromSI = 1.0;
+  unit = raw;
+  if (name == "density") {
+    label = "Density (solid fraction)";
+    unit.clear();
+  } else if (raw == "Pa") {
+    unit = u.stress;
+    fromSI = u.stressFromMpa * 1e-6;
+  } else if (raw == "m") {
+    unit = u.len;
+    fromSI = u.lenFromMm * 1e3;
+  }
+}
+} // namespace
+
+struct SimManager::TopoExport {
+  std::atomic<bool> done{false};
+  bool ok = false;
+  std::string src, dst, err;
+  long long expectBytes = -1;
+};
+
+bool SimManager::configureActiveTopology(AppState &st, const nlohmann::json &patch) {
+  if (sel_ < 0 || sel_ >= (int)studies_.size() || !patch.is_object())
+    return false;
+  Study &s = studies_[sel_];
+  if (s.type != StudyType::Topology || topologyRunActive())
+    return false;
+  nlohmann::json p = patch;
+  p.erase("id");
+  p.erase("type");
+  if (p.contains("name") && p["name"].is_string() && !p["name"].get<std::string>().empty())
+    s.name = p["name"].get<std::string>();
+  p.erase("name");
+  if (!s.topo.is_object())
+    s.topo = nlohmann::json::object();
+  mergeTopologyPatch(s.topo, p);
+  topologyMeshFromJson(s, s.topo);
+  s.topoRunsCheckKey.clear();
+  persist(st, s);
+  return true;
+}
+
+nlohmann::json SimManager::activeTopologyStudy() const {
+  if (sel_ < 0 || sel_ >= (int)studies_.size() ||
+      studies_[sel_].type != StudyType::Topology)
+    return nullptr;
+  return studyToJson(studies_[sel_]);
+}
+
+nlohmann::json SimManager::activeTopologyResult() const {
+  if (sel_ < 0 || sel_ >= (int)studies_.size() ||
+      studies_[sel_].type != StudyType::Topology)
+    return nullptr;
+  const nlohmann::json &t = studies_[sel_].topo;
+  if (!t.contains("runs") || !t["runs"].is_array() || t["runs"].empty())
+    return nullptr;
+  return t["runs"].back();
+}
+
+int SimManager::topologyRunCount() const {
+  if (sel_ < 0 || sel_ >= (int)studies_.size() ||
+      studies_[sel_].type != StudyType::Topology)
+    return 0;
+  const nlohmann::json &t = studies_[sel_].topo;
+  return t.contains("runs") && t["runs"].is_array() ? (int)t["runs"].size() : 0;
+}
+
+bool SimManager::topologyRunActive() const {
+  if (prepInFlight_ && staticModalPrep_ && staticModalPrep_->type == StudyType::Topology)
+    return true;
+  return running_ && !topoRunMeta_.runId.empty();
+}
+
+bool SimManager::selectStudyById(AppState &st, const std::string &id) {
+  for (int i = 0; i < (int)studies_.size(); ++i)
+    if (studies_[i].id == id) {
+      sel_ = i;
+      node_ = SimNode::Study;
+      loadIdx_ = -1;
+      armedWell_ = -1;
+      st.leftPaneTab = AppState::LP_Simulation;
+      if (studies_[i].type == StudyType::Topology)
+        syncTopologyViews(studies_[i]);
+      return true;
+    }
+  return false;
+}
+
+std::string SimManager::activeStudyId() const {
+  return sel_ >= 0 && sel_ < (int)studies_.size() ? studies_[sel_].id : std::string();
+}
+
+void SimManager::probeTopologyCaps(AppState &st, bool retry) {
+  if (topoCapsInflight_ || (topoCapsRequested_ && !retry))
+    return;
+  topoCapsRequested_ = true;
+  topoCapsInflight_ = true;
+  topoCaps_ = topology::Capabilities{}; // Loading
+  st.rpc.call("topology_capabilities", nlohmann::json::object(),
+              [this, &st](const core::RpcResult &r) {
+    topoCapsInflight_ = false;
+    if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+        !simJsonBool(r.result, "ok", true)) {
+      const std::string why = simJsonText(r.result, "message", "error",
+                                          r.err.empty() ? std::string("no reply") : r.err);
+      topoCaps_ = topology::capabilitiesUnavailable(
+          "The topology solver is not available in this engine (" + why + ").");
+      st.addLog("[topology] capability probe failed: " + why);
+      return;
+    }
+    const nlohmann::json &matrix =
+        r.result.contains("capabilities") && r.result["capabilities"].is_object()
+            ? r.result["capabilities"]
+            : r.result;
+    topoCaps_ = topology::parseCapabilities(matrix);
+  }, 30000);
+}
+
+void SimManager::syncTopologyViews(const Study &s) {
+  if (topoViewStudyId_ == s.id)
+    return;
+  topoViewStudyId_ = s.id;
+  topoSettingsView_ = topology::SettingsView{};
+  topoResultsView_ = topology::ResultsView{};
+  topoBcView_ = topology::BcView{};
+  topoAutoShowKey_.clear();
+  if (armedWell_ == kArmTopology)
+    armedWell_ = -1;
+}
+
+topology::MaterialLookup SimManager::topologyMaterialLookup() const {
+  return [](const std::string &key, nlohmann::json &phys) {
+    const int i = materialIndexByKey(key);
+    if (i < 0)
+      return false;
+    const Material &m = materials()[i];
+    phys = nlohmann::json::object();
+    phys["name"] = m.name;
+    // Only constants the library actually records; absent ones stay absent.
+    if (m.E_mpa > 0.0) {
+      phys["E_mpa"] = m.E_mpa;
+      phys["nu"] = m.nu;
+    }
+    if (m.density_g_cm3 > 0.0)
+      phys["density_g_cm3"] = m.density_g_cm3;
+    if (m.yield_mpa > 0.0)
+      phys["yield_mpa"] = m.yield_mpa;
+    return true;
+  };
+}
+
+std::string SimManager::topologyGeometryKey(AppState &st) {
+  if (!st.docMirror.hasDoc())
+    return {};
+  const long rev = (long)st.docMirror.revision();
+  if (topoGeomDocId_ == st.docMirror.docId() && topoGeomRevision_ == rev)
+    return topoGeomKey_;
+  // Runtime identity changes on reopen, but unchanged source geometry stays current.
+  topoGeomKey_ = topology::geometryKey(st.docMirror.tree());
+  topoGeomDocId_ = st.docMirror.docId();
+  topoGeomRevision_ = rev;
+  return topoGeomKey_;
+}
+
+bool SimManager::topologyReady(AppState &st, const Study &s, std::string &blocker) const {
+  if (activeDocIsAssembly(st)) {
+    blocker = "Topology optimization runs on a part document, not an assembly.";
+    return false;
+  }
+  if (topoCaps_.state == topology::Capabilities::State::Loading) {
+    blocker = "Waiting for the topology solver's capability matrix.";
+    return false;
+  }
+  if (topoCaps_.state == topology::Capabilities::State::Unavailable) {
+    blocker = topoCaps_.error;
+    return false;
+  }
+  const nlohmann::json topo = s.topo.value("topology", nlohmann::json());
+  if (!topo.is_object()) {
+    blocker = "Create the topology settings first (Setup).";
+    return false;
+  }
+  const std::string method = topo.value("method", std::string());
+  const std::string physics = topo.value("physics", std::string());
+  std::string reason;
+  if (!topoCaps_.supports(method, physics, &reason)) {
+    blocker = method.empty() || physics.empty()
+                  ? "Choose the physics and method in Setup."
+                  : (reason.empty() ? "This method/physics pair is not supported." : reason);
+    return false;
+  }
+  for (const auto &i : topology::validateTopology(topo, topoCaps_))
+    if (i.severity == topology::Severity::Blocking) {
+      blocker = i.message;
+      return false;
+    }
+  for (const auto &i : topology::validateBoundaries(s.topo, topologyMaterialLookup()))
+    if (i.severity == topology::Severity::Blocking) {
+      blocker = i.message;
+      return false;
+    }
+  return true;
+}
+
+void SimManager::runTopology(AppState &st, Study &s) {
+  if (!st.simClient || !st.docMirror.hasDoc())
+    return;
+  std::string blocker;
+  if (!topologyReady(st, s, blocker)) {
+    st.toast(ui::ToastLevel::Warn, blocker);
+    return;
+  }
+  auto prep = std::make_shared<StaticModalPrep>();
+  prep->type = StudyType::Topology;
+  prep->topoStudy = studyToJson(s);
+  const std::string physics = topology::studyPhysics(prep->topoStudy);
+  std::string err;
+  if (!topology::runMaterial(prep->topoStudy, topologyMaterialLookup(), prep->topoMaterial,
+                             err)) {
+    if (physics != "flow") { // flow optimizes the fluid channel; no solid constants used
+      st.toast(ui::ToastLevel::Warn, err);
+      return;
+    }
+    prep->topoMaterial = nlohmann::json::object();
+  }
+  prep->topoSelectors = topology::selectorsToResolve(prep->topoStudy);
+  prep->topoResolved.resize(prep->topoSelectors.size());
+  prep->topoGeometryKey = topologyGeometryKey(st);
+
+  // Run identity (unique per study; the result directory and record key use it).
+  const double now = unixNow();
+  const std::time_t tt = (std::time_t)now;
+  std::tm tmv{};
+#ifdef _WIN32
+  gmtime_s(&tmv, &tt);
+#else
+  gmtime_r(&tt, &tmv);
+#endif
+  char stamp[32];
+  std::strftime(stamp, sizeof(stamp), "%Y%m%dT%H%M%SZ", &tmv);
+  const std::string setup = topology::setupKey(prep->topoStudy);
+  TopoRunMeta meta;
+  meta.studyId = s.id;
+  meta.runId = std::string("run-") + stamp + "-" + setup.substr(setup.size() - 4);
+  const nlohmann::json runs = s.topo.value("runs", nlohmann::json::array());
+  for (std::size_t i = 0; runs.is_array() && i < runs.size(); ++i)
+    if (topoRunIdOf(runs[i], i) == meta.runId)
+      meta.runId += "-" + std::to_string(runs.size());
+  const nlohmann::json settings = prep->topoStudy.value("topology", nlohmann::json::object());
+  meta.label = "Run " + std::to_string((runs.is_array() ? runs.size() : 0) + 1) + " \xe2\x80\x94 " +
+               topology::methodLabel(settings.value("method", std::string()), &topoCaps_) +
+               ", " + topology::physicsLabel(physics, &topoCaps_);
+  meta.settings = settings;
+  meta.setupKey = setup;
+  meta.geometryKey = prep->topoGeometryKey;
+  meta.startedUtc = now;
+  topoRunMeta_ = meta;
+  topoBcView_.armedPointer.clear();
+  if (armedWell_ == kArmTopology)
+    armedWell_ = -1;
+
+  beginExportPrep(st, s, prep);
+  if (staticModalPrep_ != prep) { // reservation refused: nothing started
+    topoRunMeta_ = TopoRunMeta{};
+    return;
+  }
+  // beginExportPrep clears the transient result; the retained runs still exist.
+  s.hasResult = runs.is_array() && !runs.empty();
+  s.topoStatus = "Preparing: exporting the design domain and resolving " +
+                 std::to_string(prep->topoSelectors.size()) + " face selection(s)\xe2\x80\xa6";
+  s.topoStatusKind = 0;
+}
+
+void SimManager::cancelTopologyPrep(AppState &st) {
+  if (!prepInFlight_ || !staticModalPrep_ || staticModalPrep_->type != StudyType::Topology)
+    return;
+  auto prep = staticModalPrep_;
+  failStaticModalPrep(st, prep, "Topology run cancelled during preparation.");
+}
+
+void SimManager::finishTopologyRun(AppState &st, Study &s, const std::string &ownerDocId,
+                                   bool uiActive) {
+  auto &job = st.simClient->job();
+  const nlohmann::json &res = job.result;
+  TopoRunMeta meta = topoRunMeta_;
+  topoRunMeta_ = TopoRunMeta{};
+  const bool haveResult =
+      res.is_object() && (res.contains("termination") || res.contains("summary") ||
+                           res.contains("ok"));
+  if (!haveResult) {
+    s.topoStatus = job.cancelled ? "Run cancelled before the solver reported a result."
+                                 : "Run failed: " +
+                                       (job.error.empty() ? std::string("no result")
+                                                          : job.error) +
+                                       (job.errorCode.empty() ? std::string()
+                                                              : " (" + job.errorCode + ")");
+    s.topoStatusKind = job.cancelled ? 1 : 2;
+    st.addLog("[topology] " + s.topoStatus);
+    if (uiActive) {
+      st.status = s.topoStatus;
+      st.statusKind = s.topoStatusKind;
+    }
+    return;
+  }
+  if (meta.runId.empty() || meta.studyId != s.id) {
+    // The launching run's identity was lost (should not happen: runs are serialized).
+    meta.runId = "run-" + std::to_string((long long)unixNow());
+    meta.settings = s.topo.value("topology", nlohmann::json::object());
+  }
+  nlohmann::json result = topology::compactResult(res);
+  if (!job.ok) {
+    if (!result.contains("ok"))
+      result["ok"] = false;
+    if (!result.contains("error") && !job.error.empty())
+      result["error"] = job.error;
+  }
+  nlohmann::json record = {
+      {"run_id", meta.runId},
+      {"label", meta.label},
+      {"started_utc", meta.startedUtc},
+      {"finished_utc", unixNow()},
+      {"settings", meta.settings},
+      {"source", {{"geometry_key", meta.geometryKey}, {"setup_key", meta.setupKey}}},
+      {"result", std::move(result)}};
+  if (!s.topo.contains("runs") || !s.topo["runs"].is_array())
+    s.topo["runs"] = nlohmann::json::array();
+  s.topo["runs"].push_back(std::move(record));
+  s.hasResult = true;
+  s.topoRunsCheckKey.clear();
+  const topology::OutcomeSummary o = topology::classifyResult(s.topo["runs"].back()["result"]);
+  s.topoStatus = o.headline + (o.detail.empty() ? std::string() : " \xe2\x80\x94 " + o.detail);
+  s.topoStatusKind = o.outcome == topology::Outcome::Converged ? 0
+                     : o.outcome == topology::Outcome::Failed ? 2
+                                                               : 1;
+  s.summary = o.headline;
+  st.addLog("[topology] " + meta.runId + ": " + s.topoStatus);
+  persist(st, ownerDocId, s);
+  if (uiActive) {
+    st.status = "Topology: " + o.headline;
+    st.statusKind = s.topoStatusKind;
+    if (sel_ >= 0 && sel_ < (int)studies_.size() && studies_[sel_].id == s.id) {
+      syncTopologyViews(s);
+      topoResultsView_.selectedRunId = meta.runId;
+      node_ = SimNode::Results;
+      topoActions_.push_back({s.id, {topology::ResultsAction::Kind::ShowRun, meta.runId, ""}});
+    }
+  }
+}
+
+void SimManager::refreshTopologyRunsView(AppState &st, Study &s, bool force) {
+  const nlohmann::json runs = s.topo.value("runs", nlohmann::json::array());
+  const std::string geom = topologyGeometryKey(st);
+  const std::string key = std::to_string(runs.is_array() ? runs.size() : 0) + "|" + geom +
+                          "|" +
+                          (runs.is_array() && !runs.empty() ? topoRunIdOf(runs.back(), runs.size() - 1)
+                                                            : std::string());
+  if (!force && key == s.topoRunsCheckKey)
+    return;
+  s.topoRunsCheckKey = key;
+  nlohmann::json view = runs.is_array() ? runs : nlohmann::json::array();
+  for (auto &run : view) {
+    if (!run.is_object())
+      continue;
+    const std::string runGeom = topoStr(topoObj(run, "source"), "geometry_key");
+    // A run made on other source geometry no longer describes the part: its artifacts are
+    // stale, never presented as current. A run recorded without the GUI's geometry digest
+    // (model-tool runs) cannot be checked; it is flagged unverified, not silently current.
+    const bool sourceStale = !runGeom.empty() && (geom.empty() || runGeom != geom);
+    if (runGeom.empty())
+      run["source_unverified"] = true;
+    if (!run.contains("result") || !run["result"].is_object())
+      continue;
+    nlohmann::json &result = run["result"];
+    if (result.contains("artifacts") && result["artifacts"].is_object())
+      for (auto it = result["artifacts"].begin(); it != result["artifacts"].end(); ++it) {
+        nlohmann::json &a = it.value();
+        if (!a.is_object())
+          continue;
+        const std::string fmt = topoArtifactFormat(a);
+        if (!fmt.empty())
+          a["format"] = fmt;
+        const std::string path = topoStr(a, "path");
+        std::error_code ec;
+        const bool exists = !path.empty() && std::filesystem::is_regular_file(path, ec);
+        a["missing"] = !exists;
+        bool stale = sourceStale;
+        if (exists && a.contains("bytes") && a["bytes"].is_number_integer()) {
+          const auto size = std::filesystem::file_size(path, ec);
+          stale = stale || ec || (long long)size != a["bytes"].get<long long>();
+        }
+        a["stale"] = stale;
+      }
+    if (result.contains("overlay_aicm") && result["overlay_aicm"].is_string()) {
+      std::error_code ec;
+      const std::string path = result["overlay_aicm"].get<std::string>();
+      if (sourceStale || !std::filesystem::is_regular_file(path, ec))
+        result.erase("overlay_aicm");
+    }
+    if (sourceStale)
+      run["source_stale"] = true;
+  }
+  s.topoRunsView = std::move(view);
+}
+
+bool SimManager::showTopologyRun(AppState &st, Study &s, const std::string &runId) {
+  refreshTopologyRunsView(st, s);
+  const nlohmann::json *run = topoFindRun(s.topoRunsView, runId);
+  if (!run) {
+    st.toast(ui::ToastLevel::Warn, "That run is no longer in this study.");
+    return false;
+  }
+  const nlohmann::json overlay = topoOverlayArtifact(*run);
+  if (!overlay.is_object()) {
+    st.toast(ui::ToastLevel::Warn,
+             run->value("source_stale", false)
+                 ? "This run was made on different geometry; run the study again to view it."
+                 : "This run has no viewport overlay file (missing or not produced).");
+    return false;
+  }
+  const std::vector<nlohmann::json> fields = topoOverlayFields(*run, overlay);
+  const nlohmann::json *chosen = nullptr;
+  for (const auto &f : fields)
+    if (f["name"] == st.activeScalarField)
+      chosen = &f;
+  for (const auto &f : fields)
+    if (!chosen && f["name"] == "density")
+      chosen = &f;
+  if (!chosen && !fields.empty())
+    chosen = &fields.front();
+  if (chosen) {
+    st.activeScalarField = (*chosen)["name"].get<std::string>();
+    topoFieldMeta(st, *chosen, s.topoFieldLabel, s.topoFieldUnit, s.topoFieldFromSI);
+  } else {
+    st.activeScalarField = "density";
+    s.topoFieldLabel = "Density (solid fraction)";
+    s.topoFieldUnit.clear();
+    s.topoFieldFromSI = 1.0;
+  }
+  s.overlayPath = overlay["path"].get<std::string>();
+  s.hasResult = true;
+  topoResultsView_.selectedRunId = runId;
+  // syncResultView applies it on the next tick while Results is the active node.
+  resultShown_ = false;
+  shownStudyId_.clear();
+  return true;
+}
+
+void SimManager::exportTopologyArtifact(AppState &st, Study &s, const std::string &runId,
+                                        const std::string &artifactKey) {
+  if (topoExport_) {
+    st.toast(ui::ToastLevel::Info, "An export is already being written.");
+    return;
+  }
+  refreshTopologyRunsView(st, s, true);
+  const nlohmann::json *run = topoFindRun(s.topoRunsView, runId);
+  const nlohmann::json result =
+      run ? topoObj(*run, "result") : nlohmann::json::object();
+  const nlohmann::json arts = topoObj(result, "artifacts");
+  if (!run || !arts.is_object() || !arts.contains(artifactKey)) {
+    st.toast(ui::ToastLevel::Warn, "That result file is not recorded for this run.");
+    return;
+  }
+  const nlohmann::json a = arts[artifactKey];
+  if (!topoTrue(a, "missing") && topoStr(a, "path").empty()) {
+    st.toast(ui::ToastLevel::Warn, "That result file has no recorded path.");
+    return;
+  }
+  if (topoTrue(a, "missing")) {
+    st.toast(ui::ToastLevel::Warn, "The result file is missing on disk; run the study again.");
+    return;
+  }
+  if (topoTrue(a, "stale")) {
+    st.toast(ui::ToastLevel::Warn,
+             "The result file no longer matches this run or the current part; run again.");
+    return;
+  }
+  const std::string fmt = topoArtifactFormat(a);
+  const bool surface = fmt == "stl" || fmt == "3mf" || fmt == "obj";
+  const bool geometryValid = topoTrue(topoObj(result, "manufacturing"), "geometry_valid");
+  if (surface && !geometryValid) {
+    st.toast(ui::ToastLevel::Warn,
+             "The reconstructed surface did not pass geometry validation; it is not exported.");
+    return;
+  }
+  const std::string src = a.value("path", std::string());
+  std::string ext = std::filesystem::path(src).extension().string();
+  if (!ext.empty() && ext[0] == '.')
+    ext.erase(0, 1);
+  if (ext.empty())
+    ext = fmt.empty() ? "dat" : fmt;
+  const std::string base = simPathSegment(s.name) + "_" + simPathSegment(runId) + "_" +
+                           simPathSegment(artifactKey);
+  std::string dst;
+  if (std::getenv("CHUDWARE_NO_FILE_DIALOGS")) {
+    dst = (std::filesystem::current_path() / (base + "." + ext)).string();
+  } else {
+    const std::string upper = [&] {
+      std::string u = ext;
+      for (char &c : u)
+        c = (char)std::toupper((unsigned char)c);
+      return u;
+    }();
+    std::string filter = upper + " file (*." + ext + ")";
+    filter.push_back('\0');
+    filter += "*." + ext;
+    filter.push_back('\0');
+    dst = ui::saveFileDialog(filter.c_str(), ext.c_str(), (base + "." + ext).c_str());
+    if (dst.empty())
+      return; // cancelled
+  }
+  std::error_code ec;
+  if (std::filesystem::equivalent(src, dst, ec)) {
+    st.toast(ui::ToastLevel::Warn, "Choose a destination other than the run's own file.");
+    return;
+  }
+  auto job = std::make_shared<TopoExport>();
+  job->src = src;
+  job->dst = dst;
+  job->expectBytes = a.contains("bytes") && a["bytes"].is_number_integer()
+                         ? a["bytes"].get<long long>()
+                         : -1;
+  topoExport_ = job;
+  st.toast(ui::ToastLevel::Info, "Exporting " + std::filesystem::path(dst).filename().string() +
+                                     "\xe2\x80\xa6");
+  // The copy runs off the GUI thread; tick() reports completion. The run's own file is never
+  // touched (copy source only).
+  std::thread([job] {
+    std::error_code err;
+    std::filesystem::copy_file(job->src, job->dst,
+                               std::filesystem::copy_options::overwrite_existing, err);
+    if (err) {
+      job->err = err.message();
+    } else {
+      const auto size = std::filesystem::file_size(job->dst, err);
+      if (err)
+        job->err = err.message();
+      else if (job->expectBytes >= 0 && (long long)size != job->expectBytes)
+        job->err = "copied size differs from the recorded artifact size";
+      else
+        job->ok = true;
+    }
+    job->done = true;
+  }).detach();
+}
+
+void SimManager::processTopologyActions(AppState &st) {
+  if (topoExport_ && topoExport_->done.load()) {
+    auto job = std::move(topoExport_);
+    if (job->ok) {
+      st.toast(ui::ToastLevel::Info, "Exported " + job->dst);
+      st.addLog("[topology] exported " + job->src + " -> " + job->dst);
+      ui::afterFileWritten(job->dst);
+    } else {
+      st.toast(ui::ToastLevel::Error, "Export failed: " + job->err);
+      st.addLog("[topology] export failed (" + job->dst + "): " + job->err);
+    }
+  }
+  if (topoActions_.empty())
+    return;
+  std::vector<TopoPendingAction> actions;
+  actions.swap(topoActions_);
+  for (const auto &pa : actions) {
+    Study *s = nullptr;
+    for (auto &study : studies_)
+      if (study.id == pa.studyId && study.type == StudyType::Topology)
+        s = &study;
+    if (!s)
+      continue;
+    switch (pa.action.kind) {
+    case topology::ResultsAction::Kind::ShowRun:
+      showTopologyRun(st, *s, pa.action.runId);
+      break;
+    case topology::ResultsAction::Kind::ExportArtifact:
+      exportTopologyArtifact(st, *s, pa.action.runId, pa.action.artifactKey);
+      break;
+    case topology::ResultsAction::Kind::ApplyRunSettings: {
+      if (topologyRunActive()) {
+        st.toast(ui::ToastLevel::Info, "Wait for the topology run to finish.");
+        break;
+      }
+      const nlohmann::json runs = s->topo.value("runs", nlohmann::json::array());
+      const nlohmann::json *run = topoFindRun(runs, pa.action.runId);
+      if (!run)
+        break;
+      const nlohmann::json settings = run->value("settings", nlohmann::json::object());
+      nlohmann::json &topo = s->topo["topology"];
+      if (!topo.is_object())
+        topo = nlohmann::json::object();
+      topology::applyRunSettings(topo, settings);
+      persist(st, *s);
+      st.toast(ui::ToastLevel::Info, "Settings restored from " + pa.action.runId);
+      break;
+    }
+    case topology::ResultsAction::Kind::None:
+      break;
+    }
+  }
+}
+
+void SimManager::drawTopologyForm(AppState &st, Study &s) {
+  syncTopologyViews(s);
+  const bool locked = topologyRunActive() && (topoRunMeta_.studyId == s.id ||
+                                              (staticModalPrep_ && staticModalPrep_->studyId == s.id));
+  const char *lockedReason =
+      locked ? "A run owns this study; edits unlock when it finishes or is cancelled."
+             : nullptr;
+  if (topoCaps_.state == topology::Capabilities::State::Unavailable) {
+    kit::inlineStatus(topoCaps_.error.c_str(), kit::Tone::Err);
+    if (kit::secondaryButton("Check the topology solver again"))
+      probeTopologyCaps(st, true);
+  }
+  if (node_ == SimNode::Study) {
+    drawStudyTypeBanner(s.type,
+                        "Topology optimization: the solver redistributes material inside "
+                        "this part's design domain for the chosen physics and goal. The "
+                        "source geometry is never replaced; results are kept per run.");
+    // Never insert a null `topology` key into an agent record just by drawing the form.
+    nlohmann::json scratch = s.topo.contains("topology") ? s.topo["topology"] : nlohmann::json();
+    if (topology::drawTopologySettings(st, scratch, topoCaps_, topoSettingsView_,
+                                       lockedReason)) {
+      s.topo["topology"] = std::move(scratch);
+      persist(st, s);
+    }
+    return;
+  }
+  const topology::BcSection section = node_ == SimNode::Material   ? topology::BcSection::Material
+                                      : node_ == SimNode::Regions  ? topology::BcSection::Regions
+                                                                   : topology::BcSection::Boundaries;
+  std::vector<std::pair<std::string, std::string>> library;
+  for (const auto &m : materials())
+    library.emplace_back(m.key, m.name + (m.custom ? " (custom)" : ""));
+  const topology::BcResult r = topology::drawBoundaryEditor(
+      st, s.topo, section, topoBcView_, topologyMaterialLookup(), library, lockedReason);
+  if (r.committed)
+    persist(st, s);
+  if (r.armChanged)
+    st.selection.clear(); // a freshly armed well starts without stale picks
+  armedWell_ = topoBcView_.armedPointer.empty() ? -1 : kArmTopology;
+  if (node_ == SimNode::Regions) {
+    // Manufacturing intent (symmetry, extrusion, additive) lives in the scalar settings.
+    kit::gapSection();
+    kit::sectionHeader("Manufacturing settings");
+    nlohmann::json scratch = s.topo.contains("topology") ? s.topo["topology"] : nlohmann::json();
+    if (scratch.is_object() &&
+        topology::drawTopologySettings(st, scratch, topoCaps_, topoSettingsView_,
+                                       lockedReason)) {
+      s.topo["topology"] = std::move(scratch);
+      persist(st, s);
+    }
+  }
+}
+
+void SimManager::drawTopologyResults(AppState &st, Study &s) {
+  syncTopologyViews(s);
+  const nlohmann::json &runs = s.topoRunsView;
+  if (!runs.is_array() || runs.empty()) {
+    kit::emptyState("study_static", "No topology runs yet",
+                    "Run the study; every run is kept here for comparison and export.");
+    return;
+  }
+  const nlohmann::json &last = runs.back();
+  if (topoTrue(last, "source_stale"))
+    kit::inlineStatus("The part changed since the latest run: its results describe the old "
+                      "geometry and are marked stale. Run again.",
+                      kit::Tone::Warn);
+  else if (topoTrue(last, "source_unverified"))
+    kit::inlineStatus("The latest run was recorded without this editor's geometry digest "
+                      "(e.g. by a model tool); it cannot be checked against the current part.",
+                      kit::Tone::Info);
+  else if (!topoSetupKeyNow_.empty() && topoSetupKeyStudy_ == s.id &&
+           topoStr(topoObj(last, "source"), "setup_key") !=
+               topoSetupKeyNow_)
+    kit::inlineStatus("The setup was edited after the latest run; run again to see its effect.",
+                      kit::Tone::Info);
+  // Field selector for the displayed overlay (exact chunks of that AICM file).
+  if (resultShown_ && shownStudyId_ == s.id) {
+    const nlohmann::json *run = topoFindRun(runs, topoResultsView_.selectedRunId);
+    if (run) {
+      const nlohmann::json overlay = topoOverlayArtifact(*run);
+      const std::vector<nlohmann::json> fields =
+          overlay.is_object() ? topoOverlayFields(*run, overlay) : std::vector<nlohmann::json>{};
+      if (fields.size() > 1) {
+        ImGui::TextUnformatted("Viewport field");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##topo_field", s.topoFieldLabel.c_str())) {
+          for (const auto &f : fields) {
+            std::string label, unit;
+            double from = 1.0;
+            topoFieldMeta(st, f, label, unit, from);
+            const std::string name = f["name"].get<std::string>();
+            if (ImGui::Selectable((label + (unit.empty() ? "" : " (" + unit + ")")).c_str(),
+                                  name == st.activeScalarField) &&
+                name != st.activeScalarField) {
+              st.activeScalarField = name;
+              s.topoFieldLabel = label;
+              s.topoFieldUnit = unit;
+              s.topoFieldFromSI = from;
+              resultShown_ = false; // syncResultView reloads the overlay in tick
+              shownStudyId_.clear();
+            }
+          }
+          ImGui::EndCombo();
+        }
+      }
+    }
+  }
+  const topology::ResultsAction a =
+      topology::drawTopologyResults(st, runs, topoCaps_, topoResultsView_);
+  if (a.kind != topology::ResultsAction::Kind::None)
+    topoActions_.push_back({s.id, a});
+}
+
+void SimManager::drawTopologyRunArea(AppState &st, Study &s) {
+  const float S = ui::uiScale;
+  const bool ownPrep = prepInFlight_ && staticModalPrep_ &&
+                       staticModalPrep_->type == StudyType::Topology &&
+                       staticModalPrep_->studyId == s.id;
+  const bool ownSolve = running_ && topoRunMeta_.studyId == s.id && !ownPrep;
+  const bool otherBusy = !ownPrep && !ownSolve &&
+                         ((st.simClient && st.simClient->busy()) || prepInFlight_ ||
+                          advRunning_ || motionRun_ || st.rpc.busy());
+  std::string blocker;
+  bool ready = st.docMirror.hasDoc() && hasSimulationGeometry(st);
+  if (!ready)
+    blocker = "The active document has no solid geometry to optimize.";
+  else if (!st.simClient) {
+    ready = false;
+    blocker = "The simulation backend is unavailable.";
+  } else
+    ready = topologyReady(st, s, blocker);
+  const ImVec2 runSize(ImGui::GetContentRegionAvail().x, 30.0f * S);
+  if (ownPrep || ownSolve) {
+    const bool cancelAsked = ownSolve && st.simClient && st.simClient->cancelRequested();
+    if (kit::dangerButton(cancelAsked ? "Cancel requested\xe2\x80\xa6" : "Cancel run",
+                          !cancelAsked, "Waiting for the solver's next checkpoint.", runSize)) {
+      if (ownPrep) {
+        cancelTopologyPrep(st);
+      } else if (st.simClient) {
+        st.simClient->cancel();
+        s.topoStatus = "Cancellation requested; the optimizer stops at its next checkpoint.";
+        s.topoStatusKind = 1;
+        st.status = "Topology: cancellation requested";
+        st.statusKind = 1;
+      }
+    }
+    if (ownPrep) {
+      kit::progressBar(-1.0f, "Preparing");
+    } else if (st.simClient) {
+      float frac = -1.0f;
+      std::string caption = "Solving";
+      if (!topoLiveIter_.empty()) {
+        const int maxIt = topoLiveMaxIter_;
+        const int it = (int)topoLiveIter_.back();
+        caption = "Iteration " + std::to_string(it) +
+                  (maxIt > 0 ? " of " + std::to_string(maxIt) : std::string());
+        if (maxIt > 0)
+          frac = std::clamp((float)it / (float)maxIt, 0.0f, 1.0f);
+      }
+      caption += "  \xc2\xb7  " + kit::fmtDuration(st.simClient->elapsedSeconds());
+      kit::progressBar(frac, caption.c_str());
+    }
+  } else {
+    const bool canRun = ready && !otherBusy;
+    const char *why = otherBusy ? "Another simulation is running or preparing."
+                                : blocker.c_str();
+    if (kit::primaryButton("Run topology optimization", canRun, why, runSize))
+      run(st, s);
+  }
+}
+
 // ---------------------------------------------------------------- pick capture
 
 void SimManager::captureSelectionInto(AppState &st, SimWell &well) {
@@ -2916,6 +4155,25 @@ bool SimManager::routeFacePick(AppState &st, const nlohmann::json &selector,
   if (selector.value("kind", std::string()) != "face")
     return false;
   Study &s = studies_[sel_];
+  if (s.type == StudyType::Topology) {
+    // Topology wells live in the canonical study JSON, addressed by the armed pointer.
+    if (armedWell_ != kArmTopology || topoBcView_.armedPointer.empty() ||
+        topologyRunActive())
+      return false;
+    std::size_t count = 0;
+    const int changed = topology::toggleFace(s.topo, topoBcView_.armedPointer, selector,
+                                             body, topo, &count);
+    if (changed == 0) {
+      topoBcView_.armedPointer.clear();
+      armedWell_ = -1;
+      return false;
+    }
+    persist(st, s);
+    st.toast(ui::ToastLevel::Info,
+             std::string(changed > 0 ? "Added face (" : "Removed face (") +
+                 std::to_string(count) + " in this selection)");
+    return true;
+  }
   nlohmann::json sel = selector;
   sel["_pick"] = {{"body", body}, {"topo", topo}};
   SimSel ss;
@@ -2971,6 +4229,10 @@ bool SimManager::previewActive(AppState &st) const {
 void SimManager::collectFixtureFaces(std::vector<uint64_t> &keys) const {
   if (sel_ < 0 || sel_ >= (int)studies_.size())
     return;
+  if (studies_[sel_].type == StudyType::Topology) {
+    topology::collectFaceKeys(studies_[sel_].topo, topology::WellRole::Support, keys);
+    return;
+  }
   for (const auto &p : studies_[sel_].fixtures.picks)
     if (p.pickBody && p.pickTopo)
       keys.push_back(((uint64_t)p.pickBody << 32) | (uint64_t)p.pickTopo);
@@ -2979,10 +4241,31 @@ void SimManager::collectFixtureFaces(std::vector<uint64_t> &keys) const {
 void SimManager::collectLoadFaces(std::vector<uint64_t> &keys) const {
   if (sel_ < 0 || sel_ >= (int)studies_.size())
     return;
+  if (studies_[sel_].type == StudyType::Topology) {
+    topology::collectFaceKeys(studies_[sel_].topo, topology::WellRole::Load, keys);
+    return;
+  }
   for (const auto &ld : studies_[sel_].loads)
     for (const auto &p : ld.faces.picks)
       if (p.pickBody && p.pickTopo)
         keys.push_back(((uint64_t)p.pickBody << 32) | (uint64_t)p.pickTopo);
+}
+
+void SimManager::collectTopologyPreview(std::vector<uint64_t> &preserveFaces,
+                                        std::vector<uint64_t> &excludeFaces,
+                                        std::vector<uint64_t> &portFaces,
+                                        std::vector<float> &preserveBoxSegs,
+                                        std::vector<float> &excludeBoxSegs) const {
+  if (sel_ < 0 || sel_ >= (int)studies_.size() ||
+      studies_[sel_].type != StudyType::Topology)
+    return;
+  const nlohmann::json &j = studies_[sel_].topo;
+  topology::collectFaceKeys(j, topology::WellRole::Preserve, preserveFaces);
+  topology::collectFaceKeys(j, topology::WellRole::Exclude, excludeFaces);
+  topology::collectFaceKeys(j, topology::WellRole::Port, portFaces);
+  topology::collectFaceKeys(j, topology::WellRole::Wall, portFaces);
+  topology::collectRegionBoxSegments(j, true, preserveBoxSegs);
+  topology::collectRegionBoxSegments(j, false, excludeBoxSegs);
 }
 
 // ---------------------------------------------------------------- result field
@@ -3056,6 +4339,12 @@ void SimManager::finishResultOverlay(AppState &st, Study &s) {
   std::string label, unit;
   double fromSI = 1.0;
   fieldMeta(st, st.activeScalarField, label, unit, fromSI);
+  if (s.type == StudyType::Topology && !s.topoFieldLabel.empty()) {
+    // Topology overlays name their own chunks and units (run artifact descriptors).
+    label = s.topoFieldLabel;
+    unit = s.topoFieldUnit;
+    fromSI = s.topoFieldFromSI;
+  }
   st.legendTitle = label;
   st.legendUnits = unit;
   float vmin = 0, vmax = 1;
@@ -3066,7 +4355,6 @@ void SimManager::finishResultOverlay(AppState &st, Study &s) {
     st.legendMin = (float)(vmin * fromSI);
     st.legendMax = (float)(vmax * fromSI);
   }
-  (void)s;
 }
 
 void SimManager::clearMeshPreview() {
@@ -4289,6 +5577,10 @@ void SimManager::run(AppState &st, Study &s) {
     block(readiness);
     return;
   }
+  if (s.type == StudyType::Topology && !topologyReady(st, s, readiness)) {
+    block(readiness);
+    return;
+  }
 #ifdef __EMSCRIPTEN__
   if (isFlowFamily(s.type) || s.type == StudyType::Contact ||
       s.type == StudyType::FreqResponse) {
@@ -4360,6 +5652,8 @@ void SimManager::run(AppState &st, Study &s) {
     runContact(st, s);
   else if (s.type == StudyType::FreqResponse)
     runFreqResponse(st, s);
+  else if (s.type == StudyType::Topology)
+    runTopology(st, s);
   else
     runStaticOrModal(st, s);
 }
@@ -4538,6 +5832,7 @@ void SimManager::beginExportPrep(
         prep->facesRemaining = prep->fixtureSelectors.size();
         for (const auto &load : prep->loads)
           prep->facesRemaining += load.selectors.size();
+        prep->facesRemaining += prep->topoSelectors.size();
         if (prep->facesRemaining == 0) {
           finishStaticModalPrep(st, prep);
           return;
@@ -4561,6 +5856,8 @@ void SimManager::beginExportPrep(
         for (auto &load : prep->loads)
           for (std::size_t i = 0; i < load.selectors.size(); ++i)
             queueFace(load.selectors[i], &load.resolved[i]);
+        for (std::size_t i = 0; i < prep->topoSelectors.size(); ++i)
+          queueFace(prep->topoSelectors[i], &prep->topoResolved[i]);
       },
       60000);
 }
@@ -4578,19 +5875,31 @@ void SimManager::failStaticModalPrep(
   running_ = false;
   runningStudy_ = -1;
   runningStudyId_.clear();
+  const bool topo = prep->type == StudyType::Topology;
+  const bool cancelled = topo && message.rfind("Topology run cancelled", 0) == 0;
+  if (topo)
+    topoRunMeta_ = TopoRunMeta{};
   for (auto &study : studies_) {
     if (study.id != prep->studyId)
       continue;
+    if (topo) {
+      // Retained runs are untouched; only the transient status reports the refusal.
+      study.hasResult = study.topo.contains("runs") && study.topo["runs"].is_array() &&
+                        !study.topo["runs"].empty();
+      study.topoStatus = message;
+      study.topoStatusKind = cancelled ? 1 : 2;
+      break;
+    }
     study.hasResult = false;
     study.summary = message;
     persist(st, prep->docId, study);
     break;
   }
-  st.addLog("[sim] " + message);
+  st.addLog((topo ? "[topology] " : "[sim] ") + message);
   if (simOriginActive(st, this, prep->docId)) {
     st.status = message;
-    st.statusKind = 2;
-    st.toast(ui::ToastLevel::Error, message);
+    st.statusKind = cancelled ? 1 : 2;
+    st.toast(cancelled ? ui::ToastLevel::Info : ui::ToastLevel::Error, message);
   }
   staticModalPrep_.reset();
 }
@@ -4631,6 +5940,58 @@ void SimManager::finishStaticModalPrep(
   if (!simDocOpen(st, prep->docId)) {
     failStaticModalPrep(st, prep,
                         "Simulation cancelled: source document was closed");
+    return;
+  }
+  if (prep->type == StudyType::Topology) {
+    // The design domain was exported at Run; refuse if the part changed while faces resolved
+    // (the selections would describe other geometry than the exported STEP).
+    if (st.docMirror.hasDoc() && st.docMirror.docId() == prep->docId &&
+        !prep->topoGeometryKey.empty() && topologyGeometryKey(st) != prep->topoGeometryKey) {
+      failStaticModalPrep(st, prep,
+                          "Topology run stopped: the part changed during preparation. Run "
+                          "again.");
+      return;
+    }
+    std::map<std::string, nlohmann::json> resolved;
+    for (std::size_t i = 0; i < prep->topoSelectors.size(); ++i)
+      resolved[topology::selectorKey(prep->topoSelectors[i])] = prep->topoResolved[i];
+    nlohmann::json envelope;
+    std::string error;
+    if (!topology::buildRunEnvelope(prep->topoStudy, resolved, prep->resolvedStepPath,
+                                    prep->topoMaterial, envelope, error)) {
+      failStaticModalPrep(st, prep, "Topology run refused: " + error);
+      return;
+    }
+    // In-process engine: a per-run directory under the app data dir (unique run id; the
+    // surface writer creates files exclusively). In daemon mode the server owns the path.
+    if (!engine::daemonMode() && !topoRunMeta_.runId.empty())
+      envelope["topology"]["result_dir"] =
+          appdataAppDir() + "/topology/" + simPathSegment(prep->docId) + "_" +
+          simPathSegment(prep->studyId) + "/" + simPathSegment(topoRunMeta_.runId);
+    std::string note;
+    const std::uint64_t token = prep->reservationToken;
+    const bool launched = prep->sim->launch("sim_run_topology", {{"study", std::move(envelope)}},
+                                            note, prep->docId, token);
+    prep->reservationToken = 0; // a matching launch consumes the reservation either way
+    if (!launched) {
+      failStaticModalPrep(st, prep,
+                          note.empty() ? std::string("Topology solver failed to start") : note);
+      return;
+    }
+    prepInFlight_ = false;
+    staticModalPrep_.reset();
+    topoLiveIter_.clear();
+    topoLiveObjective_.clear();
+    topoLiveVolume_.clear();
+    topoLiveChange_.clear();
+    for (auto &study : studies_)
+      if (study.id == prep->studyId) {
+        study.topoStatus = "Optimizing\xe2\x80\xa6";
+        study.topoStatusKind = 0;
+      }
+    st.addLog(note.empty() ? "[topology] run started" : "[topology] " + note);
+    if (simOriginActive(st, this, prep->docId))
+      st.toast(ui::ToastLevel::Info, "Topology optimization started");
     return;
   }
   if ((prep->type == StudyType::Static || prep->type == StudyType::Buckling) &&
@@ -4975,6 +6336,66 @@ void SimManager::tick(AppState &st) {
       st.activeWorkspace == AppState::Workspace::Simulate)
     probeFwStatus(st);
   drainSimClientJob(st);
+
+  // ---- topology: capability probe, deferred panel actions (file reads / overlay loads /
+  // exports stay off the draw path), artifact checks and the live convergence copy.
+  const bool simWs = st.activeWorkspace == AppState::Workspace::Simulate;
+  bool anyTopology = false;
+  for (const auto &study : studies_)
+    anyTopology = anyTopology || study.type == StudyType::Topology;
+  if (!topoCapsRequested_ && (simWs || anyTopology))
+    probeTopologyCaps(st);
+  processTopologyActions(st);
+  if (sel_ >= 0 && sel_ < (int)studies_.size() &&
+      studies_[sel_].type == StudyType::Topology) {
+    Study &ts = studies_[sel_];
+    syncTopologyViews(ts);
+    refreshTopologyRunsView(st, ts);
+    const double now = ImGui::GetTime();
+    if (topoSetupKeyStudy_ != ts.id || now - topoSetupKeyTime_ > 0.5) {
+      topoSetupKeyNow_ = topology::setupKey(studyToJson(ts));
+      topoSetupKeyStudy_ = ts.id;
+      topoSetupKeyTime_ = now;
+    }
+    // Entering Results shows the selected (else latest) run's overlay once, silently when
+    // that run has no usable overlay (the panel says why).
+    const nlohmann::json &runs = ts.topoRunsView;
+    if (simWs && node_ == SimNode::Results && ts.overlayPath.empty() && runs.is_array() &&
+        !runs.empty()) {
+      const std::string runId = topoResultsView_.selectedRunId.empty()
+                                    ? topoRunIdOf(runs.back(), runs.size() - 1)
+                                    : topoResultsView_.selectedRunId;
+      const std::string key = ts.id + "|" + runId;
+      if (topoAutoShowKey_ != key) {
+        topoAutoShowKey_ = key;
+        const nlohmann::json *run = topoFindRun(runs, runId);
+        if (run && topoOverlayArtifact(*run).is_object())
+          showTopologyRun(st, ts, runId);
+      }
+    }
+  }
+  if (st.simClient && running_ && !topoRunMeta_.runId.empty()) {
+    const std::uint64_t rev = st.simClient->iterationRevision();
+    if (rev != topoIterRevision_) {
+      topoIterRevision_ = rev;
+      topoLiveIter_.clear();
+      topoLiveObjective_.clear();
+      topoLiveVolume_.clear();
+      topoLiveChange_.clear();
+      topoLiveMaxIter_ = 0;
+      for (const auto &it : st.simClient->iterationHistory()) {
+        topoLiveMaxIter_ = it.maxIterations;
+        topoLiveIter_.push_back(it.index);
+        // Filter once per history revision, not into a temporary chart buffer every frame.
+        if (std::isfinite(it.objective))
+          topoLiveObjective_.push_back(it.objective);
+        if (std::isfinite(it.volumeFraction))
+          topoLiveVolume_.push_back(it.volumeFraction);
+        if (std::isfinite(it.designChange))
+          topoLiveChange_.push_back(it.designChange);
+      }
+    }
+  }
 }
 
 void SimManager::drainSimClientJob(AppState &st) {
@@ -5071,6 +6492,12 @@ void SimManager::drainSimClientJob(AppState &st) {
     if (si < 0 || si >= (int)studies_.size())
       return;
     Study &s = studies_[si];
+    if (s.type == StudyType::Topology) {
+      // Completed, refused, infeasible, iteration-limited and cancelled native results are all
+      // retained as runs (job.result carries the partial/diagnostic object on !ok).
+      finishTopologyRun(st, s, ownerDocId, uiActive);
+      return;
+    }
     if (!job.ok) {
       if (job.cancelled) {
         s.summary = "Run cancelled";
@@ -5502,6 +6929,8 @@ void SimManager::drainSimClientJob(AppState &st) {
 // finite. run() repeats this gate, so ribbon commands cannot bypass the disabled panel button.
 static bool studyReady(const Study &s, std::string &blocker) {
   auto finite = [](double v) { return std::isfinite(v); };
+  if (s.type == StudyType::Topology)
+    return true; // gated by SimManager::topologyReady (needs the capability matrix)
   if (s.type == StudyType::Motion) {
     if (s.motionDrivers.empty()) {
       blocker = "Add at least one Angle or Distance driver in Motion setup.";
@@ -5991,6 +7420,20 @@ void SimManager::drawTreeBody(AppState &st) {
                           "Conduction on the part: fixed temps, flux, "
                           "convection; steady or transient.",
                           false, ""});
+      // Topology: one part's design domain (assemblies refused), and only offered as
+      // runnable while the native solver's capability matrix is reachable.
+      const bool topoAsm = activeDocIsAssembly(st);
+      const bool topoUnavailable =
+          topoCaps_.state == topology::Capabilities::State::Unavailable;
+      kEntries.push_back(
+          {Kind::Fea, StudyType::Topology, "Topology",
+           studyTypeIcon(StudyType::Topology),
+           "Optimize the material layout of this part's design domain (structural, "
+           "thermal, modal, buckling, flow, coupled).",
+           topoAsm || topoUnavailable,
+           topoAsm ? std::string("Topology optimization runs on a single part; open the "
+                                 "part document.")
+                   : topoCaps_.error});
     }
     if (hasAsm)
       kEntries.push_back({Kind::Fea, StudyType::Motion, "Motion",
@@ -6201,6 +7644,12 @@ bool SimManager::drawPanelHeader(AppState &st, Study &s) {
   case SimNode::Results:
     section = (s.type == StudyType::Motion) ? "Playback" : "Results";
     break;
+  case SimNode::Boundaries:
+    section = "Boundaries";
+    break;
+  case SimNode::Regions:
+    section = "Regions & Manufacturing";
+    break;
   case SimNode::Study:
     switch (s.type) {
     case StudyType::Flow:
@@ -6214,6 +7663,9 @@ bool SimManager::drawPanelHeader(AppState &st, Study &s) {
       break;
     case StudyType::Motion:
       section = "Driver / Time";
+      break;
+    case StudyType::Topology:
+      section = "Topology Setup";
       break;
     default:
       section = "Study";
@@ -6351,6 +7803,81 @@ void SimManager::drawStudyRow(AppState &st, int i) {
       simBadge(ok, tip);
     };
 
+    if (s.type == StudyType::Topology) {
+      // Topology rows: setup, material, boundaries, regions, mesh, results — each badge is
+      // the first blocking validation issue of that part of the record.
+      const auto bcIssues = topology::validateBoundaries(s.topo, topologyMaterialLookup());
+      auto firstBlocking = [&](auto pred) -> std::string {
+        for (const auto &is : bcIssues)
+          if (is.severity == topology::Severity::Blocking && pred(is.key))
+            return is.message;
+        return {};
+      };
+      auto startsWith = [](const std::string &k, const char *p) { return k.rfind(p, 0) == 0; };
+      const std::string matIssue =
+          firstBlocking([&](const std::string &k) { return startsWith(k, "/material"); });
+      const std::string regIssue = firstBlocking([&](const std::string &k) {
+        return startsWith(k, "/preserve") || startsWith(k, "/exclude");
+      });
+      const std::string meshIssue =
+          firstBlocking([&](const std::string &k) { return startsWith(k, "/mesh"); });
+      const std::string bcIssue = firstBlocking([&](const std::string &k) {
+        return !startsWith(k, "/material") && !startsWith(k, "/preserve") &&
+               !startsWith(k, "/exclude") && !startsWith(k, "/mesh");
+      });
+      const nlohmann::json settings = s.topo.value("topology", nlohmann::json());
+      std::string setupIssue;
+      std::string setupLabel = "Setup";
+      if (settings.is_object()) {
+        const std::string m = settings.value("method", std::string());
+        const std::string p = settings.value("physics", std::string());
+        if (!p.empty())
+          setupLabel += ": " + topology::physicsLabel(p, &topoCaps_);
+        if (!m.empty())
+          setupLabel += ", " + topology::methodLabel(m, &topoCaps_);
+      }
+      if (topoCaps_.state != topology::Capabilities::State::Ready) {
+        setupIssue = topoCaps_.state == topology::Capabilities::State::Loading
+                         ? "Waiting for the topology solver's capability matrix."
+                         : topoCaps_.error;
+      } else if (!settings.is_object()) {
+        setupIssue = "No topology settings yet.";
+      } else {
+        std::string why;
+        if (!topoCaps_.supports(settings.value("method", std::string()),
+                                settings.value("physics", std::string()), &why))
+          setupIssue = why.empty() ? "Choose a supported physics and method." : why;
+        for (const auto &is : topology::validateTopology(settings, topoCaps_))
+          if (setupIssue.empty() && is.severity == topology::Severity::Blocking)
+            setupIssue = is.message;
+      }
+      nlohmann::json mat = nlohmann::json::object();
+      std::string matErr;
+      const bool haveMat = topology::runMaterial(s.topo, topologyMaterialLookup(), mat, matErr);
+      const std::string matName =
+          haveMat ? mat.value("name", std::string("custom")) : std::string("(not set)");
+      const int nRuns = s.topo.contains("runs") && s.topo["runs"].is_array()
+                            ? (int)s.topo["runs"].size()
+                            : 0;
+      child("study_static", setupLabel, SimNode::Study, setupIssue.empty(),
+            setupIssue.c_str());
+      child("material", "Material: " + matName, SimNode::Material, matIssue.empty(),
+            matIssue.c_str());
+      child("fixture", "Boundary conditions", SimNode::Boundaries, bcIssue.empty(),
+            bcIssue.c_str());
+      child("fixture", "Regions & manufacturing", SimNode::Regions, regIssue.empty(),
+            regIssue.c_str());
+      child("mesh", "Mesh (linear tet4)", SimNode::Mesh, meshIssue.empty(), meshIssue.c_str());
+      child("results",
+            nRuns > 0 ? "Results (" + std::to_string(nRuns) + (nRuns == 1 ? " run)" : " runs)")
+                      : std::string("Results (not run)"),
+            SimNode::Results, nRuns > 0, nRuns > 0 ? "" : "Run the study to generate results.");
+      ImGui::TreePop();
+      ImGui::PopID();
+      if (wantDelete)
+        deleteStudy(st, i);
+      return;
+    }
     const std::string matName = [&] {
       int mi = materialIndexByKey(s.materialKey);
       if (mi >= 0)
@@ -6779,8 +8306,10 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
   ImGui::TextUnformatted("Element order");
   static const char *kOrder[2] = {"Draft - linear (tet4)",
                                   "High quality - quadratic (tet10)"};
-  int orderIndex = !modal && s.meshOrder == 2 ? 1 : 0;
-  if (modal)
+  const bool topologyStudy = s.type == StudyType::Topology;
+  const bool linearOnly = modal || topologyStudy;
+  int orderIndex = !linearOnly && s.meshOrder == 2 ? 1 : 0;
+  if (linearOnly)
     ImGui::BeginDisabled();
   for (int i = 0; i < 2; ++i)
     if (ImGui::RadioButton(kOrder[i], orderIndex == i) && orderIndex != i) {
@@ -6788,12 +8317,26 @@ void SimManager::drawMeshForm(AppState &st, Study &s) {
       persist(st, s);
       clearMeshPreview();
     }
-  if (modal)
+  if (linearOnly)
     ImGui::EndDisabled();
   simTip("Quadratic elements capture bending and curved boundaries more "
-         "accurately. Modal studies use linear elements.");
+         "accurately. Modal and topology studies use linear elements.");
   if (modal)
     ImGui::TextDisabled("Frequency studies always use 1st-order elements.");
+  if (topologyStudy) {
+    ImGui::TextDisabled("Topology optimization solves on linear tetrahedra (tet4).");
+    const nlohmann::json order = s.topo.value("mesh_order", nlohmann::json(1));
+    if (!(order.is_number_integer() && order.get<int>() == 1)) {
+      kit::inlineStatus("This study was saved with another element order; the topology "
+                        "solver only accepts tet4.",
+                        kit::Tone::Err);
+      if (kit::secondaryButton("Use linear tet4")) {
+        s.topo["mesh_order"] = 1;
+        persist(st, s);
+        clearMeshPreview();
+      }
+    }
+  }
   ImGui::Spacing();
 
   if (ImGui::CollapsingHeader("Advanced")) {
@@ -7953,6 +9496,10 @@ static void drawAdvisorDisclosure(AppState &st, const Study &s) {
 }
 
 void SimManager::drawResultControls(AppState &st, Study &s) {
+  if (s.type == StudyType::Topology) {
+    drawTopologyResults(st, s);
+    return;
+  }
   // T-FIN24 kinds render numeric/plot results (no viewport overlay).
   if (s.type == StudyType::Buckling || s.type == StudyType::Contact ||
       s.type == StudyType::FreqResponse || s.type == StudyType::ThermalFea) {
@@ -8533,7 +10080,13 @@ void SimManager::drawForm(AppState &st, Study &s) {
         if (ImGui::Selectable(kUnitItems[i], ui_ == i)) {
           st.simUnits = i;
           // Keep cached legend labels current even while the colormap is hidden.
-          if (s.hasResult && st.renderer) {
+          if (s.type == StudyType::Topology) {
+            // Re-derive the topology legend (its fields carry their own SI units).
+            if (!topoResultsView_.selectedRunId.empty() && !s.overlayPath.empty())
+              topoActions_.push_back(
+                  {s.id,
+                   {topology::ResultsAction::Kind::ShowRun, topoResultsView_.selectedRunId, ""}});
+          } else if (s.hasResult && st.renderer) {
             std::string label, unit;
             double fromSI = 1.0;
             fieldMeta(st, st.activeScalarField, label, unit, fromSI);
@@ -8557,17 +10110,65 @@ void SimManager::drawForm(AppState &st, Study &s) {
   // action is drawn after EndChild(), so long forms, study lists and result
   // warnings can scroll without ever disappearing behind it.
   const float runButtonHeight = 30.0f * S;
+  // Topology pins only its Run/Cancel button plus, while this study's run is live, the
+  // one-row progress bar (same ownership predicate as drawTopologyRunArea). Its status
+  // line and live convergence plots scroll with the form instead.
+  bool topoOwnPrep = false, topoOwnSolve = false;
+  if (s.type == StudyType::Topology) {
+    topoOwnPrep = prepInFlight_ && staticModalPrep_ &&
+                  staticModalPrep_->type == StudyType::Topology &&
+                  staticModalPrep_->studyId == s.id;
+    topoOwnSolve = running_ && topoRunMeta_.studyId == s.id && !topoOwnPrep;
+  }
+  const float topoProgressRow =
+      topoOwnPrep || (topoOwnSolve && st.simClient)
+          ? std::max(ui::metrics::reProgressH(), ImGui::GetTextLineHeight()) +
+                ImGui::GetStyle().ItemSpacing.y
+          : 0.0f;
   const float actionReserve =
-      runButtonHeight + ImGui::GetStyle().ItemSpacing.y * 4.0f +
-      1.0f * S;
+      runButtonHeight + ImGui::GetStyle().ItemSpacing.y * 4.0f + 1.0f * S +
+      topoProgressRow;
   const float bodyHeight =
       std::max(ImGui::GetContentRegionAvail().y - actionReserve,
                ImGui::GetFrameHeight());
+  // One scroll position per node: a long Results page must not leave Setup (or any other
+  // tool's form) opened half-way down.
+  ImGui::PushID(static_cast<int>(node_));
   ImGui::BeginChild("##sim_form_scroll", ImVec2(0.0f, bodyHeight),
                     ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
   ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
                          ImGui::GetContentRegionAvail().x);
-
+  if (s.type == StudyType::Topology) {
+    if (!s.topoStatus.empty())
+      kit::inlineStatus(s.topoStatus.c_str(), s.topoStatusKind == 2   ? kit::Tone::Err
+                                              : s.topoStatusKind == 1 ? kit::Tone::Warn
+                                                                      : kit::Tone::Neutral);
+    if (topoOwnPrep)
+      kit::dimText("Preparing (export + face resolution)");
+    if (topoOwnSolve && st.simClient) {
+      const std::string stage = st.simClient->stage();
+      if (!stage.empty())
+        kit::inlineStatus(stage.c_str(), kit::Tone::Neutral);
+      auto plot = [&](const char *id, const std::vector<double> &values,
+                      const char *label) {
+        if (values.size() < 2)
+          return;
+        char overlay[96];
+        std::snprintf(overlay, sizeof(overlay), "%s %.5g", label, values.back());
+        ImGui::PlotLines(
+            id,
+            [](void *data, int index) {
+              return static_cast<float>(
+                  (*static_cast<const std::vector<double> *>(data))[index]);
+            },
+            const_cast<std::vector<double> *>(&values), static_cast<int>(values.size()),
+            0, overlay, FLT_MAX, FLT_MAX, ImVec2(-FLT_MIN, 38.0f * S));
+      };
+      plot("##topo_live_obj", topoLiveObjective_, "Objective");
+      plot("##topo_live_vol", topoLiveVolume_, "Volume fraction");
+      plot("##topo_live_chg", topoLiveChange_, "Design change");
+    }
+  }
   // sim-gui rework: each panel shows ONLY the invoked tool's editor
   // (PropertyManager flow) — the numbered always-open accordion stack
   // (drawStudyChecklist) is retired. The Study node hosts the type-level setup
@@ -8577,7 +10178,16 @@ void SimManager::drawForm(AppState &st, Study &s) {
   case SimNode::Results:
     drawResultControls(st, s);
     break;
+  case SimNode::Boundaries:
+  case SimNode::Regions:
+    if (s.type == StudyType::Topology)
+      drawTopologyForm(st, s);
+    break;
   case SimNode::Material:
+    if (s.type == StudyType::Topology) {
+      drawTopologyForm(st, s);
+      break;
+    }
     drawMaterialCombo(st, s);
     if (s.type == StudyType::Static) {
       // Failure criterion lives logically with the material choice.
@@ -8669,7 +10279,9 @@ void SimManager::drawForm(AppState &st, Study &s) {
     break;
   case SimNode::Study:
   default:
-    if (s.type == StudyType::Motion) {
+    if (s.type == StudyType::Topology) {
+      drawTopologyForm(st, s);
+    } else if (s.type == StudyType::Motion) {
       drawMotionForm(st, s);
     } else if (isFlowFamily(s.type)) {
       drawStudyTypeBanner(
@@ -8839,6 +10451,7 @@ void SimManager::drawForm(AppState &st, Study &s) {
   ImGui::PopTextWrapPos();
   ui::drawWindowPillScrollbarV(simSurf());
   ImGui::EndChild();
+  ImGui::PopID();
 
   // ---- Gated Run button (always at the bottom, visible on every sub-node)
   // -------- Disabled when a solve is running OR prerequisites are unmet
@@ -8848,6 +10461,10 @@ void SimManager::drawForm(AppState &st, Study &s) {
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
+    if (s.type == StudyType::Topology) {
+      drawTopologyRunArea(st, s);
+      return;
+    }
     const bool jobRunning = st.simClient && st.simClient->job().running.load();
     const bool ownsJob = jobRunning &&
         ((st.simClient->job().ownerDocId.empty() && running_) ||

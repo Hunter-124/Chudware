@@ -705,6 +705,33 @@ static const RibbonCmd kCmds[] = {
     // open the doc's saved Motion study on its playback node (or create one) — SimManager.
     { "sim_motion_study",     "Motion Study",    "mate",           "Features",   "Assembly",  true,  nullptr,     false },
     { "sim_motion_study",     "Motion Study",    "mate",           "Simulation", "Study",     true,  nullptr,     false },
+
+    // --- Tab: Topology (topology optimization study — Simulate workspace only, tab index 21).
+    // Every row routes through SimManager::handleCommand (app.cpp sends the whole sim_ prefix
+    // there). Material / Fixture / Force / Pressure / Mesh / Run / Results reuse the shared
+    // study commands; the sim_topology_* rows open the topology study's own setup nodes:
+    // method + physics + objective/constraints (capability-matrix driven), the thermal / flow
+    // boundary editor, preserved (keep-solid) and excluded (keep-void) region wells,
+    // manufacturing rules, and the retained-run comparison. Result export lives on the result
+    // panel's artifact rows (only geometry-validated surfaces are offered), so no ribbon row.
+    { "sim_new_topology",           "New Study",   "study_static",  "Topology", "Study",         true,  nullptr, false },
+    { "sim_topology_setup",         "Method",      "settings",      "Topology", "Setup",         true,  nullptr, false },
+    { "sim_material",               "Material",    "material",      "Topology", "Setup",         true,  nullptr, false },
+    { "sim_fixture",                "Fixture",     "fixture",       "Topology", "Boundaries",    true,  nullptr, false },
+    { "sim_load_force",             "Force",       "load_force",    "Topology", "Boundaries",    false, nullptr, false },
+    { "sim_load_pressure",          "Pressure",    "load_pressure", "Topology", "Boundaries",    false, nullptr, false },
+    { "sim_topology_boundaries",    "Heat / Flow", "flow_arrow",    "Topology", "Boundaries",    true,  nullptr, false },
+    { "sim_topology_preserve",      "Preserve",    "combine",       "Topology", "Regions",       true,  nullptr, false },
+    { "sim_topology_exclude",       "Exclude",     "subtract",      "Topology", "Regions",       true,  nullptr, false },
+    { "sim_topology_manufacturing", "Mfg. Rules",  "draft",         "Topology", "Manufacturing", true,  nullptr, false },
+    { "sim_mesh",                   "Mesh",        "mesh",          "Topology", "Mesh",          true,  nullptr, false },
+    { "sim_run",                    "Run",         "run_study",     "Topology", "Run",           true,  nullptr, false },
+    { "sim_results",                "Results",     "results",       "Topology", "Results",       true,  nullptr, false },
+    { "sim_topology_compare",       "Compare",     "legend",        "Topology", "Results",       true,  nullptr, false },
+    { "ref_plane",                  "Ref. Plane",  "ref_plane",     "Topology", "Reference",     false, nullptr, false },
+    { "ref_axis",                   "Ref. Axis",   "ref_axis",      "Topology", "Reference",     false, nullptr, false },
+    { "ref_point",                  "Ref. Point",  "ref_point",     "Topology", "Reference",     false, nullptr, false },
+    { "ref_csys",                   "Coord. Sys.", "ref_csys",      "Topology", "Reference",     false, nullptr, false },
 };
 // clang-format on
 

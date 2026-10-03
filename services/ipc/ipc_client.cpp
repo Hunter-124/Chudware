@@ -123,13 +123,12 @@ bool EngineClient::hello(const std::string& kind, std::string& err) {
     if (!userId_.empty())
         params["user"] = {{"id", userId_}, {"display", userDisplay_}};
     json result;
-#ifdef __EMSCRIPTEN__
-    // Browser: never block first paint forever if the gateway is slow/silent.
+    // Bounded on every platform: a daemon that accepts but never answers hello must
+    // fail the connect (callers fall back or retry) rather than wedge startup. Same
+    // bound as reconnectLocked's inline hello; hostd answers hello even mid-solve.
+    // Browser: never block first paint forever if the gateway is slow/silent —
     // maintainConnection retries with backoff when hello fails.
-    const int timeoutMs = 5000;
-#else
-    const int timeoutMs = (kind == "control") ? 2000 : -1;
-#endif
+    const int timeoutMs = (kind == "control") ? 2000 : 5000;
     if (!call("hello", params, result, err, timeoutMs)) return false;
     serverInfo_ = result;
     return true;
@@ -186,6 +185,7 @@ bool EngineClient::connectInner(const Options& opts, std::string& err) {
     clientKind_ = opts.clientKind;
     userId_ = opts.userId;
     userDisplay_ = opts.userDisplay;
+    discardEvents_ = opts.discardUnconsumedEvents;
     if (sockPath_.empty()) {
         err = "no runtime dir for hostd socket";
         return false;
@@ -235,6 +235,10 @@ bool EngineClient::connectInner(const Options& opts, std::string& err) {
     }
 }
 
+void EngineClient::retainEvent(json&& msg) {
+    if (!discardEvents_) events_.push_back(std::move(msg));
+}
+
 bool EngineClient::readResponse(int id, json& out, std::string& err, int timeoutMs,
                                 const std::function<void(const json&)>& onEvent) {
     // One deadline for the WHOLE response wait: event lines arriving on the way
@@ -259,17 +263,23 @@ bool EngineClient::readResponse(int id, json& out, std::string& err, int timeout
             wait = 200;
         }
         if (!conn_.readLine(line, wait)) {
-            if (!conn_.eof() && timeoutMs >= 0) {
-                // Timed out with the peer still alive: the response is still in
-                // flight, so this connection is mid-stream and unusable — close
-                // it; the next call() reconnects cleanly instead of reading a
-                // stale reply. err-only (no {code} in result), same transport-
-                // error shape as a connection failure, so callers toast it.
-                err = "engine call timed out after " + std::to_string(timeoutMs) + "ms";
-                conn_.close();
+            // abortPending() half-closes the socket, which reads as EOF: report the abort.
+            if (abort_.load(std::memory_order_acquire)) continue;
+            if (conn_.eof() || !conn_.valid()) {
+                err = "daemon connection closed";
                 return false;
             }
-            err = conn_.eof() ? "daemon connection closed" : "daemon read failed";
+            // A poll slice expired with the peer alive. An unbounded call keeps waiting:
+            // a solver factorizing a large system legitimately pushes nothing for minutes,
+            // and failing here abandoned a running native solve after 200 ms of silence.
+            if (timeoutMs < 0) continue;
+            // A bounded call has reached its deadline with the response still in
+            // flight, so this connection is mid-stream and unusable — close it; the
+            // next call() reconnects cleanly instead of reading a stale reply.
+            // err-only (no {code} in result), same transport-error shape as a
+            // connection failure, so callers toast it.
+            err = "engine call timed out after " + std::to_string(timeoutMs) + "ms";
+            conn_.close();
             return false;
         }
         json msg = json::parse(line, nullptr, /*allow_exceptions=*/false);
@@ -277,7 +287,8 @@ bool EngineClient::readResponse(int id, json& out, std::string& err, int timeout
         if (msg.contains("event")) {
             // Live agent-event streaming: fire onEvent NOW (mid-call) for agent.event so a
             // blocking agent run streams instead of buffering until it returns. Other events
-            // (doc.*) still queue for the GUI-thread drainEvents().
+            // (doc.*) still queue for the GUI-thread drainEvents() — or are dropped on a
+            // discarding lane that nothing drains.
             //
             // The callback receives the event PAYLOAD (`data`), never the {"event","data"}
             // envelope — the same shape WorkerClient's local-pipe path delivers, so a
@@ -291,7 +302,7 @@ bool EngineClient::readResponse(int id, json& out, std::string& err, int timeout
                     onEvent(it != msg.end() && it->is_object() ? *it : json::object());
                 } catch (...) {}
             } else {
-                events_.push_back(std::move(msg));
+                retainEvent(std::move(msg));
             }
             continue;
         }
@@ -387,7 +398,7 @@ bool EngineClient::pollAlive() {
     std::string line;
     while (conn_.readLine(line, 0)) {
         json msg = json::parse(line, nullptr, false);
-        if (!msg.is_discarded() && msg.contains("event")) events_.push_back(std::move(msg));
+        if (!msg.is_discarded() && msg.contains("event")) retainEvent(std::move(msg));
     }
     return conn_.valid() && !conn_.eof();
 }
@@ -441,7 +452,7 @@ std::vector<json> EngineClient::drainEvents() {
     std::string line;
     while (conn_.valid() && conn_.readLine(line, 0)) {
         json msg = json::parse(line, nullptr, false);
-        if (!msg.is_discarded() && msg.contains("event")) events_.push_back(std::move(msg));
+        if (!msg.is_discarded() && msg.contains("event")) retainEvent(std::move(msg));
         // Orphan responses (no waiter) are dropped.
     }
     std::vector<json> out;

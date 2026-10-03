@@ -311,6 +311,10 @@ register_cad_sim_tools(_reg.view(mcp, "sim"))
 # cross-check lane (polymesh_cli). Same "sim" family as the solves they document.
 from services.mcp.sim_evidence_tools import register_sim_evidence_tools
 register_sim_evidence_tools(_reg.view(mcp, "sim"))
+# Topology optimization: native capability matrix + the durable sim_run_topology study run
+# (persisted type "topology" study the GUI opens; collector registered at import).
+from services.mcp.topology_tools import register_topology_tools
+register_topology_tools(_reg.view(mcp, "sim"))
 register_cad_asm_tools(_reg.view(mcp, "cad"))
 # Kinematic evidence (swept envelope/solid, Ackermann turning radius, batched motion->FEA).
 # Registered AFTER cad_asm_tools because it composes simulate_motion / motion_fea_handoff

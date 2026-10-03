@@ -23,6 +23,8 @@
 #include <nlohmann/json.hpp>
 
 #include "../render/aicm_loader.h"   // render::DocMesh for motion study body-transform cache
+#include "sim_topology.h"            // topology capabilities / settings + results views
+#include "sim_topology_bc.h"         // topology boundary-condition editor view
 
 struct AppState;
 
@@ -38,7 +40,7 @@ namespace ui {
 // transient); Buckling is engine linear buckling; Contact is a CalculiX box proxy;
 // FreqResponse is modal superposition (core modal + worker vibration post-processing).
 enum class StudyType { Static, Modal, Flow, Fatigue, Thermal, Motion,
-                       ThermalFea, Buckling, Contact, FreqResponse };
+                       ThermalFea, Buckling, Contact, FreqResponse, Topology };
 
 // Static failure theory used for the headline factor of safety + the FoS plot field.
 enum class FailureCriterion { VonMises = 0, Tresca = 1, MaxNormal = 2 };
@@ -286,10 +288,26 @@ struct Study {
     // Optional core-advisor envelope from the last run (transient; never persisted). Absent by
     // default — `advisor.present == false` reproduces the pre-advisor UI exactly.
     SimAdvisor advisor;
+
+    // ---- Topology (StudyType::Topology) ----
+    // The canonical study record (sim_topology_bc.h schema) is owned VERBATIM: every GUI edit
+    // mutates this JSON in place, so agent-authored keys, the retained `runs`, `last_job` and
+    // sections of other physics survive (studyToJson returns it with id/type/name refreshed).
+    // `fixtures`/`loads` above are a read-only mirror of its structural wells for the viewport
+    // indicator glyphs; they are never serialized for a topology study.
+    nlohmann::json topo;
+    // Transient (never persisted): last prep/run status line and the runs decorated with the
+    // off-draw artifact checks (missing / stale) for the results panel.
+    std::string topoStatus;
+    int topoStatusKind = 0;         // 0 info, 1 warn, 2 error
+    nlohmann::json topoRunsView = nlohmann::json::array();
+    std::string topoRunsCheckKey;   // inputs of the last artifact check ("" = never checked)
+    std::string topoFieldLabel, topoFieldUnit;  // legend of the displayed overlay field
+    double topoFieldFromSI = 1.0;
 };
 
 // Which sub-node of a study the tree has selected (drives the form + previews).
-enum class SimNode { Study, Material, Fixtures, Load, Mesh, Results };
+enum class SimNode { Study, Material, Fixtures, Load, Mesh, Results, Boundaries, Regions };
 
 class SimManager {
 public:
@@ -332,6 +350,13 @@ public:
     bool previewActive(AppState& st) const;      // Sim tab active + a study selected + no colormap
     void collectFixtureFaces(std::vector<uint64_t>& keys) const;  // (body<<32)|topo
     void collectLoadFaces(std::vector<uint64_t>& keys) const;
+    // Topology preview extras: preserve / exclude / flow-port face washes and region box
+    // wireframes of the selected topology study (empty for every other study kind).
+    void collectTopologyPreview(std::vector<uint64_t>& preserveFaces,
+                                std::vector<uint64_t>& excludeFaces,
+                                std::vector<uint64_t>& portFaces,
+                                std::vector<float>& preserveBoxSegs,
+                                std::vector<float>& excludeBoxSegs) const;
 
     // Build world-space indicator geometry for the selected study's setup, sized to the model: red
     // arrows for force/pressure loads (force along the vector, pressure into the face) and green
@@ -420,6 +445,25 @@ public:
     // C++ LBM route may legitimately have no contour overlay, so scripted/live
     // verification must not equate "no colormap" with solver failure.
     bool flowHasResult() const;
+
+    // ---- topology (human UI + scripted scenarios share these) ----
+    // Deep-merge `patch` into the SELECTED topology study (objects merge recursively, arrays and
+    // scalars replace, null erases a key; id/type ignored), then persist it. False when the
+    // selected study is not a topology study or the patch is not an object.
+    bool configureActiveTopology(AppState& st, const nlohmann::json& patch);
+    // Canonical JSON of the selected topology study (null otherwise).
+    nlohmann::json activeTopologyStudy() const;
+    // Latest retained run record {run_id,label,started_utc,settings,source,result} of the
+    // selected topology study (null when it has no run).
+    nlohmann::json activeTopologyResult() const;
+    int  topologyRunCount() const;
+    // True while this manager's topology preparation or solve is in flight.
+    bool topologyRunActive() const;
+    // Native topology_capabilities() matrix (Loading until the async reply lands).
+    const topology::Capabilities& topologyCapabilities() const { return topoCaps_; }
+    // Select a study by its engine id (false when absent). Resets the sub-node to Study.
+    bool selectStudyById(AppState& st, const std::string& id);
+    std::string activeStudyId() const;
 
     // Material lookup (singleton: built-in engine/sim/materials.json + user custom_materials.json).
     struct Material {
@@ -730,6 +774,58 @@ private:
     bool prepInFlight_ = false;
     // After loadDocMeshAsync for a result overlay, finish legend/deform once drain commits.
     std::string pendingOverlayStudyId_;
+
+    // ---- topology study integration ------------------------------------------------------------
+    static constexpr int kArmTopology = 1 << 20;   // armedWell_ value: topoBcView_.armedPointer
+    topology::Capabilities topoCaps_;              // Loading until the async reply lands
+    bool topoCapsRequested_ = false, topoCapsInflight_ = false;
+    void probeTopologyCaps(AppState& st, bool retry = false);
+    topology::SettingsView topoSettingsView_;
+    topology::ResultsView topoResultsView_;
+    topology::BcView topoBcView_;
+    std::string topoViewStudyId_;                  // study the three views belong to
+    void syncTopologyViews(const Study& s);        // reset views when the selected study changes
+    // Results-panel action deferred from draw to tick (file probes / overlay loads off draw).
+    struct TopoPendingAction {
+        std::string studyId;
+        topology::ResultsAction action;
+    };
+    std::vector<TopoPendingAction> topoActions_;
+    void runTopology(AppState& st, Study& s);
+    void cancelTopologyPrep(AppState& st);
+    void drawTopologyForm(AppState& st, Study& s);
+    void drawTopologyResults(AppState& st, Study& s);
+    void drawTopologyRunArea(AppState& st, Study& s);
+    void finishTopologyRun(AppState& st, Study& s, const std::string& ownerDocId, bool uiActive);
+    void processTopologyActions(AppState& st);
+    void refreshTopologyRunsView(AppState& st, Study& s, bool force = false);
+    bool showTopologyRun(AppState& st, Study& s, const std::string& runId);
+    void exportTopologyArtifact(AppState& st, Study& s, const std::string& runId,
+                                const std::string& artifactKey);
+    topology::MaterialLookup topologyMaterialLookup() const;
+    std::string topologyGeometryKey(AppState& st); // hash of the doc tree minus studies
+    // Run gate shared by the panel button, ribbon sim_run and scenarios: capability matrix,
+    // method/physics support, scalar settings and boundary/material validation.
+    bool topologyReady(AppState& st, const Study& s, std::string& blocker) const;
+    std::string topoSetupKeyNow_;                  // setupKey() of the selected study (tick-sampled)
+    std::string topoSetupKeyStudy_;
+    double topoSetupKeyTime_ = -1.0;
+    std::string topoAutoShowKey_;                  // run auto-shown on entering Results
+    long topoGeomRevision_ = -1;
+    std::string topoGeomDocId_, topoGeomKey_;
+    // Run identity carried from prep to completion (the reservation serializes runs).
+    struct TopoRunMeta {
+        std::string studyId, runId, setupKey, geometryKey, label;
+        double startedUtc = 0.0;
+        nlohmann::json settings;
+    };
+    TopoRunMeta topoRunMeta_;
+    uint64_t topoIterRevision_ = 0;                // last SimClient::iterationRevision() copied
+    int topoLiveMaxIter_ = 0;                      // last reported max iterations (0 = unknown)
+    std::vector<double> topoLiveIter_, topoLiveObjective_, topoLiveVolume_, topoLiveChange_;
+    // Background artifact export (copy off the GUI thread; completion reported in tick()).
+    struct TopoExport;
+    std::shared_ptr<TopoExport> topoExport_;
 
     std::string lastDocId_;         // doc id the mirror was last refreshed for (re-pull on change)
     long lastRevision_ = -1;        // engine revision at last refresh

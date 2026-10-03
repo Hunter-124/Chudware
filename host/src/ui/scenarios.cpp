@@ -12,10 +12,12 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <filesystem>
 #include <fstream>
 #include <vector>
@@ -30,6 +32,7 @@
 #include "property_manager.h"
 #include "onboarding.h"
 #include "sim_manager.h"
+#include "sim_topology.h"
 #include "sketch_mode.h"
 #include "sketch3d_mode.h"
 
@@ -1044,6 +1047,9 @@ void ScenarioRunner::tick(AppState& st) {
 
     // ---------- motion scenario (CHUDWARE_SHOT=motion) ----------
     runMotion(st);
+
+    // ---------- topology optimization scenario (CHUDWARE_SHOT=topology) ----------
+    runTopology(st);
 }
 
 // First-run onboarding visual proof. Each step is forced through the public scenario seam, so a
@@ -2320,6 +2326,32 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         return st.motionShotDone ? FrameAction::Break : FrameAction::Continue;
     }
 
+    // topology scenario: per-step captures (the final capture is mirrored to --ui-screenshot).
+    // A failure latches topoFailed: its capture is written, then the report, then the process
+    // exits non-zero so a harness can never read the screenshots as a pass.
+    if (topoWant) {
+        ++st.frame;
+        if (!topoCapture.empty() && (!st.rpc.busy() || ++topoCaptureWait > 600)) {
+            std::error_code ec; std::filesystem::create_directories(topoSavePath, ec);
+            writeBackbufferPng(topoCapture.c_str(), dw, dh, topoDone ? screenshotPath : nullptr);
+            std::printf("topology: screenshot -> %s (%dx%d)\n", topoCapture.c_str(), dw, dh);
+            std::fflush(stdout);
+            topoReport["captures"].push_back(topoCapture);
+            topoCapture.clear();
+            topoCaptureWait = 0;
+        }
+        glfwSwapBuffers(st.win);
+        if (topoDone && topoCapture.empty()) {
+            topoWriteReport();
+            if (topoFailed) {
+                std::fflush(nullptr);
+                std::_Exit(EXIT_FAILURE);
+            }
+            return FrameAction::Break;
+        }
+        return FrameAction::Continue;
+    }
+
     return FrameAction::None;
 }
 
@@ -2615,6 +2647,884 @@ void ScenarioRunner::runMotion(AppState& st) {
             std::printf("motion: scenario complete (runOk=%d)\n", (int)mtRunOk);
             std::fflush(stdout);
             break;
+    }
+}
+
+// ---------- topology optimization scenario (CHUDWARE_SHOT=topology) ----------
+namespace {
+
+constexpr double kTopoNaN = std::numeric_limits<double>::quiet_NaN();
+
+double topoNow() {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+// A positive number from the environment (seconds), else the fallback.
+double topoEnvSeconds(const char* name, double fallback) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return fallback;
+    char* end = nullptr;
+    const double d = std::strtod(v, &end);
+    return (end != v && std::isfinite(d) && d > 0.0) ? d : fallback;
+}
+
+// A numeric field, NaN when absent or not a number (never a silent default).
+double topoNum(const nlohmann::json& o, const char* key) {
+    if (!o.is_object()) return kTopoNaN;
+    auto it = o.find(key);
+    if (it == o.end() || !it->is_number()) return kTopoNaN;
+    return it->get<double>();
+}
+
+std::string topoText(const nlohmann::json& v) {
+    if (v.is_string()) return v.get<std::string>();
+    if (v.is_null()) return std::string();
+    return v.dump();
+}
+
+const char* topoOutcomeName(ui::topology::Outcome o) {
+    using O = ui::topology::Outcome;
+    switch (o) {
+        case O::Failed:         return "failed";
+        case O::Cancelled:      return "cancelled";
+        case O::Converged:      return "converged";
+        case O::IterationLimit: return "iteration_limit";
+        case O::Infeasible:     return "infeasible";
+        case O::NotConverged:   return "not_converged";
+        case O::Inconsistent:   return "inconsistent";
+    }
+    return "unknown";
+}
+
+}  // namespace
+
+void ScenarioRunner::topoFail(const std::string& code, const std::string& detail) {
+    std::printf("topology: FAILED [%s] %s\n", code.c_str(), detail.c_str());
+    std::fflush(stdout);
+    topoReport["ok"] = false;
+    topoReport["failure"] = {{"code", code}, {"detail", detail}, {"step", topoStep}};
+    topoFailed = true;
+    topoDone = true;
+    topoShotQueued.clear();
+    topoCapture = topoSavePath + "/topology_FAILED.png";
+}
+
+void ScenarioRunner::topoWriteReport() {
+    if (topoFailed) topoReport["ok"] = false;
+    std::error_code ec;
+    std::filesystem::create_directories(topoSavePath, ec);
+    const std::string path = topoSavePath + "/topology_report.json";
+    std::ofstream out(path, std::ios::trunc);
+    out << topoReport.dump(2) << '\n';
+    out.close();
+    if (!out) {
+        std::printf("topology: FAILED [report_write] could not write %s\n", path.c_str());
+        topoFailed = true;
+    } else {
+        std::printf("topology: report -> %s ok=%d\n", path.c_str(),
+                    (int)topoReport.value("ok", false));
+    }
+    std::fflush(stdout);
+}
+
+// Checks one retained run record honestly: the computation finished, the response is finite at
+// the final design, the flags agree with each other and the final volume honours the budget it
+// claims to satisfy. Non-convergence (iteration limit) is reported, not hidden and not failed.
+bool ScenarioRunner::topoVerifyRun(const nlohmann::json& run, const std::string& tag,
+                                   std::string& why) {
+    namespace topo = ui::topology;
+    if (!run.is_object() || !run.contains("result") || !run["result"].is_object()) {
+        why = "the study holds no run record with a result";
+        return false;
+    }
+    const nlohmann::json& r = run["result"];
+    const topo::OutcomeSummary o = topo::classifyResult(r);
+    const nlohmann::json sum = r.value("summary", nlohmann::json::object());
+    const nlohmann::json settings = run.value("settings", nlohmann::json::object());
+    const double objB = topoNum(sum, "objective_baseline");
+    double objF = topoNum(sum, "objective_final");
+    if (!std::isfinite(objF)) objF = topoNum(sum, "objective");
+    const double vf = topoNum(sum, "volume_fraction_final");
+    double target = topoNum(sum, "volume_fraction_target");
+    if (!std::isfinite(target)) target = topoNum(settings, "volume_fraction");
+    const double iters = topoNum(sum, "iterations");
+    const double massF = topoNum(sum, "mass_final_g");
+
+    nlohmann::json entry = {
+        {"tag", tag},
+        {"run_id", run.value("run_id", std::string())},
+        {"method", r.value("method", std::string())},
+        {"physics", r.value("physics", std::string())},
+        {"formulation", r.value("formulation", std::string())},
+        {"ok", o.computationOk},
+        {"converged", o.converged},
+        {"feasibility_reported", o.feasibilityReported},
+        {"feasible", o.feasible},
+        {"termination", o.termination},
+        {"outcome", topoOutcomeName(o.outcome)},
+        {"headline", o.headline},
+        {"detail", o.detail},
+        {"objective", sum.value("objective", nlohmann::json())},
+        {"objective_units", sum.value("objective_units", nlohmann::json())},
+        {"volume_phase", sum.value("volume_phase", nlohmann::json())},
+        {"convergence_criterion", sum.value("convergence_criterion", nlohmann::json())},
+    };
+    auto putNum = [&](const char* k, double v) {
+        entry[k] = std::isfinite(v) ? nlohmann::json(v) : nlohmann::json();
+    };
+    putNum("objective_baseline", objB);
+    putNum("objective_final", objF);
+    putNum("volume_fraction_final", vf);
+    putNum("volume_fraction_target", target);
+    putNum("iterations", iters);
+    putNum("mass_final_g", massF);
+    putNum("max_constraint_violation", o.maxViolation);
+    if (r.contains("artifacts") && r["artifacts"].is_object()) {
+        nlohmann::json keys = nlohmann::json::array();
+        for (auto it = r["artifacts"].begin(); it != r["artifacts"].end(); ++it)
+            keys.push_back(it.key());
+        entry["artifacts"] = keys;
+    }
+    topoReport["runs"].push_back(entry);
+    std::printf("topology: run[%s] %s method=%s ok=%d converged=%d feasible=%s termination=%s "
+                "objective %g -> %g, volume %g (target %g), iterations %g — %s\n",
+                tag.c_str(), entry["run_id"].get<std::string>().c_str(),
+                entry["method"].get<std::string>().c_str(), (int)o.computationOk,
+                (int)o.converged,
+                o.feasibilityReported ? (o.feasible ? "yes" : "no") : "not-reported",
+                o.termination.c_str(), objB, objF, vf, target, iters, o.headline.c_str());
+    std::fflush(stdout);
+
+    if (!o.computationOk) {
+        std::string err = topoText(r.value("error", nlohmann::json()));
+        if (err.empty()) err = topoText(r.value("termination_detail", nlohmann::json()));
+        why = "the solver reported ok=false: " + (err.empty() ? o.detail : err);
+        return false;
+    }
+    if (o.outcome == topo::Outcome::Cancelled) { why = "the run was cancelled"; return false; }
+    if (o.outcome == topo::Outcome::Inconsistent) {
+        why = "the result contradicts itself: " + o.detail;
+        return false;
+    }
+    if (!std::isfinite(objB) || !std::isfinite(objF)) {
+        why = "objective baseline/final is not finite";
+        return false;
+    }
+    if (!std::isfinite(vf) || vf < 0.0 || vf > 1.0) {
+        why = "final volume fraction is missing or outside [0,1]";
+        return false;
+    }
+    if (!std::isfinite(iters) || iters < 1.0) {
+        why = "the result reports no optimization iteration";
+        return false;
+    }
+    // History: one iteration axis, every series the same length, finite samples only.
+    const nlohmann::json hist = r.value("history", nlohmann::json::object());
+    if (!hist.contains("iteration") || !hist["iteration"].is_array() ||
+        hist["iteration"].empty()) {
+        why = "the result carries no iteration history";
+        return false;
+    }
+    const size_t nHist = hist["iteration"].size();
+    for (auto it = hist.begin(); it != hist.end(); ++it) {
+        if (!it->is_array()) continue;
+        if (it->size() != nHist) {
+            why = "history series '" + it.key() + "' length differs from the iteration axis";
+            return false;
+        }
+        // The iteration axis and the objective trace must be finite everywhere; other series may
+        // carry null for "not evaluated at this iterate" (JSON has no NaN), never a non-number.
+        const bool strict = it.key() == "iteration" || it.key() == "objective";
+        for (const auto& v : *it) {
+            if (v.is_null() && !strict) continue;
+            if (!v.is_number() || !std::isfinite(v.get<double>())) {
+                why = "history series '" + it.key() + "' holds a non-finite sample";
+                return false;
+            }
+        }
+    }
+    if (r.contains("constraints") && r["constraints"].is_array()) {
+        for (const auto& c : r["constraints"]) {
+            for (const char* k : {"value", "limit", "violation"}) {
+                const double v = topoNum(c, k);
+                if (!std::isfinite(v)) {
+                    why = "constraint '" + c.value("name", std::string("?")) + "' has non-finite " + k;
+                    return false;
+                }
+            }
+        }
+    }
+    if (o.feasibilityReported && !o.feasible) {
+        why = "the final design violates its constraints (max violation " +
+              std::to_string(o.maxViolation) + ")";
+        return false;
+    }
+    // A feasible claim must agree with the measured final volume of the budgeted phase.
+    if (o.feasible && std::isfinite(target) && vf > target * 1.05 + 1e-3) {
+        why = "feasible is claimed but the final volume fraction " + std::to_string(vf) +
+              " exceeds the target " + std::to_string(target);
+        return false;
+    }
+    if (!o.converged)
+        std::printf("topology: run[%s] NOTE not converged (%s): %s\n", tag.c_str(),
+                    o.termination.c_str(), o.detail.c_str());
+    std::fflush(stdout);
+    return true;
+}
+
+// Steps (each capture is preceded by a settle so panels lay out before the readback):
+//   0 design domain: new part, 120x40x40 mm box, resolve its six faces
+//   1 Simulate workspace + Topology ribbon tab; 2 wait for the native capability matrix,
+//     choose SIMP + a second structural method, capture the ribbon and the "+ New Study" picker
+//   3 sim_new_topology, picked fixture (-X) / force (+X) / preserve (bottom) faces
+//   4 configure: 500 N -Z force, 4 mm preserve band, exclude keep-out box, steel, 5 mm tet4
+//     mesh, SIMP compliance at 35 % solid; capture the Regions form
+//   5..7 Boundaries / Manufacturing / Method captures
+//   8..9 Run SIMP, wait, verify, capture the result
+//   10..12 switch to the second method (selectCombination), run, verify, capture the result
+//   13 compare the two retained runs, capture
+//   14 save .step+, reopen a copy through the engine, verify the retained runs + artifacts
+//   15 thermal study: picked fixture + real heat loads, capture the boundary editor (no run)
+//   16 flow study: inlet/outlet + picked wall, capture the boundary editor (no run)
+//   17..18 reselect the structural study, comparison view, final capture
+void ScenarioRunner::runTopology(AppState& st) {
+    namespace topo = ui::topology;
+    if (!topoInit) {
+        topoInit = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        topoWant = st.shot && mode && std::strcmp(mode, "topology") == 0;
+        if (topoWant) {
+            topoReport = {{"scenario", "topology"}, {"ok", false},
+                          {"captures", nlohmann::json::array()},
+                          {"runs", nlohmann::json::array()}};
+        }
+    }
+    if (!topoWant || topoDone) return;
+    if (!st.workerStarted || st.frame < 5) return;
+    if (!topoDirReady) {
+        topoDirReady = true;
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        const std::string base = repo ? std::string(repo) : std::string(".");
+        topoSavePath = base + "/scratch/topology_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(topoSavePath, ec);
+    }
+    if (!topoCapture.empty()) return;  // endFrame consumes it
+    if (topoSettle > 0) { --topoSettle; return; }
+    if (!topoShotQueued.empty()) {
+        topoCapture = topoShotQueued;
+        topoShotQueued.clear();
+        return;
+    }
+
+    const int kSettle = 8;
+    const double kCapsTimeoutS = topoEnvSeconds("CHUDWARE_TOPOLOGY_CAPS_TIMEOUT_S", 90.0);
+    const double kRunTimeoutS  = topoEnvSeconds("CHUDWARE_TOPOLOGY_RUN_TIMEOUT_S", 1800.0);
+    auto shoot = [&](const std::string& name, int settle) {
+        topoShotQueued = topoSavePath + "/" + name;
+        topoSettle = settle;
+    };
+    // Face selector of a resolved role, with the viewport identity the wash highlight uses.
+    auto faceSel = [&](const char* role) {
+        nlohmann::json sel = topoFaces[role]["sel"];
+        sel["_pick"] = {{"body", 1}, {"topo", topoFaces[role]["tid"]}};
+        return sel;
+    };
+    // Human route: the face lands in st.selection exactly as a viewport click resolves it.
+    auto pickFace = [&](const char* role) {
+        st.selection.clear();
+        core::SelItem it;
+        it.hit.body_id = 1;
+        it.hit.kind = render::PickKind::Face;
+        it.hit.topo_id = topoFaces[role]["tid"].get<uint32_t>();
+        it.selector = topoFaces[role]["sel"].dump();
+        it.pending_resolve = false;
+        st.selection.mutableItems().push_back(it);
+    };
+    auto lastEntryHasFaces = [](const nlohmann::json& arr) {
+        return arr.is_array() && !arr.empty() && arr.back().is_object() &&
+               arr.back().contains("faces") && arr.back()["faces"].is_array() &&
+               !arr.back()["faces"].empty();
+    };
+    // validateTopology over the selected study; blocking issues fail the scenario by name.
+    auto validateActive = [&](const char* code) -> bool {
+        const nlohmann::json study = st.simManager->activeTopologyStudy();
+        const auto issues = topo::validateTopology(
+            study.value("topology", nlohmann::json::object()), st.simManager->topologyCapabilities());
+        std::string blocking;
+        for (const auto& is : issues) {
+            const bool block = is.severity == topo::Severity::Blocking;
+            std::printf("topology: %s issue [%s] %s\n", block ? "BLOCKING" : "warning",
+                        is.key.c_str(), is.message.c_str());
+            if (block) blocking += (blocking.empty() ? "" : "; ") + is.message;
+        }
+        std::fflush(stdout);
+        if (!blocking.empty()) { topoFail(code, blocking); return false; }
+        return true;
+    };
+    // Steps 9/12: wait for the run sim_run started; verify it and capture the result.
+    auto waitRun = [&](const std::string& tag, const std::string& shotName) {
+        SimManager* sm = st.simManager;
+        const double elapsed = topoNow() - topoWaitStart;
+        if (sm->topologyRunActive()) {
+            topoIdleFrames = 0;
+            if (elapsed > kRunTimeoutS) {
+                topoFail("run_" + tag + "_timeout",
+                         "no result after " + std::to_string((int)elapsed) + " s: " + st.status);
+                return;
+            }
+            if (!topoProgressShot && elapsed > 3.0) {  // Run/Cancel/progress panel mid-solve
+                topoProgressShot = true;
+                topoCapture = topoSavePath + "/topology_run_" + tag + "_progress.png";
+            }
+            return;
+        }
+        if (sm->topologyRunCount() <= topoRunsBefore) {
+            // Neither running nor finished: give the launch a moment, then it was refused.
+            if (st.rpc.busy() || ++topoIdleFrames < 30) return;
+            topoFail("run_" + tag + "_not_started", "sim_run appended no run: " + st.status);
+            return;
+        }
+        const nlohmann::json run = sm->activeTopologyResult();
+        std::string why;
+        if (!topoVerifyRun(run, tag, why)) { topoFail("run_" + tag + "_invalid", why); return; }
+        topoRunIds.push_back(run.value("run_id", std::string()));
+        std::printf("topology: run[%s] verified in %.1f s\n", tag.c_str(), elapsed);
+        std::fflush(stdout);
+        sm->handleCommand(st, "sim_results");
+        shoot(shotName, kSettle * 2);
+        ++topoStep;
+    };
+    auto launchRun = [&](const char* tag) {
+        if (st.rpc.busy()) return;  // the setup edit is still persisting
+        topoRunsBefore = st.simManager->topologyRunCount();
+        st.simManager->handleCommand(st, "sim_run");
+        topoWaitStart = topoNow();
+        topoIdleFrames = 0;
+        topoProgressShot = false;
+        std::printf("topology: run[%s] launched (%d retained runs before)\n", tag, topoRunsBefore);
+        std::fflush(stdout);
+        ++topoStep;
+    };
+
+    if (topoStep > 0 && !st.simManager) {
+        topoFail("no_sim_manager", "the active document has no Simulation manager");
+        return;
+    }
+
+    switch (topoStep) {
+        case 0: {  // design domain
+            std::string err;
+            if (!st.docMirror.newPart(st.worker, err)) { topoFail("new_part", err); return; }
+            auto dim = [](double v) { return nlohmann::json{{"value", v}, {"expr", nullptr}}; };
+            nlohmann::json ops = nlohmann::json::array();
+            ops.push_back({{"op", "add_feature"}, {"feature", {
+                {"type", "box"}, {"name", "DesignDomain"},
+                {"params", {{"length", dim(120.0)}, {"width", dim(40.0)}, {"height", dim(40.0)}}},
+                {"centered", true}}}});
+            auto r = st.docMirror.applyOps(st.worker, ops);
+            if (!r.ok) { topoFail("design_domain", r.error_message); return; }
+            if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+            // Resolve the six box faces and classify them by centroid.
+            // Minimised keys per role: cx, -cx, cz, -cz (minX, maxX, minZ, maxZ).
+            double ext[4] = {1e30, 1e30, 1e30, 1e30};
+            const char* roles[4] = {"min_x", "max_x", "min_z", "max_z"};
+            int faces = 0;
+            topoFaces = nlohmann::json::object();
+            for (uint32_t tid = 1; tid <= 24; ++tid) {
+                std::string se;
+                const std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
+                if (s.empty()) continue;
+                nlohmann::json o;
+                try { o = nlohmann::json::parse(s); } catch (...) { continue; }
+                if (!o.contains("centroid") || !o["centroid"].is_array() || o["centroid"].size() != 3)
+                    continue;
+                ++faces;
+                const double cx = o["centroid"][0].get<double>();
+                const double cz = o["centroid"][2].get<double>();
+                const double key[4] = {cx, -cx, cz, -cz};
+                for (int k = 0; k < 4; ++k)
+                    if (key[k] < ext[k]) {
+                        ext[k] = key[k];
+                        topoFaces[roles[k]] = {{"tid", tid}, {"sel", o}};
+                    }
+            }
+            for (const char* role : roles)
+                if (!topoFaces.contains(role)) {
+                    topoFail("design_domain_faces",
+                             "resolved " + std::to_string(faces) + " faces; no '" + role + "' face");
+                    return;
+                }
+            std::printf("topology: design domain 120x40x40 mm rev=%d, %d faces (fixture tid %u, "
+                        "load tid %u, preserve tid %u)\n", r.revision, faces,
+                        topoFaces["min_x"]["tid"].get<uint32_t>(),
+                        topoFaces["max_x"]["tid"].get<uint32_t>(),
+                        topoFaces["min_z"]["tid"].get<uint32_t>());
+            std::fflush(stdout);
+            st.yaw = 35; st.pitch = 24; st.zoom = 1.0f;
+            topoSettle = 3; ++topoStep;
+            return;
+        }
+        case 1: {  // Simulate workspace, Topology ribbon tab; the capability fetch starts here
+            if (!st.simManager) { topoFail("no_sim_manager", "no Simulation manager for the part"); return; }
+            st.activeWorkspace = AppState::Workspace::Simulate;
+            st.leftPaneTab = AppState::LP_Simulation;
+            st.showRibbon = true;
+            st.showSimulationTools = true;
+            st.ribbonTab = AppState::RT_Topology;
+            topoWaitStart = topoNow();
+            ++topoStep;
+            return;
+        }
+        case 2: {  // the native capability matrix decides the methods; nothing is assumed
+            SimManager* sm = st.simManager;
+            const topo::Capabilities& caps = sm->topologyCapabilities();
+            if (caps.state == topo::Capabilities::State::Loading) {
+                if (topoNow() - topoWaitStart > kCapsTimeoutS)
+                    topoFail("capabilities_timeout", "topology_capabilities did not answer within " +
+                                                         std::to_string((int)kCapsTimeoutS) + " s");
+                return;
+            }
+            if (caps.state == topo::Capabilities::State::Unavailable) {
+                topoFail("capabilities_unavailable", caps.error);
+                return;
+            }
+            nlohmann::json matrix = nlohmann::json::array();
+            for (const auto& c : caps.combinations)
+                if (c.supported) matrix.push_back(c.method + "/" + c.physics);
+            topoReport["capabilities_supported"] = matrix;
+            std::printf("topology: capabilities ready, supported pairs: %s\n", matrix.dump().c_str());
+            std::string reason;
+            if (!caps.supports("simp", "structural", &reason)) {
+                topoFail("structural_simp_unsupported", reason);
+                return;
+            }
+            if (!caps.find("simp", "structural")->offersObjective("compliance")) {
+                topoFail("structural_compliance_unsupported",
+                         "SIMP/structural does not offer the compliance objective");
+                return;
+            }
+            topoMethodA = "simp";
+            topoMethodB.clear();
+            for (const char* m : {"beso", "level_set", "ramp"})
+                if (caps.supports(m, "structural")) { topoMethodB = m; break; }
+            if (topoMethodB.empty()) {
+                topoFail("no_second_structural_method",
+                         "no BESO / level-set / RAMP structural combination is supported");
+                return;
+            }
+            std::printf("topology: methods %s then %s\n",
+                        topo::methodLabel(topoMethodA, &caps).c_str(),
+                        topo::methodLabel(topoMethodB, &caps).c_str());
+            std::fflush(stdout);
+            st.ribbonTab = AppState::RT_Topology;
+            sm->shotForcePicker = true;  // the "+ New Study" picker with its Topology entry
+            shoot("topology_01_ribbon_picker.png", kSettle * 2);
+            ++topoStep;
+            return;
+        }
+        case 3: {  // new study from the ribbon command + picked fixture / load / preserve faces
+            SimManager* sm = st.simManager;
+            sm->shotForcePicker = false;
+            if (st.rpc.busy()) return;
+            const int before = sm->studyCount();
+            sm->handleCommand(st, "sim_new_topology");
+            if (sm->studyCount() != before + 1 || !sm->activeTopologyStudy().is_object()) {
+                topoFail("new_study", "sim_new_topology created no topology study: " + st.status);
+                return;
+            }
+            topoStudyId = sm->activeStudyId();
+            st.ribbonTab = AppState::RT_Topology;
+            pickFace("min_x");
+            sm->handleCommand(st, "sim_fixture");
+            pickFace("max_x");
+            sm->handleCommand(st, "sim_load_force");
+            pickFace("min_z");
+            sm->handleCommand(st, "sim_topology_preserve");  // opens the Regions form
+            st.selection.clear();
+            std::printf("topology: study %s created; fixture/load/preserve faces picked\n",
+                        topoStudyId.c_str());
+            std::fflush(stdout);
+            topoSettle = 4; ++topoStep;
+            return;
+        }
+        case 4: {  // physical setup through the shared study contract
+            SimManager* sm = st.simManager;
+            if (st.rpc.busy()) return;
+            const topo::Capabilities& caps = sm->topologyCapabilities();
+            const nlohmann::json study = sm->activeTopologyStudy();
+            if (!study.is_object()) { topoFail("study_not_selected", "topology study lost"); return; }
+            nlohmann::json loads = study.value("loads", nlohmann::json::array());
+            nlohmann::json preserve = study.value("preserve", nlohmann::json::array());
+            if (!lastEntryHasFaces(study.value("fixtures", nlohmann::json::array())) ||
+                !lastEntryHasFaces(loads) || !lastEntryHasFaces(preserve)) {
+                topoFail("pick_capture", "picked faces did not land in fixtures/loads/preserve: " +
+                                             study.dump());
+                return;
+            }
+            loads.back()["type"] = "force";
+            loads.back()["vec"] = {0.0, 0.0, -500.0};       // N, tip load on the +X end
+            preserve.back()["thickness_mm"] = 4.0;           // mounting flange stays solid
+            // Keep-out above the middle of the span (cable / neighbour clearance), placed from
+            // the resolved face centroids so it is right whatever the part origin: x 35..65 mm
+            // from the fixed end, full width, from 26 mm above the bottom through the top.
+            auto cen = [&](const char* role, int axis) {
+                return topoFaces[role]["sel"]["centroid"][axis].get<double>();
+            };
+            const double x0 = cen("min_x", 0), yc = cen("min_x", 1);
+            const double z0 = cen("min_z", 2), z1 = cen("max_z", 2);
+            const nlohmann::json exclude = nlohmann::json::array({{
+                {"label", "Clearance keep-out"},
+                {"box_min_mm", {x0 + 35.0, yc - 21.0, z0 + 26.0}},
+                {"box_max_mm", {x0 + 65.0, yc + 21.0, z1 + 1.0}}}});
+            nlohmann::json t = study.value("topology", nlohmann::json::object());
+            const topo::SwitchResult sw = topo::selectCombination(t, caps, topoMethodA, "structural");
+            if (!sw.applied) { topoFail("method_select", sw.refusal); return; }
+            for (const auto& k : sw.removedKeys) t[k] = nullptr;  // erase on merge, never send
+            const topo::Combination* comb = caps.find(topoMethodA, "structural");
+            t["objective"] = "compliance";
+            // Solid budget over the whole domain: the BC/preserve layers (~17 %) are fixed solid
+            // and the keep-out (~9 %) fixed void, so 35 % leaves real material to distribute.
+            t["volume_fraction"] = 0.35;
+            auto setIf = [&](const char* k, const nlohmann::json& v) {
+                if (comb->offersKey(k)) t[k] = v;
+            };
+            setIf("max_iterations", 80);
+            setIf("change_tolerance", 0.01);
+            setIf("filter_radius_mm", 10.0);   // two 5 mm elements
+            setIf("penalty", 3.0);
+            setIf("preserve_thickness_mm", 4.0);
+            setIf("build_direction", {0.0, 0.0, 1.0});
+            setIf("overhang_angle_deg", 45.0);
+            setIf("no_enclosed_voids", true);
+            const nlohmann::json patch = {
+                {"name", "Bracket topology"},
+                {"material", "steel_1018"},
+                {"mesh_order", 1},
+                {"mesh_target_mm", 5.0},
+                {"loads", loads},
+                {"preserve", preserve},
+                {"exclude", exclude},
+                {"topology", t}};
+            if (!sm->configureActiveTopology(st, patch)) {
+                topoFail("configure", "configureActiveTopology refused the structural setup");
+                return;
+            }
+            if (!validateActive("setup_blocked")) return;
+            topoReport["structural_setup"] = sm->activeTopologyStudy();
+            std::printf("topology: structural setup configured (SIMP, compliance, 35%% solid, "
+                        "steel, 5 mm tet4)\n");
+            std::fflush(stdout);
+            shoot("topology_02_regions.png", kSettle * 2);
+            ++topoStep;
+            return;
+        }
+        case 5:
+            st.simManager->handleCommand(st, "sim_topology_boundaries");
+            shoot("topology_03_boundaries.png", kSettle * 2);
+            ++topoStep;
+            return;
+        case 6:
+            st.simManager->handleCommand(st, "sim_topology_manufacturing");
+            shoot("topology_04_manufacturing.png", kSettle * 2);
+            ++topoStep;
+            return;
+        case 7:
+            st.simManager->handleCommand(st, "sim_topology_setup");
+            shoot("topology_05_setup_" + topoMethodA + ".png", kSettle * 2);
+            ++topoStep;
+            return;
+        case 8:
+            launchRun(topoMethodA.c_str());
+            return;
+        case 9:
+            waitRun(topoMethodA, "topology_06_result_" + topoMethodA + ".png");
+            return;
+        case 10: {  // second method on the same setup; unsupported keys erased, never sent
+            SimManager* sm = st.simManager;
+            if (st.rpc.busy()) return;
+            const topo::Capabilities& caps = sm->topologyCapabilities();
+            nlohmann::json t = sm->activeTopologyStudy().value("topology", nlohmann::json::object());
+            const topo::SwitchResult sw = topo::selectCombination(t, caps, topoMethodB, "structural");
+            if (!sw.applied) { topoFail("method_switch", sw.refusal); return; }
+            const topo::Combination* comb = caps.find(topoMethodB, "structural");
+            if (topoMethodB == "beso" && comb->offersKey("beso_evolution_rate"))
+                t["beso_evolution_rate"] = 0.04;  // reaches 35 % well inside 80 iterations
+            for (const auto& k : sw.removedKeys) t[k] = nullptr;
+            std::string removed;
+            for (const auto& k : sw.removedKeys) removed += (removed.empty() ? "" : ",") + k;
+            if (!sm->configureActiveTopology(st, {{"topology", t}})) {
+                topoFail("configure_variant", "configureActiveTopology refused " + topoMethodB);
+                return;
+            }
+            if (!validateActive("variant_blocked")) return;
+            std::printf("topology: switched to %s (objective %s -> %s, removed keys [%s])\n",
+                        topoMethodB.c_str(), sw.objectiveBefore.c_str(), sw.objectiveAfter.c_str(),
+                        removed.c_str());
+            std::fflush(stdout);
+            sm->handleCommand(st, "sim_topology_setup");
+            shoot("topology_07_setup_" + topoMethodB + ".png", kSettle * 2);
+            ++topoStep;
+            return;
+        }
+        case 11:
+            launchRun(topoMethodB.c_str());
+            return;
+        case 12:
+            waitRun(topoMethodB, "topology_08_result_" + topoMethodB + ".png");
+            return;
+        case 13: {  // retained-run comparison from the study itself
+            SimManager* sm = st.simManager;
+            const nlohmann::json runs =
+                sm->activeTopologyStudy().value("runs", nlohmann::json::array());
+            if (!runs.is_array() || runs.size() < 2) {
+                topoFail("compare_runs", "the study retains " +
+                                             std::to_string(runs.is_array() ? runs.size() : 0) +
+                                             " run(s); two are required");
+                return;
+            }
+            const auto rows = topo::compareRuns(runs[runs.size() - 2], runs[runs.size() - 1]);
+            nlohmann::json out = nlohmann::json::array();
+            int comparable = 0;
+            for (const auto& d : rows) {
+                const bool finite = d.comparable && std::isfinite(d.baseline) &&
+                                    std::isfinite(d.selected);
+                if (finite) ++comparable;
+                out.push_back({{"key", d.key}, {"label", d.label}, {"units", d.units},
+                               {"baseline", std::isfinite(d.baseline) ? nlohmann::json(d.baseline)
+                                                                      : nlohmann::json()},
+                               {"selected", std::isfinite(d.selected) ? nlohmann::json(d.selected)
+                                                                      : nlohmann::json()},
+                               {"comparable", d.comparable}, {"note", d.note}});
+                std::printf("topology: compare %-28s %g -> %g %s%s%s\n", d.label.c_str(),
+                            d.baseline, d.selected, d.units.c_str(), d.note.empty() ? "" : " — ",
+                            d.note.c_str());
+            }
+            std::fflush(stdout);
+            topoReport["compare"] = out;
+            if (comparable == 0) {
+                topoFail("compare_empty", "no finite comparable metric between the two runs");
+                return;
+            }
+            sm->handleCommand(st, "sim_topology_compare");
+            shoot("topology_09_compare.png", kSettle * 2);
+            ++topoStep;
+            return;
+        }
+        case 14: {  // save, reopen an independent copy through the engine, check retention
+            SimManager* sm = st.simManager;
+            if (st.rpc.busy() || sm->topologyRunActive()) return;  // the run record is persisting
+            const std::string savePath = topoSavePath + "/topology_bracket.step+";
+            const std::string copyPath = topoSavePath + "/topology_bracket_reopen.step+";
+            std::string err;
+            if (!st.docMirror.save(st.worker, savePath, err)) { topoFail("save", err); return; }
+            std::error_code ec;
+            std::filesystem::copy_file(savePath, copyPath,
+                                       std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) { topoFail("save_copy", ec.message()); return; }
+            nlohmann::json opened;
+            if (!st.worker.call("doc_open", {{"path", copyPath}}, opened, err) ||
+                !opened.is_object() || opened.contains("code")) {
+                topoFail("reopen", err.empty() ? opened.dump() : err);
+                return;
+            }
+            const std::string did = opened.value("doc_id", std::string());
+            if (did.empty() || did == st.docMirror.docId()) {
+                topoFail("reopen", "doc_open of the saved copy returned no independent document");
+                return;
+            }
+            nlohmann::json list;
+            const bool listed = st.worker.call("sim_study_list", {{"doc_id", did}}, list, err, 15000) &&
+                                list.is_object() && !list.contains("code");
+            nlohmann::json reopenedTree;
+            const bool treeRead = st.worker.call("doc_tree", {{"doc_id", did}}, reopenedTree, err);
+            nlohmann::json closed;
+            std::string cerr;
+            st.worker.call("doc_close", {{"doc_id", did}}, closed, cerr);
+            if (!listed) { topoFail("reopen_studies", err.empty() ? list.dump() : err); return; }
+            if (!treeRead || !reopenedTree.contains("tree")) {
+                topoFail("reopen_source", err.empty() ? reopenedTree.dump() : err);
+                return;
+            }
+            const std::string reopenedKey = topo::geometryKey(reopenedTree["tree"]);
+            nlohmann::json found;
+            for (const auto& s : list.value("studies", nlohmann::json::array()))
+                if (s.is_object() && s.value("id", std::string()) == topoStudyId) found = s;
+            if (!found.is_object() || found.value("type", std::string()) != "topology") {
+                topoFail("reopen_study_missing", "study " + topoStudyId +
+                                                     " is not a topology study in the reopened file");
+                return;
+            }
+            const nlohmann::json runs = found.value("runs", nlohmann::json::array());
+            for (const auto& id : topoRunIds) {
+                bool present = false;
+                for (const auto& r : runs)
+                    if (r.is_object() && r.value("run_id", std::string()) == id.get<std::string>())
+                        present = true;
+                if (!present) {
+                    topoFail("reopen_run_missing", "run " + id.get<std::string>() +
+                                                       " was not retained by save/reopen");
+                    return;
+                }
+            }
+            int artifacts = 0;
+            nlohmann::json missing = nlohmann::json::array();
+            for (const auto& r : runs) {
+                if (r.value("source", nlohmann::json::object())
+                        .value("geometry_key", std::string()) != reopenedKey) {
+                    topoFail("reopen_stale", "unchanged reopened geometry invalidated a retained run");
+                    return;
+                }
+                const nlohmann::json arts = r.is_object() && r.contains("result")
+                    ? r["result"].value("artifacts", nlohmann::json::object())
+                    : nlohmann::json::object();
+                if (!arts.is_object()) continue;
+                for (auto it = arts.begin(); it != arts.end(); ++it) {
+                    const std::string p = it->is_object() ? it->value("path", std::string())
+                                                          : std::string();
+                    if (p.empty()) continue;
+                    ++artifacts;
+                    std::error_code fe;
+                    if (!std::filesystem::exists(p, fe)) missing.push_back(p);
+                }
+            }
+            topoReport["reopen"] = {{"saved", savePath}, {"reopened_copy", copyPath},
+                                    {"runs_retained", runs.size()}, {"artifacts", artifacts},
+                                    {"artifacts_missing", missing},
+                                    {"reopened_doc", did}, {"live_doc", st.docMirror.docId()},
+                                    {"source_current", true}};
+            std::printf("topology: save/reopen kept %zu run(s), %d artifact file(s), %zu missing\n",
+                        runs.size(), artifacts, missing.size());
+            std::fflush(stdout);
+            if (!missing.empty()) {
+                topoFail("artifacts_missing", "retained artifact files are gone: " + missing.dump());
+                return;
+            }
+            topoSettle = 2; ++topoStep;
+            return;
+        }
+        case 15: {  // thermal boundary editor on a real conduction setup (inspected, not run)
+            SimManager* sm = st.simManager;
+            if (st.rpc.busy()) return;
+            const topo::Capabilities& caps = sm->topologyCapabilities();
+            nlohmann::json cfg = topo::newTopologyConfig(caps, "thermal");
+            if (cfg.empty()) { topoFail("thermal_unsupported", "no method supports thermal"); return; }
+            const int before = sm->studyCount();
+            sm->handleCommand(st, "sim_new_topology");
+            if (sm->studyCount() != before + 1) {
+                topoFail("thermal_study", "sim_new_topology created no study: " + st.status);
+                return;
+            }
+            cfg["volume_fraction"] = 0.4;
+            const nlohmann::json aluminum = {
+                {"name", "Aluminum 6061-T6"}, {"E_mpa", 68900.0}, {"nu", 0.33},
+                {"density_g_cm3", 2.70}, {"k_w_mk", 167.0}, {"alpha_per_k", 2.36e-5},
+                {"cp_j_kgk", 896.0}};
+            if (!sm->configureActiveTopology(st, {{"name", "Heat spreader topology"},
+                                                  {"material", aluminum}, {"mesh_order", 1},
+                                                  {"mesh_target_mm", 5.0}, {"topology", cfg}})) {
+                topoFail("thermal_configure", "configureActiveTopology refused the thermal setup");
+                return;
+            }
+            pickFace("min_x");
+            sm->handleCommand(st, "sim_fixture");  // thermal physics: a temperature fixture
+            st.selection.clear();
+            nlohmann::json thermal =
+                sm->activeTopologyStudy().value("thermal", nlohmann::json::object());
+            nlohmann::json fixtures = thermal.value("fixtures", nlohmann::json::array());
+            if (!lastEntryHasFaces(fixtures)) {
+                topoFail("thermal_pick", "the picked face did not land in thermal.fixtures");
+                return;
+            }
+            fixtures.back()["temperature_c"] = 25.0;
+            const nlohmann::json loads = nlohmann::json::array({
+                {{"faces", nlohmann::json::array({faceSel("max_x")})}, {"type", "power"},
+                 {"power_w", 20.0}},
+                {{"faces", nlohmann::json::array({faceSel("max_z")})}, {"type", "convection"},
+                 {"h_w_m2k", 15.0},
+                 {"ambient_c", 25.0}}});
+            if (!sm->configureActiveTopology(
+                    st, {{"thermal", {{"reference_temperature_c", 25.0},
+                                      {"fixtures", fixtures}, {"loads", loads}}}})) {
+                topoFail("thermal_configure", "configureActiveTopology refused the thermal BCs");
+                return;
+            }
+            if (!validateActive("thermal_blocked")) return;
+            topoReport["thermal_setup"] = sm->activeTopologyStudy();
+            sm->handleCommand(st, "sim_topology_boundaries");
+            std::printf("topology: thermal study: 25 C fixture (-X), 20 W (+X), h=15 convection (top)\n");
+            std::fflush(stdout);
+            shoot("topology_10_thermal_boundaries.png", kSettle * 2);
+            ++topoStep;
+            return;
+        }
+        case 16: {  // flow boundary editor on a real low-Re channel setup (inspected, not run)
+            SimManager* sm = st.simManager;
+            if (st.rpc.busy()) return;
+            const topo::Capabilities& caps = sm->topologyCapabilities();
+            nlohmann::json cfg = topo::newTopologyConfig(caps, "flow");
+            if (cfg.empty()) { topoFail("flow_unsupported", "no method supports flow"); return; }
+            const int before = sm->studyCount();
+            sm->handleCommand(st, "sim_new_topology");
+            if (sm->studyCount() != before + 1) {
+                topoFail("flow_study", "sim_new_topology created no study: " + st.status);
+                return;
+            }
+            cfg["volume_fraction"] = 0.4;  // flow budgets the FLUID phase
+            const nlohmann::json flow = {
+                {"viscosity_pa_s", 1.0e-3}, {"density_kg_m3", 998.0},
+                {"inlets", nlohmann::json::array({{{"faces", nlohmann::json::array({faceSel("min_x")})},
+                                                   {"velocity_m_s", {0.001, 0.0, 0.0}}}})},
+                {"outlets", nlohmann::json::array({{{"faces", nlohmann::json::array({faceSel("max_x")})},
+                                                    {"pressure_pa", 0.0}}})},
+                {"fluid_k_w_mk", 0.6}, {"fluid_cp_j_kgk", 4182.0}};
+            if (!sm->configureActiveTopology(st, {{"name", "Coolant channel topology"},
+                                                  {"mesh_order", 1}, {"mesh_target_mm", 5.0},
+                                                  {"topology", cfg}, {"flow", flow}})) {
+                topoFail("flow_configure", "configureActiveTopology refused the flow setup");
+                return;
+            }
+            pickFace("max_z");
+            sm->handleCommand(st, "sim_fixture");  // flow physics: a no-slip wall
+            st.selection.clear();
+            const nlohmann::json walls = sm->activeTopologyStudy()
+                                             .value("flow", nlohmann::json::object())
+                                             .value("walls", nlohmann::json::array());
+            if (!lastEntryHasFaces(walls)) {
+                topoFail("flow_pick", "the picked face did not land in flow.walls");
+                return;
+            }
+            if (!validateActive("flow_blocked")) return;
+            topoReport["flow_setup"] = sm->activeTopologyStudy();
+            sm->handleCommand(st, "sim_topology_boundaries");
+            std::printf("topology: flow study: 1 mm/s inlet (-X), 0 Pa outlet (+X), wall (top)\n");
+            std::fflush(stdout);
+            shoot("topology_11_flow_boundaries.png", kSettle * 2);
+            ++topoStep;
+            return;
+        }
+        case 17: {  // back to the optimized bracket's comparison
+            SimManager* sm = st.simManager;
+            if (st.rpc.busy()) return;
+            if (!sm->selectStudyById(st, topoStudyId)) {
+                topoFail("reselect", "could not reselect study " + topoStudyId);
+                return;
+            }
+            st.ribbonTab = AppState::RT_Topology;
+            sm->handleCommand(st, "sim_topology_compare");
+            topoSettle = kSettle * 2;
+            ++topoStep;
+            return;
+        }
+        default:
+            topoReport["ok"] = true;
+            topoDone = true;
+            topoCapture = topoSavePath + "/topology_12_final.png";
+            std::printf("topology: scenario complete (%s vs %s, %zu retained runs verified)\n",
+                        topoMethodA.c_str(), topoMethodB.c_str(), topoRunIds.size());
+            std::fflush(stdout);
+            return;
     }
 }
 

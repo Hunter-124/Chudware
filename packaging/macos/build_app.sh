@@ -192,7 +192,13 @@ build_python_sidecar() {
         exit 1
     }
     echo "==> compiling $name"
-    local -a includes=("--include-module=chudware_protected_assets" "--include-module=services.$module")
+    # Both sidecars re-enter compiled_entry as `--module services.sim.job_worker <job_id>`
+    # for background simulation jobs (services/sim/jobs.py), and the topology tool/study
+    # modules back those jobs; forcing them fails the build if any is missing.
+    local -a includes=("--include-module=chudware_protected_assets" "--include-module=services.$module"
+                       "--include-module=services.sim.job_worker"
+                       "--include-module=services.sim.topology"
+                       "--include-module=services.mcp.topology_tools")
     # pycolmap is a bundled runtime package declared in packaging/requirements-release.txt.
     # It publishes arm64 macOS wheels only, so Intel builds ship without sparse SfM.
     if [ "$(uname -m)" = arm64 ]; then

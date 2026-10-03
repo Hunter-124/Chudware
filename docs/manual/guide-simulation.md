@@ -221,6 +221,160 @@ GOLDEN DEMO (T-FIN25 — living E2E worked example):
   Narrative + artifacts: docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md. Prefer this script over
   inventing a new end-to-end recipe when demonstrating the content is finished.
 
+TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ribbon tab, and
+  the model tools topology_capabilities / run_topology_optimization). Both surfaces edit the
+  SAME persisted study and run the same native sim_run_topology route. It searches for a
+  material layout inside the part's current solid (the design domain) under a volume budget.
+  The source part is only read (its exported STEP is hashed); it is never replaced.
+
+  Capability matrix (read it live — the GUI Method form and topology_capabilities show the
+  exact supported pairs, objectives, limits and parameters; never assume beyond them):
+                     structural thermal modal buckling flow thermomechanical cht
+    simp, ramp           yes      yes    yes    yes     yes        yes        yes
+    beso, level_set      yes      yes    no     no      no         no         no
+  BESO and level set are volume-budget only: compliance (structural) or thermal_compliance
+  (thermal), no response limits, no mass objective. An unsupported pair shows its reason and
+  cannot run. Formulations: SIMP rho^p / RAMP rho/(1+q(1-rho)) density interpolation with MMA
+  updates and optional tanh projection; BESO = Huang-Xie soft-kill with binary removal AND
+  reintroduction; level set = reaction-diffusion level set (phi in [-1,1], regularized
+  Heaviside, linear ersatz material).
+
+  Objectives (first = default; reported units) and optional limits (SIMP/RAMP only):
+    structural        compliance N*mm | mass g        stress_limit_mpa, max_displacement_mm
+                      (mass needs one of those limits)
+    thermal           thermal_compliance W*K          max_temperature_c
+    modal             frequency Hz (maximized)        min_frequency_hz
+    buckling          buckling_factor (maximized)     min_buckling_factor
+    flow              dissipation W                   max_pressure_drop_pa
+    thermomechanical  compliance N*mm                 stress_limit_mpa, max_displacement_mm,
+                                                      max_temperature_c
+    cht               mean_temperature C              max_temperature_c, max_pressure_drop_pa
+  Stress and max-temperature limits act on smooth (KS) aggregates of the relaxed design; the
+  reanalysis of the reconstructed geometry (below) is what checks them on real geometry.
+
+  Scalar settings (topology{}; defaults in parentheses; the pair's `parameters` list wins):
+    volume_fraction (0,1] REQUIRED — budgets SOLID, except flow/cht where it budgets FLUID
+    (rho = 1 is always solid). max_iterations 1..100000 (200); change_tolerance > 0 (0.01);
+    filter_radius_mm >= 0 (absent: min_member_mm/2, else 2 x median element size);
+    density_threshold (0,1) (0.5); min_density (0,1) property floor (1e-4). SIMP/RAMP:
+    move_limit (0,1] (0.2), projection_beta >= 0 (0 = off). penalty >= 1 (3; SIMP, BESO);
+    ramp_q >= 0 (5; RAMP); beso_evolution_rate (0,1) (0.02); level_set_regularization >= 0
+    (5e-4). Clearing a GUI field erases the key, so the solver default applies.
+
+  Units (converted once to SI inside the solver): geometry mm; force N; pressure and stress
+    MPa; temperature C; heat W, W/m2, W/(m*K), W/(m2*K); flow m/s, Pa, Pa*s, kg/m3; material
+    density g/cm3, alpha 1/K, cp J/(kg*K). Mesh is tet4 only (mesh_order 1; other orders are
+    refused, never silently changed). Material keys required: structural/buckling E_mpa, nu;
+    modal + density_g_cm3; thermal/cht k_w_mk; thermomechanical E_mpa, nu, k_w_mk,
+    alpha_per_k; flow none (fluid properties live in flow{}).
+
+  Setup by physics (sections a physics does not use stay saved but are not sent):
+    structural / buckling / thermomechanical: fixtures [{faces, dofs?:[0,1,2]}] (no dofs =
+      all) and loads {faces, type:"force", vec:[N,N,N]} | {faces, type:"pressure",
+      magnitude: MPa inward}. Multi-load: load_cases [{name, weight > 0, fixtures?, loads}]
+      add case fixtures to the shared ones; the objective is the weighted sum (buckling
+      soft-mins the smallest positive load factor over cases, weights 1). Buckling needs a
+      compressive pre-stress. Modal uses fixtures only (saved loads are kept, not sent).
+    thermal / thermomechanical / cht: thermal{reference_temperature_c, fixtures [{faces,
+      temperature_c}], loads {type:"flux", magnitude_w_m2} | {type:"power", power_w} |
+      {type:"convection", h_w_m2k, ambient_c}}. Thermomechanical requires
+      reference_temperature_c (the strain-free temperature).
+    flow / cht: flow{viscosity_pa_s, density_kg_m3, inlets [{faces, velocity_m_s:[3],
+      temperature_c (cht only, required there)}], outlets [{faces, pressure_pa}], walls?,
+      brinkman_max (1e5), reference_length_mm (default: equivalent inlet diameter)}; cht adds
+      fluid_k_w_mk and fluid_cp_j_kgk, and its heat input goes in thermal.loads. Every
+      exterior face outside a port is a no-slip wall; walls overlapping a port refuse.
+
+  Passive regions and ties:
+    preserve (fixed solid) / exclude (fixed void): {faces, thickness_mm?} = elements touching
+      the faces plus those within the thickness (default topology.preserve_thickness_mm /
+      exclude_thickness_mm, 0), or {box_min_mm, box_max_mm} by element centroid. An element
+      in both refuses (passive_conflict).
+    Kept solid automatically: structural fixture and load patches; thermal fixture and load
+      patches for thermal and thermomechanical (not cht). Kept fluid: flow inlets/outlets.
+      A boundary inside an exclude refuses (boundary_in_keep_out), a port inside a preserve
+      refuses (port_in_preserve), and fixed regions already above the budget refuse
+      (volume_fraction_infeasible).
+    symmetry_axes (+ symmetry_origin_mm, default bounding-box centre) and extrusion_axis tie
+      design variables. A tied group touching a passive region becomes passive; one spanning
+      fixed solid and fixed void refuses (tie_passive_conflict); a mesh without mirror images
+      within the local element size refuses (symmetry_domain_mismatch).
+
+  Manufacturing: intent vs enforcement vs measurement (result.manufacturing):
+    intent only — min_member_mm sets the filter radius; member thickness is NOT measured.
+    enforced — symmetry/extrusion ties; no_enclosed_voids (BESO and level set reject updates
+      that enclose a void; SIMP/RAMP treat it as a feasibility check).
+    heuristic — build_direction + overhang_angle_deg + overhang_penalty penalize unsupported
+      material; this never guarantees a support-free part.
+    measured on the reconstructed geometry — closed manifold surface, single body, passive
+      regions kept, enclosed cavities, unsupported-overhang fraction, reanalysis response
+      limits; each check row reads pass | fail | not_measured.
+
+  Reading a result:
+    ok = the computation finished, not a certified design. converged = a stationary design
+    that also satisfies every constraint. feasible = the final re-evaluated constraints (and
+    the enclosure rule) hold. An iteration limit, stall or violated limit is a finished but
+    unconverged or infeasible run. termination: converged | max_iterations | stalled |
+    line_search_failed | infeasible | stuck_at_bounds | cancelled | failed. Objective and
+    fields are re-evaluated at the FINAL design (summary.fields_at); summary carries baseline
+    vs final objective, volume fraction and mass, max_constraint_violation,
+    convergence_criterion and iterations. Report units: mm, N, MPa, C, W, Pa, Hz, g.
+    Thresholded actual-domain reanalysis: a completed design is cut at density_threshold
+    into a closed surface plus conforming clipped tets, the study's ORIGINAL selectors are
+    resolved again on that new mesh, and the physics is solved once on it (solid physics:
+    the clipped solid; flow: pure Stokes in the clipped fluid channel; cht: the two-phase
+    solid + fluid mesh, solid still a Brinkman resistance). See reconstruction{},
+    summary.reanalysis_objective / reanalysis_feasible / geometry_valid and the
+    reconstruction_response check. A boundary that does not survive reconstruction is a
+    named failure, never repaired. Unfinished runs are not reconstructed.
+
+  Artifacts are created exclusively, SHA-256 hashed and never overwritten: run.json,
+    study.json, normalized_spec.json, history.jsonl / history.json, checkpoint.json,
+    density.vtu, reanalysis.vtu, overlay.aicm (viewport), surface.stl (only when the geometry
+    is valid), result.json. Model-tool runs live under
+    <project>/simulation/topology/<study>/<run_id>/ (or a project-relative
+    topology.result_dir) with source.step, inputs/setup/provenance JSON. checkpoint.json holds
+    retained optimizer state, but sim_run_topology takes no resume input: a cancelled,
+    failed or killed run starts over from the beginning; its checkpoint iteration is only reported.
+
+  Human workflow (Topology tab): New Study (needs an open part with solid geometry) → Method
+    (physics, method, objective, volume budget, limits; only supported pairs) → Material →
+    Fixture / Force / Pressure / Heat / Flow (pick faces in the viewport; load cases in the
+    boundary panel) → Preserve / Exclude → Mfg. Rules → Mesh → Run (progress, Cancel) →
+    Results: convergence history, constraints, manufacturing checks, artifacts. "Show in
+    viewport" overlays density/fields; Export copies a run file to a path you choose
+    (surfaces only when geometry is valid); Compare sets a baseline run (metrics compare only
+    for the same physics, objective and units); "Use these settings" restores a run's scalar
+    settings. Every run is retained in the study, and the setup stays editable (locked only
+    while a run is active). Runs made on other geometry are marked stale; model-tool runs are
+    flagged unverified against the editor's geometry digest.
+
+  Model workflow: topology_capabilities → run_topology_optimization(study=…, background=True)
+    (saved into the document as type "topology" BEFORE the solve, so the GUI shows it) →
+    wait_job / get_job → sim_cancel(job_id) to stop → read ok / converged / feasible
+    separately, result.constraints, the reanalysis, manufacturing checks and artifacts.
+    run_topology_optimization(study_id=…) re-runs a GUI-authored study exactly as stored.
+
+  Model limits:
+    flow / cht: steady incompressible Stokes-Brinkman on MINI elements. Refused
+      (flow_regime_invalid) when the prescribed-inlet Reynolds number exceeds 1 or when the
+      solved velocity bound does. That covers pressure-driven flow the inlet check cannot see.
+      No Navier-Stokes, no turbulence. Solid is a Brinkman resistance with finite leakage,
+      reported (cht: thermal.heat_leakage). More than 1.5 M flow unknowns refuses
+      (problem_too_large).
+    cht: steady advection-diffusion with a constant fluid heat capacity rho_f*cp_f on the
+      superficial velocity (energy-conservative) and interpolated conductivity; one-way
+      flow → heat coupling.
+    thermomechanical: one-way steady coupling (temperature drives thermal strain), linear
+      elastic.
+    All physics are linear and small-strain: no contact, plasticity, geometric nonlinearity,
+      post-buckling or design-dependent convection.
+    The output is a mesh surface plus fields, NOT a reconstructed parametric CAD feature
+      history.
+    print_ready stays false. A DFAM check of the surface (model-tool runs) is evidence, not
+      a print gate, and nothing is sliced automatically. Slice the exported surface.stl with
+      slice_part; only its passing G-code check makes a part print-ready.
+
 SIMULATE TAB (T-FIN24, host GUI): one multiphysics Simulate workspace hosts every live
   study kind with progressive disclosure by open doc type, plus handoff actions
   (Send board to thermal FEA, Pick heatsink, …) driven by aicad.simhandoff/1. Worker

@@ -180,6 +180,19 @@ judgment).
   2.9.6 CLI facts: no `--arrange`; bare `--merge` segfaults headless (use `--dont-arrange
   --merge`); `--duplicate N` arranges copies. Never let an agent download a slicer or write
   slicer keys by hand again.
+- **Multi-part plates and "Complete individual objects" (2026-10-03).** `slice_part(parts=
+  [{doc_id|path, copies, orientation, …}], complete_individual_objects=True)`: each part is
+  oriented/analysed alone, `services/manufacturing/slicer/plate.py` lays the plate out
+  (meshes written at absolute bed coordinates, `slice_mesh(center_xy=None)` keeps them;
+  PrusaSlicer prints sequential objects in argument order), and one G-code + one manifest
+  (`plate` block: objects, print order, parts) is one `publish_print_media` job. The 2.9.6
+  CLI checks NO sequential clearance — it exported objects 10 mm apart on a 55 mm radius and
+  a 30 mm object before others under a 25 mm gantry. So the planner spaces hulls by
+  `extruder_clearance_radius` + brims + 2 mm, orders by ascending height, allows one object
+  above `extruder_clearance_height` (printed last), and `gcode_check`'s
+  `sequential_clearance` re-proves it from the toolpath (object labels or Z restarts; every
+  move after an object's last extrusion vs its hull/height). `complete_objects` in
+  `overrides` is refused.
 - **Printer media is published, never copied (2026-10-03).** `print_media_inventory` (read
   risk) and `publish_print_media` (write; in `contracts/copilot_modes.json` `mutating_tools`,
   so Ask/Plan refuse it) wrap `services/manufacturing/print_media.py`; humans use

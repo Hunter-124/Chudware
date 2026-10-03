@@ -70,10 +70,28 @@ class GcodeModel:
     final_bed_c: float | None = None
     first_extrusion_z: float | None = None
     units_mm: bool = True
+    # Filled only by parse_gcode(track_objects=True): one dict per printed object instance
+    # {key, points (x,y float32 pairs of physical extrusion), z_max, first, last} where
+    # first/last index ``moves``, the x0,y0,x1,y1,z_min float32 rows of EVERY motion.
+    objects: list[dict] = field(default_factory=list)
+    moves: array | None = None
 
 
-def parse_gcode(path) -> GcodeModel:
-    """Read once, retaining compact per-layer extrusion arrays, not source lines."""
+def _tail_flag(path, key: str) -> bool:
+    """True when the trailing slicer config block sets ``; key = 1`` (cheap pre-scan)."""
+    with Path(path).open('rb') as stream:
+        stream.seek(0, 2)
+        stream.seek(max(0, stream.tell() - (1 << 20)))
+        tail = stream.read().decode('utf-8', errors='replace')
+    return re.search(r'^;\s*' + re.escape(key) + r'\s*=\s*1\s*$', tail, re.M) is not None
+
+
+def parse_gcode(path, *, track_objects: bool = False) -> GcodeModel:
+    """Read once, retaining compact per-layer extrusion arrays, not source lines.
+
+    ``track_objects`` additionally attributes extrusion to the slicer's object labels
+    (``; printing object <name> id:N copy M``; without labels, a layer Z that drops back
+    starts a new object) and keeps every motion segment, for the sequential-print check."""
     model = GcodeModel()
     buffers: dict[float, array] = {}
     heights: dict[float, float] = {}
@@ -98,6 +116,13 @@ def parse_gcode(path) -> GcodeModel:
     after_z = False
     layer_number = 0
     type_ids = {}
+    # Object attribution (track_objects only).
+    object_label = None
+    auto_object = 0
+    object_ids: dict[str, int] = {}
+    moves = array('f') if track_objects else None
+    move_count = 0
+    untracked_roles = tuple(_EXCLUDED)
     with Path(path).open('r', encoding='utf-8', errors='replace') as stream:
         for raw in stream:
             line = raw.strip()
@@ -113,9 +138,17 @@ def parse_gcode(path) -> GcodeModel:
                 elif line.startswith(';LAYER_CHANGE'):
                     layer_number += 1
                 elif line.startswith(';Z:'):
+                    previous_layer_z = layer_z
                     try: layer_z = round(float(line[3:]), 5)
                     except ValueError: pass
+                    if (track_objects and previous_layer_z is not None and layer_z is not None
+                            and layer_z < previous_layer_z - 0.05):
+                        auto_object += 1
                     after_z = True
+                elif line.startswith('; printing object '):
+                    object_label = line[len('; printing object '):].strip() or None
+                elif line.startswith('; stop printing object'):
+                    object_label = None
                 elif line.startswith(';HEIGHT:'):
                     try: extrusion_height = float(line[8:])
                     except ValueError: pass
@@ -213,6 +246,20 @@ def parse_gcode(path) -> GcodeModel:
                             buffers.setdefault(z, array('f')).extend((*xyz[:2], *target[:2], width, deposited, length, type_id))
                             heights.setdefault(z, layer_height)
                             extrusion_heights[z] = max(extrusion_heights.get(z,0.0),extrusion_height)
+                if track_objects and target != xyz:
+                    moves.extend((xyz[0], xyz[1], target[0], target[1], min(xyz[2], target[2])))
+                    move_count += 1
+                    if deposited > 1e-7 and not role.startswith(untracked_roles):
+                        key = object_label or f'object {auto_object + 1}'
+                        index = object_ids.get(key)
+                        if index is None:
+                            index = object_ids[key] = len(model.objects)
+                            model.objects.append({'key': key, 'points': array('f'), 'z_max': 0.0,
+                                                  'first': move_count - 1, 'last': move_count - 1})
+                        record = model.objects[index]
+                        record['points'].extend((*xyz[:2], *target[:2]))
+                        record['z_max'] = max(record['z_max'], target[2])
+                        record['last'] = move_count - 1
                 xyz = target
     model.types = list(type_ids)
     previous_z = 0.0
@@ -223,6 +270,7 @@ def parse_gcode(path) -> GcodeModel:
         previous_z = z
     model.final_nozzle_c = nozzle_target
     model.final_bed_c = bed_target
+    model.moves = moves
     return model
 
 
@@ -491,6 +539,142 @@ def _geometry(model):
     return floating, unique_towers, first_area, evaluated, floating_metrics
 
 
+# Extrusion centerlines sit half a line inside the printed edge.
+_HALF_LINE_MM = 0.25
+# A nozzle this far inside the clearance radius is a collision; closer to it, a warning.
+_SEQUENTIAL_TOLERANCE_MM = 1.0
+
+
+def _config_number(value):
+    try:
+        number = float(str(value).split(',')[0].strip().rstrip('%'))
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _segment_polygon_distance(segments, polygon):
+    """Distance from each segment (N x [x0,y0,x1,y1]) to a convex CCW polygon; 0 inside/through."""
+    p0, p1 = segments[:, None, :2], segments[:, None, 2:4]
+    a = polygon[None, :, :]
+    b = np.roll(polygon, -1, axis=0)[None, :, :]
+    edge = b - a
+
+    def cross(u, v):
+        return u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0]
+
+    def point_segment(p, s, e):
+        v = e - s
+        length = (v * v).sum(-1)
+        t = np.clip(((p - s) * v).sum(-1) / np.where(length > 0, length, 1.0), 0.0, 1.0)
+        return np.linalg.norm(p - s - t[..., None] * v, axis=-1)
+
+    inside = ((cross(edge, p0 - a) >= -1e-9).all(axis=1)
+              | (cross(edge, p1 - a) >= -1e-9).all(axis=1))
+    direction = p1 - p0
+    crosses = ((cross(direction, a - p0) * cross(direction, b - p0) < 0)
+               & (cross(edge, p0 - a) * cross(edge, p1 - a) < 0)).any(axis=1)
+    distance = np.minimum.reduce([point_segment(p0, a, b), point_segment(p1, a, b),
+                                  point_segment(a, p0, p1)]).min(axis=1)
+    return np.where(inside | crosses, 0.0, distance)
+
+
+def _sequential_clearance(model, detail=False):
+    """Complete-individual-objects safety from the toolpath itself.
+
+    After an object's last extrusion it stands at its printed height. Every later motion
+    below that height must keep the nozzle at least extruder_clearance_radius from the
+    object's footprint (hotend body), and must not run more than extruder_clearance_height
+    below its top (the gantry spans the bed). Objects must also print one after another."""
+    radius = _config_number(model.config.get('extruder_clearance_radius'))
+    gantry = _config_number(model.config.get('extruder_clearance_height'))
+    objects = sorted(model.objects, key=lambda o: o['first'])
+    limits = {'extruder_clearance_radius_mm': radius, 'extruder_clearance_height_mm': gantry,
+              'collision_inside_radius_by_mm': _SEQUENTIAL_TOLERANCE_MM}
+    if not objects or model.moves is None or radius is None or gantry is None:
+        return _row('sequential_clearance', 'not_evaluated',
+                    'Complete individual objects is on, but the file names no printed objects or '
+                    'no extruder clearance radius/height; extruder and gantry collisions were not checked.',
+                    limits=limits, fix=['Slice with slice_part so the printer clearances and object labels are present.'])
+    from .plate import footprint_hull  # noqa: PLC0415
+
+    moves = np.frombuffer(model.moves, dtype=np.float32).reshape(-1, 5).astype(np.float64)
+    interleaved = []
+    latest_end, latest_key = -1, None
+    for obj in objects:
+        if obj['first'] < latest_end:
+            interleaved.append([latest_key, obj['key']])
+        if obj['last'] > latest_end:
+            latest_end, latest_key = obj['last'], obj['key']
+    summary, regions = [], []
+    extruder_hits = gantry_hits = 0
+    min_clearance = math.inf
+    for order, obj in enumerate(objects, 1):
+        points = np.frombuffer(obj['points'], dtype=np.float32).reshape(-1, 2).astype(np.float64)
+        hull = np.asarray(footprint_hull(points), dtype=np.float64)
+        top = obj['z_max']
+        low_x, low_y = (float(v) for v in hull.min(axis=0))
+        high_x, high_y = (float(v) for v in hull.max(axis=0))
+        summary.append({'object': obj['key'], 'print_order': order, 'height_mm': round(top, 3),
+                        'bbox_mm': [round(low_x, 3), round(low_y, 3), round(high_x, 3), round(high_y, 3)]})
+        later = np.flatnonzero(moves[obj['last'] + 1:, 4] < top - 0.05) + obj['last'] + 1
+        if not len(later):
+            continue
+        segments = moves[later]
+        under_gantry = segments[:, 4] + gantry < top - 0.05
+        if under_gantry.any():
+            gantry_hits += int(under_gantry.sum())
+            first = int(np.flatnonzero(under_gantry)[0])
+            regions.append({'kind': 'gantry', 'finished_object': obj['key'],
+                            'object_height_mm': round(top, 3),
+                            'z_mm': round(float(segments[first, 4]), 3),
+                            'xy': [round(float(segments[first, 2]), 3), round(float(segments[first, 3]), 3)],
+                            'moves': int(under_gantry.sum())})
+        near = ((np.maximum(segments[:, 0], segments[:, 2]) >= low_x - radius)
+                & (np.minimum(segments[:, 0], segments[:, 2]) <= high_x + radius)
+                & (np.maximum(segments[:, 1], segments[:, 3]) >= low_y - radius)
+                & (np.minimum(segments[:, 1], segments[:, 3]) <= high_y + radius))
+        candidates = segments[near]
+        if not len(candidates):
+            continue
+        clearance = np.concatenate([
+            _segment_polygon_distance(candidates[start:start + 20000, :4], hull)
+            for start in range(0, len(candidates), 20000)]) - _HALF_LINE_MM
+        min_clearance = min(min_clearance, float(clearance.min()))
+        hits = clearance < radius - _SEQUENTIAL_TOLERANCE_MM
+        if hits.any():
+            extruder_hits += int(hits.sum())
+            worst = int(np.argmin(clearance))
+            regions.append({'kind': 'extruder', 'finished_object': obj['key'],
+                            'object_height_mm': round(top, 3),
+                            'z_mm': round(float(candidates[worst, 4]), 3),
+                            'xy': [round(float(candidates[worst, 2]), 3), round(float(candidates[worst, 3]), 3)],
+                            'clearance_mm': round(float(clearance[worst]), 3),
+                            'moves': int(hits.sum())})
+    failed = bool(interleaved or extruder_hits or gantry_hits)
+    close = math.isfinite(min_clearance) and min_clearance < radius
+    status = 'fail' if failed else 'warn' if close else 'pass'
+    shown = 'none within the radius' if not math.isfinite(min_clearance) else f'{min_clearance:.1f} mm'
+    note = (f'{len(objects)} objects printed one at a time; closest nozzle approach to a finished, '
+            f'taller object {shown} (clearance radius {radius:g} mm); {extruder_hits} moves inside the '
+            f'hotend clearance, {gantry_hits} moves with the gantry ({gantry:g} mm) below a finished '
+            f'object top; {len(interleaved)} interleaved objects')
+    fix = []
+    if failed:
+        fix = ['Space objects at least the clearance radius apart (plus brims) and print them in '
+               'ascending height, with at most one object taller than the clearance height, '
+               'printed last; slice_part(parts=[...], complete_individual_objects=True) lays the '
+               'plate out that way.',
+               'Or print the plate layer by layer (complete_individual_objects=False).']
+    return _row('sequential_clearance', status, note,
+                {'objects': summary if detail or len(summary) <= 24 else summary[:24],
+                 'object_count': len(objects),
+                 'min_clearance_mm': round(min_clearance, 3) if math.isfinite(min_clearance) else None,
+                 'extruder_collision_moves': extruder_hits, 'gantry_collision_moves': gantry_hits,
+                 'interleaved': interleaved},
+                limits, regions[:50 if detail else 5], fix)
+
+
 def verify_gcode(path, *, bed_polygon=None, max_height_mm=None, material=None, nozzle_mm=None,
                  expect_nozzle_c=None, expect_bed_c=None, detail=False, max_unanchored_mm: float=10.0,
                  max_hard_run_mm: float=2.0, max_hard_area_mm2: float=2.0, anchored_warn_fraction: float=0.5,
@@ -505,7 +689,11 @@ def verify_gcode(path, *, bed_polygon=None, max_height_mm=None, material=None, n
                 (max_unanchored_mm, max_hard_run_mm, max_hard_area_mm2, anchored_bridge_warn_mm))
             or not 0 < anchored_warn_fraction <= 1):
         raise ValueError('Floating-extrusion limits must be positive; warning fraction must be in (0,1].')
-    model = parse_gcode(path)
+    # Complete individual objects (``complete_objects = 1``) needs per-object attribution;
+    # the flag sits in the trailing config block, so peek at it before the single pass.
+    model = parse_gcode(path, track_objects=_tail_flag(path, 'complete_objects'))
+    if model.config.get('complete_objects') == '1' and model.moves is None:
+        model = parse_gcode(path, track_objects=True)
     checks = []
     all_segments = [layer.segments for layer in model.layers]
     height = max((layer.z for layer in model.layers), default=0.0)
@@ -644,6 +832,10 @@ def verify_gcode(path, *, bed_polygon=None, max_height_mm=None, material=None, n
                        f'{len(towers)} distinct tall/slender support islands (height >=20 mm, height/width >8)', {'risky_islands':len(towers)},
                        {'minimum_height_mm':20,'warning_slenderness':8}, towers[:50 if detail else 5],
                        ['Use a flatter orientation or grid/organic supports with wider anchored bases.','Add a support sheath/brim and reduce unsupported tower height.'] if towers else []))
+    sequential = model.config.get('complete_objects') == '1'
+    checks.append(_sequential_clearance(model, detail) if sequential else
+                  _row('sequential_clearance', 'not_applicable',
+                       'Objects print together layer by layer (Complete individual objects off).'))
     status = 'fail' if any(r['status']=='fail' for r in checks) else 'warn' if any(r['status'] in ('warn','not_evaluated') for r in checks) else 'pass'
     total_path = sum(model.by_type_mm.values())
     support_path = sum(v for t,v in model.by_type_mm.items() if t.startswith('Support'))

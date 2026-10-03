@@ -251,8 +251,13 @@ def validate_overrides(install: SlicerInstall, resolved_config: dict[str, str],
 
 
 def slice_mesh(install: SlicerInstall, *, mesh_paths: list[Path], config: dict[str, str],
-               output_gcode: Path, work_dir: Path, center_xy: tuple[float, float], copies: int = 1,
-               export_3mf: Path | None = None, timeout_s=600) -> SliceRun:
+               output_gcode: Path, work_dir: Path, center_xy: tuple[float, float] | None,
+               copies: int = 1, export_3mf: Path | None = None, timeout_s=600) -> SliceRun:
+    """Slice the meshes as ONE job (one object per mesh, in argument order).
+
+    ``center_xy`` centres the model on the bed; ``None`` keeps every mesh at the bed
+    coordinates it was written with (plates laid out by ``plate.plan_plate``). With
+    ``complete_objects = 1`` PrusaSlicer prints the objects in argument order."""
     started = time.monotonic()
     work_dir = Path(work_dir).resolve()
     output_gcode = Path(output_gcode).resolve()
@@ -283,13 +288,18 @@ def slice_mesh(install: SlicerInstall, *, mesh_paths: list[Path], config: dict[s
         write_ini({**config, 'binary_gcode': '0'}, config_path)
     except ValueError as exc:
         return refused('invalid_config', str(exc))
-    transforms = ['--ensure-on-bed', '--center', f'{center_xy[0]:g},{center_xy[1]:g}']
+    transforms = ['--ensure-on-bed']
+    if center_xy is not None:
+        transforms += ['--center', f'{center_xy[0]:g},{center_xy[1]:g}']
     # 2.9.6 has no --arrange. --duplicate arranges copies. Multi-mesh
-    # components retain their supplied relative coordinates: bare --merge's
-    # auto-layout crashes in the headless flatpak, and separate actions would
-    # silently overwrite the one requested output.
+    # components retain their supplied coordinates (probed 2026-10-03): bare
+    # --merge's auto-layout crashes in the headless flatpak, and separate
+    # actions would silently overwrite the one requested output. The 2.9.6 CLI
+    # does NOT check sequential-print clearances; plate.py and gcode_check do.
+    if len(mesh_paths) > 1 or center_xy is None:
+        transforms += ['--dont-arrange']
     if len(mesh_paths) > 1:
-        transforms += ['--dont-arrange', '--merge']
+        transforms += ['--merge']
     if copies > 1:
         transforms += ['--duplicate', str(copies)]
     common = ['--load', str(config_path), '--threads', '2', '--loglevel', '2', *transforms]

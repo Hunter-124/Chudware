@@ -247,3 +247,53 @@ def test_support_branch_may_start_over_support_base_within_the_drop(tmp_path, ga
     branch = _line(z, 'Support material', 12, 10.2, 28, 10.2)
     checks, _ = _verify(tmp_path, _START + _column(2.2) + base + branch + _END)
     assert checks['floating_extrusion']['status'] == expected, checks['floating_extrusion']['note']
+
+
+_SEQUENTIAL = '; complete_objects = 1\n; extruder_clearance_radius = 20\n; extruder_clearance_height = 5\n'
+
+
+def _object(name, x, top, layers=None):
+    """A labelled 10 mm square column at (x, 40) printed from the bed to `top`.
+
+    Like PrusaSlicer, it travels to the object at the previous height, then descends."""
+    out = ''
+    for i in layers or range(1, int(round(top / .2)) + 1):
+        z = round(i * .2, 3)
+        out += (f'; printing object {name} id:0 copy 0\n;LAYER_CHANGE\n;Z:{z}\n;HEIGHT:0.2\n'
+                f';TYPE:Perimeter\n;WIDTH:0.45\nG1 X{x} Y40\nG1 Z{z}\nG1 X{x+10} Y40 E1\n'
+                f'G1 X{x+10} Y50 E1\nG1 X{x} Y50 E1\nG1 X{x} Y40 E1\n'
+                f'; stop printing object {name} id:0 copy 0\n')
+    return out + f'G1 Z{round(top + .4, 3)}\n'
+
+
+def _sequential(tmp_path, body):
+    checks, _ = _verify(tmp_path, _START + body + _END + _SEQUENTIAL, detail=True)
+    return checks['sequential_clearance']
+
+
+def test_sequential_objects_spaced_beyond_the_clearance_in_ascending_height_pass(tmp_path):
+    row = _sequential(tmp_path, _object('low', 10, 2) + _object('high', 60, 4))
+    assert row['status'] == 'pass', row['note']
+    assert [o['object'].split()[0] for o in row['metrics']['objects']] == ['low', 'high']
+
+
+def test_sequential_hotend_passing_a_finished_object_inside_the_radius_fails(tmp_path):
+    row = _sequential(tmp_path, _object('first', 10, 2) + _object('second', 35, 4))
+    assert row['status'] == 'fail'
+    hit = row['regions'][0]
+    assert hit['kind'] == 'extruder' and hit['finished_object'].startswith('first')
+    assert hit['clearance_mm'] < 20
+
+
+def test_sequential_object_taller_than_the_gantry_printed_first_fails(tmp_path):
+    row = _sequential(tmp_path, _object('tall', 10, 8) + _object('short', 70, 2))
+    assert row['status'] == 'fail'
+    assert row['metrics']['gantry_collision_moves'] > 0
+    assert row['regions'][0]['kind'] == 'gantry'
+
+
+def test_sequential_flag_with_interleaved_objects_fails(tmp_path):
+    body = (_object('a', 10, .2, layers=[1]) + _object('b', 70, .2, layers=[1])
+            + _object('a', 10, .4, layers=[2]))
+    row = _sequential(tmp_path, body)
+    assert row['status'] == 'fail' and row['metrics']['interleaved']

@@ -168,7 +168,9 @@ system_prompt: |
   2. slice_part is the ONLY route to G-code: vendor presets for the user's
      printer, measured orientation, supports from the analysis, verify_gcode on
      the result. Never fetch a slicer, write slicer .ini keys, or reuse an
-     unmeasured build_dir.
+     unmeasured build_dir. Several parts in one job: slice_part(parts=[...]);
+     add complete_individual_objects=True for PrusaSlicer's "Complete
+     individual objects" (one object at a time, clearance-checked).
   3. Deliver only print_ready results, or say exactly which check failed and why.
   4. Printer media (USB/SD) holds exactly the current set; the printer shows
      names, not dates. The moment a flashdrive/SD delivery is asked for, call

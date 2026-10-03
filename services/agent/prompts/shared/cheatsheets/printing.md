@@ -9,7 +9,22 @@
    supports and the bed off those faces). `slice_part(orientation="auto")` uses the same scorer.
 3. `slice_part(doc_id=…, printer="ender 3", material="PLA", goal=…)` — vendor presets from the
    installed PrusaSlicer, orientation, supports and brim from the analysis, then
-   `verify_gcode`. One call per part; `copies=N` for repeats on one plate.
+   `verify_gcode`. `copies=N` repeats one part on its plate.
+   Several parts in one job: `slice_part(parts=[{"doc_id": a, "copies": 2}, {"doc_id": b},
+   {"path": "…stl"}], printer=…, name="small_parts")` — each part is oriented and analysed on
+   its own (per-entry `orientation`/`build_dir`/`preserve_faces`/`strength_dir`), the
+   plate is laid out and bed-checked deterministically, and the result is ONE G-code with
+   `plate.objects` (position, height, print order).
+   "Complete individual objects" (PrusaSlicer `complete_objects`): add
+   `complete_individual_objects=True` (with `parts` or `copies`). Each object prints to
+   completion before the next, so a failed object does not scrap the rest. Objects are spaced
+   by the printer's `extruder_clearance_radius` (Ender-3: 55 mm) plus brims and printed in
+   ascending height; at most ONE object may exceed `extruder_clearance_height` (Ender-3:
+   25 mm), and it prints last. A plate that breaks this is refused naming the objects —
+   split it, reorient lower, or print layer by layer. Never set `complete_objects` through
+   `overrides`: stock PrusaSlicer's CLI checks none of these clearances, so the layout and
+   `gcode_check.sequential_clearance` (hotend and gantry vs finished objects, from the
+   toolpath) are the only guard.
 4. Deliver only `print_ready: true`, or name the failing check. Put G-code on printer media
    only through the media tools below.
 - No slicer installed → `slicer_status` returns the install command; give it to the user.
@@ -76,7 +91,9 @@ indistinguishable on its screen. The media must hold exactly the current set.
   suits most functional parts; goal "strength" (4+ walls, 35 % cubic) only for loaded parts;
   goal "material"/"speed" for covers, jigs, prototypes.
 - Prefer one larger plate over many single jobs only when parts share a material and layer
-  height; split parts that exceed the bed or would need large supports.
+  height; split parts that exceed the bed or would need large supports. Sequential plates
+  (`complete_individual_objects=True`) hold far fewer objects (clearance spacing) but lose
+  only one object to a failure; publish each plate as one job (`part_id` for the plate).
 - Report slicer time/grams from `slice_part.stats` — never the deterministic estimate as truth.
 
 ## Reading verify_gcode
@@ -84,3 +101,6 @@ indistinguishable on its screen. The media must hold exactly the current set.
   spaghetti. Reorient, enable supports, or redesign; never ship it.
 - `heat_before_extrude`, `temperatures`, `bounds`, `max_height`, `homing_before_motion` are hard
   stops. Warnings on retraction/fan are advice tied to the printer type.
+- `sequential_clearance` fail (Complete individual objects): a later move runs the hotend
+  inside the clearance radius of, or the gantry below the top of, a finished object;
+  `regions` name it. Re-plan the plate; never print it.

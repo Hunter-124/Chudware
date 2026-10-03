@@ -456,6 +456,7 @@ def _validate_jobs(jobs: Any) -> list[dict]:
             "manifest_path": manifest_path,
             "manifest_sha256": loaded["sha256"],
             "part": manifest.get("part"),
+            "plate": _plate_contents(manifest),
             "printer": manifest.get("printer"),
             "warnings": evidence,
         })
@@ -1243,6 +1244,23 @@ def _build_archive(rootp: Path, staged_zip: Path, retire: list[dict], info: dict
     return _hash_path(staged_zip)[0]
 
 
+def _plate_contents(manifest: dict) -> Optional[dict]:
+    """{complete_individual_objects, parts:[{part, copies}]} of a slice_part plate job, else None."""
+    plate = manifest.get("plate")
+    if not isinstance(plate, dict):
+        return None
+    parts = []
+    for row in plate.get("parts") or []:
+        if not isinstance(row, dict):
+            continue
+        copies = row.get("copies")
+        parts.append({"part": str(row.get("part")),
+                      "copies": copies if isinstance(copies, int) and not isinstance(copies, bool)
+                      else 1})
+    return {"complete_individual_objects": plate.get("complete_individual_objects") is True,
+            "parts": parts}
+
+
 def _readme(folder: str, revision: int, published_at: str, current: list[dict],
             archive_rel: Optional[str]) -> str:
     lines = [
@@ -1258,6 +1276,12 @@ def _readme(folder: str, revision: int, published_at: str, current: list[dict],
     for entry in current:
         lines.append(f"  {entry['file_name']:<{width}}  part_id={entry['part_id']}  "
                      f"sha256={entry['sha256'][:16]}")
+        plate = entry.get("plate")
+        if plate:
+            members = ", ".join(f"{row['part']} x{row['copies']}" for row in plate["parts"])
+            mode = ("one object at a time (Complete individual objects)"
+                    if plate["complete_individual_objects"] else "all objects together")
+            lines.append(f"  {'':<{width}}  plate: {members}; prints {mode}")
     lines += [
         "",
         f"Older releases are kept as non-printable ZIP archives in {ARCHIVE_DIR}/{folder}/.",
@@ -1550,6 +1574,7 @@ def _publish_locked(rootp: Path, folder: str, sources: list[dict], retire: list[
             "part_id": s["part_id"], "part_number": s["part_number"],
             "code": s["file_name"][:6], "file_name": s["file_name"], "path": s["dest"],
             "sha256": s["sha256"], "size": s["size"], "part": s["part"],
+            **({"plate": s["plate"]} if s["plate"] else {}),
             "printer": s["printer"],
             "source": {"manifest_path": str(s["manifest_path"]),
                        "manifest_sha256": s["manifest_sha256"],

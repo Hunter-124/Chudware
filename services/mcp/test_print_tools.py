@@ -140,3 +140,44 @@ def test_copies_arrange_a_part_modelled_far_from_the_origin(tmp_path):
                    output_dir=str(tmp_path), name="far")
     assert result["ok"], result
     assert result["print_ready"] is True, result
+
+
+def _box(length, width, height) -> str:
+    return _part([cb.feat("box", "Box", {"length": cb.dim(length), "width": cb.dim(width),
+                                         "height": cb.dim(height)})])
+
+
+def test_sequential_plate_prints_each_object_to_completion_in_height_order(tmp_path):
+    low, tall = _box(20, 20, 6), _box(12, 12, 30)
+    result = _call("slice_part", parts=[{"doc_id": tall, "orientation": "as_is"},
+                                        {"doc_id": low, "copies": 2}],
+                   printer="ender 3", complete_individual_objects=True,
+                   output_dir=str(tmp_path), name="small_parts")
+    assert result["ok"] and result["print_ready"], result
+    objects = result["plate"]["objects"]
+    assert [o["height_mm"] for o in objects] == [6.0, 6.0, 30.0]
+    assert result["plate"]["min_object_gap_mm"] >= 55
+    # The toolpath itself prints the objects one after another in the planned order.
+    gcode = Path(result["gcode_path"]).read_text()
+    starts = [gcode.index(f"; printing object {o['gcode_label']}", gcode.index(";LAYER_CHANGE"))
+              for o in objects]
+    assert starts == sorted(starts)
+    check = _call("verify_gcode", path=result["gcode_path"], printer="ender 3", material="PLA")
+    rows = {row["check"]: row for row in check["checks"]}
+    assert rows["sequential_clearance"]["status"] == "pass", rows["sequential_clearance"]
+    assert rows["sequential_clearance"]["metrics"]["object_count"] == 3
+    manifest = json.loads(Path(result["manifest_path"]).read_text())
+    assert manifest["effective"]["complete_objects"] == "1"
+    assert [p["copies"] for p in manifest["plate"]["parts"]] == [1, 2]
+    assert manifest["print_ready"] is True and manifest["source"]["kind"] == "plate"
+
+
+def test_sequential_plate_with_two_objects_above_the_gantry_is_refused(tmp_path):
+    first, second = _box(12, 12, 30), _box(12, 12, 28)
+    result = _call("slice_part", parts=[{"doc_id": first, "orientation": "as_is"},
+                                        {"doc_id": second, "orientation": "as_is"}],
+                   printer="ender 3", complete_individual_objects=True,
+                   output_dir=str(tmp_path), name="too_tall")
+    assert result["ok"] is False and result["reason"] == "too_tall_for_sequential", result
+    assert len(result["objects"]) == 2
+    assert not list(tmp_path.glob("*.gcode"))

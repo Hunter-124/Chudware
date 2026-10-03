@@ -10,7 +10,9 @@ Family ``cam`` (additive CAM). Seven tools:
 * ``slice_part`` — the one supported way to produce G-code: vendor presets for the named
   printer + goal-driven settings, auto orientation and supports from the DFAM analysis,
   STOCK PrusaSlicer as an out-of-process subprocess (AGPL boundary: files and argv only),
-  then ``verify_gcode`` on the result and a manifest beside it.
+  then ``verify_gcode`` on the result and a manifest beside it. ``parts=[...]`` slices
+  several parts as one plate (layout: ``services/manufacturing/slicer/plate.py``) and
+  ``complete_individual_objects=True`` prints them one at a time, clearance-checked.
 * ``verify_gcode`` — deterministic proof of an existing G-code file (bounds, temperatures,
   cold extrusion, homing, layer heights, and per-layer mid-air extrusion detection).
 * ``print_media_inventory`` — read-only inventory of a printer flashdrive/SD card: every
@@ -317,19 +319,178 @@ def _write_binary_stl(path: Path, vertices, triangles) -> None:
         handle.write(record.tobytes())
 
 
-def _slice_mesh_arrays(source: dict, work_dir: Path):
+def _slice_mesh_arrays(source: dict, work_dir: Path, raw_name: str = "model_frame.stl"):
     """(vertices, triangles) at slicing quality in the MODEL frame."""
     from services.dfam import load_mesh_file  # noqa: PLC0415
 
     if source["kind"] == "file":
         mesh = load_mesh_file(Path(source["path"]))
         return mesh.vertices, mesh.triangles
-    raw = work_dir / "model_frame.stl"
+    raw = work_dir / raw_name
     cb.call("export_file", {"doc_id": source["doc_id"], "path": str(raw), "format": "stl",
                             "lin_deflection": _SLICE_LIN_DEFLECTION_MM,
                             "ang_deflection": _SLICE_ANG_DEFLECTION_RAD})
     mesh = load_mesh_file(raw)
     return mesh.vertices, mesh.triangles
+
+
+def _oriented_arrays(source: dict, orient: dict, work_dir: Path, raw_name: str):
+    """(vertices, triangles) in the chosen build pose, XY-centred on the origin, resting on z=0.
+
+    Origin-centred because PrusaSlicer's --duplicate arrange fails with "No outline can be
+    derived" on a mesh that sits far from the origin."""
+    import numpy as np  # noqa: PLC0415
+    from services.dfam import frame_for_build_dir  # noqa: PLC0415
+
+    vertices, triangles = _slice_mesh_arrays(source, work_dir, raw_name)
+    rotation = frame_for_build_dir(orient["build_dir"], orient["yaw_deg"])
+    oriented = np.asarray(vertices, dtype=np.float64) @ np.asarray(rotation).T
+    low, high = oriented.min(axis=0), oriented.max(axis=0)
+    oriented = oriented - np.array([(low[0] + high[0]) / 2, (low[1] + high[1]) / 2, low[2]])
+    return oriented, triangles
+
+
+_PART_KEYS = ("doc_id", "path", "copies", "orientation", "build_dir", "name", "preserve_faces",
+              "strength_dir")
+_MAX_OBJECTS = 64
+
+
+def _slice_targets(*, doc_id, path, copies, orientation, build_dir, preserve_faces,
+                   strength_dir, parts) -> list[dict]:
+    """One {doc_id, path, copies, orientation, build_dir, …} per distinct part to slice."""
+    copies = int(copies)
+    if parts is None:
+        if not 1 <= copies <= _MAX_OBJECTS:
+            raise ValueError(f"copies must be 1..{_MAX_OBJECTS}")
+        return [{"doc_id": doc_id, "path": path, "copies": copies, "orientation": orientation,
+                 "build_dir": build_dir, "preserve_faces": preserve_faces,
+                 "strength_dir": strength_dir, "name": None}]
+    if doc_id or path:
+        raise ValueError("pass either parts=[...] or doc_id/path, not both")
+    if copies != 1 or build_dir is not None or preserve_faces or strength_dir is not None:
+        raise ValueError("with parts=[...], give copies, build_dir, preserve_faces and "
+                         "strength_dir inside each part entry")
+    if not isinstance(parts, list) or not parts:
+        raise ValueError("parts must be a non-empty list of {doc_id or path, copies, …}")
+    targets = []
+    for index, item in enumerate(parts):
+        if not isinstance(item, dict):
+            raise ValueError(f"parts[{index}] must be an object like {{'doc_id': ..., 'copies': 2}}")
+        unknown = sorted(set(item) - set(_PART_KEYS))
+        if unknown:
+            raise ValueError(f"parts[{index}]: unknown keys {unknown}; allowed {list(_PART_KEYS)}")
+        if bool(item.get("doc_id")) == bool(item.get("path")):
+            raise ValueError(f"parts[{index}] needs exactly one of doc_id or path")
+        count = int(item.get("copies", 1))
+        if not 1 <= count <= _MAX_OBJECTS:
+            raise ValueError(f"parts[{index}].copies must be 1..{_MAX_OBJECTS}")
+        targets.append({"doc_id": item.get("doc_id"), "path": item.get("path"), "copies": count,
+                        "orientation": item.get("orientation", orientation),
+                        "build_dir": item.get("build_dir"),
+                        "preserve_faces": item.get("preserve_faces"),
+                        "strength_dir": item.get("strength_dir"), "name": item.get("name")})
+    total = sum(t["copies"] for t in targets)
+    if total > _MAX_OBJECTS:
+        raise ValueError(f"a plate holds at most {_MAX_OBJECTS} objects; these parts ask for {total}")
+    return targets
+
+
+def _prepare_target(target: dict, params, goal: str) -> dict:
+    """Load, orient and analyse one part: {label, source, orient, analysis, rows, copies}."""
+    from services.dfam import analyze_printability  # noqa: PLC0415
+
+    mesh, label, source = load_target(target.get("doc_id"), target.get("path"))
+    orient = _orientation_choice(mesh, params, orientation=target.get("orientation") or "auto",
+                                 build_dir=target.get("build_dir"), goal=goal,
+                                 preserve_faces=target.get("preserve_faces"),
+                                 strength_dir=target.get("strength_dir"))
+    analysis = analyze_printability(mesh, params, orient["build_dir"], yaw_deg=orient["yaw_deg"])
+    return {"label": str(target.get("name") or label), "source": source, "orient": orient,
+            "analysis": analysis, "rows": {row["check"]: row for row in analysis["checks"]},
+            "copies": target["copies"]}
+
+
+def _support_brim_settings(prepared: list[dict], params, supports, brim) -> tuple[dict, bool, dict]:
+    """Plate-wide support/brim keys decided from every part's DFAM rows.
+
+    PrusaSlicer applies these per job; auto supports still only grow under the overhangs the
+    slicer finds, so a part that needs none stays clean."""
+    mode = str(supports or "auto").strip().lower()
+    if mode not in ("auto", "on", "off", "buildplate"):
+        raise ValueError("supports must be auto | on | off | buildplate")
+
+    def needs_support(rows):
+        row = rows.get("support") or {}
+        return row.get("status") in ("warn", "fail") or float(
+            (row.get("metrics") or {}).get("support_volume_mm3") or 0.0) > 1.0
+
+    support_for = [p["label"] for p in prepared if needs_support(p["rows"])]
+    enable = mode in ("on", "buildplate") or (mode == "auto" and bool(support_for))
+    settings: dict[str, str] = {}
+    if enable:
+        settings.update({
+            "support_material": "1", "support_material_auto": "1",
+            "support_material_style": "organic",
+            "support_material_threshold": f"{90.0 - params.overhang_max_deg:g}",
+            "support_material_buildplate_only": "1" if mode == "buildplate" else "0"})
+        # Vendor presets skip support under anything the slicer calls a bridge; a
+        # span the analysis measured beyond twice the bridge limit then prints its
+        # perimeters in mid-air. Support those spans instead.
+        if any((p["rows"].get("bridges") or {}).get("status") == "fail" for p in prepared):
+            settings["dont_support_bridges"] = "0"
+    else:
+        settings["support_material"] = "0"
+    brim_for = [p["label"] for p in prepared
+                if (p["rows"].get("bed_adhesion") or {}).get("status") in ("warn", "fail")]
+    if isinstance(brim, (int, float)) and not isinstance(brim, bool):
+        settings["brim_width"] = f"{float(brim):g}"
+    elif str(brim).strip().lower() == "auto":
+        if brim_for:
+            settings["brim_width"] = "5"
+            settings["brim_type"] = "outer_only"
+    else:
+        raise ValueError("brim must be 'auto' or a width in mm")
+    return settings, enable, {"support_for": support_for, "brim_for": brim_for}
+
+
+def _layout_plate(prepared: list[dict], config: dict, resolved, work_dir: Path,
+                  sequential: bool) -> tuple[dict, list[Path], list[dict]]:
+    """Plan the plate and write one placed STL per object, in print order.
+
+    Returns (plan, mesh_paths, objects) or raises PlateRefusal. The STL file name is the
+    object's label in the G-code (``; printing object 01_<part>_1.stl``), so the order and
+    part of every printed object can be read back from the toolpath."""
+    import numpy as np  # noqa: PLC0415
+    from services.manufacturing.slicer.plate import PlateItem, footprint_hull, plan_plate  # noqa: PLC0415
+
+    items, arrays = [], {}
+    for index, part in enumerate(prepared):
+        oriented, triangles = _oriented_arrays(part["source"], part["orient"], work_dir,
+                                               f"model_frame_{index:02d}.stl")
+        arrays[part["label"]] = (oriented, triangles)
+        hull = footprint_hull(oriented[:, :2])
+        height = float(oriented[:, 2].max())
+        for copy in range(1, part["copies"] + 1):
+            items.append(PlateItem(f"{part['label']}#{copy}", part["label"], copy, hull, height))
+    brim_mm = _num(config.get("brim_width"), 0.0) or 0.0
+    if str(config.get("brim_type") or "").strip() == "no_brim":
+        brim_mm = 0.0
+    skirts = int(_num(config.get("skirts"), 0.0) or 0)
+    skirt_mm = (_num(config.get("skirt_distance"), 0.0) or 0.0) + 0.45 * skirts if skirts else 0.0
+    plan = plan_plate(items, bed_polygon=resolved.bed_polygon(), sequential=sequential,
+                      clearance_radius_mm=_num(config.get("extruder_clearance_radius")),
+                      clearance_height_mm=_num(config.get("extruder_clearance_height")),
+                      brim_mm=brim_mm, skirt_mm=skirt_mm)
+    paths = []
+    for obj in plan["objects"]:
+        oriented, triangles = arrays[obj["part"]]
+        placed = oriented + np.array([obj["offset_mm"][0], obj["offset_mm"][1], 0.0])
+        stl = work_dir / f"{obj['print_order']:02d}_{_slug(obj['part'])}_{obj['copy']}.stl"
+        _write_binary_stl(stl, placed, triangles)
+        obj["gcode_label"] = stl.name
+        obj["mesh_sha256"] = _sha256_file(stl)
+        paths.append(stl)
+    return plan, paths, plan["objects"]
 
 
 def _output_dir(output_dir: Optional[str], stem: str, printer_slug: str) -> Path:
@@ -480,8 +641,10 @@ def register_print_tools(mcp: FastMCP) -> None:
                    print_preset: Optional[str] = None, filament_preset: Optional[str] = None,
                    overrides: Optional[dict] = None, preserve_faces: Optional[list] = None,
                    strength_dir: Optional[list] = None, output_dir: Optional[str] = None,
-                   name: Optional[str] = None, export_3mf: bool = True) -> str:
-        """Slice a part to printer-ready G-code with STOCK PrusaSlicer and prove the result.
+                   name: Optional[str] = None, export_3mf: bool = True,
+                   parts: Optional[list[dict]] = None,
+                   complete_individual_objects: bool = False) -> str:
+        """Slice one part, or several parts on one plate, to printer-ready G-code with STOCK PrusaSlicer and prove the result.
 
         This is the ONLY supported way to make G-code. Never download a slicer, never write a
         slicer .ini by hand, never pass a design-time build_dir you did not measure.
@@ -504,26 +667,46 @@ def register_print_tools(mcp: FastMCP) -> None:
           (validated; unknown keys are refused with close matches).
         copies: identical instances arranged on one plate.
 
+        Several parts on ONE plate (one G-code file): parts=[{doc_id or path, copies?,
+          orientation?, build_dir?, name?, preserve_faces?, strength_dir?}, ...] instead of
+          doc_id/path. Each part is oriented and analysed on its own; supports/brim and the
+          print settings apply to the whole plate; name= names the plate (default "plate").
+          Objects are laid out deterministically, spaced and checked against the bed.
+        complete_individual_objects: PrusaSlicer's "Complete individual objects"
+          (complete_objects=1): each object prints to completion before the next starts, so
+          one failure does not scrap the plate. Works with parts=[...] or copies. Spacing
+          becomes the printer's extruder_clearance_radius (Ender-3: 55 mm) plus brims, the
+          print order is ascending height, and at most ONE object may be taller than
+          extruder_clearance_height (Ender-3: 25 mm) — it prints last. A plate that cannot
+          meet that is refused naming the objects (split the plate or print layer by layer);
+          gcode_check.sequential_clearance then proves from the toolpath that no move runs
+          the hotend or gantry into a finished object.
+
         Writes <output_dir>/<name>.gcode (+ .3mf project for review in PrusaSlicer, + a
         .print.json manifest) — default <project>/print/<printer>/. Returns printer/presets,
         orientation (with alternatives), effective settings, slicer stats (time, grams,
         layers, support share), printability issues (dfm-style rows) and gcode_check
-        (verify_gcode). print_ready is true only when the G-code verification passes and the
-        printability analysis has no failure. Report print_ready=false honestly and fix the
-        design (dfm_check lists the faces) or settings, then slice again. The manifest_path of
-        a print-ready result is what publish_print_media takes to put it on printer media
-        (print_media_inventory first); never copy the G-code there by hand."""
+        (verify_gcode); a plate also returns plate.objects (print order, position, height)
+        and per-part orientation/printability. print_ready is true only when the G-code
+        verification passes and the printability analysis has no failure. Report
+        print_ready=false honestly and fix the design (dfm_check lists the faces) or
+        settings, then slice again. The manifest_path of a print-ready result is what
+        publish_print_media takes to put it on printer media (one job per plate;
+        print_media_inventory first); never copy the G-code there by hand."""
         started = time.monotonic()
         try:
-            from services.dfam import analyze_printability, frame_for_build_dir  # noqa: PLC0415
             from services.manufacturing.slicer import prusaslicer as ps  # noqa: PLC0415
+            from services.manufacturing.slicer.plate import PlateRefusal  # noqa: PLC0415
 
             goal = str(goal or "balanced").strip().lower()
             if goal not in _GOALS:
                 raise ValueError(f"goal must be one of {', '.join(_GOALS)}")
-            copies = int(copies)
-            if not 1 <= copies <= 64:
-                raise ValueError("copies must be 1..64")
+            targets = _slice_targets(doc_id=doc_id, path=path, copies=copies,
+                                     orientation=orientation, build_dir=build_dir,
+                                     preserve_faces=preserve_faces, strength_dir=strength_dir,
+                                     parts=parts)
+            sequential = bool(complete_individual_objects)
+            plate_mode = parts is not None or sequential
             if not printer or not str(printer).strip():
                 return _dumps({"ok": False, "reason": "printer_required",
                                "content": "Ask the user which printer (make and model, nozzle "
@@ -545,8 +728,6 @@ def register_print_tools(mcp: FastMCP) -> None:
             filament_name = filament_preset or catalog.default_filament(printer_name, material)
             resolved = catalog.resolve(printer_name, print_name, filament_name)
 
-            mesh, label, source = load_target(doc_id, path)
-            stem = _project_save_stem(name or label, source.get("doc_id") or label)
             dfm = dfm_profile_params("fdm")
             settings: dict[str, str] = dict(_goal_settings(goal, resolved.config))
             if infill_percent is not None:
@@ -562,49 +743,25 @@ def register_print_tools(mcp: FastMCP) -> None:
             params = print_params(resolved=resolved, dfm=dfm, material=material,
                                   config=settings)
 
-            orient = _orientation_choice(mesh, params, orientation=orientation,
-                                         build_dir=build_dir, goal=goal,
-                                         preserve_faces=preserve_faces,
-                                         strength_dir=strength_dir)
-            analysis = analyze_printability(mesh, params, orient["build_dir"],
-                                            yaw_deg=orient["yaw_deg"])
-            rows = {row["check"]: row for row in analysis["checks"]}
-            volume_row = rows.get("build_volume") or {}
-            if volume_row.get("status") == "fail":
-                return _dumps({"ok": False, "reason": "does_not_fit_printer",
-                               "printer": printer_name, "orientation": orient,
-                               "build_volume": volume_row,
-                               "content": volume_row.get("note") or "part exceeds the bed"})
+            prepared = [_prepare_target(target, params, goal) for target in targets]
+            seen: dict[str, int] = {}
+            for part in prepared:  # plate object labels must be unique
+                count = seen.get(part["label"], 0) + 1
+                seen[part["label"]] = count
+                if count > 1:
+                    part["label"] = f"{part['label']}_{count}"
+            for part in prepared:
+                volume_row = part["rows"].get("build_volume") or {}
+                if volume_row.get("status") == "fail":
+                    return _dumps({"ok": False, "reason": "does_not_fit_printer",
+                                   "printer": printer_name, "part": part["label"],
+                                   "orientation": part["orient"], "build_volume": volume_row,
+                                   "content": f"{part['label']}: "
+                                              f"{volume_row.get('note') or 'part exceeds the bed'}"})
 
-            support_row = rows.get("support") or {}
-            mode = str(supports or "auto").strip().lower()
-            if mode not in ("auto", "on", "off", "buildplate"):
-                raise ValueError("supports must be auto | on | off | buildplate")
-            needs_support = support_row.get("status") in ("warn", "fail") or float(
-                (support_row.get("metrics") or {}).get("support_volume_mm3") or 0.0) > 1.0
-            enable = mode in ("on", "buildplate") or (mode == "auto" and needs_support)
-            if enable:
-                settings.update({
-                    "support_material": "1", "support_material_auto": "1",
-                    "support_material_style": "organic",
-                    "support_material_threshold": f"{90.0 - params.overhang_max_deg:g}",
-                    "support_material_buildplate_only": "1" if mode == "buildplate" else "0"})
-                # Vendor presets skip support under anything the slicer calls a bridge; a
-                # span the analysis measured beyond twice the bridge limit then prints its
-                # perimeters in mid-air. Support those spans instead.
-                if (rows.get("bridges") or {}).get("status") == "fail":
-                    settings["dont_support_bridges"] = "0"
-            else:
-                settings["support_material"] = "0"
-            adhesion = rows.get("bed_adhesion") or {}
-            if isinstance(brim, (int, float)) and not isinstance(brim, bool):
-                settings["brim_width"] = f"{float(brim):g}"
-            elif str(brim).strip().lower() == "auto":
-                if adhesion.get("status") in ("warn", "fail"):
-                    settings["brim_width"] = "5"
-                    settings["brim_type"] = "outer_only"
-            else:
-                raise ValueError("brim must be 'auto' or a width in mm")
+            support_settings, enable, reasons = _support_brim_settings(prepared, params,
+                                                                       supports, brim)
+            settings.update(support_settings)
             # Plain-text G-code so verify_gcode can read every move (MK4-class presets
             # default to binary .bgcode, which the printer also accepts as text).
             settings["binary_gcode"] = "0"
@@ -612,6 +769,8 @@ def register_print_tools(mcp: FastMCP) -> None:
             # Creality-class vendor presets ship it off, which prints unsupported outer
             # walls at full perimeter speed.
             settings["overhangs"] = "1"
+            if plate_mode:
+                settings["complete_objects"] = "1" if sequential else "0"
             if overrides:
                 requested = {str(key): str(value) for key, value in overrides.items()}
                 refusal = ps.validate_overrides(install, resolved.config, requested)
@@ -619,28 +778,47 @@ def register_print_tools(mcp: FastMCP) -> None:
                     return _dumps({"ok": False, "reason": "invalid_override",
                                    "refusal": refusal.to_dict(),
                                    "content": refusal.message})
+                if "complete_objects" in requested:
+                    raise ValueError("set Complete individual objects with "
+                                     "complete_individual_objects=True, not overrides: the "
+                                     "plate layout and clearance checks depend on it")
                 settings.update(requested)
 
+            first = prepared[0]
+            if parts is not None:
+                stem = _project_save_stem(name or "plate", "plate")
+            else:
+                stem = _project_save_stem(name or first["label"],
+                                          first["source"].get("doc_id") or first["label"])
             out_dir = _output_dir(output_dir, stem, _slug(printer_name))
             work_dir = out_dir / f".{stem}.slice"
             work_dir.mkdir(parents=True, exist_ok=True)
-            vertices, triangles = _slice_mesh_arrays(source, work_dir)
-            import numpy as np  # noqa: PLC0415
-            rotation = frame_for_build_dir(orient["build_dir"], orient["yaw_deg"])
-            oriented = np.asarray(vertices, dtype=np.float64) @ np.asarray(rotation).T
-            # Origin-centred, resting on z=0: PrusaSlicer's --duplicate arrange fails with
-            # "No outline can be derived" on a mesh that sits far from the origin.
-            low, high = oriented.min(axis=0), oriented.max(axis=0)
-            oriented = oriented - np.array([(low[0] + high[0]) / 2, (low[1] + high[1]) / 2, low[2]])
-            oriented_stl = work_dir / f"{stem}.oriented.stl"
-            _write_binary_stl(oriented_stl, oriented, triangles)
-
             config = {**resolved.config, **settings}
+            plan = None
+            if plate_mode:
+                try:
+                    plan, mesh_paths, objects = _layout_plate(prepared, config, resolved,
+                                                              work_dir, sequential)
+                except PlateRefusal as refusal:
+                    return _dumps({**refusal.to_dict(), "printer": printer_name,
+                                   "complete_individual_objects": sequential})
+                center_xy, instance_copies = None, 1
+                mesh_sha = hashlib.sha256("".join(
+                    o["mesh_sha256"] for o in objects).encode()).hexdigest()
+            else:
+                oriented, triangles = _oriented_arrays(first["source"], first["orient"],
+                                                       work_dir, "model_frame.stl")
+                oriented_stl = work_dir / f"{stem}.oriented.stl"
+                _write_binary_stl(oriented_stl, oriented, triangles)
+                mesh_paths, center_xy = [oriented_stl], resolved.bed_center()
+                instance_copies = first["copies"]
+                mesh_sha = _sha256_file(oriented_stl)
+
             gcode_path = out_dir / f"{stem}.gcode"
             project = out_dir / f"{stem}.3mf" if export_3mf else None
-            run = ps.slice_mesh(install, mesh_paths=[oriented_stl], config=config,
+            run = ps.slice_mesh(install, mesh_paths=mesh_paths, config=config,
                                 output_gcode=gcode_path, work_dir=work_dir,
-                                center_xy=resolved.bed_center(), copies=copies,
+                                center_xy=center_xy, copies=instance_copies,
                                 export_3mf=project)
             if not run.ok:
                 refusal = getattr(run, "refusal", None)
@@ -661,7 +839,8 @@ def register_print_tools(mcp: FastMCP) -> None:
             # else (vanishing walls, trapped support, sealed cavities, floating bodies, bed
             # fit) survives slicing and blocks print_ready.
             solved = {"overhang", "bridges"} if enable else set()
-            printability_fail = [r for r in analysis["checks"]
+            printability_fail = [{**r, "part": p["label"]} for p in prepared
+                                 for r in p["analysis"]["checks"]
                                  if r.get("status") == "fail" and r.get("check") not in solved]
             print_ready = bool(check.get("ok")) and not printability_fail
             stats = check.get("stats") or {}
@@ -672,25 +851,60 @@ def register_print_tools(mcp: FastMCP) -> None:
                 "overhangs", "brim_width",
                 "temperature", "first_layer_temperature", "bed_temperature",
                 "first_layer_bed_temperature", "nozzle_diameter", "retract_length")}
+            if plate_mode:
+                effective.update({k: config.get(k) for k in (
+                    "complete_objects", "extruder_clearance_radius", "extruder_clearance_height")})
+            gcode_issues = _check_brief(check.get("checks") or [])
+            if plate_mode:
+                part_rows = [{"part": p["label"], "copies": p["copies"], "source": p["source"],
+                              "orientation": {k: p["orient"][k] for k in
+                                              ("build_dir", "yaw_deg", "source", "why")},
+                              "estimate": p["analysis"].get("estimate"),
+                              "printability": {"status": p["analysis"].get("status"),
+                                               "issues": _check_brief(p["analysis"]["checks"])}}
+                             for p in prepared]
+                statuses = [p["analysis"].get("status") for p in prepared]
+                printability = {
+                    "status": next((s for s in ("fail", "warn") if s in statuses), statuses[0]),
+                    "issues": [{**row, "part": p["label"]} for p in prepared
+                               for row in _check_brief(p["analysis"]["checks"])]}
+                plate_info = {**plan, "parts": part_rows, "support_for": reasons["support_for"],
+                              "brim_for": reasons["brim_for"]}
+                label = stem
+                source = {"kind": "plate", "parts": [
+                    {"part": p["label"], "source": p["source"], "copies": p["copies"]}
+                    for p in prepared]}
+                orientation_out = None
+                estimate = [{"part": p["label"], "estimate": p["analysis"].get("estimate")}
+                            for p in prepared]
+                total_copies = sum(p["copies"] for p in prepared)
+            else:
+                printability = {"status": first["analysis"].get("status"),
+                                "issues": _check_brief(first["analysis"]["checks"])}
+                plate_info = None
+                label, source = first["label"], first["source"]
+                orientation_out = {k: first["orient"][k]
+                                   for k in ("build_dir", "yaw_deg", "source", "why")}
+                estimate = first["analysis"].get("estimate")
+                total_copies = first["copies"]
             manifest = {
                 "schema": "chudware.print_job/1",
-                "part": label, "source": source, "copies": copies,
+                "part": label, "source": source, "copies": total_copies,
                 "printer": {"name": printer_name, "vendor": resolved.vendor,
                             "bed_polygon": resolved.bed_polygon(),
                             "max_height_mm": resolved.max_height()},
                 "presets": {"print": resolved.print_, "filament": resolved.filament},
                 "goal": goal, "settings_changed": settings, "effective": effective,
-                "orientation": {k: orient[k] for k in ("build_dir", "yaw_deg", "source", "why")},
+                "orientation": orientation_out,
+                **({"plate": plate_info} if plate_info is not None else {}),
                 "slicer": install.to_dict(),
                 "config_sha256": _sha256_file(Path(run.config_path)),
-                "mesh_sha256": _sha256_file(oriented_stl),
+                "mesh_sha256": mesh_sha,
                 "gcode": str(run.gcode_path), "gcode_sha256": _sha256_file(Path(run.gcode_path)),
                 "project_3mf": str(run.project_3mf) if run.project_3mf else None,
-                "stats": stats, "estimate": analysis.get("estimate"),
-                "printability": {"status": analysis.get("status"),
-                                 "issues": _check_brief(analysis["checks"])},
-                "gcode_check": {"status": check.get("status"),
-                                "issues": _check_brief(check.get("checks") or [])},
+                "stats": stats, "estimate": estimate,
+                "printability": printability,
+                "gcode_check": {"status": check.get("status"), "issues": gcode_issues},
                 "slicer_warnings": run.warnings, "print_ready": print_ready,
             }
             manifest_path = out_dir / f"{stem}.print.json"
@@ -702,18 +916,31 @@ def register_print_tools(mcp: FastMCP) -> None:
             if not check.get("ok"):
                 next_steps.append("G-code verification failed: read gcode_check.issues; "
                                   "change orientation/supports or the design before printing")
+            if any(row.get("check") == "sequential_clearance" and row.get("status") == "fail"
+                   for row in gcode_issues):
+                next_steps.append("sequential_clearance failed: the hotend or gantry would hit "
+                                  "a finished object; split the plate or print it layer by "
+                                  "layer (complete_individual_objects=False)")
             if print_ready:
                 next_steps.append(
                     f"to deliver on a printer USB/SD card: print_media_inventory(root=<mount>) "
                     f"first, compare its printable files with the project's COMPLETE job set, "
                     f"then publish_print_media(root, project, jobs=[{{part_id, manifest_path}} "
-                    f"for EVERY part, this one: {manifest_path}], expected_inventory="
+                    f"for EVERY part{' or plate' if plate_mode else ''}, this one: "
+                    f"{manifest_path}], expected_inventory="
                     f"<inventory_token>, media_idle=True only after the user confirms no "
                     f"printer is using the media). Never cp/fs_write G-code onto media; "
                     f"report the returned PRINT/<project>/ filenames and leftover unmanaged "
                     f"printables")
-            alternatives = orient.get("alternatives") or []
-            return _dumps({
+            hours = f"{(stats.get('print_time_s') or 0) / 3600:.2f} h"
+            if plate_mode:
+                mode_text = ("printed one at a time (Complete individual objects)" if sequential
+                             else "printed together layer by layer")
+                headline = (f"plate {stem}: {len(plan['objects'])} objects of "
+                            f"{len(prepared)} parts, {mode_text}; {run.gcode_path} — ")
+            else:
+                headline = f"{run.gcode_path} — "
+            result = {
                 "ok": True, "print_ready": print_ready, "part": label,
                 "gcode_path": str(run.gcode_path),
                 "project_3mf": str(run.project_3mf) if run.project_3mf else None,
@@ -722,20 +949,24 @@ def register_print_tools(mcp: FastMCP) -> None:
                             "other_matches": [m["name"] for m in matches[1:4]]},
                 "presets": {"print": resolved.print_, "filament": resolved.filament},
                 "goal": goal, "settings": effective,
-                "orientation": {**{k: orient[k] for k in ("build_dir", "yaw_deg", "source",
-                                                           "why")},
-                                "alternatives": alternatives[:2]},
-                "stats": stats, "estimate": analysis.get("estimate"),
-                "printability": {"status": analysis.get("status"),
-                                 "issues": _check_brief(analysis["checks"])},
-                "gcode_check": {"status": check.get("status"),
-                                "issues": _check_brief(check.get("checks") or [])},
+            }
+            if plate_mode:
+                result["plate"] = {k: plate_info[k] for k in (
+                    "complete_individual_objects", "objects", "gap_mm", "min_object_gap_mm",
+                    "clearance", "parts", "support_for", "brim_for")}
+            else:
+                alternatives = first["orient"].get("alternatives") or []
+                result["orientation"] = {**orientation_out, "alternatives": alternatives[:2]}
+            result.update({
+                "stats": stats, "estimate": estimate, "printability": printability,
+                "gcode_check": {"status": check.get("status"), "issues": gcode_issues},
                 "slicer_warnings": run.warnings, "next_steps": next_steps,
                 "elapsed_s": round(time.monotonic() - started, 1),
                 "content": (f"{'PRINT-READY' if print_ready else 'NOT print-ready'}: "
-                            f"{run.gcode_path} — {stats.get('print_time_s', 0) / 3600:.2f} h, "
+                            f"{headline}{hours}, "
                             f"{stats.get('filament_g', '?')} g on {printer_name}"),
             })
+            return _dumps(result)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -752,7 +983,10 @@ def register_print_tools(mcp: FastMCP) -> None:
         consistency, retraction plausibility, part-cooling fan, heaters off at the end, and a
         per-layer FLOATING-EXTRUSION scan: extrusion more than one line width away from
         anything in the layer below (bridges/overhang perimeters reported separately) — the
-        mid-air plastic that turns into spaghetti. Returns {ok, status, checks:[...], stats}."""
+        mid-air plastic that turns into spaghetti. For "Complete individual objects" files
+        (complete_objects=1), sequential_clearance checks every move after an object is
+        finished against it: hotend inside extruder_clearance_radius or gantry below its top
+        fails. Returns {ok, status, checks:[...], stats}."""
         try:
             resolved = None
             if printer:

@@ -186,7 +186,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "The only way to make G-code: never download a slicer or hand-write "
             ".ini keys. Run dfm_check and fix fails first; report print_ready and "
-            "gcode_check issues honestly. One call per part; copies= for repeats."
+            "gcode_check issues honestly. copies= repeats a part; parts=[{doc_id|path, "
+            "copies}] puts several parts on one plate; complete_individual_objects=True "
+            "prints them one at a time (clearance-spaced, height-ordered; refusals name "
+            "the objects that break it)."
         ),
     },
     "optimize_print_orientation": {

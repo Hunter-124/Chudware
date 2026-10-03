@@ -1,6 +1,6 @@
 """3D-print preparation: deterministic printability, orientation, real slicing, G-code proof.
 
-Family ``cam`` (additive CAM). Five tools:
+Family ``cam`` (additive CAM). Seven tools:
 
 * ``slicer_status`` — which PrusaSlicer the pipeline will run, or the exact install step.
 * ``list_print_profiles`` — vendor printer/print/filament presets read from the installed
@@ -13,6 +13,12 @@ Family ``cam`` (additive CAM). Five tools:
   then ``verify_gcode`` on the result and a manifest beside it.
 * ``verify_gcode`` — deterministic proof of an existing G-code file (bounds, temperatures,
   cold extrusion, homing, layer heights, and per-layer mid-air extrusion detection).
+* ``print_media_inventory`` — read-only inventory of a printer flashdrive/SD card: every
+  file, its sha256, which ones the printer can select, duplicates, managed status, and a
+  whole-drive token (``services/manufacturing/print_media.py``).
+* ``publish_print_media`` — the managed delivery of a project's COMPLETE verified job set to
+  that media: revision-prefixed names under ``PRINT/<project>/``, readback-verified, old
+  managed toolpaths retired into a non-printable archive, unmanaged printables reported.
 
 Why this exists: an agent once sliced a 17-part arm by downloading a PrusaSlicer RPM into
 /tmp and hand-writing ~100 slicer keys from memory (flimsy sheathless snug supports, tall parts
@@ -504,7 +510,9 @@ def register_print_tools(mcp: FastMCP) -> None:
         layers, support share), printability issues (dfm-style rows) and gcode_check
         (verify_gcode). print_ready is true only when the G-code verification passes and the
         printability analysis has no failure. Report print_ready=false honestly and fix the
-        design (dfm_check lists the faces) or settings, then slice again."""
+        design (dfm_check lists the faces) or settings, then slice again. The manifest_path of
+        a print-ready result is what publish_print_media takes to put it on printer media
+        (print_media_inventory first); never copy the G-code there by hand."""
         started = time.monotonic()
         try:
             from services.dfam import analyze_printability, frame_for_build_dir  # noqa: PLC0415
@@ -694,6 +702,16 @@ def register_print_tools(mcp: FastMCP) -> None:
             if not check.get("ok"):
                 next_steps.append("G-code verification failed: read gcode_check.issues; "
                                   "change orientation/supports or the design before printing")
+            if print_ready:
+                next_steps.append(
+                    f"to deliver on a printer USB/SD card: print_media_inventory(root=<mount>) "
+                    f"first, compare its printable files with the project's COMPLETE job set, "
+                    f"then publish_print_media(root, project, jobs=[{{part_id, manifest_path}} "
+                    f"for EVERY part, this one: {manifest_path}], expected_inventory="
+                    f"<inventory_token>, media_idle=True only after the user confirms no "
+                    f"printer is using the media). Never cp/fs_write G-code onto media; "
+                    f"report the returned PRINT/<project>/ filenames and leftover unmanaged "
+                    f"printables")
             alternatives = orient.get("alternatives") or []
             return _dumps({
                 "ok": True, "print_ready": print_ready, "part": label,
@@ -756,5 +774,73 @@ def register_print_tools(mcp: FastMCP) -> None:
                            "content": ("G-code verification PASSED" if result.get("ok") else
                                        "G-code verification FAILED: " + "; ".join(
                                            str(r.get("note")) for r in failing[:4]))})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def print_media_inventory(root: str, offset: int = 0, limit: int = 200) -> str:
+        """Read-only inventory of printer media (USB stick / SD card): every file, which G-code is selectable.
+
+        Changes nothing. Call it FIRST, before any delivery, and again to read back what a
+        publish left. root: the mounted media root (e.g. /run/media/<user>/<LABEL>); it must
+        already exist — a missing mount is reported, never created. Walks the whole real file
+        tree without following symlinks and returns rows {path (relative to root), size,
+        sha256, printable (.gcode/.gco/.g/.bgcode, any case), managed status current |
+        superseded | modified}, duplicate groups, the managed revision per PRINT/<project>/,
+        and inventory_token — a digest of the WHOLE drive, identical on every page.
+        offset/limit page the rows (total, truncated). Compare the printable rows against the
+        complete job set you intend to deliver: the printer shows names only, no timestamps, so
+        a stale or duplicate G-code is indistinguishable from the current one on its screen.
+        Never decide which file is current from mtime. Pass inventory_token unchanged to
+        publish_print_media."""
+        try:
+            from services.manufacturing.print_media import inventory_print_media  # noqa: PLC0415
+
+            return _dumps(inventory_print_media(root, offset=offset, limit=limit))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def publish_print_media(root: str, project: str, jobs: list[dict],
+                            expected_inventory: str, media_idle: bool = False,
+                            retire_paths: Optional[list[str]] = None) -> str:
+        """Publish a project's COMPLETE verified print set to printer media; retire its old managed G-code.
+
+        The one supported way to put G-code on a printer stick — never cp/rsync/fs_write
+        G-code onto media (nothing can stop a shell copy; this tool is what makes the result
+        verifiable). Mutates the media. Prerequisites the tool cannot detect for you:
+        media_idle=True only after the USER confirmed the media is not in a printer that is
+        printing or reading it (ejected/detached, or the printer idle); default False refuses.
+        expected_inventory: the inventory_token from print_media_inventory on this root; any
+        change since then refuses, so inventory, compare, then publish.
+
+        project: the canonical folder name — files land in PRINT/<project>/.
+        jobs: the COMPLETE desired set for the project, one {part_id, manifest_path,
+          gcode_path?} per part: part_id a stable identifier (same part, same id across
+          revisions), manifest_path the slice_part .print.json, gcode_path only when the
+          saved G-code moved since slicing. Each needs print_ready true and the G-code
+          sha256 equal to the manifest's gcode_sha256 — nothing is resliced or relaxed. A
+          part omitted from jobs is retired, not kept.
+        retire_paths: extra relative paths (e.g. old hand-copied G-code from the
+          inventory's unmanaged printables) the user reviewed and approved for removal;
+          nothing else unrecognised is touched.
+
+        Files are named R<rev:03><part:02>_<PART>.gcode (e.g. R00101_UPPER_ARM.gcode): the
+        first six characters encode release + part, so they stay unique and ordered even on
+        a printer that truncates FAT short names. The same content set is idempotent (no new
+        revision). Every file is staged and read back by sha256 before anything is retired;
+        previous managed revisions of this project go into a non-printable ZIP archive; a
+        sidecar manifest maps part_id -> filename with source hashes and warnings. Returns
+        the exact current printable files, what was archived/replaced, unmanaged printables
+        still on the media and warnings; a failure says what state the media is in. Report
+        those filenames and the PRINT/<project>/ path verbatim, plus any remaining
+        unmanaged printables — do not call the media clean while they exist."""
+        try:
+            from services.manufacturing.print_media import (  # noqa: PLC0415
+                publish_print_media as publish,
+            )
+
+            return _dumps(publish(root, project, jobs, expected_inventory,
+                                  media_idle=media_idle, retire_paths=retire_paths))
         except Exception as e:  # noqa: BLE001
             return _err(e)

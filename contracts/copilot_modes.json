@@ -94,7 +94,8 @@
       "research_thread_spec",
       "research_unit_convert",
       "research_web_search",
-      "topology_capabilities"
+      "topology_capabilities",
+      "print_media_inventory"
     ],
     "edit": [
       "activate_configuration",
@@ -271,7 +272,8 @@
       "wait_job",
       "wall_thickness",
       "workspace_status",
-      "topology_capabilities"
+      "topology_capabilities",
+      "print_media_inventory"
     ]
   },
   "mutating_tools": [
@@ -300,7 +302,8 @@
     "new_assembly",
     "new_part",
     "solve_mates",
-    "run_topology_optimization"
+    "run_topology_optimization",
+    "publish_print_media"
   ],
   "edit_denied": [
     "relocate_native_files",

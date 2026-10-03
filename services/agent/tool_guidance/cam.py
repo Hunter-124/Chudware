@@ -215,4 +215,21 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "command (Linux: per-user flatpak) instead of improvising one."
         ),
     },
+    "print_media_inventory": {
+        "prompt_note": (
+            "Read-only; call it the moment a USB/SD delivery is asked for, and again after "
+            "publishing. Compare its printable rows with the complete job set; the printer "
+            "shows no timestamps, so never pick 'current' by mtime. Pass inventory_token to "
+            "publish_print_media."
+        ),
+    },
+    "publish_print_media": {
+        "prompt_note": (
+            "The only way G-code goes onto printer media — never cp/fs_write it there. "
+            "jobs = the COMPLETE project set of print_ready slice_part manifests; "
+            "media_idle=True only after the user confirms no printer is using the media. "
+            "Report the returned PRINT/<project>/R<rev><part>_*.gcode names and any "
+            "unmanaged printables left; never call the media clean while they remain."
+        ),
+    },
 }

@@ -145,8 +145,11 @@ runtime's doctor command.
    silent `doc_open(internal)`→`doc_render_png`→`doc_close` for STEP/IGES/reference
    assemblies, caching in `<project>/.plm/thumbs/<content_key>.png` — the GUI PLM grid's own
    cache (key = cad_graph `meta.dh`). `fs_read` of a CAD file returns its card + one
-   labelled render (`ok:true`); `fs_list` rows carry the one-line summary. Its system prompt
-   carries the MORE TOOLS menu
+   labelled render (`ok:true`); `fs_list` rows carry the one-line summary. Since 2026-10-03
+   the core also carries `print_media_inventory` (read) and `publish_print_media` (mutating,
+   contract `mutating_tools`, so Ask/Plan refuse it): printer-stick delivery is part of
+   "print this", and without them agents shell-copied G-code beside stale revisions. Its
+   system prompt carries the MORE TOOLS menu
    naming every other registered tool; `enable_tools(tools=[...])` and
    `enable_tools(categories=[group])` load the rest mid-turn through the single refresh
    callback `chudcode_roles._register_category_refresh` (re-runs `build_host_tools` and

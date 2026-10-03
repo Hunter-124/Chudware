@@ -85,7 +85,11 @@ _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tr
               "research_web_search", "research_fetch_page",
               # Deterministic printability / G-code analysis (print_tools.py, dfm_check):
               # they measure a part or a file and touch no document.
-              "dfm_check", "optimize_print_orientation", "verify_gcode"}
+              "dfm_check", "optimize_print_orientation", "verify_gcode",
+              # Printer-media inventory hashes the files on a mounted stick and changes
+              # nothing. Its twin publish_print_media writes/retires files on the media
+              # and stays unclassified -> RISK_WRITE.
+              "print_media_inventory"}
 
 # Explicit overrides for names the classifier would mislabel. name -> risk.
 _RISK_OVERRIDES: dict[str, str] = {

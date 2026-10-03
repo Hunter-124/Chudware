@@ -10,11 +10,46 @@
 3. `slice_part(doc_id=…, printer="ender 3", material="PLA", goal=…)` — vendor presets from the
    installed PrusaSlicer, orientation, supports and brim from the analysis, then
    `verify_gcode`. One call per part; `copies=N` for repeats on one plate.
-4. Deliver only `print_ready: true`, or name the failing check. Copy files to removable media
-   with the file tools and compare sha256 from the `.print.json` manifest.
+4. Deliver only `print_ready: true`, or name the failing check. Put G-code on printer media
+   only through the media tools below.
 - No slicer installed → `slicer_status` returns the install command; give it to the user.
 - NEVER download/extract a slicer, write slicer `.ini` keys by hand, or reuse a design-time
   build direction nobody measured. That combination produced collapsed support towers.
+
+## Delivering to printer media (USB stick / SD card)
+The printer lists file NAMES only, no dates: a stale revision beside the current one is
+indistinguishable on its screen. The media must hold exactly the current set.
+1. The moment a flashdrive/SD delivery is asked for:
+   `print_media_inventory(root=<mount, e.g. /run/media/<user>/<LABEL>>)`. Read every page
+   (`total`/`truncated`): printable rows, duplicate groups, managed status
+   (current/superseded/modified), unmanaged printables. Compare them with the COMPLETE set of
+   parts the project needs. Never decide which file is current by mtime or by "newest".
+2. Prerequisite for publishing: the USER confirms the media is not in a printer that is
+   printing or reading it (ejected/detached, or the printer idle). The tool cannot see the
+   printer, so `media_idle=True` is that confirmation — never assume it.
+3. `publish_print_media(root=…, project="<name>", jobs=[{"part_id": "upper_arm",
+   "manifest_path": "<…>.print.json"}, …], expected_inventory=<inventory_token>,
+   media_idle=True)`. `jobs` is the whole project set: a part left out is retired. Every job
+   must be `print_ready: true` with the manifest's `gcode_sha256` (pass `gcode_path` only for
+   a saved G-code that moved). The tool never reslices or relaxes a check: on refusal, fix
+   the part and run `slice_part` again. Same content set = no new revision.
+   Unmanaged/hand-copied printables are never touched unless the user reviewed them and you
+   pass their relative paths in `retire_paths`.
+4. Read back with `print_media_inventory` and report: the `PRINT/<project>/` path, each exact
+   `R<rev:03><part:02>_<PART>.gcode` filename (e.g. `R00101_UPPER_ARM.gcode`, release 001
+   part 01 — the first six characters stay unique when a printer truncates names) and its
+   part, the revision, what was archived (a non-printable ZIP), every warning unchanged
+   (slicer, printability, physical-fit caveats), and every unmanaged printable or duplicate
+   still on the media. While any remain, the media is NOT clean — list them and ask.
+- A refusal (inventory changed, idle not confirmed, hash mismatch, modified managed file,
+  symlink/path escape) or partial failure: report it with the state the tool returned; never
+  fall back to copying.
+- Never `cp`/`rsync`/`fs_write`/shell-copy G-code onto media. Nothing can stop a shell copy;
+  the tool is what makes the delivery hash-verified, revisioned and fully reported, and
+  ad-hoc copies are how stale duplicates pile up. Humans have the same path:
+  `python3 scripts/print_media.py inventory ROOT` and `python3 scripts/print_media.py publish
+  ROOT --project PROJECT --jobs-file JOBS.json --expected-inventory TOKEN --media-idle
+  [--retire-path RELPATH …]`.
 
 ## Geometry rules (0.4 mm nozzle, 0.2 mm layers; scale with nozzle)
 - Walls: ≥ 1.2 mm (3 lines) structural, never < 0.8 mm; size in line-width multiples

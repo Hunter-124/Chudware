@@ -180,6 +180,16 @@ judgment).
   2.9.6 CLI facts: no `--arrange`; bare `--merge` segfaults headless (use `--dont-arrange
   --merge`); `--duplicate N` arranges copies. Never let an agent download a slicer or write
   slicer keys by hand again.
+- **Printer media is published, never copied (2026-10-03).** `print_media_inventory` (read
+  risk) and `publish_print_media` (write; in `contracts/copilot_modes.json` `mutating_tools`,
+  so Ask/Plan refuse it) wrap `services/manufacturing/print_media.py`; humans use
+  `scripts/print_media.py`. The printer UI shows names without timestamps, so repeated
+  hand-copied deliveries left obsolete duplicate G-code selectable. Publish takes the
+  project's COMPLETE `.print.json` job set, the whole-drive `inventory_token`, and an explicit
+  `media_idle=True` (an offline stick cannot reveal printer activity); writes
+  `PRINT/<project>/R<rev:03><part:02>_<PART>.gcode`, reads back hashes, archives prior managed
+  revisions in a non-printable ZIP, and reports unmanaged printables it did not touch. An
+  agent with a shell can still `cp` — the guarantee is policy + tool, not prevention.
 
 ## Daemon / mission lifecycle (don't regress these)
 

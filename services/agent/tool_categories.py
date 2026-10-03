@@ -264,6 +264,11 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "verify_gcode",
         "list_print_profiles",
         "slicer_status",
+        # Printer media delivery: read-only inventory first, then the managed publish
+        # (revision-prefixed PRINT/<project>/ set, readback-verified, old managed G-code
+        # archived non-printable). Mutating publish is denied in Ask/Plan by the contract.
+        "print_media_inventory",
+        "publish_print_media",
         "wall_thickness",
         "check_geometry_health",
         "export_part",
@@ -721,7 +726,8 @@ _CATEGORY_DESCS: dict[str, str] = {
     "requirements": "Layout plan, requirements capture and auto-verification",
     "office": "PDF/DOCX read, extract, edit and render",
     "sheetmetal": "Sheet-metal flanges/bends via add_features + bend calcs",
-    "print": "3D printing: printability checks, orientation, slicing to G-code, G-code proof",
+    "print": ("3D printing: printability checks, orientation, slicing to G-code, G-code proof, "
+              "printer-media inventory and managed publish"),
 }
 
 
@@ -894,6 +900,11 @@ MAIN_CHAT_CORE_TOOLS: tuple[str, ...] = (
     "optimize_print_orientation",
     "slice_part",
     "verify_gcode",
+    # Delivering G-code to a printer stick is part of "print this": without these in the
+    # core the agent shell-copied revisions next to stale ones the printer shows with no
+    # timestamps. Inventory is read-only; publish is mutating (Ask/Plan refuse it).
+    "print_media_inventory",
+    "publish_print_media",
     # assembly
     "asm_add_component",
     "asm_mate",

@@ -287,6 +287,21 @@ class TestModeToolAllowlists:
         assert cmt.is_tool_allowed("cam_generate", "plan") is False
         assert cmt.is_tool_allowed("ecad_place_symbol", "plan") is False
 
+    def test_print_media_inventory_is_read_only_and_publish_is_refused_read_only(self):
+        # The main chat advertises both; a user-picked Ask/Plan must keep the drive
+        # inventory but never publish (it writes and retires files on printer media).
+        core = list(tcat.MAIN_CHAT_CORE_TOOLS)
+        assert {"print_media_inventory", "publish_print_media"} <= set(core)
+        for mode in ("ask", "plan"):
+            allowed = cmt.apply_mode_tools(mode, core)
+            assert "print_media_inventory" in allowed, mode
+            assert "publish_print_media" not in allowed, mode
+            assert cmt.is_tool_allowed("publish_print_media", mode) is False
+        plan_only = cmt.apply_mode_tools("agent", core, plan_only=True)
+        assert "publish_print_media" not in plan_only
+        assert cmt.apply_mode_tools("agent", None) is None  # unrestricted keeps it
+        assert "publish_print_media" in cmt.apply_mode_tools("agent", core)
+
 
 class TestToolCategories:
     def test_category_packs_cover_required(self):

@@ -838,6 +838,9 @@ static nlohmann::json chatHistoryForAgent(AppState& st) {
 static void attachAgentConversationOptions(AppState& st, nlohmann::json& opts) {
     opts["session_id"] = st.activeConvId();
     opts["sessions_dir"] = chatSessionsDir();
+    // The chat renders ask_user as an interactive question card and answers it over the control
+    // lane (`answer`), so the worker blocks the tool instead of auto-accepting the defaults.
+    opts["interactive_questions"] = true;
     ui::ensureWorkspaceDir(st);
     if (!st.workspaceDir.empty()) {
         opts["workspace_dir"] = st.workspaceDir;
@@ -3534,17 +3537,65 @@ bool aiTurnActive(AppState& st) {
 // (under the SAME mtx that already guards the job deque); agentControlDrainLogs() drains that
 // queue into AppState::addLog() from the GL thread once per composer frame.
 struct AgentControlChannel {
-    // empty steer = cancel; attachments ride only with a steer
-    struct Job { std::string runId; std::string steer; nlohmann::json attachments; };
+    // empty steer = cancel; attachments ride only with a steer. `answer` jobs carry an ask_user
+    // batch resolution (answers, or declined) instead.
+    struct Job {
+        std::string runId;
+        std::string steer;
+        nlohmann::json attachments;
+        bool answer = false;
+        std::string convId, batchId;
+        nlohmann::json answers;
+        bool declined = false;
+    };
+    // An `answer` call's outcome, applied to its batch on the GL thread by agentControlDrainLogs.
+    struct AnswerResult {
+        std::string convId, batchId;
+        bool declined = false;
+        bool delivered = false;     // the worker accepted the answer
+        std::string transportErr;   // the call itself failed (retryable)
+        std::string reason;         // the worker refused it (no longer pending)
+    };
     std::mutex mtx;
     std::condition_variable cv;
     std::deque<Job> q;
     std::deque<std::string> pendingLogs;   // GL-thread-only drain via agentControlDrainLogs()
+    std::deque<AnswerResult> pendingAnswers;   // likewise
     std::atomic<AppState*> st{nullptr};
 
     void pushLog(const std::string& msg) {
         std::lock_guard<std::mutex> lk(mtx);
         pendingLogs.push_back(msg);
+    }
+
+    void runAnswer(AppState& s, const Job& job) {
+        AnswerResult res;
+        res.convId = job.convId;
+        res.batchId = job.batchId;
+        res.declined = job.declined;
+        nlohmann::json r;
+        std::string e;
+        try {
+            s.worker.callAgentAnswer(job.runId, job.batchId, job.answers, job.declined, r, e);
+        } catch (const std::exception& ex) {
+            e = ex.what();
+        } catch (...) {
+            e = "agent_answer exception";
+        }
+        if (!e.empty()) {
+            res.transportErr = e;
+        } else if (jbool(r, "ok") || jbool(r, "answered")) {
+            res.delivered = true;
+        } else {
+            res.reason = jstr(r, "reason");
+            if (res.reason.empty()) res.reason = jstr(r, "error");
+            if (res.reason.empty()) res.reason = "question is no longer pending";
+        }
+        std::lock_guard<std::mutex> lk(mtx);
+        pendingLogs.push_back("[..] agent_answer " + job.batchId + ": " +
+                              (res.delivered ? std::string("ok")
+                               : !res.transportErr.empty() ? res.transportErr : res.reason));
+        pendingAnswers.push_back(std::move(res));
     }
 
     AgentControlChannel() {
@@ -3559,6 +3610,10 @@ struct AgentControlChannel {
                 }
                 AppState* s = st.load(std::memory_order_acquire);
                 if (!s) continue;
+                if (job.answer) {
+                    runAnswer(*s, job);
+                    continue;
+                }
                 nlohmann::json r;
                 std::string e;
                 if (job.steer.empty()) {
@@ -3593,20 +3648,55 @@ struct AgentControlChannel {
 };
 static AgentControlChannel g_agentCtl;
 
-// GL-thread drain of the control channel's queued log lines — the only safe place to touch
-// AppState::log from this subsystem. Cheap no-op when nothing queued; call once per composer
-// frame (covers both the docked Copilot and the AI-tab workspace host, since both draw the
-// composer every visible frame).
+// One `answer` outcome onto its batch. A delivered answer resolves the card; a failed call puts
+// it back to pending with the reason (retry, or reply in the chat); a refusal means the worker
+// no longer holds the question, so the card says it expired.
+static void applyAnswerResult(AppState& st, const AgentControlChannel::AnswerResult& res) {
+    std::vector<ChatMsg>* msgs = conversationMsgs(st, res.convId);
+    if (!msgs) return;
+    ChatMsg* owner = nullptr;
+    AskBatch* b = findAskBatch(*msgs, res.batchId, &owner);
+    // agent.answer may already have resolved it (it is the authoritative record).
+    if (!b || b->status != AskStatus::Submitting) return;
+    if (res.delivered) {
+        b->status = res.declined ? AskStatus::Declined : AskStatus::Answered;
+        b->error.clear();
+    } else if (!res.transportErr.empty()) {
+        b->status = AskStatus::Pending;
+        b->error = "Couldn't deliver your answers (" + res.transportErr +
+                   "). Try again, or reply in the chat.";
+    } else {
+        b->status = AskStatus::Expired;
+        b->error = res.reason;
+    }
+    owner->uiCachedH = -1.0f;
+    markChatHistoryDirty();
+}
+
+// GL-thread drain of the control channel's queued log lines and answer outcomes — the only safe
+// place to touch AppState::log / ChatMsg from this subsystem. Cheap no-op when nothing queued;
+// call once per composer frame (covers both the docked Copilot and the AI-tab workspace host,
+// since both draw the composer every visible frame).
 static void agentControlDrainLogs(AppState& st) {
     for (;;) {
         std::string msg;
         {
             std::lock_guard<std::mutex> lk(g_agentCtl.mtx);
-            if (g_agentCtl.pendingLogs.empty()) return;
+            if (g_agentCtl.pendingLogs.empty()) break;
             msg = std::move(g_agentCtl.pendingLogs.front());
             g_agentCtl.pendingLogs.pop_front();
         }
         st.addLog(msg);
+    }
+    for (;;) {
+        AgentControlChannel::AnswerResult res;
+        {
+            std::lock_guard<std::mutex> lk(g_agentCtl.mtx);
+            if (g_agentCtl.pendingAnswers.empty()) return;
+            res = std::move(g_agentCtl.pendingAnswers.front());
+            g_agentCtl.pendingAnswers.pop_front();
+        }
+        applyAnswerResult(st, res);
     }
 }
 
@@ -3615,7 +3705,28 @@ void agentControlDispatch(AppState& st, const std::string& runId, const std::str
     g_agentCtl.st.store(&st, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lk(g_agentCtl.mtx);
-        g_agentCtl.q.push_back({runId, steer, std::move(attachments)});
+        AgentControlChannel::Job job;
+        job.runId = runId;
+        job.steer = steer;
+        job.attachments = std::move(attachments);
+        g_agentCtl.q.push_back(std::move(job));
+    }
+    g_agentCtl.cv.notify_one();
+}
+
+void agentAnswerDispatch(AppState& st, const std::string& runId, const std::string& batchId,
+                         nlohmann::json answers, bool declined) {
+    g_agentCtl.st.store(&st, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(g_agentCtl.mtx);
+        AgentControlChannel::Job job;
+        job.runId = runId;
+        job.answer = true;
+        job.convId = st.activeConvId();
+        job.batchId = batchId;
+        job.answers = std::move(answers);
+        job.declined = declined;
+        g_agentCtl.q.push_back(std::move(job));
     }
     g_agentCtl.cv.notify_one();
 }
@@ -3706,6 +3817,9 @@ void requestStopRun(AppState& st) {
     // Only a job-based run produces a result the drain must discard. Async ask/sim runs land via
     // their own callbacks, which look for a *running* message — clearing it below makes them no-op.
     if (run->running.load() || run->ready.load()) run->stopRequested = true;
+    // Stopping drops the run's remaining events, so its open questions never hear back: close
+    // them here (the worker's own agent.answer {cancelled} is folded idempotently if it lands).
+    closeOpenAsks(st.chat);
     st.livePhase.clear();
     st.agentV2Status.clear();
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
@@ -4131,7 +4245,8 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     drawComposerPrelude(st, busy);
 
     const char* placeholder =
-        st.aiInteraction == (int)CopilotMode::Ask  ? "Ask about this part\xE2\x80\xA6"
+        hasOpenAsk(st.chat)                        ? "Answer in the form above, or type a reply\xE2\x80\xA6"
+      : st.aiInteraction == (int)CopilotMode::Ask  ? "Ask about this part\xE2\x80\xA6"
       : st.aiInteraction == (int)CopilotMode::Plan ? "Describe what to plan\xE2\x80\xA6"
                                                    : "Describe what to build or change\xE2\x80\xA6";
 

@@ -12,6 +12,8 @@
 //                          transparency rows, tool-call rows, artifact actions
 //   cards.cpp              plan/objectives section, clarify + plan-approve cards, corporate-org
 //                          cards, exec-mode (swarm/eng-firm/advisor) cards, AI-VC checkpoint UI
+//   ask_answers.cpp        GL-free ask_user question batches (AskBatch): suggested-default prefill,
+//                          RAW `answer` JSON per kind, session-file form (cards.cpp draws them)
 //   feed.cpp               feedTurnActivity: stream-event -> ActivityItem folding (orchestrator
 //                          events, corporate events, ops-JSON detection), chat-history dirty flag
 //   conversations.cpp      conversation tabs + chat-history/prompt-draft persistence (incl.
@@ -142,6 +144,9 @@ void finalizeThoughtBox(ActivityItem& a);
 void markChatHistoryDirty();
 extern std::atomic<bool> s_chatHistoryDirty;
 extern double            s_chatHistoryLastPersist;
+// Batch `batchId` anywhere in `msgs` (newest message first); `owner` receives its message.
+AskBatch* findAskBatch(std::vector<ChatMsg>& msgs, const std::string& batchId,
+                       ChatMsg** owner = nullptr);
 
 
 namespace ui {
@@ -262,10 +267,17 @@ nlohmann::json agentProviderOverride(const Settings& s);
 // extra.options.mode defaults to the composer's current mode name ("agent"|"plan"|"ask").
 void launchAgentTurn(AppState& st, const std::string& request,
                      nlohmann::json extra = nlohmann::json::object());
+// Send an ask_user answer (or a dismissal) for `batchId` over the agent control lane. Off the GL
+// thread; the result lands back on the batch through the composer's per-frame drain (composer).
+void agentAnswerDispatch(AppState& st, const std::string& runId, const std::string& batchId,
+                         nlohmann::json answers, bool declined);
 
 // ---- cards (cards) ----
 void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts);
 void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts);
+// The online agent's ask_user question batches on this turn: interactive while pending,
+// a compact read-only summary once resolved (cards.cpp).
+void drawAskCards(AppState& st, ChatMsg& m, const ui::Fonts& fonts);
 void drawCorpOrgCard(ActivityItem& a, const ui::Fonts& fonts);
 void drawCorpMeetingCard(ActivityItem& a, const ui::Fonts& fonts);
 void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts);

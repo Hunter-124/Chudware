@@ -221,7 +221,8 @@ bool sendControlRequest(const std::string& transport, const std::string& endpoin
     result = json::object();
     err.clear();
     if (!validControlInfo(transport, endpoint, token) ||
-        (action != "cancel" && action != "steer" && action != "status") ||
+        (action != "cancel" && action != "steer" && action != "answer" &&
+         action != "status") ||
         !params.is_object()) {
         err = "worker control information is invalid";
         return false;

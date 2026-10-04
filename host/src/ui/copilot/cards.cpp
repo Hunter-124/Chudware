@@ -1166,6 +1166,378 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     launchAgentTurn(st, req, extras);
 }
 
+// ============================ ask_user question cards ============================
+// The online agent's ask_user batch (agent.question): one glass card per batch with a typed
+// input per question (contracts/interaction.md kinds), Submit/Dismiss sent over the agent control
+// lane (`answer`). Resolved batches collapse to a read-only summary. The model's own run keeps
+// going while the card waits; a reply typed in the composer resolves the batch worker-side.
+
+// The run_id an answer must name: the batch's own, else the viewed conversation's live run.
+static std::string askRunId(AppState& st, const AskBatch& b) {
+    if (!b.runId.empty()) return b.runId;
+    if (auto* run = st.runIfExists(st.activeConvId())) {
+        std::lock_guard<std::mutex> lk(run->mtx);
+        return run->runId;
+    }
+    return std::string();
+}
+
+// Native-dialog filter (pairs of description/pattern, NUL-separated, double-NUL terminated).
+static std::string askFileFilter(const AskQuestion& q) {
+    std::vector<std::string> exts = q.accept;
+    if (exts.empty() && q.media == "image") exts = {"png", "jpg", "jpeg", "webp", "bmp"};
+    std::string f;
+    if (!exts.empty()) {
+        std::string pat;
+        for (std::string e : exts) {
+            while (!e.empty() && (e[0] == '*' || e[0] == '.')) e.erase(0, 1);
+            if (e.empty()) continue;
+            if (!pat.empty()) pat += ";";
+            pat += "*." + e;
+        }
+        if (!pat.empty()) {
+            f += (q.media == "image" ? "Images (" : "Accepted files (") + pat + ")";
+            f.push_back('\0');
+            f += pat;
+            f.push_back('\0');
+        }
+    }
+    f += "All files (*.*)";
+    f.push_back('\0');
+    f += "*.*";
+    f.push_back('\0');
+    f.push_back('\0');
+    return f;
+}
+
+// Move the composer's context-picker chips that fit this question's targets into its picks.
+// Returns how many were taken (0 = none matched).
+static int askTakePicks(AppState& st, AskQuestion& q) {
+    int taken = 0;
+    std::vector<core::ContextRef> keep;
+    for (const auto& r : st.pendingContextRefs) {
+        const bool fits = q.targets.empty() ||
+                          std::find(q.targets.begin(), q.targets.end(), r.kind) != q.targets.end();
+        if (!fits || r.id.empty() || (!q.multi && taken > 0)) {
+            keep.push_back(r);
+            continue;
+        }
+        if (!q.multi) q.picks.clear();
+        const bool dup = std::any_of(q.picks.begin(), q.picks.end(), [&](const AskPick& p) {
+            return p.kind == r.kind && p.id == r.id && p.docId == r.docId;
+        });
+        if (!dup) q.picks.push_back(AskPick{r.kind, r.id, r.docId, r.label, r.selector});
+        ++taken;
+    }
+    if (taken > 0) {
+        st.pendingContextRefs = std::move(keep);
+        savePromptDraft(st, /*force=*/true);
+    }
+    return taken;
+}
+
+// One question's input widget, by kind. Unknown kinds edit as free text.
+static void drawAskInput(AppState& st, AskQuestion& q, const ui::AdaptiveSurface& surf) {
+    const auto& pal = ui::palette;
+    const ImGuiStyle& style = ImGui::GetStyle();
+    if (q.kind == "choice") {
+        if (q.checked.size() != q.options.size()) q.checked.resize(q.options.size(), 0);
+        for (size_t oi = 0; oi < q.options.size(); ++oi) {
+            ImGui::PushID((int)oi);
+            const AskOption& opt = q.options[oi];
+            const char* lab = opt.label.empty() ? opt.value.c_str() : opt.label.c_str();
+            if (q.multi) {
+                bool on = q.checked[oi] != 0;
+                if (ImGui::Checkbox(lab, &on)) q.checked[oi] = on ? 1 : 0;
+            } else if (ImGui::RadioButton(lab, q.choice == (int)oi)) {
+                q.choice = (int)oi;
+            }
+            ImGui::PopID();
+        }
+        // "Other": the user's own words. Typing in the field selects the row.
+        if (q.multi) ImGui::Checkbox("Other", &q.otherOn);
+        else if (ImGui::RadioButton("Other", q.choice == kAskOther)) q.choice = kAskOther;
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputTextWithHint("##other", "Your own answer", q.otherBuf.data(),
+                                     q.otherBuf.size())) {
+            if (q.multi) q.otherOn = true;
+            else q.choice = kAskOther;
+        }
+    } else if (q.kind == "dimension") {
+        const auto& units = askDimUnits(q.family);
+        const bool pickUnit = units.size() > 1;
+        const float unitW = pickUnit ? ui::metrics::U(18.0f) : 0.0f;
+        ImGui::SetNextItemWidth(pickUnit ? ImGui::GetContentRegionAvail().x - unitW -
+                                               style.ItemSpacing.x
+                                         : -FLT_MIN);
+        ImGui::InputTextWithHint("##dim", "Value", q.textBuf.data(), q.textBuf.size(),
+                                 ImGuiInputTextFlags_CharsScientific);
+        if (pickUnit) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(unitW);
+            const ImVec4 popBg(pal.popupBg[0], pal.popupBg[1], pal.popupBg[2], pal.popupBg[3]);
+            ImGui::PushStyleColor(ImGuiCol_PopupBg, popBg);
+            if (ImGui::BeginCombo("##unit", q.unit.c_str())) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::maxContrastTextOn(popBg));
+                for (const auto& u : units)
+                    if (ImGui::Selectable(u.c_str(), u == q.unit)) q.unit = u;
+                ImGui::PopStyleColor();
+                ImGui::EndCombo();
+            }
+            ImGui::PopStyleColor();
+        }
+    } else if (q.kind == "approval") {
+        if (!q.proposal.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+            ImGui::TextWrapped("%s", q.proposal.c_str());
+            ImGui::PopStyleColor();
+        }
+        // kit::segmented always shows a selection, so it would imply a choice the user has not
+        // made; with no suggested default, start from two unselected radios instead.
+        if (q.approval < 0) {
+            if (ImGui::RadioButton("Approve", false)) q.approval = 1;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Decline", false)) q.approval = 0;
+        } else {
+            static const char* const kApprove[] = {"Approve", "Decline"};
+            int sel = q.approval == 1 ? 0 : 1;
+            if (kit::segmented("##approval", kApprove, 2, &sel)) q.approval = sel == 0 ? 1 : 0;
+        }
+    } else if (q.kind == "file_request") {
+        const char* browse = "Browse\xe2\x80\xa6";
+        const float browseW = ImGui::CalcTextSize(browse).x + style.FramePadding.x * 2.0f;
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - browseW - style.ItemSpacing.x);
+        ImGui::InputTextWithHint("##paths",
+                                 q.multiple ? "File paths, separated by ;" : "File path",
+                                 q.textBuf.data(), q.textBuf.size());
+        ImGui::SameLine();
+        if (kit::secondaryButton(browse)) {
+            if (std::getenv("CHUDWARE_NO_FILE_DIALOGS")) {
+                st.toast(ui::ToastLevel::Info,
+                         "File dialogs are disabled (CHUDWARE_NO_FILE_DIALOGS).");
+            } else {
+                const std::string filter = askFileFilter(q);
+                const std::string p = openFileDialog(filter.c_str());
+                if (!p.empty()) {
+                    const std::string cur = askBufStr(q.textBuf);
+                    const bool keep = q.multiple && cur.find_first_not_of(" \t;") != std::string::npos;
+                    askBufSet(q.textBuf, keep ? cur + "; " + p : p);
+                }
+            }
+        }
+    } else if (q.kind == "geometry_select") {
+        if (q.picks.empty()) {
+            std::string hint = "Nothing picked yet.";
+            if (!q.targets.empty()) {
+                hint = "Nothing picked yet \xc2\xb7 pick a ";
+                for (size_t i = 0; i < q.targets.size(); ++i)
+                    hint += (i ? " or " : "") + q.targets[i];
+                hint += ".";
+            }
+            dimText(hint.c_str());
+        } else {
+            for (size_t pi = 0; pi < q.picks.size(); ++pi) {
+                const AskPick& p = q.picks[pi];
+                const std::string lab = p.label.empty() ? p.kind + " " + p.id : p.label;
+                ImGui::PushID((int)pi);
+                kit::chip(lab.c_str(), kit::Tone::Accent);
+                ImGui::PopID();
+                if (pi + 1 < q.picks.size()) ImGui::SameLine();
+            }
+        }
+        const bool resolving =
+            std::any_of(st.pendingContextRefs.begin(), st.pendingContextRefs.end(),
+                        [](const core::ContextRef& r) { return r.resolving; });
+        const int nRefs = (int)st.pendingContextRefs.size();
+        const std::string useLbl = "Use picked geometry" +
+                                   (nRefs > 0 ? " (" + std::to_string(nRefs) + ")" : std::string());
+        if (kit::secondaryButton(useLbl.c_str(), nRefs > 0 && !resolving,
+                                 resolving ? "Waiting for the pick to resolve\xe2\x80\xa6"
+                                           : "Pick on the model first, then use it here.")) {
+            if (askTakePicks(st, q) == 0)
+                st.toast(ui::ToastLevel::Info,
+                         "None of the picked items fits this question.");
+        }
+        ImGui::SameLine();
+        if (kit::secondaryButton(st.contextPickActive ? "Picking\xe2\x80\xa6" : "Pick on model",
+                                 !st.contextPickActive, "Click the model, then Esc"))
+            st.contextPickActive = true;
+        if (!q.picks.empty()) {
+            ImGui::SameLine();
+            if (kit::secondaryButton("Clear")) q.picks.clear();
+        }
+    } else if (q.kind == "text" && q.multiline) {
+        drawChatInput("##text", q.textBuf, "Your answer", 6);
+    } else {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##text", "Your answer", q.textBuf.data(), q.textBuf.size());
+    }
+}
+
+static const char* askResolvedTitle(AskStatus s) {
+    switch (s) {
+        case AskStatus::Answered:  return "Answered";
+        case AskStatus::Reply:     return "Replied in chat";
+        case AskStatus::Declined:  return "Dismissed";
+        case AskStatus::Cancelled: return "Cancelled";
+        case AskStatus::Expired:   return "Expired \xe2\x80\x94 the run that asked has ended";
+        default:                   return "Waiting for your answers";
+    }
+}
+
+// A resolved batch: what was asked and what came back, read-only.
+static void drawAskSummary(AskBatch& b, const ui::Fonts& fonts) {
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+    ImGui::BeginChild("##ask_done", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    const bool answered = b.status == AskStatus::Answered ||
+                          (b.status == AskStatus::Reply && !b.answers.empty());
+    kit::statusGlyphInline(answered || b.status == AskStatus::Reply ? kit::Status::Done
+                                                                    : kit::Status::Skipped);
+    ImGui::SameLine();
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextUnformatted(askResolvedTitle(b.status));
+    ImGui::PopFont();
+    if (!b.agentId.empty()) dimText(("Asked by " + b.agentId).c_str());
+    if (b.status == AskStatus::Expired && !b.error.empty() &&
+        b.error != "The run that asked has ended.")
+        dimText(b.error.c_str());
+
+    std::string copy = askResolvedTitle(b.status);
+    for (size_t i = 0; i < b.questions.size(); ++i) {
+        const AskQuestion& q = b.questions[i];
+        const std::string prompt = q.prompt.empty() ? q.id : q.prompt;
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextWrapped("%s", prompt.c_str());
+        ImGui::PopStyleColor();
+        copy += "\n- " + prompt;
+        if (!answered) continue;
+        auto it = b.answers.find(q.id);
+        const std::string ans = it != b.answers.end()
+                                    ? askAnswerText(q, *it)
+                                    : (q.required ? "(no answer)" : "(the suggested default)");
+        ImGui::Indent(ui::metrics::U(2.0f));
+        ImGui::TextWrapped("%s", ans.c_str());
+        ImGui::Unindent(ui::metrics::U(2.0f));
+        copy += ": " + ans;
+    }
+    if (b.status == AskStatus::Reply && !b.reply.empty()) {
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
+        dimText(("Your reply: " + b.reply).c_str());
+        copy += "\nYour reply: " + b.reply;
+    }
+    ImGui::PopStyleColor();
+    ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##ask_done WindowPadding
+    const ImRect rect = endGlassBubble(gb);
+    chatCopyContext(rect, "##ask_copy", copy);
+}
+
+// A pending batch: the interactive form.
+static void drawAskForm(AppState& st, ChatMsg& m, AskBatch& b, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const ImVec4 accentCol = semanticOnGlass(pal.accent, surf);
+    const bool busy = b.status == AskStatus::Submitting;
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+    ImGui::BeginChild("##ask", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    // Fields sit on glass: derive the frame from the surface ink (the Quick-settings idiom), so
+    // values stay legible over a bright or dark backdrop.
+    const ImVec4 ink = surf.textPrimary;
+    const ImVec4 fieldBg(ink.x, ink.y, ink.z, 0.08f);
+    const ImVec4 fieldHov(ink.x, ink.y, ink.z, 0.14f);
+    const ImVec4 fieldAct(ink.x, ink.y, ink.z, 0.18f);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, surf.textTertiary);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, fieldBg);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, fieldHov);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, fieldAct);
+    ImGui::PushStyleColor(ImGuiCol_Button, fieldBg);   // combo caret well == frame
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, fieldHov);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, fieldAct);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
+
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(accentCol, "%s",
+                       b.agentId.empty() ? "Questions for you"
+                                         : ("Questions from " + b.agentId).c_str());
+    ImGui::PopFont();
+    dimText("Answer here and submit, or just reply in the chat. The agent waits for you.");
+
+    if (busy) ImGui::BeginDisabled();
+    for (size_t i = 0; i < b.questions.size(); ++i) {
+        AskQuestion& q = b.questions[i];
+        ImGui::PushID((int)i);
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
+        std::string lbl = q.prompt.empty() ? q.id : q.prompt;
+        if (q.required) lbl += "  \xc2\xb7  required";
+        ImGui::TextWrapped("%s", lbl.c_str());
+        if (!q.why.empty()) dimText(q.why.c_str());
+        drawAskInput(st, q, surf);
+        ImGui::PopID();
+    }
+    if (busy) ImGui::EndDisabled();
+
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
+    std::string notReady;
+    const bool ready = askBatchReady(b, &notReady);
+    if (busy) kit::spinner("Sending your answers\xe2\x80\xa6");
+    kit::inlineStatus(b.error.c_str(), kit::Tone::Err);
+    const bool submit = kit::primaryButton(
+        "Submit answers", ready && !busy,
+        busy ? "Sending\xe2\x80\xa6" : (notReady.empty() ? nullptr : notReady.c_str()),
+        ImVec2(-1, ui::metrics::copilotBtnH()));
+    const bool dismiss = kit::secondaryButton("Dismiss", !busy, "Sending\xe2\x80\xa6",
+                                              ImVec2(-1, 0));
+    if (ImGui::IsItemHovered() && !busy)
+        ImGui::SetTooltip("Skip these questions \xe2\x80\x94 the agent continues on its own judgement.");
+
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(8);
+    ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##ask WindowPadding
+    endGlassBubble(gb);
+
+    if (!submit && !dismiss) return;
+    const std::string runId = askRunId(st, b);
+    if (!st.workerStarted || runId.empty()) {
+        b.status = AskStatus::Expired;
+        b.error = "No live run is waiting for these answers.";
+        m.uiCachedH = -1.0f;
+        markChatHistoryDirty();
+        return;
+    }
+    nlohmann::json answers = submit ? buildAskAnswers(b) : nlohmann::json::object();
+    b.status = AskStatus::Submitting;
+    b.error.clear();
+    b.answers = answers;
+    m.uiCachedH = -1.0f;
+    markChatHistoryDirty();
+    agentAnswerDispatch(st, runId, b.batchId, std::move(answers), /*declined=*/dismiss);
+}
+
+void drawAskCards(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
+    for (size_t bi = 0; bi < m.asks.size(); ++bi) {
+        AskBatch& b = m.asks[bi];
+        if (b.batchId.empty()) ImGui::PushID((int)bi);
+        else ImGui::PushID(b.batchId.c_str());
+        if (askStatusOpen(b.status)) drawAskForm(st, m, b, fonts);
+        else drawAskSummary(b, fonts);
+        ImGui::PopID();
+    }
+}
+
 // --- model-routing + context-meter helpers (transparency UI) -----------------------------------
 // "openai/gpt-oss-120b:free" -> "gpt-oss-120b" for compact display.
 

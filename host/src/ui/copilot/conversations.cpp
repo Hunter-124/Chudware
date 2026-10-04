@@ -816,6 +816,11 @@ static nlohmann::json rawMessageToJson(const ChatMsg& m) {
         {"curMissionTask", m.curMissionTask},
         {"steps", rawStepsToJson(m.steps)},
         {"clarify", rawClarifyToJson(m.clarify)},
+        {"asks", [&] {
+             nlohmann::json asks = nlohmann::json::array();
+             for (const auto& b : m.asks) asks.push_back(askBatchToJson(b));
+             return asks;
+         }()},
         {"planApprovePending", m.planApprovePending},
         {"planApproveRequest", m.planApproveRequest},
         {"planApproveExtras", m.planApproveExtras},
@@ -1177,7 +1182,8 @@ void persistChatHistory(AppState& st) {
             // path can render a subdued note), keeping save/load a position-preserving
             // bijection across restarts.
             const bool emptyTurn = body.empty() && !m.planState.present && !m.running &&
-                                   !m.steerSplit && m.contextRefs.empty() && m.imagePaths.empty();
+                                   !m.steerSplit && m.contextRefs.empty() && m.imagePaths.empty() &&
+                                   m.asks.empty();
             nlohmann::json entry = {{"u", m.fromUser}, {"t", body}, {"e", m.errKind}};
             if (emptyTurn) entry["empty"] = true;
             if (m.steerSplit) entry["split"] = true;
@@ -1205,6 +1211,12 @@ void persistChatHistory(AppState& st) {
                                   ? m.errorFull.substr(0, 7999) + "\xe2\x80\xa6"
                                   : m.errorFull;
             if (m.planState.present) entry["plan_state"] = planStateToJson(m.planState);
+            // ask_user question batches: what was asked and how it was resolved.
+            if (!m.asks.empty()) {
+                nlohmann::json asks = nlohmann::json::array();
+                for (const auto& b : m.asks) asks.push_back(askBatchToJson(b));
+                entry["asks"] = std::move(asks);
+            }
             // Persist activity timeline (capped) so thoughts/tools survive reload.
             if (!m.fromUser && !m.activity.empty()) {
                 nlohmann::json act = nlohmann::json::array();
@@ -1510,6 +1522,11 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
                     if (p.is_string() && !p.get_ref<const std::string&>().empty())
                         cm.imagePaths.push_back(p.get<std::string>());
             }
+            // A batch saved while still open comes back Expired: a restart drops every live run
+            // (sessions are only parsed from disk when not already resident — see above).
+            if (m.contains("asks") && m["asks"].is_array())
+                for (const auto& jb : m["asks"])
+                    if (jb.is_object()) cm.asks.push_back(askBatchFromJson(jb));
             cm.running = false;
             // Placeholder for a turn that produced no visible output (persisted as
             // "empty" so message ORDINALS survive the round trip — AI-VC msg_idx

@@ -248,3 +248,13 @@ These rules bind role prompts and `ask_user` call sites; they do not change the 
 - **v1.1 (2026-07-16, append-only):** `geometry_select` kind (§1 + §12); producer guidance §13;
   clarified that `choice.multi=true` answers as a JSON array of values (was already in §1);
   geometry `suggested` may be null/empty so models do not fabricate sids.
+- **v1.2 (2026-10-03, append-only):** the desktop chat is the live in-app transport (§8 row
+  "in-app dialog"). An interactive online turn (`interactive_questions: true`, sent by the GUI
+  composer) binds `ask_user` to `services/agent/chudcode_questions.TurnQuestions`: the batch
+  is announced as feed event `agent.question` (`batch_id` + the §2 questions), the tool blocks
+  with no timeout, and the GUI answers over the worker control lane (`answer`:
+  `{run_id, batch_id, answers{id: raw}}` or `{run_id, batch_id, declined: true}`). A mid-run
+  chat message while a batch is pending resolves it as the user's typed reply instead of a
+  steer. Every resolution emits `agent.answer` with `source` `user` | `reply` | `declined` |
+  `cancelled`; only `user` produces §4 answers (`source: "user"`). Live batches persist to the
+  run ledger but never replay by id (models reuse `q1`). Headless turns keep the default path.

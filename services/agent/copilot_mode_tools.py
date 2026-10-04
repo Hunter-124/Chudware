@@ -222,9 +222,10 @@ def apply_preference_tools(allowed, preferences, *, mode=None):
         tools = {name for _, _, names in tool_menu_groups() for name in names}
     if readonly:
         # Denylists cannot cover newly loaded tool families. Start with the
-        # frozen read-only roster and non-mutating capability floors.
+        # frozen read-only roster and non-mutating capability floors. ask_user
+        # mutates nothing, and Plan is exactly where the agent should ask.
         tools &= (set(ASK_TOOLS) | set(META_TOOL_FLOOR) | set(MAIN_CHAT_DEFAULT_TOOLS)
-                  | {"task_list", "advise", "verify_battery", "render_part"})
+                  | {"task_list", "advise", "verify_battery", "render_part", "ask_user"})
         tools -= set(MUTATING_TOOLS) | set(_MUTATING_TOOLS) | {
             "new_part", "new_assembly", "close_part", "save_part", "import_part",
             "export_part", "fs_write", "fs_edit", "run_shell", "mission_start",

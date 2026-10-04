@@ -1144,7 +1144,7 @@ static const ToolGuidance kToolGuidance[] = {
     {"advisory_dispute", "Contest only with concrete evidence; kernel-sourced disputes return waiver_required=true — a human must confirm the waiver.", 0, 0, ""},
     {"analyze_stl_geometry", "Alias of check_geometry_health. Takes doc_id, not a file path — import_part the mesh first, then call this on the document.", 0, 0, ""},
     {"apply_ascii_edits", "Preview with dry_run=True; pass grid_json + index_json from the last render_*_ascii reply so cell coords resolve against that raster, not a re-render.", 0, 0, ""},
-    {"ask_user", "No-human path: each question is answered with its `suggested` default (source:'default'), never fabricated; pass run_id so gates replay.", 0, 0, ""},
+    {"ask_user", "In the desktop chat the batch is a form and the call waits for the user's answers (or their typed reply); unattended runs take `suggested`. Ask open questions HERE in one call, never as prose at the end of a turn.", 0, 0, ""},
     {"asm_add_component", "Places a FILE — save_part each part first; the FIRST component is fixed by default. Returns the 'k<N>' id that asm_mate refs use.", 0, 0, ""},
     {"asm_mate", "Standard seat: concentric (shank↔bore) + coincident (head↔plate); each query must resolve to ONE face/edge — narrow with pick/near/count.", 0, 0, ""},
     {"assembly_plan_review", "Run at PLANNING time, before a large build — it advises subassembly grouping; deep products should be mated subassemblies, not one giant file.", 0, 0, ""},

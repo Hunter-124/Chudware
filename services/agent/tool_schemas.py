@@ -57,7 +57,7 @@ def tier_tools_slot(tier: str | None) -> tuple[int, bool]:
     return DEFAULT_TOOLS_BUDGET_TOKENS, True
 
 # Params that are call-plumbing, not model-suppliable semantics.
-_SKIP_PARAMS = frozenset({"self", "ctx", "context"})
+_SKIP_PARAMS = frozenset({"self", "ctx", "context", "ask_human"})
 
 # Hand-written schemas for agent pseudo-tools that have no live registry
 # callable outside a mission dispatcher (signatures mirror

@@ -303,6 +303,19 @@ runtime's doctor command.
     child's text; `ProgressWatchdog` counts a sub-agent's successful CAD mutation as turn
     progress but not its research. `general_agent.yaml` PARALLEL SUB-AGENTS: layout.md
     contract first, one document per sub-agent, parent integrates and mates.
+15. **`ask_user` asks the human in the desktop chat (2026-10-03).** Before this every online
+    `ask_user` returned suggested defaults instantly (`MissionDispatch.ask_user`,
+    `blocking=False`), so models ended turns with prose question lists (the plane chat).
+    The GUI composer sends `interactive_questions: true`; `run_turn` then binds
+    `context["ask_human"]` (`chudcode_questions.TurnQuestions.ask`) and dispatch injects it
+    into any target that declares `ask_human` (`_HOST_INJECTED_PARAMS`, hidden from
+    schemas). The batch goes out as `agent.question`, the call blocks with no timeout,
+    and resolves from the control action `answer` (`ChudcodeSessionHost.answer`, hostd
+    `agent_answer`), a user steer (`steer(from_user=True)` resolves the oldest pending
+    batch as `user_reply` — steering would queue behind the blocked call forever), or
+    Stop (`_cancel_run` closes it). Each end emits `agent.answer {source}`. The progress
+    watchdog holds while a batch is pending and restarts its clock afterwards; its own
+    nudges steer with `from_user=False`. Headless turns (no flag) keep the default path.
 
 ## Event rules
 

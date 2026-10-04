@@ -2276,3 +2276,66 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
     }
 
 }
+
+// ---- interactive ask_user batches (agent.question / agent.answer) ----------------------------
+AskBatch* findAskBatch(std::vector<ChatMsg>& msgs, const std::string& batchId, ChatMsg** owner) {
+    if (batchId.empty()) return nullptr;
+    for (auto it = msgs.rbegin(); it != msgs.rend(); ++it)
+        for (auto& b : it->asks)
+            if (b.batchId == batchId) {
+                if (owner) *owner = &*it;
+                return &b;
+            }
+    return nullptr;
+}
+
+bool feedAskEvent(std::vector<ChatMsg>& msgs, ChatMsg* active, const std::string& kind,
+                  const nlohmann::json& data) {
+    if (kind == "agent.question") {
+        AskBatch incoming = askBatchFromEvent(data);
+        if (incoming.batchId.empty() || incoming.questions.empty()) return true;
+        if (findAskBatch(msgs, incoming.batchId)) return true;   // replayed event
+        ChatMsg* host = active;
+        if (!host)
+            for (auto it = msgs.rbegin(); it != msgs.rend() && !host; ++it)
+                if (!it->fromUser) host = &*it;
+        if (!host) return true;
+        host->asks.push_back(std::move(incoming));
+        host->uiCachedH = -1.0f;
+        markChatHistoryDirty();
+        s_chatHistoryLastPersist = -1e9;   // a question is worth an immediate flush
+        return true;
+    }
+    if (kind == "agent.answer") {
+        ChatMsg* owner = nullptr;
+        if (AskBatch* b = findAskBatch(msgs, jstr(data, "batch_id"), &owner)) {
+            applyAskAnswerEvent(*b, data);
+            owner->uiCachedH = -1.0f;
+            markChatHistoryDirty();
+            s_chatHistoryLastPersist = -1e9;
+        }
+        return true;
+    }
+    return false;
+}
+
+bool closeOpenAsks(std::vector<ChatMsg>& msgs) {
+    bool changed = false;
+    for (auto& m : msgs)
+        for (auto& b : m.asks)
+            if (askStatusOpen(b.status)) {
+                b.status = AskStatus::Cancelled;
+                b.error.clear();
+                m.uiCachedH = -1.0f;
+                changed = true;
+            }
+    if (changed) markChatHistoryDirty();
+    return changed;
+}
+
+bool hasOpenAsk(const std::vector<ChatMsg>& msgs) {
+    for (const auto& m : msgs)
+        for (const auto& b : m.asks)
+            if (askStatusOpen(b.status)) return true;
+    return false;
+}

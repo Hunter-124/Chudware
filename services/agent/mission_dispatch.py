@@ -67,6 +67,22 @@ from services.agent.interaction import (  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+class _RecordOnlyLedger:
+    """Persist a live batch's questions and answers without id-keyed replay."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def answered(self, qid: str) -> dict | None:
+        return None
+
+    def record_question(self, q: dict) -> None:
+        self._inner.record_question(q)
+
+    def record_answer(self, qid: str, answer: dict) -> None:
+        self._inner.record_answer(qid, answer)
+
+
 def _coerce_ledger_payload(payload: Any) -> dict:
     """Normalize ledger_note payload to a dict (mega-24 leaf thrash).
 
@@ -851,13 +867,17 @@ class MissionDispatch:
         questions: Any = None,
         question: Any = None,
         scope: str = "run",
+        ask_human: Any = None,
         **extra: Any,
     ) -> dict:
         """Ask the human a typed question batch (contract §4).
 
-        In an autonomous run there is no blocking transport: every question is
-        RECORDED on the run ledger (a human reviews them later) and answered with
-        its suggested default (source: "default") — never a fabricated human reply.
+        In the desktop chat (``ask_human`` injected by an interactive turn) the batch
+        is shown to the user as a form and this call waits for their answers, a typed
+        reply, a dismissal, or Stop. Without a human transport (autonomous runs) every
+        question is RECORDED on the run ledger (a human reviews them later) and
+        answered with its suggested default (source: "default") — never a fabricated
+        human reply.
         """
         raw = questions if questions is not None else question
         if raw is None:
@@ -877,6 +897,8 @@ class MissionDispatch:
             # explicit way OUT of needing the tool at all does. Shared with
             # every other ask_user entry point (services.agent.interaction).
             return _ask_user_bad_arguments_error()
+        if callable(ask_human):
+            return self._ask_human(norm, ask_human)
         try:
             from services.agent import interaction
 
@@ -910,6 +932,85 @@ class MissionDispatch:
                 "autonomous run: questions recorded for the human; "
                 "suggested defaults applied (source per answer)"
             ),
+        }
+
+    def _ask_human(self, norm: list[dict], ask_human: Callable[[dict], Any]) -> dict:
+        """Show *norm* to the user and wait (the interactive-turn ask_user path).
+
+        Answers go through the interaction core (typed finalization, dimension
+        canonicalization, run ledger records). The ledger never REPLAYS here: models
+        number every batch q1, q2, … so an id-keyed replay would hand a later batch an
+        earlier batch's answers. A typed chat reply, a dismissal or Stop end the wait
+        without form answers and are reported as such — never as defaults.
+        """
+        from services.agent import interaction
+        from services.agent.chudcode_questions import QuestionUnavailable
+
+        outcome: dict[str, Any] = {}
+
+        class _Unanswered(Exception):
+            pass
+
+        class _HumanTransport:
+            def ask(self, batch: Any) -> dict:
+                resolution = ask_human(batch.to_dict())
+                outcome["resolution"] = resolution
+                if resolution.source != "user":
+                    raise _Unanswered()
+                return dict(resolution.answers)
+
+        ledger: Any = interaction.MemoryLedger()
+        if self.run_id:
+            try:
+                ledger = _RecordOnlyLedger(interaction.FileLedger(self.run_id))
+            except OSError:
+                pass
+        try:
+            answers = interaction.ask_user(
+                norm,
+                scope="run",
+                run_id=self.run_id or "interactive",
+                blocking=True,
+                autonomy="approve",
+                transport=_HumanTransport(),
+                ledger=ledger,
+            )
+        except _Unanswered:
+            pass
+        except QuestionUnavailable as exc:
+            return {"ok": False, "error": f"ask_user could not reach the user: {exc}"}
+        except Exception as exc:  # noqa: BLE001 — error is data for the model
+            return {"ok": False, "error": f"ask_user failed: {exc}"}
+        else:
+            return {"ok": True, "answers": answers, "answered_by": "user"}
+        resolution = outcome.get("resolution")
+        source = getattr(resolution, "source", "cancelled")
+        if source == "reply":
+            return {
+                "ok": True,
+                "answers": {},
+                "user_reply": resolution.reply,
+                "note": (
+                    "The user replied in chat instead of filling in the form. Take "
+                    "your answers from user_reply; ask again only for what it leaves open."
+                ),
+            }
+        if source == "declined":
+            return {
+                "ok": True,
+                "answers": {},
+                "declined": True,
+                "note": (
+                    "The user dismissed these questions. Continue on stated "
+                    "assumptions where that is safe, say which you used, and do not "
+                    "re-ask the same questions this turn."
+                ),
+            }
+        return {
+            "ok": False,
+            "status": "cancelled",
+            "cancelled": True,
+            "error": "The run was stopped while waiting for the user's answers.",
         }
 
     # ------------------------------------------------------------------ delegate

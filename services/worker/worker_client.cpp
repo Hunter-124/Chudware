@@ -483,8 +483,9 @@ bool agentDocIsCpp(const std::string &method, const json &params) {
   // Cancel is process-wide registry keyed by run_id — no doc needed.
   if (method == "agent_cancel")
     return true;
-  // Steer is the same per-run registry path as cancel — no doc needed.
-  if (method == "agent_steer")
+  // Steer and the ask_user answer are the same per-run registry path as cancel
+  // — no doc needed.
+  if (method == "agent_steer" || method == "agent_answer")
     return true;
   if (!params.is_object())
     return false;
@@ -509,6 +510,7 @@ bool routeAgentToCpp(const std::string &method, const json &params) {
         method == "agent_clarify_v1" || method == "agent_pm_assist_v1" ||
         method == "agent_simulate_v1" || method == "agent_mission_v1" ||
         method == "agent_cancel" || method == "agent_steer" ||
+        method == "agent_answer" ||
         method == "get_prompts_v2"))
     return false; // everything else stays Python
   if (!agentDocIsCpp(method, params))
@@ -1878,6 +1880,23 @@ bool WorkerClient::callAgentSteer(const std::string &runId,
   return call("agent_steer", params, result, err, 5000);
 }
 
+bool WorkerClient::callAgentAnswer(const std::string &runId,
+                                   const std::string &batchId,
+                                   const json &answers, bool declined,
+                                   json &result, std::string &err) {
+  json params{{"run_id", runId}, {"batch_id", batchId}};
+  if (declined)
+    params["declined"] = true;
+  else
+    params["answers"] = answers.is_object() ? answers : json::object();
+  bool matched = false;
+  if (callWorkerControl("answer", runId, params, matched, result, err))
+    return true;
+  if (matched)
+    return false;
+  return call("agent_answer", params, result, err, 5000);
+}
+
 bool WorkerClient::callViaSideClient(const std::string &method,
                                      const json &params, json &result,
                                      std::string &err, int timeoutMs,
@@ -1889,7 +1908,7 @@ bool WorkerClient::callViaSideClient(const std::string &method,
   }
   // Short-lived private connection to the daemon (no spawn: a call is already
   // in flight on the shared client, so hostd is up). Same pattern as the
-  // agent_cancel/agent_steer side channel in callImpl below.
+  // agent_cancel/agent_steer/agent_answer side channel in callImpl below.
   // hostdBin hint is REQUIRED: an empty hint hashes "default" in instanceKey(),
   // which is a different socket than the running daemon's (hostd binds
   // instanceKey(selfPath())) — the connect then fails ENOENT mid-session.
@@ -1936,7 +1955,8 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   // supposed to stop. Keep Python-worker sim_cancel serialized: its stdio pipe
   // cannot safely carry concurrent requests.
   const bool isAgentControl =
-      (method == "agent_cancel" || method == "agent_steer");
+      (method == "agent_cancel" || method == "agent_steer" ||
+       method == "agent_answer");
   const bool isCppSimCancel =
       (method == "sim_cancel" && routeSimToCpp(method, params));
   const bool bypassCallMutex = isAgentControl || isCppSimCancel;
@@ -2136,28 +2156,40 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       // the flow condition + runs LBM).
       ok =
           engine::call("agent_simulate_v1", params, cppResult, cerr, timeoutMs);
-    } else if (method == "agent_steer") {
-      // Mid-run steering: queue `text` for the run to consume at the next
-      // stage/attempt boundary. Same transport shape as agent_cancel:
+    } else if (method == "agent_steer" || method == "agent_answer") {
+      // Mid-run steering / ask_user answer: steer queues `text` for the run to
+      // consume at the next stage/attempt boundary; answer resolves the run's
+      // pending question batch. Same transport shape as agent_cancel:
       // in-process calls libchudware directly; daemon mode uses a SHORT-LIVED
-      // second EngineClient so the steer never queues behind the in-flight
-      // agent_run on the shared socket.
+      // second EngineClient so the control call never queues behind the
+      // in-flight agent_run on the shared socket (hostd routes it to the
+      // active worker run's control lane).
       if (engine::daemonMode()) {
         chudware_ipc::EngineClient side;
         chudware_ipc::EngineClient::Options opts;
         opts.clientKind = "gui";
         opts.hostdBin =
             engine::hostdBinHint(); // same instance key as the live daemon
-        opts.allowSpawn = false;    // never spawn a new hostd for steer
+        opts.allowSpawn = false;    // never spawn a new hostd for control
         std::string cerr2;
         if (side.connectOrSpawn(opts, cerr2)) {
-          ok = side.call("agent_steer", params, cppResult, cerr, 5000);
+          ok = side.call(method, params, cppResult, cerr, 5000);
         } else {
-          cerr = cerr2.empty() ? "steer: daemon unreachable" : cerr2;
+          cerr = cerr2.empty() ? method + ": daemon unreachable" : cerr2;
           ok = false;
         }
+      } else if (method == "agent_answer") {
+        // In-process there is no hostd to route to the worker's control lane,
+        // and libchudware has no question registry: callAgentAnswer already
+        // tried the direct worker control socket, so no live run owns it.
+        cppResult = json{{"ok", false},
+                         {"run_id", params.value("run_id", std::string())},
+                         {"batch_id", params.value("batch_id", std::string())},
+                         {"answered", false},
+                         {"reason", "no active agent run for this question"}};
+        ok = true;
       } else {
-        ok = engine::call("agent_steer", params, cppResult, cerr, timeoutMs);
+        ok = engine::call(method, params, cppResult, cerr, timeoutMs);
       }
     } else if (method == "agent_cancel") {
       // Best-effort stop. In-process: call libchudware directly (no mutex

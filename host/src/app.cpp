@@ -3533,7 +3533,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 #endif
     // Stop/steer when hostd is already down is a quiet local finalize — log
     // only, no red Error toast.
-    if (method == "agent_cancel" || method == "agent_steer") {
+    if (method == "agent_cancel" || method == "agent_steer" ||
+        method == "agent_answer") {
       st.addLog("[worker] " + method + ": " + err);
       return;
     }
@@ -4895,8 +4896,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             ui::activeWorkFeedEvent(orchKind, data);
             // Fold the event into the running turn's inline activity timeline
             // so the conversation transparently shows what the AI is
-            // doing/thinking.
-            if (active)
+            // doing/thinking. ask_user questions/answers become question
+            // cards instead; an answer can resolve a batch in an OLDER
+            // bubble (a composer reply split the turn), so it needs msgs.
+            const bool askEvent =
+                msgs && feedAskEvent(*msgs, active, orchKind, data);
+            if (!askEvent && active)
               feedTurnActivity(*active, orchKind, data);
             // Context meter. THREE sources, one per lane — do not collapse:
             //   * agent.context (live Python general lane): the authoritative
@@ -5131,6 +5136,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       const bool isViewedDoc =
           !job.docKey.empty() && job.docKey == st.chatDocKey;
       std::vector<ChatMsg> *msgsPtr = conversationMsgs(st, runConvId);
+      // The turn is over: a question it asked can no longer be answered.
+      if (msgsPtr)
+        closeOpenAsks(*msgsPtr);
       // The status line is viewport-singular — a background run must never
       // repaint it for the document the user is actually looking at.
       auto setStatus = [&](const char *text, int kind) {

@@ -6,9 +6,9 @@ from typing import Any
 ENTRIES: dict[str, dict[str, Any]] = {
     "ask_user": {
         "prompt_note": (
-            "No-human path: each question is answered with its `suggested` "
-            "default (source:'default'), never fabricated; pass run_id so "
-            "gates replay."
+            "In the desktop chat the batch is a form and the call waits for the "
+            "user's answers (or their typed reply); unattended runs take `suggested`. "
+            "Ask open questions HERE in one call, never as prose at the end of a turn."
         ),
     },
     "confirm_dimensions": {

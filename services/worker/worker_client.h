@@ -133,7 +133,8 @@ inline bool buildControlFrame(const std::string& token,
                               const std::string& action,
                               const nlohmann::json& params,
                               std::string& frame, std::string& err) {
-    if (action != "cancel" && action != "steer" && action != "status") {
+    if (action != "cancel" && action != "steer" && action != "answer" &&
+        action != "status") {
         err = "unsupported worker control action";
         return false;
     }
@@ -264,6 +265,15 @@ public:
     bool callAgentSteer(const std::string& runId, const std::string& text,
                         const nlohmann::json& attachments, nlohmann::json& result,
                         std::string& err);
+
+    // Interactive ask_user answer: agent_answer {run_id, batch_id, answers} or
+    // {run_id, batch_id, declined:true} → {ok, run_id, batch_id, answered} | {ok:false, reason}.
+    // Same mutex-bypass / side-channel transport as steer: the question blocks the in-flight
+    // run, so an answer queued behind it would deadlock. `answers` maps question id → raw
+    // typed value (contracts/interaction.md); ignored when `declined`.
+    bool callAgentAnswer(const std::string& runId, const std::string& batchId,
+                         const nlohmann::json& answers, bool declined,
+                         nlohmann::json& result, std::string& err);
 
     // C39: one-way teardown abort — makes a blocked (and any future) call() fail fast with
     // err "aborted" instead of running out its timeout. Set at app exit (AsyncRpc::shutdown)

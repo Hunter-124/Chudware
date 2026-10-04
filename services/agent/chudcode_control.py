@@ -271,7 +271,7 @@ class ControlServer:
                 raise RequestError("rate_limited", "too many unauthorized attempts")
             raise RequestError("unauthorized", "unauthorized")
         action = request.get("action")
-        if action not in {"cancel", "steer", "status"}:
+        if action not in {"cancel", "steer", "answer", "status"}:
             raise RequestError("invalid_action", "unsupported control action")
         params = request.get("params", {})
         if not isinstance(params, dict):

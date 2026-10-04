@@ -387,6 +387,16 @@ continuous. The flat-pattern geometry is surfaced on `CompileResult.sheet_metal_
 `agent_steer {run_id, text}` → `{ok, steered}`; queues a `[User steering]` user message the
 running turn consumes at its next stage/attempt boundary (cooperative, like cancel — never
 interrupts an in-flight provider HTTP call). Unknown/finished run_id → `{ok:true, steered:false}`.
+`agent_answer {run_id, batch_id, answers:{<qid>: RAW}}` or `{run_id, batch_id, declined:true}`
+(2026-10-03) → `{ok:true, run_id, batch_id, answered:true}` | `{ok:false, reason, …}`; resolves
+the interactive `ask_user` question batch an online turn is blocked on (`agent.question` /
+`agent.answer` feed events, typed question shapes and RAW per-kind answer values in
+`contracts/interaction.md`). Only turns started with `interactive_questions:true` block;
+headless turns keep the suggested-default path. A batch that already resolved (composer reply,
+dismiss, Stop, turn end) → `{ok:false, reason:"question is no longer pending"}`; no active
+worker run for `run_id` → `{ok:false, answered:false, reason:"no active agent run for this
+question"}` from hostd (never forwarded to the engine or queued on the agent lane). Transport
+is the worker control action `answer` (below), like `agent_steer`.
 
 ### AI context references (Wave 4, append-only)
 `agent_design` and `agent_run_v2` accept an OPTIONAL `context_refs?: [{kind, id, doc_id?,
@@ -1766,6 +1776,10 @@ general-lane request. The manufacturing lane's injected worker callback always
 uses the general process. Shutdown stops each process only if it was created.
 `agent_cancel`/`agent_steer` for an active worker run use the agent worker's
 private authenticated control socket, never its busy stdio channel.
+`agent_answer` (2026-10-03) rides the same socket as control action `answer` with params
+`{run_id, batch_id, answers}` or `{run_id, batch_id, declined:true}`; the action allowlist is
+`cancel`, `steer`, `answer`, `status`. Hostd answers an unmatched `agent_answer` itself with a
+structured `{ok:false, reason}` result — it has no engine or stdio-lane implementation.
 
 The explicit hostd dispatch classification (worker_main registration tables):
 

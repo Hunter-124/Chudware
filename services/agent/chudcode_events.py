@@ -126,6 +126,46 @@ def _bounded(value: Any, depth: int = 0) -> Any:
     return f"<{type(value).__name__}>"
 
 
+def _question_payload(q: Mapping[str, Any]) -> dict[str, Any]:
+    """One contract-§2 question for the GUI card: known fields, bounded, structure kept.
+
+    ``_bounded`` flattens below depth 4, which would turn every choice option of a
+    batch into a string; the card needs ``options[i].value``/``label`` intact.
+    """
+    out: dict[str, Any] = {
+        "id": _str(q, "id", limit=128),
+        "kind": _str(q, "kind", limit=32) or "text",
+        "prompt": _str(q, "prompt", limit=_MAX_DETAIL),
+        "required": q.get("required") is True,
+        "suggested": _bounded(q.get("suggested"), 2),
+    }
+    for key in ("why", "family", "proposal", "media", "doc_id"):
+        text = _str(q, key, limit=_MAX_DETAIL if key in ("why", "proposal") else 128)
+        if text:
+            out[key] = text
+    for key in ("multi", "multiline", "multiple"):
+        if isinstance(q.get(key), bool):
+            out[key] = q[key]
+    options = q.get("options")
+    if isinstance(options, list):
+        rows = []
+        for option in options[:32]:
+            if isinstance(option, Mapping):
+                row = {"value": _cap(option.get("value"), _MAX_LABEL)}
+                label = _str(option, "label", limit=_MAX_LABEL)
+                if label:
+                    row["label"] = label
+            else:
+                row = {"value": _cap(option, _MAX_LABEL)}
+            rows.append(row)
+        out["options"] = rows
+    for key in ("targets", "accept"):
+        values = q.get(key)
+        if isinstance(values, list):
+            out[key] = [_cap(v, 64) for v in values[:16]]
+    return out
+
+
 def _canonical(value: Any) -> str:
     return json.dumps(
         _bounded(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -1058,6 +1098,41 @@ def map_rpc_frame(
         if not text:
             return []
         return [_status(link, "notice" if event == "notice" else "progress_nudge", text)]
+    if event == "agent_question":
+        questions = [
+            _question_payload(q)
+            for q in (data.get("questions") or [])[:8]
+            if isinstance(q, Mapping)
+        ]
+        batch_id = _str(data, "batch_id", "batchId", limit=128)
+        if not batch_id or not questions:
+            return []
+        payload = _linked(
+            link,
+            batch_id=batch_id,
+            prompt=questions[0]["prompt"],
+            questions=questions,
+        )
+        agent_id = _str(data, "agent_id", "agentId", limit=128)
+        if agent_id:
+            payload["agent_id"] = agent_id
+        return [("agent.question", payload)]
+    if event == "agent_answer":
+        batch_id = _str(data, "batch_id", "batchId", limit=128)
+        if not batch_id:
+            return []
+        payload = _linked(
+            link,
+            batch_id=batch_id,
+            source=_str(data, "source", limit=32) or "cancelled",
+        )
+        answers = data.get("answers")
+        if isinstance(answers, Mapping) and answers:
+            payload["answers"] = _bounded(answers, 1)
+        reply = _str(data, "reply", limit=_MAX_DETAIL)
+        if reply:
+            payload["reply"] = reply
+        return [("agent.answer", payload)]
 
     deltas = {
         "assistant_delta",

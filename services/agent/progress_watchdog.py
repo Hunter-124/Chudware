@@ -197,6 +197,10 @@ class ProgressWatchdog:
             self._mark_progress()
         return self.due()
 
+    def user_input(self) -> None:
+        """Time spent waiting on the user (an ask_user form) is not a research stall."""
+        self._mark_progress()
+
     def _mark_progress(self) -> None:
         self.research_calls = 0
         self.first_research = None

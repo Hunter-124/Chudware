@@ -5604,3 +5604,28 @@ Probing stock PrusaSlicer 2.9.6 showed its CLI performs no sequential clearance 
 `gcode_check.verify_gcode` adds `sequential_clearance` for `complete_objects = 1` files (found by a tail pre-scan, with a re-parse fallback): objects come from PrusaSlicer's `; printing object` labels (or Z restarts), and every motion after an object's last extrusion and below its top must stay outside the clearance radius of its footprint hull and keep the gantry above it; interleaved objects fail. Layer-by-layer files report it as not applicable. `publish_print_media` copies plate membership into the media manifest and lists it in `README.txt` under the plate's file.
 
 Verification: planner, synthetic G-code and real-engine/real-slicer plate tests plus the existing print, publishing and mode suites passed (141); `scripts/check.py` 9/9 and `./build.sh`. Real MCP smoke: a 4-object/3-part Ender-3 plate printed one at a time (gaps 57 mm, tall pin last) was print-ready with `sequential_clearance` pass; two objects above 25 mm were refused by name with no G-code; a layer-by-layer plate of the same parts was print-ready; publishing the sequential plate to a scratch media root produced `R00101_SMALL_PARTS_PLATE.gcode` with its members in README/manifest. Nothing was physically printed, and the check models the hotend as the preset's clearance cylinder plus a full-width gantry, not the printer's real hotend shape. Pre-existing and unchanged: `slice_part(printer="prusa mk4")` without `filament_preset` fails in `ProfileCatalog.default_filament` with "Unknown or ambiguous filament preset: AmazonBasics PLA".
+
+## 2026-10-03 — interactive ask_user: the desktop chat answers the agent's questions
+
+Online `ask_user` used to return suggested defaults instantly (`MissionDispatch.ask_user`,
+`blocking=False`), so the agent asked its real questions as prose at the end of a turn (the
+plane chat: "the question tool returned blank default answers"). The GUI composer now sends
+`interactive_questions: true`; `chudcode_host.run_turn` binds `chudcode_questions.TurnQuestions`
+as `context["ask_human"]`, `chudcode_tools.dispatch_host_tool` injects it into targets that
+declare `ask_human` (hidden from schemas via `_HOST_INJECTED_PARAMS` / `tool_schemas._SKIP_PARAMS`),
+and `MissionDispatch._ask_human` blocks on the user through the interaction core (typed
+finalization, run-ledger records, no id-keyed replay). Feed events `agent.question` /
+`agent.answer` (`chudcode_events._question_payload` keeps option structure that `_bounded`
+would flatten). Answers return over a new control action `answer` (Python ControlServer +
+`worker_rpc.chudcode_control`, `WorkerClient::callAgentAnswer`, hostd `agent_answer` →
+`WorkerBridge::controlActiveRun`, never the busy agent lane); a user steer while a batch is
+pending resolves it as `user_reply`; Stop/turn end resolve it as cancelled. The watchdog holds
+while waiting. `ask_user` now also survives Ask/Plan (`apply_preference_tools` stripped it —
+Plan is where questions belong). GUI: `ui/copilot/ask_answers.{h,cpp}` (GL-free model, RAW
+answer building, persistence; `test_ask_answers`), `drawAskCards` in `cards.cpp`, `feedAskEvent`
+in `feed.cpp`, answer jobs on the composer's control channel; batches persist with the chat and
+restore as Expired. Verification: `test_chudcode_questions.py` (form answer, chat reply, Stop,
+headless, no replay), related suites (603 passed), `test_worker_control`, `test_ask_answers`,
+`./build.sh`, `./build.sh core`, and real gpt-6.1-sol turns through `_agent_admin_turn` that
+asked, received `PETG` + `0.125 in` (canonical 3.175 mm) over the control action, and in a
+second run took a chat reply instead.

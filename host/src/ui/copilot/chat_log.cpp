@@ -690,6 +690,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 
     // (4) Pre-flight clarify gate: the model's build-critical questions, awaiting the user.
     if (m.clarify.active) drawClarifyCard(st, m, fonts);
+    // (4a) The online agent's ask_user questions — interactive while pending, a summary after.
+    if (!m.asks.empty()) drawAskCards(st, m, fonts);
     // (4b) Plan-mode / mission plan_ready approve gate (Execute as Agent/Swarm/Eng.Firm).
     if (m.planApprovePending && !m.running) drawPlanApproveCard(st, m, fonts);
 
@@ -1017,6 +1019,8 @@ void drawChatLogWindowed(AppState& st) {
         const float y = ImGui::GetCursorPosY();
         const bool cacheValid = m.uiCachedH > 0.0f && std::fabs(m.uiCachedW - logW) < 0.5f;
         const bool interactive = m.running || m.clarify.active || m.clarify.awaiting ||
+                                 std::any_of(m.asks.begin(), m.asks.end(),
+                                             [](const AskBatch& b) { return askStatusOpen(b.status); }) ||
                                  (s_aiVc.confirmMsgIdx == (int)mi);
         // Pre-count mutating assistant turns even when the row is off-screen (stable turn nums).
         int thisTurn = 0;

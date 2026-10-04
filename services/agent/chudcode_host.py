@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from services.agent.chudcode_questions import TurnQuestions
 from services.agent.progress_watchdog import ProgressWatchdog
 
 _DEFAULT_MAX_SESSIONS = 8
@@ -381,6 +382,8 @@ class _Run:
     control_lock: threading.Lock = field(default_factory=threading.Lock)
     # (message, images) queued before prompt() returned; images are Chudcode ImageContent.
     pending_steers: list[tuple[str, list[dict[str, Any]]]] = field(default_factory=list)
+    # Pending ask_user batches of an interactive (GUI) turn; None for headless turns.
+    questions: TurnQuestions | None = None
 
 
 class ChudcodeSessionHost:
@@ -490,7 +493,7 @@ class ChudcodeSessionHost:
 
         def send_progress_nudge(text: str) -> None:
             try:
-                outcome = self.steer(run_id, text)
+                outcome = self.steer(run_id, text, from_user=False)
             except Exception as exc:  # noqa: BLE001 - advisory steering never aborts a turn
                 _LOG.warning("Progress steering failed (%s)", exc)
                 return
@@ -528,6 +531,11 @@ class ChudcodeSessionHost:
                 progress_timer = None
                 scheduled_deadline = None
                 if progress_closed:
+                    return
+                if run.questions is not None and run.questions.has_pending():
+                    # The agent is waiting on the user's answers, not researching.
+                    progress.user_input()
+                    schedule_progress_timer()
                     return
                 text = progress.due()
                 schedule_progress_timer()
@@ -613,6 +621,31 @@ class ChudcodeSessionHost:
                 observed_contexts = _bind_host_call_observer(
                     params.get("host_tools"), observe_host_call
                 )
+                if params.get("interactive_questions"):
+
+                    def emit_question_frame(frame: dict[str, Any]) -> None:
+                        with emit_lock:
+                            emit(frame)
+
+                    questions = TurnQuestions(
+                        emit_question_frame,
+                        run_id=run_id,
+                        session_id=session_id,
+                        is_cancelled=lambda: run.cancel_requested,
+                    )
+
+                    def ask_human(batch, *, agent_id=None, cancel=None):
+                        try:
+                            return questions.ask(batch, agent_id=agent_id, cancel=cancel)
+                        finally:
+                            with progress_lock:
+                                progress.user_input()
+                                schedule_progress_timer()
+
+                    with self._lock:
+                        run.questions = questions
+                    for context in observed_contexts:
+                        context["ask_human"] = ask_human
                 self._configure_turn(session, params)
                 opening_state = _safe_client_state(session.client)
                 bound_file = opening_state.get("sessionFile") or opening_state.get(
@@ -736,8 +769,11 @@ class ChudcodeSessionHost:
                         "Chudcode event unsubscription failed (%s)",
                         type(exc).__name__,
                     )
+            if run.questions is not None:
+                run.questions.close()
             for context in observed_contexts:
                 context.pop("host_call_observer", None)
+                context.pop("ask_human", None)
             dispose = False
             with self._lock:
                 if session is not None:
@@ -898,6 +934,9 @@ class ChudcodeSessionHost:
                 run.cancel_requested = True
                 client = run.client
                 should_abort = client is not None and run.started and not run.cancel_sent
+                questions = run.questions
+            if questions is not None:
+                questions.close()
             if should_abort:
                 try:
                     client.abort()
@@ -913,7 +952,27 @@ class ChudcodeSessionHost:
                     run.cancel_sent = True
         return {"ok": True, "run_id": run_key, "cancelled": True, "active": True}
 
-    def steer(self, run_id, text, attachments=None) -> dict:
+    def answer(self, run_id, batch_id, answers=None, declined=False) -> dict:
+        """Resolve a pending ask_user batch from the GUI's question card."""
+        run_key = _nonempty_string(run_id)
+        if run_key is None:
+            return {"ok": False, "reason": "run_id is required"}
+        with self._lock:
+            run = self._runs.get(run_key)
+            questions = run.questions if run is not None else None
+        if questions is None:
+            return {
+                "ok": False,
+                "run_id": run_key,
+                "answered": False,
+                "active": run is not None,
+                "reason": "question is no longer pending",
+            }
+        result = questions.answer(batch_id, answers, declined=bool(declined))
+        result["run_id"] = run_key
+        return result
+
+    def steer(self, run_id, text, attachments=None, *, from_user: bool = True) -> dict:
         run_key = _nonempty_string(run_id)
         message = _nonempty_string(text)
         if run_key is None or message is None:
@@ -939,6 +998,23 @@ class ChudcodeSessionHost:
                     "steered": False,
                     "active": False,
                 }
+        # A user message sent while the agent waits on its question form IS the answer:
+        # steering it instead would queue behind the blocked ask_user call forever.
+        questions = run.questions if from_user else None
+        if questions is not None and questions.has_pending():
+            answered = questions.reply(message)
+            if answered is not None and not images:
+                with self._lock:
+                    run.steers.add(message)
+                return {
+                    "ok": True,
+                    "run_id": run_key,
+                    "steered": True,
+                    "active": True,
+                    "answered_question": answered,
+                }
+            if answered is not None:
+                message = "(Images attached to my reply to your questions.)"
         with run.control_lock:
             with self._lock:
                 if message in run.steers or any(

@@ -910,13 +910,18 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
     }
 
     // An online worker turn occupies its stdio channel for the full run. Route
-    // matching cancel/steer through the worker's authenticated side channel
-    // first; when no such worker run is active, preserve the core control path.
-    if (method == "agent_cancel" || method == "agent_steer") {
+    // matching cancel/steer/answer through the worker's authenticated side
+    // channel first; when no such worker run is active, cancel/steer preserve
+    // the core control path. agent_answer has no engine (or worker-lane)
+    // implementation — a question only lives inside an active worker run — so an
+    // unmatched answer ends here and never queues behind a busy agent lane.
+    if (method == "agent_cancel" || method == "agent_steer" || method == "agent_answer") {
         json controlResult;
         std::string controlErr;
         bool workerRunMatched = false;
-        const char* action = method == "agent_cancel" ? "cancel" : "steer";
+        const char* action = method == "agent_cancel"  ? "cancel"
+                             : method == "agent_steer" ? "steer"
+                                                       : "answer";
         if (WorkerBridge::controlActiveRun(action, params, workerRunMatched,
                                            controlResult, controlErr))
             return controlResult;
@@ -926,6 +931,19 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& para
                         {"message", controlErr.empty()
                                         ? std::string("worker control request failed")
                                         : controlErr}};
+        }
+        if (method == "agent_answer") {
+            const auto field = [&](const char* key) {
+                const auto it = params.is_object() ? params.find(key) : params.end();
+                return params.is_object() && it != params.end() && it->is_string()
+                           ? it->get<std::string>()
+                           : std::string();
+            };
+            return json{{"ok", false},
+                        {"run_id", field("run_id")},
+                        {"batch_id", field("batch_id")},
+                        {"answered", false},
+                        {"reason", "no active agent run for this question"}};
         }
     }
 

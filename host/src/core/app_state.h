@@ -35,6 +35,7 @@
 #include "async_rpc.h"   // core::AsyncRpc (C39) — non-blocking worker calls
 #include "switch_hold.h" // core::SwitchHold — async tab switch survives ensureActiveTab
 #include "context_ref.h" // core::ContextRef — composer context-picker chips
+#include "../ui/copilot/ask_answers.h"  // AskBatch — the agent's interactive question batches
 
 #include "../ui/toast.h"    // W1-B: ToastLevel / Toast (toast queue lives on AppState)
 #include "../ui/cursors.h"  // W1-B: CursorKind (per-frame cursor request)
@@ -728,6 +729,10 @@ struct ChatMsg {
     nlohmann::json planApproveExtras = nlohmann::json::object();  // attachments/context_refs
     // Optional escalate/advisor reason shown on the approve card (needs_user_decision).
     std::string planApproveReason;
+    // The online agent's interactive ask_user batches (agent.question), drawn as question cards
+    // in this turn. Resolution (agent.answer) may land after a steer opened a NEWER bubble, so
+    // batches are located by batch_id across the conversation, never only in the live message.
+    std::vector<AskBatch> asks;
     // Mission status=="partial": warning-accent result card (not error). Geometry kept.
     bool resultPartial = false;
     // Per-message copilot mode stamp (CopilotMode 0..2). -1 = unstamped / no mode border.
@@ -761,6 +766,18 @@ struct ChatMsg {
 // run_finished; data = the event's "data" object) into a turn's activity timeline. Called on the
 // GL thread from the event-drain loop. No-op for events it doesn't recognize.
 void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json& data);
+
+// Fold an agent.question / agent.answer event into the run's conversation. A question lands on
+// `active` (the live assistant bubble; the last assistant message when none is live), deduped by
+// batch_id; an answer resolves its batch wherever it sits in `msgs`. Returns true when `kind` was
+// one of the two. GL thread (event drain, app.cpp).
+bool feedAskEvent(std::vector<ChatMsg>& msgs, ChatMsg* active, const std::string& kind,
+                  const nlohmann::json& data);
+// The run that owned `msgs` ended or was stopped: every still-open batch becomes Cancelled.
+// Idempotent with the worker's own agent.answer {source:"cancelled"}. Returns true if any changed.
+bool closeOpenAsks(std::vector<ChatMsg>& msgs);
+// True when any message in `msgs` holds an open (pending/submitting) batch.
+bool hasOpenAsk(const std::vector<ChatMsg>& msgs);
 
 // Resolve the LIVE message vector a conversation's ChatMsgs currently live in: AppState::chat if
 // convId is the currently VIEWED conversation, else that resident Conversation's parked msgs.

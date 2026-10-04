@@ -1893,6 +1893,13 @@ def chudcode_control(action: str, params: dict) -> dict:
             return get_default_chudcode_host().steer(
                 params.get("run_id"), params.get("text"), params.get("attachments")
             )
+        if command == "answer":
+            return get_default_chudcode_host().answer(
+                params.get("run_id"),
+                params.get("batch_id"),
+                params.get("answers"),
+                declined=params.get("declined") is True,
+            )
         if command == "status":
             return get_default_chudcode_host().status(
                 run_id=params.get("run_id"), session_id=params.get("session_id")
@@ -3697,6 +3704,10 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
         host_params["images"] = raw_params["images"][:_ATTACH_MAX]
     if isinstance(raw_params.get("host_uris"), list):
         host_params["host_uris"] = raw_params["host_uris"]
+    # The desktop chat can show ask_user batches and answer them; headless callers
+    # (run_mission.py) omit the flag and keep the suggested-default path.
+    if raw_params.get("interactive_questions") is True:
+        host_params["interactive_questions"] = True
     # Turn budget: only an explicit positive finite `timeout` bounds the turn
     # (run_mission.py --timeout-s). Without one the host has no wall-clock stop.
     raw_timeout = raw_params.get("timeout")

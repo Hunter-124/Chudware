@@ -982,8 +982,9 @@ def _var_param_names(fn: Any) -> frozenset[str]:
     )
 
 
-#: Parameters dispatch supplies itself (the host's progress sink and Stop probe).
-_HOST_INJECTED_PARAMS = ("progress", "cancel")
+#: Parameters dispatch supplies itself (the host's progress sink and Stop probe, and the
+#: interactive turn's question transport).
+_HOST_INJECTED_PARAMS = ("progress", "cancel", "ask_human")
 
 
 def _without_catch_alls(schema: dict[str, Any], fn: Any) -> dict[str, Any]:
@@ -1543,6 +1544,13 @@ def dispatch_host_tool(
             kwargs["progress"] = progress
         if _accepts(target, "cancel"):
             kwargs["cancel"] = cancel
+        asker = _ctx(binding.context, "ask_human", None)
+        if callable(asker) and _accepts(target, "ask_human"):
+
+            def ask_human(batch: Mapping[str, Any]) -> Any:
+                return asker(batch, agent_id=agent_id, cancel=cancel)
+
+            kwargs["ask_human"] = ask_human
         result = target(**kwargs)
         return _attach_arg_notes(result, notes) if notes else result
 

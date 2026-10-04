@@ -94,6 +94,25 @@ void requestFraming() {
                           {"params", params}},
           "request preserves authenticated action and correlated run id");
 
+    const json answerParams = {
+        {"run_id", "run-17"},
+        {"batch_id", "b_0a1b"},
+        {"answers", {{"q1", "M4"}, {"q2", {{"value", 12.5}, {"unit", "mm"}}}}},
+    };
+    std::string answerFrame;
+    err.clear();
+    check(chudware::worker::detail::buildControlFrame(
+              secret, "answer", answerParams, answerFrame, err),
+          "answer request frame builds");
+    check(json::parse(answerFrame) == json{{"token", secret},
+                                           {"action", "answer"},
+                                           {"params", answerParams}},
+          "answer request carries batch id and typed answers verbatim");
+    err.clear();
+    check(!chudware::worker::detail::buildControlFrame(
+              secret, "answer", json::array({"q1"}), answerFrame, err),
+          "answer params must be an object");
+
     std::string oversized;
     err.clear();
     check(!chudware::worker::detail::buildControlFrame(
@@ -106,10 +125,12 @@ void requestFraming() {
           "oversized request frame is rejected");
     check(oversized.empty(), "rejected request frame is wiped");
 
-    err.clear();
-    check(!chudware::worker::detail::buildControlFrame(
-              secret, "arbitrary", json::object(), frame, err),
-          "only landed control actions can be framed");
+    for (const char* action : {"arbitrary", "answers", "Answer", "eval"}) {
+        err.clear();
+        check(!chudware::worker::detail::buildControlFrame(
+                  secret, action, json::object(), frame, err),
+              "only landed control actions can be framed");
+    }
 }
 
 void responseFramingAndRedaction() {

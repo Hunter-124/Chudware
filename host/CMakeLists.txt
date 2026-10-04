@@ -168,6 +168,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/text_wrap.cpp          # composer hard-break tracking (GL-free; unit-tested)
   src/ui/copilot/tool_phrase.cpp        # tool-call human phrasing + grouping keys (GL-free; unit-tested)
   src/ui/copilot/stream_rows.cpp        # streamed-delta row routing/order (GL-free; unit-tested)
+  src/ui/copilot/ask_answers.cpp        # ask_user question batches: prefill/answers/persist (GL-free; unit-tested)
   src/ui/clipboard_image.cpp            # system clipboard -> PNG on disk (paste-an-image)
   src/ui/copilot/image_lightbox.cpp     # attachment thumbnails + full-size image viewer
   src/ui/copilot/context_estimate.cpp   # transcript token/cost estimate (GL-free; unit-tested)
@@ -854,6 +855,21 @@ set_target_properties(test_context_ref PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME test_context_ref
   COMMAND test_context_ref
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+# --- ask_user question card: links the REAL ask_answers.cpp (GL-free). Covers suggested-default
+# prefill, the RAW answer JSON per kind sent with the `answer` control action, required gating,
+# agent.answer folding and the session-file round trip.
+add_executable(test_ask_answers
+  src/ui/copilot/ask_answers.cpp
+  tests/test_ask_answers.cpp)
+target_include_directories(test_ask_answers PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_ask_answers PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(test_ask_answers PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_ask_answers
+  COMMAND test_ask_answers
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 # --- viewport catch-up after tess-less revisions: header-only core/tess_catchup.h (no GL /

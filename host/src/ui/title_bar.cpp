@@ -79,40 +79,6 @@ bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
         } else {
             dl->AddRect(ImVec2(c.x - s, c.y - s), ImVec2(c.x + s, c.y + s), fg, 0, 0, th);
         }
-    } else if (kind == BTN_FULL) {
-        // Corner-arrows expand (enter fullscreen) / inset arrows (exit fullscreen).
-        // `maximized` here is the fullscreen state (see drawTitleBar call site).
-        const float a = s * 0.95f;
-        const float arm = s * 0.55f;
-        if (maximized) {
-            // Exit: four corner brackets pointing inward.
-            // TL
-            dl->AddLine(ImVec2(c.x - a + arm, c.y - a), ImVec2(c.x - a, c.y - a), fg, th);
-            dl->AddLine(ImVec2(c.x - a, c.y - a), ImVec2(c.x - a, c.y - a + arm), fg, th);
-            // TR
-            dl->AddLine(ImVec2(c.x + a - arm, c.y - a), ImVec2(c.x + a, c.y - a), fg, th);
-            dl->AddLine(ImVec2(c.x + a, c.y - a), ImVec2(c.x + a, c.y - a + arm), fg, th);
-            // BL
-            dl->AddLine(ImVec2(c.x - a + arm, c.y + a), ImVec2(c.x - a, c.y + a), fg, th);
-            dl->AddLine(ImVec2(c.x - a, c.y + a), ImVec2(c.x - a, c.y + a - arm), fg, th);
-            // BR
-            dl->AddLine(ImVec2(c.x + a - arm, c.y + a), ImVec2(c.x + a, c.y + a), fg, th);
-            dl->AddLine(ImVec2(c.x + a, c.y + a), ImVec2(c.x + a, c.y + a - arm), fg, th);
-        } else {
-            // Enter: four L-brackets at corners pointing outward (expand).
-            // TL
-            dl->AddLine(ImVec2(c.x - a, c.y - a + arm), ImVec2(c.x - a, c.y - a), fg, th);
-            dl->AddLine(ImVec2(c.x - a, c.y - a), ImVec2(c.x - a + arm, c.y - a), fg, th);
-            // TR
-            dl->AddLine(ImVec2(c.x + a, c.y - a + arm), ImVec2(c.x + a, c.y - a), fg, th);
-            dl->AddLine(ImVec2(c.x + a, c.y - a), ImVec2(c.x + a - arm, c.y - a), fg, th);
-            // BL
-            dl->AddLine(ImVec2(c.x - a, c.y + a - arm), ImVec2(c.x - a, c.y + a), fg, th);
-            dl->AddLine(ImVec2(c.x - a, c.y + a), ImVec2(c.x - a + arm, c.y + a), fg, th);
-            // BR
-            dl->AddLine(ImVec2(c.x + a, c.y + a - arm), ImVec2(c.x + a, c.y + a), fg, th);
-            dl->AddLine(ImVec2(c.x + a, c.y + a), ImVec2(c.x + a - arm, c.y + a), fg, th);
-        }
     } else {  // BTN_CLOSE: an X
         dl->AddLine(ImVec2(c.x - s, c.y - s), ImVec2(c.x + s, c.y + s), fg, th);
         dl->AddLine(ImVec2(c.x - s, c.y + s), ImVec2(c.x + s, c.y - s), fg, th);
@@ -924,30 +890,6 @@ struct FilMenuDrawer {
     }
 };
 
-#ifndef __EMSCRIPTEN__
-// Toggle native exclusive fullscreen. Called from the caption-button click.
-static void titleBar_toggleFullscreen(AppState& st) {
-    GLFWwindow* win = st.win;
-    if (!win) return;
-    // File-static restore rect — survives across frames while fullscreen is active.
-    static int s_x = 100, s_y = 100, s_w = 1440, s_h = 900;
-    if (st.isFullscreen) {
-        glfwSetWindowMonitor(win, nullptr, s_x, s_y, s_w, s_h, 0);
-        st.isFullscreen = false;
-    } else {
-        glfwGetWindowPos(win, &s_x, &s_y);
-        glfwGetWindowSize(win, &s_w, &s_h);
-        GLFWmonitor* mon = glfwGetWindowMonitor(win);
-        if (!mon) mon = glfwGetPrimaryMonitor();
-        if (!mon) return;
-        const GLFWvidmode* mode = glfwGetVideoMode(mon);
-        if (!mode) return;
-        glfwSetWindowMonitor(win, mon, 0, 0, mode->width, mode->height, mode->refreshRate);
-        st.isFullscreen = true;
-    }
-}
-#endif
-
 void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
     GLFWwindow* win = st.win;
     chrome::HitLayout& hitLayout = *st.hitLayout;
@@ -983,7 +925,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         (void)maximized;
 #else
         const float bw   = barH * (1.35f + 0.15f * (s - 1.0f));  // one caption button width
-        const float captionZoneW = bw * 4.0f;  // min | max | fullscreen | close
+        const float captionZoneW = bw * 3.0f;  // min | max/restore | close
 
         // Right boundary of the usable zone (= where caption buttons begin), window-relative.
         const float rightGroupStartRelX = winW - captionZoneW - 4.0f * s;
@@ -1360,7 +1302,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         }
 
 #ifndef __EMSCRIPTEN__
-        // ---- Window caption buttons (right-aligned): min | max | fullscreen | close ----
+        // ---- Window caption buttons (right-aligned): min | max/restore | close ----
         const float bx = winW - captionZoneW;  // window-relative
         hitLayout.controlsLeft  = (int)bx;
         hitLayout.controlsRight = (int)(bx + captionZoneW);
@@ -1374,10 +1316,6 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             else glfwMaximizeWindow(win);
         }
         ImGui::SetCursorPos(ImVec2(bx + bw * 2.0f, 0.0f));
-        if (windowButton("##full", BTN_FULL, barH, st.isFullscreen)) {
-            titleBar_toggleFullscreen(st);
-        }
-        ImGui::SetCursorPos(ImVec2(bx + bw * 3.0f, 0.0f));
         if (windowButton("##close", BTN_CLOSE, barH, false)) glfwSetWindowShouldClose(win, 1);
 #endif
 

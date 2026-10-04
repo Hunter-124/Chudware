@@ -5647,3 +5647,13 @@ repeats its prompt is hidden, and the answered summary is a light edged list. `u
 Verification: `./build.sh`, `test_magic_keywords`, `test_ask_answers`, gui_lint color/scale/
 dupe/glyph/theme clean, light/dark/narrow/AI-workspace captures. The working-line shimmer and a
 live question form were not captured headlessly (they need a running turn).
+
+## 2026-10-04 — desktop caption controls match native window conventions
+
+`host/src/ui/title_bar.cpp` now reserves and draws three desktop caption buttons:
+minimize, maximize/restore, and close. Removed the extra exclusive-fullscreen button,
+its glyph/toggle helper, and unused `WinBtn::BTN_FULL` / `AppState::isFullscreen` state
+from `host/src/core/app_state.h`; refreshed `title_bar.h`'s desktop/browser contract.
+The WASM app bar still delegates window controls to browser chrome. Verification:
+native `Chudware` target built, theme/glyph lint clean, and an isolated Xvfb GUI smoke
+exited successfully with all three buttons visible and no fourth button or unused gap.

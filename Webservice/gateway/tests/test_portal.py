@@ -465,3 +465,36 @@ def test_brand_assets_serve_the_fonts_anonymously_and_nothing_else(pg, monkeypat
     with pytest.raises(HTTPException) as escape:
         portal_serve._resolve_under_app("../portal_serve.py")
     assert escape.value.status_code == 400
+
+
+def test_signin_icons_and_robots_are_crawlable_without_a_session(pg, monkeypatch):
+    """Google Search follows app.chudware.com's home page to sign-in and shows
+    the icon linked there only if it can fetch it anonymously; a data: URI or a
+    401 /favicon.ico made every app result show the generic globe."""
+    monkeypatch.setattr(settings, "dev_mode", False)
+    monkeypatch.setattr(settings, "session_secret", "portal-test-session-secret")
+    monkeypatch.setattr(settings, "cf_team_domain", "")
+    monkeypatch.setattr(settings, "cf_aud", "")
+    crawler = TestClient(app_mod.app)
+
+    home = crawler.get("/", headers={"Accept": "text/html"})
+    assert home.status_code == 200 and home.url.path == "/signin"
+    icons = re.findall(r'<link rel="(?:icon|apple-touch-icon)" href="([^"]+)"', home.text)
+    assert "/favicon.ico" in icons
+    expected_type = {
+        ".ico": "image/x-icon", ".png": "image/png", ".svg": "image/svg+xml",
+    }
+    for href in icons:
+        assert href.startswith("/"), f"{href[:40]} is not a crawlable URL"
+        response = crawler.get(href)
+        assert response.status_code == 200, f"{href}: {response.status_code}"
+        assert response.headers["content-type"] == expected_type[Path(href).suffix]
+        assert response.content
+
+    robots = crawler.get("/robots.txt")
+    assert robots.status_code == 200
+    assert robots.headers["content-type"] == "text/plain; charset=utf-8"
+    assert "Disallow: /api/" in robots.text
+
+    # Exact paths, not prefixes into static/.
+    assert crawler.get("/robots.txt/x").status_code == 404

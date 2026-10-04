@@ -9,6 +9,31 @@ interface Props {
 
 const { title, description } = Astro.props;
 const path = Astro.url.pathname;
+// "Chudware documentation · Chudware" reads as a mistake in a search result.
+const fullTitle = /\bChudware\b/.test(title) ? title : `${title} · Chudware`;
+const canonical = new URL(path, Astro.site).href;
+// Link previews (Slack, LinkedIn, X, iMessage) show this; a real product capture
+// says more than a logo card.
+const shareImage = new URL('/images/modeling.png', Astro.site).href;
+// Organization gives Search the logo; WebSite gives it the site name. Google reads
+// both from the home page only.
+const structuredData = path === '/' ? JSON.stringify([
+  {
+    '@context': 'https://schema.org',
+    '@type': 'Organization',
+    '@id': `${Astro.site}#organization`,
+    name: 'Chudware',
+    url: `${Astro.site}`,
+    logo: new URL('/icon-512.png', Astro.site).href,
+  },
+  {
+    '@context': 'https://schema.org',
+    '@type': 'WebSite',
+    name: 'Chudware',
+    url: `${Astro.site}`,
+    publisher: { '@id': `${Astro.site}#organization` },
+  },
+]) : null;
 const nav = [
   { href: '/product/', label: 'Product' },
   { href: '/gallery/', label: 'Gallery' },
@@ -25,9 +50,23 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content={description} />
     <meta name="theme-color" content="#111310" />
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+    <link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192" />
     <link rel="icon" href="/assets/logo.svg" type="image/svg+xml" />
-    <link rel="canonical" href={new URL(path, Astro.site)} />
-    <title>{title} · Chudware</title>
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="canonical" href={canonical} />
+    <title>{fullTitle}</title>
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Chudware" />
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={shareImage} />
+    <meta property="og:image:width" content="1600" />
+    <meta property="og:image:height" content="900" />
+    <meta property="og:image:alt" content="The Chudware modeling workspace: a parametric part beside its feature tree and the copilot" />
+    <meta name="twitter:card" content="summary_large_image" />
+    {structuredData && <script type="application/ld+json" is:inline set:html={structuredData} />}
     <slot name="head" />
   </head>
   <body>

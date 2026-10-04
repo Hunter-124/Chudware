@@ -107,6 +107,10 @@ SUPPORT_EMAIL = "support@chudware.com"
 # name, so without this the anonymous sign-in page and storefront render in a
 # system font. The route refuses anything that is not a bare hashed *.woff2
 # resolved inside static/fonts/, so opening the prefix does not open /static.
+#
+# The favicon set and robots.txt are exact paths to fixed files (see
+# portal_serve._SITE_FILES). Crawlers fetch them without a session, and Google
+# Search shows the generic globe for a host whose icon it cannot crawl.
 PUBLIC_PATHS = frozenset(
     {
         "/healthz", "/api/billing/webhook", "/api/entitlement/refresh",
@@ -116,6 +120,8 @@ PUBLIC_PATHS = frozenset(
         "/signin", "/signup", "/forgot", "/reset", "/auth-assets",
         "/marketplace", "/api/marketplace", "/marketplace-assets",
         "/static/base.css", "/install.sh", "/brand-assets",
+        "/favicon.ico", "/favicon.svg", "/icon-192.png", "/apple-touch-icon.png",
+        "/robots.txt",
     }
 )
 

@@ -316,4 +316,33 @@ async def install_script(request: Request) -> Response:
     )
 
 
+# Fixed-name site files every crawler and browser asks the host itself for.
+# Google Search shows a result's own icon only if it can crawl one linked from
+# the hostname's home page — a data: URI does not count, and before these were
+# public /favicon.ico answered 401, so every app.chudware.com result wore the
+# generic globe. Generated with chudware.com's set by
+# public-site/src/scripts/make-favicons.sh. Not content-hashed, so a day of
+# caching rather than immutable.
+_SITE_FILES: dict[str, str] = {
+    "/favicon.ico": "icons/favicon.ico",
+    "/favicon.svg": "icons/favicon.svg",
+    "/icon-192.png": "icons/icon-192.png",
+    "/apple-touch-icon.png": "icons/apple-touch-icon.png",
+    "/robots.txt": "robots.txt",
+}
+
+
+async def _site_file(request: Request) -> Response:
+    target = _resolve_under_app(_SITE_FILES[request.url.path])
+    return FileResponse(
+        str(target),
+        media_type=_media_type(target),
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+for _site_path in _SITE_FILES:
+    router.add_api_route(_site_path, _site_file, methods=["GET"], response_model=None)
+
+
 __all__ = ["router"]

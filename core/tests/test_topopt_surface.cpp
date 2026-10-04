@@ -319,12 +319,13 @@ TEST_CASE("planar cut: analytic volume, plane position and cap closure") {
     if (box.index(n, 0) == 0)
       near_face.push_back(n);
   }
-  const RetainedNodeSet far = remap_to_clipped(*mesh, clip.volume, far_face);
-  CHECK(far.dropped.empty());
-  CHECK(far.nodes.size() == far_face.size());
-  const RetainedNodeSet near = remap_to_clipped(*mesh, clip.volume, near_face);
-  CHECK(near.nodes.empty());
-  CHECK(near.dropped.size() == near_face.size());
+  // Not `far`/`near`: <windows.h> (windef.h) defines both as empty macros.
+  const RetainedNodeSet far_kept = remap_to_clipped(*mesh, clip.volume, far_face);
+  CHECK(far_kept.dropped.empty());
+  CHECK(far_kept.nodes.size() == far_face.size());
+  const RetainedNodeSet near_kept = remap_to_clipped(*mesh, clip.volume, near_face);
+  CHECK(near_kept.nodes.empty());
+  CHECK(near_kept.dropped.size() == near_face.size());
   // A y = 0 side patch is clipped: its surviving part keeps area (x >= plane).
   std::vector<int> side;
   for (int n = 0; n < mesh->node_count(); ++n)

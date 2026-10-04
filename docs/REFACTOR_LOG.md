@@ -5629,3 +5629,21 @@ headless, no replay), related suites (603 passed), `test_worker_control`, `test_
 `./build.sh`, `./build.sh core`, and real gpt-6.1-sol turns through `_agent_admin_turn` that
 asked, received `PETG` + `0.125 in` (canonical 3.175 mm) over the control action, and in a
 second run took a chat reply instead.
+
+## 2026-10-03 — copilot chat: magic-keyword gradients and a calmer chat surface
+
+Chudcode's magic keywords (ultrathink, orchestrate, workflowz, jevify, ultragoon, autobot,
+tokenmaxxing) now render like omp: `ui/copilot/magic_keywords.{h,cpp}` mirrors omp's matcher
+(standalone lowercase prose; never in inline code, fences or tags; `test_magic_keywords`), and
+`chatPaintMagicKeywords` paints a per-character hue sweep on the composer's own glyphs
+(animated only while focused with a keyword present) and a static sweep in sent bubbles. The
+chat itself was restyled: right-aligned mode-tinted user bubbles with a hover-revealed action
+row, borderless assistant prose, thin edged iteration rows, tinted error cards, fade-in for new
+messages, a sweep on the Working/Thinking labels, a rounded composer with a focus ring and a
+round send/stop disc, and one card style for question/clarify/plan-approval cards. An open
+ask_user batch shows "Waiting for your answers" instead of a stale tool phase, a proposal that
+repeats its prompt is hidden, and the answered summary is a light edged list. `ui_theme` gained
+`magicKeywordInk`, `metrics.h` the `cpChat*` bubble rhythm; `CHUDWARE_CHAT_PROMPT` pre-fills the composer for shots.
+Verification: `./build.sh`, `test_magic_keywords`, `test_ask_answers`, gui_lint color/scale/
+dupe/glyph/theme clean, light/dark/narrow/AI-workspace captures. The working-line shimmer and a
+live question form were not captured headlessly (they need a running turn).

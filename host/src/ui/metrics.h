@@ -104,6 +104,13 @@ inline float cpChatRowGap()   { return px(2.0f); }  // between sibling activity 
 inline float cpChatCardPadX() { return px(9.0f); }  // inside an activity card, horizontal
 inline float cpChatCardPadY() { return px(4.0f); }  // inside an activity card, vertical
 inline float cpChatTurnGap()  { return px(6.0f); }  // between chat TURNS (user/assistant)
+// Conversation-level rhythm (copilot chat restyle): the user's bubble and the air between
+// messages. Activity rows/cards inside a turn keep the compact cpChatRow/Card rhythm above.
+inline float cpChatMsgGap()       { return px(14.0f); }  // between chat messages (turns)
+inline float cpChatBubblePadX()   { return px(12.0f); }  // inside the user's message bubble
+inline float cpChatBubblePadY()   { return px(7.0f); }
+inline float cpChatBubbleRadius() { return 14.0f; }      // LOGICAL dp; rounding() scales it
+inline float cpChatMetaGap()      { return px(3.0f); }   // bubble -> its meta row (age, actions)
 
 // ---- Reverse Engineering workspace (ui/reveng/, RE-40 overhaul) -------------------------------
 // The RE tab is a wizard: a session rail, a stage stepper, one stage body, a properties column.

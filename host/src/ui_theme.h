@@ -583,4 +583,10 @@ void drawStackedFractionRing(ImDrawList* dl, const ImVec2& center, float radius,
 // `col` 0 (the default) uses the accent at the same 0.85 alpha the old ASCII spinners used.
 void busyLabel(const char* label, ImU32 col = 0);
 
+// Magic-keyword gradient ink: one stop of a keyword's HSL hue sweep (ui/copilot/magic_keywords.h),
+// tuned for the surface it is painted on — lighter on dark glass, deeper on bright glass
+// (`brightSurface` = AdaptiveSurface::darkText) so the word keeps body-text contrast in both
+// themes. `glint` 0..1 lifts the stop for a shimmer's travelling highlight; `alpha` multiplies.
+ImU32 magicKeywordInk(float hueDeg, bool brightSurface, float glint = 0.0f, float alpha = 1.0f);
+
 }  // namespace ui

@@ -74,6 +74,7 @@
 #include "core/sim_client.h"      // chat-triggered OpenFOAM CFD on the SimClient channel
 #include "core/jobs.h"
 #include "ui_theme.h"
+#include "ui/copilot/magic_keywords.h"   // ui::copilot::magicKeywordRanges — keyword presentation
 
 #include "worker_client.h"
 
@@ -96,7 +97,7 @@ struct GlassBubble {
 };
 const ui::AdaptiveSurface& chatSurf();
 ImVec4 semanticOnGlass(const float role[4], const ui::AdaptiveSurface& surf);
-ImU32  modeBorderColor(int mode);
+// RGB (0..1) of a message's mode role (Agent=accent, Plan=amber, Ask=neutral).
 void   modeAccentRgb(int mode, float out[3]);
 // Map a raw ActivityItem/AgentStep status string ("running"/"pass"/"done"/"retry"/"fail"/
 // "skipped"/"") onto the kit's status vocabulary. ONE spelling of that mapping for the whole
@@ -106,6 +107,14 @@ void   drawStatusGlyph(const std::string& status, float box);
 void   drawBusyMark(float box);
 GlassBubble beginGlassBubble(float width, ui::GlassLevel level, float rounding);
 ImRect  endGlassBubble(const GlassBubble& b);
+// Soft role-tinted bubble (the user's messages): begin with beginGlassBubble, end here. A flat
+// `rgb` wash at `fillAlpha` plus an optional same-hue hairline — no frost, no specular rim.
+ImRect  endTintBubble(const GlassBubble& b, const float rgb[3], float fillAlpha, float edgeAlpha);
+// Unboxed bubble (the assistant's prose): same begin/end shape, but nothing is painted — the
+// text flows on the pane's glass. Pair with a child whose horizontal inset is
+// ui::chatProseInsetX() so prose lines up with the timeline's text column.
+GlassBubble beginOpenBubble(float width);
+ImRect      endOpenBubble(const GlassBubble& b);
 
 // ---- auto-growing, wrapping chat input (composer) ----
 bool rewrapInPlace(char* buf, int len, float wrapW);
@@ -122,8 +131,28 @@ void        chatCopyContext(const ImRect& rect, const char* popupId,
                             const std::string& copyText,
                             const std::string& copyAll = {},
                             const std::string& selText = {});
+// `keywords`: magic-keyword byte ranges into `plain` to paint with their static gradient
+// (sent user bubbles — the composer animates the same words; see chatPaintMagicKeywords).
 ImGuiID     chatDrawSelectableText(const char* id, const std::string& plain,
-                                   const ImVec4& col);
+                                   const ImVec4& col,
+                                   const std::vector<ui::copilot::KeywordRange>* keywords = nullptr);
+// Recolor the magic-keyword glyphs of the InputTextMultiline submitted IMMEDIATELY before this
+// call, in place: the widget's own glyph quads get the keyword's hue gradient (vertex colors,
+// alpha kept), so there is no second image to hide and selection/caret drawing is untouched.
+// `shown` is the exact buffer the widget displayed and `ranges` index into it. `shimmer` < 0
+// paints the static gradient; a phase in [0,1) slides the gradient and sweeps a glint across the
+// word. `glow` adds a soft hue wash behind each visible word. Returns true when it painted.
+bool        chatPaintMagicKeywords(std::string_view shown,
+                                   const std::vector<ui::copilot::KeywordRange>& ranges,
+                                   float shimmer, bool glow);
+// Text with a travelling light sweep (the "working" label): `text` in `base` ink with a soft
+// band of `glint` ink moving across it once per `period` seconds. Advances the cursor like
+// ImGui::TextUnformatted; requests frames (it is ambient motion — only call it while shown).
+void        chatShimmerText(const char* text, const ImVec4& base, const ImVec4& glint,
+                            float period);
+// Narrowest wrap width at which chatDrawSelectableText keeps every hard line of `text` whole
+// (measured exactly as its soft-wrapper measures) — for shrink-to-fit bubbles.
+float       chatSoftWrapNaturalWidth(const std::string& text);
 void        chatHoverCopyGlyph(const ImRect& rect, const std::string& text);
 std::string chatActivityCopyText(const ActivityItem& a);
 
@@ -184,7 +213,8 @@ void cpMenuHint(const char* text);
 
 // ---- activity timeline (activity_timeline) ----
 void        drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW);
-std::string stripMdMarks(const std::string& in);
+// `srcOf` (optional): per output byte, the index of the input byte it came from.
+std::string stripMdMarks(const std::string& in, std::vector<size_t>* srcOf = nullptr);
 // Truncate to fit `maxW` in the CURRENT font, appending "…" when it does not (UTF-8-safe).
 // The one truncation primitive for chat chrome — call it inside the PushFont whose metrics
 // the label will be drawn with. Returns the input unchanged when it already fits.
@@ -192,6 +222,8 @@ std::string chatEllipsize(const std::string& s, float maxW);
 // Fence-aware assistant prose: ``` spans render via drawCodeBox, everything else through
 // stripMdMarks + chatDrawSelectableText. Returns the last prose segment's InputText id.
 ImGuiID     drawMdProse(const char* id, const std::string& in, const ImVec4& col, ImFont* mono);
+// Horizontal inset of the assistant's prose = the timeline rows' text column (rail + row pad).
+float       chatProseInsetX();
 void        drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, float logW,
                            bool liveFrontier = false);
 void        chatArtifactReveal(AppState& st, const std::string& path);

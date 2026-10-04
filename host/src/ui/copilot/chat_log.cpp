@@ -220,40 +220,78 @@ static void drawSentContextChips(AppState& st, const ChatMsg& m) {
     ImGui::PopID();
 }
 
+// The user's message: a right-aligned, shrink-to-fit soft bubble tinted by the turn's mode
+// (Agent = accent, Plan = amber, Ask = neutral — the role the old outline carried), with no
+// author label and no hard outline: alignment and tint already say "you". The age and the
+// rewind/edit actions sit in a quiet meta row UNDER the bubble, right-aligned, so the bubble
+// holds only what was said.
 void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                           float panelW, int msgIdx) {
-    const auto& pal = ui::palette;
+    (void)fonts;
     const float sc = ui::uiScale;
-    const ImVec4 accentCol = semanticOnGlass(pal.accent, chatSurf());
-    // Right-align: indent ~22% of the panel so the bubble sits against the right edge.
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + panelW * 0.22f);
-    const float bw = ImGui::GetContentRegionAvail().x;
-    GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular, 10.0f);
-    // Every chat bubble in the log shares ONE inset (cpChatCardPadX/Y). Before this the user
-    // bubble ran 10/5, the prose card 10/7 and every other card inherited the pane's tight
-    // 3/2 — three different insets stacked down one column, which is what made the log read
-    // as unrelated widgets rather than one surface.
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const float avail = std::min(panelW, ImGui::GetContentRegionAvail().x);
+    const float rowX = ImGui::GetCursorPosX();
+
+    // Magic keywords are matched on the RAW text — stripMdMarks drops the backticks that mark
+    // a code span, and a keyword inside one must stay plain — then carried across the strip.
+    std::vector<size_t> srcOf;
+    const std::string userBody = stripMdMarks(m.text, &srcOf);
+    std::vector<ui::copilot::KeywordRange> keywords = ui::copilot::magicKeywordRanges(m.text);
+    for (ui::copilot::KeywordRange& r : keywords) {
+        r.begin = (size_t)(std::lower_bound(srcOf.begin(), srcOf.end(), r.begin) - srcOf.begin());
+        r.end = (size_t)(std::lower_bound(srcOf.begin(), srcOf.end(), r.end) - srcOf.begin());
+    }
+
+    // Shrink-to-fit: a one-liner gets a small bubble, long text wraps at ~80% of the column
+    // (a little more on the narrow docked column, where 80% would starve the line length).
+    const float padX = ui::metrics::cpChatBubblePadX();
+    const float padY = ui::metrics::cpChatBubblePadY();
+    const float maxW = std::max(avail * (avail < ui::metrics::px(420.0f) ? 0.90f : 0.80f),
+                                ui::metrics::px(120.0f));
+    const bool hasExtras = !m.imagePaths.empty() || !m.contextRefs.empty();
+    // The selectable body wraps at (its width - 2 * FramePadding.x); +2 px keeps an exactly
+    // fitting line from wrapping on float rounding.
+    const float textW = chatSoftWrapNaturalWidth(userBody) +
+                        ImGui::GetStyle().FramePadding.x * 2.0f + ui::metrics::px(2.0f);
+    const float bw = hasExtras ? maxW
+                               : std::clamp(textW + padX * 2.0f, ui::metrics::px(48.0f), maxW);
+    ImGui::SetCursorPosX(rowX + avail - bw);
+
+    GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular,
+                                      ui::metrics::cpChatBubbleRadius());
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padX, padY));
     ImGui::BeginChild("##umsg", ImVec2(bw, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
-    // Zero the default 9px inter-item spacing for this bubble's body -> meta bar
-    // stack: without it, ImGui inserts its own gap before AND after the Dummy
-    // below on top of the explicit one, doubling the visual gap the redpen flagged.
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
-    // Body, then ONE meta bar INSIDE the bubble bottom: "You" (left) + AI-VC
-    // rewind/edit buttons + age (right; hover for the absolute time).
     // Same selectable read-only InputText treatment as assistant prose (soft-wrap +
-    // click-drag + Ctrl+C toast + right-click Copy).
-    const std::string userBody = stripMdMarks(m.text);
-    const ImGuiID textId = chatDrawSelectableText("##umsg_sel", userBody, chatSurf().textPrimary);
+    // click-drag + Ctrl+C toast + right-click Copy), plus the keywords' static gradient.
+    const ImGuiID textId = chatDrawSelectableText("##umsg_sel", userBody, surf.textPrimary,
+                                                  &keywords);
     // Pasted images this message carried: clickable thumbnails, click = full-size viewer.
     drawSentImageStrip(m);
     // Model context the message carried: chips (click = show it in the model).
     drawSentContextChips(st, m);
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
+    ImGui::PopStyleVar();   // ItemSpacing -- pushed after BeginChild, must pop before EndChild
+    // Hover-copy glyph MUST be submitted while "##umsg" is still the current window: ImGui's
+    // hovered-window resolution grants overlapping screen space to the (deeper) child window,
+    // so an InvisibleButton added to the PARENT after EndChild silently loses every click here
+    // to the InputTextMultiline underneath — the copy button drew fine but never fired.
+    {
+        const ImVec2 wp = ImGui::GetWindowPos();
+        const ImVec2 ws = ImGui::GetWindowSize();
+        chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), userBody);
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar();   // ##umsg WindowPadding -- pushed before BeginChild, pops after
+    float tint[3];
+    modeAccentRgb(m.copilotMode, tint);
+    const ImRect bubble = endTintBubble(gb, tint, surf.darkText ? 0.16f : 0.24f,
+                                        surf.darkText ? 0.22f : 0.26f);
+    const std::string sel = chatInputSelection(textId);
+    chatCopyContext(bubble, "##umsg_copy", userBody, userBody, sel);
 
-    // ---- meta bar: You [rewind edit] ......... age ----
+    // ---- meta row under the bubble, right-aligned: [rewind] [edit]  age ----
     const double now = ImGui::GetTime();
     if (s_aiVc.confirmMsgIdx >= 0 && now > s_aiVc.confirmUntil) {
         s_aiVc.confirmMsgIdx = -1;
@@ -265,29 +303,39 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     // tooltip (before) and the toast (after) must never imply a geometry restore when
     // no checkpoint exists for this message.
     const int cpState = showBtns ? aiVcMsgCheckpointState(st, msgIdx) : 2;
-    const float btnSz = ImGui::GetFrameHeight() * 0.78f;
+    const float btnSz = ImGui::GetFrameHeight() * 0.72f;
     const float gap = 4.0f * sc;
     const float lineH = ImGui::GetTextLineHeight();
     const float rowH = showBtns ? std::max(lineH, btnSz) : lineH;
-    const float textOff = (rowH - lineH) * 0.5f;
-    const float rowY = ImGui::GetCursorPosY();
-    const ui::AdaptiveSurface& surf = chatSurf();
+    const std::string age = chatStampLabel(m.ts);
+    const float ageW = age.empty() ? 0.0f : ImGui::CalcTextSize(age.c_str()).x;
+    const float rowW = (showBtns ? btnSz * 2.0f + gap : 0.0f) +
+                       (showBtns && !age.empty() ? gap * 2.0f : 0.0f) + ageW;
+    if (rowW <= 0.0f) {
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpChatMsgGap()));
+        return;
+    }
+    // Anchored to the bubble's bottom edge (not the layout cursor, which already carries the
+    // item spacing) so the row reads as the bubble's caption.
+    const ImVec2 rowMin(bubble.Max.x - ui::metrics::px(4.0f) - rowW,
+                        bubble.Max.y + ui::metrics::cpChatMetaGap());
     ImDrawList* dl = ImGui::GetWindowDrawList();
-
-    ImGui::SetCursorPosY(rowY + textOff);
-    ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(accentCol, "You");
-    ImGui::PopFont();
-
+    // The row is quiet until the message is hovered (or a rewind is waiting on its confirm).
+    const bool rowHot = pending || ImGui::IsMouseHoveringRect(
+        bubble.Min, ImVec2(bubble.Max.x, rowMin.y + rowH), /*clip=*/false);
+    const float rowA = ui::anim::toward(ImGui::GetID("##umsg_meta_hot"), rowHot ? 1.0f : 0.0f,
+                                        ui::anim::kFast);
+    const ImVec4& inkIdle = surf.textTertiary;
+    const ImVec4& inkHot = surf.textSecondary;
+    const ImVec4 ink(inkIdle.x + (inkHot.x - inkIdle.x) * rowA,
+                     inkIdle.y + (inkHot.y - inkIdle.y) * rowA,
+                     inkIdle.z + (inkHot.z - inkIdle.z) * rowA,
+                     inkIdle.w * (0.70f + 0.30f * rowA));
+    float x = rowMin.x;
     if (showBtns) {
-        float bx = (ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x) + 8.0f * sc;
         // Rewind glyph button
-        ImGui::SetCursorPos(ImVec2(bx, rowY));
+        ImGui::SetCursorScreenPos(ImVec2(x, rowMin.y + (rowH - btnSz) * 0.5f));
         {
-            if (pending) {
-                ImGui::PushStyleColor(ImGuiCol_Button,
-                    ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.55f));
-            }
             const bool clicked = ImGui::InvisibleButton("##umsg_rw", ImVec2(btnSz, btnSz));
             const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
             if (pending || ImGui::IsItemHovered())
@@ -295,15 +343,12 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                     ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
                                                           surf.textPrimary.z, pending ? 0.18f : 0.10f)),
                     ui::metrics::rounding(4.0f));
-            {
-                // Inset to match the pencil icon's 0.18 pad -- the raw glyph
-                // otherwise reads noticeably bigger/bolder than the pencil.
-                const float rp = btnSz * 0.18f;
-                drawDoubleRewindGlyph(dl, ImVec2(bmn.x + rp, bmn.y + rp),
-                                     ImVec2(bmx.x - rp, bmx.y - rp),
-                                     ImGui::ColorConvertFloat4ToU32(pending ? surf.textPrimary : surf.textSecondary));
-            }
-            if (pending) ImGui::PopStyleColor();
+            // Inset to match the pencil icon's 0.18 pad -- the raw glyph otherwise reads
+            // noticeably bigger/bolder than the pencil.
+            const float rp = btnSz * 0.18f;
+            drawDoubleRewindGlyph(dl, ImVec2(bmn.x + rp, bmn.y + rp),
+                                  ImVec2(bmx.x - rp, bmx.y - rp),
+                                  ImGui::ColorConvertFloat4ToU32(pending ? surf.textPrimary : ink));
             if (clicked) {
                 if (!pending) {
                     s_aiVc.confirmMsgIdx = msgIdx;
@@ -318,9 +363,9 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                 ImGui::SetTooltip("%s", pending ? "Click again to confirm rewind."
                                                 : aiVcRewindTip(cpState));
         }
-
+        x += btnSz + gap;
         // Pencil edit — atlas icon (msg_edit) with filled-glyph fallback.
-        ImGui::SameLine(0, gap);
+        ImGui::SetCursorScreenPos(ImVec2(x, rowMin.y + (rowH - btnSz) * 0.5f));
         {
             const bool clicked = ImGui::InvisibleButton("##umsg_edit", ImVec2(btnSz, btnSz));
             const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
@@ -329,7 +374,7 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                     ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
                                                           surf.textPrimary.z, 0.10f)),
                     ui::metrics::rounding(4.0f));
-            const ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textSecondary);
+            const ImU32 inkU = ImGui::ColorConvertFloat4ToU32(ink);
             IconUV editIcon = ui::getIcon("msg_edit", 20);
             if (editIcon.valid) {
                 const float pad = btnSz * 0.18f;
@@ -337,9 +382,9 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                              ImVec2(bmn.x + pad, bmn.y + pad),
                              ImVec2(bmx.x - pad, bmx.y - pad),
                              editIcon.uv0, editIcon.uv1,
-                             ink);
+                             inkU);
             } else {
-                drawPencilGlyph(dl, bmn, bmx, ink);
+                drawPencilGlyph(dl, bmn, bmx, inkU);
             }
             if (clicked) beginEditStage(st, msgIdx);
             if (ImGui::IsItemHovered())
@@ -351,15 +396,12 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                           "edit without changing the part."
                         : "Edit this message \xe2\x80\x94 Esc cancels without changing the part.");
         }
+        x += btnSz + gap * 2.0f;
     }
-
-    // Timestamp at the bar's right edge (hover = relative age + full date).
-    const std::string age = chatStampLabel(m.ts);
+    // Timestamp (hover = relative age + full date).
     if (!age.empty()) {
-        const float ageW = ImGui::CalcTextSize(age.c_str()).x;
-        const float rx = ImGui::GetWindowContentRegionMax().x - ageW;
-        ImGui::SetCursorPos(ImVec2(std::max(ImGui::GetCursorPosX(), rx), rowY + textOff));
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::SetCursorScreenPos(ImVec2(x, rowMin.y + (rowH - lineH) * 0.5f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ink);
         ImGui::TextUnformatted(age.c_str());
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) {
@@ -367,36 +409,10 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
             if (!tip.empty()) ImGui::SetTooltip("%s", tip.c_str());
         }
     }
-    // Guarantee the cursor advances past the bar even when the age was left of the buttons.
-    ImGui::SetCursorPosY(rowY + rowH);
-    ImGui::Dummy(ImVec2(1.0f, 0.0f));
-    ImGui::PopStyleVar();   // ItemSpacing -- pushed after BeginChild, must pop before EndChild
-    // Hover-copy glyph MUST be submitted while "##umsg" is still the current window: ImGui's
-    // hovered-window resolution grants overlapping screen space to the (deeper) child window,
-    // so an InvisibleButton added to the PARENT after EndChild silently loses every click here
-    // to the InputTextMultiline underneath — the copy button drew fine but never fired.
-    {
-        const ImVec2 wp = ImGui::GetWindowPos();
-        const ImVec2 ws = ImGui::GetWindowSize();
-        chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), userBody);
-    }
-    ImGui::EndChild();
-    ImGui::PopStyleVar();   // ##umsg WindowPadding -- pushed before BeginChild, pops after
-    ImRect bubble = endGlassBubble(gb);
-    {
-        ImU32 border = modeBorderColor(m.copilotMode);
-        if (border == 0) {
-            // Unstamped: keep legacy accent border.
-            border = ImGui::ColorConvertFloat4ToU32(
-                ImVec4(accentCol.x, accentCol.y, accentCol.z, 0.55f));
-        }
-        ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max, border,
-            ui::metrics::rounding(10.0f), 0, ui::metrics::stroke(1.0f));
-    }
-    const std::string sel = chatInputSelection(textId);
-    chatCopyContext(bubble, "##umsg_copy", userBody, userBody, sel);
-
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatTurnGap()));   // gap to the next TURN
+    // Leave the cursor at the row's left edge, one row down, whatever the row held.
+    ImGui::SetCursorPos(ImVec2(rowX, rowMin.y + rowH - ImGui::GetWindowPos().y +
+                                         ImGui::GetScrollY()));
+    ImGui::Dummy(ImVec2(1.0f, ui::metrics::cpChatMsgGap()));   // air before the next message
 }
 
 
@@ -645,17 +661,16 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // m.text, or a streamed reply prints twice.
     const std::string bodyText = proseInline ? ui::timelineProseTail(m) : m.text;
 
-    // (3) The reply as a REGULAR glass "prose" card (Liquid Glass v2 §6, host contract H5) — the
-    // heaviest silhouette in the column, matching the timeline's inline prose bubble. Every other
-    // row kind (stage cards, thoughts, tool lines) is now a rail or a bare line, so the answer is
-    // unmistakably the deliverable. Selectable for click-drag + Ctrl+C; right-click copies
-    // selection or full text.
+    // (3) The reply as open prose — no card, no rim, flowing on the pane's glass at the
+    // timeline's text column, exactly like the timeline's inline prose. Every other row kind
+    // (stage cards, thoughts, tool lines) is a rail or a bare line, so the answer still reads as
+    // the deliverable without being boxed. Selectable for click-drag + Ctrl+C; right-click
+    // copies selection or full text.
     if (proseCard || (proseInline && !bodyText.empty() && m.errKind == ERR_NONE)) {
         const std::string prose = stripMdMarks(bodyText);
-        GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x,
-                                          ui::GlassLevel::Regular, 10.0f);
+        GlassBubble gb = beginOpenBubble(ImGui::GetContentRegionAvail().x);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                            ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
+                            ImVec2(chatProseInsetX(), ui::metrics::cpChatCardPadY()));
         ImGui::BeginChild("##prose", ImVec2(0, 0),
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
         // Author meta row INSIDE the card top (model left, age right) when it
@@ -681,7 +696,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         restoreBar();
         ImGui::EndChild();
         ImGui::PopStyleVar();  // ##prose WindowPadding
-        ImRect proseRect = endGlassBubble(gb);
+        ImRect proseRect = endOpenBubble(gb);
         const std::string sel = chatInputSelection(textId);
         chatCopyContext(proseRect, "##prose_copy", prose, prose, sel);
         ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
@@ -704,7 +719,9 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 
     // (6) While running the live activity stream (timeline thoughts/tools/output) is the
     // primary content — no fake "Saying · working..." bar. Only fall back to a minimal
-    // liveStatus line when the timeline is still empty (zero content yet).
+    // liveStatus line when the timeline is still empty (zero content yet), or when the run is
+    // parked on the user's answers to an ask_user card — then the line says so, instead of the
+    // stale tool phase the run last reported ("Starting write.. · 30s" read as stuck work).
     if (m.running) {
         bool hasLiveContent = false;
         for (const auto& a : m.activity) {
@@ -713,28 +730,36 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             break;
         }
         if (!hasLiveContent && !m.text.empty()) hasLiveContent = true;
-        if (!hasLiveContent) {
+        const bool waitingOnUser =
+            std::any_of(m.asks.begin(), m.asks.end(),
+                        [](const AskBatch& b) { return b.status == AskStatus::Pending; });
+        if (!hasLiveContent || waitingOnUser) {
             ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
             const ui::AdaptiveSurface& surf = chatSurf();
-            std::string say = m.liveStatus;
-            if (say == "Working" || say == "working...")
-                say.clear();               // never "Saying · Working" — the dots carry it
-            // The silent window is the one place with NO streamed content, so a static glyph
-            // makes a slow provider and a hung app look identical. Cycle the dot count off
-            // GetTime() (same technique as drawBusyMark) and, once the wait is long
-            // enough to worry about, add an elapsed readout. Dots are padded to a fixed width
-            // so only the dots move, not the readout after them.
-            const int dots = 1 + (int)((long long)(ImGui::GetTime() * 2.5) % 3);
+            std::string say = waitingOnUser ? std::string("Waiting for your answers")
+                                            : m.liveStatus;
+            while (!say.empty() && (say.back() == '.' || say.back() == ' ')) say.pop_back();
+            if (say.size() >= 3 && say.compare(say.size() - 3, 3, "\xe2\x80\xa6") == 0)
+                say.resize(say.size() - 3);
+            if (say.empty() || say == "Working" || say == "working") say = "Working";
+            // The silent window is the one place with NO streamed content, so a static label
+            // makes a slow provider and a hung app look identical: the label carries a light
+            // sweep while the agent works and, once the wait is long enough to worry about, an
+            // elapsed readout. Waiting on the USER is not work — that line stays still.
             const double elapsed = (m.ts > 0.0) ? (chatNowEpoch() - m.ts) : 0.0;
-            const bool showElapsed = elapsed >= 3.0;
-            say.append((size_t)dots, '.');
-            if (showElapsed) {
-                say.append((size_t)(3 - dots), ' ');
-                say += " \xc2\xb7 " + std::to_string((long long)elapsed) + "s";
+            if (!waitingOnUser) say += "\xe2\x80\xa6";
+            if (elapsed >= 3.0) say += "  \xc2\xb7  " + ui::kit::fmtDuration(elapsed);
+            ImGui::Indent(chatProseInsetX());
+            say = chatEllipsize(say, ImGui::GetContentRegionAvail().x);
+            if (waitingOnUser) {
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+                ImGui::TextUnformatted(say.c_str());
+                ImGui::PopStyleColor();
+            } else {
+                chatShimmerText(say.c_str(), surf.textTertiary, surf.textPrimary,
+                                ui::anim::kBreathe);
             }
-            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-            ImGui::TextWrapped("%s", say.c_str());
-            ImGui::PopStyleColor();
+            ImGui::Unindent(chatProseInsetX());
         }
     } else {
         // (7) The run receipt — the finished turn's footer. It carries the usage numbers this slot
@@ -752,7 +777,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         if (body.empty()) body = "Partially complete";
         ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
-                                          10.0f);
+                                          ui::metrics::cpChatBubbleRadius() * 0.7f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                             ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
         ImGui::BeginChild("##partialcard", ImVec2(0, 0),
@@ -780,10 +805,9 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         restoreBar();
         ImGui::EndChild();
         ImGui::PopStyleVar();   // ##partialcard WindowPadding
-        ImRect cardRect = endGlassBubble(gb);
-        ImGui::GetWindowDrawList()->AddRect(
-            cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusWarn),
-            ui::metrics::rounding(10.0f), 0, ui::metrics::stroke(1.5f));
+        // A partial outcome is a soft amber card (wash + same-hue hairline), not glass with a
+        // heavy border: it informs, it does not alarm.
+        ImRect cardRect = endTintBubble(gb, pal.statusWarn, 0.08f, 0.40f);
         const std::string sel = chatInputSelection(textId);
         chatCopyContext(cardRect, "##partial_copy", body, body, sel);
     } else if (m.errKind != ERR_NONE) {
@@ -885,7 +909,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         if (!shown.empty() || !m.errorHuman.empty()) {
             ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
             GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
-                                              10.0f);
+                                              ui::metrics::cpChatBubbleRadius() * 0.7f);
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                                 ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
             ImGui::BeginChild("##errcard", ImVec2(0, 0),
@@ -932,9 +956,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             restoreBar();
             ImGui::EndChild();
             ImGui::PopStyleVar();   // ##errcard WindowPadding
-            ImRect cardRect = endGlassBubble(gb);
-            ImGui::GetWindowDrawList()->AddRect(cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusErr),
-                                                ui::metrics::rounding(10.0f), 0, ui::metrics::stroke(1.5f));
+            // Same soft-card treatment as the partial outcome, in the error role.
+            ImRect cardRect = endTintBubble(gb, pal.statusErr, 0.08f, 0.45f);
             const std::string sel = chatInputSelection(textId);
             chatCopyContext(cardRect, "##err_copy", fullErr, fullErr, sel);
         }
@@ -1034,15 +1057,40 @@ void drawChatLogWindowed(AppState& st) {
             ImGui::PopID();
             continue;
         }
+        // Entrance: a message that JUST arrived (its send/receive stamp is younger than kSlow)
+        // fades in, so a new bubble eases into the log instead of popping. Alpha only — no
+        // offset, so the layout never jumps and the render-windowing heights stay exact.
+        // Restored history carries old stamps and simply appears.
+        const double age = m.ts > 0.0 ? chatNowEpoch() - m.ts : 1e9;
+        float enter = 1.0f;
+        if (age >= 0.0 && age < (double)ui::anim::kSlow) {
+            enter = ui::anim::easeOut((float)(age / (double)ui::anim::kSlow));
+            ui::anim::requestFrames();
+        }
+        ImDrawList* const msgDl = ImGui::GetWindowDrawList();
+        const int vtx0 = msgDl->VtxBuffer.Size;
+        if (enter < 1.0f)
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * enter);
         ImGui::BeginGroup();
         if (m.fromUser) {
             drawUserBlock(st, m, fonts, logW, (int)mi);
         } else {
             drawAssistantTurn(st, m, fonts, logW, (int)mi, thisTurn,
                               (int)mi == lastAssistantIdx);
-            ImGui::Dummy(ImVec2(0, ui::metrics::cpChatTurnGap()));   // gap to the next TURN
+            ImGui::Dummy(ImVec2(0, ui::metrics::cpChatMsgGap()));   // air before the next message
         }
         ImGui::EndGroup();
+        if (enter < 1.0f) {
+            ImGui::PopStyleVar();
+            // Fills painted straight into this window's list (bubble washes, rails) bypass the
+            // style alpha; fade the vertices this message added so the whole bubble enters
+            // together. Child windows' content already follows the pushed alpha.
+            for (int vi = vtx0; vi < msgDl->VtxBuffer.Size; ++vi) {
+                ImU32& c = msgDl->VtxBuffer.Data[vi].col;
+                const ImU32 a = (ImU32)((float)((c >> IM_COL32_A_SHIFT) & 0xFF) * enter);
+                c = (c & ~IM_COL32_A_MASK) | (a << IM_COL32_A_SHIFT);
+            }
+        }
         // (Mode-colored left accent bar removed — it read as a stray vertical line next
         // to the model label. Mode is still stamped on the message for other chrome.)
         m.uiCachedH = ImGui::GetItemRectSize().y;

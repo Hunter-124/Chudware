@@ -804,14 +804,28 @@ void drawPartsLine(const std::vector<PartInfo>& parts) {
 
 namespace ui {
 
+// The cards that wait on the USER (clarify, plan approval, ask_user) share one language with the
+// user's own bubble: a soft accent-tinted card with a same-hue edge and the bubble's padding —
+// distinct from the glass info cards, and never a heavy frame. Begin/end pair.
+static GlassBubble beginUserActionCard() {
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
+                                      ui::metrics::cpChatBubbleRadius() * 0.8f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::cpChatBubblePadX(), ui::metrics::cpChatBubblePadY()));
+    return gb;
+}
+static ImRect endUserActionCard(const GlassBubble& gb) {
+    ImGui::PopStyleVar();   // WindowPadding pushed by beginUserActionCard
+    const bool bright = chatSurf().darkText;
+    return endTintBubble(gb, ui::palette.accent, bright ? 0.07f : 0.10f, bright ? 0.38f : 0.42f);
+}
+
 void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
     const ImVec4 accentCol = semanticOnGlass(pal.accent, surf);
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 10.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+    GlassBubble gb = beginUserActionCard();
     ImGui::BeginChild("##clarify", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
@@ -997,8 +1011,7 @@ void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     bool skip = ImGui::Button("Skip - use defaults", ImVec2(-1, 0));
     ImGui::PopStyleColor(5);   // Text + FrameBg/Hovered/Active + TextDisabled
     ImGui::EndChild();
-    ImGui::PopStyleVar();   // ##clarify WindowPadding
-    endGlassBubble(gb);
+    endUserActionCard(gb);   // pops the ##clarify WindowPadding
     if (build || skip) {
         // Fold each answer (or its suggested default on Skip) into the request.
         std::string aug = m.clarify.request;
@@ -1055,10 +1068,7 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     const ui::AdaptiveSurface& surf = chatSurf();
     const ImVec4 accentCol = semanticOnGlass(pal.accent, surf);
 
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 10.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+    GlassBubble gb = beginUserActionCard();
     ImGui::BeginChild("##plan_approve", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
@@ -1110,8 +1120,7 @@ void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     const bool cancel   = ImGui::Button("Cancel", ImVec2(-1, 0));
     ImGui::PopStyleColor();
     ImGui::EndChild();
-    ImGui::PopStyleVar();   // ##plan_approve WindowPadding
-    endGlassBubble(gb);
+    endUserActionCard(gb);   // pops the ##plan_approve WindowPadding
 
     if (cancel) {
         m.planApprovePending = false;
@@ -1236,6 +1245,25 @@ static int askTakePicks(AppState& st, AskQuestion& q) {
     return taken;
 }
 
+// Same sentence modulo case, surrounding/inner whitespace runs and trailing '?', '.' or ':'.
+static bool askSameSentence(const std::string& a, const std::string& b) {
+    auto norm = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        bool space = false;
+        for (char c : s) {
+            if (std::isspace((unsigned char)c)) { space = !out.empty(); continue; }
+            if (space) { out.push_back(' '); space = false; }
+            out.push_back((char)std::tolower((unsigned char)c));
+        }
+        while (!out.empty() && (out.back() == '?' || out.back() == '.' || out.back() == ':' ||
+                                out.back() == ' '))
+            out.pop_back();
+        return out;
+    };
+    return norm(a) == norm(b);
+}
+
 // One question's input widget, by kind. Unknown kinds edit as free text.
 static void drawAskInput(AppState& st, AskQuestion& q, const ui::AdaptiveSurface& surf) {
     const auto& pal = ui::palette;
@@ -1288,7 +1316,9 @@ static void drawAskInput(AppState& st, AskQuestion& q, const ui::AdaptiveSurface
             ImGui::PopStyleColor();
         }
     } else if (q.kind == "approval") {
-        if (!q.proposal.empty()) {
+        // The proposal often restates the prompt ("Add vent slots?" / "Add vent slots"); a
+        // second copy right under the question is noise, so it shows only when it adds words.
+        if (!q.proposal.empty() && !askSameSentence(q.proposal, q.prompt)) {
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
             ImGui::TextWrapped("%s", q.proposal.c_str());
             ImGui::PopStyleColor();
@@ -1386,57 +1416,85 @@ static const char* askResolvedTitle(AskStatus s) {
     }
 }
 
-// A resolved batch: what was asked and what came back, read-only.
+// A resolved batch: what was asked and what came back, read-only. Deliberately LIGHTER than
+// the live form — no card, no fill, just a quiet rail and compact "question  answer" lines —
+// so an answered batch reads as a record in the transcript, not a second form to fill in.
 static void drawAskSummary(AskBatch& b, const ui::Fonts& fonts) {
     const ui::AdaptiveSurface& surf = chatSurf();
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 10.0f);
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
+    GlassBubble gb = beginOpenBubble(ImGui::GetContentRegionAvail().x);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+                        ImVec2(chatProseInsetX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##ask_done", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    // A record, not a form: rows ride a compact spacing rhythm.
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::px(3.0f)));
     const bool answered = b.status == AskStatus::Answered ||
                           (b.status == AskStatus::Reply && !b.answers.empty());
     kit::statusGlyphInline(answered || b.status == AskStatus::Reply ? kit::Status::Done
                                                                     : kit::Status::Skipped);
     ImGui::SameLine();
     ImGui::PushFont(fonts.medium);
-    ImGui::TextUnformatted(askResolvedTitle(b.status));
+    ImGui::TextColored(surf.textSecondary, "%s", askResolvedTitle(b.status));
     ImGui::PopFont();
-    if (!b.agentId.empty()) dimText(("Asked by " + b.agentId).c_str());
+    if (!b.agentId.empty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(surf.textTertiary, "\xc2\xb7  %s", b.agentId.c_str());
+    }
     if (b.status == AskStatus::Expired && !b.error.empty() &&
         b.error != "The run that asked has ended.")
         dimText(b.error.c_str());
 
     std::string copy = askResolvedTitle(b.status);
+    const float gap = ui::metrics::U(2.0f);
     for (size_t i = 0; i < b.questions.size(); ++i) {
         const AskQuestion& q = b.questions[i];
         const std::string prompt = q.prompt.empty() ? q.id : q.prompt;
-        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextWrapped("%s", prompt.c_str());
-        ImGui::PopStyleColor();
         copy += "\n- " + prompt;
-        if (!answered) continue;
+        if (!answered) {
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+            ImGui::TextWrapped("%s", prompt.c_str());
+            ImGui::PopStyleColor();
+            continue;
+        }
         auto it = b.answers.find(q.id);
         const std::string ans = it != b.answers.end()
                                     ? askAnswerText(q, *it)
                                     : (q.required ? "(no answer)" : "(the suggested default)");
-        ImGui::Indent(ui::metrics::U(2.0f));
-        ImGui::TextWrapped("%s", ans.c_str());
-        ImGui::Unindent(ui::metrics::U(2.0f));
         copy += ": " + ans;
+        // One line when question and answer fit side by side; stacked otherwise.
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float pw = ImGui::CalcTextSize(prompt.c_str()).x;
+        const float aw = ImGui::CalcTextSize(ans.c_str()).x;
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        if (pw + gap + aw <= avail) {
+            ImGui::TextUnformatted(prompt.c_str());
+            ImGui::PopStyleColor();
+            ImGui::SameLine(0.0f, gap);
+            ImGui::TextUnformatted(ans.c_str());
+        } else {
+            ImGui::TextWrapped("%s", prompt.c_str());
+            ImGui::PopStyleColor();
+            ImGui::TextWrapped("%s", ans.c_str());
+        }
     }
     if (b.status == AskStatus::Reply && !b.reply.empty()) {
-        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
         dimText(("Your reply: " + b.reply).c_str());
         copy += "\nYour reply: " + b.reply;
     }
+    ImGui::PopStyleVar();   // compact ItemSpacing
     ImGui::PopStyleColor();
     ImGui::EndChild();
     ImGui::PopStyleVar();   // ##ask_done WindowPadding
-    const ImRect rect = endGlassBubble(gb);
+    const ImRect rect = endOpenBubble(gb);
+    // The quiet rail: the timeline rows' silhouette, so the record lines up with them.
+    const float railW = ui::metrics::px(2.0f);
+    ImGui::GetWindowDrawList()->AddRectFilled(
+        rect.Min, ImVec2(rect.Min.x + railW, rect.Max.y),
+        kit::toneU32(answered ? kit::Tone::Ok : kit::Tone::Neutral, 0.55f), railW * 0.5f);
     chatCopyContext(rect, "##ask_copy", copy);
 }
 
@@ -1446,10 +1504,8 @@ static void drawAskForm(AppState& st, ChatMsg& m, AskBatch& b, const ui::Fonts& 
     const ui::AdaptiveSurface& surf = chatSurf();
     const ImVec4 accentCol = semanticOnGlass(pal.accent, surf);
     const bool busy = b.status == AskStatus::Submitting;
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 10.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpMenuRowPadX(), ui::metrics::cpMenuRowPadY()));
+    // The one card in a turn that needs the user (see beginUserActionCard).
+    GlassBubble gb = beginUserActionCard();
     ImGui::BeginChild("##ask", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     // Fields sit on glass: derive the frame from the surface ink (the Quick-settings idiom), so
@@ -1506,8 +1562,7 @@ static void drawAskForm(AppState& st, ChatMsg& m, AskBatch& b, const ui::Fonts& 
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(8);
     ImGui::EndChild();
-    ImGui::PopStyleVar();   // ##ask WindowPadding
-    endGlassBubble(gb);
+    endUserActionCard(gb);   // pops the ##ask WindowPadding
 
     if (!submit && !dismiss) return;
     const std::string runId = askRunId(st, b);

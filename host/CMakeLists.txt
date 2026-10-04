@@ -169,6 +169,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/tool_phrase.cpp        # tool-call human phrasing + grouping keys (GL-free; unit-tested)
   src/ui/copilot/stream_rows.cpp        # streamed-delta row routing/order (GL-free; unit-tested)
   src/ui/copilot/ask_answers.cpp        # ask_user question batches: prefill/answers/persist (GL-free; unit-tested)
+  src/ui/copilot/magic_keywords.cpp     # magic-keyword matcher (standalone prose words; GL-free; unit-tested)
   src/ui/clipboard_image.cpp            # system clipboard -> PNG on disk (paste-an-image)
   src/ui/copilot/image_lightbox.cpp     # attachment thumbnails + full-size image viewer
   src/ui/copilot/context_estimate.cpp   # transcript token/cost estimate (GL-free; unit-tested)
@@ -870,6 +871,19 @@ set_target_properties(test_ask_answers PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME test_ask_answers
   COMMAND test_ask_answers
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+# --- magic keywords: links the REAL magic_keywords.cpp (GL-free). Covers standalone/punctuation
+# hits, embedded-word misses, code-span/fence/markup masking, case sensitivity and the hue sweep.
+add_executable(test_magic_keywords
+  src/ui/copilot/magic_keywords.cpp
+  tests/test_magic_keywords.cpp)
+target_include_directories(test_magic_keywords PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_magic_keywords PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_magic_keywords
+  COMMAND test_magic_keywords
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 # --- viewport catch-up after tess-less revisions: header-only core/tess_catchup.h (no GL /

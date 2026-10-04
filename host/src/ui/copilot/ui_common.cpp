@@ -299,8 +299,9 @@ ImVec4 semanticOnGlass(const float role[4], const ui::AdaptiveSurface& surf) {
     return semanticOnTone(role, surf.darkText);
 }
 
-// Per-message mode accent (CopilotMode 0..2). ONE source for both the border and the wash, so
-// the two can never drift: Agent=accent, Plan=amber, Ask=neutral.
+// Per-message mode accent (CopilotMode 0..2): Agent=accent, Plan=amber, Ask=neutral. ONE source
+// for the user bubble's tint and the mode-selector popup / trigger chip coloredRowWash
+// gradients, so the two can never drift.
 static const float* modeRole(int mode) {
     const auto& pal = ui::palette;
     switch (mode) {
@@ -310,16 +311,6 @@ static const float* modeRole(int mode) {
     }
 }
 
-// mode outside 0..kCopilotModeCount-1 → 0 (no border).
-ImU32 modeBorderColor(int mode) {
-    if (mode < 0 || mode >= kCopilotModeCount) return 0;
-    static const float kAlpha[kCopilotModeCount] = {0.70f, 0.75f, 0.63f};
-    const float* r = modeRole(mode);
-    return ImGui::ColorConvertFloat4ToU32(ImVec4(r[0], r[1], r[2], kAlpha[mode]));
-}
-
-// RGB (0..1) counterpart of modeBorderColor. Used by the mode-selector popup + trigger chip for
-// coloredRowWash gradients (every row gets its mode tint, not only the active one).
 void modeAccentRgb(int mode, float out[3]) {
     const float* r = modeRole(mode);
     out[0] = r[0];
@@ -445,6 +436,41 @@ ImRect endGlassBubble(const GlassBubble& b) {
     return ImRect(b.origin, p1);
 }
 
+// The user's own message: same measure-then-fill as endGlassBubble, but a flat role-tinted wash
+// with a faint same-hue edge in place of the frosted glass + specular rim. Over the pane's own
+// glass that reads as a soft accent pill, not a second boxed card.
+ImRect endTintBubble(const GlassBubble& b, const float rgb[3], float fillAlpha, float edgeAlpha) {
+    ImGui::PopStyleColor();
+    ImVec2 p1 = ImGui::GetItemRectMax();
+    if (p1.x < b.origin.x + b.width) p1.x = b.origin.x + b.width;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->ChannelsSetCurrent(0);
+    const float r = ui::metrics::rounding(b.rounding);
+    dl->AddRectFilled(b.origin, p1,
+                      ImGui::ColorConvertFloat4ToU32(ImVec4(rgb[0], rgb[1], rgb[2], fillAlpha)), r);
+    if (edgeAlpha > 0.0f)
+        dl->AddRect(b.origin, p1,
+                    ImGui::ColorConvertFloat4ToU32(ImVec4(rgb[0], rgb[1], rgb[2], edgeAlpha)), r, 0,
+                    ui::metrics::stroke(1.0f));
+    dl->ChannelsMerge();
+    return ImRect(b.origin, p1);
+}
+
+// The assistant's answer: no fill and no rim — the prose flows on the pane's own glass, the
+// way a reply reads in a modern chat, instead of sitting in a second boxed card. Same
+// begin/end shape as the glass bubble so the child, copy glyph and context menu stay put.
+GlassBubble beginOpenBubble(float width) {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+    return GlassBubble{ImGui::GetCursorScreenPos(), width, ui::GlassLevel::UltraThin, 0.0f};
+}
+
+ImRect endOpenBubble(const GlassBubble& b) {
+    ImGui::PopStyleColor();
+    ImVec2 p1 = ImGui::GetItemRectMax();
+    if (p1.x < b.origin.x + b.width) p1.x = b.origin.x + b.width;
+    return ImRect(b.origin, p1);
+}
+
 // ---- chat copy/paste affordances ---------------------------------------------------------------
 // Right-click any bubble/card → "Copy text" / "Copy all" (and "Copy" when a selection is active).
 // Prefer BeginPopupContextItem on the owning item (child/bubble) so right-click isn't stolen by
@@ -555,6 +581,19 @@ static std::string chatSoftWrap(const std::string& in, float wrapW, std::vector<
     return out;
 }
 
+// The narrowest wrapW at which chatSoftWrap leaves every hard line of `text` unbroken. Measured
+// the way rewrapCore measures (one CalcTextSize per byte, each rounded up by ImGui), which runs
+// wider than CalcTextSize of the whole line — sizing a bubble from the whole-line width wrapped
+// a short message's last word onto a second line.
+float chatSoftWrapNaturalWidth(const std::string& text) {
+    float widest = 0.0f, line = 0.0f;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\n') { widest = std::max(widest, line); line = 0.0f; continue; }
+        line += ImGui::CalcTextSize(text.data() + i, text.data() + i + 1).x;
+    }
+    return std::max(widest, line);
+}
+
 // The soft-wrapped buffer chatDrawSelectableText hands InputText is the plain text with ' '
 // swapped to '\n' at word breaks plus the '\n' bytes chatSoftWrap INSERTED inside over-wide
 // tokens; dropping those inserted indices maps a selection's byte range back to the plain text.
@@ -634,8 +673,8 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
 
 // Read-only, soft-wrapped, selectable multiline body. Returns the InputText item id so the
 // outer bubble can offer a selection-aware context menu. Ctrl+C (native) triggers the toast.
-ImGuiID chatDrawSelectableText(const char* id, const std::string& plain,
-                                      const ImVec4& col) {
+ImGuiID chatDrawSelectableText(const char* id, const std::string& plain, const ImVec4& col,
+                               const std::vector<ui::copilot::KeywordRange>* keywords) {
     if (plain.empty()) return 0;
     const ImGuiStyle& style = ImGui::GetStyle();
     float wrapW = ImGui::GetContentRegionAvail().x - style.FramePadding.x * 2.0f;
@@ -694,9 +733,199 @@ ImGuiID chatDrawSelectableText(const char* id, const std::string& plain,
             }
         }
     }
+    // Magic keywords (sent bubbles): the static gradient, painted onto the widget's own glyphs.
+    // The caller matched them on the raw message (code spans still delimited); map each plain
+    // range into the soft buffer the widget displayed — plain byte p sits at p + (inserted
+    // bytes before it).
+    if (keywords && !keywords->empty()) {
+        static std::vector<ui::copilot::KeywordRange> s_soft;   // GL-thread scratch
+        s_soft.assign(keywords->begin(), keywords->end());
+        size_t k = 0;
+        auto toSoft = [&](size_t p) {
+            while (k < s_inserted.size() && (size_t)s_inserted[k] <= p + k) ++k;
+            return p + k;
+        };
+        for (ui::copilot::KeywordRange& r : s_soft) {   // sorted, so `k` only advances
+            const size_t last = r.end - 1;
+            r.begin = toSoft(r.begin);
+            r.end = toSoft(last) + 1;
+        }
+        chatPaintMagicKeywords(soft, s_soft, /*shimmer=*/-1.0f, /*glow=*/false);
+    }
     ImGui::PopStyleVar(3);
     ImGui::PopStyleColor(5);
     return itemId;
+}
+
+// ---- magic keywords + shimmer text --------------------------------------------------------------
+namespace {
+// The keyword's gradient position for normalized t across the word. Static: the table sweep.
+// Shimmering: the sweep slides by `shimmer` and mirrors at the ends (a triangle wave, so the
+// moving gradient has no seam), which at shimmer == 0 is exactly the static sweep.
+float keywordSweepT(float t, float shimmer) {
+    if (shimmer < 0.0f) return t;
+    float u = t * 0.5f + shimmer;
+    u -= std::floor(u);
+    return 1.0f - std::fabs(2.0f * u - 1.0f);
+}
+// The travelling highlight: a soft band centred at `center` (normalized across the run).
+float glintAt(float t, float center, float halfWidth) {
+    const float d = std::fabs(t - center) / halfWidth;
+    if (d >= 1.0f) return 0.0f;
+    const float w = 1.0f - d;
+    return w * w * (3.0f - 2.0f * w);
+}
+}  // namespace
+
+bool chatPaintMagicKeywords(std::string_view shown,
+                            const std::vector<ui::copilot::KeywordRange>& ranges,
+                            float shimmer, bool glow) {
+    if (ranges.empty() || shown.empty()) return false;
+    ImGuiContext& g = *ImGui::GetCurrentContext();
+    ImGuiWindow* host = g.CurrentWindow;
+    if (!host || host->DC.ChildWindows.empty()) return false;
+    // InputTextMultiline draws into its own child window; it is the host's newest child and
+    // carries the item's id. Anything else (a hint-only frame, a skipped child) paints nothing.
+    ImGuiWindow* child = host->DC.ChildWindows.back();
+    if (!child || child->ChildId != ImGui::GetItemID() || child->Hidden) return false;
+    ImDrawList* cdl = child->DrawList;
+    ImFont* font = g.Font;
+    if (!cdl || !font || font->FontSize <= 0.0f) return false;
+
+    // Where InputTextEx placed the text: the child's content origin (padding is FramePadding
+    // for this widget) minus its scroll, truncated the way ImFont::RenderText truncates.
+    const ImGuiStyle& style = ImGui::GetStyle();
+    float scrollX = 0.0f;
+    if (ImGuiInputTextState* ist = ImGui::GetInputTextState(ImGui::GetItemID());
+        ist && ImGui::IsItemActive())
+        scrollX = ist->Scroll.x;
+    const float ox = IM_TRUNC(child->Pos.x + style.FramePadding.x - child->Scroll.x - scrollX);
+    const float oy = IM_TRUNC(child->Pos.y + style.FramePadding.y - child->Scroll.y);
+    const float fs = g.FontSize;
+    const float scale = fs / font->FontSize;
+
+    // Expected glyph quads of every keyword char, laid out exactly like RenderText walks the
+    // buffer (advance per glyph, '\n' resets x, '\r' skipped).
+    struct Quad {
+        float x1, y1, u0, v0, u1, v1;   // RenderText's first/third vertex of this glyph
+        float cellX, adv;               // the char's advance cell (x) for the gradient param
+        int range, ci;
+        bool done;
+    };
+    struct Seg { float x0, x1, y; int range; };   // per-line extent of a keyword (glow)
+    static std::vector<Quad> quads;   // GL-thread scratch
+    static std::vector<Seg> segs;
+    quads.clear();
+    segs.clear();
+    const size_t stop = std::min(shown.size(), ranges.back().end);
+    float x = 0.0f, y = 0.0f;
+    size_t ri = 0;
+    size_t p = 0;
+    while (p < stop) {
+        unsigned int c = (unsigned char)shown[p];
+        const size_t at = p;
+        if (c < 0x80) ++p;
+        else p += (size_t)ImTextCharFromUtf8(&c, shown.data() + p, shown.data() + shown.size());
+        if (c == '\n') { x = 0.0f; y += fs; continue; }
+        if (c == '\r') continue;
+        const ImFontGlyph* glyph = font->FindGlyph((ImWchar)c);
+        if (!glyph) continue;
+        const float adv = glyph->AdvanceX * scale;
+        while (ri < ranges.size() && ranges[ri].end <= at) ++ri;
+        if (ri < ranges.size() && at >= ranges[ri].begin) {
+            if (glyph->Visible)
+                quads.push_back(Quad{ox + x + glyph->X0 * scale, oy + y + glyph->Y0 * scale,
+                                     glyph->U0, glyph->V0, glyph->U1, glyph->V1,
+                                     ox + x, adv, (int)ri, (int)(at - ranges[ri].begin), false});
+            if (!segs.empty() && segs.back().range == (int)ri && segs.back().y == oy + y)
+                segs.back().x1 = ox + x + adv;
+            else
+                segs.push_back(Seg{ox + x, ox + x + adv, oy + y, (int)ri});
+        }
+        x += adv;
+    }
+    if (quads.empty()) return false;
+
+    const bool bright = chatSurf().darkText;
+    const float glintCenter = shimmer < 0.0f ? -10.0f : -0.35f + 1.7f * shimmer;
+    const float tol = 1.5f;
+    ImDrawVert* v = cdl->VtxBuffer.Data;
+    const int nv = cdl->VtxBuffer.Size;
+    int painted = 0;
+    for (int i = 0; i + 3 < nv && painted < (int)quads.size(); ++i) {
+        const ImDrawVert& a = v[i];
+        for (Quad& q : quads) {
+            if (q.done || a.uv.x != q.u0 || a.uv.y != q.v0) continue;
+            if (std::fabs(a.pos.x - q.x1) > tol || std::fabs(a.pos.y - q.y1) > tol) continue;
+            if (v[i + 2].uv.x != q.u1 || v[i + 2].uv.y != q.v1) continue;
+            const ui::copilot::KeywordRange& r = ranges[(size_t)q.range];
+            const float n = (float)std::max<size_t>(1, r.end - r.begin);
+            for (int k = 0; k < 4; ++k) {
+                ImDrawVert& vk = v[i + k];
+                const float within = q.adv > 0.0f
+                    ? std::clamp((vk.pos.x - q.cellX) / q.adv, 0.0f, 1.0f) : 0.0f;
+                const float t = std::clamp(((float)q.ci + within) / n, 0.0f, 1.0f);
+                const float hue = ui::copilot::hueAt(r.keyword, keywordSweepT(t, shimmer));
+                const float alpha = (float)((vk.col >> IM_COL32_A_SHIFT) & 0xFF) / 255.0f;
+                vk.col = ui::magicKeywordInk(hue, bright, glintAt(t, glintCenter, 0.28f), alpha);
+            }
+            q.done = true;
+            ++painted;
+            i += 3;
+            break;
+        }
+    }
+
+    // Soft hue wash behind each visible word segment, in the HOST window's list: child lists
+    // render after their parent, so the wash sits under the glyphs. Clipped to the input's
+    // visible text area so a scrolled-away word leaves no ghost.
+    if (glow && painted > 0) {
+        ImDrawList* hdl = host->DrawList;
+        const ImRect clip = child->InnerClipRect;
+        const float breathe = shimmer < 0.0f ? 0.0f : 0.5f - 0.5f * std::cos(shimmer * 2.0f * IM_PI);
+        const float padX = ui::metrics::px(3.0f);
+        const float padY = ui::metrics::px(1.0f);
+        for (const Seg& s : segs) {
+            const ImVec2 mn(s.x0 - padX, s.y - padY);
+            const ImVec2 mx(s.x1 + padX, s.y + fs + padY);
+            if (mx.y <= clip.Min.y || mn.y >= clip.Max.y) continue;
+            const ImVec2 cmn(std::max(mn.x, clip.Min.x), std::max(mn.y, clip.Min.y));
+            const ImVec2 cmx(std::min(mx.x, clip.Max.x), std::min(mx.y, clip.Max.y));
+            if (cmx.x <= cmn.x || cmx.y <= cmn.y) continue;
+            const int kw = ranges[(size_t)s.range].keyword;
+            const float hue = ui::copilot::hueAt(kw, keywordSweepT(0.5f, shimmer));
+            const float a = (bright ? 0.10f : 0.14f) + 0.05f * breathe;
+            const float rr = ui::metrics::rounding(5.0f);
+            hdl->AddRectFilled(ImVec2(cmn.x - padX, cmn.y - padY), ImVec2(cmx.x + padX, cmx.y + padY),
+                               ui::magicKeywordInk(hue, bright, 0.0f, a * 0.45f), rr + padX);
+            hdl->AddRectFilled(cmn, cmx, ui::magicKeywordInk(hue, bright, 0.0f, a), rr);
+        }
+    }
+    return painted > 0;
+}
+
+void chatShimmerText(const char* text, const ImVec4& base, const ImVec4& glint, float period) {
+    if (!text || !*text) return;
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const ImVec2 size = ImGui::CalcTextSize(text);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const int v0 = dl->VtxBuffer.Size;
+    dl->AddText(pos, ImGui::ColorConvertFloat4ToU32(base), text);
+    const int v1 = dl->VtxBuffer.Size;
+    // The band starts left of the text and leaves right of it, so each pass reads as one sweep
+    // with a short rest rather than a strobe.
+    const float center = -0.35f + 1.7f * ui::anim::phase(period);
+    const float w = std::max(size.x, 1.0f);
+    const float alphaMul = ImGui::GetStyle().Alpha;
+    for (int i = v0; i < v1; ++i) {
+        ImDrawVert& vt = dl->VtxBuffer.Data[i];
+        const float k = glintAt((vt.pos.x - pos.x) / w, center, 0.22f);
+        const ImVec4 c(base.x + (glint.x - base.x) * k, base.y + (glint.y - base.y) * k,
+                       base.z + (glint.z - base.z) * k,
+                       (base.w + (glint.w - base.w) * k) * alphaMul);
+        vt.col = ImGui::ColorConvertFloat4ToU32(c);
+    }
+    ImGui::Dummy(size);
 }
 
 // Tiny top-right "copy" glyph on hover of assistant/error bubbles (cheap, no atlas dependency).

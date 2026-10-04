@@ -129,6 +129,31 @@ int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
     return 0;
 }
 }  // namespace
+// Magic keywords in the composer: the gradient painted onto the input's own glyphs, shimmering
+// while the box is focused. Matched on a FLATTENED copy (wrapper newlines back to spaces, the
+// user's hard breaks kept) so a soft wrap can never fake a fence line; the copy is the same
+// length, so its ranges index the displayed buffer directly. The ambient phase (and with it the
+// frame pump) only runs while a keyword is on screen and the box is focused.
+static void paintComposerKeywords(ImGuiID wid, const std::vector<char>& buf, const WrapState& ws) {
+    const bool active = ImGui::IsItemActive();
+    const ImGuiInputTextState* state = active ? ImGui::GetInputTextState(wid) : nullptr;
+    const std::string_view shown = (state && state->TextA.Data)
+        ? std::string_view(state->TextA.Data, (size_t)state->TextLen)
+        : std::string_view(buf.data(), std::strlen(buf.data()));
+    bool probe = false;
+    for (const ui::copilot::MagicKeyword& k : ui::copilot::magicKeywords())
+        if (shown.find(k.word) != std::string_view::npos) { probe = true; break; }
+    if (!probe) return;
+    static std::string s_flat;   // GL-thread scratch, reused across frames
+    s_flat.assign(shown.data(), shown.size());
+    for (size_t i = 0; i < s_flat.size(); ++i)
+        if (s_flat[i] == '\n' && !ui::copilot::isHardBreak(ws.hard, (int)i)) s_flat[i] = ' ';
+    const std::vector<ui::copilot::KeywordRange> ranges = ui::copilot::magicKeywordRanges(s_flat);
+    if (ranges.empty()) return;
+    const bool focused = active || ImGui::IsItemFocused();
+    const float shimmer = focused ? ui::anim::phase(ui::anim::kBreathe) : -1.0f;
+    chatPaintMagicKeywords(shown, ranges, shimmer, /*glow=*/true);
+}
 // rightReserve narrows the widget (and its wrap width) so composer overlays anchored at the
 // input's right edge — the in-box send button — never sit over the text.
 bool drawChatInput(const char* id, std::vector<char>& buf, const char* placeholder,
@@ -215,6 +240,7 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
     ImGui::InputTextMultiline(id, buf.data(), buf.size(),
         ImVec2(rightReserve > 0.0f ? -rightReserve : -1.0f, h),
         flags, chatInputEditCallback, &cb);
+    paintComposerKeywords(wid, buf, ws);
     if (!clipOverride.empty()) ImGui::SetClipboardText(clipOverride.c_str());
     s_activeLast[wid] = ImGui::IsItemActive();
     // A BARE Enter sends; so does Ctrl+Enter, which ImGui's multiline treats as "validate"
@@ -1906,7 +1932,7 @@ void submitTurn(AppState& st, const std::string& text) {
         u.text = userBubbleText(text, attachments);
         u.imagePaths = userImagePaths(attachments);
         u.contextRefs = std::move(contextRefs);
-        u.copilotMode = mode;  // stamp composer mode for colored border
+        u.copilotMode = mode;  // stamp composer mode: tints the sent bubble
         st.chat.push_back(std::move(u));
         appendChatRawMessage(st, st.chat.back());
     }
@@ -3155,6 +3181,10 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                         ImVec2(overlap, ImGui::GetStyle().ItemSpacing.y));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
+    // Borderless chips: the hairline above already separates the row from the input, and a
+    // ring of outlined cells under a rounded field read as a spreadsheet (the light theme drew
+    // every chip's frame border; the dark theme never did). Hover/press washes carry affordance.
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
     // Shared translucent chip fill (opaque fills fought the adaptive text).
     const ImVec4 chipBg(0, 0, 0, 0);
     const ImVec4 chipHov(
@@ -3484,7 +3514,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     }
 
     ImGui::PopStyleColor(3);   // button base / hovered / active
-    ImGui::PopStyleVar(3);     // FramePadding + ItemSpacing + FrameRounding
+    ImGui::PopStyleVar(4);     // FramePadding + ItemSpacing + FrameRounding + FrameBorderSize
 
     // Fixed drop-UP model picker: anchor the popup's BOTTOM-LEFT just above the model chip so
     // options propagate upward (composer sits at the bottom). ImGuiCond_Always + NoMove keep it
@@ -3917,7 +3947,7 @@ static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2
     const bool clicked = ImGui::InvisibleButton("##cp_sendstop", ImVec2(sz, sz));
     const bool hov = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float round = ui::metrics::rounding(7.0f);
+    const float round = sz * 0.5f;   // a circle: the send/stop control reads as ONE action
     const ImVec2 c((bMin.x + bMax.x) * 0.5f, (bMin.y + bMax.y) * 0.5f);
 
     if (active) {
@@ -3939,27 +3969,30 @@ static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2
         }
         if (clicked) stopReq = true;
     } else {
+        // Send: an up-arrow in a circle. Sendable = solid accent (eased in as the message
+        // becomes sendable); not yet = a faint ink disc so the empty box shows no loud button.
         const ImVec4 accC(pal.accent[0], pal.accent[1], pal.accent[2], 1);
-        const ImVec4 fill = canStart
-            ? (hov ? ImVec4(pal.accentDim[0], pal.accentDim[1], pal.accentDim[2], 1) : accC)
-            : ImVec4(pal.button[0], pal.button[1], pal.button[2], 1);
-        dl->AddRectFilled(bMin, bMax, ImGui::ColorConvertFloat4ToU32(fill), round);
-        // Enter/return-key glyph: stem down from the top-right into a horizontal run ending in a
-        // left-pointing arrowhead. Ink pairs with the button's own fill (same rule as before).
-        const ImU32 ink = canStart
-            ? ImGui::ColorConvertFloat4ToU32(ui::maxContrastTextOn(accC))
-            : ui::Palette::toU32(pal.textDim);
-        const float g  = sz * 0.24f;
-        const float by = c.y + g * 0.55f;              // the horizontal run's y
-        const float th = ui::metrics::stroke(1.6f);
-        dl->PathClear();
-        dl->PathLineTo(ImVec2(c.x + g, c.y - g));      // stem top (right side)
-        dl->PathLineTo(ImVec2(c.x + g, by));           // down
-        dl->PathLineTo(ImVec2(c.x - g, by));           // across to the left
-        dl->PathStroke(ink, 0, th);
-        const float a = g * 0.62f;                     // arrowhead, pointing LEFT
-        dl->AddLine(ImVec2(c.x - g, by), ImVec2(c.x - g + a, by - a), ink, th);
-        dl->AddLine(ImVec2(c.x - g, by), ImVec2(c.x - g + a, by + a), ink, th);
+        const float live = ui::anim::toward(ImGui::GetID("##cp_send_live"),
+                                            canStart ? 1.0f : 0.0f, ui::anim::kFast);
+        const ui::AdaptiveSurface& ssurf = chatSurf();
+        const ImVec4 idle(ssurf.textPrimary.x, ssurf.textPrimary.y, ssurf.textPrimary.z, 0.10f);
+        const ImVec4 on = hov && canStart
+            ? ImVec4(pal.accentDim[0], pal.accentDim[1], pal.accentDim[2], 1) : accC;
+        const ImVec4 fill(idle.x + (on.x - idle.x) * live, idle.y + (on.y - idle.y) * live,
+                          idle.z + (on.z - idle.z) * live, idle.w + (on.w - idle.w) * live);
+        dl->AddCircleFilled(c, round, ImGui::ColorConvertFloat4ToU32(fill));
+        // Ink pairs with the button's own fill (same rule as before).
+        const ImVec4 onInk = ui::maxContrastTextOn(accC);
+        const ImVec4 offInk = ssurf.textTertiary;
+        const ImU32 ink = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(offInk.x + (onInk.x - offInk.x) * live, offInk.y + (onInk.y - offInk.y) * live,
+                   offInk.z + (onInk.z - offInk.z) * live, offInk.w + (onInk.w - offInk.w) * live));
+        const float g  = sz * 0.22f;
+        const float th = ui::metrics::stroke(1.7f);
+        dl->AddLine(ImVec2(c.x, c.y + g), ImVec2(c.x, c.y - g), ink, th);   // stem
+        const float a = g * 0.75f;                                         // arrowhead, UP
+        dl->AddLine(ImVec2(c.x, c.y - g), ImVec2(c.x - a, c.y - g + a), ink, th);
+        dl->AddLine(ImVec2(c.x, c.y - g), ImVec2(c.x + a, c.y - g + a), ink, th);
         if (hov)
             ImGui::SetTooltip(canStart ? "Send  (Enter)"
                               : canRun ? "Type a message first."
@@ -3991,6 +4024,15 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     st.settings.copilotMode = st.aiInteraction;
     // Every mode is one streaming Chudcode agent turn — no one-shot RPC lane left.
     st.agentV2 = true;
+    // Screenshot hook, same spirit as CHUDWARE_CHAT_MODEMENU: seed the composer once with
+    // CHUDWARE_CHAT_PROMPT (focused, so the magic-keyword shimmer is live) for headless
+    // verification of the keyword presentation. No-op in normal use.
+    static bool s_shotPromptSeeded = false;
+    if (!s_shotPromptSeeded) {
+        s_shotPromptSeeded = true;
+        if (const char* shotPrompt = std::getenv("CHUDWARE_CHAT_PROMPT"))
+            composerSetText(st, shotPrompt);
+    }
 
     // Esc: close slash autocomplete first, then staged edit restore, else disarm context pick.
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
@@ -4363,9 +4405,31 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
 
     const ImVec2 composerMax(composerMin.x + composerW, ImGui::GetItemRectMax().y);
     composerSplit.SetCurrentChannel(composerDl, 0);
+    const float composerRound = 12.0f;   // logical dp — glassPanel scales internally
     ui::glassPanel(composerDl, ImRect(composerMin, composerMax), ui::GlassLevel::Thin,
-                  8.0f /*logical dp — glassPanel scales internally*/, surf);
+                  composerRound, surf);
     composerSplit.Merge(composerDl);
+    // Focus ring: while the box holds the caret, a crisp accent edge over a soft wide halo,
+    // eased in/out so focusing reads as the field lighting up rather than a border snapping on.
+    {
+        const float focus = ui::anim::toward(ImGui::GetID("##composer_focus"),
+                                             s_composerInputActive ? 1.0f : 0.0f,
+                                             ui::anim::kFast);
+        if (focus > 0.01f) {
+            const auto& pal = ui::palette;
+            const float r = ui::metrics::rounding(composerRound);
+            const float halo = ui::metrics::px(2.0f);
+            composerDl->AddRect(ImVec2(composerMin.x - halo, composerMin.y - halo),
+                                ImVec2(composerMax.x + halo, composerMax.y + halo),
+                                ImGui::ColorConvertFloat4ToU32(ImVec4(
+                                    pal.accent[0], pal.accent[1], pal.accent[2], 0.16f * focus)),
+                                r + halo, 0, ui::metrics::stroke(3.0f));
+            composerDl->AddRect(composerMin, composerMax,
+                                ImGui::ColorConvertFloat4ToU32(ImVec4(
+                                    pal.accent[0], pal.accent[1], pal.accent[2], 0.70f * focus)),
+                                r, 0, ui::metrics::stroke(1.25f));
+        }
+    }
 
     // ---- stop / submit / queue ----
     if (stopReq) requestStopRun(st);

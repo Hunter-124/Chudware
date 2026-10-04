@@ -297,16 +297,12 @@ void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     const ui::AdaptiveSurface& stepSurf = chatSurf();
     const ImVec4 accentCol = semanticOnGlass(pal.accent, stepSurf);
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
-    // Shared card inset (cpChatCardPadX/Y — same tokens every other activity card in this file
-    // and cards.cpp uses): without it the card inherits the pane's tight 3/2 window padding and
-    // its text sits flush against the glass edge, unlike the prose/user bubbles above it.
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                        ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::cpChatRowGap()));
-    ImGui::BeginChild("##stepcard", ImVec2(0, 0),
-                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    // A stage-weight row, not a glass card: faint wash + a status rail (amber for a build issue,
+    // accent once done) — the same silhouette as the orchestrator stage cards, so iterations read
+    // as supporting work under the answer rather than a stack of equally-boxed cards.
+    const ui::kit::Tone stepTone = !s.ok ? ui::kit::Tone::Warn
+                                 : s.done ? ui::kit::Tone::Accent : ui::kit::Tone::Neutral;
+    const RowShell shell = beginRowShell("##stepcard", stepTone, kStageWash, kRailStrong);
     ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
     // Build issues are amber, not red: a failed pass is normal mid-loop — the error goes
     // straight back to the model, which usually fixes it.
@@ -316,9 +312,16 @@ void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     ImGui::PushFont(fonts.medium);
     ImGui::TextColored(badge, "Iteration %d - %s", s.index + 1, word);
     ImGui::PopFont();
+    // Same-line only when it fits: at the narrow docked width the dims (and the chip row below)
+    // used to run off the row's right edge and clip mid-word.
+    const ImGuiStyle& stepStyle = ImGui::GetStyle();
+    const float rowRight = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+    auto fitsAfterLast = [&](float w) {
+        return ImGui::GetItemRectMax().x + stepStyle.ItemSpacing.x + w <= rowRight;
+    };
     if (!s.dims.empty()) {
-        ImGui::SameLine();
         ImGui::PushFont(fonts.mono);
+        if (fitsAfterLast(ImGui::CalcTextSize(s.dims.c_str()).x)) ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, stepSurf.textSecondary);
         ImGui::Text("%s", s.dims.c_str());
         ImGui::PopStyleColor();
@@ -354,19 +357,23 @@ void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
 
     // expanders: the model's reasoning, the full code, and what changed
     bool first = true;
+    // Chips flow onto a new line when the next one would not fit beside the last.
+    auto flowChip = [&](const char* label) {
+        if (first) { first = false; return; }
+        if (fitsAfterLast(ImGui::CalcTextSize(label).x + stepStyle.FramePadding.x * 2.0f))
+            ImGui::SameLine();
+    };
     if (!s.thinking.empty()) {
+        flowChip("Thoughts");
         if (toggleChip("Thoughts", s.showThinking)) s.showThinking = !s.showThinking;
-        first = false;
     }
     if (!s.code.empty()) {
-        if (!first) ImGui::SameLine();
+        flowChip("Code");
         if (toggleChip("Code", s.showCode)) s.showCode = !s.showCode;
-        first = false;
     }
     if (!s.diff.empty()) {
-        if (!first) ImGui::SameLine();
+        flowChip("Diff");
         if (toggleChip("Diff", s.showDiff)) s.showDiff = !s.showDiff;
-        first = false;
     }
     // Console output the model's own generated code printed. Captured by the drain and written to
     // the conversation file for months, rendered nowhere: when a build "succeeds" but the geometry
@@ -377,17 +384,15 @@ void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     const ImGuiID       outKey   = ImGui::GetID("##step_stdout_open");
     bool                showOut  = outStore->GetBool(outKey, false);
     if (!s.stdoutText.empty()) {
-        if (!first) ImGui::SameLine();
+        flowChip("Console");
         if (toggleChip("Console", showOut)) {
             showOut = !showOut;
             outStore->SetBool(outKey, showOut);
         }
-        first = false;
     }
     if (!s.ok && !s.error.empty()) {
-        if (!first) ImGui::SameLine();
+        flowChip("Error details");
         if (toggleChip("Error details", s.showError)) s.showError = !s.showError;
-        first = false;
     }
     if (s.showThinking && !s.thinking.empty())
         drawProseBox("##think", s.thinking, ui::metrics::copilotProseMaxH());
@@ -400,9 +405,7 @@ void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     if (showOut && !s.stdoutText.empty())
         drawCodeBox("##stdout_v", s.stdoutText, fonts.mono, ui::metrics::px(200.0f));
     ImGui::PopStyleColor();
-    ImGui::EndChild();
-    ImGui::PopStyleVar(2);   // ##stepcard compact ItemSpacing + WindowPadding
-    endGlassBubble(gb);
+    endRowShell(shell);
 }
 
 // One assistant turn: name + plan card + summary + iteration cards. While running, an inline
@@ -411,9 +414,16 @@ void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
 // C45: local models reply in markdown but ImGui renders plain text — the raw ** and ###
 // marks read as noise. Strip the common inline marks (bold/italic asterisks, heading hashes,
 // backticks) for DISPLAY only; the stored message keeps the original text.
-std::string stripMdMarks(const std::string& in) {
+// `srcOf` (optional) receives, per output byte, the index of the input byte it came from — the
+// strip only DROPS bytes, so positions found in the raw text (magic keywords, which must be
+// matched before the backticks that delimit code spans are gone) map straight across.
+std::string stripMdMarks(const std::string& in, std::vector<size_t>* srcOf) {
     std::string out;
     out.reserve(in.size());
+    if (srcOf) {
+        srcOf->clear();
+        srcOf->reserve(in.size());
+    }
     for (size_t i = 0; i < in.size(); ++i) {
         char c = in[i];
         if (c == '*' || c == '`') continue;                       // **bold* / *it* / `code`
@@ -424,6 +434,7 @@ std::string stripMdMarks(const std::string& in) {
             continue;
         }
         out.push_back(c);
+        if (srcOf) srcOf->push_back(i);
     }
     return out;
 }
@@ -927,20 +938,22 @@ std::string timelineProseTail(const ChatMsg& m) {
     return start == std::string::npos ? std::string() : m.text.substr(start);
 }
 
-// The model's prose — the answer — as the HEAVIEST thing in the column: the only full glass
-// bubble a turn draws, at Regular rather than Thin, so it reads as the deliverable and every
-// stage/thought/tool row beside it reads as supporting material. Selectable for click-drag +
-// Ctrl+C; right-click copies the selection or the whole segment — the same affordances the single
-// trailing reply card used to carry, which chat_log.cpp now only draws for a reply the timeline
-// never saw.
+// Horizontal inset of the assistant's prose: the timeline rows' text column (rail + row pad),
+// so an answer and the tool/thought rows above it share one left edge.
+float chatProseInsetX() { return rowRailW() + ui::kit::padX(); }
+
+// The model's prose — the answer — as the calm centre of the column: no card, no rim, the text
+// flowing on the pane's glass like a reply in a modern chat, while every stage/thought/tool row
+// beside it carries a rail or a dim log line. Selectable for click-drag + Ctrl+C; right-click
+// copies the selection or the whole segment — the same affordances the single trailing reply
+// card used to carry, which chat_log.cpp now only draws for a reply the timeline never saw.
 static void drawProseBubble(ActivityItem& a, const ui::Fonts& fonts) {
     if (!ui::streamTextVisible(a.detail)) return;   // an empty segment is not a card
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     const std::string prose = stripMdMarks(a.detail);
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Regular,
-                                      10.0f);
+    GlassBubble gb = beginOpenBubble(ImGui::GetContentRegionAvail().x);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
+                        ImVec2(chatProseInsetX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##prose", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     // Raw detail (not `prose`): the renderer needs the ``` fences intact to route code spans
@@ -956,7 +969,7 @@ static void drawProseBubble(ActivityItem& a, const ui::Fonts& fonts) {
     }
     ImGui::EndChild();
     ImGui::PopStyleVar();   // ##prose WindowPadding
-    const ImRect proseRect = endGlassBubble(gb);
+    const ImRect proseRect = endOpenBubble(gb);
     const std::string sel = chatInputSelection(textId);
     chatCopyContext(proseRect, "##prose_copy", prose, prose, sel);
 }
@@ -979,7 +992,13 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     if (!showThinking && !isOpsJson) {
         ImGui::Indent(rowRailW() + ui::kit::padX());   // one left edge for the whole timeline
         ImGui::PushFont(fonts.body);
-        ImGui::TextColored(surf.textSecondary, "Thinking");
+        // While the model is still thinking the label carries the same light sweep as the
+        // turn's working line; a finished thought is a still caption.
+        if (a.streaming || liveFrontier)
+            chatShimmerText("Thinking\xe2\x80\xa6", surf.textTertiary, surf.textPrimary,
+                            ui::anim::kBreathe);
+        else
+            ImGui::TextColored(surf.textSecondary, "Thinking");
         ImGui::PopFont();
         ImGui::Unindent(rowRailW() + ui::kit::padX());
         return;
@@ -1047,8 +1066,13 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     RowShell sh = beginRowShell("##thoughtbox", ui::kit::Tone::Neutral, 0.0f, kRailMuted);
     ImGui::PushFont(fonts.body);
     const char* boxLabel = a.title.empty() ? "Thinking" : a.title.c_str();
-    ImGui::TextColored(surf.textSecondary, "%s%s", boxLabel,
-                       a.streaming ? "\xe2\x80\xa6" : "");
+    if (a.streaming) {
+        // Live reasoning: the header carries the working sweep (same as the turn's status line).
+        const std::string live = std::string(boxLabel) + "\xe2\x80\xa6";
+        chatShimmerText(live.c_str(), surf.textTertiary, surf.textPrimary, ui::anim::kBreathe);
+    } else {
+        ImGui::TextColored(surf.textSecondary, "%s", boxLabel);
+    }
     ImGui::PopFont();
     if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     if (ImGui::IsItemClicked()) {

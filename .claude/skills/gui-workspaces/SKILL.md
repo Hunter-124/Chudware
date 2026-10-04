@@ -65,6 +65,15 @@ the frame loop in `host/src/app.cpp`.
   payload on send/steer and persisted by `conversations.cpp` (`images` in compact messages,
   `imagePaths` in raw archives). Never resolve a marker's basename across paste-cache days:
   names repeat daily. Legacy records lacking paths keep their marker without a guessed image.
+- **Copilot chat conventions (2026-10-03).** Magic keywords (Chudcode's `ultrathink`,
+  `orchestrate`, `workflowz`, `jevify`, `ultragoon`, `autobot`, `tokenmaxxing`; table mirrors
+  `omp/packages/coding-agent/src/modes/magic-keywords.ts`) are matched ONLY by
+  `ui/copilot/magic_keywords.h` (standalone prose, never in code spans/fences/tags;
+  `test_magic_keywords`) and painted with `chatPaintMagicKeywords`: shimmering gradient in the
+  focused composer, static in sent bubbles. Chudcode applies their meaning server-side; the GUI
+  only presents them. `ask_user` batches are `ChatMsg::asks` (`ui/copilot/ask_answers.*`,
+  `drawAskCards`); an open batch replaces the run status with "Waiting for your answers".
+  User messages are right-aligned mode-tinted bubbles; assistant prose has no box.
 
 ### CAM / Manufacture internals (native viewport cutover)
 

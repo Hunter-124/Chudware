@@ -1454,4 +1454,30 @@ void drawStackedFractionRing(ImDrawList* dl, const ImVec2& center, float radius,
     }
 }
 
+// Magic-keyword ink (see ui_theme.h). HSL so the keyword table's hue sweeps (omp's
+// magic-keywords.ts rows) port verbatim. omp paints S=90% L=62% on a dark terminal; the same
+// stop on bright glass washes out, so a bright surface gets a deeper, slightly less saturated
+// stop that keeps body-text contrast. The glint lifts lightness toward white on dark glass and
+// toward the saturated mid-tone on bright glass, so the shimmer reads on both.
+ImU32 magicKeywordInk(float hueDeg, bool brightSurface, float glint, float alpha) {
+    float h = std::fmod(hueDeg, 360.0f);
+    if (h < 0.0f) h += 360.0f;
+    glint = std::clamp(glint, 0.0f, 1.0f);
+    const float s = brightSurface ? 0.78f : 0.90f;
+    const float l = brightSurface ? 0.42f + 0.12f * glint : 0.64f + 0.20f * glint;
+    const float c = (1.0f - std::fabs(2.0f * l - 1.0f)) * s;
+    const float hp = h / 60.0f;
+    const float x = c * (1.0f - std::fabs(std::fmod(hp, 2.0f) - 1.0f));
+    float r = 0, g = 0, b = 0;
+    if (hp < 1.0f)      { r = c; g = x; }
+    else if (hp < 2.0f) { r = x; g = c; }
+    else if (hp < 3.0f) { g = c; b = x; }
+    else if (hp < 4.0f) { g = x; b = c; }
+    else if (hp < 5.0f) { r = x; b = c; }
+    else                { r = c; b = x; }
+    const float m = l - c * 0.5f;
+    return ImGui::ColorConvertFloat4ToU32(
+        ImVec4(r + m, g + m, b + m, std::clamp(alpha, 0.0f, 1.0f)));
+}
+
 }  // namespace ui

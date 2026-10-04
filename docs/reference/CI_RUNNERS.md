@@ -336,6 +336,9 @@ private, ACL-protected namespace:
 | `D:\ChudwareCI\Windows\profile` | `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA`; tools in `profile\chudware-ci-tools`; `CARGO_HOME` `profile\.cargo`; `RUSTUP_HOME` `profile\.rustup` |
 | `D:\ChudwareCI\Windows\tmp` | `TEMP`, `TMP` |
 | `D:\ChudwareCI\Windows\w` | runner work folder (`RUNNER_TEMP` `w\_temp`, `RUNNER_TOOL_CACHE` `w\_tool`) |
+The copied work tree is owned by the virtual service SID. Administrative
+copy ownership is not accepted through a global Git `safe.directory` exception:
+it is repaired with the runner idle/stopped, without following link targets.
 
 CloudCastle's native runner keeps its own elevated virtual account and
 `D:\CloudCastleCI\Windows\cc`; Chudcode's dedicated native runner has its own
@@ -347,6 +350,10 @@ fixed D: volume with no reparse point on any of those paths, that neither
 sibling namespace is even listable, and a real MSVC compile/link/run. The
 machine-level Visual Studio Build Tools, Windows SDK and CMake are shared
 read-only; nothing mutable is shared.
+Native fixture files use `std::filesystem::temp_directory_path()` and therefore
+the account's `TMPDIR`/`TEMP`, not literal shared `/tmp` names. This also keeps
+operator-lane release tests from leaving sticky-directory files that break
+the private Mac account's next test.
 
 Inside the code, named OS objects are per process: the AICM shared-memory
 handoff (`core/util/aicm_handoff.cpp`) scopes every `Local\chudware_*` mapping

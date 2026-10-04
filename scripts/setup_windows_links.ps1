@@ -27,7 +27,11 @@ try {
     # Read the git-tracked symlinks (mode 120000) and their targets straight from the index,
     # so this stays correct if the set of compat links ever changes.
     $links = @{}
-    foreach ($line in (git ls-files -s)) {
+    # A git that cannot read the repository (e.g. "dubious ownership") prints nothing on
+    # stdout; without this check that read as "no symlinks" and left the text stubs in place.
+    $entries = @(git ls-files -s)
+    if ($LASTEXITCODE -ne 0) { throw "git ls-files -s failed (exit $LASTEXITCODE) in $repo" }
+    foreach ($line in $entries) {
         $parts = $line -split '\s+', 4
         if ($parts[0] -eq '120000') {
             $name = $parts[3]

@@ -1250,7 +1250,9 @@ int winding_of_others(const SurfaceMesh &s, const TriangleBvh &bvh,
       {0.5390, 0.6271, 0.5622},   {-0.6614, 0.3317, 0.6726},
       {0.2961, -0.8127, 0.5019},  {-0.4473, -0.5196, -0.7280},
       {0.8341, -0.2410, -0.4962}, {-0.1871, 0.9035, -0.3855}};
-  constexpr double rel = 1e-10;
+  // Static: MSVC (C3493) treats naming a local constexpr double inside a
+  // capture-less lambda as an implicit capture; GCC/Clang accept either.
+  static constexpr double rel = 1e-10;
   const auto sign = [](double x, double scale) {
     return x > rel * scale ? 1 : x < -rel * scale ? -1 : 0;
   };

@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -73,15 +74,12 @@ std::string build(const char* name, const json& ops) {
     return id;
 }
 
+// The account's own temp directory (TMPDIR/TEMP), never a literal /tmp: a fixed
+// /tmp name written by another account on a shared Mac is unwritable here.
 std::string tmp_png(const char* stem) {
-    std::string p = std::string(
-#ifdef _WIN32
-        std::getenv("TEMP") ? std::getenv("TEMP") : "."
-#else
-        "/tmp"
-#endif
-        );
-    return p + "/chudware_render_diff_" + stem + ".png";
+    return (std::filesystem::temp_directory_path() /
+            (std::string("chudware_render_diff_") + stem + ".png"))
+        .string();
 }
 
 struct Rgb {

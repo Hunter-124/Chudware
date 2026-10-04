@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <string>
 
@@ -107,15 +108,11 @@ const char* kMinimalPcb = R"KICAD(
 )
 )KICAD";
 
+// The account's own temp directory (TMPDIR/TEMP), never a literal /tmp: on a
+// Mac shared with the operator lane, a fixed /tmp name left by another account
+// is unwritable here (sticky /tmp), so the test would read a stale file or fail.
 std::string write_temp(const std::string& name, const std::string& text) {
-    const std::string path = (std::string(
-#ifdef _WIN32
-                                  std::getenv("TEMP") ? std::getenv("TEMP") : "."
-#else
-                                  "/tmp"
-#endif
-                                  ) +
-                              "/" + name);
+    const std::string path = (std::filesystem::temp_directory_path() / name).string();
     std::ofstream f(path, std::ios::binary);
     f << text;
     return path;

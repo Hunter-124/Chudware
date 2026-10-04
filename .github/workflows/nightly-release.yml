@@ -11,17 +11,23 @@
 # promote button will publish later without rebuilding a byte.
 #
 # Trust boundaries that shape every step below:
-#   * The gateway release token is used two different ways, because the runners
-#     are not on one network. `plan` and `linux-beta` run ON the gateway host:
-#     they read the token from /home/liveuser/chudware-web-data/gateway.env at
-#     the point of use and talk to http://127.0.0.1:8300, so the token never
-#     leaves the box. The Windows and macOS builders cannot route to that host
-#     at all (192.168.1.x and 192.168.0.x do not talk to each other, proven by
-#     diagnostic), so they hold the same token as the GitHub secret
+#   * Serving and building are different machines. `plan` is metadata/API work
+#     only and runs ON the gateway host (`cc-linux-livingroom`, the serving
+#     SSD): it reads the release token from
+#     /home/liveuser/chudware-web-data/gateway.env at the point of use and talks
+#     to http://127.0.0.1:8300, so that copy of the token never leaves the box,
+#     and it compiles nothing. Every build leg runs on a builder that has no
+#     gateway.env, no production SSH credential and no path into the gateway's
+#     release directory: linux-beta on the qualified `cc-linux-build` pool (the
+#     private NVMe guest), windows-beta and macos-beta on their own hosts.
+#     The builders hold the token as the GitHub secret
 #     CHUDWARE_GATEWAY_RELEASE_TOKEN and reach the gateway over TLS on
-#     https://app.chudware.com: artifacts stream in through
+#     https://app.chudware.com: artifacts and every sidecar stream in through
 #     PUT /api/releases/ci/upload/<name>, then the ordinary ci/publish and
-#     ci/status calls follow. Those runners need nothing but outbound 443.
+#     ci/status calls follow, and the gateway re-digests every staged byte
+#     against the signed body. Those runners need nothing but outbound 443.
+#     The bash legs share packaging/ci_gateway.sh; Windows uses
+#     packaging/windows/publish_release.ps1.
 #   * On every host the token reaches curl through a 0600 --config file, never
 #     argv (a shared runner's process list is readable), never a log.
 #   * The CI signing seed is only in the environment of the steps that sign.
@@ -59,10 +65,7 @@ env:
   # mistyped secret fails before anything is signed, and to the payload/AppImage
   # verifiers so they check the same key the shipped keyring trusts.
   CHUDWARE_RELEASE_CI_PUBLIC_KEY: d7434dc67f4d6e11cd4c8ced9b5ebbccf2e1477b5949d52d7685b6ca43a010f6
-  CHUDWARE_GATEWAY_LOOPBACK: http://127.0.0.1:8300
-  CHUDWARE_GATEWAY_ENV_FILE: /home/liveuser/chudware-web-data/gateway.env
-  # Anonymous, rate-limited, read-only: the public URL is correct here. Only
-  # publishing is restricted to loopback.
+  # Anonymous, rate-limited, read-only: the public URL is correct here.
   CHUDWARE_BASE_VERSION_URL: https://app.chudware.com/api/releases/base-version
   # Nightly betas have no per-version notes page yet; the portal is the honest
   # destination and satisfies the gateway's absolute-HTTP(S) requirement.
@@ -72,13 +75,13 @@ env:
   # installed client. Raising the floor is a deliberate stable-release decision
   # made through packaging/publish.py register --min-supported.
   CHUDWARE_RELEASE_MIN_SUPPORTED: 0.1.0
-  # The Windows and macOS builders cannot route to the gateway's LAN address, so
-  # they use the public origin. Uploading is authenticated with the release
-  # token; /api/releases/ci is a public pass-through in auth.py precisely so
-  # these three endpoints can be reached from off-LAN with the Bearer enforced
-  # in the handler.
+  # Every build leg publishes through the public origin: no builder can (or
+  # may) reach the gateway's loopback or its release directory. Uploading is
+  # authenticated with the release token; /api/releases/ci is a public
+  # pass-through in auth.py precisely so these endpoints can be reached from
+  # off the gateway host with the Bearer enforced in the handler.
   CHUDWARE_GATEWAY_PUBLIC_BASE: https://app.chudware.com
-  # Shared by both off-LAN legs. The CI endpoints have their own per-IP budget
+  # Shared by every build leg. The CI endpoints have their own per-IP budget
   # (_ci_by_ip, 240/min) rather than the 20/min manual publish limiter, so a
   # normal night is nowhere near it; these retries are belt-and-suspenders for a
   # throttle, a 5xx or a dropped connection part-way through a 500 MB upload.
@@ -88,9 +91,15 @@ env:
 jobs:
   plan:
     name: Plan nightly version
-    # The gateway host: this job reads gateway.env and talks to loopback.
-    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
+    # The gateway host (serving SSD): this job reads gateway.env and talks to
+    # loopback. Metadata and API calls only; it never compiles anything, and
+    # no other nightly job may route here.
+    runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-livingroom]
     timeout-minutes: 10
+    env:
+      # Scoped to this job: no build leg sees the gateway's loopback or env file.
+      CHUDWARE_GATEWAY_LOOPBACK: http://127.0.0.1:8300
+      CHUDWARE_GATEWAY_ENV_FILE: /home/liveuser/chudware-web-data/gateway.env
     outputs:
       version: ${{ steps.plan.outputs.version }}
       stable_version: ${{ steps.plan.outputs.stable_version }}
@@ -108,7 +117,7 @@ jobs:
               echo "::error::runner ${RUNNER_NAME:-unknown} is missing ${tool}"; exit 1; }
           done
           test -r "${CHUDWARE_GATEWAY_ENV_FILE}" || {
-            echo "::error::${CHUDWARE_GATEWAY_ENV_FILE} is not readable; this job must run on the gateway host so publishing stays on loopback"
+            echo "::error::${CHUDWARE_GATEWAY_ENV_FILE} is not readable; this job must run on the gateway host (cc-linux-livingroom), the only place that file exists"
             exit 1
           }
 
@@ -210,6 +219,10 @@ jobs:
     name: Linux beta AppImage
     needs: plan
     if: needs.plan.outputs.skip != 'true'
+    # The qualified Linux build pool: the private NVMe guest
+    # (`chudware-ryzen-linux`), never the serving host. It holds no production
+    # file or credential beyond the release-token secret and publishes over TLS
+    # like the other legs.
     runs-on: [self-hosted, Linux, X64, cloudcastle-ci, cc-linux-build]
     timeout-minutes: 300
     env:
@@ -228,7 +241,7 @@ jobs:
           # reads tags for provenance and the gate expects a full history.
           fetch-depth: 0
 
-      - name: Check runner capabilities and open the gateway loopback
+      - name: Check runner capabilities and select the release Python
         env:
           CHUDWARE_RUNTIME_RELEASE_TOKEN: ${{ github.token }}
         shell: bash
@@ -276,64 +289,16 @@ jobs:
             exit 1
           fi
 
-          test -r "${CHUDWARE_GATEWAY_ENV_FILE}" || {
-            echo "::error::${CHUDWARE_GATEWAY_ENV_FILE} is not readable. This job publishes over loopback, so it must run ON the gateway host; the alternative is the scp+ssh path windows-beta uses."
-            exit 1
-          }
-
-          curlrc="${RUNNER_TEMP}/gw.curlrc"
-          umask 077
-          python3 - "${CHUDWARE_GATEWAY_ENV_FILE}" "${curlrc}" "${RUNNER_TEMP}/releases-dir.txt" <<'PY'
-          import os, sys
-
-          wanted = {"CHUDWARE_GATEWAY_RELEASE_TOKEN": "", "CHUDWARE_RELEASES_DIR": ""}
-          with open(sys.argv[1], encoding="utf-8") as stream:
-              for line in stream:
-                  key, _, value = line.strip().partition("=")
-                  if key in wanted:
-                      wanted[key] = value.strip().strip("'\"")
-          token = wanted["CHUDWARE_GATEWAY_RELEASE_TOKEN"]
-          if not token:
-              raise SystemExit("gateway.env has no CHUDWARE_GATEWAY_RELEASE_TOKEN")
-          with open(sys.argv[2], "w", encoding="ascii") as config:
-              config.write('header = "Authorization: Bearer %s"\n' % token)
-          with open(sys.argv[3], "w", encoding="utf-8") as out:
-              out.write((wanted["CHUDWARE_RELEASES_DIR"] or os.path.expanduser("~/chudware-releases")) + "\n")
-          PY
-          releases_dir="$(cat "${RUNNER_TEMP}/releases-dir.txt")"
-          mkdir -p "${releases_dir}/incoming"
-          test -w "${releases_dir}/incoming" || {
-            echo "::error::${releases_dir}/incoming is not writable by this runner"; exit 1; }
-          echo "RELEASES_DIR=${releases_dir}" >> "$GITHUB_ENV"
-
-          # One helper, sourced by every later step: loopback only, token only
-          # from the config file.
-          cat > "${RUNNER_TEMP}/gw.sh" <<'SH'
-          gw_post() {  # gw_post <path> <json file>
-            curl --config "${RUNNER_TEMP}/gw.curlrc" --fail-with-body --silent --show-error \
-              --max-time 300 -H 'Content-Type: application/json' \
-              --data-binary "@$2" "${CHUDWARE_GATEWAY_LOOPBACK}$1"
-          }
-          ci_status() {  # ci_status <status> <detail>
-            local body="${RUNNER_TEMP}/ci-status.json"
-            python3 - "$1" "$2" > "${body}" <<'PY'
-          import json, os, sys
-          json.dump({
-              "run_id": os.environ["GITHUB_RUN_ID"],
-              "commit_sha": os.environ["RELEASE_COMMIT"],
-              "channel": "beta",
-              "platform": os.environ["RELEASE_PLATFORM"],
-              "arch": os.environ["RELEASE_ARCH"],
-              "version": os.environ["RELEASE_VERSION"],
-              "status": sys.argv[1],
-              "detail": sys.argv[2],
-          }, sys.stdout)
-          PY
-            gw_post /api/releases/ci/status "${body}" > /dev/null \
-              || echo "::warning::ci/status ${1} was not recorded"
-          }
-          SH
-          . "${RUNNER_TEMP}/gw.sh"
+      - name: Open the authenticated channel to the gateway
+        env:
+          GATEWAY_TOKEN: ${{ secrets.CHUDWARE_GATEWAY_RELEASE_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Public origin, run-scoped 0600 curl config, and the shared retry
+          # budget on every call; installs ${RUNNER_TEMP}/gw.sh for later steps.
+          . packaging/ci_gateway.sh
+          gw_open
           ci_status building "configuring core + host for ${RELEASE_VERSION}"
 
       - name: Generate protected assets and build core + host at the pinned version
@@ -697,15 +662,16 @@ jobs:
               "commit_sha": os.environ["RELEASE_COMMIT"],
           }
           if os.environ.get("HAS_EVIDENCE") == "1":
+              # The same local files gw_upload_release sent beside the artifact.
+              directory = pathlib.Path(sys.argv[5])
               evidence = {}
-              for field, suffix in (
+              for field, name in (
                   ("sbom", "sbom.cdx.json"),
                   ("provenance", "provenance.slsa.json"),
                   ("platform_test", "platform-test.v1.json"),
               ):
-                  document = artifact.with_name(artifact.name + "." + suffix)
-                  evidence[field + "_sha256"] = digest(document)
-                  evidence[field + "_signature_sha256"] = digest(document.with_name(document.name + ".sig"))
+                  evidence[field + "_sha256"] = digest(directory / name)
+                  evidence[field + "_signature_sha256"] = digest(directory / (name + ".sig"))
               body["evidence"] = evidence
           json.dump(body, sys.stdout)
           PY
@@ -736,46 +702,34 @@ jobs:
             sign_artifact_identity "$1" "${RELEASE_VERSION}" "$2.sig"
             sign_artifact_identity "$1" "${RELEASE_STABLE_VERSION}" "$2-stable.sig"
           }
-          # stage_release_file <source> <canonical name>: the artifact plus a copy of the
-          # SAME signed payload manifest and evidence sidecars, under this file's own
-          # basename, which is how the gateway pairs them.
+          # publish_release_file <local file> <canonical name> <format> <sig prefix>:
+          # upload the artifact plus the SAME signed payload manifest and evidence
+          # sidecars under the canonical name (which is how the gateway pairs them),
+          # then post ci/publish. Every byte stays on this runner's RUNNER_TEMP until
+          # it goes up over TLS; the body's digests and sizes come from exactly the
+          # local files just uploaded, and the gateway recomputes them from what it
+          # staged and rejects any mismatch. A 422 makes the gateway DELETE the staged
+          # artifact (sidecars survive), so every publish uploads immediately before
+          # it and never reuses an upload across a retry.
           #
-          # Every command carries `|| return 1` and both helpers end in an explicit
+          # Every command carries `|| return 1` and the helper ends in an explicit
           # `return 0`. That is not belt-and-braces: the package step below runs WITHOUT
-          # -e (one format must not abort the other) and calls these in an `if` test,
+          # -e (one format must not abort the other) and calls this in an `if` test,
           # and bash suppresses errexit for the whole subtree of an `if` condition —
           # including a nested subshell that sets `set -e` itself (measured: a subshell
           # guard reported success after a failed install). Without explicit returns a
-          # format would be reported "published" from a stage that never happened.
-          stage_release_file() {
-            local source="$1" name="$2" incoming="${RELEASES_DIR}/incoming" evidence
-            install -m 0644 "${source}" "${incoming}/${name}" || return 1
-            install -m 0644 "${RUNNER_TEMP}/verify/payload-manifest.v1.json" \
-              "${incoming}/${name}.payload-manifest.v1.json" || return 1
-            install -m 0644 "${RUNNER_TEMP}/verify/payload-manifest.v1.sig" \
-              "${incoming}/${name}.payload-manifest.v1.sig" || return 1
-            if [ "${HAS_EVIDENCE}" = 1 ]; then
-              for evidence in sbom.cdx.json provenance.slsa.json platform-test.v1.json; do
-                install -m 0644 "${RUNNER_TEMP}/final/evidence/${evidence}" \
-                  "${incoming}/${name}.${evidence}" || return 1
-                install -m 0644 "${RUNNER_TEMP}/final/evidence/${evidence}.sig" \
-                  "${incoming}/${name}.${evidence}.sig" || return 1
-              done
-            fi
-            ls -l "${incoming}/${name}"* || true
-            return 0
-          }
-          # publish_release_file <staged file> <format> <sig prefix>. Digests come from
-          # the STAGED bytes, which is what the gateway recomputes and rejects on
-          # mismatch. A 422 makes the gateway DELETE the staged artifact (sidecars
-          # survive), so callers must stage immediately before publishing and never
-          # reuse a stage across a retry.
+          # format would be reported "published" from an upload that never happened.
           publish_release_file() {
-            local staged="$1" format="$2" prefix="$3"
+            local source="$1" name="$2" format="$3" prefix="$4" evidence=""
             local body="${RUNNER_TEMP}/publish-${format}.json"
             local response="${RUNNER_TEMP}/publish-response-${format}.json"
-            python3 "${RUNNER_TEMP}/publish_body.py" "${staged}" "${prefix}.sig" \
-              "${prefix}-stable.sig" "${format}" > "${body}" || return 1
+            if [ "${HAS_EVIDENCE}" = 1 ]; then
+              evidence="${RUNNER_TEMP}/final/evidence"
+            fi
+            gw_upload_release "${source}" "${name}" "${RUNNER_TEMP}/verify" "${evidence}" \
+              || return 1
+            python3 "${RUNNER_TEMP}/publish_body.py" "${source}" "${prefix}.sig" \
+              "${prefix}-stable.sig" "${format}" "${evidence}" > "${body}" || return 1
             gw_post /api/releases/ci/publish "${body}" > "${response}" || return 1
             python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2, sort_keys=True))' \
               "${response}" || return 1
@@ -837,38 +791,30 @@ jobs:
           fi
           echo "PACKAGE_FORMATS=${published_formats}" >> "$GITHUB_ENV"
 
-      - name: Stage the artifact and sidecars for the gateway
-        shell: bash
-        run: |
-          set -euo pipefail
-          . "${RUNNER_TEMP}/pkg.sh"
-          name="$(canonical_name default)"
-          stage_release_file "${ARTIFACT}" "${name}"
-          echo "ARTIFACT_NAME=${name}" >> "$GITHUB_ENV"
-
-      - name: Publish the beta release over the gateway loopback
+      - name: Upload and publish the beta release over the gateway API
         shell: bash
         run: |
           set -euo pipefail
           . "${RUNNER_TEMP}/gw.sh"
           . "${RUNNER_TEMP}/pkg.sh"
-          ci_status publishing "posting ci/publish for ${ARTIFACT_NAME}"
+          name="$(canonical_name default)"
+          echo "ARTIFACT_NAME=${name}" >> "$GITHUB_ENV"
+          ci_status publishing "uploading and posting ci/publish for ${name}"
 
           # A 422 for a digest/size mismatch makes the gateway DELETE the staged
-          # artifact (sidecars survive), so a retry must re-stage it. Re-running
-          # this job does exactly that: it rebuilds and re-copies before publishing.
-          publish_release_file "${RELEASES_DIR}/incoming/${ARTIFACT_NAME}" default \
-            "${RUNNER_TEMP}/artifact"
-          ci_status published "${ARTIFACT_NAME} published to beta"
+          # artifact (sidecars survive), so a retry must re-upload it. Re-running
+          # this job does exactly that: it rebuilds and re-uploads before publishing.
+          publish_release_file "${ARTIFACT}" "${name}" default "${RUNNER_TEMP}/artifact"
+          ci_status published "${name} published to beta"
           {
             echo '## Linux beta published'
             echo ''
-            echo "* artifact: \`${ARTIFACT_NAME}\`"
+            echo "* artifact: \`${name}\`"
             echo "* stable pair signed for: \`${RELEASE_STABLE_VERSION}\`"
             echo "* evidence bundle: \`${HAS_EVIDENCE}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Stage and publish the Linux packages
+      - name: Upload and publish the Linux packages
         shell: bash
         run: |
           set -uo pipefail
@@ -877,9 +823,9 @@ jobs:
 
           # Runs AFTER the AppImage publish on purpose: the release has already
           # shipped by the time these formats are attempted, so no packaging
-          # problem can cost the nightly its AppImage. Each format stages
+          # problem can cost the nightly its AppImage. Each format uploads
           # immediately before it publishes, because a 422 deletes the staged
-          # artifact and the next attempt has to start from a fresh copy.
+          # artifact and the next attempt has to start from a fresh upload.
           published=""
           failed=""
           for format in ${PACKAGE_FORMATS:-}; do
@@ -890,9 +836,8 @@ jobs:
               failed="${failed}${failed:+ }${format}"
               continue
             fi
-            if stage_release_file "${source}" "${name}" \
-               && publish_release_file "${RELEASES_DIR}/incoming/${name}" "${format}" \
-                    "${RUNNER_TEMP}/artifact-${format}"; then
+            if publish_release_file "${source}" "${name}" "${format}" \
+                 "${RUNNER_TEMP}/artifact-${format}"; then
               published="${published}${published:+ }${format}"
               echo "published ${name} as format ${format}"
             else
@@ -932,9 +877,8 @@ jobs:
           fi
           # The capability step failed before gw.sh existed. Without this the
           # queued row the plan job wrote stays "queued" in /admin forever,
-          # which reads as a hung runner instead of a failed leg. Public origin
-          # and the secret token: the loopback credential lives in a file this
-          # runner may not have been able to read.
+          # which reads as a hung runner instead of a failed leg. Same public
+          # origin and secret token as gw.sh, in a run-scoped 0600 config.
           [ -n "${GATEWAY_TOKEN:-}" ] || exit 0
           umask 077
           curlrc="${RUNNER_TEMP}/gw-fallback.curlrc"
@@ -983,6 +927,10 @@ jobs:
       - name: Check runner capabilities and enter the MSVC environment
         env:
           CHUDWARE_RUNTIME_RELEASE_TOKEN: ${{ github.token }}
+          # Per-process peak for the windows-occt LTO tree and the memory left
+          # untouched for everything else on the shared host (budget below).
+          CHUDWARE_BUILD_GB_PER_JOB: '2'
+          CHUDWARE_BUILD_RESERVE_GB: '8'
         # Windows PowerShell 5.1 - these hosts have no pwsh and their `bash` is an
         # empty WSL shim. ASCII only: 5.1 reads the runner's BOM-less UTF-8 script
         # as the ANSI code page.
@@ -991,6 +939,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Write-Host "runner=$env:RUNNER_NAME os=$env:RUNNER_OS host=$env:COMPUTERNAME"
 
+          # The runner's private, non-administrator service profile
+          # (D:\ChudwareCI\Windows\profile); see docs/reference/CI_RUNNERS.md.
           $tools = Join-Path $env:USERPROFILE 'chudware-ci-tools'
           foreach ($dir in @((Join-Path $tools 'bin'), (Join-Path $tools 'python'), (Join-Path $tools 'python\Scripts'))) {
             if (Test-Path $dir) {
@@ -1121,6 +1071,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $compilerOutput | Select-Object -First 1
 
+          # This host also runs the CloudCastle and Chudcode runners and
+          # customer inference. Ninja's default width (logical CPUs + 2)
+          # starves them, so the build is held to half the logical processors
+          # and to the physical memory free right now, less a reserve, at one
+          # budgeted peak per job. The build steps pass this level explicitly
+          # because a bare `cmake --build --parallel` ignores it.
+          $logical = [Environment]::ProcessorCount
+          $freeGiB = [math]::Floor((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB)
+          $byMemory = [math]::Floor(($freeGiB - [int]$env:CHUDWARE_BUILD_RESERVE_GB) / [int]$env:CHUDWARE_BUILD_GB_PER_JOB)
+          $jobs = [math]::Max(1, [math]::Min([math]::Floor($logical / 2), $byMemory))
+          Write-Host "build budget: $logical logical CPUs, $freeGiB GiB free -> $jobs parallel jobs"
+          "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # /Zi targets write PDBs through mspdbsrv; a run-unique endpoint gives
+          # this run its own server instead of an account-wide shared one.
+          "_MSPDBSRV_ENDPOINT_=chudware-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:GITHUB_JOB" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
 
       - name: Install the release Python requirements
         # The chudware-ci-tools python ships bare; embed_protected_assets and the
@@ -1202,12 +1169,15 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          # Below-normal priority is inherited by cmake, ninja, cl, link and the
+          # helper scripts, so the release build yields to customer workloads.
+          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
           # scripts/build_windows.ps1 is the interactive one-shot build: it hard-codes
           # developer defaults and takes no cmake arguments, so a release build cannot
           # go through it without flipping CHUDWARE_DEVELOPER_BUILD back on. Its two
           # prerequisites are reused directly instead: the junction setup it calls
           # first, and the same windows-occt preset it builds.
-          & powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup_windows_links.ps1
+          & powershell -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File scripts\setup_windows_links.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $protected = "$env:HOST_BUILD_DIR/generated/protected-assets"
@@ -1219,7 +1189,7 @@ jobs:
             "-DCHUDWARE_VERSION_OVERRIDE=$env:RELEASE_VERSION" `
             "-DCHUDWARE_PROTECTED_ASSETS_DIR=$env:GITHUB_WORKSPACE/$protected"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & cmake --build --preset $env:CORE_PRESET --parallel
+          & cmake --build --preset $env:CORE_PRESET --parallel $env:CMAKE_BUILD_PARALLEL_LEVEL
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # CEF is NOT disabled here, unlike scripts/build_windows.ps1 and the
@@ -1228,7 +1198,7 @@ jobs:
           # without the provisioned CEF SDK fails this configure loudly instead of
           # quietly shipping a Chudware with no web view. Fresh checkouts carry no
           # extern/cef, so fetch the pinned SDK first (idempotent).
-          & powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fetch_cef_windows.ps1
+          & powershell -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File scripts\fetch_cef_windows.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & cmake -S host -B $env:HOST_BUILD_DIR -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCHUDWARE_DEVELOPER_BUILD=OFF `
@@ -1236,10 +1206,10 @@ jobs:
             "-DCHUDWARE_VERSION_OVERRIDE=$env:RELEASE_VERSION" `
             "-DCHUDWARE_PROTECTED_ASSETS_DIR=$env:GITHUB_WORKSPACE/$protected"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & cmake --build $env:HOST_BUILD_DIR --parallel
+          & cmake --build $env:HOST_BUILD_DIR --parallel $env:CMAKE_BUILD_PARALLEL_LEVEL
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          & powershell -NoProfile -ExecutionPolicy Bypass -File scripts\stage_windows.ps1
+          & powershell -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File scripts\stage_windows.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           foreach ($cache in @("build/$env:CORE_PRESET/CMakeCache.txt", "$env:HOST_BUILD_DIR/CMakeCache.txt")) {
@@ -1281,6 +1251,8 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          # Nuitka's C compile inherits below-normal priority from this shell.
+          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
           & (Join-Path $env:RUNNER_TEMP 'ci_status.ps1') -Status 'packaging' -Detail 'sidecars, payload signature, Inno installer'
 
           $out = Join-Path $env:RUNNER_TEMP 'installer'
@@ -1293,7 +1265,7 @@ jobs:
           $hostdBin = "build/$env:CORE_PRESET/bin/chudware-hostd.exe"
           # The canonical engine is the core build's: CMake stages its polymesh-advisor package
           # beside it, while the copy next to chudware.exe arrives without one.
-          & powershell -NoProfile -ExecutionPolicy Bypass -File packaging\windows\build_sidecars.ps1 `
+          & powershell -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File packaging\windows\build_sidecars.ps1 `
             -OutputDir $sidecars -HostBinary $hostBin -HostdBinary $hostdBin `
             -EngineBinary "build/$env:CORE_PRESET/bin/libchudware.dll"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -1722,98 +1694,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ -n "${GATEWAY_TOKEN:-}" ] || {
-            echo '::error::CHUDWARE_GATEWAY_RELEASE_TOKEN is not set; this runner publishes over TLS and has no other credential'
-            exit 1
-          }
-          [ -n "${CHUDWARE_GATEWAY_PUBLIC_BASE:-}" ] || {
-            echo '::error::CHUDWARE_GATEWAY_PUBLIC_BASE is not set'; exit 1; }
-
-          # Run-scoped: RUNNER_TEMP is wiped between jobs. The token goes to a
-          # 0600 curl --config file, never to argv: another process on this Mac
-          # can read a command line, and GitHub's log masking does not help there.
-          curlrc="${RUNNER_TEMP}/gw.curlrc"
-          umask 077
-          printf 'header = "Authorization: Bearer %s"\n' "${GATEWAY_TOKEN}" > "${curlrc}"
-          chmod 600 "${curlrc}"
-
-          # Reachability is proven before hours of building depend on it. This
-          # endpoint is anonymous and read-only, so a 200 here means DNS, TLS and
-          # routing all work; the token itself is proven by the first ci/status.
-          probe="$(curl --fail-with-body --silent --show-error --max-time 30 \
-            "${CHUDWARE_GATEWAY_PUBLIC_BASE}/api/releases/base-version")" || {
-            echo "::error::cannot reach ${CHUDWARE_GATEWAY_PUBLIC_BASE} from this runner"
-            exit 1
-          }
-          echo "gateway reachable: ${probe}"
-
-          # One helper, sourced by every later step: public origin, token only
-          # from the config file, and the shared retry budget on every call.
-          cat > "${RUNNER_TEMP}/gw.sh" <<'SH'
-          gw_post() {  # gw_post <path> <json file>
-            curl --config "${RUNNER_TEMP}/gw.curlrc" --fail-with-body --silent --show-error \
-              --max-time 300 ${CHUDWARE_GATEWAY_CURL_RETRY} \
-              -H 'Content-Type: application/json' --data-binary "@$2" \
-              "${CHUDWARE_GATEWAY_PUBLIC_BASE}$1"
-          }
-          gw_upload() {  # gw_upload <local file> <remote name>; echoes the gateway's json
-            # --upload-file streams from disk; --data-binary would read a ~500 MB
-            # zip into memory first, and the handler wants a raw body either way.
-            # The gateway writes <name>.part and renames, so ci/publish never
-            # sees a torn upload.
-            #
-            # Over the edge's 100 MB body cap the artifact goes up in chunks (a
-            # single PUT of the ~300 MB zip is answered 413 by the proxy in front
-            # of the public origin). Each chunk names the offset it continues and
-            # the last one finalizes, so only that reply carries a digest.
-            size="$(wc -c < "$1" | tr -d ' ')"
-            if [ "${size}" -le 67108864 ]; then
-              curl --config "${RUNNER_TEMP}/gw.curlrc" --fail-with-body --silent --show-error \
-                --max-time 3600 ${CHUDWARE_GATEWAY_CURL_RETRY} --upload-file "$1" \
-                "${CHUDWARE_GATEWAY_PUBLIC_BASE}/api/releases/ci/upload/$2"
-              return $?
-            fi
-            chunk="${RUNNER_TEMP}/upload.chunk"
-            offset=0
-            while [ "${offset}" -lt "${size}" ]; do
-              dd if="$1" of="${chunk}" bs=1048576 skip="$((offset / 1048576))" count=64 \
-                 status=none || return 1
-              read_bytes="$(wc -c < "${chunk}" | tr -d ' ')"
-              [ "${read_bytes}" -gt 0 ] || return 1
-              query="offset=${offset}"
-              if [ "$((offset + read_bytes))" -ge "${size}" ]; then
-                query="offset=${offset}&complete=1"
-              fi
-              response="$(curl --config "${RUNNER_TEMP}/gw.curlrc" --fail-with-body --silent \
-                --show-error --max-time 3600 ${CHUDWARE_GATEWAY_CURL_RETRY} \
-                --upload-file "${chunk}" \
-                "${CHUDWARE_GATEWAY_PUBLIC_BASE}/api/releases/ci/upload/$2?${query}")" || {
-                  rm -f "${chunk}"; printf '%s' "${response}"; return 1; }
-              offset="$((offset + read_bytes))"
-            done
-            rm -f "${chunk}"
-            printf '%s' "${response}"
-          }
-          ci_status() {  # ci_status <status> <detail>
-            body="${RUNNER_TEMP}/ci-status.json"
-            "${RELEASE_PYTHON}" - "$1" "$2" > "${body}" <<'PY'
-          import json, os, sys
-          json.dump({
-              "run_id": os.environ["GITHUB_RUN_ID"],
-              "commit_sha": os.environ["RELEASE_COMMIT"],
-              "channel": "beta",
-              "platform": os.environ["RELEASE_PLATFORM"],
-              "arch": os.environ["RELEASE_ARCH"],
-              "version": os.environ["RELEASE_VERSION"],
-              "status": sys.argv[1],
-              "detail": sys.argv[2],
-          }, sys.stdout)
-          PY
-            gw_post /api/releases/ci/status "${body}" > /dev/null \
-              || echo "::warning::ci/status $1 was not recorded"
-          }
-          SH
-          . "${RUNNER_TEMP}/gw.sh"
+          # Public origin, run-scoped 0600 curl config, and the shared retry
+          # budget on every call; installs ${RUNNER_TEMP}/gw.sh for later steps.
+          . packaging/ci_gateway.sh
+          gw_open
           ci_status building "configuring core + host for ${RELEASE_VERSION}"
 
       - name: Generate protected assets and build core + host at the pinned version
@@ -2119,49 +2003,12 @@ jobs:
           . "${RUNNER_TEMP}/gw.sh"
           name="Chudware-${RELEASE_VERSION}-macos-${RELEASE_ARCH}.zip"
 
-          upload_one() {  # upload_one <local file> <remote name>
-            local file="$1" remote="$2" expected reported response
-            test -f "${file}" || { echo "::error::missing upload ${file}"; exit 1; }
-            expected="$("${RELEASE_PYTHON}" - "${file}" <<'PY'
-          import hashlib, sys
-          value = hashlib.sha256()
-          with open(sys.argv[1], "rb") as stream:
-              for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                  value.update(chunk)
-          print(value.hexdigest())
-          PY
-          )"
-            response="$(gw_upload "${file}" "${remote}")" || {
-              echo "::error::upload failed for ${remote}"; exit 1; }
-            # The gateway re-digests these bytes again at publish time; comparing
-            # here names transport corruption at the file that caused it instead
-            # of as a 422 an hour later.
-            reported="$(printf '%s' "${response}" | "${RELEASE_PYTHON}" -c \
-              'import json,sys; print(json.load(sys.stdin).get("sha256",""))')" || reported=""
-            if [ "${reported}" != "${expected}" ]; then
-              echo "::error::the gateway stored a different digest for ${remote}: expected ${expected}, got '${reported}'"
-              exit 1
-            fi
-            echo "uploaded ${remote} sha256=${reported}"
-            uploaded=$((uploaded + 1))
-          }
-
-          # Sidecars carry the artifact's own name plus a suffix; the payload
-          # signature REPLACES the .json (payload-manifest.v1.sig), while
-          # evidence signatures append .sig to the full evidence file name.
-          uploaded=0
-          upload_one "${ARTIFACT}" "${name}"
-          upload_one "${RUNNER_TEMP}/verify/payload-manifest.v1.json" "${name}.payload-manifest.v1.json"
-          upload_one "${RUNNER_TEMP}/verify/payload-manifest.v1.sig" "${name}.payload-manifest.v1.sig"
+          evidence=""
           if [ "${HAS_EVIDENCE}" = 1 ]; then
-            for document in sbom.cdx.json provenance.slsa.json platform-test.v1.json; do
-              for suffix in '' '.sig'; do
-                upload_one "${RUNNER_TEMP}/evidence/${document}${suffix}" "${name}.${document}${suffix}"
-              done
-            done
+            evidence="${RUNNER_TEMP}/evidence"
           fi
+          gw_upload_release "${ARTIFACT}" "${name}" "${RUNNER_TEMP}/verify" "${evidence}"
           echo "ARTIFACT_NAME=${name}" >> "$GITHUB_ENV"
-          echo "uploaded ${uploaded} files into the gateway staging directory"
 
           ci_status publishing "posting ci/publish for ${name}"
 

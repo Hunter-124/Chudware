@@ -228,7 +228,11 @@ mesh result: it is the only statement of which mesher source the engine actually
 
 - Plan: `~/.claude/plans/plan-out-massive-changes-proud-snowflake.md` (Design A/B)
 - Smoke: `scripts/hostd_smoke.py` (gate stage `hostd smoke`), gate stage
-  `appimage smoke` (`CHUDWARE_GATE_APPIMAGE=1`)
+  `appimage smoke` (`CHUDWARE_GATE_APPIMAGE=1`). Its leftover-daemon check and cleanup
+  use `scripts/hostd_scope.py`, which matches only this user's `chudware-hostd` whose
+  environment carries exactly the run's `CHUDWARE_INSTANCE_KEY` and which started after
+  the stage's mark, and signals it through a re-validated pidfd — never a name/path
+  `pgrep`/`pkill`, so another run's or the user's daemon is never touched.
 - Tests: `services/mcp/test_daemon_bridge.py`, `test_hostd_registry.py`,
   `test_hostd_supervision.py`, ctest `test_hostd`
 - Windows validation: `docs/reference/PACKAGING_WINDOWS.md`

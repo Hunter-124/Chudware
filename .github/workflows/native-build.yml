@@ -61,10 +61,21 @@ jobs:
             preset: windows-occt
             build_host: true
             host_build_dir: host/build-windows
+          # Ordinary configure/build/ctest: the private Chudware Mac TEST
+          # accounts (hidden ccci-chudware; no keychain, signing identity, sudo
+          # or GUI session), one per physical Mac. Their launchd daemons export
+          # the per-product CMAKE_BUILD_PARALLEL_LEVEL/CTEST_PARALLEL_LEVEL caps
+          # that the cmake --build/ctest calls below inherit. Signed release
+          # packaging stays on the operator lanes (cc-mac-intel: release.yml,
+          # nightly-release.yml). The arm64 row needs that account provisioned
+          # natively on the physical M2 (macbook-air-m2-chudware-test); until
+          # then it queues, and neither the cc-mac-arm operator account nor an
+          # Intel lane is its substitute.
           - label: macOS arm64
             runner_os: macOS
             runner_arch: ARM64
-            runner_label: cc-mac-arm
+            runner_label: cc-mac-chudware-arm
+            ci_user: ccci-chudware
             preset: macos-arm64
             # Core only. The macOS host GUI is not a phase-1 target: the macOS
             # presets build with CHUDWARE_ENABLE_CEF=OFF, and CEF's offscreen
@@ -76,7 +87,8 @@ jobs:
           - label: macOS x86_64
             runner_os: macOS
             runner_arch: X64
-            runner_label: cc-mac-intel
+            runner_label: cc-mac-chudware-intel
+            ci_user: ccci-chudware
             preset: macos-x86_64
             build_host: false
             host_build_dir: ''
@@ -86,10 +98,46 @@ jobs:
       - name: Check runner capabilities (POSIX)
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          EXPECT_CI_USER: ${{ matrix.ci_user }}
         run: |
           set -euo pipefail
-          echo "runner=${RUNNER_NAME:-unknown} os=$RUNNER_OS arch=$RUNNER_ARCH host=$(hostname -s)"
+          echo "runner=${RUNNER_NAME:-unknown} os=$RUNNER_OS arch=$RUNNER_ARCH host=$(hostname -s) user=$(id -un)"
           uname -a
+
+          # A row that names a private CI account must actually be running as
+          # it, natively (no Rosetta, no VM) on the architecture the row asked
+          # for, in its hidden 420-499 uid and 0700 home, with the lane
+          # identity and compiler caps its launchd daemon exports; an uncapped
+          # build would oversubscribe the shared Mac.
+          if [ -n "${EXPECT_CI_USER}" ]; then
+            if [ "$(id -un)" != "${EXPECT_CI_USER}" ] || [ "${CC_CI_PRODUCT:-}" != Chudware ] || [ "${CC_CI_LANE:-}" != test ]; then
+              echo "::error::expected the private Chudware test account ${EXPECT_CI_USER} (CC_CI_PRODUCT=Chudware, CC_CI_LANE=test); got user=$(id -un) CC_CI_PRODUCT=${CC_CI_PRODUCT:-unset} CC_CI_LANE=${CC_CI_LANE:-unset}"
+              exit 1
+            fi
+            case "${RUNNER_ARCH}:$(uname -m)" in
+              X64:x86_64 | ARM64:arm64) ;;
+              *) echo "::error::runner arch ${RUNNER_ARCH} does not match the native machine $(uname -m)"; exit 1 ;;
+            esac
+            if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" != 0 ] || [ "$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)" != 0 ]; then
+              echo "::error::the private test account must run natively on physical Mac hardware, never under Rosetta translation or in a virtual machine"
+              exit 1
+            fi
+            ci_uid="$(id -u)"
+            ci_home="/Library/CloudCastleCI/${EXPECT_CI_USER}"
+            home_mode="$(stat -f '%Lp %Su' "${ci_home}" 2>/dev/null || echo missing)"
+            if [ "${ci_uid}" -lt 420 ] || [ "${ci_uid}" -gt 499 ] || [ "${HOME}" != "${ci_home}" ] || [ "${home_mode}" != "700 ${EXPECT_CI_USER}" ]; then
+              echo "::error::expected uid 420-499 and the 0700 home ${ci_home}; got uid=${ci_uid} HOME=${HOME} home-mode=${home_mode}"
+              exit 1
+            fi
+            case "${CMAKE_BUILD_PARALLEL_LEVEL:-}" in
+              '' | *[!0-9]* | 0)
+                echo "::error::the private test account exports no CMAKE_BUILD_PARALLEL_LEVEL cap (${CMAKE_BUILD_PARALLEL_LEVEL:-unset}); re-run provision-macos-test-runner.sh restart"
+                exit 1
+                ;;
+            esac
+            echo "build caps: CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} CTEST_PARALLEL_LEVEL=${CTEST_PARALLEL_LEVEL:-unset}"
+          fi
 
           missing=()
           for tool in cmake ninja ctest git python3; do
@@ -128,10 +176,13 @@ jobs:
             #
             # Checked, not installed: `brew install opencascade` on a shared
             # runner is a long, host-mutating operation that two concurrent
-            # jobs would race through brew's lock. A missing formula is a
-            # provisioning ticket, and runner-smoke reports it daily.
+            # jobs would race through brew's lock, and the private test
+            # account cannot write the operator-owned Homebrew prefix at all.
+            # A missing formula is a provisioning ticket for that Mac's
+            # operator lane (runner-provision.yml with cc-mac-intel or
+            # cc-mac-arm), and runner-smoke reports it daily.
             if ! brew list --versions opencascade >/dev/null 2>&1; then
-              echo "::error::${RUNNER_NAME:-unknown} has no Homebrew opencascade; the ${{ matrix.preset }} preset configures with CHUDWARE_WITH_OCCT=ON and will fail at find_package. Fix with: brew install opencascade"
+              echo "::error::${RUNNER_NAME:-unknown} has no Homebrew opencascade; the ${{ matrix.preset }} preset configures with CHUDWARE_WITH_OCCT=ON and will fail at find_package. Fix from the Homebrew owner: dispatch runner-provision.yml with this Mac's operator label (cc-mac-intel or cc-mac-arm), which runs brew install opencascade"
               exit 1
             fi
             echo "opencascade=$(brew list --versions opencascade)"
@@ -143,15 +194,22 @@ jobs:
         if: runner.os == 'Windows'
         # Windows PowerShell 5.1 — these hosts have no pwsh.
         shell: powershell
+        env:
+          # Per-process peaks for the windows-occt tree (cl on OCCT-heavy
+          # translation units, link with /DEBUG) and the memory left untouched
+          # for everything else on the box. See the budget block below.
+          CHUDWARE_BUILD_GB_PER_JOB: '2'
+          CHUDWARE_BUILD_RESERVE_GB: '8'
         run: |
           $ErrorActionPreference = 'Stop'
           Write-Host "runner=$env:RUNNER_NAME os=$env:RUNNER_OS arch=$env:RUNNER_ARCH host=$env:COMPUTERNAME"
           Write-Host "powershell=$($PSVersionTable.PSVersion)"
 
-          # The Windows runner service runs as NT AUTHORITY\NETWORK SERVICE.
+          # The Windows runner service is its own non-administrator virtual
+          # account whose USERPROFILE is a private D:\ChudwareCI\Windows\profile.
           # It cannot write Program Files, cannot edit the machine PATH, and
           # cannot restart itself to pick a new one up, so runner-smoke's
-          # provisioning job installs ninja and Python into a runner-local
+          # provisioning job installs ninja and Python into a profile-local
           # directory and every Windows job puts that directory on PATH here.
           # Done before the vswhere snapshot below so the dev-shell diff
           # carries it into the build steps. See docs/reference/CI_RUNNERS.md.
@@ -248,6 +306,24 @@ jobs:
           $compilerOutput | Select-Object -First 1
           if ($compilerStatus -ne 0) { exit $compilerStatus }
 
+          # The Windows builder shares its machine with the CloudCastle and
+          # Chudcode runners and with customer inference. Ninja's default width
+          # (logical CPUs + 2) on that box starves all of them, so the build is
+          # held to half the logical processors and to the physical memory that
+          # is free right now, less a reserve, at one budgeted peak per job.
+          # cmake --build reads CMAKE_BUILD_PARALLEL_LEVEL; ctest stays serial.
+          $logical = [Environment]::ProcessorCount
+          $freeGiB = [math]::Floor((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB)
+          $byMemory = [math]::Floor(($freeGiB - [int]$env:CHUDWARE_BUILD_RESERVE_GB) / [int]$env:CHUDWARE_BUILD_GB_PER_JOB)
+          $jobs = [math]::Max(1, [math]::Min([math]::Floor($logical / 2), $byMemory))
+          Write-Host "build budget: $logical logical CPUs, $freeGiB GiB free -> $jobs parallel jobs"
+          "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # /Zi targets write their PDBs through mspdbsrv. A run-unique
+          # endpoint gives this run its own server instead of attaching to (or
+          # leaving behind) an account-wide one shared with any other build.
+          "_MSPDBSRV_ENDPOINT_=chudware-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:GITHUB_JOB" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -275,7 +351,7 @@ jobs:
         if: runner.os == 'Windows' && matrix.preset == 'windows-occt'
         shell: powershell
         run: |
-          & powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup_windows_links.ps1
+          & powershell -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File scripts\setup_windows_links.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Configure and build core (${{ matrix.preset }}) (Windows)
@@ -284,6 +360,9 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          # Below-normal priority is inherited by cmake, ninja, cl and link, so
+          # a release build yields to customer workloads on the shared host.
+          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
 
           # $ErrorActionPreference does not apply to native exit codes, so each
           # cmake invocation is checked; otherwise a failed configure would run
@@ -368,6 +447,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
           cmake -S host -B ${{ matrix.host_build_dir }} -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=OFF
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build ${{ matrix.host_build_dir }}
@@ -456,6 +536,8 @@ jobs:
           $env:CHUDWARE_LIBCHUDWARE = (Resolve-Path 'build\${{ matrix.preset }}\bin\libchudware.dll').Path
           $env:CHUDWARE_ENGINE_DAEMON = '0'
           $env:CHUDWARE_SHOT = 'chat'
+          # Shot mode creates its window unmapped: nothing reaches any desktop.
+          $env:CHUDWARE_HIDDEN = '1'
 
           $shot = Join-Path $env:RUNNER_TEMP 'chudware-native-smoke.png'
           $log = Join-Path $env:RUNNER_TEMP 'chudware-native-smoke.log'

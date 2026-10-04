@@ -401,7 +401,9 @@ stage_web_parity() {
 # and the bundled chudware-hostd must idle-exit after its linger. ADVISORY: failures are
 # RECORDED as WARN, never fatal (packaging tooling + xvfb are machine-dependent).
 # Opt in with CHUDWARE_GATE_APPIMAGE=1. A scratch CHUDWARE_INSTANCE_KEY isolates the run
-# from any live dev/installed daemon.
+# from any live dev/installed daemon; leftover detection and cleanup go through
+# scripts/hostd_scope.py, which matches only this user's hostd carrying exactly that key
+# and started after this stage's mark — never a name/path pgrep or pkill.
 stage_appimage_smoke() {
     echo "=== [3c/6] AppImage smoke (advisory) ==="
     if [ "${CHUDWARE_GATE_APPIMAGE:-0}" != "1" ]; then
@@ -426,8 +428,12 @@ stage_appimage_smoke() {
         record "appimage smoke      WARN    build reported success but no .AppImage produced"
         echo "  WARN: no artifact"; return 0
     fi
-    local shot=${GATE_TMP}/appimage_shot.png key="gateimg$$"
+    local shot=${GATE_TMP}/appimage_shot.png key="gateimg$$-${RANDOM}${RANDOM}" since
     rm -f "$shot"
+    if ! since="$(python3 scripts/hostd_scope.py now)"; then
+        record "appimage smoke      WARN    cannot mark run start for scoped hostd checks"
+        echo "  WARN: hostd_scope.py now failed"; return 0
+    fi
     local rc=0
     CHUDWARE_ENGINE_DAEMON=1 CHUDWARE_HOSTD_LINGER_SECS=5 CHUDWARE_INSTANCE_KEY="$key" \
         xvfb-run -a "$img" --appimage-extract-and-run --ui-screenshot "$shot" \
@@ -445,16 +451,14 @@ stage_appimage_smoke() {
     # idle-exit within linger (5 s) + grace.
     sleep 9
     local leftover
-    leftover="$(pgrep -af chudware-hostd | grep -F "$key" || true)"
-    if [ -z "$leftover" ]; then
-        # Instance key travels via env, not argv — also check any hostd running out of
-        # an AppImage extraction dir (this run's daemon path is unique to the extract).
-        leftover="$(pgrep -af 'appimage.*chudware-hostd|chudware-hostd.*appimage_extracted' || true)"
+    if ! leftover="$(python3 scripts/hostd_scope.py list --key "$key" --since "$since")"; then
+        record "appimage smoke      WARN    cannot inspect this run's chudware-hostd"
+        echo "  WARN: hostd_scope.py list failed"; return 0
     fi
     if [ -n "$leftover" ]; then
         record "appimage smoke      WARN    chudware-hostd still running after linger+grace"
         echo "  WARN: leftover daemon:"; echo "$leftover" | sed 's/^/    /'
-        pkill -f 'appimage_extracted.*chudware-hostd' 2>/dev/null || true
+        python3 scripts/hostd_scope.py reap --key "$key" --since "$since" 2>&1 | sed 's/^/    /' || true
         return 0
     fi
     record "appimage smoke      PASS    built $(basename "$img") + xvfb screenshot + daemon idle-exit"

@@ -485,7 +485,7 @@ def test_subscription_digest_and_pool_model_injection(monkeypatch: pytest.Monkey
         "email": email, "plan": "studio", "credits_remaining": 10, "key_source": "pool",
     })
     monkeypatch.setattr(engine_bridge, "resolve_validated_key", lambda *_: None)
-    monkeypatch.setattr(engine_bridge, "resolve_subscription_token", lambda *_: {
+    monkeypatch.setattr(engine_bridge, "resolve_subscription_token", lambda *_, **_kwargs: {
         "provider": "anthropic-sub", "access_token": "customer-oauth",
     })
     actor = engine_bridge._actor_for_turn(A, json.dumps({
@@ -503,7 +503,7 @@ def test_subscription_digest_and_pool_model_injection(monkeypatch: pytest.Monkey
     assert "api_key" not in params and "api_key" not in params["options"]
     assert injected["_subscription"]["access_token"] == "customer-oauth"
     assert injected["_subscription_token_sha256"] == hashlib.sha256(b"customer-oauth").hexdigest()
-    monkeypatch.setattr(engine_bridge, "resolve_subscription_token", lambda *_: None)
+    monkeypatch.setattr(engine_bridge, "resolve_subscription_token", lambda *_, **_kwargs: None)
     monkeypatch.setenv("CHUDWARE_WEB_POOL_API_KEY", "operator-pool")
     monkeypatch.setenv("CHUDWARE_WEB_POOL_MODEL", "vendor/pool-model")
     pool = engine_bridge._actor_for_turn(A, json.dumps({

@@ -15,9 +15,10 @@
 // address-space consumer can parse without a second open/mmap. Cross-process (hostd
 // → GUI) always goes through the named shm object.
 //
-// Keys should be unique per doc+revision (e.g. "docid_r12"); non-alnum chars are
-// sanitized. Older revisions for the same doc prefix can be released via
-// release_aicm / release_older_than.
+// Keys need only be unique within the publishing process (e.g. "docid_r12", "field_3");
+// non-alnum chars are sanitized and every shared object/fallback file name is scoped by
+// the publishing process id, so concurrent engines and CI runners never alias a key.
+// Older revisions for the same doc prefix can be released via release / release_older_than.
 #pragma once
 
 #include <cstddef>
@@ -68,7 +69,7 @@ void release_doc(const std::string& doc_id);
 // on first publish as a backstop for clean process exit.
 void release_all();
 
-// Sanitize doc_id + revision into a stable shm key (no path separators).
+// Sanitize doc_id + revision into a stable per-process key (no path separators).
 std::string key_for(const std::string& doc_id, long revision);
 
 }  // namespace aicm_handoff

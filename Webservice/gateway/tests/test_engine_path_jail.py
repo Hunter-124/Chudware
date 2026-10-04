@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -47,7 +48,7 @@ def rpc(method: str, params: object, call_id: int = 1) -> str:
         # Shared scratch paths are never general-purpose file roots.
         rpc("doc_open", {"path": "/tmp/other-account.step+"}),
         rpc("doc_render", {"aicm_path": "/tmp/mesh-1234.aicm"}),
-        rpc("doc_render", {"aicm_path": "/dev/shm/chudware_doc-cpp0000002a_r1"}),
+        rpc("doc_render", {"aicm_path": "/dev/shm/chudware_p4242_doc-cpp0000002a_r1"}),
         # Nested inside a params sub-object / list — the walk must be recursive.
         rpc("batch", {"ops": [{"op": "open", "src": f"{BOB}/x.step+"}]}),
         rpc("agent_run_v2", {"ctx": {"project_dir": "/home/liveuser"}}),
@@ -93,15 +94,29 @@ def test_root_itself_is_allowed_but_its_prefix_sibling_is_not() -> None:
     assert path_violation(sibling, ROOTS) is not None
 
 
-def test_mesh_handoffs_need_this_connections_document_capability() -> None:
-    file = rpc("doc_render", {"aicm_path": "/tmp/chudware_cpp_docs/doc-cpp0000002a_r1.aicm"})
-    shm = rpc("doc_render", {"aicm_path": "/dev/shm/chudware_doc-cpp0000002a_r1"})
+def test_mesh_handoffs_need_this_connections_document_capability(tmp_path, monkeypatch) -> None:
+    # A private service account's TMPDIR is the engine's temp_directory_path(); its
+    # aicm_handoff file fallback lives there, never in a fixed /tmp.
+    private = tmp_path / "private-tmp"
+    private.mkdir()
+    alias = tmp_path / "tmp-alias"
+    alias.symlink_to(private)
+    monkeypatch.setattr(tempfile, "tempdir", str(alias))
+    scratch = f"{alias}/chudware_cpp_docs"
+    file = rpc("doc_render", {"aicm_path": f"{scratch}/p4242_doc-cpp0000002a_r1.aicm"})
+    resolved = rpc("doc_render", {"aicm_path": f"{private}/chudware_cpp_docs/p4242_doc-cpp0000002a_r1.aicm"})
+    shm = rpc("doc_render", {"aicm_path": "/dev/shm/chudware_p4242_doc-cpp0000002a_r1"})
     caps = {"doc-cpp0000002a"}
     assert path_violation(file, ROOTS) is not None
     assert path_violation(shm, ROOTS) is not None
     assert path_violation(file, ROOTS, caps) is None
+    assert path_violation(resolved, ROOTS, caps) is None
     assert path_violation(shm, ROOTS, caps) is None
-    for bad in ("/tmp/chudware_cpp_docs/doc-cpp0000002a_r1.step+",
-                "/tmp/chudware_cpp_docs/sub/doc-cpp0000002a_r1.aicm",
-                "/dev/shm/chudware_doc-cpp0000002b_r1"):
+    for bad in (f"{scratch}/p4242_doc-cpp0000002a_r1.step+",
+                f"{scratch}/sub/p4242_doc-cpp0000002a_r1.aicm",
+                f"{scratch}/doc-cpp0000002a_r1.aicm",
+                # Another account's (or the host's shared) temp root is not this one.
+                "/tmp/chudware_cpp_docs/p4242_doc-cpp0000002a_r1.aicm",
+                f"{tmp_path}/chudware_cpp_docs/p4242_doc-cpp0000002a_r1.aicm",
+                "/dev/shm/chudware_p4242_doc-cpp0000002b_r1"):
         assert path_violation(rpc("doc_open", {"path": bad}), ROOTS, caps) is not None

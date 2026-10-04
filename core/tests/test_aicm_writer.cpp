@@ -2,16 +2,26 @@
 // tiny AicmBody, serializes it, and round-trips through the shared viewport loader
 // (render::parseAicm) to prove byte compatibility without needing the geometry
 // kernel. Runs in the default CHUDWARE_WITH_OCCT=OFF build.
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <cstdint>
+#include <random>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <vector>
 
+#include "environment_test_support.h"
 #include "geom/aicm.h"
 #include "aicm_loader.h"
 #include "util/aicm_handoff.h"
@@ -78,6 +88,110 @@ aicm::AicmBody region_body() {
     };
     return body;
 }
+
+// --- cross-process handoff ----------------------------------------------------------------
+// Engines (hostd, webd, MCP/render workers) and their readers (GUI) are separate processes,
+// and engines key publications identically ("compile_1", "doc-cpp00000001_r0"). The binary
+// re-executes itself as a second publisher so the real OS objects are exercised: POSIX shm or
+// Windows named mappings, plus the private-file fallback a held Windows mapping forces.
+
+constexpr const char* kCrossProcessKey = "test_aicm_cross_process";
+constexpr const char* kPublisherFlag = "--aicm-handoff-publisher";
+constexpr const char* kReaderFlag = "--aicm-handoff-reader";
+constexpr const char* kGateEnv = "CHUDWARE_TEST_AICM_GATE";
+constexpr const char* kParentUriEnv = "CHUDWARE_TEST_AICM_PARENT_URI";
+
+std::string executable_path;
+
+std::vector<uint8_t> named_mesh(const char* name) {
+    auto body = tiny_body();
+    body.name = name;
+    return aicm::write_aicm({body});
+}
+
+// Body name behind `uri`, or "error: ..." when it cannot be mapped or parsed.
+std::string mapped_body_name(const std::string& uri) {
+    chudware::aicm_handoff::Mapping mapping;
+    std::string err;
+    if (!chudware::aicm_handoff::map(uri, mapping, err)) return "error: " + err;
+    render::DocMesh mesh;
+    const bool ok = render::parseAicm(mapping.data, mapping.size, mesh, err);
+    chudware::aicm_handoff::unmap(mapping);
+    if (!ok) return "error: " + err;
+    return mesh.bodies.size() == 1 ? mesh.bodies[0].name : "error: body count";
+}
+
+bool wait_for_gate(const std::filesystem::path& gate) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    std::error_code ec;
+    while (!std::filesystem::exists(gate, ec)) {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+}
+
+void open_gate(const std::filesystem::path& gate) { std::ofstream(gate) << '1'; }
+
+// Second publisher: same key as the parent, replaced while the parent holds the first object
+// and again after it lets go, then released by the normal exit path (the atexit backstop)
+// like a closing engine.
+int run_handoff_publisher() {
+    const char* gates = std::getenv(kGateEnv);
+    const char* parent_uri = std::getenv(kParentUriEnv);
+    if (!gates || !parent_uri) return 2;
+    using chudware::aicm_handoff::publish;
+    std::printf("uri %s\n", publish(kCrossProcessKey, named_mesh("Child")).c_str());
+    std::fflush(stdout);
+    if (!wait_for_gate(std::filesystem::path(gates) / "republish")) return 3;
+    std::printf("uri %s\n", publish(kCrossProcessKey, named_mesh("ChildV2")).c_str());
+    std::printf("parent %s\n", mapped_body_name(parent_uri).c_str());
+    std::fflush(stdout);
+    if (!wait_for_gate(std::filesystem::path(gates) / "republish-unheld")) return 3;
+    std::printf("uri %s\n", publish(kCrossProcessKey, named_mesh("ChildV3")).c_str());
+    std::fflush(stdout);
+    return wait_for_gate(std::filesystem::path(gates) / "exit") ? 0 : 3;
+}
+
+// Quote the executable for the shell the pipe spawns (see test_twin.cpp): cmd.exe only takes
+// double quotes, POSIX sh single quotes. Only the executable is quoted, which keeps cmd /c
+// from stripping quotes; everything else reaches the child through the environment.
+std::string shell_quote(std::string_view text) {
+#if defined(_MSC_VER)
+    std::string result = "\"";
+    result.append(text);
+    result.push_back('"');
+    return result;
+#else
+    std::string result = "'";
+    for (const char c : text) {
+        if (c == '\'') result += "'\\''";
+        else result.push_back(c);
+    }
+    result.push_back('\'');
+    return result;
+#endif
+}
+
+FILE* spawn_self(const char* flag) {
+    return chudware::test::openPipe((shell_quote(executable_path) + " " + flag).c_str(), "r");
+}
+
+// Next "<tag> <value>" line from a child, or a "missing ..." string that fails the check.
+std::string read_tagged(FILE* stream, const std::string& tag) {
+    std::string line;
+    std::array<char, 512> buffer{};
+    while (std::fgets(buffer.data(), static_cast<int>(buffer.size()), stream)) {
+        line += buffer.data();
+        if (line.back() == '\n') break;
+    }
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+    const std::string prefix = tag + " ";
+    return line.rfind(prefix, 0) == 0 ? line.substr(prefix.size()) : "missing " + tag + ": " + line;
+}
+
+bool is_error(const std::string& name) { return name.rfind("error: ", 0) == 0; }
+
 
 }  // namespace
 
@@ -285,4 +399,97 @@ TEST_CASE("mapped mesh survives replacement and release of its publication") {
     REQUIRE(new_mesh.bodies.size() == 1);
     CHECK(old_mesh.bodies[0].name == "Tiny");
     CHECK(new_mesh.bodies[0].name == "Replacement");
+}
+
+TEST_CASE("processes publishing one key keep isolated objects across replacement and exit") {
+    using namespace chudware::aicm_handoff;
+    struct Cleanup {
+        ~Cleanup() { release(kCrossProcessKey); }
+    } cleanup;
+    const std::string parent_uri = publish(kCrossProcessKey, named_mesh("Parent"));
+    REQUIRE(is_shm_uri(parent_uri));
+
+    std::random_device entropy;
+    const auto gates = std::filesystem::temp_directory_path() /
+                       ("chudware_test_aicm_" + std::to_string(entropy()) + "_" +
+                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    REQUIRE(std::filesystem::create_directories(gates));
+    REQUIRE(chudware::test::setEnvironment(kGateEnv, gates.string().c_str()) == 0);
+    REQUIRE(chudware::test::setEnvironment(kParentUriEnv, parent_uri.c_str()) == 0);
+    // Always let the publisher run to completion and reap it, even when a check below fails.
+    struct Publisher {
+        FILE* stream;
+        std::filesystem::path gates;
+        int finish() {
+            if (!stream) return -1;
+            open_gate(gates / "republish");
+            open_gate(gates / "republish-unheld");
+            open_gate(gates / "exit");
+            const int status = chudware::test::closePipe(stream);
+            stream = nullptr;
+            return status;
+        }
+        ~Publisher() {
+            finish();
+            std::error_code ec;
+            std::filesystem::remove_all(gates, ec);
+        }
+    } publisher{spawn_self(kPublisherFlag), gates};
+    REQUIRE(publisher.stream != nullptr);
+
+    // Same key, two live processes: two objects, each holding its own publisher's mesh.
+    const std::string child_uri = read_tagged(publisher.stream, "uri");
+    REQUIRE(is_shm_uri(child_uri));
+    CHECK(child_uri != parent_uri);
+    CHECK(mapped_body_name(child_uri) == "Child");
+
+    // A reader holds the child's object while the child republishes the key. The held view
+    // keeps the bytes it mapped; the new URI resolves to the replacement (on Windows the held
+    // mapping makes the name pre-existing, so the replacement must take the file fallback).
+    struct Held {
+        Mapping mapping;
+        ~Held() { unmap(mapping); }
+    } held;
+    std::string err;
+    REQUIRE(map(child_uri, held.mapping, err));
+    open_gate(gates / "republish");
+    const std::string replacement_uri = read_tagged(publisher.stream, "uri");
+    CHECK(read_tagged(publisher.stream, "parent") == "Parent");
+    CHECK(mapped_body_name(replacement_uri) == "ChildV2");
+    render::DocMesh held_mesh;
+    REQUIRE(render::parseAicm(held.mapping.data, held.mapping.size, held_mesh, err));
+    REQUIRE(held_mesh.bodies.size() == 1);
+    CHECK(held_mesh.bodies[0].name == "Child");
+    unmap(held.mapping);
+
+    // Unheld again, the key goes back to a shared object; a fallback file the previous
+    // publication needed is removed rather than left behind in the temp dir.
+    open_gate(gates / "republish-unheld");
+    const std::string unheld_uri = read_tagged(publisher.stream, "uri");
+    CHECK(is_shm_uri(unheld_uri));
+    CHECK(mapped_body_name(unheld_uri) == "ChildV3");
+    if (replacement_uri != unheld_uri) CHECK(is_error(mapped_body_name(replacement_uri)));
+
+    // The child's exit releases everything it published and nothing of the parent's.
+    CHECK(publisher.finish() == 0);
+    CHECK(is_error(mapped_body_name(child_uri)));
+    CHECK(is_error(mapped_body_name(replacement_uri)));
+    CHECK(is_error(mapped_body_name(unheld_uri)));
+    FILE* reader = spawn_self(kReaderFlag);
+    REQUIRE(reader != nullptr);
+    CHECK(read_tagged(reader, "name") == "Parent");
+    CHECK(chudware::test::closePipe(reader) == 0);
+}
+
+int main(int argc, char** argv) {
+    executable_path = argc > 0 ? argv[0] : "";
+    if (argc == 2 && std::string_view(argv[1]) == kPublisherFlag) return run_handoff_publisher();
+    if (argc == 2 && std::string_view(argv[1]) == kReaderFlag) {
+        const char* uri = std::getenv(kParentUriEnv);
+        if (!uri) return 2;
+        std::printf("name %s\n", mapped_body_name(uri).c_str());
+        return 0;
+    }
+    doctest::Context context(argc, argv);
+    return context.run();
 }

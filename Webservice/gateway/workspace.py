@@ -33,7 +33,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 try:
     from . import orgs
-    from .engine_bridge import mesh_doc_id, mesh_document_authorized
+    from .engine_bridge import mesh_doc_id, mesh_document_authorized, mesh_file_dirs
     from .auth import User, get_current_user
     from .accounts import get_account
     from .config import settings
@@ -49,7 +49,7 @@ try:
 except ImportError:  # uvicorn app:app from package dir
     import orgs
     from auth import User, get_current_user
-    from engine_bridge import mesh_doc_id, mesh_document_authorized
+    from engine_bridge import mesh_doc_id, mesh_document_authorized, mesh_file_dirs
     from accounts import get_account
     from config import settings
     from limits import (
@@ -571,8 +571,7 @@ def files_aicm(request: Request, path: str = "", shm: str = "", scope: str = "")
     except OSError:
         raise HTTPException(status_code=404, detail="not found")
     if caller_root is None or (target != caller_root and caller_root not in target.parents):
-        scratch = Path(tempfile.gettempdir()).resolve() / "chudware_cpp_docs"
-        doc_id = mesh_doc_id(target.name) if target.parent == scratch else None
+        doc_id = mesh_doc_id(target.name) if target.parent in mesh_file_dirs() else None
         if doc_id is None or not mesh_document_authorized(user.email, doc_id):
             raise HTTPException(status_code=403, detail="document not authorized")
     if not target.is_file():

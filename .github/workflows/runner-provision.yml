@@ -4,9 +4,11 @@
 # end. Safe to re-run: every step is idempotent and skips anything already
 # present.
 #
-# Runner realities (measured 2026-08-20): the service runs as NetworkService, so
-# Program Files is off-limits. Everything lands under %USERPROFILE%\chudware-ci-tools
-# (the nightly prepends its bin\ dir to PATH itself, so no service restart is
+# Runner realities: the Windows service runs as its own non-administrator
+# virtual account (NT SERVICE\actions.runner.Hunter-124-CAD.ryzen-7900x3d), so
+# Program Files is off-limits. Everything lands under %USERPROFILE%\chudware-ci-tools,
+# which is that account's private D:\ChudwareCI\Windows\profile (the nightly
+# prepends its bin\ dir to PATH itself, so no service restart is
 # needed). Inno Setup's installer needs admin, so we unpack it with innounp
 # instead of executing it. Steps run under Windows PowerShell 5.1: ASCII only,
 # no ternary.

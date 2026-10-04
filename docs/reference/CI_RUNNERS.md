@@ -39,21 +39,58 @@ never fired is not a rule.
 
 Runners register to a *repository*, an organization, or an enterprise. `Hunter-124`
 is a personal account with no organization tier, so the CloudCastle fleet cannot
-serve this repository as registered. Each machine therefore runs **two** runner
-instances: the original CloudCastle one, and a second CAD-scoped one in its own
-directory with its own service name. The GitHub runner explicitly supports this.
+serve this repository as registered. Most machines therefore run a separate
+CAD-scoped runner instance beside the CloudCastle one, in its own directory with
+its own service name. The GitHub runner explicitly supports this. On
+GarrisonGamingPC each product goes further: separate identities and storage, so
+CloudCastle, Chudware and Chudcode tests can never collide (see
+[Per-product isolation on GarrisonGamingPC](#per-product-isolation-on-garrisongamingpc)).
+
+Labels as registered on this repository (runners API, 2026-10-03):
 
 | Runner | OS / Arch | Labels | CAD install dir |
 |---|---|---|---|
-| `livingroom-pc` | Linux X64 | `cloudcastle-ci`, `cc-linux-build`, `cc-linux-livingroom` | `/opt/actions-runner-cad` |
+| `livingroom-pc` | Linux X64 | `cloudcastle-ci`, `cc-linux-livingroom` | `/opt/actions-runner-cad` (service runs as `liveuser`) |
 | `hunter-workstation` | Linux X64 | `cloudcastle-ci`, `cc-linux-hunter` | `/opt/actions-runner-cad` |
 | `cloudcastle-server` | Linux X64 | `cloudcastle-ci`, `cc-prod-control`, `cc-artifact-host`, `cc-infra-webservice` | `/opt/actions-runner-cad` |
-| `ryzen-7900x3d` | Windows X64 | `cloudcastle-ci`, `cc-win-primary`, `cc-win-package`, `cc-win-ryzen` | `C:\actions-runner-cad` |
-| `imac-intel` | macOS X64 | `cloudcastle-ci`, `cc-mac-intel` | `~/actions-runner-cad` |
-| `macbook-air-m2` | macOS ARM64 | `cloudcastle-ci`, `cc-mac-arm` | `~/actions-runner-cad` |
+| `chudware-ryzen-linux` | Linux X64 | `cc-linux-chudware`; `cloudcastle-ci` and `cc-linux-build` only after qualification | `/opt/actions-runner-chudware` inside the `Chudware-CI` WSL2 guest |
+| `ryzen-7900x3d` | Windows X64 | `cloudcastle-ci`, `cc-win-primary`, `cc-win-package`, `cc-win-ryzen` | `C:\actions-runner-cad` (work folder `D:\ChudwareCI\Windows\w`) |
+| `imac-intel` | macOS X64 | `cloudcastle-ci`, `cc-mac-intel` | `~/actions-runner-cad` (operator/signer lane: GUI account, login keychain, signing identities, Homebrew owner) |
+| `imac-intel-chudware-test` | macOS X64 | `cc-mac-chudware-intel-bootstrap`; `cloudcastle-ci` and `cc-mac-chudware-intel` only after qualification | `/Library/CloudCastleCI/ccci-chudware/actions-runner` (system LaunchDaemon `com.cloudcastle.ci.runner.chudware` as the hidden `ccci-chudware` account) |
+| `macbook-air-m2` | macOS ARM64 | `cloudcastle-ci`, `cc-mac-arm` | `~/actions-runner-cad` (operator lane: GUI account, Homebrew owner) |
+| `macbook-air-m2-chudware-test` | macOS ARM64 | **not registered yet** — will register with only `cc-mac-chudware-arm-bootstrap`; `cloudcastle-ci` and `cc-mac-chudware-arm` only after qualification | `/Library/CloudCastleCI/ccci-chudware/actions-runner` on the M2 (system LaunchDaemon `com.cloudcastle.ci.runner.chudware` as the hidden `ccci-chudware` account) |
 
 Labels deliberately match the CloudCastle install on the same machine, so
 workflow routing syntax is portable between the two repositories.
+
+**`cc-linux-build` has no runner until `chudware-ryzen-linux` is qualified.**
+It used to be carried by `livingroom-pc`, which is also the production gateway
+host; it was removed there so build legs stop landing on production. Jobs
+routed at `cc-linux-build` (fast-gate's Linux row, linux-gate, native-build's
+Linux row, site-build, stripe-sandbox, release prep, nightly-release's
+`linux-beta`) queue until the guest is promoted. The legacy shared
+`cc-linux-ryzen`/`cc-nvme-bootstrap` guest is drained and offline and is not
+part of the fleet.
+
+**nightly-release splits serving from building.** `plan` is metadata/API work
+only and routes at `cc-linux-livingroom`: it reads the release token from
+`/home/liveuser/chudware-web-data/gateway.env` (custody stays with `liveuser`
+on the serving host) to ask loopback `http://127.0.0.1:8300` whether `HEAD`
+already published and to record the queued rows; it compiles nothing.
+`linux-beta` builds on `cc-linux-build` (the private NVMe guest) and needs no
+production file, NAS release path or production SSH credential: like the
+Windows and macOS legs it holds the `CHUDWARE_GATEWAY_RELEASE_TOKEN` secret in a
+run-scoped 0600 curl config and publishes over TLS to `https://app.chudware.com`.
+Every signed byte stays in its `RUNNER_TEMP`; the artifact and each payload
+manifest/signature/evidence sidecar go up under its canonical name through
+`PUT /api/releases/ci/upload/<name>` (streamed up to 64 MiB, otherwise 64 MiB
+offset chunks with `complete=1`; each reply's sha256 must match the local
+digest), and only then does `ci/publish` run, where the gateway re-digests
+every staged file against the signed body. The bash client is
+`packaging/ci_gateway.sh` (`gw_open`, `gw_post`, `gw_upload`,
+`gw_upload_verified`, `gw_upload_release`, `ci_status`), shared with
+`macos-beta`; Windows uses `packaging/windows/publish_release.ps1`.
+Neither gateway.env nor any production secret is ever copied into a build guest.
 
 ### Roles: builder vs control
 
@@ -63,8 +100,8 @@ expectations follow from it:
 
 | Role | Labels | Must have |
 |---|---|---|
-| **builder** | `cc-linux-build`, `cc-linux-livingroom`, `cc-linux-hunter`, `cc-win-primary`, `cc-win-package`, `cc-win-ryzen`, `cc-mac-arm`, `cc-mac-intel` | git, Python >= 3.11, cmake, ninja, ctest, a C++ toolchain, >= 20 GiB free |
-| **control** | `cc-prod-control`, `cc-artifact-host`, `cc-infra-webservice` | git and python, nothing else |
+| **builder** | `cc-linux-build`, `cc-linux-chudware`, `cc-linux-hunter`, `cc-win-primary`, `cc-win-package`, `cc-win-ryzen`, `cc-mac-arm`, `cc-mac-intel`, `cc-mac-chudware-intel`, `cc-mac-chudware-arm` | git, Python >= 3.11, cmake, ninja, ctest, a C++ toolchain that compiles, links and runs, >= 20 GiB free |
+| **control** | `cc-linux-livingroom`, `cc-prod-control`, `cc-artifact-host`, `cc-infra-webservice` | git and python, nothing else |
 
 `cloudcastle-server` is control-only: it publishes artifacts and operates
 production. It has **no `cmake` and no `ninja`**, deliberately, and demanding
@@ -73,9 +110,15 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
 
 ### Capability notes that workflows depend on
 
-- **`livingroom-pc` is also the production host.** Keep heavy matrix legs on
-  `hunter-workstation`; a release build that starves the box also starves
-  paying customers.
+- **`livingroom-pc` is the production host, not build capacity.** Its CAD
+  runner runs as `liveuser` and carries only `cc-linux-livingroom`, which
+  exists for `deploy-prod.yml`'s updater, nightly-release's metadata-only
+  `plan` job (above), and runner-smoke's inventory and probe. The livingroom
+  smoke row is control-only too: it must not compile or require a builder's
+  20 GiB free-space threshold on the serving SSD.
+  The updater builds there because it must, under `liveuser`, against the canonical
+  checkout; nothing else may be routed at that label, because a build that
+  starves the box also starves paying customers.
 - **`livingroom-pc` cannot be woken remotely as currently cabled.** Measured
   2026-09-03 from its own CloudCastle RMM inventory (`devices.inventory.wake`)
   while it was offline: `wired_wol` is armed in the OS (`ethtool` reports
@@ -87,7 +130,7 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
   `fa:bc:db:88:50:2d` (randomized by NetworkManager, so it is not a stable WoL
   target either). **Connect `eno1` to the LAN** and the wake path becomes real —
   `cloudcastle-wol.service` re-arms `wol g` on every boot — which is the only
-  change that makes `cc-linux-build` and production recoverable without hands
+  change that makes production recoverable without hands
   on the box.
 - **Builders need Python >= 3.11**, not merely "a python3". `fast-gate` runs
   `scripts/check.py`, whose `advertised_tool_audit` imports the real MCP tool
@@ -109,7 +152,32 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
 - Homebrew prefixes are `/opt/homebrew` on `macbook-air-m2` (arm64) and
   `/usr/local` on `imac-intel` (x86_64), which is what the `macos-arm64` and
   `macos-x86_64` CMake presets set `CMAKE_PREFIX_PATH` to. Homebrew is not on
-  CMake's default search path.
+  CMake's default search path. The prefix is owned by the operator account;
+  the private test account reads it and never writes it.
+- **Ordinary Mac tests run on the private test accounts.** fast-gate's macOS
+  row and native-build's `macOS x86_64` row route at
+  `[self-hosted, macOS, X64, cloudcastle-ci, cc-mac-chudware-intel]`;
+  native-build's `macOS arm64` row routes at
+  `[self-hosted, macOS, ARM64, cloudcastle-ci, cc-mac-chudware-arm]`. Before
+  anything compiles they fail unless they run as `ccci-chudware` with the
+  `CC_CI_PRODUCT=Chudware`, `CC_CI_LANE=test` identity its LaunchDaemon
+  exports; native-build additionally requires the runner architecture to be
+  the machine's native one (`X64`/`x86_64` or `ARM64`/`arm64`, never Rosetta
+  translation or a VM), a uid in 420-499 and the 0700 home
+  `/Library/CloudCastleCI/ccci-chudware`. That daemon also exports
+  `CMAKE_BUILD_PARALLEL_LEVEL` (CPU/RAM-derived, shared across the three
+  product lanes on each Mac) and `CTEST_PARALLEL_LEVEL=1`, which
+  `cmake --build`/`ctest` inherit; native-build refuses to start without the
+  cap. The accounts have no login keychain, signing identity, sudo or GUI
+  session, so signed packaging (`release.yml`, nightly-release's `macos-beta`)
+  and `runner-provision.yml` stay on the operator lanes (`cc-mac-intel`,
+  `cc-mac-arm`).
+- **The ARM private test account does not exist yet.** It is created only by
+  running CloudCastle's `provision-macos-test-runner.sh` (product `Chudware`)
+  natively on the physical M2, which is offline; there is no runtime proof of
+  it. Until it is registered and qualified, native-build's `macOS arm64` row
+  queues. Neither the `cc-mac-arm` operator account nor an Intel lane is ever
+  its substitute.
 - `CMakePresets.json` requires **CMake >= 3.24** on any runner that runs
   `cmake --preset`; `native-build.yml` checks this explicitly and fails with
   that message rather than a confusing generator error.
@@ -123,44 +191,176 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
   `build/windows-core/bin/libchudware.dll` through the in-process fallback, and
   validates a real PNG headless capture. Release packaging remains CEF-enabled,
   so `cc-linux-build` and `cc-win-package` need the platform CEF SDK provisioned.
+- **Windows builds are resource-bounded.** The Windows legs of `native-build.yml`
+  and `nightly-release.yml` derive `CMAKE_BUILD_PARALLEL_LEVEL` from half the
+  logical processors, capped by currently free physical memory less an 8 GiB
+  reserve at 2 GiB per job; run build and packaging steps at below-normal
+  priority (inherited by cmake, ninja, cl, link and Nuitka); keep ctest serial;
+  and give each run its own `_MSPDBSRV_ENDPOINT_`, so no build shares an
+  account-wide `mspdbsrv`. The headless GUI capture sets `CHUDWARE_HIDDEN=1` and
+  nested PowerShell runs `-NonInteractive -WindowStyle Hidden`: nothing a
+  runner launches may reach anyone's desktop.
 
-### Provisioning: `runner-smoke.yml`'s dispatch-only `provision` job
+### Provisioning and qualification: `runner-smoke.yml`
 
 `runner-smoke.yml` does not only report gaps, it can close the ones that can be
-closed unattended. Dispatching it manually runs a `provision` job over
-`cc-win-ryzen`, `cc-mac-intel` and `cc-mac-arm` before the probe, so a single
-dispatch repairs the fleet and proves the repair in its own log. The scheduled
-run never provisions: a nightly cron that silently mutates six machines is not a
-probe.
+closed unattended. Dispatching it manually runs a `provision` job over whichever
+of `cc-win-ryzen`, `cc-mac-intel` and `cc-mac-arm` are online before the probe,
+so a single dispatch repairs the fleet and proves the repair in its own log. The
+scheduled run never provisions: a nightly cron that silently mutates six
+machines is not a probe.
 
-On macOS it is `brew install` for any of `cmake`, `ninja`, `python@3.13` and
-`opencascade` that is missing, and a no-op for any that is present — it repairs
-a gap, it never upgrades a working builder underneath a release.
+On a builder the probe compiles, links, runs and ctests a one-file CMake/Ninja
+C++ project in `RUNNER_TEMP` (on Windows through the same vswhere-then-
+`vcvars64.bat` discovery native-build uses), because a toolchain that only
+answers `--version` proves nothing about headers, the linker or the loader.
+Fleet rows that share hardware with another product's CI also carry an
+isolation contract the probe asserts against the live job (next section).
 
-On Windows it is harder, and the shape is worth remembering. `ryzen-7900x3d`'s
-runner service is `NT AUTHORITY\NETWORK SERVICE` (its `$env:USERNAME` reads
-`GARRISONGAMINGP$`). That account cannot write `C:\Program Files`, cannot edit
-the machine `PATH`, and cannot restart its own service — and the service takes
-its environment as a snapshot at start, so even a successful `PATH` edit would
-be invisible until someone reboots the box. So:
+Its `runner_label` dispatch input selects one endpoint instead of `all`:
+
+```bash
+gh workflow run runner-smoke.yml -R Hunter-124/Chudware -f runner_label=cc-win-ryzen
+gh workflow run runner-smoke.yml -R Hunter-124/Chudware -f runner_label=cc-linux-chudware
+gh workflow run runner-smoke.yml -R Hunter-124/Chudware -f runner_label=cc-mac-chudware-intel-bootstrap
+```
+
+Only that endpoint is provisioned (when it is provisionable) and probed, so
+qualifying a new runner never queues rows for unrelated or offline hardware. A
+targeted row is routed by `self-hosted`, OS, architecture and the unique runner
+label only, **without `cloudcastle-ci`**: a runner joins that pool after this
+run qualifies it, so demanding the pool label would make qualification
+impossible. The cron and `all` dispatches keep routing every row through
+`cloudcastle-ci`.
+
+On macOS provisioning is `brew install` for any of `cmake`, `ninja`,
+`python@3.13` and `opencascade` that is missing, and a no-op for any that is
+present — it repairs a gap, it never upgrades a working builder underneath a
+release. It runs only on the operator lanes (`cc-mac-intel`, `cc-mac-arm`),
+which own Homebrew.
+
+The private Mac test accounts `imac-intel-chudware-test` and (once it exists)
+`macbook-air-m2-chudware-test` are never provisioned (`provision:false`; the
+provision step also refuses any `CC_CI_LANE=test` account). Their probe only
+CHECKS the same formulae, Python >= 3.11 and a real compile/link/ctest, and
+asserts the isolation contract: account `ccci-chudware` in the hidden 420-499
+uid range, running natively on the Mac's own architecture (no Rosetta, no VM),
+`HOME` `/Library/CloudCastleCI/ccci-chudware` at mode 0700, workspace under
+`/Library/CloudCastleCI/ccci-chudware/actions-runner/_work`, `TMPDIR` and the
+XDG directories inside that home, `CC_CI_PRODUCT=Chudware`, `CC_CI_LANE=test`,
+numeric `CMAKE_BUILD_PARALLEL_LEVEL`/`CC_CI_BUILD_JOBS`, serial ctest, and a
+Homebrew prefix it does not own. A missing formula is fixed from that Mac's
+operator lane (`runner-provision.yml` with `cc-mac-intel` or `cc-mac-arm`).
+Promotion order: the runner registers with only its
+`cc-mac-chudware-<intel|arm>-bootstrap` label; dispatch that label (the row
+keeps `self-hosted`, `macOS` and its architecture), and only after it is green
+add `cloudcastle-ci` and `cc-mac-chudware-<intel|arm>`.
+
+`macbook-air-m2-chudware-test` carries `registered:false` in runner-smoke's
+fleet list: a cron or `all` run reports it under *Pending registration* rather
+than queueing a row nothing can claim, and only a targeted dispatch of
+`cc-mac-chudware-arm-bootstrap` (or `cc-mac-chudware-arm`) probes it. Drop the
+marker, and update the table above, in the change that records its
+registration.
+
+On Windows `ryzen-7900x3d`'s runner service is its own non-administrator
+virtual account (next section). That account cannot write `C:\Program Files`,
+cannot edit the machine `PATH`, and cannot restart its own service — and the
+service takes its environment as a snapshot at start, so even a successful
+`PATH` edit would be invisible until the service restarts. So:
 
 - Python is the **`python-build-standalone` relocatable tarball**, not the
   python.org installer. The installer was tried first and returned
   `0x80070005` (access denied) even with `InstallAllUsers=0`: Windows Installer
-  cannot run a per-user install for `NETWORK SERVICE`. The tarball needs no
+  cannot run a per-user install for a service account. The tarball needs no
   msiexec, no registry and no elevation, is the same distribution
   `actions/setup-python` uses, and carries `pip` and `venv`, which is all
   `fast-gate` asks of it. It is unpacked with `System32\tar.exe` (bsdtar, in
   Windows since 10 1803).
 - Python and ninja (the official `ninja-win.zip`) land **unelevated in
-  `%USERPROFILE%\chudware-ci-tools`** — `\python` and `\bin`. Both downloads are
+  `%USERPROFILE%\chudware-ci-tools`** — `\python` and `\bin`, inside the
+  account's private `D:\ChudwareCI\Windows\profile`. Both downloads are
   version-pinned and SHA-256-verified in the workflow, the same discipline
   `ci-workflow-policy.yml` uses for its actionlint asset.
+- Console-script launchers in `python\Scripts` embed the absolute interpreter
+  path they were generated for. The tools tree moved with the account from the
+  old `NETWORK SERVICE` profile, so provisioning reinstalls any distribution
+  whose launchers name another interpreter, and the probe fails on any stale
+  launcher that remains. Workflows still call `python -m pip`, never a launcher.
 - Every Windows job puts that directory on `PATH` **itself**, in its first step:
   `$env:PATH` for the current step and `$GITHUB_PATH` for the ones after it.
-  `fast-gate.yml`, `native-build.yml` and `runner-smoke.yml` all carry the same
-  six-line block. This is the whole mechanism; there is no machine `PATH` entry
-  to find and nothing survives outside that directory.
+  `fast-gate.yml`, `native-build.yml`, `nightly-release.yml` and
+  `runner-smoke.yml` all carry the same six-line block. This is the whole
+  mechanism; there is no machine `PATH` entry to find and nothing survives
+  outside that directory.
+
+### Per-product isolation on GarrisonGamingPC
+
+GarrisonGamingPC (`GARRISONGAMINGP`) hosts CloudCastle, Chudware and Chudcode
+CI. Their tests must never collide, and persistent build caches live on the
+4TB NVMe (`D:`), never on the serving SSD. The boundary is collision safety
+between products, not a malicious-tenant security boundary: the CloudCastle
+runner keeps the elevated capability its own jobs require.
+
+**Linux** runs in one WSL2 guest per product, each launched by its own
+non-administrator, batch-only Windows account, so each product gets its own
+WSL utility VM (kernel) and an ext4 root on its own VHDX under `D:\<Product>CI`.
+No guest mounts another product's storage, and no guest holds production
+secrets.
+
+| Product | Windows account | Guest | Runner / account | Root on D: | Labels |
+|---|---|---|---|---|---|
+| Chudware | `ChudwareLinuxCI` | `Chudware-CI` (`chudware-ryzen-linux`, 24 GB / 8 CPU) | `chudware-ryzen-linux` as `ccci-chudware` in `/opt/actions-runner-chudware` | `D:\ChudwareCI` | `cc-linux-chudware`, then `cloudcastle-ci` + `cc-linux-build` once qualified |
+| CloudCastle | `CloudCastleLinuxCI` | `CloudCastle-CI` | its own repository | `D:\CloudCastleCI` | not this repository |
+| Chudcode | `ChudcodeLinuxCI` | `Chudcode-CI` | its own repository | `D:\ChudcodeCI` | not this repository |
+
+The guest's HOME (pip/uv/venv/emsdk caches), runner work tree and temp all sit
+on that ext4 root, so they persist on the NVMe and are private to the guest.
+runner-smoke's `chudware-ryzen-linux` row asserts the account, a non-root
+runner, an owned HOME, a workspace under `/opt/actions-runner-chudware/_work`,
+the `/etc/cloudcastle-ci/product` binding `Chudware`, a WSL2 kernel, and ext4
+for `/`, HOME, `RUNNER_TEMP` and the workspace (never a host share).
+Promotion order: dispatch `runner_label=cc-linux-chudware`; only after it is
+green does `cloudcastle-ci`/`cc-linux-build` get added to the runner.
+
+**Native Windows** keeps the single CAD runner `ryzen-7900x3d`
+(`C:\actions-runner-cad`, service
+`actions.runner.Hunter-124-CAD.ryzen-7900x3d`), which runs as the
+non-administrator virtual account
+`NT SERVICE\actions.runner.Hunter-124-CAD.ryzen-7900x3d`
+(`S-1-5-80-1193026161-3971065153-2732555818-2173988348-3783229323`) with a
+private, ACL-protected namespace:
+
+| Path | Use |
+|---|---|
+| `D:\ChudwareCI\Windows\profile` | `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA`; tools in `profile\chudware-ci-tools`; `CARGO_HOME` `profile\.cargo`; `RUSTUP_HOME` `profile\.rustup` |
+| `D:\ChudwareCI\Windows\tmp` | `TEMP`, `TMP` |
+| `D:\ChudwareCI\Windows\w` | runner work folder (`RUNNER_TEMP` `w\_temp`, `RUNNER_TOOL_CACHE` `w\_tool`) |
+
+CloudCastle's native runner keeps its own elevated virtual account and
+`D:\CloudCastleCI\Windows\cc`; Chudcode's dedicated native runner has its own
+non-administrator virtual account and `D:\ChudcodeCI\Windows`. runner-smoke's
+`ryzen-7900x3d` row asserts the account name and SID, a token without an
+enabled Administrators group, the exact profile/home/cache/temp values,
+APPDATA/LOCALAPPDATA/workspace/runner temp/tool cache under the namespace, a
+fixed D: volume with no reparse point on any of those paths, that neither
+sibling namespace is even listable, and a real MSVC compile/link/run. The
+machine-level Visual Studio Build Tools, Windows SDK and CMake are shared
+read-only; nothing mutable is shared.
+
+Inside the code, named OS objects are per process: the AICM shared-memory
+handoff (`core/util/aicm_handoff.cpp`) scopes every `Local\chudware_*` mapping
+and fallback file by the publishing process id and refuses a mapping that
+already exists instead of writing into it. Session 0's `Local\` namespace is
+shared by every service, so a bare per-process counter name would let two
+runners' test processes alias each other's meshes.
+
+The provisioning and identity cutover are operated from the CloudCastle
+repository (`CloudCastle-RMM/deploy/selfhost/provision-nvme-linux-ci.{ps1,sh}`
+and `relocate-windows-ci-cache.ps1`), not from a workflow on this repository:
+the old `chudcode-runner-windows-provision.yml`, which cloned this runner into
+a second `NETWORK SERVICE` service through an interactive scheduled task, is
+deleted.
 
 ### Pinned Chudcode artifact (`CHUDWARE_CHUD_BIN`)
 
@@ -177,7 +377,7 @@ Its assets keep the filenames from `vendor/chudcode/CHUDCODE_ARTIFACT.lock`:
 
 | Runner | Lock target | Mirror asset |
 |---|---|---|
-| `livingroom-pc` | `linux-x86_64` | `chudcode-linux-x64` |
+| the `cc-linux-build` runner | `linux-x86_64` | `chudcode-linux-x64` |
 | `imac-intel` | `macos-x86_64` | `chudcode-darwin-x64` |
 | `ryzen-7900x3d` | `windows-x86_64` | `chudcode-windows-x64.exe` (must be built and pinned before the Windows nightly can pass) |
 
@@ -199,9 +399,7 @@ binaries or use metered Actions artifacts.
 
 The v0.4.1 upstream release contains no Windows binary. Build the exact locked
 commit on the existing Ryzen runner using
-`.github/workflows/chudcode-runtime-windows-build.yml`, not
-`chudcode-runner-windows-provision.yml` (the latter registers another Actions
-service; it does not build the runtime). Upload an authenticated source tarball
+`.github/workflows/chudcode-runtime-windows-build.yml`. Upload an authenticated source tarball
 to the same CAD mirror as
 `chudcode-source-<full locked repository_commit>.tar.gz`, with the archive root
 `Hunter-124-chudcode-<full locked repository_commit>/`, and supply its SHA-256

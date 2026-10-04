@@ -2498,7 +2498,13 @@ TEST_CASE("assembly display reuse follows explode changes and released handoffs"
     auto check_display = [&](const json& response, double x) {
         render::DocMesh mesh;
         std::string error;
-        REQUIRE_MESSAGE(render::loadAicmFile(response.at("tess").at("aicm_path"), mesh, error), error);
+        const std::string uri = response.at("tess").at("aicm_path");
+        // Producer-owned publication only: the pid-scoped handoff object, never an
+        // unscoped <tmp>/chudware_cpp_docs/<doc>_r<rev>.aicm fallback.
+        CHECK(chudware::aicm_handoff::is_shm_uri(uri));
+        CHECK(uri.find("chudware_" + id) == std::string::npos);
+        CHECK(uri.find(id + "_r") != std::string::npos);
+        REQUIRE_MESSAGE(render::loadAicmFile(uri, mesh, error), error);
         REQUIRE(mesh.bodies.size() == 1);
         double lo[3], hi[3];
         bbox(mesh.bodies[0], lo, hi);

@@ -23,9 +23,9 @@
 #
 # NumPy and SciPy require Python >= 3.11, so that is this gate's floor, and the
 # interpreter is chosen explicitly rather than taken from whatever `python3`
-# resolves to. macOS ships 3.9.6; both Macs therefore carry a Homebrew
-# python@3.13, and this job would fail loudly rather than mysteriously if one
-# lost it.
+# resolves to. macOS ships 3.9.6; the Intel Mac therefore carries a Homebrew
+# python@3.13 (shared read-only with the private test account), and this job
+# would fail loudly rather than mysteriously if it lost it.
 #
 # It runs on all three operating systems because these audits walk paths, read
 # files, and compare text. A separator or encoding assumption that only breaks
@@ -79,10 +79,14 @@ jobs:
             runner_os: Windows
             runner_arch: X64
             runner_label: cc-win-primary
+          # The private Chudware Mac TEST account (hidden ccci-chudware, no
+          # keychain, signing identity, sudo or GUI session), never the
+          # signer/operator lane that carries cc-mac-intel.
           - label: macOS
             runner_os: macOS
             runner_arch: X64
-            runner_label: cc-mac-intel
+            runner_label: cc-mac-chudware-intel
+            ci_user: ccci-chudware
     steps:
       # Before checkout: a missing or too-old Python otherwise surfaces as a
       # confusing traceback from an audit script rather than as the runner
@@ -90,10 +94,21 @@ jobs:
       - name: Report runner identity and select an interpreter (POSIX)
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          EXPECT_CI_USER: ${{ matrix.ci_user }}
         run: |
           set -euo pipefail
-          echo "runner=${RUNNER_NAME:-unknown} os=$RUNNER_OS arch=$RUNNER_ARCH host=$(hostname -s)"
+          echo "runner=${RUNNER_NAME:-unknown} os=$RUNNER_OS arch=$RUNNER_ARCH host=$(hostname -s) user=$(id -un)"
           uname -a
+
+          # A row that names a private CI account must actually be running as
+          # it, with the lane identity its launchd daemon exports.
+          if [ -n "${EXPECT_CI_USER}" ]; then
+            if [ "$(id -un)" != "${EXPECT_CI_USER}" ] || [ "${CC_CI_PRODUCT:-}" != Chudware ] || [ "${CC_CI_LANE:-}" != test ]; then
+              echo "::error::expected the private Chudware test account ${EXPECT_CI_USER} (CC_CI_PRODUCT=Chudware, CC_CI_LANE=test); got user=$(id -un) CC_CI_PRODUCT=${CC_CI_PRODUCT:-unset} CC_CI_LANE=${CC_CI_LANE:-unset}"
+              exit 1
+            fi
+          fi
 
           # Newest first. macOS's /usr/bin/python3 is 3.9.6, which cannot
           # install the pinned NumPy or SciPy at all, so `python3` is the last
@@ -109,7 +124,7 @@ jobs:
           done
 
           if [ -z "${gate_python}" ]; then
-            echo "::error::runner ${RUNNER_NAME:-unknown} has no Python >= 3.11 on PATH; scripts/check.py needs one because the pinned NumPy and SciPy require it. Fix on macOS with: brew install python@3.13"
+            echo "::error::runner ${RUNNER_NAME:-unknown} has no Python >= 3.11 on PATH; scripts/check.py needs one because the pinned NumPy and SciPy require it. Fix on macOS from the operator lane: dispatch runner-provision.yml with runner_label=cc-mac-intel (installs python@3.13)"
             exit 1
           fi
 
@@ -127,10 +142,11 @@ jobs:
           Write-Host "runner=$env:RUNNER_NAME os=$env:RUNNER_OS arch=$env:RUNNER_ARCH host=$env:COMPUTERNAME"
           Write-Host "powershell=$($PSVersionTable.PSVersion)"
 
-          # The Windows runner service runs as NT AUTHORITY\NETWORK SERVICE.
+          # The Windows runner service is its own non-administrator virtual
+          # account whose USERPROFILE is a private D:\ChudwareCI\Windows\profile.
           # It cannot write Program Files, cannot edit the machine PATH, and
           # cannot restart itself to pick a new one up, so runner-smoke's
-          # provisioning job installs Python and ninja into a runner-local
+          # provisioning job installs Python and ninja into a profile-local
           # directory and every Windows job puts that directory on PATH here --
           # $env:PATH for this step, $GITHUB_PATH for the ones after it.
           # See docs/reference/CI_RUNNERS.md.

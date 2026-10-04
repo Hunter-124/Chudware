@@ -86,11 +86,32 @@ std::string name_from_uri(const std::string& uri) {
     return uri.substr(std::strlen(kUriPrefix));
 }
 
+unsigned long process_id() {
+#ifdef _WIN32
+    return static_cast<unsigned long>(::GetCurrentProcessId());
+#elif defined(__EMSCRIPTEN__)
+    return 0;
+#else
+    return static_cast<unsigned long>(::getpid());
+#endif
+}
+
+// Every named object and fallback file is scoped by the publishing process id. Callers key by
+// per-process counters ("compile_<n>", "field_<n>", "overlay_<n>") and per-process sequential
+// doc ids ("doc-cpp00000001"), so a bare key is shared by every engine on the box: the user's
+// hostd, an in-process MCP/training engine, parallel render workers and, on Windows, every
+// service-hosted CI runner (all services share session 0's Local\ namespace). Each publish
+// replaced or reopened the other process's live object (SIGBUS in the reader, or a silently
+// foreign mesh). Readers only ever use the returned URI, so the scope is invisible to them.
+std::string object_key(const std::string& key) {
+    return "p" + std::to_string(process_id()) + "_" + sanitize(key);
+}
+
 std::string publish_file(const std::string& key, const uint8_t* data, size_t n) {
     std::error_code ec;
     std::filesystem::path dir = std::filesystem::temp_directory_path(ec) / "chudware_cpp_docs";
     std::filesystem::create_directories(dir, ec);
-    std::filesystem::path target = dir / (sanitize(key) + ".aicm");
+    std::filesystem::path target = dir / (object_key(key) + ".aicm");
     std::ofstream f(target, std::ios::binary | std::ios::trunc);
     if (!f) return {};
     if (n) f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
@@ -100,15 +121,34 @@ std::string publish_file(const std::string& key, const uint8_t* data, size_t n) 
 }
 
 #ifdef _WIN32
-std::string shm_object_name(const std::string& key) { return "Local\\chudware_" + sanitize(key); }
+std::string shm_object_name(const std::string& key) { return "Local\\chudware_" + object_key(key); }
+
+void unlink_shm_name(const std::string& name) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto it = g_win_keepers.find(name);
+    if (it != g_win_keepers.end()) {
+        CloseHandle(it->second);
+        g_win_keepers.erase(it);
+    }
+}
 
 std::string publish_shm(const std::string& key, const uint8_t* data, size_t n) {
     const std::string name = shm_object_name(key);
     const size_t total = 8 + n;
+    // Drop this process's previous publication of the key first: a named mapping lives until
+    // its last handle closes, so a republish must never write into the old object in place.
+    unlink_shm_name(name);
     HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
                                   static_cast<DWORD>((total >> 32) & 0xffffffffu),
                                   static_cast<DWORD>(total & 0xffffffffu), name.c_str());
     if (!h) return {};
+    // An existing object is someone else's: a reader still holding the previous revision, or
+    // a dead process whose id was reused. CreateFileMapping hands back that object at its old
+    // size; writing it would corrupt a live mesh, so fall back to a private file instead.
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(h);
+        return {};
+    }
     void* view = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, total);
     if (!view) {
         CloseHandle(h);
@@ -155,19 +195,10 @@ bool map_shm(const std::string& name, Mapping& out, std::string& err) {
     out.size = static_cast<size_t>(sz);
     return true;
 }
-
-void unlink_shm_name(const std::string& name) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    auto it = g_win_keepers.find(name);
-    if (it != g_win_keepers.end()) {
-        CloseHandle(it->second);
-        g_win_keepers.erase(it);
-    }
-}
 #elif defined(__EMSCRIPTEN__)
 // Browser client: no POSIX shm. publish falls back to publish_file (MEMFS);
 // consumers fetch aicm-shm:// via GET /files/aicm?shm=… (see loadAicmFile).
-std::string shm_object_name(const std::string& key) { return "/chudware_" + sanitize(key); }
+std::string shm_object_name(const std::string& key) { return "/chudware_" + object_key(key); }
 
 std::string publish_shm(const std::string& /*key*/, const uint8_t* /*data*/, size_t /*n*/) {
     return {};
@@ -180,16 +211,15 @@ bool map_shm(const std::string& name, Mapping& /*out*/, std::string& err) {
 
 void unlink_shm_name(const std::string& /*name*/) {}
 #else  // POSIX
-std::string shm_object_name(const std::string& key) { return "/chudware_" + sanitize(key); }
+std::string shm_object_name(const std::string& key) { return "/chudware_" + object_key(key); }
 
 std::string publish_shm(const std::string& key, const uint8_t* data, size_t n) {
     const std::string name = shm_object_name(key);
     shm_unlink(name.c_str());
+    // O_EXCL right after the unlink: an object that reappears in between belongs to a racing
+    // publisher, and silently reopening it would hand out a mesh this call did not write.
     int fd = shm_open(name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);
-    if (fd < 0) {
-        fd = shm_open(name.c_str(), O_RDWR, 0600);
-        if (fd < 0) return {};
-    }
+    if (fd < 0) return {};
     const size_t total = 8 + n;
     if (ftruncate(fd, static_cast<off_t>(total)) != 0) {
         close(fd);
@@ -285,20 +315,10 @@ bool map_file(const std::string& path, Mapping& out, std::string& err) {
 
 bool is_shm_uri(const std::string& uri) { return uri.rfind(kUriPrefix, 0) == 0; }
 
-// Doc ids are per-process sequential ("doc-cpp00000001"), so a bare doc_id+rev name is shared
-// by every engine on the box: the user's hostd, an in-process MCP/training engine and parallel
-// render workers all published /dev/shm/chudware_doc-cpp00000001_r0, and each publish
-// shm_unlink+ftruncate'd the other process's live object (SIGBUS in the reader, or a silently
-// foreign mesh). The publishing process id scopes the name; readers only ever use the URI.
+// Cache keys stay process-local; object_key() adds the publishing process id to the shared
+// object/file name, so the published name is still /dev/shm/chudware_p<pid>_<doc>_r<rev>.
 static std::string doc_key_prefix(const std::string& doc_id) {
-#ifdef _WIN32
-    const unsigned long pid = static_cast<unsigned long>(::GetCurrentProcessId());
-#elif defined(__EMSCRIPTEN__)
-    const unsigned long pid = 0;
-#else
-    const unsigned long pid = static_cast<unsigned long>(::getpid());
-#endif
-    return "p" + std::to_string(pid) + "_" + sanitize(doc_id) + "_r";
+    return sanitize(doc_id) + "_r";
 }
 
 std::string key_for(const std::string& doc_id, long revision) {
@@ -334,9 +354,19 @@ std::string publish(const std::string& key, const uint8_t* data, size_t n) {
     e.bytes = n ? std::make_shared<const std::vector<uint8_t>>(data, data + n)
                 : std::make_shared<const std::vector<uint8_t>>();
     e.uri = uri;
+    std::string replaced;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        g_cache[key] = std::move(e);
+        CacheEntry& slot = g_cache[key];
+        replaced = std::move(slot.uri);
+        slot = std::move(e);
+    }
+    // A fallback file from this key's previous publication is not reused once the key gets a
+    // shared object again (Windows falls back while a reader holds the old mapping); drop it
+    // so replaced fallbacks do not pile up in the temp dir. Same-path rewrites are kept.
+    if (!replaced.empty() && replaced != uri && !is_shm_uri(replaced)) {
+        std::error_code ec;
+        std::filesystem::remove(replaced, ec);
     }
     return uri;
 }

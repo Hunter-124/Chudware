@@ -408,15 +408,21 @@ def test_files_aicm_cannot_read_across_tenants(client):
     assert r.status_code == 200
 
 
-def test_mesh_handoffs_require_the_accounts_daemon_grant(client, monkeypatch):
+def test_mesh_handoffs_require_the_accounts_daemon_grant(client, monkeypatch, tmp_path):
     generation = [(1, 2, 3)]
     monkeypatch.setattr(engine_bridge, "_mesh_socket_generation", lambda: generation[0])
+    # The gateway's private account TMPDIR is the engine's temp root; the file
+    # fallback is served from there, not from a fixed /tmp.
+    private_tmp = tmp_path / "private-tmp"
+    private_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(private_tmp))
     doc_id = "doc-cpp" + uuid.uuid4().hex
-    filename = f"{doc_id}_r2.aicm"
-    scratch = Path(tempfile.gettempdir()) / "chudware_cpp_docs"
-    scratch.mkdir(exist_ok=True)
+    # Producer names are scoped by the publishing engine's pid (aicm_handoff object_key).
+    filename = f"p4242_{doc_id}_r2.aicm"
+    scratch = private_tmp / "chudware_cpp_docs"
+    scratch.mkdir()
     file = scratch / filename
-    shm_name = f"chudware_{doc_id}_r2"
+    shm_name = f"chudware_p4242_{doc_id}_r2"
     shm = Path("/dev/shm") / shm_name
     file.write_bytes(b"alice file mesh")
     shm.write_bytes(b"alice shm mesh")
@@ -442,12 +448,18 @@ def test_mesh_handoffs_require_the_accounts_daemon_grant(client, monkeypatch):
             response = client.get("/files/aicm", params=params, headers=A)
             assert response.status_code == 200
             assert response.content == expected
+        # The granted document's name under a different temp root (another account's
+        # TMPDIR) is not this engine's handoff.
+        foreign = tmp_path / "foreign-tmp" / "chudware_cpp_docs" / filename
+        foreign.parent.mkdir(parents=True)
+        foreign.write_bytes(b"foreign mesh")
+        assert client.get("/files/aicm", params={"path": str(foreign)}, headers=A).status_code == 403
         # A daemon restart may reuse its sequential document IDs; old grants
         # must not authorize the new process's mesh.
         generation[0] = (1, 2, 4)
         assert client.get("/files/aicm", params={"shm": shm_name}, headers=A).status_code == 403
         # A grant for one document never covers the neighboring sequential id.
-        other = scratch / f"{doc_id}extra_r2.aicm"
+        other = scratch / f"p4242_{doc_id}extra_r2.aicm"
         other.write_bytes(b"other")
         try:
             assert client.get("/files/aicm", params={"path": str(other)}, headers=A).status_code == 403

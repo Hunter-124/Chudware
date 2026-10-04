@@ -19,14 +19,16 @@ change here gives CI the ability to publish a stable release: `POST
 
 Every night, and on demand from the Actions tab:
 
-1. **`plan`** (gateway host) reads `GET https://app.chudware.com/api/releases/base-version`
+1. **`plan`** (gateway host, `cc-linux-livingroom`; metadata and API calls
+   only, it compiles nothing) reads `GET https://app.chudware.com/api/releases/base-version`
    for the stable base (highest stable patch + 1, floor `0.1.0`) and builds the
    nightly version `<base>-beta.<run number>` — e.g. `0.1.0-beta.42`. On a
    *scheduled* run it asks the gateway over loopback whether `ci_builds` already
    holds a `published` row for `HEAD`; if so the night is skipped. A manual
    dispatch always builds. Every Chudcode-backed build leg is recorded as
    `queued`: `linux/x86_64`, `windows/x86_64` and `macos/x86_64`.
-2. **`linux-beta`** (gateway host, `cc-linux-build`) configures core and host with
+2. **`linux-beta`** (`cc-linux-build`, the private NVMe build guest; never the
+   serving host) configures core and host with
    `-DCHUDWARE_VERSION_OVERRIDE=<version> -DCHUDWARE_DEVELOPER_BUILD=OFF`, builds,
    runs `ctest` for core and host, takes a headless `CHUDWARE_SHOT=m1` screenshot
    under Xvfb, stages the immutable AppDir via
@@ -72,21 +74,25 @@ Every night, and on demand from the Actions tab:
    Gatekeeper claim. `macbook-air-m2` can still run the CAD core-only
    `macos-arm64` preset, but no Mac ARM Chudcode builder or release artifact
    exists; it cannot package a Chudcode-backed release.
-5. **Publish.** Every job gets its bytes into `<releases_dir>/incoming/` on the
-   gateway host and then calls `POST /api/releases/ci/publish`. There are two
-   transports, because the fleet is not one network:
-   * **`linux-beta` runs ON the gateway host.** It copies the files into
-     `incoming/` directly and posts to **`http://127.0.0.1:8300`**, reading the
-     token from `gateway.env` at the point of use. The token never leaves the box.
-   * **`windows-beta` and `macos-beta` cannot route to it at all** (the builders
-     are on `192.168.1.x`, the gateway is `192.168.0.183`; proven by diagnostic).
-     They hold the same token as the `CHUDWARE_GATEWAY_RELEASE_TOKEN` secret and
-     reach the gateway over TLS on `https://app.chudware.com`: each produced file
-     is streamed in with `PUT /api/releases/ci/upload/<name>` (curl
-     `--upload-file`, so a 300 MB installer is never buffered in memory), and the
-     job compares the sha256 the endpoint reports against the local digest before
-     moving on. Then the ordinary `ci/publish` and `ci/status` calls follow over
-     the same origin. Those runners need nothing but outbound 443.
+5. **Publish.** Every build job gets its bytes into `<releases_dir>/incoming/`
+   on the gateway host through the authenticated HTTP API and then calls
+   `POST /api/releases/ci/publish`. No builder reads `gateway.env`, holds a
+   production SSH credential or writes the gateway's release directory; only
+   `plan`, which runs on the gateway host and builds nothing, reads the token
+   from `gateway.env` and talks to **`http://127.0.0.1:8300`**.
+   * **`linux-beta`, `windows-beta` and `macos-beta`** hold the same token as
+     the `CHUDWARE_GATEWAY_RELEASE_TOKEN` secret and reach the gateway over TLS
+     on `https://app.chudware.com`: the artifact and each payload-manifest,
+     signature and evidence sidecar is streamed in under its canonical name with
+     `PUT /api/releases/ci/upload/<name>` (curl `--upload-file`, so a 300 MB
+     installer is never buffered in memory), and the job compares the sha256
+     the endpoint reports against the local digest before moving on. A missing
+     local file or a failed upload fails that publish. Then the ordinary
+     `ci/publish` and `ci/status` calls follow over the same origin, with the
+     body's digests computed from the same local `RUNNER_TEMP` files that were
+     uploaded. Those runners need nothing but outbound 443. The Linux and macOS
+     legs share `packaging/ci_gateway.sh`; Windows uses
+     `packaging/windows/publish_release.ps1`.
 
      Anything larger than 64 MiB goes up in 64 MiB chunks
      (`?offset=<n>`, and `&complete=1` on the last one), because the proxy in
@@ -196,7 +202,7 @@ normal mount the same call returns `Relaunching` and the new build takes over.
 | Secret | Used by | Content |
 |---|---|---|
 | `CHUDWARE_RELEASE_CI_KEY` | all three build jobs | base64 32-byte Ed25519 **seed** for `release-ci-v1` (single line, no PEM). Offline copy: `~/.chudware/release-ci-v1.seed.b64` on the owner workstation. |
-| `CHUDWARE_GATEWAY_RELEASE_TOKEN` | `windows-beta`, `macos-beta` | the gateway's release publishing token, the same value as `CHUDWARE_GATEWAY_RELEASE_TOKEN` in `gateway.env`. Those two runners cannot route to the gateway host's LAN address, so they authenticate to `https://app.chudware.com` with this Bearer token over TLS. `plan` and `linux-beta` do **not** use it: they run on the gateway host and read the token from `gateway.env` at the point of use. |
+| `CHUDWARE_GATEWAY_RELEASE_TOKEN` | `linux-beta`, `windows-beta`, `macos-beta` | the gateway's release publishing token, the same value as `CHUDWARE_GATEWAY_RELEASE_TOKEN` in `gateway.env`. Every build leg authenticates to `https://app.chudware.com` with this Bearer token over TLS; no builder reads `gateway.env`. Only `plan` does **not** use it: it runs on the gateway host, builds nothing, and reads the token from `gateway.env` at the point of use. |
 
 There are no SSH secrets any more. `CHUDWARE_LIVINGROOM_SSH_HOST`,
 `CHUDWARE_LIVINGROOM_SSH_KEY` and `CHUDWARE_LIVINGROOM_HOST_KEY` were removed
@@ -221,9 +227,9 @@ installed client still verifies against it.
 
 ## Runner prerequisites
 
-**`cc-linux-build`, and it must be the gateway host** (it reads
-`/home/liveuser/chudware-web-data/gateway.env` and posts to loopback; the job
-fails at its capability check with an explicit message otherwise):
+**`cc-linux-build`, the private NVMe build guest, never the gateway host** (it
+publishes over TLS with the `CHUDWARE_GATEWAY_RELEASE_TOKEN` secret and needs no
+production file):
 
 * `cmake`, `ninja`, `ctest`, `python3`, `curl`, `tar`, `file`, `ldd`,
   `sha256sum`, `strip`, `rsync`
@@ -233,7 +239,7 @@ fails at its capability check with an explicit message otherwise):
   `docs/reference/CI_RUNNERS.md`, "Pinned Chudcode artifact")
 * Nuitka and the rest of `packaging/requirements-release.txt` in the release
   Python (the AppImage compiles the Python sidecars)
-* write access to `<releases_dir>/incoming`
+* outbound HTTPS to `https://app.chudware.com`
 
 **`cc-win-package`:**
 
@@ -436,7 +442,7 @@ pipeline pinned the commit it built.
   so waiting on `cc-mac-arm` cannot publish a Chudcode-backed release.
 * **A rejected publish:** the gateway recomputes the digest and size, and a
   mismatch (422) **deletes the staged artifact** from `incoming/` while leaving
-  the sidecars. Re-run the job: it rebuilds and re-stages everything before
+  the sidecars. Re-run the job: it rebuilds and re-uploads everything before
   publishing. Every other 422 leaves `incoming/` untouched.
 * **No Promote button on a row:** its evidence bundle is incomplete. `POST
   /api/admin/releases/promote` answers 422 and names every missing column, and a
@@ -460,10 +466,11 @@ pipeline pinned the commit it built.
   sha256 the endpoint returns against the local digest, so transport corruption
   is named at the file that caused it instead of as a 422 an hour later. A 413
   means the artifact passed the endpoint's 2 GiB ceiling.
-* **Transport rules.** `plan` and `linux-beta` run on the gateway host: they must
-  use `http://127.0.0.1:8300` and read the token from `gateway.env`, never the
-  public URL. `windows-beta` and `macos-beta` are off-LAN and must use
-  `https://app.chudware.com` with the `CHUDWARE_GATEWAY_RELEASE_TOKEN` secret;
-  there is no SSH path any more, and adding one back would not work - those
-  subnets do not route. On both transports the token goes to curl in a `0600`
-  `--config` file, never in argv.
+* **Transport rules.** Only `plan` runs on the gateway host: it must use
+  `http://127.0.0.1:8300` and read the token from `gateway.env`, never the
+  public URL, and it must never compile. `linux-beta`, `windows-beta` and
+  `macos-beta` are builders and must use `https://app.chudware.com` with the
+  `CHUDWARE_GATEWAY_RELEASE_TOKEN` secret; no builder gets `gateway.env`, a NAS
+  release path or an SSH path, and adding one back would put production
+  secrets on a build guest. On both transports the token goes to curl in a
+  `0600` `--config` file, never in argv.

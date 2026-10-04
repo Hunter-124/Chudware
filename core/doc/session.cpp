@@ -4181,31 +4181,15 @@ json warm_and_respond(Session& s, CompileResult r, const json& id_map, bool with
     return resp;
 }
 
-// Legacy filesystem path (fallback only — prefer aicm_handoff::publish).
-std::filesystem::path aicm_file(const std::string& doc_id, long revision) {
-    std::filesystem::path dir = std::filesystem::temp_directory_path() / "chudware_cpp_docs";
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir / (doc_id + "_r" + std::to_string(revision) + ".aicm");
-}
-
-// T-PERF10: publish tess AICM via shared memory (aicm-shm://…) so the host can
-// map it without a temp-file round-trip. Falls back to aicm_file() path on shm failure.
+// T-PERF10: publish tess AICM via aicm_handoff (aicm-shm://…, or its own pid-scoped temp
+// file when shm is unavailable) so the host maps it without a second unscoped file. Empty
+// on a hard publish failure: responses then carry no aicm_path (the existing "no mesh"
+// signal) instead of failing an edit/open whose document state has already committed.
 std::string publish_doc_aicm(const std::string& doc_id, long revision,
                              const std::vector<uint8_t>& aicm) {
     if (aicm.empty()) return {};
     const std::string key = chudware::aicm_handoff::key_for(doc_id, revision);
     std::string uri = chudware::aicm_handoff::publish(key, aicm);
-    if (uri.empty()) {
-        std::filesystem::path target = aicm_file(doc_id, revision);
-        std::ofstream f(target, std::ios::binary | std::ios::trunc);
-        if (f) {
-            f.write(reinterpret_cast<const char*>(aicm.data()),
-                    static_cast<std::streamsize>(aicm.size()));
-            f.close();
-            uri = std::filesystem::absolute(target).string();
-        }
-    }
     // Drop old revisions so shm objects don't accumulate. Keep a few recent ones:
     // the host's async mesh loader (T-PERF3) may still be mapping the previous path
     // while this rebuild publishes the next.
@@ -4627,12 +4611,6 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
     std::vector<uint8_t> blob = aicm::write_aicm(tesses);
     if (blob_out) *blob_out = blob;
     std::string path = publish_doc_aicm(s.doc_id, s.revision, blob);
-    if (path.empty() && !blob.empty()) {
-        // Last-resort file write if publish fully failed.
-        std::filesystem::path target = aicm_file(s.doc_id, s.revision);
-        aicm::write_aicm_file(target.string(), tesses);
-        path = std::filesystem::absolute(target).string();
-    }
     if (!path.empty() && s.asm_result)
         display = {s.asm_result, s.revision, s.display_quality, s.explode_active,
                    s.explode_factor, path, bodies_meta};
@@ -7173,7 +7151,7 @@ json doc_export_step(const std::string& doc_id, const std::string& path) {
                       {{"doc_id", doc_id}});
     // Path resolution: an absolute client/server path is honored verbatim (desktop non-daemon
     // keeps writing under the host appdata cache). Empty OR relative paths get a server-owned
-    // temp file under the same chudware_cpp_docs dir publish_doc_aicm uses — required for WASM /
+    // temp file under the same chudware_cpp_docs dir aicm_handoff's file fallback uses — required for WASM /
     // daemon hosts where the client would otherwise send a browser-local path hostd can't use.
     // The resolved absolute path is always returned in the response so callers can seed step_path.
     std::string use_path = path;

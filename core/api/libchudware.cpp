@@ -4,8 +4,9 @@
 //   ping             liveness + ABI echo (no kernel work; used by the host to
 //                    confirm the DLL loaded and its OCCT deps resolved).
 //   doc_compile_cpp  DIAGNOSTIC compile: takes a full document feature tree +
-//                    env, runs chudware::doc::compile_document, writes the surviving
-//                    bodies to an AICM file, and returns the per-feature statuses
+//                    env, runs chudware::doc::compile_document, publishes the
+//                    surviving bodies' AICM (aicm_handoff, or an explicit
+//                    params["aicm_out"] file), and returns the per-feature statuses
 //                    + body count + the AICM path. This is the strangler's
 //                    parity probe (Step 2 of the strangler migration recorded in
 //                    docs/REFACTOR_LOG.md): the host can
@@ -291,20 +292,10 @@ std::string to_hex(const std::vector<uint8_t>& b) {
     return s;
 }
 
-// Choose where to write the AICM bytes. Honour an explicit params["aicm_out"]
-// (the host/tests can pin a path), else shared-mem handoff (T-PERF10), else a
-// unique file in the OS temp dir.
-std::filesystem::path aicm_target(const json& params) {
-    if (params.contains("aicm_out") && params["aicm_out"].is_string()) {
-        return std::filesystem::path(params["aicm_out"].get<std::string>());
-    }
-    static std::atomic<unsigned long long> seq{0};
-    unsigned long long n = seq.fetch_add(1);
-    std::filesystem::path dir = std::filesystem::temp_directory_path();
-    return dir / ("chudware_cpp_" + std::to_string(n) + ".aicm");
-}
-
-// Prefer aicm-shm handoff for diagnostic compiles too (same consumer path as session).
+// Publish the compile AICM. An explicit params["aicm_out"] (caller-pinned output file)
+// is written verbatim; otherwise the bytes go through aicm_handoff, whose shm object or
+// temp-file fallback is scoped by this process id. Empty on hard failure — never a
+// second, unscoped temp file.
 std::string publish_or_write_aicm(const json& params, const std::vector<uint8_t>& aicm) {
     if (params.contains("aicm_out") && params["aicm_out"].is_string()) {
         std::filesystem::path target = params["aicm_out"].get<std::string>();
@@ -313,20 +304,12 @@ std::string publish_or_write_aicm(const json& params, const std::vector<uint8_t>
         f.write(reinterpret_cast<const char*>(aicm.data()),
                 static_cast<std::streamsize>(aicm.size()));
         f.close();
+        if (!f) return {};
         return std::filesystem::absolute(target).string();
     }
     static std::atomic<unsigned long long> seq{0};
     unsigned long long n = seq.fetch_add(1);
-    const std::string key = "compile_" + std::to_string(n);
-    std::string uri = chudware::aicm_handoff::publish(key, aicm);
-    if (!uri.empty()) return uri;
-    std::filesystem::path target = aicm_target(params);
-    std::ofstream f(target, std::ios::binary | std::ios::trunc);
-    if (!f) return {};
-    f.write(reinterpret_cast<const char*>(aicm.data()),
-            static_cast<std::streamsize>(aicm.size()));
-    f.close();
-    return std::filesystem::absolute(target).string();
+    return chudware::aicm_handoff::publish("compile_" + std::to_string(n), aicm);
 }
 
 // doc_compile_cpp: compile a document tree to AICM + statuses (diagnostic).

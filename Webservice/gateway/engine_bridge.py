@@ -10,11 +10,13 @@ Backpressure is natural: each side awaits the other's write.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -71,10 +73,28 @@ _mesh_generation: tuple[int, int, int] | None = None
 _mesh_grants_lock = threading.Lock()
 _MESH_GRANT_TTL = 24 * 60 * 60
 _MESH_GRANT_LIMIT = 8192
-_FILE_MESH_RE = re.compile(r"^(?P<doc>[A-Za-z0-9_.-]{1,180})_r\d+\.aicm$")
-_SHM_MESH_RE = re.compile(r"^chudware_(?P<doc>[A-Za-z0-9_.-]{1,180})_r\d+$")
-_FILE_MESH_DIR = PurePosixPath("/tmp/chudware_cpp_docs")
+# aicm_handoff scopes every published name by the publishing engine's process id
+# (chudware_p<pid>_<doc>_r<rev>, fallback p<pid>_<doc>_r<rev>.aicm); the doc id follows it.
+_FILE_MESH_RE = re.compile(r"^p\d+_(?P<doc>[A-Za-z0-9_.-]{1,180})_r\d+\.aicm$")
+_SHM_MESH_RE = re.compile(r"^chudware_p\d+_(?P<doc>[A-Za-z0-9_.-]{1,180})_r\d+$")
 _SHM_MESH_DIR = PurePosixPath("/dev/shm")
+
+
+@functools.lru_cache(maxsize=8)
+def _mesh_file_dirs_for(tempdir: str) -> frozenset[PurePosixPath]:
+    leaf = "chudware_cpp_docs"
+    return frozenset({PurePosixPath(os.path.normpath(tempdir)) / leaf,
+                      PurePosixPath(os.path.realpath(tempdir)) / leaf})
+
+
+def mesh_file_dirs() -> frozenset[PurePosixPath]:
+    """aicm_handoff's file-fallback directory under the effective temp root.
+
+    The engine writes <temp_directory_path()>/chudware_cpp_docs, i.e. $TMPDIR (else
+    /tmp) — a private service account's own TMPDIR, not a fixed /tmp. Both the
+    spelled and the symlink-resolved form name that one directory.
+    """
+    return _mesh_file_dirs_for(tempfile.gettempdir())
 
 
 def mesh_doc_id(name: str, *, shm: bool = False) -> str | None:
@@ -242,7 +262,7 @@ def path_violation(
         if any(candidate == root or root in candidate.parents for root in allowed_roots
                if root not in {PurePosixPath("/tmp"), _SHM_MESH_DIR}):
             continue
-        if candidate.parent == _FILE_MESH_DIR:
+        if candidate.parent in mesh_file_dirs():
             doc_id = mesh_doc_id(candidate.name)
         elif candidate.parent == _SHM_MESH_DIR:
             doc_id = mesh_doc_id(candidate.name, shm=True)

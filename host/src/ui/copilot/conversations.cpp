@@ -2143,6 +2143,8 @@ static void pollChudcodeSessionHealth(AppState& st) {
 // On a project switch, remember the last active session in the project being left and
 // reselect the last active one in the project being entered. An empty/draft session has
 // not run anywhere yet: move its scope instead of stranding a ghost in the old project.
+// Sessions are tied to their workspace, so when the entered project has no session to
+// resume, a session from another project never stays in view: a new one opens there.
 static void followProjectActiveConversation(AppState& st) {
     static bool s_seeded = false;
     static std::string s_lastKey;
@@ -2167,12 +2169,17 @@ static void followProjectActiveConversation(AppState& st) {
     s_lastKey = key;
     if (key.empty()) return;
     const auto it = s_activeByProject.find(key);
-    if (it == s_activeByProject.end() || it->second.empty()) return;
-    for (int i = 0; i < (int)st.conversations.size(); ++i) {
-        if (st.conversations[i].id != it->second) continue;
-        if (i != st.activeConv) switchConversation(st, i);  // parks the outgoing session
-        return;
+    if (it != s_activeByProject.end() && !it->second.empty()) {
+        for (int i = 0; i < (int)st.conversations.size(); ++i) {
+            if (st.conversations[i].id != it->second) continue;
+            if (i != st.activeConv) switchConversation(st, i);  // parks the outgoing session
+            return;
+        }
     }
+    if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size() &&
+        convProjectKey(st.conversations[st.activeConv].projectDir) == key)
+        return;
+    newConversation(st);  // parks the outgoing session; scope = the entered project
 }
 
 // Per-frame chat/doc sync (called each frame). Sessions are document-independent now: a

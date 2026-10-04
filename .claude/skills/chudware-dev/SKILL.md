@@ -493,6 +493,9 @@ judgment).
   `workspace_dir` sent on each turn. `index.json` v3 keeps `active_by_project`; Sessions
   filters the stored key (never a live artifact scan) and adopts headless Chudcode
   `*.jsonl` files from the Sessions dir. Do not re-derive membership at draw time.
+  On a workspace switch (`followProjectActiveConversation`) the entered project's
+  remembered session is reselected; if it has none, a session from another project never
+  stays in view — `newConversation` opens one scoped to the entered project (2026-10-03).
 - **An agent's sim is a study the user can open (2026-09-28).** `run_fea_*` and
   `simulate_motion` persist their study into the doc (`_persist_study`; motion stores inputs
   only, keyed by driven mate names) and hostd fans `sim_study_*` mutations as

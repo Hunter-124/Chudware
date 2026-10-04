@@ -5657,3 +5657,26 @@ from `host/src/core/app_state.h`; refreshed `title_bar.h`'s desktop/browser cont
 The WASM app bar still delegates window controls to browser chrome. Verification:
 native `Chudware` target built, theme/glyph lint clean, and an isolated Xvfb GUI smoke
 exited successfully with all three buttons visible and no fourth button or unused gap.
+## 2026-10-04 — visible compaction and provider stalls; c245 tool-failure fixes
+
+Run c245 (GPT-6.1-Sol, 272k window) looked frozen for 10–28 min at a time. Evidence
+(`~/.chudcode/logs/chud.2026-10-04.<pid>.log`, session JSONL): compaction was NOT the stall —
+the one real compaction applied an armed speculative summary in 20 ms; the long silences were
+provider calls, two of them recovered Codex streams (a second assistant `start`). The feed
+showed a never-closing "threshold" row, a separate "context-full" row and "Agent · start".
+`services/agent/chudcode_events.py`: `_compaction` pairs unkeyed start/end frames through
+`RpcFrameState.compaction_id` into one "Auto-compacting context" → "Context compacted (was
+N k tokens)" sub_run; `_response_restarted` names stream restarts; `irc_message` becomes
+"Message from <agent>"; `tool_stream_update` emits nothing; turn/message start read "Waiting
+for model". GUI (`feed.cpp`, `cards.cpp`, `chat_log.cpp`, `app_state.h` GUI-only
+`ActivityItem::startedTs`/`ChatMsg::lastEventTs`): live sub_runs shimmer with elapsed time,
+terminal sub_runs no longer leave "X (done)" as the status, and the status line returns with
+the silence duration after 5 s of no streaming/running row. Tool fixes from the same run:
+`cad_doc_tools.py` remaps a constraint on an expanded polyline (fix → per segment; others get
+a segment-listing error), natural-sorts the id list, and refuses `rename` without a feature id
+with the real part-naming path; `cad_asm_tools.py` resolves relative component paths
+project-root first (listing every candidate on a miss) and accepts face/edge sids (bare,
+`{sid}`, part- or assembly-frame) in asm_mate refs. Not fixed (outside this repo or policy):
+Chudcode's "No such tool: xd://<menu tool>" should point at `enable_tools`; the eval kernel
+lacks `shapely`/`fitz`; `research_web_search` has only DDG configured (`provider_blocked`).
+

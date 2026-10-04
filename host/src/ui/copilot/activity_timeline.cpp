@@ -2611,7 +2611,7 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         } else if (a.rowKind == 16) {
             drawAdvisorCard(a, fonts);
         } else if (a.rowKind == 17) {
-            drawSubRunCard(a, fonts);
+            drawSubRunCard(a, fonts, turnRunning && a.status == "running");
         } else if (a.rowKind == 18) {
             // Plan position marker — the plan/objectives section renders HERE, where the plan
             // first arrived in the event stream, instead of pinned to the top of the turn.

@@ -505,6 +505,9 @@ TRUE-ASSEMBLY WORKFLOW
        The query is the SAME plain-word geometry query as query_geometry, resolved against
        that component's SOURCE PART, and must match exactly ONE face/edge (narrow with
        pick/near/count; the error lists candidates when it matches several).
+       A face/edge sid tag read off describe_part, query_geometry or a render tile
+       ("F2bb10f") also works: "query": "F2bb10f", "query": {"sid": "F2bb10f"}, or
+       {"component": "k1", "sid": "F2bb10f"} — part-frame or assembly-frame sids alike.
        mate types: coincident | parallel | perpendicular | tangent | concentric |
                    distance | angle | lock   (distance mm / angle deg take value=)
        align="aligned"|"anti" flips which way normals/axes point.

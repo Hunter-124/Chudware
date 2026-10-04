@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import OrderedDict
 from collections.abc import Mapping
 from typing import Any
@@ -29,6 +30,22 @@ class RpcFrameState:
         self._calls: OrderedDict[str, dict[str, str]] = OrderedDict()
         self._terminals: OrderedDict[str, None] = OrderedDict()
         self._subagents: OrderedDict[str, str] = OrderedDict()
+        self._compactions = 0
+        self._open_compaction = ""
+
+    def compaction_id(self, base: str, phase: str) -> str:
+        """Shared id for one compaction's start, progress and end frames.
+
+        Chudcode's compaction frames carry no id: ``phase`` "start" opens a new
+        compaction, "end" closes the open one (opening one if none was seen).
+        """
+        if phase == "start" or not self._open_compaction:
+            self._compactions += 1
+            self._open_compaction = f"{base}:{self._compactions}"
+        current = self._open_compaction
+        if phase == "end":
+            self._open_compaction = ""
+        return current
 
     def remember_subagent(self, subagent_id: str, parent_tool_call_id: str) -> None:
         """Bind a task sub-agent to the parent ``task`` call that spawned it."""
@@ -460,9 +477,7 @@ def _tool_progress(
         limit=_MAX_LABEL,
     )
     if not text:
-        text = (
-            "Starting " if event.endswith(("start", "started", "call")) else "Running "
-        ) + tool
+        text = "Running " + tool
     return _status(link, "tool", text, tool_name=tool, tool_call_id=call_id)
 
 
@@ -935,7 +950,97 @@ def _message_update(
     ):
         if key in data and key not in child:
             child[key] = data[key]
+    if _name(child.get("type")) == "start":
+        return _response_restarted(child, context)
     return map_rpc_frame(child, context, state)
+
+
+def _response_restarted(
+    data: Mapping[str, Any], context: Mapping[str, Any]
+) -> list[tuple[str, dict[str, Any]]]:
+    """A second ``start`` inside one assistant message: the provider request restarted.
+
+    Chudcode turns a response's first ``start`` into ``message_start``; a later one
+    means the stream was recovered (dropped/stalled connection, steer commit) and
+    the partial output was discarded. It used to surface as an "Agent · start" row
+    after minutes of silence.
+    """
+    ids = {
+        key: data[key]
+        for key in ("id", "messageId", "message_id", "runId", "run_id", "turnId", "turn_id")
+        if key in data
+    }
+    link = _link(ids, context, "response_restart")
+    row = _linked(
+        link,
+        id="response-restart:" + link["id"],
+        purpose="Model response restarted",
+        status="retry",
+        detail="The provider stream was interrupted; the request was re-sent and its "
+        "partial output discarded.",
+    )
+    return [
+        ("sub_run", row),
+        _status(link, "response_restart", "Waiting for model (response restarted)"),
+    ]
+
+
+_COMPACTION_TRIGGERS = {
+    "overflow": " (window overflowed)",
+    "idle": " (idle cleanup)",
+    "incomplete": " (recovering an incomplete reply)",
+}
+
+
+def _compaction(
+    event: str,
+    data: Mapping[str, Any],
+    context: Mapping[str, Any],
+    link: Mapping[str, Any],
+    state: RpcFrameState | None,
+) -> tuple[str, dict[str, Any]]:
+    """One ``sub_run`` per compaction, upserted from its start to its end frame.
+
+    Chudcode's compaction frames carry no shared id, and their ``reason``
+    (``threshold``) / ``action`` (``context-full``) are enum values. Until
+    2026-10-04 the feed showed a "threshold" row that never closed beside a
+    separate "context-full" row, and nothing said the agent was compacting.
+    """
+    if event.endswith(("start", "started")):
+        phase, status = "start", "running"
+    elif event.endswith(("update", "progress")):
+        phase, status = "update", "running"
+    elif event.endswith("failed") or data.get("errorMessage"):
+        phase, status = "end", "fail"
+    elif _bool(data, "aborted") is True:
+        phase, status = "end", "cancelled"
+    elif _bool(data, "skipped") is True:
+        phase, status = "end", "skipped"
+    else:
+        phase, status = "end", "done"
+    item_id = _str(data, "compactionId", "compaction_id", "id", limit=160)
+    if not item_id:
+        base = "compaction:" + (_first(data, context, "run_id", "runId") or link["node_id"])
+        item_id = state.compaction_id(base, phase) if state is not None else base
+    verb = "Auto-compacting" if event.startswith("auto_") else "Compacting"
+    if status == "running":
+        trigger = _name(data.get("reason"))
+        purpose = f"{verb} context" + _COMPACTION_TRIGGERS.get(trigger, "")
+    elif status == "done":
+        purpose = "Context compacted"
+        result = data.get("result")
+        before = _int(result, "tokensBefore", "tokens_before") if isinstance(result, Mapping) else 0
+        if before > 0:
+            purpose += f" (was {before / 1000:.1f}k tokens)"
+    else:
+        purpose = f"Context compaction {'failed' if status == 'fail' else status}"
+    if status != "running" and _bool(data, "willRetry", "will_retry") is True:
+        purpose += " \u00b7 retrying the request"
+    row = _linked(link, id=item_id, purpose=purpose, status=status)
+    error = _str(data, "errorMessage", "error", limit=_MAX_DETAIL)
+    if error:
+        row["detail"] = error
+    return "sub_run", row
 
 
 def _remember_tool_call(tool_call: Any, state: RpcFrameState | None) -> None:
@@ -1098,6 +1203,18 @@ def map_rpc_frame(
         if not text:
             return []
         return [_status(link, "notice" if event == "notice" else "progress_nudge", text)]
+    if event == "irc_message":
+        message = data.get("message")
+        body = _str(message, "content", limit=_MAX_DETAIL) if isinstance(message, Mapping) else ""
+        sender = re.search(r"from agent `([^`]{1,120})`", body)
+        row = _linked(
+            link,
+            purpose="Message from " + sender.group(1) if sender else "Agent message",
+            status="done",
+        )
+        if body:
+            row["detail"] = body
+        return [("sub_run", row)]
     if event == "agent_question":
         questions = [
             _question_payload(q)
@@ -1176,6 +1293,8 @@ def map_rpc_frame(
         "toolcall_start",
         "toolcall_delta",
         "toolcall_end",
+        # Streamed tool arguments (edit previews): the tool_execution_* lifecycle owns the row.
+        "tool_stream_update",
     }:
         return []
 
@@ -1189,10 +1308,12 @@ def map_rpc_frame(
         "session_start": ("session_start", "Session started"),
         "session_started": ("session_start", "Session started"),
         "session_created": ("session_start", "Session started"),
-        "turn_start": ("turn_start", "Turn started"),
-        "turn_started": ("turn_start", "Turn started"),
-        "message_start": ("message_start", "Message started"),
-        "message_started": ("message_start", "Message started"),
+        # The provider request is in flight from turn_start until its first delta;
+        # the chat's quiet-wait line shows this text with the elapsed silence.
+        "turn_start": ("turn_start", "Waiting for model"),
+        "turn_started": ("turn_start", "Waiting for model"),
+        "message_start": ("message_start", "Waiting for model"),
+        "message_started": ("message_start", "Waiting for model"),
         "message_end": ("message_end", "Message complete"),
         "message_completed": ("message_end", "Message complete"),
         "message_complete": ("message_end", "Message complete"),
@@ -1454,29 +1575,7 @@ def map_rpc_frame(
         "compaction_failed",
     }
     if event in compaction:
-        if event.endswith(("start", "started", "update", "progress")):
-            status = "running"
-        elif (
-            event.endswith("failed")
-            or _bool(data, "aborted") is True
-            or data.get("errorMessage")
-        ):
-            status = "fail"
-        elif _bool(data, "skipped") is True:
-            status = "skipped"
-        else:
-            status = "done"
-        work = dict(data)
-        work.setdefault(
-            "id",
-            _str(data, "compactionId", "compaction_id") or "compaction:" + link["id"],
-        )
-        work.setdefault(
-            "purpose",
-            _str(data, "message", "summary", "reason", "action", limit=240)
-            or "Compacting context",
-        )
-        return [_subrun(work, ctx, event, status, "Compacting context")]
+        return [_compaction(event, data, ctx, link, state)]
 
     retry_start = {
         "auto_retry_start",

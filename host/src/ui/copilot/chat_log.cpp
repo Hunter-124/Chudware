@@ -718,22 +718,28 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     }
 
     // (6) While running the live activity stream (timeline thoughts/tools/output) is the
-    // primary content — no fake "Saying · working..." bar. Only fall back to a minimal
-    // liveStatus line when the timeline is still empty (zero content yet), or when the run is
-    // parked on the user's answers to an ask_user card — then the line says so, instead of the
-    // stale tool phase the run last reported ("Starting write.. · 30s" read as stuck work).
+    // primary content — no fake "Saying · working..." bar. The liveStatus line appears only when
+    // the timeline is still empty, when the run is parked on the user's answers to an ask_user
+    // card, or when the run has gone QUIET: nothing streaming or running and no event for a few
+    // seconds. A provider stalled for 25 min (c245: two restarted GPT responses at 248k
+    // context) otherwise left a finished row on screen that read as a frozen app.
     if (m.running) {
+        constexpr double kQuietWaitS = 5.0;
         bool hasLiveContent = false;
+        bool rowInProgress = false;
         for (const auto& a : m.activity) {
             if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
             hasLiveContent = true;
-            break;
+            if (a.streaming || a.status == "running") rowInProgress = true;
         }
         if (!hasLiveContent && !m.text.empty()) hasLiveContent = true;
         const bool waitingOnUser =
             std::any_of(m.asks.begin(), m.asks.end(),
                         [](const AskBatch& b) { return b.status == AskStatus::Pending; });
-        if (!hasLiveContent || waitingOnUser) {
+        const double now = chatNowEpoch();
+        const bool quiet = hasLiveContent && !rowInProgress && m.lastEventTs > 0.0 &&
+                           now - m.lastEventTs >= kQuietWaitS;
+        if (!hasLiveContent || waitingOnUser || quiet) {
             ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
             const ui::AdaptiveSurface& surf = chatSurf();
             std::string say = waitingOnUser ? std::string("Waiting for your answers")
@@ -745,8 +751,10 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             // The silent window is the one place with NO streamed content, so a static label
             // makes a slow provider and a hung app look identical: the label carries a light
             // sweep while the agent works and, once the wait is long enough to worry about, an
-            // elapsed readout. Waiting on the USER is not work — that line stays still.
-            const double elapsed = (m.ts > 0.0) ? (chatNowEpoch() - m.ts) : 0.0;
+            // elapsed readout — since the turn began, or since the last event once the timeline
+            // has content. Waiting on the USER is not work — that line stays still.
+            const double since = quiet ? m.lastEventTs : m.ts;
+            const double elapsed = (since > 0.0) ? (now - since) : 0.0;
             if (!waitingOnUser) say += "\xe2\x80\xa6";
             if (elapsed >= 3.0) say += "  \xc2\xb7  " + ui::kit::fmtDuration(elapsed);
             ImGui::Indent(chatProseInsetX());

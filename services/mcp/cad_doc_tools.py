@@ -722,8 +722,29 @@ def _constraint_dialect_keys(c: dict) -> bool:
     return False
 
 
+def _natural_key(s: Any) -> tuple:
+    """e2 < e10: an id roster listed lexicographically (e10, e11, e2…) reads as scrambled."""
+    m = re.fullmatch(r"(.*?)(\d+)", s) if isinstance(s, str) else None
+    return (m.group(1), int(m.group(2))) if m else (str(s), -1)
+
+
+def _id_assignment_note(renamed: Optional[dict], expanded: Optional[dict]) -> str:
+    """How this sketch's entity ids were actually assigned, for a dangling-ref refusal."""
+    parts = ["an e<N> id you gave is kept; any other id takes the next free e<N> "
+             "in list order"]
+    moved = sorted(((k, v) for k, v in (renamed or {}).items() if k != v),
+                   key=lambda kv: _natural_key(kv[1]))
+    if moved:
+        parts.append(", ".join(f'your "{k}" is {v}' for k, v in moved))
+    for pid, segs in (expanded or {}).items():
+        span = segs[0] if len(segs) == 1 else f"{segs[0]}..{segs[-1]}"
+        parts.append(f'polyline "{pid}" became lines {span}')
+    return "; ".join(parts)
+
+
 def _normalize_one_constraint(c: dict, remap, etypes: Optional[dict], label: str,
-                              rewrites: set) -> dict:
+                              rewrites: set, expanded: Optional[dict] = None,
+                              renamed: Optional[dict] = None) -> dict:
     """One relation/dimension -> the engine's canonical constraint object.
 
     `remap` rewrites an AUTHORED entity id onto the e<N> the entity pass minted; `etypes`
@@ -732,6 +753,9 @@ def _normalize_one_constraint(c: dict, remap, etypes: Optional[dict], label: str
     Rewrites are accumulated in `rewrites` so a 30-constraint sketch emits one note per
     KIND of rewrite, not one per constraint.
     Raises ValueError for a ref that names nothing — a dangling relation is never dropped.
+    `expanded` maps an expanded polyline's authored id -> its segment ids: a ref to it is
+    not dangling (the caller fans a `fix` out or teaches), and it and `renamed` (authored
+    id -> assigned e<N>) let the refusal state the id assignment that actually happened.
     """
     # etypes=None means "the entity roster is not in hand" — the standalone
     # sketch_add_constraint op names a sketch that is already in the document, so the
@@ -839,7 +863,7 @@ def _normalize_one_constraint(c: dict, remap, etypes: Optional[dict], label: str
     # then solves without the relation the model believes it placed. The engine does reject
     # it, but names no alternative («'e99' is not a valid handle»), so teach here where the
     # id roster is in hand.
-    known = sorted(etypes)
+    known = sorted(etypes, key=_natural_key)
     for h in (nc.get("refs") or []):
         if not isinstance(h, str):
             raise ValueError(
@@ -850,7 +874,7 @@ def _normalize_one_constraint(c: dict, remap, etypes: Optional[dict], label: str
         if not roster_known:
             continue
         base = h.partition(".")[0]
-        if base in ("origin",) or base in etypes:
+        if base in ("origin",) or base in etypes or base in (expanded or {}):
             continue
         hint = ""
         if _BATCH_REF_RE.match(base):
@@ -860,7 +884,7 @@ def _normalize_one_constraint(c: dict, remap, etypes: Optional[dict], label: str
             f'{label}: constraint "{ctype or raw_type}" references entity "{base}", which '
             f"this sketch does not contain. Its entity ids are "
             f'{", ".join(known) if known else "(none — params.entities is empty)"} '
-            f"(they are renumbered e1..eN in the order you listed them).{hint}")
+            f"({_id_assignment_note(renamed, expanded)}).{hint}")
 
     # ---- generic "put a dimension here" -------------------------------------
     if generic:
@@ -1275,6 +1299,7 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
     reserved_eids = {e["id"] for e in ents_in if isinstance(e, dict)
                      and isinstance(e.get("id"), str) and _EID_RE.fullmatch(e["id"])}
     expanded_ids: dict[str, list[str]] = {}
+    expanded_segs: dict[str, list[dict]] = {}
     # Flat shorthand a model writes instead of the engine's canonical entity fields
     # (cx/cy for center, r/d/dia/diameter for radius, x1/y1/x2/y2 for a line's
     # endpoints, x/y for a lone point) — tracked here so a 29-circle lattice sketch
@@ -1295,13 +1320,19 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             start = max([eid] + [int(x[1:]) for x in reserved_eids])
             seg = _expand_polyline(e, start)
             if seg:
-                if isinstance(e.get("id"), str) and e["id"]:
-                    expanded_ids[e["id"]] = [x["id"] for x in seg]
+                pid = e.get("id")
+                if isinstance(pid, str) and pid:
+                    if pid in id_map or pid in expanded_ids:
+                        raise ValueError(f'sketch "{_feat_label(feat, "sketch")}": '
+                                         f"duplicate entity id {pid!r}")
+                    expanded_ids[pid] = [x["id"] for x in seg]
+                    expanded_segs[pid] = seg
                 eid = start + len(seg)
                 norm_ents.extend(seg)
+                span = seg[0]["id"] if len(seg) == 1 else f'{seg[0]["id"]}..{seg[-1]["id"]}'
                 sink.append(
                     f'{_feat_label(feat, "sketch")}: expanded the polyline into '
-                    f"{len(seg)} line entities — a sketch entity is one segment "
+                    f"{len(seg)} line entities ({span}) — a sketch entity is one segment "
                     f"(line/arc/circle/spline), so a profile is a list of them")
                 continue
             # < 2 distinct points, or a point that is not [x,y]: nothing unambiguous to
@@ -1316,7 +1347,7 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             new_id = f"e{eid}"
             reserved_eids.add(new_id)
         if isinstance(raw_id, str) and raw_id:
-            if raw_id in id_map:
+            if raw_id in id_map or raw_id in expanded_ids:
                 raise ValueError(f'sketch "{_feat_label(feat, "sketch")}": duplicate entity id {raw_id!r}')
             id_map[raw_id] = new_id
         ne = dict(e)
@@ -1495,16 +1526,30 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             continue
         nc = _normalize_one_constraint(c, _remap, etypes,
                                        f'sketch "{_feat_label(feat, "sketch")}"',
-                                       con_rewrites)
+                                       con_rewrites, expanded_ids, id_map)
         copies = [nc]
         for ref in nc.get("refs", []):
-            if isinstance(ref, str) and ref.partition(".")[0] in expanded_ids:
-                if nc.get("type") != "fix" or "." in ref or len(nc["refs"]) != 1:
-                    raise ValueError(
-                        f"constraint on expanded polyline {ref!r} is ambiguous; name "
-                        "the emitted line entity/endpoint, or fix the whole polyline")
-                copies = [{**nc, "refs": [eid]} for eid in expanded_ids[ref]]
-                break
+            pid = ref.partition(".")[0] if isinstance(ref, str) else None
+            if pid not in expanded_ids:
+                continue
+            ctype = nc.get("type")
+            if ctype != "fix" or "." in ref or len(nc["refs"]) != 1:
+                which = ", ".join(f'{s["id"]} {s["p1"]}->{s["p2"]}'
+                                  for s in expanded_segs[pid])
+                raise ValueError(
+                    f'sketch "{_feat_label(feat, "sketch")}": constraint "{ctype}" '
+                    f'references {ref!r}, but polyline "{pid}" was expanded into '
+                    f"{len(expanded_ids[pid])} line entities, segment by segment in point "
+                    f"order: {which}. A \"fix\" whose only ref is the whole polyline pins "
+                    f"every segment; any other relation must name the segment (or its "
+                    f'endpoint, e.g. "{expanded_ids[pid][0]}.p1") it means.')
+            copies = [{**nc, "refs": [sid]} for sid in expanded_ids[pid]]
+            ids = expanded_ids[pid]
+            sink.append(
+                f'{_feat_label(feat, "sketch")}: "fix" on polyline "{pid}" -> one "fix" '
+                f"per expanded segment ({ids[0]}..{ids[-1]}), which pins the whole "
+                f"polyline")
+            break
         for index, nc in enumerate(copies):
             cid = nc.get("id")
             if index or not (isinstance(cid, str) and _CID_RE.fullmatch(cid)):
@@ -3577,6 +3622,18 @@ def _normalize_op_target(op: dict, kind: str, notes: list) -> dict:
             notes.append(f'{kind}: interpreted {alias}="{v}" as id="{v}" '
                          f"— the op addresses its feature with `id`")
             return out
+    if kind == "rename":
+        # {"op":"rename","name":"aa_battery_cassette"} with no target is a model naming the
+        # PART (live c245 batch head); session.cpp only answers «rename: no feature».
+        raise ValueError(
+            f'rename renames a FEATURE by id: {{"op":"rename","id":"f1","name":'
+            f'"{op.get("name") or "NewName"}"}} (feature ids come from get_part(summary=true) '
+            f"or an earlier add_features reply). "
+            f"This one names no feature, so nothing was applied. add_features has no op "
+            f"that renames the open part/document: its name is set when it is created — "
+            f'new_part(name="…"), or a leading {{"op":"new_part","name":"…"}} in a batch '
+            f'that has no doc yet — and save_part(path="<name>.step+") writes the file '
+            f"under the name you want.")
     return op
 
 

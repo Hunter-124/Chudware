@@ -2348,7 +2348,7 @@ void drawAdvisorCard(ActivityItem& a, const ui::Fonts& fonts) {
     chatCopyContext(cardRect, "##advisor_copy", copyTxt);
 }
 
-void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts) {
+void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts, bool live) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -2365,11 +2365,23 @@ void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts) {
         statusCol = semanticOnGlass(pal.statusOk, surf);
     else if (a.status == "fail" || a.status == "error")
         statusCol = semanticOnGlass(pal.statusErr, surf);
+    else if (a.status == "retry")
+        statusCol = semanticOnGlass(pal.statusWarn, surf);
 
+    const std::string title = a.title.empty() ? std::string("Sub-run") : a.title;
     ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(statusCol, "%s", a.title.empty() ? "Sub-run" : a.title.c_str());
+    if (live) {
+        // Live work that emits nothing while it runs (a compaction summary takes minutes):
+        // motion plus elapsed time is what tells it apart from a hung app.
+        std::string say = title + "\xe2\x80\xa6";
+        const double elapsed = a.startedTs > 0.0 ? chatNowEpoch() - a.startedTs : 0.0;
+        if (elapsed >= 3.0) say += "  \xc2\xb7  " + ui::kit::fmtDuration(elapsed);
+        chatShimmerText(say.c_str(), surf.textTertiary, statusCol, ui::anim::kBreathe);
+    } else {
+        ImGui::TextColored(statusCol, "%s", title.c_str());
+    }
     ImGui::PopFont();
-    if (!a.reason.empty()) {
+    if (!live && !a.reason.empty()) {
         ImGui::SameLine(0, 8 * sc);
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
         ImGui::TextUnformatted(a.reason.c_str());

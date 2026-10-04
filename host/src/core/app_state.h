@@ -687,6 +687,9 @@ struct ActivityItem {
                             // (and auto-collapsed) by the matching completed agent.thought
     bool userToggled = false; // rowKind 2: user clicked the thought/output header; suppresses
                               // one-shot auto-collapse when the stream completes
+    double startedTs = 0.0;   // GUI-only, not persisted: epoch s this row last entered
+                              // "running" — the live elapsed readout on long sub-runs
+                              // (context compaction, sub-agents)
 };
 
 // Wall-clock epoch seconds (UTC) — stamps ChatMsg send/receive times at construction.
@@ -714,6 +717,8 @@ struct ChatMsg {
     std::string errorFull;
     bool errFullOpen = false;      // user expanded the raw-detail box on this card
     std::string liveStatus;        // transient "Iteration N: building..." while running
+    double lastEventTs = 0.0;      // GUI-only, not persisted: epoch s the run's latest feed event
+                                   // landed — drives the "Waiting for model · 12m" quiet line
     PlanInfo plan;                 // the build plan drafted before the code (plan mode)
     PlanState planState;           // multi-shape Plan/Objectives section (plan_state + normalizers)
     std::vector<ActivityItem> activity;  // transparent "what the AI is doing" timeline (orchestrator)

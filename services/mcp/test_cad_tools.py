@@ -3433,6 +3433,104 @@ def test_asm_mate_operand_shapes(tmp_path):
     _call("close_part", {"doc_id": plate})
 
 
+def test_asm_add_component_relative_path_is_project_root_relative(tmp_path, monkeypatch):
+    """Live c245: with the assembly saved in `<project>/assemblies/`, asm_add_component(
+    path="parts/x.step+") resolved only against the assembly folder and failed "no such
+    file" beside the part save_part had just written. Relative paths are project-root
+    relative like every other project tool; a miss lists every candidate tried."""
+    project = tmp_path / "plane"
+    (project / "parts").mkdir(parents=True)
+    (project / "assemblies").mkdir()
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(project))
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    elsewhere = tmp_path / "worker"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    r, _ = _call("new_part", {"name": "rp_frame"})
+    part = r["doc_id"]
+    _call("add_features", {"doc_id": part, "ops": [
+        cb.feat("box", "Frame", {"length": cb.dim(20), "width": cb.dim(10),
+                                 "height": cb.dim(5)})]})
+    part_path = project / "parts" / "rp_frame.step+"
+    assert _call("save_part", {"doc_id": part, "path": str(part_path)})[0]["ok"]
+    asm = _call("new_assembly", {"name": "rp_asm"})[0]["doc_id"]
+    cb.call("doc_save", {"doc_id": asm, "path": str(project / "assemblies" / "rp_asm.step+")})
+    try:
+        r, _ = _call("asm_add_component", {"doc_id": asm, "path": "parts/rp_frame.step+",
+                                           "name": "frame", "at": [0, 0, -16.3]})
+        assert r["ok"], r
+        sources = [(c.get("source") or {}).get("path")
+                   for c in cb.call("doc_tree", {"doc_id": asm})["tree"]["components"]]
+        assert sources == [str(part_path)], sources
+
+        r, _ = _call("asm_add_component", {"doc_id": asm, "path": "parts/missing.step+"})
+        assert r["ok"] is False, r
+        assert str(project / "parts" / "missing.step+") in r["tried"], r
+        assert str(project / "assemblies" / "parts" / "missing.step+") in r["tried"], r
+    finally:
+        cb.call("doc_close", {"doc_id": asm})
+        _call("close_part", {"doc_id": part})
+
+
+def test_asm_mate_accepts_face_sids(tmp_path):
+    """Live c245: asm_mate(a={"component":"k1","query":"F2bb10f"}) failed "geom query: bad
+    'side' 'F2bb10f'" — a bare string query was shipped to the engine as a side word. The
+    sids describe_part/query_geometry/render tiles hand out name ONE face: from the
+    component's source part, or off the assembly's posed instance."""
+    r, _ = _call("new_part", {"name": "sid_plate"})
+    plate = r["doc_id"]
+    _call("add_features", {"doc_id": plate, "ops": [
+        cb.feat("box", "Plate", {"length": cb.dim(60), "width": cb.dim(40),
+                                 "height": cb.dim(10)}),
+        cb.feat("hole", "Bore", {"style": "simple", "end": "through_all",
+                                 "diameter": cb.dim(8), "positions": [[15, 5]]},
+                {"face": {"of": "face", "side": "top"}})]})
+    plate_path = str(tmp_path / "sid_plate.step+")
+    assert _call("save_part", {"doc_id": plate, "path": plate_path})[0]["ok"]
+    r, _ = _call("new_part", {"name": "sid_pin"})
+    pin = r["doc_id"]
+    _call("add_features", {"doc_id": pin, "ops": [
+        cb.feat("cylinder", "Pin", {"radius": cb.dim(4), "height": cb.dim(20)})]})
+    pin_path = str(tmp_path / "sid_pin.step+")
+    assert _call("save_part", {"doc_id": pin, "path": pin_path})[0]["ok"]
+
+    round_face = {"of": "face", "surf": "round"}
+    bore = cb.call("doc_query", {"doc_id": plate, "query": round_face})["matches"]
+    shank = cb.call("doc_query", {"doc_id": pin, "query": round_face})["matches"]
+    assert len(bore) == 1 and len(shank) == 1, (bore, shank)
+
+    asm = _call("new_assembly", {"name": "sid_asm"})[0]["doc_id"]
+    try:
+        _call("asm_add_component", {"doc_id": asm, "path": plate_path, "fixed": True})
+        _call("asm_add_component", {"doc_id": asm, "path": pin_path, "at": [15, 5, 30]})
+        # Part-frame sids: bare string and the {"sid": …} query form.
+        r, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric", "solve": False,
+                                  "a": {"component": "k1", "query": bore[0]["sid"]},
+                                  "b": {"component": "k2", "query": {"sid": shank[0]["sid"]}}})
+        assert r["ok"] and r["mate"], r
+
+        # Assembly-frame sid of the posed pin (stable_sid hashes the WORLD centroid).
+        posed = [m for m in cb.call("doc_query", {"doc_id": asm, "query": round_face})["matches"]
+                 if m["centroid"][2] > 20]
+        assert len(posed) == 1 and posed[0]["sid"] != shank[0]["sid"], posed
+        r, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric", "solve": False,
+                                  "a": {"component": "k1", "query": bore[0]["sid"]},
+                                  "b": {"component": "k2", "sid": posed[0]["sid"]}})
+        assert r["ok"] and r["mate"], r
+
+        # The pin's sid is not a face of the plate: a miss teaches, never the side parser.
+        r, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric", "solve": False,
+                                  "a": {"component": "k1", "query": posed[0]["sid"]},
+                                  "b": {"component": "k2", "query": round_face}})
+        assert r["ok"] is False and "carries sid" in r["error"], r
+        assert "bad 'side'" not in r["error"], r
+    finally:
+        _call("close_part", {"doc_id": asm})
+        _call("close_part", {"doc_id": pin})
+        _call("close_part", {"doc_id": plate})
+
+
+
 def test_simulate_motion_mate_id_placeholder(tmp_path):
     """Class-2 selector-shape gap: simulate_motion's mate_id="" / "none" / "null" must read
     the same as omitting it (auto-pick), not fail a literal lookup for a mate named that."""

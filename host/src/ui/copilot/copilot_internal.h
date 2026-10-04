@@ -321,7 +321,8 @@ void drawFirmAwardCard(const ActivityItem& a, const ui::Fonts& fonts);
 void drawFirmTeamCard(const ActivityItem& a, const ui::Fonts& fonts);
 void drawFirmCommCard(ActivityItem& a, const ui::Fonts& fonts);
 void drawAdvisorCard(ActivityItem& a, const ui::Fonts& fonts);
-void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts);
+// `live`: the row is running inside a running turn — shimmer + elapsed instead of a static title.
+void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts, bool live);
 
 // ---- AI-VC (agent version control) state + cards (cards) ----
 struct AiVcCheckpoint {

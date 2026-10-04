@@ -317,6 +317,62 @@ class ChudcodeEventMapperTests(unittest.TestCase):
         self.assertEqual((kind, fallback["status"]), ("sub_run", "done"))
         self.assertIn("m2", fallback["purpose"])
 
+    def test_unkeyed_compaction_frames_pair_into_one_row_per_compaction(self):
+        """Chudcode's real frames carry no id; the end must close its start row."""
+        state = RpcFrameState()
+
+        def mapped(frame):
+            [(kind, row)] = map_rpc_frame(frame, CTX, state)
+            self.assertEqual(kind, "sub_run")
+            return row
+
+        start = mapped(
+            {"type": "auto_compaction_start", "reason": "threshold", "action": "context-full"}
+        )
+        end = mapped(
+            {
+                "type": "auto_compaction_end",
+                "action": "context-full",
+                "result": {"summary": "s", "tokensBefore": 274850},
+                "aborted": False,
+                "willRetry": False,
+            }
+        )
+        self.assertEqual((start["status"], end["status"]), ("running", "done"))
+        self.assertEqual(start["id"], end["id"])
+        self.assertIn("compacting", start["purpose"].lower())
+        second = mapped(
+            {"type": "auto_compaction_start", "reason": "overflow", "action": "context-full"}
+        )
+        failed = mapped(
+            {
+                "type": "auto_compaction_end",
+                "action": "context-full",
+                "result": None,
+                "aborted": False,
+                "willRetry": False,
+                "errorMessage": "summary request failed",
+            }
+        )
+        self.assertNotEqual(second["id"], start["id"])
+        self.assertEqual((second["id"], failed["status"]), (failed["id"], "fail"))
+        self.assertEqual(failed["detail"], "summary request failed")
+
+    def test_restarted_response_is_named_not_an_unknown_agent_row(self):
+        """A second assistant ``start`` is a provider-stream restart, not a mystery row."""
+        out = map_rpc_frame(
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "start", "partial": {"content": []}},
+                "message": {"role": "assistant"},
+            },
+            CTX,
+            RpcFrameState(),
+        )
+        self.assertEqual([kind for kind, _ in out], ["sub_run", "status"])
+        self.assertEqual(out[0][1]["status"], "retry")
+        self.assertNotIn("Agent \u00b7", out[0][1]["purpose"])
+
     def test_subagent_lineage_spawn_progress_generic_notification_and_end(self):
         kind, spawn = one(
             {

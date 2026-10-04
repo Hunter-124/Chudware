@@ -665,6 +665,7 @@ void markChatHistoryDirty() {
 
 void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json& data) {
     ui::ChatRawActivityCapture rawCapture(m);
+    m.lastEventTs = chatNowEpoch();
     // Plan-section position marker (rowKind 18): the plan/objectives section renders at the
     // point in the timeline where the plan FIRST arrived, not pinned to the top of the turn.
     // Without this a late plan used to pop in ABOVE thinking blocks the user had already read,
@@ -2215,6 +2216,13 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
                 if (it->rowKind == 17 && it->stage == key) { existing = &*it; break; }
         }
+        const std::string norm = (stt == "done" || stt == "pass") ? "done"
+                               : (stt == "fail" || stt == "failed" || stt == "error") ? "fail"
+                               : (stt == "running" || stt == "started") ? "running"
+                               : stt;
+        // The status line names live work only. A terminal sub-run used to leave
+        // "Agent · start (done)" behind as the run's status for the rest of a silent wait.
+        std::string closedLive;
         if (!existing) {
             ActivityItem ni;
             ni.rowKind = 17;
@@ -2227,13 +2235,14 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             } else {
                 ni.reason = stt;
             }
-            ni.status = (stt == "done" || stt == "pass") ? "done"
-                      : (stt == "fail" || stt == "failed" || stt == "error") ? "fail"
-                      : (stt == "running" || stt == "started") ? "running"
-                      : stt;
+            ni.status = norm;
+            if (norm == "running") ni.startedTs = chatNowEpoch();
             ni.detail = purpose;
             m.activity.push_back(std::move(ni));
         } else {
+            if (existing->status == "running" && norm != "running") closedLive = existing->title;
+            if (existing->status != "running" && norm == "running")
+                existing->startedTs = chatNowEpoch();
             if (!purpose.empty()) existing->title = purpose;
             if (!parent.empty()) {
                 existing->reason = parent;
@@ -2241,13 +2250,11 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             } else if (!stt.empty()) {
                 existing->reason = stt;
             }
-            existing->status = (stt == "done" || stt == "pass") ? "done"
-                             : (stt == "fail" || stt == "failed" || stt == "error") ? "fail"
-                             : (stt == "running" || stt == "started") ? "running"
-                             : stt;
+            existing->status = norm;
         }
-        if (m.running && !purpose.empty()) {
-            m.liveStatus = purpose + (stt.empty() ? std::string() : (" (" + stt + ")"));
+        if (m.running) {
+            if (norm == "running" && !purpose.empty()) m.liveStatus = purpose;
+            else if (!closedLive.empty() && m.liveStatus == closedLive) m.liveStatus = "Working";
         }
     } else if (kind == "agent.context") {
         separateLiveStreamThoughtParagraph(m);

@@ -352,6 +352,20 @@ runtime's doctor command.
   Never drop genuinely unknown frames or guess a stronger semantic event.
 - Provider usage maps to both `agent.provider_usage` and `agent.context`; todos, retry,
   compaction, fallback, spawn/subagent, and terminal events retain their existing feed shapes.
+- **Compaction and silent waits are visible (2026-10-04).** Chudcode's
+  `auto_compaction_start`/`_end` carry no shared id and only enum `reason`/`action`
+  values; `_compaction` pairs them through `RpcFrameState.compaction_id` into ONE upserted
+  `sub_run` ("Auto-compacting context" → "Context compacted (was 274.9k tokens)" / failed /
+  cancelled / skipped). Before, c245 showed a never-closing "threshold" row beside a
+  "context-full" row. Speculative compaction runs in the background with no frame and its
+  apply is instant, so it needs no row. A `message_update` whose assistant event is `start`
+  is a provider-stream RESTART (the first `start` is `message_start`; Codex re-sends after a
+  stalled/dropped stream): it maps to a "Model response restarted" `retry` row, never
+  `_unknown`'s "Agent · start". `turn_start`/`message_start` status text is "Waiting for
+  model". GUI: a running `sub_run` in a running turn shimmers with elapsed time
+  (`drawSubRunCard(live)`), and `chat_log.cpp` shows the liveStatus line with the silence
+  duration once nothing streams/runs for 5 s (`ChatMsg.lastEventTs`, GUI-only) — c245
+  sat 25 min on a finished row while GPT-6.1 restarted twice at 248k context.
 - **The context meter (`agent.context`) speaks the frozen `{used, window, window_source}`
   contract (`host/src/app.cpp` reads nothing else).** Chudcode 0.3.0 emits no usage frame:
   usage exists only on the assistant `message_end` envelope, mapped to `used` with

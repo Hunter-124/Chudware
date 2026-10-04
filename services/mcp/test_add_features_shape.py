@@ -1156,6 +1156,67 @@ def test_the_live_mudbucket_batch_normalizes_end_to_end():
     assert boolean["params"] == {"op": "fuse", "a": "body", "b": "drain_boss"}
 
 
+# Live c245 (GPT-6.1-Sol): one closed polyline "e1" pinned by {"type":"fix","refs":["e1"]}.
+# The expansion consumed "e1" and the dangling-ref check then refused the model's own valid
+# reference, so the fan-out meant for exactly this case never ran.
+_C245_POINTS = [[-16, 0], [16, 0], [16, 2.4], [8.5, 2.4], [8.5, 6], [4, 6], [4, 2.4],
+                [-4, 2.4], [-4, 6], [-8.5, 6], [-8.5, 2.4], [-16, 2.4]]
+
+
+def _c245_sketch(constraints):
+    return {"op": "add_feature", "feature": {
+        "type": "sketch", "name": "cassette_profile", "refs": {"plane": "plane.front"},
+        "params": {"entities": [{"id": "e1", "closed": True, "construction": False,
+                                 "type": "polyline", "points": _C245_POINTS}],
+                   "constraints": constraints}}}
+
+
+def test_live_c245_fix_on_a_polyline_pins_every_expanded_segment():
+    notes: list = []
+    ops = [_c245_sketch([{"id": "c1", "refs": ["e1"], "type": "fix"}]),
+           {"op": "add_feature", "feature": {
+               "type": "extrude", "name": "cassette_body",
+               "refs": {"profile": {"kind": "region", "sketch": "$0", "centroid": [0, 1]}},
+               "params": {"mode": "boss", "distance": 10}}}]
+    ops = M._normalize_op_elements(ops, notes)
+    ops = M._normalize_feature_types(ops, notes)
+    ops = M._normalize_sketch_ops(ops, notes)
+    ops = M._normalize_feature_ops(ops, notes)
+    sketch, extrude = (o["feature"] for o in ops)
+    ents = sketch["params"]["entities"]
+    seg_ids = [e["id"] for e in ents]
+    assert len(ents) == 12 and all(e["type"] == "line" for e in ents)
+    cons = sketch["params"]["constraints"]
+    assert [c["type"] for c in cons] == ["fix"] * 12
+    assert [c["refs"] for c in cons] == [[i] for i in seg_ids]
+    assert len({c["id"] for c in cons}) == 12
+    assert [p["sketch"] for p in extrude["refs"]["profile"]] == ["$0"]
+    assert any('"fix" on polyline "e1"' in n for n in notes)
+
+
+def test_a_non_fix_relation_on_a_whole_polyline_teaches_the_segment_ids():
+    with pytest.raises(ValueError) as ei:
+        _sketch_ops(_c245_sketch([{"id": "c1", "refs": ["e1"], "type": "horizontal"}]))
+    msg = str(ei.value)
+    assert "e2 [-16, 0]->[16, 0]" in msg and "e13 [-16, 2.4]->[-16, 0]" in msg
+
+
+def test_a_dangling_ref_lists_entity_ids_in_numeric_order():
+    with pytest.raises(ValueError) as ei:
+        _sketch_ops(_c245_sketch([{"id": "c1", "refs": ["e99"], "type": "fix"}]))
+    msg = str(ei.value)
+    assert "e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12, e13" in msg
+    assert 'polyline "e1" became lines e2..e13' in msg
+
+
+def test_rename_without_a_feature_id_is_refused_before_the_engine():
+    with pytest.raises(ValueError) as ei:
+        M._normalize_op_elements([{"op": "rename", "name": "aa_battery_cassette"}], [])
+    assert "new_part" in str(ei.value)
+    op = {"op": "rename", "id": "f1", "name": "Base"}
+    assert M._normalize_op_elements([op], []) == [op]
+
+
 @enginetest
 def test_live_mudbucket_polyline_revolve_boolean_batch_builds():
     """The VERBATIM shapes of both rejected calls in run-13918288087065 (kimi-k3, "make me

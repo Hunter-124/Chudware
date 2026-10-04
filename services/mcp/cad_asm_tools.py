@@ -19,6 +19,9 @@ from .cad_common import (
     _docs_in_version_series,
     _dumps,
     _err,
+    _QVOCAB_HELP,
+    _SID_RE,
+    _as_face_query,
     _is_empty_slot_word,
     _merge_face_sets,
     _normalize_optional_slot,
@@ -29,6 +32,7 @@ from .cad_common import (
     _resolve_one_selector,
     _resolve_material,
     _resumable_docs,
+    _sid_match,
     _strip_version_suffix,
     _tmp,
     _version_series_base,
@@ -98,21 +102,64 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
 
 
 
-    def _component_source_path(path: str, asm_doc: Optional[str]) -> str:
-        """Absolute path of a component's source file.
+    def _assembly_dir(asm_doc: Optional[str]) -> Optional[str]:
+        """Folder of the assembly's saved file, or None for an unsaved assembly."""
+        if not asm_doc:
+            return None
+        asm_path = next((e.get("path") for e in (cb.call("doc_list", {}) or {})
+                         .get("docs", []) if isinstance(e, dict)
+                         and e.get("doc_id") == asm_doc), None)
+        if isinstance(asm_path, str) and asm_path:
+            return os.path.dirname(asm_path)
+        return None
 
-        A relative component source is stored relative to the ASSEMBLY file's folder
-        (`Parts/…`, `../Frame/…`) — the engine's compile_assembly resolves it that way. It
+
+
+    def _component_source_path(path: str, asm_doc: Optional[str]) -> str:
+        """Absolute path of a component source STORED in the assembly document.
+
+        A relative stored source is relative to the ASSEMBLY file's folder (`Parts/…`,
+        `../Frame/…`) — the engine's compile_assembly resolves it that way. It
         was resolved against the worker's cwd here, so asm_mate on a saved assembly failed
         with "no such file" for every relative component (2026-09-24)."""
         p = path
-        if not os.path.isabs(p) and asm_doc:
-            asm_path = next((e.get("path") for e in (cb.call("doc_list", {}) or {})
-                             .get("docs", []) if isinstance(e, dict)
-                             and e.get("doc_id") == asm_doc), None)
-            if isinstance(asm_path, str) and asm_path:
-                p = os.path.join(os.path.dirname(asm_path), p)
+        if not os.path.isabs(p):
+            asm_dir = _assembly_dir(asm_doc)
+            if asm_dir:
+                p = os.path.join(asm_dir, p)
         return os.path.abspath(p)
+
+
+
+    def _input_component_candidates(path: str, asm_doc: Optional[str]) -> list:
+        """Every absolute path a caller-typed asm_add_component `path` may mean, in order.
+
+        A relative path the MODEL types is project-root relative, exactly as fs_*, save_part
+        and plm_* read it (CHUDWARE_PROJECT_DIR -> CHUDWARE_FS_ROOT, each through
+        project_context.resolve_project_root). Live c245: with the assembly in
+        `<project>/assemblies/`, `parts/servo_receiver_frame.step+` resolved only against
+        the assembly folder and failed "no such file" beside the file save_part had just
+        written. The assembly folder (the STORED-source convention) and the worker cwd stay
+        as later candidates."""
+        p = os.path.expanduser(str(path))
+        if os.path.isabs(p):
+            return [os.path.abspath(p)]
+        from services.agent.project_context import resolve_project_root
+        bases: list = []
+        for key in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT"):
+            start = os.environ.get(key, "").strip()
+            if start:
+                bases += [str(resolve_project_root(start)), os.path.abspath(start)]
+        asm_dir = _assembly_dir(asm_doc)
+        if asm_dir:
+            bases.append(asm_dir)
+        bases.append(os.getcwd())
+        out: list = []
+        for base in bases:
+            cand = os.path.abspath(os.path.join(base, p))
+            if cand not in out:
+                out.append(cand)
+        return out
 
 
 
@@ -130,6 +177,40 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         d = r.get("doc_id")
         _ASM_QUERY_DOCS[p] = d
         return d
+
+
+    def _component_sid_match(part_doc: str, asm_doc: str, comp: dict,
+                              sid: str) -> Optional[dict]:
+        """The component-part match a stable sid names, or None.
+
+        The sid is looked up with cad_common's _sid_match (the lookup query_geometry/hover
+        use) in the component's SOURCE part first. stable_sid hashes the
+        WORLD centroid (core/doc/selectors.cpp), so a sid read off this assembly — its
+        render tiles, query_geometry on the assembly — names the POSED instance instead:
+        that match is mapped back through the component's transform onto the one part face/
+        edge of the same kind+surf at that local centroid. A sid on a different component
+        maps to nothing there and stays a miss."""
+        m = _sid_match(part_doc, sid)
+        if m is not None:
+            return m
+        world = _sid_match(asm_doc, sid)
+        if world is None or world.get("centroid") is None:
+            return None
+        import numpy as np
+        try:
+            inverse = np.linalg.inv(np.asarray(comp.get("transform"), dtype=float)
+                                    .reshape(4, 4))
+        except (TypeError, ValueError, np.linalg.LinAlgError):
+            return None
+        local = inverse[:3, :3] @ np.asarray(world["centroid"], dtype=float) + inverse[:3, 3]
+        kind = world.get("kind") or "face"
+        rows = (cb.call("doc_query", {"doc_id": part_doc, "query": {"of": kind}})
+                .get("matches") or [])
+        hits = [r for r in rows if isinstance(r, dict) and r.get("surf") == world.get("surf")
+                and r.get("centroid") is not None
+                and float(np.linalg.norm(np.asarray(r["centroid"], dtype=float) - local)) < 1e-3]
+        return hits[0] if len(hits) == 1 else None
+
 
 
 
@@ -231,6 +312,8 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         """Insert a saved part file into the current assembly as a component.
 
         path  : the part file to place (.step+ preferred — editable; plain STEP accepted).
+                A relative path is PROJECT-ROOT relative (like fs_*/save_part), e.g.
+                "parts/bracket.step+", wherever the assembly file itself lives.
         name  : component display name (default: the file stem).
         fixed : ground this component (default: the FIRST component is fixed, later ones free).
         at    : optional [x,y,z] mm translation — a STARTING POSE for the mate solver, or a
@@ -259,9 +342,15 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            p = _component_source_path(path, d)
-            if not os.path.exists(p):
-                return _dumps({"ok": False, "error": f"no such file: {p}"})
+            candidates = _input_component_candidates(path, d)
+            p = next((c for c in candidates if os.path.exists(c)), None)
+            if p is None:
+                return _dumps({"ok": False,
+                               "error": f"no such file: {path!r} (tried: "
+                                        f"{', '.join(candidates)}). A relative path is "
+                                        "project-root relative; pass the path save_part "
+                                        "reported, or an absolute path.",
+                               "tried": candidates})
             op: dict = {"op": "asm_insert_component", "source": {"path": p}}
             if name:
                 op["name"] = name
@@ -329,8 +418,9 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         if isinstance(v, dict):
             if "component" not in v and v.get("kind") in ("component", "part") and v.get("id"):
                 out = {"component": v["id"]}
-                if "query" in v:
-                    out["query"] = v["query"]
+                for key in ("query", "sid"):
+                    if key in v:
+                        out[key] = v[key]
                 return out
             if "component" not in v:
                 raise ValueError(
@@ -355,7 +445,12 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                     `query` is the same plain-word geometry query used everywhere
                     (query_geometry), resolved against that component's SOURCE part — a bare
                     side word ("top") also works. It must resolve to exactly ONE face/edge;
-                    narrow with pick/near/count if it matches several.
+                    narrow with pick/near/count if it matches several. A face/edge sid
+                    ("F2bb10f" — describe_part/query_geometry/render tiles hand them out)
+                    names ONE element outright: {"component": "k1", "query": "F2bb10f"},
+                    {"component": "k1", "query": {"sid": "F2bb10f"}} or
+                    {"component": "k1", "sid": "F2bb10f"}. A sid read off the component's
+                    source part or off this assembly (posed instance) both resolve.
         align     : "aligned" or "anti" (flip which way the normals/axes face).
         value     : the driving dimension for distance/angle mates. For an angle-only
                     hinge, pass {"value":0, "axis":[0,1,0], "axis_point":[x,y,z]};
@@ -394,10 +489,34 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                 if not src:
                     return _dumps({"ok": False, "error": f"{tag}: component '{kid}' has no "
                                    "source path (embedded components not supported yet)"})
-                q = ref.get("query", "top")
-                if isinstance(q, str):
-                    q = {"of": "face", "side": q}
+                q = ref.get("query", ref.get("sid", "top"))
                 part_doc = _asm_component_doc(src, d)
+                sid = None
+                if isinstance(q, str) and _SID_RE.fullmatch(q.strip()):
+                    sid = q.strip()
+                elif (isinstance(q, dict) and isinstance(q.get("sid"), str)
+                      and _SID_RE.fullmatch(q["sid"].strip())):
+                    sid = q["sid"].strip()
+                if sid is not None:
+                    # A sid IS one element, not a query predicate — picks.cpp has no `sid`
+                    # predicate, and a bare string here used to reach the engine as
+                    # `side` ("geom query: bad 'side' 'F2bb10f'", live c245).
+                    match = _component_sid_match(part_doc, d, comps[kid], sid)
+                    if match is None:
+                        return _dumps({"ok": False, "error":
+                                       f"{tag}: no face/edge of component '{kid}' carries "
+                                       f"sid {sid!r} — sids move whenever geometry does. "
+                                       f"Re-read them with describe_part on its source part "
+                                       f"({src}) or query_geometry on this assembly, or pass a "
+                                       f"geometry query {_QVOCAB_HELP}."})
+                    refs.append({"component": kid, "selector": match})
+                    continue
+                if isinstance(q, str):
+                    try:
+                        q = _as_face_query(q)
+                    except ValueError as e:
+                        return _dumps({"ok": False, "error": f"{tag}: {e} A face/edge sid "
+                                       "(\"F2bb10f\") is also accepted as the query."})
                 matches = (cb.call("doc_query", {"doc_id": part_doc, "query": q})
                            .get("matches") or [])
                 if len(matches) != 1:
@@ -407,7 +526,8 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                     return _dumps({"ok": False, "error":
                                    f"{tag}: query must resolve to exactly ONE face/edge of "
                                    f"'{kid}' — got {len(matches)}. Narrow with pick/near/"
-                                   "count (candidates below).", "candidates": brief})
+                                   "count, or pass one candidate's sid as the query "
+                                   "(candidates below).", "candidates": brief})
                 refs.append({"component": kid, "selector": matches[0]})
             mate: dict = {"type": mate_type, "align": align, "suppressed": False,
                           "refs": refs}

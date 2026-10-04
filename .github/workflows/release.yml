@@ -68,6 +68,11 @@ jobs:
     env:
       CHUDWARE_SIGN_IDENTITY: ${{ secrets.CHUDWARE_SIGN_IDENTITY }}
       CHUDWARE_NOTARIZE_PROFILE: ${{ secrets.CHUDWARE_NOTARIZE_PROFILE }}
+      # /Zi targets on the Windows row write PDBs through mspdbsrv. A run-unique
+      # endpoint gives this job its own server instead of attaching to (or
+      # leaving behind) one shared with any other build on the host, as in
+      # native-build.yml. Ignored off Windows.
+      _MSPDBSRV_ENDPOINT_: chudware-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

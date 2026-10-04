@@ -921,6 +921,10 @@ jobs:
                     [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
                   }
                 }
+              # CMake's compiler checks build with /Zi, whose PDBs go through
+              # mspdbsrv; a run-unique endpoint keeps this probe off any server
+              # shared with another build on the host (as native-build does).
+              $env:_MSPDBSRV_ENDPOINT_ = "chudware-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:GITHUB_JOB"
               $smoke = Join-Path $env:RUNNER_TEMP 'toolchain-smoke'
               Remove-Item -LiteralPath $smoke -Recurse -Force -ErrorAction SilentlyContinue
               $src = Join-Path $smoke 'src'

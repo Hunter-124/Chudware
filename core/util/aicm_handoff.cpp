@@ -211,7 +211,29 @@ bool map_shm(const std::string& name, Mapping& /*out*/, std::string& err) {
 
 void unlink_shm_name(const std::string& /*name*/) {}
 #else  // POSIX
+#if defined(__APPLE__)
+// macOS rejects POSIX shm names longer than PSHMNAMLEN (31) with ENAMETOOLONG, and the
+// pid-scoped "/chudware_p<pid>_<doc>_r<rev>" name exceeds it, which silently demoted every
+// publish to the temp-file fallback. Use a short product prefix, and past the limit a
+// pid-scoped FNV-1a digest of the key (at most 4 + 10 + 1 + 16 = 31 characters).
+constexpr size_t kMacShmNameMax = 31;
+
+std::string shm_object_name(const std::string& key) {
+    std::string name = "/cw" + object_key(key);
+    if (name.size() <= kMacShmNameMax) return name;
+    uint64_t hash = 14695981039346656037ull;
+    for (unsigned char c : sanitize(key)) {
+        hash ^= c;
+        hash *= 1099511628211ull;
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string digest(16, '0');
+    for (int i = 15; i >= 0; --i, hash >>= 4) digest[static_cast<size_t>(i)] = kHex[hash & 0xf];
+    return "/cwp" + std::to_string(process_id()) + "_" + digest;
+}
+#else
 std::string shm_object_name(const std::string& key) { return "/chudware_" + object_key(key); }
+#endif
 
 std::string publish_shm(const std::string& key, const uint8_t* data, size_t n) {
     const std::string name = shm_object_name(key);

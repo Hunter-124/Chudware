@@ -447,12 +447,18 @@ Constraint ThermalSystem::max_temperature_constraint(
                           "value");
   const int N = mesh_.node_count();
   const double beta = max_temperature_beta(limit_k);
-  const double peak = peak_temperature_k() - reference_k_;
+  // Shift by the peak node's own theta and add the log term to the peak's
+  // kelvin value: the peak term is then exactly exp(0) = 1, so log(sum) >= 0
+  // and KS >= the nodal peak holds bit-for-bit. Re-deriving the peak as
+  // (peak_k - ref) + ref can round one ulp below it (seen on MSVC).
+  int peak_node = -1;
+  const double peak_k = peak_temperature_k(&peak_node);
+  const double peak = peak_node >= 0 ? theta_[peak_node] : peak_k - reference_k_;
   double sum = 0;
   for (int n = 0; n < N; ++n)
     if (mesh_.node_referenced[n])
       sum += std::exp(beta * (theta_[n] - peak));
-  const double ks = peak + reference_k_ + std::log(sum) / beta;
+  const double ks = peak_k + std::log(sum) / beta;
 
   Constraint c;
   c.name = "max_temperature";

@@ -5965,3 +5965,20 @@ assertions before and passed all 48 after; the real STEP-bar consumer passed all
 47 original assertions. The upstream standalone product's separate release
 history and the user's local branch/index were not changed.
 
+## 2026-10-05 — retain strict-gate Python failure diagnostics
+
+The completed strict Linux gate `37331563747` passed native core/host/WASM builds,
+core tests, daemon/parity/packaging, the sensor-node demo and GUI shots, but six
+Python tests failed across agent, MCP, simulation and tools units. Its wrapper
+printed only counts with `--tb=no`; runner-temp cleanup then removed both failure
+identities and their diagnostics. No retained artifacts or pytest failure cache
+were available.
+
+The per-unit sweep now records short tracebacks and copies failed-unit output
+into unmetered CI logs, including collection errors. Passing units remain quiet;
+test enumeration, suite separation, failure verdicts and skip policy are unchanged.
+The actual stage was exercised with real pytest: the original hid an assertion
+failure's identity, the revised stage emitted its name/source/assertion details,
+collection errors remained fatal with diagnostics, and all-passing units stayed
+green without failure blocks. Temporary smoke fixtures were removed.
+

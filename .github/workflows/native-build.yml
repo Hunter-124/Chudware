@@ -7,8 +7,25 @@
 # ones a developer uses by hand, so a green release row means the documented
 # build command works on a clean checkout, not that a CI-only incantation does.
 #
-# Rows are independent (fail-fast: false): a broken macOS toolchain must not
-# hide a Windows regression.
+# Every row says how its tests ran (matrix.test_mode), and nothing else may be
+# claimed for it:
+#   native        built and tested on the target OS and CPU
+#   qemu          aarch64 Linux cross-built on the x86_64 Linux builder and
+#                 all portable core tests run under qemu-user emulation;
+#                 ARM code paths, not ARM hardware
+#   compile-only  arm64 macOS cross-compiled and linked on the Intel Mac;
+#                 Mach-O architecture checked, nothing executed or tested
+# No row needs Apple-silicon hardware or waits for the offline M2: native
+# arm64 Darwin runtime is not qualified here.
+#
+# The ARM rows are hard-bounded: one job-wide deadline (timeout_minutes less
+# three minutes of cleanup room) caps every SDK, configure, build and test
+# command, each of which also has its own budget, through
+# scripts/run_bounded.py. An overrun stops that command's whole process group
+# (SIGTERM, SIGKILL 15 s later) and fails the step with status 124.
+#
+# Native rows run first. ARM qualification cannot claim the same private
+# runner before native checks finish; no native job depends on ARM.
 #
 # Nothing is uploaded. Build outputs are about 500 MB per platform and Actions
 # artifact storage is metered above the 500 MB shared with Packages, accrued
@@ -27,20 +44,17 @@ permissions:
 
 # Never cancel. This is a coherent multi-platform build of one commit; a
 # half-cancelled matrix leaves two platforms reporting on different trees, and
-# the whole value of the workflow is that the four rows describe one commit.
+# the whole value of the workflow is that the rows describe one commit.
 concurrency:
-  group: native-build-${{ github.ref }}
+  group: native-build-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
   build:
     name: ${{ matrix.label }}
-    # Self-hosted fleet only — hosted minutes are billed on this private
-    # repository, and a compile matrix is the most expensive thing that could
-    # land on one. Each row names its own capacity label so legs run in
-    # parallel and never contend for a single endpoint.
-    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", cloudcastle-ci, "${{ matrix.runner_label }}"]
-    timeout-minutes: 180
+    # Product-private native runners; ARM follows these baseline checks.
+    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.runner_label }}"]
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
@@ -48,51 +62,63 @@ jobs:
           - label: Linux x86_64
             runner_os: Linux
             runner_arch: X64
-            runner_label: cc-linux-build
+            runner_label: cc-linux-chudware
             preset: linux-core
+            test_mode: native
+            arm_sdk: ''
+            timeout_minutes: 180
             build_host: true
             host_build_dir: host/build-linux
           - label: Windows x86_64
             runner_os: Windows
             runner_arch: X64
-            runner_label: cc-win-package
+            runner_label: cc-win-chudware
             # Exercise the shipping geometry paths (doc_view_metrics, sections,
             # drawing provenance); windows-core disables OCCT and misses them.
             preset: windows-occt
+            test_mode: native
+            arm_sdk: ''
+            timeout_minutes: 180
             build_host: true
             host_build_dir: host/build-windows
           # Ordinary configure/build/ctest: the private Chudware Mac TEST
-          # accounts (hidden ccci-chudware; no keychain, signing identity, sudo
-          # or GUI session), one per physical Mac. Their launchd daemons export
+          # account on the Intel iMac (hidden ccci-chudware; no keychain,
+          # signing identity, sudo or GUI session). Its launchd daemon exports
           # the per-product CMAKE_BUILD_PARALLEL_LEVEL/CTEST_PARALLEL_LEVEL caps
           # that the cmake --build/ctest calls below inherit. Signed release
           # packaging stays on the operator lanes (cc-mac-intel: release.yml,
-          # nightly-release.yml). The arm64 row needs that account provisioned
-          # natively on the physical M2 (macbook-air-m2-chudware-test); until
-          # then it queues, and neither the cc-mac-arm operator account nor an
-          # Intel lane is its substitute.
-          - label: macOS arm64
-            runner_os: macOS
-            runner_arch: ARM64
-            runner_label: cc-mac-chudware-arm
-            ci_user: ccci-chudware
-            preset: macos-arm64
-            # Core only. The macOS host GUI is not a phase-1 target: the macOS
-            # presets build with CHUDWARE_ENABLE_CEF=OFF, and CEF's offscreen
-            # render path has no WKWebView equivalent. Bringing up the core
-            # tree is the whole macOS goal for now, so a host row here would be
-            # a known-red leg that trains everyone to ignore this workflow.
-            build_host: false
-            host_build_dir: ''
+          # nightly-release.yml).
+          #
+          # Core only. The macOS host GUI is not a phase-1 target: the macOS
+          # presets build with CHUDWARE_ENABLE_CEF=OFF, and CEF's offscreen
+          # render path has no WKWebView equivalent. Bringing up the core
+          # tree is the whole macOS goal for now, so a host row here would be
+          # a known-red leg that trains everyone to ignore this workflow.
           - label: macOS x86_64
             runner_os: macOS
             runner_arch: X64
             runner_label: cc-mac-chudware-intel
             ci_user: ccci-chudware
             preset: macos-x86_64
+            test_mode: native
+            arm_sdk: ''
+            timeout_minutes: 180
             build_host: false
             host_build_dir: ''
-    steps:
+    steps: &build_steps
+      # First, so the deadline counts from the job's start. Three minutes short
+      # of timeout-minutes leave room for the 15 s kill grace, the step summary
+      # and post-job cleanup before Actions' own hard stop, which would report
+      # neither a status nor a stopped process group.
+      - name: Start the job-wide deadline (ARM rows)
+        if: matrix.arm_sdk != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + (${{ matrix.timeout_minutes }} - 3) * 60 ))
+          echo "CHUDWARE_JOB_DEADLINE=${deadline}" >> "$GITHUB_ENV"
+          echo "every bounded command of this row ends within $(( ${{ matrix.timeout_minutes }} - 3 )) minutes (epoch ${deadline})"
+
       # Before checkout: a missing compiler or an old CMake otherwise surfaces
       # as a confusing configure error with no runner-state evidence attached.
       - name: Check runner capabilities (POSIX)
@@ -100,6 +126,7 @@ jobs:
         shell: bash
         env:
           EXPECT_CI_USER: ${{ matrix.ci_user }}
+          ARM_SDK: ${{ matrix.arm_sdk }}
         run: |
           set -euo pipefail
           echo "runner=${RUNNER_NAME:-unknown} os=$RUNNER_OS arch=$RUNNER_ARCH host=$(hostname -s) user=$(id -un)"
@@ -164,30 +191,72 @@ jobs:
             xcode-select -p
             echo "sdk=$(xcrun --show-sdk-version) clang=$(xcrun --find clang)"
             clang --version | head -n 1
-
-            # On everything except Windows, ProvisionOCCT.cmake does not
-            # download anything — it goes straight to
-            # find_package(OpenCASCADE REQUIRED) against a system install, and
-            # the preset's CMAKE_PREFIX_PATH (/opt/homebrew on arm64,
-            # /usr/local on Intel) is what lets it see the keg. Without the
-            # formula the configure dies on "Could not find a package
-            # configuration file provided by OpenCASCADE", which reads like a
-            # code defect and is not one. Named here instead, with the fix.
-            #
-            # Checked, not installed: `brew install opencascade` on a shared
-            # runner is a long, host-mutating operation that two concurrent
-            # jobs would race through brew's lock, and the private test
-            # account cannot write the operator-owned Homebrew prefix at all.
-            # A missing formula is a provisioning ticket for that Mac's
-            # operator lane (runner-provision.yml with cc-mac-intel or
-            # cc-mac-arm), and runner-smoke reports it daily.
-            if ! brew list --versions opencascade >/dev/null 2>&1; then
-              echo "::error::${RUNNER_NAME:-unknown} has no Homebrew opencascade; the ${{ matrix.preset }} preset configures with CHUDWARE_WITH_OCCT=ON and will fail at find_package. Fix from the Homebrew owner: dispatch runner-provision.yml with this Mac's operator label (cc-mac-intel or cc-mac-arm), which runs brew install opencascade"
-              exit 1
-            fi
-            echo "opencascade=$(brew list --versions opencascade)"
-            echo "brew-prefix=$(brew --prefix)"
           fi
+
+          case "${ARM_SDK}" in
+            '')
+              if [ "$RUNNER_OS" = "macOS" ]; then
+                # On everything except Windows, ProvisionOCCT.cmake does not
+                # download anything — it goes straight to
+                # find_package(OpenCASCADE REQUIRED) against a system install,
+                # and the preset's CMAKE_PREFIX_PATH (/usr/local on Intel) is
+                # what lets it see the keg. Without the formula the configure
+                # dies on "Could not find a package configuration file
+                # provided by OpenCASCADE", which reads like a code defect and
+                # is not one. Named here instead, with the fix.
+                #
+                # Checked, not installed: `brew install opencascade` on a
+                # shared runner is a long, host-mutating operation that two
+                # concurrent jobs would race through brew's lock, and the
+                # private test account cannot write the operator-owned
+                # Homebrew prefix at all. A missing formula is a provisioning
+                # ticket for that Mac's operator lane (runner-provision.yml
+                # with cc-mac-intel), and runner-smoke reports it daily.
+                if ! brew list --versions opencascade >/dev/null 2>&1; then
+                  echo "::error::${RUNNER_NAME:-unknown} has no Homebrew opencascade; the ${{ matrix.preset }} preset configures with CHUDWARE_WITH_OCCT=ON and will fail at find_package. Fix from the Homebrew owner: dispatch runner-provision.yml with this Mac's operator label (cc-mac-intel), which runs brew install opencascade"
+                  exit 1
+                fi
+                echo "opencascade=$(brew list --versions opencascade)"
+                echo "brew-prefix=$(brew --prefix)"
+              fi
+              ;;
+            linux-aarch64)
+              # The GNU cross compiler, qemu-user and the guest kernel's
+              # binfmt_misc entry are root-owned prerequisites of the private
+              # Chudware guest (CloudCastle provision-nvme-linux-ci.sh); this
+              # account can neither install nor register them. binfmt is what
+              # lets the x86_64 /bin/sh start an aarch64 test child, as the
+              # AICM cross-process handoff test does.
+              missing=()
+              for tool in aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ qemu-aarch64-static perl make curl pkg-config gperf readelf; do
+                command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
+              done
+              [ -e /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1 ] || missing+=("/usr/aarch64-linux-gnu (libc6-arm64-cross)")
+              if [ "${#missing[@]}" -ne 0 ]; then
+                echo "::error::the aarch64 cross toolchain is incomplete on ${RUNNER_NAME:-unknown}: ${missing[*]}; install g++-aarch64-linux-gnu, qemu-user-static, perl, make, curl, pkg-config and gperf in the guest"
+                exit 1
+              fi
+              binfmt=/proc/sys/fs/binfmt_misc/qemu-aarch64
+              if [ "$(head -n 1 "${binfmt}" 2>/dev/null)" != enabled ]; then
+                echo "::error::no enabled qemu-aarch64 binfmt_misc entry in this guest's kernel (${binfmt}); aarch64 test children cannot start"
+                exit 1
+              fi
+              aarch64-linux-gnu-g++ --version | head -n 1
+              qemu-aarch64-static --version | head -n 1
+              cat "${binfmt}"
+              ;;
+            darwin-arm64)
+              # The CLT SDK provides arm64 slices of the system libraries the
+              # core links (libcurl among them); build_arm_sdk.sh provides the
+              # rest. Homebrew's x86_64-only prefix is never used.
+              sdk="$(xcrun --sdk macosx --show-sdk-path)"
+              if ! grep -q arm64 "${sdk}/usr/lib/libcurl.tbd"; then
+                echo "::error::${sdk} has no arm64 libcurl stub; this SDK cannot link arm64 macOS"
+                exit 1
+              fi
+              echo "arm64 sdk=${sdk}"
+              ;;
+          esac
           df -h "${RUNNER_TEMP:-/tmp}" "$HOME"
 
       - name: Check runner capabilities and enter the MSVC environment (Windows)
@@ -332,6 +401,26 @@ jobs:
           # `git describe --tags`; a shallow clone without tags yields 0.0.0.
           fetch-depth: 0
 
+      # The cross rows' OCCT and its dependencies, built from pinned sources
+      # for the target architecture. Cached per runner account under its own
+      # RUNNER_TOOL_CACHE (never an operator Homebrew, another product's
+      # account or a shared prefix) and rebuilt only when the recipe changes.
+      # A cold build gets at most an hour; reuse takes seconds.
+      - name: Build or reuse the ${{ matrix.arm_sdk }} SDK (POSIX, bounded)
+        if: matrix.arm_sdk != '' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="$(python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" 3600 \
+            scripts/build_arm_sdk.sh ${{ matrix.arm_sdk }})"
+          echo "CHUDWARE_ARM_SDK=${sdk}" >> "$GITHUB_ENV"
+          {
+            echo '## ${{ matrix.arm_sdk }} SDK'
+            echo '```text'
+            echo "${sdk}"
+            cat "${sdk}/.complete"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # `shell:` must name a literal interpreter — actionlint rejects an
       # expression there, and on these Windows hosts `bash` resolves to an
@@ -340,12 +429,83 @@ jobs:
       # built a release that reached no endpoint"). So every step that runs on
       # more than one OS is split in two, guarded by `if:`.
       - name: Configure and build core (${{ matrix.preset }}) (POSIX)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.arm_sdk == ''
         shell: bash
         run: |
           set -euo pipefail
           cmake --preset ${{ matrix.preset }}
           cmake --build --preset ${{ matrix.preset }}
+
+      # The configure fetches the pinned Polyhedral-FEA source; the build
+      # compiles and links every engine binary for the target. Neither runs
+      # anything it built.
+      - name: Cross-configure and build core (${{ matrix.preset }}) (ARM, bounded)
+        if: matrix.arm_sdk != '' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" 900 \
+            cmake --preset ${{ matrix.preset }}
+          python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" 1800 \
+            cmake --build --preset ${{ matrix.preset }}
+
+      # A cross build that silently produced host binaries would make the
+      # emulated tests meaningless and the compile-only row a lie, so every
+      # engine binary must be the target architecture.
+      - name: Check target architecture (${{ matrix.preset }})
+        if: matrix.arm_sdk != '' && runner.os != 'Windows'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="build/${{ matrix.preset }}/bin"
+          bad=()
+          count=0
+          case "${{ matrix.arm_sdk }}" in
+            linux-aarch64)
+              want=AArch64
+              for f in "${bin}"/* "${CHUDWARE_ARM_SDK}/lib/libTKernel.so" "${CHUDWARE_ARM_SDK}/lib/libcurl.so"; do
+                [ -f "${f}" ] && [ "$(head -c 4 "${f}" | od -An -tx1 | tr -d ' ')" = 7f454c46 ] || continue
+                count=$((count + 1))
+                machine="$(readelf -h "${f}" | awk -F: '/Machine:/ {gsub(/^ +/, "", $2); print $2}')"
+                [ "${machine}" = "${want}" ] || bad+=("${f}: ${machine}")
+              done
+              evidence="$(readelf -h "${bin}/libchudware.so" | grep -E 'Class:|Type:|Machine:')"
+              ;;
+            darwin-arm64)
+              want=arm64
+              for f in "${bin}"/* "${CHUDWARE_ARM_SDK}/lib/libTKernel.dylib"; do
+                if [ ! -f "${f}" ] || ! lipo -archs "${f}" >/dev/null 2>&1; then
+                  continue
+                fi
+                count=$((count + 1))
+                archs="$(lipo -archs "${f}")"
+                [ "${archs}" = "${want}" ] || bad+=("${f}: ${archs}")
+              done
+              evidence="$(file -L "${bin}/libchudware.dylib")"
+              ;;
+          esac
+          echo "${evidence}"
+          if [ "${count}" -lt 3 ]; then
+            echo "::error::found only ${count} target binaries under ${bin}; the build did not produce the engine"
+            exit 1
+          fi
+          if [ "${#bad[@]}" -ne 0 ]; then
+            for b in "${bad[@]}"; do echo "::error::not ${want}: ${b}"; done
+            exit 1
+          fi
+          case "${{ matrix.test_mode }}" in
+            qemu) mode='Tests run next under qemu-user emulation on the x86_64 builder, not on ARM hardware.' ;;
+            compile-only) mode='Compile-only: nothing built here was executed or tested.' ;;
+          esac
+          {
+            echo '## Target architecture — ${{ matrix.label }}'
+            echo ''
+            echo "${count} binaries are ${want}. ${mode}"
+            echo '```text'
+            echo "${evidence}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Refresh Windows source junctions for OCCT
         if: runner.os == 'Windows' && matrix.preset == 'windows-occt'
@@ -372,8 +532,10 @@ jobs:
           cmake --build --preset ${{ matrix.preset }}
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Native rows only; the emulated row has its own bounded step below, and
+      # compile-only rows never run anything they built.
       - name: ctest core (${{ matrix.preset }}) (POSIX)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.test_mode == 'native'
         shell: bash
         run: |
           set -euo pipefail
@@ -394,6 +556,59 @@ jobs:
 
           {
             echo '## ctest — ${{ matrix.label }} (${{ matrix.preset }})'
+            echo '```text'
+            tail -n 40 "${log}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "${status}"
+
+      # The emulated row: aarch64 test binaries under qemu-user on the x86_64
+      # builder. All portable core tests execute; this is not ARM hardware proof.
+      - name: ctest core under qemu-user (${{ matrix.preset }}, bounded)
+        if: matrix.test_mode == 'qemu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="build/${{ matrix.preset }}/core"
+          log="${RUNNER_TEMP}/ctest-core.log"
+
+          # ctest starts each test through the toolchain's
+          # CMAKE_CROSSCOMPILING_EMULATOR (cmake/toolchains/
+          # qemu-aarch64-run.sh: QEMU_LD_PREFIX plus a private TMPDIR per
+          # test); children a test spawns through /bin/sh reach qemu via
+          # binfmt_misc. The suite fills the guest's CPUs instead of running
+          # serially; the per-test TMPDIR is what makes that safe.
+          if ! grep -q 'qemu-aarch64-run.sh' "${tree}/CTestTestfile.cmake"; then
+            echo "::error::${tree}/CTestTestfile.cmake does not launch tests through qemu-aarch64-run.sh; the toolchain's CMAKE_CROSSCOMPILING_EMULATOR did not apply"
+            exit 1
+          fi
+
+          # All registered portable core tests run: 600 s per test and
+          # 30 minutes total, capped again by the shared job deadline.
+          registered="$(ctest --test-dir "${tree}" -N | awk '/^Total Tests:/ {print $3}')"
+
+          # A directory a timed-out (SIGKILLed) wrapper could not remove stays
+          # in the job's own temp, which the runner wipes.
+          export TMPDIR="${RUNNER_TEMP}"
+          status=0
+          python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" 1800 \
+            ctest --test-dir "${tree}" --output-on-failure --parallel "$(nproc)" \
+            --timeout 600 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
+
+          if grep -qE 'No tests were found' "${log}"; then
+            echo "::error::ctest found no tests in ${tree}; the configure did not register the suite"
+            exit 1
+          fi
+          ran="$(awk '/tests failed out of/ {print $NF}' "${log}")"
+
+          {
+            echo '## ctest — ${{ matrix.label }} (${{ matrix.preset }}, qemu-user)'
+            echo ''
+            if [ "${status}" -eq 124 ]; then
+              echo "**Incomplete: the run hit its 30-minute bound (or the job deadline) and was stopped.**"
+            fi
+            echo "Ran ${ran:-an incomplete set} of ${registered} registered core tests as aarch64 under qemu-user on the x86_64 builder; emulation, not ARM hardware. No portable core test is excluded."
             echo '```text'
             tail -n 40 "${log}"
             echo '```'
@@ -579,3 +794,45 @@ jobs:
             "Core: $env:CHUDWARE_LIBCHUDWARE"
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
+  arm:
+    name: ${{ matrix.label }}
+    needs: [build]
+    runs-on: [self-hosted, "${{ matrix.runner_os }}", "${{ matrix.runner_arch }}", "${{ matrix.runner_label }}"]
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # These same-account cross builds start only after native baselines.
+          # The pinned, validated SDK lives in the account's RUNNER_TOOL_CACHE.
+          # A cold build and the core suite share one 87-minute hard deadline;
+          # insufficient budget fails 124 instead of skipping portable tests.
+          - label: Linux aarch64 (QEMU-emulated tests)
+            runner_os: Linux
+            runner_arch: X64
+            runner_label: cc-linux-chudware
+            preset: linux-aarch64-qemu
+            test_mode: qemu
+            arm_sdk: linux-aarch64
+            timeout_minutes: 90
+            build_host: false
+            host_build_dir: ''
+          # arm64 macOS from the same Intel test account: AppleClang and the
+          # Command Line Tools SDK cross-compile and link the core against an
+          # arm64 SDK (pinned OCCT 7.9.3, FreeType, RapidJSON) that
+          # scripts/build_arm_sdk.sh builds into the account's own
+          # RUNNER_TOOL_CACHE. The Intel Mac has no Rosetta and could not run
+          # arm64 code anyway: the row checks the Mach-O architecture and
+          # executes nothing. 90 minutes hold a cold SDK plus the core build.
+          - label: macOS arm64 (cross-compiled, compile-only)
+            runner_os: macOS
+            runner_arch: X64
+            runner_label: cc-mac-chudware-intel
+            ci_user: ccci-chudware
+            preset: macos-arm64-cross
+            test_mode: compile-only
+            arm_sdk: darwin-arm64
+            timeout_minutes: 90
+            build_host: false
+            host_build_dir: ''
+    steps: *build_steps

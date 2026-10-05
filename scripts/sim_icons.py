@@ -32,11 +32,9 @@ Icon families (contracts/icons.md, Simulation tab + extended + mesh types):
 All tiles share the fea_result_icons iso camera family (yaw 35 / pitch 26) and reuse that
 module's proven helpers (_iso / _fit / _cmap / painter) by import -- no copy-paste.
 
-The overlay handoff changed: sim_run_* now returns overlay_aicm as a POSIX shared-memory
-URI ("aicm-shm:///chudware_overlay_N") mapping to /dev/shm/chudware_overlay_N, an 8-byte LE size
-header + AICM payload (core/util/aicm_handoff.cpp). _read_overlay() below resolves both a
-plain file path AND that shm URI, so this script works against the current engine (the
-older fea_result_icons.py assumed a file path and now trips on the shm handle).
+sim_run_* returns overlay_aicm as an engine AICM handoff (an aicm-shm:// shared-memory URI
+or a fallback file path); services.aicm_handoff.read_handoff resolves every form on every
+platform (core/util/aicm_handoff.cpp is the publisher).
 
 Standalone (render + inject into both atlases + contact sheet):
     python3 scripts/sim_icons.py
@@ -52,7 +50,6 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -109,47 +106,10 @@ def _cmap_stops(stops, t: float) -> tuple:
     return stops[-1][1]
 
 
-# ---------------------------------------------------------------------------
-# Overlay resolution: file path OR aicm-shm:// URI -> AICM bytes.
-# ---------------------------------------------------------------------------
-def _read_overlay(handle: str) -> bytes:
-    """Resolve a sim_run_* overlay_aicm handle to raw AICM bytes.
-
-    Handles two forms the engine emits:
-      * a plain filesystem path (older engine / file fallback)
-      * "aicm-shm:///chudware_overlay_N" -> POSIX shm object /chudware_overlay_N, i.e.
-        /dev/shm/chudware_overlay_N, whose layout is an 8-byte little-endian size header
-        followed by exactly that many AICM payload bytes (core/util/aicm_handoff.cpp
-        publish_shm: memcpy(p, &sz, 8); memcpy(p+8, data, n)).
-    """
-    if not handle:
-        raise RuntimeError("empty overlay handle")
-    prefix = "aicm-shm://"
-    if handle.startswith(prefix):
-        name = handle[len(prefix):]          # "/chudware_overlay_0"
-        name = "/" + name.lstrip("/")        # normalize to a single leading slash
-        shm_path = Path("/dev/shm") / name.lstrip("/")
-        if not shm_path.exists():
-            raise RuntimeError(f"shm overlay object missing: {shm_path}")
-        raw = shm_path.read_bytes()
-        if len(raw) < 8:
-            raise RuntimeError(f"shm overlay too small: {len(raw)} bytes")
-        (sz,) = struct.unpack_from("<Q", raw, 0)
-        if sz <= 0 or 8 + sz > len(raw):
-            raise RuntimeError(f"shm overlay bad size header: sz={sz} raw={len(raw)}")
-        return raw[8:8 + sz]
-    p = Path(handle)
-    if not p.exists():
-        raise RuntimeError(f"overlay file missing: {handle}")
-    return p.read_bytes()
-
-
 def _parse_aicm(handle: str) -> dict:
-    try:
-        from services.sim.tessellate import read_aicm
-    except ImportError:
-        from engine_oracle.doc.tessellate import read_aicm
-    return read_aicm(_read_overlay(handle))
+    from services.aicm_handoff import read_handoff
+    from services.sim.tessellate import read_aicm
+    return read_aicm(read_handoff(handle))
 
 
 # ---------------------------------------------------------------------------

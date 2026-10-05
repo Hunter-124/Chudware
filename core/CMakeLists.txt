@@ -14,7 +14,6 @@ chudware_version_derive()
 project(chudware_core VERSION ${CHUDWARE_VERSION_MAJOR}.${CHUDWARE_VERSION_MINOR}.${CHUDWARE_VERSION_PATCH} LANGUAGES C CXX)  # C enabled for chudware_miniz (miniz.c); the VS generator
                                      # tolerates an implicit C, but Ninja/Make + GCC/Clang need it explicit.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-include(cmake/EmbedFirmwareBuses.cmake)
 
 # The new pure-C++ engine (libchudware). Wave 1 = the constraint solver core; later
 # waves add doc/geom (OCCT) and sim (CUDA). Built standalone here so the solver is
@@ -173,7 +172,7 @@ FetchContent_MakeAvailable(doctest)
 # Boost Software License 1.0 (GPL-clean, commercial-safe). The amalgamated lib
 # ships its own CMakeLists under CPP/, but we POPULATE-only and compile the three
 # engine .cpp ourselves into a tiny static lib (mirrors the miniz approach) to
-# skip Clipper2's tests/benchmarks/USINGZ options. See contracts/licenses.md.
+# skip Clipper2's tests/benchmarks/USINGZ options. See docs/contracts/licenses.md.
 FetchContent_Declare(clipper2
   GIT_REPOSITORY https://github.com/AngusJohnson/Clipper2.git
   GIT_TAG Clipper2_1.5.4
@@ -194,7 +193,7 @@ set_property(TARGET chudware_clipper2 PROPERTY
 # (RtlVirtualUnwind), symbolizing with DbgHelp at report time. Linux: a sampler thread signals
 # the work thread, an async-signal-safe backtrace() feeds a ring, and dladdr/__cxa_demangle
 # symbolize at report time. OCCT-free + tiny, so it links cleanly into libchudware.{dll,so} and the
-# unit test. See core/prof/sampler.{h,cpp}.
+# unit test. See core/prof/sampler.{h,cpp} and docs/PROFILER.md.
 add_library(chudware_prof STATIC
   prof/sampler.cpp
   prof/phases.cpp
@@ -228,8 +227,8 @@ target_include_directories(chudware_geom PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_geom PUBLIC Eigen3::Eigen)
 
 # --- libchudware util (dimension-expression arithmetic evaluator + AICM handoff) -
-# expr: the dimension-expression evaluator (the `evaluate` entry point) the sketch
-# solver's resolve_dim() uses for expr:"A*B"-style dims.
+# C++ port of engine/doc/equations.py (the `evaluate` entry point) so the sketch
+# solver's resolve_dim() matches the Python oracle for expr:"A*B"-style dims.
 # aicm_handoff: POSIX shm / Win named mapping for tess mesh (T-PERF10).
 # platform_paths / parent_death: the one spelling per OS of "where am I", "is that
 # pid alive", and "bind this child's life to mine" — see util/platform_paths.h.
@@ -275,8 +274,8 @@ set_target_properties(test_security PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # --- libchudware sim (simulation solvers) ---------------------------------------
-# FEA static linear elasticity first (tet4 + Eigen::SparseLU, ported from the retired
-# Python engine); modal / LBM / SPICE follow. OCCT-free —
+# C++ port of engine/sim. FEA static linear elasticity first (tet4 + Eigen::SparseLU,
+# the oracle is engine/sim/fea_static.py); modal / LBM / SPICE follow. OCCT-free —
 # pure Eigen — so it builds in the standalone config too. CUDA acceleration is a
 # later layer on top of these correct CPU cores.
 add_library(chudware_sim STATIC
@@ -361,7 +360,7 @@ endif()
 # material-removal sim, and the stateful job session. OCCT-FREE — pure numerics +
 # JSON like chudware_sim/chudware_ecad, so it builds in the standalone config and is
 # unit-tested headless (test_cam). A separate OCCT extraction adapter (geom layer)
-# feeds live-part geometry into operations for the product. See contracts/cam.md.
+# feeds live-part geometry into operations for the product. See docs/CAM_PLAN.md.
 add_library(chudware_cam STATIC
   cam/model.cpp
   cam/geometry.cpp
@@ -395,7 +394,7 @@ set_property(TARGET chudware_cam PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 # --- libchudware ecad (ECAD document model: schema + ops + session) -------------
-# Ported from the retired Python engine's ECAD schema/ops/session. OCCT-free — the
+# C++ port of engine/ecad (schema.py + ops.py + session.py). OCCT-free — the
 # ECAD doc/ops layer is pure JSON (like chudware_sim) — so it builds in the
 # standalone config and stays fast + isolated. Netlist/ERC/DRC/autoroute/Gerber/
 # 3D are DEFERRED to later waves.
@@ -456,14 +455,12 @@ add_library(chudware_firmware STATIC
   firmware/eng_rails.cpp
   firmware/pyfmt.cpp
   firmware/scenario.cpp
-  firmware/bus_models.cpp
   firmware/emulator.cpp
   firmware/powerprofile.cpp
   firmware/sensor_models.cpp
   firmware/sim_sensor_bridge.cpp
   firmware/firmware_rpc.cpp)
 target_include_directories(chudware_firmware PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(chudware_firmware PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(chudware_firmware PUBLIC nlohmann_json::nlohmann_json chudware_ecad)
 if(MSVC)
   # MSVC only defines M_PI et al. in <cmath> when _USE_MATH_DEFINES is set (firmware/scenario.cpp).
@@ -492,16 +489,16 @@ add_test(NAME firmware COMMAND test_firmware)
 # Do not drop RUN_SERIAL without re-running that 3x comparison.
 set_tests_properties(firmware PROPERTIES RUN_SERIAL TRUE TIMEOUT 600)
 
-# fw_cli: manual debugging CLI — reads {"method","params"} and prints the
-# firmware::call result as one JSON line. Built for hand diagnosis; no test or
-# script drives it (its T-RF15 Python parity harness is retired).
+# fw_cli: differential-harness driver (same role as sketch_cli) — reads
+# {"method","params"} and prints the firmware::call result as one JSON line.
+# Used by the T-RF15 parity diffs against the Python oracle.
 add_executable(fw_cli firmware/fw_cli.cpp)
 target_link_libraries(fw_cli PRIVATE chudware_firmware)
 set_target_properties(fw_cli PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # T-RF17: KiCad importers (import_kicad_sch / import_kicad_pcb) + the ecad_open
-# .kicad_* extension dispatch (cases carried over from the retired Python engine).
+# .kicad_* extension dispatch — mirrors engine/ecad/test_formats.py tests 3-6.
 add_executable(test_kicad_import tests/test_kicad_import.cpp)
 target_include_directories(test_kicad_import PRIVATE ${doctest_SOURCE_DIR})
 target_link_libraries(test_kicad_import PRIVATE chudware_ecad)
@@ -567,9 +564,9 @@ set_target_properties(test_structural PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME structural COMMAND test_structural)
 
-# struct_cli: manual debugging CLI — reads {"method","params"} and prints the
-# structural::call result as one JSON line. No test or script drives it (its
-# T-RF19 PyNite parity harness is retired).
+# struct_cli: differential-harness driver (same role as fw_cli) — reads
+# {"method","params"} and prints the structural::call result as one JSON line.
+# Used by the T-RF19 parity diffs against the Python (PyNite) oracle.
 add_executable(struct_cli structural/struct_cli.cpp)
 target_link_libraries(struct_cli PRIVATE chudware_structural)
 set_target_properties(struct_cli PROPERTIES
@@ -655,7 +652,7 @@ add_library(chudware_sketch STATIC
 target_include_directories(chudware_sketch PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_sketch PUBLIC chudware_solver chudware_util nlohmann_json::nlohmann_json)
 
-# --- sketch_cli (native sketch-solve driver; corpora/sw_parity/_run_fixtures.py) ---
+# --- sketch_cli (differential-harness driver; see tools/solver_diff.py) -------
 # Reads { "sketch":{...}, "env":{...} } from argv[1] (or stdin if "-") and prints
 # the solve_sketch result as one JSON line. Output to bin/ alongside the tests.
 add_executable(sketch_cli
@@ -779,7 +776,7 @@ set_target_properties(test_thread_pool PROPERTIES
 add_test(NAME thread_pool COMMAND test_thread_pool)
 
 # --- libchudware geom-aicm (OCCT-free AICM v1 writer) ---------------------------
-# The encoder half of the AICM v1 contract (contracts/mesh_format.md), kept OCCT-free so it builds and
+# The encoder half of engine/doc/tessellate.py, kept OCCT-free so it builds and
 # unit-tests in the default (CHUDWARE_WITH_OCCT=OFF) configuration too. The OCCT
 # tessellator below links this same lib.
 add_library(chudware_aicm STATIC
@@ -910,23 +907,17 @@ set_target_properties(test_firm_team PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME firm_team COMMAND test_firm_team)
 
-# --- host AICM loader for core round-trip tests --------------------------------
-# The GUI's own reader (host/src/render/aicm_loader.cpp, the one host/CMakeLists.txt
-# ships), compiled once and linked into every core test that parses write_aicm output,
-# so those tests prove byte compatibility with the parser users actually run. Its only
-# engine dependency is util/aicm_handoff (chudware_util). The include root is the
-# loader's OWN directory, NOT host/src — the latter contains a project-local math.h
-# that shadows the CRT <math.h> and breaks <cmath>/<cstdlib> (MSVC C2039 'sinhf').
-add_library(chudware_host_aicm_loader STATIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
-target_include_directories(chudware_host_aicm_loader PUBLIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
-target_link_libraries(chudware_host_aicm_loader PUBLIC chudware_util)
-
 add_executable(test_aicm
   tests/test_aicm_writer.cpp)
-target_include_directories(test_aicm PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_aicm PRIVATE chudware_aicm chudware_host_aicm_loader)
+# Include the host loader's OWN directory (host/src/render), NOT host/src — the
+# latter contains a project-local math.h that shadows the CRT <math.h> and breaks
+# the standard <cmath>/<cstdlib> headers (MSVC C2039 'sinhf' etc.).
+target_include_directories(test_aicm PRIVATE
+  ${doctest_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
+target_link_libraries(test_aicm PRIVATE chudware_aicm chudware_util)
+target_sources(test_aicm PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
 set_target_properties(test_aicm PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME aicm COMMAND test_aicm)
@@ -965,7 +956,7 @@ set_target_properties(test_parts_place PROPERTIES
 add_test(NAME parts_place COMMAND test_parts_place)
 
 # --- libchudware sourcing (BOM roll-up / cost model / spec-match / providers) -------
-# T-RF18: C++ port of the retired Python {bom,cost_model,spec_sheet_matcher,parts_providers,
+# T-RF18: C++ port of engine_oracle/{bom,cost_model,spec_sheet_matcher,parts_providers,
 # quote_providers}.py backing the worker methods bom_rollup / bom_price /
 # request_quote / match_part_number / vendor_part_fetch and the MCP spec_sheet_match
 # lane. PURE (OCCT-free, no doc/ecad/agent linkage): every side effect — assembly /
@@ -992,14 +983,14 @@ set_target_properties(test_sourcing PROPERTIES
 add_test(NAME sourcing COMMAND test_sourcing)
 
 # --- libchudware tolerance / mechanical / materials / dfm (T-RF19 leaf 6) ------------
-# C++ ports of the retired Python {tolerance/stackup, mechanical/{gear_check,bearing_life},
-# materials/registry, dfm/process_profiles} modules behind
+# C++ ports of engine_oracle/{tolerance/stackup, mechanical/{gear_check,bearing_life},
+# materials/registry, dfm/process_profiles}.py — the small pure oracle modules behind
 # the MCP stackup_analyze / gear_check / bearing_life tools, the CAM materials seam,
 # the FEA material library and the intake/dimension-scheme DfM brain. PURE (OCCT-free,
 # no doc/ecad/agent linkage); each owns its methods behind a single
 # call(method, params, result, err) dispatch entry for the libchudware glue. Envelope
-# parity with those retired modules is pinned by frozen golden fixtures under tests/data/
-# (captured before their deletion — see each test's header comment).
+# parity with the Python oracle is proven by golden fixtures under tests/data/
+# (generated from the oracle — see each test's header comment).
 add_library(chudware_tolerance STATIC
   tolerance/stackup.cpp)
 target_include_directories(chudware_tolerance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -1064,12 +1055,12 @@ set_target_properties(test_dfm PROPERTIES
 add_test(NAME dfm COMMAND test_dfm)
 
 # --- libchudware piping + hydraulic (T-RF19 leaf 4) ------------------------------
-# C++ ports of the retired Python piping modules (1-D liquid + gas network solver, fluid
+# C++ ports of engine_oracle/piping/ (1-D liquid + gas network solver, fluid
 # properties, B36 schedule catalog, CFD handoff math) and
-# hydraulic modules (ISO 1219 circuit schema, cylinder/pump/accumulator/
+# engine_oracle/hydraulic/ (ISO 1219 circuit schema, cylinder/pump/accumulator/
 # valve sizing, BOM) plus the services/mcp tool envelopes for both families
 # (incl. the aicad.simhandoff/1 builders they share). PURE (OCCT-free, no
-# doc/ecad/agent linkage): the `fluids` algorithms those modules called (Clamond
+# doc/ecad/agent linkage): the `fluids` algorithms the oracle calls (Clamond
 # friction factor, Rennels fitting K) are re-implemented and the B36.10M/19M
 # schedule tables + B16 fitting CSV are vendored (pipe_tables.h, generated
 # from the MIT fluids package; fittings_data.h), so the port always behaves
@@ -1116,8 +1107,8 @@ set_target_properties(test_hydraulic PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME hydraulic COMMAND test_hydraulic)
 
-# rpc_cli: manual debugging CLI — {"method","params"} per line on stdin -> dispatch
-# result per line. No test or script drives it (its T-RF19 parity harness is retired).
+# {"method","params"} per line on stdin -> dispatch result per line; the T-RF19
+# parity harness drives this against the Python oracle (mirrors fw_cli).
 add_executable(rpc_cli piping/rpc_cli.cpp)
 target_link_libraries(rpc_cli PRIVATE chudware_hydraulic chudware_piping)
 set_target_properties(rpc_cli PROPERTIES
@@ -1172,8 +1163,8 @@ if(CHUDWARE_WITH_OCCT)
     "Polyhedral-FEA volume meshing and adaptive refinement" ON)
 
   # --- P55r: lib3mf 3MF reader/writer (BSD — clean to link/distribute) -------
-  # Provision the SAME lib3mf 2.5.0 the retired Python engine wrapped
-  # via the `lib3mf` wheel, so the 3MF mesh extraction (vertex coords +
+  # Provision the SAME lib3mf 2.5.0 the Python oracle (engine/doc/formats.py)
+  # wraps via the `lib3mf` wheel, so the 3MF mesh extraction (vertex coords +
   # triangle indices) is bit-identical. The header-only CppDynamic binding lives
   # ONLY in doc/formats.cpp and dlopens lib3mf.dll at runtime (no import lib on
   # the link line); chudware_doc compiles with CHUDWARE_WITH_LIB3MF + the binding's
@@ -1183,8 +1174,8 @@ if(CHUDWARE_WITH_OCCT)
   endif()
 
   # --- P55s: openNURBS (Rhino .3dm read/write) — MIT-ish, built FROM SOURCE ---
-  # Provision + build opennurbsStatic from the SAME rhino3dm v8.17.0 the retired
-  # Python engine wrapped via the `rhino3dm 8.17.0` wheel, so the
+  # Provision + build opennurbsStatic from the SAME rhino3dm v8.17.0 the Python
+  # oracle (engine/doc/formats.py) wraps via the `rhino3dm 8.17.0` wheel, so the
   # .3dm mesh extraction (ON_Mesh m_V float32 + m_F quad/tri) is bit-identical.
   # opennurbs.h lives ONLY in doc/formats.cpp; chudware_doc compiles with
   # CHUDWARE_WITH_OPENNURBS + the include dir and links opennurbsStatic below.
@@ -1295,7 +1286,7 @@ if(CHUDWARE_WITH_OCCT)
     TKernel TKMath TKG2d TKG3d TKGeomBase TKGeomAlgo
     TKBRep TKTopAlgo TKPrim TKMesh TKShHealing TKBO TKFillet
     # TKHLR: hidden-line removal (HLRBRep_Algo / HLRBRep_HLRToShape) for the 2D
-    # drawing projection (doc/drawing.cpp).
+    # drawing projection (doc/drawing.cpp; engine/doc/drawing.py oracle).
     TKHLR
     # TKOffset: shell (BRepOffsetAPI_MakeThickSolid) + draft (BRepOffsetAPI_DraftAngle)
     # + loft (BRepOffsetAPI_ThruSections).
@@ -1489,13 +1480,19 @@ if(CHUDWARE_WITH_OCCT)
   set_tests_properties(surf_replace_face_heal PROPERTIES
     ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
-  # Verification: tessellate -> write_aicm -> the GUI's render::parseAicm round-trip.
+  # Verification: tessellate -> write_aicm -> HOST render::parseAicm round-trip.
   add_executable(test_geom_aicm
     tests/test_geom_aicm.cpp)
+  # host/src/render (the loader's dir) — NOT host/src, whose math.h shadows the
+  # CRT <math.h> and breaks <cmath>/<cstdlib> under MSVC.
   target_include_directories(test_geom_aicm PRIVATE
     ${doctest_SOURCE_DIR}
-    ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_geom_aicm PRIVATE chudware_geom_occt chudware_host_aicm_loader)
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
+  target_link_libraries(test_geom_aicm PRIVATE chudware_geom_occt chudware_util)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_geom_aicm PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_geom_aicm PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME geom_aicm COMMAND test_geom_aicm)
@@ -1504,16 +1501,20 @@ if(CHUDWARE_WITH_OCCT)
 
   # --- Wave 2 milestone: solved sketch -> profile -> extrude/revolve ---------
   # End-to-end: chudware::sketch::solve_sketch -> faces_from_solved_sketch ->
-  # extrude_face/revolve_face -> tessellate -> write_aicm -> the GUI's render::parseAicm.
+  # extrude_face/revolve_face -> tessellate -> write_aicm -> HOST render::parseAicm.
   # Links chudware_sketch for solve_sketch (chudware_geom_occt already brings the geom
   # kernel + chudware_geom + nlohmann_json transitively).
   add_executable(test_profile_extrude
     tests/test_profile_extrude.cpp)
   target_include_directories(test_profile_extrude PRIVATE
     ${doctest_SOURCE_DIR}
-    ${OpenCASCADE_INCLUDE_DIR})
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_profile_extrude PRIVATE
-    chudware_geom_occt chudware_sketch chudware_geom chudware_host_aicm_loader)
+    chudware_geom_occt chudware_sketch chudware_geom chudware_util)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_profile_extrude PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_profile_extrude PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME profile_extrude COMMAND test_profile_extrude)
@@ -1522,15 +1523,19 @@ if(CHUDWARE_WITH_OCCT)
 
   # --- Wave 2 milestone: boolean + dress-up ops compose into real parts ------
   # End-to-end: make_box/extrude_face base -> fuse/cut/common (booleans.h) +
-  # fillet/chamfer (dress.h) -> tessellate -> write_aicm -> the GUI's render::parseAicm.
+  # fillet/chamfer (dress.h) -> tessellate -> write_aicm -> HOST render::parseAicm.
   # Same wiring as test_profile_extrude (chudware_geom_occt now carries TKBO/TKFillet).
   add_executable(test_ops
     tests/test_ops.cpp)
   target_include_directories(test_ops PRIVATE
     ${doctest_SOURCE_DIR}
-    ${OpenCASCADE_INCLUDE_DIR})
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_ops PRIVATE
-    chudware_geom_occt chudware_sketch chudware_geom chudware_host_aicm_loader)
+    chudware_geom_occt chudware_sketch chudware_geom chudware_util)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_ops PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_ops PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME ops COMMAND test_ops)
@@ -1571,9 +1576,12 @@ if(CHUDWARE_WITH_OCCT)
     tests/test_import_roundtrip.cpp)
   target_include_directories(test_import_roundtrip PRIVATE
     ${doctest_SOURCE_DIR}
-    ${OpenCASCADE_INCLUDE_DIR})
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_import_roundtrip PRIVATE
-    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_host_aicm_loader)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util)
+  target_sources(test_import_roundtrip PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_import_roundtrip PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   if(CHUDWARE_WITH_POLYMESH)
@@ -1696,16 +1704,20 @@ if(CHUDWARE_WITH_OCCT)
     endif()
   endif()
 
-  # Verification: compile a document -> write_aicm -> the GUI's render::parseAicm, with
+  # Verification: compile a document -> write_aicm -> HOST render::parseAicm, with
   # the parametric-rebuild case (same doc, two envs -> two solids). Same wiring as
   # test_ops; chudware_doc carries the OCCT toolkits transitively via chudware_geom_occt.
   add_executable(test_document
     tests/test_document.cpp)
   target_include_directories(test_document PRIVATE
     ${doctest_SOURCE_DIR}
-    ${OpenCASCADE_INCLUDE_DIR})
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_document PRIVATE
-    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_host_aicm_loader)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_document PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_document PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME document COMMAND test_document)
@@ -1736,8 +1748,8 @@ if(CHUDWARE_WITH_OCCT)
   add_test(NAME op_registry COMMAND test_op_registry)
   set_tests_properties(op_registry PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
-  # --- Format-registry lockstep (T-RF19): doc_formats payload vs the frozen dump of the
-  # retired Python engine's list_formats + detect_format. ---------------------------
+  # --- Format-registry parity (T-RF19): doc_formats payload vs the Python oracle
+  # dump (engine/doc/formats.py::list_formats) + detect_format lockstep. --------
   add_executable(test_formats_registry
     tests/test_formats_registry.cpp)
   target_include_directories(test_formats_registry PRIVATE
@@ -1918,11 +1930,13 @@ if(CHUDWARE_WITH_OCCT)
   # bodies; the test drives the op end to end (doc field + both tess paths + .step+ round-trip).
   add_executable(test_appearance
     tests/test_appearance.cpp)
+  target_sources(test_appearance PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   target_include_directories(test_appearance PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
   target_link_libraries(test_appearance PRIVATE
-    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_host_aicm_loader)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
   set_target_properties(test_appearance PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME appearance COMMAND test_appearance)
@@ -1997,18 +2011,22 @@ if(CHUDWARE_WITH_OCCT)
   # --- A3: pattern feature compilers — linear_pattern / circular_pattern ------
   # core/doc/document.cpp's pattern branches REPLICATE a referenced seed solid with
   # rigid transforms (geom/transform.cpp: translate_copy / rotate_copy) and FUSE the
-  # copies into one body (the geometry-pattern strategy ported from the retired Python
-  # engine, in the simplified id-ref model). The test round-trips a linear + a circular
-  # pattern document through the GUI's AICM loader and asserts analytic,
+  # copies into one body (the geometry-pattern strategy of engine/doc/features/pattern.py,
+  # in the simplified id-ref model). The test round-trips a linear + a circular pattern
+  # document through the host AICM loader (the contract oracle) and asserts analytic,
   # OCCT-version-independent invariants (face counts, bbox, mesh volume). Same wiring as
   # test_document; chudware_doc carries the OCCT toolkits transitively via chudware_geom_occt.
   add_executable(test_pattern
     tests/test_pattern.cpp)
   target_include_directories(test_pattern PRIVATE
     ${doctest_SOURCE_DIR}
-    ${OpenCASCADE_INCLUDE_DIR})
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_pattern PRIVATE
-    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_host_aicm_loader)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_pattern PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_pattern PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME pattern COMMAND test_pattern)
@@ -2021,16 +2039,20 @@ if(CHUDWARE_WITH_OCCT)
   # (geom/transform.cpp: mirror_copy) and either FUSES the reflection into the body
   # (merge:true, default) or keeps it as a separate body (merge:false). The test
   # round-trips an explicit-plane merge, a face-selector merge, and a no-merge
-  # document through the GUI's AICM loader and asserts analytic,
+  # document through the host AICM loader (the contract oracle) and asserts analytic,
   # OCCT-version-independent invariants (face counts, bbox, mesh volume). Same wiring
   # as test_pattern; chudware_doc carries the OCCT toolkits transitively via chudware_geom_occt.
   add_executable(test_mirror
     tests/test_mirror.cpp)
   target_include_directories(test_mirror PRIVATE
     ${doctest_SOURCE_DIR}
-    ${OpenCASCADE_INCLUDE_DIR})
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_mirror PRIVATE
-    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_host_aicm_loader)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_mirror PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_mirror PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mirror COMMAND test_mirror)
@@ -2057,7 +2079,7 @@ if(CHUDWARE_WITH_OCCT)
   # + residual_regions). Calls doc_new/doc_apply_ops/doc_eval_* directly on primitive box/
   # cylinder features and asserts on the returned JSON -- no host AICM loader needed (no
   # mesh parsing here, unlike test_document/test_mirror/test_hole), so this target skips
-  # chudware_host_aicm_loader.
+  # the render include path and the aicm_loader.cpp source.
   add_executable(test_interference
     tests/test_interference.cpp)
   target_include_directories(test_interference PRIVATE
@@ -2073,7 +2095,7 @@ if(CHUDWARE_WITH_OCCT)
   # --- PLM graphical revision diff (doc_render_diff): asserts on the returned JSON AND on the
   # decoded PNG pixels (miniz inflate of encode_png_rgb's filter-none RGB), so the red/green
   # colour semantics and the lowered min_painted floor for a sparse changes_only render are
-  # both proven. No host AICM loader needed, like test_interference.
+  # both proven. No host AICM loader / render include path needed, like test_interference.
   add_executable(test_render_diff
     tests/test_render_diff.cpp)
   target_include_directories(test_render_diff PRIVATE
@@ -2091,19 +2113,23 @@ if(CHUDWARE_WITH_OCCT)
   # SELECTOR-resolved planar face, building a cylinder/cbore/csink tool per position
   # (geom/hole.cpp: make_hole_tool), unioning them, and cutting the union from the
   # body — the SolidWorks Hole Wizard multi-position behaviour, simplified (no thread
-  # tables / cosmetic threads / grid / sketch positions), ported from the retired
-  # Python engine. The test round-trips four hole documents (simple-
-  # through, cbore-through, csink-through, multi-position) through the GUI's AICM loader
-  # and asserts analytic, OCCT-version-independent invariants
+  # tables / cosmetic threads / grid / sketch positions), ported from
+  # engine/doc/features/hole.py. The test round-trips four hole documents (simple-
+  # through, cbore-through, csink-through, multi-position) through the host AICM loader
+  # (the contract oracle) and asserts analytic, OCCT-version-independent invariants
   # (face counts incl. the bore cylinder / csink cone, bbox, mesh volume). Same wiring
   # as test_mirror; chudware_doc carries the OCCT toolkits transitively via chudware_geom_occt.
   add_executable(test_hole
     tests/test_hole.cpp)
   target_include_directories(test_hole PRIVATE
     ${doctest_SOURCE_DIR}
-    ${OpenCASCADE_INCLUDE_DIR})
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_hole PRIVATE
-    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_host_aicm_loader)
+    chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_hole PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_hole PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME hole COMMAND test_hole)
@@ -2134,17 +2160,21 @@ if(CHUDWARE_WITH_OCCT)
   # --- A2: edge-selector pick resolution (doc/picks.cpp) ---------------------
   # core/doc/picks.cpp resolves edge selectors against a live B-rep body (the two-
   # stage describe_edges -> hint-fallback resolve -> nearest-unique-edge mapping ported
-  # from the retired Python engine) so the fillet/chamfer compilers accept an EDGE
+  # from engine/doc/features/dress.py) so the fillet/chamfer compilers accept an EDGE
   # SELECTOR (not just the dir filter), and a dangling selector becomes a per-feature
-  # error status. The test round-trips a fillet-by-selector document through the GUI's
-  # AICM loader, exactly like test_document. Same wiring.
+  # error status. The test round-trips a fillet-by-selector document through the host
+  # AICM loader (the contract oracle), exactly like test_document. Same wiring.
   add_executable(test_picks
     tests/test_picks.cpp)
   target_include_directories(test_picks PRIVATE
     ${doctest_SOURCE_DIR}
-    ${OpenCASCADE_INCLUDE_DIR})
+    ${OpenCASCADE_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_picks PRIVATE
-    chudware_doc chudware_geom_occt chudware_geom chudware_host_aicm_loader)
+    chudware_doc chudware_geom_occt chudware_geom chudware_util)
+  # Compile the host loader straight into the test target (the contract oracle).
+  target_sources(test_picks PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_picks PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME picks COMMAND test_picks)
@@ -2262,7 +2292,7 @@ if(CHUDWARE_WITH_OCCT)
   # over local IPC (unix socket / named pipe). Like chudware_probe it dlopens the
   # engine (via services/worker/cpp_core.cpp) rather than linking it, so the
   # daemon binary is tiny, engine-version-agnostic, and reuses the exact loader
-  # every other consumer runs. See docs/reference/HOSTD.md.
+  # every other consumer runs. See the hostd plan + docs/HOSTD.md.
   # (Build id header configured above, next to the chudware target — shared.)
   # Both platform backends are always listed; each file self-selects via
   # #ifdef _WIN32 / #ifndef _WIN32, so there is one source list to maintain.
@@ -2361,29 +2391,20 @@ if(CHUDWARE_WITH_OCCT)
   endif()
 endif()
 
-# hostd engine-call watchdog policy (hostd/engine_watchdog.h, header-only): which calls
-# the short/long wall-clock ceilings may end, and that agent_*/chudcode_* turns are never
-# capped. OCCT-free, so it runs in every config; doctest checks stay active under NDEBUG.
-add_executable(test_engine_watchdog hostd/test_engine_watchdog.cpp)
-target_include_directories(test_engine_watchdog PRIVATE ${doctest_SOURCE_DIR})
-set_target_properties(test_engine_watchdog PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME engine_watchdog COMMAND test_engine_watchdog)
-
-# === 3D assembly mate solver (ported from the retired Python mate_solver) =====
+# === 3D assembly mate solver (C++ port of engine/doc/mate_solver.py) ==========
 # Standalone, OCCT-free: rigid-component placement over the shared solver core
-# (chudware_solver) + Eigen + json. Mirrors the sketch lib/cli shape.
+# (chudware_solver) + Eigen + json. Mirrors the sketch lib/cli/diff-harness shape.
 add_library(chudware_mate STATIC
   mate/mate.cpp
   # numpy_rng.cpp is a standalone (stdlib-only) bit-exact clone of numpy's
   # default_rng().standard_normal(); the antipodal-escape restart in mate.cpp draws from it
-  # so the C++ random restarts land on the SAME points as the retired Python solver. Compiled in
+  # so the C++ random restarts land on the SAME points as the Python oracle. Compiled in
   # directly (not via chudware_sim) to keep chudware_mate OCCT-/sim-free.
   sim/numpy_rng.cpp)
 target_include_directories(chudware_mate PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_mate PUBLIC chudware_solver Eigen3::Eigen nlohmann_json::nlohmann_json)
 
-# mate_cli (manual debugging CLI; no test or script drives it). Reads the
+# mate_cli (differential-harness driver; see tools/mate_diff.py). Reads the
 # {components, mates, resolved_geometry, warm?, drag?} fixture from argv[1] (or
 # stdin if "-") and prints the solve_mates result as one JSON line.
 add_executable(mate_cli
@@ -2421,10 +2442,12 @@ if(TARGET test_nsolve)
     target_compile_features(test_platform_parity PRIVATE cxx_std_20)
     target_include_directories(test_platform_parity PRIVATE
       ${doctest_SOURCE_DIR}
-      ${OpenCASCADE_INCLUDE_DIR})
+      ${OpenCASCADE_INCLUDE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
     target_link_libraries(test_platform_parity PRIVATE
-      chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_mate
-      chudware_host_aicm_loader)
+      chudware_doc chudware_geom_occt chudware_sketch chudware_geom chudware_util chudware_mate)
+    target_sources(test_platform_parity PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
     target_compile_definitions(test_platform_parity PRIVATE
       CHUDWARE_PLATFORM_PARITY_CORPUS="${CMAKE_CURRENT_SOURCE_DIR}/../corpora/platform_parity")
     if(CHUDWARE_WITH_POLYMESH)
@@ -2649,9 +2672,11 @@ set_target_properties(test_topopt_spectral PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME topopt_spectral COMMAND test_topopt_spectral)
 
-add_executable(test_topopt_surface tests/test_topopt_surface.cpp)
-target_include_directories(test_topopt_surface PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_topopt_surface PRIVATE chudware_sim chudware_host_aicm_loader)
+add_executable(test_topopt_surface tests/test_topopt_surface.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
+target_include_directories(test_topopt_surface PRIVATE ${doctest_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
+target_link_libraries(test_topopt_surface PRIVATE chudware_sim)
 set_target_properties(test_topopt_surface PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME topopt_surface COMMAND test_topopt_surface)

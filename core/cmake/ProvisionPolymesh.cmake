@@ -180,9 +180,13 @@ endif()
 # it. The mesher itself (polymesh::pipeline) has no such constraint, so mirror upstream's
 # platform predicate here and build the pipeline WITHOUT the learned advisor rather than
 # refusing to configure at all. Keep this condition identical to upstream's `_ort_archive`
-# selection: a build that satisfies it is exactly a build that can fetch and stage ORT.
-if((WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8) OR
-   (UNIX AND NOT APPLE AND CMAKE_SIZEOF_VOID_P EQUAL 8))
+# selection, narrowed to the x86-64 processors those two archives contain: upstream picks
+# the linux-x64 archive for any 64-bit Unix, so an aarch64 Linux build would fetch x86-64
+# ONNX Runtime and fail to link it. A build that satisfies this is exactly a build that can
+# fetch and stage ORT.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND
+   ((WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8) OR
+    (UNIX AND NOT APPLE AND CMAKE_SIZEOF_VOID_P EQUAL 8)))
   set(_pm_advisor_enabled ON)
 else()
   set(_pm_advisor_enabled OFF)

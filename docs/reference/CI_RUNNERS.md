@@ -188,11 +188,12 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
   hardware. The native release gate uses `NullWebView` and therefore does not
   compile the CEF backend; CEF is covered by the separate packaging workflow.
   The Windows row additionally launches the built GUI with a deliberately
-  missing managed worker, loads that row's
-  `build/windows-occt/bin/libchudware.dll` through the in-process fallback, and
-  validates a real PNG headless capture. An engine-dependent screenshot fails
-  with exit 1 and no capture if neither worker nor library can start; static UI
-  shots remain usable without an engine. Release packaging remains CEF-enabled,
+  missing managed worker and the engine daemon off: the engine-dependent `m1`
+  scenario must load that row's `build/windows-occt/bin/libchudware.dll`
+  through the in-process fallback, exit 0, write a real PNG and save its part;
+  a copy of the host `bin` directory outside the checkout, with no library
+  anywhere, must fail `m1` with exit 1 and no capture while the static `chat`
+  shot still exits 0 with a PNG. Release packaging remains CEF-enabled,
   so `cc-linux-build` and `cc-win-package` need the platform CEF SDK provisioned.
 - **Windows builds are resource-bounded.** The Windows legs of `native-build.yml`
   and `nightly-release.yml` derive `CMAKE_BUILD_PARALLEL_LEVEL` from half the

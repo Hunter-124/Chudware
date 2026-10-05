@@ -100,6 +100,51 @@
         "lhs": "${hostSystemName}",
         "rhs": "Darwin"
       }
+    },
+    {
+      "name": "linux-aarch64-qemu",
+      "displayName": "Linux aarch64 core, cross-built, tests under QEMU (OCCT + Polyhedral-FEA)",
+      "description": "Cross-compile the core for aarch64 Linux with the GNU cross toolchain on an x86_64 Linux host; ctest runs all registered core tests through qemu-user (cmake/toolchains/qemu-aarch64-run.sh, private TMPDIR per test), with explicit test timeouts capped at 600 seconds. Use scripts/run_bounded.py to bound the whole ctest command to 1800 seconds and CHUDWARE_JOB_DEADLINE. Emulated, not native ARM hardware. Export CHUDWARE_ARM_SDK from scripts/build_arm_sdk.sh linux-aarch64 first; ARM children that re-exec themselves require the guest's qemu-aarch64 binfmt_misc registration. CHOLMOD is off because the ARM SDK carries no SuiteSparse; FEA uses the Eigen solver. LTO is off because these are qualification binaries, not shipping artifacts.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-aarch64-qemu",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/aarch64-linux-gnu.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CHUDWARE_ARM_SDK": "$env{CHUDWARE_ARM_SDK}",
+        "CHUDWARE_LTO": "OFF",
+        "CHUDWARE_BUILD_CORE": "ON",
+        "CHUDWARE_WITH_OCCT": "ON",
+        "CHUDWARE_WITH_POLYMESH": "ON",
+        "CHUDWARE_WITH_CHOLMOD": "OFF"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "macos-arm64-cross",
+      "displayName": "macOS arm64 core, cross-compiled on an Intel Mac, COMPILE ONLY (OCCT + Polyhedral-FEA)",
+      "description": "Cross-compile and link the core for arm64 macOS with AppleClang on an Intel Mac. Nothing built here can run on the build host and nothing is tested; native arm64 runtime belongs to the macos-arm64 preset on Apple silicon. Export CHUDWARE_ARM_SDK from scripts/build_arm_sdk.sh darwin-arm64 first. CHOLMOD is off because the ARM SDK carries no SuiteSparse; CEF is disabled because no Darwin CEF distribution is vendored. LTO is off: nothing built here ships, and LTO links would double the bounded build.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/macos-arm64-cross",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/darwin-arm64.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CHUDWARE_ARM_SDK": "$env{CHUDWARE_ARM_SDK}",
+        "CHUDWARE_LTO": "OFF",
+        "CHUDWARE_BUILD_CORE": "ON",
+        "CHUDWARE_WITH_OCCT": "ON",
+        "CHUDWARE_WITH_POLYMESH": "ON",
+        "CHUDWARE_WITH_CHOLMOD": "OFF",
+        "CHUDWARE_ENABLE_CEF": "OFF"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     }
   ],
   "buildPresets": [
@@ -126,6 +171,16 @@
     {
       "name": "macos-x86_64",
       "configurePreset": "macos-x86_64",
+      "configuration": "Release"
+    },
+    {
+      "name": "linux-aarch64-qemu",
+      "configurePreset": "linux-aarch64-qemu",
+      "configuration": "Release"
+    },
+    {
+      "name": "macos-arm64-cross",
+      "configurePreset": "macos-arm64-cross",
       "configuration": "Release"
     }
   ]

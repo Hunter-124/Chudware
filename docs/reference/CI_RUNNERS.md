@@ -46,29 +46,29 @@ GarrisonGamingPC each product goes further: separate identities and storage, so
 CloudCastle, Chudware and Chudcode tests can never collide (see
 [Per-product isolation on GarrisonGamingPC](#per-product-isolation-on-garrisongamingpc)).
 
-Labels as registered on this repository (runners API, 2026-10-03):
+Labels as registered after the private-lane migration:
 
 | Runner | OS / Arch | Labels | CAD install dir |
 |---|---|---|---|
 | `livingroom-pc` | Linux X64 | `cloudcastle-ci`, `cc-linux-livingroom` | `/opt/actions-runner-cad` (service runs as `liveuser`) |
-| `hunter-workstation` | Linux X64 | `cloudcastle-ci`, `cc-linux-hunter` | `/opt/actions-runner-cad` |
+| `hunter-workstation` | Linux X64 | retired; service and GitHub registration removed | `/opt/actions-runner-cad` (retained source/SDK, not build capacity) |
 | `cloudcastle-server` | Linux X64 | `cloudcastle-ci`, `cc-prod-control`, `cc-artifact-host`, `cc-infra-webservice` | `/opt/actions-runner-cad` |
 | `chudware-ryzen-linux` | Linux X64 | `cc-linux-chudware`; `cloudcastle-ci` and `cc-linux-build` only after qualification | `/opt/actions-runner-chudware` inside the `Chudware-CI` WSL2 guest |
-| `ryzen-7900x3d` | Windows X64 | `cloudcastle-ci`, `cc-win-primary`, `cc-win-package`, `cc-win-ryzen` | `C:\actions-runner-cad` (work folder `D:\ChudwareCI\Windows\w`) |
+| `ryzen-7900x3d` | Windows X64 | `cloudcastle-ci`, `cc-win-primary`, `cc-win-package`, `cc-win-ryzen`, `cc-win-chudware` | `C:\actions-runner-cad` (work folder `D:\ChudwareCI\Windows\w`) |
 | `imac-intel` | macOS X64 | `cloudcastle-ci`, `cc-mac-intel` | `~/actions-runner-cad` (operator/signer lane: GUI account, login keychain, signing identities, Homebrew owner) |
-| `imac-intel-chudware-test` | macOS X64 | `cc-mac-chudware-intel-bootstrap`; `cloudcastle-ci` and `cc-mac-chudware-intel` only after qualification | `/Library/CloudCastleCI/ccci-chudware/actions-runner` (system LaunchDaemon `com.cloudcastle.ci.runner.chudware` as the hidden `ccci-chudware` account) |
-| `macbook-air-m2` | macOS ARM64 | `cloudcastle-ci`, `cc-mac-arm` | `~/actions-runner-cad` (operator lane: GUI account, Homebrew owner) |
-| `macbook-air-m2-chudware-test` | macOS ARM64 | **not registered yet** — will register with only `cc-mac-chudware-arm-bootstrap`; `cloudcastle-ci` and `cc-mac-chudware-arm` only after qualification | `/Library/CloudCastleCI/ccci-chudware/actions-runner` on the M2 (system LaunchDaemon `com.cloudcastle.ci.runner.chudware` as the hidden `ccci-chudware` account) |
+| `imac-intel-chudware-test` | macOS X64 | `cloudcastle-ci`, `cc-mac-chudware-intel-bootstrap`, `cc-mac-chudware-intel` | `/Library/CloudCastleCI/ccci-chudware/actions-runner` (system LaunchDaemon `com.cloudcastle.ci.runner.chudware` as the hidden `ccci-chudware` account) |
+| `macbook-air-m2` | macOS ARM64 | offline, not currently registered; ordinary checks do not route here | `~/actions-runner-cad` (operator lane: GUI account, Homebrew owner) |
+| `macbook-air-m2-chudware-test` | macOS ARM64 | **not registered yet** — will register with only `cc-mac-chudware-arm-bootstrap`; `cloudcastle-ci` and `cc-mac-chudware-arm` only after qualification. No ordinary workflow routes at it (see [ARM coverage without ARM hardware](#arm-coverage-without-arm-hardware)) | `/Library/CloudCastleCI/ccci-chudware/actions-runner` on the M2 (system LaunchDaemon `com.cloudcastle.ci.runner.chudware` as the hidden `ccci-chudware` account) |
 
-Labels deliberately match the CloudCastle install on the same machine, so
-workflow routing syntax is portable between the two repositories.
+The ordinary native-build matrix uses product-specific labels, rather than
+requiring another product's generic runner label.
 
 **`cc-linux-build` has no runner until `chudware-ryzen-linux` is qualified.**
 It used to be carried by `livingroom-pc`, which is also the production gateway
 host; it was removed there so build legs stop landing on production. Jobs
-routed at `cc-linux-build` (fast-gate's Linux row, linux-gate, native-build's
-Linux row, site-build, stripe-sandbox, release prep, nightly-release's
-`linux-beta`) queue until the guest is promoted. The legacy shared
+routed at `cc-linux-build` (fast-gate's Linux row, linux-gate, site-build,
+stripe-sandbox, release prep, nightly-release's `linux-beta`) queue until the
+guest is promoted. Native-build uses `cc-linux-chudware` directly. The legacy shared
 `cc-linux-ryzen`/`cc-nvme-bootstrap` guest is drained and offline and is not
 part of the fleet.
 
@@ -155,15 +155,14 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
   CMake's default search path. The prefix is owned by the operator account;
   the private test account reads it and never writes it.
 - **Ordinary Mac tests run on the private test accounts.** fast-gate's macOS
-  row and native-build's `macOS x86_64` row route at
-  `[self-hosted, macOS, X64, cloudcastle-ci, cc-mac-chudware-intel]`;
-  native-build's `macOS arm64` row routes at
-  `[self-hosted, macOS, ARM64, cloudcastle-ci, cc-mac-chudware-arm]`. Before
-  anything compiles they fail unless they run as `ccci-chudware` with the
+  row routes at `[self-hosted, macOS, X64, cloudcastle-ci, cc-mac-chudware-intel]`.
+  Native-build's `macOS x86_64` and compile-only `macOS arm64` rows use
+  `[self-hosted, macOS, X64, cc-mac-chudware-intel]`.
+  Before anything compiles they fail unless they run as `ccci-chudware` with the
   `CC_CI_PRODUCT=Chudware`, `CC_CI_LANE=test` identity its LaunchDaemon
   exports; native-build additionally requires the runner architecture to be
-  the machine's native one (`X64`/`x86_64` or `ARM64`/`arm64`, never Rosetta
-  translation or a VM), a uid in 420-499 and the 0700 home
+  the machine's native one (`X64`/`x86_64`, never Rosetta translation or a
+  VM), a uid in 420-499 and the 0700 home
   `/Library/CloudCastleCI/ccci-chudware`. That daemon also exports
   `CMAKE_BUILD_PARALLEL_LEVEL` (CPU/RAM-derived, shared across the three
   product lanes on each Mac) and `CTEST_PARALLEL_LEVEL=1`, which
@@ -175,9 +174,11 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
 - **The ARM private test account does not exist yet.** It is created only by
   running CloudCastle's `provision-macos-test-runner.sh` (product `Chudware`)
   natively on the physical M2, which is offline; there is no runtime proof of
-  it. Until it is registered and qualified, native-build's `macOS arm64` row
-  queues. Neither the `cc-mac-arm` operator account nor an Intel lane is ever
-  its substitute.
+  it. No ordinary workflow waits for it: native-build covers arm64 macOS by
+  cross-compiling on the Intel test account, which proves compilation and
+  linking only. Native Apple-silicon runtime stays unqualified until that
+  account is registered, and neither the `cc-mac-arm` operator account nor an
+  Intel lane is ever its substitute.
 - `CMakePresets.json` requires **CMake >= 3.24** on any runner that runs
   `cmake --preset`; `native-build.yml` checks this explicitly and fails with
   that message rather than a confusing generator error.
@@ -187,9 +188,12 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
   hardware. The native release gate uses `NullWebView` and therefore does not
   compile the CEF backend; CEF is covered by the separate packaging workflow.
   The Windows row additionally launches the built GUI with a deliberately
-  missing managed worker, loads that row's
-  `build/windows-core/bin/libchudware.dll` through the in-process fallback, and
-  validates a real PNG headless capture. Release packaging remains CEF-enabled,
+  missing managed worker and the engine daemon off: the engine-dependent `m1`
+  scenario must load that row's `build/windows-occt/bin/libchudware.dll`
+  through the in-process fallback, exit 0, write a real PNG and save its part;
+  a copy of the host `bin` directory outside the checkout, with no library
+  anywhere, must fail `m1` with exit 1 and no capture while the static `chat`
+  shot still exits 0 with a PNG. Release packaging remains CEF-enabled,
   so `cc-linux-build` and `cc-win-package` need the platform CEF SDK provisioned.
 - **Windows builds are resource-bounded.** The Windows legs of `native-build.yml`
   and `nightly-release.yml` derive `CMAKE_BUILD_PARALLEL_LEVEL` from half the
@@ -200,6 +204,98 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
   account-wide `mspdbsrv`. The headless GUI capture sets `CHUDWARE_HIDDEN=1` and
   nested PowerShell runs `-NonInteractive -WindowStyle Hidden`: nothing a
   runner launches may reach anyone's desktop.
+
+### ARM coverage without ARM hardware
+
+Native-build completes its three native baseline rows before either ARM row
+starts. Per-run workflow concurrency prevents a delayed ARM row from locking
+the next native build out; no row is cancelled to achieve this. Both ARM targets
+use x86_64 builders, no paid runner and no M2. Each row's `test_mode` states
+exactly what it proves:
+
+| Row | Builder | Preset | `test_mode` | Proves |
+|---|---|---|---|---|
+| `Linux aarch64 (QEMU-emulated tests)` | `cc-linux-chudware` (`chudware-ryzen-linux` guest) | `linux-aarch64-qemu` | `qemu` | all registered portable OCCT core tests as aarch64 ELF under qemu-user, including the AICM cross-process shm/file-fallback handoff, whose child the x86_64 `/bin/sh` starts through binfmt_misc |
+| `macOS arm64 (cross-compiled, compile-only)` | `cc-mac-chudware-intel` (`ccci-chudware`) | `macos-arm64-cross` | `compile-only` | the OCCT core compiles and links as arm64 Mach-O; nothing is executed |
+
+Neither proves ARM hardware: emulation is not ARM timing, memory ordering or
+kernel behaviour, and the Intel iMac has no Rosetta and cannot run arm64 code
+at all. Native Darwin arm64 runtime qualification remains with the physical M2
+test account above; the signed `cc-mac-arm`/`cc-mac-intel` release lanes are
+unchanged. Both rows check every binary in `build/<preset>/bin` (readelf
+`AArch64` / `lipo -archs` `arm64`) after the build, and the emulated row
+refuses to run ctest unless the generated CTest file launches tests through
+`cmake/toolchains/qemu-aarch64-run.sh`. That wrapper sets `QEMU_LD_PREFIX`
+and gives every test its own `TMPDIR`, because the emulated suite runs ctest
+in parallel across the guest's CPUs and several tests write fixed file names
+into the temp directory.
+
+QEMU runs the FP-heavy mesh/FEA code far slower than native. Every registered
+portable core test executes; a slow test is a failure, not an exclusion or
+native-only claim. Emulated tests are capped at 1,800 seconds; shorter explicit
+allowances are retained. Numerical tests that exceeded 600 seconds are not
+excluded, and native test allowances are unchanged.
+The row's summary distinguishes registered/executed tests from ARM hardware
+qualification.
+
+Every ARM command is hard-bounded by `scripts/run_bounded.py` (stdlib Python;
+macOS has no GNU `timeout`), which runs the command in its own process group
+and on overrun sends that group SIGTERM, then SIGKILL 15 s later, and exits
+124; a failing command's own status passes through. Budgets: each SDK fetch
+10 min, configure 15 min, build 30 min, install 10 min; the whole SDK step
+60 min; core configure 15 min and build 30 min; the emulated ctest run
+60 min with 1,800 s per test. Both ARM rows have a 90-minute job budget, and a
+job-wide deadline three minutes short of it caps every bounded command, so a
+cold SDK that leaves too little time for the rest fails that step with 124
+rather than running into Actions' hard stop. The cross presets build with
+`CHUDWARE_LTO=OFF`: nothing they build ships.
+
+The ARM dependencies come from `scripts/build_arm_sdk.sh <linux-aarch64|darwin-arm64>`,
+which builds pinned sources into the runner account's own
+`RUNNER_TOOL_CACHE/chudware-arm-sdk/<target>/<recipe id>` (no Homebrew, shared
+prefix or other product's account). Cache identity includes the build recipe,
+target toolchain, QEMU wrapper and compiler/SDK identity. Completed SDKs are
+atomically published under an owned lock; incomplete or invalid SDKs rebuild.
+OCCT `V7_9_3` at `a016080b` includes visualization, application framework and
+data exchange, alongside FreeType, RapidJSON and, on Linux, fontconfig and
+static OpenSSL inside shared libcurl. Both cold and cached SDKs must configure
+and link a consumer of all installed OCCT exports. The Linux consumer runs
+real box-volume, mesh, CAF, glTF, FreeType, curl and fontconfig checks under
+QEMU; Darwin validates thin arm64 links without execution. A timeout remains
+exit 124, never a successful cache hit.
+Both ARM presets set `CHUDWARE_WITH_CHOLMOD=OFF` because the SDK carries no
+SuiteSparse, so FEA uses the Eigen solver. The Polyhedral-FEA learned advisor
+is off on aarch64 because only x86-64 ONNX Runtime archives are pinned.
+
+Root-owned prerequisites in the Chudware Linux guest (installed by
+CloudCastle's `provision-nvme-linux-ci.sh`, never by the runner account):
+`g++-aarch64-linux-gnu` (cross libraries in `/usr/aarch64-linux-gnu`),
+`qemu-user-static` with an enabled `qemu-aarch64` binfmt_misc entry in that
+guest's own kernel, `perl`, `make`, `curl`, `pkg-config` and `gperf` (the
+OpenSSL and fontconfig builds), plus the `python3` every row already needs
+(it runs the bounds). Ubuntu's arm64 multiarch packages are
+deliberately not used: `libcurl4-openssl-dev:arm64` cannot be co-installed with
+the amd64 package the native build needs. The Mac row needs only the Command
+Line Tools (SDK and `/usr/bin/python3`).
+
+To reproduce on an x86_64 Linux host with those packages (each command
+bounded as in CI):
+
+```bash
+export CHUDWARE_ARM_SDK="$(python3 scripts/run_bounded.py 3600 scripts/build_arm_sdk.sh linux-aarch64)"
+python3 scripts/run_bounded.py 900 cmake --preset linux-aarch64-qemu
+python3 scripts/run_bounded.py 1800 cmake --build --preset linux-aarch64-qemu
+python3 scripts/run_bounded.py 1800 ctest --test-dir build/linux-aarch64-qemu/core \
+  --output-on-failure --parallel "$(nproc)" --timeout 600
+```
+
+and the compile-only arm64 build on an Intel Mac with the Command Line Tools:
+
+```bash
+export CHUDWARE_ARM_SDK="$(python3 scripts/run_bounded.py 3600 scripts/build_arm_sdk.sh darwin-arm64)"
+python3 scripts/run_bounded.py 900 cmake --preset macos-arm64-cross
+python3 scripts/run_bounded.py 1800 cmake --build --preset macos-arm64-cross
+```
 
 ### Provisioning and qualification: `runner-smoke.yml`
 
@@ -231,7 +327,12 @@ targeted row is routed by `self-hosted`, OS, architecture and the unique runner
 label only, **without `cloudcastle-ci`**: a runner joins that pool after this
 run qualifies it, so demanding the pool label would make qualification
 impossible. The cron and `all` dispatches keep routing every row through
-`cloudcastle-ci`.
+`cloudcastle-ci`. Without `CI_RUNNER_ADMIN_TOKEN` (absent today) those runs
+cannot see which runners are online, so they queue the registered fleet minus
+`macbook-air-m2` (`may_be_offline`): a queued row for the offline M2 never
+starts, so its timeout never applies, and it would hold every daily run open
+for GitHub's 24-hour queue limit. `-f runner_label=cc-mac-arm` still probes
+it on demand.
 
 On macOS provisioning is `brew install` for any of `cmake`, `ninja`,
 `python@3.13` and `opencascade` that is missing, and a no-op for any that is
@@ -361,6 +462,14 @@ and fallback file by the publishing process id and refuses a mapping that
 already exists instead of writing into it. Session 0's `Local\` namespace is
 shared by every service, so a bare per-process counter name would let two
 runners' test processes alias each other's meshes.
+Python consumers use `services.aicm_handoff.read_handoff` as borrowed readers.
+Linux and macOS open the existing POSIX object read-only with `shm_open` and
+never register, unregister or unlink it through Python's resource tracker.
+Windows holds an existing named-mapping handle before calling `mmap`, so a
+missing publication cannot create a fake empty object. Only shared-memory URI
+names are percent-decoded; fallback filenames are used literally. The native
+publisher keeps its object alive across independent reader exits and releases
+it through its own document/process lifetime.
 
 The provisioning and identity cutover are operated from the CloudCastle
 repository (`CloudCastle-RMM/deploy/selfhost/provision-nvme-linux-ci.{ps1,sh}`

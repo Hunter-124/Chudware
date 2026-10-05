@@ -1459,7 +1459,6 @@ struct AppState {
     core::AsyncRpc rpc{worker};
     std::string werr;
     bool workerStarted = false;
-    bool rtReady = false;
     std::atomic<bool> setupRunning{false}, setupDone{false}, setupOk{false};
     std::mutex setupMtx;
     std::string setupMsg;

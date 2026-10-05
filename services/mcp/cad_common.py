@@ -5184,34 +5184,6 @@ def _annot_font(size: int = 13):
         return ImageFont.load_default()
 
 
-def _aicm_payload(handle: str) -> bytes:
-    """AICM bytes for an engine tess handle (8-byte little-endian size + payload).
-
-    Windows publishes ``aicm-shm://Local\\chudware_<key>`` as a named file mapping;
-    POSIX publishes ``aicm-shm:///chudware_<key>`` in shared memory. Older engine
-    versions may return an ordinary file path instead.
-    """
-    prefix = "aicm-shm://"
-    if handle.startswith(prefix):
-        name = handle[len(prefix):]
-        if os.name == "nt":
-            import mmap  # noqa: PLC0415
-
-            with mmap.mmap(-1, 8, tagname=name, access=mmap.ACCESS_READ) as header:
-                n = int.from_bytes(header[:8], "little")
-            with mmap.mmap(-1, 8 + n, tagname=name, access=mmap.ACCESS_READ) as mapping:
-                return mapping[8:8 + n]
-        name = name.lstrip("/")
-        with open(os.path.join("/dev/shm", name), "rb") as f:
-            raw = f.read()
-        if len(raw) < 8:
-            raise ValueError(f"short AICM shm object {name!r}")
-        n = int.from_bytes(raw[:8], "little")
-        return raw[8:8 + n]
-    with open(handle, "rb") as f:
-        return f.read()
-
-
 def _doc_mesh(doc_id: str) -> Optional[dict]:
     """Current tessellation of `doc_id`, or None when it cannot be read.
 
@@ -5239,14 +5211,12 @@ def _doc_mesh(doc_id: str) -> Optional[dict]:
     if cached and cached[0] == handle:
         return cached[1]
     try:
+        from services.aicm_handoff import read_handoff  # noqa: PLC0415
         from services.sim.tessellate import read_aicm  # noqa: PLC0415
     except Exception:  # noqa: BLE001
-        try:
-            from sim.tessellate import read_aicm  # noqa: PLC0415
-        except Exception:  # noqa: BLE001
-            return None
+        return None
     try:
-        parsed = read_aicm(_aicm_payload(handle))
+        parsed = read_aicm(read_handoff(handle))
     except Exception:  # noqa: BLE001
         return None
 

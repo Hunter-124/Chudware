@@ -3568,13 +3568,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // OCCT + daemon hello) off the pre-loop path so the first frames can paint
   // chrome and become interactive. Shot/scenario mode still boots synchronously
   // so captures stay deterministic.
-  st.rtReady = runtimeReady();
-
-#ifndef _WIN32
-  // On Linux/macOS the backend is the in-process C++ core (libchudware), not a
-  // managed Python venv — route through tryStartWorker, whose libchudware guard
-  // reports readiness and only falls back to Python provisioning if libchudware is
-  // genuinely unavailable.
+  // Every desktop platform routes through tryStartWorker: the managed worker
+  // first, then the in-process C++ core (libchudware), and only if both are
+  // unavailable one automatic runtime setup. A missing managed runtime must not
+  // keep a loadable libchudware from serving the session or a headless capture.
   if (shot) {
     st.tryStartWorker();
   } else {
@@ -3583,29 +3580,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     st.status = "Starting engine...";
     st.statusKind = 0;
   }
-#else
-  if (st.rtReady) {
-    if (shot) {
-      st.tryStartWorker();
-    } else {
-      st.workerBootPending = true;
-      st.startupPhase = "Starting engine\xe2\x80\xa6";
-      st.status = "Starting engine...";
-      st.statusKind = 0;
-    }
-  } else {
-    st.status = "Runtime not installed";
-    st.statusKind = 2;
-    st.addLog("[!] runtime not found at %APPDATA%\\Chudware\\runtime");
-    st.autoSetupTried = true;
-    // Provisioning is already on a background thread; mark the status-bar
-    // startup chip so the left loading readout shows while the first-run venv
-    // is built.
-    st.startupPhase = "Provisioning runtime\xe2\x80\xa6";
-    st.startSetup(
-        false); // self-provision from the payload next to the exe / source tree
-  }
-#endif
 
   // NOTE: the old "welcome model" (mounting_plate.stl into the bare renderer)
   // is gone — it contradicted the empty Part1 document (a mesh with no tree
@@ -4478,6 +4452,27 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         !styleColorMatchesRole(colors[ImGuiCol_FrameBg], ui::palette.frameBg);
     if (desired != ui::activeTheme || staleColors)
       ui::applyTheme(desired, scale);
+  };
+
+  // Headless capture with no engine: every scripted scenario (and every async
+  // shot that waits on frame 99999) gates on workerStarted, so once startup has
+  // tried the worker, the in-process core AND the one automatic setup, and all
+  // of them failed, the capture can never happen. Report it and exit non-zero
+  // instead of rendering frames forever.
+  int shotExitCode = 0;
+  auto shotEngineUnavailable = [&]() {
+    return shot && !st.workerStarted && !st.workerBootPending &&
+           st.autoSetupTried && !st.setupRunning.load() && !st.setupDone.load();
+  };
+  auto failShotNoEngine = [&]() {
+    const char *scenario = std::getenv("CHUDWARE_SHOT");
+    std::fprintf(stderr,
+                 "ui screenshot FAILED: no engine could start (%s; worker: %s); "
+                 "CHUDWARE_SHOT=%s cannot run\n",
+                 st.status.c_str(), st.werr.empty() ? "-" : st.werr.c_str(),
+                 scenario ? scenario : "(none)");
+    std::fflush(stderr);
+    shotExitCode = 1;
   };
 
   WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
@@ -8173,8 +8168,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           scenarios.endFrame(st, dw, dh, screenshotPath);
       if (act == ui::ScenarioRunner::FrameAction::Break)
         break;
-      if (act == ui::ScenarioRunner::FrameAction::Continue)
+      if (act == ui::ScenarioRunner::FrameAction::Continue) {
+        if (shotEngineUnavailable()) {
+          failShotNoEngine();
+          break;
+        }
         continue;
+      }
     }
 
     // tree shot needs extra frames for the tree to repaint after async doc load
@@ -8277,6 +8277,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       }
       shotFrame = 8;
     }
+    if (shotFrame >= 99999 && shotEngineUnavailable()) {
+      failShotNoEngine();
+      break;
+    }
     if (shot && ++st.frame >= shotFrame) {
       std::vector<unsigned char> px(dw * dh * 4);
       glReadBuffer(GL_BACK);
@@ -8377,5 +8381,5 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   glfwTerminate();
   if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
     std::fprintf(stderr, "[td] done\n");
-  return 0;
+  return shotExitCode;
 }

@@ -313,12 +313,12 @@ def _thinnest_wall_faces(doc_id: str, fields: list) -> list:
     """
     import numpy as np
 
-    from .cad_common import _aicm_payload
+    from services.aicm_handoff import read_handoff
     from services.sim.tessellate import read_aicm
 
     candidates = []
     for body_no, handle in fields:
-        field = read_aicm(_aicm_payload(handle))
+        field = read_aicm(read_handoff(handle))
         bodies = field.get("bodies") or []
         for scalar in field.get("scalars") or []:
             body = next((b for b in bodies if b["body_id"] == scalar.get("body_id")), None)

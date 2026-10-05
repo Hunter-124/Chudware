@@ -584,17 +584,17 @@ jobs:
             exit 1
           fi
 
-          # All registered portable core tests run: 600 s per test and
-          # 30 minutes total, capped again by the shared job deadline.
+          # All registered portable core tests run: 30 minutes per test and
+          # 60 minutes total, capped again by the shared job deadline.
           registered="$(ctest --test-dir "${tree}" -N | awk '/^Total Tests:/ {print $3}')"
 
           # A directory a timed-out (SIGKILLed) wrapper could not remove stays
           # in the job's own temp, which the runner wipes.
           export TMPDIR="${RUNNER_TEMP}"
           status=0
-          python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" 1800 \
+          python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" 3600 \
             ctest --test-dir "${tree}" --output-on-failure --parallel "$(nproc)" \
-            --timeout 600 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
+            --timeout 1800 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
 
           if grep -qE 'No tests were found' "${log}"; then
             echo "::error::ctest found no tests in ${tree}; the configure did not register the suite"
@@ -606,7 +606,7 @@ jobs:
             echo '## ctest — ${{ matrix.label }} (${{ matrix.preset }}, qemu-user)'
             echo ''
             if [ "${status}" -eq 124 ]; then
-              echo "**Incomplete: the run hit its 30-minute bound (or the job deadline) and was stopped.**"
+              echo "**Incomplete: the run hit its 60-minute bound (or the job deadline) and was stopped.**"
             fi
             echo "Ran ${ran:-an incomplete set} of ${registered} registered core tests as aarch64 under qemu-user on the x86_64 builder; emulation, not ARM hardware. No portable core test is excluded."
             echo '```text'

@@ -1,4 +1,4 @@
-// core/agent/paths.cpp — see paths.h. Mirrors services/paths.py exactly.
+// core/agent/paths.cpp — see paths.h for the resolution and migration rules.
 #include "agent/paths.h"
 
 #include <cstdlib>
@@ -51,8 +51,8 @@ bool copy_tree_if_missing(const fs::path& src, const fs::path& dst) {
     return ok;
 }
 
-// Chudware is the unconditional data dir (mirrors app_state.cpp appdataAppDir() and
-// services/paths.py active_root()).
+// Chudware is the unconditional data dir (mirrors host/src/core/app_state.cpp
+// appdataAppDir() and services/paths.py active_root()).
 fs::path pick_app_dir(const fs::path& base) {
     const fs::path neu = base / "Chudware";
     std::error_code ec;
@@ -91,7 +91,7 @@ fs::path appdata_root() {
     return pick_app_dir(root);
 #else
     // Linux/macOS: the XDG data home (else ~/.local/share), matching the GUI's
-    // platform::appdataRoot() so the C++ core and the GUI agree on the data dir.
+    // appdataDir() in host/src/core/app_state.cpp so the C++ core and the GUI agree.
     if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && xdg[0])
         return pick_app_dir(fs::path(xdg));
     if (const char* home = std::getenv("HOME"); home && home[0])

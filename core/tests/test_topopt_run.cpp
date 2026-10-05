@@ -4,7 +4,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "device/device_id.h"
+#include "util/sha256.h"
 #include "sim/progress.h"
 #include "sim/sim_cancel.h"
 #include "sim/topopt_optimizer.h"
@@ -146,7 +146,7 @@ void check_artifacts(const json &result, const fs::path &root) {
       continue;
     const std::string bytes = read_file(a["path"].get<std::string>());
     CHECK(bytes.size() == a["bytes"].get<std::uint64_t>());
-    CHECK(chudware::device::detail::sha256_hex(bytes) ==
+    CHECK(chudware::util::sha256_hex(bytes) ==
           a["sha256"].get<std::string>());
   }
 }
@@ -347,13 +347,13 @@ TEST_CASE("structural inline run: honest result, consistent evidence, owned "
         64);
 
   // A second run never overwrites the first.
-  const std::string first_hash = chudware::device::detail::sha256_hex(
+  const std::string first_hash = chudware::util::sha256_hex(
       read_file((run_dir / "result.json").string()));
   json again = cantilever(dir, 2);
   const json r2 = fea_run_topology(again);
   REQUIRE(r2["result_dir"].is_string());
   CHECK(r2["result_dir"] != r["result_dir"]);
-  CHECK(chudware::device::detail::sha256_hex(
+  CHECK(chudware::util::sha256_hex(
             read_file((run_dir / "result.json").string())) == first_hash);
   CHECK(children(dir) == 2);
   fs::remove_all(dir);

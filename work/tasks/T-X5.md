@@ -3,7 +3,7 @@ id: T-X5
 title: Profile manager UX seam - list/refresh/delete site profiles + expiry detection
 workstream: X
 owner: gissa
-status: todo
+status: review
 branch: task/T-X5-profile-manager-seam
 depends_on: [T-X1]
 lane: parts-sourcing
@@ -85,3 +85,7 @@ mission brief, "GUI panel is a LATER task").
   control surface, fresh redirect-aware expiry probes using the shared login classifier,
   complete locked deletion, sourcing-pack reachability, and focused regression coverage.
   Implementation is verified and awaiting the board's human merge-time `done` transition.
+- 2026-10-04 [board audit] Status `todo` -> `review`: all five DoD boxes are checked, the
+  2026-08-30 entry records the verified implementation, and the code exists
+  (`services/mcp/parts_tools.py::browser_profiles`, `services/browser/profiles.py`,
+  `services/browser/test_profile_manager.py`). The flip to `done` stays a human action.

@@ -377,7 +377,7 @@ nlohmann::json build_sensor_scenario(const nlohmann::json& sim_result_or_profile
                     events.push_back(
                         {{"t_ms", row["t_ms"].get<double>()}, {"text", row["uart_text"]}});
                 nlohmann::json tr = {{"kind", "uart_rx"}, {"events", events},
-                                     {"device", "neo6m"}};
+                                     {"device", "neo6m"}, {"baud_hz", 9600}};
                 if (ent.uart.is_string()) tr["uart"] = ent.uart;
                 tracks.push_back(tr);
             } else {

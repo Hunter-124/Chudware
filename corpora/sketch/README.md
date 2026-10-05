@@ -1,33 +1,49 @@
-# `corpora/sketch/` — differential-test fixtures (Python oracle ↔ C++ port)
+# `corpora/sketch/` — sketch-solver fixture corpus
 
-Each `*.json` file here is one sketch-solver fixture. The differential runner
-`tools/solver_diff.py` feeds every fixture to **both** engines and diffs the
-results:
+Each `*.json` file here is one sketch-solver fixture: a sketch, its expression
+environment, and (for most fixtures) hand-authored expected results.
 
-- the **Python oracle** — `engine.doc.sketch_solver.solve_sketch(sketch, env)`
-- the **C++ port** — `core/build/bin/Release/sketch_cli.exe` (calls
-  `chudware::sketch::solve_sketch`)
+## Legacy oracle corpus
 
-A fixture **passes** when the two engines agree on `converged`, `dof`, the
-per-entity `statuses`, the `redundant` / `conflicting` constraint sets, and every
-entity coordinate within a tolerance (default `1e-5`).
+The corpus was built as the differential corpus for porting the sketch solver
+from the Python oracle (`engine.doc.sketch_solver`) to C++. Its runner
+(`tools/solver_diff.py`) fed every fixture to both engines and required
+agreement on `converged`, `dof`, per-entity `statuses`, the `redundant` /
+`conflicting` sets, and entity coordinates within `1e-5`. The oracle and that
+runner have been deleted, so no automated job iterates this directory today;
+the fixtures remain the recorded parity cases for the native solver.
 
-## Scope of this corpus
+## Native tooling
 
-These fixtures use **only** the constraint/entity subset currently ported to
-C++ (`core/sketch/sketch.cpp`):
+The live solver is `chudware::sketch::solve_sketch` (`core/sketch/`). Its
+standalone driver `sketch_cli` (`core/sketch/sketch_cli.cpp`, CMake target
+`sketch_cli`, emitted to `<build>/bin/`) solves any fixture in this directory
+directly, ignoring the extra `name` / `expect` / `_note` fields:
 
-- **Entities**: `point`, `line`, `circle`, `arc`.
-- **Constraints**: `coincident`, `horizontal`, `vertical`, `parallel`,
-  `perpendicular`, `concentric`, `equal`, `midpoint`, `point_on`, `fix`
-  (whole-entity + sub-handle), `tangent` (line↔circle), `distance`
-  (point-point + point-line), `radius`, `diameter`.
+```bash
+core/build-linux/bin/sketch_cli corpora/sketch/bracket_full.json
+```
 
-Fixtures requiring deferred features (ellipse/spline/slot entities; `angle`,
-`symmetric`, `collinear`, circle-circle tangency; the C50 `cond`/`axis`
-directional distances; expression dims beyond a bare env-variable lookup; drag /
-warm-start) are intentionally **absent** — they will be added as those features
-reach parity. See the runner's report for anything currently deferred.
+It prints one JSON line `{converged, dof, redundant, conflicting, statuses,
+entities}`. Compare that against the fixture's `expect` block by hand; there is
+no automated corpus runner for this directory. The SolidWorks-parity cases in
+`corpora/sw_parity/` have their own runner over the same binary
+(`corpora/sw_parity/_run_fixtures.py`). The C++ unit tests (`test_sketch` and
+the related `core/tests/` suites) carry their own inline cases.
+
+New sketch capability follows `core/README.md`: implement the residual and
+analytic Jacobian in `core/sketch/`, add a fixture here, and add or update the
+C++ solver test.
+
+## Coverage
+
+The corpus spans `point`, `line`, `circle`, `arc`, and the ported `slot`,
+`arc_slot`, `ellipse`, `ellipse_arc`, `conic`, `parabola` and `spline`
+entities, with `coincident`, `horizontal`, `vertical`, `parallel`,
+`perpendicular`, `collinear`, `concentric`, `coradial`, `equal`, `midpoint`,
+`symmetric`, `point_on`, `fix` (whole-entity + sub-handle), `tangent`,
+`angle`, `distance`, `radius` and `diameter` constraints, plus expression
+dimensions driven by `env`.
 
 ## Fixture format
 
@@ -40,7 +56,7 @@ reach parity. See the runner's report for anything currently deferred.
     "constraints": [ { "id": "c1", "type": "coincident", "refs": ["e1.p2","e2.p1"] }, ... ]
   },
 
-  "env": { "W": 80.0, "H": 50.0 },  // optional: expression-dim variable env (default {})
+  "env": { "W": 80.0, "H": 50.0 },  // expression-dim variable env ({} when unused)
 
   "expect": {                       // optional: hand-authored ground truth (see below)
     "converged": true,
@@ -61,30 +77,21 @@ reach parity. See the runner's report for anything currently deferred.
 | `circle` | `center: [x, y]`, `radius: r`                     |
 | `arc`    | `center: [x, y]`, `radius: r`, `start: deg`, `end: deg` |
 
-(`construction` and other non-coordinate keys are ignored by the comparator.)
+The ported curve entities carry their own parameter keys; see the matching
+`ported_*.json` fixture and `core/sketch/` for each shape. `construction` and
+other non-coordinate keys are not solver coordinates.
 
 ### Constraints
 
 `refs` is a list of handles. A handle is an entity id, optionally with a
 sub-handle: `e1`, `e1.p1`, `e1.p2`, `e1.mid`, `e2.center`, `arc.start`,
 `arc.end`, or the virtual `origin` / `origin.p`. Dimension constraints
-(`distance`, `radius`, `diameter`) carry a `value` object
-`{ "value": <number>, "expr": <env-var-name|null> }`; an `expr` that names a key
-in `env` overrides the literal value.
+(`distance`, `radius`, `diameter`, `angle`) carry a `value` object
+`{ "value": <number>, "expr": <expression|null> }`; an `expr` evaluated against
+`env` overrides the literal value.
 
 ### `expect` (optional)
 
-`expect` is **not required** — the harness's primary check is direct Python↔C++
-parity, so most fixtures omit it. Add `expect` only for hand-authored
-ground-truth cases where you want to additionally pin the expected result
-independent of the oracle. When present, the runner asserts the **Python** result
-matches `expect` too (coordinates are not checked against `expect`, only
-`converged` / `dof` / `statuses` / `redundant` / `conflicting`).
-
-## Running
-
-See `tools/solver_diff.py` (run from the repo root). Quick version:
-
-```powershell
-& "$env:APPDATA\Chudware\runtime\venv\Scripts\python.exe" tools/solver_diff.py
-```
+`expect` pins hand-authored ground truth: `converged`, `dof`, `statuses`,
+`redundant`, `conflicting`. Coordinates are not part of `expect`; under the
+legacy runner they were checked by engine-to-engine agreement only.

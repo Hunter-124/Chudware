@@ -2,8 +2,8 @@
 
 One cheap canary search per registered source adapter, timed and classified.
 ``run_health_check`` NEVER raises — every failure mode collapses into a
-per-site result dict so a caller (the ``vendors_health_check`` RPC on the
-engine_oracle side) can render a status board without try/except gymnastics.
+per-site result dict so ``vendors_health_check`` in ``services/parts/gui_rpc.py``
+can render a status board without try/except gymnastics.
 
 Classification:
 - ok=True  — the canary search returned ≥1 hit carrying both title and url.

@@ -31,7 +31,7 @@
 #include <gp_Pnt.hxx>
 
 #include "aicm_loader.h"
-#include "device/device_id.h"
+#include "util/sha256.h"
 #include "doc/document.h"
 #include "doc/stepplus.h"
 #include "mate/mate.h"
@@ -78,7 +78,7 @@ std::vector<fs::path> fixture_paths() {
 }
 
 std::string sha256(std::string_view bytes) {
-    return chudware::device::detail::sha256_hex(bytes);
+    return chudware::util::sha256_hex(bytes);
 }
 
 std::string sha256(const std::vector<uint8_t>& bytes) {

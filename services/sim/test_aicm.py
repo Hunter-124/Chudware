@@ -1,6 +1,6 @@
-"""Tests for engine/doc/tessellate.py — AICM writer/parser.
+"""Tests for services/sim/tessellate.py — AICM writer/parser.
 
-Run:  python -m engine.doc.test_aicm   (from repo root, using venv python)
+Run: python -m services.sim.test_aicm
 
 House style: plain main() + asserts, no pytest.
 """

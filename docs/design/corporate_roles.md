@@ -1,5 +1,14 @@
 # Corporate Roles — authoritative design (`aicad.corporate/1`)
 
+> **Dated design authority, not a current as-built specification.** This records the
+> 2026-07-16 first cut and proposed lifecycle changes; "live", "missing" and the setting
+> layout below refer to that snapshot. It does not establish that the listed gaps remain
+> open or that all proposed org behavior shipped. Current governance is in
+> `services/agent/corporate.py` / `mission_dispatch.py`; online turns and nested agents
+> follow [Chudcode integration](../../.claude/skills/cad-chudcode-integration/SKILL.md).
+> Preserve the distinction from `services/agent/org.py`; do not replace either capability
+> on the strength of this historical prose.
+
 Status: **design** (2026-07-16). Grounded on first-cut commit `f538b36c` and live code in
 `services/agent/corporate.py`, `coordination.py`, `delegation.py`, `mission_dispatch.py`,
 `role_models.py`, `config.py`, `test_corporate.py`, `contracts/agent_events.md`, and the

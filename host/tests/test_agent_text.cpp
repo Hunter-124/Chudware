@@ -9,7 +9,7 @@
 //         {"doc_id": "doc-cpp00000039", "ops": [...]}
 //     — so the part's NAME was replaced, on screen, by an opaque engine id.
 //  2. The same card's header read "DevicePocket ? MouthpieceSlot ?+2 more". Those '?' are
-//     U+2192 RIGHTWARDS ARROW drawn as notdef: ui_theme.cpp uiGlyphRanges() does not request
+//     U+2192 RIGHTWARDS ARROW drawn as notdef: the atlas table (ui/glyph_ranges.h) does not request
 //     the arrows block, and services/agent/agent_events.py joins tool-card targets with " -> ".
 //
 // Acceptance:
@@ -25,18 +25,13 @@
 //   ✓ covered glyphs (· — … ⌀) survive untouched; emoji/CJK degrade to '?'
 //   ✓ pure ASCII is byte-identical
 //   ✓ malformed UTF-8 does not crash and yields valid UTF-8
-//   ✓ the mirrored atlas range table has NOT drifted from ui_theme.cpp
+//   ✓ every codepoint the atlas loads survives the fold; its neighbours outside the table do not
 
 #include "ui/copilot/agent_text.h"
 
 #include <cstdio>
-#include <cctype>
-#include <cstdlib>
-#include <fstream>
 #include <map>
-#include <sstream>
 #include <string>
-#include <vector>
 
 static int g_failures = 0;
 
@@ -234,70 +229,25 @@ static void test_pipeline_order() {
     CHECK_EQ(ui::foldToAtlasGlyphs(subbed), "edit Bracket -> v2 (doc-cpp00000039)");
 }
 
-// ---- 3. drift guard: the mirrored range table vs ui_theme.cpp ---------------------------------
+// ---- 3. the atlas edges, observed through the fold ----------------------------------------------
 
-// Parse the hex range pairs out of one `static const ImWchar* <fn>() { ... }` body.
-static std::vector<unsigned> parseRanges(const std::string& src, const std::string& fn) {
-    std::vector<unsigned> out;
-    const size_t at = src.find("* " + fn + "()");
-    if (at == std::string::npos) return out;
-    const size_t open = src.find('{', at);
-    const size_t close = src.find("};", open);
-    if (open == std::string::npos || close == std::string::npos) return out;
-    const std::string body = src.substr(open, close - open);
-    for (size_t i = 0; i + 2 < body.size(); ++i) {
-        if (body[i] != '0' || (body[i + 1] != 'x' && body[i + 1] != 'X')) continue;
-        out.push_back((unsigned)std::strtoul(body.c_str() + i, nullptr, 16));
-        i += 2;
-        while (i < body.size() && std::isxdigit((unsigned char)body[i])) ++i;
-    }
-    return out;
-}
-
-static void test_atlas_ranges_have_not_drifted() {
-#ifndef UI_THEME_CPP
-    std::printf("FAIL: UI_THEME_CPP not defined\n");
-    ++g_failures;
-#else
-    std::ifstream f(UI_THEME_CPP);
-    if (!f) {
-        std::printf("FAIL: cannot open %s\n", UI_THEME_CPP);
-        ++g_failures;
-        return;
-    }
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    const std::string src = ss.str();
-
-    std::vector<unsigned> want = parseRanges(src, "uiGlyphRanges");
-    const std::vector<unsigned> cad = parseRanges(src, "cadSymbolRanges");
-    want.insert(want.end(), cad.begin(), cad.end());
-    CHECK(!want.empty());
-
-    std::size_t pairs = 0;
-    const unsigned* have = ui::atlasCoveredRanges(pairs);
-    // ui_theme's tables are 0-terminated; ours holds only the pairs.
-    while (!want.empty() && want.back() == 0) want.pop_back();
-
-    if (want.size() != pairs * 2) {
-        std::printf("FAIL: atlas range table drifted from ui_theme.cpp "
-                    "(ui_theme has %zu values, agent_text.cpp mirrors %zu)\n",
-                    want.size(), pairs * 2);
-        ++g_failures;
-        return;
-    }
-    for (std::size_t i = 0; i < want.size(); ++i) {
-        if (want[i] != have[i]) {
-            std::printf("FAIL: atlas range drift at index %zu: ui_theme.cpp 0x%04X vs "
-                        "agent_text.cpp 0x%04X\n", i, want[i], have[i]);
-            ++g_failures;
-        }
-    }
-    // And the consequence the fold depends on: U+2192 is NOT covered, U+2300 IS.
-    CHECK(!ui::atlasCovers(0x2192));
-    CHECK(ui::atlasCovers(0x2300));
-    CHECK(ui::atlasCovers(0x00B7));
-#endif
+// ui/glyph_ranges.h is the table ui_theme.cpp loads. What the user sees is the fold's output, so
+// pin that: every edge of the table passes through byte-for-byte, one past each edge does not.
+static void test_atlas_edges_survive_or_fold() {
+    // CADSymbols merged over the body face: ∥ ≡ ⊕ ⊙ ⊥ ◆ ◇ (∅ and ⌀ are covered above).
+    const std::string cad = "\xE2\x88\xA5 \xE2\x89\xA1 \xE2\x8A\x95 \xE2\x8A\x99 \xE2\x8A\xA5 "
+                            "\xE2\x97\x86 \xE2\x97\x87";
+    CHECK_EQ(ui::foldToAtlasGlyphs(cad), cad);
+    // Body-face range edges: U+00FF, U+2010, U+2027, U+2070, U+209F.
+    const std::string body = "\xC3\xBF \xE2\x80\x90 \xE2\x80\xA7 \xE2\x81\xB0 \xE2\x82\x9F";
+    CHECK_EQ(ui::foldToAtlasGlyphs(body), body);
+    // One past an edge with no spelled-out fold: U+0100, U+200F, U+2028, U+20A0, U+2204,
+    // U+2206, U+2301 — each would paint as notdef, so each becomes the '?' stand-in.
+    CHECK_EQ(ui::foldToAtlasGlyphs("\xC4\x80 \xE2\x80\x8F \xE2\x80\xA8 \xE2\x82\xA0 "
+                                   "\xE2\x88\x84 \xE2\x88\x86 \xE2\x8C\x81"),
+             "? ? ? ? ? ? ?");
+    // The geometric shapes either side of the merged diamonds fold to the bullet stand-in.
+    CHECK_EQ(ui::foldToAtlasGlyphs("\xE2\x97\x85\xE2\x97\x88"), "**");
 }
 
 int main() {
@@ -317,7 +267,7 @@ int main() {
     test_pure_ascii_is_byte_identical();
     test_malformed_utf8_survives();
     test_pipeline_order();
-    test_atlas_ranges_have_not_drifted();
+    test_atlas_edges_survive_or_fold();
     if (g_failures) {
         std::printf("test_agent_text: %d failure(s)\n", g_failures);
         return 1;

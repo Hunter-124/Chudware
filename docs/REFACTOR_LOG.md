@@ -5680,3 +5680,198 @@ project-root first (listing every candidate on a miss) and accepts face/edge sid
 Chudcode's "No such tool: xd://<menu tool>" should point at `enable_tools`; the eval kernel
 lacks `shapely`/`fitz`; `research_web_search` has only DDG configured (`provider_blocked`).
 
+
+## 2026-10-04 — evidence-backed project deslop pass
+
+Reviewed code/build tooling, all 11 repository skills and 18 discoverable runtime skills,
+current internal documentation/task records, and accessible Claude project memory. Removed
+proven obsolete host/platform/worker/parser paths, hidden provider substitution, duplicated
+digest/calendar helpers and implementation-only tests; preserved persisted/wire contracts,
+historical engineering evidence, design data, resource policies, user sessions and unrelated
+dirty work. Online CAD helpers now use private, tool-free compiled runtime completions with
+the owning actor's selected model/credentials and cancellation; Hunter explicitly accepted
+that RPC v2 cannot enforce exact helper output-token caps. Normal conversations remain
+uncapped. Policy/configuration/lease failures refuse execution rather than enabling it.
+Durable training-state writes fsync before atomic replacement and do not reset corrupt
+resume data. Manual/catalog/DAG generation uses the current registries; historical claims
+are distinguished from operational authority. Memory contains 110 classified topic notes,
+each indexed exactly once, including Hunter's new bus-fidelity policy; auth/vault/mnemopi and
+decision stores were not rewritten.
+
+Observed baseline verification: source gate, core/host/WASM builds and all 123 CTest targets
+passed; packaging had 22 passing tests. The Python sweep initially failed three incidental
+agent assertions; after correction, the complete agent unit passed with 3,519 tests and the
+other 28 already-passing units remained unchanged, totaling 10,500 observed Python passes.
+This is not a claim that the original failing gate invocation returned success. The FIN25
+demo passed 13 legs. Actual compiled helper/RPC loopback completed and cancelled/reaped
+private processes, without a live provider/authentication claim. Independent digest
+verification covered 54 SHA and five HMAC vectors; Release watchdog negative control failed
+as intended. Production policy fault injections refused all three failure cases; interrupted
+atomic JSON-state publication preserved the last successful checkpoint and later advanced.
+The native sketch corpus executed all 18 fixtures (10 agreements, eight historical
+divergences, no execution errors); expected results were not rewritten to hide divergences.
+All 12 migrated hydraulic/piping/impedance/MNA V&V cases passed. B2 passed ten actual legs
+including compiled firmware/Renode fault handling; its dry thermal handoff is not a solved
+thermal analysis.
+
+Integration smoke exposed stale engine selection and user-project restoration in the gate's
+screenshots. The corrected stage selected `core/build-linux/bin/libchudware.so` and actual
+private-HOME/private-working-directory native captures passed. Seeded real Parts Library
+queue state rendered two active downloads and zero for all-terminal state, not a real vendor
+download claim. Empty GUI scan roots now exit 2 and preserve baselines; nine audit tests
+passed. Flight-computer PDN/mount setup and sensor firmware were repaired, but its rejected
+I2C stream exposed missing simulation capability rather than a passing sensor loop. Hunter
+authorized implementing I2C and expanded the request to CAN, UART/serial and SPI with
+virtual latency and electrical loading/impedance. Those new models require separate
+end-to-end evidence; this baseline entry does not claim their completion.
+
+Limits: no live-provider/login, Windows/macOS, AppImage, openEMS, physical hardware/vendor
+download, GPU-training or real-power-loss proof. Graphify refresh was AST-incremental, not a
+new semantic extraction. No user daemon was restarted and no unrelated work was discarded.
+
+
+## 2026-10-05 — bounded STM32F4 bus cutover and exercised flight mission
+
+Implemented I2C, TTL UART, master SPI and classical bxCAN in one shared Renode runtime,
+reached through the existing Firmware > Emulate and native/MCP `fw_sim_run` surfaces.
+No additional simulation framework or target family was introduced. Clocks, link loading,
+receiver thresholds, delays, source edges and lossless-line segments are explicit inputs;
+unsupported target/variant requests refuse instead of inventing hardware behavior.
+
+Actual compiled firmware exercised the complete B1 flight mission: 11 legs passed;
+GNSS passed all four predicates and MPU6050/BMP280/LIS3MDL passed all six. Both partitions
+used the same ELF and a three-second virtual horizon. Initial gyro was 1876 raw,
+barometric pressure was 100129 Pa, and the final GNSS fix was 1100 decimeters altitude,
+2865 centidegrees course, with zero checksum/framing accounting errors. GNSS excitation
+starts one millisecond after reset so firmware can enable the receiver before the first
+start edge; all eleven sentence pairs and 200 ms cadence remain intact. IRQ-serviced
+bounded serial buffers and elapsed-time deadlines replaced instruction-count polling.
+
+Correction smoke retained hardware-visible failures: delayed I2C ACK caused NACK,
+STOP-only retry established phase recovery before any peripheral reset, and slower legal
+CCR programming recovered checked data. Missing SCL bias timed out; weak/capacitive SDA
+caused arbitration loss. Both documented POS/ACK orderings read the identical two-byte
+sample and all fourteen burst bytes. SPI's healthy five-nanosecond-edge link passed,
+whereas the same ELF on the twenty-nanosecond-edge link reported bad data and actual
+indeterminate MISO. CAN's declared external electrical shunt drove TEC to 256/bus-off,
+then 128 observed recessive sequences recovered transmission; isolated ACK loss stopped
+at TEC 128 rather than falsely declaring bus-off. Unsolicited peer traffic did not block
+three real loopback TXOK interrupts and receive frames. ONEBIT UART received electrically
+indeterminate words with `errors=0`; completion evidence retained their unresolved cause
+rather than inventing NF or claiming that zero hardware flags meant healthy data.
+
+Independent common-runtime probes compared 78 voltage observations with native SPICE MNA
+(maximum difference 0.0002366103 V), measured the RC threshold crossing, and exercised
+matched/open/short transmission-line arrivals, reflections and historical reads. Quiet
+ports no longer skip waves in flight. UART assertion evidence is selected before its own
+4096-entry cap, so unrelated I2C volume cannot remove valid mission messages. Real Renode
+clock observation exposed scientific-notation `RunFor` intervals being misparsed;
+intervals now use decimal seconds at nanosecond formatting precision.
+
+Production firmware UI, in private state and working directory, ran real `fw_sim_run`
+against the compiled electrical UART probe and displayed its actual assertion name,
+host elapsed time and native Engineering result. No canned result supplied that proof.
+A long private-state Unix socket path was corrected in the throwaway harness, not hidden
+by altering production error handling.
+
+B1 PASS is a benchmark execution verdict, not board signoff: this run retained eight DRC
+and 93 DFM findings, unknown current draw for ten components, and an unavailable openEMS
+full-wave antenna result. These are reduced linear RC/lossless-line models, not calibrated
+hardware, full RCC/PLL, sensor-conversion, nonlinear-transceiver, EMC or subnanosecond
+accuracy claims. Windows/macOS and live-provider/hardware coverage remain unexercised.
+
+Late consumer proof used the same native surface, not empty assertion-list success:
+CAN mailbox 0 lost arbitration at 186510 ns with TEC zero, then retried and received
+ACK at 564510 ns with TEC/REC zero. Slow MOSI produced an actual peer transaction
+rejection at 2980 ns with `threshold_indeterminate`, without a fabricated peer word
+or committed partial register transaction. The final native firmware behavior suite
+passed all 35 cases and 8956 assertions, including a real 50-microsecond versus
+40-millisecond execution boundary. Actual production Bus events and selected-event
+detail rendered the native result in an isolated desktop capture.
+
+Regenerated twelve manual pages with 379/379 ribbon-command coverage and the live
+offline catalog with 519 tools, 21 families, 514 descriptions and 519 guidance entries.
+Local AST-only graph refresh completed without a shrink override or provider call:
+86134 nodes and 197048 edges. These are code/structure freshness counts, not a new
+semantic extraction. Protected publication distinguishes recorded cleanup hunks from
+initial and later user edits, including concurrent CI/ARM and shared-memory reader work.
+
+The first strict final gate passed source/core/host/WASM/CTest/hostd/web-parity and ten
+Python units but did not finish green: system `python3` lacked manual/packaging dependencies,
+one firmware-authoring assertion exposed raw-read final-newline loss, and the MCP process
+ended without a pytest summary during provisioning-dependent reconstruction tests.
+The launch now explicitly selects the provisioned interpreter and fresh daemon binary.
+A real pytest exit-7 negative control proved the narrow gate guard preserves a fatal verdict
+while continuing to a later real unit; before the guard the sweep aborted.
+
+Raw UTF-8 reads now retain physical line terminators across bounded offset/range pages,
+including CRLF and files without a final newline; numbered/document behavior remains.
+Filesystem and firmware MCP suites passed all 65 tests, including actual authored code
+cross-compilation. Two concurrent real private daemons inherited the same gate key but
+received distinct private identities/sockets and independently owned exactly one document;
+their environment bindings restored and owned processes closed. Daemon discovery now uses
+the existing resolver and exact listener ownership instead of adopting arbitrary new sockets.
+Missing-backend scan tests use deterministic capability/backend fault injection rather than
+leaking installed native SfM into another test; six tests passed, one full-backend test skipped.
+The original no-summary process termination cause remains unconfirmed; the source hazards
+and isolation defects are corrected, not presented as a proven kernel/GPU fault.
+
+The existing charger caller had relied on ignored UART baud and a 30-second native default
+despite declaring 120 seconds. It now programs reset-HSI baud, passes the declared deadline,
+keeps deadline failure fatal, and emits a latched fault transition once rather than flooding
+bounded evidence with repeated state diagnostics. Actual rebuilt firmware passed both unchanged
+FAULT predicates in 4.89 seconds with intact evidence. This safety-loop proof does not claim
+that its earlier failing full benchmark passed. The cleanup-only App.cpp publication snapshot
+also compiled with production Release flags while excluding the user's protected source hunks.
+
+The corrected strict run completed the entire MCP sweep: 3309 passed, 32 skipped and
+one expected failure. Its remaining failures were outside MCP: Python 3.11's `tarfile`
+cannot directly read the packager's Zstandard output, and private HOME hid the installed
+DVC package behind an otherwise discoverable CLI launcher. The package comparison now
+uses the existing `zstd` executable before inspecting real tar metadata; all 22 package
+tests pass under the provisioned interpreter. Keeping the installed Python user-base
+fixed, while retaining private HOME/data, passed both actual DVC push/pull round trips.
+No DVC behavior or test verdict was replaced with a mock, skip or weakened assertion.
+
+That run reached nine passing sensor-demo legs, including built firmware and a solved
+133.3956-degree-C thermal result, but the verification launch's 3600-second deadline
+stopped it before the final demo, charger and screenshot stages. A new complete strict
+run has no launch deadline and still enables the full charger benchmark. The interrupted
+invocation is not recorded as a full-gate PASS.
+
+The final incremental local AST refresh completed at 86142 nodes, 197072 edges and
+2594 communities without a force/shrink override or semantic-provider call. Curated
+graph instructions and hooks were retained; no installer rewrote them. Generated
+structure is current, not a claim of newly re-extracted semantic documentation.
+
+The complete uncapped strict Linux gate finished PASS in 4145.74 seconds: source/audit,
+manual regeneration, core OCCT/native host/WASM builds, core CTest, hostd lifecycle,
+web parity, 22 package tests and all 30 Python units. Python totals were 10732 collected,
+10524 passed, 207 skipped and one expected failure; available stages did not use an
+environment SKIP. Remaining gate SKIPs were disabled opt-in benchmarks or AppImage.
+
+Detailed demo reports passed all 12 sensor-node legs and all 10 charger legs; the gate's
+13/11 PASS-marker counts also include each overall-result marker. The sensor-node FEA
+heatsink solve met its target at 69.7 degrees C. Its 70 DRC findings, 19 ERC warnings and
+unknown power-budget data remain advisory findings, not erased by the execution PASS.
+The charger retained 131 DRC findings and a dry, unsolved thermal handoff; rebuilt firmware
+passed the real safety-loop FAULT predicates in 4.74 seconds. That is no thermal or board
+certification. Both production headless GUI captures were inspected, including the real
+Copilot slash-command fill; the separately exercised firmware Engineering/Bus-event UI
+used the native electrical probe result. No live-provider, hardware or Windows/macOS
+verification is claimed.
+
+Selective-publication verification also excluded the concurrent user startup change
+in `host/src/app.cpp` and its coupled `AppState::rtReady` deletion. The original field
+is retained only in the index projection alongside cleanup-owned state changes; neither
+working-tree file was rewritten. All 162 production host-source units compiled and the
+real GUI linked against that projection. Dependency evidence showed all 57 state-header
+consumers used the projected header, not a mixed working-tree ABI. Both isolated real GUI
+scenarios then exited zero and their host/Copilot captures were inspected. The first relocated
+launch lacked the worker module path and exited 141; supplying the real repository Python
+module path corrected the harness without suppressing the error or changing production code.
+
+After the concurrent user edit, another guarded local AST update completed at 86141 nodes,
+197071 edges and 2562 communities, without semantic-provider calls or a shrink override.
+Publication uses 494 explicit whole-file paths and six index-only mixed-file projections;
+initial and later user edits remain outside the cleanup commit.

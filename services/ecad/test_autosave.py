@@ -1,8 +1,7 @@
 """ECAD crash-recovery autosave tests (pytest-collectable, self-contained).
 
-Covers services.ecad.autosave + its session-layer hooks: a heavy MCP tool that overruns the client's
-transport timeout gets the server killed, and without this every open schematic/board is lost. These
-tests prove that:
+Covers services.ecad.autosave and its native-session facade hooks. Snapshots provide
+best-effort recovery after a server restart. These tests exercise:
   * autosave is DISABLED by default (unit tests / the engine never touch disk uninvited);
   * once enabled, every mutating session op persists the doc to <doc_id>.json;
   * a simulated server restart (new session id + cleared registry) RECOVERS the prior docs;
@@ -10,7 +9,7 @@ tests prove that:
   * a deliberately closed session's autosave is removed (no resurrection).
 
 Each test points CHUDWARE_ECAD_AUTOSAVE_DIR at a fresh temp dir so nothing touches %APPDATA%.
-Run:  python -m pytest engine/ecad/test_autosave.py -q
+Run:  python -m pytest services/ecad/test_autosave.py -q
 """
 from __future__ import annotations
 

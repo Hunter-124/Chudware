@@ -556,9 +556,15 @@ def _window_lines(
     offset: int,
     limit: int,
     raw: bool,
+    final_eol: bool = False,
 ) -> dict:
     """Select + number the requested lines under the byte/line caps. Returns the
-    payload fields for fs_read: text, total_lines, shown_lines, truncated, next_offset."""
+    payload fields for fs_read: text, total_lines, shown_lines, truncated, next_offset.
+
+    *lines* are the physical lines split on ``\\n`` (terminator removed). Raw output
+    re-attaches each selected line's own ``\\n`` — every line but the last has one, the last
+    only when *final_eol* — so a raw slice is the source text verbatim (CRLF keeps its
+    ``\\r`` in the line body; a file without a final newline stays without one)."""
     total = len(lines)
     max_lines = min(limit if limit > 0 else DEFAULT_MAX_LINES, HARD_MAX_LINES)
 
@@ -583,9 +589,11 @@ def _window_lines(
     shown = 0
     for n in wanted:
         body = lines[n - 1]
-        rendered = _clip_line(body) if not raw else body
-        piece = rendered if raw else f"{n:>6}\t{rendered}"
-        used += len(piece) + 1
+        if raw:
+            piece = body + ("\n" if n < total or final_eol else "")
+        else:
+            piece = f"{n:>6}\t{_clip_line(body)}"
+        used += len(piece) + (0 if raw else 1)
         if used > DEFAULT_MAX_BYTES and shown > 0:
             truncated = True
             break
@@ -594,10 +602,11 @@ def _window_lines(
 
     last_shown = wanted[shown - 1] if shown else (offset if offset > 0 else 0)
     next_offset = last_shown + 1 if (truncated and last_shown < total) else None
-    text = "\n".join(out)
+    text = "".join(out) if raw else "\n".join(out)
     if truncated and next_offset is not None:
         text += (
-            f"\n… [truncated — showed {shown} of {total} lines; "
+            ("" if raw else "\n")
+            + f"… [truncated — showed {shown} of {total} lines; "
             f"continue with offset={next_offset} or path selector ':{next_offset}-']"
         )
     return {
@@ -659,9 +668,10 @@ def _read_text(path: str, ranges, offset: int, limit: int, raw: bool) -> dict:
                     f"{p.name} looks binary ({len(data)} bytes); fs_read serves text/documents only")
     text = data.decode("utf-8", errors="replace")
     lines = text.split("\n")
-    if lines and lines[-1] == "":
+    final_eol = lines[-1] == ""
+    if final_eol:
         lines.pop()  # trailing newline shouldn't count as a phantom blank line
-    win = _window_lines(lines, ranges, offset, limit, raw)
+    win = _window_lines(lines, ranges, offset, limit, raw, final_eol)
     return _ok(path=str(p), kind=_kind_for(path) or "text", is_document=False, **win)
 
 

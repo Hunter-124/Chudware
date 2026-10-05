@@ -6,7 +6,7 @@ Provides a ``Library`` class and module-level singleton functions
     from services.ecad import library
     library.resolve("Device:R")
 
-works out of the box from engine/ecad/ops.py.
+works out of the box for Python ECAD service callers.
 
 Resolution order (first match wins):
   1. Starter lib (always available)

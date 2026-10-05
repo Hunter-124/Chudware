@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import unittest
-from pathlib import Path
 
 from services.agent import prompt_tiers as pt
 from services.agent import roles
@@ -18,7 +17,6 @@ from services.agent.capability import profile_for_letter, resolve_capability
 
 
 _ROLES = ("feature_modeler", "geometry_designer", "sketcher")
-_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 
 class TestSoftBlocks(unittest.TestCase):
@@ -134,33 +132,12 @@ class TestBaseRoleProseFreedom(unittest.TestCase):
         self.assertNotIn("after every mutation", card.system_prompt)
         self.assertNotIn("after every mutation", card.goal)
 
-    def test_geometry_designer_base_mentions_soft_hook(self):
-        card = roles.load_role("geometry_designer")
-        self.assertIn("Capability SOFT", card.system_prompt)
-
 
 class TestMcpProfilePreference(unittest.TestCase):
     def test_c_prefers_lite(self):
         self.assertEqual(pt.mcp_profile_for_letter("C"), "lite")
         self.assertEqual(pt.mcp_profile_for_letter("A"), "full")
         self.assertEqual(pt.mcp_profile_for_letter("B"), "full")
-
-    def test_mcp_soft_tails_present_in_server_source(self):
-        """MCP instruction blocks carry SOFT tails and C-prefer-lite selection."""
-        server = (Path(__file__).resolve().parents[1] / "mcp" / "server.py").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("[CAPABILITY_SOFT]", server)
-        self.assertIn("calculate-before-model", server)
-        self.assertIn("_resolve_mcp_profile", server)
-        self.assertIn("Prefer verify_battery before done", server)
-
-
-class TestPromptMdHooks(unittest.TestCase):
-    def test_modeler_executor_reviewer_mention_capability_soft(self):
-        for name in ("modeler.md", "executor.md", "reviewer.md"):
-            text = (_PROMPTS_DIR / name).read_text(encoding="utf-8")
-            self.assertIn("CAPABILITY_SOFT", text, name)
 
 
 class TestAppendIdempotent(unittest.TestCase):

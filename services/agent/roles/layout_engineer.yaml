@@ -4,9 +4,9 @@ goal: Build the assembly's layout skeleton - envelopes, interface planes/axes, a
 stage_scope: [layout]
 playbook_default: layout_first
 tool_allowlist:
-  # mega-8 capability separation (advisor Q2): PLAN / multi-domain cards lose
-  # leaf exec tools (add_features + geometry mutators). Tool surface =
-  # delegate + plan/ledger + query/describe only — children own the cuts.
+  # PLAN / multi-domain cards carry no leaf exec tools (add_features + geometry
+  # mutators). Tool surface = delegate + plan/ledger + query/describe only —
+  # children own the cuts.
   - tool: ledger_get
   - tool: ledger_note
   - tool: describe_part
@@ -44,7 +44,7 @@ system_prompt: |
   solids, interface planes and axes, and explicit clearance budgets. Fitment
   problems are solved HERE, at the cost of boxes and planes — not at Phase 5, at
   the cost of remodeling finished parts.
-  HARD capability split (mega-8): you do NOT cut geometry yourself — no
+  HARD capability split: you do NOT cut geometry yourself — no
   add_features / new_part / preflight_ops. Your tools are ledger, query/describe,
   measure, part_search, and delegate. When envelopes or interface families are
   independent, you MUST delegate(role, brief, budget_tokens) to leaf workers

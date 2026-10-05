@@ -101,47 +101,6 @@ void drawCodeBox(const char* id, const std::string& code, ImFont* mono, float ma
 }
 
 
-// Colored unified-diff view (+ green / - red / @@ blue) in a scrolling box.
-void drawDiffBox(const char* id, const std::string& diff, ImFont* mono, float maxH) {
-    const auto& p = ui::palette;
-    int lines = 1;
-    for (char c : diff) if (c == '\n') ++lines;
-    if (mono) ImGui::PushFont(mono);
-    float lh = ImGui::GetTextLineHeightWithSpacing();
-    float h = lh * (float)lines + 10.0f * ui::uiScale;
-    if (h > maxH) h = maxH;
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(p.codeBg[0], p.codeBg[1], p.codeBg[2], p.codeBg[3]));
-    ImGui::BeginChild(id, ImVec2(0, h), ImGuiChildFlags_Border,
-                      ImGuiWindowFlags_HorizontalScrollbar);
-    size_t start = 0;
-    while (start <= diff.size()) {
-        size_t nl = diff.find('\n', start);
-        std::string ln = diff.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
-        ImVec4 col(p.diffDefault[0], p.diffDefault[1], p.diffDefault[2], 1);
-        if (ln.rfind("+++", 0) == 0 || ln.rfind("---", 0) == 0)
-            col = ImVec4(p.diffHdr[0], p.diffHdr[1], p.diffHdr[2], 1);
-        else if (ln.rfind("@@", 0) == 0)
-            col = ImVec4(p.diffHunk[0], p.diffHunk[1], p.diffHunk[2], 1);
-        else if (!ln.empty() && ln[0] == '+')
-            col = ImVec4(p.diffAdd[0], p.diffAdd[1], p.diffAdd[2], 1);
-        else if (!ln.empty() && ln[0] == '-')
-            col = ImVec4(p.diffDel[0], p.diffDel[1], p.diffDel[2], 1);
-        ImGui::TextColored(col, "%s", ln.empty() ? " " : ln.c_str());
-        if (nl == std::string::npos) break;
-        start = nl + 1;
-    }
-    ImGui::EndChild();
-    {
-        const ImRect r(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
-        // Unique popup id per call site (id already unique: "##actdiff" / "##actcode" etc.).
-        chatCopyContext(r, (std::string(id) + "_copy").c_str(), diff);
-    }
-    ImGui::PopStyleColor();
-    if (mono) ImGui::PopFont();
-}
-
-
 // Dim, wrapped prose (reasoning / notes). growToFit=false (default): fixed-height scrolling box
 // at maxH, as always. growToFit=true: a LIVE streaming thinking/thought box — auto-sizes to the
 // wrapped text height as it arrives (SetNextWindowSizeConstraints + AutoResizeY) instead of

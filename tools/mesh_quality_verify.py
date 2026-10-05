@@ -1,5 +1,5 @@
-"""Live check of the rebuilt FEA mesher + export tessellation against the STAGED
-libchudware.dll (the one the app loads).
+"""Live check of the FEA mesher + export tessellation against the native core
+selected by CHUDWARE_LIBCHUDWARE or the shared core_bridge resolver.
 
 Builds a 60x60x10 plate with an 8 mm hole (so curvature matters), exports a STEP, then
 exercises:
@@ -10,37 +10,19 @@ exercises:
 
 Run:  python tools/mesh_quality_verify.py
 """
-import ctypes, json, os, tempfile
+import json, os, sys, tempfile
 
-DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "Chudware")
-os.add_dll_directory(DIST)
-dll = ctypes.CDLL(os.path.join(DIST, "libchudware.dll"))
-dll.chudware_call.restype = ctypes.c_int
-dll.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-dll.chudware_free.argtypes = [ctypes.c_char_p]
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
+from services.mcp import core_bridge
+from services.mcp.core_bridge import dim, feat
 
 
 def call(method, params):
-    out = ctypes.c_char_p()
-    rc = dll.chudware_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
-    s = out.value.decode() if out.value else ""
-    if out.value:
-        dll.chudware_free(out)
     try:
-        return rc, (json.loads(s) if s else {})
-    except Exception:
-        return rc, {"_raw": s[:400]}
-
-
-def dim(v):
-    return {"value": v, "expr": None}
-
-
-def feat(ftype, name, params=None, refs=None, **extra):
-    f = {"type": ftype, "name": name, "params": params or {}, "refs": refs or {}}
-    f.update(extra)
-    return {"op": "add_feature", "feature": f}
-
+        return 0, core_bridge.call(method, params)
+    except core_bridge.CoreError as exc:
+        return 1, {"error": str(exc), "code": exc.code, "detail": exc.detail}
 
 results = []
 

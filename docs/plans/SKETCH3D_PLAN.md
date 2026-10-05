@@ -10,6 +10,14 @@
 > genuinely Hunter's to make, it is called out in a **DECISION-NEEDED** block; the rest of the
 > plan proceeds around it.
 
+**Board scope:** [T-BL45](../../work/backlog/done/T-BL45-3d-sketcher-plan.md) is done
+for the survey/design deliverable only. The build cards T-BL56 through T-BL60 in
+`work/backlog/` remain `status: backlog` and `deferred: yes`; their existence and any
+separate sketch capabilities do not establish sign-off for this proposed solver/schema.
+Paths and task ids in the original phased plan below are dated planning evidence, not
+instructions to revive retired `engine/` or `ui/imgui` trees. Current sketch implementation
+guidance is [gui-sketch](../../.claude/skills/gui-sketch/SKILL.md).
+
 ---
 
 ## 0. Why a 3D sketcher

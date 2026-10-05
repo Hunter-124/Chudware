@@ -5,7 +5,7 @@ PIFA antennas from target frequency + substrate parameters, then emits real
 board copper (tracks / zones / pads) placeable on an ``aicad.pcb/1`` document.
 
 Feed widths for 50 Ω are synthesised via the existing IPC-2141 / CPWG closed
-forms in :mod:`engine.ecad.impedance` (binary search on width).
+forms in :mod:`services.ecad.impedance` (binary search on width).
 
 References (standard textbook forms, not vendor tables):
   * Rectangular patch — Balanis *Antenna Theory* §14.2 / Pozar *Microwave
@@ -110,8 +110,8 @@ def synthesize_feed_width(
 ) -> dict:
     """Binary-search a feed width that hits ``target_z0`` via impedance.py.
 
-    For ``kind='microstrip'`` uses :func:`engine.ecad.impedance.microstrip_z0`.
-    For ``kind in {'cpw','cpwg'}`` uses :func:`engine.ecad.impedance.coplanar_z0`
+    For ``kind='microstrip'`` uses :func:`services.ecad.impedance.microstrip_z0`.
+    For ``kind in {'cpw','cpwg'}`` uses :func:`services.ecad.impedance.coplanar_z0`
     with gap ``gap_mm`` (defaults to ``substrate_h_mm`` when omitted).
 
     Returns ``{width_mm, z0, eeff, model, kind, gap_mm?, iterations}``.

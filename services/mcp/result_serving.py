@@ -100,9 +100,6 @@ _SAMPLEABLE_LISTS: frozenset[str] = frozenset({
     "components", "footprints", "nets", "results", "unconnected_pins", "items",
 })
 
-# Back-compat alias.
-_DROP_PRIORITY: tuple[str, ...] = _SOFT_DROP
-
 
 def count_tokens(obj: Any) -> int:
     """Estimate tokens for a string or JSON-serializable object (ceil(chars/4))."""

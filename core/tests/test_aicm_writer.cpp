@@ -1,7 +1,7 @@
 // Standalone (OCCT-free) test of the AICM v1 writer geom/aicm.cpp. Hand-builds a
-// tiny AicmBody, serializes it, and round-trips through the shared viewport loader
-// (render::parseAicm) to prove byte compatibility without needing the geometry
-// kernel. Runs in the default CHUDWARE_WITH_OCCT=OFF build.
+// tiny AicmBody, serializes it, and round-trips through the GUI's own loader
+// (host/src/render/aicm_loader, render::parseAicm) to prove byte compatibility without
+// needing the geometry kernel. Runs in the default CHUDWARE_WITH_OCCT=OFF build.
 #define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 
@@ -352,6 +352,19 @@ TEST_CASE("malformed appearance payloads are refused") {
     render::DocMesh doc;
     std::string err;
     CHECK_FALSE(render::parseAicm(bytes.data(), bytes.size(), doc, err));
+}
+
+TEST_CASE("out-of-range BODY vertex indices are refused") {
+    // A triangle naming a vertex past n_verts would make the renderer read beyond pos/nrm.
+    for (const uint32_t bad : {3u, std::numeric_limits<uint32_t>::max()}) {
+        CAPTURE(bad);
+        auto body = tiny_body();
+        body.idx = {0, 1, bad};
+        const auto bytes = aicm::write_aicm({body});
+        render::DocMesh doc;
+        std::string err;
+        CHECK_FALSE(render::parseAicm(bytes.data(), bytes.size(), doc, err));
+    }
 }
 
 TEST_CASE("appearance material channels reject nonfinite and out-of-range values") {

@@ -1,14 +1,85 @@
 """IP-18 regen_diagnose MCP seam: the callable backend fires on a rebuild-failure doc, returns a
-fix-preview card, and degrades honestly when no provider is configured. Offline — MockProvider,
-no core (structural verify)."""
+fix-preview card, and degrades honestly when its model step cannot run. The default model step
+is a tool-free agent-runtime completion (``ChudcodeSessionHost.complete_text``), exercised here
+through an injected process-free RPC client; no binary is started and no provider is contacted.
+Offline/local-only binds an offline-safe provider. No core (structural verify)."""
 import json
 import random
+from types import SimpleNamespace
 
+import pytest
+
+from services.agent import config as agent_config
 from services.agent import regen_diagnosis as RD
+from services.agent import role_models
+from services.agent.chudcode_host import (
+    ChudcodeSessionHost,
+    _set_default_chudcode_host_for_tests,
+)
 from services.agent.providers.base import ProviderUnreachable
 from services.agent.providers.mock_provider import MockProvider
 from services.mcp import regen_tools as RT
 from tools.flywheel.bench.corpus import regen_corpus as RC
+
+
+class _HelperClient:
+    """The RpcClient surface ``complete_text`` drives, without a process."""
+
+    protocol_version = 2
+
+    def __init__(self, script, **kwargs):
+        self.kwargs = kwargs
+        self.script = script
+        self.listeners = []
+        self.prompts = []
+        self.models = []
+        self.stopped = False
+
+    def start(self):
+        return self
+
+    def on_notification(self, listener):
+        self.listeners.append(listener)
+        return lambda: self.listeners.remove(listener)
+
+    def set_model(self, provider, model):
+        self.models.append((provider, model))
+
+    def prompt_and_wait(self, message, timeout=None):
+        self.prompts.append(message)
+        error = self.script.get("error")
+        message_end = {"role": "assistant", "stopReason": "error" if error else "stop"}
+        if error:
+            message_end["errorMessage"] = error
+        for listener in list(self.listeners):
+            listener({"type": "message_end", "message": message_end})
+        return SimpleNamespace(assistant_text=self.script.get("reply"))
+
+    def stop(self):
+        self.stopped = True
+
+
+@pytest.fixture
+def runtime(monkeypatch):
+    """The process-global agent host with a process-free client and the runtime's own model."""
+    clients = []
+    script = {}
+
+    def factory(**kwargs):
+        clients.append(_HelperClient(script, **kwargs))
+        return clients[-1]
+
+    host = ChudcodeSessionHost(client_factory=factory)
+    monkeypatch.setattr(host, "_resolve_binary", lambda *, required: None)
+    monkeypatch.setattr(agent_config, "load_config", lambda *a, **k: {})
+    monkeypatch.setattr(role_models, "resolve_role_model",
+                        lambda *a, **k: SimpleNamespace(provider="", model=""))
+    previous = _set_default_chudcode_host_for_tests(host)
+    try:
+        yield host, clients, script
+    finally:
+        _set_default_chudcode_host_for_tests(previous)
+        host.shutdown()
 
 
 def _corrupt(mclass, seed=1):
@@ -47,22 +118,15 @@ def test_seam_returns_card_and_logs_ip18():
     assert any(e.get("kind") == "ai_artifact" and e["insertion_point"] == "IP-18" for e in events)
 
 
-def test_seam_degrades_without_provider():
+def test_seam_degrades_without_provider(runtime):
+    _, clients, script = runtime
+    script["error"] = "no provider credentials configured"
     doc = _corrupt("bad_selector", seed=3)
     out = RT.diagnose_failed_document(doc, provider=None)
-    # Three legitimate outcomes, depending on the machine's configured provider:
-    #   * one resolves and answers      -> ok, with a fix
-    #   * none resolves (no credentials) -> honest failure
-    #   * one resolves but is DOWN       -> honest failure (a configured-but-not-running
-    #     local LM Studio used to raise ProviderUnreachable straight out of the tool)
-    # The invariant under test is that the no-model path still DETECTS the failure:
-    # detect_failures is pure analysis, so a missing model costs the fix, not the diagnosis.
-    if out["ok"]:                                    # a local provider happened to resolve
-        assert out["card"]["fix_ops"] is not None
-    else:
-        assert ("no provider configured" in out["reason"]
-                or "provider unreachable" in out["reason"]), out["reason"]
-        assert any(f["kind"] == "bad_selector" for f in out["failures"])
+    assert out["ok"] is False
+    assert "no provider credentials configured" in out["reason"]
+    assert any(f["kind"] == "bad_selector" for f in out["failures"])
+    assert len(clients) == 1 and clients[0].stopped
 
 
 def test_unreachable_provider_degrades_instead_of_raising():
@@ -103,7 +167,7 @@ def test_tool_registration_and_json_contract():
     doc = _corrupt("suppressed_parent", seed=4)
     # inject an oracle provider by monkeypatching the resolver for this call
     orig = RT._resolve_provider
-    RT._resolve_provider = lambda: MockProvider([_oracle_reply(doc)])
+    RT._resolve_provider = lambda cancel=None: MockProvider([_oracle_reply(doc)])
     try:
         raw = fn(json.dumps(doc))
     finally:
@@ -127,3 +191,50 @@ def test_tool_reports_bad_json():
     assert "regen_diagnose" in captured
     result = json.loads(captured["regen_diagnose"]("{not valid json"))
     assert result["ok"] is False and "invalid JSON" in result["error"]
+
+
+def test_default_helper_returns_logged_fix_card(runtime):
+    host, clients, script = runtime
+    doc = _corrupt("suppressed_parent", seed=2)
+    script["reply"] = _oracle_reply(doc)
+    events = []
+    out = RT.diagnose_failed_document(
+        doc, on_event=events.append, consent_fn=lambda: "meta", verify=False)
+    assert out["ok"] is True and out["card"]["fix_ops"]
+    assert out["artifact_id"]
+    assert any(event.get("kind") == "ai_artifact" for event in events)
+    assert len(clients) == 1 and clients[0].stopped
+    assert "Rebuild failed. Repair it." in clients[0].prompts[0]
+    assert not host._sessions and not host._helper_clients
+
+
+def test_explicit_offline_helper_binds_only_offline_safe_provider(monkeypatch):
+    from services.agent.providers.chudcode_provider import helper_provider
+
+    bound = MockProvider(["offline repair"])
+    monkeypatch.setattr(agent_config, "load_config", lambda: {"offline_mode": True})
+    monkeypatch.setattr(agent_config, "get_provider", lambda **kwargs: bound)
+    monkeypatch.setattr(agent_config, "provider_offline_safe", lambda provider: provider is bound)
+    assert helper_provider("fixer").complete("", []) == "offline repair"
+
+    monkeypatch.setattr(agent_config, "provider_offline_safe", lambda provider: False)
+    with pytest.raises(agent_config.OfflineModeError, match="offline helper"):
+        helper_provider("fixer")
+
+
+def test_cancelled_default_helper_retains_detected_failures_without_prompting(runtime):
+    _, clients, _ = runtime
+    doc = _corrupt("bad_selector", seed=3)
+    out = RT.diagnose_failed_document(doc, cancel=lambda: True)
+    assert not out["ok"] and "cancelled" in out["reason"]
+    assert any(f["kind"] == "bad_selector" for f in out["failures"])
+    assert not clients
+
+
+def test_incomplete_selected_model_fails_without_runtime_default_substitution(runtime, monkeypatch):
+    _, clients, _ = runtime
+    monkeypatch.setattr(agent_config, "load_config", lambda: {"provider": "codex"})
+    doc = _corrupt("bad_selector", seed=3)
+    out = RT.diagnose_failed_document(doc)
+    assert not out["ok"] and "needs both provider and model" in out["reason"]
+    assert not clients

@@ -1,18 +1,25 @@
 """Dev / Settings previews of the real prompt assembly (not stubs).
 
 Used by Settings → AI → Dev Preview and the Tools → Options "Model receives"
-panel. Both call the same paths a live ``general_agent`` turn uses:
+panel.
 
-  * ``roles.load_role`` + ``assemble_system_for_capability``
-  * ``tool_schemas.render_tools_block`` (with ``agent.tool_options`` overrides)
-  * ``agent_turn._SYSTEM_BASE`` + optional autolearn standing guidance
-  * role catalog / harness blocks (best-effort)
+* :func:`preview_main_chat_system` defaults to the ONLINE lane every normal chat
+  uses: ``prompt_cache.compose_online`` — the role prompt
+  (``mission_dispatch.role_prompt``) Chudcode receives as its appended system
+  prompt, plus the native host-tool definitions
+  (``chudcode_tools.build_host_tools``). ``lane="offline"`` shows the explicit
+  local-model fallback instead: the ``prompt_cache`` static prompt that
+  ``agent_turn.run_turn`` renders (harness protocol, catalogs, tools slot).
+* :func:`preview_tool_entry` shows one offline tools-slot entry with the
+  ``agent.tool_options`` overrides applied.
 
-The user-request slot is marked with ``USER_REQUEST_PLACEHOLDER`` so the GUI can
-colour it; never send that marker to a model.
+Token figures are ~4 chars/token estimates. The user-request slot is marked
+with ``USER_REQUEST_PLACEHOLDER`` so the GUI can colour it; never send that
+marker to a model.
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 # GUI colour-span marker — must match host/src/ui/settings_modal.cpp Dev Preview.
@@ -197,107 +204,65 @@ def tool_catalog() -> dict[str, Any]:
         return {"ok": False, "tools": [], "error": f"{type(exc).__name__}: {exc}"}
 
 
-def preview_main_chat_system(*, include_tools: bool = True) -> dict[str, Any]:
-    """Build the system prompt a typical main-chat / ``general_agent`` turn gets.
+def preview_main_chat_system(
+    *, include_tools: bool = True, lane: str = "online"
+) -> dict[str, Any]:
+    """Build the system prompt a fresh main-chat / ``general_agent`` turn gets.
 
-    Mirrors ``mission_dispatch.run_linear_role_turn`` + the injections inside
-    ``agent_turn.run_turn`` (base, harness/role catalog, memory block stub,
-    tools slot, autolearn guidance). Does **not** call a provider.
+    *lane* ``"online"`` (default) is the Chudcode lane: ``system`` is exactly the
+    CAD system prompt appended to Chudcode's own, and with *include_tools* the
+    CAD host-tool definitions are returned beside it (``host_tools`` /
+    ``host_tools_text``) — they are native tool definitions, not system-prompt
+    text. *lane* ``"offline"`` is the explicit local-model fallback's static
+    prompt; *include_tools* there keeps or drops its text tools slot. Does
+    **not** call a provider.
 
-    Returns ``{ok, system, user_placeholder, messages_preview, meta, error?}``.
-    ``messages_preview`` is a single user message containing the coloured
-    placeholder so the GUI can render the full turn shape.
+    Returns ``{ok, lane, system, user_placeholder, messages_preview, meta,
+    error?}`` (online adds ``host_tools`` / ``host_tools_text``).
+    ``messages_preview`` is the system message plus a user message holding the
+    coloured placeholder so the GUI can render the full turn shape.
     """
-    meta: dict[str, Any] = {"role": "general_agent"}
+    meta: dict[str, Any] = {"role": "general_agent", "lane": lane, "estimate": True}
     try:
-        from services.agent.roles import load_role  # noqa: PLC0415
-        from services.agent import agent_turn as _at  # noqa: PLC0415
-        from services.agent.autolearn import standing_guidance  # noqa: PLC0415
-        from services.agent.mission_dispatch import (  # noqa: PLC0415
-            _apply_session_preferences,
-            effective_role_system_prompt,
-            linear_role_allowed_tools,
-        )
+        from services.agent import prompt_cache as _pcache  # noqa: PLC0415
 
-        card = load_role("general_agent")
-        base_system_prompt = effective_role_system_prompt(card)
-        system_prompt = base_system_prompt
-        try:
-            from services.agent.prompt_tiers import (  # noqa: PLC0415
-                assemble_system_for_capability,
-                letter_from_capability,
-            )
-            system_prompt = assemble_system_for_capability(
-                base_system_prompt, letter_from_capability(None))
-        except Exception:  # noqa: BLE001
-            system_prompt = base_system_prompt
-        allowed = linear_role_allowed_tools(card)
-        allowed, system_prompt = _apply_session_preferences(
-            "general_agent", allowed, system_prompt)
-        system = (system_prompt or "").rstrip() + "\n\n" + _at._SYSTEM_BASE
-
-        try:
-            from services.agent.role_catalog import (  # noqa: PLC0415
-                format_role_catalog_block,
-                harness_context_block,
-            )
-            system = system.rstrip() + "\n\n" + harness_context_block()
-            system = system.rstrip() + "\n\n" + format_role_catalog_block()
-            meta["role_catalog"] = True
-        except Exception:  # noqa: BLE001
-            meta["role_catalog"] = False
-
-
-        guidance = standing_guidance()
-        if guidance:
-            system = system.rstrip() + "\n\n" + guidance
-            meta["autolearn"] = True
-        else:
+        extra: dict[str, Any] = {}
+        if lane == "online":
+            op = _pcache.compose_online(role="general_agent")
+            system = op.system
+            meta["allowed_tool_count"] = len(op.host_tools)
             meta["autolearn"] = False
-
-        tools_text = ""
-        if include_tools:
-            try:
-                from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
-                # The online lane hands Chudcode every allowed tool as a native
-                # definition with its full description — no tier slot, no trim.
-                # The preview must show that surface, not a 2.5k-token text slot.
-                tools_text, tools_meta = render_tools_block(
-                    allowed, resolver=_at.resolver_for(None),
-                    budget_tokens=1_000_000, trim=False,
+            meta["warnings"] = op.warnings
+            if include_tools:
+                extra["host_tools"] = op.host_tools
+                extra["host_tools_text"] = "\n".join(
+                    f"- {tool['name']}: {tool['description']}\n"
+                    f"    parameters: {json.dumps(tool['parameters'], ensure_ascii=False)}"
+                    for tool in op.host_tools
                 )
-                meta["tools"] = tools_meta
-            except Exception as exc:  # noqa: BLE001
-                meta["tools_error"] = f"{type(exc).__name__}: {exc}"
-                tools_text = ""
-            if tools_text:
-                system = system.rstrip() + "\n\n" + tools_text
-            elif allowed:
-                system = system.rstrip() + "\n\nAllowed tools: " + ", ".join(allowed[:40])
-                if len(allowed) > 40:
-                    system += f", … (+{len(allowed) - 40} more)"
+                meta["host_tool_names"] = [tool["name"] for tool in op.host_tools]
+                meta["host_tool_tokens_est"] = op.host_tool_tokens
+        elif lane == "offline":
+            sp = _pcache.get(role="general_agent")
+            segments = [
+                seg for seg in sp.segments if include_tools or seg.label != "tools"
+            ]
+            system = _pcache.render_segments(segments)
+            present = {seg.label for seg in segments if seg.text}
+            meta["allowed_tool_count"] = len(sp.allowed)
+            meta["autolearn"] = "autolearn" in present
+            meta["warnings"] = sp.warnings
+            meta["segments"] = [
+                row for row in sp.breakdown() if row["label"] in present
+            ]
+        else:
+            raise ValueError(f"unknown lane {lane!r} (online|offline)")
 
-        try:
-            from services.agent.skills import catalog_block  # noqa: PLC0415
-            skill_catalog = catalog_block()
-            if skill_catalog:
-                system = system.rstrip() + "\n\n" + skill_catalog
-                meta["skills_catalog"] = True
-            else:
-                meta["skills_catalog"] = False
-        except Exception:  # noqa: BLE001
-            meta["skills_catalog"] = False
-
-        meta["allowed_tool_count"] = len(allowed)
         meta["system_chars"] = len(system)
-        try:
-            from services.agent.tiers import _count_tokens  # noqa: PLC0415
-            meta["system_tokens_est"] = _count_tokens(system)
-        except Exception:  # noqa: BLE001
-            meta["system_tokens_est"] = max(1, (len(system) + 3) // 4)
-
+        meta["system_tokens_est"] = _pcache._count_tokens(system)
         return {
             "ok": True,
+            "lane": lane,
             "system": system,
             "user_placeholder": USER_REQUEST_PLACEHOLDER,
             "messages_preview": [
@@ -305,10 +270,12 @@ def preview_main_chat_system(*, include_tools: bool = True) -> dict[str, Any]:
                 {"role": "user", "content": USER_REQUEST_PLACEHOLDER},
             ],
             "meta": meta,
+            **extra,
         }
     except Exception as exc:  # noqa: BLE001
         return {
             "ok": False,
+            "lane": lane,
             "system": "",
             "user_placeholder": USER_REQUEST_PLACEHOLDER,
             "messages_preview": [],

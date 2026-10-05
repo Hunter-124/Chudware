@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Firecrawl key-pool CLI — search/scrape with automatic API-key rotation.
 
-Thin wrapper over `engine/research/firecrawl_pool.py` so anything that can spawn a
+Thin wrapper over `services/research/firecrawl_pool.py` so anything that can spawn a
 process (the omp custom tool, shell one-liners, other agents) gets the same rotating
 key pool as the in-app research tools. Keys come from FIRECRAWL_API_KEYS /
 FIRECRAWL_API_KEY / config.json `keys.firecrawl`; cooldowns are shared via the pool

@@ -1,4 +1,4 @@
-"""Provider-neutral content-refusal classification regressions."""
+"""Provider-neutral content-refusal classification and honest provider-failure regressions."""
 
 from __future__ import annotations
 
@@ -83,3 +83,83 @@ def test_non_refusal_bad_request_is_not_reclassified_by_generic_body_walk():
     )
 
     assert agent_turn.classify_provider_error(exc) == ("provider_error", False)
+
+
+def _run_failing_turn(tmp_path, monkeypatch, provider):
+    """Run one turn on *provider* with a cloud key configured and record any
+    attempt to build a different provider."""
+    from services.agent import config as agent_config
+    from services.agent.ledger import Ledger
+
+    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-not-a-credential")
+    cfg = {
+        "provider": provider.name,
+        "model": provider.model,
+        "openrouter": {"api_key": "sk-or-test-not-a-credential"},
+        "enabled_providers": [
+            {"provider": "openrouter", "model": "deepseek/deepseek-chat-v3.1"},
+            {"provider": "openai", "model": "gpt-5"},
+        ],
+    }
+    monkeypatch.setattr(agent_config, "load_config", lambda: dict(cfg))
+    built: list[dict] = []
+
+    def _no_other_provider(*args, **kwargs):
+        built.append({"args": args, "kwargs": kwargs})
+        raise AssertionError("run_turn must not build another provider")
+
+    monkeypatch.setattr(agent_config, "get_provider", _no_other_provider)
+    ledger = Ledger("provider_failure", path=tmp_path / "ledger.json")
+    res = agent_turn.run_turn(
+        "finish", provider, name="n_test", ledger=ledger, max_tool_calls=2
+    )
+    events = [(e.get("payload") or {}).get("event") for e in ledger.events]
+    return res, built, events
+
+
+def test_local_provider_failure_reports_error_without_cloud_fallback(
+    tmp_path, monkeypatch
+):
+    calls: list[int] = []
+
+    class _DeadLocal:
+        name = "llamacpp"
+        model = "local"
+
+        def complete(self, system, messages, max_tokens=8000):
+            calls.append(1)
+            raise ProviderUnreachable(
+                "Could not reach http://127.0.0.1:1234/v1: connection refused"
+            )
+
+    res, built, events = _run_failing_turn(tmp_path, monkeypatch, _DeadLocal())
+
+    assert res.success is False
+    assert built == []
+    assert len(calls) == 1
+    assert "connection refused" in res.result["error"]
+    assert res.result["retryable"] is True
+    assert "provider_error" in events
+
+
+def test_content_refusal_stops_without_resending_to_another_vendor(
+    tmp_path, monkeypatch
+):
+    class _Refusing:
+        name = "anthropic"
+        model = "claude-sonnet-5"
+
+        def complete(self, system, messages, max_tokens=8000):
+            exc = RuntimeError("vendor declined")
+            exc.is_content_refusal = True  # type: ignore[attr-defined]
+            exc.provider = "anthropic"  # type: ignore[attr-defined]
+            raise exc
+
+    res, built, events = _run_failing_turn(tmp_path, monkeypatch, _Refusing())
+
+    assert res.success is False
+    assert res.stop_reason == "provider_refused"
+    assert built == []
+    assert "vendor declined" in res.result["error"]
+    assert "provider_error" in events

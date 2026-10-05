@@ -1,4 +1,4 @@
-"""Connectivity-aware placer tests (Wave 2a E1).
+"""Connectivity-aware placer tests.
 
 Builds a >=15-component board (MCU + decoupling caps + 2 connectors + passives)
 from starter footprints, then asserts:
@@ -12,8 +12,7 @@ from starter footprints, then asserts:
 Prints wall-times via time.perf_counter.
 
 Run:
-  /home/hunter/.local/share/Chudware/mcp-venv/bin/python -X utf8 -m pytest \\
-      engine_oracle/ecad/test_place.py -q
+  python -X utf8 -m pytest services/ecad/test_place.py -q
 """
 
 from __future__ import annotations
@@ -36,7 +35,7 @@ from services.ecad.place import (
 
 
 def run_dfm(board):
-    """engine.ecad.dfm was ported to core (T-RF17); inline-board DFM via the RPC."""
+    """Run native inline-board DFM through the ``ecad_dfm`` RPC."""
     return _cb.call("ecad_dfm", {"board": board}).get("violations", [])
 
 
@@ -396,7 +395,7 @@ def test_autoplace_session_writeback():
 
 
 def test_public_signature():
-    """Wave 2b contract: place_board(doc, opts=None) -> {doc, report}."""
+    """Public contract: place_board(doc, opts=None) -> {doc, report}."""
     import inspect
     from services.ecad.place import place_board as pb
 

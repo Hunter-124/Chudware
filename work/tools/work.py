@@ -31,7 +31,7 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
-try:                       # identity/profile helpers live beside this script
+try:                       # optional external contributor-identity integration
     import _teamlib
 except Exception:          # never let a helper import break the core CLI
     _teamlib = None
@@ -53,8 +53,8 @@ def _resolve_owner(args):
     """Owner from --owner, else the stored identity. Errors clearly if neither."""
     owner = getattr(args, "owner", None) or _identity_owner()
     if not owner:
-        raise RuntimeError("no --owner given and no identity set — run "
-                           "`work.py whoami --github <username>` once, or pass --owner")
+        raise RuntimeError("no --owner given and no stored identity available; "
+                           "pass --owner explicitly")
     return owner
 
 
@@ -75,13 +75,9 @@ LANES = {
 KINDS = {"fix", "overhaul", "new"}
 KIND_RANK = {"fix": 0, "overhaul": 1, "new": 2}  # fix-first tiebreak inside a priority
 
-# --- Lane ownership / branch model (2026-07-06, Hunter directive) -----------
-# Each lane is owned by a human contributor and worked on its own branch, so
-# agents driven toward that lane's scope land on lane/<lane> and never touch
-# master until a human reviews & merges. Uncategorised / untagged bugfixes are
-# grouped onto ONE shared branch (lane/misc-fixes) to reduce cross-branch
-# divergence. Authored here (git-tracked work/lanes.json) — NOT in work/sync/,
-# which teamsync regenerates from remote and would clobber.
+# Historical lane/branch metadata retained for the legacy CLI and task records.
+# The current repo workflow is master-only: these mappings do not authorize new
+# branches or restore the retired teamsync machinery. See work/WORKFLOW.md.
 LANES_FILE = ROOT / "lanes.json"
 UNTAGGED = "(untagged)"
 ASSIGNABLE_LANES = LANES | {UNTAGGED}
@@ -330,6 +326,7 @@ def cmd_dag(tasks, errors, _args):
         "  classDef done fill:#cdeec9,stroke:#57a05a,color:#1e4d20",
         "  classDef blocked fill:#f5c6c6,stroke:#c0504d,color:#5e1f1d",
         "  classDef backlog fill:#f4f0fa,stroke:#b0a3c9,color:#4a3d63,stroke-dasharray: 4 3",
+        "  classDef dropped fill:#f2f2f2,stroke:#b5b5b5,color:#8a8a8a,stroke-dasharray: 2 2",
     ]
     by_ws = {}
     for t in tasks.values():
@@ -972,8 +969,8 @@ def cmd_mine(tasks, errors, args):
         aliases = _teamlib.identity_aliases()
         label = _teamlib.human_name() or aliases[0]
     else:
-        print("ERROR: no --owner given and no identity set — run "
-              "`work.py whoami --github <username>` once", file=sys.stderr)
+        print("ERROR: no --owner given and no stored identity available; "
+              "pass --owner explicitly", file=sys.stderr)
         return 1
     mine = [t for t in tasks.values() if t.get("owner", "").lower() in aliases]
     doing = [t for t in mine if t.get("status") == "doing"]

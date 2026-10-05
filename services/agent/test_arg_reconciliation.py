@@ -134,19 +134,6 @@ def test_no_second_synonym_table_exists_anywhere_in_services():
     assert not hits, f"duplicate synonym table definition(s) found: {hits}"
 
 
-def test_server_and_agent_turn_import_the_shared_resolver():
-    """Both dispatch modules must import (not reimplement) the shared functions."""
-    agent_src = (_REPO_ROOT / "services/agent/agent_turn.py").read_text()
-    server_src = (_REPO_ROOT / "services/mcp/server.py").read_text()
-    assert "from services.agent.arg_reconciliation import" in agent_src
-    assert "from services.agent.arg_reconciliation import" in server_src
-    # the local reimplementations this fix removed must not have come back
-    assert "def _map_arg_name(" not in agent_src
-    assert "def _bad_kwargs_error(" not in agent_src
-    assert "def _resolve_unknown(" not in server_src
-    assert "def _unknown_arg_payload(" not in server_src
-
-
 # --------------------------------------------------------------------- export_part(format=...)
 # Live 2026-07-27 (claude-opus, flyswatter run): rejected on the agent path only,
 # because the fix was never ported to server.py's independent implementation.

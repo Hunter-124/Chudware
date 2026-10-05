@@ -1,4 +1,4 @@
-# Browser integration tests (opt-in) — T-X6
+# Browser integration tests (opt-in)
 
 These tests drive the **real** per-source adapters (GrabCAD, TraceParts, McMaster,
 Amazon, JLCPCB, PCBWay) against the **live** sites, under **your own** logged-in
@@ -19,7 +19,11 @@ So a skipped live case always means "profile/flag not provisioned", never "code 
 
 Live cases are gated behind an env flag **and** a saved profile per source.
 
-1. **Install Playwright** (once): `pip install playwright && playwright install chromium`.
+1. **Provision the selected backend** — see `services/browser/README.md`.
+   Headless calls default to the CEF host daemon on Linux/Windows and Playwright
+   on macOS. Ordinary headed login still needs the residual Playwright-compatible
+   driver; for stock Playwright, use `pip install playwright` and provision Chromium
+   explicitly with `playwright install chromium`.
 2. **Log into each source** you want to test — this opens a real headed window and
    saves a LOCAL-ONLY profile (cookies never leave your machine, never committed):
 
@@ -30,13 +34,13 @@ Live cases are gated behind an env flag **and** a saved profile per source.
    ```
 
    If the site shows a **captcha or 2FA**, complete it yourself in that window — the
-   tool detects it and prints a reminder, but never solves or bypasses it (T-X6).
+   tool detects it and prints a reminder, but never solves or bypasses it.
 
 3. **Run the gated suite** with the flag set:
 
    ```bash
    CHUDWARE_BROWSER_INTEGRATION_TESTS=1 \
-     ~/.local/share/Chudware/mcp-venv/bin/python -m pytest \
+     python -m pytest \
      services/browser/integration/ -v
    ```
 

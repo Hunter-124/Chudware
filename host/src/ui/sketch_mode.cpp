@@ -3776,7 +3776,6 @@ static std::string dimLabel(const SketchConstraint& c) {
     else if (c.type == "radius")    body = "R" + fmtLen(v);
     else if (c.type == "diameter")  body = "\xE2\x8C\x80" + fmtLen(v);   // ⌀ U+2300 (CADSymbols)
     else                            body = fmtLen(v);
-    if (c.hasExpr) body += "";   // expr-bound dims still show the measured value
     return c.driven ? "(" + body + ")" : body;
 }
 

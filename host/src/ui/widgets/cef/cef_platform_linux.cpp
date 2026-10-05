@@ -1,5 +1,5 @@
 // cef/cef_platform_linux.cpp — Linux half of the CEF platform seam.
-// SCAFFOLDING (docs/cef_webview.md phase 2); compiled only with CHUDWARE_ENABLE_CEF.
+// Compiled only with CHUDWARE_ENABLE_CEF (design: docs/design/cef_webview.md).
 #include "cef_platform.h"
 
 #include <cstdlib>
@@ -49,8 +49,8 @@ void configure_settings(CefSettings& settings) {
     // browser process still needs a working Ozone platform. no_sandbox keeps the
     // single-binary layout simple for now (revisit for release hardening).
     settings.no_sandbox = 1;
-    // TODO(cef): if the zygote/helper handshake misbehaves on this distro, set
-    // --no-zygote via CefCommandLine in cef_app instead of here.
+    // If the zygote/helper handshake misbehaves on a distro, set --no-zygote via
+    // CefCommandLine in cef_app rather than here.
 }
 
 }  // namespace ui::cef_platform

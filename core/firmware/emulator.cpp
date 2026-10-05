@@ -14,6 +14,9 @@
 #include "firmware/pyfmt.h"
 #include "firmware/scenario.h"
 #include "firmware/subprocess.h"
+#include "firmware/bus_models.h"
+#include "firmware/hardware.h"
+#include <map>
 
 namespace chudware::firmware {
 namespace {
@@ -29,7 +32,7 @@ const std::regex kOdrEndRe(R"(CHUDWARE_GPIO_ODR_END\s+([A-K]))");
 const std::regex kHexRe(R"(0x[0-9a-fA-F]+)");
 const std::regex kTMarkRe(R"(CHUDWARE_T_MARK\s+([0-9]+(?:\.[0-9]+)?))");
 const std::regex kStm32PinRe(R"(^P([A-K])(\d{1,2})$)");
-const std::regex kReplUartRe(R"(^(\w+)\s*:\s*UART\.)");
+const std::regex kReplUartRe(R"(^(\w+)\s*:\s*(?:UART\.|Chudware\.TimedSTM32UART))");
 
 // Assertion-grammar regexes (emulator.py).
 const std::regex kGpioTimeRe(R"(^([^=@]+)=(\S+?)@([<>]?)([0-9]+(?:\.[0-9]+)?)ms$)");
@@ -88,6 +91,44 @@ std::string trim(const std::string& s) {
     size_t b = s.find_first_not_of(" \t\r\n");
     if (b == std::string::npos) return "";
     return s.substr(b, s.find_last_not_of(" \t\r\n") - b + 1);
+}
+
+std::optional<nlohmann::json> parse_bus_event(const std::string& line, size_t seq) {
+    const size_t marker = line.find("CHUDWARE_BUS_EVT ");
+    if (marker == std::string::npos) return std::nullopt;
+    std::istringstream in(line.substr(marker + 17));
+    std::string token;
+    nlohmann::json event = {{"type", "bus"}, {"seq", seq}};
+    while (in >> token) {
+        const auto separator = token.find('=');
+        if (separator == std::string::npos) continue;
+        const auto key = token.substr(0, separator), value = token.substr(separator + 1);
+        if (key == "t_ns") {
+            try {
+                event[key] = std::stoull(value);
+                event["t_ms"] = event[key].get<double>() / 1e6;
+            } catch (...) {
+                event[key] = nullptr;
+            }
+        } else {
+            event[key] = value;
+        }
+    }
+    if (event.value("event", std::string()) == "trace_truncated")
+        event["type"] = "trace_truncated";
+    return event;
+}
+
+std::map<std::string, std::string> uart_streams(const nlohmann::json& events) {
+    std::map<std::string, std::string> streams;
+    for (const auto& event : events) {
+        if (event.value("type", std::string()) == "trace_truncated") {
+            for (auto& [bus, stream] : streams) stream += "\n[trace truncated]\n";
+        } else if (event.contains("t_ns")) {
+            streams[event.value("bus", std::string())] += event.value("text", std::string());
+        }
+    }
+    return streams;
 }
 
 
@@ -247,21 +288,6 @@ bool requires_timestamped_gpio_observation(const std::string& raw) {
     return std::regex_match(spec, match, kGpioTimeRe);
 }
 
-std::string register_stream_capability_error(const nlohmann::json& scenario) {
-    if (!scenario.is_object() || !scenario.contains("tracks") ||
-        !scenario["tracks"].is_array())
-        return "";
-    for (const auto& track : scenario["tracks"]) {
-        if (track.is_object() &&
-            track.value("kind", std::string()) == "i2c_register_stream") {
-            return "register-addressed i2c_register_stream is unsupported by the current "
-                   "Renode backend: Mocks.DummyI2CSlave exposes only a sequential response "
-                   "FIFO, so it cannot answer register-address reads or atomically replace "
-                   "timestamped register maps; refusing instead of queueing stale byte bursts";
-        }
-    }
-    return "";
-}
 
 int count_toggles(const nlohmann::json& gpio_events, const std::string& pin) {
     std::vector<int> levels;
@@ -292,20 +318,22 @@ nlohmann::json final_gpio_states(const std::string& text,
 SimResult run_renode(const std::string& elf_path, const std::string& platform_file,
                      const std::vector<std::string>& assertions, double timeout_s,
                      const nlohmann::json& gpio_regmap, const nlohmann::json& scenario,
-                     const nlohmann::json& mcu_caps) {
+                     const nlohmann::json& mcu_caps, double requested_run_s) {
     auto t0 = std::chrono::steady_clock::now();
     if (which("renode").empty())
         return refused_result(
             "emulator_not_found: 'renode' is not installed / not on PATH", assertions, t0);
 
-    double run_seconds = std::max(1.0, timeout_s - 5.0);
+    double run_seconds = requested_run_s > 0 ? requested_run_s : 1.0;
     auto gpio_pins = pins_from_assertions(assertions);
 
     // Compile the scenario (T-FIN3) — pure plan first, then aux files on disk.
     std::vector<std::string> scenario_setup;
     std::vector<std::pair<double, std::string>> scenario_timeline;
     std::string scenario_dir;
-    if (scenario.is_object()) {
+    nlohmann::json resolved_links=nlohmann::json::array();
+    nlohmann::json limits=nlohmann::json::array();
+    if (scenario.is_object() || mcu_caps.value("timed_bus",false)) {
         nlohmann::json caps = mcu_caps.is_object() ? mcu_caps : get_capabilities("cortex-m");
         std::string platform_text;
         {
@@ -314,7 +342,15 @@ SimResult run_renode(const std::string& elf_path, const std::string& platform_fi
             ss << in.rdbuf();
             platform_text = ss.str();
         }
-        ScenarioPlan plan = build_scenario_plan(scenario, caps, platform_text);
+        ScenarioPlan plan;
+        if(scenario.is_object()) plan=build_scenario_plan(scenario,caps,platform_text);
+        else {
+            plan.aux_files["chudware_buses.cs"]=generated_bus_source(nlohmann::json::array());
+            plan.pre_platform_lines={"include @{CHUDWARE_SCENARIO_DIR}/chudware_buses.cs"};
+            plan.warnings={"Functional bus mode: reset 16MHz HSI clocks; no calibrated electrical network"};
+        }
+        if(requested_run_s>0 && plan.duration_ms>requested_run_s*1000)
+            plan.errors.push_back("scenario stimulus exceeds explicit run_s virtual horizon");
         if (!plan.errors.empty()) {
             SimResult r;
             r.passed = false;
@@ -338,10 +374,12 @@ SimResult run_renode(const std::string& elf_path, const std::string& platform_fi
                            std::chrono::steady_clock::now().time_since_epoch().count()));
         scenario_dir = dir.string();
         materialize_aux_files(plan, scenario_dir);
-        scenario_setup = plan.setup_lines;
+        scenario_setup = plan.pre_platform_lines;
+        scenario_setup.insert(scenario_setup.end(),plan.setup_lines.begin(),plan.setup_lines.end());
         scenario_timeline = plan.timeline;
-        run_seconds = std::max(run_seconds, plan.duration_ms / 1000.0 + 1.0);
-        timeout_s = std::max(timeout_s, run_seconds + 5.0);
+        resolved_links=plan.resolved_links;
+        for(const auto& warning:plan.warnings) limits.push_back(warning);
+        if(requested_run_s==0) run_seconds=std::max(run_seconds,plan.duration_ms/1000+1.0);
     }
 
     std::string resc = build_resc(elf_path, platform_file, run_seconds, gpio_pins, gpio_regmap,
@@ -378,20 +416,33 @@ SimResult run_renode(const std::string& elf_path, const std::string& platform_fi
     nlohmann::json gpio_events = parse_gpio_events(raw);
     nlohmann::json gpio_states = final_gpio_states(raw, parse_renode_gpio_odr(raw));
     nlohmann::json uart_events = parse_uart_events(raw);
+    std::string firmware_output=raw;
+    if(mcu_caps.value("timed_bus",false)) {
+        const auto streams = uart_streams(uart_events);
+        firmware_output.clear();for(const auto& [bus,stream]:streams) {firmware_output+=stream;firmware_output+='\n';}
+        uart_log=cap(firmware_output+"\n"+raw);
+    }
     auto trace_path = write_trace_artifact(elf_path, "renode", raw, gpio_events, gpio_states);
     SimResult r;
+    r.bus_events=parse_bus_events(raw);
+    r.uart_events=uart_events;
+    r.bus_summary={{"resolved_links",resolved_links},{"limitations",limits},{"event_count",r.bus_events.size()},{"truncated",events_truncated(r.bus_events)}};
     if (rr.returncode != 0) {
+        auto evidence=std::move(r.bus_events);
+        auto summary=std::move(r.bus_summary);
+        auto uart_evidence=std::move(r.uart_events);
         r = refused_result(
             cap("emulator_fault: renode exited with code " +
                 std::to_string(rr.returncode) + "\n" + raw),
             assertions, t0);
+        r.bus_events=std::move(evidence);r.bus_summary=std::move(summary);r.uart_events=std::move(uart_evidence);
         r.gpio_states = gpio_states;
         r.gpio_events = gpio_events;
         r.trace_path = trace_path;
         return r;
     }
     r.assertion_results =
-        evaluate_assertions(raw, gpio_states, assertions, gpio_events, uart_events);
+        evaluate_assertions(firmware_output, gpio_states, assertions, gpio_events, uart_events);
     r.passed = true;
     for (const auto& a : r.assertion_results)
         if (!a.value("passed", false)) {
@@ -505,8 +556,20 @@ nlohmann::json SimResult::to_dict() const {
         {"assertion_results", assertion_results},
         {"ms", std::round(ms * 100.0) / 100.0},
         {"gpio_events", gpio_events},
+        {"bus_events", bus_events},
+        {"bus_summary", bus_summary},
+        {"uart_events", uart_events},
         {"trace_path", trace_path ? nlohmann::json(*trace_path) : nlohmann::json(nullptr)},
     };
+}
+
+nlohmann::json parse_bus_events(const std::string& text) {
+    nlohmann::json events=nlohmann::json::array();
+    for (const auto& line : split_lines(text)) {
+        auto event = parse_bus_event(line, events.size());
+        if (event) events.push_back(std::move(*event));
+    }
+    return bound_events(events);
 }
 
 nlohmann::json parse_gpio_events(const std::string& text) {
@@ -536,9 +599,38 @@ nlohmann::json parse_gpio_events(const std::string& text) {
 
 nlohmann::json parse_uart_events(const std::string& text) {
     nlohmann::json events = nlohmann::json::array();
+    // Select transmit evidence before bounding it: unrelated bus traffic must not
+    // discard mid-mission UART bytes or introduce a false UART truncation marker.
+    nlohmann::json legacy_events = nlohmann::json::array();
     nlohmann::json t_ms = nullptr;
     auto lines = split_lines(text);
     for (size_t i = 0; i < lines.size(); ++i) {
+        if (auto event = parse_bus_event(lines[i], events.size())) {
+            const auto protocol = event->value("protocol", std::string());
+            if (event->value("type", std::string()) == "trace_truncated") {
+                // Sample limits and another protocol's emitter loss do not drop UART bytes.
+                // An unscoped emitter loss can affect UART, so retain it conservatively.
+                if (event->value("cause", std::string()) != "sample_limit" &&
+                    (protocol.empty() || protocol == "uart")) {
+                    events.push_back(std::move(*event));
+                    legacy_events.clear();
+                }
+            } else if (protocol == "uart" &&
+                       event->value("event", std::string()) == "tx_complete" &&
+                       event->contains("t_ns")) {
+                try {
+                    const auto& record = *event;
+                    const char byte = static_cast<char>(
+                        std::stoul(record.value("value", std::string("0")), nullptr, 0));
+                    events.push_back({{"type", "uart"}, {"seq", events.size()},
+                                      {"t_ns", record["t_ns"]}, {"t_ms", record["t_ms"]},
+                                      {"bus", record["bus"]}, {"text", std::string(1, byte)}});
+                    legacy_events.clear();
+                } catch (...) {}
+            }
+            continue;
+        }
+        if (!events.empty()) continue;
         std::smatch m;
         if (std::regex_search(lines[i], m, kTMarkRe)) {
             try {
@@ -551,14 +643,14 @@ nlohmann::json parse_uart_events(const std::string& text) {
         }
         std::string s = trim(lines[i]);
         if (s.empty() || s.find("CHUDWARE_GPIO_EVT") != std::string::npos ||
-            s.find("CHUDWARE_GPIO_ODR_") != std::string::npos)
+            s.find("CHUDWARE_GPIO_ODR_") != std::string::npos || s.find("CHUDWARE_BUS_EVT")!=std::string::npos)
             continue;
-        events.push_back({{"type", "uart"},
+        legacy_events.push_back({{"type", "uart"},
                           {"seq", static_cast<long long>(i)},
                           {"t_ms", t_ms},
                           {"text", s}});
     }
-    return bound_events(events);
+    return bound_events(events.empty() ? legacy_events : events);
 }
 
 nlohmann::json parse_renode_gpio_odr(const std::string& text) {
@@ -710,6 +802,11 @@ nlohmann::json evaluate_assertions(const std::string& uart_log,
     const nlohmann::json& uart_events = uart_events_in.is_array() ? uart_events_in
                                                                   : nlohmann::json::array();
     const bool gpio_trace_truncated = events_truncated(gpio_events);
+    const bool uart_trace_truncated = events_truncated(uart_events);
+    const bool precise_uart = std::any_of(uart_events.begin(), uart_events.end(),
+        [](const auto& event) { return event.contains("t_ns"); });
+    const auto transmitted = precise_uart && !uart_trace_truncated
+        ? uart_streams(uart_events) : std::map<std::string, std::string>();
 
     for (const auto& raw_assertion : assertions) {
         std::string a = trim(raw_assertion);
@@ -786,26 +883,32 @@ nlohmann::json evaluate_assertions(const std::string& uart_log,
                     a, false, "uart_within assertion must be uart_within:<text>@<T>ms"));
                 continue;
             }
+            if (uart_trace_truncated) {
+                results.push_back(assertion_result(a,false,"not evaluated: UART/bus evidence exceeded event limit"));continue;
+            }
             std::string text = m[1].str();
             double t_ref = std::stod(m[2].str());
-            std::vector<nlohmann::json> stamped;
-            for (const auto& e : uart_events)
-                if (e.contains("t_ms") && e["t_ms"].is_number()) stamped.push_back(e);
-            if (stamped.empty()) {
+            const bool stamped=std::any_of(uart_events.begin(),uart_events.end(),[](const auto& event) {
+                return event.contains("t_ms") && event["t_ms"].is_number();
+            });
+            if (!stamped) {
                 results.push_back(assertion_result(
-                    a, false, "no time-stamped uart events (uart timestamps come from the "
-                              "scenario timeline's CHUDWARE_T_MARK markers)"));
+                    a, false, "no time-stamped UART events (timed STM32F4 events require real model transmit completion)"));
                 continue;
             }
             const nlohmann::json* hit = nullptr;
             const nlohmann::json* later = nullptr;
-            for (const auto& e : stamped) {
-                if (e.value("text", std::string()).find(text) != std::string::npos) {
-                    if (e["t_ms"].get<double>() <= t_ref) {
-                        hit = &e;
-                        break;
-                    }
-                    if (!later) later = &e;
+            std::map<std::string,std::string> streams;
+            for (const auto& e : uart_events) {
+                if(!e.contains("t_ms") || !e["t_ms"].is_number()) continue;
+                auto& stream=streams[e.value("bus",std::string())];
+                const std::string fragment=e.value("text",std::string());
+                const size_t old_size=stream.size();
+                stream+=fragment;
+                const size_t from=old_size>=text.size()?old_size-text.size()+1:0;
+                if(stream.find(text,from)!=std::string::npos) {
+                    if(e["t_ms"].get<double>()<=t_ref) {hit=&e;break;}
+                    if(!later) later=&e;
                 }
             }
             if (hit) {
@@ -905,11 +1008,19 @@ nlohmann::json evaluate_assertions(const std::string& uart_log,
             }
         } else {
             std::string text = a.rfind("uart:", 0) == 0 ? a.substr(5) : a;
-            if (uart_log.find(text) != std::string::npos)
-                results.push_back(assertion_result(a, true, "found in uart_log"));
-            else
-                results.push_back(
-                    assertion_result(a, false, "'" + text + "' not found in uart_log"));
+            if (uart_trace_truncated) {
+                results.push_back(assertion_result(
+                    a, false, "not evaluated: UART/bus evidence exceeded event limit"));
+            } else {
+                const bool found = precise_uart
+                    ? std::any_of(transmitted.begin(), transmitted.end(), [&](const auto& stream) {
+                          return stream.second.find(text) != std::string::npos;
+                      })
+                    : uart_log.find(text) != std::string::npos;
+                const std::string source = precise_uart ? "transmitted UART data" : "uart_log";
+                results.push_back(assertion_result(
+                    a, found, found ? "found in " + source : "'" + text + "' not found in " + source));
+            }
         }
     }
     return results;
@@ -955,18 +1066,14 @@ std::string build_resc(const std::string& elf_path, const std::string& platform_
         odr_offset = gpio_regmap.value("odr_offset", odr_offset);
     }
 
-    std::vector<std::string> lines = {"mach create",
-                                      "machine LoadPlatformDescription @" + platform_file};
-    for (const auto& l : scenario_setup_lines) lines.push_back(l);
+    std::vector<std::string> lines = {"mach create"};
+    for(const auto& l:scenario_setup_lines) if(l.rfind("include ",0)==0) lines.push_back(l);
+    lines.push_back("machine LoadPlatformDescription @" + platform_file);
+    for(const auto& l:scenario_setup_lines) if(l.rfind("include ",0)!=0) lines.push_back(l);
     lines.push_back("sysbus LoadELF @" + elf_path);
     if (!uart_name.empty()) lines.push_back("showAnalyzer sysbus." + uart_name);
-    lines.push_back("start");
-    if (!scenario_timeline.empty()) {
-        for (const auto& l : timeline_resc_lines(scenario_timeline, run_seconds))
-            lines.push_back(l);
-    } else {
-        lines.push_back("sleep " + fmt_g(run_seconds));
-    }
+    for (const auto& l : timeline_resc_lines(scenario_timeline, run_seconds))
+        lines.push_back(l);
     std::set<char> ports;
     for (const auto& [p, _] : gpio_pins) ports.insert(p);
     for (char port : ports) {
@@ -975,6 +1082,7 @@ std::string build_resc(const std::string& elf_path, const std::string& platform_
         lines.push_back("sysbus ReadDoubleWord " + fmt_hex(odr));
         lines.push_back("echo \"CHUDWARE_GPIO_ODR_END " + std::string(1, port) + "\"");
     }
+    lines.push_back("quit");
     std::string out;
     for (const auto& l : lines) {
         out += l;
@@ -985,11 +1093,25 @@ std::string build_resc(const std::string& elf_path, const std::string& platform_
 
 SimResult run_simulation(const std::string& elf_path, const std::string& mcu_family,
                          const std::vector<std::string>& assertions, double timeout_s,
-                         const nlohmann::json& scenario) {
+                         const nlohmann::json& scenario, double run_s, const std::string& backend) {
     auto t0 = std::chrono::steady_clock::now();
     if (!std::isfinite(timeout_s) || timeout_s <= 0.0)
         return refused_result(
             "invalid_setup: timeout_s must be finite and greater than zero", assertions, t0);
+    if(!std::isfinite(run_s) || run_s<0 || (backend!="auto"&&backend!="renode"&&backend!="qemu"&&backend!="simavr"))
+        return refused_result("invalid_setup: run_s must be finite nonnegative and backend auto/renode/qemu/simavr",assertions,t0);
+    if(backend=="simavr") {
+        if(!scenario.is_null()) return refused_result("scenario_unsupported: simavr has no timed bus scenario surface",assertions,t0);
+        const auto invalid=image_error(elf_path,83);
+        if(!invalid.empty()) return refused_result(invalid,assertions,t0);
+        auto legacy=simavr_run(elf_path,mcu_family,run_s>0?run_s:1.0,1234,{},timeout_s);
+        SimResult result;result.uart_log=legacy.output;result.ms=legacy.ms;
+        result.assertion_results=evaluate_assertions(result.uart_log,result.gpio_states,assertions,result.gpio_events,parse_uart_events(result.uart_log));
+        result.passed=legacy.success;
+        for(const auto& assertion:result.assertion_results) if(!assertion.value("passed",false)) result.passed=false;
+        result.bus_summary={{"limitations",{"simavr run_s is legacy wall-duration stop, not virtual timed/electrical bus evidence"}}};
+        return result;
+    }
     const auto setup_errors = assertion_errors(assertions);
     if (!setup_errors.empty()) {
         std::string joined;
@@ -1012,15 +1134,12 @@ SimResult run_simulation(const std::string& elf_path, const std::string& mcu_fam
     }
     const std::string invalid_image = image_error(elf_path, 40);  // EM_ARM
     if (!invalid_image.empty()) return refused_result(invalid_image, assertions, t0);
-    const std::string scenario_capability_error =
-        register_stream_capability_error(scenario);
-    if (!scenario_capability_error.empty())
-        return refused_result(
-            "scenario_unsupported: " + scenario_capability_error, assertions, t0);
 
     std::string platform = get_platform_file(mcu_family);
-    bool have_renode = !which("renode").empty();
-    bool have_qemu = !which("qemu-system-arm").empty();
+    bool have_renode = backend!="qemu" && !which("renode").empty();
+    bool have_qemu = backend!="renode" && !which("qemu-system-arm").empty();
+    if(run_s>0 && !have_renode && have_qemu)
+        return refused_result("unsupported_timing: QEMU backend has no precise virtual RunFor stop surface; use Renode for run_s",assertions,t0);
 
     if (have_renode && !platform.empty()) {
         std::set<std::string> untimestampable;
@@ -1067,7 +1186,7 @@ SimResult run_simulation(const std::string& elf_path, const std::string& mcu_fam
                 t0);
         }
         return run_renode(elf_path, platform, assertions, timeout_s, caps["gpio_regmap"],
-                          scenario, caps);
+                          scenario, caps, run_s);
     }
     if (have_qemu) {
         if (scenario.is_object()) {

@@ -162,7 +162,6 @@
    "sketch3d_add_curves",
    "sketch3d_as_sweep_guide",
    "sketch3d_clear",
-   "sketch3d_from_ledger",
    "sketch3d_get",
    "sketch3d_list",
    "sketch3d_new",
@@ -172,7 +171,6 @@
    "sketch3d_ref_vertex",
    "sketch3d_sample_at",
    "sketch3d_section_at",
-   "sketch3d_to_ledger",
    "sketch_preview_text",
    "solve_mates",
    "stackup_analyze",
@@ -679,7 +677,7 @@
   "describe_assembly": "Compact narrative of an assembly (or multi-body part) — world placement, fit/clearance, and mate solve summary. Use INSTEAD of dumping …",
   "describe_board": "Compact narrative of an ECAD schematic or PCB — component roster, net list, ERC/DRC summary, and unconnected pins. Promotes ecad_status …",
   "describe_part": "Compact, NAMED outline of the part — use INSTEAD of dumping every face on a complex part.",
-  "describe_project": "Compact narrative of a DAG project run — nodes done/blocked, budgets, open questions. Feeds WS-A dag_status and the T-F17 mission-control …",
+  "describe_project": "Compact narrative of a DAG project run — nodes done/blocked, budgets, open questions. Uses the live DAG run's status, budget and …",
   "describe_results": "Compact narrative of FEA/CFD simulation results — use INSTEAD of dumping raw study JSON. Returns max von Mises stress, displacement, factor …",
   "describe_reveng_result": "Describe the reverse-engineering result for *session_id*.",
   "describe_scene": "Deterministic \"what the render would show\" per view, from B-rep face normals — the non-vision fallback for render_part / render_views / …",
@@ -792,7 +790,7 @@
   "fw_serial_open": "Open a live serial/UART port (raw termios 8N1) for the physical-device monitor.",
   "fw_serial_read": "Non-blocking read of up to ``max_bytes`` currently buffered on an open serial handle (immediate return, no wait — poll this repeatedly for …",
   "fw_serial_write": "Write to an open serial handle. Pass ``data_hex`` (hex-encoded raw bytes) for binary payloads, or ``text`` for a plain string (e.g. typing …",
-  "fw_sim_run": "Run the firmware emulation loop via Renode or QEMU and return SimResult.",
+  "fw_sim_run": "Run the canonical firmware simulation used by Firmware > Emulate.",
   "fw_sources": "List, add/remove, or WRITE the project's source files (paths relative to the project root). Returns ``{src_paths}`` plus ``{written …",
   "fw_status": "Firmware provisioning doctor (T-FIN4) — call FIRST before any fw_* work.",
   "fw_verify_board": "Firmware↔board co-verification (T-FIN6): check the firmware BACK against the PCB before fab and return ERC/DRC-shaped findings.",
@@ -1058,7 +1056,6 @@
   "sketch3d_add_curves": "Append curve entities to a sketch3d feature (edit_feature) and report the solve.",
   "sketch3d_as_sweep_guide": "Get the exact sweep ref syntax for using this sketch3d as the PATH or a GUIDE.",
   "sketch3d_clear": "Erase all entities + constraints from a sketch3d feature (keeps the feature id).",
-  "sketch3d_from_ledger": "DEPRECATED entry point — MIGRATES an old session-store payload into REAL features.",
   "sketch3d_get": "Read back a sketch3d feature: authored params + SOLVED geometry + health.",
   "sketch3d_list": "List all sketch3d FEATURES in the part document.",
   "sketch3d_new": "Create a NEW `sketch3d` FEATURE in the part document and return its feature id.",
@@ -1068,7 +1065,6 @@
   "sketch3d_ref_vertex": "Ground a sketch3d constraint to a specific VERTEX on the built model (T-3DXREF).",
   "sketch3d_sample_at": "Sample a POINT + TANGENT on the SOLVED sketch3d path at arc-length fraction t.",
   "sketch3d_section_at": "Cross-section the part with a plane whose ORIENTATION follows the path tangent.",
-  "sketch3d_to_ledger": "DEPRECATED — 3D sketches are now real doc features; the DOCUMENT is the persistence.",
   "sketch_auto_constrain": "Stitch a sketch's near-touching endpoints closed by adding coincident constraints — the cheap way to close chains before dimensioning.",
   "sketch_health": "The single narrated read of a sketch's constraint state — solve it and get back WHY it is under/over-defined plus an ordered plan to reach …",
   "sketch_preview_text": "Full TEXT description of a 2D sketch — entities, constraints, DOF, regions, health.",
@@ -2626,14 +2622,11 @@
   "sketch3d_clear": {
    "prompt_note": "Wipes entities but keeps the feature id, so downstream sweep refs survive (they fail until the sketch has a wire again)."
   },
-  "sketch3d_from_ledger": {
-   "prompt_note": "DEPRECATED migration shim for old session payloads — new work never needs this; sketch3d features persist with the document."
-  },
   "sketch3d_get": {
    "prompt_note": "Reads authored constraints + SOLVED entity coordinates (what the GUI shows) + health; use before referencing a wire in a sweep."
   },
   "sketch3d_list": {
-   "prompt_note": "All sketch3d features with wire/status/length summary — persistent doc features that save with the part, no session store."
+   "prompt_note": "All sketch3d features with wire/status/length summary — persistent doc features that save with the part."
   },
   "sketch3d_new": {
    "prompt_note": "Needs a current part (new_part first); returns the feature id every other sketch3d_* tool takes — populate via sketch3d_add_curves."
@@ -2655,9 +2648,6 @@
   },
   "sketch3d_section_at": {
    "prompt_note": "ENGINE LIMIT: the cut is always at the world ORIGIN — t only picks the plane orientation from the tangent; the on-path point → sketch3d_sample_at."
-  },
-  "sketch3d_to_ledger": {
-   "prompt_note": "DEPRECATED — sketch3d features save with the document; this only reports them so old workflows don't dead-end."
   },
   "sketch_auto_constrain": {
    "prompt_note": "Auto-runs after sketch edits (sketch.auto_coincident, default ON) — call explicitly only to preview (apply=False) or re-stitch with a looser tol_mm."

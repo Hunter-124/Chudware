@@ -26,3 +26,9 @@ metadata always in context (~100 tokens/skill), full body injected on activation
   mutations) and single-source-of-truth sequencing (model the mating part FIRST, reference its
   dims — never parallel-guess mating interfaces).
 - Builtin domain extensions: surface-modeling, weldment-frame, design-for-manufacturability.
+
+## Current runtime clarification (supersedes compaction claim above)
+
+The Python skill registry injects an automatic skill once per session. An explicit
+`services.agent.skills.reset_session()` permits reinjection; there is no Python
+compaction callback. Online context compaction is owned by Chudcode.

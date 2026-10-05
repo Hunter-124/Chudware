@@ -1,13 +1,16 @@
 """Schema validation + factories for ``aicad.piping/1`` documents.
 
-Executable form of ``contracts/piping_schema.md``. Structural validation only (envelopes,
-types, id prefixes, enum membership) — geometry realizability and catalog resolution are
-separate passes (:mod:`services.piping.catalog` / :mod:`services.piping.threed`), exactly as
-engine.ecad keeps DRC/3D out of its schema validator.
+Python executable form of ``contracts/piping_schema.md``: the kernel-side legs
+(:mod:`services.piping.threed` / :mod:`services.piping.cfd_handoff`) share its constants and
+their tests build/validate documents with it; the core's validator (``core/piping/schema.cpp``)
+answers the ``piping_*`` RPCs. Structural validation only
+(envelopes, types, id prefixes, enum membership) — geometry realizability and catalog
+resolution are separate passes (:mod:`services.piping.catalog` / :mod:`services.piping.threed`),
+just as the ECAD schema validator leaves DRC/3D to their own passes.
 
 Every ``validate_*`` returns a list of error strings (empty = valid), each prefixed with a
-JSON-path-ish locator so failures are actionable — same convention as engine.doc.schema and
-engine.ecad.schema.
+JSON-path-ish locator so failures are actionable — same convention as the part-document and
+ECAD schema validators.
 
 Coordinates are ``[x, y, z]`` in **mm**; angles in **degrees**.
 """
@@ -256,6 +259,6 @@ def validate_piping(doc: dict) -> list[str]:
     return errs
 
 
-# Convenience alias mirroring engine.ecad.schema.validate
+# Convenience alias mirroring services.ecad.schema.validate
 def validate(doc: dict) -> list[str]:
     return validate_piping(doc)

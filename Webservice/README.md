@@ -64,12 +64,17 @@ Browser/device restrictions can disable them; the startup panel identifies missi
 capabilities. Mobile layout and input are exercised in Chromium touch emulation;
 physical iOS/Safari keyboard and safe-area behavior still require device checks.
 
-## IP note — before any PUBLIC deployment
+## IP note — the client bundle is downloadable
 
-The WASM bundle ships the full GUI as downloadable bytecode. Behind the current
-Cloudflare Access whitelist that is acceptable; **revisit before opening chudware.com
-to the general public** (options: keep Access-gated, obfuscate/split, or move rendering
-server-side). The engine itself stays on the server — only the client UI is exposed.
+`app.chudware.com` is public: there is no Cloudflare Access wall and no allowlist.
+Anyone can self-register (email + password or Google/GitHub OAuth); an account
+activates through email verification or admin approval, and the gateway resolves
+the `chudware_sid` server-side session cookie on every request (see `DESIGN.md`,
+decision 2 "Auth", and `deploy/PUBLIC_ROLLOUT.md` §2). Any active account can
+therefore download `/app`, and the WASM bundle ships the full GUI as downloadable
+bytecode. That exposure is unmitigated; the options remain obfuscating/splitting
+the bundle or moving rendering server-side. The engine itself stays private on the
+server behind the gateway's `/engine` bridge — only the client UI is exposed.
 
 ## Future compute offload (unprovisioned)
 

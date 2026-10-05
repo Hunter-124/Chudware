@@ -7,6 +7,17 @@ Status: ratified 2026-07-04, authored by the lead session (Hunter directive:
 The canonical role system prompts live in `services/agent/roles/*.yaml` and are
 authored; T-W7 wires the loader around them VERBATIM, T-W19 wires this pipeline.
 
+Adopted design record. The associated tasks are `status: done` on the board
+(`work/tasks/done/`): T-W1, T-W5, T-W7, T-W10, T-W12–T-W16, T-W18 and T-W19;
+T-BL50 is in `work/backlog/done/`. These are closure records, not blanket proof of
+every sentence below. Read the pipeline as design intent and check behavior against
+`services/agent/` before relying on a detail. The July role counts are dated; use the
+current `services/agent/roles/` catalog rather than a fixed count. Since 2026-08-31,
+role turns' online model execution runs inside the embedded Chudcode RPC runtime.
+The pipeline's phases, roles and governance stay
+Chudware-owned
+([omp-integration/01-DECISIONS.md, 2026-08-31 section](../omp-integration/01-DECISIONS.md#2026-08-31--superseding-architecture-chudcode-rpc-is-the-only-online-runtime)).
+
 ## 0. Shape of the whole thing
 
 ```

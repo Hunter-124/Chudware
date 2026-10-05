@@ -249,8 +249,7 @@ def _assemble_role_runtime(
     actor: Any,
     on_event: Callable[..., None] | None,
 ) -> tuple[str, list[str], list[Any], Any, dict[str, Any]]:
-    from services.agent import agent_turn
-    from services.agent.mission_dispatch import MissionDispatch, linear_role_prompt
+    from services.agent.mission_dispatch import MissionDispatch, role_prompt
     from services.agent.preferences import resolve_turn_preferences
 
     mission_dispatch = options.get("mission_dispatch")
@@ -269,13 +268,10 @@ def _assemble_role_runtime(
             options=dict(options),
             chudware_actor=actor,
         )
-    resolver = agent_turn.resolver_for(mission_dispatch)
-    system_prompt, role_allowed_tools, _tools_text = linear_role_prompt(
+    system_prompt, role_allowed_tools = role_prompt(
         role,
-        resolver=resolver,
         card=card,
         capability=capability,
-        tier=tier,
         preferences=resolve_turn_preferences("", task_kind="modelling", headless=True),
     )
     # Nested callers may narrow a role card without mutating the process-global

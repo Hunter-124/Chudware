@@ -7,9 +7,8 @@
 //                (fw_status, T-FIN4) — honest gating: missing tools show a guidance banner
 //                instead of a dead button.
 //   center     : tabs — Editor (read-only source preview) | Debug (fw_debug_gdb_* console:
-//                reset/halt/step, breakpoints, memory view) | Emulate (fw_sim_run /
-//                fw_emulate_renode / fw_emulate_simavr live UART + GPIO trace viewer, contract
-//                §7).
+//                reset/halt/step, breakpoints, memory view) | Emulate (fw_sim_run scenario
+//                editor, engineering evidence, UART and GPIO trace viewer, contract §7).
 //   right      : AI Copilot pane — reuses the docked Copilot's own chat state/send path
 //                (ui/copilot/copilot.h reuse hooks) so the firmware hub doesn't fork a second
 //                chat implementation.
@@ -31,6 +30,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -45,6 +45,7 @@
 
 #include "core/app_state.h"
 #include "ui/copilot/copilot.h"
+#include "ui/file_dialog.h"
 #include "ui/icons.h"
 #include "ui/metrics.h"
 #include "ui/widgets/kit.h"   // ui::kit — the app-wide section header
@@ -95,13 +96,21 @@ struct FwState {
     std::string buildStderr, elfPath;
     double buildMs = 0.0;
 
-    // ---- emulation (fw_sim_run / fw_emulate_renode / fw_emulate_simavr) ----
+    // ---- emulation (canonical fw_sim_run for every backend) ----
     bool simPending = false, simDone = false, simPassed = false;
     std::string uartLog, simErr, tracePath;
     double simMs = 0.0;
     std::vector<std::string> assertionLines;   // "PASS uart:hello" style summaries
     std::vector<GpioEvent> gpio;
     char assertBuf[256] = "";
+    int simBackend = 0;
+    double runSeconds = 0.0, hostTimeoutSeconds = 0.0;
+    std::vector<char> scenarioBuf = std::vector<char>(4096, '\0');
+    char scenarioPathBuf[2048] = "";
+    std::string scenarioErr, resultJson;
+    nlohmann::json simEvidence;
+    std::vector<std::string> busEventRows;
+    int selectedBusEvent = -1;
 
     // ---- hardware rail (fw_flash / fw_avr_flash / fw_debug_start / fw_debug_halt) ----
     char chipBuf[64] = "STM32F407VGTx";
@@ -295,7 +304,7 @@ static bool fwProjectRow(const FwProject& p, bool selected) {
 
 // Small secondary action ("Refresh"/"Recheck") parked on the right edge of the header row
 // that the next fwSectionHeader() call draws. Call IMMEDIATELY before fwSectionHeader.
-static void fwHeaderAction(const char* label, float width, std::function<void()> onClick) {
+static void fwHeaderAction(const char* label, float width, const std::function<void()>& onClick) {
     const ImVec2 cp = ImGui::GetCursorPos();
     ImGui::SetCursorPosX(cp.x + ImGui::GetContentRegionAvail().x - width);
     if (ImGui::SmallButton(label)) onClick();
@@ -438,8 +447,7 @@ static void loadTraceArtifact(FwState& s) {
     }
 }
 
-// Apply a SimResult payload (contract §4/§7.1) to the state. Shared by fw_sim_run and the
-// backend-specific fw_emulate_renode / fw_emulate_simavr entry points — same result shape.
+// Apply the canonical SimResult payload; keep native fields intact for engineering inspection.
 static void applySimResult(FwState& s, const nlohmann::json& j) {
     s.simDone   = true;
     s.simPassed = j.value("passed", false);
@@ -447,12 +455,20 @@ static void applySimResult(FwState& s, const nlohmann::json& j) {
     s.simMs     = j.value("ms", 0.0);
     s.tracePath = (j.contains("trace_path") && j["trace_path"].is_string())
                       ? j["trace_path"].get<std::string>() : std::string();
+    s.simEvidence = j;
+    s.resultJson = j.dump(2);
+    s.busEventRows.clear();
+    s.selectedBusEvent = -1;
+    if (j.contains("bus_events") && j["bus_events"].is_array()) {
+        for (const auto& event : j["bus_events"])
+            s.busEventRows.push_back(event.dump());
+    }
     s.assertionLines.clear();
     if (j.contains("assertion_results") && j["assertion_results"].is_array()) {
         for (const auto& a : j["assertion_results"]) {
             if (!a.is_object()) continue;
             std::string line = a.value("passed", false) ? "PASS  " : "FAIL  ";
-            line += a.value("assertion", std::string());
+            line += a.value("name", std::string());
             const std::string detail = a.value("detail", std::string());
             if (!detail.empty()) line += "  (" + detail + ")";
             s.assertionLines.push_back(std::move(line));
@@ -595,7 +611,7 @@ static void triggerFlash(AppState& st) {
 // callstack/vars in that shape, so the raw "output" text is what surfaces (in the caller's
 // own display AND the shared GDB Console dock tab transcript).
 static void gdbCall(AppState& st, const char* method, nlohmann::json p,
-                    std::function<void(bool ok, const std::string& out)> onDone = nullptr) {
+                    const std::function<void(bool ok, const std::string& out)>& onDone = nullptr) {
     FwState& s = S();
     s.gdbPending = true;
     std::string cmdLabel = method;
@@ -624,8 +640,7 @@ static void gdbCall(AppState& st, const char* method, nlohmann::json p,
     });
 }
 
-// Split the ';'-separated scenario text (assertBuf) into an assertion array. Shared by
-// fw_sim_run and the two backend-specific emulate RPCs.
+// Split the ';'-separated assertion editor into the canonical assertion array.
 static nlohmann::json parseAssertionBuf(const char* buf) {
     nlohmann::json asserts = nlohmann::json::array();
     std::string s(buf);
@@ -643,17 +658,25 @@ static nlohmann::json parseAssertionBuf(const char* buf) {
     return asserts;
 }
 
-static void runEmulation(AppState& st, const char* method) {
+static const char* kSimBackends[] = {"auto", "renode", "qemu", "simavr"};
+
+static void runEmulation(AppState& st) {
     FwState& s = S();
     if (s.selected < 0 || s.selected >= (int)s.projects.size() || s.simPending) return;
     s.simPending = true;
     s.simDone = false;
     s.uartLog.clear(); s.assertionLines.clear(); s.gpio.clear();
+    s.busEventRows.clear(); s.selectedBusEvent = -1;
+    s.simEvidence = nlohmann::json(); s.resultJson.clear();
     s.tracePath.clear(); s.simErr.clear();
-    nlohmann::json p{{"project_id", s.projects[s.selected].id}};
+    nlohmann::json p{{"project_id", s.projects[s.selected].id},
+                     {"backend", kSimBackends[s.simBackend]}};
+    if (s.scenarioBuf[0]) p["scenario"] = std::string(s.scenarioBuf.data());
+    if (s.runSeconds > 0.0) p["run_s"] = s.runSeconds;
+    if (s.hostTimeoutSeconds > 0.0) p["timeout_s"] = s.hostTimeoutSeconds;
     nlohmann::json asserts = parseAssertionBuf(s.assertBuf);
     if (!asserts.empty()) p["assertions"] = asserts;
-    st.rpc.call(method, std::move(p), [](const core::RpcResult& r) {
+    st.rpc.call("fw_sim_run", std::move(p), [](const core::RpcResult& r) {
         FwState& s2 = S();
         s2.simPending = false;
         if (!r.ok || !r.result.is_object()) {
@@ -662,13 +685,13 @@ static void runEmulation(AppState& st, const char* method) {
             s2.simErr = r.err.empty() ? "worker unreachable" : r.err;
             return;
         }
-        if (r.result.contains("code")) {
-            s2.simDone = true;
-            s2.simPassed = false;
-            s2.simErr = r.result.value("message", std::string("emulation failed"));
-            return;
-        }
         applySimResult(s2, r.result);
+        if (r.result.contains("code") || r.result.value("ok", true) == false) {
+            s2.simErr = r.result.value("message", r.result.value("hint",
+                           r.result.value("error", std::string("emulation failed"))));
+            if (r.result.contains("detail") && r.result["detail"].is_string())
+                s2.simErr += "\n" + r.result["detail"].get<std::string>();
+        }
     });
 }
 
@@ -985,7 +1008,7 @@ static void drawProjectRail(AppState& st, float w) {
                    [&st]() { loadStatus(st, /*force=*/true); });
     fwSectionHeader("health_check", "Backend");
     if (!s.statusLoaded) {
-        ImGui::TextDisabled(s.statusErr.empty() ? "Checking fw_status\xe2\x80\xa6"
+        ImGui::TextDisabled("%s", s.statusErr.empty() ? "Checking fw_status\xe2\x80\xa6"
                                                 : s.statusErr.c_str());
     } else {
         ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1197,118 +1220,272 @@ static void drawDebugTab(AppState& st) {
                         "Reset/Halt/Step/Memory results stream into the GDB Console dock tab.");
 }
 
-// ---- center tab: Emulate (fw_sim_run / fw_emulate_renode / fw_emulate_simavr) ------------
+// ---- center tab: Emulate — canonical scenario and native evidence ----------------------
+
+static int resizeScenarioInput(ImGuiInputTextCallbackData* data) {
+    auto& buf = *static_cast<std::vector<char>*>(data->UserData);
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
+        buf.resize(static_cast<size_t>(data->BufSize));
+        data->Buf = buf.data();
+    }
+    return 0;
+}
+
+static void loadScenarioFile(FwState& s) {
+    s.scenarioErr.clear();
+    std::ifstream f(s.scenarioPathBuf, std::ios::binary);
+    if (!f) { s.scenarioErr = "Cannot open scenario file."; return; }
+    std::ostringstream text;
+    text << f.rdbuf();
+    if (f.bad()) { s.scenarioErr = "Cannot read scenario file."; return; }
+    const std::string content = text.str();
+    const auto parsed = nlohmann::json::parse(content, nullptr, false);
+    if (!parsed.is_object()) {
+        s.scenarioErr = "Scenario file must contain a JSON object. Existing editor preserved.";
+        return;
+    }
+    s.scenarioBuf.resize(std::max(size_t(4096), content.size() + 1));
+    std::memcpy(s.scenarioBuf.data(), content.c_str(), content.size() + 1);
+}
+
+static void saveScenarioFile(FwState& s) {
+    s.scenarioErr.clear();
+    const auto parsed = nlohmann::json::parse(s.scenarioBuf.data(), nullptr, false);
+    if (!parsed.is_object()) {
+        s.scenarioErr = "Save requires a JSON scenario object, not a fixture reference.";
+        return;
+    }
+    std::ofstream f(s.scenarioPathBuf, std::ios::binary);
+    if (!f) { s.scenarioErr = "Cannot open scenario file for saving."; return; }
+    f << s.scenarioBuf.data();
+    f.close();
+    if (!f) s.scenarioErr = "Cannot write scenario file.";
+}
+
+// Render only fields present in the native response; missing physics is never filled in here.
+static void drawEvidenceValue(const char* key, const nlohmann::json& value) {
+    ImGui::PushID(key);
+    if (value.is_object() || value.is_array()) {
+        if (ImGui::TreeNodeEx("##value", ImGuiTreeNodeFlags_None, "%s (%zu)", key, value.size())) {
+            if (value.is_object()) {
+                for (auto it = value.begin(); it != value.end(); ++it)
+                    drawEvidenceValue(it.key().c_str(), it.value());
+            } else {
+                for (size_t i = 0; i < value.size(); ++i)
+                    drawEvidenceValue(std::to_string(i).c_str(), value[i]);
+            }
+            ImGui::TreePop();
+        }
+    } else if (value.is_string()) {
+        ImGui::TextWrapped("%s: %s", key, value.get_ref<const std::string&>().c_str());
+    } else {
+        const std::string text = value.dump();
+        ImGui::TextWrapped("%s: %s", key, text.c_str());
+    }
+    ImGui::PopID();
+}
+
+static void drawTraceViewer(AppState& st);
 
 static void drawEmulationSection(AppState& st, float h) {
     FwState& s = S();
-    const float sc = ui::uiScale;
-    ImGui::BeginChild("##fw_sim_sec", ImVec2(0, h), ImGuiChildFlags_None);
+    ImGui::BeginChild("##fw_sim_sec", ImVec2(0, h), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar);
+    const auto surf = ui::adaptiveSurface(-1.0f);
     fwSectionHeader("run_study", "Emulation");
     const bool haveProject = s.selected >= 0 && s.selected < (int)s.projects.size();
-    if (haveProject) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDim[0], palette.textDim[1],
-                                                    palette.textDim[2], 1));
-        ImGui::Text("platform: %s  (Renode preferred, QEMU/simavr fallback)",
-                    s.projects[s.selected].mcu.c_str());
-        ImGui::PopStyleColor();
-    }
+    if (haveProject) ImGui::TextWrapped("Target: %s", s.projects[s.selected].mcu.c_str());
+    if (s.statusLoaded && !s.canEmulate)
+        ui::kit::inlineStatus("Emulator tooling unavailable. See Backend doctor.",
+                             ui::kit::Tone::Warn);
 
-    if (s.statusLoaded && !s.canEmulate) {
-        fwBanner("Emulation unavailable: install Renode (preferred), simavr, or "
-                 "qemu-system-arm.", palette.statusWarn);
-    } else {
-        const char* runLabel = s.simPending ? "Running\xe2\x80\xa6" : "Run emulation";
-        const float runW = fwGlassButtonWidth(runLabel, "run_study");
-        const float renodeW = fwGlassButtonWidth("Renode", "run_study");
-        const float avrW = fwGlassButtonWidth("simavr", "run_study");
-        ImGui::SetNextItemWidth(-(runW + renodeW + avrW + 24.0f * sc));
-        ImGui::InputTextWithHint("##fw_asserts",
-                                 "Scenario assertions, ';'-separated  e.g. uart:hello; gpio:PA5=1",
-                                 s.assertBuf, sizeof(s.assertBuf));
-        const bool canGo = haveProject && st.workerStarted && !s.simPending;
-
-        ImGui::SameLine(0.0f, 8.0f * sc);
-        if (fwGlassButton("##fw_sim_btn", runLabel, "run_study", /*accent=*/true, runW, canGo))
-            runEmulation(st, "fw_sim_run");
-        if (!canGo && !haveProject && ImGui::IsItemHovered())
-            ImGui::SetTooltip("Select a project first");
-
-        // Backend-specific variants — same SimResult contract as fw_sim_run's auto-pick;
-        // useful when a project needs ONE backend forced (e.g. AVR chips only run under
-        // simavr, not Renode/QEMU).
-        ImGui::SameLine(0.0f, 6.0f * sc);
-        if (fwGlassButton("##fw_sim_renode", "Renode", "run_study", /*accent=*/false, renodeW,
-                          canGo))
-            runEmulation(st, "fw_emulate_renode");
-        ImGui::SameLine(0.0f, 6.0f * sc);
-        if (fwGlassButton("##fw_sim_avr", "simavr", "run_study", /*accent=*/false, avrW, canGo))
-            runEmulation(st, "fw_emulate_simavr");
-    }
-
-    if (s.simDone) {
-        {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%s  \xc2\xb7  %.0f ms",
-                          s.simPassed ? "PASSED" : "NOT PASSED", s.simMs);
-            fwStatusPill(buf, s.simPassed ? palette.statusOk : palette.statusErr);
+    // Full-width controls stay usable in a narrow centre pane, including at high DPI.
+    ImGui::BeginDisabled(s.simPending);
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::Combo("##fw_sim_backend", &s.simBackend, "Auto\0Renode\0QEMU\0simavr\0");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Forced backends never silently fall back. Scenarios require Renode.");
+    if (ImGui::CollapsingHeader("Scenario JSON / file")) {
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##fw_scenario_path", "Saved scenario JSON path",
+                                 s.scenarioPathBuf, sizeof(s.scenarioPathBuf));
+        if (ui::kit::secondaryButton("Browse scenario", true, nullptr, ImVec2(-1.0f, 0))) {
+            const std::string path = ui::openFileDialog("Scenario JSON (*.json)\0*.json\0All files\0*.*\0");
+            if (!path.empty()) {
+                if (path.size() >= sizeof(s.scenarioPathBuf)) s.scenarioErr = "Scenario path is too long.";
+                else {
+                    std::memcpy(s.scenarioPathBuf, path.c_str(), path.size() + 1);
+                    loadScenarioFile(s);
+                }
+            }
         }
+        if (ui::kit::secondaryButton("Load file", s.scenarioPathBuf[0], "Enter a path first",
+                                     ImVec2(-1.0f, 0))) loadScenarioFile(s);
+        if (ui::kit::secondaryButton("Save JSON to file", s.scenarioPathBuf[0], "Enter a path first",
+                                     ImVec2(-1.0f, 0))) saveScenarioFile(s);
         if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
-        for (const std::string& a : s.assertionLines) {
-            const bool pass = a.rfind("PASS", 0) == 0;
-            const float* tint = pass ? palette.statusOk : palette.statusErr;
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(tint[0], tint[1], tint[2], 0.9f));
-            ImGui::TextUnformatted(a.c_str());
-            ImGui::PopStyleColor();
-        }
-        if (!s.simErr.empty()) ImGui::TextDisabled("%s", s.simErr.c_str());
+        ImGui::InputTextMultiline("##fw_scenario_json", s.scenarioBuf.data(), s.scenarioBuf.size(),
+                                  ImVec2(-1.0f, ImGui::GetFrameHeightWithSpacing() * 6),
+                                  ImGuiInputTextFlags_CallbackResize,
+                                  resizeScenarioInput, &s.scenarioBuf);
         if (st.fonts.mono) ImGui::PopFont();
+        ImGui::TextWrapped("Same aicad.fwscenario/1 JSON as fw_sim_run: tracks + optional bus_links "
+                           "and track link_id. Empty means no scenario; fixture: references also run.");
+        if (!s.scenarioErr.empty())
+            ui::kit::inlineStatus(s.scenarioErr.c_str(), ui::kit::Tone::Err);
+        if (ImGui::CollapsingHeader("Engineering units and model limits")) {
+            ImGui::TextWrapped("Timed/electrical buses require a supported STM32F4 controller on "
+                               "Renode. Check fw_status capabilities and native run evidence; "
+                               "other target electrical modes are refused.");
+            ImGui::TextWrapped("Explicit SI parameters: controller_clock_hz; electrical signal "
+                               "model lumped_rc (series_r_ohm, wire_capacitance_f) or lossless_tline "
+                               "(segments: from, to, z0_ohm, propagation_s); endpoints specify "
+                               "input_capacitance_f, vil_v/vih_v (CAN: recessive_max_v/"
+                               "dominant_min_v), v_low_v/v_high_v, r_low_ohm/r_high_ohm, "
+                               "rise_s/fall_s, tx_delay_s/rx_delay_s. Rise/fall are 10-90%% "
+                               "exponential source transitions. Bias/termination locations "
+                               "and resistance_ohm must be declared, not guessed.");
+            ImGui::TextWrapped("Peer timing uses seconds (response_delay_s, clock_stretch_s, "
+                               "clock_to_output_s, setup_s, hold_s); baud_hz/bitrate_hz use Hz. "
+                               "UART electrical variant is TTL; CAN is differential only. "
+                               "Without declared electrical inputs, functional mode is not "
+                               "calibrated electrical evidence. Inspect resolved_links and limitations "
+                               "for exclusions, missing parameters and sample truncation.");
+        }
     }
+    if (ImGui::CollapsingHeader("Virtual duration / host timeout")) {
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputDouble("##fw_run_seconds", &s.runSeconds, 0, 0, "%.6g");
+        ImGui::TextWrapped("Renode virtual run_s in seconds; 0 uses native default/scenario "
+                           "horizon. An explicit horizon must include every stimulus. "
+                           "simavr cannot guarantee virtual duration; QEMU has no virtual bus "
+                           "stimulus. Their native limitations remain visible in Engineering.");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputDouble("##fw_host_timeout", &s.hostTimeoutSeconds, 0, 0, "%.6g");
+        ImGui::TextWrapped("Host timeout_s in seconds; 0 uses native default. "
+                           "Wall time is not virtual bus latency.");
+    }
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##fw_asserts", "Assertions: uart:hello; gpio:PA5=1",
+                             s.assertBuf, sizeof(s.assertBuf));
+    ImGui::EndDisabled();
+    const bool validTimes = std::isfinite(s.runSeconds) && s.runSeconds >= 0 &&
+                            std::isfinite(s.hostTimeoutSeconds) && s.hostTimeoutSeconds >= 0;
+    const bool canGo = haveProject && st.workerStarted && !s.simPending && validTimes;
+    if (ui::kit::primaryButton(s.simPending ? "Running..." : "Run emulation", canGo,
+                               !haveProject ? "Select a project first" : !validTimes
+                                   ? "Times must be finite and non-negative" : "Worker unavailable or run active",
+                               ImVec2(-1.0f, 0))) runEmulation(st);
+    if (s.simDone) {
+        char verdict[96];
+        if (s.simEvidence.contains("ms") && s.simEvidence["ms"].is_number())
+            std::snprintf(verdict, sizeof(verdict), "%s · %.0f ms host elapsed",
+                          s.simPassed ? "Assertions passed" : "Not passed", s.simMs);
+        else
+            std::snprintf(verdict, sizeof(verdict), "%s",
+                          s.simPassed ? "Assertions passed" : "Not passed");
+        ui::kit::inlineStatus(verdict, s.simPassed ? ui::kit::Tone::Ok : ui::kit::Tone::Err);
+        for (const auto& assertion : s.assertionLines) ImGui::TextWrapped("%s", assertion.c_str());
+    }
+    if (!s.simErr.empty()) ui::kit::inlineStatus(s.simErr.c_str(), ui::kit::Tone::Err);
+    if (!s.resultJson.empty() &&
+        ui::kit::secondaryButton("Copy native result JSON", true, nullptr, ImVec2(-1.0f, 0)))
+        ImGui::SetClipboardText(s.resultJson.c_str());
 
-    // Live UART console (auto-scrolls to the newest output).
-    ui::pushGlassChildStyle(8.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 8 * sc));
-    ImGui::BeginChild("##fw_uart_console", ImVec2(0, 0), ImGuiChildFlags_Border);
-    ImGui::PopStyleVar();
-    if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
-    if (s.uartLog.empty()) {
-        ImGui::TextDisabled(s.simPending ? "Emulator starting\xe2\x80\xa6"
-                                         : "UART / semihosting output appears here.");
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.consoleDefault[0],
-                                                    palette.consoleDefault[1],
-                                                    palette.consoleDefault[2], 1));
-        ImGui::TextUnformatted(s.uartLog.c_str());
-        ImGui::PopStyleColor();
-        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f) ImGui::SetScrollHereY(1.0f);
+    if (ImGui::BeginTabBar("##fw_sim_outputs")) {
+        if (ImGui::BeginTabItem("UART")) {
+            ImGui::BeginChild("##fw_uart_console", ImVec2(0, ImGui::GetFrameHeightWithSpacing() * 8),
+                              ImGuiChildFlags_Border, ImGuiWindowFlags_NoScrollbar);
+            if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
+            ImGui::TextWrapped("%s", s.uartLog.empty() ? "No UART / semihosting output recorded."
+                                                       : s.uartLog.c_str());
+            if (st.fonts.mono) ImGui::PopFont();
+            ui::drawWindowPillScrollbarV(surf);
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("GPIO")) {
+            ImGui::BeginChild("##fw_gpio_output", ImVec2(0, ImGui::GetFrameHeightWithSpacing() * 8),
+                              ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+            drawTraceViewer(st);
+            ui::drawWindowPillScrollbarV(surf);
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Engineering")) {
+            if (!s.simEvidence.is_object()) ImGui::TextWrapped("Run a scenario to inspect native evidence.");
+            else {
+                if (!s.simEvidence.contains("bus_summary"))
+                    ui::kit::inlineStatus("No bus engineering summary reported by this backend.",
+                                         ui::kit::Tone::Warn);
+                for (auto it = s.simEvidence.begin(); it != s.simEvidence.end(); ++it) {
+                    if (it.key() == "uart_log" || it.key() == "gpio_events" ||
+                        it.key() == "bus_events" || it.key() == "assertion_results") continue;
+                    if (it.key() == "bus_summary") ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+                    drawEvidenceValue(it.key().c_str(), it.value());
+                }
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Bus events")) {
+            ImGui::TextWrapped("Native register/frame/sample evidence; t_ns is virtual time. "
+                               "Select an event for every recorded field.");
+            ImGui::BeginChild("##fw_bus_events", ImVec2(0, ImGui::GetFrameHeightWithSpacing() * 8),
+                              ImGuiChildFlags_Border, ImGuiWindowFlags_NoScrollbar);
+            if (s.busEventRows.empty()) ImGui::TextWrapped("No bus events recorded.");
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(s.busEventRows.size()));
+            while (clipper.Step()) {
+                for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+                    ImGui::PushID(i);
+                    const auto label = ui::kit::elide(s.busEventRows[i].c_str(),
+                                                      ImGui::GetContentRegionAvail().x);
+                    if (ImGui::Selectable(label.c_str(), s.selectedBusEvent == i))
+                        s.selectedBusEvent = i;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", s.busEventRows[i].c_str());
+                    ImGui::PopID();
+                }
+            }
+            ui::drawWindowPillScrollbarV(surf);
+            ImGui::EndChild();
+            if (s.selectedBusEvent >= 0) {
+                ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+                drawEvidenceValue("Selected event", s.simEvidence["bus_events"][s.selectedBusEvent]);
+            }
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
     }
-    if (st.fonts.mono) ImGui::PopFont();
-    ImGui::EndChild();
-    ui::popGlassChildStyle();
+    ui::drawWindowPillScrollbarV(surf);
     ImGui::EndChild();
 }
 
 static void drawTraceViewer(AppState& st) {
     FwState& s = S();
     const float sc = ui::uiScale;
-    ImGui::BeginChild("##fw_trace_sec", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::BeginChild("##fw_trace_sec", ImVec2(0, 0), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar);
+    const auto surf = ui::adaptiveSurface(-1.0f);
     fwSectionHeader("activity", "GPIO trace");
     if (!s.tracePath.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDisabled[0],
                                                     palette.textDisabled[1],
                                                     palette.textDisabled[2], 1));
-        ImGui::TextUnformatted(s.tracePath.c_str());
+        ImGui::TextWrapped("%s", s.tracePath.c_str());
         ImGui::PopStyleColor();
     }
 
     ui::pushGlassChildStyle(8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 8 * sc));
-    ImGui::BeginChild("##fw_trace_body", ImVec2(0, 0), ImGuiChildFlags_Border);
+    ImGui::BeginChild("##fw_trace_body", ImVec2(0, 0), ImGuiChildFlags_Border,
+                      ImGuiWindowFlags_NoScrollbar);
     ImGui::PopStyleVar();
     if (s.gpio.empty()) {
-        ImGui::TextDisabled("No GPIO events. Run an emulation with gpio: assertions —\n"
-                            "the aicad.firmware.trace/1 artifact renders here as waveforms.");
+        ImGui::TextWrapped("No GPIO events recorded. Native trace events appear here as waveforms.");
+        ui::drawWindowPillScrollbarV(surf);
         ImGui::EndChild();
         ui::popGlassChildStyle();
+        ui::drawWindowPillScrollbarV(surf);
         ImGui::EndChild();
         return;
     }
@@ -1389,16 +1566,15 @@ static void drawTraceViewer(AppState& st) {
     if (st.fonts.mono) ImGui::PopFont();
     if (anyT) ImGui::TextDisabled("t: %.1f .. %.1f ms", xMin, xMax);
     else      ImGui::TextDisabled("no timestamps — event order (seq %d .. %d)", (int)xMin, (int)xMax);
+    ui::drawWindowPillScrollbarV(surf);
     ImGui::EndChild();
     ui::popGlassChildStyle();
+    ui::drawWindowPillScrollbarV(surf);
     ImGui::EndChild();
 }
 
 static void drawEmulateTab(AppState& st) {
-    const float availH = ImGui::GetContentRegionAvail().y;
-    drawEmulationSection(st, availH * 0.55f);
-    ImGui::Spacing();
-    drawTraceViewer(st);
+    drawEmulationSection(st, ImGui::GetContentRegionAvail().y);
 }
 
 // ---- center pane: tab strip (Editor | Debug | Emulate) -----------------------------------

@@ -32,7 +32,7 @@ Avoid: "a small bolt", "bearing for the shaft" without size.
 3. `fetch_cad_model(url)` for a specific model page or STEP/IGES file found by web search; if `import_part=False`, pass its `artifact_path` to `import_artifact`.
 4. Web search only for specs/datasheets absent from the library. Then COMMIT to cited dimensions with clearance and build; never loop on research. For an MG90S six-axis arm, search MG90S first, use its referenced servo envelope and mount dimensions, then design mating brackets.
 
-Browse `parts_taxonomy(node_id?)` for facet keys when needed. Vendors requiring human login need `vendor_login`; never invent stock or price. Use `cam_tool_import(part_id)` for catalog cutting tools and `bom_rollup()` after placements (optionally `bom_price()`).
+Browse `parts_taxonomy(node_id?)` for facet keys when needed. Vendors requiring human login need `vendor_login`; never invent stock or price. Use `cam_tool_import(part_id)` for catalog cutting tools and `bom_rollup(doc_path=<saved assembly>)` after placements (optionally `bom_price(doc_path=...)`).
 
 ## Rules
 

@@ -1,7 +1,7 @@
 // Chudware shared application state + data model (extracted from gui_app.cpp).
 //
-// Holds the structs the worker/agent loop produces (Settings, JobState, ChatMsg, AgentStep,
-// AgentEvent, PlanInfo, PartInfo, FitReport, ...) and the AppState aggregate that bundles every
+// Holds the structs the worker/agent loop produces (Settings, JobState, ChatMsg, AgentEvent,
+// PlanInfo, PartInfo, FitReport, ...) and the AppState aggregate that bundles every
 // run_gui() local so the panel modules can share it. Behavior-preserving split — names and
 // semantics are unchanged from the monolith.
 #pragma once
@@ -605,19 +605,6 @@ void dimText(const char* t);
 
 void buildDefaultLayout(ImGuiID root, const ImVec2& size);
 
-// One pass of the agent loop, shown as an expandable card in the conversation.
-struct AgentStep {
-    int index = 0;
-    bool ok = false, done = false;
-    std::string notes, thinking, code, diff, dims, error, contactSheet, stdoutText;
-    bool isAssembly = false;       // this pass built a multi-part assembly
-    std::vector<PartInfo> parts;   // per-part list (assemblies)
-    FitReport fit;                 // interference/clearance report (assemblies)
-    Tex thumb;                 // lazily loaded from contactSheet on the GL thread
-    bool triedThumb = false;
-    bool showThinking = false, showCode = false, showDiff = false, showError = false;
-};
-
 enum ErrKind { ERR_NONE = 0, ERR_CAD = 1, ERR_SYSTEM = 2, ERR_PARTIAL = 3 };
 
 // ---------------- pre-flight clarify gate ----------------
@@ -716,7 +703,7 @@ struct ChatMsg {
     std::string errorHuman;
     std::string errorFull;
     bool errFullOpen = false;      // user expanded the raw-detail box on this card
-    std::string liveStatus;        // transient "Iteration N: building..." while running
+    std::string liveStatus;        // transient status line ("Building… rev 3") while running
     double lastEventTs = 0.0;      // GUI-only, not persisted: epoch s the run's latest feed event
                                    // landed — drives the "Waiting for model · 12m" quiet line
     PlanInfo plan;                 // the build plan drafted before the code (plan mode)
@@ -724,7 +711,6 @@ struct ChatMsg {
     std::vector<ActivityItem> activity;  // transparent "what the AI is doing" timeline (orchestrator)
     int curMissionTask = -1;       // index of the mission task currently running (-1 = not a mission);
                                    // namespaces sub-run stage keys so per-task stages don't collide
-    std::vector<AgentStep> steps;  // assistant turn: the iteration trace
     ClarifyState clarify;          // pre-flight clarify gate (Agent/Design) — see ClarifyState
     // User-facing plan approve gate: ONLY manual Plan mode (plan_only) or advisor escalate
     // (stop_reason needs_user_decision). Agent/Edit/Swarm/EngFirm agent-decided plans are
@@ -839,29 +825,18 @@ struct Conversation {
 
 
 // A progress event streamed from the worker (parsed off the worker thread, applied on the
-// main/GL thread so texture uploads stay on the GL context). kind: "status" | "iteration".
+// main/GL thread). kind = "orch_" + the run event's kind; text = the raw event JSON; notes = the
+// compact status-line summary (jobs.cpp / engine_events.cpp).
 struct AgentEvent {
     std::string kind;
-    int index = 0;
-    bool ok = false, done = false;
-    std::string phase, text, notes, thinking, code, diff, dims, error, contactSheet, stdoutText;
-    std::string stlPath;  // this iteration's built mesh — drives the live viewport preview
-    bool isAssembly = false;
-    std::vector<PartInfo> parts;
-    FitReport fit;
-    PlanInfo plan;        // kind == "plan": the drafted build plan
+    std::string text, notes;
 };
-
-void freeChatTextures(std::vector<ChatMsg>& chat);
 
 // A small pill button that highlights when its section is expanded.
 bool toggleChip(const char* label, bool active);
 
 // Read-only, copyable monospace code view; height fits the content up to maxH.
 void drawCodeBox(const char* id, const std::string& code, ImFont* mono, float maxH);
-
-// Colored unified-diff view (+ green / - red / @@ blue) in a scrolling box.
-void drawDiffBox(const char* id, const std::string& diff, ImFont* mono, float maxH);
 
 // Dim, wrapped prose (reasoning / notes) in a scrolling box, fixed at maxH.
 // growToFit=true (a LIVE streaming card): grow to fit the content instead, capped at maxH —
@@ -875,9 +850,6 @@ void drawFitReadout(const FitReport& fit, bool detailed);
 // Multi-shape Plan / Objectives section (tiles + todos tree + subagents).
 void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& activity,
                      const ui::Fonts& fonts);
-
-// One line "Parts: a, b, c" with each name tinted its assembly color.
-void drawPartsLine(const std::vector<PartInfo>& parts);
 
 // Manufacture operator surface owns only presentation/request state. Authoritative
 // device/run/approval state lives in ui::MfgMirror and the hostd manufacturing lane.

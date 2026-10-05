@@ -1,8 +1,7 @@
-"""Tests for services/browser — T-X1.
+"""Tests for services/browser session helpers.
 
-No real Playwright launch, no real network: sync_playwright is injected via
-each function's private ``_sync_playwright`` seam (same pattern as
-``engine_oracle.parts_providers``'s ``_http_json`` monkeypatch seam).
+No real browser launch or network: tests inject the residual Playwright login
+factory and fake the headless browser client, profile, cache and transport seams.
 """
 from __future__ import annotations
 

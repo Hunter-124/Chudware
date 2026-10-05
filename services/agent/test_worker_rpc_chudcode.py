@@ -9,7 +9,6 @@ import os
 import pytest
 
 from services.agent import (
-    agent_turn,
     chudcode_tools,
     config,
     mission_dispatch,
@@ -373,7 +372,6 @@ def online_lane(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(config, "clear_pooled_credentials", lambda: None)
     monkeypatch.setattr(config, "bind_subscription_grant", lambda grant: None)
-    monkeypatch.setattr(agent_turn, "resolver_for", lambda dispatch: lambda name: None)
 
     class FakeDispatch:
         def __init__(self, **kwargs):
@@ -384,9 +382,9 @@ def online_lane(monkeypatch, tmp_path):
 
     def fake_prompt(role, **kwargs):
         prompt_calls.append({"role": role, **kwargs})
-        return "RESOLVED ROLE PROMPT", ["cad_tool", "enable_tools"], None
+        return "RESOLVED ROLE PROMPT", ["cad_tool", "enable_tools"]
 
-    monkeypatch.setattr(mission_dispatch, "linear_role_prompt", fake_prompt)
+    monkeypatch.setattr(mission_dispatch, "role_prompt", fake_prompt)
 
     def fake_tools(context):
         tool_contexts.append(context)

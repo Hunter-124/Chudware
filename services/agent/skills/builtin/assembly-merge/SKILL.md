@@ -103,8 +103,9 @@ a source file.
    Do not write another kinematic pose loop or hand-edit assembly source files.
 5. **Classify evidence honestly.** Require `ok`, successful pose checks, and
    `interference.complete:true` with `frames_checked` equal to the requested sample count
-   before claiming the sampled sweep is clear. Inspect every frame's `collisions`, not only
-   `first_collision_step`; IDs identify components even when names repeat.
+   before claiming the sampled sweep is clear. Inspect every `trajectory` frame's
+   `collision_detail`, not only `first_collision_step`; `component_a`/`component_b`
+   identify components even when names repeat.
    `pair_failures` and `geometry_failures` must be resolved and the study rerun.
    Per-frame `interference:null` / `interference_complete:false` is unchecked or incomplete,
    not false. Known hits remain actionable even when other checks failed. Increase sampling

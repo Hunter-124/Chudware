@@ -5,11 +5,17 @@ flight-computer design (MCU + 3V3 buck + MPU6050 + BMP280 + LIS3MDL + NEO-6M).
 
 ## Run
 
+From the repo root, with the services venv (any interpreter with the MCP service
+requirements works; `CHUDWARE_LIBCHUDWARE` points at a built engine):
+
 ```bash
-CHUDWARE_ECAD_HEAVY_BUDGET_S=180 \
-  /home/hunter/.local/share/Chudware/mcp-venv/bin/python \
-  scripts/bench_flight_computer.py
+CHUDWARE_LIBCHUDWARE="$PWD/core/build-occt-linux/bin/libchudware.so" \
+  ~/.local/share/Chudware/mcp-venv/bin/python scripts/bench_flight_computer.py
 ```
+
+Env: `CHUDWARE_FC_OUT`, `CHUDWARE_FC_MARKERS`, `CHUDWARE_FC_SEED` (default 0),
+`CHUDWARE_FC_ANT_FULLWAVE_BUDGET_S` (openEMS, default 90), `CHUDWARE_FC_SIM_BUDGET_S`
+(Renode, default 120), `CHUDWARE_ECAD_HEAVY_BUDGET_S` (default 180).
 
 Exit code `0` when no leg is `FAIL` (`SKIP` / `WARN` allowed).
 
@@ -39,9 +45,20 @@ Written under this directory (override with `CHUDWARE_FC_OUT`):
 - `sensor_scenario.json` / `power_budget.json` / `checks.json`
 - `markers/*.marker` — per-leg PASS/WARN/FAIL/SKIP
 
-## Gate / simsuite wiring (Main)
+## Gate
 
-- Env-gate: `CHUDWARE_RUN_BENCH_FC=1` → run `scripts/bench_flight_computer.py`
-- Do **not** hard-fail the gate on `SKIP` (Renode/openEMS/build123d optional paths)
-- simsuite: optional thin wrapper that shells this script and maps
-  `summary.json` legs into the simsuite case list
+`scripts/gate.sh` runs this script as the opt-in stage `stage_bench_flight_computer`
+when `CHUDWARE_RUN_BENCH_FC=1` (otherwise the stage is skipped). The stage uses the
+gate's resolved Python, picks `core/build-occt-linux` or `core/build-linux`
+`libchudware.so` when `CHUDWARE_LIBCHUDWARE` is unset, writes output and markers under
+the gate temp dir (not this directory), and defaults `CHUDWARE_ECAD_HEAVY_BUDGET_S` to
+300. Any FAIL marker or non-zero exit fails the gate; SKIP legs (absent
+Renode/openEMS/build123d) do not.
+
+## Known breakage
+
+`scripts/bench_flight_computer.py` still imports the retired top-level `engine`
+package (`engine.ecad` in `parts` / `schematic` / `board`, `engine.firmware` in
+`sensor_loop`). Each leg that reaches one of those imports records FAIL with
+`ModuleNotFoundError` (dependent legs then SKIP) until the script is repointed at the
+live `services.*` modules, so an opted-in gate run currently fails.

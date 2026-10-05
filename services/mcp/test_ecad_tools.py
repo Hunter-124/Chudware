@@ -1428,29 +1428,16 @@ def test_fin11_fpga_check_and_constraints(tools: dict) -> None:
 
 
 def _disable_live_provider():
-    """Force ecad_design onto its deterministic recipe path for the whole suite.
+    """Pin the actual helper resolver to the deterministic, no-model recipe path."""
+    from services.agent.providers import chudcode_provider
 
-    ``ecad_design`` calls ``agent.config.get_provider()`` and, when a real provider (e.g. a live
-    Gemini key) is configured and reachable, plans the topology with the LLM. That plan is
-    NON-deterministic: it usually fails the strict schema and falls back to the recipe (green), but
-    occasionally emits a valid design whose self-check expectation is model-mismatched — e.g. an LED
-    driver probing ``I(LED1)`` against a real-LED current while the generic Shockley model conducts
-    at a different drop — which MISSes and flips ``d['ok']`` to False. That is the source of the
-    flaky ``I(LED1)=nan`` / recipe-mismatch failures. These tests assert ``recipe_used`` and exist to
-    exercise the RECIPE, not the planner, so we pin the provider to None (also stops the suite making
-    paid API calls on every run). Returns a restore() callable. Best-effort: a no-op if agent.config
-    is absent.
-    """
-    try:
-        from services.agent import config as _cfg  # type: ignore
-    except Exception:  # noqa: BLE001 -- agent package not importable in this env
-        return lambda: None
-    _orig = getattr(_cfg, "get_provider", None)
-    _cfg.get_provider = lambda *a, **k: None  # type: ignore[attr-defined]
-    def _restore():
-        if _orig is not None:
-            _cfg.get_provider = _orig  # type: ignore[attr-defined]
-    return _restore
+    original = chudcode_provider.helper_provider
+    chudcode_provider.helper_provider = lambda *a, **k: None
+
+    def restore():
+        chudcode_provider.helper_provider = original
+
+    return restore
 
 # --------------------------------------------------------------------------- pytest collection
 # pytest treats bare `tools` parameters as fixtures. The main() harness passes the dict
@@ -1471,7 +1458,7 @@ if pytest is not None:
     # which is exactly the non-determinism _disable_live_provider() exists to prevent.
     @pytest.fixture(scope="module", autouse=True)
     def _no_live_provider():
-        """Pin agent.config.get_provider to None for every test in this module."""
+        """Pin the helper resolver to None for every test in this module."""
         restore = _disable_live_provider()
         yield
         restore()

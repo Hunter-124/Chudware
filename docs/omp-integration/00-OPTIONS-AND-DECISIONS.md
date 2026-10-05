@@ -1,5 +1,16 @@
 # OMP → CAD (Chudware): Integration Options & Decisions
 
+> **HISTORICAL — superseded 2026-08-31. Not current authority.** This synthesis, its
+> KEEP/PORT/SIDECAR/FORK menu, the private-OMP "backbone" strategy, and the
+> `vendor/omp/OMP_VENDOR.lock` / `vendor/omp/bridge` production source it names are dated
+> provenance. The vendored OMP tree, its lock/updater, and the Bun adapter were deleted
+> (`docs/REFACTOR_LOG.md`, 2026-08-31 entry). The online agent runtime is now Chudcode RPC; see
+> [01-DECISIONS.md, 2026-08-31 section](01-DECISIONS.md#2026-08-31--superseding-architecture-chudcode-rpc-is-the-only-online-runtime),
+> [ARCHITECTURE.md, Agent runtime](../../ARCHITECTURE.md#agent-runtime), and
+> [`.claude/skills/cad-chudcode-integration/SKILL.md`](../../.claude/skills/cad-chudcode-integration/SKILL.md).
+> Firmware/IDE and other CAD-owned findings are evidence only and must be re-verified
+> against the current code.
+
 Consolidated synthesis of 11 research dossiers (see `./research/`). Purpose: give you a
 feature-by-feature menu of **KEEP / PORT / SIDECAR / FORK / GLUE** choices so we can decide
 what to bring over from oh-my-pi ("OMP") before implementing.

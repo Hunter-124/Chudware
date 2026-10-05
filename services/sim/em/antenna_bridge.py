@@ -1,6 +1,6 @@
 """EM bridge for PCB antennas — analytic resonance always + openEMS S11 when present.
 
-Given a parametric antenna design (from :mod:`engine_oracle.ecad.antenna`) or an
+Given a parametric antenna design (from :mod:`services.ecad.antenna`) or an
 already-emitted geometry dict, build:
 
 1. **Analytic estimate (always)** — closed-form resonant frequency + rough
@@ -12,7 +12,7 @@ already-emitted geometry dict, build:
    ``{skipped: true, reason: ...}`` — never fabricated numbers.
 
 License containment: openEMS / CSXCAD are imported **lazily** inside the
-full-wave path only (same rule as :mod:`engine_oracle.sim.em.openems_adapter`).
+full-wave path only (same rule as :mod:`services.sim.em.openems_adapter`).
 """
 from __future__ import annotations
 

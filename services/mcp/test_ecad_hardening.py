@@ -535,17 +535,23 @@ def test_multi_doc_explicit_doc_id_isolation() -> None:
 
 
 class _SlowProvider:
-    """Stub provider whose complete() blocks well past the plan budget."""
+    """Slow planner that observes the helper's cancellation callback."""
 
     def __init__(self, delay_s: float = 30.0):
         self.delay_s = delay_s
         self.calls = 0
+        self.cancel = lambda: False
+        self.cancelled = et._threading.Event()
         self.release = et._threading.Event()
         self.base_url = "http://127.0.0.1:9/v1"  # unused — reachability is monkeypatched
 
     def complete(self, system, messages):  # noqa: ANN001
         self.calls += 1
-        self.release.wait(self.delay_s)
+        deadline = time.monotonic() + self.delay_s
+        while not self.release.wait(0.01) and time.monotonic() < deadline:
+            if self.cancel():
+                self.cancelled.set()
+                raise RuntimeError("helper completion cancelled")
         return '{"components":[], "nets":{}, "study":{"analysis":"op","expect":{}}}'
 
 
@@ -557,10 +563,15 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
     orig_budget = os.environ.get("CHUDWARE_ECAD_PLAN_BUDGET_S")
     os.environ["CHUDWARE_ECAD_PLAN_BUDGET_S"] = "1.0"
 
-    # Force the configured provider path and skip the TCP pre-flight.
-    import services.agent.config as _cfg  # T-RF8: canonical path (ecad_design uses it)
-    orig_get = getattr(_cfg, "get_provider", None)
-    _cfg.get_provider = lambda *a, **k: slow  # type: ignore[attr-defined]
+    # Patch the resolver ecad_design actually calls, not the retired SDK config seam.
+    from services.agent.providers import chudcode_provider as helper
+    orig_get = helper.helper_provider
+
+    def resolve_provider(role, *, cancel=None, timeout=None):
+        slow.cancel = cancel
+        return slow
+
+    helper.helper_provider = resolve_provider
     import services.mcp.ecad_sim_tools as et_sim  # T-RF8: ecad_design looks it up here
     orig_reach = et_sim._provider_reachable
     et_sim._provider_reachable = lambda p, timeout_s=0.6: True  # type: ignore[assignment]
@@ -575,6 +586,7 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
         t0 = time.time()
         p = _call(tools, "ecad_design", request="5V voltage divider with 2.5V output")
         dt = time.time() - t0
+        cancelled = slow.cancelled.wait(2.0)
     finally:
         slow.release.set()
         with et._cad_jobs._JOB_LOCK:
@@ -586,8 +598,7 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
                 if drained_plan_jobs[jid].get("status") in ("done", "error"):
                     break
                 time.sleep(0.01)
-        if orig_get is not None:
-            _cfg.get_provider = orig_get  # type: ignore[attr-defined]
+        helper.helper_provider = orig_get
         et_sim._provider_reachable = orig_reach  # type: ignore[assignment]
         if orig_budget is None:
             os.environ.pop("CHUDWARE_ECAD_PLAN_BUDGET_S", None)
@@ -597,6 +608,8 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
     assert all(job.get("status") in ("done", "error")
                for job in drained_plan_jobs.values())
 
+    assert cancelled, "abandoned model plan was not cancelled"
+    assert slow.calls == 1, "the slow model plan must actually have started"
     # Must return well under the 30 s MCP transport deadline (plan budget 1 s + build ~2 s).
     assert dt < 8.0, f"slow-provider design hung for {dt:.1f}s (would trip transport timeout)"
     assert p.get("provider_timed_out") is True, p

@@ -1,8 +1,6 @@
-"""Extra analytic anchors for engine/sim/fea_thermal_transient.py (the Python parity
-oracle for core/sim/fea_thermal.cpp).
+"""Independent analytic anchors for the native transient thermal kernel.
 
-Complements test_thermal_transient.py — cases here pin DIFFERENT closed-form truths
-(same differential-parity convention: never weaken; both stacks share these anchors):
+Complements test_thermal_transient.py with different closed-form references:
 
   1. semi-infinite solid — early-time surface step, probe point vs the erf solution
      T(x,t) = Ts + (T0-Ts)·erf(x / (2√(αt)))            (Incropera §5.7, eq. 5.60)

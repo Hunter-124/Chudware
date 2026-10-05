@@ -1,5 +1,5 @@
 """Piping -> 3D bridge: turn an ``aicad.piping/1`` document into a STEP solid + a CAD
-``aicad.part/1`` doc, mirroring :mod:`engine.ecad.threed`.
+``aicad.part/1`` doc, mirroring :mod:`services.ecad.threed`.
 
 Two entry points (contract §7):
 
@@ -7,8 +7,9 @@ Two entry points (contract §7):
   filleted 3-D centreline (bend radius honoured, so elbows are real, not mitred) + parametric
   fitting solids (elbow/tee/reducer/flange) -> one ``Compound`` -> STEP on disk.
 * :func:`piping_to_part_doc` — a minimal ``aicad.part/1`` document whose single ``import``
-  feature references the STEP, matching the envelope the engine.doc compiler expects, so the
-  host opens the routed pipe directly in the CAD viewport (same as ECAD's board_to_part_doc).
+  feature references the STEP, matching the envelope the core part-document compiler expects,
+  so the host opens the routed pipe directly in the CAD viewport (same as ECAD's
+  board_to_part_doc).
 
 build123d / OCP are imported lazily inside functions so importing this module stays cheap and
 side-effect-free on a box without the kernel. Units are **mm**. Geometry realizability issues
@@ -367,8 +368,8 @@ def piping_to_step(doc: dict, out_path: str, opts=None) -> dict:
 
 def piping_to_part_doc(doc: dict, step_path: str) -> dict:
     """A minimal ``aicad.part/1`` document whose single ``import`` feature references
-    ``step_path`` — the same envelope engine.doc compiles + the host opens in the viewport
-    (identical shape to engine.ecad.threed.board_to_part_doc)."""
+    ``step_path`` — the same envelope the core part-document compiler compiles + the host opens
+    in the viewport (identical shape to services.ecad.threed.board_to_part_doc)."""
     name = str(doc.get("name") or "Piping")
     return {
         "schema": "aicad.part/1",

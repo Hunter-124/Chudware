@@ -1,8 +1,8 @@
-"""Tests for the FPGA support pack (T-FIN11): device model, bank/diff/clock/config
+"""Tests for the FPGA support pack: device model, bank/diff/clock/config
 checks, and golden-file constraint exports (XDC/LPF/CSV).
 
 Golden files live in ``golden/fpga/``. To regenerate after an intentional format
-change: ``python -m engine.ecad.test_fpga --regen`` (writes them from the fixtures).
+change: ``python -m services.ecad.test_fpga --regen`` (writes them from the fixtures).
 """
 
 from __future__ import annotations

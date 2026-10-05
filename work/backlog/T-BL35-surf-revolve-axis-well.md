@@ -28,11 +28,16 @@ can't accept a datum axis (`axis.z`); the solid `revolve` form (L228) already us
 
 ## Definition of done
 
-- [ ] `pm_forms.cpp` ~L681: surf_revolve axis well `K_EDGE` → `K_EDGEAXIS` (mirror the
+- [x] `pm_forms.cpp` ~L681: surf_revolve axis well `K_EDGE` → `K_EDGEAXIS` (mirror the
       solid `revolve` form at L228). Engine already accepts a datum-axis ref for
       surf_revolve (`routeDatumAxis` L1163 fills `selKinds.axis` with
       `{kind:datum,feature:axis.z}` — confirmed via MCP in T-G20).
-- [ ] Gate `readyForPreview` on the axis well (~L1815) so OK cannot fire without an axis.
+      — In tree (2026-10-04): `host/src/ui/pm_forms.cpp:711` (`K_EDGEAXIS`);
+      `PropertyManager::routeDatumAxis` at `host/src/ui/property_manager.cpp:1486`.
+- [x] Gate `readyForPreview` on the axis well (~L1815) so OK cannot fire without an axis.
+      — In tree (2026-10-04): `host/src/ui/property_manager.cpp:2218-2226` requires both
+      the profile and axis picks; the preview (L2309) and commit (L2463) paths return
+      early when it is false.
 - [ ] Live-pick GUI verify: build under the host-build lock, drive surf_revolve with a
       real datum-axis pick to a successful surface, screenshot light+dark, LOOK at every
       PNG. (This one DOES need the live check — it's a form-behavior change, unlike
@@ -57,11 +62,11 @@ VERIFICATION DONE:
 - Headless pmform render (CHUDWARE_SHOT=pmform CHUDWARE_PMCMD=surf_revolve CHUDWARE_PMBOX=1) in BOTH light and dark: the Revolved Surface form now shows the Axis well, and the footer reads "set parameters to preview" (gate OFF) with empty wells. Looked at both PNGs - text readable, no black-on-black.
 - check.py: all 4 gates PASS (surfacing no drift). graphify update . done.
 
-RESIDUAL (for human merge-time check): the DoD's fully-interactive "datum-axis pick -> successful surface" could NOT be completed in a Claude-launched instance. Even with CHUDWARE_PYTHON pointed at the real Roaming venv, the live app fell back to the Python worker with "unknown method: doc_new" â€” libchudware.dll (staged in dist/Chudware with all 102 OCCT siblings) did not load/wire in the sandbox-launched process. This is the known "my launches get redirected; the user's Explorer launch gets the real runtime" limitation, orthogonal to this change. A normal Explorer launch should complete the live pick trivially. Filing an issue for the runtime-wiring + fix_math.h build breakage.
-- 2026-07-04 05:13 UTC [mooseinatree] ENGINE-LEVEL LIVE VERIFY (headless, real C++ core via core_bridge â€” the same libchudware the GUI form drives):
+RESIDUAL (for human merge-time check): the DoD's fully-interactive "datum-axis pick -> successful surface" could NOT be completed in a Claude-launched instance. Even with CHUDWARE_PYTHON pointed at the real Roaming venv, the live app fell back to the Python worker with "unknown method: doc_new" — libchudware.dll (staged in dist/Chudware with all 102 OCCT siblings) did not load/wire in the sandbox-launched process. This is the known "my launches get redirected; the user's Explorer launch gets the real runtime" limitation, orthogonal to this change. A normal Explorer launch should complete the live pick trivially. Filing an issue for the runtime-wiring + fix_math.h build breakage.
+- 2026-07-04 05:13 UTC [mooseinatree] ENGINE-LEVEL LIVE VERIFY (headless, real C++ core via core_bridge — the same libchudware the GUI form drives):
 built doc_new(part) -> sketch profile on plane.front -> surf_revolve(angle 360) with axis ref
 {"kind":"datum","feature":"axis.z"}. Result: rebuild OK, surf_revolve feature error=None and
-dangling_refs=[] (the DATUM-AXIS ref resolved â€” the exact behavior the K_EDGE->K_EDGEAXIS well fix
+dangling_refs=[] (the DATUM-AXIS ref resolved — the exact behavior the K_EDGE->K_EDGEAXIS well fix
 enables), producing a valid 4-face revolved surface. doc_render_png shows the revolved ring surface.
 
 This substantiates T-BL35 end-to-end: (form) K_EDGEAXIS arms routeDatumAxis which emits
@@ -73,3 +78,7 @@ Left at status=review; the in-GUI pick is trivial to confirm on a normal user la
 - 2026-08-27 [cleanup audit] Remaining DoD item: complete the literal in-GUI mouse pick
   of a real datum axis through the surf_revolve Axis well and confirm a successful surface;
   the form kind, two-well preview gate, and engine datum-axis route are present in the tree.
+- 2026-10-04 [board audit] Ticked the two form-layer DoD boxes from the code in the tree
+  (line refs on the boxes). Still open: the live in-GUI datum-axis pick with light/dark
+  screenshots, and the gate box. The 2026-07-04 entry records `check.py` and
+  `graphify update .` but not `scripts/gate.sh`. Status stays `review`.

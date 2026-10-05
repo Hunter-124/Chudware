@@ -29,10 +29,16 @@ short structural summary drawn from that public spec.
   (handle→offset), and optional preview/summary/appinfo. Objects are handle-keyed
   records with bit-packed fields; entities reference symbol-table records (layer,
   linetype, style) by handle.
-- **This repo:** DWG import is **not yet implemented**; Chudware's documented plan
-  is DWG via an ODA membership (or a subprocess-isolated LibreDWG conversion —
-  LibreDWG is GPL, so it stays out-of-process) — see `docs/design/PLATFORM_ADR.md` §5 and
-  `work/backlog/T-BL02.md`. Reference-only until that lands.
+- **This repo:** DWG **import is implemented, import-only**, without any in-process
+  DWG parser: `core/doc/formats.cpp` (`dwg_to_temp_dxf` / `run_dwg2dxf`) runs a
+  user-installed LibreDWG `dwg2dxf` found on `PATH` (literal argv, no shell, output to
+  a private temp `.dxf`), then feeds the result through the DXF importer below. Missing
+  converter → an actionable `import_failed` error. LibreDWG is GPL, so it is
+  subprocess-only, never linked or bundled (`contracts/licenses.md`). DWG is never
+  written. The Python helper `services/formats/formats_dwg.py` (parity oracle) also
+  tries the ODA File Converter via `ezdxf.addons.odafc` before `dwg2dxf`; the C++
+  production path does not. The ODA-membership decision for full DWG fidelity is
+  still open in `work/backlog/T-BL02.md`.
 
 ## 2. DXF — Drawing Exchange Format
 
@@ -44,12 +50,15 @@ short structural summary drawn from that public spec.
   sections: `HEADER` (drawing variables), `CLASSES`, `TABLES` (symbol tables:
   layers, linetypes, text styles, views, UCS, viewports, dimstyles, block records),
   `BLOCKS`, `ENTITIES`, `OBJECTS` (dictionaries, non-graphical objects), `THUMBNAIL`.
-- **This repo:** DXF **import is implemented** — `services/formats/formats.py` +
-  `services/formats/formats_dxf.py`, via **ezdxf** (MIT). Modelspace entities
-  (LINE/CIRCLE/ARC/LWPOLYLINE/POLYLINE/ELLIPSE/SPLINE/INSERT) are converted to
-  build123d planar B-rep (closed wires → faces, open wires kept as reference
-  wires); text/dimensions/hatches/points/3D-mesh entities are skipped and counted.
-  Import-only for now (2D-projection-from-3D DXF export is a separate follow-up).
+- **This repo:** DXF **import is implemented, import-only** (`can_export` is false).
+  Production is `core/doc/formats.cpp`: a hand-written ASCII DXF tag parser plus
+  OCCT edge builders — no ezdxf, no third-party DXF library. It reads the `ENTITIES`
+  section, honours `$INSUNITS` (scaled to mm), and converts LINE / CIRCLE / ARC /
+  LWPOLYLINE / POLYLINE (bulges → arcs) / SPLINE / ELLIPSE to edges; closed wires become
+  planar faces, open wires stay as reference wires. INSERT (block references), text,
+  dimensions, hatches, points and 3D-mesh entities are skipped and counted. The Python
+  helper `services/formats/formats_dxf.py` (ezdxf, MIT; parity oracle) additionally
+  explodes INSERT blocks — that is not the production behaviour.
 
 ## 3. DGN — MicroStation design file
 
@@ -90,10 +99,12 @@ short structural summary drawn from that public spec.
   geometry, and APs like AP203/AP214/AP242). EXPRESS schemas are public.
 - **Structure:** `DATA` section of `#id = ENTITY(args);` records; geometry via
   BREP topology (manifold solids, faces on surfaces, edges on curves).
-- **This repo:** **STEP (AP214) is a first-class, bidirectional format** — see
-  `services/formats/formats.py` (via `build123d.export_step` / `import_step`) and the
-  `.step+` native container contract (`contracts/stepplus.md`), which embeds an
-  AP214 `geometry.step` snapshot alongside the full parametric document.
+- **This repo:** **STEP is a first-class, bidirectional format** — production
+  read/write is OCCT `STEPControl_Reader`/`STEPControl_Writer` in `core/doc/formats.cpp`
+  (the Python `services/formats/formats.py` reaches the same OCCT readers/writers via
+  build123d as the parity oracle). The `.step+` native container contract
+  (`contracts/stepplus.md`) embeds an AP214 `geometry.step` snapshot alongside the
+  full parametric document.
 
 ## 7. IGES — Initial Graphics Exchange Specification
 
@@ -101,9 +112,10 @@ short structural summary drawn from that public spec.
 - **Authoritative public spec:** **IGES 5.3** (publicly available).
 - **Structure:** fixed 80-column records in five sections (Start, Global,
   Directory Entry, Parameter Data, Terminate); entities referenced by DE pointer.
-- **This repo:** **implemented** — `services/formats/formats.py` via `OCP.IGESControl`
-  (reader result is face-soup, re-sewn to a shell; volume computed from the
-  closed shell).
+- **This repo:** **implemented, import + export** — OCCT `IGESControl_Reader`/
+  `IGESControl_Writer` in `core/doc/formats.cpp`. Import sews the face soup into
+  shells and heals it; export sews bodies into a solid and writes B-rep mode so the
+  file re-sews on re-import.
 
 ## 8. PRC — Product Representation Compact (3D in PDF)
 
@@ -126,10 +138,14 @@ short structural summary drawn from that public spec.
 - All **public**: STL (de-facto public), OBJ (Wavefront, public), Collada
   (`.dae`, Khronos open), **glTF** (Khronos open spec), Three.js JSON (open),
   SVG (W3C). Easiest format family to implement — no proprietary encoding at all.
-- **This repo:** **STL, OBJ, PLY, glTF/GLB, and 3MF are all implemented**
-  (mesh lane, `services/formats/formats.py`, via `build123d` mesh export/import,
-  `trimesh`, and `lib3mf` — see `contracts/licenses.md`). Collada/Three.js
-  JSON/SVG are not on the current surface; reference-only.
+- **This repo:** **STL, OBJ, PLY, glTF/GLB, and 3MF are implemented** for import
+  and export (mesh lane, `core/doc/formats.cpp`: OCCT `RWStl`/`RWObj`/`RWGltf` readers,
+  `StlAPI_Writer`/`RWGltf_CafWriter`, in-file OBJ/PLY writers, and lib3mf for 3MF when
+  the core is built with it; the Python oracle in `services/formats/formats.py` uses
+  trimesh/lib3mf). Rhino `.3dm` is also on the
+  mesh-level surface (openNURBS in C++, guarded by `CHUDWARE_WITH_OPENNURBS`;
+  rhino3dm in the Python oracle). Collada/Three.js JSON/SVG are not on the current
+  surface; reference-only.
 
 ## 11. PDF (Publish / export) — ISO 32000
 
@@ -154,4 +170,5 @@ independent-implementation path is the same one Chudware already follows for
 STEP/IGES/DXF/mesh formats: cite and build from the public spec (or an
 appropriately-licensed open-source library — see `building-format-support.md`),
 never from a proprietary binary. See `docs/reference/README.md` for how this
-survey maps onto `services/formats/formats.py`'s actual `FORMAT_REGISTRY`.
+survey maps onto the production format matrix (`format_registry` in
+`core/doc/formats.cpp`).

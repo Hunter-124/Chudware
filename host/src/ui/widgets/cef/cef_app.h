@@ -1,6 +1,6 @@
 // cef/cef_app.h — CEF process lifecycle + the browser-process CefApp.
 //
-// SCAFFOLDING (docs/cef_webview.md phase 2); compiled only with CHUDWARE_ENABLE_CEF.
+// Compiled only with CHUDWARE_ENABLE_CEF (design: docs/design/cef_webview.md).
 //
 // Two entry points, both of which MUST run CefExecuteProcess at the very top of
 // their process's main():
@@ -24,11 +24,11 @@ int execute_subprocess(int argc, char** argv);
 
 // Browser process only. Initialises CEF with windowless rendering + the cookie
 // crypto settings that let the Playwright scraper reuse CEF's sessions. Reuses
-// the argc/argv captured by stash_args (call that first). Returns false
-// (and available()==false) if CEF failed to start, so callers fall back to the
-// screencast backend. Safe to call once; also the T-PERF10 lazy-init entry —
-// first CefWebView::open() calls this if main() did not (default). Force early
-// init with CHUDWARE_CEF_EARLY=1.
+// the argc/argv captured by stash_args (call that first). Returns false (and
+// init_failed()==true) if CEF failed to start; CefWebView::available() then
+// reports false so the sign-in wizard falls back to desktop login. Safe to call
+// once; also the T-PERF10 lazy-init entry — first CefWebView::open() calls this
+// if main() did not (default). Force early init with CHUDWARE_CEF_EARLY=1.
 bool initialize();
 
 // True after a successful initialize(). CefWebView::processReady() forwards this.

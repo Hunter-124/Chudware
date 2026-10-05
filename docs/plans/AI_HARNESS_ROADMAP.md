@@ -1,7 +1,17 @@
 # AI Harness Roadmap — copilot, benchmarks, tiering, compliance
 
-Owner directives (Hunter, 2026-07-14) organized into workstreams. Living document:
-update status per wave. Driver: session manager agent; execution: task subagents.
+Historical workstream and experiment record begun from Hunter's 2026-07-14 directives.
+The ground-truth inventory and status log below are dated observations, not the current
+provider catalog, routing policy or acceptance results. Run ids, metrics and failed
+experiments are preserved; `reports/runs/` links name local run artifacts and are not
+guaranteed to be present in a fresh checkout.
+
+Current online-runtime authority:
+[Chudcode integration](../../.claude/skills/cad-chudcode-integration/SKILL.md).
+The 2026-09-07 entry "Copilot preferences and Auto resolver — overhaul Phases 0–1" in
+[`docs/REFACTOR_LOG.md`](../REFACTOR_LOG.md) records the later preference cutover;
+`services/agent/preferences.py` owns that policy. This does not mark every WS0–WS5
+proposal or VERIFY LATER experiment complete.
 
 ## Ground truth so far (evidence)
 

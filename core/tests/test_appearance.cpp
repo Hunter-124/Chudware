@@ -18,7 +18,7 @@
 #include "doc/session.h"
 #include "doc/stepplus.h"
 #include "doc/document.h"
-#include "../../ui/viewport/render/aicm_loader.h"
+#include "aicm_loader.h"  // host loader (host/src/render on the include path)
 #include "geom/aicm.h"
 
 using json = nlohmann::json;

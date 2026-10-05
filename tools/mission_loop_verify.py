@@ -7,28 +7,11 @@ Asserts the RPC returns the expected shape — ordered tasks, threaded doc, and 
 that cites the numbers. This exercises the planner-parse, the executor loop, doc threading, and
 the verdict stage end-to-end without any live model.
 """
-import ctypes, json, os
+import json, os, sys
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CORE = os.path.join(_REPO_ROOT, "core", "build-occt", "bin", "Release")
-os.environ.setdefault("CHUDWARE_PROMPTS_DIR", os.path.join(_REPO_ROOT, "services", "agent", "prompts"))
-os.add_dll_directory(CORE)
-lib = ctypes.WinDLL(os.path.join(CORE, "libchudware.dll"))
-lib.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-lib.chudware_call.restype = ctypes.c_int
-lib.chudware_free.argtypes = [ctypes.c_char_p]
-
-
-def call(method, params):
-    out = ctypes.c_char_p()
-    rc = lib.chudware_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
-    raw = out.value.decode() if out.value else ""
-    if out.value:
-        lib.chudware_free(out)
-    data = json.loads(raw) if raw else {}
-    if rc != 0 or (isinstance(data, dict) and data.get("code")):
-        raise RuntimeError(f"{method} failed rc={rc}: {raw[:300]}")
-    return data
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
+from services.mcp.core_bridge import call
 
 
 # A pre-built part to analyze (the mission's "active" doc).

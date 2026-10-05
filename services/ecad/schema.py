@@ -1,12 +1,12 @@
 """Schema validation + geometry helpers for aicad.sch/1 and aicad.pcb/1 documents.
 
-Executable form of docs/contracts/ecad/sch_schema.md + pcb_schema.md. Structural validation only
-(envelopes, types, id prefixes, enum membership, cross-refs). Connectivity/ERC/DRC are separate
-passes (engine.ecad.netlist / erc / drc), exactly as engine.doc keeps semantic checks in the
-compiler rather than the schema validator.
+Python validation helpers for ``contracts/ecad/sch_schema.md`` + ``pcb_schema.md``.
+Structural validation only (envelopes, types, id prefixes, enum membership, cross-refs).
+Native session validation, connectivity, ERC and DRC live in ``core/ecad/`` and are
+exposed through the ``ecad_*`` RPCs.
 
 Every ``validate_*`` returns a list of error strings (empty = valid), each prefixed with a
-JSON-path-ish locator so failures are actionable — same convention as engine.doc.schema.
+JSON-path-ish locator so failures are actionable.
 
 Coordinates are ``[x, y]`` in **mm**, +x right, +y up (math convention; the C++ canvas flips for
 screen). Angles in **degrees CCW**. The transform helpers (:func:`pin_world`, :func:`pad_world`)
@@ -24,7 +24,7 @@ from typing import Any
 SCHEMA_SCH = "aicad.sch/1"
 SCHEMA_PCB = "aicad.pcb/1"
 
-# ── enums (kept as module constants so ops.py / importers share one definition) ──
+# ── enums (shared by Python library helpers and importers) ────────────────────
 
 PIN_TYPES = {
     "input", "output", "bidirectional", "tri_state", "passive", "power_in", "power_out",
@@ -33,7 +33,7 @@ PIN_TYPES = {
 LABEL_SCOPES = {"local", "global", "hier"}
 SYM_MIRROR = {"none", "x", "y"}
 # Hierarchical sheet-pin directions (cosmetic + ERC hint; mirrors KiCad sheet-pin shapes). Connection
-# semantics do not depend on the value - the netlist bridges by name (see netlist.py / netlist.md).
+# semantics do not depend on the value - core/ecad/netlist.cpp bridges by name (contracts/ecad/netlist.md).
 SHEET_PIN_SHAPES = {"input", "output", "bidirectional", "tri_state", "passive"}
 
 COPPER_LAYERS_MAX = 32

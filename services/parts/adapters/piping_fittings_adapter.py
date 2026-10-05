@@ -146,7 +146,7 @@ def _make_record(row: dict) -> dict | None:
         "provenance":   (
             f"ASME B16 fitting dimensions (clean-room); {standard} dimensional facts. "
             "Source: services/piping/data/fittings.csv — ASME text not bundled. "
-            "See engine/piping/catalog.py module docstring and contracts/licenses.md."
+            "See services/piping/catalog.py and contracts/licenses.md."
         ),
         "license":      "clean-room",
     }

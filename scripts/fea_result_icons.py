@@ -181,10 +181,7 @@ def solve_cantilever(cb):
     Returns (aicm_dict, summary, stats) where aicm_dict is services.sim.tessellate
     .read_aicm output (surface pos/idx + von_mises SCLR + displacement DISP).
     """
-    try:  # deployed engine aliases `engine`; source tree uses `engine_oracle`
-        from services.sim.tessellate import read_aicm
-    except ImportError:
-        from engine_oracle.doc.tessellate import read_aicm
+    from services.sim.tessellate import read_aicm
 
     doc = cb.call("doc_new", {"kind": "part", "name": "ws_simulate_cantilever"})["doc_id"]
     try:

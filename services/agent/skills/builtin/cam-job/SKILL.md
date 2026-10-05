@@ -13,12 +13,16 @@ triggers:
 ## Sequence
 
 1. **Orient** — `cam_op_types` / `cam_materials` if vocabulary is thin.
-2. **Job** — `cam_new_job` then `cam_set_stock` (material + envelope).
-3. **Setup** — `cam_add_setup` (WCS / fixture).
+2. **Job** — `cam_new_job`; keep the returned job `doc_id`.
+3. **Setup + stock** — `cam_add_setup(material=..., stock=..., wcs=...)` for the WCS,
+   fixture and measured stock envelope. Keep `setup_id`; later stock changes use
+   `cam_set_stock(setup_id, stock)`.
 4. **Tools** — `cam_add_tool` from library; never invent diameters.
 5. **Ops** — facing → rough → finish → drill/chamfer via `cam_add_operation`.
 6. **Generate** — `cam_generate`.
-7. **Simulate** — `cam_simulate` must be clean (no gouges/collisions).
+7. **Simulate** — `cam_simulate` must be clean (no gouges/rapid collisions).
+   Holder/shank checking needs geometry and `check_holder=True`; an unchecked
+   holder is not collision-free.
 8. **Post** — `cam_post` only after clean simulate; `cam_setup_sheet` for handoff.
 
 ## Rules

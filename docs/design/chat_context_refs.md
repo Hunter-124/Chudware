@@ -1,6 +1,16 @@
 # Chat Context References — copilot "context cube" picker
 
 Status: design + Wave-4 implementation (2026-07-16 session).
+
+This is the July design/implementation record, not current toolbar layout or visual
+acceptance. Current payload ownership is `host/src/core/context_ref.{h,cpp}` and
+`host/src/ui/copilot/composer.cpp::submitTurn`; online engine-resolved context comes
+from `services/agent/worker_rpc.py::_editor_context_block` / `_picked_context_block`.
+The explicit offline route uses `services/agent/agent_turn.py::apply_context_refs`.
+Do not restore the removed `loop.py` helper from older references. The worker names and
+verification bullets below record the original task split and intended smoke, not a
+claim that today's picker has been visually verified.
+
 Goal: let the user attach live model entities (parts/components, faces, edges, sketches,
 features) from the 3D viewport or the feature tree into the chat prompt as first-class
 context references, so the AI targets and reasons about exactly those entities when editing

@@ -299,12 +299,10 @@ public:
     // A fragment is visible only when it is inside ALL active half-spaces: dot(p,Ni) <= Oi.
     // When showCap is set, each active plane gets a stencil-masked filled cap, also clipped by
     // the other planes so intersecting cuts read as solid material (SolidWorks zonal mode).
-    // count must be 1..3. The single-plane setSectionPlane() wrapper forwards here with count=1.
+    // count must be 1..3; clearSectionPlanes() disables all clipping.
     void setSectionPlanes(const float n[][3], const float off[], int count,
                           const float capRgb[3], bool showCap);
-    // Backward-compat single-plane setter (existing callers unchanged).
-    void setSectionPlane(const float normal[3], float offset, bool enabled,
-                         const float capRgb[3], bool showCap);
+    void clearSectionPlanes() { section_.count = 0; }
     int sectionClip(float normals[3][3], float offsets[3]) const;
 
     // ---- C19 result colormap + deformation ----

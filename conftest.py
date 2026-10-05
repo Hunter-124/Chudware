@@ -1,11 +1,9 @@
 """Root conftest.py — stub optional heavy deps ONLY when they are genuinely absent,
 plus cross-test state hygiene (core_bridge daemon-fallback reset).
 
-engine.vision.__init__ eagerly imports engine.vision.ingest, which needs Pillow (a declared
-runtime dep). On a bare box without Pillow/cv2, collection of ANY test that touches engine
-would die on that import — so we stub just enough for import-time. When the real library IS
-installed we must NOT shadow it (T-F5's test_vision.py makes real photos with Pillow), hence
-the try/except-import guard rather than a `sys.modules` presence check.
+Optional vision and document-format dependencies may be absent in lightweight
+test environments. Stubs support collection only when an import fails; installed
+libraries must remain available to tests that exercise real image and file data.
 """
 from __future__ import annotations
 

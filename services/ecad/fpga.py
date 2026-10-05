@@ -1,7 +1,7 @@
-"""FPGA support pack (T-FIN11) — bank-aware checks + pin-constraint export.
+"""FPGA support pack — bank-aware checks + pin-constraint export.
 
 Data-driven FPGA part model: every supported device is ONE JSON file under
-``engine/ecad/fpga_devices/`` (schema ``aicad.fpga_device/1`` below). Adding a new
+``services/ecad/fpga_devices/`` (schema ``aicad.fpga_device/1`` below). Adding a new
 family/package is a DATA addition — no code changes.
 
 Device JSON schema (aicad.fpga_device/1)

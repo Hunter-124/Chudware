@@ -53,7 +53,8 @@ inline void put_u32_array(std::vector<uint8_t>& b, const std::vector<uint32_t>& 
     for (uint32_t v : a) put_u32(b, v);
 }
 
-// --- per-chunk payload encoders (mirror tessellate.py _encode_*) -------------
+// --- per-chunk payload encoders (contracts/mesh_format.md §2; same bytes as the
+//     Python services/sim/tessellate.py _encode_*) ---------------------------------
 
 std::vector<uint8_t> encode_body(const AicmBody& bt) {
     std::vector<uint8_t> p;
@@ -148,7 +149,7 @@ void emit_chunk(std::vector<uint8_t>& out, const char fourcc[4],
 
 }  // namespace
 
-// --- Overlay chunk encoders (mirror tessellate.py scalar_chunk/disp_chunk/lines_chunk) ---
+// --- Overlay chunk encoders (contracts/mesh_format.md §2 SCLR/DISP/LINS) ---
 
 std::vector<uint8_t> scalar_chunk(uint32_t body_id, const std::string& name,
                                   const std::vector<float>& values, float vmin, float vmax) {
@@ -167,11 +168,10 @@ std::vector<uint8_t> disp_chunk(uint32_t body_id, float scale_hint,
     std::vector<uint8_t> p;
     put_u32(p, body_id);
     put_f32(p, scale_hint);
-    // n = floor(len/3), mirroring tessellate.py disp_chunk (vec flattened, n = len//3).
+    // n = floor(len/3) (contract: u32 n · f32[3*n]).
     put_u32(p, static_cast<uint32_t>(vectors.size() / 3));
-    // Only the first 3*n floats are written (tessellate.py packs vec.tobytes() of the
-    // flattened array, which is 3*n long once reshaped through (n,3); a non-multiple of
-    // 3 trailing remainder is dropped). Match that exactly.
+    // Only the first 3*n floats are written so the payload length always matches n;
+    // a non-multiple-of-3 trailing remainder is dropped.
     const size_t n3 = (vectors.size() / 3) * 3;
     for (size_t i = 0; i < n3; ++i) put_f32(p, vectors[i]);
     return make_chunk("DISP", p);
@@ -228,8 +228,8 @@ std::vector<uint8_t> write_aicm(const std::vector<AicmBody>& bodies,
         if (!bt.appearance_regions.empty())
             emit_chunk(out, "APRG", encode_appearance_regions(bt));
     }
-    // Append pre-encoded extra chunks (SCLR/DISP/LINS) after the body chunks — exactly
-    // as tessellate.py: all_chunks = body_chunks + list(extra_chunks).
+    // Append pre-encoded extra chunks (SCLR/DISP/LINS) after the body chunks — the same
+    // order as services/sim/tessellate.py: all_chunks = body_chunks + list(extra_chunks).
     for (const std::vector<uint8_t>& ec : extra_chunks)
         out.insert(out.end(), ec.begin(), ec.end());
     return out;

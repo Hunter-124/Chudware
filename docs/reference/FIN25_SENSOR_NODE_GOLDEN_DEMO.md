@@ -38,8 +38,9 @@ Exit 0 iff every leg is PASS or SKIP (no FAIL). Markers land under
 
 ## Gate wiring
 
-`scripts/gate.sh` stage **4.7** runs the demo by default (bounded well under 5 min on
-this machine — typically ~5 s with live thermal). Opt out: `CHUDWARE_SKIP_FIN25=1`.
+`scripts/gate.sh` stage **4.7** runs the demo by default. The 2026-07-10 record reported
+typically ~5 s with live thermal on the recording machine; this is not a current runtime
+budget or a re-measured result. Opt out: `CHUDWARE_SKIP_FIN25=1`.
 
 Per-leg SKIP markers keep Renode/OpenFOAM-gated paths honest without failing the gate
 on an unprovisioned box.

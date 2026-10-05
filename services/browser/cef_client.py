@@ -1,10 +1,11 @@
 """services/browser/cef_client.py — Python client for the CEF host daemon.
 
-The headless replacement for Playwright: instead of launching Playwright Chromium,
+The CEF headless fetch/download backend: instead of launching Playwright Chromium,
 we drive our OWN CEF Chromium (``chudware --cef-daemon``) over a local socket. CEF is
-driven through its native C++ API, so there is no CDP ``Runtime.enable`` handshake —
-the automation-protocol fingerprint that bot gates key on is absent (the whole
-reason for the migration; see the plan + services/browser/cef_headless.cpp).
+driven through its native C++ API, without a CDP ``Runtime.enable`` handshake.
+The daemon and headless implementation live in ``host/src/ui/widgets/cef/cef_daemon.cpp``
+and ``host/src/ui/widgets/cef/cef_headless.cpp``. Residual Python embed/login paths
+still use the Playwright-compatible driver selected by :mod:`services.browser.driver`.
 
 Lifecycle: the daemon is lazily spawned on the first request if nothing is
 listening, owns the shared *warm* profile (so a login in the interactive CEF panel
@@ -13,8 +14,7 @@ resident when parts search is not running.
 
 Transport mirrors services/mcp/daemon_bridge.py: connect-or-spawn against a
 per-binary socket key, newline-delimited JSON-RPC, one request per connection.
-POSIX (AF_UNIX) for now — Windows named-pipe parity is a follow-up, tracked with
-the same _PipeIO shape daemon_bridge already implements.
+POSIX (AF_UNIX) only; this client does not implement Windows named pipes.
 """
 from __future__ import annotations
 

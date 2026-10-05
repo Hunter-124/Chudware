@@ -1,8 +1,20 @@
 # Pillar 20 — The Advisory Layer ("Foreman")
 
-Status: ratified 2026-07-04 (Hunter directive, planned by lead session).
-Frozen schemas live in `contracts/advisor.md`. Work is tracked as workstream **W**
-(T-W1 … T-W11), lane `ai-copilot`.
+Status: ratified 2026-07-04 (Hunter directive, planned by lead session) and adopted.
+Frozen schemas live in `contracts/advisor.md`. Work was tracked as workstream **W**, lane
+`ai-copilot`. The workstream grew beyond the original T-W1 … T-W11. Board status on
+2026-10-04:
+
+- **Done** (`work/tasks/done/`): `T-W1`–`T-W10`, `T-W12`–`T-W19` and `T-W21`–`T-W32`.
+- **Still open:**
+  - `T-W11`, the end-to-end benchmark, is `review` (its 2026-08-04 results are Appendix A).
+  - `T-W20`, the MCP surface catch-up, is `todo` (deferred).
+
+This document is design intent; component sections are not an as-built spec. Since
+2026-08-31, online model execution for the roles it routes runs inside the embedded
+Chudcode RPC runtime. Chudware keeps advisories, roles, councils and delegation
+governance; see
+[omp-integration/01-DECISIONS.md, 2026-08-31 section](../omp-integration/01-DECISIONS.md#2026-08-31--superseding-architecture-chudcode-rpc-is-the-only-online-runtime).
 
 ## 0. Thesis
 

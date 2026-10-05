@@ -1,39 +1,36 @@
 #!/usr/bin/env bash
-# scripts/gate.sh — the Linux build + test gate for Chudware (formerly Billet / AI-CAD).
+# scripts/gate.sh — the Linux build + test gate for Chudware.
 #
-# Every DAG node must leave this gate green before close (see AGENTS.md swarm
-# rules + the plan file). It runs, in order:
-#   1. scripts/check.py        — stdlib source/docs gate (gui_lint, feature_surface_audit,
-#                                 parity_audit). Always runs; FATAL on red (T-RF3).
-#   2. core CMake/Ninja build  — libchudware with -DCHUDWARE_WITH_OCCT=ON + ctest. SKIPPED with a
-#                                 clear reason if the system OCCT cmake config is not found
-#                                 (the gate does NOT fail just because OCCT is absent on a box).
-#   2b. host GUI + test build  — cmake -S host -B host/build-linux + ninja (default targets).
-#                                 The ui/imgui / ui/abstract (AI-CAD2) app is retired;
-#                                 host/ is the single cross-platform GUI target.
-#   2c. WASM build smoke       — ./build.sh wasm into a scratch dir (CHUDWARE_WEB_APP override).
-#                                 The web app is the same host/ tree compiled by Emscripten;
-#                                 FATAL when emsdk is provisioned and the build breaks.
-#   3. ctest                   — only if the core build succeeded; best-effort (SKIP if no tests).
-#   3b. hostd smoke            — daemon lifecycle/race/stop/recovery (scripts/hostd_smoke.py).
-#   3d. web parity probe       — contracts/web_parity.md enforced over a scratch hostd with the
-#                                 Python worker bridge disabled (scripts/web_parity_probe.py).
-#   4. engine + agent pytest   — only if a runtime venv / pytest is discoverable; SKIP with a
-#                                 clear reason if the Python runtime is not provisioned.
-#   5. host shot smoke         — CHUDWARE_SHOT=m1 headless screenshot via xvfb-run.
-#   4.7 T-FIN25 sensor-node golden demo — sim/fw content smoke (scripts/demo_sensor_node.py);
-#                                 Renode/OpenFOAM-gated legs SKIP honestly via marker files.
-#   6. PASS/SKIP summary.
+# Every DAG node must leave this gate green before close. Stages, in execution order:
+#   check.py           — source/audit gate using the provisioned runtime interpreter. FATAL.
+#   manual regen clean — docs/manual/*.md drift vs tools/manual_gen (advisory).
+#   core build         — libchudware with -DCHUDWARE_WITH_OCCT=ON. Environment SKIP when the
+#                        system OCCT cmake config is not found.
+#   host build         — cmake -S host -B host/build-linux + ninja (GUI + host test binaries).
+#   wasm build         — ./build.sh wasm into a scratch dir (CHUDWARE_WEB_APP override); the
+#                        same host/ tree compiled by Emscripten. FATAL when emsdk is provisioned.
+#   ctest              — core ctest, only after a successful core build.
+#   hostd smoke        — daemon lifecycle/race/stop/recovery (scripts/hostd_smoke.py).
+#   web parity probe   — contracts/web_parity.md over a scratch hostd with the Python worker
+#                        bridge disabled (scripts/web_parity_probe.py).
+#   appimage smoke     — opt-in (CHUDWARE_GATE_APPIMAGE=1), advisory.
+#   linux packages     — deb/rpm packaging suite (packaging/test_linux_packages.py).
+#   pytest             — per-unit sweep of services/*, services/test_*.py, tools and training
+#                        with the service venv. Any failed test is FATAL.
+#   vv-bench, modeling — opt-in (CHUDWARE_RUN_VV, CHUDWARE_RUN_MODELING).
+#   fin25 golden demo  — T-FIN25 sensor-node sim/fw content smoke (scripts/demo_sensor_node.py);
+#                        default on, Renode/OpenFOAM-gated legs SKIP honestly via marker files.
+#   E2E benches        — opt-in (CHUDWARE_RUN_BENCH_FC, CHUDWARE_RUN_BENCH_CHG).
+#   host shot          — CHUDWARE_SHOT=m1 + copilot_slash headless screenshots via xvfb-run.
+#   bench, perf        — opt-in (CHUDWARE_RUN_BENCH, CHUDWARE_RUN_PERF).
+# Then a PASS/SKIP/FAIL summary; exit 1 on any fatal stage failure.
 #
 # SKIP semantics: OCCT-absent, emsdk-absent and venv-absent are environment SKIPs, not
 # failures — the gate stays green on a box that simply hasn't provisioned those optional
-# runtimes, while still running the stdlib check + whatever builds are possible.
+# runtimes, while still running the source/audit checks and available builds.
 # That leniency is wrong in CI, where an unprovisioned runner reporting PASS having built
 # nothing is a false green. Set CHUDWARE_GATE_STRICT=1 (linux-gate.yml does) to turn every
 # environment SKIP into a fatal failure. See skip_stage() below.
-#
-# check.py is FATAL as of T-RF3 (2026-07-22): the feature_surface_audit red was fixed by
-# teaching the audit the sketch3d_mode.cpp handler file + the reveng_ prefix dispatcher.
 set -euo pipefail
 
 # COLMAP/FAISS and BLAS can nest independent native worker pools. Bound their
@@ -54,8 +51,6 @@ cd "$REPO"
 GATE_TMP="${GATE_TMPDIR:-/tmp/chudware-gate-${CHUDWARE_INSTANCE_KEY:-$$}}"
 mkdir -p "$GATE_TMP"
 echo "gate temp dir: $GATE_TMP"
-
-CHECK_PY_FATAL=1   # 1 = check.py failure fails the gate (T-RF3: audits green since 2026-07-22)
 
 declare -a SUMMARY
 fail_fatal=0
@@ -137,12 +132,12 @@ gate_python_or_system() {
     command -v python3 2>/dev/null || true
 }
 
-# ---- Stage 1: source/audit gate ---------------------------------------------
+# ---- check.py: source/audit gate ----------------------------------------------
 # CHECK_PYTHON is deliberately separate from CHUDWARE_GATE_PYTHON: linux-gate
 # provisions the audit's exact four-package import surface in a job-local venv,
 # while the later pytest sweep needs the much larger service runtime venv.
 stage_check() {
-    echo "=== [1/6] scripts/check.py (source/audit gate) ==="
+    echo "=== scripts/check.py (source/audit gate) ==="
     local check_py="${CHECK_PYTHON:-}"
     if [ -z "$check_py" ]; then
         check_py="$(command -v python3 2>/dev/null || true)"
@@ -158,21 +153,17 @@ stage_check() {
         echo "  PASS"
     else
         local rc=$?
-        if [ "$CHECK_PY_FATAL" -eq 1 ]; then
-            record "check.py            FAIL    exit $rc (fatal — see ${GATE_TMP}/check.out)"
-            fail_fatal=1
-        else
-            record "check.py            FAIL-RECORDED  exit $rc (pre-existing, non-fatal — see docs/REFACTOR_LOG.md)"
-        fi
+        record "check.py            FAIL    exit $rc (fatal — see ${GATE_TMP}/check.out)"
+        fail_fatal=1
         echo "  FAIL (exit $rc) — ${GATE_TMP}/check.out:"
         tail -n 8 ${GATE_TMP}/check.out | sed 's/^/    /'
     fi
 }
 
-# ---- Stage 1.5: manual regen clean (advisory, T-Q4) --------------------------
+# ---- manual regen clean (advisory, T-Q4) --------------------------------------
 # Drift check for the auto-generated docs/manual/*.md (tools/manual_gen.py): regenerates the
 # manual in-memory from the ribbon inventory + cad_guide prose + contracts summary and byte-
-# compares it against the committed baseline. Advisory like check.py — never sets fail_fatal —
+# compares it against the committed baseline. Advisory — never sets fail_fatal —
 # because manual drift means "someone added a ribbon command or a contract and forgot to rerun
 # `python -m tools.manual_gen`", not a build break.
 stage_manual_gen() {
@@ -191,27 +182,6 @@ stage_manual_gen() {
     fi
 }
 
-# ---- Stage 1.6: UI style conformance (advisory, T-U1) ------------------------
-# scripts/ui_style_check.py enforces panel-conformance rules from
-# docs/UI_PATTERN_LIBRARY.md. Advisory — pre-existing findings are absorbed into
-# scripts/ui_style_check_baseline.json. Now targets host/ source; ui/imgui and
-# ui/abstract are retired (see docs/PORT_LEDGER.md).
-stage_ui_style_check() {
-    echo "=== ui_style_check.py (advisory) ==="
-    if ! command -v python3 >/dev/null 2>&1; then
-        skip_stage env "ui_style_check.py" "python3 not on PATH" "python3 not installed"
-        return 0
-    fi
-    if python3 scripts/ui_style_check.py > ${GATE_TMP}/ui_style.out 2>&1; then
-        record "ui_style_check.py   PASS    no new panel-conformance drift"
-        echo "  PASS"
-    else
-        record "ui_style_check.py   FAIL-RECORDED  new drift (non-fatal — see ${GATE_TMP}/ui_style.out)"
-        echo "  FAIL (non-fatal) — ${GATE_TMP}/ui_style.out:"
-        tail -n 8 ${GATE_TMP}/ui_style.out | sed 's/^/    /'
-    fi
-}
-
 # ---- OCCT detection ---------------------------------------------------------
 find_occt_config() {
     # Look for the OpenCASCADE CMake config in the standard install locations.
@@ -226,9 +196,9 @@ find_occt_config() {
     return 1
 }
 
-# ---- Stage 2: core CMake/Ninja build ----------------------------------------
+# ---- core build: core CMake/Ninja build ---------------------------------------
 stage_core_build() {
-    echo "=== [2/6] core CMake/Ninja build (libchudware, CHUDWARE_WITH_OCCT=ON) ==="
+    echo "=== core CMake/Ninja build (libchudware, CHUDWARE_WITH_OCCT=ON) ==="
     if ! command -v cmake >/dev/null 2>&1; then
         skip_stage env "core build" "cmake not on PATH" "cmake not installed"
         return 0
@@ -265,11 +235,11 @@ stage_core_build() {
     CORE_BUILD_OK=1
 }
 
-# ---- Stage 2b: host GUI + test build (default native targets) ------------------
+# ---- host build: host GUI + test build (default native targets) ---------------
 # host/ is the single cross-platform GUI target. Build the default target set:
 # Chudware alone does not build the host tests that linux-gate.yml runs with ctest.
-stage_ui_abstract() {
-    echo "=== [2b/6] host GUI + test build (ninja default targets) ==="
+stage_host_build() {
+    echo "=== host GUI + test build (ninja default targets) ==="
     if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
         skip_stage env "host build" "cmake or ninja not on PATH" "cmake/ninja missing"
         return 0
@@ -299,14 +269,14 @@ stage_ui_abstract() {
     HOST_BUILD_OK=1
 }
 
-# ---- Stage 2c: WASM web-client build smoke (T-RF3) ---------------------------
+# ---- wasm build: WASM web-client build smoke (T-RF3) --------------------------
 # The web app is the same host/ tree compiled by Emscripten; a native-only break of the
 # WASM build is a web-parity regression, so this stage is FATAL when the toolchain is
 # provisioned and the build breaks. SKIPs honestly when emsdk is absent. Stages into
 # $GATE_TMP/wasm-app via CHUDWARE_WEB_APP so a live web deploy (~/chudware-web/app) is
 # never clobbered.
 stage_wasm_smoke() {
-    echo "=== [2c/6] WASM web-client build smoke ==="
+    echo "=== WASM web-client build smoke ==="
     local emsdk_dir="${EMSDK:-$HOME/.emsdk}"
     if [ ! -f "$emsdk_dir/emsdk_env.sh" ]; then
         skip_stage env "wasm build" "emsdk not found at $emsdk_dir" "emsdk not provisioned ($emsdk_dir)"
@@ -322,9 +292,9 @@ stage_wasm_smoke() {
     echo "  PASS"
 }
 
-# ---- Stage 3: ctest (core) -------------------------------------------------
+# ---- ctest (core) -------------------------------------------------------------
 stage_ctest() {
-    echo "=== [3/6] ctest (core) ==="
+    echo "=== ctest (core) ==="
     if [ "${CORE_BUILD_OK:-0}" -ne 1 ]; then
         skip_stage env "ctest" "core build did not succeed" "no core build"
         return 0
@@ -345,13 +315,13 @@ stage_ctest() {
     echo "  PASS (${passed:-ok})"
 }
 
-# ---- Stage 3b: chudware-hostd smoke ---------------------------------------------
+# ---- hostd smoke: chudware-hostd lifecycle ------------------------------------
 # The shared engine-host daemon (core/hostd): spawn -> connect -> engine call ->
 # idle-exit, dual-client race -> one daemon, --stop, kill -9 stale-socket
 # recovery. Uses a scratch CHUDWARE_INSTANCE_KEY so a live dev/installed daemon is
 # never touched. FATAL when the binary exists and the suite fails.
 stage_hostd_smoke() {
-    echo "=== [3b/6] hostd smoke ==="
+    echo "=== hostd smoke ==="
     local hostd=""
     for cand in core/build-occt-linux/bin/chudware-hostd core/build-linux/bin/chudware-hostd; do
         [ -x "$cand" ] && { hostd="$cand"; break; }
@@ -370,13 +340,13 @@ stage_hostd_smoke() {
     fi
 }
 
-# ---- Stage 3d: web parity probe (contracts/web_parity.md, T-RF3) ------------
+# ---- web parity probe (contracts/web_parity.md, T-RF3) ------------------------
 # Spawns a scratch chudware-hostd with the Python worker bridge disabled (exactly what the
 # WASM web client faces) and asserts contracts/web_parity.md: web_required methods are
 # libchudware-served, web_unsupported gaps fail loud. FATAL when a hostd binary exists —
 # a new parity hole (or an unrecorded cutover) must never merge silently.
 stage_web_parity() {
-    echo "=== [3d/6] web parity probe ==="
+    echo "=== web parity probe ==="
     local hostd=""
     for cand in core/build-occt-linux/bin/chudware-hostd core/build-linux/bin/chudware-hostd; do
         [ -x "$cand" ] && { hostd="$cand"; break; }
@@ -395,7 +365,7 @@ stage_web_parity() {
     fi
 }
 
-# ---- Stage 3c: AppImage smoke (advisory, env-gated) ---------------------------
+# ---- appimage smoke (advisory, opt-in) ----------------------------------------
 # Builds the AppImage (wheelhouse skipped for speed — provisioning isn't what this
 # stage tests) and boots it headless in daemon mode: screenshot must render, exit 0,
 # and the bundled chudware-hostd must idle-exit after its linger. ADVISORY: failures are
@@ -405,7 +375,7 @@ stage_web_parity() {
 # scripts/hostd_scope.py, which matches only this user's hostd carrying exactly that key
 # and started after this stage's mark — never a name/path pgrep or pkill.
 stage_appimage_smoke() {
-    echo "=== [3c/6] AppImage smoke (advisory) ==="
+    echo "=== AppImage smoke (advisory) ==="
     if [ "${CHUDWARE_GATE_APPIMAGE:-0}" != "1" ]; then
         skip_stage optin "appimage smoke" "set CHUDWARE_GATE_APPIMAGE=1 to build + boot the AppImage" "CHUDWARE_GATE_APPIMAGE not set"
         return 0
@@ -465,7 +435,7 @@ stage_appimage_smoke() {
     echo "  PASS ($(du -h "$img" | cut -f1) image, shot at $shot)"
 }
 
-# ---- Stage 3e: Linux distro packaging ----------------------------------------
+# ---- linux packages: Linux distro packaging -----------------------------------
 # packaging/test_linux_packages.py builds .deb and .rpm from a small synthetic
 # AppDir and asserts the ar member order, the control/spec metadata, the
 # prerelease version sanitisation the gateway's _canonical_artifact() agrees
@@ -474,7 +444,7 @@ stage_appimage_smoke() {
 # no Xvfb and no real build tree, so it runs by default rather than opt-in.
 # rpmbuild is optional: the suite skips its rpm cases without it.
 stage_linux_packages() {
-    echo "=== [3e/6] Linux distro packaging ==="
+    echo "=== Linux distro packaging ==="
     if [ ! -f packaging/test_linux_packages.py ]; then
         skip_stage env "linux packages" "packaging/test_linux_packages.py missing" "suite not present"
         return 0
@@ -490,33 +460,23 @@ stage_linux_packages() {
     fail_fatal=1
 }
 
-# ---- Stage 4: engine + agent pytest -----------------------------------------
-# Uses the provisioned service venv discovered by resolve_gate_python() (Chudware, then the
-# legacy Billet/AI-CAD names, then the repo-local .venv-mcp) — those venvs have all
-# service/oracle deps installed. Emits a loud SKIP when none is found so engineers know the
-# gate is not running real suites.
+# ---- pytest: per-unit Python sweep --------------------------------------------
+# Uses the service venv discovered by resolve_gate_python() (Chudware, then the legacy
+# Billet/AI-CAD names, then the repo-local .venv-mcp). Emits a loud environment SKIP when
+# none is found so engineers know the gate is not running real suites.
 #
-# CHUDWARE_LIBCHUDWARE is set to core/build-linux/bin/libchudware.so when it exists and the
-# caller has not already set it. Without a loadable .so the oracle tests deselect (or
-# skip via @pytest.importorskip); the stage still runs and collects — it just won't
-# exercise core-calling paths.
+# CHUDWARE_LIBCHUDWARE is set to the built libchudware.so when it exists and the caller
+# has not already set it. Without a loadable .so core-calling tests skip or deselect; the
+# stage still runs and collects — it just won't exercise core-calling paths.
 #
-# The files below have known collection errors. They are explicitly ignored so their
-# errors don't abort collection. Status as of T-V4 (2026-07-03):
-#   engine_oracle/doc/test_aicm.py        — REMOVED from ignores (T-V3: OCP now installed; collects cleanly)
-#   engine_oracle/sim/test_foam_case.py   — REMOVED from ignores (T-V4: trimesh now installed; 14 tests collect)
-#   engine_oracle/sim/test_lbm.py         — REMOVED from ignores (T-V4: trimesh now installed; collects cleanly)
-#   services/agent/test_loop_mock.py      — file DELETED in T-RF5 (legacy agent loop removed)
-#
-# Pre-existing test failures inside the collected suites are RECORDED (non-fatal) here,
-# matching the check.py FAIL-RECORDED policy. Only a hard collection crash or a zero-
-# collected result sets fail_fatal=1. The sweep runs one pytest invocation per unit —
+# FATAL: any failed test (pytest rc=1), a collection crash or internal error (rc>=2), a
+# services enumeration gap, or a sweep that collected zero tests. A single unit with no
+# tests (rc=5) is an environment SKIP. The sweep runs one pytest invocation per unit —
 # per top-level directory, and for `services/` one per subpackage (plus its few
-# root-level test files) — to avoid the cross-suite pollution failures that occur in a
-# combined run (pytest's import ordering differs per-dir vs. combined; T-V2 owns that
-# audit).
+# root-level test files) — to avoid the cross-suite import-order pollution failures of a
+# combined run (pytest's import ordering differs per-dir vs. combined).
 stage_pytest() {
-    echo "=== [4/6] engine + agent pytest ==="
+    echo "=== pytest (per-unit Python sweep) ==="
 
     # --- locate the python runner (see resolve_gate_python above) ---
     local venv_py=""
@@ -528,16 +488,12 @@ stage_pytest() {
         return 0
     fi
 
-    # Prefer the full OCCT/Polyhedral-FEA build, then the standard build tree. Tests probe
-    # the selected dispatcher and skip honestly only when the mesher was deliberately disabled.
+    # Exercise the core this gate just built, not an older opt-in OCCT build tree.
+    # An explicit CHUDWARE_LIBCHUDWARE still selects an external dispatcher.
     local so_path=""
-    for cand in "$REPO/core/build-occt-linux/bin/libchudware.so" "$REPO/core/build-linux/bin/libchudware.so"; do
+    for cand in "$REPO/core/build-linux/bin/libchudware.so" "$REPO/core/build-occt-linux/bin/libchudware.so"; do
         [ -f "$cand" ] && { so_path="$cand"; break; }
     done
-    # Accept CHUDWARE_LIBCHUDWARE as alias for CHUDWARE_LIBCHUDWARE (T-G10 rename shim)
-    if [ -n "${CHUDWARE_LIBCHUDWARE:-}" ] && [ -z "${CHUDWARE_LIBCHUDWARE:-}" ]; then
-        export CHUDWARE_LIBCHUDWARE="$CHUDWARE_LIBCHUDWARE"
-    fi
     if [ -z "${CHUDWARE_LIBCHUDWARE:-}" ] && [ -n "$so_path" ]; then
         export CHUDWARE_LIBCHUDWARE="$so_path"
         echo "  CHUDWARE_LIBCHUDWARE=$CHUDWARE_LIBCHUDWARE (auto-detected)"
@@ -548,8 +504,7 @@ stage_pytest() {
     fi
 
     # --- per-unit sweep ---
-    # One invocation per unit avoids cross-suite import-order pollution
-    # (combined run has ~29 extra failures; T-V2 owns the cleanup).
+    # One invocation per unit avoids cross-suite import-order pollution.
     #
     # `services/` is swept one level DEEPER than the other top-level dirs: it holds
     # ~370 test files across ~20 subpackages. Measured 2026-07-29: as ONE invocation
@@ -561,13 +516,13 @@ stage_pytest() {
     # services/agent suite is collected first (it registers hydraulic_*/ask_user tools
     # DEFAULT_TOOL_FAMILIES doesn't know) — i.e. pure registry/import-order pollution
     # that was masking any genuine new regression. The remaining 13 (browser 9,
-    # services/mcp 2, sim 2) reproduce in isolation and are genuine pre-existing
-    # defects, so they are what this stage should actually be reporting.
+    # services/mcp 2, sim 2) reproduced in isolation: genuine defects, which this
+    # stage reports as fatal failures.
     #
     # The unit list is DERIVED at runtime (glob), never hardcoded, so a new services
     # subpackage is picked up automatically and cannot silently go unrun. The
     # coverage guard below turns any enumeration gap into a hard failure.
-    local dirs=("services.mcp")
+    local dirs=()
     if [ -d "services" ]; then
         local sd f
         for sd in services/*/; do
@@ -620,42 +575,43 @@ stage_pytest() {
     local total_collected=0
     local total_passed=0
     local any_hard_fail=0
+    local any_test_fail=0
 
     for dir in "${dirs[@]}"; do
         if [ ! -e "$dir" ]; then
-            echo "  $dir: path not found, skipping"
+            # Every unit is either globbed from disk or a tracked top-level dir, so a
+            # missing one means the sweep list is stale — never a silent skip.
+            echo "  $dir: path not found"
+            record "pytest/$dir         FAIL    sweep unit does not exist (stale unit list)"
+            any_hard_fail=1
             continue
         fi
 
         local out_file="${GATE_TMP}/pytest_${dir//\//_}.out"
 
-        # Build the ignore flags (only for dirs that have the relevant files).
-        local ignore_args=()
-        # T-V2/T-V3 tracked ignores: collection-error files that poison the whole run.
-        # engine_oracle/doc/test_aicm.py was removed (T-V3): OCP now installed, collects cleanly.
-        # T-V4: foam_case and lbm ignores removed — trimesh now installed, both collect cleanly.
-        # (test_loop_mock.py ignore removed in T-RF5 — the file was deleted with the legacy loop.)
-        # T-Q2: test_autosave_recovery must be collected via services/mcp/ (not services/)
-        # because it imports services.mcp.cad_tools; from services/ the 'mcp' name resolves
-        # to the services/mcp/ package and shadows mcp.server.fastmcp (collection crash).
-        [ -f "services/mcp/test_autosave_recovery.py" ] && ignore_args+=(--ignore=services/mcp/test_autosave_recovery.py)
-
         echo -n "  $dir ... "
         local rc=0
-        "$venv_py" -m pytest "$dir" "${ignore_args[@]}" -q --tb=no >"$out_file" 2>&1 || rc=$?
+        "$venv_py" -m pytest "$dir" -q --tb=no >"$out_file" 2>&1 || rc=$?
 
-        # exit 5 = no tests collected (training has none yet) — not a failure
+        # exit 5 = no tests collected in this unit — an environment SKIP, not a pass
         if [ "$rc" -eq 5 ]; then
-            echo "no tests collected (OK)"
+            echo "no tests collected (SKIP)"
             skip_stage env "pytest/$dir" "no tests collected in $dir"
             continue
         fi
 
         # Parse summary line: pytest outputs "N passed, M failed, K errors in Xs"
         local summary_line
-        summary_line="$(grep -E '[0-9]+ (passed|failed|error)' "$out_file" | tail -1 || true)"
+        summary_line="$(grep -E '[0-9]+ (passed|failed|errors?|skipped|xfailed|xpassed)' "$out_file" | tail -1 || true)"
+        if [ -z "$summary_line" ]; then
+            echo "HARD-FAIL (pytest exit $rc without a test summary)"
+            record "pytest/$dir         FAIL    pytest exit $rc without a test summary (see $out_file)"
+            any_hard_fail=1
+            continue
+        fi
         local collected
-        collected="$(grep -oE '[0-9]+ (passed|failed|error|deselected|selected)' "$out_file" | \
+        collected="$(printf '%s\n' "$summary_line" | \
+                     grep -oE '[0-9]+ (passed|failed|errors?|skipped|xfailed|xpassed)' | \
                      awk '{sum+=$1} END{print sum+0}')"
         total_collected=$((total_collected + collected))
 
@@ -668,9 +624,10 @@ stage_pytest() {
             echo "PASS  ($summary_line)"
             record "pytest/$dir         PASS    $summary_line"
         elif [ "$rc" -eq 1 ]; then
-            # rc=1 = tests failed (not a crash); pre-existing failures are RECORDED, not fatal
-            echo "FAIL-RECORDED  ($summary_line)"
-            record "pytest/$dir         FAIL-RECORDED  $summary_line (pre-existing — see ${GATE_TMP}/pytest_${dir//\//_}.out; T-V2 owns cleanup)"
+            # rc=1 = collection succeeded and one or more tests failed
+            echo "FAIL  ($summary_line)"
+            record "pytest/$dir         FAIL    $summary_line (see $out_file)"
+            any_test_fail=1
         else
             # rc=2+ = collection crash or internal error → hard failure
             echo "HARD-FAIL (rc=$rc)"
@@ -680,35 +637,38 @@ stage_pytest() {
     done
 
     echo "  total collected ≈ $total_collected tests across ${#dirs[@]} units"
-    record "pytest              total ≈ $total_collected collected | $total_passed passed | (T-V4: foam_case+lbm+test_aicm ignores removed — trimesh+OCP now installed; T-RF5: test_loop_mock.py deleted with the legacy loop)"
+    record "pytest              total ≈ $total_collected collected | $total_passed passed | ${#dirs[@]} units"
 
-    # The stage header has claimed since T-V2 that "a zero-collected result sets
-    # fail_fatal=1", but the check was never actually written — so a gate run that
-    # collected NOTHING (wrong cwd, a renamed services dir, a broken interpreter)
-    # reported PASS. Enforce it for real: the sweep dirs are tracked in-repo, so zero
-    # collected tests across all of them is always a harness break, never an
-    # environment SKIP.
+    # Zero tests collected across every sweep unit is always a harness break (wrong cwd,
+    # renamed services dir, broken interpreter), never an environment SKIP: the sweep
+    # dirs are tracked in-repo.
     if [ "$total_collected" -eq 0 ]; then
         record "pytest              FAIL    zero tests collected across ${#dirs[@]} sweep units — the suite did not run (harness/cwd break, not an environment SKIP)"
         echo "  FAIL: zero tests collected — the Python suites did not run at all"
         fail_fatal=1
     fi
 
+    if [ "$any_test_fail" -ne 0 ]; then
+        record "pytest              FAIL    one or more units had failing tests (rc=1)"
+        echo "  FAIL: failing tests in at least one unit"
+        fail_fatal=1
+    fi
+
     if [ "$any_hard_fail" -ne 0 ]; then
-        record "pytest              FAIL    one or more dirs had a hard collection crash (rc≥2)"
-        echo "  FAIL: hard collection error in at least one dir"
+        record "pytest              FAIL    one or more units crashed in collection/internals (rc≥2) or do not exist"
+        echo "  FAIL: hard collection error or missing unit in at least one dir"
         fail_fatal=1
     fi
 }
 
-# ---- Stage 5: host GUI shot smoke (CHUDWARE_SHOT=m1) -------------------------
-# ui/imgui (AI-CAD2) is retired. This stage runs the host GUI headless under
-# xvfb and verifies it renders a screenshot. The host binary is expected to
-# exist at host/build-linux/bin/Chudware (built by stage 2b above, or a prior
-# cached build). Skips gracefully when the host build did not succeed or the
-# binary is absent.
-stage_ui_imgui() {
-    echo "=== [5/6] host GUI shot smoke (CHUDWARE_SHOT=m1) ==="
+# ---- host shot: host GUI headless screenshot smoke ----------------------------
+# Runs the host GUI headless under xvfb and verifies it renders a screenshot
+# (CHUDWARE_SHOT=m1), then the copilot slash-autocomplete scenario. The binary is
+# expected at host/build-linux/bin/chudware (built by stage_host_build, or a prior
+# cached build). Environment SKIP when the host build did not succeed and the binary
+# is absent; a missing binary after a successful build is FATAL.
+stage_host_shot() {
+    echo "=== host GUI shot smoke (CHUDWARE_SHOT=m1) ==="
     local bin="$REPO/host/build-linux/bin/chudware"
     if [ ! -x "$bin" ]; then
         if [ "${HOST_BUILD_OK:-0}" -eq 1 ]; then
@@ -721,15 +681,23 @@ stage_ui_imgui() {
         return 0
     fi
     local shot="${GATE_TMP}/host-shot.png"
-    local libchudware="${CHUDWARE_LIBCHUDWARE:-$REPO/core/build-occt-linux/bin/libchudware.so}"
-    local shot_cmd="env CHUDWARE_NO_FILE_DIALOGS=1 CHUDWARE_SHOT=m1"
-    [ -f "$libchudware" ] && shot_cmd="$shot_cmd CHUDWARE_LIBCHUDWARE=$libchudware"
-    shot_cmd="$shot_cmd \"$bin\" --ui-screenshot \"$shot\""
-    # Always use xvfb-run when available unless CHUDWARE_SHOT_HEADED=1 is set.
+    local libchudware="${CHUDWARE_LIBCHUDWARE:-$REPO/core/build-linux/bin/libchudware.so}"
+    # Chats are project-local; a private HOME alone does not isolate a shot.
+    local shot_root="${GATE_TMP}/host-shot-state"
+    mkdir -p "$shot_root/home" "$shot_root/work"
+    local shot_env=(env HOME="$shot_root/home" APPDATA="$shot_root/data"
+        XDG_DATA_HOME="$shot_root/data" CHUDWARE_NO_FILE_DIALOGS=1)
+    local shot_py=""
+    shot_py="$(gate_python_or_system)"
+    [ -n "$shot_py" ] && shot_env+=(CHUDWARE_PYTHON="$shot_py")
+    [ -f "$libchudware" ] && shot_env+=(CHUDWARE_LIBCHUDWARE="$libchudware")
+    local headless=()
     if [ "${CHUDWARE_SHOT_HEADED:-0}" != "1" ] && command -v xvfb-run >/dev/null 2>&1; then
-        shot_cmd="xvfb-run -a $shot_cmd"
+        headless=(xvfb-run -a)
     fi
-    if ! eval "$shot_cmd" > ${GATE_TMP}/host_shot.out 2>&1; then
+    if ! (cd "$shot_root/work" &&
+        "${headless[@]}" "${shot_env[@]}" CHUDWARE_INSTANCE_KEY="gate-m1-$BASHPID" \
+        CHUDWARE_SHOT=m1 "$bin" --ui-screenshot "$shot") > ${GATE_TMP}/host_shot.out 2>&1; then
         record "host shot           FAIL    --ui-screenshot smoke (see ${GATE_TMP}/host_shot.out)"
         echo "  FAIL: host shot"; tail -n 15 ${GATE_TMP}/host_shot.out | sed 's/^/    /'
         fail_fatal=1
@@ -748,13 +716,9 @@ stage_ui_imgui() {
     # scripted Enter fill. Two PNGs — the open menu and the filled composer.
     local slash_shot="${GATE_TMP}/copilot-slash.png"
     local slash_menu="${GATE_TMP}/copilot_slash_menu.png"
-    local slash_cmd="env CHUDWARE_NO_FILE_DIALOGS=1 CHUDWARE_SHOT=copilot_slash"
-    [ -f "$libchudware" ] && slash_cmd="$slash_cmd CHUDWARE_LIBCHUDWARE=$libchudware"
-    slash_cmd="$slash_cmd \"$bin\" --ui-screenshot \"$slash_shot\""
-    if [ "${CHUDWARE_SHOT_HEADED:-0}" != "1" ] && command -v xvfb-run >/dev/null 2>&1; then
-        slash_cmd="xvfb-run -a $slash_cmd"
-    fi
-    if ! eval "$slash_cmd" > ${GATE_TMP}/copilot_slash.out 2>&1; then
+    if ! (cd "$shot_root/work" &&
+        "${headless[@]}" "${shot_env[@]}" CHUDWARE_INSTANCE_KEY="gate-slash-$BASHPID" \
+        CHUDWARE_SHOT=copilot_slash "$bin" --ui-screenshot "$slash_shot") > ${GATE_TMP}/copilot_slash.out 2>&1; then
         record "slash shot          FAIL    CHUDWARE_SHOT=copilot_slash (see ${GATE_TMP}/copilot_slash.out)"
         echo "  FAIL: copilot_slash shot"; tail -n 15 ${GATE_TMP}/copilot_slash.out | sed 's/^/    /'
         fail_fatal=1
@@ -770,13 +734,13 @@ stage_ui_imgui() {
     fi
 }
 
-# ---- Stage 6: model-eval bench smoke (T-H8) ---------------------------------
+# ---- bench (T-H8): model-eval bench smoke -------------------------------------
 # Optional, env-gated SKIP like the OCCT stages: runs the product-task eval benches at
 # smoke size. Default is SKIP (stays green) so the gate does not depend on the flywheel;
 # set CHUDWARE_RUN_BENCH=1 to opt in, and then a bench error DOES fail the gate. The bench
 # framework is stdlib-only, so it needs nothing but python3.
 stage_bench() {
-    echo "=== [6/6] model-eval bench smoke (T-H8) ==="
+    echo "=== model-eval bench smoke (T-H8) ==="
     if [ "${CHUDWARE_RUN_BENCH:-0}" != "1" ]; then
         skip_stage optin "bench (T-H8)" "set CHUDWARE_RUN_BENCH=1 to run smoke-size eval benches" "CHUDWARE_RUN_BENCH not set"
         return 0
@@ -795,15 +759,15 @@ stage_bench() {
     echo "  PASS"; tail -n 8 ${GATE_TMP}/bench.out | sed 's/^/    /'
 }
 
-# ---- Stage 7: modeling perf-regression (tools/perf_regression.py) -----------
+# ---- perf-regression: modeling perf (tools/perf_regression.py) ----------------
 # Times the geometry kernel against tools/perf_baseline.json and flags median slowdowns.
 # Env-gated (perf timings are machine + load sensitive, so this is NOT a hard blocker by
 # default): set CHUDWARE_RUN_PERF=1 to run. A regression is RECORDED (non-fatal) unless
-# CHUDWARE_PERF_FATAL=1. Needs a loadable .so — prefers the freshly built build-occt-linux
-# engine (the profiler/contention RPCs live there); falls back to whatever core_bridge
+# CHUDWARE_PERF_FATAL=1. Needs a loadable .so — prefers this gate's core/build-linux
+# engine; falls back to whatever core_bridge
 # resolves. Update the baseline deliberately with `python tools/perf_regression.py --update`.
 stage_perf() {
-    echo "=== [7/7] modeling perf-regression ==="
+    echo "=== modeling perf-regression ==="
     if [ "${CHUDWARE_RUN_PERF:-0}" != "1" ]; then
         skip_stage optin "perf-regression" "set CHUDWARE_RUN_PERF=1 to time the modeling kernel" "CHUDWARE_RUN_PERF not set"
         return 0
@@ -814,8 +778,8 @@ stage_perf() {
         skip_stage env "perf-regression" "no python for perf harness" "no python"; return 0
     fi
     # Prefer the just-built OCCT engine so the contention/per-feature diagnostics are captured.
-    if [ -z "${CHUDWARE_LIBCHUDWARE:-}" ] && [ -f "$REPO/core/build-occt-linux/bin/libchudware.so" ]; then
-        export CHUDWARE_LIBCHUDWARE="$REPO/core/build-occt-linux/bin/libchudware.so"
+    if [ -z "${CHUDWARE_LIBCHUDWARE:-}" ] && [ -f "$REPO/core/build-linux/bin/libchudware.so" ]; then
+        export CHUDWARE_LIBCHUDWARE="$REPO/core/build-linux/bin/libchudware.so"
     fi
     local rc=0
     "$perf_py" "$REPO/tools/perf_regression.py" --iters "${CHUDWARE_PERF_ITERS:-5}" \
@@ -833,15 +797,16 @@ stage_perf() {
     fi
 }
 
-# ---- Stage 4.5: V&V benchmark smoke (T-BL01) --------------------------------
-# Optional, env-gated SKIP: runs the V&V benchmark harness in smoke mode
-# (pure-Python families only — no .so required for the smoke subset).
+# ---- vv-bench (T-BL01): V&V benchmark smoke -----------------------------------
+# Optional, env-gated SKIP: runs the V&V benchmark harness in smoke mode. Smoke needs no
+# .so; its native-RPC cases (hydraulic/piping/ECAD) skip with the loader reason unless a
+# libchudware.so is found (the stage wires core/build-linux when CHUDWARE_LIBCHUDWARE is unset).
 # Default is SKIP (stays green) so the gate does not depend on external deps;
 # set CHUDWARE_RUN_VV=smoke (or =full) to opt in.
-# - CHUDWARE_RUN_VV=smoke  → pytest scripts/vv_benchmark.py::TestSmoke  (fast, no .so)
+# - CHUDWARE_RUN_VV=smoke  → pytest scripts/vv_benchmark.py::TestSmoke  (fast; .so optional)
 # - CHUDWARE_RUN_VV=full   → pytest scripts/vv_benchmark.py  (all suites, needs .so + deps)
 stage_vv() {
-    echo "=== [4.5/6] V&V benchmark smoke (T-BL01) ==="
+    echo "=== V&V benchmark smoke (T-BL01) ==="
     if [ -z "${CHUDWARE_RUN_VV:-}" ]; then
         skip_stage optin "vv-bench (T-BL01)" "set CHUDWARE_RUN_VV=smoke or =full to run V&V harness" "CHUDWARE_RUN_VV not set"
         return 0
@@ -889,7 +854,7 @@ stage_vv() {
     fi
 }
 
-# ---- Stage 4.6: Modeling-op combination battery (T-BL19) --------------------
+# ---- modeling (T-BL19): modeling-op combination battery -----------------------
 # Optional, env-gated SKIP: drives the C++ feature engine through every registered
 # modeling op + a pairwise/sequence matrix and asserts on live geometry. Default is
 # SKIP (stays green) so the normal gate never depends on the OCCT .so; opt in with:
@@ -898,7 +863,7 @@ stage_vv() {
 # NOTE: full mode needs the OCCT geometry kernel (core/build-occt-linux/bin/libchudware.so);
 # the plain build-linux .so has no geometry and would ALL-SKIP (which the battery fails).
 stage_modeling() {
-    echo "=== [4.6/6] Modeling-op combination battery (T-BL19) ==="
+    echo "=== Modeling-op combination battery (T-BL19) ==="
     if [ -z "${CHUDWARE_RUN_MODELING:-}" ]; then
         skip_stage optin "modeling (T-BL19)" "set CHUDWARE_RUN_MODELING=smoke or =full" "CHUDWARE_RUN_MODELING not set"
         return 0
@@ -947,12 +912,12 @@ stage_modeling() {
     fi
 }
 
-# ---- Stage 4.7: T-FIN25 sensor-node golden demo (sim/fw content smoke) ------
+# ---- fin25 golden demo: T-FIN25 sensor-node sim/fw content smoke --------------
 # Default ON (bounded <5 min). Legs that need Renode/OpenFOAM write SKIP markers
 # when those binaries are absent — never fake a pass. Opt out with CHUDWARE_SKIP_FIN25=1.
 # Fast dry thermal: CHUDWARE_FIN25_THERMAL_DRY=1. Artifacts under $GATE_TMP/fin25/.
 stage_fin_content() {
-    echo "=== [4.7/6] T-FIN25 sensor-node golden demo ==="
+    echo "=== T-FIN25 sensor-node golden demo ==="
     if [ "${CHUDWARE_SKIP_FIN25:-}" = "1" ]; then
         skip_stage optin "fin25 golden demo" "CHUDWARE_SKIP_FIN25=1" "CHUDWARE_SKIP_FIN25=1"
         return 0
@@ -984,11 +949,9 @@ stage_fin_content() {
     export CHUDWARE_PROJECT_DIR="${CHUDWARE_PROJECT_DIR:-$out/project}"
 
     local rc=0
-    if ! PYTHONPATH="$REPO:${PYTHONPATH:-}" \
+    PYTHONPATH="$REPO:${PYTHONPATH:-}" \
             "$venv_py" "$REPO/scripts/demo_sensor_node.py" \
-            > "${GATE_TMP}/fin25.out" 2>&1; then
-        rc=$?
-    fi
+            > "${GATE_TMP}/fin25.out" 2>&1 || rc=$?
 
     # Summarise per-leg markers (PASS/FAIL/SKIP) for the gate line.
     local n_pass=0 n_fail=0 n_skip=0
@@ -1010,7 +973,7 @@ stage_fin_content() {
     fi
 }
 
-# ---- Stage 4.8: master-mission E2E benchmarks (opt-in) ----------------------
+# ---- E2E benches: master-mission E2E benchmarks (opt-in) ----------------------
 # The flight-computer + battery-charger end-to-end protocols exercise the WHOLE
 # ECAD+sim+firmware stack (parts -> schematic -> SPICE -> place/route/trace-opt ->
 # antenna/openEMS -> board checks -> firmware+Renode sensor-in-the-loop). Heavy
@@ -1039,8 +1002,8 @@ _run_e2e_bench() {  # $1=label $2=script $3=tmp-subdir $4=gate-flag $5=script-en
     export "${envpfx}_OUT=$out" "${envpfx}_MARKERS=$out/markers"
     export CHUDWARE_ECAD_HEAVY_BUDGET_S="${CHUDWARE_ECAD_HEAVY_BUDGET_S:-300}"
     local rc=0
-    if ! PYTHONPATH="$REPO:${PYTHONPATH:-}" "$venv_py" "$REPO/$script" \
-            > "${GATE_TMP}/${pfx}.out" 2>&1; then rc=$?; fi
+    PYTHONPATH="$REPO:${PYTHONPATH:-}" "$venv_py" "$REPO/$script" \
+            > "${GATE_TMP}/${pfx}.out" 2>&1 || rc=$?
     local n_pass=0 n_fail=0 n_skip=0
     if [ -d "$out/markers" ]; then
         n_pass=$(grep -l '^PASS' "$out/markers"/*.marker 2>/dev/null | wc -l | tr -d ' ' || true)
@@ -1058,11 +1021,11 @@ _run_e2e_bench() {  # $1=label $2=script $3=tmp-subdir $4=gate-flag $5=script-en
     fi
 }
 stage_bench_flight_computer() {
-    echo "=== [4.8/6] E2E benchmark: central flight computer ==="
+    echo "=== E2E benchmark: central flight computer ==="
     _run_e2e_bench "bench flight-comp" "scripts/bench_flight_computer.py" "bench_fc" "CHUDWARE_RUN_BENCH_FC" "CHUDWARE_FC"
 }
 stage_bench_battery_charger() {
-    echo "=== [4.9/6] E2E benchmark: battery charger/controller ==="
+    echo "=== E2E benchmark: battery charger/controller ==="
     _run_e2e_bench "bench charger    " "scripts/bench_battery_charger.py" "bench_chg" "CHUDWARE_RUN_BENCH_CHG" "CHUDWARE_BC"
 }
 
@@ -1071,9 +1034,8 @@ CORE_BUILD_OK=0
 HOST_BUILD_OK=0
 stage_check
 stage_manual_gen
-stage_ui_style_check
 stage_core_build
-stage_ui_abstract
+stage_host_build
 stage_wasm_smoke
 stage_ctest
 stage_hostd_smoke
@@ -1086,7 +1048,7 @@ stage_modeling
 stage_fin_content
 stage_bench_flight_computer
 stage_bench_battery_charger
-stage_ui_imgui
+stage_host_shot
 stage_bench
 stage_perf
 
@@ -1103,6 +1065,6 @@ fi
 if [ "${CHUDWARE_GATE_STRICT:-0}" = "1" ]; then
     echo "RESULT: PASS (CHUDWARE_GATE_STRICT=1 — no environment SKIP occurred; any SKIP above is an unset opt-in flag)"
 else
-    echo "RESULT: PASS (SKIPs are environment-only; check.py FAIL-RECORDED is pre-existing)"
+    echo "RESULT: PASS (each SKIP above is a missing environment capability or an unset opt-in flag; WARN/FAIL-RECORDED rows come from advisory stages)"
 fi
 exit 0

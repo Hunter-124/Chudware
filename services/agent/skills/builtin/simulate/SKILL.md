@@ -15,12 +15,12 @@ triggers:
 1. State one criterion, case, pass rule, and units. Use each FEA tool's `material=`;
    `set_material` stores document identity/appearance but does not choose solver
    properties. Confirm faces with `query_geometry`. Every explicit FEA material
-   dict needs `E_mpa` and `nu`; add `yield_mpa` for
-   static/fatigue, density for modal/frequency/transient thermal,
-   `ultimate_mpa`/`endurance_mpa` for fatigue, `conductivity_w_mk`/`k_w_mk` for
-   steady thermal, and conductivity plus `cp_j_kgk` (or top-level
-   `specific_heat_j_kgk`) for transient thermal. Registry material names resolve
-   their stored properties.
+   dict for structural analysis needs `E_mpa` and `nu`; add `yield_mpa` for
+   static/fatigue, `density_g_cm3` for modal/frequency response,
+   and `ultimate_mpa`/`endurance_mpa` for fatigue. Thermal material dicts instead
+   need `conductivity_w_mk`/`k_w_mk`; transient thermal also needs
+   `density_g_cm3` and `cp_j_kgk` (or top-level `specific_heat_j_kgk`).
+   Registry material names resolve their stored properties.
 2. Record an independent closed-form anchor before solving, or explicitly record
    `no anchor`. Never convert pressure to force without loaded area.
    Useful anchors: justified beam stress/mode order, Fourier heat flow, vibration
@@ -43,19 +43,19 @@ closes a requirement:
 
 1. **Converge.** `run_fea_convergence(sizes_mm=[coarse,med,fine], vtu_dir=<absolute dir>)`
    — one setup, three stated sizes, `monitor` on a NON-singular value; or
-   `run_fea_adaptive` with `eta_target_met`. `converged:false` or a peak that grows with
-   refinement is a singularity, not strength. `vtu_dir` gives every leg its own `.vtu`
+   `run_fea_adaptive` with `eta_target_met`. `converged:false` means the target was
+   not met; a peak that grows with refinement needs singularity assessment, not a
+   strength claim. `vtu_dir` gives every leg its own `.vtu`
    (each row carries `vtu_path`) and the reply's `released_leg` names the finest solved
    leg's file — pass that reply to `sim_evidence_packet` and the released field travels
    with the numbers instead of needing a fourth solve.
 2. **Check equilibrium AND connectivity.** Read `reactions.equilibrium_error_pct` before
    trusting any stress, and `mesh_quality` (aspect_max, jacobian_min, pct_poor,
    `connected_components` / `unfixed_components`, `thin_wall_ratio`) before trusting the
-   mesh. Both ride beside `summary`, never inside it. A static solve now REFUSES a mesh
-   whose components do not all reach a fixture — equilibrium cannot catch a mechanism,
-   because a mechanism carries no load and its residual is tiny BECAUSE the model is
-   broken (live: 9.6e6 mm of displacement at 0.00042% error). `thin_wall_ratio` under 1
-   means one element spans the wall and cannot bend: re-mesh with h <= wall thickness.
+   mesh. A static solve refuses a mesh whose components do not all reach a fixture:
+   low equilibrium error alone cannot prove connectivity or exclude a mechanism.
+   `thin_wall_ratio` under 1 warns that the wall is under-resolved; refine to
+   h <= wall thickness before relying on a bending result.
    `plausibility.flag == "implausible"` means the peak displacement exceeded the part's
    own bounding-box diagonal, so the small-strain assumption is gone, `warnings` says so,
    and a convergence leg in that state is marked `implausible` and cannot converge.
@@ -90,10 +90,17 @@ closes a requirement:
 ## Current surfaces
 
 - **Static/fatigue:** mounted face plus non-zero force in N or pressure in MPa;
-  these are real-part FEA. **Buckling:** exactly one mount and one inward axial force
-  in N; pressure/shear/tension cannot map to its CalculiX fixed-free box proxy.
-- **Contact:** `run_fea_contact` is a CalculiX two-block load-transfer proxy, not the
-  document's actual contact pair. Check base reaction against applied load.
+  these are real-part FEA. Use `interfaces` for bonded multi-body load paths.
+  Static supports explicit small-strain J2 `plasticity`; state whether it was enabled.
+  **Buckling:** `run_fea_buckling` uses the real CAD mesh and static force/pressure
+  dialect. It reports positive load factors under `max_load_factor`; a refusal for
+  no mode below that ceiling is not proof against buckling or nonlinear collapse.
+- **Contact:** `run_fea_contact` meshes the document's real bodies with frictionless
+  unilateral contact and optional bonded pairs. Measure the clearance before setting
+  `max_gap_mm`; use `interface_size_mm` for local contact resolution. Read equilibrium,
+  `contact.tangential_force_fraction` and `resolution.mode`; `closed_fit` idealizes
+  sub-mesh clearance, it does not resolve it. No large sliding/deflection or true bolt
+  preload; an unsettled active set is a refusal, not a result.
 - **Modal/vibration:** modal takes no load; `fixtures=[]` is legitimate free-free and
   should show six near-zero rigid modes. Frequency response uses `excitation_dir`,
   `base_accel_g`, damping `zeta`, and optional PSD in g²/Hz; it returns acceleration
@@ -106,12 +113,15 @@ closes a requirement:
 - **CFD:** `run_cfd_flow` is directional LBM; require `converged=true` and
   `min_feature_voxels>=~8`, then refine `cells`. Absolute Cd/Cl needs
   `run_cfd_accurate`; unavailable OpenFOAM returns SKIP and started runs use `get_job`.
-- **Motion:** `simulate_motion` needs one dimensional mate, required `stop`, degrees
-  or mm, and `steps>=2`. Refine samples near first contact. `dynamics={}` adds inverse
-  reactions but no contact dynamics.
+- **Motion:** `simulate_motion` drives angle/distance mates with a required `stop`
+  (one driver or explicit synchronized `drivers`), in degrees or mm, and `steps>=2`.
+  Refine samples near first contact. `dynamics={}` adds inverse reactions
+  (`steps>=3`) but no contact dynamics.
 - **EM:** call `em_status` before `solver='openems'`. Builtin FDFD eigenmodes and
   analytic-uniform guide responses are not full-wave evidence. Track GHz versus Hz
   and mm; refine resolution/frequency samples and compare cutoff/resonance anchors.
+- **Figures:** show fixtures, loads and the analyzed region in surrounding assembly
+  context. Static vehicle stress views keep the rest of the vehicle in frame.
 
 ## Topology optimization
 
@@ -180,11 +190,14 @@ evidence for PASS and the proxy/backend/linear-model limits for every verdict.
 
 ## Mechanism proof (kinematics)
 
-A moving assembly is proven by the sweep, never by one pose. `simulate_motion` reports
-`collisions:[{a,b,overlap_volume_mm3}]` on EVERY step (plus the unchanged
-`first_collision_step`/`first_collision_value`), so quote the offending pairs and their
-overlap volumes per step; "no interference" requires `check_interference=true` and an
-empty `collisions` list at every sample, not just before the first hit.
+A moving assembly is proven by the sweep, never by one pose. Read every
+`trajectory` frame's `collision_detail` (stable `component_a`/`component_b` and
+`overlap_volume_mm3`, plus unsafe clearance pairs), not only
+`interference.first_collision_step`/`first_collision_value`. A sampled-clear claim
+requires `check_interference=True`, `interference.complete:true`, every computed
+sample checked, and no collision/clearance hits. Null `interference`, failed pose
+checks, missing geometry or pair failures mean incomplete, not clear. Report ranges,
+sample count and minimum clearance; finite samples do not prove continuous clearance.
 
 - **Envelope:** `sweep_envelope(mate_id, start, stop, steps, components)` unions each
   component's 8 transformed bbox corners over the sweep — the clearance number. Its
@@ -192,14 +205,16 @@ empty `collisions` list at every sample, not just before the first hit.
   `<component>_sweep`) and returns its volume/bbox; use it when a bbox over-reports.
 - **No dimensional mate to drive:** a steering assembly poses its uprights with
   concentric/coincident mates about measured kingpin axes and owns no angle/distance
-  mate, so `simulate_motion` has nothing to sweep. Both kinematic tools take a `steer`
-  spec instead — `steer={"components":["upright_FL","upright_FR"],
+  mate, so `simulate_motion` has nothing to sweep. `sweep_envelope` and
+  `steering_turning_radius` take a `steer` spec instead —
+  `steer={"components":["upright_FL","upright_FR"],
   "axis":{"point":[x,y,z],"dir":[x,y,z]}, "angle_deg":30}` (or `"mate_id":"<the
   concentric kingpin mate>"` to reuse the axis it already resolves, or
   `"angles_deg":[inner,outer]` for a true Ackermann pair). The named components are
   rotated rigidly about that axis on a DETACHED clone and the mate network is re-solved
   around them, so the live document keeps its revision and its mate-owned poses.
-  `rear_steer` takes the same spec for 4WS; `steps` scales the angles 0 → full lock.
+  Keep a straight rear axle non-steering for the vehicle workflow; `rear_steer`
+  supports explicitly requested 4WS studies, not an assumed vehicle configuration.
 - **Turning radius:** `steering_turning_radius(steer=… | steer_mate_id, …)` intersects
   the POSED wheel axle lines — a rolling wheel turns about a point on its own axle line —
   and reports `turning_radius_m`/`turning_radius_ft` plus per-wheel `steer_angle_deg`

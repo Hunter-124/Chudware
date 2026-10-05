@@ -91,3 +91,25 @@ def test_other_rules_still_report_non_geometry_violations(tmp_path):
     ]), {"scale", "icons", "theme", "color"}) == {
         (1, "icons"), (2, "theme"), (3, "color"),
     }
+
+
+def test_empty_scan_cannot_pass_or_erase_baseline(tmp_path):
+    root = tmp_path / "empty"
+    root.mkdir()
+    baseline = tmp_path / "baseline.json"
+    previous = b'{"keys": ["preserved"], "count": 1}\n'
+    baseline.write_bytes(previous)
+    assert gui_lint.main([
+        str(root), "--rule", "theme", "--update-baseline", str(baseline),
+    ]) == 2
+    assert baseline.read_bytes() == previous
+
+
+def test_missing_root_cannot_hide_behind_a_valid_scan(tmp_path):
+    valid = tmp_path / "valid"
+    valid.mkdir()
+    (valid / "panel.cpp").write_text("void draw() {}\n", encoding="utf-8")
+    assert gui_lint.main([
+        str(valid), str(tmp_path / "missing"), "--rule", "theme", "--no-baseline",
+    ]) == 2
+    assert gui_lint.main([str(valid), "--rule", "theme", "--no-baseline"]) == 0

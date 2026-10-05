@@ -5,8 +5,7 @@ OpenFOAM case that meshes the part inside a wind-tunnel domain (blockMesh backgr
 snappyHexMesh body-fitted refinement *with prism boundary layers*) and solves steady
 incompressible RANS (``simpleFoam``, k-ω SST).
 
-Conventions kept consistent with the LBM solver (engine/sim/lbm.py) so the two engines are
-interchangeable:
+Coordinate and domain conventions match ``services/sim/lbm.py``:
 
 * Flow direction is composed from base-axis + AoA + sideslip via ``lbm._compose_flow_dir``.
 * The part is rotated so the flow runs along +X (``lbm._align_to_x``); the background box is

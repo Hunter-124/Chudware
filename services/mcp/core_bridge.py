@@ -30,45 +30,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-# ---------------------------------------------------------------- env var compatibility shim
-# CHUDWARE_* is the new canonical name for all env vars. CHUDWARE_* is the legacy name.
-# Read sites use _env() to prefer new names while honoring old ones (with a one-time warn).
-# Write sites (gate.sh exports, test setdefault calls) are unchanged — they keep working
-# via the fallback.
-
-import warnings as _warnings
-_warned_vars: set = set()
-
-
-def _env(new_name: str, legacy_name: str | None = None, default: str | None = None) -> str | None:
-    """Read an env var preferring the CHUDWARE_* name, falling back to CHUDWARE_* legacy name.
-
-    Emits a DeprecationWarning once per process per legacy-name when the legacy var is
-    the active source, so callers know to update their scripts.
-    """
-    val = os.environ.get(new_name)
-    if val is not None:
-        return val
-    # CHUDWARE_* never shipped but briefly existed as the T-G10 canonical prefix;
-    # accept it as a silent second fallback so any stray script keeps working.
-    if new_name.startswith("CHUDWARE_"):
-        val = os.environ.get("CHUDWARE_" + new_name[len("CHUDWARE_"):])
-        if val is not None:
-            return val
-    if legacy_name:
-        val = os.environ.get(legacy_name)
-        if val is not None:
-            if legacy_name not in _warned_vars:
-                _warned_vars.add(legacy_name)
-                _warnings.warn(
-                    f"{legacy_name} is deprecated; use {new_name} instead.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-            return val
-    return default
-
-
 class CoreError(RuntimeError):
     """A hard failure from the C++ core (nonzero rc / OpError envelope / generic error)."""
 
@@ -112,7 +73,7 @@ def dist_dir() -> Path:
     required to exist until the library is first loaded; on Linux there is no ``dist``
     stage and the library is found in a build dir instead (see ``_lib_candidates``).
     """
-    env = _env("CHUDWARE_DIST", "CHUDWARE_DIST")
+    env = os.environ.get("CHUDWARE_DIST")
     if env:
         return Path(env)
     return _repo_root() / "dist" / "Chudware"
@@ -125,7 +86,7 @@ def _lib_candidates() -> list[Path]:
     """
     name = _lib_name()
     out: list[Path] = []
-    env_lib = _env("CHUDWARE_LIBCHUDWARE", "CHUDWARE_LIBCHUDWARE")
+    env_lib = os.environ.get("CHUDWARE_LIBCHUDWARE")
     if env_lib:
         out.append(Path(env_lib))
     out.append(dist_dir() / name)  # honours $CHUDWARE_DIST; Windows stage default

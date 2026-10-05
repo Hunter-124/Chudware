@@ -1,9 +1,12 @@
 # `core/` — the pure-C++ engine (libchudware)
 
 The pure-C++ engine (`libchudware`) that replaced the former Python engine.
-It is linked directly into the C++ host, so document, modeling, solver, and
-simulation operations run in process rather than through the retired Python
-stdio worker.
+The host GUI does not link it. By default the GUI talks over IPC to the
+`chudware-hostd` daemon (built from `core/hostd/`), which owns the loaded
+libchudware and serves every client. The GUI only `dlopen`s libchudware in
+process (`services/worker/engine_backend.h`, InProcCore) as a fallback, when
+`CHUDWARE_ENGINE_DAEMON=0` is set or the daemon stays unreachable after bounded
+retries.
 
 ## Layout
 
@@ -46,24 +49,37 @@ core/
     cmake/    Provision*.cmake auto-provisioners (OCCT, Polyhedral-FEA, OpenNURBS, lib3mf, …)
     data/     bundled data (materials)
     third_party/ vendored sources (rhino3dm-src)
-    docs/     design docs (wave2_occt_plan.md, kicad_reference.md)
+    docs/     kicad_reference.md; wave2_occt_plan.md is a historical record (landed —
+              keep for rationale; its setup steps are superseded by cmake/ProvisionOCCT.cmake)
   Tests
     tests/    doctest suites: test_nsolve.cpp, test_sketch.cpp, plus ~100 subsystem tests
   CMakeLists.txt            build: Eigen + doctest + nlohmann/json via FetchContent;
-                            -DCHUDWARE_WITH_OCCT=ON provisions OCCT (cmake/ProvisionOCCT.cmake)
+                            -DCHUDWARE_WITH_OCCT=ON adds the OCCT kernel (cmake/ProvisionOCCT.cmake:
+                            system OCCT on Linux/macOS, downloaded 7.9.3 on Windows)
 ```
 
-## Build & test (Windows, VS2022)
+## Build & test
+
+Linux/macOS: `./build.sh core` rebuilds the trees that `scripts/gate.sh`, the GUI and
+`CHUDWARE_LIBCHUDWARE` consumers load, `core/build-occt-<platform>` and
+`core/build-<platform>`, plus `chudware-hostd` from the same tree. If neither tree is
+configured, it configures the host's preset (`linux-core`, `macos-arm64`,
+`macos-x86_64` in the root `CMakePresets.json`), whose `build/<preset>/` output
+nothing loads. To configure a consumed tree by hand (as the gate does):
 
 ```
-cmake -S core -B core/build -G "Visual Studio 17 2022" -A x64
-cmake --build core/build --config Release
-ctest --test-dir core/build -C Release            # or run bin\Release\test_*.exe
+cmake -S core -B core/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_WITH_OCCT=ON
+ninja -C core/build-linux
+ctest --test-dir core/build-linux --output-on-failure
 ```
+
+`CMAKE_BUILD_TYPE=Release` matters: the single-config Ninja generator otherwise builds
+-O0. Windows uses the `windows-core` (MSVC, OCCT off) or `windows-occt` preset from an
+x64 Native Tools prompt; see `docs/reference/BUILD_WINDOWS.md`.
 
 CMake 4.x note: doctest's `cmake_minimum_required(3.0)` is bypassed via
 `SOURCE_SUBDIR` (header-only include), so **no** `CMAKE_POLICY_VERSION_MINIMUM`
-override is needed — and must not be set (it poisons the cache; wipe `core/build`
+override is needed — and must not be set (it poisons the cache; wipe the build tree
 if it ever gets in).
 
 ## Solver status

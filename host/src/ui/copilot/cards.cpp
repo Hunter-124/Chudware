@@ -1,5 +1,5 @@
 // Copilot cards (T-RF6 split of legacy_chat.cpp): the Plan/Objectives section (tiles + todos
-// tree + subagents, plus the drawPlanSection/drawPartsLine adapters declared in
+// tree + subagents, plus the drawPlanSection adapter declared in
 // core/app_state.h), the clarify + plan-approve cards, the corporate-org cards
 // (aicad.corporate/1), the exec-mode cards (swarm waves / eng-firm bids+award+team+comms /
 // advisor / sub-run), and the AI-VC (agent version control) checkpoint timeline + turn
@@ -783,21 +783,6 @@ void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& act
             if (!it.desc.empty()) { copyTxt += " — "; copyTxt += it.desc; }
         }
         chatCopyContext(planRect, "##plan_copy", copyTxt);
-    }
-}
-
-
-
-// One line "Parts: a, b, c" with each name tinted its assembly color.
-void drawPartsLine(const std::vector<PartInfo>& parts) {
-    if (parts.empty()) return;
-    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
-    ImGui::TextUnformatted("Parts:");
-    ImGui::PopStyleColor();
-    for (size_t i = 0; i < parts.size(); ++i) {
-        ImGui::SameLine();
-        std::string lbl = parts[i].name + (i + 1 < parts.size() ? "," : "");
-        ImGui::TextColored(partColor((int)i), "%s", lbl.c_str());
     }
 }
 
@@ -2430,8 +2415,6 @@ bool chatMsgMutatedDoc(const ChatMsg& m) {
         if (a.rowKind == 3) return true;   // tool call row
         if (a.opsCount > 0) return true;
     }
-    for (const auto& s : m.steps)
-        if (s.ok || s.done) return true;
     return false;
 }
 
@@ -2550,7 +2533,6 @@ static bool parkConversationTail(AppState& st, const std::string& convId, int tr
     br.label = label;
     br.msgs.assign(std::make_move_iterator(msgs->begin() + truncateTo),
                    std::make_move_iterator(msgs->end()));
-    freeChatTextures(br.msgs);
     for (auto& m : br.msgs) m.uiCachedH = -1.0f;
     conv->branches.push_back(std::move(br));
     msgs->erase(msgs->begin() + truncateTo, msgs->end());

@@ -1,9 +1,9 @@
 // OCCT linkage smoke test for Wave 2.
 //
 // Proves the auto-provisioned Open CASCADE kernel is found, linked, and runnable:
-// build a box, compute its volume via BRepGProp (the mass-properties path
-// engine/doc/evaluate.py uses), and tessellate it with BRepMesh_IncrementalMesh
-// (the path engine/doc/tessellate.py uses to emit AICM). A 2x3x4 box must have
+// build a box, compute its volume via BRepGProp (the mass-properties path the
+// document evaluator uses), and tessellate it with BRepMesh_IncrementalMesh
+// (the path geom/tessellate.cpp uses to emit AICM). A 2x3x4 box must have
 // volume 24 and at least 12 triangles (6 faces x >=2 tris). Exit 0 on success.
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepGProp.hxx>

@@ -166,7 +166,6 @@ inline void wasmBootReady() {
 #include "ui/web_capabilities.h"
 #endif
 #include "ui/viewport_panel.h"
-#include "ui/widgets/interwebz.h" // InterwebzDemoDraw (View > Interwebz demo)
 #include "ui/widgets/ribbon.h"
 // --- C19: simulation + flow + evaluate UI ---
 #include "core/sim_client.h"
@@ -4242,12 +4241,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   }
   if (st.wantAssembly) {
     // Demo a 3-part fit-test: base plate, lid above it, peg through both (clash
-    // on the peg). Populates the viewport parts panel + a chat card so
-    // --ui-screenshot shows the assembly UI. A real color-coded render is shown
-    // if its cache PNG exists.
+    // on the peg). Populates the viewport parts panel + fit readout and a chat
+    // exchange so --ui-screenshot shows the assembly UI.
     const std::string asmDir = appdataAppDir() + "/cache/screenshot_asm/";
     st.asmStl = asmDir + "screenshot_asm_assembly.stl";
-    std::string sheet = asmDir + "screenshot_asm_grid.png";
     // Per-part STLs (generated once for the demo) so the viewport shows the
     // bodies color-coded; missing files just fall back to the combined mesh.
     st.asmParts = {{"base", asmDir + "screenshot_asm_base.stl",
@@ -4272,19 +4269,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     a.text = "Built a 3-part assembly. The peg passes through both plates - "
              "tell me if that "
              "press-fit is intended, or I'll trim it to clear.";
-    AgentStep s;
-    s.index = 0;
-    s.ok = true;
-    s.done = false;
-    s.isAssembly = true;
-    s.dims = "40.0 x 30.0 x 38.0 mm";
-    s.parts = st.asmParts;
-    s.fit = st.asmFit;
-    s.contactSheet = sheet; // color-coded render (loaded if present)
-    s.notes = "base and lid sit 10mm apart; the peg interferes with both - "
-              "intended as a "
-              "press-fit, or should I add radial clearance?";
-    a.steps.push_back(s);
     st.chat.push_back(a);
   }
   // CHUDWARE_SHOT=chat_context: a sent message carrying context-picker chips (a face + a
@@ -4391,45 +4375,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           "1mm chamfer on the top rim - chamfer(top_edges, length=1)"};
       a.plan.parts.push_back(pp);
     }
-    // A self-corrected build issue first, so the calm amber styling is visible.
-    AgentStep f;
-    f.index = 0;
-    f.ok = false;
-    f.done = false;
-    f.error =
-        "Traceback (most recent call last):\n"
-        "  File \"engine\\kernel.py\", line 361, in _exec_model\n"
-        "    exec(compile(code, \"<model>\", \"exec\"), g)\n"
-        "  File \"<model>\", line 9, in <module>\n"
-        "TypeError: chamfer() got an unexpected keyword argument 'radius'";
-    a.steps.push_back(f);
-    AgentStep s;
-    s.index = 1;
-    s.ok = true;
-    s.done = true;
-    s.dims = "22.0 x 19.1 x 30.0 mm  |  8243 mm^3";
-    s.notes = "The previous part was 22mm tall. I raised total_h to 30 and "
-              "added a 1mm "
-              "chamfer on the top edge ring; the bore and across-flats are "
-              "unchanged.";
-    s.thinking = "Looking at the prior render the proportions were right but "
-                 "short. I only "
-                 "need to change the height variable and add a chamfer on the "
-                 "top face's "
-                 "perimeter edges - everything else should stay parametric.";
-    s.code = "af = 11.0\ntotal_h = 30.0   # was 22\nbore_r = 1.7\n"
-             "hex_r = af / (3 ** 0.5)\nface = RegularPolygon(radius=hex_r, "
-             "side_count=6)\n"
-             "result = extrude(face, amount=total_h)\n"
-             "result -= Cylinder(radius=bore_r, height=total_h)\n"
-             "top = result.edges().filter_by(Plane.XY).group_by(Axis.Z)[-1]\n"
-             "result = chamfer(top, length=1.0)";
-    s.diff = "--- previous\n+++ current\n@@ -1,4 +1,6 @@\n af = 11.0\n-total_h "
-             "= 22.0\n"
-             "+total_h = 30.0   # was 22\n bore_r = 1.7\n+top = result.edges()."
-             "filter_by(Plane.XY).group_by(Axis.Z)[-1]\n+result = chamfer(top, "
-             "length=1.0)";
-    a.steps.push_back(s);
     // Typed transparency rows (M12-M14) + the per-call META trailer, so the shot
     // exercises the chip ellipsize, the finished-thinking auto-collapse, the
     // tool-row timestamp/cache cluster and the bubble meta-row cache suffix.
@@ -4837,10 +4782,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     static std::string s_lastPreviewDocId;
 
     // Drain streamed agent progress into the running assistant message of the
-    // conversation that OWNS each run, so every conversation updates live,
-    // iteration by iteration (texture loads stay on this thread). Runs are
-    // keyed by conversation id: a background conversation's run streams into
-    // its own (parked) transcript and never into whatever is on screen.
+    // conversation that OWNS each run, so every conversation updates live.
+    // Runs are keyed by conversation id: a background conversation's run
+    // streams into its own (parked) transcript and never into whatever is on
+    // screen.
     for (auto &[runConvId, runPtr] : st.runs) {
       if (!runPtr)
         continue;
@@ -5058,67 +5003,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
               st.agentV2Status = e.notes;
             if (active)
               active->liveStatus = e.notes;
-          }
-          continue; // don't process as legacy event
-        }
-        // --- end C22b ---
-        if (e.kind == "status") {
-          if (isViewedDoc)
-            st.livePhase = e.text;
-          if (active)
-            active->liveStatus = e.text;
-        } else if (e.kind == "plan") {
-          if (active)
-            active->plan = e.plan;
-          if (isViewedDoc)
-            st.livePhase = "Build plan ready - writing the CAD code...";
-        } else if (e.kind == "iteration") {
-          if (active) {
-            AgentStep *st2 = nullptr;
-            for (auto &s : active->steps)
-              if (s.index == e.index) {
-                st2 = &s;
-                break;
-              }
-            if (!st2) {
-              active->steps.emplace_back();
-              st2 = &active->steps.back();
-            }
-            st2->index = e.index;
-            st2->ok = e.ok;
-            st2->done = e.done;
-            st2->notes = e.notes;
-            st2->thinking = e.thinking;
-            st2->code = e.code;
-            st2->diff = e.diff;
-            st2->dims = e.dims;
-            st2->error = e.error;
-            st2->contactSheet = e.contactSheet;
-            st2->stdoutText = e.stdoutText;
-            st2->isAssembly = e.isAssembly;
-            st2->parts = e.parts;
-            st2->fit = e.fit;
-            active->liveStatus.clear();
-          }
-          // Live preview: show each successful build in the viewport the
-          // moment it lands, color-coded per part for assemblies (we're on
-          // the GL thread). Viewed doc only — a background run must never
-          // repaint the mesh someone else is looking at.
-          if (isViewedDoc) {
-            if (e.ok && !e.stlPath.empty()) {
-              st.asmStl = e.stlPath;
-              st.asmParts = e.isAssembly ? e.parts : std::vector<PartInfo>{};
-              st.asmFit = e.isAssembly ? e.fit : FitReport{};
-              st.selectedPart = -1;
-              st.showPartMesh(-1);
-              if (!e.dims.empty())
-                st.modelInfo = e.dims;
-              st.livePhase = "Iteration " + std::to_string(e.index + 1) +
-                             " built - evaluating the render...";
-            } else if (!e.ok) {
-              st.livePhase = "Iteration " + std::to_string(e.index + 1) +
-                             " - build issue, revising the code...";
-            }
           }
         }
       }
@@ -8163,9 +8047,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // ----------
     ui::drawToasts(st);
 
-    // Interwebz widget-family demo window (View > Interwebz demo).
-    ui::InterwebzDemoDraw();
-
     // ---------- W1-B: consume this frame's cursor request (item 3) ----------
     // After all panels have had a chance to call st.requestCursor(); suspends
     // ImGui cursor management and sets the GLFW cursor when a non-default
@@ -8466,8 +8347,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
   ui::persistChatHistory(
       st); // save the active conversation transcript before teardown
-  freeChatTextures(st.chat); // release iteration thumbnails while the GL
-                             // context is still live
   ui::freeIcons(); // C14: release atlas textures while GL context is still live
   ui::destroyCursors(); // W1-B: free the GLFW standard cursors
   if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))

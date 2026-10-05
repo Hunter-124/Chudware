@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .durable import durable_replace
 from .model import COMPONENTS, weighted_geometric_mean
 from .pixel_model import ENCODER_PROVENANCE, PixelModelSpec, build_pixel_policy
 from .runtime import report_device, resolve_device
@@ -325,7 +326,7 @@ def fit_pixel_policy(
             resume_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             partial_path = resume_checkpoint_path.with_suffix(".partial")
             torch.save(checkpoint_payload, partial_path)
-            partial_path.replace(resume_checkpoint_path)
+            durable_replace(partial_path, resume_checkpoint_path)
         if early_stopping_patience is not None and stale_epochs >= early_stopping_patience:
             stopped_early = True
             break
@@ -459,7 +460,7 @@ def fit_regularization_ablation(
             if checkpoint_path is not None:
                 partial_path = checkpoint_path.with_suffix(".partial")
                 torch.save(payload, partial_path)
-                partial_path.replace(checkpoint_path)
+                durable_replace(partial_path, checkpoint_path)
         else:
             training = payload["training"]
         payloads.append(payload)

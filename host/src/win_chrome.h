@@ -21,7 +21,7 @@ struct HitLayout {
     int titleBarHeight = 40;  // px height of the custom title bar (the draggable strip)
     int resizeBorder = 6;     // px edge thickness used for resize hit-testing
 
-    // Legacy coarse spans (kept for backward compat — win_chrome uses interactiveRanges now).
+    // Coarse menu/control spans used alongside per-button spans for native hit-testing.
     int menuLeft = 0, menuRight = 0;          // the menu / left-group items
     int controlsLeft = 0, controlsRight = 0;  // the minimize/maximize/close buttons
 

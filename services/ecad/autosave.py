@@ -1,17 +1,16 @@
-"""Crash-recovery autosave for ECAD sessions (the ECAD twin of services.mcp.cad_tools autosave).
+"""Best-effort crash-recovery snapshots for ECAD sessions.
 
-ECAD documents live ONLY in memory — the :mod:`engine.ecad.session` registry has no on-disk
-backing. A heavy MCP tool (ecad_simulate / ecad_make_board / ecad_design / autoroute / fill / dfm)
-can overrun the MCP client's per-call transport timeout; the client then KILLS the server and every
-open schematic/board is gone. C++ part docs survive that because cad_tools autosaves them to
-``%APPDATA%/Chudware/mcp_autosave`` and ``recover_autosaved`` reloads them on restart. This module
-gives ECAD the same protection: every session is persisted to
-``%APPDATA%/Chudware/ecad_autosave/<doc_id>.json`` after every mutation, and
-:func:`recover_ecad_autosaved` reopens them at server startup.
+The live document/session state is native (``core/ecad/session.cpp``), accessed
+through :mod:`services.mcp.ecad_common`. This module persists document JSON to
+``<autosave_dir>/<doc_id>.json``; :func:`autosave_dir` honours
+``CHUDWARE_ECAD_AUTOSAVE_DIR``, otherwise uses ``APPDATA`` or the temporary directory.
+The MCP facade saves snapshots on its mutation paths and before heavy operations,
+and recovery reopens them as fresh native sessions at server startup.
+These snapshots are crash recovery, not a substitute for saving user documents.
 
 Design constraints:
-  * PURE ENGINE — knows only the document JSON + a directory; no MCP/ctypes deps, so it is testable
-    with a standalone script (build a session, mutate, recover).
+  * DOCUMENT SNAPSHOTS — writes use the session's document JSON; recovery lazily
+    imports the native-session facade in :mod:`services.mcp.ecad_common`.
   * BEST-EFFORT — a write/read failure is swallowed; autosave must never break the op that succeeded.
   * DISABLED BY DEFAULT — unit tests don't touch disk. The MCP server calls :func:`enable` at
     startup; tests enable() with an env-overridden directory (``CHUDWARE_ECAD_AUTOSAVE_DIR``).
@@ -99,8 +98,9 @@ def save_doc(doc_id: Optional[str], doc: dict, *, kind: Optional[str] = None,
 
 
 def autosave_session(session) -> None:
-    """Persist an :class:`engine.ecad.session.EcadSession`. Called from the session mutation points
-    (apply_ops / swap_doc / undo / redo / new / open). No-op when disabled."""
+    """Persist a :class:`services.mcp.ecad_common.EcadSession` snapshot.
+    Called by the MCP facade on mutation, pre-heavy-operation and recovery paths.
+    No-op when disabled."""
     if not _STATE["enabled"]:
         return
     try:
@@ -174,8 +174,7 @@ def recover_ecad_autosaved(scope: str = "recent") -> list:
     are recovering from — never the whole history. ``scope="all"``: every autosave on disk. Prunes
     stale autosaves first. Best-effort: a bad/partial file is skipped, never fatal.
     """
-    # Lazy imports: this module is imported BY session.py, so importing it back at module load would
-    # be a cycle. At call time the cycle is long resolved.
+    # Keep the native-session facade import lazy; recovery runs after startup wiring.
     from services.mcp.ecad_common import schema as _schema
     from services.mcp.ecad_common import ecad_session as _sess
 

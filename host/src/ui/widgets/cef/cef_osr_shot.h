@@ -1,5 +1,5 @@
 // cef/cef_osr_shot.h — headless OSR render-to-PNG verification hook.
-// SCAFFOLDING (docs/cef_webview.md phase 2); available only with CHUDWARE_ENABLE_CEF.
+// Available only with CHUDWARE_ENABLE_CEF (design: docs/design/cef_webview.md).
 #pragma once
 
 #include <string>

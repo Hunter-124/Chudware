@@ -1,9 +1,9 @@
 """High-speed / signal-integrity rule pack — formula + heuristic checks over a board.
 
-T-FIN10. Advisory SI verification in the same spirit as :mod:`engine.ecad.drc`: pure functions,
+Advisory SI verification in the same spirit as :mod:`services.ecad.drc`: pure functions,
 never mutate the board, deterministic sorted output, violations in the PCB-contract shape
 (``{"rule", "severity", "locs", "items", "message"}``). Reuses the validated IPC-2141A closed
-forms in :mod:`engine.ecad.impedance` for every delay/impedance number.
+forms in :mod:`services.ecad.impedance` for every delay/impedance number.
 
 HONESTY (stated in tool output too — see :data:`LIMITATIONS`): these are closed-form and
 topological heuristics, NOT a 2-D/3-D field solver and NOT an IBIS/behavioural simulation.
@@ -564,7 +564,7 @@ def set_net_class(board: dict, name: str, params: dict | None = None,
 def run_sicheck(board: dict) -> dict:
     """Run the full SI rule pack over a board document.
 
-    Pure + advisory (mirrors :func:`engine.ecad.drc.run_drc`): never mutates the board, never
+    Pure + advisory (mirrors :func:`services.ecad.drc.run_drc`): never mutates the board, never
     raises on a bad board, deterministic sorted output.
 
     Returns::

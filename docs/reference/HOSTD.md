@@ -1,8 +1,8 @@
 # chudware-hostd — the shared engine host daemon (operator reference)
 
 `chudware-hostd` (sources: `core/hostd/`, transport: `services/ipc/`) is a small
-binary that owns the ONE shared `libchudware` engine instance on a machine. The GUI
-and every MCP server session attach to it as IPC clients instead of each loading
+binary that owns one shared `libchudware` engine instance per instance key. In daemon
+mode the GUI and MCP sessions for that key attach as IPC clients instead of loading
 their own copy of the engine. It exists to kill the orphaned-engine /
 autosave-timer-leak bug class and to make agent edits appear in the GUI viewport
 live (no `.step+` file handoff).
@@ -13,31 +13,49 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
 
 ## Lifecycle
 
-- **Spawn on demand.** No service/systemd/autostart. The first client (GUI or an
-  MCP session — daemon mode is the default) tries to connect; on refuse/absent
-  it spawns the daemon detached and retries (50 ms doubling backoff, ~15 s
-  budget). Simultaneous spawns race on a lock; the loser exits 0 and both
-  clients land on the winner.
+- **Spawn on demand.** Clients try to connect and, when permitted, spawn a detached
+  daemon if absent. Simultaneous spawns race on a lock; the loser exits 0 and clients
+  attach to the winner. The retry layers have different budgets:
+  - MCP `DaemonClient.connect()` (`services/mcp/daemon_bridge.py`): **15 s** default,
+    50 ms doubling backoff capped at 500 ms; override with
+    `CHUDWARE_HOSTD_CONNECT_BUDGET_S`.
+  - GUI `engine_backend.cpp`: an outer retry schedule of **100, 250, 500, 1000,
+    1000 ms** (**2.85 s of retry waits**), then in-process fallback if connection
+    still fails. `CHUDWARE_ENGINE_DAEMON_RETRY_MS` overrides that wait budget
+    (`0` disables outer retries). Each underlying `EngineClient::connectOrSpawn()`
+    has its own **15 s** spawn/connect budget (`Options::spawnBudgetMs`); 2.85 s is
+    not a total GUI startup deadline.
 - **Single instance per key.** Linux: `flock` on `hostd-<key>.lock` held for the
   daemon's lifetime (evaporates on death — no stale-lock heuristics). Windows:
   named mutex `Global\chudware-hostd-<SID>-<key>`.
 - **Startup order**: acquire lock → remove stale socket → bind/listen → THEN
   load libchudware asynchronously. While OCCT loads, the handshake answers
-  `state: loading`, so racing clients never time out.
-- **Idle exit.** The daemon exits after `CHUDWARE_HOSTD_LINGER_SECS` (default
-  **120**) once ALL of: 0 clients, 0 agent children, 0 in-flight RPCs, no active
-  mission. Dirty docs do not pin it forever — it writes autosave recovery
-  snapshots, logs, and exits.
+  `state: loading`; an engine call can still fail or time out waiting for readiness.
+- **Idle exit is work-based.** `Server::pinningClients()` counts every GUI client,
+  and non-GUI clients only while they have an attached doc, an in-flight call or
+  recent RPC activity. A parked socket alone does not pin the daemon. With no
+  pinning client, in-flight RPC or agent child, it exits after
+  `CHUDWARE_HOSTD_LINGER_SECS` (default **120 s**). After the last GUI detaches,
+  `CHUDWARE_HOSTD_GUI_EXIT_GRACE_S` (default **10 s**) replaces the linger.
+- **Bounded explicit drains.** `daemon_drain` / `--stop` use
+  `CHUDWARE_HOSTD_DRAIN_GRACE_S` (default **20 s**); tray Quit uses **5 s**.
+  At the deadline stragglers are disconnected. Stale-binary self-drain is soft:
+  it refuses new connections but lets active sessions finish.
+- **Doc GC is separate.** Unattached docs have a **90 s** base grace; agent/MCP
+  origins have a **1800 s** floor. That grace keeps finished mission parts openable
+  while the GUI exists, but does not pin the daemon through shutdown.
 - **CLI**:
   - `chudware-hostd --foreground` — run serving in the current terminal (dev).
   - `chudware-hostd --status` — JSON status of the running instance (`state`,
     `pid`, `children`) on **stdout**, preceded by the product version banner on
     **stderr**; exits 1 with "no running instance" if none. The two streams are
     split deliberately so `--status | jq` keeps working.
-  - `chudware-hostd --stop` — drain (autosave dirty docs) and exit. **Refused
-    while agent children / a mission are active.**
-  - `chudware-hostd --stop --force` — stop children (TERM → grace → KILL) first,
-    then drain and exit. This is what installers/uninstallers call.
+  - `chudware-hostd --stop` — request bounded drain and exit. **Refused while
+    agent children / a mission are active.** Clean exit discards session autosaves;
+    it is not a save-to-project command.
+  - `chudware-hostd --stop --force` — stop children (TERM → grace → KILL on POSIX)
+    first, then drain and exit. Never use this on an instance serving someone
+    else's GUI or agent work.
   - `chudware-hostd --version` — prints the git-describe build id.
     **Exactly one line, and the build id must be the last whitespace-separated
     token.** Two independent staleness checks parse this and disagree about the
@@ -50,13 +68,21 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
 
 | Variable | Meaning |
 |---|---|
-| `CHUDWARE_ENGINE_DAEMON` | Unset/`1` = **default**: clients route engine calls through the daemon. `0` = explicit opt-out to the legacy in-process load (kept at least one release; removal is a named N+1 task). |
-| `CHUDWARE_HOSTD_BIN` | Path to the daemon binary a client should spawn. Unset → resolution order: dist → `core/build-occt-linux/bin` → `core/build-linux/bin`. Installed/AppImage deployments pin this. |
+| `CHUDWARE_ENGINE_DAEMON` | Unset/`1` = default daemon routing; `0` = explicit in-process opt-out. Desktop GUI startup can also fall back if daemon connection fails. |
+| `CHUDWARE_HOSTD_BIN` | Explicit daemon binary to spawn. Developer MCP discovery tries `CHUDWARE_DIST`, then Linux full/slim build trees (Windows: `core/build/bin`); packaged C++ clients resolve the manifest-owned binary. Pin this explicitly in portable examples. |
 | `CHUDWARE_INSTANCE_KEY` | 12-hex instance key override. Unset → hash of the realpath of the resolved hostd binary (Windows: lowercased path). Same key = same daemon; different keys coexist. |
 | `CHUDWARE_HOSTD_SOCKET` | Explicit socket path override (Linux). |
 | `CHUDWARE_HOSTD_PIPE` | Explicit pipe name override (Windows; `CHUDWARE_HOSTD_SOCKET` also accepted). |
 | `CHUDWARE_HOSTD_LINGER_SECS` | Idle-exit linger, default 120. Tests/smokes use small values (5). |
 | `CHUDWARE_HOSTD_STALECHECK_S` | Stale-binary self-drain check interval, default 60. Tests use 1. |
+| `CHUDWARE_HOSTD_GUI_EXIT_GRACE_S` | Idle grace after the last GUI detaches, default 10 s. |
+| `CHUDWARE_HOSTD_DRAIN_GRACE_S` | Explicit drain deadline, default 20 s, minimum 1 s. |
+| `CHUDWARE_HOSTD_CONNECT_BUDGET_S` | MCP bridge connect/spawn budget, default 15 s. |
+| `CHUDWARE_ENGINE_DAEMON_RETRY_MS` | GUI outer retry-wait budget, default 2850 ms; separate from the underlying IPC spawn budget. |
+| `CHUDWARE_DOC_GC_GRACE_S` | Base unattached-document grace, default 90 s. |
+| `CHUDWARE_DOC_GC_AGENT_GRACE_S` | Agent/MCP-origin grace floor, default 1800 s. |
+| `CHUDWARE_DOC_GC` | `0` disables doc GC, not daemon idle-exit. |
+| `CHUDWARE_AUTOSAVE_INTERVAL_S` | Dirty-document snapshot interval, default 60 s; `0` disables periodic snapshots. |
 | `CHUDWARE_LIBCHUDWARE` | Engine .so/.dll the daemon loads (same variable the in-process path uses). |
 
 ## Paths (per platform)
@@ -103,31 +129,57 @@ The key is what keeps independent installs from cross-talking:
 
 ## Recovery semantics (id_remap)
 
-On start the daemon recovers the most recent prior session's autosaves. Because
-recovered docs get fresh ids, the `hello` handshake returns an `id_remap`
-(old→new); reconnecting clients rebind their references (MCP `_CUR`, GUI tabs)
-transparently. Loss bound after a hard kill (SIGKILL/crash) = one autosave
-interval; undo/redo stacks are not persisted. Clean shutdown (idle-exit,
-`--stop`, SIGTERM) always saves dirty docs first.
+Recovery is **crash-only**, not automatic document reopening. A hard-killed
+daemon leaves a session autosave directory; on restart its eligible snapshots
+are registered in the orphan recovery tier. They wait for explicit
+`recovery_list` → `recovery_open`. Only that open mints a fresh doc id and records
+the old→new mapping returned by `hello.id_remap`. Undo/redo stacks are not persisted;
+recoverable geometry is limited to the last successful snapshot, not a guaranteed
+one-interval loss bound if saving was disabled or failed.
+
+Clean shutdown (idle-exit, drain, SIGTERM) removes the current session's autosaves.
+Explicit discard purges that doc's artifacts. While the daemon is serving, GC retires
+eligible abandoned unsaved docs to the orphan tier before closing them; already-saved
+clean docs, empty/internal docs and pristine reproducible imports do not create recovery
+rows. These behaviours live in `core/hostd/autosave.*` and `doc_registry.*`.
+
+Durable mission delivery is a different boundary:
+`services/mcp/cad_common.py::save_touched_docs()` saves eligible agent-authored docs to
+`CHUDWARE_PROJECT_SAVE_DIR` at turn termination
+(`services/agent/mission_dispatch.py::run_linear_role_turn`,
+`services/agent/worker_rpc.py::_agent_admin_turn`). It **saves, never closes**, skips user-origin documents,
+empty/discarded docs and pristine reproducible imports, and reports persistence errors.
+Do not substitute daemon shutdown or crash recovery for that save.
+
+For an isolated Linux development run, from the repository root:
+
+```bash
+export CHUDWARE_HOSTD_BIN="$PWD/core/build-occt-linux/bin/chudware-hostd"
+export CHUDWARE_LIBCHUDWARE="$PWD/core/build-occt-linux/bin/libchudware.so"
+export CHUDWARE_INSTANCE_KEY="reference-$$"
+"$CHUDWARE_HOSTD_BIN" --foreground
+```
+
+Use the same exported key and paths for that run's clients. This starts a separate
+instance; it does not attach to, stop or replace an already-open user session.
 
 ## Mode matrix (`CHUDWARE_ENGINE_DAEMON` × client)
 
 | | GUI | MCP |
 |---|---|---|
-| unset/`=1` (**default**) | Engine calls go through `DaemonConn` → daemon; viewport gets live `doc.changed` events | `core_bridge` routes via `daemon_bridge.py`; docs shared with GUI + other sessions; NO `.step+` handoff files are written |
-| `=0` (explicit legacy opt-out) | In-process dlopen (legacy) | In-process ctypes load (legacy); doc sharing with the GUI is OFF; `.step+` handoff files remain the preview path |
+| unset/`=1` (default) | Attempts `DaemonConn` → daemon; viewport receives live `doc.changed` events. Startup failure can select in-process fallback. | `core_bridge` routes through `daemon_bridge.py`; docs are shared with daemon-mode clients. |
+| `=0` (explicit opt-out) | In-process dlopen | In-process ctypes load; no shared live document registry with the GUI. |
 
 Mixing modes on the same docs is guarded: a legacy in-process load warns loudly
 when a live daemon socket for the same install exists ("mode divergence" —
-two engines would be two sources of truth). The N+1 release upgrades the
-warning to a refusal, alongside deleting the legacy path.
+two engines would be two sources of truth). Do not mix modes when shared live
+documents are required.
 
 ## Version staleness (drain-replace)
 
-The daemon and the engine embed the same configure-time git-describe build id
-(`chudware-hostd --version`, `chudware_build_id()`; the `hello` handshake carries both
-as `git_rev` and `engine_build_id`). Two mechanisms keep a running daemon from
-outliving its binaries:
+The daemon and engine embed a build-time git-describe id
+(`chudware-hostd --version`, `chudware_build_id()`; `hello` carries `git_rev` and
+`engine_build_id`). Two mechanisms detect stale binaries:
 
 - **Client-side drain-replace**: on connect, clients compare `hello.git_rev`
   (the RUNNING daemon) against the build id of the hostd binary ON DISK
@@ -145,25 +197,26 @@ outliving its binaries:
 
 - **AppImage** (`packaging/linux/build_appimage.sh`): stages
   `usr/bin/chudware-hostd`, the full-FEA `usr/lib/libchudware.so`, optional lib3mf,
-  and the Polyhedral-FEA advisor package from `core/build-occt-linux`.
-  The full OCCT 7.9 closure (34 `libTK*.so.7.9` + TBB + the engine's non-system
-  dep tail) is bundled into `usr/lib` via an ldd walk filtered by the AppImage
-  excludelist, so the target machine needs **no** OCCT install (verified: the
-  engine `ctypes.CDLL`-loads in a clean `fedora:rawhide` container with no OCCT).
-  Caveat: glibc/libstdc++ stay host-provided (excludelist), so an AppImage built
-  on glibc 2.43 requires host glibc ≥ 2.43 — build on an older base for wider
-  distro coverage. freetype/fontconfig/libX11 are likewise host-provided (they
-  interoperate with the host's fonts/X server; present on any GUI machine).
+  and the Polyhedral-FEA advisor package beside the supplied engine,
+  plus its non-system dependency closure via an `ldd` walk filtered by the
+  AppImage excludelist. The build script probes the staged engine's `dlopen`;
+  this is build-time validation, not proof that every target distro runs it.
+  Excluded system libraries (including glibc/libstdc++, graphics and font libraries)
+  remain host-provided; compatibility depends on the build base and target system.
 - **Windows** (`services/installer/` + `packaging/windows/chudware.iss`):
-  `build_release.py` stages `chudware-hostd.exe` (+ `.pdb`) into the payload;
-  `install.ps1`/`uninstall.ps1` first run `<InstallDir>\chudware-hostd.exe --stop`
-  and then a taskkill scoped to processes whose image path is under the install
-  dir (a dev-tree daemon is never touched); MCP registration pins
-  `CHUDWARE_HOSTD_BIN` at the installed exe. Inno has `CloseApplications=yes` as a
-  Restart-Manager backstop. Behavioral verification lives on the
-  `docs/reference/PACKAGING_WINDOWS.md` manual checklist.
-- **Upgrades**: installers stop the daemon before replacing binaries; deploys
-  must always be temp-file + RENAME, never `cp` over a live .so (SIGBUS).
+  `build_release.py` requires `chudware-hostd.exe` and rejects `.pdb` in the customer
+  payload. Inno installs the verified payload and invokes the hash-checked native
+  uninstall helper, not `install.ps1`/`uninstall.ps1` provisioning. Its
+  `CloseApplications=yes` enables Restart Manager. Separately, the developer
+  `install.ps1` drains known install-directory daemons with `--stop --force`,
+  then uses image-path-scoped `taskkill`; MCP registration pins `CHUDWARE_HOSTD_BIN`.
+  Windows daemon execution remains unverified by the daemon-disabled CI GUI smoke;
+  use the manual checklist in `PACKAGING_WINDOWS.md`.
+- **Upgrades**: the developer installer has an explicit daemon stop path; the packaged
+  installer uses Restart Manager. The Windows checklist must establish the runtime
+  behaviour before claiming safe replacement of a running daemon.
+  POSIX deployment keeps copy-to-temp plus atomic rename, never overwriting a live
+  mapped engine library.
 - **Dev tree (Linux)**: `./build.sh stage` deploys `libchudware.so`, optional lib3mf/
   advisor artifacts, and `chudware-hostd` from `core/build-occt-linux/bin` into
   `services/dist/Chudware/`, the directory that `core_bridge` and
@@ -172,7 +225,7 @@ outliving its binaries:
   the fnv of the hostd binary's realpath, so a dist libchudware.so with only a
   build-dir hostd silently splits clients across two engines. On Windows,
   `build.bat` stages `chudware-hostd.exe` into `dist\Chudware` alongside the core
-  DLLs (warn+skip when not built, like `build_release.py`).
+  DLLs (warn+skip when not built); production `build_release.py` instead requires it.
 
 ## Troubleshooting
 
@@ -194,28 +247,29 @@ outliving its binaries:
   GUI (never jobbed) first so IT owns the daemon.
 - **Daemon exits "too soon" during tests** — you inherited a small
   `CHUDWARE_HOSTD_LINGER_SECS`; unset it (default 120 s).
-- **Engine load FAILED in hostd.log** — the daemon resolves the engine like the
-  GUI does; set `CHUDWARE_LIBCHUDWARE` to a full `core/build-occt-linux` build (the
-  slim build has no FEA — see memory of the MCP "FEA solver unavailable" trap).
+- **Engine load FAILED in hostd.log** — inspect the resolved engine path and build
+  capabilities. For a Linux development checkout, set
+  `CHUDWARE_LIBCHUDWARE="$PWD/core/build-occt-linux/bin/libchudware.so"` for the
+  OCCT/Polyhedral-FEA engine rather than an OCCT-free test tree.
 
 ## The `polymesh` CLI beside the daemon
 
 Every OCCT core build with `CHUDWARE_WITH_POLYMESH=ON` also builds and stages the
 Polyhedral-FEA driver `polymesh` (`check|mesh|solve|diag|render`, plus
 `--fix-box`/`--load-box`) into the SAME `bin/` directory as `chudware-hostd` and
-`libchudware.so` — `core/build-occt-linux/bin/polymesh` on this box. That is deliberate:
-anything resolving the daemon binary can resolve the CLI beside it, and the ONNX Runtime
-plus the advisor model package are already staged in that directory, so the CLI's learned
-mesh advisor works without extra setup. The CLI is the reproducible mesh/solve path for an
-FEA evidence packet: the exact mesher and solver the engine links, driven from a shell.
+`libchudware.so` — for example `core/build-occt-linux/bin/polymesh` in a Linux
+development checkout. Build/runtime staging places the linked ONNX Runtime and
+advisor package beside the engine. The CLI is the reproducible mesh/solve path for an
+FEA evidence packet: the same mesher and solver the engine links, driven from a shell.
 `./build.sh core` rebuilds it alongside the engine (it is a dependency of the `chudware`
 target); slim non-OCCT trees declare no such target and stage nothing. `polymesh-gui`,
 `apps/bench`, `apps/testlab` and Polyhedral-FEA's own tests are never built.
 
-By default the dependency is the pinned public fetch into `core/third_party/polymesh/src`.
-To build Chudware against a live Polyhedral-FEA working tree instead, export
-`CHUDWARE_POLYMESH_ROOT=<checkout>` (source of truth for development:
-`/home/hunter/Repositories/Polyhedral-FEA-private`). `build.sh` forwards it as
+By default the dependency is the pinned public fetch configured by
+`core/cmake/ProvisionPolymesh.cmake`. To use a local Polyhedral-FEA working tree,
+export `CHUDWARE_POLYMESH_ROOT="$HOME/src/Polyhedral-FEA"`.
+This is a development override, not evidence that the public release pin works.
+`build.sh` forwards it as
 `-DPOLYMESH_SOURCE_DIR`, re-configures each consumed core tree so the cached value flips,
 and `ProvisionPolymesh.cmake` neither fetches nor patches nor pin-checks that directory —
 it records `git -C <dir> rev-parse HEAD` as `POLYMESH_COMMIT` and prints
@@ -226,13 +280,28 @@ mesh result: it is the only statement of which mesher source the engine actually
 
 ## Related
 
-- Plan: `~/.claude/plans/plan-out-massive-changes-proud-snowflake.md` (Design A/B)
+- Implementation: `core/hostd/{main,server,doc_registry,autosave,worker_bridge}.*`.
 - Smoke: `scripts/hostd_smoke.py` (gate stage `hostd smoke`), gate stage
   `appimage smoke` (`CHUDWARE_GATE_APPIMAGE=1`). Its leftover-daemon check and cleanup
   use `scripts/hostd_scope.py`, which matches only this user's `chudware-hostd` whose
   environment carries exactly the run's `CHUDWARE_INSTANCE_KEY` and which started after
   the stage's mark, and signals it through a re-validated pidfd — never a name/path
   `pgrep`/`pkill`, so another run's or the user's daemon is never touched.
-- Tests: `services/mcp/test_daemon_bridge.py`, `test_hostd_registry.py`,
-  `test_hostd_supervision.py`, ctest `test_hostd`
-- Windows validation: `docs/reference/PACKAGING_WINDOWS.md`
+- Runtime regression suites: `services/mcp/test_daemon_bridge.py`,
+  `services/mcp/test_hostd_registry.py`, `services/mcp/test_hostd_supervision.py`,
+  `services/mcp/test_hostd_worker_bridge.py`. They use private scratch instance keys;
+  running them must not stop a user-owned daemon. Registry coverage includes
+  `test_parked_client_does_not_pin_the_daemon`,
+  `test_attached_client_still_pins_the_daemon`,
+  `test_drain_exits_on_its_deadline_despite_a_stuck_client`,
+  `test_clean_shutdown_discards_docs` and `test_crash_recovery_prompts_via_orphan_tier`.
+  Worker coverage includes fail-fast calls behind an active turn, no turn replay after
+  worker loss and bounded SIGTERM teardown. These are test references, not a current
+  pass report.
+- Durable save scope tests: `services/mcp/test_terminal_save_sweep.py`;
+  standalone server shutdown hooks: `services/mcp/test_server_shutdown_save.py`.
+  These use fake save/engine boundaries; a real stdio mission followed by disconnect
+  still needs an isolated runtime smoke for end-to-end durable-file proof.
+- Native watchdog policy: CTest **`engine_watchdog`**
+  (`core/hostd/test_engine_watchdog.cpp`), not a `test_hostd` CTest target.
+- Windows validation: `PACKAGING_WINDOWS.md`.

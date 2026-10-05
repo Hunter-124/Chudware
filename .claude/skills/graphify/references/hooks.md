@@ -1,33 +1,17 @@
-# graphify reference: commit hook and native CLAUDE.md integration
+# graphify reference: hooks and Claude integration
 
-Load this when the user asked to install the post-commit hook or wire graphify into a project's CLAUDE.md.
+This repo already has curated graph guidance and PreToolUse hooks. A graph query, update or compatibility review must not install, uninstall or rewrite them, `.claude/settings.json`, or either `CLAUDE.md`.
 
-## For git commit hook
+## Post-commit hook
 
-Install a post-commit hook that auto-rebuilds the graph after every commit. No background process needed - triggers once per commit, works with any editor.
+The installed CLI provides `graphify hook install`, `graphify hook uninstall` and `graphify hook status`. Only `status` is inspection. Install/uninstall mutate `.git/hooks`; leave them to an explicitly authorized integration task, never run them to fix a skill-version warning.
 
-```bash
-graphify hook install    # install
-graphify hook uninstall  # remove
-graphify hook status     # check
-```
+The hook schedules local AST rebuilding for code changes after commits; it is not a semantic LLM pass. The installer preserves an existing hook by appending its managed block. Document/media semantic changes still need the `/graphify <path> --update` host-agent flow in `references/update.md`. No new commit, staging, branch or dirty-tree procedure is implied by this skill.
 
-After every `git commit`, the hook detects which code files changed (via `git diff HEAD~1`), re-runs AST extraction on those files, and rebuilds `graph.json` and `GRAPH_REPORT.md`. Doc/image changes are ignored by the hook - run `/graphify --update` manually for those.
+## Claude integration and skill installation
 
-If a post-commit hook already exists, graphify appends to it rather than replacing it.
+`graphify claude install` writes a graphify section in `CLAUDE.md` and installs PreToolUse hooks in `.claude/settings.json`; `graphify claude uninstall` removes that managed integration. `graphify install` can replace SKILL.md, references and the version stamp with package assets. Do not use these commands here: they would discard the locally maintained safety rules or curated integration.
 
----
+`graphify hook-guard` is the installed shell-independent Claude/Codebuddy guard: it consumes tool-call JSON on stdin and emits graph-orientation guidance. Its strict mode can deny an indexed source read once per session; it is not an ordinary graph query. `graphify hook-check` is a no-op compatibility hook for Codex Desktop, not an index freshness check. Neither command is a reason to replace this repo's existing hooks.
 
-## For native CLAUDE.md integration
-
-Run once per project to make graphify always-on in Claude Code sessions:
-
-```bash
-graphify claude install
-```
-
-This writes a `## graphify` section to the local `CLAUDE.md` that instructs Claude to check the graph before answering codebase questions and rebuild it after code changes. No manual `/graphify` needed in future sessions.
-
-```bash
-graphify claude uninstall  # remove the section
-```
+After a graphify package upgrade, review the CLI source and bundled skill/reference assets, update these local instructions and their compatibility stamp, and leave installation collateral unchanged.

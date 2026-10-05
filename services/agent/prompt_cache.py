@@ -1,41 +1,27 @@
-"""Pre-composed system prompt: one ordering definition, cached on disk.
+"""Precomposed system prompts for both agent lanes, and the fresh-chat baseline.
 
-Why this module exists
-----------------------
-The system prompt a fresh ``general_agent`` turn receives is expensive to build
-(``tool_schemas.render_tools_block`` renders every allowed tool's schema) and it
-is almost entirely **request-independent**: the role card, the capability
-assembly, the session-preference block, the harness/role-catalog blocks, the
-project-folder listing, the autolearn standing guidance, the tools slot and the
-skills catalog are all functions of *settings and files on disk*, not of what
-the user typed. Only three slots depend on the request — project-memory recall,
-skill activation, and Rules injection — and those stay live in ``run_turn``.
+Two lanes, two different prompts — never mirrored into each other:
 
-Two things that used to be broken and are the reason for this module:
+* **Online (Chudcode, every normal chat).** ``worker_rpc._agent_admin_turn``
+  composes the role prompt with ``mission_dispatch.role_prompt`` and hands it to
+  Chudcode as ``append_system_prompt``; the CAD tools travel separately as
+  native host-tool definitions from ``chudcode_tools.build_host_tools``.
+  :func:`online_prompt` runs those same two calls for the main-chat defaults.
+  :func:`baseline` (the GUI context meter) and ``prompt_preview`` report it, and
+  :func:`warm` composes it ahead of the first message, which also pays the MCP
+  registry import the first turn would otherwise wait on. Chudcode adds its own
+  system prompt and builtin tools, and may defer host-tool schemas, so every
+  online figure here is an ESTIMATE of what CAD contributes, never a claim
+  about the exact upstream token count.
 
-1. **The first request paid for composition.** A fresh chat's first provider
-   call was preceded by a full render of the tools slot. That work is now done
-   ahead of time (``warm()``) and reused.
-
-2. **The GUI could not honestly show what a fresh chat costs.** The context
-   meter read an em-dash over the window until a provider call measured
-   something, and the only other assembled-prompt surface,
-   ``prompt_preview.preview_main_chat_system``, is a *mirror* of the live path
-   that injects a SAMPLE ledger/stage a real turn never sends — so its number
-   was never the real one. ``baseline()`` reports the tokens of the bytes a real
-   turn actually sends, broken down per segment, so the meter's tooltip can say
-   *what* is filling the context rather than only how much.
-
-Single source of truth
-----------------------
-``static_segments()`` is the ONLY place the static block order is written down.
-``agent_turn.run_turn`` iterates it (splicing the request-dependent project
-memory block at :data:`MEMORY_SLOT`) instead of appending those blocks itself,
-and ``mission_dispatch.run_linear_role_turn`` takes ``role_system`` /
-``allowed`` / ``tools_text`` from here instead of composing them again.
-``test_prompt_cache.py`` pins byte-equality between this composition and the
-system prompt a live turn actually hands its provider — a mirror that drifts is
-the defect class this module removes, so it is asserted rather than hoped for.
+* **Offline (explicit local-model fallback).** ``agent_turn.run_turn`` builds
+  the fenced-json protocol prompt from :func:`static_segments` — the ONLY place
+  that block order is written down (role card, harness protocol, harness/role
+  catalog, project files, standing guidance, tools slot, skills catalog) — and
+  ``mission_dispatch.linear_role_prompt`` reuses the tools slot of the cached
+  :class:`StaticPrompt` (:func:`get`) when it renders the same bytes.
+  ``test_prompt_cache.py`` pins byte-equality between this composition and the
+  system prompt an offline turn hands its provider.
 
 Invalidation
 ------------
@@ -83,6 +69,7 @@ _REVALIDATE_AFTER_S = 2.0
 
 _lock = threading.RLock()
 _mem: dict[str, "StaticPrompt"] = {}
+_online_mem: dict[str, "OnlinePrompt"] = {}
 _fp_cache: tuple[float, str] | None = None
 
 
@@ -581,6 +568,157 @@ def get(
     return sp
 
 
+# --------------------------------------------------------------------------- online lane
+
+#: Run id of the throwaway ``MissionDispatch`` the online composition binds so
+#: the mission-scoped meta tools (``ask_user``, ``delegate`` …) resolve exactly
+#: as in a live turn. Nothing is dispatched through it.
+_ONLINE_COMPOSE_RUN_ID = "prompt-baseline"
+
+
+@dataclass
+class OnlinePrompt:
+    """What CAD hands Chudcode for a fresh main-chat turn, before the request.
+
+    ``system`` is the ``append_system_prompt`` text; ``host_tools`` are the
+    host-tool definitions (``name``/``description``/``parameters``) exactly as
+    ``chudcode_tools.build_host_tools`` produces them for ``set_custom_tools``.
+    """
+
+    role: str
+    system: str
+    allowed: list[str]
+    host_tools: list[dict[str, Any]]
+    fingerprint: str
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def host_tools_text(self) -> str:
+        return json.dumps(self.host_tools, ensure_ascii=False, separators=(",", ":"))
+
+    @property
+    def system_tokens(self) -> int:
+        return _count_tokens(self.system)
+
+    @property
+    def host_tool_tokens(self) -> int:
+        return _count_tokens(self.host_tools_text)
+
+    @property
+    def total_tokens(self) -> int:
+        return self.system_tokens + self.host_tool_tokens
+
+    def breakdown(self) -> list[dict[str, Any]]:
+        """Per-block token estimate, largest first, for the meter tooltip."""
+        rows = [
+            {"label": "system", "title": "CAD system prompt",
+             "tokens": self.system_tokens, "chars": len(self.system)},
+            {"label": "host_tools",
+             "title": f"CAD host-tool definitions ({len(self.host_tools)})",
+             "tokens": self.host_tool_tokens, "chars": len(self.host_tools_text)},
+        ]
+        rows = [r for r in rows if r["chars"]]
+        rows.sort(key=lambda r: -int(r["tokens"]))
+        return rows
+
+
+def compose_online(*, role: str = "general_agent") -> OnlinePrompt:
+    """Compose the online main-chat prompt and host tools for Settings defaults.
+
+    The same calls ``worker_rpc._agent_admin_turn`` makes — env tier/capability,
+    ``mission_dispatch.role_prompt`` (Settings system-prompt override, mode/scope
+    tool policy, preference guidance, MORE TOOLS menu, skills catalog) and
+    ``chudcode_tools.build_host_tools`` — with the preferences an empty request
+    resolves to under the saved Settings. Per-turn inputs (picked mode, open
+    document, enabled categories) are not known here. Raises on failure.
+    """
+    from services.agent.chudcode_tools import build_host_tools  # noqa: PLC0415
+    from services.agent.mission_dispatch import (  # noqa: PLC0415
+        MissionDispatch,
+        role_prompt,
+    )
+    from services.agent.preferences import resolve_turn_preferences  # noqa: PLC0415
+    from services.agent.roles import load_role  # noqa: PLC0415
+
+    warn: list[str] = []
+    want = fingerprint()
+    tier = None
+    capability = None
+    try:
+        from services.agent.tiers import detect_tier_from_env  # noqa: PLC0415
+
+        tier = detect_tier_from_env()
+        if tier:
+            from services.agent.capability import resolve_capability  # noqa: PLC0415
+
+            capability = resolve_capability(tier)
+    except Exception as exc:  # noqa: BLE001 — the live turn degrades the same way
+        warn.append(f"capability: {type(exc).__name__}: {exc}")
+
+    card = load_role(role)
+    preferences = resolve_turn_preferences("")
+    system, allowed = role_prompt(
+        role, card=card, capability=capability, preferences=preferences
+    )
+    options = {
+        "mode": preferences.mode,
+        "advisor": preferences.advisor,
+        "max_subagent_depth": preferences.delegation_depth,
+    }
+    mission_dispatch = MissionDispatch(
+        run_id=_ONLINE_COMPOSE_RUN_ID,
+        provider=None,
+        on_event=None,
+        capability=capability,
+        tier=tier,
+        options=options,
+    )
+    bindings = build_host_tools({
+        "role_card": card,
+        "allowed_tools": allowed,
+        "mission_dispatch": mission_dispatch,
+        "capability": capability,
+        "tier": tier,
+        "actor": role,
+        "run_id": _ONLINE_COMPOSE_RUN_ID,
+        "options": options,
+        "mode": options["mode"],
+        "turn_preferences": preferences,
+        "categories": [],
+        "enabled_categories": [],
+    })
+    host_tools = []
+    for binding in bindings:
+        definition = binding.as_dict()
+        host_tools.append({
+            "name": definition["name"],
+            "description": definition["description"],
+            "parameters": definition["input_schema"],
+        })
+    return OnlinePrompt(
+        role=role,
+        system=system,
+        allowed=list(allowed),
+        host_tools=host_tools,
+        fingerprint=want,
+        warnings=warn,
+    )
+
+
+def online_prompt(*, role: str = "general_agent", refresh: bool = False) -> OnlinePrompt:
+    """The online composition, reused in-process while the fingerprint holds."""
+    want = fingerprint()
+    if not refresh:
+        with _lock:
+            hit = _online_mem.get(role)
+        if hit is not None and hit.fingerprint == want:
+            return hit
+    op = compose_online(role=role)
+    with _lock:
+        _online_mem[role] = op
+    return op
+
+
 def invalidate() -> None:
     """Drop every cached entry and the fingerprint throttle.
 
@@ -592,6 +730,7 @@ def invalidate() -> None:
     global _fp_cache
     with _lock:
         _mem.clear()
+        _online_mem.clear()
         _fp_cache = None
     try:
         for p in cache_dir().glob("*.json"):
@@ -600,19 +739,21 @@ def invalidate() -> None:
         pass
 
 
-def warm(*, project_root: str | None = None, background: bool = True) -> Any:
-    """Compose ahead of the user's first message.
+def warm(*, background: bool = True) -> Any:
+    """Compose the online main-chat prompt ahead of the user's first message.
 
-    The point of the whole module: ``render_tools_block`` is the expensive step
-    and it used to run inside the first turn, so the first provider call waited
-    on it. Returns the thread when *background*, else the ``StaticPrompt``.
+    Composition imports the MCP tool registry (~1.9 s in a cold process); doing
+    it here keeps that cost off the first turn and makes :func:`baseline`
+    answer at once. The offline lane's tools slot is NOT rendered here: it
+    composes on the first explicit-offline turn. Returns the thread when
+    *background*, else the :class:`OnlinePrompt`.
     """
     if not background:
-        return get(project_root=project_root)
+        return online_prompt()
 
     def _run() -> None:
         try:
-            get(project_root=project_root)
+            online_prompt()
         except Exception:  # noqa: BLE001 — warming never breaks the worker
             pass
 
@@ -621,29 +762,33 @@ def warm(*, project_root: str | None = None, background: bool = True) -> Any:
     return t
 
 
-def baseline(*, project_root: str | None = None,
-             role: str = "general_agent") -> dict[str, Any]:
-    """What a fresh chat costs, for the GUI context meter and its tooltip.
+def baseline(*, role: str = "general_agent") -> dict[str, Any]:
+    """Estimated CAD contribution to a fresh online chat, for the context meter.
 
-    ``tokens`` is the estimated input cost of the system prompt a real turn
-    sends — the bytes from :meth:`StaticPrompt.render`, not a mirror of them.
-    ``segments`` is the per-block breakdown the tooltip renders so the user can
-    see *what* is filling the window (tool schemas dominate) rather than only
-    that something is.
+    ``tokens`` estimates the online system prompt plus the host-tool
+    definitions CAD hands Chudcode (``estimate: true``, ~4 chars/token).
+    Chudcode's own system prompt and builtin tools come on top, and it may
+    defer host-tool schemas, so this is not the provider's exact prompt count.
+    ``segments`` is the per-block breakdown the tooltip renders.
     """
     try:
-        sp = get(role=role, project_root=project_root)
+        op = online_prompt(role=role)
         return {
             "ok": True,
-            "tokens": sp.total_tokens,
-            "chars": len(sp.render()),
-            "role": sp.role,
-            "fingerprint": sp.fingerprint,
-            "project_root": sp.project_root,
-            "allowed_tool_count": len(sp.allowed),
-            "segments": sp.breakdown(),
-            "warnings": sp.warnings,
+            "lane": "online",
+            "estimate": True,
+            "tokens": op.total_tokens,
+            "chars": len(op.system) + len(op.host_tools_text),
+            "role": op.role,
+            "fingerprint": op.fingerprint,
+            "allowed_tool_count": len(op.host_tools),
+            "segments": op.breakdown(),
+            "warnings": op.warnings,
+            "note": ("Estimate of what CAD adds to a fresh online chat: its system "
+                     "prompt and host-tool definitions. Chudcode's own system "
+                     "prompt and builtin tools are not included."),
         }
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "tokens": 0, "chars": 0, "segments": [],
+        return {"ok": False, "lane": "online", "estimate": True, "tokens": 0,
+                "chars": 0, "segments": [],
                 "error": f"{type(exc).__name__}: {exc}"}

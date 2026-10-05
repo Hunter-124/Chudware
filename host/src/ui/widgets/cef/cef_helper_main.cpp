@@ -1,6 +1,6 @@
 // cef/cef_helper_main.cpp — the CEF subprocess helper (chudware_cef_helper).
 //
-// SCAFFOLDING (docs/cef_webview.md phase 2); built only with CHUDWARE_ENABLE_CEF.
+// Built only with CHUDWARE_ENABLE_CEF (design: docs/design/cef_webview.md).
 //
 // CEF's render/GPU/utility processes re-exec THIS binary. Its whole job is to run
 // CefExecuteProcess and return the code — it must never start the GUI. Keeping it

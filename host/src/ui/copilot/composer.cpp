@@ -263,9 +263,6 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
     return submit;
 }
 
-// Forward decls — drawCodeBox/drawDiffBox sit above the chat-copy helper block but need
-// the shared "Copied" toast + context menu (every copy path must light the same indicator).
-
 namespace ui {
 
 // ---- O1: model picker → RPC payload threading --------------------------------------------------
@@ -965,7 +962,6 @@ static nlohmann::json chatMsgsToWireMessages(const std::vector<ChatMsg>& msgs) {
 
 static void applyWireMessagesToChat(AppState& st, const nlohmann::json& messages) {
     if (!messages.is_array()) return;
-    freeChatTextures(st.chat);
     st.chat.clear();
     for (const auto& jm : messages) {
         if (!jm.is_object()) continue;

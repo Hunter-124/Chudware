@@ -1,7 +1,20 @@
-# OMP → CAD Integration — Locked Decisions (2026-07-23)
+# OMP → CAD Integration — Locked Decisions (2026-07-23) — HISTORICAL, superseded 2026-08-31
 
-Authoritative record of the choices made after the research + verification rounds. Supersedes
-the "Open decisions" section of `00-OPTIONS-AND-DECISIONS.md`. Implementation follows these.
+> **Not current authority.** Every section above the
+> [2026-08-31 superseding section](#2026-08-31--superseding-architecture-chudcode-rpc-is-the-only-online-runtime)
+> at the bottom of this file is dated provenance. Do not implement from it. That includes
+> the bun bridge, `vendor/omp/`, `scripts/vendor_omp.py`, the bridge-forwarded "stable RPC"
+> table, and the implementation order. The vendored implementation, updater and Bun
+> adapter were deleted (`docs/REFACTOR_LOG.md`, 2026-08-31 entry); the table remains
+> historical contract text, not a callable bridge. The current online runtime is Chudcode RPC:
+> the superseding section,
+> [ARCHITECTURE.md, Agent runtime](../../ARCHITECTURE.md#agent-runtime), and
+> [`.claude/skills/cad-chudcode-integration/SKILL.md`](../../.claude/skills/cad-chudcode-integration/SKILL.md).
+> The 2026-07-23 text below is kept as the record of what was decided then.
+
+As of 2026-07-23, this was the authoritative record of the choices made after the research and
+verification rounds. It superseded the "Open decisions" section of `00-OPTIONS-AND-DECISIONS.md`,
+and implementation followed these choices until the 2026-08-31 section below replaced them.
 
 ## Strategy
 - **Curated selective reuse via a bun "bridge" sidecar + deterministic re-vendor script.**

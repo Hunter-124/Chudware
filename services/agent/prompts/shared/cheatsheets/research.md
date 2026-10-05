@@ -1,6 +1,6 @@
 # Research tools — look it up, don't recall
 
-Pillar 8: when a fact could be wrong from memory (a material property, a price, a spec, a
+When a fact could be wrong from memory (a material property, a price, a spec, a
 standard, current data), **look it up and cite it** instead of recalling. The `research_*`
 tools return a provenance-stamped answer envelope you quote verbatim.
 

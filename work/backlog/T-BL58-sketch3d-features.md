@@ -14,8 +14,8 @@ deferred: yes
 
 ## Context
 
-Phase 3 of the 3D sketcher plan (`docs/SKETCH3D_PLAN.md`, T-BL45). PARKED until greenlight.
-Depends on P2 (T-BL52). This is the highest-value slice: 3D sketch paths driving sweeps.
+Phase 3 of the 3D sketcher plan (`docs/plans/SKETCH3D_PLAN.md`, T-BL45). PARKED until greenlight.
+Depends on P2 (T-BL57). This is the highest-value slice: 3D sketch paths driving sweeps.
 
 ## Scope
 

@@ -1,10 +1,10 @@
-"""Shared helpers for ``engine/research``: the v1 answer envelope, timestamps, and the
+"""Shared helpers for ``services/research``: the v1 answer envelope, timestamps, and the
 offline gate. Contract: ``contracts/research_tools.md`` §1 (envelope), §5 (offline),
 §6 (degradation).
 
 Kept dependency-light on purpose: no network, no heavy imports at module load. The
-offline check lazily imports the agent config so ``engine`` never hard-depends on
-``agent`` (avoids an import cycle — ``agent.config`` imports ``services.paths``).
+offline check lazily imports ``services.agent.config`` to avoid an import cycle;
+agent configuration itself imports ``services.paths``.
 """
 from __future__ import annotations
 

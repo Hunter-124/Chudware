@@ -24,37 +24,34 @@ from __future__ import annotations
 from typing import Any
 
 
-def _ssm_normalize(mpn: str) -> str:
-    """spec_sheet_matcher was deleted (T-RF18); the C++ port answers via core_bridge."""
-    from services.mcp import core_bridge as _cb
+def _normalize_mpn(mpn: str) -> str:
+    """Use an ``ok`` core reply's value (defaulting to raw input when absent).
+
+    Other replies or call errors fall back to stripped uppercase input; import
+    errors propagate.
+    """
+    from services.mcp import core_bridge
+    from .normalization import core_normalize_mpn
+
     try:
-        r = _cb.call("normalize_mpn", {"mpn": mpn})
-        if isinstance(r, dict) and r.get("ok"):
-            return r.get("normalized", mpn)
+        reply = core_normalize_mpn(mpn, core_bridge.call)
+        if isinstance(reply, dict) and reply.get("ok"):
+            return reply.get("normalized", mpn)
     except Exception:  # noqa: BLE001 — offline/degraded: identity normalize
         pass
     return str(mpn).strip().upper()
 
 
-def _ssm_match(mpn: str, generate: bool = False) -> dict:
-    from services.mcp import core_bridge as _cb
-    r = _cb.call("match_part_number", {"mpn": mpn, "generate": generate})
+def _match_part_number(mpn: str) -> dict:
+    """The core's standard-hardware lookup (``match_part_number`` RPC), identity only
+    (``generate=False``). Core failures propagate to the caller."""
+    from services.mcp import core_bridge
+
+    r = core_bridge.call("match_part_number", {"mpn": mpn, "generate": False})
     if isinstance(r, dict) and isinstance(r.get("match"), dict):
         return r["match"]
     return r if isinstance(r, dict) else {}
 
-
-class _Ssm:
-    @staticmethod
-    def normalize_mpn(mpn: str) -> str:
-        return _ssm_normalize(mpn)
-
-    @staticmethod
-    def match_part_number(mpn: str, generate: bool = False) -> dict:
-        return _ssm_match(mpn, generate)
-
-
-_ssm = _Ssm()
 
 # CAD-model-yielding sites ONLY (contracts/sourcing.md §2a). Commerce/datasheet
 # adapters do not yield importable geometry and are excluded from the fan-out.
@@ -149,9 +146,9 @@ def _classify(product: dict, hit: dict) -> str | None:
     weak   — title-token overlap only (no part-number agreement).
     """
     p_mpn = product["mpn"]
-    p_mpn_n = _ssm.normalize_mpn(p_mpn) if p_mpn else ""
+    p_mpn_n = _normalize_mpn(p_mpn) if p_mpn else ""
     h_pn = _hit_pn(hit)
-    h_pn_n = _ssm.normalize_mpn(h_pn) if h_pn else ""
+    h_pn_n = _normalize_mpn(h_pn) if h_pn else ""
 
     if p_mpn_n and h_pn_n and p_mpn_n.upper() == h_pn_n.upper():
         return "exact"
@@ -193,18 +190,18 @@ def _cad_adapters() -> list[Any]:
 
 
 def _standard_match(product: dict) -> dict | None:
-    """STEP 1: resolve the product MPN via the standard-hardware clean-room tables.
+    """STEP 1: resolve the product MPN against the core's standard-hardware tables.
 
     A hit IS the answer — an ``exact``/``attach:true`` match whose artifact_plan
     builds the part parametrically (make_standard_part for a fastener/bearing
-    family, else part_place). ``generate=False``: we only need identity here, not
-    a (no-op-offline) core build. ``None`` when the MPN does not resolve.
+    family, else part_place). Lookup only, never a core build. ``None`` when the
+    MPN does not resolve or the core is unavailable.
     """
     mpn = product["mpn"]
     if not mpn:
         return None
     try:
-        res = _ssm.match_part_number(mpn, generate=False)
+        res = _match_part_number(mpn)
     except Exception:  # noqa: BLE001
         return None
     if not res or not res.get("matched"):
@@ -216,10 +213,10 @@ def _standard_match(product: dict) -> dict | None:
     else:
         plan = {"how": "part_place", "query": mpn}
     return {
-        "part_id": res.get("catalog_id") or f"standard:{_ssm.normalize_mpn(mpn)}",
+        "part_id": res.get("catalog_id") or f"standard:{_normalize_mpn(mpn)}",
         "title": res.get("standard_name") or res.get("description") or product["title"] or mpn,
         "site": "standard_hardware",
-        "mpn": _ssm.normalize_mpn(mpn),
+        "mpn": _normalize_mpn(mpn),
         "confidence": "exact",
         "score": _TIER_SCORE["exact"],
         "attach": True,
@@ -291,7 +288,7 @@ def match_model(product: dict, *, limit: int = 8) -> dict:
                 "part_id": pid,
                 "title": _first_str(hit, ("title",)),
                 "site": hsite,
-                "mpn": _ssm.normalize_mpn(_hit_pn(hit)) if _hit_pn(hit) else "",
+                "mpn": _normalize_mpn(_hit_pn(hit)) if _hit_pn(hit) else "",
                 "confidence": tier,
                 "score": _TIER_SCORE[tier],
                 "attach": tier == "exact",

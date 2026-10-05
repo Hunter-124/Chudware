@@ -1402,13 +1402,6 @@ PlanInfo parsePlan(const nlohmann::json& p) {
     return pi;
 }
 
-
-void freeChatTextures(std::vector<ChatMsg>& chat) {
-    for (auto& m : chat)
-        for (auto& s : m.steps)
-            if (s.thumb.id) { glDeleteTextures(1, &s.thumb.id); s.thumb.id = 0; }
-}
-
 // ---------------- job/run registry (per-conversation JobState slots) ----------------
 // See core/app_state.h for the contract. JobState is non-copyable — every slot is created
 // once (default-constructed shared_ptr<JobState>) and mutated in place for the conversation's

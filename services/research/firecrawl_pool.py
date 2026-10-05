@@ -21,9 +21,10 @@ key itself) so separate processes — the GUI agent, the MCP server, ``scrape_kn
 the omp CLI — share one view of which keys are hot. ``FIRECRAWL_POOL_STATE`` overrides the
 state-file path (tests); ``FIRECRAWL_POOL_MAX_WAIT_S`` overrides the default wait cap.
 
-Stdlib-only on purpose: ``tools/`` scripts and the omp custom tool import this without the
-runtime venv. ``request()`` takes an injectable ``transport`` so tests never touch the
-network.
+Stdlib-only on purpose: ``tools/firecrawl_pool.py`` is the CLI wrapper for this
+``services/research/firecrawl_pool.py`` implementation; scripts and custom tools
+can import it without the runtime venv. ``request()`` takes an injectable
+``transport`` so tests never touch the network.
 """
 from __future__ import annotations
 
@@ -86,7 +87,7 @@ def _default_config_path() -> Optional[Path]:
     if override:
         return Path(override)
     try:
-        from services import paths  # repo package (engine -> engine_oracle symlink)
+        from services import paths  # app configuration path when running in the repo package
 
         return paths.CONFIG
     except Exception:  # noqa: BLE001 — running outside the repo tree (e.g. deployed tool)

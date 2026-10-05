@@ -2688,3 +2688,229 @@ def test_dataclass_wire_names_match_every_protocol_key():
     assert not mismatched, f"_camel does not reproduce the wire keys: {mismatched}"
     stale = sorted(set(_WIRE_NAME_OVERRIDES) - {field for field, _ in pairs})
     assert not stale, f"overrides for fields the protocol no longer has: {stale}"
+
+
+class HelperClient(FakeClient):
+    """Process-free SDK lifecycle with the real prompt_and_wait result shape."""
+
+    def prompt_and_wait(self, message, *, timeout=None):
+        self.prompt(message)
+        if not self.release.wait(timeout):
+            raise TimeoutError("helper terminal wait timed out")
+        if not self.started:
+            raise RuntimeError("RPC process stopped")
+        for event in self.events:
+            for listener in tuple(self.listeners):
+                listener(event)
+        return type("PromptTurn", (), {"assistant_text": self.factory.reply})()
+
+
+@pytest.fixture
+def helper_runtime(monkeypatch):
+    factory = FakeFactory()
+    factory.reply = "helper answer"
+
+    def make_client(**kwargs):
+        client = HelperClient(factory, **kwargs)
+        factory.clients.append(client)
+        return client
+
+    host = ChudcodeSessionHost(client_factory=make_client)
+    monkeypatch.setattr(host, "_resolve_binary", lambda *, required: None)
+    yield host, factory
+    host.shutdown()
+
+
+def test_helper_completion_is_private_and_disposed_without_touching_saved_sessions(helper_runtime):
+    host, factory = helper_runtime
+    assert host.complete_text("diagnose", "failed feature", provider="gemini", model="model") == "helper answer"
+    client = factory.clients[0]
+    assert client.started is False and client.stop_count == 1
+    assert not Path(client.kwargs["cwd"]).exists()
+    assert client.kwargs["append_system_prompt"] == "diagnose"
+    assert client.kwargs["tools"] == []
+    assert client.kwargs["no_session"] and client.kwargs["no_rules"] and client.kwargs["no_skills"]
+    assert ("prompt", {"message": "failed feature", "images": None}) in client.calls
+    assert ("set_model", {"provider": "google", "modelId": "model"}) in client.calls
+    assert not host._sessions and not host._helper_clients
+    host.shutdown()
+    assert client.stop_count == 1
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "message_end", "message": {
+        "role": "assistant", "stopReason": "error", "errorMessage": "model rejected"}},
+    {"type": "auto_retry_end", "success": False, "finalError": "quota exhausted"},
+])
+def test_helper_does_not_return_partial_text_after_provider_failure(helper_runtime, event):
+    host, factory = helper_runtime
+    original = host._client_factory
+
+    def make_client(**kwargs):
+        client = original(**kwargs)
+        client.events.insert(1, event)
+        return client
+
+    host._client_factory = make_client
+    factory.reply = "partial answer that must not be accepted"
+    with pytest.raises(chudcode_host_module.HelperCompletionError):
+        host.complete_text("", "repair")
+    assert factory.clients[0].stop_count == 1
+
+
+def test_helper_model_rejection_never_prompts_or_substitutes(helper_runtime):
+    host, factory = helper_runtime
+    original = host._client_factory
+
+    def make_client(**kwargs):
+        client = original(**kwargs)
+
+        def reject(*args):
+            raise LookupError("selected model unavailable")
+
+        client.set_model = reject
+        return client
+
+    host._client_factory = make_client
+    with pytest.raises(chudcode_host_module.HelperCompletionError):
+        host.complete_text("", "repair", provider="openai", model="chosen")
+    assert factory.clients[0].model_prompt_count == 0
+    assert factory.clients[0].stop_count == 1
+
+
+@pytest.mark.parametrize("ending", ["cancel", "shutdown", "timeout"])
+def test_helper_running_call_stops_on_cancel_shutdown_or_budget(helper_runtime, monkeypatch, ending):
+    host, factory = helper_runtime
+    factory.block = True
+    cancel = threading.Event()
+    result = {}
+    monkeypatch.setattr(chudcode_host_module, "_HELPER_WAIT_SLICE_SECONDS", 0.01)
+
+    def complete():
+        try:
+            host.complete_text("", "repair", timeout=0.1 if ending == "timeout" else 10,
+                               cancel=cancel.is_set)
+        except chudcode_host_module.HelperCompletionError as exc:
+            result["error"] = str(exc)
+
+    thread = threading.Thread(target=complete, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2
+    while not factory.clients and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert factory.clients
+    client = factory.clients[0]
+    assert client.prompted.wait(2)
+    if ending == "cancel":
+        cancel.set()
+    elif ending == "shutdown":
+        host.shutdown()
+    thread.join(3)
+    assert not thread.is_alive()
+    assert result["error"]
+    assert client.stop_count == 1 and not client.started
+    assert not host._helper_clients
+    assert not Path(client.kwargs["cwd"]).exists()
+
+
+def test_helper_prestart_cancel_and_shutdown_do_not_spawn(helper_runtime):
+    host, factory = helper_runtime
+    with pytest.raises(chudcode_host_module.HelperCompletionError):
+        host.complete_text("", "repair", cancel=lambda: True)
+    assert not factory.clients
+    host.shutdown()
+    with pytest.raises(chudcode_host_module.HelperCompletionError):
+        host.complete_text("", "repair")
+    assert not factory.clients
+
+
+@pytest.mark.parametrize("reply", [None, "", "   "])
+def test_helper_empty_response_is_not_a_success(helper_runtime, reply):
+    host, factory = helper_runtime
+    factory.reply = reply
+    with pytest.raises(chudcode_host_module.HelperCompletionError):
+        host.complete_text("", "repair")
+    assert factory.clients[0].stop_count == 1
+
+
+def test_helper_applies_selected_compaction_overlay(helper_runtime, monkeypatch):
+    host, factory = helper_runtime
+    policies = []
+    monkeypatch.setattr(host, "_resolve_binary", lambda *, required: "/fake/chud")
+    monkeypatch.setattr(chudcode_host_module, "_binary_supports_flag", lambda *args: True)
+
+    def overlay(memory, settings):
+        policies.append((memory, settings))
+        return "/fake/overlay.yml"
+
+    monkeypatch.setattr(chudcode_host_module, "_cad_session_overlay", overlay)
+    chosen = {"enabled": True, "methodOrder": ["shake"]}
+    assert host.complete_text("", "repair", compaction_settings=chosen) == "helper answer"
+    assert policies == [("off", chosen)]
+    assert factory.clients[0].kwargs["extra_args"] == (
+        "--no-lsp", "--config", "/fake/overlay.yml", "--no-mcp")
+
+
+def test_scoped_online_tool_helper_inherits_exact_model_credentials_and_policy(tmp_path, monkeypatch):
+    from services.agent.chudcode_tools import HostToolBinding, dispatch_host_tool
+    from services.agent.providers.chudcode_provider import helper_provider
+
+    class Policy:
+        def deny_reason(self, name):
+            return None
+
+    records = []
+    binding = HostToolBinding(
+        "repair", "repair", {"type": "object", "properties": {}},
+        handler=lambda: {"ok": True, "repair": helper_provider("fixer").complete("", [
+            {"role": "user", "content": "repair the selector"}])},
+        context={"policy_registry": Policy(), "tool_calls": records})
+    factory = FakeFactory()
+    factory.reply = "repaired"
+
+    class ParentClient(FakeClient):
+        def prompt(self, message, *, images=None):
+            super().prompt(message, images=images)
+            assert dispatch_host_tool(binding, {}, None, lambda: False)["repair"] == "repaired"
+
+    def make_client(**kwargs):
+        client = (HelperClient if kwargs.get("tools") == [] else ParentClient)(factory, **kwargs)
+        factory.clients.append(client)
+        return client
+
+    host = ChudcodeSessionHost(client_factory=make_client)
+    monkeypatch.setattr(host, "_resolve_binary", lambda *, required: None)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "operator-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "operator-openai-secret")
+    try:
+        result, events = run(
+            host, "web-helper", host_tools=[binding],
+            chudcode_session_dir=str(tmp_path), provider="openai", model="selected-model",
+            web_actor=True, web_key_source="byok", web_tenant="alice", web_provider="openai",
+            web_credential="alice-private-token",
+            settings={"compaction_settings": {"methodOrder": ["soft"]},
+                      "thinking": "low", "auto_retry": False})
+        assert result["ok"]
+        helper = factory.clients[1]
+        assert helper.kwargs["provider_session_id"] == "web-helper"
+        assert helper.kwargs["env"]["OPENAI_API_KEY"] == "alice-private-token"
+        assert helper.kwargs["env"]["ANTHROPIC_API_KEY"] == ""
+        assert ("set_model", {"provider": "openai", "modelId": "selected-model"}) in helper.calls
+        assert ("set_thinking_level", {"level": "low"}) in helper.calls
+        assert ("set_auto_retry", {"enabled": False}) in helper.calls
+        assert helper.stop_count == 1
+        assert not Path(helper.kwargs["env"]["HOME"]).exists()
+        assert not Path(helper.kwargs["cwd"]).exists()
+        assert "helper_runtime" not in binding.context
+        serialized = json.dumps([result, events, records])
+        assert "alice-private-token" not in serialized and "operator-secret" not in serialized
+        assert "web_credential" not in serialized
+    finally:
+        host.shutdown()
+
+
+def test_web_helper_missing_scope_fails_before_spawning_or_using_desktop_auth(helper_runtime):
+    host, factory = helper_runtime
+    with pytest.raises(chudcode_host_module.HelperCompletionError, match="web_credential_source_invalid"):
+        host.complete_text("", "repair", runtime_params={"web_actor": True})
+    assert not factory.clients

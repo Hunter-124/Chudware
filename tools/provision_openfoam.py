@@ -1,6 +1,6 @@
 """Provision a working OpenFOAM for the CFD bridge (services.sim.openfoam).
 
-The bridge drives OpenFOAM three ways (see engine/sim/foam_runner.py) — always as
+The bridge drives OpenFOAM three ways (see services/sim/foam_runner.py) — always as
 subprocesses, never linked (GPL isolation, contracts/license_debt.md):
 
   * LINUX (posix)   — any reachable install: a sourced environment, an openfoam.com

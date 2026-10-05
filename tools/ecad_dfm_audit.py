@@ -1,7 +1,7 @@
 """Audit: which library footprints put silk over pads, and does acid_trap fire on 90deg joints.
 
-Zero-Python cutover (T-RF20): the ECAD session is the C++ core via the ecad_common
-facade and DFM is the ``ecad_dfm`` RPC (engine.ecad.dfm is deleted).
+The ECAD session is the C++ core via services.mcp.ecad_common, and DFM
+uses the native ``ecad_dfm`` RPC.
 """
 from collections import Counter
 

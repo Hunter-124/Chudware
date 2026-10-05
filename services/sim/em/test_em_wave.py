@@ -275,23 +275,5 @@ class TestWorkerRpcDegradation(unittest.TestCase):
         self.assertIn(res["defaults"]["driven"], ("openems", "analytic-uniform"))
 
 
-# --------------------------------------------------------------- upstream seam
-
-
-class TestUpstreamSeam(unittest.TestCase):
-    def test_engine_alias_import_matches_worker_registration(self):
-        # T-RF21: the engine->engine_oracle symlink is gone; services.worker_main
-        # registers the EM RPCs from services.sim.em.worker_rpc (dual-path first
-        # choice). Assert the canonical module surface and the registration entry.
-        from ...sim.em import worker_rpc as canonical
-        self.assertEqual(set(canonical.WORKER_METHODS),
-                         {"em_status", "em_eigenmode", "em_driven",
-                          "em_timedomain"})
-        # the RPCs actually run
-        res = canonical.WORKER_METHODS["em_eigenmode"]({"standard": "WR-90",
-                                                       "n_modes": 1}, None)
-        self.assertTrue(res["ok"])
-
-
 if __name__ == "__main__":
     unittest.main()

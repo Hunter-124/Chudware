@@ -1537,9 +1537,9 @@ def _apply_symbol_eng(syms: dict) -> None:
             syms[libid]["eng"] = eng
 
 
-# ─── FPGA parts (T-FIN11) ─────────────────────────────────────────────────────
-# Symbol pins are GENERATED from the aicad.fpga_device/1 JSON seed (engine/ecad/
-# fpga_devices/) so the schematic part can never drift from the bank/pin model the
+# ─── FPGA parts ──────────────────────────────────────────────────────────────
+# Symbol pins are GENERATED from the aicad.fpga_device/1 JSON seed in
+# services/ecad/fpga_devices/ so the schematic part can never drift from the bank/pin model the
 # FPGA checks and constraint exporters use. Only the full-coverage seed (the
 # iCE40UP5K-SG48) gets a placeable symbol+footprint; partial seeds (ECP5/XC7A35T
 # classes) are check/export data — tag any symbol with fields {"fpga_device": ...}

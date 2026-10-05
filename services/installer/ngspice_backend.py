@@ -360,7 +360,7 @@ def simulate_ngspice(circuit: dict, study: dict) -> dict:
     """Run the study through ngspice; return a sim.md §4 result dict.
 
     Raises :class:`NgspiceError` on any subprocess/parse failure — the seam in
-    :func:`engine.sim.circuit.simulate` catches it and falls back to MNA.
+    :func:`services.mcp.ecad_common._sim_run` reports it and falls back to MNA.
     """
     t0 = time.perf_counter()
     log: list[str] = []

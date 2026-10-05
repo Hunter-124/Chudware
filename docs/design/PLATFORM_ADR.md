@@ -1,8 +1,18 @@
 # ADR-001: Idea-to-Production Platform on Chudware
 
-**Status:** Adopted — pillars landed (`T-A1`, `T-D1`, `T-F1`..`T-F17` all `status:done`)
+**Status:** Adopted design record (`T-A1`, `T-D1`, `T-F1`..`T-F17` all `status: done`
+in `work/tasks/done/`). Board closure is scoped to those cards, not a blanket
+feature-shipping or certification claim.
 **Date:** 2026-07-02 (status updated 2026-08-17)
 **Deciders:** Bruh + team (4 people)
+
+**Authority scope:** the context, implementation patterns and action-item checkboxes
+below are the original July architecture record. In particular, the Python engine
+pattern in the Decision section predates the native-engine consolidation; it is not
+an instruction to restore the retired engine. Current boundaries are in
+[ARCHITECTURE.md](../../ARCHITECTURE.md) and
+[chudware-dev](../../.claude/skills/chudware-dev/SKILL.md). Later simulation credibility
+notes in this ADR retain their own linked evidence and program scope.
 
 ## Context
 

@@ -1,35 +1,22 @@
-"""Live end-to-end check of the plain-language geometry vocabulary against the STAGED
-libchudware.dll (the one the app loads) — and an optional live run on the local LM Studio
-model. Part A drives the real doc_apply_ops RPC (which also runs validate.cpp), proving
-the staged DLL accepts: word-query fillet, sketch-on-a-named-face, relational `at`,
-query-target hole, and the new bolt_circle feature. Part B asks Gemma to use them.
+"""Live end-to-end check of the plain-language geometry vocabulary against the
+native core selected by CHUDWARE_LIBCHUDWARE — and an optional live local LM Studio
+run. Part A drives doc_apply_ops (including validate.cpp), proving the core accepts
+word-query fillet, sketch-on-a-named-face, relational `at`, query-target hole,
+and bolt_circle. Part B asks the local model to use them.
 """
-import ctypes, json, os, sys
+import json, os, sys
 
-DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "Chudware")
-os.add_dll_directory(DIST)
-os.environ.setdefault("CHUDWARE_PROMPTS_DIR", os.path.join(DIST, "app", "agent", "prompts"))
-
-dll = ctypes.CDLL(os.path.join(DIST, "libchudware.dll"))
-dll.chudware_call.restype = ctypes.c_int
-dll.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-dll.chudware_free.argtypes = [ctypes.c_char_p]
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
+from services.mcp import core_bridge
+from services.mcp.core_bridge import dim, feat
 
 
 def call(method, params):
-    out = ctypes.c_char_p()
-    rc = dll.chudware_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
-    s = out.value.decode() if out.value else ""
-    if out.value:
-        dll.chudware_free(out)
     try:
-        return rc, json.loads(s) if s else {}
-    except Exception:
-        return rc, {"_raw": s[:400]}
-
-
-def dim(v):
-    return {"value": v, "expr": None}
+        return 0, core_bridge.call(method, params)
+    except core_bridge.CoreError as exc:
+        return 1, {"error": str(exc), "code": exc.code, "detail": exc.detail}
 
 
 def new_doc():
@@ -37,10 +24,6 @@ def new_doc():
     return r.get("doc_id")
 
 
-def feat(ftype, name, params=None, refs=None, **extra):
-    f = {"type": ftype, "name": name, "params": params or {}, "refs": refs or {}}
-    f.update(extra)
-    return {"op": "add_feature", "feature": f}
 
 
 def apply(doc, ops):

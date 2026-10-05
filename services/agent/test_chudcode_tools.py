@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import queue
+import sys
 import tempfile
 import threading
 import unittest
@@ -77,6 +79,20 @@ def _context(entries, **extra):
     }
     context.update(extra)
     return context
+
+
+@contextlib.contextmanager
+def _unimportable(module):
+    """Make ``import module`` raise ImportError, touching only that sys.modules key."""
+    saved = sys.modules.get(module)
+    sys.modules[module] = None
+    try:
+        yield
+    finally:
+        if saved is None:
+            sys.modules.pop(module, None)
+        else:
+            sys.modules[module] = saved
 
 
 class HostToolDefinitionTests(unittest.TestCase):
@@ -319,6 +335,79 @@ class HostToolDefinitionTests(unittest.TestCase):
         self.assertIn("enable_tools", names)
         self.assertIn("list_tool_categories", names)
 
+    def _mode_entries(self):
+        return OrderedDict(
+            (
+                ("add_features", _entry(_beta, "geometry mutator")),
+                ("measure_part", _entry(_beta, "read-only measure")),
+            )
+        )
+
+    def test_ask_mode_filters_mutators_the_model_loads_mid_turn(self):
+        """Loads are unioned BEFORE the user's mode policy: Ask stays read-only
+        whatever the model enables, while Agent advertises the same load."""
+        loaded = mock.patch(
+            "services.agent.tool_categories.resolve_tool_requests",
+            return_value=({"add_features"}, []),
+        )
+        with loaded:
+            ask = [
+                b.name
+                for b in build_host_tools(
+                    _context(self._mode_entries(), mode="ask", categories=["modeling"])
+                )
+            ]
+            agent = [
+                b.name
+                for b in build_host_tools(
+                    _context(self._mode_entries(), mode="agent", categories=["modeling"])
+                )
+            ]
+        self.assertNotIn("add_features", ask)
+        self.assertIn("measure_part", ask)  # shared read floor survives Ask
+        self.assertIn("add_features", agent)
+
+    def test_mode_policy_error_fails_the_build_instead_of_advertising_mutators(self):
+        broken = mock.patch(
+            "services.agent.copilot_mode_tools.apply_mode_tools",
+            side_effect=RuntimeError("mode contract unreadable"),
+        )
+        with broken, self.assertRaisesRegex(RuntimeError, "mode contract unreadable"):
+            build_host_tools(_context(self._mode_entries(), mode="ask"))
+
+    def test_mode_module_import_error_fails_the_build(self):
+        with _unimportable("services.agent.copilot_mode_tools"):
+            with self.assertRaises(ImportError):
+                build_host_tools(_context(self._mode_entries(), mode="ask"))
+
+    def test_registry_import_error_is_not_an_empty_surface(self):
+        context = _context(OrderedDict())
+        del context["tool_entries"]
+        with _unimportable("services.mcp.server"):
+            with self.assertRaises(ImportError):
+                build_host_tools(context)
+
+    def test_policy_evaluation_error_fails_the_build(self):
+        class _BrokenPolicy:
+            def deny_reason(self, name):
+                raise RuntimeError(f"policy for {name} unreadable")
+
+        context = _context(self._mode_entries(), allowed_tools=None)
+        context["policy_registry"] = _BrokenPolicy()
+        with self.assertRaisesRegex(RuntimeError, "unreadable"):
+            build_host_tools(context)
+
+    def test_live_registry_settings_error_fails_the_build(self):
+        """A Settings read that raises refuses every policed tool and then fails the
+        build visibly, instead of a silent meta-only (or unpoliced) surface."""
+        context = _context(self._mode_entries(), mode="agent", allowed_tools=None)
+        del context["policy_registry"]  # the live tool_registry decides
+        with mock.patch(
+            "services.agent.config.get_tool_options",
+            side_effect=RuntimeError("tool_options unreadable"),
+        ), self.assertRaisesRegex(RuntimeError, "tool_options unreadable"):
+            build_host_tools(context)
+
 
 class HostToolDispatchTests(unittest.TestCase):
     def _binding(self, name="alpha", handler=_alpha, **context):
@@ -330,6 +419,45 @@ class HostToolDispatchTests(unittest.TestCase):
             handler=handler,
             context=ctx,
         )
+
+    def test_mode_policy_error_at_dispatch_never_runs_the_mutator(self):
+        ran = []
+        binding = self._binding(
+            "add_features", handler=lambda: ran.append("add_features"), mode="ask"
+        )
+        with mock.patch(
+            "services.agent.copilot_mode_tools.apply_mode_tools",
+            side_effect=RuntimeError("mode contract unreadable"),
+        ), self.assertRaisesRegex(RuntimeError, "mode contract unreadable"):
+            dispatch_host_tool(binding, {}, None, None)
+        self.assertEqual(ran, [])
+
+    def test_policy_evaluation_error_at_dispatch_never_runs_the_tool(self):
+        class _BrokenPolicy:
+            def deny_reason(self, name):
+                raise RuntimeError("policy unreadable")
+
+        ran = []
+        binding = self._binding("alpha", handler=lambda: ran.append("alpha"))
+        binding.context["policy_registry"] = _BrokenPolicy()
+        with self.assertRaisesRegex(RuntimeError, "policy unreadable"):
+            dispatch_host_tool(binding, {}, None, None)
+        self.assertEqual(ran, [])
+
+    def test_live_registry_settings_error_refuses_dispatch_in_shape(self):
+        ran = []
+        binding = self._binding("alpha", handler=lambda: ran.append("alpha"))
+        del binding.context["policy_registry"]  # the live tool_registry decides
+        with mock.patch(
+            "services.agent.config.get_tool_options",
+            side_effect=RuntimeError("tool_options unreadable"),
+        ):
+            result = dispatch_host_tool(binding, {}, None, None)
+        self.assertEqual(list(result), ["ok", "reason", "hint"])
+        self.assertFalse(result["ok"])
+        self.assertIn("could not be evaluated", result["reason"])
+        self.assertIn("tool_options unreadable", result["reason"])
+        self.assertEqual(ran, [])
 
     def test_success_forwards_progress_cancel_and_document_context(self):
         observed = []
@@ -1188,6 +1316,60 @@ class HostToolResultEdgeTests(unittest.TestCase):
         result = dispatch_host_tool(binding, {"job_id": "job-1", "cancel": False}, None, stop)
         self.assertIs(seen["cancel"], stop)
         self.assertIs(result["stopped"], True)
+
+
+class HelperRuntimeScopeTests(unittest.TestCase):
+    def test_model_cannot_replace_hidden_helper_factory_or_leak_it_into_records(self):
+        from services.agent.online_turn import current_helper_runtime
+
+        ran = []
+        factory = lambda *args, **kwargs: "host-only"
+
+        def repair():
+            ran.append(current_helper_runtime() is factory)
+            return {"ok": True}
+
+        records = []
+        [binding] = [b for b in build_host_tools(_context(
+            {"repair": _entry(repair, "repair")},
+            helper_runtime=factory, tool_calls=records)) if b.name == "repair"]
+        self.assertNotIn("helper_runtime", binding.input_schema.get("properties", {}))
+        refused = dispatch_host_tool(binding, {"helper_runtime": "attacker"}, None, None)
+        self.assertFalse(refused["ok"])
+        self.assertEqual(ran, [])
+        self.assertEqual(records, [])
+        self.assertTrue(dispatch_host_tool(binding, {}, None, None)["ok"])
+        self.assertEqual(ran, [True])
+        self.assertIsNone(current_helper_runtime())
+        self.assertNotIn("helper_runtime", json.dumps(records))
+
+    def test_helper_runtime_is_thread_local_and_restored_after_failure(self):
+        from services.agent.online_turn import current_helper_runtime
+
+        barrier = threading.Barrier(2)
+        observed = {}
+
+        def execute(actor):
+            def repair():
+                barrier.wait(timeout=2)
+                observed[actor] = current_helper_runtime()()
+                raise RuntimeError("diagnosis failed")
+
+            binding = HostToolBinding(
+                "repair", "repair", {"type": "object", "properties": {}}, handler=repair,
+                context={"policy_registry": _Policy(), "helper_runtime": lambda: actor})
+            try:
+                dispatch_host_tool(binding, {}, None, None)
+            except RuntimeError:
+                observed[actor + "-cleared"] = current_helper_runtime() is None
+
+        threads = [threading.Thread(target=execute, args=(actor,)) for actor in ("a", "b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(3)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(observed, {"a": "a", "b": "b", "a-cleared": True, "b-cleared": True})
 
 
 if __name__ == "__main__":

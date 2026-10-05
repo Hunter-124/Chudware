@@ -20,8 +20,6 @@ point_on), and compiled 3D wire chains that a downstream `sweep` consumes as `pa
     sketch3d_as_sweep_guide(id, role)     the exact sweep path/guides ref syntax for this sketch
     sketch3d_sample_at(id, t)             point + tangent at fractional arc-length t (solved geom)
     sketch3d_section_at(id, t, doc_id)    origin-plane section oriented from the path tangent
-    sketch3d_to_ledger / from_ledger      DEPRECATED (doc IS the persistence); from_ledger
-                                          migrates old session payloads into real features
 
     render_sketch / sketch_preview_text / doc_sketch_contact_sheet — 2D sketch preview
     helpers (unchanged; see their docstrings).
@@ -910,7 +908,7 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
 
         Returns {ok, sketches: [{id, name, entity_count, constraint_count, wires, status,
         dof, total_length_mm}], count}.  These are persistent doc features — they save with
-        the part (no session store).
+        the part.
         """
         try:
             d = _doc(doc_id)
@@ -1278,70 +1276,6 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
                 "Iyy": res.get("Iyy"), "Ixy": res.get("Ixy"),
                 "summary": summary, "doc_id": d,
             })
-        except Exception as e:  # noqa: BLE001
-            return _err(e)
-
-    # ─────────────────────────── ledger persistence (DEPRECATED) ─────────────────────────────────
-
-    @mcp.tool()
-    def sketch3d_to_ledger(doc_id: Optional[str] = None) -> str:
-        """DEPRECATED — 3D sketches are now real doc features; the DOCUMENT is the persistence.
-
-        There is no session store to serialize any more: sketch3d features save with the
-        part (save_part / PLM checkpoints) and survive MCP restarts like any feature.  This
-        tool now just reports the doc's sketch3d features so old workflows don't dead-end.
-
-        Returns {ok, deprecated:true, sketch_count, sketches, note}.
-        """
-        try:
-            d = _doc(doc_id)
-            rows = [{"id": f.get("id"), "name": f.get("name")}
-                    for f in _tree_features(d)
-                    if isinstance(f, dict) and f.get("type") == "sketch3d"]
-            return _dumps({"ok": True, "deprecated": True, "doc_id": d,
-                           "sketch_count": len(rows), "sketches": rows,
-                           "note": "sketch3d features persist in the document — just "
-                                   "save_part(). No ledger payload is needed."})
-        except Exception as e:  # noqa: BLE001
-            return _err(e)
-
-    @mcp.tool()
-    def sketch3d_from_ledger(payload: str, doc_id: Optional[str] = None) -> str:
-        """DEPRECATED entry point — MIGRATES an old session-store payload into REAL features.
-
-        Old sessions serialized Python-side 3D sketches via sketch3d_to_ledger.  This tool
-        converts each sketch in such a payload (version-1 {sketches:[{name, segs}]}) into a
-        real `sketch3d` doc feature.  New workflows never need this: sketches persist with
-        the document.
-
-        Returns {ok, deprecated:true, migrated:[{old_id, feature_id, name}]}.
-        """
-        try:
-            d = _doc(doc_id)
-            data = json.loads(payload)
-            if data.get("version", 1) != 1:
-                return _dumps({"ok": False,
-                               "error": f"unsupported payload version {data.get('version')}"})
-            migrated = []
-            for raw in data.get("sketches", []):
-                segs = raw.get("segs") or []
-                curves = [{"kind": s.get("kind", "line"), "pts": s.get("pts", [])}
-                          for s in segs if s.get("pts")]
-                if not curves:
-                    continue
-                entities = _curves_to_entities(curves)
-                r = _apply_ops(d, [{"op": "add_feature", "feature": {
-                    "type": "sketch3d", "name": raw.get("name", "migrated3d"),
-                    "params": {"entities": entities, "constraints": []}}}])
-                fid = (r.get("id_map") or {}).get("$0")
-                migrated.append({"old_id": raw.get("id"), "feature_id": fid,
-                                 "name": raw.get("name")})
-            return _dumps({"ok": True, "deprecated": True, "doc_id": d,
-                           "migrated": migrated,
-                           "note": "sketches are now real doc features — use the returned "
-                                   "feature_id with the sketch3d_* tools."})
-        except json.JSONDecodeError as e:
-            return _err(ValueError(f"payload is not valid JSON: {e}"))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

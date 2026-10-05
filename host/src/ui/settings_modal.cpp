@@ -7233,7 +7233,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 ImGui::SetTooltip("%s%s", pr.role.c_str(),
                                                   pr.overridden ? " (overridden)" : "");
                         }
-                        if (!s_promptRecs.empty() || true) ImGui::Separator();
+                        ImGui::Separator();
                         {
                             std::string syslbl = "system (override)";
                             if (st.spBuf[0] != 0) syslbl += " *";

@@ -17,8 +17,11 @@ Default policy = everything allowed (no behavior change vs. today). The DAG node
 from __future__ import annotations
 
 import inspect
+import logging
 import os
 from functools import wraps
+
+_LOG = logging.getLogger(__name__)
 
 # Risk classes (contract §6). Order = increasing sensitivity.
 RISK_READ = "read"
@@ -372,38 +375,52 @@ def is_allowed(name: str) -> bool:
     return deny_reason(name) is None
 
 
+# Marker shared by deny_reason and refusal: the policy itself could not be evaluated.
+_POLICY_FAILURE = "tool policy could not be evaluated"
+
+
+def _policy_failure(name: str, source: str, exc: BaseException) -> str:
+    """Fail-closed reason for a settings/family policy that raised while evaluating."""
+    _LOG.error("%s for %r (%s): %s: %s; refusing the call",
+               _POLICY_FAILURE, name, source, type(exc).__name__, exc)
+    return (f"tool {name!r} refused: {_POLICY_FAILURE} "
+            f"({source}: {type(exc).__name__}: {exc})")
+
+
 def deny_reason(name: str) -> str | None:
-    """None if allowed; else a human reason string for the refusal."""
+    """None if allowed; else a human reason string for the refusal.
+
+    A Settings or family policy that raises refuses the call (fail closed): a broken
+    config read must never re-enable a tool the user switched off.
+    """
     # Meta-tools are always permitted (request more surface / list packs / recipes).
     if name in ("enable_tools", "list_tool_categories", "design_recipe"):
         return None
     # Per-tool enabled flag (Settings → AI → Tools options).
     try:
         from services.agent.config import get_tool_options  # lazy
-        opts = get_tool_options(None, name)
-        if not opts.get("enabled", True):
-            return f"tool '{name}' disabled in Settings → AI → Tools"
-    except Exception:
-        pass
+        tool_enabled = get_tool_options(None, name).get("enabled", True)
+    except Exception as exc:  # noqa: BLE001 — fail closed; the reason names the error
+        return _policy_failure(name, "per-tool settings", exc)
+    if not tool_enabled:
+        return f"tool '{name}' disabled in Settings → AI → Tools"
     # Config agent.tool_families — disabled families blocked unless env/policy allow
     # list is active (CHUDWARE_TOOLS_ALLOW still wins via _current_allow below).
-    try:
-        from services.agent.config import is_tool_family_enabled  # lazy: avoid import cycles
-        fam = (_CATALOG.get(name) or {}).get("family")
-        if fam and not is_tool_family_enabled(str(fam)):
+    fam = (_CATALOG.get(name) or {}).get("family")
+    if fam:
+        try:
+            from services.agent.config import is_tool_family_enabled  # lazy: avoid import cycles
+            family_enabled = is_tool_family_enabled(str(fam))
+        except Exception as exc:  # noqa: BLE001 — fail closed; the reason names the error
+            return _policy_failure(name, "tool-family settings", exc)
+        if not family_enabled:
             # If an explicit allow-list is active, family filter still applies unless
             # the tool/family token is in the allow set (checked later). When allow is
             # None (default open), family disable is enough to deny.
             allow = _current_allow()
-            if allow is None:
+            if allow is None or (name not in allow and f"family:{fam}" not in allow):
                 return (f"tool {name!r} family {fam!r} is disabled in "
                         f"config agent.tool_families")
-            # allow-list active: only deny if neither name nor family: token present
-            if name not in allow and f"family:{fam}" not in allow:
-                return (f"tool {name!r} family {fam!r} is disabled in "
-                        f"config agent.tool_families")
-    except Exception:
-        pass
     if name in _SAFETY_TOOLS:
         return f"tool {name!r} is safety-class: no model dispatch path exists"
     if name in _MOTION_TOOLS:
@@ -439,7 +456,12 @@ def refusal(name: str) -> dict:
     """
     reason = deny_reason(name) or f"tool {name!r} is not permitted"
     fam = _family_of(name)
-    if "agent.tool_families" in reason and fam:
+    if _POLICY_FAILURE in reason:
+        hint = ("The tool policy (Settings -> AI -> Tools / config.json agent.tool_options, "
+                "agent.tool_families) raised while being evaluated, so the call was refused "
+                "instead of running unchecked. Report the error in `reason`; retrying will "
+                "not help until that configuration error is fixed.")
+    elif "agent.tool_families" in reason and fam:
         hint = (f"Tool family {fam!r} is turned OFF. Re-enable it in the app under "
                 f"Settings -> AI -> Tools (or set agent.tool_families.{fam} = true in "
                 f"config.json), then retry the same call. No other tool in family "
@@ -532,7 +554,9 @@ def _workspace_lease_refusal(doc_id: str, name: str) -> dict | None:
     """Check write-lease for a mutating doc_id-bearing tool call.
 
     Returns None to proceed, or a contract-shaped refusal dict if another
-    agent holds the write lease.  Import is deferred to avoid circular imports
+    agent holds the write lease — or if the lease check itself raised: an
+    unverifiable lease refuses the mutation (fail closed) rather than letting
+    it run unchecked.  Import is deferred to avoid circular imports
     (workspace.py imports from interaction.py, not from tool_registry.py).
 
     Read tools (RISK_READ) are never checked — this is the hot path for reads
@@ -543,10 +567,18 @@ def _workspace_lease_refusal(doc_id: str, name: str) -> dict | None:
         return None  # read tools never need a lease check
     try:
         from services.agent.workspace import check_write_lease  # deferred import
-        result = check_write_lease(doc_id, name)
-        return result  # None or refusal dict
-    except Exception:  # noqa: BLE001 — guard errors must never crash dispatch
-        return None
+        return check_write_lease(doc_id, name)  # None or refusal dict
+    except Exception as exc:  # noqa: BLE001 — refuse in-shape; never crash dispatch
+        _LOG.error("write-lease check failed for %r on doc %r: %s: %s; refusing the call",
+                   name, doc_id, type(exc).__name__, exc)
+        return {
+            "ok": False,
+            "reason": (f"doc {doc_id!r} write-lease check failed for tool {name!r} "
+                       f"({type(exc).__name__}: {exc}); the mutation was refused "
+                       f"rather than run unchecked."),
+            "hint": ("Call workspace_status(run_id=...) to inspect the lease registry. "
+                     "This call cannot run until the write-lease check succeeds."),
+        }
 
 
 def _guard(fn, name):

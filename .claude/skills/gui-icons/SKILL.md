@@ -7,12 +7,13 @@ description: Chudware icon subsystem specialist — generating icons (procedural
 
 Scope: everything about how Chudware icons are made, stored, and drawn. You do NOT need to know
 anything about the Parts Library, sketcher, or other panels — if your task drifts there, that's
-a different specialist's job (`.claude/skills/gui-workspaces/SKILL.md` etc.).
+a different specialist's job (`.claude/skills/gui-workspaces/SKILL.md` etc.). Shared-file
+ownership, waves and verification: `gui-orchestrator`.
 
 ## The two generation paths
 
 **1. Procedural line-art icons** — `assets/make_icons.py` (PIL, deterministic — no timestamps,
-so regeneration is diffable). Draws ~90 icons at 8× supersample, LANCZOS downsample, into TWO
+so regeneration is diffable). Draws its icons at 8× supersample, LANCZOS downsample, into TWO
 theme atlases at TWO sizes:
 - Output: `assets/icons/atlas_dark.png`, `assets/icons/atlas_light.png`, `assets/icons/atlas.json`
 - Sizes: 32 px (ribbon big buttons) and 20 px (small buttons, tree rows), packed in the same
@@ -22,16 +23,20 @@ theme atlases at TWO sizes:
 - **Both atlases MUST share one pixel layout** — theme switch swaps texture, UVs stay constant.
 - Helpers: `assets/pack_icons.py` (packing), `assets/test_icons.py`, `assets/test_pack_icons.py`.
 
-**2. Screenshot-based icons from modeling scripts** — `scripts/icon_pipeline.py` (T-G15/T-BL34).
+**2. Screenshot-based icons from modeling scripts** — `scripts/icon_pipeline.py`.
 A recipe (name, camera, build steps) drives the REAL engine headlessly: the GUI runs with
 `CHUDWARE_SHOT=iconpipe` + `CHUDWARE_ICON_RECIPES=<json>`, builds each demo part (newPart +
 applyOps), renders through the transparent thumbnail path (no chrome, no gizmo, alpha=0) to
 `scratch/icon_render/<name>.png`, then fits the render into that icon's @32/@20 cells in BOTH
 atlases — all other cells preserved byte-for-byte.
-- Run: `python3 scripts/icon_pipeline.py --render`
+- Run: `python3 scripts/icon_pipeline.py --render` (`--only a,b` for one family, `--list` for
+  the recipe table, `--inject-only` to re-tile existing renders).
 - Icons carry NO baked background plate (must work on ribbon glass in both themes).
 - v2 layers: op-created body colored with app accent teal via `set_appearance`.
-- CAM tiles come from real generated G-code: `scripts/cam_toolpath_icons.py`.
+- **Derived-asset honesty:** screenshot icons show REAL engine output. CAM tiles
+  (`scripts/cam_toolpath_icons.py`) render the real `cam_generate` toolpath, each gated by a
+  `cam_simulate` run, so every tile doubles as a smoke check of the op chain. If an op won't
+  produce a renderable toolpath, file it as a CAM bug; never fake an icon.
 - A failed build step yields an empty tile — obvious on the contact sheet
   (`scratch/icon_contact_sheet.png`). Always regenerate the contact sheet for human review.
 
@@ -60,11 +65,5 @@ append-only: new icons get appended to the inventory, existing names never chang
 3. Verify `assets/icons/atlas.json` now has `name@32` and `name@20`, both atlas PNGs updated,
    identical layout.
 4. Reference it by name wherever needed (ribbon row, tree, etc.).
-5. Lint: `python3 scripts/gui_lint.py --rule icons` (checks every icon name used in C++ exists
-   in the atlas). Then `./build.sh` from repo root must compile.
-
-## Verification handoff
-
-Don't screenshot-judge your own work beyond the contact sheet mechanics. Return to the
-orchestrator: files changed, and a one-line user check such as "toggle Settings > theme —
-new <name> icon renders crisp on ribbon (32px) and in the feature tree (20px) in both themes."
+5. The icon gate is `python3 scripts/gui_lint.py --rule icons` (every icon name used in C++
+   exists in the atlas); the integrator runs it with the wave build.

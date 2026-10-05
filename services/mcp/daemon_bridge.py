@@ -683,8 +683,7 @@ class DaemonClient:
                 "message": "engine load timed out in hostd"}
 
     def poll_events(self) -> list[dict]:
-        """Drain buffered daemon push events (arrive interleaved with responses).
-        Phase 3 wires these into _foreign_edits tool notes."""
+        """Drain daemon push events buffered while reading responses."""
         with self._lock:
             out, self._events = self._events, []
             return out
@@ -692,16 +691,10 @@ class DaemonClient:
 
 # --------------------------------------------------------------- agent spawn
 #
-# Phase-5 routing note (child supervision): the MCP mission tools
-# (services/mcp/mission_tools.py mission_start -> dag graph -> dag_run) and the
-# in-app agent (services.agent.loop, driven by the GUI's Python worker) all run
-# IN-PROCESS today — there is no subprocess-based mission worker path in
-# services/{mcp,agent,dag} to reroute (verified: the only Popen in the tree is
-# this module's own daemon spawn). When a subprocess agent-worker path lands,
-# route it through spawn_agent_worker() below so the worker is a child of the
-# DAEMON: it survives GUI/MCP-client exit, dies deterministically with the
-# daemon (PDEATHSIG), and pins the daemon against idle-exit while it runs.
-# The GUI's engine.worker Python services process stays a GUI child by design.
+# Mission DAG execution remains in the calling MCP/GUI worker. Online model turns
+# use the Chudcode session host; services.worker_main is a separate GUI child.
+# spawn_agent_worker() is the explicit daemon-supervision seam: its child survives
+# client exit, dies with the daemon, and pins daemon idle-exit while running.
 
 
 def agent_worker_env(extra: Optional[dict] = None) -> dict:

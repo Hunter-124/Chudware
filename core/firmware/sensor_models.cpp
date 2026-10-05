@@ -147,6 +147,16 @@ std::map<int, int> bmp280_registers(double altitude_m, double temperature_c, con
     auto [adc_p, adc_t] = bmp280_find_adc(p_pa, temperature_c, cal);
     std::map<int, int> regs;
     regs[kBmpRegId] = kBmpChipId;
+    // Publish all twelve little-endian factory trimming words. The firmware's
+    // compensation and this inverse model must use the very same coefficients.
+    const int trim[] = {cal.dig_T1, cal.dig_T2, cal.dig_T3,
+                        cal.dig_P1, cal.dig_P2, cal.dig_P3, cal.dig_P4,
+                        cal.dig_P5, cal.dig_P6, cal.dig_P7, cal.dig_P8, cal.dig_P9};
+    for (int i = 0; i < 12; ++i) {
+        const unsigned word = static_cast<unsigned>(trim[i]) & 0xFFFFu;
+        regs[0x88 + 2 * i] = static_cast<int>(word & 0xFFu);
+        regs[0x89 + 2 * i] = static_cast<int>(word >> 8);
+    }
     auto pb = u24_be(adc_p << 4);
     for (int i = 0; i < 3; ++i) regs[kBmpRegPressMsb + i] = pb[i];
     auto tb = u24_be(adc_t << 4);

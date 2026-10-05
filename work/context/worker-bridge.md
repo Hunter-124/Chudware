@@ -1,68 +1,95 @@
-# services/worker — C++ engine routing seam (daemon client, libchudware loader, router)
+# services/worker — host→engine routing seam (WorkerClient, engine backend, libchudware loader)
 
-Scope: services/worker/** (four compiled modules), contracts/worker_rpc.md
-Contracts: contracts/worker_rpc.md (protocol 2, newline-delimited JSON-RPC), contracts/doc_ops.md (ops envelope), contracts/doc_schema.md (aicad.part/1 | aicad.asm/1)
-
-> Purged 2026-07-22 (T-RF2): the stale duplicate modules (async_rpc/doc_mirror/jobs/
-> sim_client/selection/doc_tabs/bootstrap/worker_command_dispatcher + worker_types/
-> doc_session/pick_hit) lived here in NO build and were deleted. The live copies of those
-> are compiled from `host/src/core/`. Only the four modules below remain.
+Scope: services/worker/** (three compiled modules), services/ipc/**, core/hostd/worker_bridge.*
+Contracts:
+- contracts/worker_rpc.md: protocol 2, newline-delimited JSON-RPC.
+- contracts/doc_ops.md: ops envelope.
+- contracts/doc_schema.md: aicad.part/1 | aicad.asm/1.
+- contracts/web_parity.md: methods the web client needs served by libchudware.
+Canonical guidance:
+- services/worker/AGENTS.md: module ownership.
+- .claude/skills/chudware-dev/SKILL.md: daemon and worker-lane invariants.
+- .claude/skills/cad-chudcode-integration/SKILL.md: `agent_admin_turn`, cancel and steer.
 
 ## Entry points
-- `services/worker/worker_client.{h,cpp}` — THE routing policy. Per-method/per-doc flags,
-  all hardcoded `true` since T-RF21 closeout (the `CHUDWARE_CPP_*` escape hatches are
-  removed): `cppDocsFlag()` (:111), `routeDocToCpp()` (:133, doc-id prefixes
-  `doc-cpp`/`dwg-cpp`/`ecadcpp` commit a doc to C++ for its lifetime; also routes the
-  T-RF18/19 ported sets — sourcing/BOM, hydraulic/piping/structural/tolerance/materials/dfm,
-  parts catalog), `cppAgentFlag()`/`routeAgentToCpp()` (:312/:347),
-  `cppSimFlag()`/`routeSimToCpp()` (:393/:399, FEA plus CFD `sim_run_flow`/`sim_cancel`),
-  `cppEcadFlag()`/`routeEcadToCpp()` (:435/:442), `cppFirmwareFlag()`/`routeFirmwareToCpp()`
-  (:481/:488, all 13 `fw_*` incl. the emulator leg), CAM block (:1440, C++-only, no Python
-  fallback). Unported methods on a C++ doc fail loud; only minting calls declined with
-  `code:"unsupported"` fall back to the Python services worker
-  (`python -m services.worker_main` → `services/worker_main.py`).
-- `services/worker/engine_backend.{h,cpp}` — daemon seam above cpp_core. `CHUDWARE_ENGINE_DAEMON`
-  (default 1) routes via `EngineClient` over the chudware-hostd unix socket (`core/hostd/`,
-  multi-client, push events, edit holds); `=0` = legacy in-proc dlopen; daemon failure falls
-  back to in-proc. The WASM web client reaches the same daemon via gateway WS `/engine`.
-- `services/worker/cpp_core.{h,cpp}` — runtime dlopen of libchudware. Resolve order:
-  `$CHUDWARE_LIBCHUDWARE`/`$CHUDWARE_LIBCHUDWARE` → compile-time `CHUDWARE_DEFAULT_LIBCHUDWARE` → exe-adjacent
-  → loader path. Flat C ABI: `chudware_call` (JSON in/out), `chudware_free`,
-  `chudware_set_event_sink`, `chudware_abi_version`, `chudware_build_id`; nonzero return = unknown
-  method → Python fallback. Method table lives in `core/api/libchudware.cpp` (~270 branches).
-- `services/worker/worker_router.{h,cpp}` — thin policy mirror (`routeMethod`, `isCppDocId`).
-
-## Current backend split (2026-08, post T-RF21 closeout)
-- **C++ by default** (T-RF15..T-RF21 are all `:::done` in work/DAG.md): docs (`doc_*`,
-  `config_*`, `export_*`, `weld_*`, `eval_*`, drawings), agent v2 (`agent_run_v2`/
-  `agent_ask_v2`/`agent_clarify_v1`/`agent_pm_assist_v1`/`agent_simulate_v1`/
-  `agent_mission_v1`/`agent_cancel`/`agent_steer`/`get_prompts_v2`) plus the C++-only
-  provider/ASR seams (`agent_provider_*`, `agent_stt_*`, `agent_models_list`,
-  `agent_cost_summary`, `agent_cap_raw`), FEA + CFD (`sim_mesh`,
-  `sim_run_static/modal/fatigue/thermal/flow`, `sim_cancel` — T-RF16), CAM (`cam_*`),
-  ECAD `ecad_*` (T-RF17 closed the autoroute doc-id form/`to_3d`/`fill_zones`/`simulate`/
-  KiCad-import gaps), firmware `fw_*` (all 13, T-RF15), sourcing/BOM/cost/spec-match
-  (`bom_rollup`/`bom_price`/`request_quote`/`match_part_number`/`vendor_part_fetch`/
-  `spec_sheet_match`/`list_spec_templates`, T-RF18), hydraulic/piping/structural/tolerance/
-  materials/dfm plus `part_place`/`part_import_file` (T-RF19), parts catalog
-  (`parts_catalog_list`/`parts_make`), `doc_formats`, `vendor_part_insert`.
-- **Python only** (services worker, `services/worker_main.py` — see
-  work/context/engine-python.md): `run_model` (build123d via `services/kernel_exec.py`),
-  `ecad_design` (an LLM state machine deferred to the agent seam; its deterministic recipe
-  fallback is already C++), `sim_caps` and the unlisted sim methods, parts-hub FTS and
-  vendor registry reads, deliverables, reveng, DAG steering, PLM, EM/multiphysics,
-  intake/vision/research/render, agent GUI seams. `agent_design` was deleted at T-RF5 — the
-  v2 run is the only agent path.
-- Escape hatches: none left — the `CHUDWARE_CPP_DOCS`/`CHUDWARE_CPP_AGENT`/
-  `CHUDWARE_CPP_SIM`/`CHUDWARE_CPP_ECAD`/`CHUDWARE_CPP_FIRMWARE` flags were all removed at
-  T-RF21 closeout; every `cpp*Flag()` now returns `true` unconditionally.
+- `services/worker/worker_client.{h,cpp}` — `WorkerClient`, the funnel for every GUI RPC.
+  - `WorkerClient::callImpl` routes by predicate: `routeDocToCpp`, `routeAgentToCpp` (also
+    translates host agent RPC names to core names), `routeSimToCpp` +
+    `isNativeOnlySimMethod`, `routeEcadToCpp`, `routeFirmwareToCpp`, and the C++-only CAM
+    block. Matching methods go to `engine::call`.
+  - Core failures surface to the caller as a structured error in `result`, or via the
+    error sink. There is no fallback from the core to the services worker.
+  - All other methods go over the engine channel in daemon/WASM mode, and hostd bridges
+    them to its services worker. Only the legacy in-process backend uses a local worker
+    child launched by `WorkerClient::start` (`python -m services.worker_main`; packaged
+    builds run the adjacent compiled worker with `--module worker`).
+- `services/worker/engine_backend.{h,cpp}` — the `engine::` seam.
+  - Default: the daemon `EngineClient` to `chudware-hostd` (`core/hostd/`, multi-client,
+    push events, edit holds), with bounded connect retry
+    (`CHUDWARE_ENGINE_DAEMON_RETRY_MS`).
+  - Fallback: `CHUDWARE_ENGINE_DAEMON=0`, or exhausted retries, gives the in-process
+    `CppCore`.
+  - `RunLane` (`Agent`/`Sim`) gives long runs their own connection.
+  - `DaemonConnState maintainConnection()` reports the link state.
+  - The WASM client reaches the same daemon through the gateway WebSocket `/engine`
+    (`Webservice/gateway/engine_bridge.py`).
+- `services/worker/cpp_core.{h,cpp}` — `CppCore`, the runtime `libchudware` loader.
+  - Developer builds accept explicit, build-tree and loader-search candidates.
+  - Production loads only the canonical signed-manifest payload.
+  - Flat C ABI (`core/api/libchudware.h`): `chudware_call`, `chudware_free`,
+    `chudware_set_event_sink`, `chudware_set_doc_publish_sink`, `chudware_abi_version`,
+    `chudware_build_id`. The method dispatch lives in `core/api/libchudware.cpp`.
+- `services/ipc/ipc_client.{h,cpp}` — `EngineClient`: connect/hello, calls, queued
+  pushes and `reconnectGeneration` (clients must re-subscribe after reconnect).
+- `services/ipc/ipc_transport*` — POSIX sockets, Windows pipes and WASM WebSocket
+  transport; `ipc_discovery*` owns binary/instance discovery and single-instance locks.
+  Developer overrides never weaken the packaged signed-payload lookup.
+- `core/hostd/server.cpp`, `doc_registry.*` — shared native engine lifetime,
+  per-client document attachment, events, autosave, work-based idle/drain and doc GC.
+- `core/hostd/worker_bridge.cpp` `WorkerBridge::forMethod` — hostd's two services-worker
+  lanes. The agent families prefix-match onto the agent lane (`agent_`, `chudcode_`,
+  `session_`, `subagent_`, `dag_`, …); everything else goes to the general lane.
+- `services/worker_main.py` `_METHODS` + `_register(...)` — the services-worker dispatch
+  table. The `agent_gui` (`services.agent.worker_rpc`) and `subagent` tables are REQUIRED,
+  and a failed import fails worker startup. The others degrade with a warning: vendor
+  parts, deliverables, parts hub, reveng, DAG, PLM, EM, multiphysics and mfg printers.
 
 ## How it connects
-GUI (host/src/core/{doc_mirror,async_rpc,jobs,...}) → `worker_client.call(method, params)` →
-routing policy → `engine_backend` (hostd daemon → libchudware) or the Python services
-worker (`services/worker_main.py`, spawned as `python -m services.worker_main`) stdio
-JSON-RPC.
+GUI (`host/src/core/{doc_mirror,async_rpc,jobs,...}`) → `WorkerClient::call` → route
+predicates.
+- Engine-bound calls: `engine::call` → hostd → libchudware.
+- Everything else: hostd `WorkerBridge` → `services/worker_main.py`.
+
 Ops responses (`{revision, tree, feature_status, owner_map, tess.aicm_path}`) update the
-DocMirror on the GL thread; the AICM mesh is parsed from the path by
-`host/src/render/aicm_loader.cpp` (a duplicate of the kept `ui/viewport/render/aicm_loader.cpp`
-compiled into core tests/tools — merging them is deferred).
+DocMirror on the GL thread. The AICM mesh at that path is parsed by
+`host/src/render/aicm_loader.cpp`, the one live AICM parser; core tests and tools reuse it.
+
+## Debugging playbook
+- Locks: `callMtx_` serializes ordinary calls. In daemon mode, long runs
+  (`agent_admin_turn`/`agent_run_v2`/`agent_mission_v1`) hold `longRunMtx_` instead, so no
+  GUI call waits on a turn client-side.
+- Lane contention: an engine-bound call whose lane is busy takes `callViaSideClient`.
+  Minting calls never take the side connection, because hostd attaches the minted doc to
+  the minting connection.
+- Cancel/steer during `agent_admin_turn`: these use the authenticated worker control
+  endpoint from `worker_control_info` (`workerControlMtx_`, `callAgentCancel`,
+  `callAgentSteer`), never the blocked stdio lane.
+- hostd fails a non-turn call behind a running turn at once with `worker_lane_busy`.
+  A new stateful agent RPC family must be added to `WorkerBridge::forMethod`'s agent
+  prefixes, or it lands on the general lane (a different process).
+- Never stop a daemon serving the user's GUI or agent children. Stale-binary drain
+  is soft; clean shutdown is not project save. Mission terminal persistence saves
+  touched agent documents and never closes or overwrites the user's open documents.
+- `CHUDWARE_RPC_TRACE=<file>` appends a redacted per-call trace from `WorkerClient::call`.
+- Tests: host `test_worker_long_run` (fake hostd, developer builds), `test_worker_control`,
+  `test_async_rpc`; hostd lifecycle `scripts/hostd_smoke.py`; web parity
+  `scripts/web_parity_probe.py`.
+
+## Graphify starters
+- graphify query "WorkerClient callImpl routeDocToCpp engine_backend daemon"
+- graphify explain "WorkerBridge"
+- graphify path "worker_client.cpp" "worker_main.py"
+
+## Related tasks/docs
+- docs/reference/HOSTD.md (daemon design, drain/replace, instance keys)
+- work/context/engine-python.md (services worker side), work/context/gui-host.md (GUI callers)

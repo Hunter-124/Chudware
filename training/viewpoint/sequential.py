@@ -20,6 +20,7 @@ from services.viewpoint.parts import GENERATOR_VERSION, generate_part_examples
 from services.viewpoint.sampling import generate_benchmark_candidate_set
 
 from .data import ViewpointBatch, encode_task, locked_expansion_part_indices
+from .durable import durable_replace
 from .metrics import sequential_evaluation_report
 from .model import COMPONENTS, NumpyViewpointPolicy, PolicyWeights, weighted_geometric_mean
 from .observation_data import (
@@ -275,7 +276,7 @@ def _write_json_atomic(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    durable_replace(temporary, path)
 
 
 def run_locked_test_curves(

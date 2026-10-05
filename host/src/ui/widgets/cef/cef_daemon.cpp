@@ -27,7 +27,7 @@ namespace {
 
 using steady = std::chrono::steady_clock;
 
-// The warm persistent profile. The daemon is now its SOLE on-disk owner (Phase 2b):
+// The warm persistent profile. The daemon is its SOLE on-disk owner:
 // the interactive panel writes its OWN separate profile (cef_web_view.cpp's
 // panel_profile_dir) so two Chromium processes never write this store concurrently.
 // A login in the panel carries here via the "import_session" method below, which

@@ -99,7 +99,7 @@ const ui::AdaptiveSurface& chatSurf();
 ImVec4 semanticOnGlass(const float role[4], const ui::AdaptiveSurface& surf);
 // RGB (0..1) of a message's mode role (Agent=accent, Plan=amber, Ask=neutral).
 void   modeAccentRgb(int mode, float out[3]);
-// Map a raw ActivityItem/AgentStep status string ("running"/"pass"/"done"/"retry"/"fail"/
+// Map a raw ActivityItem status string ("running"/"pass"/"done"/"retry"/"fail"/
 // "skipped"/"") onto the kit's status vocabulary. ONE spelling of that mapping for the whole
 // copilot: the timeline spine, the action cards and the plan checklist all read it.
 ui::kit::Status chatRowStatus(const std::string& status);
@@ -212,7 +212,6 @@ void cpMenuLabel(const char* label);
 void cpMenuHint(const char* text);
 
 // ---- activity timeline (activity_timeline) ----
-void        drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW);
 // `srcOf` (optional): per output byte, the index of the input byte it came from.
 std::string stripMdMarks(const std::string& in, std::vector<size_t>* srcOf = nullptr);
 // Truncate to fit `maxW` in the CURRENT font, appending "…" when it does not (UTF-8-safe).
@@ -224,14 +223,14 @@ std::string chatEllipsize(const std::string& s, float maxW);
 ImGuiID     drawMdProse(const char* id, const std::string& in, const ImVec4& col, ImFont* mono);
 // Horizontal inset of the assistant's prose = the timeline rows' text column (rail + row pad).
 float       chatProseInsetX();
-void        drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, float logW,
-                           bool liveFrontier = false);
+void        drawActionCard(ActivityItem& a, const ui::Fonts& fonts, bool liveFrontier,
+                           bool onSpine);
 void        chatArtifactReveal(AppState& st, const std::string& path);
 void        chatArtifactOpenSmart(AppState& st, const std::string& path);
 void        chatArtifactActions(AppState& st, const std::string& path);
 void        drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts);
-void        drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
-                              bool showThinking, bool isLastTurn = false);
+void        drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool showThinking,
+                              bool isLastTurn = false);
 // ---- transcript scroll anchors (activity_timeline) ----
 // The ONE anchor mechanism shared by the run receipt's failure list and the cost-attribution
 // strip: both need "take me to that action card". Keyed the way the timeline keys its rows —

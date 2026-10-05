@@ -1,20 +1,21 @@
-# services/worker — engine routing seam
+# services/worker — host→engine routing seam
 
-The routing seam between the host GUI and the engine: every host→engine call
-funnels through here and is routed to in-process `libchudware` or the daemon
-backend. The host compiles these sources directly (`host/CMakeLists.txt`).
+The client-side routing seam between the host GUI (desktop and WASM) and the engine. Every
+host→engine call funnels through `WorkerClient`. It goes either to `libchudware` (through
+the `chudware-hostd` daemon, or in-process) or to the services worker that hostd bridges.
+The host compiles these sources directly (`host/CMakeLists.txt`). Contract:
+`contracts/worker_rpc.md`. Rules and ownership: `AGENTS.md` in this directory.
 
-## Sources (post-R0b: these four only)
+## Sources (these three only)
 
-- `worker_client.{h,cpp}` — JSON-RPC client and libchudware routing funnel
-- `engine_backend.{h,cpp}` — backend seam: InProcCore vs daemon connection, IPC discovery
-- `cpp_core.{h,cpp}` — in-process libchudware via flat C ABI
-- `worker_router.{h,cpp}` — method/document routing policy
+- `worker_client.{h,cpp}` — `WorkerClient` and its routing predicates
+  (`routeDocToCpp`/`routeAgentToCpp`/`routeSimToCpp`/`routeEcadToCpp`/`routeFirmwareToCpp`)
+- `engine_backend.{h,cpp}` — `engine::` backend seam: daemon `EngineClient` (default) vs
+  in-process `CppCore` (`CHUDWARE_ENGINE_DAEMON=0` or daemon unreachable), plus per-run lanes
+- `cpp_core.{h,cpp}` — `CppCore`, the runtime `libchudware` loader over the flat C ABI
 
-The stale duplicate copies of the host's live modules (async_rpc, doc_mirror,
-jobs, sim_client, selection, doc_tabs, bootstrap, worker_types, doc_session,
-pick_hit, worker_command_dispatcher) were deleted in R0b — the canonical
-copies live in `host/src/core/*` and `host/src/bootstrap.cpp`.
+GUI document/job/bootstrap state is owned by `host/src/core/*` and
+`host/src/bootstrap.cpp`; this directory owns routing, backend and loading only.
 
 ## Host forwarding headers
 

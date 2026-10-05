@@ -8,10 +8,15 @@ description: Chudware workspace-tab specialist — Parts Library, Assembly panel
 Scope: the tabbed workspaces and auxiliary panels around the modeling view. **Work only in
 your assigned workspace's files** — e.g. an icon-generation task never needs the Parts Library
 section below, and vice versa. Shared plumbing (app.cpp dispatch, AppState seams) is
-integrator-owned.
+integrator-owned; dispatch, hot files and verification handoff live in
+`.claude/skills/gui-orchestrator/SKILL.md`. Visual system (`ui::kit`, colors, metrics/DPI):
+`.claude/skills/gui-theme-layout/SKILL.md`.
 
-The app has 8 workspaces cycled by the `CHUDWARE_SHOT=workspaces` scenario; each is drawn from
-the frame loop in `host/src/app.cpp`.
+`AppState::Workspace` (`host/src/core/app_state.h`) has 10 values — Model, Drawing, Simulate,
+Electronics, Manufacture, PLM, PartsLibrary, AI, ReverseEng, Firmware — and is append-only
+(`status_bar` indexes by value). Each is drawn from the frame loop in `host/src/app.cpp`.
+`CHUDWARE_SHOT=workspaces` (`ScenarioRunner::runWorkspaces`) cycles the first eight;
+ReverseEng and Firmware have their own shots.
 
 ## Per-workspace file map
 
@@ -23,13 +28,49 @@ the frame loop in `host/src/app.cpp`.
 | **ECAD** | `host/src/ui/ecad/ecad_panel.cpp/.h`, `ecad_canvas.cpp/.h`, `ecad_mirror.cpp/.h` | Schematic/PCB 2D canvas editor; schemas in `contracts/ecad/` |
 | **PLM** | `host/src/ui/plm/plm_workspace.cpp`, `plm_pages.cpp`, `plm_hub.h`, `plm_state.cpp`, `plm_quickbar.cpp`; Explorer integration: `host/src/ui/file_explorer.cpp` | Versioning, releases, document control; `contracts/plm.md`. The separate left-rail PLM tab and `plm_overview.cpp` are retired: Explorer's Changes/Files cards handle vault status (M/A/D/U), project-wide named checkpoints, rev/lifecycle labels and links into the full PLM workspace. Explicit revision-named siblings are visually grouped but remain individually openable physical files/items, never auto-merged. Shared item/status caches serve the hub; Files requests basic Git status/log, Git/Planning request full details. All hub pages enter `plmEnsureOverview` for one-shot outside-change recording; do not duplicate it in project selection. |
 | **Reverse Eng.** | `host/src/ui/reveng/`: `reveng_workspace.cpp` (shell), `reveng_widgets.h/.cpp` (shared visual kit), `sources_panel.cpp`, `webcam_capture.cpp`, `stage_panels.cpp`, `dim_review.cpp`, `image_gallery.cpp`, `img_tex.cpp` | Native live/video Gaussian reconstruction plus the separate six-stage measured-CAD wizard (`contracts/reveng.md` §13). **Every panel draws with `ui::reveng::kit`** and uses `ui::metrics::re*()`. Camera seam: `host/src/platform/camera.h` v2. Native splat/point rendering reads `kit::previewSlotRect` and `previewSlotClip`. Full breakdown below. |
-| **AI / Activity** | `host/src/ui/ai/ai_workspace.cpp/.h` shell/nav + `ai/agent_dag.cpp/.h` execution graph, `ai/current_run_view.cpp/.h` roster/single docked inspector, `ai/{plan_board,docs_panel,active_work,metrics_view,activity_view,insights_view}.cpp`, plus `host/src/ui/copilot/` chat modules (reuse hooks in `copilot.h`; `legacy_chat.cpp` is gone) | Current Run / Plan / Activity / Sessions / Insights / Options, project chip; project scoping via `convProjectDir(st)`; events per `contracts/agent_events.md` |
+| **AI / Activity** | `host/src/ui/ai/ai_workspace.cpp/.h` shell/nav + `ai/agent_dag.cpp/.h` execution graph, `ai/current_run_view.cpp/.h` roster/single docked inspector, `ai/{plan_board,docs_panel,active_work,metrics_view,activity_view,insights_view}.cpp`, plus `host/src/ui/copilot/` chat modules (reuse hooks in `copilot.h`) | Current Run / Plan / Activity / Sessions / Insights / Options, project chip; project scoping via `convProjectDir(st)`; events per `contracts/agent_events.md` |
 | **Drawing** | `host/src/ui/drawing_panel.cpp` | Sheet layout, views, DXF export |
 | **Simulation** | `host/src/ui/sim_manager.cpp/.h`, `host/src/ui/evaluate_dialogs.cpp`; topology: `host/src/ui/sim_topology.cpp/.h`, `host/src/ui/sim_topology_bc.cpp/.h` | Study tree, fixtures/loads, results; Evaluate dialogs (measure, mass props, …). The **Topology** ribbon tab (Simulate only, `ribbon_def.cpp` `sim_new_topology`/`sim_topology_*`) drives topology studies; see "Simulation: Topology tab" below |
-| **Firmware** | `host/src/ui/firmware/fw_workspace.cpp/.h` | T-FIN5: project rail + sources, build console (parsed warnings), emulation + UART console, GPIO trace viewer (`contracts/firmware_rpc.md` §7/§8); fw_status-gated Flash/Debug; tab is progressively disclosed (`ui::firmwareTabVisible`); shot: `CHUDWARE_SHOT=firmware` |
-| **Manufacture** | `host/src/ui/manufacture/{manufacture_panel,device_panel,run_panel,approval_dialog,attention_panel,mfg_mirror}.cpp/.h` | Capability-truth chips, gate-report rendering. **No floating operator surface**: Devices / Run / Attention are rail tabs 3–5 of the pinned left column (`layout.cpp`), and the Offline/Live mode strip is chrome under the ribbon. All three bodies draw with `ui::kit` — cards, tone chips, `keyValueRow`, `emptyState`/`blockedState`, `inlineStatus` — never bespoke text dumps. **Tone convention: Offline Simulation is the SAFE state and reads calm (`Tone::Ok` dot chip on neutral glass); LIVE MACHINE is the hazardous one and is the only state that gets the `statusErr` wash + danger button.** Shot: `CHUDWARE_SHOT=manufacture` (the rail opens on Attention for that shot only — `layout.cpp` resolves the shot tab ONCE from `CHUDWARE_SHOT`, so `cam` keeps the Job Manager default) |
+| **Firmware** | `host/src/ui/firmware/fw_workspace.cpp/.h` | Project rail + sources, build console (parsed warnings), Emulate scenario editor + Engineering evidence, UART/GPIO viewer; same native `fw_sim_run` as agents (operational details below); fw_status-gated Flash/Debug; tab is progressively disclosed (`ui::firmwareTabVisible`); shot: `CHUDWARE_SHOT=firmware` |
+| **Manufacture** | `host/src/ui/manufacture/{manufacture_panel,device_panel,run_panel,approval_dialog,attention_panel,mfg_mirror}.cpp/.h` | Capability-truth chips, gate-report rendering; rail/mode-strip layout in "CAM / Manufacture internals" below. Bodies draw with `ui::kit` — cards, tone chips, `keyValueRow`, `emptyState`/`blockedState`, `inlineStatus` — never bespoke text dumps. **Tone convention: Offline Simulation is the SAFE state and reads calm (`Tone::Ok` dot chip on neutral glass); LIVE MACHINE is the hazardous one and is the only state that gets the `statusErr` wash + danger button.** Shot: `CHUDWARE_SHOT=manufacture` (the rail opens on Attention for that shot only — `layout.cpp` resolves the shot tab ONCE from `CHUDWARE_SHOT`, so `cam` keeps the Job Manager default) |
 
-### Agent Hub / project ownership (2026-09-26, reworked 2026-09-27)
+### Firmware: shared Emulate surface
+
+- **One run path.** Firmware > Emulate selects the existing project, Auto/Renode/QEMU/
+  simavr backend, scenario JSON (edit or load/save), duration/host timeout and assertions.
+  Run emulation calls native `fw_sim_run`; agents use the MCP tool with the same inputs,
+  optionally `elf_path` or `scenario_path` instead of inline JSON. UI-loaded files become
+  inline JSON. See `services/mcp/firmware_tools.py::fw_sim_run` for the existing SI schema,
+  not a GUI-only dialect. Forced backends refuse rather than silently falling back.
+- **Bounded clocks/time.** The shared timed/electrical runtime supports STM32F4 Renode
+  I2C (`i2c1–3`), TTL UART (`usart1/2`), master SPI (`spi1–3`) and bxCAN (`can1/2`).
+  `fw_status` capabilities are authoritative; other families' functional support is not
+  electrical support. Firmware registers set timing against declared `controller_clock_hz`;
+  without links F4 assumes reset 16 MHz HSI clocks and an ideal medium. RCC/PLL/APB changes
+  are not modeled. Renode `run_s` is a virtual horizon, `timeout_s` an independent host
+  budget (UI/MCP 0 omits it; native default 30 s). A submitted frame may be unfinished at
+  the horizon. QEMU has no peripheral scenario/precise virtual stop; simavr stops by wall time.
+- **Peer precedence and timing.** CAN track `bitrate_hz` reconfigures the named peer even
+  with a link, using sample point 0.875, SJW 1 and track `ack_enabled` (default true);
+  conflicting settings are not rejected as a must-match rule. Inspect emitted effective
+  timing, not just link JSON. SPI receive budget includes the clock path, peer output delay
+  and MISO propagation/rise/load/threshold settling. The exercised 20 ns-edge/20 ns-output
+  profile exceeded its 50 ns half-period and produced SPI_BAD with the same ELF; a healthy
+  5 ns-edge profile is not a universal timing guarantee.
+- **Evidence, not certification.** Engineering exposes native `bus_summary`/`bus_events`
+  and Copy native result JSON. Preserve that result with the scenario; `trace_path` contains
+  GPIO/UART, not the full bus packet. `passed` is the requested assertion verdict, possibly
+  with no assertions. Check refusals, limitations and finite/truncated evidence. Resolved/
+  unresolved samples and electrical causes are independent of hardware flags: UART ONEBIT
+  retains unresolved evidence without inventing NF. Past/delayed receiver samples preserve
+  voltage/validity history; quiet line ports still integrate travelling waves. Virtual
+  nanosecond timestamps and the 0.1 ns integration floor are not subnanosecond accuracy
+  promises. Renode 1.16.1 has final GPIO ODR evidence, not the observer for timestamped
+  GPIO/toggle/period assertions. Linear RC/lossless lines exclude nonlinear/common-mode/
+  EMC/crosstalk/dispersion behavior; this guidance supplies no full-flight, Windows/macOS
+  or live-hardware proof. Keep all native limitations visible.
+
+### Agent Hub / project ownership
 
 - `ai_workspace.cpp` draws the shell (session header + New session above the chat; nav
   view persisted as `agent.ui_ai_view`); `agent_dag.cpp` owns per-conversation traces:
@@ -65,7 +106,7 @@ the frame loop in `host/src/app.cpp`.
   payload on send/steer and persisted by `conversations.cpp` (`images` in compact messages,
   `imagePaths` in raw archives). Never resolve a marker's basename across paste-cache days:
   names repeat daily. Legacy records lacking paths keep their marker without a guessed image.
-- **Copilot chat conventions (2026-10-03).** Magic keywords (Chudcode's `ultrathink`,
+- **Copilot chat conventions.** Magic keywords (Chudcode's `ultrathink`,
   `orchestrate`, `workflowz`, `jevify`, `ultragoon`, `autobot`, `tokenmaxxing`; table mirrors
   `omp/packages/coding-agent/src/modes/magic-keywords.ts`) are matched ONLY by
   `ui/copilot/magic_keywords.h` (standalone prose, never in code spans/fences/tags;
@@ -75,7 +116,7 @@ the frame loop in `host/src/app.cpp`.
   `drawAskCards`); an open batch replaces the run status with "Waiting for your answers".
   User messages are right-aligned mode-tinted bubbles; assistant prose has no box.
 
-### CAM / Manufacture internals (native viewport cutover)
+### CAM / Manufacture internals
 
 - There is **no CAM dock window or private preview canvas**. `buildDefaultLayout()` keeps one
   uninterrupted Viewport/ECAD central node. Manufacture's pinned left rail hosts Explorer,
@@ -92,7 +133,7 @@ the frame loop in `host/src/app.cpp`.
   `ui::manufactureModeBarHeight(st)` right after the ribbon, folds it into `dockTopY` BEFORE
   `setOverlayBand()`, and draws it with `ui::drawManufactureModeBar(st, x, y, w, h)`. So the
   dockspace, the doc-tab strip and both pinned columns start beneath it and it can never cover
-  geometry. `drawManufacturePanel(st)` is now only bootstrap RPCs + the approval dialog.
+  geometry. `drawManufacturePanel(st)` is only bootstrap RPCs + the approval dialog.
 - `CamMirror` owns the typed job mirror plus render-ready world-space batches. Every path class
   carries global segment start/end times and cached direction triangles; stock-box edges are
   cached too. Tree revision changes invalidate generated paths so stale geometry cannot remain
@@ -105,7 +146,7 @@ the frame loop in `host/src/app.cpp`.
   `viewportHudRect()` (declared in `cam/cam_panel.h`, frame-stamped like
   `publishOverlayColumnHeight`). The orientation triad and the model-dimensions readout in
   `viewport_panel.cpp` READ it and lift above the card, so the bottom-centre HUD and the
-  bottom-left triad can no longer overlap on a 360dp-rail workspace. Any new bottom-anchored
+  bottom-left triad never overlap on a 360dp-rail workspace. Any new bottom-anchored
   viewport card should publish the same way instead of hoping for empty space.
 - CAM UI state is one process-level active job. Extraction pins the source **Part doc id** instead
   of following whichever tab becomes active later. Mutations use the mirrored revision, reject
@@ -113,9 +154,9 @@ the frame loop in `host/src/app.cpp`.
 - Focused CPU contract: `host/tests/test_cam_mirror.cpp`. End-to-end smoke:
   `CHUDWARE_SHOT=cam ./host/build-linux/bin/chudware --ui-screenshot scratch/cam.png`.
 
-### Reverse Engineering internals (rebuilt RE-40)
+### Reverse Engineering internals
 
-Eight TUs behind one tab. Read `reveng_widgets.h` before touching any of them.
+Read `reveng_widgets.h` before touching any RE TU.
 
 - `reveng_workspace.cpp` / `.h` — the shell. Three columns: session rail (rich cards with
   thumbnails, status/progress, substring filter, New-session card), centre column with the
@@ -201,7 +242,7 @@ Eight TUs behind one tab. Read `reveng_widgets.h` before touching any of them.
   `$CHUDWARE_SHOT`-gated so demo rows can never reach a real session.
 - `image_gallery.cpp` + `img_tex.cpp` — the contact sheet: responsive tile grid with hover
   metadata previews, quality/synthetic badges, a filter + count summary, culling and full-size
-  viewer. Thumbnails come from `reveng::cachedThumbTex()` — `img_tex` now has a **bounded
+  viewer. Thumbnails come from `reveng::cachedThumbTex()` — `img_tex` has a **bounded
   downscaled thumbnail decode** (`loadThumbTexFromFile`) plus an **LRU texture cache**
   (`setThumbCacheLimit`, `thumbCacheOwns`, `thumbCacheStillMaps`, `thumbCacheEvictionEpoch`,
   `thumbCacheClear`). `freeTexture()` is a documented **no-op for cache-owned ids**, which is what
@@ -219,14 +260,14 @@ honesty flag `CameraFrame::synthetic` (a synthetic frame must never be persisted
 cross-platform `CameraBackend::create()` factory and the `frameSharpness` definition).
 
 **Transport.** The RE GUI reaches Python through the worker RPC table in
-`services/reveng/worker_rpc.py`, which is now a *thin adapter* over the reveng MCP tool registry
+`services/reveng/worker_rpc.py`, a *thin adapter* over the reveng MCP tool registry
 (`services/mcp/reveng_session_tools.py`, `reveng_build_tools.py`, `recon_tools.py`): adding a
 reveng tool exposes it to BOTH the agent and the GUI, and there is no second implementation to
 keep in sync. Bridging one is a line in `_BRIDGED_TOOLS`. Only `reveng_start_from_product` is
-still hand-written. Failure envelopes are always `{ok:false, reason, hint}` — surface `reason`
+hand-written. Failure envelopes are always `{ok:false, reason, hint}` — surface `reason`
 and `hint`, never a bare "failed".
 
-**Headless shots** (`CHUDWARE_SHOT=<name> ./host/build-linux/bin/Chudware --ui-screenshot …`):
+**Headless shots** (`CHUDWARE_SHOT=<name> ./host/build-linux/bin/chudware --ui-screenshot …`):
 `reveng` (empty shell), `reveng_capture` (Source stage, canned session), `reveng_scale`,
 `reveng_recon` (mid-run at 45 %), `reveng_review` (canned dims + deviation), `reveng_model`,
 `reveng_deliver`. All but the first seed a canned session via `seedRevengCanned` in `app.cpp`.
@@ -287,21 +328,21 @@ mutations, which can invalidate the browser cache during tree traversal.
 - Engine data arrives via the per-frame drain in `host/src/core/engine_events.cpp`; panels
   render from AppState, they don't call the worker synchronously. RPC via
   `WorkerClient::sendRpc()` (`contracts/worker_rpc.md`).
-- Colors via `ui_theme` only; icons from `contracts/icons.md`; glass containers via the
-  helpers in `host/src/ui_theme.h` (see gui-theme-layout for the visual system).
-- Scrolling children use the app's pill scrollbar, never ImGui's default: give the child
-  `ImGuiWindowFlags_NoScrollbar` and call `ui::drawWindowPillScrollbarV(surf)` right before
-  `EndChild()`. Streaming logs stick to the bottom via `ui::chatLogStickToBottom("<region id>")`
-  (a unique id per surface — two surfaces sharing one id fight over the flag).
-- Row/card gutters, corners and gaps come from `ui::metrics::cpMenu*`; compact
-  "fraction of a budget" readouts use `ui::drawFractionRing`. See gui-theme-layout for both,
-  including the logical-dp-vs-pixels double-scale trap.
+- Visual system per gui-theme-layout: colors via `ui_theme` only, widgets via `ui::kit` (or the
+  workspace's thin-wrapper kit), sizes via `ui::metrics` density tokens, pill scrollbar
+  (`ui::drawWindowPillScrollbarV`) and `ui::drawFractionRing` instead of re-rolls; icons from
+  `contracts/icons.md`.
+- Streaming logs stick to the bottom via `ui::chatLogStickToBottom("<region id>")` — a unique id
+  per surface (two surfaces sharing one id fight over the flag).
 - Contracts are append-only; schema changes are orchestrator-level decisions.
 
-## Build & verify
+## Verification
 
-`./build.sh` from repo root must compile. Headless smoke per workspace where one exists:
-`CHUDWARE_SHOT=<asm|fea|flow|drawing|workspaces|motion|firmware|reveng[_capture|_scale|_recon|_review|_model|_deliver]> ./host/build-linux/bin/Chudware
---ui-screenshot scratch/ws_smoke.png` — crash check only. Never run git. Return files changed
-+ a one-line user check, e.g. "Parts Library > type in search — results stream while typing,
-filters stay responsive."
+Workers return files changed and the shots/tests below; the integrator builds and runs them per
+gui-orchestrator. Headless scenario per workspace where one exists:
+`CHUDWARE_SHOT=<asm|fea|flow|drawing|cam|manufacture|topology|workspaces|motion|firmware|reveng[_capture|_scale|_recon|_review|_model|_deliver]> ./host/build-linux/bin/chudware --ui-screenshot scratch/ws_smoke.png`.
+Self-checking scenarios (e.g. `topology` writes `ok` into its report) are functional evidence;
+a capture alone proves the flow ran — visual judgment stays with the user check. CPU pins:
+`host/tests/test_cam_mirror.cpp`, `test_camera_backend.cpp`, `test_sim_topology.cpp`,
+`test_magic_keywords.cpp`, `test_ask_answers.cpp`, `test_usage_rings.cpp`. User check example:
+"Parts Library > type in search — results stream while typing, filters stay responsive."

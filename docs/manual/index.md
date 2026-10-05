@@ -7,7 +7,6 @@ in-app modeling guide, and the frozen contract set — see `tools/manual_gen.py`
 
 - [Overview](overview.md)
 - [Commands Reference](commands.md)
-- [Guide: Overview](guide-overview.md)
 - [Guide: Review](guide-review.md)
 - [Guide: Simulation](guide-simulation.md)
 - [Guide: Intake](guide-intake.md)

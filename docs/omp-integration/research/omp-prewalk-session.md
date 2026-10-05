@@ -1,5 +1,15 @@
 # OMP `prewalk` + session/state persistence — research dossier
 
+> **Historical research (2026-07), superseded 2026-08-31. Not a current runbook.** This dossier
+> is dated evidence from the OMP integration research round. Its bun bridge/sidecar,
+> `vendor/omp/` and `scripts/vendor_omp.py` were deleted. Any `scratch/omp-src/` or
+> inspection-checkout path is an untracked local research copy, not a dependency. Its CAD
+> file/line citations are point-in-time. Online agent execution, provider auth, models,
+> sessions, memory and compaction now run in the embedded Chudcode RPC runtime. See
+> [01-DECISIONS.md, 2026-08-31 section](../01-DECISIONS.md#2026-08-31--superseding-architecture-chudcode-rpc-is-the-only-online-runtime),
+> [ARCHITECTURE.md, Agent runtime](../../../ARCHITECTURE.md#agent-runtime), and
+> [`.claude/skills/cad-chudcode-integration/SKILL.md`](../../../.claude/skills/cad-chudcode-integration/SKILL.md).
+
 ## 1. What `prewalk` actually is
 
 **Prewalk is real and exists exactly under that name.** It is a one-way, mid-session model hand-off mechanism, not a search/exploration "walk" (no relation to game-tree/AST "prewalk" senses). Its purpose: run the *start* of a task on a strong/expensive model until a todo plan exists and the first edit/write lands, then permanently switch the running session to a fast/cheap model for the remaining implementation — cutting cost/latency on long agentic runs without sacrificing planning quality.

@@ -236,9 +236,8 @@ def download_public_cad(url: str, dest: Path, *, max_bytes: int = 200 * 1024 * 1
 def download_dir(site: str) -> Path:
     """Local landing directory for artifacts acquired from ``site``.
 
-    A sibling of ``vendor_parts`` under the app data dir (``services.paths``) —
-    T-X3 wires acquired files into the VendorPart registry proper; this is
-    just where the bytes land first.
+    A sibling of ``vendor_parts`` under the app data dir (``services.paths``).
+    This is where acquired bytes land before parts-registry ingestion.
     """
     d = paths.BROWSER_DOWNLOADS / slug(site)
     d.mkdir(parents=True, exist_ok=True)
@@ -247,9 +246,7 @@ def download_dir(site: str) -> Path:
 
 # Side-effecting: each site module calls register(...) at import time. Imported here
 # (not left to whoever happens to import a specific site module first) so all_adapters()
-# is reliably populated as soon as this package is imported — e.g. by
-# engine_oracle.parts_hub.hub.PartsHub.bootstrap() (T-X3), which only imports this
-# package's top level.
+# is reliably populated as soon as this package's top level is imported.
 from . import (amazon, content3d, digikey_web, grabcad, jlcpcb, lcsc, mcmaster,  # noqa: E402,F401
                misumi, pcbway, snapeda, traceparts)
 from . import makerworld, printables  # noqa: E402,F401 — public CAD communities
@@ -257,7 +254,7 @@ from . import (acehardware, fastenal, grainger, harborfreight, homedepot,  # noq
                lowes, metalsdepot, onlinemetals, tractorsupply)
 # Wave 3 (2026-07-07): supplier expansion — hydraulics/fluid-power, Chinese &
 # foreign electronics, materials, engineered-products CAD portals + the RE-feed
-# datasheet/standards DBs (see docs/parts_supplier_research.md).
+# datasheet/standards DBs (see docs/review/parts_supplier_research.md).
 from . import (boschrexroth, hydraforce, parker,  # hydraulics CAD  # noqa: E402,F401
                speedymetals, coremarkmetals, professionalplastics,  # metals/plastics
                rockwest, acpcomposites, fibreglast,  # composites

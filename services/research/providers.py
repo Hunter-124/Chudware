@@ -5,9 +5,8 @@ env/config driven; :class:`MockSearchProvider` backs tests so the suite never to
 network (the gate runs offline). ``httpx`` is imported lazily inside ``search`` so a
 missing network stack never breaks import.
 
-v1 wires **Tavily** (recommended BYO-key default) + **DuckDuckGo HTML** (zero-key
-fallback, ``confidence:"limited"``) + the mock. Exa/Serper/SearXNG conform to this same
-interface and land as later tasks need them.
+Implemented providers are **Tavily** (recommended BYO-key default),
+**DuckDuckGo HTML** (zero-key fallback, ``confidence:"limited"``), and the mock.
 """
 from __future__ import annotations
 

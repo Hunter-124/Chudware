@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 
 RANKINGS_SCHEMA = "aicad.model_rankings/1"
 AI_ROLES_KEY = "ai_roles"
-# User overrides for rankings (Settings GUI). Distinct from ai_roles.
+# User overrides for rankings, read from config. Distinct from ai_roles.
 USER_RANKINGS_KEY = "model_rankings"
 
 # Third assignment form, beside "auto" (ranked pick) and a fixed {provider, model}:
@@ -418,82 +418,6 @@ def is_provider_unavailable_error(exc: BaseException | str | None) -> bool:
     return False
 
 
-# Vendor families that share ONE content classifier. A refusal from `anthropic`
-# will be repeated verbatim by `anthropic-sub` (same models, same policy, only the
-# credential differs), so failing over between them just burns a second paid
-# request. Anything not listed is its own family.
-_VENDOR_FAMILY = {
-    "anthropic": "anthropic",
-    "anthropic-sub": "anthropic",
-    "claude-cli": "anthropic",
-    "xai": "xai",
-    "xai-sub": "xai",
-    "openai": "openai",
-    "codex-cli": "openai",
-    "kimi-code": "moonshot",
-    # config.py's _PROVIDER_ID_ALIASES renames kimi-sub -> kimi-code; a config
-    # written before that rename still enumerates the old id, and it is the same
-    # Moonshot policy either way.
-    "kimi-sub": "moonshot",
-    "moonshot": "moonshot",
-}
-
-
-def vendor_family(provider: str | None) -> str:
-    """The content-policy family *provider* belongs to (itself when unlisted)."""
-    p = (provider or "").strip().lower()
-    return _VENDOR_FAMILY.get(p, p)
-
-
-def refusal_failover_candidates(
-    refused: Iterable[str],
-    *,
-    cfg: Mapping[str, Any] | None = None,
-    limit: int = 3,
-) -> list[dict[str, str]]:
-    """Enabled provider+model rows that could still answer a REFUSED request.
-
-    A content refusal is vendor policy, not an outage, so this deliberately does
-    NOT consult (or populate) ``_UNAVAILABLE_PROVIDERS`` for the refusing vendor
-    — it stays perfectly usable for every other request in the run. It only
-    drops whole vendor FAMILIES that already refused, since a sibling credential
-    for the same models refuses identically.
-
-    Ordering is CAPABILITY first (rank desc, then cost), the inverse of
-    ``auto_pick_model``'s cheap-first preference: the request that got refused
-    was being served by whatever the user chose for the job, and handing a
-    frontier-grade design brief to ``llama3.2`` produces a confident wrong
-    answer, which is worse than the honest refusal it replaced.
-    """
-    cfg = cfg or {}
-    blocked = {vendor_family(p) for p in refused if str(p or "").strip()}
-    ranks = load_rankings(cfg)
-    rows: list[tuple[tuple[int, Any, str], dict[str, str]]] = []
-    for entry in _enabled_providers(cfg):
-        prov = str(entry.get("provider") or "").strip().lower()
-        model = str(entry.get("model") or "").strip()
-        if not prov or not model or vendor_family(prov) in blocked:
-            continue
-        mr = _rank_for(model, ranks)
-        rank = mr.rank if mr is not None else 2
-        if model.strip().lower() in _FRONTIER_RANK_FLOOR_IDS:
-            rank = max(rank, _FRONTIER_MEASURED_FLOOR)
-        rows.append(((-rank, _cost_key(prov, model), f"{prov}/{model}"), dict(entry)))
-    rows.sort(key=lambda t: t[0])
-    out: list[dict[str, str]] = []
-    seen_family: set[str] = set()
-    for _key, entry in rows:
-        # One shot per family: if a vendor refuses, its second-best model refuses too.
-        fam = vendor_family(str(entry["provider"]))
-        if fam in seen_family:
-            continue
-        seen_family.add(fam)
-        out.append(entry)
-        if len(out) >= max(1, int(limit)):
-            break
-    return out
-
-
 def _openrouter_key_present(cfg: Mapping[str, Any] | None) -> bool:
     """True when an OpenRouter API key is configured (any supported location).
 
@@ -650,14 +574,6 @@ def load_rankings(
             cycles=base.cycles if base else 0,
         )
     return merged
-
-
-def rankings_as_dict(
-    cfg: Mapping[str, Any] | None = None,
-    **kwargs: Any,
-) -> dict[str, dict[str, Any]]:
-    """Public view for RPCs: ``{model_id: {rank, source, notes, ...}}``."""
-    return {mid: mr.to_dict() for mid, mr in load_rankings(cfg, **kwargs).items()}
 
 
 # ---------------------------------------------------------------------------
@@ -996,50 +912,6 @@ def set_ai_roles(
     merged_cfg = dict(cfg or {})
     merged_cfg[AI_ROLES_KEY] = current
     return get_ai_roles(merged_cfg)
-
-
-
-def set_user_rankings(
-    rankings_partial: Mapping[str, Any],
-    cfg: Mapping[str, Any] | None = None,
-    *,
-    persist: bool = True,
-) -> dict[str, dict[str, Any]]:
-    """Merge user ranking overrides. Returns full merged rankings view."""
-    current = dict((cfg or {}).get(USER_RANKINGS_KEY) or {})
-    if not isinstance(current, dict):
-        current = {}
-    for mid, entry in (rankings_partial or {}).items():
-        mid_s = str(mid).strip()
-        if not mid_s:
-            continue
-        if entry is None:
-            current.pop(mid_s, None)
-            continue
-        if isinstance(entry, Mapping):
-            prev = dict(current.get(mid_s) or {}) if isinstance(current.get(mid_s), Mapping) else {}
-            if "rank" in entry:
-                prev["rank"] = _clamp_rank(entry["rank"])
-            if "notes" in entry:
-                prev["notes"] = str(entry["notes"])
-            if "provider" in entry:
-                prev["provider"] = str(entry["provider"])
-            prev.setdefault("source", "user")
-            current[mid_s] = prev
-        else:
-            current[mid_s] = {
-                "rank": _clamp_rank(entry),
-                "source": "user",
-                "notes": "user override",
-            }
-    if persist:
-        from services.agent import config as agent_config  # noqa: PLC0415
-        agent_config.save_config({USER_RANKINGS_KEY: current})
-        disk = agent_config.load_config()
-        return rankings_as_dict(disk)
-    merged_cfg = dict(cfg or {})
-    merged_cfg[USER_RANKINGS_KEY] = current
-    return rankings_as_dict(merged_cfg)
 
 
 # ---------------------------------------------------------------------------

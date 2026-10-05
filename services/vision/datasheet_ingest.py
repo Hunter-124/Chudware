@@ -13,8 +13,8 @@ Backend priority (lazy import, first available wins):
 3. If neither is available: returns the honest degradation envelope
    ``{"ok": false, "reason": "backend_not_provisioned", "hint": "pip install docling"}``.
 
-Part-number candidates are normalised with :func:`engine_oracle.spec_sheet_matcher.normalize_mpn`
-(already on master) — no reinvention.
+Part-number candidates are normalised by the C++ sourcing core through
+:mod:`services.parts.normalization` — no Python re-implementation.
 """
 from __future__ import annotations
 
@@ -26,18 +26,18 @@ from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# MPN normalisation — reuse existing, no reinvention
+# MPN normalisation — the core's normalize_mpn RPC via the shared parts seam.
+# Core call failures propagate; only an unimportable core bridge degrades to strip.
 # ---------------------------------------------------------------------------
 try:
-    # spec_sheet_matcher was deleted (T-RF18); the C++ port answers via core_bridge.
     from services.mcp.core_bridge import call as _cb_call
+    from services.parts.normalization import core_normalize_mpn
 
     def normalize_mpn(pn: str) -> str:
-        r = _cb_call("normalize_mpn", {"mpn": str(pn or "")})
-        return (r.get("normalized") or str(pn or "").strip()) if isinstance(r, dict) \
+        reply = core_normalize_mpn(str(pn or ""), _cb_call)
+        return (reply.get("normalized") or str(pn or "").strip()) if isinstance(reply, dict) \
             else str(pn or "").strip()
 except Exception:  # pragma: no cover
-    # Fallback shim when the core is unavailable
     def normalize_mpn(pn: str) -> str:  # type: ignore[misc]
         return str(pn or "").strip()
 
@@ -253,9 +253,8 @@ def ingest_datasheet(
     ``datasheet/crops/fig_NNN.png`` when docling is the backend; pdfplumber
     yields no crops.
 
-    MPN candidates are normalised via
-    :func:`engine_oracle.spec_sheet_matcher.normalize_mpn` before being
-    returned in ``mpn_candidates``.
+    MPN candidates are normalised by the core (:mod:`services.parts.normalization`)
+    before being returned in ``mpn_candidates``.
     """
     pdf_path = Path(pdf_path)
     session_root = Path(session_root)

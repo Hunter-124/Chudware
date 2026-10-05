@@ -1,6 +1,6 @@
-"""Hand-calc validation for engine_oracle.sim.vibration (T-BL17).
+"""Independent hand-calculation validation of services.sim.vibration.
 
-Discipline per docs/BENCHMARK_VALIDATION-style tiers (T-BL01 harness):
+Reference tiers:
   PRECISE  (<1%)  — validated analytic reference, formula cited inline
   EXACT    (<0.01%) — same closed form, machine-exact expected
 

@@ -53,7 +53,3 @@ WORKED EXAMPLE — a 300x180 rectangular frame in 25mm square tube, mitred corne
    ("sketch has no usable segments to sweep along").
 3. The tube wall `thickness` must be < size/2 (or w/2, od/2, ...), or the section is degenerate and
    the op errors ("degenerate profile dimensions").
-
-Confirmed against core/doc/validate.cpp (FEATURE_TYPES weld_*), core/doc/document.cpp weld handlers,
-and core/geom/weldment.cpp (8 profiles + miter/butt/cope + gusset + end_cap); live driver pass:
-member section areas match the analytic section x length, mitred round-tube frame render-verified.

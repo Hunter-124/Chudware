@@ -189,8 +189,16 @@ nlohmann::json rpc_sim_run(const nlohmann::json& params) {
             if (a.is_string()) assertions.push_back(a.get<std::string>());
 
     // Scenario (T-FIN3): dict, JSON string, or fixture reference → validated dict.
-    auto [scenario, scenario_errors] =
-        load_scenario(params.contains("scenario") ? params["scenario"] : nlohmann::json());
+    nlohmann::json scenario_input=params.contains("scenario")?params["scenario"]:nlohmann::json();
+    const std::string scenario_path=jstr(params,"scenario_path");
+    if(!scenario_path.empty()) {
+        if(!scenario_input.is_null() && scenario_input!=nlohmann::json(""))
+            return err_env("invalid_scenario","provide scenario or scenario_path, not both");
+        std::ifstream input(scenario_path,std::ios::binary);
+        if(!input) return err_env("invalid_scenario","cannot read scenario_path");
+        scenario_input=std::string(std::istreambuf_iterator<char>(input),std::istreambuf_iterator<char>());
+    }
+    auto [scenario, scenario_errors] = load_scenario(scenario_input);
     if (!scenario_errors.empty()) {
         std::string joined;
         for (const auto& e : scenario_errors) {
@@ -204,7 +212,8 @@ nlohmann::json rpc_sim_run(const nlohmann::json& params) {
     SimResult result = run_simulation(elf_path,
                                       project.mcu_family.empty() ? "cortex-m4"
                                                                  : project.mcu_family,
-                                      assertions, params.value("timeout_s", 30.0), scenario);
+                                      assertions, params.value("timeout_s", 30.0), scenario,
+                                      params.value("run_s",0.0),params.value("backend",std::string("auto")));
     nlohmann::json out = result.to_dict();
 
     // T-FIN7: emit the aicad.powerprofile/1 artifact when the project is linked

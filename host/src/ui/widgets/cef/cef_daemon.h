@@ -1,11 +1,11 @@
 // cef/cef_daemon.h — the lazily-spawned, idle-exiting CEF host daemon.
 //
-// Per the migration plan, ONE process owns all CEF. This daemon is that owner for
-// the headless path (Phase 2a): it initialises CEF once, listens on a local
-// chudware_ipc socket, and serves headless fetch/download requests from the Python
-// scraper (services/browser/cef_client.py). It idle-exits after `idle_secs` with
-// no request so Chromium is not resident when parts search is not running. The
-// interactive panel is migrated onto the same daemon in Phase 2b.
+// This daemon owns CEF for the headless path: it initialises CEF once, listens on
+// a local chudware_ipc socket, and serves headless fetch/download requests from the
+// Python scraper (services/browser/cef_client.py). It idle-exits after `idle_secs`
+// with no request so Chromium is not resident when parts search is not running.
+// The interactive panel stays in the GUI process (CefWebView) with its own
+// profile; its logins reach the daemon through "import_session".
 //
 // Compiled only with CHUDWARE_ENABLE_CEF. Entry: `Chudware --cef-daemon <sock> [idle]`.
 #pragma once

@@ -1,5 +1,7 @@
-// sketch_cli — tiny CLI wrapper around chudware::sketch::solve_sketch for the
-// differential-test harness (tools/solver_diff.py).
+// sketch_cli — standalone CLI around chudware::sketch::solve_sketch for solving
+// and debugging sketch fixtures outside the app. Consumer: the SolidWorks-parity
+// runner corpora/sw_parity/_run_fixtures.py; any corpora/sketch/*.json fixture can
+// also be solved directly.
 //
 // Usage:
 //   sketch_cli <fixture.json>     read the fixture from a file
@@ -19,8 +21,8 @@
 //   }
 //
 // Float formatting is deterministic and lossless: nlohmann::json serializes
-// doubles round-trip (shortest exact representation), so the Python side parses
-// back the same bit pattern the solver produced. Exit code 0 on success, 2 on a
+// doubles round-trip (shortest exact representation), so callers parse back the
+// same bit pattern the solver produced. Exit code 0 on success, 2 on a
 // usage/IO/parse error.
 
 #include "sketch/sketch.h"
@@ -73,7 +75,7 @@ int main(int argc, char** argv) {
         return fail(std::string("JSON parse error: ") + e.what());
     }
 
-    // Measure mode (tools/measure_diff.py): input
+    // Measure mode: input
     //   {"mode":"measure","constraint":{...},"entity_coords":{...}}
     // -> {"value": <number|null>}. The default (absent/"solve") mode is unchanged.
     if (input.value("mode", std::string("solve")) == "measure") {
@@ -91,7 +93,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // Warm-start mode (tools/warm_diff.py): input
+    // Warm-start mode: input
     //   {"mode":"warm","sketch":{...},"after":{...optional},"env":{...}}
     // cold-solves `sketch` to build a state, then warm-solves `after` (defaults to
     // `sketch`) from that state. Output:

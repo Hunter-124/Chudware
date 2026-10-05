@@ -65,7 +65,3 @@ PHASE 2 — find the +X top-rim edge, then bend a 20mm wall up 90°. The top fac
 LIMIT (by design, not a bug): a 3rd/4th flange on ADJACENT edges of the same base can fail — once
 the first walls land, the shared corner edge no longer spans the full side, and real sheet metal
 needs corner relief the builder does not auto-generate. A 1-2-flange channel is the clean limit.
-
-Confirmed against core/doc/validate.cpp (FEATURE_TYPES sm_*), core/doc/document.cpp handlers, and
-core/geom/sheetmetal.cpp; live driver pass: base_flange 80x50x2 = 8000mm³ exact, edge_flange/hem/
-jog watertight, flat_pattern unfolds with the correct bend allowance.

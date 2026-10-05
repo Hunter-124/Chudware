@@ -18,20 +18,24 @@ in this repo that check is `contracts/licenses.md`, not this file.
 - **DXF (start here):** implement directly from Autodesk's public **DXF
   Reference**. It's a tagged (group-code, value) format — a weekend to a basic
   reader, and it teaches the whole data model (see `cad-data-model.md`).
-  **This repo already did this step**: DXF import via **ezdxf** (MIT),
-  `services/formats/formats.py` + `services/formats/formats_dxf.py`.
+  **This repo already did this step**: production DXF import is a hand-written
+  ASCII DXF parser in `core/doc/formats.cpp` (no ezdxf, no third-party DXF library;
+  INSERT block references are skipped). The Python helper
+  `services/formats/formats_dxf.py` (ezdxf, MIT) is the parity oracle.
 - **DWG:** implement from the **ODA Open Design Specification for .dwg files**
   (public). Or use open-source:
-  - **LibreDWG** (GNU LGPL/GPL — check which; affects linking) — reads/writes DWG.
-  - **libdxfrw** (permissive) — DXF + basic DWG.
+  - **LibreDWG** (GPL-3.0 per its `contracts/licenses.md` row — copyleft, so
+    subprocess-only here) — reads/writes DWG.
+  - **libdxfrw** (GPL-2.0-or-later — copyleft; no ledger row) — DXF + basic DWG.
 - **Reality check:** full DWG fidelity is a large effort (that's the ODA's whole
-  business). This repo's documented plan (`docs/design/PLATFORM_ADR.md` §5,
-  `work/backlog/T-BL02.md`) is **DWG via an ODA membership later**; LibreDWG would
-  be **subprocess-convert only** (its GPL/LGPL license is incompatible with
-  in-process linking under this repo's GPL-clean posture — see
-  `contracts/licenses.md`). If production DWG fidelity is needed without that
-  effort, the legitimate shortcut is licensing the ODA commercially — not
-  decompiling anyone's DWG code.
+  business). This repo does not parse DWG in-process: production import
+  (`core/doc/formats.cpp`) runs a user-installed LibreDWG `dwg2dxf` from `PATH` as a
+  subprocess and reuses the DXF importer — LibreDWG is GPL-3.0, so it is
+  subprocess-only, never linked or bundled (`contracts/licenses.md`). Whether to pursue
+  an ODA membership for higher-fidelity DWG is an open decision in
+  `work/backlog/T-BL02.md`. If production DWG fidelity is needed beyond that, the
+  legitimate shortcut is licensing the ODA commercially — not decompiling anyone's
+  DWG code.
 
 ## Goal: read/write DGN
 
@@ -43,26 +47,25 @@ in this repo that check is `contracts/licenses.md`, not this file.
 
 - **Fully open.** Use **IfcOpenShell** (LGPL) or implement from **ISO 16739** +
   buildingSMART's public EXPRESS schema. No proprietary dependency at all. Not on
-  this repo's current interop surface (Chudware is mechanical CAD, not BIM), but
-  IfcOpenShell already appears in `contracts/licenses.md` for a different purpose
-  (BOLTS/clean-room posture reference) — worth checking that entry before adding
-  IFC support so the license posture stays consistent.
+  this repo's current interop surface (Chudware is mechanical CAD, not BIM).
+  `contracts/licenses.md` has no IfcOpenShell row; one must be added (per that
+  file's rules) before IFC support uses it.
 
 ## Goal: STEP / IGES (MCAD exchange)
 
 - **STEP:** **ISO 10303** is public; geometry kernels below can consume it.
   Open tooling: **OpenCASCADE** (LGPL-style) has robust STEP/IGES import/export.
-  **This repo already implements both**: STEP (AP214) via
-  `build123d.export_step`/`import_step`, IGES via `OCP.IGESControl` — both in
-  `services/formats/formats.py`, both riding on OCCT (see `contracts/licenses.md`, row
-  `cadquery-ocp / OCCT`).
+  **This repo already implements both**: OCCT `STEPControl_*` and `IGESControl_*`
+  readers/writers in `core/doc/formats.cpp` (the Python oracle
+  `services/formats/formats.py` reaches the same OCCT code via build123d/OCP; ledger
+  row `cadquery-ocp / OCCT` in `contracts/licenses.md`).
 - **IGES:** **IGES 5.3** public; OpenCASCADE handles it too (same as above).
 
 ## Goal: a 3D geometry kernel (BREP, booleans, tessellation)
 
 - **OpenCASCADE Technology (OCCT)** — mature open BREP kernel (LGPL-style).
-  **This is this repo's kernel** (via `build123d`/`cadquery-ocp`, dynamically
-  linked — see `contracts/licenses.md`).
+  **This is this repo's kernel** — used directly by the C++ core and via
+  `build123d`/`cadquery-ocp` in Python helpers (see `contracts/licenses.md`).
 - **CGAL** — computational geometry (GPL/commercial dual). Not used here.
 - Or build a focused geometry library from *The NURBS Book* (Piegl & Tiller) and
   standard CAGD literature — background only; not a build target for this repo.
@@ -81,8 +84,9 @@ in this repo that check is `contracts/licenses.md`, not this file.
 
 - All public specs: **ISO 32000** (PDF), **W3C SVG**, STL (public), **glTF**
   (Khronos). Many permissive libraries exist for each.
-- **This repo already covers STL, glTF/GLB, OBJ, PLY, and 3MF** (mesh lane, via
-  `build123d`/`trimesh`/`lib3mf` — `contracts/licenses.md`), plus PDF for
+- **This repo already covers STL, glTF/GLB, OBJ, PLY, and 3MF** (mesh lane in
+  `core/doc/formats.cpp`: OCCT mesh readers/writers plus lib3mf for 3MF; the Python
+  oracle uses trimesh/lib3mf — `contracts/licenses.md`), plus PDF for
   deliverables/reports (`reportlab`, `pypdfium2`). SVG export is not currently
   implemented; `cairosvg` appears in `contracts/licenses.md` only as an
   optional, import-only, feature-detected SVG *preview* path (LGPL, never
@@ -107,12 +111,13 @@ in this repo that check is `contracts/licenses.md`, not this file.
 
 Keep the format layer isolated so adding a format never touches the document
 model, and keep geometry/graphics swappable. **This repo already follows this
-shape**: `services/formats/formats.py`'s `FORMAT_REGISTRY`/`import_path` is the isolated
-format-I/O layer; it feeds build123d/OCCT shapes into the document model
-(`contracts/doc_schema.md`); tessellation to AICM (`contracts/mesh_format.md`) is
+shape**: `core/doc/formats.cpp` (`format_registry()` + the per-format import/export
+dispatch) is the isolated format-I/O layer; it feeds OCCT shapes into the document
+model (`contracts/doc_schema.md`); tessellation to AICM (`contracts/mesh_format.md`) is
 the Gi/Gs-equivalent boundary to the render backend. Adding a new format (per
-`work/backlog/T-BL02.md`) means adding a module next to `formats_dxf.py` and a row
-in `FORMAT_REGISTRY` — not touching the document model or renderer.
+`work/backlog/T-BL02.md`) means adding its importer and a `format_registry()` row in
+`core/doc/formats.cpp` with fixture round-trip tests — not touching the document
+model or renderer.
 
 ## The one rule that keeps this clean
 

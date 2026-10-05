@@ -1,7 +1,5 @@
-// struct_cli: differential-harness driver (same role as fw_cli / sketch_cli) —
-// reads one {"method","params"} JSON document on stdin and prints the
-// chudware::structural::call result as one JSON line. Used by the T-RF19 parity
-// diffs against the Python oracle.
+// Standalone structural RPC debug CLI: read one {"method","params"} JSON
+// request from stdin and print chudware::structural::call's result as one line.
 
 #include <iostream>
 #include <sstream>

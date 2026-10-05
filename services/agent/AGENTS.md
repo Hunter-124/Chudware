@@ -1,18 +1,36 @@
-# services/agent — agent support services (providers, roles, turns)
+# services/agent — Chudcode session host, CAD host tools, roles/missions/governance
 
-**Owner:** N5e (C++ cutover) / current Python implementation.
+Online agent turns are services-worker `agent_admin_turn` calls (`worker_rpc.py`
+`_agent_admin_turn`). They are driven by `chudcode_host.ChudcodeSessionHost` over the
+persistent Chudcode RPC session, and Chudcode owns providers, auth, models, history,
+compaction and nested agents. This package owns the CAD side:
+- role/mission/council context;
+- the host-tool projection (`chudcode_tools.build_host_tools`) and event mapping
+  (`chudcode_events`);
+- the private control lane (`chudcode_control`);
+- guardrails, the progress watchdog and the subagent registry.
 
-The single agent entry is the C++ core (`core/agent/run.cpp`, `agent_run_v2`); the legacy
-build123d code-gen loop (`loop.py` `run`/`run_turn`, the `agent_design` RPC, and the
-`run_agent.py` CLI) was removed in T-RF5. What remains here: provider adapters in
-`providers/` (Anthropic, OpenAI, Gemini, llamacpp, mock), `agent_turn.py` (single-turn
-tool-calling used by the DAG/PLM surfaces), roles/playbooks, and `loop.py` reduced to the
-legacy prompt constants + `apply_context_refs` (kept only for `engine.worker._get_prompts`
-and `agent_turn.py`; shrinks to nothing once those migrate).
+Native `core/agent/run.cpp` is only the explicit offline-safe local-modeling fallback.
+`agent_turn.run_turn` is explicit-offline. Online tool-internal ECAD/regen model steps
+use `providers.chudcode_provider.helper_provider` → `ChudcodeSessionHost.complete_text`,
+with scoped settings/credentials/cancellation inherited during host-tool dispatch
+(governed role/config selections otherwise), and no helper tools or memory.
+Offline/local-only helpers require an offline-safe provider, without online
+fallback; other SDK adapters retain explicitly bound standalone/bench uses.
+
+## Canonical guidance
+- `.claude/skills/cad-chudcode-integration/SKILL.md` — authority boundary, topology,
+  files by responsibility, session/tool/event/recovery rules. Read it before touching
+  sessions, providers, auth/models, memory, host tools, events or recovery.
+- `.claude/skills/chudware-dev/SKILL.md` — repo rules, worker lanes, prompt-override
+  isolation, persistence/save invariants.
+- `work/context/services-agent.md` (`/ctx-services-agent`) — the source map.
+- `work/WORKFLOW.md` — canonical task policy and context/tool freshness ownership.
 
 ## Entry points
-- `pytest services/agent -q` — the support-services suite
+- `pytest services/agent -q` (service venv) — the package suite.
+- `scripts/run_mission.py` — a headless real turn through the same path.
 
-## Migration
-- Python now → C++ agent loop in `core/agent/` at N5e.
-- Events contract: `contracts/events.md`
+## Contracts
+`contracts/worker_rpc.md` (incl. worker lanes), `contracts/agent_events.md` +
+`agent_events.json`, `contracts/events.md`, `contracts/copilot_modes.json`.

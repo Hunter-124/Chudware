@@ -1,4 +1,4 @@
-"""Section library loaders for the structural workstream (T-D3).
+"""Python section-table loaders for structural helpers.
 
 Provides two lookups:
 - :func:`get_aisc_section` — AISC W/S/C steel section properties from a curated JSON table.
@@ -6,18 +6,18 @@ Provides two lookups:
 
 Data sources
 ------------
-``engine_oracle/data/aisc_shapes/aisc_shapes_curated.json``
+``services/structural/data/aisc_shapes/aisc_shapes_curated.json``
     Curated table of common AISC shapes.  Property values are dimensional facts (re-stated from
     widely published engineering references — Salmon & Johnson *Steel Structures*, NSAI, CISC
     Handbook) rather than a bulk copy of the AISC database compilation.  See
-    ``work/questions/T-D3.md`` Q1 and ``contracts/licenses.md`` for the posture.
+    ``contracts/licenses.md`` for the licensing posture.
 
-``engine_oracle/data/lumber_table.json``
+``services/structural/data/lumber_table.json``
     Nominal-to-actual dressed (S4S) lumber dimensions per ANSI/AWC National Design Specification
     (NDS) and American Softwood Lumber Standard PS 20 — a public standard; values are physical facts.
 
-Unit system: all outputs are in **mm / mm² / mm³ / mm⁴** to match the engine's canonical N·mm·MPa
-convention (same as ``analysis.py``).
+Unit system: all outputs are in **mm / mm² / mm³ / mm⁴** to match the native solver's
+N·mm·MPa convention. The C++ solver and its section tables live in ``core/structural/``.
 """
 
 from __future__ import annotations

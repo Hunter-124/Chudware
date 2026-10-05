@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """tools/manual_gen.py — T-Q4 user-manual auto-generation.
 
-Composes ``docs/manual/*.md`` (and, best-effort, a rendered ``user_manual`` PDF/DOCX via
+Composes ``docs/manual/*.md`` (and, on request, a rendered ``user_manual`` PDF/DOCX via
 ``deliverables.make_report``) from three truth sources already in the repo — never invented
 prose:
 
 - ``scripts/feature_surface_audit.ribbon_rows`` — every ribbon command (id/label/tab/group),
   so the "Commands Reference" section covers 100% of the UI surface.
-- ``services.mcp.cad_tools.cad_guide_text`` — the agent's own modeling-guide prose (overview,
-  simulation, intake, gsl, cam, narration, deliverables, reverse-engineering) and, per-command,
-  its per-feature cheatsheets (``fillet``, ``chamfer``, ``shell``, ...) when one exists for a
-  ribbon command's id.
+- ``services.mcp.cad_tools.cad_guide_text`` — the agent's own modeling-guide prose: the
+  ``overview`` topic becomes ``overview.md``; every topic in ``GUIDE_TOPICS`` becomes
+  ``guide-<topic>.md``. Per-command, its per-feature cheatsheets (``fillet``, ``chamfer``,
+  ``shell``, ...) are used when one exists for a ribbon command's id.
 - ``contracts/*.md`` — a one-line-per-contract summary (filename + its first ``# `` heading).
 
 Provenance rule (no fabrication): a ribbon command gets a real description ONLY when
@@ -19,14 +19,20 @@ Provenance rule (no fabrication): a ribbon command gets a real description ONLY 
 gets a visibly generic AUTO-STUB sourced only from its own tab/group — the inventory is the truth
 source, so the manual never states a capability nobody wrote down.
 
-Output is fully deterministic (no timestamps, no wallclock, sorted/stable iteration everywhere)
-so ``--check`` can byte-compare freshly generated markdown against the committed baseline as a
-drift gate (wired into ``scripts/gate.sh`` as a non-fatal advisory stage).
+Missing truth sources are errors, not empty sections: ``collect`` raises when the ribbon
+inventory or a guide topic cannot be loaded, so a broken import can never regenerate (or pass
+``--check`` against) a silently hollowed-out manual.
+
+Writing updates generated pages and removes obsolete pages only when their names are known
+generator outputs; unrelated files in ``docs/manual/`` are preserved and ignored by the drift
+check. Output is fully deterministic (no timestamps, no wallclock, sorted/stable iteration
+everywhere) so ``--check`` can byte-compare freshly generated markdown against the committed
+baseline as a drift gate (wired into ``scripts/gate.sh`` as a non-fatal advisory stage).
 
 CLI:
     python -m tools.manual_gen            regenerate docs/manual/*.md, print coverage
     python -m tools.manual_gen --check    drift + coverage check only; exit 1 if not clean
-    python -m tools.manual_gen --pdf      also render the user_manual report (best-effort)
+    python -m tools.manual_gen --pdf      also render the user_manual report; exit 1 if it fails
 """
 from __future__ import annotations
 
@@ -45,14 +51,25 @@ def _ensure_sys_path(repo: Path) -> None:
         sys.path.insert(0, s)
 
 
+MANUAL_SUBDIR = Path("docs") / "manual"
+
 # --------------------------------------------------------------------------- guide topics
 
-# Fixed, documented order (matches the topic list in services.mcp.cad_tools.cad_guide_text's own
-# "No guide for ..." fallback message) — deterministic regardless of dict/set iteration.
+# The overview topic is emitted once, as overview.md.
+OVERVIEW_TOPIC = "overview"
+
+# The cad_guide topics published as guide-<topic>.md, in fixed order — deterministic regardless
+# of dict/set iteration. A curated subset of the topics cad_guide_text serves.
 GUIDE_TOPICS = [
-    "overview", "review", "simulation", "intake", "gsl", "cam", "narration",
-    "deliverables", "reverse",
+    "review", "simulation", "intake", "gsl", "cam", "narration", "deliverables", "reverse",
 ]
+
+# Known output names, including the retired duplicate overview. A guide- prefix alone
+# does not establish generator ownership of an unrelated Markdown file.
+_MANAGED_NAMES = frozenset({
+    "index.md", "overview.md", "commands.md", "contracts.md", "guide-overview.md",
+    *(f"guide-{topic}.md" for topic in GUIDE_TOPICS),
+})
 
 _NO_GUIDE_MARKER = "No guide for"
 
@@ -62,68 +79,58 @@ _AUTO_STUB_TEMPLATE = "_Available from the {tab} ▸ {group} ribbon group._"
 # --------------------------------------------------------------------------- collect
 
 def collect(repo: Path) -> dict:
-    """Gather ribbon commands, cad_guide prose, and a contracts summary. Never raises."""
+    """Gather ribbon commands, cad_guide prose, and a contracts summary.
+
+    Raises RuntimeError when a truth source is missing so no caller can emit a hollow manual.
+    """
     repo = Path(repo)
     _ensure_sys_path(repo)
 
-    ribbon: list[dict] = []
-    try:
-        # scripts/ui_inventory.py was retired with the ui/imgui shell; the live
-        # ribbon parser is feature_surface_audit.ribbon_rows (cmd → id mapping here).
-        from scripts.feature_surface_audit import ribbon_rows  # noqa: PLC0415
-        ribbon = [
-            {"id": r["cmd"], "label": r["label"], "tab": r["tab"], "group": r["group"]}
-            for r in ribbon_rows()
-        ]
-    except Exception:  # noqa: BLE001 - inventory is best-effort; never raise
-        ribbon = []
+    # scripts/ui_inventory.py was retired with the ui/imgui shell; the live
+    # ribbon parser is feature_surface_audit.ribbon_rows (cmd → id mapping here).
+    from scripts.feature_surface_audit import ribbon_rows  # noqa: PLC0415
+    from services.mcp.cad_tools import cad_guide_text  # noqa: PLC0415
 
-    try:
-        from services.mcp.cad_tools import cad_guide_text  # noqa: PLC0415
-    except Exception:  # noqa: BLE001 - guide is best-effort; the inventory is the real spine
-        cad_guide_text = None
+    ribbon = [
+        {"id": r["cmd"], "label": r["label"], "tab": r["tab"], "group": r["group"]}
+        for r in ribbon_rows()
+    ]
+    if not ribbon:
+        raise RuntimeError("ribbon inventory is empty: feature_surface_audit.ribbon_rows() "
+                           "parsed no commands")
 
     guide: dict[str, str] = {}
-    if cad_guide_text is not None:
-        for topic in GUIDE_TOPICS:
-            try:
-                text = cad_guide_text(topic)
-            except Exception:  # noqa: BLE001 - skip a topic that errors, per spec
-                continue
-            if isinstance(text, str) and text.strip():
-                guide[topic] = text.strip()
+    for topic in (OVERVIEW_TOPIC, *GUIDE_TOPICS):
+        text = cad_guide_text(topic)
+        text = text.strip() if isinstance(text, str) else ""
+        if not text or text.startswith(_NO_GUIDE_MARKER):
+            raise RuntimeError(f"cad_guide_text({topic!r}) returned no guide prose")
+        guide[topic] = text
 
     # Per-command cheatsheet mapping: only a REAL hit (no "No guide for" fallback) counts.
     command_guides: dict[str, str] = {}
-    if cad_guide_text is not None:
-        for row in ribbon:
-            cid = row.get("id")
-            if not cid or cid in command_guides:
-                continue
-            try:
-                text = cad_guide_text(cid)
-            except Exception:  # noqa: BLE001
-                continue
-            if isinstance(text, str) and text.strip() and not text.startswith(_NO_GUIDE_MARKER):
-                command_guides[cid] = text.strip()
+    for row in ribbon:
+        cid = row["id"]
+        if not cid or cid in command_guides:
+            continue
+        text = cad_guide_text(cid)
+        if isinstance(text, str) and text.strip() and not text.startswith(_NO_GUIDE_MARKER):
+            command_guides[cid] = text.strip()
 
     contracts = []
     cdir = repo / "contracts"
     if cdir.is_dir():
         for f in sorted(cdir.glob("*.md"), key=lambda p: p.name):
             heading = ""
-            try:
-                with f.open("r", encoding="utf-8") as fh:
-                    for _ in range(5):
-                        line = fh.readline()
-                        if not line:
-                            break
-                        line = line.strip()
-                        if line.startswith("# "):
-                            heading = line[2:].strip()
-                            break
-            except Exception:  # noqa: BLE001
-                pass
+            with f.open("r", encoding="utf-8") as fh:
+                for _ in range(5):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if line.startswith("# "):
+                        heading = line[2:].strip()
+                        break
             contracts.append({"filename": f.name, "heading": heading})
 
     return {"ribbon": ribbon, "guide": guide, "command_guides": command_guides,
@@ -152,10 +159,10 @@ def _sorted_ribbon(ribbon: list[dict]) -> list[dict]:
 
 def build_markdown(data: dict) -> dict[str, str]:
     """Compose deterministic markdown docs/manual/*.md content. No timestamps, no wallclock."""
-    ribbon = _sorted_ribbon(data.get("ribbon", []))
-    guide = data.get("guide", {})
-    command_guides = data.get("command_guides", {})
-    contracts = data.get("contracts", [])
+    ribbon = _sorted_ribbon(data["ribbon"])
+    guide = data["guide"]
+    command_guides = data["command_guides"]
+    contracts = data["contracts"]
 
     docs: dict[str, str] = {}
 
@@ -164,18 +171,13 @@ def build_markdown(data: dict) -> dict[str, str]:
              "in-app modeling guide, and the frozen contract set — see `tools/manual_gen.py`.",
              "", "## Contents", "", "- [Overview](overview.md)", "- [Commands Reference](commands.md)"]
     for topic in GUIDE_TOPICS:
-        if topic in guide:
-            lines.append(f"- [Guide: {topic.capitalize()}](guide-{topic}.md)")
+        lines.append(f"- [Guide: {topic.capitalize()}](guide-{topic}.md)")
     lines.append("- [Contracts Summary](contracts.md)")
     lines.append("")
     docs["index.md"] = "\n".join(lines) + "\n"
 
     # ---- overview.md ----
-    lines = ["# Overview", ""]
-    if "overview" in guide:
-        lines += ["```text", guide["overview"], "```", ""]
-    else:
-        lines += ["_No overview guide available._", ""]
+    lines = ["# Overview", "", "```text", guide[OVERVIEW_TOPIC], "```", ""]
     docs["overview.md"] = "\n".join(lines) + "\n"
 
     # ---- commands.md ----
@@ -203,8 +205,6 @@ def build_markdown(data: dict) -> dict[str, str]:
 
     # ---- guide-<topic>.md ----
     for topic in GUIDE_TOPICS:
-        if topic not in guide:
-            continue
         lines = [f"# Guide: {topic.capitalize()}", "", "```text", guide[topic], "```", ""]
         docs[f"guide-{topic}.md"] = "\n".join(lines) + "\n"
 
@@ -222,11 +222,13 @@ def build_markdown(data: dict) -> dict[str, str]:
 
 # --------------------------------------------------------------------------- write / drift
 
-def write_manual(repo: Path, data: dict) -> list[Path]:
-    repo = Path(repo)
-    out_dir = repo / "docs" / "manual"
+def write_manual(out_dir: Path, docs: dict[str, str]) -> list[Path]:
+    """Write generated pages and prune only obsolete, known generator-owned Markdown files."""
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    docs = build_markdown(data)
+    for stale in sorted(out_dir.glob("*.md")):
+        if stale.is_file() and stale.name in _MANAGED_NAMES and stale.name not in docs:
+            stale.unlink()
     written = []
     for name in sorted(docs):
         p = out_dir / name
@@ -235,44 +237,39 @@ def write_manual(repo: Path, data: dict) -> list[Path]:
     return written
 
 
-def check_drift(repo: Path) -> bool:
-    """True if the committed docs/manual/*.md matches a fresh in-memory regen, byte-for-byte."""
-    repo = Path(repo)
-    fresh = build_markdown(collect(repo))
-    manual_dir = repo / "docs" / "manual"
-    if not manual_dir.is_dir():
-        return False
-    on_disk = {}
-    for p in manual_dir.glob("*.md"):
-        on_disk[p.name] = p.read_text(encoding="utf-8")
-    return on_disk == fresh
+def drift(manual_dir: Path, docs: dict[str, str]) -> list[str]:
+    """Sorted names of generated pages that are hand-edited, missing, or obsolete.
+
+    Unknown files are not generator-owned drift; empty means all managed pages are clean.
+    """
+    manual_dir = Path(manual_dir)
+    on_disk = {
+        p.name: p.read_text(encoding="utf-8")
+        for p in manual_dir.glob("*.md")
+        if p.is_file() and (p.name in docs or p.name in _MANAGED_NAMES)
+    } if manual_dir.is_dir() else {}
+    return sorted(name for name in set(on_disk) | set(docs)
+                  if on_disk.get(name) != docs.get(name))
 
 
-def coverage(repo: Path) -> dict:
-    """Assert every ribbon command label appears in the generated commands.md."""
-    repo = Path(repo)
-    data = collect(repo)
-    docs = build_markdown(data)
-    commands_md = docs.get("commands.md", "")
-    ribbon = data.get("ribbon", [])
+def coverage(data: dict, docs: dict[str, str]) -> dict:
+    """Report which ribbon command labels have no ``#### <label>`` heading in commands.md."""
+    headings = {ln[len("#### "):] for ln in docs.get("commands.md", "").splitlines()
+                if ln.startswith("#### ")}
+    ribbon = data["ribbon"]
+    missing = [row["label"] for row in ribbon if row["label"] not in headings]
     total = len(ribbon)
-    missing = []
-    for row in ribbon:
-        label = row.get("label", "")
-        if f"#### {label}" not in commands_md:
-            missing.append(label)
-    covered = total - len(missing)
-    return {"total": total, "covered": covered, "missing": missing}
+    return {"total": total, "covered": total - len(missing), "missing": missing}
 
 
 # --------------------------------------------------------------------------- report spec / pdf
 
 def build_report_spec(data: dict, fmt: str = "pdf") -> dict:
     """A make_report spec for the ``user_manual`` template — free prose only, no lb slots."""
-    ribbon = _sorted_ribbon(data.get("ribbon", []))
-    guide = data.get("guide", {})
-    command_guides = data.get("command_guides", {})
-    contracts = data.get("contracts", [])
+    ribbon = _sorted_ribbon(data["ribbon"])
+    guide = data["guide"]
+    command_guides = data["command_guides"]
+    contracts = data["contracts"]
 
     outline = [
         {"type": "title", "body": [
@@ -280,19 +277,15 @@ def build_report_spec(data: dict, fmt: str = "pdf") -> dict:
             "Auto-generated from the ribbon command inventory, the in-app modeling guide, "
             "and the frozen contract set.",
         ]},
+        {"type": "section", "heading": "Overview",
+         "body": [ln for ln in guide[OVERVIEW_TOPIC].splitlines() if ln.strip()]},
     ]
-
-    if "overview" in guide:
-        outline.append({"type": "section", "heading": "Overview",
-                         "body": [ln for ln in guide["overview"].splitlines() if ln.strip()]})
 
     cmd_body = [f"{row.get('label', row.get('id', '?'))} — "
                 f"{_command_one_liner(row, command_guides)}" for row in ribbon]
     outline.append({"type": "section", "heading": "Commands Reference", "body": cmd_body})
 
     for topic in GUIDE_TOPICS:
-        if topic == "overview" or topic not in guide:
-            continue
         outline.append({"type": "section", "heading": f"Guide: {topic.capitalize()}",
                          "body": [ln for ln in guide[topic].splitlines() if ln.strip()]})
 
@@ -310,15 +303,15 @@ def build_report_spec(data: dict, fmt: str = "pdf") -> dict:
     }
 
 
-def render_pdf(repo: Path, spec: dict) -> dict:
-    """Best-effort render via deliverables.make_report; never raises."""
+def render_pdf(spec: dict) -> dict:
+    """Render via deliverables.make_report; failures come back as a contract envelope, never raise."""
     try:
         from services.deliverables import make_report  # noqa: PLC0415
     except ImportError as e:
         return {"ok": False, "reason": "import_error", "hint": str(e)}
     try:
         return make_report(spec)
-    except Exception as e:  # noqa: BLE001 - the markdown is primary, the PDF is best-effort
+    except Exception as e:  # noqa: BLE001 - report the failure as an envelope; markdown is primary
         return {"ok": False, "reason": "render_error", "hint": f"{type(e).__name__}: {e}"}
 
 
@@ -333,30 +326,29 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     repo = _repo_root()
+    manual_dir = repo / MANUAL_SUBDIR
+    data = collect(repo)
+    docs = build_markdown(data)
+    cov = coverage(data, docs)
 
     if args.check:
-        drift_clean = check_drift(repo)
-        cov = coverage(repo)
-        print(f"drift: {'CLEAN' if drift_clean else 'DRIFT'}")
+        drifted = drift(manual_dir, docs)
+        print(f"drift: {'CLEAN' if not drifted else 'DRIFT ' + ', '.join(drifted)}")
         print(f"coverage: {cov['covered']}/{cov['total']} (missing={len(cov['missing'])})")
         if cov["missing"]:
             print(f"missing labels: {cov['missing']}")
-        ok = drift_clean and not cov["missing"]
-        return 0 if ok else 1
+        return 0 if not drifted and not cov["missing"] else 1
 
-    data = collect(repo)
-    written = write_manual(repo, data)
-    cov = coverage(repo)
-    print(f"wrote {len(written)} files to docs/manual/")
+    written = write_manual(manual_dir, docs)
+    print(f"wrote {len(written)} files to {MANUAL_SUBDIR.as_posix()}/")
     print(f"coverage: {cov['covered']}/{cov['total']} (missing={len(cov['missing'])})")
 
     if args.pdf:
-        spec = build_report_spec(data)
-        record = render_pdf(repo, spec)
-        if record.get("ok"):
-            print(f"pdf: ok -> {record.get('path')}")
-        else:
-            print(f"pdf: degraded -> {record.get('reason')}: {record.get('hint')}")
+        record = render_pdf(build_report_spec(data))
+        if not record.get("ok"):
+            print(f"pdf: FAILED -> {record.get('reason')}: {record.get('hint')}")
+            return 1
+        print(f"pdf: ok -> {record.get('path')}")
 
     return 0
 

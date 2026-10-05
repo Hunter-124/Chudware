@@ -5,7 +5,7 @@ Fixtures are self-contained — a small board built inline from :func:`schema.ne
 rectangular outline, a GND pour on F.Cu, a couple of GND pads and a couple of different-net (SIG)
 pads/tracks inside the pour. Coordinates are mm.
 
-Run:  & "<venv>/python.exe" -m engine.ecad.test_zonefill
+Run:  python -m services.ecad.test_zonefill
 
 We verify the fill by POINT SAMPLING the resulting ``filled_polys`` with an even-odd
 point-in-polyset test. This is the convention the fill emits (a flat list of simple polygons, holes
@@ -13,7 +13,7 @@ folded in via zero-width keyhole bridges → see zonefill module docstring), so 
 the whole list is exactly "is this (x,y) bare copper after fill?". Sampling is far more robust than
 area arithmetic over self-touching keyholed polygons.
 
-Covers (per the task spec):
+Covers:
   1. A different-net pad / track carves a copper-free clearance gap (near = not copper, far = copper).
   2. A same-net GND THT pad is thermally relieved: a gap ring is bare but spoke corridors are copper.
   3. Total filled copper area < zone-polygon area (clearance removed some) and > 0.

@@ -5,6 +5,15 @@ Scope: one container family covering **parts, assemblies, drawings, and FEA/simu
 Out of scope for embedding: **ECAD** (stays `.ecad+`).  
 Interop: foreign standards (STEP/IGES/STL/…) remain **import/export around** the native format.
 
+**Authority scope:** this remains a proposal, not an implementation acceptance record.
+The "today"/"already" inventory and API sketches below are the design's baseline; use
+[`contracts/stepplus.md`](../../contracts/stepplus.md) and
+`core/doc/stepplus.h` / `stepplus.cpp` for the actual container/API boundary.
+In particular, `stepplus_open` preserves editable extras while
+`stepplus_read_document` / `stepplus_open_component` are read-only dependency paths;
+the proposed flags API below is not their signature. Proposal presence does not approve
+a format migration or establish that all proposed section/lazy-load behavior shipped.
+
 This document extends what already ships. It does **not** invent a greenfield format. Primary sources:
 
 | Area | Files / contracts |

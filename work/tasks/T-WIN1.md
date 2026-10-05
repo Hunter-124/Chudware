@@ -3,7 +3,7 @@ id: T-WIN1
 title: Windows 10 full-app bring-up (OCCT core + host GUI) under MSVC
 workstream: WIN
 owner: gissa
-status: todo
+status: review
 branch: task/T-WIN1-windows-bringup
 depends_on: []
 lane: platform-infra
@@ -40,7 +40,7 @@ untouched.
   AND Ninja `build\windows-occt\bin` preset layout (done, 750c0bbb)
 - `CMakePresets.json` — windows-occt / windows-core presets (extend if OCCT full
   core needs additional Windows-only flags)
-- `docs/BUILD_WINDOWS.md` — bring-up steps + Troubleshooting/gotchas
+- `docs/reference/BUILD_WINDOWS.md` — bring-up steps + Troubleshooting/gotchas
 - `host/` GUI build glue — Windows-only compile/link seams as they surface
 - NO edits to services/agent, services/mcp, services/browser, contracts/, or any
   tools/translator or T-W*/T-X* owned path (other active sessions).
@@ -60,7 +60,7 @@ untouched.
 6. Run the CHUDWARE_SHOT headless capture battery; produce an honest, eyeballed
    parity report vs Linux (documented broken stage + exact error is a GOOD result;
    "mostly builds" is NOT).
-7. Docs: fold every real gotcha into docs/BUILD_WINDOWS.md.
+7. Docs: fold every real gotcha into docs/reference/BUILD_WINDOWS.md.
 
 ## Definition of done
 
@@ -71,7 +71,7 @@ untouched.
 - [ ] CHUDWARE_SHOT headless battery runs; eyeballed Linux-parity report attached to
       the progress log (per-stage PASS / documented-break with exact error)
 - [ ] Every Windows fix is a platform seam; Linux build verified untouched
-- [ ] docs/BUILD_WINDOWS.md updated with the real bring-up path + gotchas
+- [ ] docs/reference/BUILD_WINDOWS.md updated with the real bring-up path + gotchas
 
 ## AI hints
 
@@ -116,6 +116,13 @@ hang with NO stdout diagnostic (errors go to the in-app log only). **Observed tw
 picks up the Windows worker-start fix.
 
 ## Progress log
+- 2026-10-04 [board audit] Status `todo` -> `review`: the 2026-07-06 entries record the
+  build verified, PR #18 open and "stays in review awaiting human merge"; `todo` contradicted
+  that. The DoD boxes stay unchecked on purpose. The log's evidence came from Win11
+  (MSVC 14.44), not the Windows 10 the DoD names. It records no per-stage CHUDWARE_SHOT
+  battery parity report and no independent Linux-untouched check. The reviewer confirms
+  or rejects each box at merge time. The 2026-08-27 entry below supersedes the
+  "STANDING BLOCKER" paragraph above: Windows now falls back to the in-process core.
 - 2026-08-27 [T-WIN2]: Unblocked. The CAD-scoped Windows runner is online,
   native core+host builds are green, and `AppState::tryStartWorker()` now falls
   back to the in-process C++ core on Windows. Release tags carry the forced
@@ -150,7 +157,7 @@ picks up the Windows worker-start fix.
     with no stdout diagnostic (errors go to the in-app log). Flagged for app-gui/engine
     owner; NOT a WIN-lane fix (deliberate "Python worker is the Windows production path"
     design per that file's comment).
-  DOCS: docs/BUILD_WINDOWS.md updated — replaced the stale "Not yet verified: ImGui
+  DOCS: docs/BUILD_WINDOWS.md (now docs/reference/) updated — replaced the stale "Not yet verified: ImGui
   desktop app" section with the verified build+headless-capture flow and the three
   honest open parity gaps above.
   NET: full app builds + launches + models on Windows; the remaining honest gap is
@@ -174,12 +181,12 @@ picks up the Windows worker-start fix.
   further. TO CLOSE PARITY, either: (a) buddy's call on the tryStartWorker Windows path
   so headless capture works, or (b) gissa does the 2-min interactive launch (worker
   starts fine interactively) + press F (Zoom to Fit) + eyeball the solid.
-- 2026-07-06 20:39 UTC [gissa] [gissa/opus-sweep] 2026-07-06 â€” host-based Windows app (AI-CAD2.exe) VERIFIED on Win11 (MSVC 14.44/VS2022 BuildTools, CMake 4.3, Ninja). Branch task/T-WIN1-windows-bringup pushed (2 commits: 026c98a6 build fix, a8876006 docs). PR not opened via CLI (gh not installed + non-interactive OAuth); one-click URL: https://github.com/Hunter-124/CAD/pull/new/task/T-WIN1-windows-bringup
+- 2026-07-06 20:39 UTC [gissa] [gissa/opus-sweep] 2026-07-06 — host-based Windows app (AI-CAD2.exe) VERIFIED on Win11 (MSVC 14.44/VS2022 BuildTools, CMake 4.3, Ninja). Branch task/T-WIN1-windows-bringup pushed (2 commits: 026c98a6 build fix, a8876006 docs). PR not opened via CLI (gh not installed + non-interactive OAuth); one-click URL: https://github.com/Hunter-124/CAD/pull/new/task/T-WIN1-windows-bringup
 
 RESULTS:
 - Core windows-occt: ctest 48/49 (only freecad_parity, pre-existing MSVC-vs-GCC diff).
 - App windows-app: clean build after 3 Windows-guarded fixes in the GUI CMake build.
-  (1) /FI fix_math.h C1083 â€” inner-quoted /FI"..." + space-in-repo-path ("AI PROJECTS") under
+  (1) /FI fix_math.h C1083 — inner-quoted /FI"..." + space-in-repo-path ("AI PROJECTS") under
       Ninja+MSVC leaked literal quotes into the filename; dropped inner quotes so Ninja quotes the
       whole /FI<path> token. (host/ VS-generator build never hit this.)
   (2) CHUDWARE_DEFAULT_LIBCHUDWARE repointed from dead VS layout core/build-occt/bin/Release to the Ninja
@@ -189,9 +196,9 @@ RESULTS:
 - AI-CAD2.exe --selftest (NO env override) -> save=1 open=1 features=3 -> OK (in-process libchudware).
 - AI-CAD2.exe --shot -> 1616x1039 PNG: ribbon+icons+fonts, FeatureManager (Base/Fillet/Shell),
   dark theme, 3D viewport solid FRAMED correctly. CLOSES the host/-era unverified viewport-framing gap.
-- Retired Python-oracle baseline: 1229 passed / 5 failed / 10 errors / 10 skipped â€”
+- Retired Python-oracle baseline: 1229 passed / 5 failed / 10 errors / 10 skipped —
   all pre-existing/environmental; zero Python touched and no new regressions.
 
 NEEDS LINUX-SIDE REVIEW: none. Every change is if(WIN32)/if(MSVC)-guarded; Linux else() path
 byte-for-byte unchanged. NOTHING duplicated/split into a per-OS tree — host/ remains the sole GUI tree.
-- 2026-07-06 21:13 UTC [gissa] [gissa/opus-sweep] 2026-07-06 â€” PR IS NOW OPEN (correcting the earlier "PR not opened via CLI" note): https://github.com/Hunter-124/CAD/pull/18 â€” "T-WIN1: Windows 11 bring-up of the unified GUI", base master <- head task/T-WIN1-windows-bringup, state open. Opened via the GitHub REST API using the existing git credential (no gh CLI / no browser OAuth needed). Task stays in review awaiting human merge â€” NOT merged, NOT marked done.
+- 2026-07-06 21:13 UTC [gissa] [gissa/opus-sweep] 2026-07-06 — PR IS NOW OPEN (correcting the earlier "PR not opened via CLI" note): https://github.com/Hunter-124/CAD/pull/18 — "T-WIN1: Windows 11 bring-up of the unified GUI", base master <- head task/T-WIN1-windows-bringup, state open. Opened via the GitHub REST API using the existing git credential (no gh CLI / no browser OAuth needed). Task stays in review awaiting human merge — NOT merged, NOT marked done.

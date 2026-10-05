@@ -162,8 +162,8 @@ for raw in sys.stdin:
         }})
         continue
     if method in {
-        "subscription_status", "bench_status", "triggers_list", "packs_get",
-        "skills_list", "ai_roles_get", "model_rankings_get", "rule_create",
+        "subscription_status", "bench_status", "triggers_list", "packs_save",
+        "skills_list", "ai_roles_get", "rule_create",
         "subagent_list", "subagent_transcript", "subagent_steer", "subagent_control",
         "subagent_terminate", "dag_status", "memory_recall", "session_btw",
         "chudcode_session_stats", "ai_prompt_warm", "ai_tool_catalog",
@@ -359,8 +359,8 @@ def test_blocked_agent_lane_does_not_block_general_worker(worker_daemon):
     assert _worker_count(worker_daemon["info_counter"]) == 1
 
     for method in (
-        "subscription_status", "bench_status", "triggers_list", "packs_get",
-        "skills_list", "ai_roles_get", "model_rankings_get", "rule_create",
+        "subscription_status", "bench_status", "triggers_list", "packs_save",
+        "skills_list", "ai_roles_get", "rule_create",
         "dag_status", "memory_recall", "session_btw",
         "chudcode_session_stats", "ai_prompt_warm", "ai_tool_catalog",
     ):

@@ -9,8 +9,8 @@ Reads the converged case with pyvista's native OpenFOAM reader (no foamToVTK hop
 * integrates a few forward streamlines through the volume and packs them as a ``streamlines``
   LINS chunk coloured by speed.
 
-The overlay AICM is written with the *same* tessellate helpers the LBM overlay uses
-(engine/sim/overlay.py + engine/doc/tessellate.py), so the viewport renders it unchanged.
+The overlay uses ``services/sim/overlay.py`` and ``services/sim/tessellate.py``,
+so the viewport consumes the same AICM format as the LBM path.
 """
 
 from __future__ import annotations

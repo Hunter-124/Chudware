@@ -692,36 +692,6 @@ static nlohmann::json rawActivityToJson(const ActivityItem& a) {
     };
 }
 
-static nlohmann::json rawFitToJson(const FitReport& fit) {
-    nlohmann::json interferences = nlohmann::json::array();
-    for (const auto& p : fit.interferences)
-        interferences.push_back({{"a", p.a}, {"b", p.b},
-                                 {"value", p.value ? nlohmann::json(*p.value) : nlohmann::json(nullptr)}});
-    nlohmann::json clearances = nlohmann::json::array();
-    for (const auto& p : fit.clearances) {
-        nlohmann::json pair = {{"a", p.a}, {"b", p.b},
-            {"value", p.value ? nlohmann::json(*p.value) : nlohmann::json(nullptr)}};
-        if (p.distanceLowerBoundMm)
-            pair["distance_lower_bound_mm"] = *p.distanceLowerBoundMm;
-        clearances.push_back(std::move(pair));
-    }
-    return {
-        {"present", fit.present},
-        {"ok", fit.ok},
-        {"summary", fit.summary},
-        {"interferences", std::move(interferences)},
-        {"clearances", std::move(clearances)},
-    };
-}
-
-static nlohmann::json rawPartsToJson(const std::vector<PartInfo>& parts) {
-    nlohmann::json out = nlohmann::json::array();
-    for (const auto& part : parts)
-        out.push_back({{"name", part.name}, {"stlPath", part.stlPath},
-                       {"dims", part.dims}, {"volume", part.volume}});
-    return out;
-}
-
 static nlohmann::json rawPlanToJson(const PlanInfo& plan) {
     nlohmann::json parts = nlohmann::json::array();
     for (const auto& part : plan.parts)
@@ -769,34 +739,6 @@ static nlohmann::json rawClarifyToJson(const ClarifyState& clarify) {
     };
 }
 
-static nlohmann::json rawStepsToJson(const std::vector<AgentStep>& steps) {
-    nlohmann::json out = nlohmann::json::array();
-    for (const auto& step : steps) {
-        out.push_back({
-            {"index", step.index},
-            {"ok", step.ok},
-            {"done", step.done},
-            {"notes", step.notes},
-            {"thinking", step.thinking},
-            {"code", step.code},
-            {"diff", step.diff},
-            {"dims", step.dims},
-            {"error", step.error},
-            {"contactSheet", step.contactSheet},
-            {"stdoutText", step.stdoutText},
-            {"isAssembly", step.isAssembly},
-            {"parts", rawPartsToJson(step.parts)},
-            {"fit", rawFitToJson(step.fit)},
-            {"triedThumb", step.triedThumb},
-            {"showThinking", step.showThinking},
-            {"showCode", step.showCode},
-            {"showDiff", step.showDiff},
-            {"showError", step.showError},
-        });
-    }
-    return out;
-}
-
 static nlohmann::json rawMessageToJson(const ChatMsg& m) {
     return {
         {"fromUser", m.fromUser},
@@ -814,7 +756,6 @@ static nlohmann::json rawMessageToJson(const ChatMsg& m) {
         {"planState", planStateToJson(m.planState)},
         {"planStatePresent", m.planState.present},
         {"curMissionTask", m.curMissionTask},
-        {"steps", rawStepsToJson(m.steps)},
         {"clarify", rawClarifyToJson(m.clarify)},
         {"asks", [&] {
              nlohmann::json asks = nlohmann::json::array();
@@ -1706,11 +1647,9 @@ void loadChatHistory(AppState& st) {
     // Park + drop everything resident — this runs before any session work has happened
     // (or from the WASM merge, which accepts a rebuild).
     parkActiveConversation(st);
-    freeChatTextures(st.chat);
     st.chat.clear();
     st.lastContextTokens = 0;
     st.queuedPrompts.clear();
-    for (auto& c : st.conversations) freeChatTextures(c.msgs);
     st.conversations.clear();
     st.activeConv = -1;
     // The Chudcode link registry mirrors the resident set — rebuild it with the store.
@@ -2250,7 +2189,6 @@ static bool conversationIsFresh(const AppState& st, int idx) {
 // Returns true when it erased — callers then skip parking (there was nothing to park).
 static bool discardActiveConversationIfFresh(AppState& st) {
     if (!conversationIsFresh(st, st.activeConv)) return false;
-    freeChatTextures(st.chat);
     st.chat.clear();
     st.lastContextTokens = 0;
     st.queuedPrompts.clear();
@@ -2357,13 +2295,10 @@ void closeConversation(AppState& st, int idx) {
     if (closingActive) {
         // Persist leaving session's draft before wiping composer.
         savePromptDraft(st, /*force=*/true);
-        freeChatTextures(st.chat);
         st.chat.clear();
         st.lastContextTokens = 0;
         st.queuedPrompts.clear();
         clearComposerState(st);
-    } else {
-        freeChatTextures(st.conversations[idx].msgs);
     }
     // Drop draft key for the closed conversation.
     {
@@ -2509,10 +2444,6 @@ int forkConversation(AppState& st, int idx) {
     for (auto& msg : fork.msgs) {
         msg.running = false;
         msg.liveStatus.clear();
-        for (auto& step : msg.steps) {
-            step.thumb.id = 0;
-            step.triedThumb = false;
-        }
     }
     seedChatRawSnapshots(fork.id, fork.msgs);
 

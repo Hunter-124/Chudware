@@ -1,5 +1,15 @@
 # OMP DAP / LSP / Slash-Commands / MCP-Client / Approval — Reuse Map for Firmware Workstream
 
+> **Historical research (2026-07), superseded 2026-08-31. Not a current runbook.** This dossier
+> is dated evidence from the OMP integration research round. Its bun bridge/sidecar,
+> `vendor/omp/` and `scripts/vendor_omp.py` were deleted. Any `scratch/omp-src/` or
+> inspection-checkout path is an untracked local research copy, not a dependency. Its CAD
+> file/line citations are point-in-time. Online agent execution, provider auth, models,
+> sessions, memory and compaction now run in the embedded Chudcode RPC runtime. See
+> [01-DECISIONS.md, 2026-08-31 section](../01-DECISIONS.md#2026-08-31--superseding-architecture-chudcode-rpc-is-the-only-online-runtime),
+> [ARCHITECTURE.md, Agent runtime](../../../ARCHITECTURE.md#agent-runtime), and
+> [`.claude/skills/cad-chudcode-integration/SKILL.md`](../../../.claude/skills/cad-chudcode-integration/SKILL.md).
+
 Scope: `scratch/omp-src/packages/{coding-agent,agent,ai}` (pinned 6ae7cdbf) +
 `omp-inspection/oh-my-pi/packages/mnemopi` (MCP server authoring example — no
 standalone `services.mcp` top-level dir exists in the inspection clone; the

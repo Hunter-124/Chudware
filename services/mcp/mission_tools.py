@@ -1,4 +1,4 @@
-"""mission_tools.py — MCP surface for the copilot mission pipeline (T-W19).
+"""mission_tools.py — MCP surface for deterministic mission planning.
 
 Three thin tools over the deterministic pipeline glue:
 
@@ -11,11 +11,10 @@ Three thin tools over the deterministic pipeline glue:
     report who must approve.
 
 These mirror the ``register_<family>_tools(mcp)`` + nested ``@mcp.tool()`` pattern
-used by ``services/dag/mcp_tools.py`` and ``services/mcp/ledger_tools.py``.  The
-in-app path (``services.agent.loop.run_mission``) is the primary integration
-target; these tools expose the same capability to external MCP clients.
+used by ``services/dag/mcp_tools.py`` and ``services/mcp/ledger_tools.py``.
+These tools expose mission planning to MCP clients and the GUI worker.
 
-Process model (Phase-5 note): missions planned here execute IN-PROCESS —
+Process model: missions planned here execute in-process —
 ``dag_run`` drives the compiled graph inside the calling MCP/GUI-worker
 process; nothing here spawns worker subprocesses. Any future subprocess-based
 agent worker must go through ``daemon_bridge.spawn_agent_worker`` so it runs

@@ -12,7 +12,7 @@ into the real, table-first, hand-authored reference files.
 
 Fetch strategy per URL:
   1. If any Firecrawl keys are configured (the key pool in
-     `engine/research/firecrawl_pool.py` — `FIRECRAWL_API_KEYS`, `FIRECRAWL_API_KEY`,
+     `services/research/firecrawl_pool.py` — `FIRECRAWL_API_KEYS`, `FIRECRAWL_API_KEY`,
      or config.json `keys.firecrawl`), POST to the Firecrawl REST v1 `/scrape` endpoint
      with `formats: ["markdown"]` and use the returned markdown directly (Firecrawl
      already does content extraction + boilerplate stripping). The pool rotates keys

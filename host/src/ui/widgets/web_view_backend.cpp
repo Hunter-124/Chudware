@@ -7,7 +7,7 @@
 // A build WITHOUT CHUDWARE_ENABLE_CEF has no browser engine at all, so makeWebView
 // returns a NullWebView that renders an honest "requires the CEF build" message
 // instead of failing to compile — the CEF SDK is a heavy, provisioned dependency
-// (docs/cef_webview.md), so SDK-less dev/CI builds still link, they just don't
+// (docs/design/cef_webview.md), so SDK-less dev/CI builds still link, they just don't
 // carry the embedded browser.
 #include "web_view_backend.h"
 

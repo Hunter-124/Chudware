@@ -15,8 +15,8 @@ Locations (precedence, first wins by name):
 Activation:
   (a) explicit ``/skill:<name>`` or ``/<name>`` slash command
   (b) auto-inject when ``inject: auto`` and a trigger fires (keyword in user
-      prompt, tool about to run, mission phase) — once per session; re-inject
-      after context compaction via :func:`mark_compacted`.
+      prompt, tool about to run, mission phase) — once per session until
+      :func:`reset_session` clears that session's injected set.
 """
 from __future__ import annotations
 
@@ -691,18 +691,12 @@ def _session_key(session_id: str | None) -> str:
 
 
 def reset_session(session_id: str | None = None) -> None:
-    """Clear injected-set for a session (or all if session_id is None and wipe_all)."""
+    """Clear one session's injected set, or every session's when *session_id* is None."""
     with _session_lock:
         if session_id is None:
             _session_injected.clear()
         else:
             _session_injected.pop(_session_key(session_id), None)
-
-
-def mark_compacted(session_id: str | None = None) -> None:
-    """After context compaction, allow re-injection of previously injected skills."""
-    with _session_lock:
-        _session_injected[_session_key(session_id)] = set()
 
 
 def already_injected(name: str, session_id: str | None = None) -> bool:
@@ -1052,12 +1046,6 @@ def resolve_slash(
     return cleaned, hits
 
 
-def is_skill_slash(text: str, *, project_root: Path | str | None = None) -> bool:
-    """True when *text* is primarily a skill slash invocation."""
-    _, hits = resolve_slash(text, project_root=project_root)
-    return bool(hits)
-
-
 # --------------------------------------------------------------------------- /rule slash command
 #
 # `/rule <trigger words> -> <context to inject>` authors a Rule (aicad.trigger/1).
@@ -1217,11 +1205,6 @@ def resolve_skill_uri(
         "content_type": ctype,
         "is_directory": False,
     }
-
-
-def read_skill_uri(uri: str, *, project_root: Path | str | None = None) -> str:
-    """Convenience: return file content or raise SkillResolveError."""
-    return str(resolve_skill_uri(uri, project_root=project_root)["content"])
 
 
 def skill_reference_text(

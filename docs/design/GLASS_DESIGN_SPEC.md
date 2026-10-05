@@ -2,10 +2,17 @@
 
 Design language for the `host/` GUI (the single target since the `ui/imgui` shell was retired).
 All panel code consumes **tokens/theme accessors only** (`host/src/ui_theme.*`);
-`scripts/check.py gui_lint theme` enforces no literal colors in panel files. Read this doc before
-writing or restyling any host panel. The live widget kit is
+`scripts/gui_lint.py --rule color` audits literal-color bypasses; `--rule theme` covers
+theme/DPI misuse, not literal colors. The live widget kit is
 `host/src/ui/widgets/kit.{h,cpp}`; palette and glass APIs live in
 `host/src/ui_theme.{h,cpp}`.
+
+**Design versus current API:** the restyle sections below retain the original task
+names, proposed signatures and layout targets. Consult
+[gui-theme-layout](../../.claude/skills/gui-theme-layout/SKILL.md) and the named
+`ui_theme` / `kit` symbols for current signatures and panel rules; this is not a
+fresh visual-acceptance report. Old `platform/dpi` references are design-era paths:
+current logical sizing uses `ui::uiScale` and `host/src/ui/metrics.h`.
 
 ---
 

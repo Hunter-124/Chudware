@@ -7,23 +7,26 @@ description: Chudware ribbon, feature tree, PropertyManager and command-routing 
 
 Scope: the command surface — ribbon, feature tree, property forms, and routing from click to
 engine. Icons themselves (drawing/generating them) are `gui-icons`; the sketcher's in-canvas
-tools are `gui-sketch`.
+tools are `gui-sketch`. Shared-file ownership, waves and verification: `gui-orchestrator`.
 
 ## File map
 
 | File | Role |
 |---|---|
-| `host/src/ui/ribbon_def.cpp/.h` | **Append-only** static command table (`RibbonCmd` rows). `ribbon.cpp` and `app.cpp` call `getRibbonCmds()` |
+| `host/src/ui/ribbon_def.cpp/.h` | **Append-only** static command table (`RibbonCmd` rows) + `ribbonCommandCapability()`. `ribbon.cpp` and `app.cpp` call `getRibbonCmds()` |
 | `host/src/ui/widgets/ribbon.cpp/.h` | Ribbon widget: tabs, groups, big/small buttons, flyouts, layout & drawing |
-| `host/src/ui/feature_tree.cpp` (~3.9k LOC) | FeatureManager tree: hierarchy, suppress/reorder, rollback bar, badges, context menus |
-| `host/src/ui/property_manager.cpp` | PropertyManager panel shell (per-doc form state) |
+| `host/src/ui/feature_tree.cpp/.h` | FeatureManager tree: hierarchy, suppress/reorder, rollback bar, badges, context menus, viewport→tree sync |
+| `host/src/ui/property_manager.cpp` | PropertyManager panel shell (per-doc form state); `PropertyManager::openForCommand` |
 | `host/src/ui/pm_forms.cpp` | Form schemas per feature type — field definitions the PropertyManager renders |
 | `host/src/ui/command_search.cpp` | Command palette / search over the ribbon table |
-| `host/src/app.cpp` (~3.2k LOC, **integrator-owned**) | Frame loop; dispatches ribbon commands via `onCommand(kCmd_Xxx, args)` |
+| `host/src/app_commands.cpp/.h` (**integrator-owned**) | `buildRibbonCommandRouter`: ordered `CommandRouter` rules mapping command ids/prefixes to the owning module; `CommandRouter::authorize` capability gate |
+| `host/src/app.cpp` (**integrator-owned**) | Frame loop; `dispatchCmd` (pre/post policy around the router) and the app-level command hooks (`RibbonCommandHooks`: Edit clipboard verbs, Make Drawing, Display style, Appearance, Sheet Metal) |
 
 ## RibbonCmd schema (ribbon_def.h)
 
 ```cpp
+enum class CommandCapability { Mutate, Inspect, Export };
+
 struct RibbonCmd {
   const char* cmd_id;  // snake_case unique id
   const char* label;   // ≤12 chars fits a big button
@@ -33,23 +36,37 @@ struct RibbonCmd {
   bool big;            // 32px icon over label vs 20px + label right
   const char* sub_of;  // parent cmd_id for flyout/dropdown sub-commands, else nullptr
   bool stretch;        // reserved-but-unwired (renders disabled)
+  CommandCapability capability = CommandCapability::Mutate;
 };
 ```
 
 **Append rows, never edit existing ones** (header says so; other cards depend on row order).
+`capability` is fail-closed: unclassified and unknown ids are `Mutate`, which read-only /
+entitlement mode blocks. Mark a row `Inspect` (view/display/measure only) or `Export` (writes a
+copy, never mutates the open document) only when that is strictly true — a mutating command
+marked Inspect/Export silently unlocks editing in read-only mode.
 
 ## Command flow
 
-Ribbon click → `onCommand(kCmd_..., args)` in `app.cpp` → `AppState::runJob()` enqueues →
-`WorkerClient::sendRpc()` (`host/src/worker_client.h`, format in `contracts/worker_rpc.md`) →
-Python kernel executes → result drained per-frame by `host/src/core/engine_events.cpp` →
-`AppState`/`DocTab` updated → tree & viewport repaint.
+Ribbon click (or shortcut bar / gesture wheel via `st.ribbonDispatch`) → `dispatchCmd` in
+`app.cpp` → `CommandRouter::authorize` (Mutate commands refused in read-only mode) →
+`CommandRouter::dispatch` walks rules in registration order; the first handler that returns true
+consumes the command — a workspace module entry point (`SketchMode::onRibbonCommand`,
+`PropertyManager::openForCommand`, `AsmPanels::handleCommand`, `camHandleCommand`, …) or an
+app-level hook → engine RPC over `st.worker` (`WorkerClient`, `host/src/worker_client.h`; method
+contracts in `contracts/worker_rpc.md`) → `engine::call` (`services/worker/engine_backend.cpp`)
+→ `chudware-hostd` executes in libchudware → `doc.changed` and other events drained per frame by
+`host/src/core/engine_events.cpp` → `AppState`/`DocTab` updated → tree & viewport repaint.
 
 ## Adding a command, end to end
 
 1. Icon exists? Check `contracts/icons.md`; if not, that's a `gui-icons` task first.
-2. Append a `RibbonCmd` row in `ribbon_def.cpp` (right tab/group, `sub_of` for flyouts).
-3. Handle the command id in `app.cpp`'s dispatch (coordinate with orchestrator — shared file).
+2. Append a `RibbonCmd` row in `ribbon_def.cpp` (right tab/group, `sub_of` for flyouts,
+   `capability` only if it is genuinely Inspect/Export).
+3. Route it: most ids already reach their module through an existing prefix rule (`sk_`, `dwg_`,
+   `asm_`, `cam_`, `reveng_`, `sim_`, `eval_`, PM forms) — handle the id in that module's entry
+   point. A new family needs a rule in `buildRibbonCommandRouter` (`app_commands.cpp`; order is
+   semantics, audit the fall-through cases) — integrator-owned, request it.
 4. If it opens a parameter form: add the schema to `pm_forms.cpp`; op fields must match
    `contracts/feature_params.md` / `contracts/doc_ops.md`.
 5. If it creates a tree node: `feature_tree.cpp` renders from the doc's feature list — usually
@@ -63,6 +80,7 @@ Python kernel executes → result drained per-frame by `host/src/core/engine_eve
   `host/src/core/app_state.h` (integrator-owned — request seam edits, don't sprawl).
 - Colors from `ui_theme` only; icon names must pass `scripts/gui_lint.py --rule icons`.
 - Interaction/gesture language: `contracts/interaction.md`.
+- The Features section header hosts only the Add Folder button (`folder_new` icon).
 
 ## Assembly component tree (feature_tree.cpp `drawAssemblyTree`)
 
@@ -91,11 +109,5 @@ Python kernel executes → result drained per-frame by `host/src/core/engine_eve
   `featureTreeNoteAssemblyPick(st, hit, component, owner)` → the nested component feature row
   lights while that pick stays selected, and its component row / Dress-up folder open once + scroll.
   Selected rows (every kind) paint via `fmRowSelectedPaint` (accentSoft fill + accent glow).
-- The AI "Name & group" tree-header button was removed (sidelined); `nameAndGroupFeatures`
-  is kept `[[maybe_unused]]` for later re-wiring.
 
-## Build & verify
-
-`./build.sh` from repo root must compile; run `scripts/gui_lint.py --rule icons` if you
-referenced any icon. Never run git. Return files changed + a one-line user check, e.g.
-"Features tab > new 'Wrap' button in the Modify group opens its PropertyManager form."
+Scenario that exercises this surface: `CHUDWARE_SHOT=m1` (see gui-orchestrator).

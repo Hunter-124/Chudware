@@ -1,12 +1,14 @@
 """``material_lookup(material, property?)`` — material properties, bundled-first with a
 runtime-fetch-with-citation fallback. Contract ``contracts/research_tools.md`` §1.
 
-Pillar 8 legal posture: the answer comes from the **unified first-party registry**
-(``engine.materials``, bundle-safe handbook nominal values) whenever possible —
-``confidence:"bundled"``, ``source_url:null`` (the citation rides in ``provenance``). Only
-on a miss (and only when online) does it fall through to ``web_search`` so the model gets
-*cited candidate sources* to ``fetch_page`` — it never fabricates a value and never
-touches a prohibited source (MatWeb/MakeItFrom/Matmatch are not reachable from here).
+The answer comes from the **unified first-party registry** (native ``material_get``
+RPC, bundle-safe handbook nominal values) whenever possible —
+``confidence:"bundled"``, ``source_url:null`` (the citation rides in ``provenance``).
+On a miss, offline mode refuses network access. Online calls first try the
+disabled-by-default ``material_web_lookup`` accepted-risk path
+(``CHUDWARE_ENABLE_MATERIAL_WEB``; ``contracts/license_debt.md``), then return cited
+``web_search`` candidates for ``fetch_page``. Values are never fabricated and
+CAPTCHAs/bot-walls are never bypassed.
 """
 from __future__ import annotations
 

@@ -52,9 +52,8 @@ _GUARD_INTERNAL = "guardrail_internal_error"
 # PROHIBITED_CONTENT). Distinct from provider_error because the provider,
 # credential and endpoint were all healthy, and distinct from
 # provider_unavailable because the vendor is fine for every other request —
-# so it must not be marked dead process-wide. Retrying the identical prompt on
-# the same vendor is guaranteed to refuse again; a different vendor routinely
-# answers it, which is what the failover below does.
+# so it must not be marked dead process-wide. The turn stops and reports the
+# refusal; it never re-sends the prompt to another vendor on its own.
 _PROVIDER_REFUSED = "provider_refused"
 
 
@@ -69,6 +68,64 @@ def _guard_stop_reason(block: str) -> str:
         if str(block or "").startswith(GUARD_INTERNAL_PREFIX)
         else _GUARD_BLOCKED
     )
+
+
+def _format_context_refs_block(context_refs) -> str:
+    """Render GUI/RPC ``context_refs`` as a model-visible block, or ``""``.
+
+    Payload shape (Wave 4): list of ``{kind, id, doc_id, label}``. Absent, empty,
+    or fully-malformed input is a no-op so callers can always pass the field
+    through. Individual bad entries are skipped.
+    """
+    if not context_refs or not isinstance(context_refs, (list, tuple)):
+        return ""
+    lines: list[str] = []
+    for raw in context_refs:
+        if not isinstance(raw, dict):
+            continue
+        kind = str(raw.get("kind") or "").strip()
+        rid = str(raw.get("id") or "").strip()
+        if not kind or not rid:
+            continue
+        label = str(raw.get("label") or "").strip()
+        doc_id = str(raw.get("doc_id") or raw.get("docId") or "").strip()
+        line = f"- {kind}"
+        if label:
+            line += f' "{label}"'
+        line += f" id={rid}"
+        if doc_id:
+            line += f" doc_id={doc_id}"
+        lines.append(line)
+    if not lines:
+        return ""
+    header = (
+        "Context references (user-picked model entities — resolve/measure/target "
+        "via describe_part, query_geometry, measure_between, measure_part, hover "
+        "using the listed id/doc_id):"
+    )
+    return header + "\n" + "\n".join(lines)
+
+
+def apply_context_refs(request: str, context_refs=None) -> str:
+    """Append a Context-references block to *request* when refs are present.
+
+    Folds the structured ``context_refs`` field into the text the model sees
+    (mirrors how file attachments are made visible). No-op for
+    absent/empty/malformed refs.
+
+    Also no-ops when the host already inlined a Context references block into
+    the request text (C++ agent_run path; host dual-writes structured + text).
+    """
+    base = request if isinstance(request, str) else str(request or "")
+    # Host (S_Composer) may already have inlined a block — don't double-inject.
+    if "Context references" in base:
+        return base
+    block = _format_context_refs_block(context_refs)
+    if not block:
+        return base
+    if not base:
+        return block
+    return base + "\n\n" + block
 
 
 # The PROVIDER cut the reply off (output cap / stopReason=length), twice, so no
@@ -257,8 +314,7 @@ def _refusal_detail(
     return format_error_detail(
         f"{who} declined this request on content policy{label}. The provider, the "
         "credential and the connection were all fine — this is that vendor's own "
-        "refusal. Every other configured provider was tried and none accepted it; "
-        "add or enable a different provider in Settings to run this work."
+        "refusal. To run this work, pick a different provider in Settings."
     )
 
 
@@ -350,8 +406,8 @@ def error_detail_for_stop(
         if stop_reason == _PROVIDER_REFUSED:
             return format_error_detail(
                 "The provider declined this request on content policy. Its "
-                "credential and connection were fine; no other configured "
-                "provider accepted it either."
+                "credential and connection were fine; pick a different provider "
+                "in Settings to run it."
             )
         return format_error_detail("Provider error (no detail).")
     if stop_reason in (_RETRY, "max_iters"):
@@ -2230,43 +2286,7 @@ def _run_turn_impl(
     _req = request
     # Wave 4: surface GUI context_refs before scaffolds so both the model and
     # reference-build novelty see the picked entities. No-op if absent/empty.
-    try:
-        from services.agent.loop import apply_context_refs as _apply_ctx  # noqa: PLC0415
-
-        _req = _apply_ctx(_req, context_refs)
-    except Exception:  # noqa: BLE001 — never break the turn on a missing helper
-        if context_refs:
-            try:
-                # Defensive local fallback (same shape as loop.apply_context_refs).
-                _lines = []
-                for _raw in (
-                    context_refs if isinstance(context_refs, (list, tuple)) else []
-                ):
-                    if not isinstance(_raw, dict):
-                        continue
-                    _k = str(_raw.get("kind") or "").strip()
-                    _i = str(_raw.get("id") or "").strip()
-                    if not _k or not _i:
-                        continue
-                    _lab = str(_raw.get("label") or "").strip()
-                    _doc = str(_raw.get("doc_id") or _raw.get("docId") or "").strip()
-                    _ln = f"- {_k}"
-                    if _lab:
-                        _ln += f' "{_lab}"'
-                    _ln += f" id={_i}"
-                    if _doc:
-                        _ln += f" doc_id={_doc}"
-                    _lines.append(_ln)
-                if _lines:
-                    _blk = (
-                        "Context references (user-picked model entities — resolve/"
-                        "measure/target via describe_part, query_geometry, "
-                        "measure_between, measure_part, hover using the listed "
-                        "id/doc_id):\n" + "\n".join(_lines)
-                    )
-                    _req = (_req + "\n\n" + _blk) if _req else _blk
-            except Exception:  # noqa: BLE001
-                pass
+    _req = apply_context_refs(_req, context_refs)
     if _sc is not None and _cap is not None:
         try:
             _ref = _sc.reference_build_context(
@@ -2447,12 +2467,7 @@ def _run_turn_impl(
         _clean, _hits = _skills.resolve_slash(_req)
         if _hits and _clean.strip():
             # Keep context_refs visible after slash-command stripping.
-            try:
-                from services.agent.loop import apply_context_refs as _reapply  # noqa: PLC0415
-
-                _req = _reapply(_clean, context_refs)
-            except Exception:  # noqa: BLE001
-                _req = _clean
+            _req = apply_context_refs(_clean, context_refs)
             messages = [
                 *_hist_msgs,
                 {"role": "user", "content": [*_parts(_req), *_att_img]},
@@ -2461,8 +2476,8 @@ def _run_turn_impl(
         if _first_catalog_turn:
             _cat = _skills.catalog_block()
             # A role prompt composed by `mission_dispatch.linear_role_prompt`
-            # already carries the catalog (it is the online lane's only source of
-            # it); appending a second copy would spend the budget twice.
+            # already carries the catalog; appending a second copy would spend
+            # the budget twice.
             if _cat and _cat not in system:
                 _sk_parts.append(_cat)
         if request or _phase:
@@ -2715,10 +2730,6 @@ def _run_turn_impl(
 
     # One trim-and-retry per turn on context overflow, then fail honestly.
     _ctx_overflow_retried = False
-    # Vendors that DECLINED this turn's prompt. Per-turn, never process-wide: the
-    # refusing vendor stays healthy for every other request, so marking it
-    # unavailable would wrongly demote it for the rest of the session.
-    _refused_providers: list[str] = []
     # Auto-enable-on-reach budget. Bounded so a model that keeps reaching for
     # unrelated packs still converges on a refusal instead of silently widening
     # its own permissions for the whole turn.
@@ -3259,33 +3270,6 @@ def _run_turn_impl(
                     )
                 except Exception:  # noqa: BLE001
                     pass
-            # mega-6: ollama/local leaf failures must not block — one-shot degrade
-            # to openrouter when keyed, else report retryable failed.
-            # mega-24 rebind: mistralai/mistral-small:free returns 404 (no
-            # endpoints). Prefer paid deepseek mid; free list as last resort.
-            # Also: do NOT treat openrouter "No endpoints found" as localish —
-            # the prior "not found" marker matched 404s and re-degraded into the
-            # dead free model (INTAKE + DELIVER DL2 thrash-kill).
-            err_l = f"{type(exc).__name__}: {exc}".lower()
-            is_or_404 = (
-                "openrouter" in err_l
-                or "no endpoints found" in err_l
-                or ("404" in err_l and "mistral" in err_l)
-            )
-            localish = (not is_or_404) and any(
-                m in err_l
-                for m in (
-                    "connection refused",
-                    "could not reach",
-                    "failed to load",
-                    "no such model",
-                    "11434",
-                    "ollama",
-                    "connection error",
-                    "connect call failed",
-                    "connecterror",
-                )
-            )
             recovered = False
             # Context overflow is structural, not fatal: drop the oldest tool
             # results (system prompt is a separate arg; original request and the
@@ -3319,261 +3303,6 @@ def _run_turn_impl(
                             exc,
                             traceback.format_exc(),
                         )
-            # A content refusal is the one provider failure where the SAME request
-            # succeeds elsewhere: the provider, credential and endpoint were all
-            # healthy, and only this vendor's classifier objected. Live
-            # 2026-08-26 (run-153290332111741): a shop-drawing request for a
-            # hand-hammer pellet press was refused "(bio)" by anthropic and the
-            # whole run died provider_error with three other credentialed providers
-            # sitting idle in the same config, delivering nothing. Re-issue the
-            # identical prompt to the next vendor FAMILY instead. Bounded by the
-            # candidate list (one shot per family) so a request every vendor
-            # declines still terminates — honestly, and saying so.
-            if not recovered and stop == _PROVIDER_REFUSED:
-                refusing = str(
-                    getattr(exc, "provider", "") or getattr(provider, "name", "") or ""
-                )
-                if refusing and refusing not in _refused_providers:
-                    _refused_providers.append(refusing)
-                try:
-                    from services.agent import config as agent_config  # noqa: PLC0415
-                    from services.agent.role_models import (  # noqa: PLC0415
-                        refusal_failover_candidates,
-                    )
-
-                    cfg = dict(agent_config.load_config() or {})
-                    candidates = refusal_failover_candidates(
-                        _refused_providers, cfg=cfg
-                    )
-                except Exception:  # noqa: BLE001 — never mask the refusal itself
-                    candidates = []
-                for cand in candidates:
-                    cand_provider = str(cand.get("provider") or "")
-                    cand_model = str(cand.get("model") or "")
-                    _log(
-                        ledger,
-                        actor,
-                        {
-                            "event": "provider_refused",
-                            "provider": refusing,
-                            "category": str(getattr(exc, "category", "") or ""),
-                            "failover_to": f"{cand_provider}/{cand_model}",
-                            "error": str(exc)[:300],
-                        },
-                    )
-                    try:
-                        cfg_alt = dict(cfg)
-                        cfg_alt["provider"] = cand_provider
-                        cfg_alt["model"] = cand_model
-                        if cand.get("base_url"):
-                            cfg_alt["base_url"] = str(cand["base_url"])
-                        alt = agent_config.get_provider(
-                            name=cand_provider,
-                            cfg=cfg_alt,
-                            **(
-                                {"actor": credit_actor}
-                                if credit_actor is not None
-                                else {}
-                            ),
-                        )
-                        _usage_before = (
-                            _tu.usage_event_count() if _tu is not None else 0
-                        )
-                        _provider_failed = False
-                        try:
-                            reply = alt.complete(
-                                system, messages, max_tokens=call_completion_cap
-                            )
-                        except BaseException:
-                            _provider_failed = True
-                            raise
-                        finally:
-                            if (
-                                _tu is not None
-                                and _tu.usage_event_count() == _usage_before
-                            ):
-                                _tu.record_usage(
-                                    provider=str(getattr(alt, "name", "") or ""),
-                                    model=str(getattr(alt, "model", "") or ""),
-                                    prompt_tokens=0,
-                                    completion_tokens=0,
-                                    total_tokens=0,
-                                    context_tokens=0,
-                                    source=(
-                                        "provider_error_unreported"
-                                        if _provider_failed
-                                        else "provider_unreported"
-                                    ),
-                                )
-                        # The rest of the turn (and every later iteration) runs on
-                        # the vendor that accepted the work.
-                        provider = alt
-                        recovered = True
-                        break
-                    except Exception as alt_exc:  # noqa: BLE001
-                        alt_stop, _alt_retryable = classify_provider_error(alt_exc)
-                        if alt_stop == _PROVIDER_REFUSED:
-                            fam = str(getattr(alt_exc, "provider", "") or cand_provider)
-                            if fam and fam not in _refused_providers:
-                                _refused_providers.append(fam)
-                        _log_mod.error(
-                            "refusal failover to %s/%s failed stop_reason=%s: %s",
-                            cand_provider,
-                            cand_model,
-                            alt_stop,
-                            alt_exc,
-                        )
-                        # Report the FIRST refusal, not a downstream vendor's
-                        # unrelated fault — the user needs to know who declined.
-                        continue
-                if not recovered:
-                    _log(
-                        ledger,
-                        actor,
-                        {
-                            "event": "provider_refused_exhausted",
-                            "provider": refusing,
-                            "category": str(getattr(exc, "category", "") or ""),
-                            "tried": list(_refused_providers),
-                            "alternatives": len(candidates),
-                        },
-                    )
-            if (
-                not recovered
-                and localish
-                and not getattr(provider, "_mega6_degraded", False)
-            ):
-                try:
-                    from services.agent import config as agent_config  # noqa: PLC0415
-                    import os as _os  # noqa: PLC0415
-
-                    cfg = dict(agent_config.load_config() or {})
-                    or_cfg = dict(cfg.get("openrouter") or {})
-                    or_key = (
-                        or_cfg.get("api_key")
-                        or cfg.get("openrouter_api_key")
-                        or _os.environ.get("OPENROUTER_API_KEY")
-                        or (cfg.get("keys") or {}).get("openrouter")
-                    )
-                    # Prefer paid mid (frontier fallback), then free that still resolve.
-                    degrade_models = [
-                        "deepseek/deepseek-chat-v3.1",
-                        "google/gemma-3-27b-it:free",
-                        "nvidia/nemotron-ultra:free",
-                    ]
-                    if or_key:
-                        last_degrade_exc = None
-                        for mid in degrade_models:
-                            try:
-                                cfg_or = dict(cfg)
-                                cfg_or["api_key"] = or_key
-                                cfg_or["model"] = mid
-                                cfg_or["openrouter"] = {
-                                    **or_cfg,
-                                    "api_key": or_key,
-                                }
-                                alt = agent_config.get_provider(
-                                    name="openrouter",
-                                    cfg=cfg_or,
-                                    **(
-                                        {"actor": credit_actor}
-                                        if credit_actor is not None
-                                        else {}
-                                    ),
-                                )
-                                setattr(alt, "_mega6_degraded", True)
-                                _log(
-                                    ledger,
-                                    actor,
-                                    {
-                                        "event": "provider_degrade",
-                                        "to": "openrouter",
-                                        "model": mid,
-                                        "error": str(exc)[:200],
-                                    },
-                                )
-                                _usage_before = (
-                                    _tu.usage_event_count() if _tu is not None else 0
-                                )
-                                _provider_failed = False
-                                try:
-                                    reply = alt.complete(
-                                        system,
-                                        messages,
-                                        max_tokens=call_completion_cap,
-                                    )
-                                except BaseException:
-                                    _provider_failed = True
-                                    raise
-                                finally:
-                                    if (
-                                        _tu is not None
-                                        and _tu.usage_event_count() == _usage_before
-                                    ):
-                                        _tu.record_usage(
-                                            provider=str(
-                                                getattr(alt, "name", "") or ""
-                                            ),
-                                            model=str(getattr(alt, "model", "") or ""),
-                                            prompt_tokens=0,
-                                            completion_tokens=0,
-                                            total_tokens=0,
-                                            context_tokens=0,
-                                            source=(
-                                                "provider_error_unreported"
-                                                if _provider_failed
-                                                else "provider_unreported"
-                                            ),
-                                        )
-                                provider = alt
-                                if _tu is not None and ledger is not None:
-                                    try:
-                                        last_u = _tu.get_last_usage()
-                                        if (
-                                            last_u
-                                            and int(last_u.get("total_tokens") or 0) > 0
-                                        ):
-                                            ledger.append(
-                                                actor or name,
-                                                "agent_turn",
-                                                {
-                                                    "event": "provider_usage",
-                                                    "provider": last_u.get("provider"),
-                                                    "model": last_u.get("model"),
-                                                    "prompt_tokens": last_u.get(
-                                                        "prompt_tokens"
-                                                    ),
-                                                    "completion_tokens": last_u.get(
-                                                        "completion_tokens"
-                                                    ),
-                                                    "total_tokens": last_u.get(
-                                                        "total_tokens"
-                                                    ),
-                                                    "source": last_u.get("source")
-                                                    or "api",
-                                                    "provider_usage_recorded": True,
-                                                    "degraded": True,
-                                                },
-                                            )
-                                    except Exception:  # noqa: BLE001
-                                        pass
-                                recovered = True
-                                break
-                            except Exception as deg_exc:  # noqa: BLE001
-                                last_degrade_exc = deg_exc
-                                continue
-                        if not recovered and last_degrade_exc is not None:
-                            # Surface the last degrade error if all models failed.
-                            exc = last_degrade_exc
-                            stop, retryable = classify_provider_error(exc)
-                            _log_mod.error(
-                                "provider degrade failed stop_reason=%s: %s\n%s",
-                                stop,
-                                exc,
-                                traceback.format_exc(),
-                            )
-                except Exception:  # noqa: BLE001
-                    recovered = False
             if not recovered:
                 detail = format_provider_error_detail(exc, provider)
                 # Never return bare "failed" for a provider exception — node_runner
@@ -3623,12 +3352,10 @@ def _run_turn_impl(
             parsed: dict | None = queued
         else:
             # Single chokepoint for the context meter: EVERY provider completion
-            # in this loop (the normal call, the context-overflow trim retry, and
-            # the degraded alt-provider call) either falls through to here with a
-            # `reply` or returns above, so one emit here covers all of them — and
-            # it runs on every billed iteration, so the meter tracks live instead
-            # of once a turn. `provider` is read fresh: a degrade rebound it, and
-            # the window must be the model that actually ran.
+            # in this loop (the normal call and the context-overflow trim retry)
+            # either falls through to here with a `reply` or returns above, so
+            # one emit here covers both — and it runs on every billed iteration,
+            # so the meter tracks live instead of once a turn.
             _emit_context_event()
 
             # An empty assistant turn is not just useless context —

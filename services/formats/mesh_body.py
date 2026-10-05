@@ -1,19 +1,16 @@
-"""First-class mesh body — a non-parametric triangle-soup body (FORMATS_PLAN.md §2 D1).
+"""Python mesh body — a non-parametric triangle-soup body.
 
-Imported meshes (STL / OBJ / PLY / 3MF / glTF, and the Rhino / SolidWorks mesh fallbacks) become a
-``MeshBody`` instead of an OCCT shape. A ``MeshBody`` flows through the SAME body pipeline as a
-B-rep body, but carries raw vertices + triangles (no topology):
+The Python format helpers represent imported meshes (STL / OBJ / PLY / 3MF / glTF,
+and Rhino / SolidWorks mesh fallbacks) as ``MeshBody`` rather than an OCCT shape.
+It carries raw vertices + triangles and exposes ``.wrapped = None`` so callers
+can distinguish it from a B-rep without inventing face/edge topology.
 
-* it exposes ``.wrapped = None`` so the compiler's topology-tagging (which guards on ``.wrapped``)
-  treats it as having no B-rep topology — no face/edge owner tags, no crash;
-* :func:`engine.doc.tessellate.tessellate_mesh_body` turns it straight into AICM geometry
-  (no ``BRepMesh`` — raw triangles, area-weighted normals, naked + sharp wireframe edges);
-* :func:`services.formats.formats.export_document` re-serialises it via the trimesh mesh writers;
-* :func:`engine.doc.evaluate.mass_props` computes volume / area / centroid from the triangles.
+:func:`services.formats.formats.export_document` re-serialises it via the trimesh
+mesh writers. The helpers below compute normals, volume, area and centroid from
+triangles. This module imports numpy only (no OCP).
 
-Downstream code dispatches on ``isinstance(shape, MeshBody)`` — robust to multi-body imports where
-the per-feature ``kind`` hint only stamps the top body. This module imports numpy ONLY (no OCP), so
-it is safe to import from the OCP-free ``engine.doc`` package surface.
+Native document import/export is separate and lives in ``core/doc/formats.cpp``;
+this Python representation does not register native document or tessellation RPCs.
 """
 
 from __future__ import annotations

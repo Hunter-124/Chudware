@@ -1,6 +1,6 @@
 """ECAD → 3D bridge: turn a ``BoardDocument`` into a STEP solid + a CAD ``aicad.part/1`` doc.
 
-This is *the* headline integration (docs/contracts/ecad/fab_outputs.md §5): a finished PCB drops
+This integration (contracts/ecad/fab_outputs.md §5) lets a finished PCB drop
 straight into the existing Chudware 3D workspace so the user can model an enclosure around it.
 
 Public surface
@@ -14,11 +14,12 @@ Public surface
 
 ``board_to_part_doc(board, step_path) -> dict``
     A minimal ``aicad.part/1`` document whose single ``import`` feature references ``step_path`` —
-    matching the envelope the engine.doc compiler expects (see engine/doc/features/import_feature.py
-    and engine/doc/schema.py), so ``ecad_to_3d`` can open it directly in the CAD viewport.
+    matching the native part-document envelope (``core/doc/validate.cpp`` and
+    ``core/doc/document.cpp``), so ``ecad_to_3d`` can open it in the CAD viewport.
 
-The kernel here is build123d / OCP — the same one engine.kernel + engine.doc use — so the produced
-geometry round-trips through ``engine.doc.formats.import_path`` and the part-doc compile pipeline.
+The Python geometry helpers use build123d / OCP; native CAD compilation uses OCCT
+in ``core/geom/`` and ``core/doc/``. STEP bridges the two, while Python model loads
+use ``services.formats.formats.import_path``.
 """
 
 from __future__ import annotations
@@ -529,7 +530,7 @@ def _is_on_board(fp: dict) -> bool:
 
 
 def _load_model(model_ref: str, summary: _Summary):
-    """Try to load a footprint ``model_3d`` via engine.doc.formats.import_path.
+    """Try to load a footprint ``model_3d`` via services.formats.formats.import_path.
 
     Returns a build123d shape on success, or ``None`` (with a recorded warning) on any failure —
     including WRL (mesh) sources and missing files. The caller then uses the box-proxy fallback.
@@ -706,9 +707,9 @@ def board_to_step(board: dict, out_path: str, opts: Any = None) -> dict:
 def board_to_part_doc(board: dict, step_path: str) -> dict:
     """A minimal ``aicad.part/1`` document whose single ``import`` feature references ``step_path``.
 
-    Matches engine/doc/schema.py's ``import`` feature envelope (params: source_path/format/
-    original_name; refs: {}) exactly, so it round-trips through the engine.doc compiler and the host
-    can open it directly in the CAD viewport (fab_outputs.md §5 step 4).
+    Matches the native ``import`` feature envelope (params: source_path/format/
+    original_name; refs: {}) so the host can compile it through ``core/doc/document.cpp``
+    and open it in the CAD viewport (contracts/ecad/fab_outputs.md §5 step 4).
     """
     name = str(board.get("name") or "PCB")
     return {

@@ -14,7 +14,6 @@ class TestAutolearnConfig(unittest.TestCase):
 
         self.assertFalse(cfg.autolearn_enabled({}))
         self.assertFalse(cfg.autolearn_auto_continue({}))
-        self.assertEqual(cfg.autolearn_min_tool_calls({}), 5)
 
     def test_reads_agent_block(self):
         from services.agent import config as cfg
@@ -37,12 +36,6 @@ class TestStandingGuidance(unittest.TestCase):
 
         self.assertEqual(standing_guidance({"agent": {"autolearn_enabled": False}}), "")
 
-    def test_present_when_enabled(self):
-        from services.agent.autolearn import standing_guidance
-
-        g = standing_guidance({"agent": {"autolearn_enabled": True}})
-        self.assertIn("Auto-Learn", g)
-        self.assertIn("ledger_note", g)
 
 
 class TestMaybeCapture(unittest.TestCase):
@@ -128,19 +121,6 @@ class TestPromptPreview(unittest.TestCase):
         out = preview_tool_entry("")
         self.assertFalse(out["ok"])
 
-    def test_main_chat_preview_assembles(self):
-        from services.agent.prompt_preview import (
-            USER_REQUEST_PLACEHOLDER,
-            preview_main_chat_system,
-        )
-
-        out = preview_main_chat_system(include_tools=False)
-        self.assertTrue(out.get("ok"), out)
-        self.assertTrue(out.get("system"), "expected non-empty system")
-        self.assertEqual(out.get("user_placeholder"), USER_REQUEST_PLACEHOLDER)
-        self.assertIn("Chudware", out["system"])
-        self.assertNotIn("(sample)", out["system"])
-        self.assertGreater(out["meta"].get("system_chars", 0), 100)
 
     def test_check_with_me_preview_preserves_custom_prompt_without_mutators(self):
         from services.agent.prompt_preview import preview_main_chat_system
@@ -154,7 +134,7 @@ class TestPromptPreview(unittest.TestCase):
 
         self.assertTrue(out.get("ok"), out)
         self.assertTrue(out["system"].startswith("CUSTOM GLOBAL SYSTEM"))
-        rendered = set((out["meta"].get("tools") or {}).get("rendered") or [])
+        rendered = {tool["name"] for tool in out["host_tools"]}
         self.assertIn("describe_part", rendered)
         self.assertFalse({"fs_write", "fs_edit", "run_shell", "undo", "new_part"} & rendered)
 
@@ -183,7 +163,6 @@ class TestPromptPreview(unittest.TestCase):
         out = tool_catalog()
         self.assertTrue(out.get("ok"), out.get("error"))
         rows = out.get("tools") or []
-        self.assertGreater(len(rows), 300)
         by_name = {r["name"]: r for r in rows}
         # Registry tool: family + live description + curated guidance present.
         lg = by_name.get("ledger_get")

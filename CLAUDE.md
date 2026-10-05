@@ -8,10 +8,8 @@ Rules:
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
 
-## Task board (solo)
+## Task board
 
-Solo dev now — main WIP happens on this machine, remote is mainly a backup. If the
-user says "start working", "chip away", or "find something to do": use
-`python3 work/tools/work.py ready` to see unblocked tasks and `work/tools/work.py
-board` for the full board. No claim/coordination step is needed since there's only
-one contributor; just pick a task, work it, and mark it done yourself when finished.
+Read `AGENTS.md` first. If asked to "start working", "chip away", or "find something to
+do", use `python3 work/tools/work.py ready`; board policy is `work/WORKFLOW.md`, task
+format and "done" are `work/README.md`.

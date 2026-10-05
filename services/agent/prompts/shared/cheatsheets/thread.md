@@ -70,6 +70,3 @@ COMMON MISTAKES:
 3. For a custom thread give BOTH major_dia AND pitch; for a standard one give just `size`.
 4. A failed cut is NOT an error — it warns and leaves the plain cylinder. That is by
    design. To force success without geometry, use mode:"cosmetic".
-
-Confirmed against: validate.cpp FEATURE_TYPES `thread` entry, document.cpp thread handler,
-geom/thread.cpp (cut_thread), and test_document.cpp case 12 (M8 external + cosmetic).

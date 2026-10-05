@@ -18,21 +18,42 @@ charger/controller:
 
 ## Run
 
+From the repo root, with the services venv (any interpreter with the MCP service
+requirements works; `CHUDWARE_LIBCHUDWARE` points at a built engine):
+
 ```bash
-CHUDWARE_LIBCHUDWARE=$PWD/core/build-occt-linux/bin/libchudware.so \
-  /home/hunter/.local/share/Chudware/mcp-venv/bin/python \
-  scripts/bench_battery_charger.py
+CHUDWARE_LIBCHUDWARE="$PWD/core/build-occt-linux/bin/libchudware.so" \
+  ~/.local/share/Chudware/mcp-venv/bin/python scripts/bench_battery_charger.py
 ```
 
 Env:
 
 - `CHUDWARE_BC_OUT` — output dir (default `benchmarks/battery_charger`)
-- `CHUDWARE_BC_MARKERS` — marker dir
+- `CHUDWARE_BC_MARKERS` — marker dir (default `$CHUDWARE_BC_OUT/markers`)
 - `CHUDWARE_BC_SEED` — fixed seed (default 0)
 - `CHUDWARE_BC_SIM_BUDGET_S` — Renode wall budget (default 120)
 - `CHUDWARE_ECAD_HEAVY_BUDGET_S` — board_from_schematic budget (default 180)
 
 Exit 0 when no leg is FAIL (SKIP/WARN allowed).
+
+## Gate
+
+`scripts/gate.sh` runs this script as the opt-in stage `stage_bench_battery_charger`
+when `CHUDWARE_RUN_BENCH_CHG=1` (otherwise the stage is skipped). The stage uses the
+gate's resolved Python, picks `core/build-occt-linux` or `core/build-linux`
+`libchudware.so` when `CHUDWARE_LIBCHUDWARE` is unset, writes output and markers under
+the gate temp dir (not this directory), and defaults `CHUDWARE_ECAD_HEAVY_BUDGET_S` to
+300. Any FAIL marker or non-zero exit fails the gate; SKIP legs do not. Wall times are
+recorded only, never gated.
+
+## Known breakage
+
+`scripts/bench_battery_charger.py` still imports the retired top-level `engine`
+package (`engine.sim.circuit` in the MNA sim legs, `engine.ecad` in `parts` /
+`schematic` / `board` / `thermal`, `engine.firmware` in `firmware`). Each leg that
+reaches one of those imports records FAIL with `ModuleNotFoundError` (dependent legs
+then SKIP) until the script is repointed at the live `services.*` modules, so an
+opted-in gate run currently fails.
 
 ## Artifacts
 
@@ -40,21 +61,3 @@ Exit 0 when no leg is FAIL (SKIP/WARN allowed).
 - `sim_charge.json` / `sim_lvd.json` / `sim_safety.json` — real sim assertions
 - `battery_charger_sch.json` / `battery_charger_board.json`
 - `power_budget.json`, `markers/*.marker`
-
-## Gate / simsuite wiring (Main)
-
-Suggested:
-
-```bash
-# scripts/gate.sh
-stage_bench_battery_charger() {
-  "$MCP_PYTHON" scripts/bench_battery_charger.py
-}
-```
-
-```python
-# benchmarks/simsuite/run_all.py — optional entry
-("battery_charger", "scripts/bench_battery_charger.py"),
-```
-
-Do **not** hard-gate on wall-times yet; record only.

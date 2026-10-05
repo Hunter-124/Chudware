@@ -16,7 +16,7 @@ deferred: yes
 
 Deferred follow-ups from the AI-experience lane, parked so they are not lost:
 
-1. **GNN adapter training** — `docs/RECOGNITION_RESIDUAL.md` gave a GO verdict for
+1. **GNN adapter training** — `docs/review/RECOGNITION_RESIDUAL.md` gave a GO verdict for
    exactly three families (ribbed_bracket, shelled_enclosure, swept_pipe); deterministic
    recognition suffices elsewhere. Train per `tools/gsl_gnn/README.md`. Gated on that
    procedure; do not start speculative training for other families.
@@ -27,5 +27,5 @@ Deferred follow-ups from the AI-experience lane, parked so they are not lost:
 ## Definition of done
 
 - [ ] Adapters trained + evaluated for the three GO families only, results appended to
-      docs/RECOGNITION_RESIDUAL.md
+      docs/review/RECOGNITION_RESIDUAL.md
 - [ ] sw_fixtures STEPs present; gsl_eval picks them up and reports

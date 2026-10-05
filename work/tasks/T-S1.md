@@ -18,9 +18,13 @@ Lead-time risk: API approvals for Nexar, Digi-Key, Mouser, Xometry, JLCPCB, and 
 
 ## Files / areas touched
 
-- `services/parts/vendor_parts.py` — VendorPart schema, will gain price fields once keys arrive
+- `core/sourcing/providers.cpp` (Nexar/Digi-Key/Mouser pricing) and `core/sourcing/quote.cpp`
+  (Xometry/JLCPCB quote-out) — the live providers and their credential resolution (the
+  Python provider chain was deleted in T-RF18)
 - `contracts/sourcing_schema.md` — will be frozen on T-B1a
-- Environment / secrets store (`.env` / OS keychain) — store keys outside repo
+- Credentials stay outside the repo: the app config (`config.json` in the Chudware app-data
+  dir, sections `parts_providers.<provider>` / `quote_providers.<provider>`, also writable
+  from the in-app vendor pane), with environment variables as the fallback
 
 ## Steps
 
@@ -29,27 +33,33 @@ Lead-time risk: API approvals for Nexar, Digi-Key, Mouser, Xometry, JLCPCB, and 
 3. Register at developer.mouser.com; request API key.
 4. Create Xometry business account; apply for Instant Quoting API access.
 5. Create JLCPCB account; apply for developer API (jlcpcb.com/api).
-6. Contact McMaster-Carr eProcurement team for API / EDI approval (haedmonds69@gmail.com as contact).
-7. Store approved keys in `.env` (gitignored) under names `NEXAR_CLIENT_ID`, `NEXAR_CLIENT_SECRET`, `DIGIKEY_CLIENT_ID`, `DIGIKEY_CLIENT_SECRET`, `MOUSER_API_KEY`, `XOMETRY_API_KEY`, `JLCPCB_API_KEY`.
-8. Verify each key works with a minimal test call; record status in a comment in `services/parts/vendor_parts.py`.
+6. Contact the McMaster-Carr eProcurement team for API / EDI approval.
+7. Store approved keys in the app config: `parts_providers.{nexar,digikey,mouser}` and
+   `quote_providers.{xometry,jlcpcb}`. The env fallbacks are `NEXAR_CLIENT_ID`,
+   `NEXAR_CLIENT_SECRET`, `DIGIKEY_CLIENT_ID`, `DIGIKEY_CLIENT_SECRET`, `MOUSER_API_KEY`,
+   `XOMETRY_API_KEY`, `JLCPCB_APP_ID`, `JLCPCB_ACCESS_KEY` and `JLCPCB_SECRET_KEY`. Nothing in
+   the repo auto-loads a `.env` file.
+8. Verify each key works with a minimal test call; record status in this card's Status section.
 
 ## Definition of done
 
 - [ ] Applications submitted for all six providers (Nexar, Digi-Key, Mouser, Xometry, JLCPCB, McMaster)
 - [x] At least Nexar key is active and a test GraphQL query returns part data
-- [x] Keys stored in `.env`, `.env` is in `.gitignore`
-- [ ] Status of each application noted (pending / active) in a comment block at top of `services/parts/vendor_parts.py`
+- [x] Nexar credentials stored outside the repo in the app config `parts_providers.nexar`
+      (recorded 2026-07-03, Status below)
+- [ ] Every other obtained key stored the same way (step 7), not in a repo `.env` that
+      nothing reads
+- [ ] Status of each application noted (pending / active) in this card's Status section
 
 ## Status (2026-07-03)
 
 Only two of six keys obtained so far — Digi-Key, Mouser, Xometry, McMaster still pending
-(Erik hasn't gotten to those applications yet).
+(applications not yet submitted).
 
-- **Nexar: ACTIVE, verified live.** `client_id`/`client_secret` in
-  `~/.local/share/Chudware/config.json` under `parts_providers.nexar` (the app's real
-  credential source per `_resolve_creds` — `.env` is env-var fallback only and nothing
-  in this repo auto-loads it). Ran `NexarProvider().fetch("NE555P")` against the real
-  API and got live pricing/stock back.
+- **Nexar: ACTIVE, verified live.** `client_id`/`client_secret` live in the app config under
+  `parts_providers.nexar`, which is the credential source `core/sourcing/providers.cpp` reads
+  first (env vars are the fallback; nothing auto-loads a `.env`). A live `NE555P` fetch
+  through the then-current provider returned real pricing/stock.
   - **Real bug found+fixed while verifying:** the `supSearchMpn` GraphQL query asked
     for a `datasheetUrl` field that no longer exists on Nexar's `SupPart` type. The
     live query and mapper in `core/sourcing/providers.cpp` use

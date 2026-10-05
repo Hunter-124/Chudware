@@ -1,19 +1,23 @@
 # Adapter Serving Runbook (T-H9)
 
-Per-task LoRA serving with vLLM, per-insertion-point routing, canary rollout, promotion, and
-rollback. This is the operator guide **and** the run-instructions for the live-gated
-Definition-of-Done items (which need a real GPU + vLLM and cannot run in CI).
+Per-task LoRA serving with vLLM and the standalone per-insertion-point routing,
+canary, promotion and rollback library/tools. The live recipes need a real GPU +
+vLLM. Unit-test coverage below is not evidence of a current live serving run.
 
 - **Contract:** `contracts/providers.md` §7 (`routing`).
 - **Code:** `services/serving/routing.py` (table + resolve + canary), `services/serving/promotion.py`
   (gate + rollback), `services/agent/providers/vllm_provider.py` (the `vllm` provider),
   `services/mcp/serving_tools.py` (MCP surface).
-- **Adapters:** DVC-versioned under `training/adapters/<job_id>/` (T-H5/H6). An `adapter_version`
-  is that opaque id (e.g. `IP-13/v3`), NOT a semver.
+- **Adapters:** DVC-versioned under `training/adapters/<job_id>/` (T-H5/H6). That directory
+  is produced by the training/flywheel pipeline (or `dvc_init ... pull`) and is not committed;
+  it is absent until adapters exist. An `adapter_version` is that opaque id (e.g. `IP-13/v3`),
+  NOT a semver.
 
-The design invariant everywhere: **the fallback is always deterministic-path or frontier**
-(kill-switch). A serving failure or a canary-excluded call degrades to it with no user-facing
-error. Nothing below can route a call onto an experimental adapter as a fallback.
+The resolver invariant: **the fallback is always deterministic-path or frontier**
+and cannot carry an experimental adapter. `RoutingTable.resolve()` returns that
+decision when the adapter is unhealthy or a caller is canary-excluded. A caller must
+execute the decision, respect offline/provider policy, and handle serving failures;
+the routing table is not automatically wired into desktop agent-turn execution.
 
 ---
 
@@ -39,9 +43,10 @@ vllm serve Qwen/Qwen3-4B \
   provider does exactly this: `VLLMProvider(base_model="Qwen/Qwen3-4B", adapter="IP-13/v3")`
   sends `model="IP-13/v3"`. Base model is requested by its own name.
 - Pull the adapters first: `python -m tools.flywheel.dvc_init --repo training pull adapters/<job_id>`.
-- Verify the SDK provider path locally (no GPU): `pip install openai==2.41.0 &&
-  python -m pytest services/agent/test_vllm_provider.py -q` → 9 passed (in CI `openai` is absent → the
-  5 SDK cases skip, like the whole openai/anthropic/openrouter family).
+- Provider contract tests (no GPU):
+  `python -m pytest services/agent/test_vllm_provider.py -q`. SDK-dependent cases
+  skip if `openai` is unavailable; install the project's pinned requirements to
+  exercise them. This is not a vLLM-server connectivity test or a pass-count claim.
 
 ### Local mode (P13 serving posture, no GPU)
 
@@ -50,8 +55,10 @@ point `base_url` at the loopback endpoint. Same routing table, same offline-safe
 
 ## 2. Routing table in `config.json`
 
-The routing table lives under the top-level `"routing"` key of the same `config.json` as
-provider settings, so every flip is one single-file edit, no restart:
+The table lives under top-level `"routing"` in the provider `config.json`.
+The MCP tools reload and rewrite that subtree per call. A separate serving caller
+must reload it to observe flips; changing it does not change `services/agent/routing.yaml`
+role assignments or prove that an active desktop turn adopted an adapter.
 
 ```jsonc
 {
@@ -68,10 +75,10 @@ provider settings, so every flip is one single-file edit, no restart:
 }
 ```
 
-Read it any time with the MCP tool `serving_status()` — this is the read-only "which brain
-answered" data the Settings surface renders (§6).
+Inspect the configured routes with `serving_status()`. It reports configuration,
+not a log proving which model actually answered a previous call (§6a).
 
-## 3. Canary flip 0% → 10% → 0%  (`[~]` live tag; logic CI-tested)
+## 3. Canary flip 0% → 10% → 0% (routing logic; live serving requires a caller)
 
 ```
 serving_set_canary(insertion_point="IP-13", pct=10)   # admit ~10% of non-opt-in users
@@ -80,36 +87,39 @@ serving_set_canary(insertion_point="IP-13", pct=0)    # rollback the canary; nob
 
 - Bucketing is deterministic (`SHA-256(salt,ip,user)`), so a user is stably in/out and the
   percentage is reproducible; flipping the pct changes *who is admitted*, never the bucket
-  assignment. No restart — the tool rewrites the `routing` subtree in place.
-- Every adapter-served response is telemetry-tagged: `RouteDecision.telemetry_tag()` threads
-  the selected adapter into the `ai_artifact` `model.adapter` slot (T-H1). Canary responses
-  (`is_canary`) are distinguishable from fully-promoted production traffic.
-- CI proof of the logic: `python -m pytest services/serving/test_routing.py -q`
+  assignment. The tool rewrites the `routing` subtree in place.
+- `RouteDecision.telemetry_tag()` supplies a `model` block containing the selected
+  adapter; the serving caller must splice it into `ai_artifact` events. The helper
+  alone does not guarantee that every desktop response is tagged.
+- Logic coverage: `python -m pytest services/serving/test_routing.py -q`
   (`test_canary_flip_live_zero_ten_zero`, `test_every_canary_response_is_tagged`).
 
-## 4. Rollback in < 1 minute
+## 4. Rollback (routing-table change)
 
 ```
 serving_rollback(insertion_point="IP-13")                    # -> previous adapter in history
 serving_rollback(insertion_point="IP-13", to_version="IP-13/v2")  # -> explicit version
 ```
 
-A rollback is a pure routing-table flip. Nothing is overwritten (adapters are DVC-versioned and
-immutable), no confirmation is required — rolling back is never dangerous. If there is no prior
-version, the route drops to the base model and `resolve()` serves the kill-switch fallback.
-CI proof: `test_rollback_*` in `services/serving/test_promotion.py`.
+A rollback changes the route, not the DVC-versioned adapter artifacts. With no
+prior version, `adapter_version=None` makes `resolve()` choose the configured
+fallback. Ordinary mutating-tool policy still applies; this is not an Ask/Plan
+exception. Coverage: `test_rollback_*` in `services/serving/test_promotion.py`.
 
-## 5. Fallback / kill-switch (proven)
+## 5. Fallback / kill-switch (resolver coverage)
 
-When the adapter is unavailable, the caller re-resolves with `adapter_healthy=False` and gets
-the deterministic/frontier fallback — no user-facing error. Canary-excluded traffic runs the
-same safe fallback (the incumbent). CI proof: `test_unhealthy_adapter_degrades_without_error`,
-`test_non_opt_in_user_excluded_at_zero_pct`, `test_rollback_with_no_history_drops_to_base`.
+When a serving caller catches an adapter failure, it can re-resolve with
+`adapter_healthy=False` to obtain the deterministic/frontier fallback.
+Canary-excluded decisions use the same fallback. The resolver does not issue
+provider calls or guarantee a successful/error-free fallback, and must not bypass
+offline-mode restrictions. Tests cover `test_unhealthy_adapter_degrades_without_error`,
+`test_non_opt_in_user_excluded_at_zero_pct` and `test_rollback_with_no_history_drops_to_base`.
 
 ## 6. Promotion (HUMAN-GATED — Erik-ratified 2026-07-02)
 
-There is **no auto-promote path**. Promotion requires BOTH automated evidence AND Erik's
-manual sign-off per promotion:
+There is **no auto-promote path**. Promotion requires BOTH automated evidence AND a
+human's manual sign-off per promotion (`SignOff` with a non-empty `approver` and an existing
+`report_ref`; the criteria were ratified by Erik on 2026-07-02):
 
 ```
 # 1. Automated evidence from a real T-H7 shadow log (writes the report Erik reviews):
@@ -126,16 +136,17 @@ serving_promote(insertion_point="IP-13", adapter_version="IP-13/v4",
 #       supplied. On success: routing flips to IP-13/v4 at 100%, previous version kept for rollback.
 ```
 
-CI proves metrics-alone-are-not-sufficient (`test_metrics_alone_are_not_sufficient`),
-no-signoff-refused, report-missing-refused, ineligible-refused, and the happy path
-(`services/serving/test_promotion.py`, `services/mcp/test_serving_tools.py`).
+Coverage for metrics-alone refusal, missing/invalid sign-off, missing report,
+ineligible evidence and promotion with evidence + sign-off lives in
+`services/serving/test_promotion.py` and `services/mcp/test_serving_tools.py`.
 
 ## 6a. Settings visibility — "which brain answered"
 
-The read-only data is `serving_status()` (per-IP provider/model/adapter_version/canary%/
-fallback). The desktop implementation lives in
-`host/src/ui/settings_modal.cpp`; its "Model routing" section is the sole GUI
-surface. See `work/tasks/T-H9.md`.
+`serving_status()` exposes configured per-IP provider/model/adapter_version/canary%/
+fallback to agents and MCP clients; it is not response-history telemetry.
+No desktop GUI section renders this table today: Settings has a "Model routing" search entry
+(`host/src/ui/settings_modal.cpp`), but it only lands on the Providers tab. Task
+history: `work/tasks/done/T-H9.md`.
 
 ## 7. Two-OS reachability  `[~] live`
 
@@ -146,8 +157,11 @@ provider is classified like `llamacpp`/`openai`, NOT the never-offline cloud set
 
 ## 8. Smoke test (operator, post-deploy)
 
-1. `serving_status()` → confirm the two routes + adapter versions.
-2. Route a call at IP-13 with the adapter healthy → response tagged `model.adapter="IP-13/v3"`.
-3. `serving_set_canary("IP-13", 10)` → ~10% admitted; `serving_set_canary("IP-13", 0)` → 0%.
-4. Kill the vLLM process → a call degrades to the frontier fallback, no user error.
-5. `serving_rollback("IP-13")` → previous version restored in seconds.
+1. `serving_status()` → confirm the configured routes and versions.
+2. In an explicit serving caller, resolve IP-13, invoke the selected provider and attach
+   `decision.telemetry_tag()`; confirm the real response and recorded adapter.
+3. Flip `serving_set_canary("IP-13", 10)` then `serving_set_canary("IP-13", 0)`;
+   reload the table and check sampled decisions.
+4. Stop only the vLLM process owned by this smoke. Confirm the caller handles the failure,
+   re-resolves unhealthy, and either executes a policy-permitted fallback or reports refusal.
+5. `serving_rollback("IP-13")` → reload and confirm the previous adapter decision.

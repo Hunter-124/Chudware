@@ -1,40 +1,49 @@
 # work-system — git-tracked personal task board
 
-Scope: work/** (work/tools/work.py, work/tasks/, work/backlog/, work/context/, work/prompts/, work/questions/, work/DAG.md, work/README.md)
-Contracts: None — this is solo dev-time infrastructure, entirely separate from the product's own MCP server (services/mcp/ — see work/context/services-mcp.md).
+Scope: work/tools/work.py, work/tasks/, work/backlog/, work/context/, work/prompts/, work/questions/, work/DAG.md
+Contracts: none; dev-time infrastructure, separate from the product MCP server.
+Canonical policy: work/WORKFLOW.md; layout and CLI reference: work/README.md.
 
 ## Entry points
-- work/tools/work.py:103 `cmd_validate` — schema + dependency-cycle check (CI-able)
-- work/tools/work.py:113 `cmd_ready` — list todo tasks whose dependencies are all done
-- work/tools/work.py:133 `cmd_board` — full status board grouped by workstream
-- work/tools/work.py:149 `cmd_dag` — regenerate work/DAG.md (mermaid graph)
-- work/tools/work.py:227 `cmd_claim` — mark a task in-progress (locks via work/.claim.lock; vestigial from the multi-agent era, harmless solo)
-- work/tools/work.py:297 `cmd_note` — append timestamped progress note to a task
-- work/tools/work.py:328 `cmd_status` — set task status (doing/review/blocked)
-- work/tools/work.py:354 `cmd_release` — put a task back to todo
-- work/tools/work.py:374 `cmd_prompt` — emit a self-contained work order from a task file
-- work/tools/work.py `cmd_relink` — edit depends_on/workstream, cycle-validated (the only way to rewrite task topology; never edit files directly)
-- work/tools/work.py `cmd_board` also takes `--workstream/--owner/--status` filters and `--json` for structured output
+- `work/tools/work.py` `load_tasks` — loads live cards and terminal `done/` archives;
+  archived dependencies remain available to readiness and lane reports.
+- Read-only commands: `cmd_validate` (schema/cycles), `cmd_ready` (unblocked work),
+  `cmd_board` (filtered board, `--json`), `cmd_roadblocks`, `cmd_lanes`, `cmd_prompt`.
+- `cmd_dag` — regenerates `work/DAG.md` from the cards; generated output belongs to
+  the session driver, not parallel workers.
+- Metadata/topology commands: `cmd_set`, `cmd_relink`, `cmd_checkdod`. These and the
+  legacy note/status/claim/release/lane-assignment commands perform git operations.
+  They are not safe leaf-agent helpers: only the integrator may use them when
+  authorized, after inspecting their current implementation and affected paths.
+- `work/tools/issue_reporter.py` / `work/report.sh` — explicit user-invoked desktop
+  reporter; `/work-report` explains prerequisites and the non-GUI CLI alternative.
 
 ## How it connects
-work.py is the source of truth: task front matter committed straight to the working
-branch. Read work/README.md (layout + task lifecycle: todo → doing → review → done)
-for the full protocol. This used to also drive a multi-agent team-coordination layer
-(teamsync.py, team_mcp.py, dashboard.py, autopilot.md) — that layer was removed
-2026-07-08 when the project went back to solo dev; work.py itself is unaffected.
+Cards are the board data; `work.py` reads them to produce views and self-contained
+work orders (`work/prompts/driver.md`). `work/WORKFLOW.md` is normative: solo board,
+no claim/reservation step and no team-coordination service. Source-file history does
+not make an archived card current work.
 
 ## Debugging playbook
-- `python3 work/tools/work.py validate` — catch schema/cycle errors before committing
-- `python3 work/tools/work.py board` — full task status (worklist inversion: what blocks whom)
-- `python3 work/tools/work.py ready` — what can start now
-- Gotcha: work/.claim.lock is filesystem-based (gitignored) — stale after 120s; remove by hand if hung
-- Gotcha: status can NEVER be set to "done" via CLI (mark it by hand when actually shipped)
+- `python3 work/tools/work.py board` / `ready` — inspect the live queue.
+- `python3 work/tools/work.py roadblocks --json` / `lanes --json` — decision/area views.
+- Integrator checks: `python3 work/tools/work.py validate`, then regenerate the DAG
+  once after the combined card edits with `python3 work/tools/work.py dag`.
+- Preserve terminal cards and archived questions: dependency resolution and provenance
+  still use them. Do not relabel historical plans as pending implementation.
+- `_lock` uses `work/.claim.lock` and handles expiry itself. Do not remove a lock
+  held by another writer or run git-mutating board commands over concurrent edits.
+- The status CLI refuses `done`; completing/archiving a card is an integrator action
+  supported by actual delivery evidence, not a worker's automated status flip.
 
 ## Graphify starters
-- Note: graphify does not index work/ — use direct file reads (work/README.md, work/tools/*.py) instead.
+- `graphify query "work tools task board cmd_ready"` may orient a mapped card/tool.
+  If the graph lacks this area, read `work/WORKFLOW.md` and `work/tools/work.py`
+  directly; do not infer that a missing graph node means dead infrastructure.
 
 ## Related tasks/docs
-- work/README.md — task lifecycle, layout, adding tasks, CLI reference
-- work/prompts/driver.md — template for cmd_prompt work orders
-- work/DAG.md — generated mermaid dependency graph (regenerate with `python3 work/tools/work.py dag`)
-- work/context/services-mcp.md — the OTHER, product MCP server (don't confuse the two)
+- work/WORKFLOW.md — task policy and MCP/context freshness requirements
+- work/README.md — layout, archive, CLI reference
+- work/prompts/driver.md — work-order template
+- work/DAG.md — generated dependency graph
+- work/context/services-mcp.md — the separate product tool registry

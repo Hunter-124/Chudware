@@ -117,18 +117,6 @@ def test_op_vocab_bridge_fallback():
         {"ok": False, "error": "op[0]: unknown op 'cylinder'"}) == "cylinder"
 
 
-def test_add_features_docstring_enumerates_vocab():
-    """Tool description must list the closed op + feature-type vocabulary."""
-    import inspect
-    from services.mcp import cad_doc_tools as cad_tools  # T-RF8: add_features moved
-    # register_cad_tools closes over add_features; pull the function source from module.
-    src = inspect.getsource(cad_tools)
-    assert "OP VOCABULARY" in src
-    assert 'op":"add_feature"' in src or "op=add_feature" in src or "op=…" in src
-    assert "WRONG" in src
-    assert "box" in src and "cylinder" in src
-
-
 # ---------------------------------------------------------------------------
 # Middleware: inject exactly once per mission
 # ---------------------------------------------------------------------------

@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""oracle_import_audit — thin-client ratchet for the engine_oracle strangler (T-RF20).
+"""oracle_import_audit — no authored Python may import the deleted engine package.
 
-The end state of the Python->C++ migration is a THIN CLIENT: no engine logic left in the
-Python services tree, and nothing under ``services/`` importing the legacy engine package
-(``engine`` is a repo-root symlink to ``engine_oracle``). This gate FAILS on any
+The Python->C++ migration is complete (T-RF21): ``engine_oracle/`` and its repo-root
+``engine`` symlink are deleted, so any
 
     from engine... import ...   /   import engine...
     from engine_oracle... ...   /   import engine_oracle...
 
-in ``services/**/*.py`` whose target module is NOT covered by
+is a broken import. This gate FAILS on every such import in the authored Python roots
+``services/``, ``scripts/`` and ``tools/`` whose target module is NOT covered by
 ``scripts/oracle_import_allowlist.txt`` (one dotted module path prefix per line; ``#``
-comments allowed). The allowlist holds ONLY genuinely-transitional modules — engine
-subsystems not yet ported to core/ or re-homed to services/. Each entry must say WHY it
-is still allowed. When a subsystem ports, its entry is deleted in the same commit, so the
-allowlist ratchets to zero as ``engine_oracle/`` is strangled out.
+comments allowed; intentionally EMPTY). Imports inside ``try:`` fallbacks count too:
+the module they reach for no longer exists. Retarget to ``core_bridge`` / the C++ RPC
+surface / the ``services.*`` re-home instead of allowlisting.
+
+Skipped directories: ``__pycache__``, dot-dirs (``.venv``, ``.pytest_cache``), vendored
+trees (``vendor``, ``third_party``, ``node_modules``) and ``services/dist`` (staged
+runtime output from ``./build.sh stage``). A missing scan root or a scan that finds no
+Python files is an invocation error (exit 2), never a clean pass.
 
 Usage:
     python scripts/oracle_import_audit.py     # text report, exit 0 (clean) / 1 (violations)
@@ -28,10 +32,13 @@ import os
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVICES = os.path.join(REPO, "services")
+SCAN_ROOTS = ("services", "scripts", "tools")
 ALLOWLIST = os.path.join(REPO, "scripts", "oracle_import_allowlist.txt")
 
-# The two spellings of the legacy engine package (repo-root `engine` symlinks engine_oracle).
+SKIP_DIR_NAMES = frozenset({"__pycache__", "vendor", "third_party", "node_modules"})
+SKIP_REL_DIRS = frozenset({os.path.join("services", "dist")})
+
+# The two spellings of the deleted engine package.
 ORACLE_ROOTS = ("engine", "engine_oracle")
 
 
@@ -101,18 +108,31 @@ def oracle_targets(tree: ast.AST) -> list[tuple[int, str]]:
     return out
 
 
+def iter_python_files(root_rel: str):
+    """Yield (abs path, repo-relative path) for every authored ``.py`` under *root_rel*."""
+    for root, dirs, files in os.walk(os.path.join(REPO, root_rel)):
+        rel_root = os.path.relpath(root, REPO)
+        dirs[:] = sorted(
+            d for d in dirs
+            if not d.startswith(".") and d not in SKIP_DIR_NAMES
+            and os.path.join(rel_root, d) not in SKIP_REL_DIRS)
+        for fname in sorted(files):
+            if fname.endswith(".py"):
+                yield os.path.join(root, fname), os.path.join(rel_root, fname)
+
+
 def main() -> int:
     entries = load_allowlist(ALLOWLIST)
     violations: list[str] = []
-    scanned = 0
-    for root, dirs, files in os.walk(SERVICES):
-        dirs[:] = [d for d in dirs if d != "__pycache__"]
-        for fname in sorted(files):
-            if not fname.endswith(".py"):
-                continue
-            path = os.path.join(root, fname)
-            rel = os.path.relpath(path, REPO)
-            scanned += 1
+    counts: dict[str, int] = {}
+    for root_rel in SCAN_ROOTS:
+        if not os.path.isdir(os.path.join(REPO, root_rel)):
+            print(f"oracle_import_audit: scan root {root_rel}/ does not exist — "
+                  "update SCAN_ROOTS rather than scanning nothing", file=sys.stderr)
+            return 2
+        counts[root_rel] = 0
+        for path, rel in iter_python_files(root_rel):
+            counts[root_rel] += 1
             try:
                 with open(path, encoding="utf-8") as fh:
                     tree = ast.parse(fh.read(), filename=rel)
@@ -130,17 +150,22 @@ def main() -> int:
                     violations.append(
                         f"{rel}:{lineno}: imports {targets[0]} "
                         f"(not in scripts/oracle_import_allowlist.txt)")
+    empty = [r for r, n in counts.items() if n == 0]
+    if empty:
+        print(f"oracle_import_audit: no Python files found under {', '.join(empty)} — "
+              "a vacuous scan is not a pass", file=sys.stderr)
+        return 2
+    scope = ", ".join(f"{r}/ {n}" for r, n in counts.items())
     if violations:
-        print(f"oracle_import_audit: {len(violations)} disallowed engine_oracle import(s) "
-              f"in services/ ({scanned} files scanned):")
+        print(f"oracle_import_audit: {len(violations)} import(s) of the deleted engine "
+              f"package ({scope} files scanned):")
         for v in violations:
             print(f"  {v}")
-        print("Flip the import to core_bridge / the services re-home, or — only if the "
-              "engine module is genuinely not yet ported — add it to "
-              "scripts/oracle_import_allowlist.txt with a reason.")
+        print("engine/engine_oracle no longer exist. Retarget each import to core_bridge, "
+              "the C++ RPC surface, or its services.* re-home.")
         return 1
-    print(f"oracle_import_audit: clean — {scanned} services/*.py files, "
-          f"{len(entries)} transitional allowlist prefix(es)")
+    print(f"oracle_import_audit: clean — {scope} .py files, "
+          f"{len(entries)} allowlist prefix(es)")
     return 0
 
 

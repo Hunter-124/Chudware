@@ -34,10 +34,9 @@ VENDOR MODEL IMPORT: attach a SPICE library to a component via its sim dict:
     {"sim": {"model": "SUBCKT", "subckt": "UA741",
              "lib": "/path/to/ua741.lib", "pin_order": ["1","2","3",...]}}
   netlist_to_spice_circuit records an X instance + .include; only the ngspice
-  backend simulates it (MNA warns and ignores). Parity gated in
-  services/sim/test_ngspice_backend.py (RC + divider fixtures match across backends).
+  backend simulates it (MNA warns and ignores).
 
-ENGINEERING METADATA (T-FIN8; contract: contracts/ecad/boardphys.md):
+ENGINEERING METADATA (contract: contracts/ecad/boardphys.md):
   The bundled library carries per-part engineering seeds — power_w (typ/max),
   theta_ja/theta_jc, Tj/Ta limits, package body dims, supply rails (voltage min/nom/max,
   current active/sleep), voltage domains, sequencing requirements — each with a datasheet
@@ -92,7 +91,7 @@ NOTES:
   * No board open? ecad_stackup_solve(apply=False) still returns the full solve
     (design-ahead mode) so you can plan the stackup before layout starts.
 
-HOST-BOARD RULE PACK (T-FIN9) — MCU/FPGA device-level checks above DRC/ERC:
+HOST-BOARD RULE PACK — MCU/FPGA device-level checks above DRC/ERC:
   ecad_run_hostcheck()               run on the active board; advisory, DRC-style output
                                      with stable rule ids + per-finding fix_hints
   ecad_make_board(hostcheck=True)    opt-in: fold the pack into the one-shot board flow
@@ -102,7 +101,7 @@ HOST-BOARD RULE PACK (T-FIN9) — MCU/FPGA device-level checks above DRC/ERC:
     host_bulk_cap                       each supply rail needs a bulk cap >= 4.7 uF
     host_sequencing[/_unparsed/_unverifiable]
                                         eng.supply.sequencing ('VCORE before VIO', from
-                                        the T-FIN8 metadata layer / boardphys.md — never
+                                        the engineering metadata / boardphys.md — never
                                         hardcoded part knowledge) verified against the
                                         board's real enable/PGOOD chains: the later
                                         rail's regulator EN must be gated by the earlier
@@ -122,7 +121,7 @@ HOST-BOARD RULE PACK (T-FIN9) — MCU/FPGA device-level checks above DRC/ERC:
     * Thresholds tune per board: board rules 'hostcheck' dict (decoupling_dist_mm,
       decoupling_min_f/max_f, bulk_min_f, xtal_loop_dist_mm, xtal_keepout_mm).
 
-HIGH-SPEED / SIGNAL-INTEGRITY RULE PACK (formula + heuristic — T-FIN10):
+HIGH-SPEED / SIGNAL-INTEGRITY RULE PACK (formula + heuristic):
   ecad_set_net_class(name, params, nets)
       THE declaration path for SI rules. Merges keys ADDITIVELY into the same
       board net_classes entries ecad_stackup_solve writes (track_width/diff_gap/
@@ -168,14 +167,14 @@ SI HONESTY (stated in every ecad_run_sicheck response):
     right place), not a waveform simulation.
   * Via-stub math ignores back-drilling — a flagged stub may be fine if drilled.
 
-PDN / IR-DROP (T-FIN13; DC resistive solve of power-net copper):
+PDN / IR-DROP (DC resistive solve of power-net copper):
   ecad_run_pdn()                     analyze every net with a detectable source
   ecad_run_pdn(net='+5V', source_refs='U3')   one net, explicit regulator/connector ref
   ecad_run_pdn(net='+5V', sink_overrides='{"U2": 0.35}', vsrc=5.0, resolution_mm=0.5)
   Meshes the net's pours/tracks/pads into a 2.5D resistor grid (sheet R from stackup
   copper thickness; vias as annular barrel resistors) and sparse-solves DC voltages.
   Sources = pads held at vsrc: auto-detected from power_out symbol pins, or source_refs.
-  Sinks = per-component supply currents from the T-FIN8 rail metadata (supply.rails
+  Sinks = per-component supply currents from the engineering rail metadata (supply.rails
   current_a_active); components WITHOUT current data are reported in
   unknown_current_refs — never silently modelled as 0 A (honesty rule).
   REPORTS: per-component drop vs the rail's voltage_v_min (within_tolerance),
@@ -186,7 +185,7 @@ PDN / IR-DROP (T-FIN13; DC resistive solve of power-net copper):
   BIAS: run after routing + zone fill (unrouted copper = "not connected" violations);
   fix drops by widening copper / adding a pour / stitching vias, then re-run.
 
-FPGA SUPPORT PACK (T-FIN11; model schema aicad.fpga_device/1):
+FPGA SUPPORT PACK (model schema aicad.fpga_device/1):
   Data-driven FPGA part model in services/ecad/fpga_devices/*.json — banks -> pins, VCCIO
   domains, clock-capable pins, TRUE differential-pair pins, config/JTAG pins. Adding a
   new family/package is a DATA addition (one JSON), not code. Shipped seeds:
@@ -211,11 +210,11 @@ FPGA SUPPORT PACK (T-FIN11; model schema aicad.fpga_device/1):
       board is the source of truth for the HDL flow): native dialect per vendor — XDC
       (Xilinx) or LPF (Lattice) — plus a neutral CSV pinout (pin,net,port,site,bank,
       clock_capable,diff_pair,polarity,iostandard). One <ref>_pins.* set per FPGA,
-      byte-deterministic (golden-tested in services/ecad/test_fpga.py).
+      byte-deterministic.
   Typical flow: place FPGA symbol -> wire IO/power/config -> ecad_run_erc() ->
   ecad_fpga_check() -> fix -> ecad_export('constraints') -> feed XDC/LPF to Vivado/nextpnr.
 
-THERMAL FEA HANDOFF (T-FIN16; aicad.simhandoff/1 coupling ecad_to_thermal_fea):
+THERMAL FEA HANDOFF (aicad.simhandoff/1 coupling ecad_to_thermal_fea):
   ecad_thermal_handoff([environment], [include_trace_heating], [transient], [dry_run])
       One call from the ACTIVE routed board to a solved thermal FEA study — zero
       manual BC setup. Pipeline: fused board+component FEA solid (substrate slab +
@@ -238,7 +237,7 @@ THERMAL FEA HANDOFF (T-FIN16; aicad.simhandoff/1 coupling ecad_to_thermal_fea):
       distributed flux cells (hottest cells first, omitted remainder reported) —
       run ecad_run_pdn on the supply nets first.
   DUTY CYCLES: transient={"t_end_s":..., "schedules": {"U1": {"duty":0.25,
-      "period_s":1.0}}} runs a true transient with per-component T-FIN18 schedules.
+      "period_s":1.0}}} runs a true transient with per-component duty schedules.
   ecad_verify_thermal([handoff_result], [tolerance_pct=75])
       Per-component Tj-vs-tj_max margin table (components without limits listed
       UNCHECKED, never assumed OK) + theta_ja hand-calc cross-check on the
@@ -252,11 +251,11 @@ THERMAL FEA HANDOFF (T-FIN16; aicad.simhandoff/1 coupling ecad_to_thermal_fea):
       include_trace_heating=True) -> ecad_verify_thermal() -> widen copper / add
       vias / forced_air and re-run until margins clear.
 
-VIBRATION RELIABILITY SCREEN (T-FIN21; aicad.simhandoff/1 coupling ecad_to_structural_fea):
+VIBRATION RELIABILITY SCREEN (aicad.simhandoff/1 coupling ecad_to_structural_fea):
   ecad_vibe_check([band_lo_hz=20], [band_hi_hz=2000], [psd_breakpoints],
                   [mount_holes], [zeta=0.05], [dry_run])
       One call from the ACTIVE routed board to a mounted-board vibration screen —
-      zero manual BC setup. Pipeline: T-FIN16 fused board+components FEA solid
+      zero manual BC setup. Pipeline: the thermal handoff's fused board+components FEA solid
       (reused) with a MASS-CORRECTED effective density (component masses from
       package dims x a mold-compound density assumption, eng mass metadata wins;
       mass_model lists every number) -> mount holes detected (mounting-hole
@@ -284,7 +283,7 @@ VIBRATION RELIABILITY SCREEN (T-FIN21; aicad.simhandoff/1 coupling ecad_to_struc
       / thicken laminate / move heavy parts toward mounts -> re-run -> re-screen
       with the real spec PSD.
 
-HEATSINK SELECTION LOOP (T-FIN17) — heatsink_select on the last thermal study:
+HEATSINK SELECTION LOOP — heatsink_select on the last thermal study:
   heatsink_select(component_ref, tj_target_c | t_case_target_c,
                   [tim_t_mm=0.1], [tim_k_w_mk=3.0], [max_candidates=8])
       Run ecad_thermal_handoff() FIRST — its geometry/loads/mesh are the cached

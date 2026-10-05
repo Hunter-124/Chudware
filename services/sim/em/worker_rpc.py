@@ -1,10 +1,9 @@
 """EM simulation worker RPC surface with automatic solver fallback.
 
 em_status / em_eigenmode / em_driven / em_timedomain.
-Registered in engine_oracle/worker.py alongside the other Python-side sim
-surfaces (the OpenFOAM CFD bridge pattern).  The host GUI reaches these over
-the standard worker seam (services/worker WorkerClient stdio JSON-RPC); the
-C++ core does not implement em_* so routing falls through to Python untouched.
+Registered by ``services.worker_main`` alongside the Python simulation services.
+The GUI uses the C++ ``services/worker`` routing seam; hostd forwards ``em_*``
+requests to this Python table because libchudware does not implement them.
 
 Method contract (all return {"ok": bool, ...}; failures return
 {"ok": False, "error": str, "solvers"?: [...]}):

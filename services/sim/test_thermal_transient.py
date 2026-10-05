@@ -1,9 +1,7 @@
-"""Tests for engine/sim/fea_thermal_transient.py — the Python parity oracle for the C++
-transient thermal kernel (core/sim/fea_thermal.cpp, T-FIN18).
+"""Analytic validation of the native transient thermal kernel.
 
-Cases mirror core/tests/test_thermal.cpp's transient suite so both stacks are pinned to
-the SAME analytic references (the differential-parity convention: never weaken an
-assertion; match the analytic truth on both sides):
+Cases complement core/tests/test_thermal.cpp and use the same independently
+derived physical references without weakening numerical tolerances:
   1. slab quench       — 1D Fourier-series decay, mid-plane at Fo=0.3 within 2%
   2. steady limit      — long-time transient lands on the linear Dirichlet profile
   3. schedule semantics- sample-and-hold + periodic wrap (lockstep with C++ Case T5)

@@ -1,4 +1,4 @@
-"""Provision openEMS (FDTD EM solver) for engine.sim.em.
+"""Provision openEMS (FDTD EM solver) for services.sim.em.
 
 openEMS is GPLv3 and is driven **only** via its Python modules (``import openEMS`` /
 ``import CSXCAD``) inside the Python sim-worker process — never linked into the C++

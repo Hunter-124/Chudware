@@ -21,8 +21,8 @@ triggers:
 
 1. `new_assembly(name)` → keep `doc_id`.
 2. Place components: `asm_add_component(path)` (or place from open parts). Prefer `part_search` + `part_place` for catalog hardware.
-3. Seat geometry: `solve_mates()` after mates are defined.
-4. Constrain with plain-word queries: `asm_mate(type, a, b)` — concentric + coincident is the classic bolt-in-hole seat. Face language: "the top face of bracket", "the shaft outer face".
+3. Constrain with plain-word queries: `asm_mate(type, a, b)` — concentric + coincident is the classic bolt-in-hole seat. Face language: "the top face of bracket", "the shaft outer face".
+4. Seat geometry: `solve_mates()` after mates are defined.
 5. Validate:
    - `describe_assembly(doc_id)`
    - `check_interference(doc_id)` — hard clash

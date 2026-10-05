@@ -1,9 +1,8 @@
 """Sheet-metal bend allowance / bend deduction calculator.
 
-Contract §8 of ``contracts/design_pipeline.md`` names sheet-metal bend as a
-geometry kind with **no existing trigger** — a "helper to add" for T-DP3. This is
-that helper: a real, cited calculator (not a recalled number), registered into the
-``aicad.calc/1`` registry so the geometry_designer never invents a flat length.
+Registered ``aicad.calc/1`` calculator for the sheet-metal bend geometry kind
+in ``contracts/design_pipeline.md`` §8. Computes bend allowance and deduction
+from dimensions and a cited K-factor table rather than a recalled flat length.
 
 Closed-form (the industry-standard neutral-axis model):
 

@@ -1,25 +1,92 @@
-"""Runner: load every corpora/sw_parity/*.json fixture, call solve_sketch,
-compare against expect block and geometric checks, print a NOTES-style report.
+"""Runner: load every corpora/sw_parity/*.json fixture, solve its `sketch`/`env`
+with the native C++ solver (the `sketch_cli` executable built from
+core/sketch/sketch_cli.cpp), compare against the `expect` block and the
+per-fixture geometric checks, and print a NOTES-style report.
 
-Run from repo root:
-    & "$env:APPDATA\\Chudware\\runtime\\venv\\Scripts\\python.exe" corpora/sw_parity/_run_fixtures.py
+The solver binary is resolved from CHUDWARE_SKETCH_CLI when set (it must name an
+existing file), otherwise from the first existing build tree for this platform:
+core/build-<platform>/bin (./build.sh slim core), core/build-occt-<platform>/bin
+(./build.sh OCCT core), then build/<preset>/bin (CMakePresets.json). A missing
+binary is a hard failure; no fixture is reported without a real solve.
+
+Exit code: number of DIVERGE + ERROR fixtures (0 = every fixture agrees),
+or 2 when no sketch_cli binary can be found.
+
+Run from the repo root:
+    python3 corpora/sw_parity/_run_fixtures.py
 """
 from __future__ import annotations
 import json
 import math
 import os
+import platform
+import subprocess
 import sys
-import traceback
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.doc.sketch_solver import solve_sketch
+FIXTURE_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.dirname(FIXTURE_DIR))
 
-FIXTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)))
-
-results = []   # list of (name, agree_or_diverge, notes)
+results = []   # list of per-fixture result dicts
 
 
-def run_fixture(path: str):
+def _candidate_binaries() -> list:
+    """Built sketch_cli locations for this platform, in lookup order."""
+    exe = "sketch_cli.exe" if os.name == "nt" else "sketch_cli"
+    system = platform.system()
+    if system == "Linux":
+        suffixes, presets = ["linux"], ["linux-core"]
+    elif system == "Darwin":
+        arch = "arm64" if platform.machine() == "arm64" else "x86_64"
+        suffixes, presets = [f"macos-{arch}"], [f"macos-{arch}"]
+    elif system == "Windows":
+        suffixes, presets = [], ["windows-occt", "windows-core"]
+    else:
+        suffixes, presets = [], []
+    dirs = []
+    for s in suffixes:
+        dirs.append(os.path.join(REPO_ROOT, "core", f"build-{s}", "bin"))
+        dirs.append(os.path.join(REPO_ROOT, "core", f"build-occt-{s}", "bin"))
+    for p in presets:
+        dirs.append(os.path.join(REPO_ROOT, "build", p, "bin"))
+    return [os.path.join(d, exe) for d in dirs]
+
+
+def find_sketch_cli() -> str:
+    """Return the sketch_cli path, or raise FileNotFoundError naming what was tried."""
+    explicit = os.environ.get("CHUDWARE_SKETCH_CLI")
+    if explicit:
+        if os.path.isfile(explicit):
+            return explicit
+        raise FileNotFoundError(f"CHUDWARE_SKETCH_CLI={explicit!r} is not an existing file")
+    candidates = _candidate_binaries()
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    tried = "\n  ".join(candidates) or "(no build-tree convention for this platform)"
+    raise FileNotFoundError(
+        "sketch_cli not found. Build the `sketch_cli` target (./build.sh core, or "
+        "cmake --build <tree> --target sketch_cli) or set CHUDWARE_SKETCH_CLI.\n"
+        f"Tried:\n  {tried}")
+
+
+def solve_native(cli: str, sketch: dict, env: dict) -> dict:
+    """Solve one sketch through sketch_cli; raise RuntimeError on any solver/IO failure."""
+    request = json.dumps({"sketch": sketch, "env": env})
+    proc = subprocess.run([cli, "-"], input=request, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"sketch_cli exit {proc.returncode}: {proc.stderr.strip()}")
+    try:
+        sol = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"sketch_cli emitted non-JSON output ({e}): {proc.stdout[:200]!r}")
+    missing = [k for k in ("converged", "dof", "redundant", "conflicting", "statuses", "entities")
+               if k not in sol]
+    if missing:
+        raise RuntimeError(f"sketch_cli output missing keys {missing}")
+    return sol
+
+
+def run_fixture(cli: str, path: str):
     with open(path) as f:
         fx = json.load(f)
     name = fx["name"]
@@ -29,64 +96,54 @@ def run_fixture(path: str):
     sw_rationale = fx.get("sw_rationale", "")
 
     try:
-        sol = solve_sketch(sketch, env, warm=None)
+        sol = solve_native(cli, sketch, env)
     except Exception as e:
         results.append({
             "name": name,
             "verdict": "ERROR",
             "error": str(e),
-            "tb": traceback.format_exc(),
             "sw_rationale": sw_rationale,
         })
         return
-
-    actual = {
-        "converged": sol.converged,
-        "dof": sol.dof,
-        "statuses": sol.statuses,
-        "redundant": sol.redundant,
-        "conflicting": sol.conflicting,
-        "entities": sol.entities,
-    }
 
     divergences = []
 
     # --- Check converged ---
     if "converged" in expect:
         exp_c = expect["converged"]
-        got_c = sol.converged
+        got_c = sol["converged"]
         if exp_c != got_c:
             divergences.append(f"converged: expected={exp_c}, got={got_c}")
 
     # --- Check dof ---
     if "dof" in expect:
         exp_d = expect["dof"]
-        got_d = sol.dof
+        got_d = sol["dof"]
         if exp_d != got_d:
             divergences.append(f"dof: expected={exp_d}, got={got_d}")
 
     # --- Check statuses ---
     if "statuses" in expect:
         for eid, exp_st in expect["statuses"].items():
-            got_st = sol.statuses.get(eid, "MISSING")
+            got_st = sol["statuses"].get(eid, "MISSING")
             if exp_st != got_st:
                 divergences.append(f"status[{eid}]: expected={exp_st!r}, got={got_st!r}")
 
     # --- Check redundant ---
     if "redundant" in expect:
         exp_r = set(expect["redundant"])
-        got_r = set(sol.redundant)
+        got_r = set(sol["redundant"])
         # Special token "c10_or_c12" in F5c
         if exp_r == {"c10_or_c12"}:
             if not (("c10" in got_r) or ("c12" in got_r)):
-                divergences.append(f"redundant: expected c10 or c12 in redundant, got={sol.redundant}")
+                divergences.append(f"redundant: expected c10 or c12 in redundant, got={sol['redundant']}")
         elif exp_r != got_r:
             divergences.append(f"redundant: expected={sorted(exp_r)}, got={sorted(got_r)}")
 
     # --- Check conflicting ---
     if "conflicting" in expect:
         exp_cf = expect["conflicting"]
-        got_cf = sol.conflicting
+        got_cf = sol["conflicting"]
         if exp_cf == [] and got_cf:
             divergences.append(f"conflicting: expected=[], got={got_cf}")
         elif exp_cf and not got_cf:
@@ -102,21 +159,21 @@ def run_fixture(path: str):
         "verdict": verdict,
         "divergences": divergences,
         "actual": {
-            "converged": sol.converged,
-            "dof": sol.dof,
-            "statuses": sol.statuses,
-            "redundant": sol.redundant,
-            "conflicting": sol.conflicting,
+            "converged": sol["converged"],
+            "dof": sol["dof"],
+            "statuses": sol["statuses"],
+            "redundant": sol["redundant"],
+            "conflicting": sol["conflicting"],
         },
         "sw_rationale": sw_rationale,
-        "entities": sol.entities,
+        "entities": sol["entities"],
     })
 
 
-def _post_checks(name: str, sol) -> list:
+def _post_checks(name: str, sol: dict) -> list:
     """Fixture-specific geometric post-checks beyond the expect block."""
     issues = []
-    ents = sol.entities
+    ents = sol["entities"]
 
     if name == "F1a_triangle_apex_above":
         if "p3" in ents:
@@ -232,19 +289,19 @@ def _post_checks(name: str, sol) -> list:
                 issues.append("F4e NaN/Inf in circle center coords - degenerate Jacobian bug")
 
     elif name == "F5b_remove_dim_under":
-        if sol.dof != 1:
+        if sol["dof"] != 1:
             pass  # already caught in expect check
         else:
-            under_count = sum(1 for s in sol.statuses.values() if s == "under")
+            under_count = sum(1 for s in sol["statuses"].values() if s == "under")
             if under_count == 0:
                 issues.append("F5b: dof=1 but no entity marked 'under'")
 
     elif name == "F5c_duplicate_dim_redundant":
-        if not sol.redundant:
+        if not sol["redundant"]:
             issues.append("F5c: no redundant constraints detected for duplicate dim")
 
     elif name == "F5d_contradictory_dim_conflicting":
-        if not sol.conflicting:
+        if not sol["conflicting"]:
             issues.append("F5d: no conflicting constraints detected for contradictory dims")
 
     elif name == "F6_complex_multientity":
@@ -264,7 +321,7 @@ def _post_checks(name: str, sol) -> list:
                 issues.append(f"F6 arc not tangent to e3: dist_to_vertical={dist_to_e3:.3f}, r={r:.3f}")
         # Verify rectangle dimensions
         if "e1" in ents:
-            p1 = ents["e1"]["p1"]; p2_e1 = ents["e1"]["p2"]
+            p1 = ents["e1"]["p1"]
             # bottom line + arc tangent point: full width = 100
             if "e3" in ents:
                 e3 = ents["e3"]
@@ -276,15 +333,22 @@ def _post_checks(name: str, sol) -> list:
 
 
 def main():
+    try:
+        cli = find_sketch_cli()
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
     files = sorted([
         os.path.join(FIXTURE_DIR, f)
         for f in os.listdir(FIXTURE_DIR)
         if f.endswith(".json") and not f.startswith("_")
     ])
 
+    print(f"Solver: {cli}")
     print(f"Running {len(files)} fixtures...\n")
     for path in files:
-        run_fixture(path)
+        run_fixture(cli, path)
 
     # Print results
     agree = [r for r in results if r["verdict"] == "AGREE"]
@@ -318,7 +382,6 @@ def main():
         print("\n--- ERRORS ---")
         for r in errors:
             print(f"\n  [ERROR] {r['name']}: {r['error']}")
-            print(r.get("tb", ""))
 
     # Dump full entity coords for each fixture (for notes)
     print("\n\n--- ENTITY COORDS (for NOTES.md) ---")

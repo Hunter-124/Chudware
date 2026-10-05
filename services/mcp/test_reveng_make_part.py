@@ -97,20 +97,20 @@ def parts_hub_fake(monkeypatch):
 
 def _inject_research_mock(monkeypatch, result: dict):
     """Patch _research_and_ingest to return *result*."""
-    import services.mcp.reveng_common as rc  # T-RF8: lookup happens in reveng_common
+    import services.mcp.reveng_common as rc  # lookup happens in reveng_common
     monkeypatch.setattr(rc, "_research_and_ingest", lambda *a, **kw: result)
 
 
 def _inject_mission_mock(monkeypatch, result: dict):
     """Patch _launch_reveng_mission to return *result*."""
-    import services.mcp.reveng_build_tools as rb  # T-RF8: tools look it up here
+    import services.mcp.reveng_build_tools as rb  # tools look it up here
     monkeypatch.setattr(rb, "_launch_reveng_mission", lambda *a, **kw: result)
 
 
 def _assert_placeable_record(part_id: str) -> None:
     """After attach, the RevengResultAdapter must serve a record the C++ part_place
-    dispatcher (core/parts/place.cpp — engine_oracle.parts_hub.place is deleted)
-    accepts: an import_file geometry_ref pointing at the mission mesh."""
+    dispatcher (core/parts/place.cpp) accepts: an import_file geometry_ref pointing at
+    the mission mesh."""
     from services.parts.adapters.reveng_result_adapter import RevengResultAdapter
     rec = RevengResultAdapter().get(part_id)
     assert rec is not None, "RevengResultAdapter has no record — attach may have failed"
@@ -155,7 +155,7 @@ def test_known_mpn_model_present_and_place(
             rt._save_session(s)
         return {"ok": True, "status": "done", "interrupted": False, "pending_dims": []}
 
-    import services.mcp.reveng_build_tools as rb  # T-RF8: tools look it up here
+    import services.mcp.reveng_build_tools as rb  # tools look it up here
     import services.mcp.reveng_tools as rt
     monkeypatch.setattr(rb, "_launch_reveng_mission", _mission_with_mesh)
 
@@ -218,7 +218,7 @@ def test_pending_dims_returned_no_fabrication(
             ],
         }
 
-    import services.mcp.reveng_build_tools as rb  # T-RF8: tools look it up here
+    import services.mcp.reveng_build_tools as rb  # tools look it up here
     import services.mcp.reveng_tools as rt
     monkeypatch.setattr(rb, "_launch_reveng_mission", _mission_pending)
 
@@ -254,14 +254,11 @@ def test_pending_dims_returned_no_fabrication(
 def test_offline_honest_envelope(
     reveng_tmp, parts_hub_fake, monkeypatch
 ):
-    """When research backend is offline, return honest {ok:false} — no traceback."""
+    """When the research ingest module is absent, return honest {ok:false} — no traceback."""
     PART_ID, _ = parts_hub_fake
 
-    _inject_research_mock(monkeypatch, {
-        "ok": False,
-        "reason": "backend_not_provisioned",
-        "hint": "research_ingest module not available; check engine_oracle install",
-    })
+    import services.mcp.reveng_common as rc
+    monkeypatch.setattr(rc, "_research_and_ingest", None)
 
     import services.mcp.reveng_tools as rt
 
@@ -292,7 +289,7 @@ def test_no_query_skips_research_and_fails_mission_gracefully(
     PART_ID, _ = parts_hub_fake
 
     # Mission runner absent
-    import services.mcp.reveng_build_tools as rb  # T-RF8: tools look it up here
+    import services.mcp.reveng_build_tools as rb  # tools look it up here
     import services.mcp.reveng_tools as rt
 
     def _mission_unavailable(session_id, template, stage_map, **kw):

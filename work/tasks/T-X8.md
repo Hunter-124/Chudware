@@ -43,7 +43,7 @@ adapters (T-X2/T-X7) to reuse.
 ## Driver notes
 
 - graphify rule: `graphify query "<question>"` before raw-file reads (subagents too).
-- Branch task/T-X8-headed-login-window, worktree ../CAD-T-X8. Stop at status: review.
+- Work on `master` (this repo uses no git worktrees). Stop at status: review.
 - Security posture is contract-level: no credential storage, no captcha/2FA automation,
   profiles local-only and gitignored. Restate this in module docstrings.
 - Python venv for gate: `~/.local/share/Chudware/mcp-venv/bin/python`.

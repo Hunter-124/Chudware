@@ -1,7 +1,7 @@
 """Live bug-finding battery for the plain-language geometry vocabulary + INTENT features.
 
 Fires natural-language modelling requests at the local LM Studio model through the
-STAGED libchudware.dll (real agent_run), then for each request verifies BOTH:
+native core selected by CHUDWARE_LIBCHUDWARE (real agent_run), then verifies BOTH:
   - DISCOVERY: did the model reach for the intended plain-language feature?
   - GEOMETRY:  did it actually build the right solid? (volume + body count via a forced
                rebuild — "built without error" is NOT enough; a dropped cut fuses
@@ -16,28 +16,18 @@ Usage:
   python tools/vocab_battery.py --hard                 # harder multi-step parts
   python tools/vocab_battery.py --only fillet,hole
 """
-import ctypes, json, os, sys, time
+import json, os, sys, time
 
-DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "Chudware")
-os.add_dll_directory(DIST)
-os.environ["CHUDWARE_PROMPTS_DIR"] = os.path.join(DIST, "app", "agent", "prompts")
-
-dll = ctypes.CDLL(os.path.join(DIST, "libchudware.dll"))
-dll.chudware_call.restype = ctypes.c_int
-dll.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-dll.chudware_free.argtypes = [ctypes.c_char_p]
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
+from services.mcp import core_bridge
 
 
 def call(method, params):
-    out = ctypes.c_char_p()
-    rc = dll.chudware_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
-    s = out.value.decode() if out.value else ""
-    if out.value:
-        dll.chudware_free(out)
     try:
-        return rc, (json.loads(s) if s else {})
-    except Exception:
-        return rc, {"_raw": s[:600]}
+        return 0, core_bridge.call(method, params)
+    except core_bridge.CoreError as exc:
+        return 1, {"error": str(exc), "code": exc.code, "detail": exc.detail}
 
 
 MODEL = "google/gemma-4-e4b"

@@ -1,6 +1,6 @@
 // core/sourcing/config.cpp — user-config location + loading for the sourcing providers.
-// Mirrors engine/paths.py (via agent/paths.cpp, same pick_app_dir alias rule) so the
-// C++ providers read the SAME config.json the Python engine reads. Never hard-fails.
+// Resolves the same <appdata>/Chudware root as agent/paths.cpp so the C++ providers read
+// the SAME config.json the rest of the engine reads. Never hard-fails.
 #include "sourcing/sourcing.h"
 
 #include <cstdlib>
@@ -31,15 +31,7 @@ fs::path expand_home_roaming() {
 }
 #endif
 
-// T-G10 alias rule (mirrors engine/paths.py active_root()): an existing legacy Chudware
-// dir wins while the new Chudware dir holds no config.json; fresh installs get Chudware.
-fs::path pick_app_dir(const fs::path& base) {
-    const fs::path neu = base / "Chudware";
-    const fs::path legacy = base / "Chudware";
-    std::error_code ec;
-    if (fs::exists(legacy, ec) && !fs::exists(neu / "config.json", ec)) return legacy;
-    return neu;
-}
+fs::path pick_app_dir(const fs::path& base) { return base / "Chudware"; }
 
 fs::path appdata_root() {
 #ifdef _WIN32

@@ -180,31 +180,14 @@ class TestValidationFailureGrace:
             assert g.check("get_job", {"job_id": "j1"}) is None
 
 
-class TestExemptToolsMatchDocstring:
-    """The module docstring makes explicit claims about which tools are exempt
-    (and, notably, that verify_battery is deliberately NOT exempt) — assert
-    against the docstring text itself so the two cannot drift apart again."""
-
-    def test_docstring_names_every_exempt_tool(self):
-        """Every exempt tool name must appear somewhere in the module's own
-        text (docstring or the comment sitting directly above the constant) —
-        not just live silently in the frozenset."""
-        import inspect
-
-        import services.agent.tool_loop_guard as mod
-
-        src = inspect.getsource(mod)
-        for name in mod.DEFAULT_EXEMPT_TOOLS:
-            assert name in src, (
-                f"{name} is exempt but not documented anywhere in the module"
-            )
-
-    def test_docstring_explicitly_excludes_verify_battery(self):
-        import services.agent.tool_loop_guard as mod
-
-        assert "verify_battery" not in mod.DEFAULT_EXEMPT_TOOLS
-        assert "verify_battery" in (mod.__doc__ or "")
-        assert "NOT" in (mod.__doc__ or "")
+class TestExemptTools:
+    def test_verify_battery_repeats_are_guarded(self):
+        """verify_battery is deliberately NOT exempt: an identical repeat loops."""
+        g = ToolCallLoopGuard(threshold=2)
+        assert g.check("verify_battery", {"doc_id": "d1"}) is None
+        detection = g.check("verify_battery", {"doc_id": "d1"})
+        assert detection is not None
+        assert detection.tool == "verify_battery"
 
     def test_swept_poller_set_is_pinned(self):
         import services.agent.tool_loop_guard as mod

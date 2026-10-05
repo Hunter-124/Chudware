@@ -4,8 +4,8 @@ This is the "signal-integrity" bridge between the PCB stackup geometry and the n
 simulator: it turns trace geometry (width, dielectric height, copper thickness, relative
 permittivity) into the characteristic impedance ``Z0`` and propagation delay of a transmission
 line, using the standard closed-form models a controlled-impedance fab house uses. The companion
-:mod:`engine.sim` transmission-line device ``T`` consumes ``Z0`` + delay so a controlled-impedance
-net can actually be simulated for reflections / ringing.
+device ``T`` in ``core/sim/`` consumes ``Z0`` + delay so a controlled-impedance
+net can actually be simulated for reflections / ringing through the native circuit RPCs.
 
 Closed-form models (cited per-function in the docstrings):
 

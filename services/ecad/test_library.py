@@ -1,7 +1,7 @@
-"""Test suite for engine.ecad.library.
+"""Test suite for services.ecad.library.
 
 Run from repo root:
-    python -m engine.ecad.test_library
+    python -m services.ecad.test_library
 
 House style: main() + asserts, zero external dependencies.
 """

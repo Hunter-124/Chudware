@@ -1980,7 +1980,7 @@ void drawSessionCostStrip(AppState& st) {
     // has a catalog price, and "Session >= $1.87 \xc2\xb7 142k tok \xc2\xb7 3 of 4 models priced"
     // when some don't — their tokens are in the token total but add $0 to the dollars, so the
     // figure is a floor. ">=" is spelled in ASCII on purpose: U+2265 is not in the font atlas
-    // (ui_theme.cpp uiGlyphRanges()) and would paint as notdef.
+    // (ui/glyph_ranges.h kBody) and would paint as notdef.
     const bool incomplete = !s_costUnpriced.empty();
     char line[192];
     const long long tokTotal = (long long)s_costTin + (long long)s_costTout;

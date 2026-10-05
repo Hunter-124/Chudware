@@ -5,7 +5,7 @@ Chudware is a **SolidWorks-class parametric CAD application**: a native C++ desk
 **OpenCASCADE** B-rep kernel, with a built-in AI copilot and an **MCP server** so the same
 document can be driven by hand or by any external agent (Claude Code, Cursor, …). One
 document model sits under every domain — and the same UI tree compiles to WASM for the web
-app, so desktop and web stay at parity by construction.
+app, so desktop and web share one GUI source tree.
 
 Naming: the product is **Chudware** (chudware.com). The GUI target is `Chudware`; the binary
 is `chudware`. `CHUDWARE_*` env vars are the only honored prefix (the legacy
@@ -31,45 +31,53 @@ compatibility: the PLM vault dir `.aicadvault`, mesh format `.aicm`, git refs
 
 ## Architecture snapshot
 
-The pure C++/CUDA kernel **`libchudware`** ([core/](core)) **is the engine** — the legacy
-Python engine was fully strangled out and deleted in the zero-Python cutover (T-RF21,
-2026-07-23). The C++ host ([host/](host), ~110k LOC under `host/src/ui/`) is the sole GUI
-target; it talks to the shared **`chudware-hostd`** daemon (which dlopens `libchudware`) over a
-unix socket. The **same `host/src/ui` tree compiles to WASM** for the web app
-([Webservice/README.md](Webservice/README.md)) — desktop/web parity by construction,
-enforced by `contracts/web_parity.md` + `scripts/web_parity_probe.py`. Python remains only
-under [services/](services): the MCP server, the built-in agent loop, the stdio worker seam
-(`worker_main.py`), installer, and pure helpers with no C++ counterpart.
+The C++ kernel **`libchudware`** ([core/](core)) **is the engine**; there is no Python CAD
+engine. The C++ host ([host/](host)) is the sole GUI target; it talks to the shared
+**`chudware-hostd`** daemon (which dlopens `libchudware`) over local IPC. The **same
+`host/src/ui` tree compiles to WASM** for the web app
+([Webservice/README.md](Webservice/README.md)); the hostd method set the WASM client relies
+on is pinned by `contracts/web_parity.md` and checked by `scripts/web_parity_probe.py`. Python remains only
+under [services/](services): the MCP server, the copilot's session host and CAD agent
+policy, the services worker (`worker_main.py`), installer, and pure helpers with no C++
+counterpart. See [ARCHITECTURE.md](ARCHITECTURE.md) for the online/offline agent runtime.
 
 ```
             ┌────────────────────────────────────────────────────┐
             │  Chudware GUI (host/, native C++ — same tree → WASM) │
  user ─────▶│  ribbon / sketcher / viewport (GL)   copilot chat  │
-            └───────┬───────────────────────────┬────────────────┘
-                    │ unix socket               │ stdio
-                    ▼                           ▼
-            chudware-hostd ──dlopen──▶ libchudware   services.worker_main
-            (daemon, core C++/CUDA engine)     (services-side methods)
-                    ▲
- external agent ────┘ MCP server (services/mcp, stdio JSON-RPC)
+            └───────┬────────────────────────────────────────────┘
+                    │ local IPC
+                    ▼
+            chudware-hostd ──dlopen──▶ libchudware (core C++ engine)
+                    │ stdio  ▲
+                    ▼        │
+     services.worker_main    └──── external agent via MCP server
+     (services-side methods,       (services/mcp, stdio JSON-RPC)
+      copilot agent turns)
 ```
 
 ## Quickstart
 
 ```bash
-./build.sh                     # core → libchudware.so, then host GUI → host/build-linux/bin/chudware
+./build.sh all                 # core → libchudware.so + chudware-hostd, then host GUI
+./build.sh                     # host GUI only → host/build-linux/bin/chudware
 ./host/build-linux/bin/chudware  # run
 bash scripts/gate.sh           # full Linux gate (check.py + builds + ctest + smokes)
-python3 scripts/check.py       # fast stdlib-only gate
+python3 scripts/check.py       # fast source/audit gate (needs the pinned audit packages;
+                               # see docs/reference/CI_RUNNERS.md)
 ```
 
-- Core only: presets `linux-core` / `windows-core` / `windows-occt` in
-  [CMakePresets.json](CMakePresets.json); test with `ctest --test-dir core/build-linux`.
+- Core only: CMake presets in [CMakePresets.json](CMakePresets.json) build into
+  `build/<preset>` — test with `ctest --test-dir build/<preset>/core`. The gate, GUI, and
+  hostd consume `core/build-linux` / `core/build-occt-linux` instead
+  (`ctest --test-dir core/build-linux`); a preset tree is not loaded by them.
 - Host only: `cmake -S host -B host/build-linux -G Ninja && ninja -C host/build-linux Chudware`
-  (`-DCHUDWARE_ENABLE_CEF=OFF` for an SDK-less build). Windows: see docs/reference/BUILD_WINDOWS.md.
+  (`-DCHUDWARE_ENABLE_CEF=OFF` for an SDK-less build). Windows: see
+  [docs/reference/BUILD_WINDOWS.md](docs/reference/BUILD_WINDOWS.md).
 - Python suites: `~/.local/share/Chudware/mcp-venv/bin/python -m pytest <dir> -q`.
 - GUI verification: headless `CHUDWARE_SHOT=<scenario>` under `xvfb-run`.
-- C++17 throughout.
+- C++17 baseline; the mesh/manufacturing layers require C++20; CUDA is an optional LBM
+  backend (`CHUDWARE_WITH_CUDA`, default OFF).
 
 ## MCP / agents
 
@@ -82,8 +90,8 @@ python3 services/installer/setup_mcp_clients.py           # (Windows: mcp_setup.
 python3 services/installer/setup_mcp_clients.py --detect  # verify
 ```
 
-The built-in copilot lives in [services/agent/](services/agent), with its chat UI
-in `host/src/ui/copilot/`.
+The built-in copilot's chat UI is `host/src/ui/copilot/`; its agent host and CAD
+roles/tools live in [services/agent/](services/agent).
 
 **If you are an AI agent working on this repo**, read [AGENTS.md](AGENTS.md) first:
 orient with `graphify query "<question>"` (a hook enforces this), pick work from
@@ -94,15 +102,14 @@ verify with `bash scripts/gate.sh` before review.
 
 | Dir | Purpose |
 |-----|---------|
-| [core/](core) | Pure C++/CUDA kernel → `libchudware` — **the engine** (zero Python) |
-| [host/](host) | Sole GUI target (native + WASM); own GL pipeline under `host/src/render/` |
-| [services/](services) | Python services: `mcp/`, `agent/`, `worker/` + `worker_main.py`, `installer/`, `ecad/`, `sim/`, `structural/`, `piping/`, `formats/`, `dag/`, `deliverables/`, `plm/`, … |
-| [ui/viewport/](ui/viewport) | AICM mesh-format loader consumed by `core/` |
-| [platform/](platform) | Cross-OS shims (`_linux`/`_win32`) |
+| [core/](core) | C++ kernel → `libchudware` — **the engine** — plus the `chudware-hostd` daemon |
+| [host/](host) | Sole GUI target (native + WASM); own GL pipeline under `host/src/render/` (its `.aicm` loader is reused by core round-trip tests) |
+| [services/](services) | C++ host-side engine routing/IPC seam (`worker/`, `ipc/`); Python `worker_main.py`, `mcp/`, `agent/`, `installer/`, `ecad/`, `sim/`, `structural/`, `piping/`, `formats/`, `dag/`, `deliverables/`, `plm/`, … |
 | [contracts/](contracts) | Frozen interface contracts — the seams (append-only) |
 | [corpora/](corpora) | Test fixtures, referenced through canonical `corpora/...` paths |
 | [work/](work) | Git-tracked solo task board (`work/tools/work.py`, `WORKFLOW.md`) |
-| [docs/](docs) | Design docs, status notes, handoffs |
+| [docs/](docs) | Design docs, references, plans, handoff log ([docs/README.md](docs/README.md)) |
+| [Webservice/](Webservice) | Web app: the `host/` WASM GUI backed by a shared hostd |
 | tools/, scripts/, vendor/, assets/, packaging/, benchmarks/, training/ | Dev tools, repo gates, vendored deps, icons/fonts, packaging, perf benches, ML eval |
 
 ## Docs & process
@@ -110,8 +117,9 @@ verify with `bash scripts/gate.sh` before review.
 - [AGENTS.md](AGENTS.md) — canonical agent-navigation doc (read first)
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system architecture
 - [contracts/](contracts) — frozen interface contracts
-- [docs/REFACTOR_LOG.md](docs/REFACTOR_LOG.md) — refactor handoff log (incl. the
-  consolidation DAG T-RF1..T-RF23 and the zero-Python cutover)
+- [docs/REFACTOR_LOG.md](docs/REFACTOR_LOG.md) — current handoff log (2026-08-14 onward);
+  the consolidation refactor T-RF1..T-RF23 and earlier entries are archived in
+  [docs/refactor-log/](docs/refactor-log)
 - [work/](work) — task board and current follow-ups
 
 ## Contributing

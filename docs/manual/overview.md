@@ -18,7 +18,10 @@ WORKFLOW
                                             downstream feature breaks — WITHOUT touching the live
                                             doc. Returns aicad.preflight/1 with advisory_items.
                                             A fail verdict is advisory (never blocks); add_features
-                                            runs preflight automatically (CHUDWARE_PREFLIGHT=1).
+                                            runs preflight automatically on non-trivial batches.
+                                            A suppressed run (trivial batch, CHUDWARE_PREFLIGHT=0,
+                                            or a preflight error) returns verdict "skipped" with
+                                            the reason in skipped/skipped_detail.
   3. render_part()                          SEE it — ONE call returns a 2x2 grid of the four
                                             most useful complementary shots (the planner
                                             measures ~200 cameras in the engine and picks the

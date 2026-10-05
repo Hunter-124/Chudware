@@ -1,4 +1,4 @@
-"""Stackup advisor — impedance-target-driven layer-stackup + trace-geometry solver (T-FIN12).
+"""Stackup advisor — impedance-target-driven layer-stackup + trace-geometry solver.
 
 Given a copper layer count, per-net-class impedance targets (e.g. 50R single-ended, 90R/100R
 differential) and a fab-capability profile (min trace/space, dielectric menu), solve:
@@ -8,9 +8,9 @@ differential) and a fab-capability profile (min trace/space, dielectric menu), s
     the menu rather than invent unbuildable dielectric heights);
   * the **trace geometries** (width, and diff-pair gap) that hit each impedance target on every
     signal layer, by **numerically inverting the validated IPC-2141A closed forms in**
-    :mod:`engine.ecad.impedance` (the forward math is REUSED, never reimplemented — the same
+    :mod:`services.ecad.impedance` (the forward math is REUSED, never reimplemented — the same
     ``microstrip_z0`` / ``stripline_z0`` / ``diff_pair_z0`` that ``ecad_check_impedance`` uses,
-    and the same :func:`engine.ecad.impedance._stackup_geometry` layer classification, so a
+    and the same :func:`services.ecad.impedance._stackup_geometry` layer classification, so a
     solved geometry round-trips through the checker exactly).
 
 Inversion is a plain bisection: every model here is strictly monotone DECREASING in trace width
@@ -21,16 +21,16 @@ naming the BINDING constraint — e.g. ``min_trace`` (the target impedance needs
 than the fab can etch), ``max_trace`` (target lower than the widest sane trace can reach), or
 ``min_space`` (diff pair cannot couple tightly enough). No silent clamping.
 
-Fab profiles live as data files in ``engine/ecad/fab/profiles/*.json`` (JLC-style 4/6-layer
+Fab profiles live as data files in ``services/ecad/fab/profiles/*.json`` (JLC-style 4/6-layer
 menus + a generic 2-layer). Each carries the published stackup layers, copper thicknesses,
 min trace/space, and candidate diff-pair gaps.
 
 Output feeds the board document directly (:func:`apply_solution`): the stackup replaces
 ``board['stackup']`` and each target becomes/updates a ``net_classes`` entry with the solved
-``track_width`` (and ``diff_gap`` for pairs), which the autorouter (``autoroute._track_width`` /
-``_diff_gap``) and DRC (``drc._clearance_for``) already honour.
+``track_width`` (and ``diff_gap`` for pairs), which the native autorouter and DRC in
+``core/ecad/autoroute.cpp`` / ``core/ecad/drc.cpp`` honour.
 
-GPL-clean: stdlib + engine.ecad.impedance (numpy/scipy) only.
+GPL-clean: stdlib + services.ecad.impedance (numpy/scipy) only.
 """
 from __future__ import annotations
 

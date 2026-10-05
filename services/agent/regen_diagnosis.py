@@ -421,9 +421,9 @@ def diagnose(document: dict, provider: Provider, *,
              registry: Optional[Any] = None) -> Diagnosis:
     """Diagnose a failed-rebuild ``document`` and return a candidate fix.
 
-    ``provider`` is any Provider (offline MockProvider in tests, a real frontier provider in
-    the ship path). Unless ``wrap_logging`` is False, it is wrapped in T-H7's LoggingProvider
-    at ``insertion_point`` so the call is captured as an IP-18 correction trace.
+    ``provider`` is an explicitly bound Provider: the tool-free compiled-runtime adapter
+    online, or an offline-safe provider offline. Unless ``wrap_logging`` is False,
+    LoggingProvider records the IP-18 correction trace without owning model requests.
 
     T-DP8: When ``council_tier`` is provided, a council is convened at the ``fix`` stage
     after diagnosis to deliberate on the proposed fix_ops — giving multi-angle validation

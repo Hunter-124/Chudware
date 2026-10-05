@@ -1,8 +1,8 @@
-// fw_cli — differential-harness driver for the firmware RPC surface (T-RF15),
-// mirroring sketch/sketch_cli.cpp. Reads {"method": ..., "params": {...}} from
-// argv[1] (or stdin when "-") and prints the chudware::firmware::call result as
-// one JSON line (or {"unhandled": true} when the method falls through, so the
-// parity script can assert the Python oracle still owns it).
+// fw_cli — standalone debug driver for the firmware RPC surface (T-RF15),
+// mirroring sketch/sketch_cli.cpp. Takes the request JSON text
+// {"method": ..., "params": {...}} as argv[1] (or reads it from stdin when "-" or
+// absent) and prints the chudware::firmware::call result as one JSON line, or
+// {"unhandled": true, "method": ...} when the method is not part of that surface.
 #include "firmware/firmware_rpc.h"
 
 #include <fstream>

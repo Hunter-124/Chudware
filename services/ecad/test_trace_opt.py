@@ -2,8 +2,7 @@
 
 Run::
 
-    /home/hunter/.local/share/Chudware/mcp-venv/bin/python -X utf8 -m pytest \\
-        engine_oracle/ecad/test_trace_opt.py -q
+    python -X utf8 -m pytest services/ecad/test_trace_opt.py -q
 """
 from __future__ import annotations
 
@@ -327,14 +326,14 @@ def test_pure_no_mutate_and_signature():
     assert set(out.keys()) >= {"doc", "report"}
     assert board["tracks"] == snap
     assert out["doc"] is not board
-    # Report keys Wave 2b relies on.
+    # Public optimization report keys.
     for k in ("corners_rounded", "teardrops", "nets_tuned", "drc_ok"):
         assert k in out["report"], out["report"]
     print("  [gate purity + signature] PASS")
 
 
 if __name__ == "__main__":
-    # Allow `python -m engine.ecad.test_trace_opt` without pytest.
+    # Allow `python -m services.ecad.test_trace_opt` without pytest.
     test_corner_rounding_and_drc()
     test_teardrops_at_pad_junctions()
     test_impedance_width_tune()

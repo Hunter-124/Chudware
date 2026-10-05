@@ -15,9 +15,7 @@
 #include <unordered_set>
 #include <vector>
 
-// Header-relative: this header is reached by targets that do NOT put host/src on the
-// include path (test_aicm pulls it in through renderer.h), and the release preset builds
-// that target — a bare "vec_math.h" failed only there.
+// Header-relative so GL-free consumers need not add host/src to their include path.
 #include "../vec_math.h"
 
 namespace render {

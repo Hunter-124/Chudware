@@ -95,7 +95,8 @@ uint8_t curve_code(GeomAbs_CurveType t) {
 }
 
 // Seam (closed-on-a-face) or degenerate (zero-length, e.g. cone apex) edges are
-// real B-rep topology but not visible model edges — match the Python _is_hidden_edge.
+// real B-rep topology but not visible model edges — same rule as _is_hidden_edge in
+// services/sim/tessellate.py.
 bool is_hidden_edge(const TopoDS_Edge& edge,
                     const TopTools_IndexedDataMapOfShapeListOfShape& anc_map) {
     if (BRep_Tool::Degenerated(edge)) return true;

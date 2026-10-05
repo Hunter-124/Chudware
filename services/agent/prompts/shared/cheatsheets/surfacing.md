@@ -74,11 +74,7 @@ KNOWN LIMITS:
    section's edge count changes) — OCCT's offset is fragile there. It works on planar / ruled /
    rect->rect lofts. If a thicken fails, keep matching section topology, or build the wall into the
    profile (loft a thin closed ring) instead.
-2. (none currently) — surf_untrim now has a working handler (creates an untrimmed patch as a new
-   body, source surface intact); the old "no compiler for surf_untrim" note is obsolete.
+2. surf_untrim creates the untrimmed patch as a NEW body; the source surface stays intact.
 
-Confirmed against core/doc/validate.cpp (FEATURE_TYPES surf_*), core/doc/document.cpp handlers, and
-core/geom/surfacing.cpp; live driver pass: planar/extrude/revolve/sweep/loft/ruled/offset/fill/
-boundary/knit/thicken/trim/untrim/delete_face/replace_face all build (surf_thicken loft caveat
-above). ruled/fill/boundary accept body-edge picks as of T-BL28 (regression: core/tests/
-test_surfacing.cpp).
+planar/extrude/revolve/sweep/loft/ruled/offset/fill/boundary/knit/thicken/trim/untrim/delete_face/
+replace_face all build (surf_thicken loft caveat above). ruled/fill/boundary accept body-edge picks.

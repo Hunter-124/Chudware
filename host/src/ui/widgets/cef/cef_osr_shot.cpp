@@ -1,4 +1,4 @@
-// cef/cef_osr_shot.cpp — headless OSR render-to-PNG (docs/cef_webview.md phase 2).
+// cef/cef_osr_shot.cpp — headless OSR render-to-PNG (docs/design/cef_webview.md).
 //
 // Proves the whole off-screen pipeline WITHOUT a display or GL: create a
 // windowless CEF browser, navigate, capture OnPaint's BGRA buffer, write a PNG.

@@ -8,28 +8,13 @@ geometry". This harness reproduces the exact path: build parts -> assemble -> ag
 and asserts the assembly produces real forces (frontal area > 0). It also checks a single part
 still simulates (regression).
 
-Uses the freshly-built core DLL directly (no dist staging required).
+Select the native core with CHUDWARE_LIBCHUDWARE; no dist staging is required.
 """
-import ctypes, json, os, tempfile
+import json, os, sys, tempfile
 
-CORE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "core", "build-occt", "bin", "Release")
-os.add_dll_directory(CORE)
-lib = ctypes.WinDLL(os.path.join(CORE, "libchudware.dll"))
-lib.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-lib.chudware_call.restype = ctypes.c_int
-lib.chudware_free.argtypes = [ctypes.c_char_p]
-
-
-def call(method, params):
-    out = ctypes.c_char_p()
-    rc = lib.chudware_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
-    raw = out.value.decode() if out.value else ""
-    if out.value:
-        lib.chudware_free(out)
-    data = json.loads(raw) if raw else {}
-    if rc != 0 or (isinstance(data, dict) and data.get("code")):
-        raise RuntimeError(f"{method} failed rc={rc}: {raw[:300]}")
-    return data
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
+from services.mcp.core_bridge import call
 
 
 def build_part(name, ops):

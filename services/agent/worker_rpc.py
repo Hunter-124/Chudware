@@ -1,21 +1,22 @@
-"""Worker-RPC bridge for the services.agent-owned GUI seams (T-RF19 fold).
+"""Worker-RPC methods for the services.agent-owned GUI seams and online turns.
 
-Single registration point for the worker-RPC tables that were squatting in
-``engine_oracle/parts_hub/`` although every one is a thin wrapper over
-:mod:`services.agent` modules:
+``services/worker_main.py`` registers :data:`WORKER_METHODS` (the merged table
+below) in the persistent services worker that hostd's agent lane spawns
+(``core/hostd/worker_bridge.cpp``). Tables:
 
 - ``subscription_*`` (§4.4/§4.5 auth, Settings Accounts) — over services.agent.providers
 - ``session_compact/shake/handoff/btw`` — over :mod:`services.agent.session_cmds`
 - ``skills_*`` — over :mod:`services.agent.skills`
-- ``triggers_*`` / ``packs_*`` — over :mod:`services.agent.advisor.triggers`
-- ``ai_roles_*`` / ``model_rankings_*`` — over :mod:`services.agent.role_models`
+- ``triggers_*`` / ``packs_save`` / ``rule_create`` — over :mod:`services.agent.advisor.triggers`
+- ``ai_roles_*`` — over :mod:`services.agent.role_models`
 - ``bench_*`` (Settings → Benchmarks) — gym CLI runner
+- ``office_extract`` (``OFFICE_METHODS``)
+- ``agent_admin_turn`` / ``agent_cancel`` / ``agent_steer``, the ``chudcode_*``
+  auth/model/session/STT seams and ``memory_*`` (``ADMIN_METHODS``)
+- ``ai_prompt_*`` / ``ai_tool_*`` — prompt previews and the context-meter baseline
 
-Each table keeps its original name (``SUBSCRIPTION_METHODS`` etc.) and every
-RPC method name is preserved; ``WORKER_METHODS`` below is the merged table
-``engine_oracle/worker.py`` registers. All failures return contract-shaped
-``{"ok": false, ...}`` envelopes — never a traceback. GUI degrades to hidden
-when an RPC reports ``unknown_method``.
+All failures return contract-shaped ``{"ok": false, ...}`` envelopes — never a
+traceback. GUI degrades to hidden when an RPC reports ``unknown_method``.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ from services.agent.chudcode_host import get_default_chudcode_host
 _LOG = logging.getLogger(__name__)
 
 
-# ──── from engine_oracle/parts_hub/subscription_rpc.py (T-RF19 fold) ────
+# ──── subscription_* ────
 
 
 # provider friendly id -> live login progress (no tokens)
@@ -295,31 +296,6 @@ def _subscription_usage(params: dict, _emit: Callable) -> dict:
         }
 
 
-def _subscription_ensure_fresh(params: dict, _emit: Callable) -> dict:
-    """Refresh a subscription access token if expired / expiring within 5 min.
-
-    Pre-run hook for the C++ in-app agent (read-only token reader). Python is the
-    single writer. Shape: ``{ok, refreshed, expires_in, error}`` — never tokens.
-    """
-    provider = str((params or {}).get("provider", "")).strip().lower()
-    if not provider:
-        return {
-            "ok": False,
-            "refreshed": False,
-            "expires_in": None,
-            "error": "provider required (codex|claude|cursor|xai|*-sub)",
-        }
-    try:
-        return _sl().ensure_fresh(provider)
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "ok": False,
-            "refreshed": False,
-            "expires_in": None,
-            "error": f"subscription_ensure_fresh failed: {exc}",
-        }
-
-
 SUBSCRIPTION_METHODS: dict[str, Callable] = {
     "subscription_status": _subscription_status,
     "subscription_login": _subscription_login,
@@ -327,18 +303,15 @@ SUBSCRIPTION_METHODS: dict[str, Callable] = {
     "subscription_accounts": _subscription_accounts,
     "subscription_switch": _subscription_switch,
     "subscription_usage": _subscription_usage,
-    "subscription_ensure_fresh": _subscription_ensure_fresh,
 }
 
 
-# ──── from engine_oracle/parts_hub/session_rpc.py (T-RF19 fold) ────
+# ──── session_* ────
 
 
 def _cmds():
-    try:
-        from services.agent import session_cmds as sc
-    except Exception:  # noqa: BLE001 — agent package alias
-        from services.agent import session_cmds as sc  # type: ignore
+    from services.agent import session_cmds as sc
+
     return sc
 
 
@@ -570,7 +543,7 @@ SESSION_METHODS: dict[str, Callable] = {
 }
 
 
-# ──── from engine_oracle/parts_hub/skills_rpc.py (T-RF19 fold) ────
+# ──── skills_* ────
 
 
 def _skills():
@@ -625,27 +598,15 @@ def _skills_delete(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "reason": f"skills_delete failed: {exc}", "hint": ""}
 
 
-def _skills_resolve(params: dict, _emit: Callable) -> dict:
-    """Optional helper: resolve skill:// URI (not in v1 contract but useful)."""
-    uri = str((params or {}).get("uri") or (params or {}).get("url") or "").strip()
-    if not uri:
-        return {"ok": False, "reason": "uri required (skill://<name>[/<path>])"}
-    try:
-        return _skills().resolve_skill_uri(uri)
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": str(exc), "hint": ""}
-
-
 SKILLS_METHODS: dict[str, Callable] = {
     "skills_list": _skills_list,
     "skills_get": _skills_get,
     "skills_save": _skills_save,
     "skills_delete": _skills_delete,
-    "skills_resolve": _skills_resolve,
 }
 
 
-# ──── from engine_oracle/parts_hub/triggers_rpc.py (T-RF19 fold) ────
+# ──── triggers_* / packs_save / rule_create ────
 
 
 def _triggers():
@@ -723,26 +684,6 @@ def _triggers_delete(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "reason": f"triggers_delete failed: {exc}", "hint": ""}
 
 
-def _packs_list(params: dict, _emit: Callable) -> dict:
-    """``packs_list {} -> {ok, packs:[{name, source}]}``."""
-    try:
-        packs = _triggers().list_packs()
-        return {"ok": True, "packs": packs, "count": len(packs)}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"packs_list failed: {exc}", "hint": ""}
-
-
-def _packs_get(params: dict, _emit: Callable) -> dict:
-    """``packs_get {name} -> {ok, name, body, source}``."""
-    name = str((params or {}).get("name") or (params or {}).get("id") or "").strip()
-    if not name:
-        return {"ok": False, "reason": "name required"}
-    try:
-        return _triggers().get_pack(name)
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"packs_get failed: {exc}", "hint": ""}
-
-
 def _packs_save(params: dict, _emit: Callable) -> dict:
     """``packs_save {name, body} -> {ok, name, source}`` — user dir only."""
     name = str((params or {}).get("name") or "").strip()
@@ -755,17 +696,6 @@ def _packs_save(params: dict, _emit: Callable) -> dict:
         return _triggers().save_pack(name, body)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"packs_save failed: {exc}", "hint": ""}
-
-
-def _packs_delete(params: dict, _emit: Callable) -> dict:
-    """``packs_delete {name} -> {ok, restored_builtin?}`` — user pack only."""
-    name = str((params or {}).get("name") or "").strip()
-    if not name:
-        return {"ok": False, "reason": "name required"}
-    try:
-        return _triggers().delete_pack(name)
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"packs_delete failed: {exc}", "hint": ""}
 
 
 def _rule_create(params: dict, _emit: Callable) -> dict:
@@ -893,15 +823,12 @@ TRIGGERS_METHODS: dict[str, Callable] = {
     "triggers_get": _triggers_get,
     "triggers_save": _triggers_save,
     "triggers_delete": _triggers_delete,
-    "packs_list": _packs_list,
-    "packs_get": _packs_get,
     "packs_save": _packs_save,
-    "packs_delete": _packs_delete,
     "rule_create": _rule_create,
 }
 
 
-# ──── from engine_oracle/parts_hub/role_models_rpc.py (T-RF19 fold) ────
+# ──── ai_roles_* ────
 
 
 def _ai_roles_get(params: dict, _emit: Callable) -> dict:
@@ -993,65 +920,20 @@ def _ai_roles_set(params: dict, _emit: Callable) -> dict:
         }
 
 
-def _model_rankings_get(params: dict, _emit: Callable) -> dict:
-    """Return merged rankings {model_id: {rank, source, notes, ...}}."""
-    try:
-        from services.agent import config as agent_config
-        from services.agent.role_models import rankings_as_dict
-
-        cfg = agent_config.load_config()
-        rankings = rankings_as_dict(cfg)
-        return {"ok": True, "rankings": rankings}
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "ok": False,
-            "reason": f"model_rankings_get failed: {exc}",
-            "hint": "",
-        }
-
-
-def _model_rankings_set(params: dict, _emit: Callable) -> dict:
-    """Merge user ranking overrides into config.json model_rankings."""
-    try:
-        from services.agent import config as agent_config
-        from services.agent.role_models import set_user_rankings
-
-        partial = (params or {}).get("rankings")
-        if not isinstance(partial, dict):
-            return {
-                "ok": False,
-                "reason": "rankings mapping required",
-                "hint": (
-                    "Pass rankings: {model_id: {rank: 1-5, notes?: str} | rank_int}"
-                ),
-            }
-        cfg = agent_config.load_config()
-        rankings = set_user_rankings(partial, cfg, persist=True)
-        return {"ok": True, "rankings": rankings}
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "ok": False,
-            "reason": f"model_rankings_set failed: {exc}",
-            "hint": "",
-        }
-
-
 ROLE_MODELS_METHODS: dict[str, Callable] = {
     "ai_roles_get": _ai_roles_get,
     "ai_roles_set": _ai_roles_set,
-    "model_rankings_get": _model_rankings_get,
-    "model_rankings_set": _model_rankings_set,
 }
 
 
-# ──── from engine_oracle/parts_hub/bench_rpc.py (T-RF19 fold) ────
+# ──── bench_* ────
 
 
 def _repo_root() -> Path:
     env = os.environ.get("CHUDWARE_REPO") or os.environ.get("CHUDWARE_ROOT")
     if env:
         return Path(env).expanduser().resolve()
-    # services/agent/worker_rpc.py → repo root (depth preserved from the T-RF19 fold)
+    # services/agent/worker_rpc.py → repo root
     return Path(__file__).resolve().parents[2]
 
 
@@ -3547,10 +3429,9 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             return refuse_before_run("insufficient_credits")
 
     try:
-        from services.agent import agent_turn as _agent_turn
         from services.agent.chudcode_events import RpcFrameState, map_rpc_frame
         from services.agent.chudcode_tools import build_host_tools
-        from services.agent.mission_dispatch import MissionDispatch, linear_role_prompt
+        from services.agent.mission_dispatch import MissionDispatch, role_prompt
         from services.agent.providers import token_usage
     except ImportError as exc:
         return refuse_before_run(f"agent_admin_turn: import failed: {exc}")
@@ -3591,12 +3472,10 @@ def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
             options=options or None,
             chudware_actor=credit_actor,
         )
-        system_prompt, allowed_tools, _tools_text = linear_role_prompt(
+        system_prompt, allowed_tools = role_prompt(
             role,
-            resolver=_agent_turn.resolver_for(mission_dispatch),
             card=card,
             capability=turn_capability,
-            tier=turn_tier,
             preferences=turn_preferences,
         )
     except Exception as exc:  # noqa: BLE001
@@ -3980,12 +3859,17 @@ def _ai_tool_preview(params: dict, _emit: Callable) -> dict:
 
 
 def _ai_prompt_preview(params: dict, _emit: Callable) -> dict:
-    """Settings → AI → Dev Preview: assembled general_agent system prompt."""
+    """Settings → AI → Dev Preview: the general_agent prompt for one lane.
+
+    ``lane`` is ``"online"`` (default; Chudcode system prompt + host-tool
+    definitions) or ``"offline"`` (the explicit local-model fallback's prompt).
+    """
     try:
         from services.agent.prompt_preview import preview_main_chat_system  # noqa: PLC0415
 
         include_tools = bool((params or {}).get("include_tools", True))
-        return preview_main_chat_system(include_tools=include_tools)
+        lane = str((params or {}).get("lane") or "online")
+        return preview_main_chat_system(include_tools=include_tools, lane=lane)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -4002,33 +3886,20 @@ def _ai_tool_catalog(params: dict, _emit: Callable) -> dict:
 
 
 def _ai_prompt_baseline(params: dict, _emit: Callable) -> dict:
-    """What a FRESH chat costs before the user types anything.
+    """Estimated CAD contribution to a FRESH online chat, before the user types.
 
     Backs the copilot context meter: with no provider call yet, the meter had no
-    honest source and rendered an em-dash over the window. This returns the
-    token estimate of the system prompt a real turn actually sends (the
-    ``prompt_cache`` composition, which ``run_turn`` itself renders — not the
-    ``ai_prompt_preview`` mirror, which injects a SAMPLE ledger/stage no live
-    turn sends and therefore never reported the real number), plus the
-    per-segment breakdown the meter tooltip renders so the user can see WHAT is
-    filling the window rather than only how much.
-
-    ``project_dir`` scopes the answer, because the composed prompt contains a
-    listing of that folder's CAD files.
+    honest source and rendered an em-dash over the window. This returns
+    ``prompt_cache.baseline()`` — a ~4 chars/token estimate of the online system
+    prompt plus the host-tool definitions CAD hands Chudcode, with the
+    per-block breakdown the meter tooltip renders. Chudcode's own system prompt
+    and builtin tools are not included, so it is never the exact upstream count.
     """
     try:
         from services.agent.prompt_cache import baseline  # noqa: PLC0415
 
-        root = (
-            str(
-                (params or {}).get("project_dir")
-                or (params or {}).get("project_root")
-                or ""
-            )
-            or None
-        )
         role = str((params or {}).get("role") or "general_agent")
-        return baseline(project_root=root, role=role)
+        return baseline(role=role)
     except Exception as exc:  # noqa: BLE001
         return {
             "ok": False,
@@ -4040,25 +3911,18 @@ def _ai_prompt_baseline(params: dict, _emit: Callable) -> dict:
 
 
 def _ai_prompt_warm(params: dict, _emit: Callable) -> dict:
-    """Compose the system prompt ahead of the user's first message.
+    """Compose the online main-chat prompt ahead of the user's first message.
 
-    Called at worker start and when the GUI opens a new session. Composition
-    costs ~1.9 s in a cold process (dominated by importing the tool registry),
-    and that cost used to land on the user's first request.
+    The worker already warms at start (``worker_main._warm_prompt_cache``); this
+    is the explicit request. Composition costs ~1.9 s in a cold process
+    (dominated by importing the tool registry), and that cost used to land on
+    the user's first request.
     """
     try:
         from services.agent.prompt_cache import warm  # noqa: PLC0415
 
-        root = (
-            str(
-                (params or {}).get("project_dir")
-                or (params or {}).get("project_root")
-                or ""
-            )
-            or None
-        )
         blocking = bool((params or {}).get("blocking"))
-        warm(project_root=root, background=not blocking)
+        warm(background=not blocking)
         return {"ok": True, "blocking": blocking}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -4112,7 +3976,7 @@ def _with_prompt_invalidation(name: str, fn: Callable) -> Callable:
     return _wrapped
 
 
-# Merged registration table (engine_oracle/worker.py does ``_METHODS.update``).
+# Merged registration table (``worker_main._register("agent_gui", ...)``).
 WORKER_METHODS: dict[str, Callable] = {}
 WORKER_METHODS.update(SUBSCRIPTION_METHODS)
 WORKER_METHODS.update(SESSION_METHODS)

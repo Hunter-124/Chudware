@@ -1,6 +1,9 @@
 """Crash recovery of campaign artifacts: a hard reset must cost redone work, never a wedged run."""
 import json
 
+import pytest
+
+from training.viewpoint import durable
 from training.viewpoint.durable import append_jsonl, durable_replace, nonempty, read_jsonl
 
 
@@ -26,3 +29,18 @@ def test_zero_length_artifact_counts_as_missing(tmp_path):
     tmp.write_bytes(b"data")
     durable_replace(tmp, empty)
     assert nonempty(empty) and not tmp.exists()
+
+
+def test_failed_flush_keeps_the_previous_checkpoint(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "run.epochs.pt"
+    checkpoint.write_bytes(b"epoch 3")
+    partial = tmp_path / "run.epochs.partial"
+    partial.write_bytes(b"epoch 4")
+
+    def failing_fsync(fd):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(durable.os, "fsync", failing_fsync)
+    with pytest.raises(OSError):
+        durable_replace(partial, checkpoint)
+    assert checkpoint.read_bytes() == b"epoch 3"

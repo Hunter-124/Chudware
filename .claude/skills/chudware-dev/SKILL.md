@@ -1,731 +1,297 @@
 ---
 name: chudware-dev
-description: Generalist skill for ANY change to the Chudware program in this repo — engine/kernel work, agent loop, MCP server, contracts, scripts, tests, docs, bug fixes, features — whenever the task isn't purely GUI (purely-GUI batches go to gui-orchestrator, which this skill points to). Carries the verified repo map, build/test commands, git workflow, and Hunter's working preferences, so read this before searching the repo or asking basics.
+description: Generalist skill for ANY change to the Chudware program in this repo — engine/kernel work, agent harness, MCP server, contracts, scripts, tests, docs, bug fixes, features — whenever the task isn't purely GUI (purely-GUI batches go to gui-orchestrator). Carries the working rules, build/gate/smoke commands, and the load-bearing daemon, document, sim, and manufacturing invariants; read it before searching the repo or asking basics.
 ---
 
 # Chudware Generalist Dev
 
-How to work in this repo, regardless of which part you're changing. GUI-heavy batches:
-hand off to `.claude/skills/gui-orchestrator/SKILL.md` (it has the panel-level map and
-specialist worker skills). Everything else: this file is your base.
-For the compiled online-agent boundary, read
-`.claude/skills/cad-chudcode-integration/SKILL.md` before touching sessions, providers,
-auth/models, memory, host tools, events, recovery, or release artifacts.
+Base skill for every non-GUI change. Pointers:
+- GUI batches: `.claude/skills/gui-orchestrator/SKILL.md` (panel maps, specialist skills).
+- Online agent boundary (sessions, providers, auth/models, memory, compaction, host tools,
+  events, control lane, recovery, release artifact): `.claude/skills/cad-chudcode-integration/SKILL.md`
+  is canonical — this skill does not repeat it.
+- Repo/architecture map: `AGENTS.md` + `ARCHITECTURE.md`. Build/gate truth: `build.sh` and
+  `scripts/gate.sh` headers. Task board policy: `work/WORKFLOW.md`.
+- Long causal histories live in `docs/REFACTOR_LOG.md` / `docs/refactor-log/` and
+  `docs/ops/HOST_CRASH_FORENSICS.md`; rules below carry only the invariant + its pin.
 
-## Hunter's working preferences (apply to every task)
+## Working rules
 
-- **Clarify first.** If the target, desired behavior, or scope is ambiguous, ask (batch all
-  questions into one round) before touching code. A wrong guess wastes a whole cycle.
-- **Master-only workflow.** Work directly on `master`; no feature branches or PRs. Start every
-  session: `git checkout master && git pull origin master`. Stray branches with unmerged
-  commits exist — surface them, don't silently merge.
-- **Commit + push as you go.** One commit per completed, building unit of work; push to
-  `origin master` immediately. Never leave verified work uncommitted.
-- **User verifies visuals/behavior in the running app.** Don't burn tokens screenshotting and
-  judging your own UI output; end with a short checklist: "open X, do Y, expect Z."
-  Compiling builds and passing gates ARE your job before handing off.
-- **Don't search when a map exists.** Use the tables below, then graphify, then grep — in
-  that order.
-- Solo dev: if asked to "find something to do" / "chip away", use the task board:
-  `python3 work/tools/work.py ready` (unblocked tasks) and `... board` (full board). No
-  claim step; pick, work, mark done.
+- **Act on evidence.** Resolve ambiguity from the repo first. Ask only about a material
+  choice the repo cannot answer, and batch every question into one question-tool call.
+- **Master only, no worktrees.** No feature branches or PRs. Never create git worktrees
+  (they branched from stale bases and silently reverted master; `.claude/settings.json`
+  pins `worktree.bgIsolation: none`). Surface stray branches with unmerged commits; never
+  merge them silently.
+- **The tree is shared and usually dirty.** Record `git status` once; leave unrelated paths
+  untouched; give parallel agents disjoint write-sets in the main tree. Never
+  `checkout`/`pull`/`stash`/`reset` over uncommitted work. Stop only when a file you need
+  carries conflicting user edits.
+- **Commits belong to the integrator.** Subagents never run git. The session driver commits
+  only when the user asks or the repo workflow expects it, stages explicit paths/hunks
+  (never `git add -A`/`.`), and never commits the user's own edits.
+- **Verification is centralized and includes runtime.** Workers return changed files plus
+  the exact checks; the integrator builds once across the union (concurrent `./build.sh`
+  runs race the Ninja lock) and then runs a runtime smoke — scenario harness, MCP/hostd
+  call, or headless `run_mission.py` turn as the change warrants. A green build alone is not
+  done. For UI changes, inspect the actual changed surface; add a user acceptance checklist.
+- **Locate code:** graphify per `AGENTS.md` workflow item 1, then grep.
+- Notable multi-file efforts append a one-paragraph handoff to `docs/REFACTOR_LOG.md`
+  (files, deferred items, gotchas). If a change alters structure or conventions, update the
+  affected skill alongside it.
 
-## Locating code — graphify first
+## Repo pointers AGENTS.md does not carry
 
-The repo has a knowledge graph at `graphify-out/` (skill: `.claude/skills/graphify/SKILL.md`):
-- `graphify query "<question>"` — scoped subgraph for any codebase question
-- `graphify path "<A>" "<B>"` — dependency chain between files
-- `graphify explain "<concept>"` — focused concept context
-- `graphify-out/GRAPH_REPORT.md` / `graphify-out/wiki/index.md` — broad architecture only
-- After meaningful structural changes: `graphify update .` (AST-only, free)
-
-## Repo map (verified in working tree, 2026-09-26)
-
-**Current GUI ownership:** `host/` is the sole GUI target; `ui/imgui/` and `ui/abstract/` are gone, and T-G11's deletion of `host/` was reversed.
-
-| Dir | What it is |
+| Path | What |
 |---|---|
-| `core/` | Pure C++/CUDA kernel → `libchudware`: geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. Public API seam: `core/api/libchudware.h` (append-only) |
-| `core/device/**` | Device identity and capability truth; transports, Grbl codec/adapter, and emulator |
-| `core/manufacturing/**` | Journal + durable sequence, result registry, invalidation, tier0, policy, gates, approval, lease, and arbiter |
-| `core/twin/**` | Manufacturing digital twin |
-| `core/print/**` | Additive-print model |
-| `host/` | **The production GUI** — C++ GLFW/ImGui desktop app. `host/src/app.cpp` frame loop, `host/src/ui/` panels (52k LOC), `host/src/core/app_state.h` central data model. Details: the gui-* skills |
-| `ui/viewport/` | AICM mesh loader (`render/aicm_loader.*`) consumed by `core/`; the host renderer lives under `host/src/render/` |
-| `services/agent/` | Chudcode RPC host/adapters, `online_turn.py` turn assembly, `progress_watchdog.py`, `subagent_registry.py`, CAD-owned roles/missions/governance, tool projection and event mapping |
-| `services/mcp/` | MCP server exposing the engine to external agents (Claude Code etc.) |
-| `services/worker/` | Engine routing seam: WorkerClient / DocMirror / bootstrap |
-| `services/installer/` | Provisioning, MCP self-registration, packaging |
-| `services/manufacturing/**` | Gateway transports + allowlist, printer adapters, slicer (stock-PrusaSlicer adapter, vendor presets, G-code verifier), monitor, metrology, notification, PnP, and robot services |
-| `services/dfam/` | Deterministic design-for-additive analysis (numpy/scipy): wall thickness, overhang/bridges, support + trapped support, holes, internal voids, bed adhesion, bed fit, orientation ranking |
-| `services/perception/**`, `training/perception/**` | Perception model/runtime and reproducible training pipeline |
-| `contracts/` | **Frozen interface contracts — THE seams. Append-only.** `worker_rpc.md`, `doc_ops.md`, `feature_params.md`, `icons.md`, `parts.md`, `ecad/`, … (`contracts/README.md`) |
-| `corpora/` | Consolidated test fixtures (sketch/render/sw_parity), referenced by canonical paths |
-| `scripts/` | Gates & audits: `gate.sh`, `check.py`, `gui_lint.py`, `icon_pipeline.py` |
-| `docs/` | Design docs and live handoffs in `docs/REFACTOR_LOG.md`, with older handoffs split under `docs/refactor-log/` |
-| `docs/manufacturing/**` | Manufacturing subsystem design corpus |
-| `work/` | Task board (`work/tools/work.py`) + backlog cards `work/backlog/T-*.md` |
-| `assets/` | Icons + generators (`make_icons.py`, `pack_icons.py`), logo |
-| `tools/`, `benchmarks/`, `training/`, `services/dag/`, `services/deliverables/` | Dev tools, benches, ML training, DAG missions, deliverable templates |
-| `Webservice/` | chudware-web: browser-native `host/` WASM GUI backed by one shared hostd — `gateway/` (FastAPI portal+auth+engine bridge+chat), `deploy/` (systemd user units, cf_provision.py, RUNBOOK.md), `DESIGN.md`. T-R7 PLM remote subset lives in `services/plm/remote.py`. Secrets NEVER committed (`Cloudflare-info.txt` gitignored) |
-| `scratch/` | Throwaway output — never commit anything load-bearing here |
+| `core/device/**` | Device identity/capability truth, transports, Grbl codec/adapter, emulator |
+| `core/manufacturing/**` | Journal + durable `seq`, result registry, invalidation, tier0, policy, gates, approval, lease, arbiter |
+| `core/twin/**`, `core/print/**` | Manufacturing digital twin; additive-print model (standalone libraries) |
+| `services/manufacturing/**` | Gateway + allowlist, printer adapters, slicer (stock PrusaSlicer, vendor presets, G-code verifier), print media, monitor, metrology, PnP, robot |
+| `services/dfam/` | Deterministic design-for-additive analysis (walls, overhangs, supports, holes, voids, adhesion, bed fit, orientation) |
+| `services/perception/**`, `training/perception/**` | Perception runtime and reproducible training |
+| `Webservice/` | chudware-web: browser WASM `host/` over one shared hostd (`gateway/`, `deploy/`, `DESIGN.md`). Secrets never committed |
+| `scratch/` | Throwaway output; nothing load-bearing |
 
-Env/naming: `CHUDWARE_*` env vars are canonical; MCP id is `chudware`
+`CHUDWARE_*` env vars are canonical; the MCP id is `chudware`.
 
 ## Commands
 
 ```bash
-scripts/provision_venv.sh # create/refresh .venv-mcp + audit deps; VENV_DIR and CHUDCODE_RPC_SRC override paths
-./build.sh              # default: host GUI (cmake -S host -B host/build-linux + ninja), 2–3 min
-./build.sh core         # C++ kernel only (linux-core preset; needs system OCCT)
-./build.sh all          # core, then GUI
-./build.sh clean        # wipe host/build-linux (core kept — OCCT reconfig is expensive)
-./host/build-linux/bin/chudware                     # run the app
-CHUDWARE_HEADROOM_GB=2 CHUDWARE_MEM_FRAC=0.6 scripts/gate.sh   # THE gate: check.py → core build+ctest → host build → pytest → shot smoke
-#   ^ ctest tet10_thin_wall needs an 11.6 GB solve budget (budget = min(frac×total, avail−headroom));
-#     at the box default headroom 6 it is 4–20 % short whenever anything else holds RAM.
-python3 scripts/check.py                          # fast stdlib gate (gui_lint, audits) — always runnable
-python3 work/tools/work.py ready|board            # task board
-CHUDWARE_POLYMESH_ROOT=~/Repositories/Polyhedral-FEA-private ./build.sh core   # build against Hunter's live Polyhedral-FEA tree (else pinned public fetch)
-./build.sh stage        # restage libchudware + chudware-hostd + polymesh CLI into services/dist (dist is FIRST in hostd lookup — stale dist = stale daemon)
-scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware/Sessions --prompt-file p.md --model claude-opus-5   # headless agent turn; --resume for follow-ups
+./build.sh [app|core|daemon|all|wasm|stage|clean]   # modes/env in build.sh; host/build-linux/bin/chudware
+scripts/gate.sh                  # THE gate: check.py → core build+ctest → host build → pytest → shot smoke
+python3 scripts/check.py         # source/audit gates; use the provisioned runtime interpreter
+scripts/provision_venv.sh        # .venv-mcp; gate.sh resolves its python (override CHUDWARE_GATE_PYTHON)
+./build.sh stage                 # dist is FIRST in hostd lookup: stale dist = stale daemon
+CHUDWARE_SHOT=<scenario> ./host/build-linux/bin/chudware --ui-screenshot scratch/smoke.png   # headless runtime smoke
+scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware/Sessions --prompt-file p.md   # headless agent turn; --resume
 ```
 
-Before shipping a Polyhedral-FEA API change, validate the public pin in
-`core/cmake/ProvisionPolymesh.cmake` without a local source override. A successful
-private-tree build does not prove production can fetch the headers it needs.
-The configure log must say **PINNED FETCH**, not **LOCAL SOURCE**; clear
-`POLYMESH_SOURCE_DIR` and reset a previously overridden `POLYMESH_ROOT` to
-`<CAD>/third_party/polymesh` when checking that path. The public
-`cad-fill-progress` branch is the CAD integration line; standalone product
-`master` can advance independently. Never publish private history just to move
-the pin.
+- Gate SKIPs (not failures) when OCCT or the runtime venv is absent. Scripted GUI launches
+  use `xvfb-run`; `CHUDWARE_SHOT_HEADED=1` shows a window.
+- The `tet10_thin_wall` ctest (RUN_SERIAL) needs a large solve budget. Only when RAM is
+  otherwise free may a gate run use `CHUDWARE_HEADROOM_GB=2 CHUDWARE_MEM_FRAC=0.6`.
+- Mixed pytest collections: root `conftest.py` isolates non-MCP engine tests per test;
+  `services/mcp/conftest.py` opts its daemon tests out at collection.
+- **Polyhedral-FEA pin:** `CHUDWARE_POLYMESH_ROOT=<tree> ./build.sh core` builds a local
+  tree, but before shipping an API change validate the public pin in
+  `core/cmake/ProvisionPolymesh.cmake` with no override: the configure log must say
+  **PINNED FETCH**, not **LOCAL SOURCE** (clear `POLYMESH_SOURCE_DIR`, reset an overridden
+  `POLYMESH_ROOT` to `<CAD>/third_party/polymesh`). The public `cad-fill-progress` branch is
+  the integration line; never publish private history to move the pin.
 
-Gate semantics: OCCT-absent and runtime-venv-absent are **SKIPs, not failures** — the gate
-stays green on an unprovisioned box. Python pytest sweeps run per unit under `services/`,
-plus `tools/` and `training/`, when the runtime venv exists.
-Scripted GUI launches use `xvfb-run` automatically; set `CHUDWARE_SHOT_HEADED=1` to see a real
-window. Headless scenario smoke: `CHUDWARE_SHOT=<m1|sketch|asm|fea|flow|drawing|…>
-./host/build-linux/bin/chudware --ui-screenshot scratch/smoke.png` (crash check, not visual
-judgment).
+## Resource safety
 
-## Rules that bind every change
-
-- **Contracts and seam files are append-only** and integrator-owned: `contracts/*`,
-  `core/api/libchudware.h`, top-level CMake, `scripts/gate.sh`, `AGENTS.md`. If you're a
-  subagent, request these edits from your orchestrator instead of making them.
-- **Subagents never run git**; the session driver commits, parallel agents use disjoint
-  write-sets, and all run in the main tree because **this repo has no git worktrees** —
-  they branch from stale bases and have silently reverted master. On 2026-08-27 the stale
-  `~/.cache/wt-cad-code` and `~/.cache/wt-cad-release` worktrees plus 7 stale stashes were
-  removed; the stashes remain archived as local refs `refs/archive/stash-0..6` and patches
-  in `~/Backups/CAD-stashes-2026-08-28/`.
-- A change is done when the relevant gate is green: `./build.sh` compiles at minimum;
-  `scripts/gate.sh` for anything touching core/engine/agent; `scripts/gui_lint.py --rule
-  theme|icons` when styling/icons changed.
-- Notable multi-file efforts get a one-paragraph handoff appended to `docs/REFACTOR_LOG.md`
-  (files touched, deferred items, gotchas).
-- **Feature booleans unify same-domain faces (2026-09-27).** Additive/removal feature paths
-  in `core/doc/document.cpp` use `geom::fuse_unify` / `geom::cut_unify`, never plain
-  `fuse`/`cut`: split coplanar faces render as seams users read as "not fused". Any change
-  to compiled geometry/topology bumps `stepplus_cache_engine_key`. After `./build.sh stage`
-  an auto-spawned dev hostd serves the OLD engine until it drains — check
-  `chudware-hostd --status` before trusting an MCP smoke.
-- **Face ownership follows op history (2026-09-27).** A geom op that rebuilds faces of an
-  existing body must record its history (`geom::op_history_record`, or index provenance via
-  `op_provenance_encode`/`_record` across `isolate_shape_build`'s `sidecar`) — otherwise the
-  owner map hands every rebuilt face to that feature (`core/geom/op_history.h`).
-- **Agent visual review is numbers first, then ONE planner grid (2026-09-28, ViewNet).**
-  `render_part` with no `view` (whole part or `target=`) returns one 2×2 grid of the 4 best
-  complementary perspective shots chosen by `services/mcp/shot_planner.py` from ~160–250
-  candidates measured by the native `doc_view_metrics` RPC (per-face visible true area, edge
-  crease contrast/silhouettes, normal entropy); hidden targets get x-ray (translucent occluders,
-  opaque target) or section tiles (`doc_render_view view.section`: hatch cap, cut outline,
-  ghosted removed half). Ranking = `services/viewpoint/utility` model when
-  `weights/utility_v1.npz` is shipped, else `features.hand_utility`; an attachment defect found by
-  `eval_feature_attachment` is pinned as one tile. Tiles carry SID face tags that tools accept
-  verbatim. Explicit `view=` stays a single shot. Before this, CAD tool images never reached the
-  online model at all (`services/agent/tool_images.py`: the Chudcode adapter stringified FastMCP
-  `Image` objects) — keep image blocks end to end. Don't re-add "render after every mutation".
-- **ViewNet learning is LLM-free (2026-09-28).** Labels come from `training/viewpoint/datasets`
-  (`chudware.geomlabel/1`: MFCAD MIT, MFCAD++ generator port, GSL), usefulness from the
-  from-scratch cross-fitted Observer CNN (`training/viewpoint/observer`), the utility model from
-  `training/viewpoint/utility`; `training/viewpoint/campaign.sh` runs it all resumably. No
-  VLM/LLM calls anywhere in that pipeline, by the owner's decision. Observer queries must not
-  carry geometry (centroids/axes/flags) — the report's `blind` and `qvec_probe` rows must sit at
-  majority; the observer reads pixels only because of dense per-pixel class/edge supervision
-  (`observer/dense.py`). Launch the campaign with `campaign.sh service [stages]` (reboot-surviving
-  unit; the box's GPU can hard-reset), never edit `campaign.sh` while it runs (bash reads it
-  incrementally), and write artifacts via `training/viewpoint/durable.py` (fsync before rename).
-  `shot_planner.candidate_cameras`/`section_candidates` enumeration is replayed by index from
-  stored trial sets — append new candidate kinds inside `plan_shots`, not in those generators.
-
-### Manufacturing rules that bind every change
-
-- The `manufacture` MCP family is default-OFF.
-- The arbiter is the only approval validator; the device allowlist denies by default.
-- `FreshValue<T>` is the sole external freshness shape, and the journal is the sole source of durable `seq`.
-- Nothing may advertise physical `execute` or `safety_integration` before the E4–E6 pilot.
-- `mfg_run_resume` exists only to refuse.
-- **3D printing goes through `slice_part` (2026-10-01).** `services/mcp/print_tools.py` (family
-  `cam`, NOT the gated `manufacture` family — it only writes files): stock PrusaSlicer found by
-  `services/manufacturing/slicer/prusaslicer.discover()` (CHUDWARE_SLICER_BIN → per-user flatpak
-  `com.prusa3d.PrusaSlicer`, always `--command=prusa-slicer` because the default entrypoint dies
-  headless → system flatpak → standard paths; `scripts/provision_slicer.py --install`), vendor
-  presets read at runtime from the install's profile bundles (`vendor_bundle.ProfileCatalog`,
-  never copied into the repo), orientation/supports/brim from the deterministic DFAM package
-  `services/dfam` (also behind `dfm_check`'s FDM rows), then `gcode_check.verify_gcode`.
-  `print_ready` requires a passing G-code check — its `floating_extrusion` scan is what catches
-  mid-air perimeters; old hand-rolled arm slices had 225 mm unsupported overhang-perimeter runs.
-  2.9.6 CLI facts: no `--arrange`; bare `--merge` segfaults headless (use `--dont-arrange
-  --merge`); `--duplicate N` arranges copies. Never let an agent download a slicer or write
-  slicer keys by hand again.
-- **Multi-part plates and "Complete individual objects" (2026-10-03).** `slice_part(parts=
-  [{doc_id|path, copies, orientation, …}], complete_individual_objects=True)`: each part is
-  oriented/analysed alone, `services/manufacturing/slicer/plate.py` lays the plate out
-  (meshes written at absolute bed coordinates, `slice_mesh(center_xy=None)` keeps them;
-  PrusaSlicer prints sequential objects in argument order), and one G-code + one manifest
-  (`plate` block: objects, print order, parts) is one `publish_print_media` job. The 2.9.6
-  CLI checks NO sequential clearance — it exported objects 10 mm apart on a 55 mm radius and
-  a 30 mm object before others under a 25 mm gantry. So the planner spaces hulls by
-  `extruder_clearance_radius` + brims + 2 mm, orders by ascending height, allows one object
-  above `extruder_clearance_height` (printed last), and `gcode_check`'s
-  `sequential_clearance` re-proves it from the toolpath (object labels or Z restarts; every
-  move after an object's last extrusion vs its hull/height). `complete_objects` in
-  `overrides` is refused.
-- **Printer media is published, never copied (2026-10-03).** `print_media_inventory` (read
-  risk) and `publish_print_media` (write; in `contracts/copilot_modes.json` `mutating_tools`,
-  so Ask/Plan refuse it) wrap `services/manufacturing/print_media.py`; humans use
-  `scripts/print_media.py`. The printer UI shows names without timestamps, so repeated
-  hand-copied deliveries left obsolete duplicate G-code selectable. Publish takes the
-  project's COMPLETE `.print.json` job set, the whole-drive `inventory_token`, and an explicit
-  `media_idle=True` (an offline stick cannot reveal printer activity); writes
-  `PRINT/<project>/R<rev:03><part:02>_<PART>.gcode`, reads back hashes, archives prior managed
-  revisions in a non-printable ZIP, and reports unmanaged printables it did not touch. An
-  agent with a shell can still `cp` — the guarantee is policy + tool, not prevention.
-
-## Daemon / mission lifecycle (don't regress these)
-
-- **hostd control:** `chudware-hostd --status` / `--stop` / `--stop --force`. Bare `--stop`
-  refuses while agent children run; `--force` stops children (TERM → grace → KILL) first.
-  If the control socket is dead but the pidfile process still lives, `--stop` escalates
-  via pidfile: SIGTERM → 3 s → SIGKILL (`core/hostd/main.cpp`).
-- **Doc-GC:** abandoned docs: `CHUDWARE_DOC_GC_GRACE_S` (default 90 s); agent/mcp-origin
-  docs use floor `CHUDWARE_DOC_GC_AGENT_GRACE_S` (default 1800 s) so mission-built parts stay
-  openable from the GUI after the agent detaches; `CHUDWARE_DOC_GC=0` disables
-  (`core/hostd/doc_registry.*`).
-- **Two worker lanes (2026-09-24).** hostd runs an agent-lane and a general-lane services
-  worker (`WorkerBridge::forMethod`, `core/hostd/worker_bridge.cpp`). A new stateful agent
-  RPC family MUST be added to the agent prefix list or it lands on the general lane (a
-  different process, blind to Chudcode sessions). Worker-side files shared across processes
-  need flocks (vault config and Box mirror drain already have them), not threading locks.
-  `WorkerBridge::stop()` never waits behind an in-flight call (a turn holds the lane for
-  hours): it cancels the active run over the control lane, waits ≤10 s, then SIGTERMs the
-  child, and a stopping bridge never respawns. Before this a tray Quit mid-turn wedged hostd
-  with its accept loop gone and the agent's next CAD call blocked forever
-  (`test_sigterm_mid_turn_ends_the_turn_and_the_daemon`).
-  Nor does any other call wait unbounded (2026-09-27): in `WorkerBridge::call` a non-turn
-  call behind a running `agent_admin_turn` fails AT ONCE with `worker_lane_busy` ("worker
-  lane busy (agent turn in progress)"), and any other lane wait ends at the call's own
-  timeout. The GUI's `subscription_accounts` (agent lane) used to queue behind a running
-  turn past its 120 s bound until the long-tier watchdog `_Exit`ed hostd after 3600 s,
-  retiring the live session's unsaved docs — and the GUI's single-FIFO `st.rpc` lane stalled
-  behind it (an AI-tab click showed "Loading" for 9 min). `provider_usage.cpp` treats the
-  busy reply as silent and keeps its rings
-  (`test_agent_lane_call_behind_a_turn_fails_fast_and_hostd_survives`).
-- **A turn never holds the GUI's call lane (2026-09-27).** hostd's fail-fast did not reach the
-  GUI side: the job thread held `WorkerClient::callMtx_` for the whole `agent_admin_turn`, so a
-  worker-routed call on `st.rpc` (single FIFO dispatch thread) blocked on that mutex and every
-  later `doc_activate`/`doc_snapshot`/`doc_tree` sat behind it for the rest of the turn — its
-  120 s timeout never starts because the call never starts. In daemon mode a long run
-  (`agent_admin_turn`/`agent_run_v2`/`agent_mission_v1`) now serializes on `longRunMtx_` only
-  (it already streams on engine_backend's dedicated run connection); pipe mode, or a run that
-  could not open that connection, keeps `callMtx_`. Invariant: no GUI call may wait on a turn
-  client-side; two long runs still never overlap (`test_worker_long_run`, fake hostd). Its
-  visible twin was a GUI bug: `AppState::ensureActiveTab` re-points the strip at the mirror's
-  doc every frame, so an async switch whose activation took more than one frame snapped back to
-  the previous tab ("flashes Loading, kicks me back, deselects it"). `core::SwitchHold` keeps an
-  async switch selected until its activation lands or fails (`test_switch_hold`).
-- **Web actors never use ambient `chud` auth (2026-09-24).** BYOK, personal Claude OAuth and
-  the pool (`CHUDWARE_WEB_POOL_API_KEY`/`_PROVIDER`/`_MODEL`) each run in a credential-scoped
-  Chudcode process with a gateway digest proof; a web actor without a servable credential
-  refuses by name. Desktop turns keep the host login.
-- **What keeps hostd alive is WORK, not sockets** (2026-08-27). `Server::idleExpired` and the
-  drain both gate on `pinningClients()`, never `status_.clients`: a `gui` client always pins
-  (the app being open IS the reason the daemon exists), any other client pins only while it
-  has an engine call in flight, an attached doc, or an RPC inside the idle window. Before
-  this, one connected-but-silent socket vetoed every exit path — a daemon sat "draining
-  (1 client)" in the tray for 5.5 h with an undismissable icon. Pinned by
-  `test_hostd_registry.py::test_parked_client_does_not_pin_the_daemon` plus its control
-  `…_attached_client_still_pins_the_daemon`. Do NOT re-add a raw client-count gate.
-- **A drain is bounded.** `Server::beginDrain(deadlineSecs)`: `daemon_drain` / `--stop` /
-  tray Quit / SIGTERM are HARD stops and carry a deadline (`CHUDWARE_HOSTD_DRAIN_GRACE_S`,
-  default 20 s; tray Quit uses 5 s) after which remaining connections are `shutdown()` and
-  the daemon exits regardless. The stale-binary self-drain passes `0` — soft, cooperative,
-  refuse new connects only, so a rebuild never kicks a live session.
-- **The doc-GC grace does NOT pin the daemon.** It used to, and with the 1800 s agent floor
-  that kept hostd (and its tray icon) alive for half an hour after the user closed the app —
-  while protecting a doc nobody could open, since the check is only reached when nothing is
-  attached. The floor's job is app-runtime: keep a just-finished mission's part openable
-  *while the GUI exists*. A grace that expires while the daemon serves is still retired by
-  `tick()`; a clean exit still discards (crash-only recovery,
-  `test_hostd_registry.py::test_clean_shutdown_discards_docs`).
-- **The CEF fetch daemon has a watchdog thread** (`host/src/ui/widgets/cef/cef_daemon.cpp`).
-  Its serve loop is single-threaded and also drives `CefDoMessageLoopWork`, and
-  `initialize()` can block on Chromium's ProcessSingleton — so the loop's own idle check is
-  not a termination guarantee. `start_idle_watchdog` is armed BEFORE `initialize()` and
-  `_Exit(0)`s after `idle_secs` of no activity. Every `last = now` in that loop must go
-  through `mark_activity()` or a live fetch looks idle. Spawning is single-flight
-  (`services/browser/cef_client.py`): an flock alone is not enough because the spawns are
-  SEQUENTIAL, minutes apart, each re-probing a socket a wedged daemon will never create — so
-  the lock file also records the spawned pid (`_daemon_alive` verifies it via
-  `/proc/<pid>/cmdline`) and a spawn is refused while that process lives. Without this, every
-  turn that found nothing listening minted another daemon: 193 were found alive at once, 34 h
-  old. Probe shape: 8 concurrent and 6 sequential spawners against a never-listening binary
-  must both yield exactly ONE process, and killing the incumbent must allow a replacement.
-  The biggest single contributor was upstream of all that: `--cef-*` argv lived entirely
-  inside `#ifdef CHUDWARE_ENABLE_CEF` in `host/src/main.cpp`, so in a CEF-OFF build
-  `chudware --cef-daemon <sock> 120` FELL THROUGH to the normal GUI launch — a whole desktop
-  app that never listened on the socket and never exited. There is now an `#else` branch that
-  claims those argv forms and refuses. It must use the `std::fflush(nullptr); std::_Exit(n)`
-  tail (like `--version`): a plain `return` deadlocks in global destruction on a detached
-  worker parked in `cv.wait` — verified, it printed the message and hung forever.
-- **GUI reconnect:** status bar shows a sticky unreachable chip; `engine_events` reconnects
-  with backoff and re-bootstraps doc tabs on `reconnectGeneration` bump
-  (`CHUDWARE_SHOT=daemon_h2`). See gui-workspaces for the status-bar surface.
-- **NEVER run `ulimit -v/-m/-d` (or `prlimit` against a pid you did not spawn) in an agent bash
-  call (2026-09-05).** The agent host's bash tool is an in-process shell (`$$` is the omp pid),
-  so an address-space cap lands on the host itself — with its ~75 GB of virtual reservations every
-  later `mmap` fails with ENOMEM while RAM is free, and the host aborts (three crashes traced in
-  `docs/ops/HOST_CRASH_FORENSICS.md`). Cap memory ONLY by wrapping the native run:
+- **Never** run `ulimit -v/-m/-d`, or `prlimit` against a pid you did not spawn, in an agent
+  bash call: that shell is in-process with the agent host, so the cap lands on the host and
+  aborts it (`docs/ops/HOST_CRASH_FORENSICS.md`). Cap memory only by wrapping the native run:
   `systemd-run --user --pipe --wait -q --collect -p MemoryMax=12G bash -c 'ulimit -c 0; …'`
-  (cgroup kill instead of abort; `ulimit -c 0` keeps the coredump pipeline out of it). Box policy:
-  `CHUDWARE_MEM_FRAC=0.5 CHUDWARE_HEADROOM_GB=6 CHUDWARE_SIM_THREADS=4`, one >4 GB run per agent,
-  announced on hub, aggregate under ~24 GB.
-- **A mission turn lives for hours; nothing in the lane may cap it silently (2026-09-05).**
-  `chudcode_host` builds `RpcClient(max_event_history=CHUDWARE_CHUDCODE_EVENT_HISTORY,
-  default 1e6)` — the package default of 10 000 frames killed a 65-minute turn with "Event
-  history limit was exceeded". A turn whose last real event is a failed provider retry
-  (`auto_retry_end success:false` with no assistant output after it) returns
-  `ok:false, stop_reason:"provider_error"` even though Chudcode emitted a terminal
-  `agent_end`; `scripts/run_mission.py` exits non-zero on it. Hunter's `chud config` carries
-  `retry.maxDelayMs=1800000, retry.maxRetries=4` so a 429 with a 17-minute retry-after is
-  waited out instead of ending the mission; a retry-after above it ends the turn. Sim
-  ladders from one call are sequential, and the memory governor budgets
-  `min(CHUDWARE_MEM_FRAC×total, avail−CHUDWARE_HEADROOM_GB)` at solve time — an explicit
-  `sizes_mm` leg is coarsened to that budget, so free RAM (close builds/GUI) before a fine
-  leg rather than raising the fraction. The coarsening is a number, not prose (2026-09-07):
-  every result carries `mesh_quality.char_len_mm` (delivered size, null when no mesh
-  length exists), ladder rows carry `delivered_size_mm` beside the requested `size_mm`,
-  and the reply's `size_delivery` names legs outside 0.8–1.25× — the `.vtu` name still
-  carries the REQUESTED `h`. `min_size_mm` on `run_fea_static|convergence|contact` lowers
-  the size-band floor when a feature-resolution refusal names a size below it.
-- **Online turns have no implicit wall-clock cap (2026-10-03).** The GUI sends no
-  `timeout`; jobs, hostd and worker transports use `-1` for an unbounded reply wait.
-  Python waits in finite slices so Stop and process death remain observable. A caller's
-  explicit positive timeout still bounds the run; clients allow abort/reporting slack
-  (GUI +120 s, hostd +60 s). `run_mission.py --timeout-s 0` runs without a budget.
-  An agent-opened doc never takes viewport focus
-  from a user's own tab (`openMirrorTab`); the error card lists only tool failures the turn
-  never got past, parsed through `splitToolRowDetail`. OAuth account balancing is
-  sticky on the **Chudware session id**, not the resumed Chudcode history: a session id
-  pinned to an exhausted account keeps 429-ing after `chud usage` shows a fresh account —
-  resume the same `.jsonl` under a new `--session-id` (`chud dry-balance <model>` shows
-  where fresh ids land).
-- **An expired turn budget STOPS the run (2026-09-25).** `chudcode_host.run_turn` used to
-  return `Timed out waiting for agent_end` and leave Chudcode running: a GUI turn hit 7200 s
-  and the agent kept editing, saving and checkpointing the user's assembly for two more
-  hours with no UI attached and the run-scoped env gone. On `wait_for_idle` timeout it now
-  sends `abort()` once, waits ≤30 s for the terminal frame (under hostd's +60 s slack) and
-  returns `ok:false, stop_reason:"turn_budget"`; `worker_rpc` forwards `stop_reason` on
-  failures, and the GUI shows an amber "Turn time limit reached" card, not "System error".
-  A failure after streamed prose is APPENDED to `ChatMsg::text` (the error card renders
-  only `timelineProseTail`; replacing the text hid the card entirely).
-- **A steer splits the running bubble (2026-09-27).** The event and result drains feed the
-  LAST running assistant `ChatMsg`. A mid-run steer used to append only the user bubble, so
-  the rest of the run and its final reply streamed into the bubble ABOVE the steer with
-  nothing live below it. `composer.cpp::appendSteerToTranscript` closes the live bubble
-  (`steerSplit`, persisted `"split"`, exempt from the empty/summary placeholders), appends
-  the steer, then a fresh running bubble. Append-only: AI-VC `msg_idx` anchors never shift.
-  A steer carries the composer's attachments/context refs like a fresh turn (a picture alone
-  is a valid steer): `agent_steer {run_id, text, attachments?}` → `chudcode_host.steer` →
-  `_prompt_payload` images → Chudcode `steer(message, images)`. The control lane caps a
-  request at 64 KB, so images travel as paths, never inline bytes.
-- **The model picker has no default-hiding pass (2026-09-27).** The removed
-  `seedModelDefaultsOnce` ran on the unfiltered ~2,350-row catalog on 2026-07-23, hid by
-  bare id across providers and ranked dated snapshots above undated flagships, so every
-  model older than that day (gpt-5.6-*, claude-opus-4-8, gemini-3.1-pro …) vanished. The
-  catalog is now signed-in-only; `hidden_models` is purely the user's own Settings →
-  Providers choices. `loadSettings` drops a list that still carries the
-  `model_defaults_seeded` marker, and saving erases the marker.
-- **Agent edits reach the user's active tab live (2026-09-25).** `engine_events.cpp`
-  defers a `doc.changed` only while `userMidEdit` (sketch/PM preview). It used to defer any
-  dirty user-owned tab, and the first applied agent revision itself dirties that tab, so the
-  viewport froze for the rest of the turn. A revision with no `aicm_path` key (the
-  `with_tess:false` writers: `asm_add_component`, `asm_mate`, animation poses) keeps the
-  displayed mesh; only an EMPTY `aicm_path` means an empty document. Since 2026-09-27 the
-  active view then fetches the current mesh (`doc_activate` on `st.rpc`, single-flight per
-  doc via `core/tess_catchup.h`, drawn only when it matches the tree on screen): without it
-  an assembly's components stayed put through a whole mate/sweep stretch (36 revisions,
-  ~10 min) until the turn ended (`host/tests/test_tess_catchup.cpp`).
-- **`render_study_setup` figures are load-vector-specific (2026-09-07).** One arrow per
-  load entry through the engine frame, a bottom banner with resultant/direction/per-entry
-  vectors; multi-body docs paint (AICM face ids are per-body 1-based — `_mesh_topo_index`
-  offsets them into `doc_query`'s running numbering; the old last-body map silently
-  aliased body A's faces onto body B).
-- **Headless turns are `do_it` (2026-09-07).** `services/agent/preferences.py` owns the four
-  Copilot preferences (work_style/priority/privacy/…); the interactive default
-  `work_style=check_with_me` maps to plan mode and MUST NOT govern unattended callers.
-  `resolve_turn_preferences(cfg, headless=True)` is the one place that forces `do_it`; it is
-  used by `mission_dispatch.run_linear_role_turn`, `chudcode_roles._assemble_role_runtime`,
-  and `scripts/run_mission.py --mode` defaults to `agent`. When it leaked, three ME 490
-  mission turns produced only `blocked_by_mode` refusals. Phase 1 of
-  `docs/plans/AI_HARNESS_OVERHAUL_2026-09-05.md` deleted `effort_presets.yaml`, `ai_effort.*`,
-  `agent.prewalk_target`, `effort.resolve_effort`, `TierProfile.deliberation` and the council
-  threshold env readers — the Auto resolver (`preferences.py` §3.1 rules + bundled
-  classifier with keyword fallback) replaces the seat lookups; the per-role table stays.
-- **Auto's task kind never changes the mode (2026-09-24).** `TurnPreferences.mode` (the
-  user's work style / composer pick) is the only mode source; a `chat`-classified prompt
-  gets a cheap model, low thinking, depth 0 and no advisor, but NOT a read-only roster.
-  The removed `roster_mode` forced `ask` on every chat-kind turn, so "what's wrong with
-  the brakes?" in Agent mode ran as Ask and refused every edit
+  (cgroup kill instead of host abort; `ulimit -c 0` keeps the coredump pipeline out).
+- Sim memory budget formula and knobs: `core/util/resource_governor.h`. On a busy box
+  `avail − CHUDWARE_HEADROOM_GB` binds, so free RAM (close builds/GUI) before a fine leg
+  instead of raising `CHUDWARE_MEM_FRAC`. Agent runs: `CHUDWARE_SIM_THREADS=4`, at most one
+  >4 GB solve per agent at a time.
+
+## Engine and contract rules
+
+- `contracts/*`, `core/api/libchudware.h`, top-level CMake, `scripts/gate.sh`, `AGENTS.md`
+  are append-only and integrator-owned; subagents request edits instead of making them.
+- Additive/removal features in `core/doc/document.cpp` use `geom::fuse_unify`/`cut_unify`,
+  never plain `fuse`/`cut` (split coplanar faces read as "not fused").
+- Any change to compiled geometry/topology bumps `stepplus_cache_engine_key`. After
+  `./build.sh stage` an auto-spawned dev hostd serves the old engine until it drains — check
+  `chudware-hostd --status` before trusting an MCP smoke.
+- A geom op that rebuilds faces of an existing body records history
+  (`geom::op_history_record`, or `op_provenance_encode`/`_record` across
+  `isolate_shape_build`'s sidecar) or every rebuilt face is attributed to that feature
+  (`core/geom/op_history.h`).
+- `core/agent/run.cpp` calls doc ops in-process; every direct `doc::doc_new`/`doc_apply_ops`
+  site invokes the `chudware_set_doc_publish_sink` callback or its result is invisible to
+  clients until the run ends. `internal:true` keeps propagating (preflight shadow clone).
+
+## hostd / daemon lifecycle
+
+- **Never stop a hostd you did not spawn** or one serving the user's GUI/agent children.
+  Run `chudware-hostd --status` first. Semantics (`core/hostd/main.cpp`): bare `--stop`
+  refuses while agent children run; `--force` stops them (TERM → grace → KILL); a dead
+  control socket with a live pidfile escalates SIGTERM → 3 s → SIGKILL.
+- **Work, not sockets, keeps hostd alive.** Idle-exit and drain gate on `pinningClients()`,
+  never raw `status_.clients`: a `gui` client always pins; others pin only with an engine call
+  in flight, an attached doc, or an RPC inside the idle window
+  (`test_hostd_registry.py::test_parked_client_does_not_pin_the_daemon` + `…_attached_client_still_pins_the_daemon`).
+- **Drains are bounded.** `Server::beginDrain(deadlineSecs)`: `daemon_drain`/`--stop`/tray
+  Quit/SIGTERM are hard stops with a deadline (`CHUDWARE_HOSTD_DRAIN_GRACE_S`, default 20 s;
+  tray Quit 5 s). The stale-binary self-drain passes `0` (soft; refuses new connects only),
+  so a rebuild never kicks a live session.
+- **Doc-GC** (`core/hostd/doc_registry.*`): `CHUDWARE_DOC_GC_GRACE_S` (90 s); agent/mcp-origin
+  docs floor at `CHUDWARE_DOC_GC_AGENT_GRACE_S` (1800 s) so mission parts stay openable while
+  the GUI exists; `CHUDWARE_DOC_GC=0` disables. The grace never pins the daemon; a clean exit
+  discards — recovery is crash-only (`test_clean_shutdown_discards_docs`).
+- **Worker lanes** (`WorkerBridge::forMethod`, `core/hostd/worker_bridge.cpp`): a new stateful
+  agent RPC family joins the agent-lane prefix list or lands in a process blind to Chudcode
+  sessions. Files shared across worker processes need flocks, not threading locks.
+- **Nothing waits behind a turn.** `WorkerBridge::stop()` cancels the active run over the
+  control lane, waits ≤10 s, SIGTERMs, never respawns (`test_sigterm_mid_turn_ends_the_turn_and_the_daemon`).
+  A non-turn call behind `agent_admin_turn` fails at once with `worker_lane_busy`; other lane
+  waits end at the call's own timeout (`test_agent_lane_call_behind_a_turn_fails_fast_and_hostd_survives`;
+  `provider_usage.cpp` treats busy as silent). hostd never replays an `agent_admin_turn` after
+  worker loss (`worker_lost_mid_turn`).
+- **No GUI call waits on a turn client-side.** In daemon mode long runs
+  (`agent_admin_turn`/`agent_run_v2`/`agent_mission_v1`) serialize on
+  `WorkerClient::longRunMtx_`, not `callMtx_`; two long runs never overlap (`test_worker_long_run`).
+  An async tab switch stays selected until activation lands or fails (`core::SwitchHold`, `test_switch_hold`).
+- **CEF fetch daemon** (`host/src/ui/widgets/cef/cef_daemon.cpp`): `start_idle_watchdog` is
+  armed before `initialize()`; every activity update goes through `mark_activity()`. Spawn is
+  single-flight with the spawned pid recorded and verified (`services/browser/cef_client.py`
+  `_daemon_alive`); concurrent and sequential spawners yield exactly one process. A CEF-OFF
+  build claims and refuses `--cef-*` argv with the `std::fflush(nullptr); std::_Exit(n)` tail
+  (`host/src/main.cpp`), never a plain `return`.
+- GUI reconnect: sticky unreachable chip; `engine_events` re-bootstraps tabs on
+  `reconnectGeneration` (`CHUDWARE_SHOT=daemon_h2`).
+
+## Documents, saving, selection
+
+- **hostd is the only autosave authority in daemon mode**; the guard sits at the single write
+  in `cad_common._autosave()`, not its callers. The standalone MCP server keeps snapshots.
+- **Mission docs are saved, never closed.** `cad_common.save_touched_docs()` runs at every
+  turn terminal (`mission_dispatch.run_linear_role_turn`) and in the crash-path `finally`
+  (`worker_rpc._agent_admin_turn`), writing docs hostd would retire into
+  `CHUDWARE_PROJECT_SAVE_DIR`. It never touches `origin_kind=gui`, never writes an empty doc,
+  skips pristine reproducible imports (`reproducible_from`) and docs recorded in
+  `_DISCARDED_DOCS`.
+- **One design = one document; names carry no version.** A version token resumes the series
+  (`_docs_in_version_series`; `fresh=True` escapes) and `_strip_version_suffix` normalizes all
+  three `doc_new` mint payloads. Series lookups see the raw name; the strip is skipped when a
+  doc of that exact name is open (`test_exact_name_match_still_goes_through_the_engine_mint_lock`).
+  `sanitize_part_name` (`core/agent/run_stop.cpp`) mirrors the token set — keep in lockstep.
+- **Save paths.** `save_part`/`export_part` with no path go to `CHUDWARE_PROJECT_SAVE_DIR`
+  (temp only for headless external MCP clients with no project); a doc already in a real
+  `.step+` saves in place; an explicit path removes the harness's own stale root copy
+  (`_HARNESS_SAVED_PATHS`, `removed_stale_copy`). `save_part` refuses
+  `path_open_in_user_tab` over a file a user-opened doc holds (`cad_common.user_doc_open_at`):
+  the agent edits that doc in place. Empty docs refuse save/export unless `allow_empty`.
+- **PLM tools.** `plm_item_add` is for non-design files (`.step+`/`.ecad+` auto-register on
+  save → `plm_checkpoint`); its `path` is the project root, the tracked item goes in
+  `file_path`/`folder_path`. `plm_*` default `path` to `CHUDWARE_PROJECT_DIR` →
+  `CHUDWARE_FS_ROOT` → `project_context.resolve_project_root()`, else
+  `project_root_unavailable`; document-scoped AI-VC ops take no project root.
+- **The user's view.** An agent-opened doc never takes focus from the user's tab
+  (`openMirrorTab`). Agent edits reach the active tab live: `engine_events.cpp` defers
+  `doc.changed` only while `userMidEdit`; a revision without an `aicm_path` key keeps the mesh
+  (only an empty `aicm_path` means empty) and the active view catches up via
+  `core/tess_catchup.h` (`test_tess_catchup`). A part the agent is editing stays selected.
+- **Chat sessions follow the workspace of their latest turn.** `bindActiveConversationProject`
+  restamps `Conversation.projectDir`; `index.json` v3 keeps `active_by_project`; Sessions
+  filters the stored key (never a draw-time scan). On a workspace switch
+  (`followProjectActiveConversation`) a session from another project never stays in view.
+- **Steers split the running bubble** (`composer.cpp::appendSteerToTranscript`, persisted
+  `steerSplit`/`"split"`): append-only, so AI-VC `msg_idx` anchors never shift.
+- The model picker has no default-hiding pass: `hidden_models` is only the user's own choice;
+  `loadSettings` drops a list carrying `model_defaults_seeded`.
+
+## CAD-side agent policy
+
+- **Headless turns are `do_it`:** `resolve_turn_preferences(cfg, headless=True)` is the one
+  forcing site (mission roles, `chudcode_roles._assemble_role_runtime`, `run_mission.py
+  --mode agent`). The interactive `check_with_me` default never governs unattended callers.
+- **Auto never changes the mode.** `TurnPreferences.mode` (user pick) is the only mode source;
+  a chat-classified prompt gets cheaper settings, not a read-only roster
   (`test_chat_classified_question_keeps_the_agent_mode_the_user_picked`).
-- **Buckling and steady thermal are engine-native (2026-09-07).** `run_fea_buckling` = static
-  prestress → geometric stiffness → reciprocal pencil `K_G φ = μ K φ` (Spectra Cholesky on
-  the shared modal factor); `max_load_factor` (default 1e4) is an engineering ceiling: the
-  LDLT inertia of `K_G + K/λ_max` counts the modes below it exactly, zero → refusal naming
-  the ceiling (a clamped tension bar legitimately has local compressive Gauss stresses).
-  `run_fea_thermal` steady runs `fea_thermal_solve` on the part mesh (the CalculiX box proxy
-  is gone; ccx remains only as V&V cross-check elsewhere). Known mesher defect: a 10×10×200
-  bar at h=4 yields 205 504 tet10 (thin_wall_ratio 17.1) vs 2700 structured. `placement_source`
-  persists in doc meta `placement_sources` (inside `.step+`); `scripts/provision_venv.sh`
-  builds `.venv-mcp` from `requirements.txt` (+ `CHUDCODE_RPC_SRC` editable).
-- **Contact studies model joints, not meshes (2026-09-08..10).** `run_fea_contact` /
-  `run_fea_static` take `material={"per_body":{ordinal|name: …},"default":…}` (uint16
-  element→material index; FoS against each element's own yield; penalty uses the softer
-  body) and `interfaces={"bonded":[[a,b]],"contact":[[a,b]],"free":[…],"default":…}` —
-  press fits are bonded, running clearances are contact, declared pairs stay unfused and
-  only contact pairs are refined (band depth ≤ 3h). `contact.resolution.mode` is
-  `closed_fit` when a measured clearance is below h/4 (initially-closed conformal fit,
-  opens under tension; `closed_fit=false` restores the resolve-or-refuse rule).
-  `penalty_scale` / `max_iterations` are args. The active set uses hysteresis (`tol_g`
-  1e-3·h, `tol_f` 1e-4·|R|/n) and one union step on a 2-cycle; packet
-  `contact.active_set{iterations,cycles_broken}`. A contact pair whose normals all share a
-  sign against the load is refused by name (`normal_cone_excludes_load`, with the arc and
-  normal range) before any solve — the ME 490 bushing was an 87° open saddle. A delayed
-  refusal keeps its diagnostics in the job result.
-- **The governor measures, it does not extrapolate (2026-09-09).** Element counts come
-  from half-octave probes (`measured_octave`), first forecast p=1, never more than one
-  octave from a measured probe; `provenance.governor{estimate_gb, measured_probe, probes,
-  model}` on every packet and `sim_mesh` reply. The old `105·A_bbox/h²` envelope said a
-  thin wheel slice at h 2.84 needed 6.8 M tet10 / 2061 GB; measured: 227 k at h 4. Real
-  counts are non-monotone in h on thin parts. sim_cache namespace is `/5`.
-- **Angle mates with a hinge line are revolutes (2026-09-09).** `asm_mate value={"value",
-  "axis","axis_point"}` (WORLD line, converted once to the reference component's local
-  frame) binds the other five DOF: `residual_dof 0`, mechanism `dof 1`, `simulate_motion`
-  sweeps a bore-less body. A reference face normal parallel to the axis gets a
-  deterministic perpendicular datum; a residual builder that throws is `ok:false,
-  reason:mate_unresolved`, never "converged". `sweep_envelope` / `steering_turning_radius`
-  transport the reference WORLD-shape bounds by the relative placement (the local AABB
-  square spun through a wheel's free axle spin put wheels 109 mm underground).
-  Native mates persist engine-owned `reference_frames` at creation/first legacy
-  compilation. Derived angle datums, virtual pins and lock rest poses use these
-  frames, never solved-placement writeback or warm seeds. Scalar edits and
-  save/reopen must not redefine zero; exact-current-value sweeps must not apply
-  the current angle twice. Legacy binding preserves first-observed interpretation,
-  not a reconstructed original datum.
-- **Assembly loading retains geometry, not discarded component display packets (2026-09-13).**
-  `compile_document(..., quality, with_display=false)` is the assembly-only lane:
-  it keeps exact per-body Fine triangulation through shared `geom::mesh_body`, but
-  skips AICM extraction/serialization and display stats. The default remains true;
-  compile-cache identity includes the mode. Do not remove the initial meshing:
-  compound-relative deflections can otherwise coarsen small bodies. Selective
-  `stepplus_read_document` / `stepplus_open_component` avoid unrelated ZIP payloads;
-  ordinary editable `stepplus_open` still preserves them. Session assembly display
-  reuse keys on result identity, revision, quality and explode state. A
-  `preserve_path` save republishes the same handoff URI from a scratch session, so
-  it must invalidate the live display cache even without a revision change.
-- **Assemblies report honestly (2026-09-08).** `doc_bbox` / `eval_mass` / native import
-  gather assembly world solids; `describe_part` states the body count; `save_part` /
-  `export_part` refuse an empty document (`allow_empty`); `check_interference` refuses an
-  EMPTY document and reports `pairs_checked` (one body is a no-pair success — the
-  members-filter contract). `import_part` of `.step+` is a fresh detached document
-  (`resume=True` opts in) with a real import feature; nested path-backed assemblies load
-  recursively; `validated: true` requires every component to contribute solids and an
-  exact round-trip count (`components:[{name,solids,source}]`). The MCP mass tool is
-  `measure_part(density_g_cm3=)`; `eval_mass` is engine-internal. A `doc_solve_mates` that
-  moves nothing beyond solver tolerance is not an edit (2026-09-24): revision, dirty and
-  undo stay put, so `describe_assembly` never dirties a user's solved assembly.
-- **Refuse before you mesh; never go silent (2026-09-10).** Contact geometry preflights
-  (interface classification, selector span, normal cone from CAD face normals) run before
-  any fill — the open-saddle refusal takes ~1 s with 0 elements where it used to burn 45
-  min in `local_refine_tets`. Governor probes mesh the BACKGROUND only; the interface
-  band is filled once at the delivered size and its measured count enters admission.
-  Every sim job writes native phase events + a 30 s heartbeat to `partial.json`
-  (atomic); `get_job` keeps the last record. Silence > 60 s is a defect. `add_features`
-  `mode:"new"` / `merge:false` is an independent body never booleaned with existing
-  geometry; `add`/boss fuse only with bodies they touch; unknown modes refused by name;
-  `centered:false` primitives are not offset by their padded bbox.
-  `project_external_refs` resolves against the whole document, not the last body.
-- **Ladders share their probes; meshes deliver the size you asked for (2026-09-11).**
-  `run_fea_convergence` carries the measured probe table across legs (leg k's count is
-  leg k+1's anchor); every row has `delivered_size_mm`, `provenance.governor` and a named
-  reason; `degenerate_ladder` names `memory_admission` / `feature_resolution` /
-  `size_band_floor` / `probe_time_budget`; falling DOF invalidates convergence.
-  `mesh_quality.underresolved_wall{min_wall_mm, elements_across}` + a summary caveat when
-  < 1 element spans a wall. Explicit-h bbox forecasts are diagnostic, never coarsening
-  instructions. Mesher (Polyhedral-FEA `e66efe4`): local CAD size fields (no global
-  curved-area halving, no crease bands on straight edges), parents refined BEFORE
-  projection, LEB ceiling from the governor, pitch `p = h/√2`, boundary-collision sliver
-  collapse + a global collapse-only pass below Jacobian 0.034;
-  `mesh_quality.size_band{applied_floor_mm,reason}` and `edge_mm{min,median,max}`. Bar
-  10×10×200 at h=4: 205 504 → 6 912 tet10. Known: curved-rim feature-segment fidelity
-  (upstream test 266, plate 0.092 > 0.09, cylinder 0.310 > 0.20 — needs rim-chain
-  topology, two designs rejected for regressing pin quality/contact); brake isolate at
-  h 8 bulk Jacobian 0.029. `boundary_faceset_membership` admits a facet only when every
-  corner passes (chamfer facets bled midside nodes into a cylinder pressure set).
-  `transform` MOVES its body (`copy:true` duplicates; a consumed owner is a named
-  refusal); assembly transforms compose with placements; `set_suppressed` takes component
-  ids on assembly docs. Sim job `_reconcile` observes exit before reading `result.json`.
-- **Chat sessions are keyed by the workspace of their latest turn (2026-09-26).**
-  `Conversation.projectDir` starts at `convProjectDir(st)` (= `st.workspaceDir`, else
-  `plmProjectPath()`), then `bindActiveConversationProject` restamps it to the actual
-  `workspace_dir` sent on each turn. `index.json` v3 keeps `active_by_project`; Sessions
-  filters the stored key (never a live artifact scan) and adopts headless Chudcode
-  `*.jsonl` files from the Sessions dir. Do not re-derive membership at draw time.
-  On a workspace switch (`followProjectActiveConversation`) the entered project's
-  remembered session is reselected; if it has none, a session from another project never
-  stays in view — `newConversation` opens one scoped to the entered project (2026-10-03).
-- **An agent's sim is a study the user can open (2026-09-28).** `run_fea_*` and
-  `simulate_motion` persist their study into the doc (`_persist_study`; motion stores inputs
-  only, keyed by driven mate names) and hostd fans `sim_study_*` mutations as
-  `doc.studies_changed` so an open Simulation tree re-pulls. A new agent sim tool must persist
-  the same way, or the user cannot see what the agent verified.
-- **Sim results are evidence-grade or they are not results.** `sim_run_static|adaptive|modal|
-  thermal` emit top-level `mesh_quality`, `reactions` (static/adaptive), `provenance`
-  (`engine_build_id`, `polymesh_commit`) and honour `study.vtu_path`; `sim_cache` schema `/3`.
-  `run_fea_convergence` → `sim_evidence_packet` → `polymesh_cli` (mm STEP ⇒ `--scale 0.001`)
-  is the release path in `simulate/SKILL.md`. Keep new fields TOP-LEVEL siblings of `summary`.
-- **Assembly merges go through `assembly-merge/SKILL.md`.** Import features take
-  `keep_bodies`/`exclude_bodies`; `fit_cylinder_axis` samples the true surface; components
-  carry `placement_source` and exports warn `placement_unverified` until `check_interference`
-  runs. Hand-editing STEP/JSONL text is a hard-rule violation for agents.
-- **Mission docs are never CLOSED, only SAVED** (2026-08-05). T-RF5 deleted
-  `services/agent/loop.py`'s `_terminal_autosave_close_docs` and C++ never re-implemented
-  it: `core/agent/run.cpp` only `doc_save`s the doc a DAG node is on, with zero
-  `doc_close`/`doc_discard`. So every doc a run builds stays open, the GUI only *detaches*
-  un-adopted AI mirror tabs on exit (`host/src/app.cpp` ~7069), and hostd's retire tier
-  turned each unsaved one into a "Recover unsaved parts?" row (eight in one second on a
-  real machine). Closing them is NOT the fix — it destroys the mirror tab the user browses
-  after a run, which is why agent-origin docs get the 30-min GC floor. Instead
-  `cad_common.save_touched_docs()` runs at every turn terminal
-  (`mission_dispatch.run_linear_role_turn`) and in a `finally` on the crash path
-  (`worker_rpc._agent_admin_turn`), writing anything hostd would retire
-  (`path.empty() || dirty || autosave path`) into `CHUDWARE_PROJECT_SAVE_DIR`. It NEVER
-  touches `origin_kind=gui` and never writes a file for an empty doc. Only `new_part` and
-  `add_features` project-save on their own — every assembly and every `edit_feature` /
-  `set_material` / `asm_*` mutation depends on this sweep. Since 2026-09-24 a pristine
-  import of a file still on disk (engine `doc_list.reproducible_from`) is neither swept
-  (`skipped: reproducible_import`) nor autosaved/retired by hostd — GC just closes it.
-  A `close_part(discard=True)` that hostd degraded to a detach is recorded
-  (`_DISCARDED_DOCS`, keyed with the doc's path) and the sweep skips it (`discarded`);
-  it once wrote a discarded stale Wheel End back over the rebuilt file.
-- **In daemon mode hostd is the ONLY autosave authority** (2026-08-27). The daemon-mode
-  early-return lives in `cad_common._autosave()` — the single write — not at its callers.
-  It used to sit on the two aggregate entry points (`_autosave_all_open`,
-  `start_periodic_autosave`) while the ~7 per-tool call sites had none, and each ungated
-  write repointed the live doc's `path` outside hostd's recovery tier and cleared `dirty`,
-  which silently defeats `gcCloseDoc`'s retire-if-unsaved gate (`isAutosavePath` only
-  recognizes hostd's own dir) — an abandoned, never-delivered agent doc got closed without
-  ever reaching the orphan tier. Keep the guard at the write; the standalone (non-daemon)
-  MCP server still needs the snapshots.
-- **Refine cap (WI-10) is live** for non-frontier tiers: `scaffolds.should_stop_refine` is
-  called at the tail of `agent_turn.run_turn`'s loop and stops with the `refine_cap`
-  stop_reason. A "round" is geometry re-worked AFTER the model itself declared the build
-  finished (`_GEOMETRY_SETTLERS` = verify_battery / save_part / export_part), so a first
-  build is never counted however many features it takes. Do NOT add describe_part /
-  measure_part / render_part to the settlers — models interleave them, and A's limit of 1
-  would then cap a normal part at one feature.
-- **One design is one document, and its name never carries a version.** An iteration is a
-  REVISION, never another doc. A version bump (`part_v4`, `-rev2`, `gen3`) RESUMES the
-  series in `new_part` / `new_assembly` / the `add_features` `{"op":"new_part"}` batch head
-  (`_docs_in_version_series`); `fresh=True` is the only escape. And since 2026-08-05 the
-  token never reaches a document at all: `cad_common._strip_version_suffix` normalizes the
-  name in all three `doc_new` MINT payloads, so `new_part("holster_v1")` mints `holster`
-  even on a first-ever call and even with `fresh=True`. Two rules bind any change here:
-  the resume/series lookups must keep seeing the RAW requested name, and the strip is
-  SKIPPED when a doc of that EXACT name is already open — that call is the engine's own
-  `resume_if_open` match, which keys on the name verbatim, so stripping there mints a
-  duplicate instead of resuming (pinned by
-  `test_exact_name_match_still_goes_through_the_engine_mint_lock` and two twins).
-  `core/agent/run.cpp`'s `sanitize_part_name` (in `run_stop.cpp`) mirrors the same token
-  set for the mission lane — keep the two in lockstep. Every extra mint costs a tab, a
-  project `.step+`, its own AI-VC chain (keyed by `doc_id`), its own auto-registered vault
-  item (`services/plm/vault.py` rglobs the project on save), and a recovery row.
-- **Chudcode is the only online agent/provider runtime (2026-08-31).** Every online
-  top-level `core/agent/run.cpp` request becomes services-worker `agent_admin_turn`;
-  `worker_rpc._agent_admin_turn` assembles the CAD role prompt and run-scoped host tools,
-  then `ChudcodeSessionHost` drives the persistent protocol-v2 RPC session. Chudcode owns
-  nested agents, providers, auth, models, session history, memory, compaction/retry/cache,
-  browser/computer, and STT. Native C++ provider execution is only the explicit offline-safe
-  local modeling fallback. Never add a second online provider loop or an external MCP hop.
-- **One conversation owns one persistent Chudcode process.** A session may be seeded once
-  from `chudcode_session_file`; changing that file while the session is live is an error.
-  Session count is bounded (`CHUDWARE_CHUDCODE_MAX_SESSIONS`, 8 default/32 hard max), and
-  LRU eviction may dispose only an idle session. `chudcode_close_session` is idempotent:
-  abort active work, dispose the process, preserve the persisted file. Worker shutdown
-  disposes every saved-session and transient client.
-- **Control cannot share the blocked stdio lane.** `services/worker_main.py` starts the
-  authenticated `chudcode_control.ControlServer` and exposes its endpoint/token only through
-  `worker_control_info`. Cancel, steer, and status use that private Unix socket (POSIX) or
-  random loopback TCP endpoint (Windows), so Stop remains live during a synchronous
-  `agent_admin_turn`. Never log or echo the token; malformed, oversized, repeated-auth, and
-  oversized-response paths stay bounded.
-- **`plm_item_add` is for NON-design files only.** `.step+`/`.ecad+` are auto-registered by
-  `vault._explode_project_into_shadow` on every save/checkpoint, so `Vault.add_item` can
-  never succeed on one — that rejection now runs FIRST and points at `plm_checkpoint`. Its
-  `path` is the PROJECT ROOT (unlike every sibling tool, where `path` is the target); the
-  thing being tracked goes in `file_path`/`folder_path`. Role cards must not tell a model to
-  register "what you changed" without that carve-out; that phrasing cost four dead calls.
-- **The agent's in-process doc ops publish** (2026-08-05). `core/agent/run.cpp` calls
-  `doc::doc_new`/`doc::doc_apply_ops` directly, bypassing `Server::dispatch` and therefore
-  `DocRegistry` — so nothing it built was visible to any client until the run ended. Every
-  such call site now invokes the `chudware_set_doc_publish_sink` callback (armed by
-  `Server::dispatch` for `agent_*`), which drives the same `registry_.postCall` a socket
-  `doc_new` would. Add a publish call beside any NEW direct doc op you introduce there, or
-  it is invisible again. `internal:true` must keep propagating (preflight shadow clone).
-- **Chudcode event mapping is single-display and terminal-strict.**
-  `services/agent/chudcode_events.py` is the only RPC-frame → Chudware-feed mapper.
-  Streamed deltas are the only visible assistant text; message-complete envelopes are
-  lifecycle records and must never replay final text. Preserve `text` versus `thinking`
-  channel order, and do not treat an empty text flush as a thinking boundary.
-- **Tool events correlate by the Chudcode call id.** Start/progress map to status only;
-  terminal result/cancel maps once to `agent.tool_call`, carrying bounded previews, digests,
-  outcome and usage. A synchronous `host_tool_call` with a result is already terminal.
-  `RpcFrameState` carries start args/intent into terminal cards and unwraps `xd://` write
-  content for the actual target; `read xd://` only inspects tool docs. Unknown frames
-  become deterministic bounded `sub_run` rows, not guessed successes; provider usage emits
-  both `agent.provider_usage` and `agent.context`.
-- **A turn is not complete merely because the process is idle.** `run_turn` requires a
-  terminal `agent_end`; ending without it is a protocol error. Event-forwarding failure
-  fails the turn. Cancel before prompt is a valid cancellation; cancel after prompt calls
-  `abort()` at most once. Identical steering is idempotent, and steering received before
-  prompt start queues for immediate delivery after the prompt.
-- **`plm_*` tools default their `path` to the resolved project root** (2026-08-05):
-  `CHUDWARE_PROJECT_DIR` → `CHUDWARE_FS_ROOT` → `project_context.resolve_project_root()`,
-  explicit argument still wins, `project_root_unavailable` when nothing resolves. Three
-  separate live runs died at the tail because the model had no way to know that root. The
-  document-scoped AI-VC ops (`plm_timeline`/`plm_rollback`/`plm_rollback_check`) take no
-  project root and are deliberately excluded.
-- **`save_part`/`export_part` with no path go to `CHUDWARE_PROJECT_SAVE_DIR`.** The temp
-  fallback survives ONLY for headless external MCP clients with no project. A
-  `chudware_mcp_*` basename is also dropped by the artifact allowlist as internal scratch,
-  so a scratch save is invisible in the GUI as well as misplaced. Since 2026-09-24 a bare
-  `save_part` of a doc that already lives in a real `.step+` saves IN PLACE, and an explicit
-  `save_part(path=…)` deletes the root copy the harness itself placed for that doc
-  (`cad_common._HARNESS_SAVED_PATHS`, only when it is the doc's current file) and reports
-  `removed_stale_copy` — a live run left five `<Stem>.step+` duplicates in the project root.
-  Since 2026-09-27 `save_part` REFUSES (`path_open_in_user_tab`, naming `open_doc_id`) to
-  write a document over a file another, user-opened doc (hostd `origin_kind:"gui"`) holds:
-  one design is one document, so the agent edits the user's open doc in place and the tab
-  updates live. A run rebuilt the arm as a new assembly and saved it over the user's open
-  `sixaxis_arm.step+`; the tab showed rev C for 80 min and saving it would have reverted the
-  file (`cad_common.user_doc_open_at`).
-- **Nested agents remain inside Chudcode.** CAD owns the role/council/mission/governance
-  context and the host-tool surface, but does not run a nested provider loop. Session,
-  subagent, retry, compaction, todo, and usage events are mapped back into the existing
-  Chudware feed contract; do not synthesize success when Chudcode reports failure.
-- **Session recovery is a service boundary, not file surgery.**
-  `chudcode_export_session`, `chudcode_branch_session`, `chudcode_repair_session`, and
-  `chudcode_close_session` call the live runtime. Export uses Chudcode HTML export;
-  branch uses a real entry id; doctor is bounded and `repair:true` uses Chudcode's
-  backup-producing repair workflow. Never hand-edit persisted session JSONL.
-- **The main chat includes ordinary sourcing (2026-09-26).** The online `general_agent`
-  advertises `tool_categories.MAIN_CHAT_CORE_TOOLS`, including `part_search`, `part_get`,
-  `part_source`, `match_model`, `make_standard_part`, `fetch_cad_model`,
-  `import_artifact` and `simulate_motion`. `mission_dispatch._apply_session_preferences`
-  appends the MORE TOOLS menu naming every other registered tool by group. Load specialty
-  tools via `enable_tools(tools=[...])` / `enable_tools(categories=[group])`, resolved by
-  `resolve_tool_requests` (group → pack → `family:` → exact name); unknown tokens are
-  reported. Do not move the whole registry into core; `run_shell` remains menu-only.
-- **Research is not CAD progress (2026-09-26).** `progress_watchdog.ProgressWatchdog`
-  counts completed research calls; after 12 calls or 6 minutes without a successful CAD
-  mutation it steers once per stall, at most twice per turn. `read xd://` is not a mutation.
-  `chudcode_host.run_turn` disables it for Ask/Plan and `plan_only`. For multi-part
-  mechanisms, `roles/general_agent.yaml` directs `design/layout.md` first, one saved
-  editable part at a time, mates at every joint, then `simulate_motion` sweeps.
-- **Source real geometry before guessing (2026-09-26).** `core/parts/catalog.cpp` and
-  `generate.cpp` provide the sourced `hobby_servo` family (SG90/MG90S/MG996R/MG995/
-  DS3218/micro_9g); `core/api/libchudware.cpp::parts_make_impl` exposes its
-  `output_axis` datum. `services/mcp/parts_tools.py::fetch_cad_model_impl` imports
-  direct HTTPS CAD or supported model pages and saves provenance beside the file in
-  `<project>/reference/`; `services/browser/adapters/printables.py` gets guest files
-  through public GraphQL, whereas MakerWorld/GrabCAD may return `login_required`.
-  `services/research/fetch_page.py` retries JS shells with rendered content; web search
-  must report DDG challenges as `provider_blocked` and empty results as `no_results`.
-- **Sub-agent status is evidence-based (2026-09-26).** `subagent_registry.list_sessions`
-  reconciles owner PID/start time and heartbeat to terminal `abandoned`, never by live
-  process age alone. Records carry a run project root; `subagent_list{project_dir}`
-  excludes missing or different project ownership. In mixed pytest collections root
-  `conftest.py` isolates non-MCP engine tests per test; `services/mcp/conftest.py`
-  opts its daemon tests out at collection.
+- **Refine cap** (`scaffolds.should_stop_refine`, tail of `agent_turn.run_turn`, stop reason
+  `refine_cap`) counts only geometry reworked after a settler (`_GEOMETRY_SETTLERS` =
+  verify_battery/save_part/export_part). Never add describe/measure/render to the settlers.
+- **Prompt overrides stay split:** core prompts read `appdata/prompts/<id>.md`, YAML mission
+  roles `<id>.mission.md` (`core:`/`mission:` in Settings); overlapping ids have incompatible
+  output contracts. `system_prompt` replaces role prose but keeps harness base/capability/
+  tools/skills/output enforcement.
+- CAD skill packs live in `services/agent/skills/builtin/<name>/SKILL.md` and reach agents
+  only via `cad_skill(name)` (e.g. `simulate`, `assembly-merge`). Agents never hand-edit
+  STEP/JSONL text.
+- **Visual review is numbers first, then one planner grid.** `render_part` without `view`
+  returns one 2×2 grid chosen by `services/mcp/shot_planner.py` from native
+  `doc_view_metrics` (x-ray/section tiles for hidden targets; SID face tags accepted
+  verbatim); explicit `view=` stays one shot. Keep image blocks end to end
+  (`services/agent/tool_images.py`); never re-add render-after-every-mutation. Append new
+  candidate kinds inside `plan_shots`, never in `candidate_cameras`/`section_candidates`
+  (replayed by index).
+- **ViewNet training is LLM-free** (owner decision): no VLM/LLM calls in
+  `training/viewpoint/**`; observer queries carry no geometry (`blind`/`qvec_probe` rows sit
+  at majority). Launch via `campaign.sh service [stages]`, never edit `campaign.sh` while it
+  runs, write artifacts via `training/viewpoint/durable.py` (fsync before rename).
 
-- **Tool floors stay CAD-authoritative.** Preserve allowlist tri-state: `None` is
-  unrestricted, explicit `[]` is restricted to live floors, and a non-empty list is an
-  ordinary restriction. `chudcode_tools._effective_names` unions on-demand loads BEFORE the
-  mode policy so a user-picked Ask/Plan stays read-only whatever the model loads; Plan is
-  "the agent set minus mutators and fs_write/fs_edit/run_shell", not the contract's broad
-  PLAN_TOOLS. Then meta/bug-report/`verify_battery` floors, then advertise and dispatch the
-  exact same effective set.
-- **Host-tool registration is an adapter, never a second catalog.**
-  `chudcode_tools.build_host_tools` derives names, descriptions, schemas, load mode and
-  handlers from the live MCP/mission registries. Do not advertise unbound or async-only
-  entries. Chudcode builtin names (`read`, `edit`, `bash`, `browser`, `computer`, `task`,
-  etc.) remain Chudcode-owned unless a CAD entry explicitly claims ownership.
-  Model-facing resource selectors that share a harness context name (e.g. workspace/DAG
-  `run_id`, graph/taxonomy `node_id`) declare `@model_selectors("run_id")` from
-  `services.mcp.tool_registry` below `@mcp.tool()` or on the mission handler. Omission
-  keeps the tool's own semantics; ledger/mission context parameters stay injectable.
-- **Every host call still crosses CAD's chokepoints.** Before execution:
-  policy refusal → cancellation → mission/run dispatcher → scaffold and guardrail checks →
-  `agent_turn._dispatch_tool` loop guard/accounting. Preserve document context injection,
-  progress and cancellation callbacks, JSON-safe results, and machine-readable refusal
-  shapes. Tool exceptions propagate as Chudcode tool errors; never turn them into a
-  successful result.
-- **There is no classification step (2026-09-03).** A chat send is ONE Chudcode
-  `general_agent` turn with the user-picked mode (Agent | Plan | Ask, `CopilotMode` 0/1/2)
-  and `options.scope = {doc_id, feature_ids, selection}` whenever a document is open (rendered
-  as the ACTIVE DOCUMENT block by `worker_rpc._editor_context_block`). The composer never
-  keyword-routes (no `agent_ask_v2`/`agent_simulate_v1`/auto-mission/edit-scope paths), never
-  creates or replaces a document (that is the agent's `new_part` decision), and never inlines
-  the transcript into the request (the persistent Chudcode session is the conversation;
-  `options.history` seeds a fresh one once). The GUI has no Routing card and no session
-  `scopeClass`; do not reintroduce `task_route`/`agent.classification` consumers. The offline
-  exception is deterministic: general work refuses without an online provider, while
-  offline-safe local modeling may use the native C++ pipeline (which keeps its own
-  complexity/domain classification for its stage structure). Explicit Chudware mission/DAG
-  policy remains CAD-owned but its provider calls run through Chudcode.
-- **Prompt override isolation (2026-08-07):** native/core C++ prompts consume
-  `appdata/prompts/<id>.md`; YAML mission roles consume
-  `appdata/prompts/<id>.mission.md`. Settings catalogs both as `core:<id>` and
-  `mission:<id>`. Never collapse them: overlapping ids such as reviewer/fixer have
-  incompatible output contracts. The top-level `system_prompt` setting intentionally
-  replaces role prose but still receives harness base, capability, tools, skills, and
-  runtime output enforcement.
-- **Shutdown follows ownership.** `core/hostd/worker_bridge.cpp` owns the persistent
-  services worker. Its clean-shutdown path stops that worker; `worker_main.stop_services`
-  first closes the private control server, then `chudcode_shutdown()` disposes all live and
-  transient RPC clients. Keep process-tree termination bounded and never leave a session
-  process detached from its owning worker.
+## Simulation and assemblies
 
-## Commit / push template
+- **Evidence-grade or not a result.** Sim outputs carry top-level `mesh_quality`, `reactions`
+  (static/adaptive), `provenance` (`engine_build_id`, `polymesh_commit`, `governor`) as
+  siblings of `summary`; ladder rows carry `delivered_size_mm` and a named reason
+  (`degenerate_ladder`); `size_delivery` names legs outside 0.8–1.25× (the `.vtu` name keeps the
+  requested `h`); under-resolved walls get `mesh_quality.underresolved_wall` + caveat;
+  `min_size_mm` lowers the size-band floor when a refusal names a smaller size. Release path:
+  `simulate` CAD skill (`run_fea_convergence` → `sim_evidence_packet` → `polymesh_cli`).
+- **The governor measures, never extrapolates:** element counts come from probes
+  (`provenance.governor`), shared across ladder legs; explicit-h bbox forecasts are
+  diagnostics, never coarsening orders.
+- **Refuse before meshing; never go silent.** Contact preflights (interface classification,
+  selector span, `normal_cone_excludes_load`) run before any fill; every sim job writes phase
+  events + a 30 s heartbeat to `partial.json`; silence >60 s is a defect; delayed refusals
+  keep diagnostics; job `_reconcile` observes exit before reading `result.json`.
+- Contact/static studies model joints: per-body `material`, `interfaces` (press fits bonded,
+  running clearances contact; declared pairs stay unfused; only contact pairs refine);
+  `closed_fit` applies below h/4 clearance unless disabled. Buckling refuses by name at
+  `max_load_factor`; steady thermal is native (`fea_thermal_solve`; ccx is V&V only).
+  `boundary_faceset_membership` admits a facet only when every corner passes.
+- Multi-body figures (`render_study_setup`) offset per-body AICM face ids via
+  `_mesh_topo_index`; never alias one body's faces onto another.
+- **An agent's sim is a study the user can open:** `run_fea_*`/`simulate_motion` persist via
+  `_persist_study` and hostd fans `doc.studies_changed`; new agent sim tools do the same.
+- **Assemblies report honestly:** bbox/mass/import gather world solids (`measure_part` is the
+  MCP mass tool); `check_interference` refuses an empty doc and reports `pairs_checked`;
+  `validated: true` needs every component's solids and an exact round trip; a no-op
+  `doc_solve_mates` is not an edit (no revision/dirty/undo). Importing a `.step+` is a fresh
+  detached doc (`resume=True` opts in). Merges use the `assembly-merge` CAD skill
+  (`keep_bodies`/`exclude_bodies`, `fit_cylinder_axis` on the true surface); exports warn
+  `placement_unverified` until `check_interference` runs.
+- Mates: hinge-line angle mates are revolutes; a throwing residual builder is
+  `reason:mate_unresolved`, never converged; `sweep_envelope` transports world-shape bounds.
+  Native mates persist engine-owned `reference_frames`; scalar edits and save/reopen never
+  redefine zero, exact-current-value sweeps never apply the angle twice, and legacy binding
+  keeps its first-observed interpretation.
+- `compile_document(..., with_display=false)` is the assembly-only lane: keep the initial
+  per-body meshing; compile-cache identity includes the mode; selective
+  `stepplus_read_document`/`stepplus_open_component` skip unrelated payloads while editable
+  `stepplus_open` preserves them; a `preserve_path` save invalidates the live display cache
+  without a revision change.
+- `add_features mode:"new"`/`merge:false` is an independent body; `add`/boss fuse only with
+  touching bodies; unknown modes refuse by name; `centered:false` primitives are not offset;
+  `transform` moves (`copy:true` duplicates); `project_external_refs` resolves against the
+  whole document.
 
-```bash
-./build.sh   # or scripts/gate.sh for engine/agent work — must be green
-git add <files> && git commit -m "<area>: <what changed>"   # area: core|engine|agent|mcp|gui|icons|scripts|docs|skills
-git push origin master
-```
+## Manufacturing and print
 
-Then hand the user the verification checklist. If a change alters repo structure or
-conventions, update this skill (or the affected gui-* skill) in the same commit — these
-skills are version-controlled precisely so they stay current for every contributor.
+- The `manufacture` MCP family is default-OFF; the arbiter is the only approval validator;
+  the device allowlist denies by default.
+- `FreshValue<T>` is the sole external freshness shape; the journal is the sole source of
+  durable `seq`.
+- Nothing advertises physical `execute` or `safety_integration` before the E4–E6 pilot;
+  `mfg_run_resume` exists only to refuse.
+- 3D printing goes through `slice_part` (`services/mcp/print_tools.py`, family `cam`, not the
+  gated `manufacture` family): stock PrusaSlicer via `prusaslicer.discover()` (flatpak always
+  `--command=prusa-slicer`; `scripts/provision_slicer.py --install`), vendor presets read at
+  runtime (never copied), orientation/supports from `services/dfam`, then `gcode_check`.
+  `print_ready` requires a passing check (`floating_extrusion` catches mid-air perimeters).
+  Agents never download a slicer or hand-write slicer keys. PrusaSlicer 2.9.6 CLI (re-verify
+  on upgrade): no `--arrange`, bare `--merge` segfaults headless (use `--dont-arrange --merge`),
+  and no sequential-clearance check.
+- Multi-part plates (`complete_individual_objects=True`, `slicer/plate.py`): hulls spaced by
+  `extruder_clearance_radius` + brims + 2 mm, ascending height, at most one object above
+  `extruder_clearance_height` (printed last); `gcode_check`'s `sequential_clearance` re-proves
+  it from the toolpath; one G-code + manifest is one `publish_print_media` job;
+  `complete_objects` in `overrides` is refused.
+- **Printer media is published, never copied:** `print_media_inventory` (read) and
+  `publish_print_media` (mutating; Ask/Plan refuse via `contracts/copilot_modes.json`) wrap
+  `services/manufacturing/print_media.py`; humans use `scripts/print_media.py`. The printer UI
+  shows no timestamps, so stale duplicates are ambiguous. Publish takes the complete job set,
+  the whole-drive `inventory_token` and explicit `media_idle=True`, reads back hashes,
+  archives prior managed revisions in a non-printable ZIP, and reports unmanaged printables
+  it did not touch. An agent with a shell can still `cp` — the guarantee is policy + tool,
+  not prevention.

@@ -298,3 +298,10 @@ Mode→role: agent→default, plan→planning, swarm→default(+corporate), edit
 - `options.scope {doc_id, feature_ids?, selection?}` is sent in EVERY mode whenever a document
   is open. It is editor CONTEXT (rendered into the user message as ACTIVE DOCUMENT), not an
   edit-targeting restriction.
+
+## Current producer ownership
+
+The online producer is the Chudcode session host and `services/agent/worker_rpc.py`.
+The offline-safe producer is `core/agent/run.cpp`; `services/agent/agent_turn.py`
+retains the explicit Python provider loop. References above to `services.agent.loop`
+are historical implementation pointers, not an active module or wire requirement.

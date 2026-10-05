@@ -14,10 +14,12 @@ deferred: yes
 
 ## Context
 
-Phase 1 of the 3D sketcher build plan frozen in `docs/SKETCH3D_PLAN.md` (T-BL45). PARKED until
-Hunter greenlights the build. **Do not start without a greenlight** (`work_set` to unpark) — and
-first confirm DECISION-NEEDED-A (parity oracle) and DECISION-NEEDED-B (build-own vs subprocess)
-in that doc are resolved.
+Phase 1 of the 3D sketcher build plan frozen in `docs/plans/SKETCH3D_PLAN.md` (T-BL45). PARKED until
+Hunter greenlights the build. **Do not start without a greenlight** (`work.py set T-BL56 --deferred no`
+to unpark) — and first confirm DECISION-NEEDED-A (parity oracle) and DECISION-NEEDED-B
+(build-own vs subprocess) in that doc are resolved. Note for DECISION-NEEDED-A: the Python
+engine oracle (`engine/`) the plan cites was retired on 2026-07-23, so A1 now means writing a
+standalone Python reference solver rather than extending an existing oracle.
 
 ## Scope
 
@@ -26,7 +28,7 @@ in that doc are resolved.
 - New solver module `core/sketch3d/` — Newton loop over Eigen with analytic Jacobians, DOF
   analysis (`under`/`full`/`over`), mirroring `core/sketch/sketch.{h,cpp}` in 3-space.
 - Schema addition to `contracts/doc_schema.md` (§3-3D) — append-only, dedicated commit.
-- Per DECISION-NEEDED-A: if A1, write `engine/doc/sketch3d_solver.py` reference first + a
+- Per DECISION-NEEDED-A: if A1, write a Python `sketch3d_solver.py` reference first + a
   differential harness (C++ matches Python).
 
 ## Clean-room protocol (binding, from T-BL45 §1)

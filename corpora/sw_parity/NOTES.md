@@ -4,11 +4,31 @@
 are derived from geometric first principles and should be validated by the human owner (SolidWorks
 expert) before treating any DIVERGE as a confirmed bug.
 
-**Date**: 2026-06-15  
-**Solver**: `core/sketch/sketch.cpp`
+**Date**: 2026-06-15 (recorded baseline)  
+**Solver at baseline**: the Python oracle `engine.doc.sketch_solver` (since deleted), kept at
+parity with `core/sketch/sketch.cpp`; every "Python actual" below is that dated run.  
 **Runner**: `corpora/sw_parity/_run_fixtures.py`  
 **Total fixtures**: 18 across 6 families  
-**Result**: 9 AGREE · 9 DIVERGE · 0 ERROR
+**Result (2026-06-15 baseline)**: 9 AGREE · 9 DIVERGE · 0 ERROR
+
+## Current runtime
+
+The runner now solves each fixture's `sketch`/`env` with the native C++ solver through the
+`sketch_cli` executable (`core/sketch/sketch_cli.cpp`, CMake target `sketch_cli`). It uses
+`CHUDWARE_SKETCH_CLI` when set, otherwise the first existing build tree for the platform:
+`core/build-<platform>/bin`, `core/build-occt-<platform>/bin`, then `build/<preset>/bin`. A
+missing binary fails with exit code 2; otherwise the exit code is DIVERGE + ERROR fixtures.
+
+```bash
+python3 corpora/sw_parity/_run_fixtures.py
+```
+
+The fixtures and their `expect` blocks are the recorded originals and are not rewritten to match
+the solver. Known fixture-authoring caveats documented below therefore still read as DIVERGE on a
+correct solver: F1a/F1b and F3a/F3c (redundant double-bookkeeping), F2a (intentionally
+over-constrained), F3b and F4c (`expect.dof` under-counted; the F3b detail's "expect corrected"
+was never applied to the JSON), and F6 (wrong point pair for the width dimension). The dated
+results below have not been re-recorded against the native runner.
 
 ---
 

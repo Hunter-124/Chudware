@@ -1,6 +1,6 @@
-"""engine.ecad.library — ECAD symbol/footprint/3D library system.
+"""services.ecad.library — Python ECAD symbol/footprint/3D library system.
 
-Public API re-exported at module level so engine.ecad.ops.py can call::
+Public API re-exported at module level for Python service callers::
 
     from services.ecad import library
     library.resolve("Device:R")

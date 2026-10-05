@@ -155,10 +155,10 @@ def network_from_handoff(env: Any) -> "tuple[Optional[dict], Optional[list], Opt
 
 
 def _schema_errors_via_core(d: dict) -> list:
-    """Validate an ``aicad.piping/1`` doc through the core (the schema validator lives in
-    libchudware now — ``services.piping.schema`` is deleted in this round). A boundary-less
-    ``piping_solve`` returns the validator's error list under ``errors`` for a bad doc,
-    and the boundary-conditions error (no ``errors`` key) for a good one."""
+    """Validate an ``aicad.piping/1`` doc through the core validator.
+    Python schema helpers remain in ``services.piping.schema`` for handoff consumers.
+    A boundary-less ``piping_solve`` returns ``errors`` for an invalid doc, or the
+    boundary-conditions error (without ``errors``) for a valid one."""
     r = cb.call("piping_solve", {"doc": d})
     if isinstance(r, dict) and not r.get("ok") and isinstance(r.get("errors"), list):
         return r["errors"]

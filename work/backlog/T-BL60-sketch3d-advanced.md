@@ -14,8 +14,8 @@ deferred: yes
 
 ## Context
 
-Phase 5 of the 3D sketcher plan (`docs/SKETCH3D_PLAN.md`, T-BL45). PARKED until greenlight.
-Final hardening phase; depends on P3 (T-BL53) and P4 (T-BL54).
+Phase 5 of the 3D sketcher plan (`docs/plans/SKETCH3D_PLAN.md`, T-BL45). PARKED until greenlight.
+Final hardening phase; depends on P3 (T-BL58) and P4 (T-BL59).
 
 ## Scope
 

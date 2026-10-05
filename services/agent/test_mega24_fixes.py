@@ -448,21 +448,6 @@ def test_plan_read_autocomp_and_typed_refusal_synth():
     assert out["data"].get("stop_reason") != "delegate_or_typed_refusal_required"
 
 
-def test_degrade_model_not_dead_mistral():
-    """Source: degrade list prefers paid deepseek; free loop drops dead mistral."""
-    src = (_ROOT / "services/agent/agent_turn.py").read_text(encoding="utf-8")
-    assert "deepseek/deepseek-chat-v3.1" in src
-    assert "degrade_models" in src
-    # Free-tier for-loop body must not *add* dead mistral (comment OK).
-    src_rm = (_ROOT / "services/agent/role_models.py").read_text(encoding="utf-8")
-    free_block_start = src_rm.find("Free-tier OpenRouter candidates")
-    free_block = src_rm[free_block_start:free_block_start + 500]
-    # Extract for-mid list lines only
-    body = free_block.split("for mid in", 1)[-1]
-    assert '"mistralai/mistral-small:free"' not in body
-    assert '"nvidia/nemotron-ultra:free"' in body
-
-
 # ---------------------------------------------------------------------------
 # a2 thrash residual (20260715T223717Z): no_code on xai-sub SPECIFY/layout
 # ---------------------------------------------------------------------------

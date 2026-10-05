@@ -36,8 +36,7 @@ NARRATION TOOLS — compact text summaries of every domain state:
 
   describe_project([run])
     Narrates a DAG project run: nodes done/doing/blocked/pending, budget usage,
-    and open questions. Feeds WS-A dag_status and the T-F17 mission-control UI.
-    Pass run=dag_status()['run'] from your WS-A driver.
+    and open questions. Pass run=dag_status()['run'] or run_id=<id>.
     See contracts/dag_schema.md for the run dict shape.
 
 All tools narrate EXISTING numbers only — they never recompute values.

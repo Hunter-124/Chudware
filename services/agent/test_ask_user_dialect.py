@@ -3,8 +3,8 @@ rejection (services.agent.interaction) used by every entry point -
 MissionDispatch.ask_user, agent_turn._ask_user_sync, and the MCP `ask_user`
 tool (services.mcp.interaction_tools). Regression coverage for the live
 desktop-run failures (`ask_user got no question text`, `{}` x4 until the
-loop guard killed the run) and an anti-drift check that the three call
-sites cannot re-diverge onto their own copies again.
+loop guard killed the run) and a behavioral check that every entry point
+gives the same verdict on the same live payload.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from services.agent import agent_turn, interaction, mission_dispatch
+from services.agent import agent_turn, interaction
 from services.agent.interaction import (
     ask_user_bad_arguments_error, normalize_questions,
 )
@@ -168,36 +168,10 @@ class TestBadArgumentsTeaching:
 
 
 # ---------------------------------------------------------------------------
-# anti-drift: every ask_user entry point shares ONE definition
+# every ask_user entry point gives the same verdict
 # ---------------------------------------------------------------------------
 
-class TestSharedDefinitionAntiDrift:
-    def test_mission_dispatch_reuses_interaction_normalizer(self):
-        assert mission_dispatch._normalize_questions is normalize_questions
-
-    def test_mission_dispatch_reuses_interaction_teaching_error(self):
-        assert mission_dispatch._ask_user_bad_arguments_error is ask_user_bad_arguments_error
-
-    def test_mission_dispatch_reuses_interaction_alias_tuples(self):
-        assert mission_dispatch._PROMPT_ALIASES is interaction.PROMPT_ALIASES
-        assert (mission_dispatch._TOP_LEVEL_QUESTION_ALIASES
-                is interaction.TOP_LEVEL_QUESTION_ALIASES)
-
-    def test_agent_turn_bridge_imports_from_interaction_not_mission_dispatch(self):
-        """_ask_user_sync used to import its normalizer FROM mission_dispatch
-        (a second-hand copy of a copy); it must now import the interaction
-        core directly, or the two entry points can silently re-diverge."""
-        import inspect
-        src = inspect.getsource(agent_turn._ask_user_sync)
-        assert "from services.agent.interaction import" in src
-        assert "normalize_questions" in src and "ask_user_bad_arguments_error" in src
-        assert "from services.agent.mission_dispatch import" not in src
-
-    def test_mcp_tool_module_imports_from_interaction(self):
-        from services.mcp import interaction_tools
-        assert interaction_tools.normalize_questions is normalize_questions
-        assert interaction_tools.ask_user_bad_arguments_error is ask_user_bad_arguments_error
-
+class TestEntryPointsAgree:
     def test_all_entry_points_agree_on_the_live_regression_payload(self, md):
         """Same payload, same ids, same rejection/acceptance verdict everywhere."""
         direct_ids = {q["id"] for q in normalize_questions(LIVE_QUESTION_KEY_PAYLOAD)}

@@ -263,3 +263,9 @@ via `.get()` when absent — this appendix is additive and does not bump the sch
 - `open_questions` — `[{"node": id, "question"|"text": str, "blocked_reason"?: str}]`
 
 T-A2's node runner / executor is the natural producer (recorded in its Driver notes).
+
+## Current implementation pointers
+
+`services/dag/` owns DAG planning and execution. Online model turns use the
+Chudcode runtime; explicit Python provider turns live in `services/agent/agent_turn.py`.
+The earlier `services.agent.loop` reference is historical. Schema fields are unchanged.

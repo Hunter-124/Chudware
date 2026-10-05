@@ -1,5 +1,5 @@
 // Copilot activity timeline (T-RF6 split of legacy_chat.cpp): the per-turn typed-block
-// timeline — agent steps, thinking blocks, action cards, the inline transparency rows
+// timeline — thinking blocks, action cards, the inline transparency rows
 // (context chips, thought boxes, tool-call rows), artifact file actions, and
 // drawAgentTimeline which sequences a turn's ActivityItems. Cards it delegates to live in
 // cards.cpp; the items themselves are built in feed.cpp.
@@ -18,10 +18,10 @@ namespace ui {
 // ---- agent-authored text sanitizers (agent_text.{h,cpp}) -------------------------------------
 // Two live defects, both on strings the copilot did NOT author in C++: a tool-call card printed
 // the opaque engine id ("doc-cpp00000039") where the part's NAME belongs, and the U+2192 arrows
-// services/agent/agent_events.py joins tool targets with rendered as notdef '?' (uiGlyphRanges()
-// never requests the arrows block). Fixed HERE rather than at ingest because feed.cpp has no
-// AppState — the doc-id -> name lookup needs the tab list — and because a transcript restored
-// from disk never passes through feed.cpp at all.
+// services/agent/agent_events.py joins tool targets with rendered as notdef '?' (the atlas body
+// table, ui/glyph_ranges.h kBody, never requests the arrows block). Fixed HERE rather than at
+// ingest because feed.cpp has no AppState — the doc-id -> name lookup needs the tab list — and
+// because a transcript restored from disk never passes through feed.cpp at all.
 //
 // docLabel() is deliberately NOT used: it returns the literal "a document" for an unknown id,
 // which must never be spliced into a JSON blob. An id with no open tab stays a raw id.
@@ -292,125 +292,6 @@ static const Tex& artTexFor(const std::string& path) {
     return s_artTex.emplace(path, e).first->second.tex;
 }
 
-void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
-    const auto& pal = ui::palette;
-    const ui::AdaptiveSurface& stepSurf = chatSurf();
-    const ImVec4 accentCol = semanticOnGlass(pal.accent, stepSurf);
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
-    // A stage-weight row, not a glass card: faint wash + a status rail (amber for a build issue,
-    // accent once done) — the same silhouette as the orchestrator stage cards, so iterations read
-    // as supporting work under the answer rather than a stack of equally-boxed cards.
-    const ui::kit::Tone stepTone = !s.ok ? ui::kit::Tone::Warn
-                                 : s.done ? ui::kit::Tone::Accent : ui::kit::Tone::Neutral;
-    const RowShell shell = beginRowShell("##stepcard", stepTone, kStageWash, kRailStrong);
-    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-    // Build issues are amber, not red: a failed pass is normal mid-loop — the error goes
-    // straight back to the model, which usually fixes it.
-    ImVec4 badge = s.ok ? (s.done ? accentCol : semanticOnGlass(pal.iterBuilt, stepSurf))
-                        : semanticOnGlass(pal.statusWarn, stepSurf);
-    const char* word = s.ok ? (s.done ? "done" : "built") : "build issue";
-    ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(badge, "Iteration %d - %s", s.index + 1, word);
-    ImGui::PopFont();
-    // Same-line only when it fits: at the narrow docked width the dims (and the chip row below)
-    // used to run off the row's right edge and clip mid-word.
-    const ImGuiStyle& stepStyle = ImGui::GetStyle();
-    const float rowRight = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
-    auto fitsAfterLast = [&](float w) {
-        return ImGui::GetItemRectMax().x + stepStyle.ItemSpacing.x + w <= rowRight;
-    };
-    if (!s.dims.empty()) {
-        ImGui::PushFont(fonts.mono);
-        if (fitsAfterLast(ImGui::CalcTextSize(s.dims.c_str()).x)) ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, stepSurf.textSecondary);
-        ImGui::Text("%s", s.dims.c_str());
-        ImGui::PopStyleColor();
-        ImGui::PopFont();
-    }
-
-    // assembly: colored parts line + interference/clearance readout
-    if (s.isAssembly) {
-        drawPartsLine(s.parts);
-        drawFitReadout(s.fit, /*detailed=*/true);
-    }
-
-    // render thumbnail (lazy GL upload — we're on the GL thread here)
-    if (!s.contactSheet.empty()) {
-        if (!s.triedThumb) { s.thumb = loadTexture(s.contactSheet); s.triedThumb = true; }
-        if (s.thumb.id) {
-            float maxTw = ui::metrics::copilotThumbW();
-            float tw = logW < maxTw ? logW : maxTw;
-            float th = tw * (float)s.thumb.h / (float)s.thumb.w;
-            ImGui::Image((ImTextureID)(intptr_t)s.thumb.id, ImVec2(tw, th));
-        }
-    }
-
-    if (!s.notes.empty()) dimText(s.notes.c_str());
-    if (!s.ok && !s.error.empty()) {
-        // Calm one-line cause; the raw traceback stays behind a toggle so a self-correcting
-        // pass never reads like a crash.
-        ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(pal.statusWarn, stepSurf));
-        ImGui::TextWrapped("%s", errSummary(s.error).c_str());
-        ImGui::PopStyleColor();
-        dimText("The CAD code failed this pass; the error was fed back to the AI to correct.");
-    }
-
-    // expanders: the model's reasoning, the full code, and what changed
-    bool first = true;
-    // Chips flow onto a new line when the next one would not fit beside the last.
-    auto flowChip = [&](const char* label) {
-        if (first) { first = false; return; }
-        if (fitsAfterLast(ImGui::CalcTextSize(label).x + stepStyle.FramePadding.x * 2.0f))
-            ImGui::SameLine();
-    };
-    if (!s.thinking.empty()) {
-        flowChip("Thoughts");
-        if (toggleChip("Thoughts", s.showThinking)) s.showThinking = !s.showThinking;
-    }
-    if (!s.code.empty()) {
-        flowChip("Code");
-        if (toggleChip("Code", s.showCode)) s.showCode = !s.showCode;
-    }
-    if (!s.diff.empty()) {
-        flowChip("Diff");
-        if (toggleChip("Diff", s.showDiff)) s.showDiff = !s.showDiff;
-    }
-    // Console output the model's own generated code printed. Captured by the drain and written to
-    // the conversation file for months, rendered nowhere: when a build "succeeds" but the geometry
-    // is wrong, these are the print statements the model added to debug itself. The open flag lives
-    // in ImGui's per-window storage rather than on AgentStep — app_state.h is integrator-owned —
-    // and the ##stepcard child makes that id unique per iteration.
-    ImGuiStorage* const outStore = ImGui::GetStateStorage();
-    const ImGuiID       outKey   = ImGui::GetID("##step_stdout_open");
-    bool                showOut  = outStore->GetBool(outKey, false);
-    if (!s.stdoutText.empty()) {
-        flowChip("Console");
-        if (toggleChip("Console", showOut)) {
-            showOut = !showOut;
-            outStore->SetBool(outKey, showOut);
-        }
-    }
-    if (!s.ok && !s.error.empty()) {
-        flowChip("Error details");
-        if (toggleChip("Error details", s.showError)) s.showError = !s.showError;
-    }
-    if (s.showThinking && !s.thinking.empty())
-        drawProseBox("##think", s.thinking, ui::metrics::copilotProseMaxH());
-    if (s.showCode && !s.code.empty())
-        drawCodeBox("##code_v", s.code, fonts.mono, ui::metrics::px(260.0f));
-    if (s.showDiff && !s.diff.empty())
-        drawDiffBox("##diff_v", s.diff, fonts.mono, ui::metrics::copilotDiffMaxH());
-    if (s.showError && !s.error.empty())
-        drawCodeBox("##err_v", s.error, fonts.mono, ui::metrics::px(200.0f));
-    if (showOut && !s.stdoutText.empty())
-        drawCodeBox("##stdout_v", s.stdoutText, fonts.mono, ui::metrics::px(200.0f));
-    ImGui::PopStyleColor();
-    endRowShell(shell);
-}
-
-// One assistant turn: name + plan card + summary + iteration cards. While running, an inline
-// live status line (spinner + phase) with a thin progress accent bar, plus a collapsible
-// "Activity" section embedding the orchestrator run tree for this run.
 // C45: local models reply in markdown but ImGui renders plain text — the raw ** and ###
 // marks read as noise. Strip the common inline marks (bold/italic asterisks, heading hashes,
 // backticks) for DISPLAY only; the stored message keeps the original text.
@@ -653,9 +534,7 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
 }
 
 // An orchestrator build stage: status glyph + stage icon + human label + duration/ops meta, the
-// verdict folded in as a result line, and an expandable drawer (a legacy AgentStep's
-// thinking/code/console/diff/thumbnail when attached, else the raw detail). `step` is non-null
-// only for v1 runs that carry an AgentStep.
+// verdict folded in as a result line, and an expandable drawer with the raw detail.
 //
 // Silhouette: a faint wash behind a status-toned LEFT RAIL — never a full border. The card is one
 // beat in the run's story, not a document; a boxed border per stage is what made eight of them
@@ -664,8 +543,7 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
 // `onSpine` = the run spine is drawing this row's status mark out in the left gutter, so the card
 // must NOT draw its own leading glyph — two marks for one step reads as two steps. The card keeps
 // drawing its own when it is rendered outside a timeline (drawToolCallRow's single-row entry).
-void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, float logW,
-                           bool liveFrontier, bool onSpine) {
+void drawActionCard(ActivityItem& a, const ui::Fonts& fonts, bool liveFrontier, bool onSpine) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const bool running = a.status == "running";
@@ -749,13 +627,7 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
     // ends — UNLESS the user explicitly toggled it (userToggled always wins, both directions).
     // No mutation of a.expanded here: pinning state belongs to the click handlers only.
     const bool open = a.userToggled ? a.expanded : (a.expanded || running || liveFrontier);
-    // The console output the model's own code printed. It is captured, drained and persisted; the
-    // ONLY reason it never appeared is that this predicate did not test it, so the drawer it
-    // belongs in was never offered on a step whose sole extra payload was stdout.
-    const bool hasDrawer = (step && (!step->thinking.empty() || !step->code.empty() ||
-                                     !step->diff.empty() || !step->contactSheet.empty() ||
-                                     !step->stdoutText.empty())) ||
-                           !replyBody.empty() || !sentBody.empty() || !altLines.empty();
+    const bool hasDrawer = !replyBody.empty() || !sentBody.empty() || !altLines.empty();
     if (hasDrawer) {
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) { a.expanded = !open; a.userToggled = true; }
@@ -782,7 +654,6 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
 
     // ---- result / notes line (folded into the card) ----
     if (!a.reason.empty()) dimText(a.reason.c_str());
-    else if (step && !step->notes.empty()) dimText(step->notes.c_str());
 
     // ---- expandable drawer ----
     if (open && hasDrawer) {
@@ -798,33 +669,6 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
                 ImGui::PopStyleColor();
             }
         }
-        if (step) {
-            if (!step->thinking.empty())
-                drawProseBox("##actthink", step->thinking, ui::metrics::copilotProseMaxH());
-            if (!step->code.empty())
-                drawCodeBox("##actcode", step->code, fonts.mono, ui::metrics::px(260.0f));
-            if (!step->diff.empty())
-                drawDiffBox("##actdiff", step->diff, fonts.mono, ui::metrics::copilotDiffMaxH());
-            if (!step->stdoutText.empty()) {
-                // Collapsed by default: when a build "succeeds" but the geometry is wrong, these
-                // are the print statements the model wrote to debug its own code.
-                if (ImGui::TreeNodeEx("Console output##actstdout",
-                                      ImGuiTreeNodeFlags_SpanAvailWidth)) {
-                    drawCodeBox("##actstdout_box", step->stdoutText, fonts.mono,
-                                ui::metrics::px(200.0f));
-                    ImGui::TreePop();
-                }
-            }
-            if (!step->contactSheet.empty()) {
-                if (!step->triedThumb) { step->thumb = loadTexture(step->contactSheet); step->triedThumb = true; }
-                if (step->thumb.id) {
-                    float maxTw = ui::metrics::copilotThumbW();
-                    float tw = logW < maxTw ? logW : maxTw;
-                    float th = tw * (float)step->thumb.h / (float)step->thumb.w;
-                    ImGui::Image((ImTextureID)(intptr_t)step->thumb.id, ImVec2(tw, th));
-                }
-            }
-        }
         // Model I/O: Sent to model + Model reply (drawProseBox scrollable bodies).
         if (!sentBody.empty()) {
             if (ImGui::TreeNodeEx("Sent to model##actsent", ImGuiTreeNodeFlags_SpanAvailWidth)) {
@@ -837,7 +681,7 @@ void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, fl
                 drawProseBox("##actreplybox", stripMdMarks(replyBody), ui::metrics::copilotProseMaxH());
                 ImGui::TreePop();
             }
-        } else if (step == nullptr && !a.detail.empty() && sentBody.empty()) {
+        } else if (!a.detail.empty() && sentBody.empty()) {
             // Fallback: no SENT packing, show detail as before.
             drawProseBox("##actdetail", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
         }
@@ -2429,8 +2273,8 @@ void paintRunSpine(ImDrawList* dl, float railX, float cell,
 }  // namespace
 
 
-void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
-                              bool showThinking, bool isLastTurn) {
+void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool showThinking,
+                       bool isLastTurn) {
     if (m.activity.empty()) return;
     // ONE rhythm for the whole run (metrics.h:93): a streaming conversation is denser than a
     // docked menu, and every kit widget any row draws — here, or in the corp/firm/swarm family
@@ -2619,7 +2463,7 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float l
         } else if (isThinkingItem(a)) {
             drawThinkingBlock(a, fonts, showThinking, liveFrontier);
         } else {
-            drawActionCard(a, nullptr, fonts, logW, liveFrontier, onSpine);
+            drawActionCard(a, fonts, liveFrontier, onSpine);
         }
         // The mark's y: the row's own header line, not its centre — a card with a long open
         // drawer would otherwise float its mark halfway down the rail, away from the title it

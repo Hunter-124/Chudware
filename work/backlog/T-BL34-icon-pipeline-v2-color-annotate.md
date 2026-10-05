@@ -100,7 +100,7 @@ not let it fall off the board.
 
 - Pipeline: `scripts/icon_pipeline.py` RECIPES + `CHUDWARE_SHOT=iconpipe`;
   `host/src/renderer.{h,cpp}` renderThumbnail; `host/src/ui/scenarios.cpp` runIconPipe
-  (face ref-selectors live here). See work/tasks/T-G15.md HANDOFF 2 for the per-face
+  (face ref-selectors live here). See work/tasks/done/T-G15.md HANDOFF 2 for the per-face
   overlay design constraints already mapped.
 - Annotation compositing is a post-render step (overlay onto the RGBA tile before atlas
   injection) — keep it in the Python pipeline, not the C++ renderer, where practical.

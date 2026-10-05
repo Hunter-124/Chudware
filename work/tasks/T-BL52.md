@@ -20,12 +20,19 @@ sections, and closed the dangerous hole where an imperial fractional string
 safe per-type default). But `estimate._AISC_LBS_PER_FT` still keys mass off the
 imperial AISC catalog format, so an element named `HSS4X4X1/4` gets **correct
 takeoff mass** (exact string match) but a **generic default-rectangle solid** —
-geometry and cost disagree about the same member. See work/questions/T-BL21.md A1
+geometry and cost disagree about the same member. See work/questions/archive/T-BL21.md A1
 (foreman ruling: accept mm-only, defer this reconciliation here).
+
+**Current code (2026-10-04):** the Python modules named on this card were ported to C++.
+The mass table is now `kAiscLbsPerFt` in `core/structural/estimate.cpp`, which still keys
+`HSS4X4X1/4`-style imperial strings. The hollow-section grammar is in
+`core/structural/model.cpp::section_properties`, where `HSS`/`RHS` require numeric `WxHxT`.
+Before starting, re-check what the C++ geometry side does with an imperial fractional name;
+the "default rectangle" behavior above was observed in the pre-port Python code.
 
 ## Scope
 
-- Convert `_AISC_LBS_PER_FT`'s imperial designations to their mm outer×wall
+- Convert `kAiscLbsPerFt`'s imperial designations to their mm outer×wall
   equivalents (e.g. `HSS4X4X1/4` -> `HSS101.6x101.6x6.35`) so a single
   `section_name` drives BOTH the geometry engine and the mass table.
 - Either add the mm designation strings to the lbs/ft table, or route mass lookup

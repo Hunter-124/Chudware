@@ -1,7 +1,7 @@
 """KiCad .kicad_sym library importer.
 
 Maps ``(kicad_symbol_lib (symbol "Name" ...))`` trees to SymbolDef dicts as
-specified in docs/contracts/ecad/sch_schema.md §3.
+specified in contracts/ecad/sch_schema.md §3.
 
 Coordinate convention: KiCad uses +y-down internally; we convert all y coords to
 +y-up by negating. Angles are already CCW-positive in both conventions so they

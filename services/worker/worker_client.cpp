@@ -260,21 +260,14 @@ bool callAgentStreaming(const std::string &coreMethod, const json &p,
 // A document CREATED in the C++ core gets a "doc-cpp..." id, so every
 // subsequent doc_* call carrying that id routes to the C++ core too — the id
 // prefix IS the commit-at-doc_new marker, giving an all-or-nothing-per-document
-// cutover with no separate routing state. R5a (T-RF21): unconditional — the C++
-// doc engine is the only backend (parity-complete since 2026-06-19: 24/24
-// differential gate vs the retired Python oracle; the CHUDWARE_CPP_DOCS escape
-// hatch is gone). cppAgentFlag() follows, so the agent also routes C++ (it
-// drives the same doc session it edits). doc-cpp session it edits).
-bool cppDocsFlag() {
-  // R5a (T-RF21): the CHUDWARE_CPP_DOCS escape hatch is removed — the pure-C++
-  // doc engine is the only backend (the Python oracle is deleted at closeout).
-  return true;
-}
+// binding with no separate routing state. The C++ doc engine is the only
+// document backend (R5a/T-RF21; parity-complete since 2026-06-19), so the
+// native agent seam below drives the same doc-cpp sessions.
 
-// Methods that MINT a new document (vs. operate on an existing one). For these
-// the C++ core has not created a session yet when it reports "unsupported", so
-// the host can safely fall back to the Python worker (no mid-document engine
-// switch).
+// Methods that MINT a new document (vs. operate on an existing one). hostd
+// attaches a minted document rw to the connection that minted it, so callImpl
+// never sends these over a short-lived side connection. No services worker
+// serves them: a core failure surfaces to the caller.
 bool isMintingMethod(const std::string &method, const json &params) {
   if (method == "doc_new" || method == "doc_open")
     return true;
@@ -431,15 +424,12 @@ bool routeDocToCpp(const std::string &method, const json &params) {
         sit->get<std::string>().rfind("doc-cpp", 0) == 0)
       return true;
   }
-  // doc_new / doc_open / import_file (no `into`) MINT a fresh doc -> route to
-  // C++ when the flag is on. C++ now handles PART and ASSEMBLY documents (P57b
-  // compile + P57d resolve_pick assembly branch + P57e primitive cut/merge —
-  // the asm scenario now seats its peg at z=15, matching Python; cpp_asm_parity
+  // doc_new / doc_open / import_file (no `into`) MINT a fresh doc in the C++
+  // core, which handles PART and ASSEMBLY documents (P57b compile + P57d
+  // resolve_pick assembly branch + P57e primitive cut/merge; cpp_asm_parity
   // 10/10 incl. the host pick->mate->seat path). A doc_open of a non-part/asm
-  // container is detected by the core (code "unsupported") and falls back
-  // below.
-  if (!cppDocsFlag())
-    return false;
+  // container is declined by the core (code "unsupported") and that structured
+  // error reaches the caller.
   if (method == "doc_new") {
     const std::string kind = params.is_object()
                                  ? params.value("kind", std::string("part"))
@@ -447,7 +437,7 @@ bool routeDocToCpp(const std::string &method, const json &params) {
     return kind.empty() || kind == "part" || kind == "assembly";
   }
   if (method == "doc_open")
-    return true; // core rejects non-parts -> host falls back
+    return true; // core declines non-parts with a structured error
   if (isMintingMethod(method, params))
     return true; // import_file minting a new doc
   // vendor_part_insert mutates/mints a doc by applying an `import` feature; it
@@ -461,11 +451,6 @@ bool routeDocToCpp(const std::string &method, const json &params) {
 // --- Native offline-agent routing ------------------------------------------------
 // Online turns use agent_admin_turn/Chudcode. These methods retain deterministic native
 // fallback behavior for C++ documents, plus read-only probes and control calls.
-bool cppAgentFlag() {
-  // Native fallback edits the same C++ document session, so availability follows the
-  // unconditional C++ document engine.
-  return cppDocsFlag();
-}
 
 // Is the active document a C++-backed ("doc-cpp") session? For agent_run_v2 /
 // agent_ask_v2 the host passes the active doc_id directly in params;
@@ -497,15 +482,12 @@ bool agentDocIsCpp(const std::string &method, const json &params) {
 
 bool routeAgentToCpp(const std::string &method, const json &params) {
   // Model-availability probe is doc-independent and provider-diagnostic; route
-  // it to the C++ core whenever the DLL loads, regardless of the agent flag
-  // (the host picker falls back to a static catalog if the core is
-  // unavailable).
+  // it to the C++ core whenever the DLL loads (the host picker falls back to a
+  // static catalog if the core is unavailable).
   if (method == "agent_list_models") {
     std::string lerr;
     return engine::ensureLoaded(lerr);
   }
-  if (!cppAgentFlag())
-    return false;
   if (!(method == "agent_run_v2" || method == "agent_ask_v2" ||
         method == "agent_clarify_v1" || method == "agent_pm_assist_v1" ||
         method == "agent_simulate_v1" || method == "agent_mission_v1" ||
@@ -523,17 +505,12 @@ bool routeAgentToCpp(const std::string &method, const json &params) {
   std::string lerr;
   return engine::ensureLoaded(lerr);
 }
-// --- C++ SIM (FEA) routing (opt-in, default OFF) ----------------------------
-// Route the host's FEA simulation RPCs (sim_mesh / sim_run_static /
-// sim_run_modal / sim_run_fatigue / sim_run_thermal) to the pure-C++ core
-// (libchudware) instead of the Python sim worker. MIRRORS the agent seam but is
-// DEFAULT OFF: unless CHUDWARE_CPP_SIM is set (and != "0") every sim call goes to
-// the Python sim worker exactly as today. sim_run_flow (LBM/CFD) stays Python
-// for the host panel path (stl-shaped params); the C++ core owns doc_id-shaped
-// flow runs directly. sim_cancel is now C++-dispatched in core (T-RF16,
-// core/sim/sim_cancel.cpp) and served to daemon/web clients; the host panel's
-// Python flow runs keep their own Python-side cancel — the two cancel paths
-// coexist per run ownership, so no routing change is made here.
+// --- C++ SIM (FEA/flow) routing ---------------------------------------------
+// Route the host's simulation RPCs (sim_mesh / sim_run_static / sim_run_modal /
+// sim_run_fatigue / sim_run_thermal / sim_run_flow / sim_cancel) to the
+// pure-C++ core (libchudware); FEA and flow run on the C++ core only
+// (R5a/T-RF21). sim_cancel is C++-dispatched in core (T-RF16,
+// core/sim/sim_cancel.cpp).
 //
 // The host's send-shape for sim_run_static/sim_run_modal is already the C++
 // contract
@@ -542,11 +519,6 @@ bool routeAgentToCpp(const std::string &method, const json &params) {
 // summary + overlay_aicm, which is exactly what sim_panel consumes (it never
 // reads results_npz/solve_time_s, the two fields the C++ result omits) — so the
 // result is byte-compatible for display.
-bool cppSimFlag() {
-  // R5a (T-RF21): the CHUDWARE_CPP_SIM escape hatch is removed — FEA/flow run on
-  // the C++ core only.
-  return true;
-}
 
 // Native-only simulation RPCs: libchudware is their sole implementation (no
 // services-worker/CalculiX/Python counterpart exists). Claim them even when the
@@ -564,8 +536,6 @@ bool isTopologyMethod(const std::string &method) {
 bool routeSimToCpp(const std::string &method, const json & /*params*/) {
   if (isNativeOnlySimMethod(method))
     return true;
-  if (!cppSimFlag())
-    return false;
   if (!(method == "sim_mesh" || method == "sim_run_static" ||
         method == "sim_run_modal" || method == "sim_run_fatigue" ||
         method == "sim_run_thermal" || method == "sim_run_flow" ||
@@ -2009,11 +1979,12 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     // calls on normal interaction, and blocking it behind that call froze the
     // whole app (2026-07-21 SIGABRT crash, then behind an agent_run). In daemon mode
     // hostd serves each connection on its own thread, so sidestep the wait
-    // with a short-lived side connection. Excluded (keep legacy blocking):
-    // minting calls (doc_new/doc_open/import_file, ecad_new/ecad_open —
-    // their "unsupported" fallback needs the shared Python-worker pipe
-    // below), agent-seam methods (routeAgentToCpp translates host RPC names
-    // to core names — agent_ask_v2→agent_answer_question etc. — which the
+    // with a short-lived side connection. Excluded (keep blocking on the shared
+    // connection): minting calls (doc_new/doc_open/import_file,
+    // ecad_new/ecad_open — hostd attaches a minted document rw to the
+    // connection that minted it, and a side connection closes as soon as the
+    // call returns), agent-seam methods (routeAgentToCpp translates host RPC
+    // names to core names — agent_ask_v2→agent_answer_question etc. — which the
     // side channel does not do), and pipe-bound methods (plm_*, git_*,
     // most sim_* — rare on the GUI thread).
     const bool engineBound =
@@ -2242,12 +2213,9 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     // else: fall through to the Python worker path below (list_models tolerates
     // failure).
   }
-  // C++ SIM (FEA) routing (opt-in via CHUDWARE_CPP_SIM, default OFF). Run the FEA
-  // mesh / static / modal RPCs in-process against libchudware. The host already
-  // sends the C++ {study:{...}} contract verbatim, so params pass through
-  // unchanged; the result carries summary + overlay_aicm (what sim_panel
-  // reads). Default OFF => routeSimToCpp() returns false and this block is
-  // skipped (byte-for-byte today's Python sim path).
+  // C++ SIM (FEA/flow) routing. The host already sends the C++ {study:{...}}
+  // contract verbatim, so params pass through unchanged; the result carries
+  // summary + overlay_aicm (what sim_panel reads).
   if (routeSimToCpp(method, params)) {
     std::string cerr;
     json cppResult;
@@ -2348,37 +2316,23 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   // hostd/worker bridge below. No params translation is needed for claimed
   // calls: the host send-shape is the libchudware contract.
   if (routeEcadToCpp(method, params)) {
-    // ecad_new / ecad_open are the minting calls eligible for fallback if the
-    // core cannot create a session. Every other call was explicitly claimed by
-    // the libchudware method allowlists.
-    const bool minting = (method == "ecad_new" || method == "ecad_open");
     std::string cerr;
     if (engine::call(method, params, result, cerr, timeoutMs))
       return true; // handled (rc==0); `result` holds {doc_id, revision, tree,
                    // ...}
     // Nonzero rc: a structured OpError carries {code,message,detail} in
-    // `result`.
+    // `result` — including an ecad_new/ecad_open the core declined.
     if (result.is_object() && result.contains("code")) {
-      // A MINTING call the core declined as "unsupported" created no C++ doc —
-      // fall back to the Python worker instead of surfacing the error (no
-      // engine switch).
-      if (!(minting && result.value("code", std::string()) == "unsupported")) {
-        err = result.value("message", std::string("cpp-ecad error"));
-        return true; // structured error reported (round-trip OK)
-      }
-      // else: fall through to the Python worker path below
-    } else if (!minting) {
-      // Hard failure on an allowlisted non-mint core RPC: surface the core
-      // failure rather than masking it behind a different backend.
-      err = "cpp-ecad (" + method + "): " + cerr;
-      if (errorSink_)
-        errorSink_(method, err);
-      return false;
+      err = result.value("message", std::string("cpp-ecad error"));
+      return true; // structured error reported (round-trip OK)
     }
-    // Minting-call fallback: the core could not mint this doc (unsupported kind
-    // / the DLL is unavailable) — continue to the Python worker so ECAD
-    // creation never hard-breaks (it mints a Python doc id, which keeps the doc
-    // on Python).
+    // Hard failure on a claimed core RPC (minting included — no services worker
+    // serves ECAD documents): surface the core failure rather than masking it
+    // behind a different backend.
+    err = "cpp-ecad (" + method + "): " + cerr;
+    if (errorSink_)
+      errorSink_(method, err);
+    return false;
   }
   // CAM (computer-aided machining): every cam_* RPC lives ONLY in the C++ core
   // (libchudware); there is no Python CAM engine. Route them all to cpp_core and
@@ -2430,11 +2384,10 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       errorSink_(method, err);
     return false;
   }
-  // P16: route C++-backed documents to the in-process core (libchudware) instead
-  // of the Python worker. All-or-nothing per document (NO mid-doc Python
-  // fallback — Python never created this doc), so an unported method surfaces a
-  // clear error rather than silently misrouting. The diagnostic parity probe in
-  // doc_mirror is unaffected.
+  // P16: route C++-backed documents to the core (libchudware). All-or-nothing
+  // per document, and the C++ core is the only document engine, so an unported
+  // method or a declined mint surfaces a clear error rather than silently
+  // misrouting. The diagnostic parity probe in doc_mirror is unaffected.
   if (routeDocToCpp(method, params)) {
     const bool minting = isMintingMethod(method, params);
     std::string cerr;
@@ -2442,38 +2395,20 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       return true; // handled (chudware_call rc==0); `result` holds the
                    // ops-response
     // Nonzero rc: a structured OpError carries {code,message,detail} in
-    // `result`.
+    // `result` — including a MINTING call the core declined as "unsupported"
+    // (e.g. doc_open of a non-part container), which created no doc.
     if (result.is_object() && result.contains("code")) {
-      // A MINTING call the core declined as "unsupported" (e.g. doc_open of an
-      // assembly container) created no C++ doc — fall back to the Python worker
-      // instead of surfacing the error (no mid-document engine switch happens).
-      if (!(minting && result.value("code", std::string()) == "unsupported")) {
-        err = result.value("message", std::string("cpp-core error"));
-        return true; // structured error reported (round-trip OK)
-      }
-      // else: fall through to the Python worker path below
-    } else if (!minting) {
-      // Hard failure (DLL missing / a throw) on a call bound to an EXISTING C++
-      // doc — there is no Python doc to fall back to, so fail loudly.
-      err = "cpp-core (" + method + "): " + cerr;
-      if (errorSink_)
-        errorSink_(method, err);
-      return false;
-    } else if (engine::available()) {
-      // MINTING call failed with an UNSTRUCTURED core error while the DLL is
-      // loaded (e.g. doc_open: "no such file: live.step+"). That is a real
-      // failure, not an "unsupported container" decline — falling through to
-      // the Python worker would mask it behind "unknown method: doc_open"
-      // (the oracle has no doc engine anymore). Surface the core's message.
-      err = cerr.empty() ? ("cpp-core (" + method + ") failed") : cerr;
-      if (errorSink_)
-        errorSink_(method, err);
-      return false;
+      err = result.value("message", std::string("cpp-core error"));
+      return true; // structured error reported (round-trip OK)
     }
-    // Minting-call fallback: the core could not mint this doc (unsupported kind
-    // or the core DLL is unavailable) — continue to the Python worker path
-    // below so document creation never hard-breaks when C++ is the default
-    // engine.
+    // Hard failure (DLL missing / a throw / doc_open: "no such file:
+    // live.step+"). No services worker serves documents, so fail loudly with
+    // the core's message instead of masking it behind "unknown method".
+    err = minting ? (cerr.empty() ? ("cpp-core (" + method + ") failed") : cerr)
+                  : ("cpp-core (" + method + "): " + cerr);
+    if (errorSink_)
+      errorSink_(method, err);
+    return false;
   }
   // Fall-through methods (plm_*, git_*, ai_roles_*, subscription_status, bench_*,
   // triggers_*, skills_*, list_editable_prompts, provider accounts, and service-side provider

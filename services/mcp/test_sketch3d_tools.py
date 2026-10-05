@@ -686,7 +686,7 @@ class TestSketch3dDocTools:
         assert abs(r["point"][2] - 25.0) < 0.1
         assert "area_mm2" in r and "origin" in r["summary"].lower()
 
-    # ── preview + deprecated ledger surface ──────────────────────────────────
+    # ── preview ──────────────────────────────────────────────────────────────
 
     def test_preview_text_read(self):
         d = self._new_part("s3d_preview")
@@ -699,26 +699,6 @@ class TestSketch3dDocTools:
         txt = r["summary_text"]
         assert fid in txt and "wire 0" in txt and "Health:" in txt
         assert "e1" in txt and "e2" in txt
-
-    def test_ledger_deprecated_and_migration(self):
-        d = self._new_part("s3d_ledger")
-        rout, _ = _call("sketch3d_to_ledger", {"doc_id": d})
-        assert rout["ok"] and rout["deprecated"] is True
-        # Old-format payload migrates into a REAL feature.
-        payload = json.dumps({"version": 1, "sketches": [
-            {"id": "s3d_old", "name": "legacy_path",
-             "segs": [{"kind": "line", "pts": [[0, 0, 0], [0, 0, 25]]}]}]})
-        rin, _ = _call("sketch3d_from_ledger", {"payload": payload, "doc_id": d})
-        assert rin["ok"] and rin["deprecated"] is True, rin
-        assert rin["migrated"] and rin["migrated"][0]["old_id"] == "s3d_old"
-        fid = rin["migrated"][0]["feature_id"]
-        rg, _ = _call("sketch3d_get", {"sketch3d_id": fid, "doc_id": d})
-        assert rg["ok"] and abs(rg["total_length_mm"] - 25.0) < 1e-6
-
-    def test_ledger_bad_payload_errors(self):
-        d = self._new_part("s3d_ledger_bad")
-        r, _ = _call("sketch3d_from_ledger", {"payload": "not-json", "doc_id": d})
-        assert r and r.get("ok") is False
 
     # ── 2D preview tools still work ──────────────────────────────────────────
 

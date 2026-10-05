@@ -1,7 +1,7 @@
 """services/browser/adapters/digikey_web.py — DigiKey WEBSITE source adapter (T-X7).
 
 The browser fallback for DigiKey (digikey.com) parts search — DISTINCT from
-the Nexar/DigiKey API path in engine_oracle.parts_providers, which is the
+the native sourcing API path in ``core/sourcing/``, which is the
 preferred route when API credentials exist. This adapter browses the public
 website under the user's own saved browser session instead: search returns
 part cards with price/stock; `acquire` returns a structured price/stock

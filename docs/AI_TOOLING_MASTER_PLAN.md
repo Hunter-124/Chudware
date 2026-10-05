@@ -1,9 +1,25 @@
 # AI Tooling & Infrastructure Master Plan
 
-**Status:** Complete draft for ratification — all research passes integrated
-(engineering data sources, provider/session auth, vision/metrology, translator
+**Status:** Adopted plan of record, now historical. Board status as of 2026-10-04: every
+workstream this plan cut has all of its cards at `status: done` in `work/tasks/done/`. That
+covers F (`T-F1`..`T-F17`), H (`T-H1`..`T-H11`), P (`T-P1`..`T-P3`), U (`T-U1`..`T-U9`),
+Q (`T-Q1`..`T-Q4`) and R (`T-R1`..`T-R8`). These cards record closure of their scoped
+work, not fresh verification of every aspiration in the pillar prose below. In particular:
+
+- **Provider and session auth.** The Pillar-12 provider/session-auth layer was superseded on
+  2026-08-31. Online providers, auth and models are owned by the embedded Chudcode RPC
+  runtime; see
+  [omp-integration/01-DECISIONS.md, 2026-08-31 section](omp-integration/01-DECISIONS.md#2026-08-31--superseding-architecture-chudcode-rpc-is-the-only-online-runtime).
+- **Chudware Cloud relay.** This plan only reserved the relay as a human-gated seam. It is
+  not the record of any rollout.
+- **Research slot.** The Pillar-12 "RESEARCH SLOT R2 … being filled" note is a frozen draft
+  marker, not open work.
+
+Original status (2026-07-02): "Complete draft for ratification — all research passes
+integrated (engineering data sources, provider/session auth, vision/metrology, translator
 architecture+training, distillation theory, eval metrics; ToS/license claims verified
-against primary sources 2026-07-02)
+against primary sources 2026-07-02)".
+
 **Date:** 2026-07-02
 **Owner:** Hunter + AI drivers
 **Companions:** [PLATFORM_ADR.md](design/PLATFORM_ADR.md) (pillars 1–6),

@@ -10,6 +10,7 @@ graph TD
   classDef done fill:#cdeec9,stroke:#57a05a,color:#1e4d20
   classDef blocked fill:#f5c6c6,stroke:#c0504d,color:#5e1f1d
   classDef backlog fill:#f4f0fa,stroke:#b0a3c9,color:#4a3d63,stroke-dasharray: 4 3
+  classDef dropped fill:#f2f2f2,stroke:#b5b5b5,color:#8a8a8a,stroke-dasharray: 2 2
   subgraph WS_A["workstream A"]
     T_A1["T-A1: Freeze dag_schema.md and scaffold services/dag/"]:::done
     T_A2["T-A2: Node runner with context packs and dag_planner prompt"]:::done
@@ -252,7 +253,7 @@ graph TD
   end
   subgraph WS_SIM["workstream SIM"]
     T_SIM1["T-SIM1: Thermal FEA solver - steady-state heat conduction kernel + sim_new_thermal end-to-end"]:::done
-    T_SIM10["T-SIM10: Simulate tab — full multi-physics setup tree with per-part-type disclosure"]:::backlog
+    T_SIM10["T-SIM10: Simulate tab — full multi-physics setup tree with per-part-type disclosure"]:::dropped
     T_SIM11["T-SIM11: EM simulation family — deferred solvers (GetDP/Meep/Elmer/MoM), doc-geometry intake, field viz"]:::todo
     T_SIM2["T-SIM2: Simulation results field visualization - mesh/nodal-field export + color-mapped contour overlay in the viewport"]:::done
     T_SIM3["T-SIM3: Simulation UI overhaul - material assignment dialog, T-W9 advisor wiring, studies panel polish"]:::done
@@ -313,7 +314,7 @@ graph TD
     T_W9["T-W9: Simulation verification advisor - pre-sim sanity, hand-calc cross-check, margin-policy narration"]:::done
   end
   subgraph WS_WIN["workstream WIN"]
-    T_WIN1["T-WIN1: Windows 10 full-app bring-up (OCCT core + host GUI) under MSVC"]:::todo
+    T_WIN1["T-WIN1: Windows 10 full-app bring-up (OCCT core + host GUI) under MSVC"]:::review
   end
   subgraph WS_X["workstream X"]
     T_WIN2["T-WIN2: Windows CI runner — build + smoke the host/ GUI on Hunter's Windows box"]:::done
@@ -321,7 +322,7 @@ graph TD
     T_X2["T-X2: Source adapter framework + GrabCAD/TraceParts adapters"]:::done
     T_X3["T-X3: part_search federation seam - browser adapters as providers"]:::done
     T_X4["T-X4: Datasheet and document acquisition - authenticated-browser fallback"]:::done
-    T_X5["T-X5: Profile manager UX seam - list/refresh/delete site profiles + expiry detection"]:::todo
+    T_X5["T-X5: Profile manager UX seam - list/refresh/delete site profiles + expiry detection"]:::review
     T_X6["T-X6: Hardening - license register, captcha/2FA failure modes, gated integration tests"]:::done
     T_X7["T-X7: Vendor adapter wave 2 - Amazon, McMaster-Carr, JLCPCB, PCBWay + manufacturing-service discovery"]:::done
     T_X7b["T-X7b: Vendor wave-2 follow-ups — McMaster STEP import + structured price to bom_price seam"]:::done
@@ -389,7 +390,7 @@ graph TD
     T_BL61["T-BL61: Fillet on a compiled document SIGSEGVs hostd — OCCT PerformFilletOnVertex kills the daemon"]:::review
   end
   subgraph WS_integration["workstream integration"]
-    T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog
+    T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::dropped
   end
   subgraph WS_perf["workstream perf"]
     T_PERF1["T-PERF1: GUI async applyOps conversions (never block GL thread on edits)"]:::done

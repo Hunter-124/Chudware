@@ -10,7 +10,9 @@ Covers:
   3. piping_to_part_doc emits a valid aicad.part/1 import envelope pointing at the STEP.
   4. An all-unresolvable doc raises PipingGeometryError (never a bare traceback).
 
-Run (from repo root):  python -m engine.piping.test_threed
+Run (from repo root):  python -m services.piping.test_threed
+    # or via pytest:
+    python -m pytest services/piping/test_threed.py -q
 """
 
 from __future__ import annotations

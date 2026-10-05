@@ -17,22 +17,20 @@ Unset defaults to `playwright` on macOS and `cef` on Linux/Windows. See the
 [canonical macOS Parts Library platform note](https://chudware.com/docs/troubleshooting/#macos-parts-library-vendor-access);
 release notes should link there rather than duplicate its wording.
 
-## Why the CEF backend remains
+## Backend boundaries and setup
 
-An August 2026 audit considered Chudcode's `browser` and `computer` tools. They work in their
-intended harness, but are currently in-process AgentTools rather than a stable bridge, CLI,
-or library API callable by this service. The `browser` and relay modes use CDP-family
-transports, so they are not substitutes for the CEF daemon's deliberately no-CDP vendor
-anti-bot path. `computer` drives an isolated Xvfb desktop but does not expose an embeddable
-texture or off-screen frame source suitable for `IWebViewBackend`.
+The host's native CEF panel and headless daemon are implemented under
+`host/src/ui/widgets/cef/`. Headless calls use `driver.headless_client()`;
+the residual Python embed worker in `embed.py` still uses Playwright/CDP.
+These are separate surfaces, not interchangeable browser transports.
+The CEF client currently uses POSIX local sockets; selecting `cef` does not
+provide Windows named-pipe transport support.
 
-Keep the CEF guidance above. Re-evaluate a Chudcode integration only when upstream provides
-a **stable callable service/library API plus a non-CDP vendor transport and/or an embeddable
-off-screen frame surface**. This records an integration-capability mismatch, not a general
-failure of Chudcode.
-
-One-time setup (already done in the shared mcp-venv; needed again only for a
-fresh venv). **Never auto-downloads at import** — provision explicitly:
+For a fresh runtime venv, install the selected residual driver explicitly.
+The CEF daemon needs a CEF-enabled Chudware host binary, not a Playwright
+binary download. Residual login/embed/cookie export (and headless calls
+when selecting `playwright` or `patchright`) need their Python driver and
+browser binary. **Never auto-downloads at import** — provision explicitly:
 
 ```
 pip install playwright          # or: pip install patchright
@@ -53,5 +51,5 @@ never solved** (`challenge.py`).
 
 Profiles created by `browser_login(site)` live under the app data dir
 (`~/.local/share/Chudware/browser_profiles/<site>/` or the Windows/legacy
-equivalent — see `engine.paths.BROWSER_PROFILES`) and are **local only**:
+equivalent — see `services.paths.BROWSER_PROFILES`) and are **local only**:
 never synced, never uploaded, never bundled into crash reports or diagnostics.

@@ -1501,9 +1501,8 @@ def _describe_board_text(doc_id: str) -> str:
 def _describe_project_text(run: dict | None = None, notes: list | None = None) -> str:
     """Narrate a DAG run's status: nodes done/blocked, budgets, open questions.
 
-    Feeds WS-A dag_status and the T-F17 mission-control UI. Accepts an optional
-    ``run`` dict matching contracts/dag_schema.md; degrades gracefully when no run
-    data is available (services/dag/ not yet landed as of T-F8).
+    Accepts an optional ``run`` dict matching contracts/dag_schema.md; returns
+    a no-run explanation when no data is supplied.
 
     ``run["brief"]`` (a {field: value} map assembled by _describe_project_args from the
     semantic fields a model wrote instead of a run dict) is narrated back verbatim, so
@@ -1514,8 +1513,7 @@ def _describe_project_text(run: dict | None = None, notes: list | None = None) -
     if run is None:
         out = {"ok": True, "text":
                "No DAG run data supplied — pass run=<dag_run_dict> from "
-               "dag_status() once services/dag is available, or from your "
-               "WS-A dag driver directly. See contracts/dag_schema.md "
+               "dag_status()['run']. See contracts/dag_schema.md "
                "for the expected shape."}
         if notes:
             out["interpreted"] = notes
@@ -2327,11 +2325,10 @@ def register_gsl_tools(mcp: FastMCP) -> None:
     def describe_project(run: Optional[Union[dict, str]] = None,
                          **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Compact narrative of a DAG project run — nodes done/blocked, budgets, open questions.
-        Feeds WS-A dag_status and the T-F17 mission-control UI.
+        Uses the live DAG run's status, budget and open-question data.
 
         run: a dag_run dict matching contracts/dag_schema.md — pass dag_status()['run'] or your
-        WS-A driver's run record. When omitted entirely, returns a graceful 'no run supplied'
-        message.
+        executor's run record. When omitted, returns a 'no run supplied' explanation.
 
         ALSO ACCEPTED, because a run dict is rarely what a caller has to hand:
           * a run ID string — run="<id>", run_id="<id>", id="<id>". The persisted DAG run is

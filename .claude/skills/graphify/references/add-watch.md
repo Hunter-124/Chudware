@@ -1,56 +1,23 @@
 # graphify reference: add a URL and watch a folder
 
-Load this when the user ran `/graphify add <url>` or passed `--watch`. Neither is part of the default build.
+Load only for `/graphify add <url>` or an explicit `--watch` request. Neither runs during a graph question or a default build.
 
-## For /graphify add
-
-Fetch a URL and add it to the corpus, then update the graph.
+## Add
 
 ```bash
-$(cat graphify-out/.graphify_python) -c "
-import sys
-from graphify.ingest import ingest
-from pathlib import Path
-
-try:
-    out = ingest('URL', Path('./raw'), author='AUTHOR', contributor='CONTRIBUTOR')
-    print(f'Saved to {out}')
-except ValueError as e:
-    print(f'error: {e}', file=sys.stderr)
-    sys.exit(1)
-except RuntimeError as e:
-    print(f'error: {e}', file=sys.stderr)
-    sys.exit(1)
-"
+graphify add URL --dir ./raw                  # optional --author NAME --contributor NAME
 ```
 
-Replace `URL` with the actual URL, `AUTHOR` with the user's name if provided, `CONTRIBUTOR` likewise. If the command exits with an error, tell the user what went wrong - do not silently continue. After a successful save, automatically run the `--update` pipeline on `./raw` to merge the new file into the existing graph.
+`add` fetches and saves an input; it does not extract or merge it into `graph.json`. On failure report the error and stop. On success, run the host-agent semantic update in `references/update.md` using the **existing recorded scan root**, provided it includes `raw/`. Do not change a parent graph's root to `./raw`: a subset scan can misclassify unrelated indexed sources as excluded. If `raw/` is outside the recorded root, build a separate graph and use `merge-graphs` into a separate output, or obtain the user's choice of a broader root.
 
-Supported URL types (auto-detected):
-- YouTube / any video URL → audio downloaded via yt-dlp, transcribed to `.txt` on next run (requires `pip install 'graphifyy[video]'`)
-- Twitter/X → fetched via oEmbed, saved as `.md` with tweet text and author
-- arXiv → abstract + metadata saved as `.md`
-- PDF → downloaded as `.pdf`
-- Images (.png/.jpg/.webp) → downloaded, Claude vision extracts on next run
-- Any webpage → converted to markdown via html2text
+Supported inputs include webpages (Markdown via html2text), Twitter/X (oEmbed), arXiv (abstract and metadata), PDFs and images. Video URLs use yt-dlp and local Whisper, requiring the installed package's video dependencies; see `references/transcribe.md`. Image extraction uses this session's vision capability on the host-agent route, not necessarily Claude or Gemini. Preserve ingested frontmatter (`source_url`, `captured_at`, `author`, `contributor`) on graph nodes. Fetching a URL is network access, but does not authorize sending the rest of the corpus to an LLM provider. Never bypass the package URL/security validation.
 
----
-
-## For --watch
-
-Start a background watcher that monitors a folder and auto-updates the graph when files change.
+## Watch
 
 ```bash
-$(cat graphify-out/.graphify_python) -m graphify.watch INPUT_PATH --debounce 3
+"$(cat graphify-out/.graphify_python)" -m graphify.watch INPUT_PATH --debounce 3
 ```
 
-Replace INPUT_PATH with the folder to watch. Behavior depends on what changed:
+The `graphify watch INPUT_PATH` CLI is also available; the Python module accepts the explicit debounce setting. Run from the directory containing the graph to update and retain its original scan root. This is a long-lived watcher: start only when requested, retain ownership of its process, and stop with Ctrl+C or terminate only the watcher you started. Do not interrupt another user's watcher/session.
 
-- **Code files only (.py, .ts, .go, etc.):** re-runs AST extraction + rebuild + cluster immediately, no LLM needed. `graph.json` and `GRAPH_REPORT.md` are updated automatically.
-- **Docs, papers, or images:** writes a `graphify-out/needs_update` flag and prints a notification to run `/graphify --update` (LLM semantic re-extraction required).
-
-Debounce (default 3s): waits until file activity stops before triggering, so a wave of parallel agent writes doesn't trigger a rebuild per file.
-
-Press Ctrl+C to stop.
-
-For agentic workflows: run `--watch` in a background terminal. Code changes from agent waves are picked up automatically between waves. If agents are also writing docs or notes, you'll need a manual `/graphify --update` after those waves.
+Code changes trigger local AST rebuilding and reporting, with no LLM or API key. Document/paper/image changes signal that a semantic update is needed; the watcher does not perform the host-agent extraction for you. Debouncing waits for a quiet interval so a group of edits is not rebuilt per file. Preserve shrink guards and sensitive/ignore exclusions. If a rebuild refuses unexplained loss, report it; never turn on `GRAPHIFY_FORCE` globally to silence the refusal.

@@ -7,26 +7,11 @@ assembly doc, inserts the parts as positioned components, and doc_saves the asse
 This harness exercises the same doc-level op sequence directly via libchudware (no LLM), then
 asserts the produced assembly .step+ is a valid aicad.asm/1 container referencing the parts.
 """
-import ctypes, json, os, sys, tempfile, zipfile
+import json, os, sys, tempfile, zipfile
 
-DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "Chudware")
-os.add_dll_directory(DIST)
-lib = ctypes.WinDLL(os.path.join(DIST, "libchudware.dll"))
-lib.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-lib.chudware_call.restype = ctypes.c_int
-lib.chudware_free.argtypes = [ctypes.c_char_p]
-
-
-def call(method, params):
-    out = ctypes.c_char_p()
-    rc = lib.chudware_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
-    raw = out.value.decode() if out.value else ""
-    if out.value:
-        lib.chudware_free(out)
-    data = json.loads(raw) if raw else {}
-    if rc != 0 or (isinstance(data, dict) and data.get("code")):
-        raise RuntimeError(f"{method} failed rc={rc}: {raw[:300]}")
-    return data
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
+from services.mcp.core_bridge import call
 
 
 def build_part(name, ops):

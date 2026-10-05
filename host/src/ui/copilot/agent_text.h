@@ -24,7 +24,6 @@
 // ingest side (feed.cpp) and the render side (activity_timeline.cpp) may each apply them.
 #pragma once
 
-#include <cstddef>
 #include <functional>
 #include <string>
 
@@ -72,13 +71,9 @@ std::string substituteDocIds(const std::string& text,
 // every rendered row.
 std::string foldToAtlasGlyphs(const std::string& text);
 
-// True when the font atlas has a glyph for *cp*. Mirrors ui_theme.cpp uiGlyphRanges() (:662) and
-// cadSymbolRanges() (:675), which are file-static there and cannot be linked from a GL-free TU.
+// True when the font atlas has a glyph for *cp*: the ui/glyph_ranges.h table ui_theme.cpp loads,
+// plus the layout controls ('\n', '\t', '\r', 0x1E) ImGui handles without a glyph.
 bool atlasCovers(unsigned cp);
-
-// The mirrored range table, as flat inclusive [lo,hi] pairs; *pairs* receives the pair count.
-// Exists so test_agent_text.cpp can diff it against ui_theme.cpp and FAIL if the two drift.
-const unsigned* atlasCoveredRanges(std::size_t& pairs);
 
 // ---- 3. skip-work predicate ---------------------------------------------------------------
 

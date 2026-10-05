@@ -162,7 +162,59 @@ def test_fs_read_selectors():
         r = t["fs_read"](p + ":1-2,1000-1001")
         assert "line 1\n" in r["text"] and "line 1000" in r["text"]
         r = t["fs_read"](p + ":5-6:raw")
-        assert "\t" not in r["text"] and r["text"] == "line 5\nline 6"
+        assert "\t" not in r["text"] and r["text"] == "line 5\nline 6\n"
+
+
+@pytest.mark.parametrize("source", [
+    b"int main(void)\n{\n    return 0;\n}\n",          # LF, final newline
+    b"alpha\nbeta\n\ngamma",                          # no final newline, blank line
+    b"one\r\ntwo\r\n\r\nthree\r\n",                   # CRLF
+    b"\n\n",                                          # only terminators
+    b"",                                              # empty file
+])
+def test_fs_read_raw_is_byte_verbatim(tmp_path, monkeypatch, source):
+    """raw=True / ':raw' returns the file text verbatim — every line keeps its own
+    terminator, so an offset or range window is exactly the matching source slice and a
+    file without a final newline stays without one — while the line count is unchanged."""
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    t = _tools()
+    p = tmp_path / "src.c"
+    p.write_bytes(source)
+    physical = source.decode().splitlines(keepends=True)
+    numbered = t["fs_read"](str(p))
+    assert numbered["total_lines"] == len(physical)
+
+    full = t["fs_read"](str(p), raw=True)
+    assert full["ok"] and full["text"] == source.decode()
+    assert full["total_lines"] == len(physical) and not full["truncated"]
+    assert t["fs_read"](f"{p}:raw")["text"] == source.decode()
+
+    for start in range(1, len(physical) + 1):
+        win = t["fs_read"](str(p), offset=start, limit=2, raw=True)
+        assert win["text"].split("… [truncated")[0] == "".join(physical[start - 1:start + 1])
+        assert t["fs_read"](f"{p}:{start}-{start}:raw")["text"] == physical[start - 1]
+
+
+def test_fs_read_raw_pages_reassemble_exact_file(tmp_path, monkeypatch):
+    """Paging a raw read with next_offset reassembles the exact file: the truncation footer
+    is appended after the last shown line's own terminator, never in place of it."""
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    t = _tools()
+    p = tmp_path / "big.txt"
+    source = "".join(f"line {i}\r\n" for i in range(1, 30)) + "tail without eol"
+    p.write_bytes(source.encode())
+    got, offset = [], 1
+    while True:
+        r = t["fs_read"](str(p), offset=offset, limit=7, raw=True)
+        assert r["ok"] and r["total_lines"] == 30
+        if "next_offset" not in r:
+            got.append(r["text"])
+            break
+        body, footer = r["text"].split("… [truncated")
+        assert body.endswith("\r\n") and f"offset={r['next_offset']}" in footer
+        got.append(body)
+        offset = r["next_offset"]
+    assert "".join(got) == source
 
 
 def test_fs_read_offset_limit():

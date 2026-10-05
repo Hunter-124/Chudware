@@ -1,36 +1,105 @@
-# services/agent — built-in agent loop & provider adapters
+# services/agent — Chudcode sessions, CAD host tools, roles/missions and provider adapters
 
-Scope: services/agent/** (agent support services: provider adapters, agent_turn, roles/playbooks; the autonomous design loop itself is C++ in core/agent/)
-Contracts: contracts/worker_rpc.md (protocol 2), contracts/events.md
+Scope: services/agent/** (online turns are hosted by the compiled Chudcode runtime; native C++ `core/agent/run.cpp` is the offline-safe local-modeling fallback)
+Contracts: contracts/worker_rpc.md (protocol 2, worker lanes), contracts/agent_events.md + agent_events.json, contracts/events.md, contracts/copilot_modes.json
+Canonical guidance:
+- `.claude/skills/cad-chudcode-integration/SKILL.md`: topology, file table, session/tool/
+  event/recovery rules, compaction choice.
+- `.claude/skills/chudware-dev/SKILL.md`: CAD-side agent policy, worker lanes, prompt
+  override isolation.
 
 ## Entry points
-- (T-RF5: the legacy build123d design loop — `run_agent.py`, `loop.run`/`run_turn`/`Session`, the `agent_design` RPC — is DELETED. The C++ core's `agent_run_v2` is the single agent entry; `loop.py` keeps only the legacy prompt constants + `apply_context_refs` for `engine.worker._get_prompts` / `agent_turn.py`.)
-- services/agent/config.py:112 `get_provider()` — resolve the active backend (Anthropic/OpenAI/local LM Studio; offline mode enforcement at C35)
-- services/agent/providers/base.py:27 `Provider` — abstract vision+text chat backend; concrete impls: AnthropicProvider, OpenAIProvider, GeminiProvider, LlamaCppProvider, MockProvider
-- services/installer/llamacpp.py `ensure_server_running()` — local llama.cpp spawn/health and CUDA build selection (`CHUDWARE_LLAMA_VARIANT=cuda|cpu` override); `services/agent/providers/llamacpp_provider.py` uses it for local provider construction. The former `services/agent/local_runtime.py` routing auto-registration wrapper had no production caller and was removed.
-- services/agent/model_manager.py `structured_output_for()` / `model_for_role_shape()` (T-W31, W29 mapping) — per-model structured-output capability (qwen3-4b = prompted_json fan-out, GBNF broken; gemma3-4b-qat = gbnf worker); tiers.yaml `local_models:` block + `tiers.load_local_models()` carry the shipped role-shape defaults
-- services/agent/roles.py `load_role()` / `load_all_playbooks()` / `validate_suite()` / `assemble_context()` / `validate_handoff()` / `schema_to_gbnf()` (T-W7) — loads the 13 authored role cards (services/agent/roles/*.yaml, verbatim) + 6 playbooks (services/agent/playbooks/*.yaml); validates schema/allowlist/stage-vocab; assembles per-turn context in contract §9.1 order; validates handoff envelopes + emits a llama.cpp GBNF grammar per handoff schema. Host: services/dag/node_runner.py (node `role:` field).
-- services/agent/tool_guidance/ — built-in curated per-tool options (one-line `prompt_note` for every registry tool + `timeout_s` on the slow FEA/CFD/CAM/EM/reveng/DAG calls). Layering in `config.get_tool_options`: stock defaults < curated guidance < config.json (user wins per-field; `""` silences a note). One module per family in `_FAMILIES`; `tool_schemas` renders the note as the `Note:` line in the tools slot; the Settings → AI → Tools panel shows curated values as dimmed placeholders.
-- Tools panel data path: `prompt_preview.tool_catalog()` (worker RPC `ai_tool_catalog`) feeds the live Settings → AI → Tools tree; `tools/gen_tool_panel_tables.py` (venv) bakes the offline fallback `host/src/ui/tool_panel_tables.h` + `.snapshot.json`. After adding/renaming a tool: add its `prompt_note` in `tool_guidance/<family>.py` (new family → new module + `_FAMILIES` entry + `config.DEFAULT_TOOL_FAMILIES`) and re-run the generator. Gates: `scripts/check.py` tool_panel_sync, `services/agent/test_tool_guidance.py` (registry set is frozen at collection import — in-test fake registrations cannot flake it).
-- `compaction.py` — context-window compaction: `snapcompact_archive()` (text-phase cut, canonical local semantics) + `reinject_archive()`. Under `CHUDWARE_COMPACTION_BACKEND=omp` + a vision provider, the archive is ADDITIONALLY rendered to OMP snapcompact PNG frames via the bridge `snap_render` RPC (text→image only; the old full-bridge `compact` path is deleted). OG source + frames persist in `snap_store.py` (content-addressed, `<appdata>/snaps/<snap_id>/`); a `[snap:<id> api=… model=…]` stamp line leads the reinjected message so the next round re-snaps cumulatively (`_snap_anchor`), and a provider switch re-renders the stored OG in the new provider's shape (`_resnap_for_provider`). `snap_spec.py` maps provider→(api, model, vision, image budget). Knobs: `agent.compaction.{snap_frames,snap_dir,snap_max_frames}`. Any bridge/store failure degrades to text-only with `archive["warning"]`.
+- `services/agent/worker_rpc.py` — `ADMIN_METHODS` (`agent_admin_turn`, `agent_cancel`,
+  `agent_steer`, `chudcode_*`, `memory_*`), `PREVIEW_METHODS` (`ai_tool_catalog`,
+  `ai_prompt_*`), and the merged `WORKER_METHODS` that `worker_main` registers.
+  `_agent_admin_turn` assembles the CAD role prompt and run-scoped host tools, and runs
+  `save_touched_docs` in `finally`.
+- `services/agent/chudcode_host.py` `ChudcodeSessionHost` / `get_default_chudcode_host()` —
+  one persistent `chud --mode rpc` process per conversation.
+  - The binary resolves via `_resolve_binary` (`CHUDWARE_CHUDCODE_BIN`).
+  - Session count is bounded by `CHUDWARE_CHUDCODE_MAX_SESSIONS`.
+  - `run_turn` requires a terminal `agent_end`.
+- `services/agent/chudcode_tools.py` `build_host_tools` / `dispatch_host_tool` — projects the
+  live MCP/mission registries as host tools. `_effective_names` applies the allowlist
+  tri-state, mode policy and floors.
+- `services/agent/chudcode_events.py` `map_rpc_frame` / `RpcFrameState` — the only RPC-frame
+  → feed mapper.
+- `services/agent/chudcode_control.py` `ControlServer` — the authenticated private
+  cancel/steer/status lane; `worker_control_info` exposes it.
+- `services/agent/online_turn.py` — `resolve_workspace`, `resolve_settings`,
+  `resolve_model_and_effort`, `activate_turn_env`.
+- `services/agent/chudcode_roles.py` `run_role_turn` and
+  `mission_dispatch.MissionDispatch` — delegated role/mission turns through Chudcode.
+- `services/agent/tool_categories.py` (`MAIN_CHAT_CORE_TOOLS`, `resolve_tool_requests`),
+  `copilot_mode_tools.py`, `progress_watchdog.ProgressWatchdog`, and
+  `subagent_registry.py` + `subagent_rpc.py`.
+- `services/agent/roles.py` (`load_role`, `load_all_roles`, `load_all_playbooks`,
+  `validate_suite`, `assemble_context`, `validate_handoff`, `list_editable_prompts`) — loads
+  the `roles/*.yaml` cards (`schema: aicad.role/1`; `council_seats.yaml` is data) and
+  `playbooks/*.yaml`.
+- `services/agent/skills/builtin/<name>/SKILL.md` — CAD skills fetched via `cad_skill(name)`,
+  never `skill://`.
+- `services/agent/tool_guidance/` — a curated `prompt_note`/`timeout_s` per tool family
+  (`_FAMILIES`). It is layered by `config.get_tool_options` (stock < curated < config.json).
+  - `prompt_preview.tool_catalog()` → `ai_tool_catalog` feeds Settings → AI → Tools.
+  - `tools/gen_tool_panel_tables.py` bakes the offline fallback
+    `host/src/ui/tool_panel_tables.h` + `.snapshot.json`.
+- Local execution and non-turn helpers:
+  - `agent_turn.run_turn` is the explicit-offline/test provider loop, entered via
+    `chudcode_roles._run_offline` → `mission_dispatch.run_linear_role_turn` and gated by
+    `config.provider_offline_safe`. Its helpers (`_dispatch_tool`, `resolver_for`,
+    guardrails) are shared with the online path.
+  - `providers/chudcode_provider.py` `helper_provider` / `ChudcodeProvider` route ECAD
+    planning and regeneration diagnosis through `ChudcodeSessionHost.complete_text`.
+    During host-tool dispatch they inherit the owning turn's provider/model/credential
+    scope, Stop and compaction policy; they have no session/tools/skills/rules and
+    memory is off. Outside a turn, governed role/config selections apply.
+    Explicit offline/local-only helpers require `provider_offline_safe`, without
+    online fallback. Other provider adapters retain explicitly bound standalone/
+    bench consumers; do not remove SDK capability merely because chat uses Chudcode.
+  - `compaction.py` is the deterministic local compaction; online sessions use Chudcode
+    compaction per the user's choice (`config.ONLINE_COMPACTION_METHODS`).
+- Online invariants: no implicit turn wall-clock cap; an explicit positive timeout is
+  the user's budget. Compaction uses the selected method, never a substituted default.
+  Ask/Plan remain read-only after tool loads/floors; advertise and dispatch the same set.
+  Terminal persistence saves agent documents, never closes them or overwrites user tabs.
 
 ## How it connects
-Autonomous part design runs in the C++ core (`core/agent/run.cpp`, `agent_run_v2` — doc-ops orchestrator with modes, missions via `agent_mission_v1`); the GUI launches it via `launchAgentRunV2` (host/src/core/jobs.cpp) and streams orch_-prefixed events to the ActivityPanel. This Python package keeps the provider adapters, `agent_turn.py` (single-turn tool-calling for the DAG/PLM surfaces), roles/playbooks, and support services. Provider-agnostic abstraction allows swapping Anthropic/OpenAI/local LM without touching agent logic; offline mode (C35) enforces loopback-only endpoints for ITAR compliance.
+1. Host `launchAgentRunV2` (`host/src/core/jobs.cpp`) sends online sends to
+   services-worker `agent_admin_turn` on hostd's agent lane.
+2. `ChudcodeSessionHost` drives the Chudcode session; Chudcode owns providers, auth,
+   models, history, compaction and nested agents.
+3. CAD tools run in-process (`build_host_tools` → `agent_turn._dispatch_tool`). Events map
+   back through `chudcode_events` into the `orch_` feed.
+
+Explicit-offline runs go to native `agent_run_v2`/`agent_mission_v1`
+(`core/agent/run.cpp`) or the offline role loop. There is never a second online provider
+loop.
 
 ## Debugging playbook
-- `pytest services/agent/test_compaction.py -xvs` — token overflow + context window compaction edge cases
-- `pytest services/agent/test_snap_compaction.py -q` — snap compaction with a faked bridge (store round-trip, cumulative re-snap chain, provider-switch re-snap, budgets, text fallbacks); `CHUDWARE_SNAP_LIVE=1` enables the live-bridge render test
-- Gotcha (snap): the snap store root resolves via `agent.compaction.snap_dir` config → `CHUDWARE_SNAP_DIR` env → `<appdata>/snaps`; on legacy installs that's `~/.local/share/AI-CAD/snaps`. OMP `planArchive` images only text beyond ~2 edge capacities, so small archives legitimately store 0 frames (everything rides the text edges)
-- Gotcha: offline mode is enforced twice: at provider resolution (config.py:132) AND at loop start (config.py:847); disable via config.json `"offline_mode": false` or `CHUDWARE_PROVIDER` env var override
-- Gotcha: `MockProvider` replies use fixed scripts; for real design, configure ANTHROPIC_API_KEY env var or %APPDATA%/Chudware/config.json
-- `pytest services/agent/test_roles.py -q` — role cards + playbooks + handoff/GBNF machinery (T-W7), fully headless (no engine, no LLM); includes a self-contained GBNF acceptor
-- Gotcha (T-W7): role allowlist enforcement is bound via `services.mcp.tool_registry.set_policy(allow=...)` — the ONE dispatch chokepoint; the loader flags `delegate`/`workspace_status` as not-yet-registered (they land with sibling W tasks), not as errors
+- `<venv>/python -X utf8 -m pytest services/agent -q` (whole package, as the gate runs it).
+  - Online path: `test_chudcode_{host,tools,events,control,roles,questions,progress,compaction_policy}.py`,
+    `test_worker_rpc_chudcode.py`, `test_online_compaction.py`.
+  - Registry/projection: `test_subagent_registry.py`, `test_mission_dispatch.py`,
+    `test_roles.py` (headless), `test_tool_guidance.py`.
+- Headless real turn: `scripts/run_mission.py --workspace <project> --prompt-file p.md --model <id>`
+  (`--resume` for follow-ups). It uses the user's Chudcode auth.
+- Gotcha: after adding or renaming a tool:
+  - add its `prompt_note` in `tool_guidance/<family>.py`;
+  - re-run `tools/gen_tool_panel_tables.py`;
+  - `scripts/check.py` `tool_panel_sync` / `advertised_tool_audit` fail until both are done.
+- Gotcha: a new stateful agent RPC family must join hostd's agent-lane prefixes
+  (`WorkerBridge::forMethod`).
+- Gotcha: prompt overrides are split by consumer:
+  - `appdata/prompts/<id>.md` is for native C++;
+  - `<id>.mission.md` is for YAML roles.
+  Never collapse them.
 
 ## Graphify starters
-- graphify explain "built-in agent loop"
-- graphify query "agent_turn provider complete tool calls"
+- graphify query "ChudcodeSessionHost run_turn agent_admin_turn"
+- graphify explain "build_host_tools"
+- graphify path "worker_rpc.py" "chudcode_host.py"
 
 ## Related tasks/docs
-- work/tasks: T-F* tasks (AI experience workstream; T-F9 ≈ agentic workflow UX); T-A* tasks (DAG orchestrator; agent runs execute in core/agent/run.cpp)
-- docs/design/PLATFORM_ADR.md (platform architecture)
-- docs/AI_TOOLING_MASTER_PLAN.md (pillars 8–14: MCP integration, copilot modes, offline design)
+- services/agent/AGENTS.md, AGENTS.md (online-agent split), ARCHITECTURE.md (component map)
+- docs/design/PLATFORM_ADR.md, docs/AI_TOOLING_MASTER_PLAN.md (pillars 8–14)

@@ -1,5 +1,5 @@
 // cef/cef_platform_windows.cpp — Windows half of the CEF platform seam.
-// SCAFFOLDING (docs/cef_webview.md phase 2); compiled only with CHUDWARE_ENABLE_CEF.
+// Compiled only with CHUDWARE_ENABLE_CEF (design: docs/design/cef_webview.md).
 #include "cef_platform.h"
 
 #include <windows.h>
@@ -47,9 +47,9 @@ std::string cache_root() {
 }
 
 void configure_settings(CefSettings& settings) {
-    // TODO(cef): for the sandbox, allocate cef_sandbox_info via
-    // cef_sandbox_win.h and thread it through CefExecuteProcess/CefInitialize.
-    // Scaffolding runs unsandboxed to match the Linux single-binary layout.
+    // Runs unsandboxed to match the Linux single-binary layout. Enabling the
+    // sandbox means allocating cef_sandbox_info via cef_sandbox_win.h and threading
+    // it through CefExecuteProcess/CefInitialize.
     settings.no_sandbox = 1;
 }
 

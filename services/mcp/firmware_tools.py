@@ -125,10 +125,6 @@ _PROJECT_ROOTS: dict[str, Path] = {}
 # core/firmware/project.cpp).
 _COMPILABLE_EXTS = frozenset({".c", ".cpp", ".cc", ".cxx", ".s"})
 
-# Emulator harness margin: the engine runs the emulated target for
-# ``timeout_s - 5s`` (core/firmware/emulator.cpp run_simulation), so a caller who asks
-# for a target run of N seconds needs timeout_s = N + 5.
-_SIM_HARNESS_MARGIN_S = 5.0
 
 
 def _firmware_root() -> Path:
@@ -270,8 +266,11 @@ def register_firmware_tools(mcp) -> None:
           ``missing`` tool list that would unlock each family.
         - ``platforms`` = T-FIN2 Renode platform capability matrix (``stm32f4`` /
           ``stm32f1`` / ``nrf52`` / ``rp2040`` / ``esp32`` / ``cortex-m`` →
-          ``{file, emulation, uart, gpio, gpio_observe, adc, i2c, spi, timers,
-          notes}``). ESP32 is build+flash only (``emulation="none"``).
+          ``{file, emulation, uart, gpio, gpio_observe, adc, i2c, spi, can, timers,
+          timed_bus, electrical_bus, notes}``). ESP32 is build+flash only
+          (``emulation="none"``). Only implemented STM32F4 controllers on Renode
+          support the timed/electrical bus models; a functional peripheral capability
+          alone does not promise electrical fidelity on other families.
         - ``banners`` = human-readable fix-it lines; ``missing`` = absent core tools.
 
         This doctor is GLOBAL: it reports the machine's toolchain provisioning, not any
@@ -445,11 +444,23 @@ def register_firmware_tools(mcp) -> None:
     @mcp.tool()
     def fw_sim_run(project_id: str, elf_path: str = "", scenario: str = "",
                    assertions: Optional[list[str]] = None, run_s: float = 0.0,
-                   timeout_s: float = 0.0, power_profile: bool = False) -> str:
-        """Run the firmware emulation loop via Renode or QEMU and return SimResult.
+                   timeout_s: float = 0.0, power_profile: bool = False,
+                   backend: str = "auto", scenario_path: str = "") -> str:
+        """Run the canonical firmware simulation used by Firmware > Emulate.
 
-        SimResult fields: ``{passed, uart_log, gpio_states, assertion_results, ms,
-        gpio_events, trace_path}``. ``passed`` is True iff every assertion matched.
+        Humans select a project in Emulate, edit/load/save the same scenario JSON,
+        choose backend, duration/host timeout and assertions, then Run emulation.
+        The UI exposes Engineering evidence and Copy native result JSON; loaded files
+        become inline JSON. Agents can instead pass ``scenario_path``.
+        ``project_id`` is required; explicit ``elf_path`` wins over build discovery.
+        Run ``fw_build`` first or supply an executable ELF for the selected architecture.
+        ``backend`` is auto / renode / qemu / simavr. Forced choices refuse when
+        unavailable or incompatible, never silently fall back. Scenarios require Renode.
+        SimResult preserves ``{passed, uart_log, gpio_states, assertion_results, ms,
+        gpio_events, trace_path}`` and adds ``bus_events`` / ``bus_summary`` / ``uart_events``.
+        ``passed`` concerns the requested assertions, not engineering certification.
+        ``ms`` is host wall elapsed time; bus event ``t_ns`` is nanosecond-quantized
+        virtual time, not a guarantee of subnanosecond physical accuracy.
         Assertions:
         - ``"uart:<text>"`` — UART/semihosting output contains ``<text>``.
         - ``"gpio:<PIN>=<level>"`` — GPIO pin is at the given logic level at end of run.
@@ -460,8 +471,8 @@ def register_firmware_tools(mcp) -> None:
           a time-stamped event shows the pin at that level after/before/at-or-after T ms.
         - ``"toggles:<PIN>>=<N>"`` (also <=, ==, >, <) — pin level changed N times (T-FIN3).
         - ``"period:<PIN>=<P>ms±<TOL>ms"`` — mean rising-edge period within P±TOL (T-FIN3).
-        - ``"uart_within:<text>@<T>ms"`` — text in a time-stamped UART event at or before
-          T ms (timestamps come from the scenario timeline's CHUDWARE_T_MARK marks; T-FIN3).
+        - ``"uart_within:<text>@<T>ms"`` — text in an actually time-stamped UART event
+          at or before T ms; inspect timing evidence, not host log arrival time.
         - plain string — treated as uart match.
 
         ``scenario`` (T-FIN3, schema ``aicad.fwscenario/1``, contracts/firmware_rpc.md §9)
@@ -470,23 +481,90 @@ def register_firmware_tools(mcp) -> None:
         temp sensor with programmed temperature), ``"fixture:spi_imu_stub"``,
         ``"fixture:quadrature_encoder"`` (PA0/PA1, 24 steps CW), ``"fixture:adc_thermistor"``
         (NTC heat-up curve via the Python-peripheral ADC stub), ``"fixture:user_button"``.
-        Track kinds: gpio_edges / button / quadrature / i2c_sensor / i2c_registers /
-        spi_stub / uart_rx / adc_waveform (sine|ramp|samples — STM32 families only; no
-        ADC model ships upstream, other families refuse honestly). Scenarios run on the
-        Renode path ONLY; an invalid or platform-unsupported scenario refuses honestly
-        (``invalid_scenario`` envelope, or ``scenario_error`` / ``scenario_unsupported``
-        in ``uart_log``) — never a silent drop.
+        Alternatively pass ``scenario_path`` to read a saved UTF-8 scenario JSON file
+        (the same file humans load/save in Emulate); do not supply both inputs.
+        Track kinds include gpio_edges / button / quadrature / i2c_sensor /
+        i2c_registers / i2c_register_stream / spi_stub / spi_peer / uart_rx /
+        can_frames / adc_waveform. ``spi_peer`` supplies ``response_hex`` or register
+        mappings plus actual ``cs_gpio`` / ``cs_pin``. ``can_frames`` events supply
+        ``t_ms,id,payload_hex`` and optional ``extended,remote``. A CAN track's optional
+        ``bitrate_hz`` reconfigures its named peer even with a link, using sample point
+        0.875, SJW 1 and track ``ack_enabled`` (default true); it can override link peer
+        settings rather than rejecting a mismatch. Omit redundant track timing to retain
+        link peer settings; inspect emitted effective peer timing, not just resolved_links.
+        Native validation is authoritative: malformed, incomplete or platform-unsupported
+        scenarios refuse with native diagnostics; inspect code/message/detail or the
+        recorded scenario/platform errors rather than treating empty UART as success.
 
-        ``gpio_events`` is the time-ordered pin timeline; ``trace_path`` points at a JSON
-        trace artifact (schema ``aicad.firmware.trace/1``, contracts/firmware_rpc.md §7)
-        with interleaved pin + UART events, written next to the ELF.
+        Add optional ``bus_links`` to ``aicad.fwscenario/1`` and ``link_id`` to tracks.
+        Each link names ``id``, ``bus`` (actual controller), ``protocol`` (i2c / uart /
+        spi / can), explicit ``controller_clock_hz``, ``peer`` and ``electrical.signals``.
+        Firmware register programming determines controller timing; declared clock
+        frequency is not a silent override for baud/bitrate/mode registers.
+        SI physical inputs are required rather than invented: signal ``name`` and
+        ``mode``; ``model=lumped_rc`` with ``series_r_ohm`` / ``wire_capacitance_f``, or
+        ``model=lossless_tline`` with located segments ``from,to,z0_ohm,propagation_s``.
+        Endpoint records declare ``id,at,input_capacitance_f``; receiver ``vil_v,vih_v``
+        (CAN ``recessive_max_v,dominant_min_v``); driver ``drive,v_low_v,v_high_v,
+        r_low_ohm,r_high_ohm,rise_s,fall_s,tx_delay_s,rx_delay_s``.
+        Bias/termination records declare location, ``resistance_ohm`` and rail/ground/
+        differential reference. Resistances are ohms, capacitances farads, voltages
+        volts, all delays seconds; rise/fall are 10–90% exponential source transitions.
+        No nominal impedance/clock/termination is inferred from a board label.
+        Peer protocol settings: I2C ``response_delay_s,clock_stretch_s``; TTL UART
+        ``baud_hz,data_bits,parity,stop_bits,electrical_variant=ttl``; SPI ``cpol,cpha,
+        clock_to_output_s,setup_s,hold_s``; CAN ``bitrate_hz,sample_point,sjw_tq,
+        clock_hz,ack_enabled``. Hz means cycles/second; sample_point is a fraction.
+        SPI's receive budget includes the clock link/receiver delay, peer clock-to-output
+        delay and MISO return propagation, rise/threshold settling and load, plus setup.
+        In the exercised 50 ns half-period profile, 20 ns edges plus 20 ns peer output
+        delay exceeded that budget and produced actual SPI_BAD with the same ELF;
+        the healthy 5 ns-edge profile is not a universal SPI timing guarantee.
 
-        Supported targets (T-FIN2 platform pack): stm32f4 (uart+gpio+i2c+spi+timers),
-        stm32f1 (uart+gpio+i2c+timers), nrf52 (uart+i2c+spi+timers; NO gpio assertions),
-        rp2040 (bare-metal uart only), cortex-m generic (no peripherals; QEMU semihosting
-        path). ESP32 has NO emulation — build+flash only. When an assertion needs a
-        peripheral the platform lacks, the run refuses honestly: ``passed=False`` with a
-        ``platform_capability`` explanation per assertion (see fw_status ``platforms``).
+        ``bus_summary`` reports resolved_links, limitations, retained event_count and
+        truncation. ``bus_events`` contains actual register/frame/electrical outcomes
+        with bus, protocol, event and virtual ``t_ns``; other observed fields are strings.
+        Sample level -1/cause floating_network or threshold_indeterminate is unresolved
+        electrical evidence, independent of hardware error flags. UART outcome=unresolved
+        preserves that cause even with ONEBIT, which does not invent a hardware NF flag.
+        Resolved samples do not by themselves prove correct received data or framing.
+        Inspect firmware-visible status/data/IRQ/completion/timeouts against these events.
+        Run the SAME ELF with healthy and faulty loading/timing, compare actual firmware
+        outcomes, and preserve scenario inputs + native evidence. Console text alone
+        is not proof that electrical latency affected firmware. Evidence is finite:
+        parsed streams/trace cap at 4096 entries, detailed samples at 4096 and model
+        events at 65536; uart_log caps at 32000 bytes. Inspect truncation diagnostics;
+        UART transmit completions are selected before their independent 4096-entry cap.
+        Plain UART and uart_within assertions are not evaluated on selected UART loss,
+        including UART or unscoped emitter loss. Other protocol loss, the global parsed
+        bus cap and UART sample-detail-only loss do not prevent their evaluation.
+
+        ``gpio_events`` is the retained pin timeline; ``trace_path`` is the best-effort
+        JSON artifact (schema ``aicad.firmware.trace/1``) next to the ELF, containing
+        GPIO/UART evidence, not the full bus/resolved-link packet. Renode 1.16.1 observes
+        final ODR state but lacks the observer needed for timestamped GPIO/toggle/period
+        assertions; those refuse rather than turning a final snapshot into a timeline.
+        Timed F4 UART assertions reconstruct per-bus bytes; uart_within uses virtual
+        transmit completion, not host console receipt. Legacy UART timestamps may be coarse/null.
+
+        Timed/electrical I2C, TTL UART, master SPI and bxCAN share the existing Renode
+        bus runtime, bounded to STM32F4 i2c1–3, usart1/2, spi1–3 and can1/2.
+        Query fw_status platform capabilities and inspect resolved_links before choosing
+        a bus. Other families' functional UART/I2C/SPI support does not imply electrical
+        support. ESP32 has no emulation. Missing physical values or unsupported models/
+        variants are refused, not silently idealized. Without links the F4 controllers
+        assume reset 16 MHz HSI peripheral clocks and an ideal medium. RCC/PLL/APB clock
+        changes are not modeled; controller_clock_hz declares the assumed peripheral
+        input, not an implementation of RCC. Functional runs are not calibrated evidence.
+        Linear RC MNA / lossless Branin lines start with zero stored energy; explicit
+        biases charge the medium, with no invented gmin or termination. Receiver voltage/
+        validity history is preserved for delayed/past samples, not replaced by the latest
+        voltage. Quiet line ports do not skip travelling-wave integration.
+        The numerical timestep floor (0.1 ns) and quantized schedules are controls, not
+        accuracy promises. CAN is differential only; common-mode, asymmetry, EMC,
+        crosstalk, nonlinear drivers, dispersion and general SPICE behavior are excluded.
+        Respect all additional reported limitations; this is not full-flight,
+        Windows/macOS or live-hardware proof.
 
         T-FIN7: when the project is linked to an ECAD board (``board_doc_ref``) and a
         trace was written, the result also carries ``power_profile_path`` — an
@@ -495,12 +573,17 @@ def register_firmware_tools(mcp) -> None:
         duty x the board's T-FIN8 ``eng.supply.rails`` currents). Bookkeeping, not
         SPICE. Use fw_power_profile to derive one from an existing trace.
 
-        ``run_s`` / ``timeout_s`` bound the run: ``timeout_s`` is the emulator wall-clock
-        budget (engine default 30 s) and the emulated machine is told to run for
-        ``timeout_s - 5 s``. Pass ``run_s`` to say how long the TARGET should run and the
-        5 s harness margin is added for you (``run_s=1.0`` → ``timeout_s=6.0``); an
-        explicit ``timeout_s`` wins. A scenario timeline longer than that still extends the
-        run — it is a floor, not a cap. Both are echoed in ``arg_notes``.
+        On Renode, ``run_s`` is the TARGET virtual-time horizon in seconds (0 = native default,
+        1 second without a scenario; an unspecified scenario horizon includes the last
+        stimulus + 1 second). An explicit horizon must include every scheduled stimulus.
+        ``timeout_s`` is the independent HOST process safety budget in seconds
+        (0 = native default, 30 seconds). Neither replaces the other; no wall sleeps
+        count as virtual latency. Short virtual runs may need a larger host budget.
+        A stimulus can still have an unfinished serialized transfer at the horizon.
+        MCP/UI 0 timeout omits the native field; native RPC requires positive timeout_s.
+        simavr uses a wall-duration stop, not a precise virtual horizon; QEMU refuses
+        explicit positive run_s. Neither accepts peripheral scenarios or supplies
+        timed/electrical bus evidence; use Renode for the bounded models above.
 
         ``power_profile=True`` is not a knob here — the power profile is a SEPARATE tool,
         ``fw_power_profile(trace_path=...)``, which post-processes the ``trace_path`` this
@@ -522,6 +605,26 @@ def register_firmware_tools(mcp) -> None:
         if not _finite_number(timeout_s, nonnegative=True):
             return _dumps(_err(
                 "invalid_request", "timeout_s must be finite and non-negative (0 uses the engine default)"))
+        if backend not in ("auto", "renode", "qemu", "simavr"):
+            return _dumps(_err(
+                "invalid_request", "backend must be auto, renode, qemu or simavr"))
+        if scenario_path:
+            if scenario:
+                return _dumps(_err(
+                    "invalid_request", "Pass scenario or scenario_path, not both"))
+            problem = _file_problem(scenario_path, "scenario_path")
+            if problem:
+                return _dumps(_err("invalid_request", problem))
+            try:
+                scenario = Path(scenario_path).expanduser().read_text(encoding="utf-8")
+            except (OSError, UnicodeError, ValueError) as exc:
+                return _dumps(_err("invalid_request", f"scenario_path cannot be read: {exc}"))
+            try:
+                saved = json.loads(scenario)
+            except ValueError as exc:
+                return _dumps(_err("invalid_request", f"scenario_path is not valid JSON: {exc}"))
+            if not isinstance(saved, dict):
+                return _dumps(_err("invalid_request", "scenario_path JSON must be an object"))
         if assertions is not None:
             if not isinstance(assertions, list) or any(
                     not isinstance(item, str) or not item.strip() for item in assertions):
@@ -538,19 +641,13 @@ def register_firmware_tools(mcp) -> None:
             p["scenario"] = scenario
         if assertions:
             p["assertions"] = assertions
-        notes: list[str] = []
+        if backend != "auto":
+            p["backend"] = backend
+        if float(run_s) > 0:
+            p["run_s"] = float(run_s)
         if float(timeout_s) > 0:
             p["timeout_s"] = float(timeout_s)
-            if float(run_s) > 0:
-                notes.append(
-                    f"run_s={run_s} ignored: explicit timeout_s={timeout_s} wins "
-                    f"(target runs for timeout_s-{_SIM_HARNESS_MARGIN_S:g}s)")
-        elif float(run_s) > 0:
-            p["timeout_s"] = float(run_s) + _SIM_HARNESS_MARGIN_S
-            notes.append(
-                f"run_s={run_s} applied as timeout_s={p['timeout_s']:g} — the emulated "
-                f"target runs for {max(1.0, float(run_s)):g}s plus a "
-                f"{_SIM_HARNESS_MARGIN_S:g}s harness margin")
+        notes: list[str] = []
         if power_profile:
             notes.append(
                 "power_profile is not a fw_sim_run option — the profile comes from "
@@ -747,11 +844,11 @@ def register_firmware_tools(mcp) -> None:
                            name: str = "", sim_result: str = "") -> str:
         """Build an ``aicad.fwscenario/1`` from a flight/CFD/kinematic profile (Wave-3 S1).
 
-        Bridge from SIMULATED REALITY into the emulated MCU: physics-accurate sensor
-        models (MPU6050 IMU, BMP280 baro, LIS3MDL mag, NEO-6M GNSS, pitot/airspeed)
-        convert a time-series profile into time-varying ``i2c_register_stream`` tracks
-        (and GNSS ``uart_rx`` NMEA) that ``fw_sim_run`` can play back via Renode's
-        ``Mocks.DummyI2CSlave``.
+        Convert a time-series profile into modeled sensor register values (MPU6050 IMU,
+        BMP280 baro, LIS3MDL mag, pitot/airspeed) as ``i2c_register_stream`` tracks and
+        NEO-6M GNSS ``uart_rx`` NMEA tracks. ``fw_sim_run`` replays these through the
+        selected platform's actual peripheral models. Sensor register conversion is not
+        evidence that bus timing/electrical behavior passed.
 
         Args:
           profile: JSON object string of a flight profile / trajectory, e.g.
@@ -768,10 +865,13 @@ def register_firmware_tools(mcp) -> None:
 
         Returns JSON ``{scenario, n_tracks, devices, dt_s, duration_s, ms}``. The
         ``scenario`` object is a valid ``aicad.fwscenario/1`` ready for
-        ``fw_sim_run(scenario=...)``. Building the scenario is pure Python (no Renode
-        required); *running* it still needs Renode — when Renode is absent,
-        ``fw_sim_run`` honest-skips with an explanation in ``uart_log`` (Renode 1.16.1
-        is installed on the flight-computer benchmark host).
+        ``fw_sim_run(scenario=...)``. Generation runs in the native core and needs no
+        emulator; replay requires a supported Renode platform. For engineering bus
+        simulation, add measured ``bus_links`` and track ``link_id`` using fw_sim_run's
+        SI parameter schema, then save the same JSON for Firmware > Emulate.
+        Inspect native bus_summary limitations and bus_events before claiming latency/
+        impedance correctness; generated sensor samples alone do not supply physical
+        line, threshold, driver or controller-clock parameters.
 
         Example (climb+turn into IMU+baro)::
 
@@ -940,9 +1040,10 @@ def register_firmware_tools(mcp) -> None:
                           mi_commands: Optional[list[str]] = None) -> str:
         """Run an AVR ELF under simavr (``simavr -m <mcu> <elf_path>``) and return FlashResult.
 
-        Free-run mode (``gdb=False``, default): emulates for ``run_s`` seconds and captures
-        stdout/stderr (simavr's UART trace etc.). simavr never self-exits, so the scheduled
-        stop after ``run_s`` is reported as ``success=True`` (not a timeout failure).
+        This is the low-level ELF/debug process runner, not the scenario/electrical
+        evidence API. Use ``fw_sim_run(project_id, backend="simavr")`` for canonical
+        project assertions/results. Here free-run ``run_s`` controls a host-side
+        scheduled process stop; it does not prove a virtual-time horizon or bus fidelity.
 
         GDB-attach mode (``gdb=True``): launches simavr with ``-g`` (built-in GDB server on
         ``gdb_port``, default 1234) and drives ``avr-gdb --batch --interpreter=mi2`` with
@@ -994,13 +1095,11 @@ def register_firmware_tools(mcp) -> None:
         """Run an ARM machine under Renode (``renode --disable-xwt --console <resc_path>``,
         same invocation shape as fw_sim_run's Renode backend) and return FlashResult.
 
-        ``resc_path`` is a pre-generated Renode script (schema/generation matches
-        fw_sim_run's emulator.cpp path — this tool runs an EXISTING .resc rather than
-        building one, so pass the same script fw_sim_run would use, or a hand-authored one
-        for scenarios fw_sim_run doesn't cover).
-
-        Free-run mode (``gdb=False``): emulates for ``run_s`` seconds; the scheduled stop is
-        reported as ``success=True`` (Renode doesn't self-exit either).
+        ``resc_path`` is an EXISTING Renode script; this low-level process/debug runner
+        does not resolve scenario JSON or produce canonical bus evidence. For timed/
+        electrical scenarios use ``fw_sim_run(project_id, backend="renode", scenario=...)``.
+        Here free-run ``run_s`` controls a host-side scheduled process stop, not a
+        virtual-time horizon; script ``RunFor`` determines virtual execution.
 
         GDB-attach mode (``gdb=True``): expects the .resc to start Renode's built-in GDB
         server on ``gdb_port`` (``machine StartGdbServer <port>``, Renode default 3333) and

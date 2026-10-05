@@ -2,6 +2,7 @@
 #include "sim/fea_run.h"
 
 #include "prof/phases.h"
+#include "util/time_local.h"
 
 #include <algorithm>
 #include <array>
@@ -345,11 +346,7 @@ json mesh_quality_json(const MeshQualityFacts& quality, std::size_t n_nodes,
 std::string utc_now_iso8601() {
     const std::time_t now = std::time(nullptr);
     std::tm parts{};
-#if defined(_WIN32)
-    gmtime_s(&parts, &now);
-#else
-    gmtime_r(&now, &parts);
-#endif
+    if (!chudware::util::gmTime(now, parts)) return std::string();
     char buf[32] = {0};
     if (std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &parts) == 0)
         return std::string();

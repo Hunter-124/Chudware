@@ -185,6 +185,108 @@ class TestRefusalConformsToDeclaredOutputSchema(unittest.TestCase):
             self._patch.start()
 
 
+class TestBrokenPolicyFailsClosed(unittest.TestCase):
+    """A policy that RAISES while being evaluated refuses the call — never re-enables it.
+
+    Settings, family and write-lease checks used to be wrapped in ``except: pass`` /
+    ``return None``: one config/import error and a tool the user switched off (or a doc
+    another agent holds the write lease on) ran as if no policy existed.
+    """
+
+    FAMILY = "policy_probe"
+
+    def setUp(self):
+        self._catalog = copy.deepcopy(reg.catalog())
+        reg.reset_policy()
+        self.ran: list[str] = []
+        ran = self.ran
+        self.mcp = FastMCP("policy-fail-test")
+        view = reg.view(self.mcp, self.FAMILY)
+
+        @view.tool()
+        def probe_mutate(doc_id: str = "") -> str:
+            ran.append("probe_mutate")
+            return "ran"
+
+        @view.tool()
+        def describe_probe(doc_id: str = "") -> str:
+            ran.append("describe_probe")
+            return "read"
+
+    def tearDown(self):
+        reg.reset_policy()
+        reg._CATALOG.clear()
+        reg._CATALOG.update(self._catalog)
+
+    def _refused(self, name: str, args: dict) -> dict:
+        _content, structured = _dispatch(self.mcp, name, args)
+        payload = json.loads(structured["result"])
+        self.assertFalse(payload["ok"], payload)
+        return payload
+
+    def test_settings_read_error_refuses_instead_of_running(self):
+        with unittest.mock.patch(
+            "services.agent.config.get_tool_options",
+            side_effect=RuntimeError("tool_options unreadable"),
+        ):
+            payload = self._refused("probe_mutate", {})
+            self.assertIn("could not be evaluated", payload["reason"])
+            self.assertIn("tool_options unreadable", payload["reason"])
+            self.assertIn("instead of running unchecked", payload["hint"])
+            # The model's on-ramp stays: meta-tools never consult Settings.
+            self.assertIsNone(reg.deny_reason("enable_tools"))
+            self.assertIsNone(reg.deny_reason("list_tool_categories"))
+        self.assertEqual(self.ran, [])
+
+    def test_family_policy_error_refuses_even_under_the_default_open_policy(self):
+        with unittest.mock.patch(
+            "services.agent.config.is_tool_family_enabled",
+            side_effect=KeyError("tool_families"),
+        ):
+            payload = self._refused("describe_probe", {})
+            self.assertIn("could not be evaluated", payload["reason"])
+            self.assertIn("tool-family settings", payload["reason"])
+            self.assertEqual(payload["family"], self.FAMILY)
+        self.assertEqual(self.ran, [])
+
+    def test_write_lease_check_error_refuses_the_mutation_but_not_reads(self):
+        with unittest.mock.patch(
+            "services.agent.workspace.check_write_lease",
+            side_effect=RuntimeError("lease registry gone"),
+        ) as lease:
+            payload = self._refused("probe_mutate", {"doc_id": "d1"})
+            self.assertIn("write-lease check failed", payload["reason"])
+            self.assertIn("lease registry gone", payload["reason"])
+            # Read tools are lease-exempt: they never reach the broken check.
+            _content, structured = _dispatch(self.mcp, "describe_probe", {"doc_id": "d1"})
+            self.assertEqual(structured["result"], "read")
+        lease.assert_called_once_with("d1", "probe_mutate")
+        self.assertEqual(self.ran, ["describe_probe"])
+
+    def test_per_tool_disable_wins_over_allow_list_membership(self):
+        reg.set_policy(allow=["probe_mutate"], deny_risk=None)
+        with unittest.mock.patch(
+            "services.agent.config.get_tool_options",
+            side_effect=lambda cfg, name: {"enabled": name != "probe_mutate"},
+        ):
+            payload = self._refused("probe_mutate", {})
+        self.assertIn("Settings → AI → Tools", payload["reason"])
+        self.assertEqual(self.ran, [])
+
+    def test_disabled_family_admits_only_explicit_allow_list_members(self):
+        with unittest.mock.patch(
+            "services.agent.config.is_tool_family_enabled",
+            side_effect=lambda fam, cfg=None: fam != self.FAMILY,
+        ):
+            reg.set_policy(allow=[f"family:{self.FAMILY}"], deny_risk=None)
+            _content, structured = _dispatch(self.mcp, "probe_mutate", {})
+            self.assertEqual(structured["result"], "ran")
+            reg.set_policy(allow=["describe_probe"], deny_risk=None)
+            payload = self._refused("probe_mutate", {})
+            self.assertIn("agent.tool_families", payload["reason"])
+        self.assertEqual(self.ran, ["probe_mutate"])
+
+
 class TestRealReverseEngineerRefusal(unittest.TestCase):
     """The exact tool from the bug report, on the real server, with recon switched off."""
 

@@ -849,12 +849,6 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "(they fail until the sketch has a wire again)."
         ),
     },
-    "sketch3d_from_ledger": {
-        "prompt_note": (
-            "DEPRECATED migration shim for old session payloads — new work never needs "
-            "this; sketch3d features persist with the document."
-        ),
-    },
     "sketch3d_get": {
         "prompt_note": (
             "Reads authored constraints + SOLVED entity coordinates (what the GUI "
@@ -864,7 +858,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "sketch3d_list": {
         "prompt_note": (
             "All sketch3d features with wire/status/length summary — persistent doc "
-            "features that save with the part, no session store."
+            "features that save with the part."
         ),
     },
     "sketch3d_new": {
@@ -907,12 +901,6 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "ENGINE LIMIT: the cut is always at the world ORIGIN — t only picks the "
             "plane orientation from the tangent; the on-path point → sketch3d_sample_at."
-        ),
-    },
-    "sketch3d_to_ledger": {
-        "prompt_note": (
-            "DEPRECATED — sketch3d features save with the document; this only reports "
-            "them so old workflows don't dead-end."
         ),
     },
     "sketch_preview_text": {

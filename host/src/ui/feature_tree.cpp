@@ -3740,62 +3740,6 @@ static void createFolderFromSelection(AppState& st) {
     st.addLog("[tree] grouped " + std::to_string(members.size()) + " feature(s) into " + name);
 }
 
-
-// ---- "Name & group" — SolidWorks-style auto-naming + folder grouping ----
-// Renames every feature to a conventional per-type name ("Boss-Extrude1", "Fillet2", ...) and
-// sorts dress-up / pattern / reference / sketch features into folders. One batched op set, one
-// rebuild. (A future revision can route this through the AI agent for semantic names.)
-// SIDELINED (Hunter, 2026-07-12): the tree-header "Name & group" button was removed from the GUI
-// for now; this logic is kept intact so the button can be re-wired later without rewriting it.
-[[maybe_unused]] static void nameAndGroupFeatures(AppState& st) {
-    const nlohmann::json& tree = st.docMirror.tree();
-    if (!tree.is_object()) return;
-    auto feat = tree.find("features");
-    if (feat == tree.end() || !feat->is_array()) return;
-
-    std::map<std::string, int> counts;
-    nlohmann::json ops = nlohmann::json::array();
-
-    for (const auto& f : *feat) {
-        if (!f.is_object()) continue;
-        std::string fid = jfld(f, "id");
-        std::string ty  = jfld(f, "type");
-        std::string mode;
-        if (f.contains("params") && f["params"].is_object())
-            mode = jfld(f["params"], "mode");
-        bool cut = (mode == "cut");
-
-        std::string base, folder;
-        if      (ty == "sketch")           { base = "Sketch";              folder = "Sketches"; }
-        else if (ty == "extrude")          { base = cut ? "Cut-Extrude" : "Boss-Extrude"; }
-        else if (ty == "revolve")          { base = cut ? "Cut-Revolve" : "Boss-Revolve"; }
-        else if (ty == "sweep")            { base = cut ? "Cut-Sweep"   : "Boss-Sweep"; }
-        else if (ty == "loft")             { base = cut ? "Cut-Loft"    : "Boss-Loft"; }
-        else if (ty == "fillet")           { base = "Fillet";   folder = "Dress-up"; }
-        else if (ty == "chamfer")          { base = "Chamfer";  folder = "Dress-up"; }
-        else if (ty == "shell")            { base = "Shell";    folder = "Dress-up"; }
-        else if (ty == "draft")            { base = "Draft";    folder = "Dress-up"; }
-        else if (ty == "rib")              { base = "Rib";      folder = "Dress-up"; }
-        else if (ty == "hole")             { base = "Hole"; }
-        else if (ty == "linear_pattern")   { base = "LPattern"; folder = "Patterns"; }
-        else if (ty == "circular_pattern") { base = "CPattern"; folder = "Patterns"; }
-        else if (ty == "mirror")           { base = "Mirror";   folder = "Patterns"; }
-        else if (ty == "plane" || ty == "datum_plane") { base = "Plane"; folder = "Reference"; }
-        else if (ty == "axis")             { base = "Axis";  folder = "Reference"; }
-        else if (ty == "point")            { base = "Point"; folder = "Reference"; }
-        else                                { base = ty.empty() ? "Feature" : ty; }
-
-        int n = ++counts[base];
-        std::string name = base + std::to_string(n);
-        ops.push_back({{"op", "rename"}, {"id", fid}, {"name", name}});
-        ops.push_back({{"op", "set_folder"}, {"id", fid}, {"folder", folder}});
-    }
-    if (!ops.empty()) {
-        applyTreeOps(st, ops, "name & group");
-        st.addLog("[tree] named & grouped " + std::to_string(ops.size() / 2) + " features");
-    }
-}
-
 // ---- C37-E (item 4): the rollback bar widget ----
 // Draws a thick grabbable horizontal line at the CURRENT cursor position (the caller places it right
 // after the bar feature's row, or after the last row when the bar is at the end). The bar is a
@@ -3890,26 +3834,12 @@ static void drawFeatureManagerTopStrip(AppState& st) {
 
     // W5C: the old tree/Properties/Configurations stub tabs were removed here — they were visual
     // decoration that duplicated the real vertical tab strip in the LeftPane container (layout.cpp
-    // drawLeftPane). This strip now hosts only the functional document toolbar + "Name & group".
+    // drawLeftPane). This strip now hosts only the functional document toolbar.
     // --- centered document toolbar ---
     // glassRowAtCursor is draw-only and does not advance the layout cursor. Without an explicit
     // row reservation the full-width filter InputText below was placed at the same Y and stole
     // clicks from undo/redo (and the rest of the toolbar).
-    // "Name & group" sits inline in the toolbar (between Save and Undo). It only applies to a part
-    // doc that actually has features; computed up here so the toolbar width/centering is stable.
-    bool isPart = st.docMirror.hasDoc() &&
-                  jfld(st.docMirror.tree(), "schema") != "aicad.asm/1";
-    int featCount = 0;
-    if (isPart) {
-        const nlohmann::json& tr = st.docMirror.tree();
-        auto fa = tr.find("features");
-        if (fa != tr.end() && fa->is_array()) featCount = (int)fa->size();
-    }
-    const bool canNameGroup = canDoc && isPart && featCount > 0;
-
-    // Name & group moved OUT of this toolbar down to the Features section header (fmFeaturesHeader),
-    // so the toolbar is now 6 buttons (new / new-asm / open / save / undo / redo).
-    (void)canNameGroup;
+    // Six buttons: new part / new assembly / open / save / undo / redo.
     const float bw = 24.0f * S, gap = 4.0f * S, nBtns = 6.0f;
     const float toolW = nBtns * bw + (nBtns - 1) * gap;
     ImVec2 toolRowMin = ImGui::GetCursorScreenPos();
@@ -5024,7 +4954,7 @@ void drawFeatureTreeBody(AppState& st,
             ImGui::Unindent(kSecIndent);
         }   // end References section
 
-        // ---- Features section — its own collapse, now hosting Add Folder + Name & group. ----
+        // ---- Features section — its own collapse; the header hosts Add Folder. ----
         {
             const bool isPartDoc = tree.is_object() && jfld(tree, "schema") != "aicad.asm/1";
             // Add Folder no longer requires a selection: with features selected it groups them; with

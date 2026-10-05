@@ -1,14 +1,8 @@
 """Generate a NEW symbol + footprint for a part the starter library does not have.
 
-WHY THIS EXISTS
----------------
-``starter.py`` is a clean-room set of ~53 GENERIC symbols / ~43 footprints, and
-``substitute.py`` answers a miss with the closest generic by function. For a 2-pin
-passive that is genuinely the right symbol. For a 38-pin module it is not: a live
-request for an ``ESP32-WROOM-32`` used to come back as ``MCU:Generic_QFP48`` with a
-pin-count-mismatch warning and ``ok: true`` — a schematic wired against that pinout is
-a fabricated design, and there was NO tool that could produce the real part. This
-module is that tool's engine.
+Generates caller-defined symbols and footprints without substituting a generic
+part with a different pinout. ``starter.py`` supplies the clean-room primitives;
+electrical pin facts and package-specific dimensions come from the caller.
 
 WHAT THIS DOES NOT DO — read this before extending it
 -----------------------------------------------------
@@ -46,9 +40,8 @@ PIN PERMUTATION
 ``pins`` carries ``number`` and ``name`` as INDEPENDENT caller-set fields, and layout
 is derived from ``number`` alone, so an importer that has to remap a foreign pin order
 only has to emit the right ``number`` per name — no new mechanism and no change here.
-``partid.py`` now does exactly that for the KiCad pin-order variants (``Q_NPN_BCE``,
-``Conn_02xNN_Counter_Clockwise``, ...) via its own hand-audited permutation table, and
-needed nothing from this module to do it.
+``partid.py`` applies this for the KiCad pin-order variants (``Q_NPN_BCE``,
+``Conn_02xNN_Counter_Clockwise``, ...) via its own hand-audited permutation table.
 
 STORAGE
 -------
@@ -979,10 +972,10 @@ def make_part(name: str, pins, *, libid: str = "", package: str = "",
     the two artefacts live in separate namespaces (``symbols/`` vs ``footprints/`` in the
     native dir, mirroring KiCad's separate symbol libs and ``.pretty`` dirs) and both
     resolve correctly — but it produces two DIFFERENT records under one string, and a
-    downstream consumer keyed on a flat id keeps only one of them. Measured by
-    EcadRefPinDialect 2026-07-29: the parts index kept the FOOTPRINT record, whose
+    downstream consumer keyed on a flat id keeps only one of them. In the
+    2026-07-29 parts-index observation, it kept the FOOTPRINT record, whose
     geometry_ref carries no libid, so ``part_place`` reported "geometry_ref missing 'libid'"
-    for a part that had just been created successfully. Their adapter now dedupes, but the
+    for a part that had just been created successfully. The adapter now dedupes, but the
     ambiguity is real for any future flat-id consumer, so it is reported loudly rather than
     silently renamed (an auto-suffix would be exactly the silent substitution this module
     exists to avoid) and rather than refused (the same-name pattern is KiCad-idiomatic and

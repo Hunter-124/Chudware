@@ -5,13 +5,15 @@ cross-sections, frequency-domain driven S-parameters, and broadband time-domain 
 behind a pluggable solver adapter layer with openEMS (FDTD) as the primary full-wave engine.
 
 - Code: `services/sim/em/`
-- RPCs: `em_status`, `em_eigenmode`, `em_driven`, `em_timedomain` — served over the standard
-  worker seam (`python -m services.worker_main`)
-- Tests: `python3 -m pytest services/sim/em/test_em.py` (21 real + 1 gated live test)
+- RPCs: `em_status`, `em_eigenmode`, `em_driven`, `em_timedomain` — registered by
+  `services/worker_main.py` (`_register("em", "services.sim.em.worker_rpc", ...)`) and
+  exposed to agents as the same-named tools
+- Tests: `python3 -m pytest services/sim/em/test_em.py` (the 2026-07-07 landing recorded
+  21 real + 1 gated live test; current count not re-verified here)
 - Follow-ups: `work/tasks/T-SIM11.md`
 - License containment: `contracts/license_debt.md` row 9
 
-## Solver matrix (capability x solver x status)
+## Solver matrix (capability x solver x status; status column as recorded 2026-07-07)
 
 | Solver | Method | Eigenmode | Driven (S-params) | Time-domain | Linkage | License | Status on this repo |
 |--------|--------|-----------|-------------------|-------------|---------|---------|---------------------|
@@ -26,12 +28,13 @@ behind a pluggable solver adapter layer with openEMS (FDTD) as the primary full-
 Auto-selection (`solver: "auto"` or omitted): registry preference order is
 openems → builtin-fdfd → analytic-uniform → scaffolds; the first *installed* adapter
 offering the requested analysis wins. `em_status` reports the live matrix + per-analysis
-defaults so the GUI can gate study kinds.
+defaults; the GUI's EM tab uses the probe to enable or grey its commands.
 
 ## Architecture
 
 ```
-GUI SimManager ── WorkerClient (stdio JSON-RPC) ──> services/worker_main.py (stdio worker)
+GUI SimManager ── st.rpc / WorkerClient ──> chudware-hostd ── WorkerBridge ──> services/worker_main.py
+               (legacy in-process mode, CHUDWARE_ENGINE_DAEMON=0: local stdio worker pipe)
                                                         │  em_* WORKER_METHODS
                                                         v
                                         services/sim/em/worker_rpc.py
@@ -47,7 +50,7 @@ GUI SimManager ── WorkerClient (stdio JSON-RPC) ──> services/worker_main
 Key seams:
 
 - `OpenEmsAdapter.build_plan(spec)` is pure (spec → mesh lines / modal ports / boundaries /
-  Gaussian excitation plan) and fully unit-tested without the solver.
+  Gaussian excitation plan); plan-builder unit tests run without the solver.
 - `OpenEmsAdapter._execute(plan)` is the ONLY code importing `openEMS`/`CSXCAD` — the GPL
   containment and the mock seam for tests. Swapping it to external-process CLI invocation
   (if legal review requires) touches nothing else.
@@ -88,7 +91,7 @@ Geometry intake v1: `geometry.stl_path` feeds openEMS as a PEC polyhedron
 (CSXCAD `AddPolyhedronReader`) — export the doc body with `export_part` first.
 Direct doc solids/tess + material assignment intake is deferred (T-SIM11).
 
-## Validation results (this machine, 2026-07-07)
+## Validation results (dated record, 2026-07-07 — not re-measured since)
 
 | Case | Reference | Computed | Error |
 |------|-----------|----------|-------|
@@ -129,7 +132,11 @@ report `installed: true, detail: "adapter not implemented yet"` until T-SIM11 la
 
 ## GUI wiring
 
-The Simulate GUI is owned by the parallel sim-GUI agent; the study-kind registration for
-**EM Eigenmode / EM Frequency Sweep / EM Time Domain** is requested in
-`host/WIRE_REQUESTS.md` (em_* RPC names, param schemas, em_status gating). Until that
-lands, the family is fully usable over the worker RPC seam and from Python.
+Wired. The Simulate workspace's **EM** ribbon tab (`host/src/ui/ribbon_def.cpp`,
+`sim_em_*` commands) routes to `SimManager::handleEmCommand`
+(`host/src/ui/sim_manager.cpp`). The first EM command probes `em_status` once
+asynchronously; if the call fails or reports an error code (e.g. the worker does not
+serve `em_*`), the whole `sim_em_*` set is greyed with an "EM solver not installed"
+tooltip. Otherwise the EM panel opens and issues `em_eigenmode` / `em_driven` /
+`em_timedomain`. EM runs are stateless one-shot analyses, not doc-persisted studies
+(`host/src/ui/sim_manager.h`).

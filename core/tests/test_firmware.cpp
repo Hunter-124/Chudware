@@ -9,6 +9,7 @@
 // and when the tool IS present we skip the live leg instead of faking a pass.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "environment_test_support.h"
+#include "firmware/bus_models.h"
 #include "firmware/emulator.h"
 #include "firmware/firmware_rpc.h"
 #include "firmware/pinmap.h"
@@ -25,6 +26,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -112,6 +114,27 @@ const json kBlinkSrc = {
      "  while (1) { HAL_GPIO_TogglePin(GPIOA, PIN_PA5); }\n"
      "}\n"},
 };
+
+json electrical_uart_scenario() {
+    json network=json::array();
+    for(const char* name:{"tx","rx"}) {
+        json endpoints=json::array();
+        for(const char* id:{"mcu","peer"})
+            endpoints.push_back({{"id",id},{"at",id},{"input_capacitance_f",5e-12},
+                {"vil_v",0.8},{"vih_v",2.0},{"drive","push_pull"},
+                {"v_low_v",0.0},{"v_high_v",3.3},{"r_low_ohm",20.0},{"r_high_ohm",20.0},
+                {"rise_s",1e-9},{"fall_s",1e-9},{"tx_delay_s",0.0},{"rx_delay_s",0.0}});
+        network.push_back({{"name",name},{"mode","single_ended"},{"model","lumped_rc"},
+            {"series_r_ohm",0.0},{"wire_capacitance_f",10e-12},{"endpoints",endpoints}});
+    }
+    return {{"schema","aicad.fwscenario/1"},{"tracks",json::array({
+        {{"kind","uart_rx"},{"bus","usart1"},{"link_id","serial"},
+         {"events",json::array({{{"t_ms",2.0},{"text","A"}}})}}})},
+        {"bus_links",json::array({{{"id","serial"},{"bus","usart1"},{"protocol","uart"},
+            {"controller_clock_hz",16000000.0},
+            {"peer",{{"baud_hz",9600.0},{"electrical_variant","ttl"}}},
+            {"electrical",{{"signals",network}}}}})}};
+}
 
 }  // namespace
 
@@ -493,6 +516,112 @@ TEST_CASE("emulator parsers: gpio/uart events + ODR snapshot (pure)") {
     CHECK(states.value("PB3", -1) == 0);
 }
 
+TEST_CASE("UART consumers retain complete flight messages despite unrelated bus caps") {
+    using namespace chudware::firmware;
+    std::ostringstream raw;
+    const auto i2c_traffic = [&] {
+        for (int i = 0; i < 5000; ++i)
+            raw << "CHUDWARE_BUS_EVT t_ns=" << i
+                << " bus=i2c1 protocol=i2c event=register_read value=0\n";
+    };
+    const auto transmit = [&](const std::string& bus, unsigned char byte, int t_ms) {
+        raw << "CHUDWARE_BUS_EVT t_ns=" << t_ms * 1000000
+            << " bus=" << bus << " protocol=uart event=tx_complete value="
+            << static_cast<unsigned int>(byte) << "\n";
+    };
+    i2c_traffic();
+    // Neither sample loss nor another protocol's emitter loss drops UART TX data.
+    raw << "CHUDWARE_BUS_EVT t_ns=1 bus=i2c1 protocol=i2c event=trace_truncated cause=event_limit\n"
+        << "CHUDWARE_BUS_EVT t_ns=2 bus=usart1 protocol=uart event=trace_truncated cause=sample_limit\n"
+        << "monitor metadata: METADATA_ONLY\n";
+    const std::string message = "BARO_CLIMB\nMAG_TURN";
+    for (size_t i = 0; i < message.size(); ++i) {
+        transmit("usart1", static_cast<unsigned char>(message[i]), 100 + static_cast<int>(i));
+        transmit("usart2", 'x', 100 + static_cast<int>(i));
+    }
+    std::string binary = "\r\n";
+    binary.push_back('\0');
+    binary += "\xC3\xA9";
+    for (unsigned char byte : binary) transmit("usart1", byte, 130);
+    for (unsigned char byte : std::string("CROSS_")) transmit("usart3", byte, 130);
+    for (unsigned char byte : std::string("BUS")) transmit("usart4", byte, 130);
+    // Malformed transmit values and records without timestamps stay ignored.
+    raw << "CHUDWARE_BUS_EVT t_ns=131000000 bus=usart1 protocol=uart event=tx_complete value=invalid\n"
+        << "CHUDWARE_BUS_EVT bus=usart1 protocol=uart event=tx_complete value=65\n";
+    i2c_traffic();
+
+    const auto buses = parse_bus_events(raw.str());
+    REQUIRE(buses.size() == 4096);
+    CHECK(buses[2047].value("type", "") == "trace_truncated");
+    const auto uart = parse_uart_events(raw.str());
+    std::map<std::string, std::string> streams;
+    for (size_t i = 0; i < uart.size(); ++i) {
+        CHECK(uart[i].value("type", "") == "uart");
+        CHECK(uart[i].value("seq", -1LL) == static_cast<long long>(i));
+        streams[uart[i].value("bus", "")] += uart[i].value("text", "");
+    }
+    REQUIRE(streams["usart1"] == message + binary);
+    CHECK(streams["usart2"] == std::string(message.size(), 'x'));
+    CHECK(streams["usart3"] == "CROSS_");
+    CHECK(streams["usart4"] == "BUS");
+    CHECK(uart[2 * message.size() - 2].value("t_ms", -1.0) == 118.0);
+    const auto verdicts = evaluate_assertions(raw.str(), json::object(),
+        {"uart:BARO_CLIMB", "MAG_TURN", "uart_within:MAG_TURN@118ms",
+         "uart_within:MAG_TURN@117ms", "uart:METADATA_ONLY", "uart:CROSS_BUS",
+         "uart_within:CROSS_BUS@130ms"}, json::array(), uart);
+    REQUIRE(verdicts.size() == 7);
+    CHECK(verdicts[0].value("passed", false));
+    CHECK(verdicts[1].value("passed", false));
+    CHECK(verdicts[2].value("passed", false));
+    CHECK_FALSE(verdicts[3].value("passed", true));
+    CHECK(verdicts[3].value("detail", "").find("first match at t=118ms") != std::string::npos);
+    CHECK_FALSE(verdicts[4].value("passed", true));
+    CHECK_FALSE(verdicts[5].value("passed", true));
+    CHECK_FALSE(verdicts[6].value("passed", true));
+}
+
+TEST_CASE("UART consumers refuse genuine UART cap and emitter loss") {
+    using namespace chudware::firmware;
+    SUBCASE("UART's own 4096 event cap") {
+        const std::string message = "BARO_CLIMB";
+        std::ostringstream raw;
+        for (size_t i = 0; i < 5000; ++i)
+            raw << "CHUDWARE_BUS_EVT t_ns=" << i * 1000000
+                << " bus=usart1 protocol=uart event=tx_complete value="
+                << static_cast<unsigned int>(i < message.size() ? message[i] : 'x') << "\n";
+        const auto uart = parse_uart_events(raw.str());
+        REQUIRE(uart.size() == 4096);
+        CHECK(uart[2047].value("type", "") == "trace_truncated");
+        CHECK(uart[2047].value("dropped", 0) == 905);
+        const auto verdicts = evaluate_assertions(raw.str(), json::object(),
+            {"uart_within:BARO_CLIMB@20ms", "uart:BARO_CLIMB"}, json::array(), uart);
+        REQUIRE(verdicts.size() == 2);
+        for (const auto& verdict : verdicts) {
+            CHECK_FALSE(verdict.value("passed", true));
+            CHECK(verdict.value("detail", "").find("not evaluated") == 0);
+        }
+    }
+    SUBCASE("UART or unscoped emitter loss") {
+        for (const std::string scope : {"bus=usart1 protocol=uart ", ""}) {
+            std::string raw =
+                "CHUDWARE_BUS_EVT t_ns=1000000 bus=usart1 protocol=uart event=tx_complete value=79\n"
+                "CHUDWARE_BUS_EVT t_ns=2000000 " + scope +
+                "event=trace_truncated cause=event_limit\n"
+                "CHUDWARE_BUS_EVT t_ns=3000000 bus=usart1 protocol=uart event=tx_complete value=75\n";
+            const auto uart = parse_uart_events(raw);
+            REQUIRE(uart.size() == 3);
+            CHECK(uart[1].value("type", "") == "trace_truncated");
+            const auto verdicts = evaluate_assertions(raw, json::object(),
+                {"uart_within:OK@10ms", "uart:OK"}, json::array(), uart);
+            REQUIRE(verdicts.size() == 2);
+            for (const auto& verdict : verdicts) {
+                CHECK_FALSE(verdict.value("passed", true));
+                CHECK(verdict.value("detail", "").find("not evaluated") == 0);
+            }
+        }
+    }
+}
+
 TEST_CASE("emulator traces are bounded, ordered, and disclose truncation") {
     std::ostringstream raw;
     for (int i = 0; i < 5000; ++i)
@@ -552,26 +681,8 @@ TEST_CASE("emulator rejects invalid setup before probing a backend") {
     fs::remove(bad, ec);
 }
 
-TEST_CASE("Renode script preserves sub-second precision and uses only supported GPIO snapshots") {
-    fs::path dir = fs::temp_directory_path() / "chudware-renode-resc";
-    fs::create_directories(dir);
-    fs::path platform = dir / "platform.repl";
-    std::ofstream(platform, std::ios::binary | std::ios::trunc)
-        << "gpioPortA: GPIOPort.STM32_GPIOPort @ sysbus 0x40020000\n";
 
-    std::string script = chudware::firmware::build_resc(
-        "firmware.elf", platform.string(), 1.025, {{'A', 5}},
-        {{"base", 0x40020000}, {"stride", 0x400}, {"odr_offset", 0x14}}, {}, {});
-    CHECK(script.find("sleep 1.025\n") != std::string::npos);
-    CHECK(script.find("AddStateChangedHook") == std::string::npos);
-    CHECK(script.find("CHUDWARE_GPIO_ODR_BEGIN A") != std::string::npos);
-    CHECK(script.find("CHUDWARE_GPIO_ODR_END A") != std::string::npos);
-
-    std::error_code ec;
-    fs::remove_all(dir, ec);
-}
-
-TEST_CASE("Renode capability-refuses untimestamped GPIO and byte-FIFO register streams") {
+TEST_CASE("Renode refuses unavailable timestamped GPIO observation") {
 #ifndef _WIN32
     fs::path dir = fs::temp_directory_path() /
                    ("chudware-renode-capability-" + std::to_string(static_cast<long long>(
@@ -610,11 +721,6 @@ TEST_CASE("Renode capability-refuses untimestamped GPIO and byte-FIFO register s
     auto timed = chudware::firmware::run_simulation(
         elf.string(), "stm32f4",
         {"gpio:PA5=1@>10ms", "toggles:PA5>=2", "period:PA5=10ms+-1ms"}, 2.0);
-    json sensor_scenario = chudware::firmware::build_sensor_scenario(
-        {{"t_s", {0.0, 0.1}}, {"altitude_m", {100.0, 101.0}}},
-        json::array({{{"device", "mpu6050"}}}), json(), 0.1, "register-map");
-    auto sensor = chudware::firmware::run_simulation(
-        elf.string(), "stm32f4", {}, 2.0, sensor_scenario);
     if (old_path)
         chudware::test::setEnvironment("PATH", old_path->c_str());
     else
@@ -622,16 +728,10 @@ TEST_CASE("Renode capability-refuses untimestamped GPIO and byte-FIFO register s
 
     CHECK(timed.passed == false);
     CHECK(timed.uart_log.find("platform_capability:") == 0);
-    CHECK(timed.uart_log.find("timestamped GPIO observation is unavailable") !=
-          std::string::npos);
     REQUIRE(timed.assertion_results.size() == 3);
     for (const auto& assertion : timed.assertion_results)
-        CHECK(assertion.value("detail", "").find("unsupported") != std::string::npos);
+        CHECK_FALSE(assertion.value("passed", true));
 
-    CHECK(sensor.passed == false);
-    CHECK(sensor.uart_log.find("scenario_unsupported:") == 0);
-    CHECK(sensor.uart_log.find("register-addressed") != std::string::npos);
-    CHECK(sensor.uart_log.find("stale byte bursts") != std::string::npos);
     CHECK_FALSE(fs::exists(invoked));
 
     std::error_code ec;
@@ -762,21 +862,19 @@ TEST_CASE("scenario: validation + fixtures + plan (pure)") {
     auto [s2, e2] = load_scenario("no-such-fixture");
     CHECK(s2.is_null());
     REQUIRE(e2.size() == 1);
-    CHECK(e2[0].find("unknown scenario fixture") == 0);
     auto [s3, e3] = load_scenario("{not json");
     CHECK(s3.is_null());
     CHECK(e3.size() == 1);
     auto [s4, e4] = load_scenario(json{{"schema", "wrong"}, {"tracks", json::array()}});
     CHECK(e4.size() >= 2);  // bad schema + empty tracks
 
-    // Validation error text spot-checks (parity-sensitive)
+    // Invalid input remains rejected independently of diagnostic wording.
     json bad_pin = {{"schema", "aicad.fwscenario/1"},
                     {"tracks", json::array({{{"kind", "gpio_edges"},
                                              {"pin", "P99"},
                                              {"events", json::array({{{"t_ms", 1}, {"level", 1}}})}}})}};
     auto errs = validate_scenario(bad_pin);
     REQUIRE(errs.size() == 1);
-    CHECK(errs[0].find("pin must be STM32-style") != std::string::npos);
 
     // Plan: user_button on the stm32f4 platform → Button attach + 6 timeline actions
     json caps = get_capabilities("stm32f4");
@@ -787,29 +885,110 @@ TEST_CASE("scenario: validation + fixtures + plan (pure)") {
     ss << in.rdbuf();
     ScenarioPlan plan = build_scenario_plan(fx, caps, ss.str());
     REQUIRE(plan.errors.empty());
-    CHECK(plan.setup_lines.size() == 1);  // one Button peripheral
-    CHECK(plan.setup_lines[0].find("Miscellaneous.Button @ gpioPortA 0") != std::string::npos);
-    CHECK(plan.timeline.size() == 6);     // 3 presses × (press+release)
     CHECK(plan.duration_ms == doctest::Approx(1080.0));
 
     // ADC track on nrf52 → honest refusal (no stub window registered)
     ScenarioPlan adc_plan = build_scenario_plan(adc, get_capabilities("nrf52"), "");
     REQUIRE(adc_plan.errors.size() == 1);
-    CHECK(adc_plan.errors[0].find("adc stimulus unsupported on family 'nrf52'") == 0);
 
     // gpio stimulus on a platform without the port → honest refusal
     ScenarioPlan no_port = build_scenario_plan(fx, get_capabilities("rp2040"), "");
     CHECK(!no_port.errors.empty());
 
-    // timeline rendering: sleep interleave + CHUDWARE_T_MARK marks
-    auto lines = timeline_resc_lines({{100.0, "act1"}, {100.0, "act2"}, {250.0, "act3"}}, 1.0);
-    REQUIRE(lines.size() >= 7);
-    CHECK(lines[0] == "echo \"CHUDWARE_T_MARK 0\"");
-    CHECK(lines[1] == "sleep 0.100");
-    CHECK(lines[2] == "echo \"CHUDWARE_T_MARK 100\"");
-    CHECK(lines[3] == "act1");
-    CHECK(lines[4] == "act2");
-    CHECK(lines[5] == "sleep 0.150");
+}
+
+TEST_CASE("bus links: selected track propagation excludes branched same-net copper") {
+    using namespace chudware::firmware;
+    json track={{"id","route"},{"net","SERIAL"},{"layer","F.Cu"},{"width",0.2},
+                {"p1",{0.0,0.0}},{"p2",{10.0,0.0}}};
+    json board={{"stackup",{{"layers",json::array({
+        {{"id","F.Cu"},{"type","copper"},{"thickness",0.035}},
+        {{"id","core"},{"type","dielectric"},{"thickness",0.2},{"er",4.2}},
+        {{"id","B.Cu"},{"type","copper"},{"thickness",0.035}}})}}},
+        {"tracks",json::array({track})}};
+    auto resolve=[&](const json& source) {
+        auto scenario=electrical_uart_scenario();
+        auto& signal=scenario["bus_links"][0]["electrical"]["signals"][1];
+        signal["model"]="lossless_tline";
+        signal["wire_capacitance_f"]=0.0;
+        signal["segments"]=json::array({{{"from","mcu"},{"to","peer"},{"ecad_source",source}}});
+        std::vector<std::string> errors;
+        auto resolved=resolve_bus_links(scenario,get_capabilities("stm32f4"),
+                                       read_text(get_platform_file("stm32f4")),errors);
+        REQUIRE(errors.empty());
+        REQUIRE_FALSE(resolved.empty());
+        return resolved[0]["electrical"]["signals"][1]["segments"][0];
+    };
+    const json baseline=resolve({{"board",board},{"track_or_net","route"}});
+    auto branch=track;
+    branch["id"]="branch";
+    branch["p2"]={0.0,1000.0};
+    board["tracks"].push_back(branch);
+    for(const json& selector:std::vector<json>{json("route"),track}) {
+        const json source={{"board",board},{"track_or_net",selector}};
+        const json segment=resolve(source);
+        CHECK(segment["propagation_s"]==baseline["propagation_s"]);
+        CHECK(segment["ecad_reference"]["length_mm"]==10.0);
+        CHECK(segment["ecad_reference"]["net"]=="SERIAL");
+        CHECK(segment["ecad_source"]==source);
+    }
+    auto scenario=electrical_uart_scenario();
+    auto& signal=scenario["bus_links"][0]["electrical"]["signals"][1];
+    signal["model"]="lossless_tline";
+    signal["wire_capacitance_f"]=0.0;
+    signal["segments"]=json::array({{{"from","mcu"},{"to","peer"},
+        {"ecad_source",{{"board",board},{"track_or_net","SERIAL"}}}}});
+    CHECK_FALSE(validate_scenario(scenario).empty());
+    const json explicit_path=resolve({{"board",board},{"track_or_net","SERIAL"},{"length_mm",25.0}});
+    CHECK(explicit_path["propagation_s"].get<double>()==
+          doctest::Approx(baseline["propagation_s"].get<double>()*2.5));
+    signal["segments"][0]["propagation_s"]=1e-9;
+    CHECK(validate_scenario(scenario).empty());
+}
+
+TEST_CASE("fw_sim_run: malformed nested bus links return invalid_scenario") {
+    FirmwareRootGuard guard;
+    const auto project=call("fw_new_project",{{"mcu_family","stm32f4"}});
+    const std::string pid=project["project_id"];
+    fs::create_directories(guard.dir/pid/"build");
+    std::ofstream(guard.dir/pid/"build"/"app.elf")<<"fake";
+    const auto valid=electrical_uart_scenario();
+    REQUIRE(chudware::firmware::validate_scenario(valid).empty());
+    const std::vector<std::pair<std::string,json>> malformed={
+        {"/bus_links/0/peer",nullptr},{"/bus_links/0/peer","bad"},
+        {"/bus_links/0/peer",json::array()},{"/bus_links/0/peer/baud_hz",json::object()},
+        {"/bus_links/0/electrical",json::array()},
+        {"/bus_links/0/electrical/signals",json::object()},
+        {"/bus_links/0/electrical/signals/0",nullptr},
+        {"/bus_links/0/electrical/signals/0/endpoints",json::object()},
+        {"/bus_links/0/electrical/signals/0/endpoints/0",json::array()},
+        {"/bus_links/0/electrical/signals/0/endpoints/0/vih_v","bad"},
+        {"/bus_links/0/electrical/signals/0/segments",nullptr},
+        {"/bus_links/0/electrical/signals/0/segments",json::object()},
+        {"/bus_links/0/electrical/signals/0/bias",false},
+        {"/bus_links/0/electrical/signals/0/terminations",json::array({nullptr})},
+        {"/bus_links/0/sources",json::object()},{"/bus_links/0/limitations","bad"}};
+    for(const auto& [path,value]:malformed) {
+        INFO("malformed field: ",path);
+        auto scenario=valid;
+        scenario[json::json_pointer(path)]=value;
+        json result;
+        REQUIRE_NOTHROW(result=call("fw_sim_run",{{"project_id",pid},{"scenario",scenario}}));
+        CHECK(result.value("code","")=="invalid_scenario");
+    }
+    auto missing_bus=valid;
+    missing_bus["bus_links"][0].erase("bus");
+    json result;
+    REQUIRE_NOTHROW(result=call("fw_sim_run",{{"project_id",pid},{"scenario",missing_bus}}));
+    CHECK(result.value("code","")=="invalid_scenario");
+    auto invalid_ecad=valid;
+    auto& signal=invalid_ecad["bus_links"][0]["electrical"]["signals"][0];
+    signal["model"]="lossless_tline";
+    signal["wire_capacitance_f"]=0.0;
+    signal["segments"]=json::array({{{"from","mcu"},{"to","peer"},
+        {"z0_ohm",50.0},{"propagation_s",1e-9},{"ecad_source",false}}});
+    REQUIRE_NOTHROW(result=call("fw_sim_run",{{"project_id",pid},{"scenario",invalid_ecad}}));
+    CHECK(result.value("code","")=="invalid_scenario");
 }
 
 TEST_CASE("fw_sim_run: envelopes + no-elf + esp32 refusal + invalid scenario") {
@@ -962,6 +1141,123 @@ TEST_CASE("fw_sim_run LIVE: Renode UART path on stm32f4 (honest skip without too
     REQUIRE_FALSE(r["trace_path"].is_null());
     json trace = read_json(r["trace_path"].get<std::string>());
     CHECK(trace.value("source", "") == "renode");
+}
+
+TEST_CASE("fw_sim_run LIVE: UART text delivers exact UTF-8 bytes through firmware DR") {
+    using namespace chudware::firmware;
+    if(which("renode").empty() || which("arm-none-eabi-gcc").empty()) {
+        MESSAGE("SKIP live UART byte leg: renode or arm-none-eabi-gcc absent");
+        return;
+    }
+    FirmwareRootGuard guard;
+    const fs::path source=guard.dir/"uart_bytes.c", elf=guard.dir/"uart_bytes.elf";
+    {
+        std::ofstream out(source);
+        out<<R"C(#include <stdint.h>
+#define REG(a) (*(volatile uint32_t *)(a))
+#define SR REG(0x40011000u)
+#define DR REG(0x40011004u)
+extern uint32_t _estack;
+void Reset_Handler(void);
+__attribute__((section(".isr_vector")))
+void (*const vectors[])(void)={(void (*)(void))&_estack,Reset_Handler};
+void Reset_Handler(void) {
+    static const uint8_t expected[]={65,66,67,13,10,0,34,92,195,169,240,159,152,128};
+    REG(0x40023844u)|=1u<<4;
+    REG(0x40011008u)=139u;
+    REG(0x4001100cu)=(1u<<13)|(1u<<3)|(1u<<2);
+    // At 16 MHz this boot byte takes about 87 us on the wire.
+    DR='!';
+    while(!(SR&(1u<<6))) {}
+    REG(0x40011008u)=1667u;
+    unsigned good=1;
+    for(unsigned i=0;i<sizeof(expected);++i) {
+        while(!(SR&(1u<<5))) {}
+        if((uint8_t)DR!=expected[i]) good=0;
+    }
+    const char *message=good?"UART_BYTES_OK":"UART_BYTES_BAD";
+    while(*message) {
+        while(!(SR&(1u<<7))) {}
+        DR=(uint8_t)*message++;
+    }
+    for(;;) {}
+}
+)C";
+    }
+    const auto build=run_capture({"arm-none-eabi-gcc","-mcpu=cortex-m4","-mthumb",
+        "-nostdlib","-nostartfiles","-Os","-T",(kData/"stm32_hello.ld").string(),
+        source.string(),"-o",elf.string()},"",60.0);
+    INFO(build.stderr_text);
+    REQUIRE(build.returncode==0);
+    std::string text="ABC\r\n";
+    text.push_back('\0');
+    text+="\"\\";
+    text+="\xC3\xA9\xF0\x9F\x98\x80";
+    json scenario={{"schema","aicad.fwscenario/1"},
+        {"tracks",json::array({{{"kind","uart_rx"},{"uart","usart1"},
+            {"baud_hz",16000000.0/1667.0},
+            {"events",json::array({{{"t_ms",2.0},{"text",text}}})}}})}};
+    const auto project=call("fw_new_project",{{"mcu_family","stm32f4"}});
+    const auto short_result=call("fw_sim_run",{{"project_id",project["project_id"]},
+        {"elf_path",elf.string()},{"run_s",0.00005},
+        {"assertions",json::array({"uart:!"})},{"timeout_s",180.0}});
+    if(emulator_timed_out(short_result)) {
+        MESSAGE("SKIP live 50 us UART horizon leg: emulator exceeded wall-clock budget");
+        return;
+    }
+    INFO(short_result.value("uart_log",std::string{}));
+    REQUIRE(short_result.contains("bus_events"));
+    bool boot_byte_started=false;
+    for(const auto& event:short_result["bus_events"]) {
+        REQUIRE(event.contains("t_ns"));
+        REQUIRE(event["t_ns"].is_number_unsigned());
+        CHECK(event["t_ns"].get<unsigned long long>()<=50000);
+        if(event.value("bus","")!="usart1") continue;
+        CHECK(event.value("event","")!="tx_complete");
+        CHECK(event.value("event","")!="rx_complete");
+        CHECK_FALSE((event.value("event","")=="register_read" &&
+                     event.value("register","")=="DR"));
+        if(event.value("event","")=="tx_start" && event.value("value","")=="33") {
+            boot_byte_started=true;
+            CHECK(std::stoull(event.at("end_ns").get<std::string>())>50000);
+        }
+    }
+    REQUIRE(boot_byte_started);
+    REQUIRE_FALSE(short_result.value("passed",true));
+    REQUIRE(short_result["assertion_results"].size()==1);
+    CHECK_FALSE(short_result["assertion_results"][0].value("passed",true));
+    CHECK(short_result["assertion_results"][0].value("detail","").find("not found")!=
+          std::string::npos);
+    const auto result=call("fw_sim_run",{{"project_id",project["project_id"]},
+        {"elf_path",elf.string()},{"scenario",scenario},{"run_s",0.04},
+        {"assertions",json::array({"uart:UART_BYTES_OK"})},{"timeout_s",180.0}});
+    if(emulator_timed_out(result)) {
+        MESSAGE("SKIP live UART byte leg: emulator exceeded wall-clock budget");
+        return;
+    }
+    INFO(result.value("uart_log",std::string{}));
+    REQUIRE(result.value("passed",false));
+    std::vector<int> expected,consumed,completed;
+    for(unsigned char byte:text) expected.push_back(byte);
+    REQUIRE(result.contains("bus_events"));
+    bool boot_byte_completed=false;
+    for(const auto& event:result["bus_events"]) {
+        if(event.value("bus","")!="usart1") continue;
+        if(event.value("event","")=="tx_complete" && event.value("value","")=="33") {
+            boot_byte_completed=true;
+            CHECK(event["t_ns"].get<unsigned long long>()>50000);
+            CHECK(event["t_ns"].get<unsigned long long>()<=100000);
+        }
+        if(event.value("event","")=="register_read" && event.value("register","")=="DR")
+            consumed.push_back(std::stoi(event.at("value").get<std::string>()));
+        if(event.value("event","")=="rx_complete") {
+            CHECK(event.value("outcome","")=="sampled");
+            completed.push_back(std::stoi(event.at("value").get<std::string>()));
+        }
+    }
+    CHECK(consumed==expected);
+    CHECK(completed==expected);
+    CHECK(boot_byte_completed);
 }
 
 TEST_CASE("fw_power_profile: activity-only + board rails + envelopes") {

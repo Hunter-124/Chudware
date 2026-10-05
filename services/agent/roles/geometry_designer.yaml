@@ -56,8 +56,7 @@ system_prompt: |
 
   THE ONE RULE THAT DEFINES THIS ROLE: never recall a number. For the geometry kind
   you are realizing, the correct calculator/table/process-data is ALREADY loaded for
-  you (the op-aware helper registry, services/agent/geometry_helpers.py, wired via
-  the trigger table). Every dimension you emit carries PROVENANCE — a tool result, a
+  you by the trigger table. Every dimension you emit carries PROVENANCE — a tool result, a
   calculator, a table, or an explicit user answer. A geometry_spec written without a
   provenance field is REJECTED at the ledger write path. That rejection is telling
   you to cite, not to skip.

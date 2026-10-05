@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """GUI sizing / icon / theme linter for the Chudware host (Dear ImGui, C++).
 
-A lightweight "typechecker" for the GUI sizing standard in docs/GUI_STYLE_GUIDE.md. It catches the
-exact bug classes the 2026-06 GUI audit found, so they cannot silently ship again and so the sizing
-backlog can be cleared (and kept clear) deterministically:
+A lightweight "typechecker" for the GUI sizing standard in host/src/ui/metrics.h (all GUI dimensions,
+DPI-scaled) and the rules in .claude/skills/gui-theme-layout/SKILL.md. It catches the exact bug classes
+the 2026-06 GUI audit found, so they cannot silently ship again and so the sizing backlog can be
+cleared (and kept clear) deterministically:
 
   rule=icons  every getIcon/treeIcon/asmIcon/hasIcon/huBtn("name") and every ribbon_def.cpp row icon
               field (host/src) must name an icon in assets/icons/atlas.json. This is the bug that
@@ -25,7 +26,8 @@ Usage:
   python scripts/gui_lint.py --baseline scripts/gui_lint_baseline.json
   python scripts/gui_lint.py --update-baseline scripts/gui_lint_baseline.json   # snapshot current
 
-Exit code: 0 = clean (after baseline), 1 = violations, 2 = bad invocation. Stdlib only.
+Exit code: 0 = clean (after baseline), 1 = violations, 2 = bad invocation or an unreadable
+atlas.json / glyph_ranges.h. Stdlib only.
 """
 from __future__ import annotations
 
@@ -40,7 +42,6 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ATLAS = os.path.join(REPO, "assets", "icons", "atlas.json")  # T-G11 de-dup: icons moved host/assets -> shared assets/
 DEFAULT_ROOTS = [
     os.path.join(REPO, "host", "src"),
-    os.path.join(REPO, "ui", "viewport"),
 ]
 # Keep unscoped runs on the production GUI trees: the retired ui/imgui root made iter_source_files()
 # yield nothing, so both scripts/check.py GUI gates stayed green without opening a source file.
@@ -251,11 +252,12 @@ COLOR_AUTHORING_FILES = {
 }
 
 # ---- rule "glyph": codepoints the UI font does not carry ------------------------------------------
-# This is an ALLOWLIST transcribed from the source of truth, ui_theme.cpp uiGlyphRanges() (line 662)
-# and cadSymbolRanges() (675) — not a guessed blocklist. Anything outside these ranges was never
-# requested from the TTF, so ImGui has no cell for it and draws the notdef: a literal '?' in the
-# shipping UI. ui_theme.cpp:659-661 states the omission is deliberate ("Rubik does not ship them, so
-# leaving them out keeps the atlas small"), so the fix is always at the call site, never the font.
+# This is an ALLOWLIST parsed from the source of truth, host/src/ui/glyph_ranges.h (kBody +
+# kCadSymbols, the exact tables ui_theme.cpp loadFonts() requests) — not a guessed blocklist.
+# Anything outside these ranges was never requested from the TTF, so ImGui has no cell for it and
+# draws the notdef: a literal '?' in the shipping UI. The header states the omission is deliberate
+# ("Rubik does not ship them, so leaving them out keeps the atlas small"), so the fix is always at
+# the call site, never the font.
 #
 # Consequence worth knowing, because it is counter-intuitive and has caused over-correction: the
 # font DOES carry '…' U+2026, '—' U+2014, '·' U+00B7, '×' U+00D7 and '•' U+2022 — those are in
@@ -263,25 +265,49 @@ COLOR_AUTHORING_FILES = {
 # checkmark, cross, filled/hollow circle, box-drawing rule and dingbat. Status marks belong in
 # ui::kit::statusGlyph (vector) or the icon atlas, never in a string. Shipped as a '?' at least
 # twice already: the 3D toggle's U+25CF and the PLM breadcrumb's U+25A3 + U+203A.
-GLYPH_ALLOWED_RANGES = (
-    (0x0000, 0x00FF),  # uiGlyphRanges: ASCII + Latin-1
-    (0x2010, 0x2027),  # uiGlyphRanges: general punctuation (dashes, quotes, bullet, ellipsis)
-    (0x2070, 0x209F),  # uiGlyphRanges: super/subscripts
-    (0x2205, 0x2205),  # CADSymbols: empty set / diameter
-    (0x2225, 0x2225),  # CADSymbols: parallel
-    (0x2261, 0x2261),  # CADSymbols: identical to
-    (0x2295, 0x2295),  # CADSymbols: circled plus
-    (0x2299, 0x2299),  # CADSymbols: circled dot
-    (0x22A5, 0x22A5),  # CADSymbols: perpendicular
-    (0x2300, 0x2300),  # CADSymbols: diameter sign
-    (0x25C6, 0x25C7),  # CADSymbols: filled/hollow diamond
-)
+GLYPH_RANGES_HEADER = os.path.join(REPO, "host", "src", "ui", "glyph_ranges.h")
+GLYPH_TABLES = ("kBody", "kCadSymbols")
+GLYPH_PAIR_RE = re.compile(r"\{\s*(0[xX][0-9a-fA-F]+)\s*,\s*(0[xX][0-9a-fA-F]+)\s*\}")
+# C0 controls (\n, \t, ...) are layout, not glyphs; ImGui never looks them up in the atlas.
+GLYPH_LAYOUT_MAX = 0x1F
 UNICODE_ESCAPE_RE = re.compile(r"\\u[0-9a-fA-F]{4}")
 STRING_LITERAL_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 
 
+class GlyphTableError(Exception):
+    pass
+
+
+def load_glyph_ranges(path: str = GLYPH_RANGES_HEADER) -> tuple:
+    """Parse every inclusive (lo, hi) pair of the kBody and kCadSymbols tables in *path*."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+    except OSError as exc:
+        raise GlyphTableError(f"cannot read glyph table {path}: {exc}") from exc
+    ranges = []
+    for table in GLYPH_TABLES:
+        m = re.search(r"\b" + table + r"\[\]\s*=\s*\{(.*?)\};", src, re.S)
+        pairs = GLYPH_PAIR_RE.findall(m.group(1)) if m else []
+        if not pairs:
+            raise GlyphTableError(f"parsed 0 ranges for {table}[] from {path}; "
+                                  "the glyph rule has no allowlist")
+        ranges.extend((int(lo, 16), int(hi, 16)) for lo, hi in pairs)
+    return tuple(ranges)
+
+
+_glyph_ranges = None
+
+
+def glyph_ranges() -> tuple:
+    global _glyph_ranges
+    if _glyph_ranges is None:
+        _glyph_ranges = load_glyph_ranges()
+    return _glyph_ranges
+
+
 def glyph_supported(cp: int) -> bool:
-    return any(lo <= cp <= hi for lo, hi in GLYPH_ALLOWED_RANGES)
+    return cp <= GLYPH_LAYOUT_MAX or any(lo <= cp <= hi for lo, hi in glyph_ranges())
 
 
 def glyph_offenders(code: str):
@@ -476,13 +502,25 @@ def main(argv) -> int:
     atlas = load_atlas_names(ATLAS)
     rules = ({"icons", "theme", "scale", "color", "glyph", "dupe"}
              if args.rule == "all" else {args.rule})
+    if "glyph" in rules:
+        try:
+            glyph_ranges()
+        except GlyphTableError as exc:
+            print(f"gui_lint: {exc}", file=sys.stderr)
+            return 2
 
     explicit_roots = bool(args.roots)
     roots = args.roots if explicit_roots else list(DEFAULT_ROOTS)
 
     findings: list = []
-    for path in iter_source_files(roots):
-        lint_file(path, atlas, rules, findings)
+    for root in roots:
+        scanned = False
+        for path in iter_source_files([root]):
+            scanned = True
+            lint_file(path, atlas, rules, findings)
+        if not scanned:
+            print(f"gui_lint: no source files found in scan root {root}", file=sys.stderr)
+            return 2
     findings.sort(key=lambda f: (f[2], f[0], f[1]))
 
     if args.update_baseline:

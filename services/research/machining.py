@@ -10,7 +10,7 @@ The data table (``services/research/data/feeds_speeds.json``) stores per-materia
 tool-type × operation ranges (Vc surface speed in SFM/m·min, chipload-per-tooth by
 diameter bracket, stepdown/stepover fractions). The Python layer:
 
-1. Resolves the material via ``engine_oracle/materials/registry.cam_material_id()`` so
+1. Resolves material aliases through the native ``material_resolve_key`` RPC so
    callers can pass any registry alias (``alu_6061``, ``aluminum``, ``6061-t6``, …).
 2. Interpolates a conservative midpoint default (range mid) clamped to
    ``machine_limits``.
@@ -22,7 +22,7 @@ diameter bracket, stepdown/stepover fractions). The Python layer:
    clamped values) — contract §3.
 
 **Relationship to C++ CuttingDB** (``core/cam/feeds.cpp``)
-The C++ CuttingDB computes feeds for actual toolpath generation inside the kernel kernel.
+The C++ CuttingDB computes feeds for actual toolpath generation inside the kernel.
 This Python layer is the *advisory* calculator that range-checks and surfaces candidates.
 The SFM/chipload values in ``feeds_speeds.json`` are anchored to the same Machinery's
 Handbook ranges used to seed ``core/cam/feeds.cpp``; they are NOT meant to replace it.

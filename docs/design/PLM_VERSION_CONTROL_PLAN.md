@@ -1,10 +1,22 @@
 # PLM Version Control Plan (Pillar 19, Workstream R)
 
-Status: DESIGN APPROVED FOR TASK CUT — Hunter directive 2026-07-03.
-Supersedes backlog proposals T-BL15 (in-app document version control) and
-T-BL10 (PDM-lite). This document answers T-BL15's open questions and is the
-source of truth for workstream R. Detailed schemas freeze in `contracts/plm.md`
-(T-R1) — this doc fixes intent, UX model, and architecture direction.
+Status: ADOPTED design record. On the board, `T-R1` through `T-R8` are all
+`status: done` (`work/tasks/done/`); that records scoped closure, not fresh GUI or
+deployment acceptance. The implementation lives in `services/plm/`, and the frozen
+schemas live in `contracts/plm.md` (plus `contracts/plm_live.md` for T-R8). This document
+remains the design-intent record, not an as-built spec. Two places where reality moved past
+it:
+
+- **Post-v1 live co-editing.** `T-R8` records self-hosted PLM server + live co-editing
+  after v1, beyond the §6 "Real-time co-editing" v1 non-goal.
+- **Chudware Cloud remote.** The remote is still only the reserved seam. `services/plm/remote.py`
+  answers `reserved_remote` ("Chudware Cloud is not available yet").
+
+Original status: DESIGN APPROVED FOR TASK CUT — Hunter directive 2026-07-03.
+The original approval superseded backlog proposals T-BL15 (in-app document version
+control) and T-BL10 (PDM-lite). The original text answers T-BL15's open questions and
+records workstream R's intent, UX model and architecture direction; detailed schemas
+are frozen in `contracts/plm.md` (T-R1), not replaced by this design record.
 
 > **T-R1 CONTRACT FROZEN (2026-07-03).** The detailed schemas are now frozen in
 > [`contracts/plm.md`](../../contracts/plm.md) (`aicad.plm/1`). The OSS survey +

@@ -3,8 +3,7 @@ id: T-SIM10
 title: Simulate tab — full multi-physics setup tree with per-part-type disclosure
 workstream: SIM
 owner: unassigned
-status: backlog
-deferred: yes
+status: dropped
 branch: task/T-SIM10-simulate-tab-multiphysics
 depends_on: []
 lane: simulation
@@ -14,7 +13,7 @@ priority: 1
 
 ## Context
 
-Hunter directive 2026-07-06 (see `docs/GUI_OVERHAUL_SPEC.md` §5 — the canonical register).
+Hunter directive 2026-07-06 (see `docs/plans/GUI_OVERHAUL_SPEC.md` §5 — the canonical register).
 The host/ GUI Simulate workspace tab must host EVERY simulation kind in one place, with the
 option surface scoped to what the user actually has open so nobody is overwhelmed:
 
@@ -65,3 +64,7 @@ honest. Original disclosure-matrix intent (mech-only vs electronics-open, handof
 actions, honest engine-pending states) shipped under T-FIN24 against the live `host/`
 GUI (not the deleted ui/imgui path this brief once targeted). Do not re-claim this
 card — open a follow-up only for gaps found against T-FIN24 DoD.
+
+**2026-10-04 dropped.** The supersession above is explicit and terminal, so the card is
+`dropped` and archived in `work/tasks/done/` instead of sitting on the live board as
+deferred backlog. Gaps against T-FIN24 get a new card.

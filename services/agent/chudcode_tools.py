@@ -694,6 +694,10 @@ def _effective_names(context: Any, available: Sequence[str]) -> list[str]:
     are unioned BEFORE the mode policy runs, so a user-picked read-only mode
     (ask/plan) stays read-only no matter what the model loads mid-turn. The
     policy is a user choice; the loads are the model's.
+
+    The mode policy and its floors are not optional: an import or evaluation
+    error propagates (the caller refuses the turn) instead of advertising the
+    un-narrowed surface.
     """
     role = _role_card(context)
     explicit = _ctx_present(context, "allowed_tools")
@@ -720,51 +724,36 @@ def _effective_names(context: Any, available: Sequence[str]) -> list[str]:
 
     mode = _ctx(context, "mode", None)
     plan_only = _ctx(context, "plan_only", None)
-    try:
-        from services.agent.copilot_mode_tools import apply_mode_tools
+    from services.agent.config import bugreport_floor
+    from services.agent.copilot_mode_tools import (
+        apply_meta_tool_floor,
+        apply_mode_tools,
+    )
+    from services.agent.guardrails import MUTATING_TOOLS
 
-        # Plan narrows the SAME set agent would get (minus mutators + the shared
-        # floor) rather than the contract's broad PLAN_TOOLS list, so the main
-        # chat's Plan mode is "Agent, read-only" and costs no extra context.
-        narrowed = apply_mode_tools(
-            mode,
-            names,
-            plan_only=plan_only,
-            subagent=bool(
-                _ctx(context, "subagent_id", None) or _ctx(context, "subagent", False)
-            ),
-            preferences=_ctx(context, "turn_preferences", None),
-        )
-        if narrowed is not None:
-            names = _ordered_unique(narrowed)
-            restricted = True
-    except Exception as exc:  # noqa: BLE001 - mode helpers are optional at startup
-        _debug_fallback("mode policy", exc)
-
-    if names is not None:
-        try:
-            from services.agent.copilot_mode_tools import apply_meta_tool_floor
-
-            floored = apply_meta_tool_floor(names)
-            if floored is not None:
-                names = _ordered_unique(floored)
-        except Exception as exc:  # noqa: BLE001 - optional mode floor
-            _debug_fallback("meta-tool floor", exc)
+    # Plan narrows the SAME set agent would get (minus mutators + the shared
+    # floor) rather than the contract's broad PLAN_TOOLS list, so the main
+    # chat's Plan mode is "Agent, read-only" and costs no extra context.
+    narrowed = apply_mode_tools(
+        mode,
+        names,
+        plan_only=plan_only,
+        subagent=bool(
+            _ctx(context, "subagent_id", None) or _ctx(context, "subagent", False)
+        ),
+        preferences=_ctx(context, "turn_preferences", None),
+    )
+    if narrowed is not None:
+        names = _ordered_unique(narrowed)
+        restricted = True
 
     if names is not None:
-        try:
-            from services.agent.config import bugreport_floor
-
-            names = _ordered_unique([*names, *bugreport_floor()])
-        except Exception as exc:  # noqa: BLE001 - optional config floor
-            _debug_fallback("bug-report floor", exc)
-        try:
-            from services.agent.guardrails import MUTATING_TOOLS
-
-            if set(names).intersection(MUTATING_TOOLS):
-                names = _ordered_unique([*names, "verify_battery"])
-        except Exception as exc:  # noqa: BLE001 - optional guardrail catalog
-            _debug_fallback("mutation verification floor", exc)
+        floored = apply_meta_tool_floor(names)
+        if floored is not None:
+            names = _ordered_unique(floored)
+        names = _ordered_unique([*names, *bugreport_floor()])
+        if set(names).intersection(MUTATING_TOOLS):
+            names = _ordered_unique([*names, "verify_battery"])
     preferences = _ctx(context, "turn_preferences", None)
     if preferences is not None:
         from services.agent.copilot_mode_tools import apply_preference_tools
@@ -783,21 +772,16 @@ def _effective_names(context: Any, available: Sequence[str]) -> list[str]:
         # and sketch tool categories", found no such tool, and fell back to `bash` and
         # `write` for the rest of the turn without ever touching CAD geometry.
         unrestricted = _ordered_unique(available)
-        try:
-            from services.agent.copilot_mode_tools import apply_meta_tool_floor
-
-            floored = apply_meta_tool_floor(unrestricted)
-            if floored is not None:
-                # Append only what the floor ADDS. Live registry order is this list's
-                # contract (it is the order the model sees), and the floor helper returns
-                # its own ordering, so adopting it wholesale would reshuffle the catalog.
-                present = set(unrestricted)
-                unrestricted = [
-                    *unrestricted,
-                    *(name for name in floored if name not in present),
-                ]
-        except Exception as exc:  # noqa: BLE001 - optional mode floor
-            _debug_fallback("meta-tool floor", exc)
+        floored = apply_meta_tool_floor(unrestricted)
+        if floored is not None:
+            # Append only what the floor ADDS. Live registry order is this list's
+            # contract (it is the order the model sees), and the floor helper returns
+            # its own ordering, so adopting it wholesale would reshuffle the catalog.
+            present = set(unrestricted)
+            unrestricted = [
+                *unrestricted,
+                *(name for name in floored if name not in present),
+            ]
         return unrestricted
     return _ordered_unique(names or ())
 
@@ -836,13 +820,11 @@ def _load_registry_entries(context: Any) -> dict[str, Any]:
         injected = _ctx(context, "tool_registry", _MISSING)
     entries = _tool_manager_entries(injected) if injected is not _MISSING else None
     if entries is None:
-        try:
-            from services.mcp.server import mcp
+        # No injected registry: the live MCP server is the registry. An import
+        # failure propagates — an empty surface is not a successful build.
+        from services.mcp.server import mcp
 
-            entries = _tool_manager_entries(mcp)
-        except Exception as exc:  # noqa: BLE001 - full MCP server is optional in tests
-            _debug_fallback("MCP registry import", exc)
-            entries = {}
+        entries = _tool_manager_entries(mcp)
     return {str(name): entry for name, entry in (entries or {}).items()}
 
 
@@ -869,13 +851,15 @@ def _resolver(context: Any) -> Callable[[str], Any]:
 
 
 def _policy_refusal(name: str, context: Any) -> dict[str, Any] | None:
+    """The CAD dispatch-policy refusal for *name*, or None when it may run.
+
+    ``policy_registry`` in the context is the injection seam; otherwise the live
+    ``tool_registry`` decides. Import or evaluation errors propagate, so a
+    broken policy never advertises or dispatches the tool.
+    """
     registry = _ctx(context, "policy_registry", None)
     if registry is None:
-        try:
-            from services.mcp import tool_registry as registry
-        except Exception as exc:  # noqa: BLE001 - policy module is optional in tests
-            _debug_fallback("policy registry import", exc)
-            return None
+        from services.mcp import tool_registry as registry
     deny = getattr(registry, "deny_reason", None)
     if not callable(deny):
         allowed = getattr(registry, "is_allowed", None)
@@ -1070,15 +1054,11 @@ def _entry_description(entry: Any, fn: Any) -> str:
 
 
 def _entry_load_mode(name: str, entry: Any) -> str:
-    value = _entry_value(entry, "load_mode", "loadMode", default=None)
-    try:
-        from services.agent.config import get_tool_options
+    from services.agent.config import get_tool_options
 
-        options = get_tool_options(None, name) or {}
-        value = options.get("load_mode", value)
-    except Exception as exc:  # noqa: BLE001 - per-tool config is optional at startup
-        _debug_fallback("tool load mode", exc)
-    return str(value or "always")
+    value = _entry_value(entry, "load_mode", "loadMode", default=None)
+    options = get_tool_options(None, name) or {}
+    return str(options.get("load_mode", value) or "always")
 
 
 def _collision_allowed(name: str, entry: Any, context: Any) -> bool:
@@ -1403,43 +1383,37 @@ def _mode_refusal(name: str, context: Any) -> dict[str, Any] | None:
     advertised set; this re-applies the same ``apply_mode_tools`` policy to the
     call itself, so a stale binding or a sub-agent inheriting the parent's
     bindings can never mutate under a mode the user chose to be read-only.
+    A policy import or evaluation error propagates: the call is never run
+    unchecked.
     """
+    from services.agent.config import bugreport_floor
+    from services.agent.copilot_mode_tools import (
+        META_TOOL_FLOOR,
+        apply_mode_tools,
+        normalize_mode,
+    )
+
     mode = _ctx(context, "mode", None)
     plan_only = _ctx(context, "plan_only", None)
     preferences = _ctx(context, "turn_preferences", None)
-    try:
-        from services.agent.copilot_mode_tools import (
-            META_TOOL_FLOOR,
-            apply_mode_tools,
-            normalize_mode,
-        )
-
-        effective = "plan" if plan_only else normalize_mode(mode)
-        if getattr(preferences, "mode", None) == "ask":
-            effective = "ask"
-        if effective not in {"ask", "plan"}:
-            return None
-        allowed = apply_mode_tools(
-            mode,
-            [name],
-            plan_only=plan_only,
-            subagent=bool(
-                _ctx(context, "subagent_id", None) or _ctx(context, "subagent", False)
-            ),
-            preferences=preferences,
-        )
-    except Exception as exc:  # noqa: BLE001 - mode helpers are optional at startup
-        _debug_fallback("dispatch mode policy", exc)
+    effective = "plan" if plan_only else normalize_mode(mode)
+    if getattr(preferences, "mode", None) == "ask":
+        effective = "ask"
+    if effective not in {"ask", "plan"}:
         return None
+    allowed = apply_mode_tools(
+        mode,
+        [name],
+        plan_only=plan_only,
+        subagent=bool(
+            _ctx(context, "subagent_id", None) or _ctx(context, "subagent", False)
+        ),
+        preferences=preferences,
+    )
     if allowed is None or name in allowed or name in META_TOOL_FLOOR:
         return None
-    try:
-        from services.agent.config import bugreport_floor
-
-        if name in bugreport_floor():
-            return None
-    except Exception as exc:  # noqa: BLE001 - optional config floor
-        _debug_fallback("dispatch bug-report floor", exc)
+    if name in bugreport_floor():
+        return None
     return {
         "ok": False,
         "status": "mode_refused",
@@ -1465,8 +1439,9 @@ def dispatch_host_tool(
     """Dispatch one host call through CAD's run-scoped dispatch chokepoint.
 
     Policy refusals are returned in their existing machine-readable shape.  Tool
-    exceptions deliberately propagate so Chudcode records a tool error rather
-    than a fabricated successful result.
+    exceptions — and policy/mode evaluation errors, which fail closed before the
+    tool body runs — deliberately propagate so Chudcode records a tool error
+    rather than a fabricated successful result.
 
     ``agent_id``/``parent_agent_id`` name the Chudcode task sub-agent making the
     call (None for the top-level agent). Sub-agents run concurrently on their own
@@ -1482,6 +1457,8 @@ def dispatch_host_tool(
         supplied = dict(args)
     else:
         raise TypeError("tool arguments must be a JSON object")
+    if "helper_runtime" in supplied:
+        return {"ok": False, "error": "helper_runtime is host-owned", "executed": False}
     # Validate input without reordering its keys.
     json.dumps(_json_safe(supplied), ensure_ascii=False, allow_nan=False)
     if _cancelled(cancel):
@@ -1565,13 +1542,16 @@ def dispatch_host_tool(
         call_counts = binding.context.setdefault("tool_call_counts", {})
     if call_counts is None:
         call_counts = binding.metadata.get("tool_call_counts")
-    result = _dispatch_tool(
-        binding.name,
-        call_args,
-        _call_counts=call_counts,
-        _inner=inner,
-        _loop_guard=_ctx(binding.context, "tool_loop_guard", None),
-    )
+    from services.agent.online_turn import bind_helper_runtime
+
+    with bind_helper_runtime(_ctx(binding.context, "helper_runtime", None)):
+        result = _dispatch_tool(
+            binding.name,
+            call_args,
+            _call_counts=call_counts,
+            _inner=inner,
+            _loop_guard=_ctx(binding.context, "tool_loop_guard", None),
+        )
     safe_result = _json_safe(result)
     records = _ctx(binding.context, "tool_calls", _ctx(binding.context, "calls", None))
     if records is None:

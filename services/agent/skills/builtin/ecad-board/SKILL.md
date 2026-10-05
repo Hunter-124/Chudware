@@ -49,4 +49,4 @@ triggers:
 
 - Schematic sheet ASCII: `render_schematic_ascii` (grid + cell index).
 - SPICE/sim plaintext: `render_sim_ascii`.
-- Targeted layout/schematic edits from the grid: `apply_ascii_edits(kind='pcb'|'schematic', edits=[...])` with `grid_json`/`index_json` from the last render (move/swap/delete/replace_section/place).
+- Targeted layout/schematic edits from the grid: `apply_ascii_edits(kind='pcb'|'schematic', edits_json='<JSON list>', grid_json='<JSON grid>', index_json='<JSON index>')` from the last render (move/swap/delete/replace_section/place).

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Convenience wrapper — canonical installer lives under packaging/linux/.
-# Installs Chudware.desktop + hicolor icons into ~/.local/share (no root).
-# One-shot after a Linux build so the taskbar / launcher / alt-tab show the
-# Chudware icon (matches WM_CLASS=Chudware set in host/src/app.cpp).
+# Provision the runtime, then invoke the canonical packaging/linux/ installer.
+# Installs chudware.desktop + hicolor icons into ~/.local/share (no root).
+# Run after a Linux build to match the launcher's WM_CLASS=chudware.
 #
 # Usage (from repo root):  scripts/install_desktop.sh
 set -euo pipefail

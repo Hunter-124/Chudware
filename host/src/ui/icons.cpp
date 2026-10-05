@@ -306,8 +306,8 @@ void freeIcons() {
     gAtlas.loaded = false;
 }
 
-// Icon aliases: names referenced by the ribbon/toolbar that have no dedicated atlas cell borrow a
-// semantically-close existing glyph, so nothing ever falls to the magenta placeholder. This table
+// Icon aliases: names referenced by the ribbon/toolbar that draw another atlas glyph instead of their
+// own cell (or lack one), so nothing ever falls to the magenta placeholder. This table
 // is the single source of truth for those fallbacks; the atlas-coverage guard (assets/test_icons.py)
 // treats an aliased name as "covered". Prefer adding a real rendered tile (scripts/icon_pipeline.py)
 // over a permanent alias — replace the entry here once the dedicated glyph lands.
@@ -315,13 +315,10 @@ const char* resolveIconAlias(const char* name) {
     if (!name) return name;
     struct Alias { const char* from; const char* to; };
     static const Alias kAliases[] = {
-        {"rotate_ent",          "pattern_circ_ent"},  // TODO: dedicated rotate-entities glyph
-        {"stock",               "cat_stock_metal"},   // Manufacture▸Stock — reuse the metal-block tile
-        // (Features▸Thread now has its own atlas glyph "thread" — interim cam_thread_mill alias removed.)
-        {"name_group_features", "folder_new"},         // group selected features into a named folder
-        {"new_part",            "part"},
-        {"open_part",           "open"},
-        // (appr_steel/brass/dark now have their own distinct tinted-metal atlas glyphs — aliases removed.)
+        // Both names also have rendered atlas tiles (contracts/icons.md, 2026-08-17); these rows
+        // shadow them and keep the established ribbon look until those tiles are visually signed off.
+        {"rotate_ent",          "pattern_circ_ent"},  // Sketch▸Rotate Ent.
+        {"stock",               "cat_stock_metal"},   // Manufacture▸Stock — metal-block tile
     };
     for (const Alias& a : kAliases)
         if (std::strcmp(name, a.from) == 0) return a.to;

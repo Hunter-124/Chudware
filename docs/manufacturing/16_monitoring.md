@@ -448,14 +448,14 @@ Integrator-owned append (one line, not applied by this lane):
 |---|---|
 | `host/src/ui/manufacture/monitor_state.h` | `MonitorMirror`: sources, devices, items, last `FreshValue` per item, condition ring, replay flag, `aggregate` counters. **Written only by the authoritative `mfg.monitor.*` event drain** |
 | `host/src/ui/manufacture/monitor_panel.h/.cpp` | `ui::drawMonitorPanel(AppState&)` — read-only: source list, device tree, item table (value / state / age / ttl / seq / `quality_src`), condition log, `SourceSchema` column, raw-extension inspector popover, replay banner |
-| `host/src/ui/status_bar.h` | **append** a seam hook mirroring the existing `int (*partsDownloadQueueCount)()` idiom |
+| `host/src/ui/status_bar.h` | **proposed** monitor-status seam; the Parts Library token currently reads its owned queue directly |
 | `host/src/ui/status_bar.cpp` | fill the currently-empty `Workspace::Manufacture` arm of the `wsTok` switch (`status_bar.cpp:347-364`) and add the warn tint branch (`status_bar.cpp:384-392`) |
 
 `host/src/ui/cam/**` is untouched; no new canvas or panel host is created — the monitor panel docks in the existing
 Manufacture workspace surface.
 
-Status-bar seam, matching the existing pattern exactly (`extern`, default `nullptr`, so the token honestly reads
-"not configured" until the monitor lane assigns it):
+Proposed status-bar seam (`extern`, default `nullptr`, so the token would read
+"not configured" until a monitor owner assigns it); this is not a shipped hook:
 
 ```cpp
 // status_bar.h — [workspace-tabs seam] read-only monitoring token.

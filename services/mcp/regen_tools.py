@@ -2,8 +2,13 @@
 
 When a parametric document fails to rebuild, ``diagnose_failed_document`` runs the IP-18
 diagnosis (``services.agent.regen_diagnosis``), verifies the proposed fix against the live core
-when present, and returns a fix-preview card (``services.agent.regen_card``). The provider call
+when present, and returns a fix-preview card (``services.agent.regen_card``). The model call
 is logged as an IP-18 correction trace via T-H7's LoggingProvider.
+
+The model step is one tool-free completion through the Chudcode runtime
+(``providers.chudcode_provider.helper_provider``); an explicit offline/local-only
+configuration binds an offline-safe provider instead. When the step cannot run, the card
+still carries the detected failures and the runtime's reason.
 
 This is the shared surface the copilot / orchestrator call on a rebuild-failure event.
 LIVE SINCE T-BL22: ``add_features`` (cad_tools.py) invokes ``diagnose_failed_document`` on
@@ -16,8 +21,9 @@ journaled to ``CACHE/telemetry/events.jsonl`` (the spec_sheet_matcher precedent)
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
+from services.agent.chudcode_host import HelperCompletionError
 from services.agent.providers.base import ProviderUnreachable
 from services.agent.regen_diagnosis import detect_failures
 
@@ -41,14 +47,10 @@ def _journal_sink() -> Callable[[dict], None]:
     return _sink
 
 
-def _resolve_provider():
-    """The configured agent provider, or None when none is resolvable (no credentials / offline
-    with nothing local). The tool degrades honestly rather than fabricating a diagnosis."""
-    try:
-        from services.agent.config import get_provider
-        return get_provider()
-    except Exception:
-        return None
+def _resolve_provider(cancel: Optional[Callable[[], bool]] = None):
+    """The helper provider for the fixer's model step (see ``helper_provider``)."""
+    from services.agent.providers.chudcode_provider import helper_provider
+    return helper_provider("fixer", cancel=cancel)
 
 
 def _verify(document: dict, diagnosis, reference_document: Optional[dict]):
@@ -97,20 +99,24 @@ def _no_llm_result(document: dict, reason: str) -> dict:
 def diagnose_failed_document(document: dict, *, provider=None,
                              reference_document: Optional[dict] = None,
                              engine_error: Optional[str] = None,
-                             on_event=None, consent_fn=None, verify: bool = True) -> dict:
+                             on_event=None, consent_fn=None, verify: bool = True,
+                             cancel: Optional[Callable[[], bool]] = None) -> dict:
     """Diagnose a failed-rebuild ``document`` and return a fix-preview card.
 
     ``document`` is a full aicad.part/1 doc or a ``{revision, tree, owner_map}`` wrapper.
     ``reference_document`` (optional) is the last known-good revision, enabling the compare_parts
-    drift check. ``provider`` defaults to the configured agent provider; when none is resolvable
-    -- or one resolves but cannot be reached -- the tool returns ``ok=False`` with the detected
-    failures (still useful) rather than guessing.
+    drift check. ``provider`` defaults to the helper provider (Chudcode runtime online, the
+    bound offline-safe provider offline); ``cancel`` stops its model step. When the model step
+    cannot be set up or does not answer, the tool returns ``ok=False`` with the detected
+    failures (still useful) and the reason, rather than guessing.
     """
-    prov = provider or _resolve_provider()
+    prov = provider
     if prov is None:
-        return _no_llm_result(
-            document,
-            "no provider configured for regen diagnosis (set one to enable IP-18 fixes)")
+        try:
+            prov = _resolve_provider(cancel)
+        except Exception as e:  # noqa: BLE001 -- offline refusal / role resolution is result data
+            return _no_llm_result(
+                document, f"no model available for regen diagnosis: {type(e).__name__}: {e}")
     if on_event is None:
         # T-BL22: no caller sink (the MCP tool path) -> journal the IP-18 correction trace
         # to CACHE/telemetry/events.jsonl instead of dropping it on the floor.
@@ -127,6 +133,9 @@ def diagnose_failed_document(document: dict, *, provider=None,
         # running) must not turn a diagnosis into a crash: failure DETECTION needs no
         # model, so hand back the same honest card the no-provider path returns.
         return _no_llm_result(document, f"provider unreachable: {e}")
+    except HelperCompletionError as e:
+        # The runtime's own reason: cancelled, over budget, model rejected, provider error.
+        return _no_llm_result(document, f"model step failed: {e}")
     score, detail = _verify(document, d, reference_document) if verify else (None, {})
     card = build_fix_preview(document, d, verifier_score=score, verifier_detail=detail)
     return {"ok": True, "artifact_id": d.artifact_id, "card": card}
@@ -137,7 +146,7 @@ def register_regen_tools(mcp) -> None:
 
     @mcp.tool()
     def regen_diagnose(document_json: str, reference_json: str = "",
-                       engine_error: str = "") -> str:
+                       engine_error: str = "", cancel=None) -> str:
         """Diagnose a document that FAILED TO REBUILD and return a fix-preview card the user can
         accept/edit/reject.
 
@@ -149,8 +158,8 @@ def register_regen_tools(mcp) -> None:
 
         Returns a JSON card: ``{ok, artifact_id, card:{diagnosis, fix_ops, changes, semantic_diff,
         verifier, actions}}``. The fix ops are editable doc-ops (R1 parity). The call is logged as
-        an IP-18 correction trace. ``ok=false`` (with the detected failures) when no model provider
-        is configured.
+        an IP-18 correction trace. ``ok=false`` (with the detected failures and the reason) when
+        the model step is unavailable or fails.
         """
         try:
             document = json.loads(document_json)
@@ -163,7 +172,8 @@ def register_regen_tools(mcp) -> None:
             except json.JSONDecodeError as e:
                 return json.dumps({"ok": False, "error": f"reference_json: invalid JSON — {e}"})
         result = diagnose_failed_document(
-            document, reference_document=reference, engine_error=engine_error or None)
+            document, reference_document=reference, engine_error=engine_error or None,
+            cancel=cancel if callable(cancel) else None)
         return json.dumps(result, default=str)
 
     @mcp.tool()

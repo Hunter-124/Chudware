@@ -1,10 +1,22 @@
 # AI Harness Overhaul — Auto-first settings for mechanical engineers
 
-Owner: Hunter. Drafted 2026-09-05. Status: PROPOSAL (no code changed). Target user: a mechanical engineer or ME
-student using a CAD app — not an AI power user. Inspiration: *The Harness Playbook*, Can Bölük, 2026-09-02 —
-https://stencil.so/blog/harness-playbook. `docs/plans/AI_HARNESS_ROADMAP.md` (WS0–WS5) covers harness
-*correctness/benchmarking* and trends toward MORE settings (WS2 adds per-role rows); this plan is the opposite
-vector — see Open question 1.
+Owner: Hunter. Drafted 2026-09-05. **Status: partially adopted design record.**
+The 2026-09-07 entry "Copilot preferences and Auto resolver — overhaul Phases 0–1" in
+[`docs/REFACTOR_LOG.md`](../REFACTOR_LOG.md) records those phases and explicitly leaves
+Settings/transparency Phases 2–3 and VERIFY LATER experiments untouched/unrun.
+It is not evidence that the full UI proposal shipped. Current policy lives in
+`services/agent/preferences.py`; current online-runtime and compaction authority is
+[Chudcode integration](../../.claude/skills/cad-chudcode-integration/SKILL.md).
+In particular, the user's selected compaction method must be honored; the proposal
+below to hide that choice is not current policy. Source-line citations, model examples,
+control counts and migration instructions below are the original design snapshot.
+
+Original status: "PROPOSAL (no code changed)." Original target user: a mechanical
+engineer or ME student using a CAD app — not an AI power user. Inspiration:
+*The Harness Playbook*, Can Bölük, 2026-09-02 —
+https://stencil.so/blog/harness-playbook. `docs/plans/AI_HARNESS_ROADMAP.md` (WS0–WS5)
+covers harness *correctness/benchmarking* and trends toward MORE settings (WS2 adds
+per-role rows); this plan is the opposite vector — see Open question 1.
 
 ## 1. What the playbook recommends, and what applies here
 

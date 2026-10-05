@@ -1,5 +1,15 @@
 # OMP snapcompact deep-dive — data-loss/corruption revamp research
 
+> **Historical research (2026-07), superseded 2026-08-31. Not a current runbook.** This dossier
+> is dated evidence from the OMP integration research round. Its bun bridge/sidecar,
+> `vendor/omp/` and `scripts/vendor_omp.py` were deleted. Any `scratch/omp-src/` or
+> inspection-checkout path is an untracked local research copy, not a dependency. Its CAD
+> file/line citations are point-in-time. Online agent execution, provider auth, models,
+> sessions, memory and compaction now run in the embedded Chudcode RPC runtime. See
+> [01-DECISIONS.md, 2026-08-31 section](../01-DECISIONS.md#2026-08-31--superseding-architecture-chudcode-rpc-is-the-only-online-runtime),
+> [ARCHITECTURE.md, Agent runtime](../../../ARCHITECTURE.md#agent-runtime), and
+> [`.claude/skills/cad-chudcode-integration/SKILL.md`](../../../.claude/skills/cad-chudcode-integration/SKILL.md).
+
 Source: `/home/hunter/Repositories/CAD/scratch/omp-src/packages/snapcompact/src/snapcompact.ts` (1977 lines, read in full), native renderer `crates/pi-natives/src/snapcompact.rs`, compared against CAD `/home/hunter/Repositories/CAD/services/agent/compaction.py` (1054 lines, read in full). No existing porting-docs file on snapcompact specifically (glob for `*snap*` under `omp-inspection/porting-docs` returned nothing — this feature is undocumented there).
 
 ## 1. Algorithm end-to-end

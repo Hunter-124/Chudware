@@ -742,14 +742,16 @@ sysbus:
 
 nvic: IRQControllers.NVIC @ sysbus 0xE000E000
     priorityMask: 0xF0
-    systickFrequency: 72000000
+    systickFrequency: 16000000
     IRQ -> cpu@0
 
 cpu: CPU.CortexM @ sysbus
     cpuType: "cortex-m4f"
     nvic: nvic
 
-usart1: UART.STM32_UART @ sysbus <0x40011000, +0x100>
+usart1: Chudware.TimedSTM32UART @ sysbus <0x40011000, +0x100>
+    name: "usart1"
+    frequency: 16000000
     -> nvic@37
 
 flash: Memory.MappedMemory @ sysbus 0x08000000
@@ -786,29 +788,54 @@ gpioPortE: GPIOPort.STM32_GPIOPort @ sysbus <0x40021000, +0x400>
 // Local changes vs upstream: DMA request links dropped (this curated platform declares
 // no DMA controller) and the rcc->timer9 reset link dropped (no RCC model here).
 
-usart2: UART.STM32_UART @ sysbus <0x40004400, +0x100>
+usart2: Chudware.TimedSTM32UART @ sysbus <0x40004400, +0x100>
+    name: "usart2"
+    frequency: 16000000
     -> nvic@38
 
-spi1: SPI.STM32SPI @ sysbus 0x40013000
+spi1: Chudware.TimedSTM32SPI @ sysbus 0x40013000
+    name: "spi1"
+    frequency: 16000000
     IRQ->nvic@35
 
-spi2: SPI.STM32SPI @ sysbus 0x40003800
+spi2: Chudware.TimedSTM32SPI @ sysbus 0x40003800
+    name: "spi2"
+    frequency: 16000000
     IRQ->nvic@36
 
-spi3: SPI.STM32SPI @ sysbus 0x40003C00
+spi3: Chudware.TimedSTM32SPI @ sysbus 0x40003C00
+    name: "spi3"
+    frequency: 16000000
     IRQ->nvic@51
 
-i2c1: I2C.STM32F4_I2C @ sysbus 0x40005400
+i2c1: Chudware.TimedSTM32I2C @ sysbus 0x40005400
+    name: "i2c1"
+    frequency: 16000000
     EventInterrupt -> nvic@31
     ErrorInterrupt -> nvic@32
 
-i2c2: I2C.STM32F4_I2C @ sysbus 0x40005800
+i2c2: Chudware.TimedSTM32I2C @ sysbus 0x40005800
+    name: "i2c2"
+    frequency: 16000000
     EventInterrupt -> nvic@33
     ErrorInterrupt -> nvic@34
 
-i2c3: I2C.STM32F4_I2C @ sysbus 0x40005C00
+i2c3: Chudware.TimedSTM32I2C @ sysbus 0x40005C00
+    name: "i2c3"
+    frequency: 16000000
     EventInterrupt -> nvic@72
     ErrorInterrupt -> nvic@73
+
+can1: Chudware.TimedSTM32CAN @ sysbus 0x40006400
+    name: "can1"
+    frequency: 16000000
+    [0, 1, 2, 3] -> nvic@[19, 20, 21, 22]
+
+can2: Chudware.TimedSTM32CAN @ sysbus 0x40006800
+    name: "can2"
+    frequency: 16000000
+    master: can1
+    [0, 1, 2, 3] -> nvic@[63, 64, 65, 66]
 
 timer1: Timers.STM32_Timer @ sysbus 0x40010000
     BreakInterrupt -> nvic@24

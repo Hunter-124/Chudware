@@ -371,3 +371,9 @@ may be printed as such; it is not an exact zero gap. Assembly narration explicit
 that no minimum measured gap is available and does not report an exact tightest gap.
 Its source attribution distinguishes the pre-solve placement snapshot, live mate solve,
 and live threshold classification/overlap-volume evaluation.
+
+## Current implementation pointers
+
+The online runtime is the Chudcode session host through `services/agent/worker_rpc.py`;
+the retained Python provider loop is `services/agent/agent_turn.py`, not the removed
+`services.agent.loop`. This updates implementation references only, not narration payloads.

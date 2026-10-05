@@ -1,5 +1,27 @@
 # Chudware Consolidation Refactor — Monolithic DAG Plan
 
+> **HISTORICAL — executed plan, not current authority.** The board closed every node card:
+> `work/tasks/done/T-RF1.md` through `T-RF23.md` are all `status: done` (R0a–R5b, plus the
+> R0c-found exit hang T-RF23). Per-node handoffs are recorded in `docs/refactor-log/` and
+> `docs/REFACTOR_LOG.md`. This establishes board completion of the scoped nodes, not fresh
+> verification that every aspiration in this plan shipped as written.
+>
+> Later decisions reversed parts of this plan:
+>
+> - The "Agent auth" locked decision (CLI-subscription providers ported into `core/agent`)
+>   and the Python-provider risk notes were superseded on 2026-08-31. Online provider calls
+>   and auth now belong to the embedded Chudcode RPC runtime
+>   ([01-DECISIONS.md, 2026-08-31 section](../omp-integration/01-DECISIONS.md#2026-08-31--superseding-architecture-chudcode-rpc-is-the-only-online-runtime)).
+>   `core/agent` keeps only the offline-safe local fallback.
+> - R5a (T-RF21) removed the Python *engine* worker (`python -m engine.worker`) and
+>   `engine_oracle/`. Online agent turns and services-side methods now run in a separate,
+>   long-lived Python services worker (`services/worker_main.py`). "Zero-Python" therefore
+>   describes the engine, not the whole product runtime.
+>
+> Paths below such as `ui/abstract`, `ui/imgui`, `ui/viewport`, `engine_oracle/` and
+> `legacy_chat.cpp` were deletion targets and no longer exist. Current architecture:
+> [ARCHITECTURE.md](../../ARCHITECTURE.md).
+
 ## Why this plan (current-state findings)
 
 Exploration confirmed the desktop↔web parity architecture **already exists and is the right one**:

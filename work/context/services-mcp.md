@@ -1,193 +1,110 @@
-# services/mcp — MCP server (Chudware engine exposed to external agents)
+# services/mcp — the CAD tool registry (stdio MCP server + online-agent host tools)
 
-Scope: services/mcp/** (the stdio MCP server)
-Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.md,
-           contracts/feature_params.md, contracts/ecad/ecad_rpc.md,
-           contracts/narration.md, contracts/interaction.md, contracts/requirements.md,
-           contracts/dag_schema.md, contracts/parts.md, contracts/sourcing.md,
-           deliverables/1 (deliverables package)
+Scope: services/mcp/**; consumers: services/agent/chudcode_tools.py, services/agent/tool_categories.py
+Contracts:
+- contracts/doc_ops.md, doc_schema.md, worker_rpc.md, feature_params.md
+- contracts/ecad/ecad_rpc.md
+- contracts/narration.md, interaction.md, requirements.md, dag_schema.md
+- contracts/parts.md, sourcing.md, deliverables.md, cad_graph.md
+- contracts/copilot_modes.json (`mutating_tools`)
+
+Canonical guidance:
+- .claude/skills/cad-chudcode-integration/SKILL.md: host-tool projection, floors,
+  chokepoints.
+- .claude/skills/chudware-dev/SKILL.md: persistence and save rules.
 
 ## Entry points
-- services/mcp/server.py:26 `mcp` FastMCP instance — root MCP server; registers all 26
-  tool families via `register_*` functions (L60–185). Instructions string (L29–51) is the
-  agent's first-contact map of the full capability surface.
-- services/mcp/server.py:298 `main()` — entrypoint; spawns libchudware.so warmup thread,
-  redirects native stdout (OCCT prints) to a log file to protect the JSON-RPC channel.
-- services/mcp/cad_tools.py — COMPAT FACADE (T-RF8 split): re-exports the historical
-  cad_tools namespace + register_cad_tools(mcp) composite. The mechanical-CAD tools now
-  live in per-family modules over `cad_common.py` (doc registry/handoff/autosave/jobs/
-  materials/inspect-render helpers) + `cad_guide.py` (topic texts + cad_guide_text):
-  cad_doc_tools (new_part, add_features, get_part, undo/redo, save/close/recover, configs,
-  set_material, engine_profile, cad_guide), cad_eval_tools (query_geometry, check_sketch,
-  measure*, check_interference/overlap/symmetry, wall_thickness, draft_analysis),
-  cad_render_tools (render_part, contact_sheet, render_views, inspect_part, look_around,
-  inspect_feature), cad_exchange_tools (export_part, import_part, standard parts),
-  cad_sim_tools (run_fea_*, run_cfd_*), cad_asm_tools (new_assembly, asm_add_component,
-  asm_mate, solve_mates, simulate_motion, motion_fea_handoff, list_world_bodies),
-  cad_drawing_tools (make_drawing + view/dimension/gdt/datum/titleblock tools).
-  ASSEMBLY AUTHORING (2026-07-06): new_assembly (doc_new kind=assembly),
-  asm_add_component (asm_insert_component op + initial pose), asm_mate (plain-word
-  queries resolved per component source doc via doc_open+doc_query → asm_add_mate +
-  auto-solve) — cad_guide("assembly") is the workflow topic. Engine rejects asm_* ops
-  on part docs (used to silently no-op). hole/bolt_circle `positions` frame is now
-  DETERMINISTIC (origin = outer-boundary centroid, u = world +X projected, v = n×u —
-  contracts/feature_params.md `hole`); {"side","pick":"largest"} = largest face FACING
-  that way (core/doc/picks.cpp W3). Regression tests: test_cad_tools.py W2/W3/G4-G5
-  sections; acceptance = NEMA17 bracket+motor+screws mate assembly (2026-07-06 session).
-- services/mcp/cad_guide.py `cad_guide_text(topic)` — the knowledge-dispatch
-  function behind the `cad_guide` tool; topics: overview, simulation, review, intake, gsl,
-  cam, narration, parts, reverse, deliverables, requirements, dag, verify, interaction,
-  sourcing, cost, spec, piping, hydraulic, firmware, structural, regen, code_compliance,
-  serving, design_review, doc_diff, plm, + per-feature cheatsheets.
-- services/mcp/graph_tools.py `register_graph_tools(mcp)` — PLM project graph:
-  cad_graph (get/blast/path/tree), cad_graph_link (+ cross-project qualified
-  `<project_key>/<node_id>` endpoints), assembly_plan_review, and the plm_graph_* web
-  family: plm_graph_keyword / search / neighbors / links / watch / changes / configure /
-  suggest / brief over `file` + `keyword` nodes and TAGGED edges (contracts/cad_graph.md
-  2026-07-27 addendum: keyword overlay, watch overlay, graph_config with office_content
-  extraction + linked_projects cross-project merge).
-- services/mcp/gsl_tools.py:1221 `register_gsl_tools(mcp)` — compact geometry read:
-  describe_part, query_adjacency, hover, describe_sketch, describe_scene,
-  describe_toolpaths, describe_results, describe_assembly, describe_board, describe_project.
-- services/mcp/recon_tools.py `register_recon_tools(mcp)` — reverse-engineering + intake:
-  reverse_engineer, compare_parts, convert_face_to_sketch, resolve_process, dfm_check,
-  start/stop_capture_session, request/submit_part_photos, measure_from_photo.
-- services/mcp/intake_tools.py `register_intake_tools(mcp)` — manufacturing clarification:
-  intake_status, confirm_dimensions, dfm_check, fit_report, make_fit_coupon.
-- services/mcp/interaction_tools.py:66 `register_interaction_tools(mcp)` — elicitation
-  seam (Pillar 9, contracts/interaction.md): ask_user (typed questions with defaults,
-  persist + replay within scope).
-- services/mcp/ecad_tools.py — COMPAT FACADE (T-RF8 split): re-exports _ECAD,
-  register_ecad_tools, autosave entry points. Tools now live in per-family modules over
-  `ecad_common.py` (session state, autosave/recovery, provider budgets, pin/net helpers,
-  sim summarizers): ecad_sch_tools (ecad_new_schematic, find_part, place_symbol, wire,
-  add_power, label, status, run_erc, update_from_sch), ecad_pcb_tools (ecad_new_pcb,
-  run_drc/hostcheck/dfm, autoroute, zones, export, to_3d, net-class, stackup_solve,
-  make_board, board_from_schematic, autoplace, optimize_traces), ecad_sim_tools
-  (ecad_simulate, run_pdn, sweep, fpga_check, impedance/diff-impedance, run_sicheck,
-  tf, design).
-- services/mcp/reveng_tools.py — COMPAT FACADE (T-RF8 split): re-exports _ingest_pdf,
-  register_reveng_tools. Tools now live in reveng_session_tools (session CRUD/status/
-  coverage/deviation, images/video/datasheet ingest, scale) + reveng_build_tools
-  (reconstruct, single_photo, fit_primitives, build_parametric, attach_result,
-  import_scan_mesh, export_reveng_bundle, make_part_from_library, research_source) over
-  `reveng_common.py` (session store, ingest, pipeline-agent factory, mission launcher).
-- services/mcp/ecad_thermal.py — ecad_thermal_handoff/verify (+ thermal_handoff_impl shared
-  with worker), airflow/CHT, vibe screen registration
-- services/mcp/heatsink.py — heatsink_select / heatsink_select_impl (T-FIN17; worker probe)
-- services/mcp/power_budget.py — system power/energy budget (T-FIN23)
-- services/mcp/firmware_tools.py — fw_* suite incl. scenarios (T-FIN3) + fw_verify_board (T-FIN6)
-- services/mcp/simhandoff.py — aicad.simhandoff/1 builders/validators (T-FIN15)
-- Golden demo: scripts/demo_sensor_node.py (T-FIN25); gate stage_fin_content; cad_guide
-  ('simulation'/'firmware') + server instructions reference it
-- services/mcp/cam_tools.py:49 `register_cam_tools(mcp)` — CAM/toolpaths: cam_new_job,
-  cam_add_setup/tool/operation, cam_update/remove_operation, cam_generate, cam_simulate,
-  cam_post, cam_job_tree, cam_open, cam_save, cam_undo/redo, cam_extract, cam_set_stock,
-  cam_setup_sheet, cam_materials, cam_op_types, cam_tool_types, cam_post_dialects.
-- services/mcp/doc_diff_tools.py:185 `register_doc_diff_tools(mcp)` — semantic
-  feature-level diff between two document revisions: doc_diff_tool(rev_a, rev_b).
-- services/mcp/req_tools.py:102 `register_req_tools(mcp)` — requirements CRUD
-  (aicad.req/1): req_create, req_update, req_status, req_report.
-- services/mcp/verify_tools.py:8 `register_verify_tools(mcp)` — done-check battery:
-  verify_battery(doc_id, checks?), check_metadata().
-- services/mcp/research_tools.py `register_research_tools(mcp)` — Pillar 8 look-it-up:
-  research_web_search, research_fetch_page, research_material_lookup, research_unit_convert,
-  research_standard_section, research_datasheet_fetch, research_thread_spec, research_eng_calc.
-- deliverables/ `register_deliverables_tools(mcp)` — spec-driven office artifacts: make_report,
-  make_presentation, make_workbook, render_document, list_artifacts. Guide: cad_guide('deliverables').
-- services/mcp/sourcing_tools.py:17 `register_sourcing_tools(mcp)` — BOM roll-up + pricing:
-  bom_rollup(doc_path), bom_price(doc_path).
-- services/mcp/cost_tools.py:62 `register_cost_tools(mcp)` — made-part cost model:
-  cam_cost_estimate(doc_path, material?, process?), request_quote(doc_path, vendor, qty).
-- services/mcp/spec_tools.py:19 `register_spec_tools(mcp)` — MPN resolution + datasheet
-  extraction: match_part_number(mpn), spec_sheet_match(text_or_url, mpn, template),
-  list_spec_templates().
-- services/mcp/piping_tools.py:77 `register_piping_tools(mcp)` — routed pipe networks:
-  piping_solve, piping_report, piping_operating_point, piping_fluid, piping_internal_volume,
-  piping_cfd_handoff, piping_verify_cfd.
-- services/mcp/hydraulic_tools.py:76 `register_hydraulic_tools(mcp)` — ISO 1219 circuits:
-  hydraulic_new, hydraulic_add_component, hydraulic_add_hose, hydraulic_size_cylinder,
-  hydraulic_size_pump, hydraulic_bom.
-- services/mcp/firmware_tools.py:25 `register_firmware_tools(mcp)` — embedded compile loop:
-  fw_new_project, fw_build, fw_sources, fw_sim_run, fw_flash, fw_debug_start/halt/read_mem.
-- services/mcp/structural_tools.py:37 `register_structural_tools(mcp)` — PyNite member
-  analysis: struct_analyze, struct_check (AISC 360/NDS code check), struct_estimate.
-- services/mcp/parts_tools.py:51 `register_parts_tools(mcp)` — federated standard-parts
-  library (aicad.parts/1): part_search, part_get, part_place.
-- services/mcp/serving_tools.py:28 `register_serving_tools(mcp)` — LoRA adapter routing:
-  serving_status, serving_set_canary, serving_rollback, serving_evaluate, serving_promote.
-- services/mcp/regen_tools.py `register_regen_tools(mcp)` — IP-18 rebuild-failure repair (regen_diagnose → fix-preview card; regen_resolve records accept/edit/reject as a T-H1 action trace). LIVE since T-BL22: a failed add_features batch auto-attaches the card as `regen_diagnosis`; traces journal to CACHE/telemetry/events.jsonl when no caller sink exists
-- services/mcp/code_compliance_tools.py:23 `register_code_compliance_tools(mcp)` —
-  building-code checks (IBC/ASCE/NFPA + RAG): code_check(doc_path, codes?, jurisdiction?).
-- services/dag/mcp_tools.py:100 `register_dag_tools(mcp)` + `register_dag_replan_tools(mcp)` —
-  DAG orchestrator: dag_plan, dag_run, dag_status, dag_approve, dag_abort, dag_replan.
-- services/mcp/design_review_tools.py:32 `register_design_review_tools(mcp)` — one-call
-  geometry battery narrated via contracts/narration.md: design_review(doc_id, checks?).
-- services/mcp/intake_ledger.py `IntakeLedger(doc_id)` — doc-scoped interaction answer store (contracts/interaction.md §5): persists ask_user Q/A inside the doc's IntakeState meta record (rides the .step+, survives save/reopen — doc_id is per-process, the record travels with the doc); no FastMCP import, get/set injectable for engine-less tests. Used by intake_tools._ask_via_contract and ask_user's scope=doc default ledger (T-BL25)
-- services/mcp/core_bridge.py:20 `call(method, params)` — the one engine funnel (JSON string-in/out). DEFAULT (Phase-8 flip): routes through the shared chudware-hostd daemon via daemon_bridge.py; explicit CHUDWARE_ENGINE_DAEMON=0 = legacy in-process ctypes load (resolves library via $CHUDWARE_LIBCHUDWARE / $CHUDWARE_DIST / build dirs)
-- services/mcp/test_roundtrip.py:5 `python -m services.mcp.test_roundtrip` — integration test: list tools, new_part, add_features, render, measure, run_fea_static, export
+- `services/mcp/server.py` — the module-level `mcp = FastMCP("Chudware", …)` is THE tool
+  registry.
+  - Every family registers as `register_*_tools(_reg.view(mcp, "<family>"))`.
+  - Registered families come from the live `tool_registry.catalog()`; do not maintain
+    a second list in an agent adapter or infer dead tools from absent GUI callers.
+  - `_resolve_mcp_profile()` (`CHUDWARE_MCP_PROFILE=full|lite`, else capability tier) skips
+    the `if not _LITE:` block. Instructions are `_FULL_INSTRUCTIONS` /
+    `_LITE_INSTRUCTIONS`.
+  - At the end of the module: `_reg.mark_warm_baseline()`, then `_install_arg_teaching(mcp)`.
+- `server.py::main` installs terminal savers and the parent-watchdog, redirects
+  native stdout before warming the core, then serves stdio over the retained real
+  stream (`mcp.run` only when fd redirection is unsupported).
+
+  `finally` runs `terminal_save()`, which calls `cad_common.save_touched_docs`.
+- `services/mcp/tool_registry.py` — `view` stamps `{family, risk}`, and `_guard` enforces
+  it at dispatch (the workspace write-lease check is part of `_guard`).
+  - `deny_reason(name)` checks: Settings per-tool/per-family flags (`manufacture` is
+    default-OFF), `_MOTION_TOOLS` (need an explicit allow), `CHUDWARE_TOOLS_ALLOW` /
+    `CHUDWARE_TOOLS_DENY_RISK`, and `set_policy`. Policy errors fail closed.
+  - `model_selectors` decorator: `@model_selectors("run_id")` below `@mcp.tool()`.
+  - `catalog` / `warm_catalog` (reset-to-warm replay of `_WARM_BASELINE`).
+- `services/mcp/core_bridge.py` `call(method, params)` — the one engine funnel.
+  - Default: `_call_via_daemon` → `daemon_bridge.client()` (`DaemonClient`) to the shared
+    `chudware-hostd`.
+  - `CHUDWARE_ENGINE_DAEMON=0`, or a hostd startup failure (sticky), takes the legacy
+    in-process ctypes `chudware_call`; `_lib_candidates()` lists where it looks.
+  - `services/mcp/daemon_bridge.py`: `resolve_hostd_bin`, `socket_path`,
+    `spawn_agent_worker`.
+- `services/mcp/cad_common.py` — doc registry/handoff, `_publish_current`, autosave (daemon
+  mode: hostd is the only autosave authority), `save_touched_docs`, durable jobs;
+  `cad_guide.py` `cad_guide_text(topic)` backs the `cad_guide` tool.
+- Per-family modules. `cad_tools.py`, `ecad_tools.py` and `reveng_tools.py` are
+  compat facades for importers only. New tools go to the matching family module, never
+  into a facade.
+  - CAD: `cad_{doc,eval,render,exchange,sim,asm,drawing,motion,animation}_tools.py` over
+    `cad_common.py`.
+  - ECAD: `ecad_{sch,pcb,sim,qa}_tools.py` over `ecad_common.py`. ECAD docs live in
+    `core/ecad`; the facade is RPC-backed.
+  - Reverse engineering: `reveng_{session,build}_tools.py` over `reveng_common.py`.
+  - Others: `gsl_tools`, `recon_tools`, `intake_tools`, `cam_tools`, `cam_audit`,
+    `print_tools` (`slice_part`, print media), `mfg_tools`/`mfg_plan_tools`,
+    `topology_tools`, `sim_evidence_tools`, `fs_tools` (`fs_*`, `run_shell`), `plm_tools`,
+    `graph_tools`, `parts_tools`, `research_tools`, `verify_tools`, `design_review_tools`,
+    `interaction_tools`, `firmware_tools`, `ecad_thermal`/`ecad_reliability`,
+    `bugreport_tools`.
+  - Outside this directory: `services/dag/mcp_tools.py`, `services/deliverables/mcp_tools.py`.
 
 ## How it connects
+ONE Python registry serves two consumers:
+1. External MCP clients (Claude Code, Cursor, …) via `python -m services.mcp.server` over
+   stdio. The server id is `chudware`, registered by `services/installer/register_mcp.py` /
+   `setup_mcp_clients.py`.
+2. The online Chudcode agent, in-process with no MCP hop: services-worker `agent_admin_turn`
+   (`services/agent/worker_rpc.py`) → `chudcode_tools.build_host_tools`. That function
+   imports `services.mcp.server.mcp`, then:
+   - filters with `_effective_names` (role/mode/`tool_categories.resolve_tool_requests`,
+     then floors) and `tool_registry.deny_reason`;
+   - dispatches through `dispatch_host_tool` → `agent_turn._dispatch_tool`.
 
-The stdio MCP server (server.py) wraps the SAME C++ core (`libchudware.so`) that the desktop
-app uses, exposing it to external MCP clients (Claude Code, Cursor, etc.) as a tool palette.
-Each tool group registers its tools via FastMCP decorators (`@mcp.tool()`) and dispatches
-into the C++ engine through `core_bridge.call()` — a ctypes wrapper over the native
-`chudware_call(method, params_json)` C-ABI entry. The tool_registry `view()` wrapper stamps
-each registration with a `{family, risk}` tag and enforces a per-context allow-list at
-dispatch. Default policy = everything allowed; DAG nodes + env can restrict it.
-`tool_registry.warm_catalog()` imports server.py for its module-level registrations AND
-registers the lazily-activated `org` family (channel_send / request_raise / request_resolve /
-council_convene — production registration happens in reviewer_exec / corporate mode), so
-`family:org` resolution and the Settings → AI → Tools panel see it unconditionally.
+   `tool_categories.MAIN_CHAT_CORE_TOOLS` is the main chat's default set; `enable_tools`
+   loads the rest.
 
-Python engine_oracle modules (worker.py, kernel.py, formats.py) are called in-process by
-MCP tools, NOT through the worker socket. ECAD is pure Python until 3D (board_to_step).
+Engine-bound tools use `core_bridge.call` → hostd → libchudware. Files, research and
+other service-only tools keep their own implementations. There is no C++ MCP server.
 
 ## Debugging playbook
-
-- Run: `python -m services.mcp.test_roundtrip` — full MCP roundtrip (new_part, add_features,
-  render, FEA, export); prints each step. Requires libchudware.so.
-- Run: `python -m pytest services/mcp/test_mcp_freshness.py -v` — freshness/consistency
-  test: every tool family discoverable from server instructions + cad_guide. No libchudware needed.
-- Run: `python -m pytest services/mcp/test_cad_tools.py -v` — mechanical CAD tool suite.
-- Run: `python -m pytest services/mcp/test_gsl_tools.py -v` — GSL describe/query/hover tests.
-- Run: `python -m pytest services/mcp/test_recon_tools.py -v` — reverse-engineering tests.
-- Run: `python -m pytest services/mcp/test_ecad_tools.py -v` — ECAD tool tests.
-- Run: `python -m pytest services/mcp/test_cam_tools.py -v` — CAM tool tests.
-- Run: `python -m pytest services/mcp/test_req_tools.py -v` — requirements CRUD tests.
-- Run: `python -m pytest services/mcp/test_autosave_recovery.py -v` — autosave recovery.
-- Environment: `$CHUDWARE_LIBCHUDWARE=/path/to/libchudware.so` (Linux) or `$CHUDWARE_DIST=dist/Chudware`
-  (Windows); core_bridge.py L75–92 lists candidates.
-- Gotcha: server.py `_install_clean_stdout()` redirects fd 1 to a log file — native C++
-  dependency output would otherwise corrupt the JSON-RPC channel.
-- Gotcha: `_warm_core()` pre-loads libchudware.so + ECAD deps in a background thread to avoid
-  transport timeouts on the first tool call; the thread also runs ECAD autosave recovery.
-
-## MCP freshness rule (WORKFLOW.md §6 — enforced mechanically)
-
-`test_mcp_freshness.py` catches drift: every registered tool family must have a signal string
-in server.py instructions OR a cad_guide topic in cad_guide.py:cad_guide_text() (re-exported
-through the cad_tools facade). When adding
-a new tool family: (1) add it to `_TOOL_FAMILIES` in the test, (2) add its signal to
-`_FAMILY_SIGNALS`, (3) update either server.py instructions or cad_guide_text() with a topic.
-The test runs in the pytest gate stage (no libchudware.so needed).
+- Tests use the service venv: `<venv>/python -X utf8 -m pytest services/mcp/<test> -q`.
+  - `services/mcp/conftest.py` starts a PRIVATE hostd (`private_hostd.private_daemon`, from
+    `core/build-occt-linux/bin`). It SKIPs the suite when none can start, unless
+    `CHUDWARE_ENGINE_DAEMON=0`.
+  - Never point tests at the user's live daemon: that fans `doc.opened` events into the
+    open GUI.
+- `python -m services.mcp.test_roundtrip` runs IN-PROCESS (`mcp.call_tool`). In daemon mode
+  it attaches to whichever hostd is running; use a private daemon or
+  `CHUDWARE_ENGINE_DAEMON=0`.
+- Freshness: `test_mcp_freshness.py` requires each family in `_TOOL_FAMILIES` to have a
+  `_FAMILY_SIGNALS` string in server instructions or a `cad_guide_text` topic. A new family
+  updates all three.
+- Every tool named in prose must be reachable: `scripts/advertised_tool_audit.py` (check.py).
+- After adding/renaming a tool: add its `prompt_note` in `services/agent/tool_guidance/` and
+  regenerate `host/src/ui/tool_panel_tables.h` (`tools/gen_tool_panel_tables.py`).
+- Gotcha: native stdout is redirected (`_install_clean_stdout`); OCCT prints would
+  otherwise corrupt JSON-RPC.
+- Gotcha: `core_bridge.available()` dlopens libchudware in-process even in daemon mode. It
+  is a presence probe, not a hostd connect.
 
 ## Graphify starters
-
-- graphify query "services.mcp call cad_guide new_part add_features render_part"
-- graphify query "register_cad_tools register_gsl_tools register_cam_tools server.py"
-- graphify explain "core_bridge call"
+- graphify query "services.mcp server register tool_registry view core_bridge call"
+- graphify explain "build_host_tools"
 - graphify path "server.py" "core_bridge.py"
 
 ## Related tasks/docs
-
 - docs/AI_TOOLING_MASTER_PLAN.md (pillar 12 — MCP-first distribution)
-- contracts/doc_ops.md (feature op vocabulary), contracts/doc_schema.md
-- contracts/worker_rpc.md (C++ core protocol), contracts/ecad/ecad_rpc.md
-- contracts/narration.md (narration style guide for describe_* tools)
-- contracts/interaction.md (ask_user contract — Pillar 9)
-- contracts/requirements.md (aicad.req/1 schema)
-- contracts/dag_schema.md (DAG run/node schema)
-- contracts/parts.md (aicad.parts/1 federated catalog schema)
-- work/tasks: T-BL26 (freshness audit this file documents), T-R2 (PLM plm_* tools)
+- work/WORKFLOW.md §3 (MCP freshness rule), services/mcp/AGENTS.md

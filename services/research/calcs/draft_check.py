@@ -1,10 +1,8 @@
 """Molded-part draft-angle helper.
 
-Contract §8 of ``contracts/design_pipeline.md`` names molded draft as a geometry
-kind with **no existing trigger** — a "helper to add" for T-DP3. This is that
-helper: a real, cited calculator that (a) returns the recommended draft angle for a
-molded wall and (b) computes the resulting dimensional taper over a draw depth, so
-the geometry_designer sizes a draft rather than recalling "1 degree".
+Recommended draft angle for a molded wall and the resulting dimensional taper
+over a draw depth, for the molded-draft geometry kind in
+``contracts/design_pipeline.md`` §8.
 
 Draft is mandatory for injection-molded parts so the solidified part releases from
 the tool. The per-side wall offset a draft angle produces over a draw depth is:
@@ -13,8 +11,8 @@ the tool. The per-side wall offset a draft angle produces over a draw depth is:
 
 The recommended angle rises with texture (a textured surface needs ~1° extra per
 0.025 mm of texture depth) and with draw depth.  The baseline angles come from the
-process DFM table (``engine_oracle/dfm/process_profiles.py`` → ``injection`` profile,
-``draft.min_deg``) and the standard molding references.
+process DFM ``injection`` profile (now in ``core/dfm/process_profiles.cpp``,
+``draft.min_deg``) and standard molding references; finish-specific defaults are encoded below.
 
 Source kind: heuristic (draft angles are DFM guidelines); the taper geometry is exact.
 """
@@ -26,8 +24,8 @@ from typing import Optional
 from .registry import calc_envelope, calc_fail, register
 
 # Baseline recommended draft by surface finish.
-# Ref: Bryce, "Plastic Injection Molding"; the process_profiles ``injection`` profile
-# fixes the mandatory minimum at 1.0° for a smooth wall.
+# Ref: Bryce, "Plastic Injection Molding"; core/dfm/process_profiles.cpp's injection profile
+# sets the mandatory minimum at 1.0° for a smooth wall.
 _DRAFT_BY_FINISH_DEG: dict[str, float] = {
     "smooth":   1.0,   # SPI A/B polished — matches process_profiles injection min_deg
     "matte":    1.5,   # SPI C

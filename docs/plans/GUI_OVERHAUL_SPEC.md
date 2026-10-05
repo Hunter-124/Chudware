@@ -1,11 +1,27 @@
 # GUI Overhaul Requirement Register (Hunter, 2026-07-06)
 
-Canonical, durable register of every GUI requirement from the 2026-07-06 direction reset.
-The host/ GUI (`host/build-linux/bin/Chudware`) is THE product GUI; ui/imgui (AI-CAD2) is deleted
-(port ledger: `docs/PORT_LEDGER.md`). **Nothing on this list may be silently dropped** — items
-not implemented tonight stay checked-off here and on the work board until done.
+Historical requirement and acceptance register for the 2026-07-06 direction reset.
+The dated checks, source-line citations and scratch captures below record that work,
+not acceptance of today's build. Preserve unresolved requirements; consult the linked
+board cards and [current GUI guidance](../../.claude/skills/gui-orchestrator/SKILL.md)
+before treating an item as current implementation guidance.
 
-Status legend: `[ ]` pending · `[~]` in progress (fleet wf_b556d138-1bf) · `[x]` done+verified.
+Status legend (dated record): `[ ]` unresolved in this register · `[~]` partial or
+awaiting a design decision · `[x]` recorded complete at the cited date. No live fleet
+status is tracked here.
+
+**Later evidence, without changing the historical checkboxes:**
+- Progressive disclosure: [T-FIN24](../../work/tasks/done/T-FIN24.md) is `done` and its
+  scope includes the disclosure matrix; it superseded T-SIM10. That card records a
+  July implementation against the retired `ui/imgui` tree, not fresh acceptance of
+  every condition in §5 on the current host GUI.
+- Windows: [T-WIN1](../../work/tasks/T-WIN1.md) remains `review`; its July evidence is
+  Win11, not the Win10 acceptance target. [T-WIN2](../../work/tasks/done/T-WIN2.md)
+  records the August native build and release-only PNG smoke. Neither establishes
+  current full interactive UI or cross-platform render parity.
+- Retired paths such as `ui/viewport` and `ui/imgui` below are provenance. The shipped
+  AICM reader is `host/src/render/aicm_loader`; the current launcher/build entry is
+  [`build.sh`](../../build.sh), not the old binary casing or line anchors below.
 
 ## 1. Top chrome (title bar)
 - [x] Remove the Edit, View, Insert, Tools, Window, Help menus.

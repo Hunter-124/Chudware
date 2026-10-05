@@ -310,7 +310,6 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/widgets/ribbon.cpp
   src/ui/widgets/web_view_backend.cpp  # IWebViewBackend factory → CEF (or NullWebView without the SDK)
   src/ui/widgets/interwebz.cpp
-  src/ui/widgets/interwebz_demo.cpp
   src/ui/ribbon_def.cpp
   # --- end C14 ---
   # --- [parts-plm sources] workspace bodies (parts-port agent appends here) ---
@@ -618,33 +617,7 @@ set_target_properties(Chudware PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 if(NOT EMSCRIPTEN)
-# --- C15: optional pure-CPU loader test (no GL/GLFW). Built with the default target set. ---
-add_executable(test_aicm
-  src/render/aicm_loader.cpp
-  ../core/util/aicm_handoff.cpp
-  src/render/test_aicm_cpp/test_aicm.cpp)
-target_include_directories(test_aicm PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../core
-  ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/include)
-if(UNIX AND NOT APPLE)
-  target_link_libraries(test_aicm PRIVATE rt)
-endif()
-set_target_properties(test_aicm PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-# --- end C15 ---
-
-# --- RE-08: image decode + GL texture util test (pure-CPU, no GL context) ---
 enable_testing()
-add_executable(test_img_tex
-  tests/test_img_tex.cpp)
-target_include_directories(test_img_tex PRIVATE
-  ${stb_SOURCE_DIR})
-set_target_properties(test_img_tex PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME test_img_tex
-  COMMAND test_img_tex "${CMAKE_BINARY_DIR}/test_img_tex_tmp"
-  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
-# --- end RE-08 ---
 
 # Authenticated private worker-control framing/endpoint codec (GL-free).
 add_executable(test_worker_control tests/test_worker_control.cpp)
@@ -770,16 +743,6 @@ add_test(NAME test_camera_backend
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # Real V4L2 smoke: ctest -R test_camera_backend with CHUDWARE_TEST_CAMERA=1 env set externally
 # --- end RE-07 ---
-
-# --- RE-22: dim-review accept/edit FSM unit test (no GL / imgui / rpc needed) ---
-add_executable(test_dim_review_fsm
-  tests/test_dim_review_fsm.cpp)
-set_target_properties(test_dim_review_fsm PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME test_dim_review_fsm
-  COMMAND test_dim_review_fsm
-  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
-# --- end RE-22 ---
 
 # --- RE-28: 3DGS splat loader + depth-sort test (pure-CPU, no GL context) ---
 add_executable(test_splat_renderer
@@ -1048,15 +1011,13 @@ add_test(NAME test_cef_spool_reaper
 # --- copilot agent-authored text sanitizers: links the REAL agent_text.cpp (no GL / imgui /
 # AppState). Guards two live chat defects: tool-call cards printing the opaque engine doc id
 # ("doc-cpp00000039") where the part's name belongs, and U+2192 arrows from the Python harness
-# rendering as notdef '?' because uiGlyphRanges() never requested the arrows block. The test
-# also FAILS if the atlas range table mirrored in agent_text.cpp drifts from ui_theme.cpp.
+# rendering as notdef '?' because the atlas table (src/ui/glyph_ranges.h) never requests the
+# arrows block. Both sides read that one header-only table (no source edits needed).
 add_executable(test_agent_text
   src/ui/copilot/agent_text.cpp
   tests/test_agent_text.cpp)
 target_include_directories(test_agent_text PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_definitions(test_agent_text PRIVATE
-  UI_THEME_CPP="${CMAKE_CURRENT_SOURCE_DIR}/src/ui_theme.cpp")
 set_target_properties(test_agent_text PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME test_agent_text

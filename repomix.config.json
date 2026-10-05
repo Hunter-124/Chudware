@@ -51,7 +51,6 @@
       "**/__pycache__/**",
       "work/sync/**",
       ".worksync/**",
-      "benchmarks/simsuite/results/**",
       "signal-desktop*",
       "repomix-output.*",
       "*.step",

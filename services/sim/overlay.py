@@ -1,8 +1,8 @@
 """C19 sim-result overlay packaging.
 
-The sim solvers (engine.sim.fea_static / fea_modal / lbm) produce results on the VOLUME mesh
-(tet nodes) or on lattice slices.  The viewport renders the AICM v1 SURFACE tessellation
-(docs/contracts/mesh_format.md).  This module bridges the two:
+The native static/modal solvers and ``services.sim.lbm`` produce results on a volume
+mesh or lattice slices. The viewport renders the AICM surface tessellation
+(``contracts/mesh_format.md``). This module bridges the two:
 
 * :func:`static_overlay` — tessellate the analysed STEP surface, map each volume-node scalar
   (von Mises, |u|, FoS) + displacement vector to the nearest surface vertex, and write an AICM
@@ -10,7 +10,7 @@ The sim solvers (engine.sim.fea_static / fea_modal / lbm) produce results on the
 * :func:`flow_overlay` — render the LBM mid-plane velocity slices to transparent colormap PNGs
   (fixed range) and pack the streamlines as a LINS chunk coloured by speed.
 
-Kept separate from worker.py so the worker stays a thin dispatcher (surgical C08 extension).
+Packaging is separate from the worker dispatcher.
 """
 
 from __future__ import annotations

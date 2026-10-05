@@ -1,6 +1,6 @@
 // cef/cef_platform.h — the ENTIRE OS-specific surface of the CEF backend.
 //
-// SCAFFOLDING (docs/cef_webview.md phase 2). CEF itself is the cross-platform
+// Design: docs/design/cef_webview.md. CEF itself is the cross-platform
 // engine; the only genuinely per-OS bits are collected here so Linux and Windows
 // stay at parity through one small seam. If something new turns out to be
 // OS-specific, it belongs in this header + the two cef_platform_{linux,windows}
@@ -31,7 +31,7 @@ std::string helper_path();
 // CefRequestContextSettings.cache_path to be a child of this dir. Deliberately
 // SEPARATE from the Playwright profile dirs (services/browser/profiles) for now:
 // two Chromium engines must not share one user-data-dir until the cookie-interop
-// pass lands (docs/cef_webview.md).
+// pass lands (docs/design/cef_webview.md).
 //
 // GUI and --cef-daemon MUST use different roots: Chromium's ProcessSingleton is
 // keyed on root_cache_path. Sharing one dir made the GUI's CefInitialize fail

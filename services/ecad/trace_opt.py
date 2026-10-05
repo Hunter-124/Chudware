@@ -1,6 +1,6 @@
 """Post-route PCB trace optimization (corner rounding, teardrops, impedance width).
 
-Public entry point for Wave 2b::
+Public entry point::
 
     optimize_traces(doc: dict, opts: dict | None = None) -> dict
 
@@ -9,8 +9,8 @@ input. Every geometry/width change is DRC-guarded and reverted on a new clearanc
 (or other error-severity) violation. Designed to be deterministic and idempotent —
 a second call on the result reports zero changes.
 
-Track dict shapes match :mod:`engine.ecad.schema` / :mod:`engine.ecad.ops` /
-:mod:`engine.ecad.fab.gerber`::
+Track dict shapes match :mod:`services.ecad.schema`, ``core/ecad/ops.cpp`` and
+:mod:`services.ecad.fab.gerber`::
 
     segment: {id, net, layer, width, kind:'segment', p1, p2}
     arc:     {id, net, layer, width, kind:'arc', p1, p2, center, a0, a1, radius?}

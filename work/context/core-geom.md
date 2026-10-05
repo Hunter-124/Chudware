@@ -2,25 +2,26 @@
 
 Scope: core/geom/**, core/sketch/**, core/solver/**
 Contracts: contracts/doc_schema.md (entities/constraints §3), contracts/feature_params.md (B-rep feature vocabulary)
+Canonical guidance: .claude/skills/chudware-dev/SKILL.md (geometry history and build/resource safety).
 
 ## Entry points
-- core/solver/nsolve.h:64 `System` — numeric residual-based constraint solver (Levenberg-Marquardt, Eigen-based, analytic Jacobians)
-- core/sketch/sketch.h:66 `solve_sketch()` — parameterizes sketch entities to nsolve variables and solves 2D constraints; returns SketchSolution + warm-start state
-- core/sketch/sketch.h:92 `drag()` — constrained interactive drag with 10ms wall-clock budget
-- core/sketch/sketch.h:75 `measure_constraint()` — read solved values from dimensional constraints (distance/angle/radius)
+- `core/solver/nsolve.h` `System` — numeric residual-based solver (Levenberg-Marquardt, Eigen, analytic Jacobians).
+- `core/sketch/sketch.h` `solve_sketch` — sketch entities/constraints → solver variables, solution and warm state.
+- `core/sketch/sketch.h` `drag` / `DragContext` — constrained interactive drag with a 10 ms solve budget.
+- `core/sketch/sketch.h` `measure_constraint` — solved dimensional values.
 - core/geom/aicm.h — ASCII-Compressed-Index-Mesh tessellation format (STEP+ container read/write)
 - core/geom/features.h — B-rep feature compilation (extrude/revolve/sweep/loft/rib primitives)
 - core/geom/dress.h — dress-up features (fillet/chamfer/shell/draft); calls OCCT's ShapeUpgrade
 
 ## How it connects
-core/solver is a standalone numeric solver (knows nothing about geometry); core/sketch wraps it to solve 2D constraint problems (sketch entities → nsolve variables, constraints → residual blocks). core/geom provides OCCT-backed B-rep primitives for the 3D feature compiler. The feature tree (core/doc/session.cpp) uses core/sketch to resolve sketches on faces, then core/geom to build 3D solids. Sketch-plane lift (2D→3D) is in core/geom/plane.h. README reports 24/24 geometric-feature parity.
+`core/solver` knows no geometry; `core/sketch` wraps it for 2D constraints; `core/geom` supplies OCCT B-rep primitives. `core/doc/session.cpp` and `sketch_geom.cpp` place sketches and compile document features. `core/geom/plane.h` lifts the sketch plane to 3D.
 
 ## Debugging playbook
-- Build: `cmake -S core -B core/build-linux -DCHUDWARE_WITH_OCCT=ON && cmake --build core/build-linux`
+- Integrator build: `./build.sh core` (configured consumed trees; see build-test.md).
 - Tests: `ctest --test-dir core/build-linux -R "sketch|nsolve|polygon|drag|plane|profile" --output-on-failure` (doctest suite under core/tests/test_*.cpp)
 - Gotcha: sketch.h solve_sketch is 2D-only; face placement (sketch-on-face) is in core/doc/session.cpp / sketch_geom.cpp
-- Gotcha: nsolve.h has no Jacobian validation — supply analytic derivatives only; finite-diff will silently ignore mismatches
-- Gotcha: drag() wall-clock budget is 10 ms; UX sluggishness signals tight Jacobian code or system_rank complexity (e.g. many redundant constraints)
+- Residual blocks use analytic derivatives; preserve numerical regression assertions rather than weakening them to hide mismatches.
+- Reuse `DragContext` only for the exact sketch/environment; reset it after any document change. Cached drag skips per-frame diagnostics, so retain drag-start statuses and compute full diagnostics on commit.
 
 ## Graphify starters
 - graphify query "sketch_solver constraint solver system nsolve entities"

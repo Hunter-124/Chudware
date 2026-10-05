@@ -15,6 +15,7 @@
 #include "sketch_mode.h"   // C18
 #include "sketch3d_mode.h" // 3D sketch status readout
 #include "plm/plm_quickbar.h"  // embedded per-doc PLM control
+#include "parts/parts_internal.h"  // Parts Library download queue (Downloads: N token)
 #include "../core/sim_client.h"
 #include "sim_manager.h"
 #ifndef __EMSCRIPTEN__
@@ -23,10 +24,6 @@
 #endif
 
 namespace ui {
-
-// [workspace-tabs seam] Parts download-queue hook (see status_bar.h). Default-implemented as
-// unwired (null) — the Parts Library token shows "Downloads: 0" until the parts agent assigns it.
-int (*partsDownloadQueueCount)() = nullptr;
 
 // Human-readable stage labels that match the sim worker's stage token vocabulary.
 static std::string prettySimStage(const std::string& s) {
@@ -447,8 +444,8 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
                         : std::string();
     // [workspace-tabs seam] Per-workspace live token, leftmost in the right cluster. Kept small
     // and quiet; degrades gracefully when idle (Simulate shows "Solver idle", Parts Library shows
-    // the download-queue count via the partsDownloadQueueCount hook). Workspaces with no cheap
-    // live source (Manufacture CAM post state lives in the panel, not AppState) show nothing.
+    // the pending/running download-queue count). Workspaces with no cheap live source
+    // (Manufacture CAM post state lives in the panel, not AppState) show nothing.
     std::string wsTok;
     bool wsTokLive = false;   // true => tint statusOk (something is actively running)
     switch (st.activeWorkspace) {
@@ -462,7 +459,9 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
             }
             break;
         case AppState::Workspace::PartsLibrary: {
-            int n = partsDownloadQueueCount ? partsDownloadQueueCount() : 0;
+            int n = 0;
+            for (const auto& job : parts::S().queue)
+                if (job.status == "pending" || job.status == "running") ++n;
             wsTok = "Downloads: " + std::to_string(n);
             wsTokLive = n > 0;
             break;

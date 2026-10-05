@@ -1,4 +1,4 @@
-"""MCU/FPGA host-board rule pack (T-FIN9) — decoupling, sequencing, crystal, reset, boot-strap.
+"""MCU/FPGA host-board rule pack — decoupling, sequencing, crystal, reset, boot-strap.
 
 The first device-specific verification layer above the generic geometric DRC and the
 pin-type ERC. ``run_hostcheck(board)`` audits a *board* document for the layout/topology
@@ -8,7 +8,7 @@ mistakes that brick an MCU/FPGA host board even when DRC and ERC are clean:
     net and ground, close enough, on the same side (via-quality heuristic),
   * bulk capacitance per supply rail,
   * power-supply sequencing — the ``eng.supply.sequencing`` requirements from the
-    T-FIN8 metadata layer (contracts/ecad/boardphys.md) validated against the board's
+    metadata layer (contracts/ecad/boardphys.md) validated against the board's
     actual enable/PGOOD chains. NO part knowledge is hardcoded here: the requirement
     comes exclusively from the component's resolved metadata,
   * crystal/oscillator layout — load caps present + matched, close (loop-area
@@ -38,7 +38,7 @@ key carrying the actionable fix. Rule ids are STABLE (suppression keys):
   host_bootstrap_shared     warning  boot-strap net shared with an active driver
 
 Identification is metadata- and convention-driven, never per-part:
-  * A **host** is any footprint whose resolved T-FIN8 metadata has a non-empty
+  * A **host** is any footprint whose resolved engineering metadata has a non-empty
     ``supply.rails`` list (multi- or single-rail MCU/FPGA/IC class) OR whose symbol
     def exposes at least one ``power_in`` pin.
   * **Capacitors / resistors** are recognized by libid stem (``Device:C…`` /
@@ -48,7 +48,7 @@ Identification is metadata- and convention-driven, never per-part:
     ``Y``/``XTAL``. **Reset / boot-strap / enable / PGOOD** pins by symbol pin-name
     pattern (nRST/RESET/MCLR…, BOOT/MODE/CFG/MSEL…, EN/SHDN/RUN…, PGOOD/PG/POK…).
 
-Pure + advisory, mirrors :mod:`engine.ecad.drc`: never raises on a bad board, never
+Pure + advisory, mirrors :mod:`services.ecad.drc`: never raises on a bad board, never
 mutates its input, output fully sorted. All thresholds live in :data:`DEFAULTS` and can
 be overridden per-call (``opts``) or per-board (``board["rules"]["hostcheck"]``).
 """
@@ -319,7 +319,7 @@ def _rail_source(comps: list[_Comp], rail: str) -> _Comp | None:
 
 
 def _check_sequencing(host: _Comp, comps: list[_Comp], out: list[dict]) -> None:
-    """host_sequencing / _unparsed / _unverifiable — from the T-FIN8 metadata ONLY.
+    """host_sequencing / _unparsed / _unverifiable — from engineering metadata ONLY.
 
     ``supply.sequencing == []`` means "known: none required" (nothing to check);
     ``None`` means unknown (honest silence — we cannot invent a requirement).

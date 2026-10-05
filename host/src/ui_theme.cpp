@@ -8,6 +8,7 @@
 
 #include "imgui.h"
 #include "imgui_internal.h"   // ImHashStr (panelId)
+#include "ui/glyph_ranges.h"   // the atlas codepoint table (shared with agent_text + gui_lint)
 #include "ui/tesseract.h"     // drawTesseractSpinner — the brand mark doubles as the busy indicator
 #include "ui/icons.h"         // recolorIconAtlas — the baked 3D ribbon tiles track the accent pair
 
@@ -813,48 +814,21 @@ void glassRowAtCursor(float rounding, bool stripe, bool selected, float rowPadV)
 // =========================================================================
 // Font loading (unchanged)
 // =========================================================================
-// Glyphs covered by Rubik / JetBrains Mono (the body faces).
-// Latin-1 (incl. ° U+00B0, Ø U+00D8), general punctuation, superscripts/subscripts, bullet.
-// NOTE: arrows (0x2190-0x21FF) and geometric-shapes (0x25A0-0x25FF) are intentionally NOT
-// requested — Rubik does not ship them, so leaving them out keeps the atlas small and avoids
-// allocating notdef boxes. CAD-specific math/shape glyphs come from CADSymbols below.
-static const ImWchar* uiGlyphRanges() {
-    static const ImWchar r[] = {
-        0x0020, 0x00FF,
-        0x2010, 0x2027,
-        0x2070, 0x209F,
-        0,
-    };
-    return r;
-}
-
-// CAD-specific symbols sourced from CADSymbols.ttf (merged over the body face).
-// Codepoints: ∅ U+2205, ∥ U+2225, ≡ U+2261, ⊕ U+2295, ⊙ U+2299, ⊥ U+22A5,
-// ⌀ U+2300, ◆ U+25C6, ◇ U+25C7. Keep this in sync with the font's cmap.
-static const ImWchar* cadSymbolRanges() {
-    static const ImWchar r[] = {
-        0x2205, 0x2205,
-        0x2225, 0x2225,
-        0x2261, 0x2261,
-        0x2295, 0x2295,
-        0x2299, 0x2299,
-        0x22A5, 0x22A5,
-        0x2300, 0x2300,
-        0x25C6, 0x25C7,
-        0,
-    };
-    return r;
-}
+// Codepoints come from ui/glyph_ranges.h — the one table the chat fold and gui_lint also read.
+static_assert(glyphs::maxCodepoint() <= IM_UNICODE_CODEPOINT_MAX,
+              "glyph_ranges.h requests a codepoint ImWchar cannot hold");
+static constexpr auto kUiGlyphRanges = glyphs::fontRanges<ImWchar>(glyphs::kBody);
+static constexpr auto kCadSymbolRanges = glyphs::fontRanges<ImWchar>(glyphs::kCadSymbols);
 
 static ImFont* addFont(ImGuiIO& io,
                        const std::string& path, float px, ImFont* fallback,
                        const std::string& cadSymPath /*may be empty*/) {
-    ImFont* f = io.Fonts->AddFontFromFileTTF(path.c_str(), px, nullptr, uiGlyphRanges());
+    ImFont* f = io.Fonts->AddFontFromFileTTF(path.c_str(), px, nullptr, kUiGlyphRanges.v);
     if (!f) return fallback;
     if (!cadSymPath.empty()) {
         ImFontConfig merge; merge.MergeMode = true; merge.PixelSnapH = true;
         // Match the host face's vertical metrics so merged glyphs sit on the same baseline.
-        io.Fonts->AddFontFromFileTTF(cadSymPath.c_str(), px, &merge, cadSymbolRanges());
+        io.Fonts->AddFontFromFileTTF(cadSymPath.c_str(), px, &merge, kCadSymbolRanges.v);
     }
     return f;
 }

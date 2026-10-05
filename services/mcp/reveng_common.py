@@ -1,8 +1,7 @@
-"""Shared session store + pipeline machinery for the reveng MCP tool family modules
-(T-RF8 split of the former reveng_tools.py god file): session JSON CRUD, research/PDF
-ingest, provision status, pipeline-agent factory, mission launcher.
-Imported by the reveng_*_tools family modules; re-exported through the reveng_tools
-facade."""
+"""Shared session store + pipeline machinery for the reveng MCP tool family modules:
+session JSON CRUD, research/PDF ingest, provision status, pipeline-agent factory,
+mission launcher. Imported by the reveng_*_tools family modules; re-exported through
+the reveng_tools facade."""
 
 from __future__ import annotations
 
@@ -24,8 +23,10 @@ from services.mcp.cad_tools import _dumps, _err  # type: ignore[attr-defined]
 # ── RE-29: research ingest orchestrator ────────────────────────────────────
 try:
     from services.vision.research_ingest import research_and_ingest as _research_and_ingest
-except ImportError:
+    _RESEARCH_INGEST_IMPORT_ERROR: Optional[str] = None
+except ImportError as _exc:
     _research_and_ingest = None  # type: ignore[assignment]
+    _RESEARCH_INGEST_IMPORT_ERROR = str(_exc)
 
 
 def _research_ingest(
@@ -37,10 +38,13 @@ def _research_ingest(
 ) -> dict:
     """Internal helper: run research_and_ingest for *session_id*."""
     if _research_and_ingest is None:
+        detail = f" ({_RESEARCH_INGEST_IMPORT_ERROR})" if _RESEARCH_INGEST_IMPORT_ERROR else ""
         return {
             "ok": False,
             "reason": "backend_not_provisioned",
-            "hint": "research_ingest module not available; check engine_oracle install",
+            "hint": ("services.vision.research_ingest failed to import" + detail
+                     + "; the Chudware services runtime is incomplete — reprovision it "
+                       "(scripts/provision_venv.sh)"),
         }
     session_root = _session_path(session_id)
     try:

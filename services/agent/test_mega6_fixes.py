@@ -5,7 +5,7 @@ Watch-list from mega-5 findings + mega-6 attempt-1 openrouter auth wipe:
   2. child join handoff not null when child had tools / success
   3. provider token usage recorded into turn result + ledger
   4. BUILD geometry roles keep new_part/add_features + tool floor ≥8
-  5. ollama local leaf construction failure degrades (does not block pick)
+  5. role-settings resolution keeps the injected identity and reports assignments
 """
 
 from __future__ import annotations
@@ -365,7 +365,7 @@ def test_build_role_tool_floor_at_least_eight(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 5. Local leaf construction failure degrades (construction path)
+# 5. Role-settings resolution (injected identity + assignment events)
 # ---------------------------------------------------------------------------
 
 

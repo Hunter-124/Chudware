@@ -255,7 +255,7 @@ _FULL_INSTRUCTIONS = (
         "DELIVERABLES: make_report/make_presentation/make_workbook build real office files "
         "(cad_guide('deliverables')). RESEARCH: research_web_search/research_fetch_page "
         "for missing specs/datasheets, never recall a load-bearing number from memory.\n"
-        "DESIGN LEDGER (Pillar 20): ledger_get(run_id, budget_tokens) / ledger_note(run_id, kind, "
+        "DESIGN LEDGER: ledger_get(run_id, budget_tokens) / ledger_note(run_id, kind, "
         "payload) persist mission state (brief, decisions, dimensions, requirements, questions, "
         "stage_log, artifacts) across role handoffs — the anti-context-loss mechanism for "
         "24k-context local models. Every role should cold-start from ledger_get, not chat history.\n"
@@ -270,9 +270,10 @@ _FULL_INSTRUCTIONS = (
         "ECAD (schematic/PCB) tools are also available (ecad_*). Pre-fab host-board verification: "
         "ecad_run_hostcheck / ecad_run_sicheck / ecad_fpga_check / ecad_run_pdn; cross-sim handoffs "
         "via cad_guide('simulation') (ecad_thermal_handoff, heatsink_select, power_budget).\n"
-        "CONTENT GOLDEN DEMO (T-FIN25): scripts/demo_sensor_node.py is the living E2E worked "
+        "CONTENT GOLDEN DEMO: scripts/demo_sensor_node.py is the living E2E worked "
         "example (sensor-node board → verify ladder → firmware → thermal → heatsink → budget → "
-        "make_report); see docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md and cad_guide('simulation').\n"
+        "make_report); see docs/reference/FIN25_SENSOR_NODE_GOLDEN_DEMO.md and "
+        "cad_guide('simulation').\n"
         + _soft_tail_for_profile()
 )
 
@@ -581,8 +582,7 @@ if not _LITE:
     # The copilot's mission front door — INTAKE→DELIVER phase machine on top of the
     # ledger + roles + buildgraph + DAG.  mission_status renders phase state from the
     # ledger stage_log (what mission control + the GUI consume); replan_request routes
-    # an aicad.replan/1 request per contract §17.  The in-app path is
-    # services.agent.loop.run_mission.
+    # an aicad.replan/1 request per contract §17.
     from services.mcp.mission_tools import register_mission_tools
     register_mission_tools(_reg.view(mcp, "mission"))
     # Build-order DAG planner (T-W15): buildgraph_plan / buildgraph_status.
@@ -593,7 +593,7 @@ if not _LITE:
     register_buildgraph_tools(_reg.view(mcp, "mission"))
     # Advisory engine / foreman (T-W5, Pillar 20): advise / stage_set / advisory_dispute.
     # advise runs a stage's read-only check battery over a doc on demand (aicad.advisory/1);
-    # the in-app loop.py + dag node runner already run the foreman automatically. advise is
+    # the dag node runner already runs the foreman automatically after each node. advise is
     # risk-class READ; stage_set / advisory_dispute are WRITE (ledger-logged, §9.3).
     from services.mcp.advisor_tools import register_advisor_tools
     register_advisor_tools(_reg.view(mcp, "advisor"))

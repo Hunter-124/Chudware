@@ -1,7 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "aicm_loader.h" // host AICM loader (ui/viewport/render on the include path)
+#include "aicm_loader.h" // host AICM loader (host/src/render on the include path)
 #include "sim/topopt_surface.h"
 
 #include <algorithm>

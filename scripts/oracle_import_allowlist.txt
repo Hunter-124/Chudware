@@ -1,13 +1,10 @@
-# oracle_import_allowlist.txt — transitional engine_oracle imports still allowed in services/
+# oracle_import_allowlist.txt — engine/engine_oracle imports still allowed in authored Python
 #
 # One dotted module path prefix per line (# comments allowed). `engine` and
 # `engine_oracle` spellings canonicalize to the same entry. scripts/oracle_import_audit.py
-# FAILS on any engine import in services/ not covered here. DELETE an entry in the same
-# commit that ports/re-homes the subsystem — this list ratchets to zero as engine_oracle/
-# is strangled out (T-RF20). Every entry must state why it is still transitional.
+# scans services/, scripts/ and tools/ and FAILS on any engine import not covered here.
 #
-# 2026-07-23 (zero-Python cutover): engine_oracle/ is deleted; every former consumer was
-# retargeted (services.ecad / services.sim / services.structural / services.piping /
-# services.paths / services.worker_main / C++ RPCs via core_bridge). There are NO live
-# engine imports left in services/ — this list is intentionally EMPTY and stays as the
-# ratchet that keeps it that way.
+# 2026-07-23 (zero-Python cutover, T-RF21): engine_oracle/ and the `engine` symlink are
+# deleted, so every such import is broken. This list is intentionally EMPTY and stays the
+# ratchet that keeps it that way: retarget an offending import (services.* re-home, C++ RPC
+# via core_bridge) instead of adding an entry.

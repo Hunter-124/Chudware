@@ -9,7 +9,7 @@ Coverage of contracts/sourcing.md §2a:
     → the exact match ranks first with attach:true; the near-miss has attach:false.
   * a fuzzy-only product → best is a non-exact candidate (attach:false) + a
     reverse_engineer fallback.
-  * a standard-MPN (bearing "6205") resolves via spec_sheet_matcher — no repo search.
+  * a standard-MPN (bearing "6205") resolves via the core RPC — no repo search.
 """
 from __future__ import annotations
 
@@ -109,6 +109,47 @@ def test_normalized_mpn_equality_is_exact(patch_adapters):
     r = mm.match_model({"title": "bearing", "mpn": "608-2RS"})
     assert r["matches"][0]["confidence"] == "exact"
     assert r["matches"][0]["attach"] is True
+
+
+@pytest.mark.parametrize(
+    ("reply", "confidence", "candidate_mpn"),
+    [
+        ({"ok": True, "normalized": "X42"}, "exact", "X42"),
+        ({"ok": True}, "exact", "x-42"),
+        ({"ok": True, "normalized": ""}, "weak", ""),
+        ({"ok": True, "normalized": None}, "weak", None),
+        ({"normalized": "X42"}, "exact", "X-42"),
+        ({"ok": False, "normalized": "X42"}, "exact", "X-42"),
+        (None, "exact", "X-42"),
+        (RuntimeError("core unavailable"), "exact", "X-42"),
+    ],
+)
+def test_normalization_reply_controls_candidate_attachment(
+    monkeypatch, patch_adapters, reply, confidence, candidate_mpn,
+):
+    from services.parts import normalization
+
+    def normalize(_mpn, _call):
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(normalization, "core_normalize_mpn", normalize)
+    monkeypatch.setattr(mm, "_match_part_number", lambda _mpn: {"matched": False})
+    patch_adapters({"grabcad": [{
+        "title": "Widget Housing", "mpn": "x-42", "site": "grabcad",
+        "url": "https://grabcad.com/library/widget",
+    }]})
+
+    result = mm.match_model({"title": "Widget Housing", "mpn": "X-42"})
+
+    assert result["best"]["confidence"] == confidence
+    assert result["best"]["mpn"] == candidate_mpn
+    assert result["best"]["attach"] is (confidence == "exact")
+    if confidence == "exact":
+        assert result["fallback"] is None
+    else:
+        assert result["fallback"]["how"] == "reverse_engineer"
 
 
 # ---------------------------------------------------------------------------

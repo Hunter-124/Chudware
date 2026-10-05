@@ -20,6 +20,8 @@ struct ScenarioPlan {
     std::vector<std::string> setup_lines;
     std::vector<std::pair<double, std::string>> timeline;  // (t_ms, monitor line)
     std::map<std::string, std::string> aux_files;          // relpath -> content
+    nlohmann::json resolved_links = nlohmann::json::array();
+    std::vector<std::string> pre_platform_lines;
     double duration_ms = 0.0;
     std::vector<std::string> errors;
     std::vector<std::string> warnings;
@@ -49,8 +51,7 @@ std::vector<int> waveform_samples(const nlohmann::json& wf, double sample_ms = 1
 ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann::json& caps,
                                  const std::string& platform_text);
 
-// Render a t_ms-sorted timeline into monitor sleep/action lines covering
-// run_seconds, with CHUDWARE_T_MARK echoes after every sleep. Pure.
+// Render a t_ms-sorted timeline into paused emulation RunFor intervals.
 std::vector<std::string> timeline_resc_lines(
     const std::vector<std::pair<double, std::string>>& timeline, double run_seconds);
 

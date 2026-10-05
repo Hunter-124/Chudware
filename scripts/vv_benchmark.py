@@ -10,7 +10,8 @@ Extends scripts/sim_audit.py with:
   - Tolerance tiers: EXACT (<0.01%), PRECISE (<1%), ENGINEERING (<10%), TREND (labeled)
   - Machine-readable JSON results table
   - Plain-text Markdown V&V report (auto-generated, cites formula source in-code)
-  - pytest entry points for CI integration (smoke subset runs with no .so)
+  - pytest entry points for CI integration (smoke subset needs no .so; its native-RPC
+    cases skip until CHUDWARE_LIBCHUDWARE names a staged core library)
 
 Reference values are derived INDEPENDENTLY in this script (never read from the engine
 under test). Every formula is cited in the inline comment above it.
@@ -19,8 +20,9 @@ Usage (standalone):
     CHUDWARE_LIBCHUDWARE=/path/to/libchudware.so \\
         ~/.local/share/Chudware/mcp-venv/bin/python scripts/vv_benchmark.py
 
-Usage (pytest smoke — no .so needed):
-    pytest scripts/vv_benchmark.py -q
+Usage (pytest smoke — no .so needed; native hydraulic/piping/ECAD RPC cases skip
+without one):
+    pytest scripts/vv_benchmark.py::TestSmoke -q
 
 Usage (full suite via pytest):
     CHUDWARE_RUN_VV=full CHUDWARE_LIBCHUDWARE=... pytest scripts/vv_benchmark.py -q
@@ -154,17 +156,59 @@ def _check(family: str, case: str, tier: str,
             solver_revision=solver_revision)
 
 
+# ---------------------------------------------------------------------------
+# Native core access for the hydraulic / piping / ECAD families
+# ---------------------------------------------------------------------------
+
+def _native_core():
+    """The C++ core bridge, or ``(None, reason)`` — scripts/sim_audit.py's policy: the
+    explicitly selected CHUDWARE_LIBCHUDWARE, loaded in-process."""
+    from scripts.sim_audit import _load_core_bridge
+    return _load_core_bridge()
+
+
+def _piping_run_doc(length_m: float, nps: float, schedule: str) -> dict:
+    """An ``aicad.piping/1`` document holding one straight run along +X (path in mm)."""
+    return {
+        "schema": "aicad.piping/1", "id": "vv-pipe", "name": "VV",
+        "units": {"system": "MMGS"}, "material": "A106-B",
+        "runs": [{
+            "id": "r0", "name": "main", "suppressed": False,
+            "path": [[0, 0, 0], [int(length_m * 1000), 0, 0]],
+            "nps": nps, "schedule": schedule, "material": None,
+            "bend_radius": None, "end_type": "BW", "bore_mm": None,
+        }],
+        "fittings": [],
+    }
+
+
+def _piping_single_run(cb, length_m: float, nps: float, schedule: str,
+                       head_m: float) -> dict:
+    """``piping_solve`` on one run driven by ``head_m`` from its start to its end."""
+    result = cb.call("piping_solve", {
+        "doc": _piping_run_doc(length_m, nps, schedule),
+        "boundary": [{"run": "r0", "end": "start", "head": head_m},
+                     {"run": "r0", "end": "end", "head": 0.0}],
+    })
+    if not result.get("ok") or not result.get("converged"):
+        raise RuntimeError(f"piping_solve failed to converge: {result}")
+    return result
+
+
 # ===========================================================================
-# FAMILY 1: Hydraulic sizing (pure Python, no .so)
+# FAMILY 1: Hydraulic sizing (core hydraulic_size_* RPCs)
 # Reference: first-principles hydraulics
 # ===========================================================================
 
 def bench_hydraulic() -> None:
     """Extended hydraulic benchmarks beyond sim_audit.py."""
     print("\n--- [hydraulic] Extended cylinder/pump sizing ---")
+    cb, reason = _native_core()
+    if cb is None:
+        _skip("hydraulic", "H1-retract-force", reason, "Merritt 1967 §2.2")
+        _skip("hydraulic", "H2-pump-displacement", reason, "Vickers Ind. Hyd. Manual 1992 ch.3")
+        return
     try:
-        from engine.hydraulic import solve as hyd
-
         # -- Case H1: Annular-area retract force (rod side) --
         # Citation: Merritt, H.E. "Hydraulic Control Systems" (1967) §2.2
         #   F_retract = (A_bore - A_rod) * P * η
@@ -173,18 +217,18 @@ def bench_hydraulic() -> None:
         A_bore = math.pi / 4 * (bore * 1e-3) ** 2
         A_rod = math.pi / 4 * (rod * 1e-3) ** 2
         F_ret_ref = (A_bore - A_rod) * P * 1e5 * eta * 1e-3  # kN
-        # rod_mm is the correct param name (not rod_diameter_mm)
-        res = hyd.size_cylinder(bore_mm=bore, pressure_bar=P,
-                                stroke_mm=200, velocity_mm_s=30,
-                                efficiency=eta, rod_mm=rod)
+        res = cb.call("hydraulic_size_cylinder", {
+            "bore_mm": bore, "pressure_bar": P, "stroke_mm": 200,
+            "velocity_mm_s": 30, "efficiency": eta, "rod_mm": rod})
         if res.get("ok") and "retract_force_kn" in res:
             _check("hydraulic", "H1-retract-force", "EXACT",
                    res["retract_force_kn"], F_ret_ref,
                    "Merritt 1967 §2.2: F_ret = (A_bore-A_rod)*P*η",
                    note=f"bore={bore}mm rod={rod}mm P={P}bar")
         else:
-            _skip("hydraulic", "H1-retract-force",
-                  "engine does not expose retract_force_kn in this version")
+            _record("hydraulic", "H1-retract-force", "EXACT", "FAIL",
+                    None, F_ret_ref, f"hydraulic_size_cylinder returned: {res}",
+                    "Merritt 1967 §2.2")
 
         # -- Case H2: Pump volumetric efficiency & delivered flow --
         # Citation: Vickers Industrial Hydraulics Manual (1992) ch.3
@@ -194,8 +238,9 @@ def bench_hydraulic() -> None:
         Q_m3s = Q_lpm / 60000.0
         disp_ref = Q_lpm * 1000.0 / rpm          # cc/rev
         shaft_ref = Q_m3s * dP * 1e5 / (eta2 * 1000.0)  # kW
-        res2 = hyd.size_pump(flow_lpm=Q_lpm, pressure_bar=dP,
-                             speed_rpm=rpm, efficiency=eta2)
+        res2 = cb.call("hydraulic_size_pump", {
+            "flow_lpm": Q_lpm, "pressure_bar": dP, "speed_rpm": rpm,
+            "efficiency": eta2})
         if res2.get("ok"):
             _check("hydraulic", "H2-pump-displacement", "EXACT",
                    res2["displacement_cc_rev"], disp_ref,
@@ -207,46 +252,29 @@ def bench_hydraulic() -> None:
                    note=f"dP={dP}bar η={eta2}")
         else:
             _record("hydraulic", "H2-pump-displacement", "EXACT", "FAIL",
-                    None, disp_ref, f"size_pump returned not-ok: {res2}",
+                    None, disp_ref, f"hydraulic_size_pump returned not-ok: {res2}",
                     "Vickers Ind. Hyd. Manual 1992 ch.3")
 
     except Exception as exc:
         _record("hydraulic", "H1-retract-force", "N/A", "FAIL",
-                None, None, f"import/runtime error: {exc}", "")
+                None, None, f"runtime error: {exc}", "")
         traceback.print_exc()
 
 
 # ===========================================================================
-# FAMILY 2: Piping / Darcy-Weisbach (fluids library)
+# FAMILY 2: Piping / Darcy-Weisbach (core piping_solve RPC)
 # Reference: Moody chart, Colebrook-White equation
 # ===========================================================================
 
 def bench_piping() -> None:
     """Piping network solver benchmarks."""
     print("\n--- [piping] Darcy-Weisbach network ---")
+    cb, reason = _native_core()
+    if cb is None:
+        _skip("piping", "P1-straight-pipe", reason, "Darcy-Weisbach: h_f = f*L/D*v²/2g")
+        _skip("piping", "P2-length-scaling", reason)
+        return
     try:
-        from engine.piping import solve as pip_solve, schema as pip_schema
-
-        if not pip_solve.have_fluids():
-            _skip("piping", "P1-straight-pipe",
-                  "fluids library not installed — pip install fluids (MIT)",
-                  "Darcy-Weisbach: h_f = f*L/D*v²/2g")
-            _skip("piping", "P2-serial-pipes",
-                  "fluids library not installed")
-            return
-
-        # Helper to build a single-run network
-        def _single_run(length_m, nps, schedule, dH_m):
-            doc = pip_schema.new_piping("VV")
-            run = pip_schema.new_pipe_run(
-                id="r0",
-                path=[[0, 0, 0], [int(length_m * 1000), 0, 0]],
-                nps=nps, schedule=schedule, name="main")
-            doc["runs"].append(run)
-            bc = [{"run": "r0", "end": "start", "head": dH_m},
-                  {"run": "r0", "end": "end", "head": 0.0}]
-            return pip_solve.solve(doc, boundary=bc)
-
         # -- Case P1: Single straight pipe, turbulent regime --
         # Citation: White, F.M. "Fluid Mechanics" 8th ed §8.4 (public-domain formula)
         #   Moody friction factor f_T ≈ 0.316 * Re^-0.25  (Blasius, smooth pipe)
@@ -259,9 +287,9 @@ def bench_piping() -> None:
         v_approx = math.sqrt(dH_p1 * 2 * g * D_p1 / (f_approx * L_p1))
         Q_ref_p1 = math.pi / 4 * D_p1 ** 2 * v_approx * 3600.0  # m³/h
 
-        r_p1 = _single_run(L_p1, 1.0, "40", dH_p1)  # 1" NPS ≈ DN25
+        r_p1 = _piping_single_run(cb, L_p1, 1.0, "40", dH_p1)  # 1" NPS ≈ DN25
         if r_p1.get("ok") and r_p1.get("links"):
-            Q_got_p1 = r_p1["links"][0].get("flow_m3h", 0.0)
+            Q_got_p1 = r_p1["links"][0]["flow_m3h"]
             _check("piping", "P1-straight-pipe", "ENGINEERING",
                    Q_got_p1, Q_ref_p1,
                    "White 2011 §8.4: h_f=f(L/D)(v²/2g), Blasius f",
@@ -274,14 +302,14 @@ def bench_piping() -> None:
 
         # -- Case P2: Longer run — head loss scales linearly with L at same Q --
         # Citation: Darcy-Weisbach proportionality: for fixed f,D,v: h_f ∝ L
-        #   Doubling L at same dH should halve Q (since v² ∝ dH/L, v ∝ sqrt(dH/L))
+        #   Doubling L at fixed dH reduces Q by roughly 1/√2 (constant-f estimate).
         #   Ratio: Q(2L) / Q(L) ≈ 1/sqrt(2)
-        r_p2 = _single_run(L_p1 * 2, 1.0, "40", dH_p1)  # 100m instead of 50m
+        r_p2 = _piping_single_run(cb, L_p1 * 2, 1.0, "40", dH_p1)  # 100m instead of 50m
         if (r_p1.get("ok") and r_p1.get("links") and
                 r_p2.get("ok") and r_p2.get("links")):
-            Q_p2 = r_p2["links"][0].get("flow_m3h", 0.0)
-            Q_p1 = r_p1["links"][0].get("flow_m3h", 0.0)
-            ratio_got = Q_p2 / Q_p1 if Q_p1 > 0 else 0.0
+            Q_p2 = r_p2["links"][0]["flow_m3h"]
+            Q_p1 = r_p1["links"][0]["flow_m3h"]
+            ratio_got = Q_p2 / Q_p1
             ratio_ref = 1.0 / math.sqrt(2.0)  # ≈ 0.7071
             err = _pct_err(ratio_got, ratio_ref)
             passed = err < ENGINEERING  # 10% tolerance on the ratio
@@ -291,32 +319,43 @@ def bench_piping() -> None:
                     f"Q ratio (2L/L) = {ratio_got:.4f} (ref 1/√2={ratio_ref:.4f}, err={err:.1f}%)",
                     "Darcy-Weisbach: Q∝√(dH/L) → Q(2L)/Q(L)=1/√2")
         else:
-            _skip("piping", "P2-length-scaling",
-                  "P1 or P2 solve failed — cannot compute scaling ratio")
+            _record("piping", "P2-length-scaling", "ENGINEERING", "FAIL",
+                    None, 1.0 / math.sqrt(2.0),
+                    f"P1 or P2 solve failed: P1={r_p1}, P2={r_p2}",
+                    "Darcy-Weisbach: Q∝√(dH/L)")
 
     except Exception as exc:
         _record("piping", "P1-straight-pipe", "N/A", "FAIL",
-                None, None, f"import/runtime error: {exc}", "")
+                None, None, f"runtime error: {exc}", "")
         traceback.print_exc()
 
 
 # ===========================================================================
-# FAMILY 3: ECAD impedance (IPC-2141A closed-form)
+# FAMILY 3: ECAD impedance (IPC-2141A closed-form, core ecad_impedance RPC)
 # These are the same formula the engine implements — tolerance is EXACT
 # ===========================================================================
+
+def _impedance(cb, mode: str, **geometry: Any) -> dict:
+    """One ``ecad_impedance`` call — the RPC behind ecad_check_impedance."""
+    return cb.call("ecad_impedance", {"mode": mode, **geometry})
+
 
 def bench_ecad_impedance() -> None:
     """ECAD PCB trace impedance benchmarks."""
     print("\n--- [ecad-impedance] IPC-2141A cases ---")
+    cb, reason = _native_core()
+    if cb is None:
+        for case in ("I1-microstrip-narrow", "I2-microstrip-wide", "I3-stripline",
+                     "I4-diff-pair"):
+            _skip("ecad-impedance", case, reason, "IPC-2141A §6")
+        return
     try:
-        from engine.ecad import impedance as imp
-
         # -- Case I1: Microstrip (narrow trace) --
         # Citation: IPC-2141A §6.2 (public-domain closed-form)
         #   Z0 = 87/√(εr+1.41) × ln(5.98h/(0.8w+t))
         w, h, t, er = 0.5, 1.6, 0.035, 4.5
         ref_i1 = (87.0 / math.sqrt(er + 1.41)) * math.log(5.98 * h / (0.8 * w + t))
-        res_i1 = imp.microstrip_z0(w, h, t, er)
+        res_i1 = _impedance(cb, "microstrip", w=w, h=h, t=t, er=er)
         _check("ecad-impedance", "I1-microstrip-narrow", "EXACT",
                res_i1["z0"], ref_i1,
                "IPC-2141A §6.2: Z0=87/√(εr+1.41)×ln(5.98h/(0.8w+t))",
@@ -326,7 +365,7 @@ def bench_ecad_impedance() -> None:
         # Citation: IPC-2141A §6.2 same formula, different geometry
         w2, h2, t2, er2 = 3.0, 1.6, 0.035, 4.5
         ref_i2 = (87.0 / math.sqrt(er2 + 1.41)) * math.log(5.98 * h2 / (0.8 * w2 + t2))
-        res_i2 = imp.microstrip_z0(w2, h2, t2, er2)
+        res_i2 = _impedance(cb, "microstrip", w=w2, h=h2, t=t2, er=er2)
         _check("ecad-impedance", "I2-microstrip-wide", "EXACT",
                res_i2["z0"], ref_i2,
                "IPC-2141A §6.2",
@@ -337,7 +376,7 @@ def bench_ecad_impedance() -> None:
         w3, h3, t3, er3 = 2.0, 3.2, 0.035, 4.5
         ref_i3 = (60.0 / math.sqrt(er3)) * math.log(
             4.0 * h3 / (0.67 * math.pi * (0.8 * w3 + t3)))
-        res_i3 = imp.stripline_z0(w3, h3, t3, er3)
+        res_i3 = _impedance(cb, "stripline", w=w3, h=h3, t=t3, er=er3)
         _check("ecad-impedance", "I3-stripline", "EXACT",
                res_i3["z0"], ref_i3,
                "IPC-2141A §6.3: Z0=60/√εr×ln(4h/(0.67π(0.8w+t)))",
@@ -349,7 +388,7 @@ def bench_ecad_impedance() -> None:
         s, h4 = 0.2, 1.6
         Z0_se = (87.0 / math.sqrt(er + 1.41)) * math.log(5.98 * h4 / (0.8 * w + t))
         ref_i4 = 2.0 * Z0_se * (1.0 - 0.48 * math.exp(-0.96 * s / h4))
-        res_i4 = imp.diff_pair_z0(w, s, h4, t, er, kind="microstrip")
+        res_i4 = _impedance(cb, "diff_pair", w=w, s=s, h=h4, t=t, er=er, kind="microstrip")
         _check("ecad-impedance", "I4-diff-pair", "EXACT",
                res_i4["z0_diff"], ref_i4,
                "IPC-2141A §6.4: Z_diff=2·Z0_se·(1-0.48·exp(-0.96·s/h))",
@@ -357,21 +396,31 @@ def bench_ecad_impedance() -> None:
 
     except Exception as exc:
         _record("ecad-impedance", "I1-microstrip-narrow", "N/A", "FAIL",
-                None, None, f"import/runtime error: {exc}", "")
+                None, None, f"runtime error: {exc}", "")
         traceback.print_exc()
 
 
 # ===========================================================================
-# FAMILY 4: ECAD circuit simulation (MNA solver)
+# FAMILY 4: ECAD circuit simulation (core sim_spice native MNA RPC)
 # Reference: classical circuit theory (Hayt & Kemmerly, Sedra & Smith)
 # ===========================================================================
+
+def _spice(cb, circuit: dict, study: dict) -> dict:
+    """One native MNA run through ``sim_spice`` (sim.md result shape)."""
+    return cb.call("sim_spice", {"circuit": circuit, "study": study})
+
 
 def bench_ecad_circuit() -> None:
     """Circuit simulation accuracy benchmarks."""
     print("\n--- [ecad-circuit] MNA solver accuracy ---")
+    cb, reason = _native_core()
+    if cb is None:
+        for case in ("C1-RC-lowpass-corner", "C2-RLC-resonance-frequency",
+                     "C3-thevenin-load"):
+            _skip("ecad-circuit", case, reason, "Hayt&Kemmerly 8th")
+        return
     try:
         import numpy as np
-        from engine.sim.circuit import simulate
 
         def _make_rlc_circuit(R, L, C, V=1.0):
             """Series RLC driven by an AC source."""
@@ -412,7 +461,7 @@ def bench_ecad_circuit() -> None:
                           "fstart": 10, "fstop": 1e6}],
             "probes": ["V(OUT)"],
         }
-        res_c1 = simulate(circ_c1, study_c1)
+        res_c1 = _spice(cb, circ_c1, study_c1)
         if res_c1.get("convergence", {}).get("ac"):
             f = np.array(res_c1["ac"]["x_f"])
             mag = np.array(res_c1["ac"]["mag"]["V(OUT)"])
@@ -442,7 +491,7 @@ def bench_ecad_circuit() -> None:
                           "fstart": 100, "fstop": 1e5}],
             "probes": ["V(N1)", "V(OUT)"],
         }
-        res_c2 = simulate(circ_c2, study_c2)
+        res_c2 = _spice(cb, circ_c2, study_c2)
         if res_c2.get("convergence", {}).get("ac"):
             f2 = np.array(res_c2["ac"]["x_f"])
             # V(N1)-V(OUT) is the voltage across L1; V(IN)-V(N1) is across R1.
@@ -460,9 +509,9 @@ def bench_ecad_circuit() -> None:
                     f"peak freq={f_peak:.1f}Hz ref f0={f0_c2:.1f}Hz err={err_freq:.1f}%",
                     "Sedra&Smith 6th §1.5: ω0=1/√(LC), series RLC peak at ω0")
         else:
-            _skip("ecad-circuit", "C2-RLC-resonance-frequency",
-                  "AC analysis did not converge",
-                  "Sedra&Smith 6th §1.5")
+            _record("ecad-circuit", "C2-RLC-resonance-frequency", "ENGINEERING", "FAIL",
+                    None, f0_c2, f"AC analysis did not converge: {res_c2}",
+                    "Sedra&Smith 6th §1.5")
 
         # -- Case C3: Thevenin equivalent — superposition DC --
         # Citation: Hayt & Kemmerly 8th §5.3 (Thevenin theorem)
@@ -490,7 +539,7 @@ def bench_ecad_circuit() -> None:
             "models": {}, "params": {"TEMP": 27},
         }
         study_c3 = {"analyses": [{"type": "op"}], "probes": ["V(MID)"]}
-        res_c3 = simulate(circ_c3, study_c3)
+        res_c3 = _spice(cb, circ_c3, study_c3)
         if res_c3.get("convergence", {}).get("op"):
             _check("ecad-circuit", "C3-thevenin-load", "EXACT",
                    res_c3["op"]["V(MID)"], V_load_ref,
@@ -504,11 +553,11 @@ def bench_ecad_circuit() -> None:
 
     except ImportError as exc:
         _skip("ecad-circuit", "C1-RC-lowpass-corner",
-              f"numpy/scipy not available: {exc}",
+              f"numpy not available: {exc}",
               "Hayt&Kemmerly 8th")
     except Exception as exc:
         _record("ecad-circuit", "C1-RC-lowpass-corner", "N/A", "FAIL",
-                None, None, f"unexpected error: {exc}", "")
+                None, None, f"runtime error: {exc}", "")
         traceback.print_exc()
 
 
@@ -1601,8 +1650,8 @@ def _generate_report(elapsed: float) -> str:
         "## CI Integration",
         "",
         "```bash",
-        "# Smoke subset (pure-Python, no .so required):",
-        "pytest scripts/vv_benchmark.py -k 'smoke' -q",
+        "# Smoke subset (no .so required; native-RPC cases skip until one is staged):",
+        "pytest scripts/vv_benchmark.py::TestSmoke -q",
         "",
         "# Full suite:",
         "CHUDWARE_RUN_VV=full CHUDWARE_LIBCHUDWARE=/path/to/libchudware.so \\",
@@ -1689,8 +1738,9 @@ def main() -> int:
 # ---------------------------------------------------------------------------
 # pytest entry points
 # ---------------------------------------------------------------------------
-# These are the pytest-runnable wrappers. Import this module and run with
-# -k 'smoke' for the subset that needs no .so.
+# These are the pytest-runnable wrappers. ``::TestSmoke`` needs no .so: its pure-Python
+# cases always run, and its native-RPC cases skip with the loader's reason until
+# CHUDWARE_LIBCHUDWARE names a staged core library.
 
 import pytest  # noqa: E402 (pytest may not be installed in all envs)
 
@@ -1705,18 +1755,28 @@ def _reset_results():
     yield
 
 
+def _native_core_or_skip():
+    """The core bridge for a native-RPC case, or an honest pytest skip."""
+    cb, reason = _native_core()
+    if cb is None:
+        pytest.skip(reason)
+    return cb
+
+
 class TestSmoke:
-    """Smoke subset: pure-Python, no .so required. Runs in CI gate."""
+    """Smoke subset: no .so required. Runs in CI gate; native-RPC cases skip honestly
+    when no core library is staged."""
 
     def test_hydraulic_pump_sizing(self):
-        """H2: Pump displacement and shaft power — pure Python, EXACT tier."""
-        from engine.hydraulic import solve as hyd
+        """H2: Pump displacement and shaft power — hydraulic_size_pump RPC, EXACT tier."""
+        cb = _native_core_or_skip()
         Q_lpm, dP_bar, rpm, eta = 30.0, 180.0, 1000.0, 0.88
         disp_ref = Q_lpm * 1000.0 / rpm
         Q_m3s = Q_lpm / 60000.0
         shaft_ref = Q_m3s * dP_bar * 1e5 / (eta * 1000.0)
-        res = hyd.size_pump(flow_lpm=Q_lpm, pressure_bar=dP_bar,
-                            speed_rpm=rpm, efficiency=eta)
+        res = cb.call("hydraulic_size_pump", {
+            "flow_lpm": Q_lpm, "pressure_bar": dP_bar, "speed_rpm": rpm,
+            "efficiency": eta})
         assert res.get("ok"), f"size_pump failed: {res}"
         d_err = _pct_err(res["displacement_cc_rev"], disp_ref)
         p_err = _pct_err(res["shaft_power_kw"], shaft_ref)
@@ -1724,29 +1784,29 @@ class TestSmoke:
         assert p_err < EXACT, f"shaft power err={p_err:.3f}% > {EXACT}%"
 
     def test_ecad_microstrip_z0(self):
-        """I2: Microstrip ~50Ω — IPC-2141A EXACT tier."""
-        from engine.ecad import impedance as imp
+        """I2: Microstrip ~50Ω — ecad_impedance RPC, IPC-2141A EXACT tier."""
+        cb = _native_core_or_skip()
         w, h, t, er = 3.0, 1.6, 0.035, 4.5
         ref = (87.0 / math.sqrt(er + 1.41)) * math.log(5.98 * h / (0.8 * w + t))
-        got = imp.microstrip_z0(w, h, t, er)["z0"]
+        got = _impedance(cb, "microstrip", w=w, h=h, t=t, er=er)["z0"]
         err = _pct_err(got, ref)
         assert err < EXACT, f"microstrip Z0 err={err:.4f}% > {EXACT}%"
 
     def test_ecad_stripline_z0(self):
-        """I3: Stripline — IPC-2141A EXACT tier."""
-        from engine.ecad import impedance as imp
+        """I3: Stripline — ecad_impedance RPC, IPC-2141A EXACT tier."""
+        cb = _native_core_or_skip()
         w, h, t, er = 2.0, 3.2, 0.035, 4.5
         ref = (60.0 / math.sqrt(er)) * math.log(
             4.0 * h / (0.67 * math.pi * (0.8 * w + t)))
-        got = imp.stripline_z0(w, h, t, er)["z0"]
+        got = _impedance(cb, "stripline", w=w, h=h, t=t, er=er)["z0"]
         err = _pct_err(got, ref)
         assert err < EXACT, f"stripline Z0 err={err:.4f}% > {EXACT}%"
 
     def test_ecad_rc_corner_frequency(self):
-        """C1: RC low-pass -3dB corner — PRECISE tier."""
+        """C1: RC low-pass -3dB corner — sim_spice RPC, PRECISE tier."""
         pytest.importorskip("numpy")
         import numpy as np
-        from engine.sim.circuit import simulate
+        cb = _native_core_or_skip()
         R, C = 1000.0, 159.155e-9
         fc = 1.0 / (2 * math.pi * R * C)
         circ = {
@@ -1764,7 +1824,7 @@ class TestSmoke:
         study = {"analyses": [{"type": "ac", "sweep": "dec", "points": 30,
                                 "fstart": 10, "fstop": 1e6}],
                  "probes": ["V(OUT)"]}
-        res = simulate(circ, study)
+        res = _spice(cb, circ, study)
         assert res.get("convergence", {}).get("ac"), "AC did not converge"
         f = np.array(res["ac"]["x_f"])
         mag = np.array(res["ac"]["mag"]["V(OUT)"])
@@ -1774,11 +1834,11 @@ class TestSmoke:
         assert err < PRECISE, f"|H(fc)| err={err:.3f}% > {PRECISE}%"
 
     def test_ecad_dc_divider(self):
-        """C3: Thevenin-loaded divider — EXACT tier.
+        """C3: Thevenin-loaded divider — sim_spice RPC, EXACT tier.
 
         R2 ∥ R_L from MID to GND; probe V(MID) = Thevenin loaded voltage.
         """
-        from engine.sim.circuit import simulate
+        cb = _native_core_or_skip()
         R1, R2, RL, Vs = 1000.0, 2000.0, 3000.0, 12.0
         Vth = Vs * R2 / (R1 + R2)
         Rth = R1 * R2 / (R1 + R2)
@@ -1798,7 +1858,7 @@ class TestSmoke:
             "models": {}, "params": {"TEMP": 27},
         }
         study = {"analyses": [{"type": "op"}], "probes": ["V(MID)"]}
-        res = simulate(circ, study)
+        res = _spice(cb, circ, study)
         assert res.get("convergence", {}).get("op"), "DC OP did not converge"
         err = _pct_err(res["op"]["V(MID)"], ref)
         assert err < EXACT, f"V(MID) err={err:.4f}% > {EXACT}%"
@@ -1914,46 +1974,26 @@ class TestFull:
             pytest.skip("set CHUDWARE_RUN_VV=full to run full V&V suite")
 
     def test_piping_darcy_weisbach(self):
-        """P1: Piping Darcy-Weisbach single run — ENGINEERING tier."""
-        pytest.importorskip("fluids")
-        from engine.piping import solve as pip_solve, schema as pip_schema
-        if not pip_solve.have_fluids():
-            pytest.skip("fluids library not installed")
-        doc = pip_schema.new_piping("VV")
-        run = pip_schema.new_pipe_run(
-            id="r0", path=[[0, 0, 0], [50000, 0, 0]],
-            nps=1.0, schedule="40", name="main")
-        doc["runs"].append(run)
-        bc = [{"run": "r0", "end": "start", "head": 5.0},
-              {"run": "r0", "end": "end", "head": 0.0}]
-        result = pip_solve.solve(doc, boundary=bc)
+        """P1: Piping Darcy-Weisbach single run — piping_solve RPC, ENGINEERING tier."""
+        cb = _native_core_or_skip()
+        result = _piping_single_run(cb, 50.0, 1.0, "40", 5.0)
         assert result.get("ok"), f"solve failed: {result.get('reason')}"
         links = result.get("links", [])
         assert links, "no links in result"
         D, f_approx, L_m, dH = 0.027, 0.03, 50.0, 5.0
         v_approx = math.sqrt(dH * 2 * 9.81 * D / (f_approx * L_m))
         Q_ref = math.pi / 4 * D ** 2 * v_approx * 3600.0
-        Q_got = links[0].get("flow_m3h", 0.0)
+        Q_got = links[0]["flow_m3h"]
         err = _pct_err(Q_got, Q_ref)
         assert err < ENGINEERING, f"Q err={err:.1f}% > {ENGINEERING}%"
 
     def test_piping_length_scaling(self):
-        """P2: Piping Q∝√(1/L) scaling — ENGINEERING tier."""
-        pytest.importorskip("fluids")
-        from engine.piping import solve as pip_solve, schema as pip_schema
-        if not pip_solve.have_fluids():
-            pytest.skip("fluids library not installed")
+        """P2: Piping Q∝√(1/L) scaling — piping_solve RPC, ENGINEERING tier."""
+        cb = _native_core_or_skip()
 
         def _run(length_m):
-            doc = pip_schema.new_piping("VV")
-            run = pip_schema.new_pipe_run(
-                id="r0", path=[[0, 0, 0], [int(length_m * 1000), 0, 0]],
-                nps=1.0, schedule="40", name="main")
-            doc["runs"].append(run)
-            bc = [{"run": "r0", "end": "start", "head": 5.0},
-                  {"run": "r0", "end": "end", "head": 0.0}]
-            result = pip_solve.solve(doc, boundary=bc)
-            assert result.get("ok")
+            result = _piping_single_run(cb, length_m, 1.0, "40", 5.0)
+            assert result.get("ok"), f"solve failed: {result.get('reason')}"
             return result["links"][0]["flow_m3h"]
 
         Q1 = _run(50.0)
@@ -2027,10 +2067,10 @@ class TestFull:
         assert err < ENGINEERING, f"two-span δ_max err={err:.3f}% > {ENGINEERING}%"
 
     def test_ecad_rlc_resonance(self):
-        """C2: Series RLC resonance frequency peak — ENGINEERING tier."""
+        """C2: Series RLC resonance frequency peak — sim_spice RPC, ENGINEERING tier."""
         pytest.importorskip("numpy")
         import numpy as np
-        from engine.sim.circuit import simulate
+        cb = _native_core_or_skip()
         R, L_h, C_f = 10.0, 1e-3, 1e-6
         f0_ref = 1.0 / (2 * math.pi * math.sqrt(L_h * C_f))
         circ = {
@@ -2050,7 +2090,7 @@ class TestFull:
         study = {"analyses": [{"type": "ac", "sweep": "dec", "points": 50,
                                 "fstart": 100, "fstop": 1e5}],
                  "probes": ["V(N1)", "V(OUT)"]}
-        res = simulate(circ, study)
+        res = _spice(cb, circ, study)
         assert res.get("convergence", {}).get("ac"), "AC did not converge"
         f = np.array(res["ac"]["x_f"])
         mag = np.array(res["ac"]["mag"]["V(OUT)"])

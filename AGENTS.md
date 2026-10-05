@@ -23,32 +23,29 @@ or deleted). Back-compat that is NOT renamed (persisted on-disk / wire formats):
 vault dir `.aicadvault`, mesh format `.aicm`, git refs `refs/aicad/*`, and
 `aicad.<x>/<n>` contract schema ids are kept for data compatibility.
 
-Architecture in one paragraph: the pure C++/CUDA kernel `libchudware` (under
-`core/`) IS the engine — the legacy Python engine (`engine_oracle/` + the root
-`engine` symlink) was fully strangled out and deleted in T-RF21 (zero-Python
-cutover, 2026-07-23); what Python remains lives under `services/` (MCP tools,
-agent, worker seam, pure-helper modules with no C++ counterpart). The C++ host
-under `host/` owns the **sole GUI source tree** (~110k LOC under `host/src/ui/`).
-Native builds ship from that tree on Linux, Windows, and macOS; the same source
-tree also compiles to WASM for the web app (`Webservice/README.md`). The host
-talks to the shared `chudware-hostd` daemon (which dlopens `libchudware`) over a
-Unix socket, with `python -m services.worker_main` as the stdio worker for
-services-side methods. Desktop and web therefore stay at parity by construction.
-The host builds its own OpenGL pipeline under `host/src/render/`.
+Architecture in one paragraph: the C++ kernel `libchudware` (under `core/`) IS the
+engine; there is no Python CAD engine. The C++ host under `host/` is the **sole GUI
+source tree**: native builds ship from it on Linux, Windows, and macOS, and the same
+tree compiles to WASM for the web app (`Webservice/README.md`). The host talks to the
+shared `chudware-hostd` daemon (which dlopens `libchudware`) over local IPC, through the
+C++ routing/IPC seam in `services/worker/` + `services/ipc/`. hostd runs the persistent
+Python services worker (`services/worker_main.py`) for services-side methods. **Online
+agent turns** run in the embedded Chudcode RPC runtime (`chud --mode rpc`), hosted by
+`services/agent/chudcode_host.py`: Chudcode owns provider calls, auth, models, session
+history, memory, and compaction; Chudware owns CAD tools, documents, roles, missions,
+approvals, and guardrails. The native agent in `core/agent/run.cpp` is the
+**offline-safe fallback** only (offline-safe local providers). Boundary details:
+`.claude/skills/cad-chudcode-integration/SKILL.md`. The host builds its own OpenGL
+pipeline under `host/src/render/`.
 
 Canonical references:
 - `ARCHITECTURE.md` — system architecture and locked decisions.
 - `contracts/` — frozen interface contracts, the seams between components
   (append-only; see `contracts/README.md`).
-- `docs/REFACTOR_LOG.md` — refactor
-  handoff log (each DAG node appends a paragraph: files touched, deferred,
-  gotchas). Active plans live under `docs/plans/`.
-- The consolidation refactor (hygiene → agent harness → UI/UX → perf →
-  zero-Python cutover) is **complete**: `T-RF1`..`T-RF23` are all `status:done`
-  as of 2026-07-23. Its plan,
-  `docs/plans/2026-07-22-consolidation-refactor-dag.md`, is historical record —
-  read it for rationale, not for pending work. (The older cursor-plan file was
-  superseded 2026-07-22 — see `docs/REFACTOR_LOG.md`.)
+- `docs/REFACTOR_LOG.md` — current handoff log (2026-08-14 onward); older entries
+  are archived under `docs/refactor-log/`. Active plans live under `docs/plans/`.
+- `docs/plans/2026-07-22-consolidation-refactor-dag.md` — historical record of the
+  completed consolidation refactor (`T-RF1`..`T-RF23`); rationale, not pending work.
 
 ## Agent workflow on this repo (read before starting any task)
 
@@ -57,52 +54,45 @@ Canonical references:
    `graphify path`) before reading source — a repo hook enforces this. Read raw
    files only after the graph orients you. After modifying code, run
    `graphify update .` to keep it current (AST-only, no API cost).
-2. **Solo-dev task board.** Work is tracked in `work/` (git-tracked markdown,
-   no external tracker). `python3 work/tools/work.py ready` shows unblocked
-   tasks; `work.py board` shows everything. No claim/coordination step — pick a
-   task, do it, mark it done yourself. Policy (priorities, lanes,
-   `kind: fix|overhaul|new`, `deferred: yes` plans you must not touch) is in
-   `work/WORKFLOW.md`. Task lifecycle and DoD: `work/README.md` ("done" =
-   DoD boxes checked, `scripts/gate.sh` green, `graphify update .` run).
-3. **MCP freshness rule (binding).** Any task that adds/changes an agent-facing
-   workflow, tool, prompt, or context pack must, in the same branch: update the
-   MCP server instructions (`services/mcp/`), update `cad_guide` topics if
-   modeling/CAM/ECAD-facing, refresh the touched `work/context/` section pack,
-   and run `graphify update .`.
+2. **Task board.** Work is tracked in `work/` (git-tracked markdown, no external
+   tracker): `python3 work/tools/work.py ready` / `board`. Board policy is
+   `work/WORKFLOW.md`; task fields, lifecycle, and "done" are `work/README.md`.
+3. **MCP freshness rule (binding)** — `work/WORKFLOW.md` §3: a change to an
+   agent-facing workflow, tool, prompt, or context pack updates the MCP server
+   instructions, `cad_guide` topics, and the touched `work/context/` pack in the
+   same change, then `graphify update .`.
 4. **Verify before review.** `bash scripts/gate.sh` must show no new reds. GUI
    work verifies via the headless screenshot harness (`CHUDWARE_SHOT=<scenario>`).
 
-## Repo map (current on-disk reality)
+## Repo map
 
 | Dir | Purpose |
 |-----|---------|
-| `core/` | Pure C++/CUDA kernel → `libchudware`: geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. **The engine** (zero-Python since T-RF21). |
-| `host/` | **The sole GUI source tree.** Production C++ host (~110k LOC under `host/src/ui/`), compiled natively on Linux (GCC/Clang), Windows (MSVC), and macOS (AppleClang), and to WASM/Emscripten for the web app. Binary: `host/build-linux/bin/chudware`. Own GL pipeline under `host/src/render/`. |
-| `services/` | Python services: `agent/` (built-in agent loop), `mcp/` (MCP server for external agents), `worker/` (C++ engine routing seam, four modules: worker_client / engine_backend / cpp_core / worker_router), `worker_main.py` (the stdio worker hostd spawns), `installer/` (provisioning, MCP registration, packaging), `ecad/`+`sim/`+`structural/`+`piping/`+`formats/` (pure-helper re-homes from the deleted Python engine), plus `dag/`, `deliverables/`, `plm/`, `browser/`, `ipc/`, `serving/` (LoRA adapter routing — not the webservice; the webservice is top-level `Webservice/`), `verify/`, `dist/`. All Python imports use canonical `services.*` names. |
-| `ui/viewport/` | AICM mesh-format loader (`render/aicm_loader.*`) consumed by `core/` (libchudware tests/tools). The rest of the former "shared renderer" extraction was orphaned (host builds its own pipeline in `host/src/render/`) and was purged in T-RF2. `ui/imgui`/`ui/abstract` (the AI-CAD2 shell) are retired and gone. |
-| `platform/` | Cross-OS shims (dialogs, DPI, paths, resources, window) with `_linux`/`_win32` implementations. |
+| `core/` | C++ kernel → `libchudware`: geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests, plus the `chudware-hostd` daemon (`core/hostd/`). **The engine.** |
+| `host/` | **The sole GUI source tree.** Production C++ host, compiled natively on Linux (GCC/Clang), Windows (MSVC), and macOS (AppleClang), and to WASM/Emscripten for the web app. Binary: `host/build-linux/bin/chudware`. Own GL pipeline (including the `.aicm` loader `host/src/render/aicm_loader.*`, also compiled into core tests) under `host/src/render/`. |
+| `services/` | C++: `worker/` (host-side engine routing seam: `worker_client`, `engine_backend`, `cpp_core`) and `ipc/` (hostd client/transport/discovery), both compiled into `host/`. Python: `worker_main.py` (the persistent services worker hostd spawns), `agent/` (Chudcode session host, host tools, CAD roles/missions/governance), `mcp/` (MCP server for external agents), `installer/` (provisioning, MCP registration, packaging), pure helpers with no C++ counterpart (`ecad/`, `sim/`, `structural/`, `piping/`, `formats/`, …), plus `dag/`, `deliverables/`, `plm/`, `browser/`, `serving/` (LoRA adapter routing — not the webservice; that is top-level `Webservice/`), `verify/`, `dist/`. Python imports use canonical `services.*` names. |
 | `contracts/` | Frozen interface contracts — THE seams. Append-only, integrator-owned. |
-| `corpora/` | Consolidated test fixtures (`sketch/`, `render/`, `sw_parity/`, `sw_fixtures/`), referenced directly by their canonical paths. |
+| `corpora/` | Consolidated test fixtures, referenced directly by their canonical `corpora/...` paths. |
 | `work/` | Git-tracked solo task board (`tasks/`, `backlog/`, `work/tools/work.py`, `WORKFLOW.md` policy). |
-| `docs/` | Design docs, status notes, parity specs, handoffs, perf audits. |
+| `docs/` | Design docs, references, plans, handoff log (`docs/README.md` indexes it). |
+| `Webservice/` | Web app: the `host/` WASM GUI backed by a shared hostd. |
 | `tools/`, `scripts/`, `vendor/`, `assets/`, `packaging/`, `benchmarks/`, `training/` | Dev tools; repo gates + audits (`check.py`, `gate.sh`); vendored deps; icons/fonts; packaging; perf benches; ML eval/telemetry (training itself is a deferred plan). |
 | `scratch/` | Throwaway area (non-blocking). |
 
 ## GUI ownership policy
 
-- **`host/` is the sole GUI source tree.** There is no second GUI tree; the
-  `ui/imgui` + `ui/abstract` (AI-CAD2) shell is retired. (Historical: T-G11
-  briefly deleted `host/`; that was reversed.) Native Linux, Windows, and macOS
-  builds and the web app's WASM build all compile this tree.
+- **`host/` is the sole GUI source tree.** There is no second GUI tree. Native Linux,
+  Windows, and macOS builds and the web app's WASM build all compile this tree.
 - **Form/PropertyManager schema lives with the host GUI** (`host/src/ui/`) —
   the single source every build reads. A form/PM fix (selector kinds, wells,
   gating) belongs there.
-- **OS-specifics belong behind build conditionals and platform seams**, not in a
-  second GUI. Shared native shims live under top-level `platform/`; host-only
-  devices such as cameras live under `host/src/platform/`.
-- Scripted GUI launches (gate.sh, tools/gui_parity/run_all.py) always use
-  `xvfb-run` when available unless `CHUDWARE_SHOT_HEADED=1` is set. Set that env
-  var for interactive/walkthrough runs to see a real window.
+- **OS-specifics belong behind build conditionals in the existing seams**, not in a
+  second GUI: host-side shims such as `host/src/ui/file_dialog.*` and
+  `host/src/win_chrome.*`, host-only devices such as cameras under
+  `host/src/platform/`, engine-side paths in `core/util/platform_paths.cpp`.
+- Scripted GUI launches (the gate's host shot stage) use `xvfb-run` when available
+  unless `CHUDWARE_SHOT_HEADED=1` is set. Set that env var for interactive/walkthrough
+  runs to see a real window.
 - **Derived-asset honesty:** screenshot-derived icons must show REAL engine
   output. CAM/Manufacture icons must render the real `cam_simulate` toolpath
   over stock — each doubles as a smoke check of the op chain. If an op won't
@@ -110,45 +100,38 @@ Canonical references:
 
 ## Build and test commands
 
-The Linux gate is **`bash scripts/gate.sh`** — every DAG node must leave it
-green. It runs, in order:
-
-1. `python3 scripts/check.py` — stdlib-only fast gate (always runs, FATAL on red
-   since T-RF3): `gui_lint` (icons exist in the atlas; no HiDPI-collapse theme bug),
-   `feature_surface_audit` (every ribbon command routes to a real handler),
-   `parity_audit` (SW_PARITY_SPEC claims resolve to real code).
-2. Core CMake/Ninja build — `libchudware` with `-DCHUDWARE_WITH_OCCT=ON` (Linux
-   `linux-core` preset). SKIPPED with a clear reason if system OCCT is absent —
-   a SKIP is **not** a failure.
-3. Host GUI build: `cmake -S host -B host/build-linux -G Ninja` + `ninja Chudware`;
-   then a WASM build smoke (`./build.sh wasm` into a scratch dir — FATAL when
-   emsdk is provisioned and the web build breaks).
-4. `ctest` on the core build, plus the `chudware-hostd` lifecycle smoke, plus the
-   **web parity probe** (`scripts/web_parity_probe.py` enforcing
-   `contracts/web_parity.md` over a scratch hostd with the Python worker bridge
-   disabled — what the WASM client faces).
-5. Agent pytest suite: `<venv>/python -X utf8 -m pytest services/agent -q`.
-   SKIPPED if the runtime venv/pytest is not provisioned on the box — again a
-   SKIP, not a failure.
-6. `CHUDWARE_SHOT=m1` headless screenshot smoke via `xvfb-run`, plus the
-   sensor-node golden demo, then a PASS/SKIP summary.
+The Linux gate is **`bash scripts/gate.sh`** — every change must leave it green. Its
+header comment is the authoritative stage list. In outline: `scripts/check.py`
+(source/audit gate), core build into `core/build-linux` (`cmake -S core` with
+`-DCHUDWARE_WITH_OCCT=ON`, SKIP when system OCCT is absent) + ctest, host GUI build
+(`host/build-linux`) + WASM build smoke (FATAL when emsdk is provisioned and the web
+build breaks), `chudware-hostd` lifecycle smoke and the web parity probe
+(`scripts/web_parity_probe.py` enforcing `contracts/web_parity.md` over a scratch hostd
+with the Python worker bridge disabled — what the WASM client faces), Python suites in
+the service venv, content/demo smokes, and the `CHUDWARE_SHOT=m1` headless screenshot
+smoke, then a PASS/SKIP summary. Environment SKIPs are not failures;
+`CHUDWARE_GATE_STRICT=1` makes them fatal (CI).
 
 Other entry points:
 
-- `./build.sh` — thin wrapper: builds core → `libchudware.so`, then the host GUI
-  → `host/build-linux/bin/Chudware`. (`build.bat` on Windows.)
-- Core presets (`CMakePresets.json`): `linux-core`, `windows-core` (MSVC,
-  OCCT off, self-contained), `windows-occt` (OCCT + Polyhedral-FEA).
-  See `docs/reference/BUILD_WINDOWS.md`.
+- `./build.sh` — thin wrapper. Bare `./build.sh` (= `app`) builds **only** the host GUI
+  → `host/build-linux/bin/chudware`. `./build.sh all` builds core (`libchudware.so` +
+  `chudware-hostd` in the consumed core trees), then the host GUI, then the daemon.
+  Modes: `default|app|core|daemon|wasm|all|stage|clean` (usage header in `build.sh`).
+  Windows: `build.bat` / CMake presets.
+- Two kinds of core tree: CMake presets (`CMakePresets.json`; see
+  `docs/reference/BUILD_WINDOWS.md`) build into `build/<preset>` and test with
+  `ctest --test-dir build/<preset>/core`; the trees the gate, GUI, and hostd consume are
+  `core/build-linux` (gate) and `core/build-occt-linux` (`./build.sh` daemon/stage).
+  A preset tree is NOT read by `gate.sh`, the GUI, or `CHUDWARE_LIBCHUDWARE`.
 - Host GUI has its own CMakeLists: `cmake -S host -B host/build-linux
   -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C host/build-linux Chudware`.
   CEF (embedded vendor sign-in browser) defaults ON and needs the SDK under
   `extern/cef/` (`-DCHUDWARE_ENABLE_CEF=OFF` for an SDK-less build).
-- Python runtime pins: `requirements.txt` (build123d, cadquery-ocp-novtk,
-  numpy, scipy, pyvista/vtk, opencv-headless, …) — provisioned into the
-  managed runtime (`%APPDATA%\Chudware\runtime` on Windows).
+- Python runtime pins: `requirements.txt` is the source of truth for the managed
+  runtime (`%APPDATA%\Chudware\runtime` on Windows).
 
-## Swarm operating rules (binding during the refactor)
+## Multi-agent operating rules (binding)
 
 - **No worktree isolation.** Worktrees here branch from a stale base and
   silently revert `master`. Run all subagents non-isolated in the main tree.
@@ -169,8 +152,10 @@ Other entry points:
 ## Code style and conventions
 
 - Language of code, comments, and docs: **English**.
-- C++17 (`CMAKE_CXX_STANDARD 17` in both the top-level and host CMake); MSVC
-  builds use `/utf-8 /MP`.
+- C++17 baseline (`CMAKE_CXX_STANDARD 17` in the top-level, core, and host CMake);
+  the mesh, manufacturing, twin, and print layers (and a few tests) require C++20 via
+  `cxx_std_20`; CUDA is an optional LBM backend (`CHUDWARE_WITH_CUDA`, default OFF).
+  MSVC builds use `/utf-8 /MP`.
 - Minimal, scoped changes: a bug fix does not clean up surrounding code; match
   the surrounding file's naming, comment density, and idioms. No speculative
   generality.
@@ -189,31 +174,32 @@ Other entry points:
     exists.
   - Before adding a dependency (vendored, pip, or CMake), prove an existing
     in-repo capability can't do the job.
-- The Python→C++ strangler migration is COMPLETE (T-RF21, 2026-07-23):
-  `engine_oracle/` is deleted, `scripts/oracle_import_allowlist.txt` is empty,
-  and `scripts/check.py`'s `oracle_import_audit` gate fails on any new
-  `engine.*`/`engine_oracle.*` import in `services/`. New engine functionality
-  lands in `core/` (C++) behind the RPC surface; services-side Python is for
-  MCP tools, the agent loop, and pure helpers with no C++ counterpart.
-- Subsystem-local `AGENTS.md` files exist (for example,
-  `services/agent/AGENTS.md`, `services/mcp/AGENTS.md`, and `platform/AGENTS.md`);
-  the deeper, more specific one wins. Keep them current when you change the
-  conventions they describe.
+- New engine functionality lands in `core/` (C++) behind the RPC surface.
+  `scripts/check.py`'s `oracle_import_audit` fails on any `engine.*` /
+  `engine_oracle.*` import in `services/`, `scripts/`, or `tools/`
+  (`scripts/oracle_import_allowlist.txt` is empty). Services-side Python is for MCP
+  tools, the agent host/policy, and pure helpers with no C++ counterpart.
+- Subsystem-local `AGENTS.md` files exist (for example, `services/agent/AGENTS.md`
+  and `services/mcp/AGENTS.md`); the deeper, more specific one wins. Keep them current
+  when you change the conventions they describe.
 - CMake 4.x note for `core/`: doctest's old `cmake_minimum_required` is
   bypassed via `SOURCE_SUBDIR`; do **not** set
-  `CMAKE_POLICY_VERSION_MINIMUM` (it poisons the cache — wipe `core/build` if
-  it ever gets in).
+  `CMAKE_POLICY_VERSION_MINIMUM` (it poisons the cache — wipe the affected core
+  build tree if it ever gets in).
 
 ## Testing instructions
 
-- Full gate: `bash scripts/gate.sh` (see stage list above). Environment SKIPs
-  (no OCCT, no venv, no xvfb) are honest SKIPs, not failures.
-- Fast stdlib gate only: `python3 scripts/check.py`.
+- Full gate: `bash scripts/gate.sh` (see above). Environment SKIPs (no OCCT, no venv,
+  no xvfb) are honest SKIPs, not failures.
+- Fast source/audit gate only: `python3 scripts/check.py`. It is not stdlib-only: some
+  audits import the MCP tool catalog, so the interpreter needs the pinned audit
+  packages (`CHECK_PYTHON` overrides; see `docs/reference/CI_RUNNERS.md`).
 - Python suites: `<venv>/python -X utf8 -m pytest services/agent -q`
-  (`-X utf8` matters on Windows). A root `conftest.py` exists.
-- C++ core: `ctest --test-dir core/build-linux` (or the preset's build dir);
-  GUI-adjacent unit tests build into `host/build-linux/bin/` (`test_aicm`,
-  `test_camera_backend`, `test_splat_renderer`, …).
+  (`-X utf8` matters on Windows). The gate resolves the venv (override with
+  `CHUDWARE_GATE_PYTHON`). A root `conftest.py` exists.
+- C++ core: `ctest --test-dir core/build-linux` (gate tree) or
+  `ctest --test-dir build/<preset>/core` (preset tree); GUI-adjacent unit tests build
+  into `host/build-linux/bin/` (`test_camera_backend`, `test_splat_renderer`, …).
 - GUI verification: headless screenshot harness `CHUDWARE_SHOT=<scenario>`; use
   `xvfb-run` unless `CHUDWARE_SHOT_HEADED=1`.
 - Test fixtures: `corpora/` (canonical); SW-parity fixtures are under
@@ -229,4 +215,4 @@ Other entry points:
   handles the sandbox bits; don't hand-modify them.
 - The MCP server is a local stdio/JSON-RPC harness; any change to its tool
   surface must follow the MCP freshness rule above (server instructions +
-  `cad_guide` + context packs updated in the same branch).
+  `cad_guide` + context packs updated in the same change).

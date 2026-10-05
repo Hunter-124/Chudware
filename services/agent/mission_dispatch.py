@@ -2706,7 +2706,7 @@ def _apply_session_preferences(
     return allowed, system_prompt
 
 
-# ---------------------------------------------------------------- static prompt
+# ------------------------------------------------- offline-lane static prompt
 #: Warning prefixes ``prompt_cache.compose`` emits when a step of THIS lane's
 #: composition degraded to a fallback (role policy, capability assembly, session
 #: preferences). Such an entry is not this lane's bytes, so its tool text is not
@@ -2715,14 +2715,14 @@ _PROMPT_CACHE_COMPOSE_WARNINGS = frozenset(
     {"effective_role_policy", "prompt_tiers", "session_preferences"}
 )
 
-#: In-process memo for the rendered TOOLS SLOT, keyed by everything
+#: In-process memo for the offline lane's rendered TOOLS SLOT, keyed by everything
 #: ``render_tools_block`` reads: the prompt-cache fingerprint (config.json, the
 #: role cards, packs, skills and the composing source — so a settings write or an
 #: edited docstring drops the entry), the tier's ``(budget, trim)`` allocation,
 #: the allowlist, and the identity of the callable each tool resolves to.
 #:
 #: The disk cache normally cannot serve this text: it renders with
-#: ``resolver_for(None)`` and no tier, while a live turn resolves the
+#: ``resolver_for(None)`` and no tier, while an offline turn resolves the
 #: mission-scoped meta tools (``ask_user``, ``delegate``) against its
 #: ``MissionDispatch``, whose signatures and docstrings are different bytes, and
 #: allocates its own tier slot. The slot is budget-coupled (pass 2 spends the
@@ -2766,53 +2766,20 @@ def _tools_render_idents(
     return tuple(out)
 
 
-def linear_role_prompt(
+def _compose_role_prompt(
     role: str,
     *,
-    resolver: Callable[[str], Any],
-    card: Any | None = None,
-    capability: Any | None = None,
-    tier: str | None = None,
-    preferences: Any | None = None,
-) -> tuple[str, list[str], str | None]:
-    """``(system_prompt, allowed, tools_text)`` for one linear role turn.
+    card: Any | None,
+    capability: Any | None,
+    preferences: Any | None,
+) -> tuple[str, list[str], str]:
+    """``(system_prompt, allowed, cache_witness)`` — the one role composition.
 
-    Every turn used to recompose all three (~16 ms for the main-chat floor: 20
-    ``inspect.signature`` calls, 20 docstring reads and ~40 config reads, of
-    which the tool-schema render is ~11 ms) while ``prompt_cache`` — which
-    performs exactly this sequence, fingerprinted — was consulted only by the
-    GUI context meter and the tests. This routes the live path through it.
-
-    The result is byte-identical to composing inline, which is what decides how
-    much may be reused:
-
-    * ``system_prompt`` / ``allowed`` are composed HERE, every turn. They cost
-      ~4 ms and they read the preference accessors directly, so the cached
-      entry's copies are used only as a witness: it must agree with this
-      composition before its tool text is trusted. A knob whose value changed
-      without a config.json write (Settings writes call
-      ``prompt_cache.invalidate``; the harness tests monkeypatch the accessors)
-      would otherwise be silently overridden by a fingerprint-valid entry.
-    * ``tools_text`` — the expensive part — is taken from the entry only when it
-      provably renders the same bytes: same role prose and allowlist, the tier
-      must allocate the same ``(budget, trim)`` slot the entry was rendered
-      with, and every allowed tool must resolve to the same callable under
-      *resolver* as under the entry's ``resolver_for(None)``.
-    * Otherwise the slot is rendered live with *resolver* — the mission-scoped
-      meta tools (``ask_user``, ``delegate``) resolve to ``MissionDispatch``
-      methods whose signatures and docstrings are different bytes, and the slot
-      is budget-coupled, so splicing cached entries around live ones would
-      change the rendered text — and memoized against the cache fingerprint, so
-      a repeat turn reuses the text without recomposing it while a fingerprint
-      change (settings write, edited docstring, new role card) recomposes.
-
-    Never raises: a cache fault degrades to the live composition, and a failed
-    schema render yields ``None`` exactly as the inline path did.
+    Role prose (Settings override applied) → capability assembly → session
+    preferences (mode/scope tool policy, preference guidance, MORE TOOLS menu) →
+    skills catalog. ``cache_witness`` is the prompt before the skills catalog,
+    which is exactly what ``prompt_cache.compose`` produces for the offline lane.
     """
-    from services.agent import agent_turn as _at  # noqa: PLC0415
-    from services.agent import prompt_cache as _pcache  # noqa: PLC0415
-    from services.agent import tool_schemas as _tool_schemas  # noqa: PLC0415
-
     if card is None:
         from services.agent.roles import load_role  # noqa: PLC0415
 
@@ -2833,24 +2800,17 @@ def linear_role_prompt(
         )
     except Exception:  # noqa: BLE001
         system_prompt = base_system_prompt
-    # Preferences BEFORE the tools render: a dropped tool must also vanish from
-    # the schema block, or the model is shown a tool every call to which will be
-    # refused.
+    # Preferences BEFORE any tool surface is derived from ``allowed``: a dropped
+    # tool must also vanish from the schemas, or the model is shown a tool every
+    # call to which will be refused.
     allowed, system_prompt = _apply_session_preferences(role, allowed, system_prompt, preferences)
 
-    # The skills catalog, for the ONLINE lane. Every online role prompt — main
-    # chat (`worker_rpc._agent_admin_turn`) and delegated roles
-    # (`chudcode_roles._assemble_role_runtime`) — is composed here, and nothing
-    # downstream of it consults `services.agent.skills`: the Chudcode-embedded
-    # model used to be told "full procedure: skill://assembly-merge" by role-card
-    # prose while the only skill:// resolver in reach was Chudcode's own, which
-    # answers "Unknown skill" for every CAD pack (live, mission-18d24905b774203f).
-    # One line per pack plus the cad_skill fetch instruction, capped at
-    # `skills.SKILL_CATALOG_CHAR_LIMIT` — metadata only, bodies load on demand.
-    #
-    # `cache_witness` is what `prompt_cache` composed (role prose + capability +
-    # preferences, no catalog): the entry must agree with THAT before its tool
-    # text is trusted, or appending here would invalidate every cache hit.
+    # The skills catalog. Role-card prose used to say "full procedure:
+    # skill://assembly-merge" while the only skill:// resolver in the online
+    # model's reach is Chudcode's own, which answers "Unknown skill" for every CAD
+    # pack (live, mission-18d24905b774203f). One line per pack plus the cad_skill
+    # fetch instruction, capped at `skills.SKILL_CATALOG_CHAR_LIMIT` — metadata
+    # only, bodies load on demand.
     cache_witness = system_prompt
     try:
         from services.agent import skills as _skills  # noqa: PLC0415
@@ -2860,14 +2820,87 @@ def linear_role_prompt(
             system_prompt = system_prompt.rstrip() + "\n\n" + _catalog
     except Exception:  # noqa: BLE001 — a broken skills dir never fails a turn
         pass
+    return system_prompt, allowed, cache_witness
 
+
+def role_prompt(
+    role: str,
+    *,
+    card: Any | None = None,
+    capability: Any | None = None,
+    preferences: Any | None = None,
+) -> tuple[str, list[str]]:
+    """``(system_prompt, allowed)`` for one ONLINE (Chudcode) role turn.
+
+    The main chat (``worker_rpc._agent_admin_turn``), delegated roles
+    (``chudcode_roles._assemble_role_runtime``) and the online prompt
+    preview/baseline (``prompt_cache.online_prompt``) all compose here. The
+    system prompt is appended to Chudcode's own; ``allowed`` feeds
+    ``chudcode_tools.build_host_tools``, which hands the tools to Chudcode as
+    native host-tool definitions — so no text tools slot is rendered for this
+    lane.
+    """
+    system_prompt, allowed, _witness = _compose_role_prompt(
+        role, card=card, capability=capability, preferences=preferences
+    )
+    return system_prompt, allowed
+
+
+def linear_role_prompt(
+    role: str,
+    *,
+    resolver: Callable[[str], Any],
+    card: Any | None = None,
+    capability: Any | None = None,
+    tier: str | None = None,
+    preferences: Any | None = None,
+) -> tuple[str, list[str], str | None]:
+    """``(system_prompt, allowed, tools_text)`` for one OFFLINE linear role turn.
+
+    The explicit-offline loop (:func:`run_linear_role_turn` → ``agent_turn.run_turn``)
+    shows its tools as a text slot in the system prompt; online turns use
+    :func:`role_prompt`, which composes the same ``system_prompt`` / ``allowed``
+    without that slot. The tool-schema render is the expensive part (~11 ms for
+    the main-chat floor: ``inspect.signature`` + docstring reads per tool), so
+    the fingerprinted ``prompt_cache`` entry is reused when it provably renders
+    the same bytes:
+
+    * ``system_prompt`` / ``allowed`` are composed HERE, every turn. They cost
+      ~4 ms and they read the preference accessors directly, so the cached
+      entry's copies are used only as a witness: it must agree with this
+      composition before its tool text is trusted. A knob whose value changed
+      without a config.json write (Settings writes call
+      ``prompt_cache.invalidate``; the harness tests monkeypatch the accessors)
+      would otherwise be silently overridden by a fingerprint-valid entry.
+    * ``tools_text`` is taken from the entry only when it provably renders the
+      same bytes: same role prose and allowlist, the tier must allocate the
+      same ``(budget, trim)`` slot the entry was rendered with, and every
+      allowed tool must resolve to the same callable under *resolver* as under
+      the entry's ``resolver_for(None)``.
+    * Otherwise the slot is rendered live with *resolver* — the mission-scoped
+      meta tools (``ask_user``, ``delegate``) resolve to ``MissionDispatch``
+      methods whose signatures and docstrings are different bytes, and the slot
+      is budget-coupled, so splicing cached entries around live ones would
+      change the rendered text — and memoized against the cache fingerprint, so
+      a repeat turn reuses the text without recomposing it while a fingerprint
+      change (settings write, edited docstring, new role card) recomposes.
+
+    Never raises past the composition itself: a cache fault degrades to the
+    live render, and a failed schema render yields ``None``.
+    """
+    from services.agent import agent_turn as _at  # noqa: PLC0415
+    from services.agent import prompt_cache as _pcache  # noqa: PLC0415
+    from services.agent import tool_schemas as _tool_schemas  # noqa: PLC0415
+
+    system_prompt, allowed, cache_witness = _compose_role_prompt(
+        role, card=card, capability=capability, preferences=preferences
+    )
     static = None
     try:
         # No project_root: nothing this lane takes from the entry (role prose,
         # allowlist, tool schemas) depends on the project folder, while keying on
         # it would fold that folder's mtimes into the fingerprint and recompose
-        # the slot every time a file there changes. This is also the key
-        # ``prompt_cache.warm()`` fills at worker start.
+        # the slot every time a file there changes.
         static = _pcache.get(role=role, capability=capability)
         if any(
             w.split(":", 1)[0] in _PROMPT_CACHE_COMPOSE_WARNINGS

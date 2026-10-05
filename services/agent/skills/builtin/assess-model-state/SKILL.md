@@ -17,7 +17,8 @@ Read-only pass. Prefer this before large edits and always before "done".
 1. Scope: `list_parts()` — which docs are open? Pick the target `doc_id`.
 2. Narrative geometry:
    - Part: `describe_part(doc_id)` (and `describe_sketch` if sketch-heavy)
-   - Assembly: `describe_assembly(doc_id)` after `solve_mates` if mates exist
+   - Assembly: `describe_assembly(doc_id)` reads the current mate-solve status;
+     report unresolved mates rather than running `solve_mates` in a read-only pass
 3. Metrics: `measure_part` / `query_geometry` for critical dims.
 4. Structure checks:
    - `check_feature_overlap(doc_id)` on parts

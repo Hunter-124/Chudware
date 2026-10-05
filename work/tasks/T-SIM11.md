@@ -14,8 +14,8 @@ priority: 2
 
 ## Context
 
-The EM sim family landed 2026-07-07 (docs/EM_SIMULATION.md): pluggable adapter layer in
-`engine_oracle/sim/em/` behind `em_status` / `em_eigenmode` / `em_driven` / `em_timedomain`
+The EM sim family landed 2026-07-07 (docs/reference/EM_SIMULATION.md): pluggable adapter layer in
+`services/sim/em/` (originally `engine_oracle/sim/em/`) behind `em_status` / `em_eigenmode` / `em_driven` / `em_timedomain`
 worker RPCs. Shipped REAL: builtin-fdfd 2-D eigensolver (WR-90 TE10 validated to 0.006 %),
 analytic-uniform driven/time-domain, and a complete mock-proven openEMS FDTD adapter
 (`openems_adapter.py` — only the `_execute` solver seam needs a live binary). This task
@@ -24,7 +24,7 @@ captures everything intentionally deferred so nothing is lost.
 ## Definition of done (pick up incrementally; each box is independently shippable)
 
 - [ ] **openEMS live validation**: install openEMS on a dev machine (no PyPI wheel — recipe
-      in docs/EM_SIMULATION.md), run `test_live_openems_if_installed`, record the real WR-90
+      in docs/reference/EM_SIMULATION.md), run `test_live_openems_if_installed`, record the real WR-90
       S21 curve vs analytic in the docs validation table. Consider flipping `_execute` to
       external-process CLI invocation per the license review in contracts/license_debt.md row 9.
 - [ ] **Gmsh+GetDP FEM adapter** (`GetdpAdapter`, currently detection-only scaffold):
@@ -42,21 +42,26 @@ captures everything intentionally deferred so nothing is lost.
       today (PEC polyhedron via CSXCAD AddPolyhedronReader). Wire the doc's solids/tess +
       material/boundary assignments directly (doc_id → tess export → dielectric/metal per
       body material), matching how FEA studies consume the doc.
-- [ ] **Circular-guide ports in openEMS** (`build_plan` currently rejects circular; the
-      builtin FDFD already handles circular eigenmodes).
+- [ ] **Circular-guide ports in openEMS** (`build_plan` currently rejects circular —
+      `services/sim/em/openems_adapter.py`; the builtin FDFD already handles circular eigenmodes).
 - [ ] **Field visualization**: mode field previews exist as JSON grids (`fields: true` on
       em_eigenmode); render them in the GUI (heatmap in the results panel) and add openEMS
       E/H dump boxes → AICM overlay chunks like the FEA/CFD results (contracts/mesh_format.md).
-- [ ] **GUI study kinds**: apply the host/WIRE_REQUESTS.md entry (EM Eigenmode / EM Frequency
-      Sweep / EM Time Domain in SimManager, gated by em_status) once the sim-GUI rework merges.
-- [ ] **MCP tools**: expose em_* as MCP tools (services/mcp) so agents can run EM studies —
-      mirror run_fea_static's shape (`em_status` capability text in the tool docstring).
+- [x] **GUI study kinds**: EM Eigenmode / EM Frequency Sweep / EM Time Domain in SimManager,
+      gated by em_status — landed via T-FIN24: `host/src/ui/ribbon_def.cpp` EM tab
+      (`sim_em_eigen`/`sim_em_sweep`/`sim_em_time`), `host/src/ui/sim_manager.cpp`
+      `probeEmStatus` + `EmForm::{Eigenmode,Driven,TimeDomain}`. The old
+      host/WIRE_REQUESTS.md entry no longer exists.
+- [x] **MCP tools**: em_* exposed as MCP tools so agents can run EM studies —
+      `services/mcp/em_tools.py` (`em_status`/`em_eigenmode`/`em_driven`/`em_timedomain`,
+      registered in `services/mcp/server.py`; capability text in the `em_status` docstring),
+      covered by `services/mcp/test_em_tools.py`.
 
 ## Verify
 
-- `python3 -m pytest engine_oracle/sim/em/test_em.py` stays green (21 real tests; the live
-  test un-skips wherever a solver is installed).
-- Differential rule: numerical adapters validate against `engine_oracle/sim/em/analytic.py`
+- `python3 -m pytest services/sim/em/` stays green (`test_em.py`, `test_em_wave.py`,
+  `test_antenna_bridge.py`; the live test un-skips wherever a solver is installed).
+- Differential rule: numerical adapters validate against `services/sim/em/analytic.py`
   (WR-90 TE10 6.5571 GHz; uniform-section S21=exp(-γL)) — never weaken tolerances.
 
 ## Linkage (FIN finalize, 2026-07-10)

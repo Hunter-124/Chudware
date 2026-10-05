@@ -6,6 +6,7 @@ from typing import Optional, Union
 import json
 import os
 import math
+import threading
 
 from .cad_common import coerce_json_or_repr, require_list, require_mapping
 from .ecad_common import (
@@ -862,14 +863,15 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
     # ---------------------------------------------------------------- autonomous design
 
     @mcp.tool()
-    def ecad_design(request: str) -> str:
+    def ecad_design(request: str, cancel=None) -> str:
         """Autonomous ECAD design: natural-language request -> verified schematic + simulation.
 
         Runs the full deterministic orchestrator pipeline (PLAN -> BUILD -> ERC -> SIMULATE ->
         REPORT) and returns a summary with the doc_id, stage results, ERC counts, and sim
-        pass/fail. With a provider configured, the model proposes the topology; without one (or
-        if the provider is offline/unavailable) the closest built-in recipe is used so the
-        pipeline ALWAYS produces a verified schematic.
+        pass/fail. The model proposes the topology through a tool-free agent-runtime helper
+        (an offline-safe provider when offline/local-only is configured); when that step is
+        unavailable, slow, or rejected, the closest built-in recipe is used and the reason is
+        reported, so the pipeline ALWAYS produces a verified schematic.
 
         After this call the produced schematic becomes the active one -- ecad_status() and
         ecad_simulate() operate on it immediately.
@@ -879,6 +881,8 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
           'LED driver for a red LED from a 3.3V supply'
           'inverting op-amp with gain 10'
         """
+        if callable(cancel) and cancel():
+            return _err("ecad_design cancelled")
         # Lazy-import so a missing scipy/numpy degrades gracefully.
         try:
             from services import ecad_design as _orch  # type: ignore
@@ -890,17 +894,25 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                         next_actions=["ecad_new_schematic('mydesign')",
                                       "ecad_find_part('resistor')"])
 
-        # Resolve the configured provider (best-effort; fall back to None -> recipe path).
+        # Resolve the helper model step (best-effort; fall back to None -> recipe path).
         # WHY the model path did not run must never be swallowed: a canned recipe standing in
         # for model-authored design is only honest if the caller is told it happened AND why.
-        # get_provider() returns None when nothing is configured (e.g. the hermetic test config)
-        # and raises when resolution itself fails — both used to vanish into `pass`.
+        # Online the planner is a tool-free completion through the agent runtime, which owns
+        # auth/retry/model; offline/local-only binds an offline-safe provider. Resolution
+        # raises when the selection cannot be honoured.
+        # An abandoned plan (budget overrun / error) or a host Stop cancels the helper so it
+        # never keeps a model request running behind the recipe fallback.
+        plan_abandoned = threading.Event()
+
+        def _plan_cancelled() -> bool:
+            return plan_abandoned.is_set() or bool(callable(cancel) and cancel())
+
         provider = None
         provider_setup_err: Exception | None = None
         try:
-            from services.agent import config as _cfg  # type: ignore
-            provider = _cfg.get_provider()
-        except Exception as exc:  # noqa: BLE001 -- offline / unconfigured / module absent
+            from services.agent.providers.chudcode_provider import helper_provider
+            provider = helper_provider("ecad_engineer", cancel=_plan_cancelled)
+        except Exception as exc:  # noqa: BLE001 -- offline refusal / role resolution / module absent
             provider_setup_err = exc
         provider_absent = provider is None and provider_setup_err is None
 
@@ -929,7 +941,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
             _PLAN_BUDGET_S = float(os.environ.get("CHUDWARE_ECAD_PLAN_BUDGET_S", "") or 12.0)
         except (TypeError, ValueError):
             _PLAN_BUDGET_S = 12.0
-        if not (_PLAN_BUDGET_S > 0.0):
+        if not (math.isfinite(_PLAN_BUDGET_S) and _PLAN_BUDGET_S > 0.0):
             _PLAN_BUDGET_S = 12.0
 
         plan_box: dict = {}
@@ -986,6 +998,8 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                     plan_box.clear()
                 # st == "done" and no err: plan_box holds design/recipe_used.
             finally:
+                # The plan phase is over: a still-running (timed-out) helper stops now.
+                plan_abandoned.set()
                 with _PROVIDER_PLAN_LOCK:
                     _PROVIDER_PLAN_BUSY["v"] = False
         elif provider is None:
@@ -994,6 +1008,8 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
             plan_gen["v"] = my_gen
             _plan_worker(my_gen)
         # provider_busy: leave plan_box empty -> recipe plan below.
+        if callable(cancel) and cancel():
+            return _err("ecad_design cancelled")
 
         design = plan_box.get("design")
         recipe_used = plan_box.get("recipe_used")

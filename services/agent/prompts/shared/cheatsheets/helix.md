@@ -47,5 +47,3 @@ Full op JSON:
 THREAD FORM — same idea: profile = the thread cross-section (triangle/trapezoid), path = a helix
 whose radius matches the thread's pitch radius. Sweep mode "cut" on a cylinder shaft = external
 thread; mode "boss" on a hollow bore sketch = internal thread form.
-
-Confirmed against: validate.cpp FEATURE_TYPES helix entry + test_document.cpp cases 7 & 8.

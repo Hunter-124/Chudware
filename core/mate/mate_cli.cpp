@@ -1,5 +1,5 @@
-// mate_cli — tiny CLI wrapper around chudware::mate::solve_mates for the
-// differential-test harness (tools/mate_diff.py).
+// mate_cli — standalone CLI around chudware::mate::solve_mates_json for solving
+// and debugging mate fixtures (e.g. core/mate/corpus/*.json) outside the app.
 //
 // Usage:
 //   mate_cli <fixture.json>     read the fixture from a file
@@ -15,7 +15,7 @@
 //     "warm":  { component_id: {"t":[3], "w":[3]}, ... }   (optional),
 //     "drag":  { "component": id, "target":[3] }           (optional)
 //   }
-//   Any extra fields the harness fixtures carry ("name", "expect", ...) are ignored.
+//   Any extra fields a fixture carries ("name", "expect", ...) are ignored.
 // Output : a JSON object printed to stdout, one line, full float precision:
 //   {
 //     "converged":    bool,
@@ -32,7 +32,7 @@
 //   }
 //
 // nlohmann::json serializes doubles round-trip (shortest exact representation),
-// so the Python side parses back the same bit pattern. Exit code 0 on success, 2
+// so callers parse back the same bit pattern. Exit code 0 on success, 2
 // on a usage/IO/parse error.
 
 #include "mate/mate.h"

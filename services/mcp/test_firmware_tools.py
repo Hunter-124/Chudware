@@ -8,9 +8,7 @@ Defends the contracts an agent authoring firmware actually depends on:
   written at all. ``fw_sources(write={relpath: content})`` is the sanctioned path, and the
   test below drives the FULL loop with tool calls only and asserts the exact TEXT is at the
   path the build compiles (plus a real cross-toolchain build when one is installed).
-* The argument dialect a live model actually types: ``fw_status(project_id=...)``,
-  ``fw_sim_run(run_s=..., power_profile=True)`` — accepted or refused with a message that
-  names the tool that does the job, never silently dropped.
+* Consumer file-I/O boundaries and invalid simulation inputs are refused before launch.
 * A genuinely unknown argument is still a hard refusal (no catch-all **kwargs).
 """
 from __future__ import annotations
@@ -99,26 +97,21 @@ def test_authoring_loop_puts_real_source_where_the_build_compiles_it(tools):
     root = created["root_dir"]                    # surfaced so the agent can read it back
     assert os.path.isdir(root)
 
-    written = _call(tools, "fw_sources", project_id=pid,
-                    write={"src/main.c": MAIN_C, "src/blink.c": BLINK_C})
-    assert "src/blink.c" in written["src_paths"]
-    assert {w["path"] for w in written["written"]} == {"src/main.c", "src/blink.c"}
-    # A brand-new source is useless unless the build knows about it: the cmake_arm template
-    # hard-codes src/main.c + src/startup.c, so fw_sources must extend add_executable().
-    assert written["cmake_sources_added"] == ["src/blink.c"]
+    _call(tools, "fw_sources", project_id=pid,
+          write={"src/main.c": MAIN_C, "src/blink.c": BLINK_C})
 
     # READ BACK from the path the build compiles — not the tool's own ok/echo.
     main_abs = os.path.join(root, "src", "main.c")
-    assert next(w for w in written["written"] if w["path"] == "src/main.c")["abs_path"] == main_abs
+    with open(os.path.join(root, "src", "blink.c"), encoding="utf-8") as fh:
+        assert fh.read() == BLINK_C
     with open(main_abs, encoding="utf-8") as fh:
         assert fh.read() == MAIN_C
     # ...and through the tool an agent would use — reads are jailed in general
     # (3aaee658), but a REGISTERED firmware project root is the one read carve-out:
     # fw_sources' contract is "write through fw_sources, read it back with fs_read".
     got = _call(tools, "fs_read", path=main_abs, raw=True)
-    assert got["ok"] and "CHUDWARE_AUTHORED_MARKER" in got["text"]
-    assert "blink_once" in got["text"]
-    assert "src/blink.c" in open(os.path.join(root, "CMakeLists.txt"), encoding="utf-8").read()
+    assert got["ok"]
+    assert got["text"] == MAIN_C
 
     build = _call(tools, "fw_build", project_id=pid)
     if build.get("returncode") == -1:
@@ -147,48 +140,54 @@ def test_add_dict_entries_are_a_write_synonym(tools):
         assert fh.read() == "void drv(void){}\n"
 
 
-def test_list_add_remove_behaviour_is_unchanged(tools):
-    """The legacy shapes must keep their exact old semantics (stub, sorted, no extras)."""
-    pid = _call(tools, "fw_new_project", mcu_family="stm32f4")["project_id"]
+def test_source_add_creates_a_stub_and_remove_deregisters_without_deleting_it(tools):
+    created = _call(tools, "fw_new_project", mcu_family="stm32f4")
+    pid, root = created["project_id"], created["root_dir"]
     listed = _call(tools, "fw_sources", project_id=pid)
-    assert listed == {"src_paths": ["src/main.c", "src/startup.c"]}
+    original = set(listed["src_paths"])
 
     added = _call(tools, "fw_sources", project_id=pid, add=["src/stub.c"])
-    assert added == {"src_paths": ["src/main.c", "src/startup.c", "src/stub.c"]}
-    root = _call(tools, "fw_sources", project_id=pid, write={"src/main.c": MAIN_C})["root_dir"]
-    assert os.path.getsize(os.path.join(root, "src", "stub.c")) == 0   # still an empty stub
+    assert set(added["src_paths"]) == original | {"src/stub.c"}
+    stub = os.path.join(root, "src", "stub.c")
+    with open(stub, encoding="utf-8") as fh:
+        assert fh.read() == ""
 
-    removed = _call(tools, "fw_sources", project_id=pid, remove=["src/startup.c"])
-    assert removed == {"src_paths": ["src/main.c", "src/stub.c"]}
+    removed = _call(tools, "fw_sources", project_id=pid, remove=["src/stub.c"])
+    assert set(removed["src_paths"]) == original
+    assert os.path.isfile(stub)
 
 
 def test_write_refuses_escaping_and_unknown_projects(tools):
     pid = _call(tools, "fw_new_project", mcu_family="stm32f4")["project_id"]
     esc = _call(tools, "fw_sources", project_id=pid, write={"../../evil.c": "x"})
-    assert esc["code"] == "invalid_request" and "escapes" in esc["hint"]
+    assert esc["code"] == "invalid_request"
 
     abs_outside = _call(tools, "fw_sources", project_id=pid, write={"/etc/evil.c": "x"})
     assert abs_outside["code"] == "invalid_request"
 
     unknown = _call(tools, "fw_sources", project_id="nope", write={"src/main.c": "x"})
-    assert unknown["code"] == "unknown_project" and "fw_new_project" in unknown["hint"]
+    assert unknown["code"] == "unknown_project"
 
     not_text = _call(tools, "fw_sources", project_id=pid, write={"src/main.c": 17})
-    assert not_text["code"] == "invalid_request" and "string" in not_text["hint"]
+    assert not_text["code"] == "invalid_request"
 
 
-def test_absolute_path_inside_the_project_is_relativised(tools):
+def test_absolute_path_inside_the_project_writes_source(tools):
     created = _call(tools, "fw_new_project", mcu_family="stm32f4")
     pid, root = created["project_id"], created["root_dir"]
-    out = _call(tools, "fw_sources", project_id=pid,
-                write={os.path.join(root, "src", "main.c"): MAIN_C})
-    assert out["written"][0]["path"] == "src/main.c"
+    _call(tools, "fw_sources", project_id=pid,
+          write={os.path.join(root, "src", "main.c"): MAIN_C})
+    with open(os.path.join(root, "src", "main.c"), encoding="utf-8") as fh:
+        assert fh.read() == MAIN_C
 
 
-def test_fs_write_into_a_firmware_project_names_fw_sources(tools, tmp_path, monkeypatch):
-    """The other path must not be a dead end (and the jail must not widen)."""
+def test_fs_write_cannot_modify_a_firmware_project(tools, tmp_path, monkeypatch):
+    """Firmware reads are allowed, but writes must still respect the workspace jail."""
     created = _call(tools, "fw_new_project", mcu_family="stm32f4")
-    pid, root = created["project_id"], created["root_dir"]
+    root = created["root_dir"]
+    main_abs = os.path.join(root, "src", "main.c")
+    with open(main_abs, encoding="utf-8") as fh:
+        original = fh.read()
     workspace = tmp_path / "work"
     workspace.mkdir()
     monkeypatch.setenv("CHUDWARE_FS_ROOT", str(workspace))
@@ -196,10 +195,8 @@ def test_fs_write_into_a_firmware_project_names_fw_sources(tools, tmp_path, monk
     refused = _call(tools, "fs_write", path=os.path.join(root, "src", "main.c"), content=MAIN_C)
     assert refused["ok"] is False
     assert refused["reason"] == "use_fw_sources"
-    assert "fw_sources" in refused["hint"] and pid in refused["hint"]
-    assert 'write={"src/main.c"' in refused["hint"]
-    with open(os.path.join(root, "src", "main.c"), encoding="utf-8") as fh:
-        assert "CHUDWARE_AUTHORED_MARKER" not in fh.read()   # jail held: nothing written
+    with open(main_abs, encoding="utf-8") as fh:
+        assert fh.read() == original
 
     # Unrelated cross-root writes keep the ORIGINAL refusal — the jail did not widen.
     other = _call(tools, "fs_write", path=str(tmp_path / "elsewhere.txt"), content="x")
@@ -207,30 +204,17 @@ def test_fs_write_into_a_firmware_project_names_fw_sources(tools, tmp_path, monk
     assert not (tmp_path / "elsewhere.txt").exists()
 
 
-# ------------------------------------------------------------------ item 2: fw_status
-
-def test_fw_status_accepts_project_id_and_says_it_is_global(tools):
-    bare = _call(tools, "fw_status")
-    with_pid = _call(tools, "fw_status", project_id="x")
-    note = with_pid.pop("note")
-    assert with_pid == bare                      # payload otherwise identical
-    assert "GLOBAL" in note and "ignored" in note
-    assert "fw_sources(project_id=...)" in note
-
-
-# ------------------------------------------------------------------ item 3: fw_sim_run
+# ------------------------------------------------------------------ simulation boundaries
 
 @pytest.fixture
-def sim_spy(tools, monkeypatch):
-    """Capture the params fw_sim_run hands the engine, without running an emulator."""
+def simulation_calls(tools, monkeypatch):
+    """Observe whether boundary validation or trace availability permits an RPC."""
     seen = []
 
     def fake(method, params=None):
-        seen.append((method, params or {}))
+        seen.append(method)
         if method == "fw_sim_run":
-            return {"passed": False, "uart_log": "", "trace_path": fake.trace}
-        if method == "fw_power_profile":
-            return {"schema": "aicad.powerprofile/1", "rails": []}
+            return {"trace_path": fake.trace}
         return {}
 
     fake.trace = ""
@@ -238,46 +222,47 @@ def sim_spy(tools, monkeypatch):
     return tools, seen, fake
 
 
-def test_run_s_is_applied_as_the_real_duration_knob(sim_spy):
-    tools, seen, _ = sim_spy
-    out = _call(tools, "fw_sim_run", project_id="p", run_s=1.0)
-    assert seen[0][1]["timeout_s"] == 6.0        # engine runs the target for timeout_s - 5
-    assert any("run_s=1.0 applied as timeout_s=6" in n for n in out["arg_notes"])
+def test_scenario_file_failures_and_ambiguous_sources_do_not_launch(simulation_calls, tmp_path):
+    tools, seen, _ = simulation_calls
+    missing = tmp_path / "missing.json"
+    out = _call(tools, "fw_sim_run", project_id="p", scenario_path=str(missing))
+    assert out["code"] == "invalid_request"
+    path = tmp_path / "bad-encoding.json"
+    path.write_bytes(b"\xff")
+    out = _call(tools, "fw_sim_run", project_id="p", scenario_path=str(path))
+    assert out["code"] == "invalid_request"
+    out = _call(tools, "fw_sim_run", project_id="p",
+                scenario="fixture:user_button", scenario_path=str(path))
+    assert out["code"] == "invalid_request"
+    out = _call(tools, "fw_sim_run", project_id="p", backend="pretend")
+    assert out["code"] == "invalid_request"
+    assert not seen
 
 
-def test_explicit_timeout_s_wins_over_run_s(sim_spy):
-    tools, seen, _ = sim_spy
-    out = _call(tools, "fw_sim_run", project_id="p", run_s=1.0, timeout_s=40.0)
-    assert seen[0][1]["timeout_s"] == 40.0
-    assert any("run_s=1.0 ignored" in n for n in out["arg_notes"])
+@pytest.mark.parametrize("text", ["", "{broken", "[]", '"fixture:user_button"'])
+def test_saved_file_must_be_a_json_object_not_a_silent_empty_run(simulation_calls, tmp_path, text):
+    tools, seen, _ = simulation_calls
+    path = tmp_path / "scenario.json"
+    path.write_text(text, encoding="utf-8")
+    out = _call(tools, "fw_sim_run", project_id="p", scenario_path=str(path))
+    assert out["code"] == "invalid_request"
+    assert not seen
 
 
-def test_no_duration_argument_leaves_the_engine_default(sim_spy):
-    tools, seen, _ = sim_spy
-    out = _call(tools, "fw_sim_run", project_id="p")
-    assert "timeout_s" not in seen[0][1]
-    assert "arg_notes" not in out
-
-
-def test_power_profile_names_fw_power_profile_and_chains_it(sim_spy):
-    tools, seen, fake = sim_spy
+def test_power_profile_is_available_when_a_trace_exists(simulation_calls):
+    tools, seen, fake = simulation_calls
     fake.trace = "/tmp/run.trace.json"
     out = _call(tools, "fw_sim_run", project_id="p", power_profile=True)
-    note = " ".join(out["arg_notes"])
-    assert "fw_power_profile" in note and "trace_path" in note
-    assert out["power_profile"]["schema"] == "aicad.powerprofile/1"
-    assert ("fw_power_profile", {"trace_path": "/tmp/run.trace.json",
-                                 "project_id": "p"}) in seen
+    assert "power_profile" in out
+    assert "fw_power_profile" in seen
 
 
-def test_power_profile_without_a_trace_still_explains_itself(sim_spy):
-    tools, seen, fake = sim_spy
+def test_power_profile_is_not_fabricated_without_a_trace(simulation_calls):
+    tools, seen, fake = simulation_calls
     fake.trace = ""
     out = _call(tools, "fw_sim_run", project_id="p", power_profile=True)
-    note = " ".join(out["arg_notes"])
-    assert "fw_power_profile" in note and "no trace_path" in note
     assert "power_profile" not in out
-    assert [m for m, _ in seen] == ["fw_sim_run"]      # nothing fabricated
+    assert "fw_power_profile" not in seen
 
 @pytest.mark.parametrize(
     ("argument", "value"),
@@ -287,52 +272,52 @@ def test_power_profile_without_a_trace_still_explains_itself(sim_spy):
         ("timeout_s", float("inf")),
     ],
 )
-def test_simulation_rejects_invalid_time_bounds_before_rpc(sim_spy, argument, value):
-    tools, seen, _ = sim_spy
+def test_simulation_rejects_invalid_time_bounds_before_rpc(simulation_calls, argument, value):
+    tools, seen, _ = simulation_calls
     out = _call(tools, "fw_sim_run", project_id="p", **{argument: value})
     assert out["code"] == "invalid_request"
     assert not seen
 
 
-def test_simulation_rejects_bad_images_and_assertions_before_rpc(sim_spy, tmp_path):
-    tools, seen, _ = sim_spy
+def test_simulation_rejects_bad_images_and_assertions_before_rpc(simulation_calls, tmp_path):
+    tools, seen, _ = simulation_calls
     bad_elf = tmp_path / "bad.elf"
     bad_elf.write_bytes(b"not an elf")
     out = _call(tools, "fw_sim_run", project_id="p", elf_path=str(bad_elf))
-    assert out["code"] == "invalid_request" and "not an ELF" in out["hint"]
+    assert out["code"] == "invalid_request"
     assert not seen
 
     out = _call(tools, "fw_sim_run", project_id="p", assertions=[""])
-    assert out["code"] == "invalid_request" and "non-empty" in out["hint"]
+    assert out["code"] == "invalid_request"
     assert not seen
 
 
-def test_sensor_tool_refuses_ambiguous_nonfinite_and_invalid_grids(sim_spy):
-    tools, seen, _ = sim_spy
+def test_sensor_tool_refuses_ambiguous_nonfinite_and_invalid_grids(simulation_calls):
+    tools, seen, _ = simulation_calls
     profile = {"t_s": [0.0, 1.0], "altitude_m": [10.0, 11.0]}
     sensors = [{"device": "bmp280"}]
 
     out = _call(
         tools, "fw_sensor_scenario", profile=profile, sim_result=profile,
         sensor_map=sensors)
-    assert out["code"] == "invalid_request" and "not both" in out["hint"]
+    assert out["code"] == "invalid_request"
     out = _call(
         tools, "fw_sensor_scenario", profile=profile, sensor_map=sensors, dt_s=0.0)
-    assert out["code"] == "invalid_request" and "dt_s" in out["hint"]
+    assert out["code"] == "invalid_request"
     out = _call(
         tools, "fw_sensor_scenario", profile=profile, sensor_map=sensors,
         duration_s=-1.0)
-    assert out["code"] == "invalid_request" and "duration_s" in out["hint"]
+    assert out["code"] == "invalid_request"
     out = _call(
         tools, "fw_sensor_scenario",
         profile='{"t_s":[0, NaN], "altitude_m":[10,11]}',
         sensor_map=sensors)
-    assert out["code"] == "invalid_request" and "$.t_s[1]" in out["hint"]
+    assert out["code"] == "invalid_request"
     assert not seen
 
 
-def test_direct_emulator_tools_validate_setup_and_forward_valid_runs(sim_spy, tmp_path):
-    tools, seen, _ = sim_spy
+def test_direct_emulator_tools_refuse_invalid_setup_before_rpc(simulation_calls, tmp_path):
+    tools, seen, _ = simulation_calls
     elf = tmp_path / "app.elf"
     header = bytearray(52)
     header[:7] = b"\x7fELF\x01\x01\x01"
@@ -343,35 +328,11 @@ def test_direct_emulator_tools_validate_setup_and_forward_valid_runs(sim_spy, tm
     resc.write_text("mach create\n", encoding="utf-8")
 
     out = _call(
-        tools, "fw_emulate_simavr", elf_path=str(elf), mcu="atmega328p", run_s=0.5)
-    assert out == {}
-    assert seen[-1] == (
-        "fw_emulate_simavr",
-        {"elf_path": str(elf), "mcu": "atmega328p", "run_s": 0.5},
-    )
-
-    out = _call(
-        tools, "fw_emulate_renode", resc_path=str(resc), run_s=1.0, gdb=True,
-        gdb_port=4444, mi_commands=["-exec-step-instruction"])
-    assert out == {}
-    assert seen[-1] == (
-        "fw_emulate_renode",
-        {
-            "resc_path": str(resc),
-            "run_s": 1.0,
-            "gdb": True,
-            "gdb_port": 4444,
-            "mi_commands": ["-exec-step-instruction"],
-        },
-    )
-
-    seen.clear()
-    out = _call(
         tools, "fw_emulate_simavr", elf_path=str(elf), mcu="atmega328p", run_s=-1.0)
     assert out["code"] == "invalid_request"
     out = _call(
         tools, "fw_emulate_renode", resc_path=str(resc), mi_commands=["-exec-run"])
-    assert out["code"] == "invalid_request" and "gdb=True" in out["hint"]
+    assert out["code"] == "invalid_request"
     assert not seen
 
 

@@ -531,7 +531,7 @@ static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
     chatCopyContext(cardRect, "##provlog_copy", allCopy);
 }
 
-static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW,
+static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
                               int msgIdx = -1, int turnNum = 0, bool isLastTurn = false) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& turnSurf = chatSurf();
@@ -624,8 +624,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     }
 
     // (1) Plan / Objectives — multi-shape section (tiles + todos + subagents).
-    // Prefer planState; back-compat: legacy PlanInfo (Python kind:plan via app.cpp) normalizes
-    // on the fly when planState was never filled. When a rowKind-18 marker exists in the
+    // Prefer planState; a PlanInfo-only turn (feed.cpp kind:plan) normalizes on the fly when
+    // planState was never filled. When a rowKind-18 marker exists in the
     // activity timeline the section renders THERE (arrival position) instead — drawing it
     // here too would double the card and re-introduce the out-of-order top-pin bug.
     bool planInTimeline = false;
@@ -634,7 +634,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     if (!planInTimeline && m.planState.present) {
         drawPlanSection(m.planState, m.activity, fonts);
     } else if (!planInTimeline && m.plan.present) {
-        // Lazy normalize so the old AgentEvent plan path still lights the section.
+        // Lazy normalize so a PlanInfo-only turn still lights the section.
         m.planState = planStateFromPlanInfo(m.plan);
         drawPlanSection(m.planState, m.activity, fonts);
     } else if (planInTimeline && m.planState.present && m.running) {
@@ -653,7 +653,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 
     // (2) Agent timeline — typed blocks in arrival order: thinking, tool cards, and the
     // model's prose exactly where it was spoken.
-    drawAgentTimeline(st, m, fonts, logW, gShowThinking, isLastTurn);
+    drawAgentTimeline(st, m, fonts, gShowThinking, isLastTurn);
 
     // What the timeline did NOT already show. For a streamed turn this is normally empty (or
     // a note appended after the fact, e.g. "(Stopped by you.)"); for a non-streaming provider
@@ -709,13 +709,6 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     if (!m.asks.empty()) drawAskCards(st, m, fonts);
     // (4b) Plan-mode / mission plan_ready approve gate (Execute as Agent/Swarm/Eng.Firm).
     if (m.planApprovePending && !m.running) drawPlanApproveCard(st, m, fonts);
-
-    // (5) Legacy v1 AgentStep cards — kept for backward compat (glass-restyled in drawAgentStep).
-    for (size_t si = 0; si < m.steps.size(); ++si) {
-        ImGui::PushID((int)si);
-        drawAgentStep(m.steps[si], fonts, logW);
-        ImGui::PopID();
-    }
 
     // (6) While running the live activity stream (timeline thoughts/tools/output) is the
     // primary content — no fake "Saying · working..." bar. The liveStatus line appears only when
@@ -1083,8 +1076,7 @@ void drawChatLogWindowed(AppState& st) {
         if (m.fromUser) {
             drawUserBlock(st, m, fonts, logW, (int)mi);
         } else {
-            drawAssistantTurn(st, m, fonts, logW, (int)mi, thisTurn,
-                              (int)mi == lastAssistantIdx);
+            drawAssistantTurn(st, m, fonts, (int)mi, thisTurn, (int)mi == lastAssistantIdx);
             ImGui::Dummy(ImVec2(0, ui::metrics::cpChatMsgGap()));   // air before the next message
         }
         ImGui::EndGroup();

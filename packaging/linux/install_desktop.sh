@@ -6,11 +6,11 @@
 # entry's StartupWMClass=chudware binds the live window to it — so the taskbar icon
 # resolves even for a window launched outside the launcher.
 #
-# The binary is named chudware (deep rename); a Chudware compat symlink ships beside
-# it for legacy scripts, but Exec points at the canonical host/build-linux/bin/chudware.
+# Exec points at the build's binary, host/build-linux/bin/chudware (the build produces
+# no alternate-name symlinks).
 #
 # Usage:  packaging/linux/install_desktop.sh
-#    or:  scripts/install_desktop.sh   (thin wrapper)
+#    or:  scripts/install_desktop.sh   (runs scripts/provision_venv.sh first, then this)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

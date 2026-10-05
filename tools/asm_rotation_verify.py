@@ -5,26 +5,11 @@ then Z, R=Rz*Ry*Rx) and feeds it to asm_insert_component. This harness reproduce
 formula and confirms that inserting a long-X part with rot=[0,0,90] swaps its world X/Y extents
 (i.e. the rotation is honored end-to-end through the assembly compile + world placement).
 """
-import ctypes, json, math, os, tempfile
+import json, math, os, sys, tempfile
 
-DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "Chudware")
-os.add_dll_directory(DIST)
-lib = ctypes.WinDLL(os.path.join(DIST, "libchudware.dll"))
-lib.chudware_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-lib.chudware_call.restype = ctypes.c_int
-lib.chudware_free.argtypes = [ctypes.c_char_p]
-
-
-def call(method, params):
-    out = ctypes.c_char_p()
-    rc = lib.chudware_call(method.encode(), json.dumps(params).encode(), ctypes.byref(out))
-    raw = out.value.decode() if out.value else ""
-    if out.value:
-        lib.chudware_free(out)
-    data = json.loads(raw) if raw else {}
-    if rc != 0 or (isinstance(data, dict) and data.get("code")):
-        raise RuntimeError(f"{method} failed rc={rc}: {raw[:300]}")
-    return data
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("CHUDWARE_ENGINE_DAEMON", "0")
+from services.mcp.core_bridge import call
 
 
 def placement_transform(pos, rot):

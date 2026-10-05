@@ -1,4 +1,4 @@
-"""services/browser/adapters/traceparts.py — TraceParts source adapter (T-X2).
+"""services/browser/adapters/traceparts.py — TraceParts source adapter.
 
 TraceParts requires an account to download most CAD, and a subset of supplier
 catalogs additionally gate downloads behind a per-download terms
@@ -7,14 +7,11 @@ NOT uniform across TraceParts, unlike GrabCAD's simpler login-only gate).
 This adapter never accepts such terms on the user's behalf: it detects the
 click-through and surfaces :func:`terms_confirmation_required` instead.
 
-Relationship to ``work/backlog/T-BL12.md`` ("TraceParts + Werk24 paid tiers",
-parked, priority 5): that plan is the *paid API* route and is untouched by
-this adapter, which uses the user's own authenticated browser session
-instead — a different mechanism serving the same catalog.
+This is the user's authenticated browser-session route, not a paid API integration.
 
-NOTE: as with grabcad.py, the regexes/markers below are a v1 best-effort
-shape, not verified against a live logged-in TraceParts session (T-X6 gates
-the real per-source integration tests behind an env flag).
+NOTE: as with grabcad.py, the regexes/markers below are a best-effort shape,
+not verified against a live logged-in TraceParts session. The real per-source
+integration tests are gated by ``CHUDWARE_BROWSER_INTEGRATION_TESTS``.
 """
 from __future__ import annotations
 

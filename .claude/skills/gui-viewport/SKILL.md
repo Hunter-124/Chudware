@@ -7,27 +7,30 @@ description: Chudware 3D viewport specialist — OpenGL rendering, orbit camera,
 
 Scope: the 3D scene and everything drawn in or picked from it. Panel chrome around the
 viewport (docking, glass columns) belongs to `gui-theme-layout`; ribbon buttons that trigger
-view commands belong to `gui-ribbon-commands`.
+view commands belong to `gui-ribbon-commands`. Shared-file ownership, waves and verification:
+`gui-orchestrator`.
 
 ## File map
 
 | File | Role |
 |---|---|
 | `host/src/ui/viewport_panel.cpp/.h` | Viewport panel: input handling, gizmo, selection UX, per-frame draw of the 3D region |
-| `host/src/renderer.cpp/.h` (~2.2k LOC) | Core OpenGL renderer: orbit camera, mesh render, shaders, thumbnail/transparent render path (used by the icon pipeline) |
+| `host/src/renderer.cpp/.h` | Core OpenGL renderer: orbit camera, mesh render, shaders, thumbnail/transparent render path (used by the icon pipeline) |
 | `host/src/render/id_pass.cpp/.h` | ID-pass picking: renders face/edge IDs to an offscreen buffer; a click reads back the ID under the cursor |
 | `host/src/render/overlays.cpp/.h` | Native GL scene overlays: selection washes, simulation indicators, and timed/glowing CAM path batches |
 | `host/src/render/splat_renderer.cpp/.h`, `re_points.cpp` | Gaussian-splat / point-cloud rendering (reverse-engineering capture views) |
 | `host/src/render/aicm_loader.cpp` | Loads `.aicm` mesh artifacts |
-| `host/src/mesh.cpp` | Mesh data (vertices, faces, normals) from worker tessellation |
+| `host/src/mesh.cpp` | Host `Mesh` data (vertices, faces, normals) |
 
 ## Data flow
 
-Python kernel tessellates → worker events drained per frame in `host/src/core/engine_events.cpp`
-→ mesh stored on `AppState::DocTab::mesh` → renderer draws active doc → user click → id_pass
-readback → face/edge ID added to `DocTab::selection` → PropertyManager / feature ops consume
-the selection. Per-doc state lives on `AppState::DocTab` (`host/src/core/app_state.h`);
-`viewport` itself is a subsystem member of `AppState`.
+libchudware (in `chudware-hostd`) tessellates the document into an AICM file → `doc.changed`
+events drained per frame in `host/src/core/engine_events.cpp` → `AppState::loadDocMesh` /
+`loadDocMeshAsync` parse it and feed the renderer, ID pass and overlays → user click → id_pass
+readback → `render::PickHit` added to `AppState::selection` → PropertyManager / feature ops
+consume the selection. Background tabs keep their parsed mesh on `DocSession::cachedDocMesh`;
+per-document state is parked on `DocSession` across tab switches
+(`captureDocState`/`restoreDocState`).
 
 CAM generation follows a sibling path: `cam_panel.cpp`/`CamMirror` retain the active job's
 classified world-space segments, global timing, direction glyphs, stock and simulation frames;
@@ -65,13 +68,13 @@ reuse the old frame-zero upload.
 
 ## Conventions & gotchas
 
-- Selection and picking are ID-based (topo IDs from the kernel), not raycast against triangles.
-  If you add a pickable thing, it needs an ID-pass representation.
+- Selection and picking are ID-based (topo IDs from libchudware's tessellation), not raycast
+  against triangles. If you add a pickable thing, it needs an ID-pass representation.
 - The transparent thumbnail path in `renderer.cpp` is a shared dependency of the icon pipeline
   (`scripts/icon_pipeline.py`) — changing its background/alpha behavior breaks icon generation.
 - Colors: never hardcode — pull from `ui_theme` (`host/src/ui_theme.h`);
-  `scripts/gui_lint.py --rule theme` fails the gate otherwise.
-- Headless render modes exist for testing: `Chudware --render <in.stl> <out.png>` and
+  `scripts/gui_lint.py --rule color` fails the gate otherwise.
+- Headless render modes exist for testing: `chudware --render <in.stl> <out.png>` and
   `--contact <in.stl> <out.png>`.
 
 ## In-context component edit (ghost mesh)
@@ -90,13 +93,6 @@ reuse the old frame-zero upload.
   banner ("Editing model: …" + Return-to-assembly) is in `viewport_panel.cpp`; its button calls
   `st.exitComponentEdit()`.
 
-## Build & smoke
+Scenario that exercises the viewport end to end: `CHUDWARE_SHOT=m1` (box + fillet + edit + undo,
+`host/src/ui/scenarios.cpp`); splat rendering has its own `reveng_splat` proof above.
 
-```bash
-./build.sh                        # repo root; 2–3 min
-CHUDWARE_SHOT=m1 ./host/build-linux/bin/Chudware --ui-screenshot scratch/vp_smoke.png
-```
-The `m1` scenario (box + fillet + edit + undo, `host/src/ui/scenarios.cpp`) exercises the
-viewport end to end — use it to confirm nothing crashes, not to judge visuals. Never run git;
-return files changed + a one-line user check (e.g. "orbit + click a face — highlight matches
-the new hover color").

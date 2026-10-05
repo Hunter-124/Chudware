@@ -1,192 +1,117 @@
-# graphify reference: incremental update and cluster-only
+# graphify reference: semantic builds, updates and clustering
 
-Load this only when the user passed `--update` or `--cluster-only`. A first-time full build never reads this file.
+`/graphify <path> --update` is a **host-agent workflow**, not a `graphify extract --update` option. `graphify update [path]` is the installed local AST operation: no LLM or API key. Keep the recorded scan root; never use a narrowed subset to refresh an existing parent graph. All snippets below run from the output parent containing `graphify-out/`. Substitute `INPUT_PATH` with that original scan root. Use the installed interpreter recorded by SKILL.md; do not run install commands to repair a documentation mismatch.
 
-## For --update (incremental re-extraction)
+## Prepare
 
-Use when you've added or modified files since the last run. Only re-extracts changed files - saves tokens and time.
+For an existing graph, run `graphify update INPUT_PATH` for local code changes. It preserves semantic contributions, can quick-scan document structure and reconciles deletions. Its guard rejects unexplained node loss, not every smaller graph. Report refusals; `--force` or ambient `GRAPHIFY_FORCE` must not bypass them without explicit acceptance. For a first build, run `graphify extract INPUT_PATH --code-only --out .` **only if code exists**; docs/media-only corpora start below without an empty AST build.
 
-```bash
-$(cat graphify-out/.graphify_python) -c "
-import sys, json
-from graphify.detect import detect_incremental, save_manifest
-from pathlib import Path
-
-result = detect_incremental(Path('INPUT_PATH'))
-new_total = result.get('new_total', 0)
-print(json.dumps(result, indent=2, ensure_ascii=False))
-Path('graphify-out/.graphify_incremental.json').write_text(json.dumps(result, ensure_ascii=False), encoding=\"utf-8\")
-deleted = list(result.get('deleted_files', []))
-if new_total == 0 and not deleted:
-    print('No files changed since last run. Nothing to update.')
-    raise SystemExit(0)
-if deleted:
-    print(f'{len(deleted)} deleted file(s) to prune.')
-if new_total > 0:
-    print(f'{new_total} new/changed file(s) to re-extract.')
-"
-```
-
-Then populate `.graphify_detect.json` so Steps 3A–6 (which read it unconditionally) see the right state for an incremental run. `files` carries the changed subset (drives Step 3A AST + Step 3B0 cache check on only what changed); `all_files` carries the full corpus for any step that needs corpus-wide context:
+Detect the current corpus and semantic changes:
 
 ```bash
-$(cat graphify-out/.graphify_python) -c "
+"$(cat graphify-out/.graphify_python)" -c "
 import json
 from pathlib import Path
-r = json.loads(Path('graphify-out/.graphify_incremental.json').read_text(encoding=\"utf-8\"))
-Path('graphify-out/.graphify_detect.json').write_text(json.dumps({
-    'files': r.get('new_files', {}),
-    'all_files': r.get('files', {}),
-    'total_files': r.get('new_total', 0),
-    'total_words': r.get('total_words', 0),
-    'skipped_sensitive': r.get('skipped_sensitive', []),
-    'needs_graph': True,
-}, ensure_ascii=False), encoding=\"utf-8\")
+from graphify.detect import detect_incremental
+r = detect_incremental(Path('INPUT_PATH'), kind='semantic')
+Path('graphify-out/.graphify_detect.json').write_text(json.dumps(r, ensure_ascii=False), encoding='utf-8')
+print({t: len(v) for t, v in r['files'].items() if v}, r['total_files'], 'files', r['total_words'], 'words', len(r.get('skipped_sensitive', [])), 'sensitive skips')
+print(len(r.get('deleted_files', [])), 'deleted;', len(r.get('excluded_files', [])), 'excluded')
 "
 ```
 
-If new files exist, first check whether all changed files are code files:
+Apply SKILL.md's corpus-size warning and sensitive exclusions before dispatch. Report only sensitive-skip counts, never the names in detection or CLI diagnostics. We check **all live semantic files** against the content/prompt/mode cache: a changed extraction prompt or first deep pass must not be suppressed by unchanged manifest hashes. `deleted_files` and `excluded_files` are removal candidates, not re-extraction inputs; review their scope before pruning. If there are no semantic files or removals, skip to clustering.
+
+## 1. Cache check
+
+Set the absolute path of this skill's `references/extraction-spec.md` as `GRAPHIFY_SPEC_PATH`. Set `GRAPHIFY_SEMANTIC_MODE` to `deep` for `--mode deep`, otherwise the empty string. These are non-secret workflow parameters.
 
 ```bash
-$(cat graphify-out/.graphify_python) -c "
+export GRAPHIFY_SPEC_PATH=/absolute/path/to/references/extraction-spec.md
+export GRAPHIFY_SEMANTIC_MODE=""    # or deep
+"$(cat graphify-out/.graphify_python)" -c "
 import json
 from pathlib import Path
-
-result = json.loads(open('graphify-out/.graphify_incremental.json', encoding='utf-8').read()) if Path('graphify-out/.graphify_incremental.json').exists() else {}
-code_exts = {'.py','.ts','.js','.go','.rs','.java','.cpp','.c','.rb','.swift','.kt','.cs','.scala','.php','.cc','.cxx','.hpp','.h','.kts','.lua','.toc','.f','.F','.f90','.F90','.f95','.F95','.f03','.F03','.f08','.F08'}
-new_files = result.get('new_files', {})
-all_changed = [f for files in new_files.values() for f in files]
-code_only = all(Path(f).suffix.lower() in code_exts for f in all_changed)
-print('code_only:', code_only)
+d = json.loads(Path('graphify-out/.graphify_detect.json').read_text(encoding='utf-8'))
+files = [f for t in ('document', 'paper', 'image', 'video') for f in d['files'].get(t, [])]
+Path('graphify-out/.graphify_semantic_files.txt').write_text('\n'.join(files), encoding='utf-8')
+print(len(files), 'semantic inputs')
 "
+rm -f graphify-out/.graphify_cached.json graphify-out/.graphify_semantic_new.json graphify-out/.graphify_transcripts.json graphify-out/.graphify_chunk_*.json
+graphify cache-check graphify-out/.graphify_semantic_files.txt --root . --prompt-file "$GRAPHIFY_SPEC_PATH"
+# Deep mode: add --deep to the same cache-check command.
 ```
 
-If `code_only` is True: print `[graphify update] Code-only changes detected - skipping semantic extraction (no LLM needed)`, run only Step 3A (AST) on the changed files, skip Step 3B entirely (no subagents), then go straight to merge and Steps 4–8.
+The output is `.graphify_uncached.txt` plus `.graphify_cached.json` when there are hits. The installed cache can replay legacy entries that predate prompt fingerprinting, with a warning: report their unknown prompt provenance, never claim they were produced by this spec or automatically force a costly re-extraction. Clearing run-owned temporary outputs prevents an all-cache or failed run from replaying stale new chunks; never remove `graph.json`, the cache directory, labels, analysis or another active run's files. Do not run overlapping semantic passes against one output directory.
 
-If `code_only` is False (any changed file is a doc/paper/image/video): **first, if any changed file is in `new_files['video']`, run `references/transcribe.md` (Step 2.5) on those files, then rewrite `.graphify_detect.json` to move the resulting transcript paths into `files['document']` and drop `files['video']`** — otherwise raw `.mp4/.mp3` paths are fed to semantic subagents as unreadable media (#1392). Then run the full Steps 3A–3C pipeline as normal.
+For uncached `video` inputs, use `references/transcribe.md` now. It writes a mapping from original media paths to readable transcript paths. Cache identity and graph provenance stay attributed to the original media, so edits/deletions reconcile correctly.
 
+## 2. Extract uncached files
 
-If no new files exist (only deletions), create an empty extraction so the merge step can prune:
+Partition `.graphify_uncached.txt` into directory-coherent chunks of roughly 20–25 files; give each image its own chunk. Dispatch write-capable extraction subagents together using the complete prompt in `extraction-spec.md`, filling `FILE_LIST` (absolute original source paths), `SCAN_ROOT` (the absolute original scan root), `MEDIA_TRANSCRIPTS` (the media-to-transcript mapping, or `{}`), `CHUNK_NUM`, `TOTAL_CHUNKS`, `DEEP_MODE` and an absolute `CHUNK_PATH`. Report the actual input/chunk count. Do not ask a read-only explorer to write a chunk.
+
+Every expected chunk must exist and validate. A successful agent message without its chunk is not success. Missing/invalid/partial output must be retried or reported; do not silently merge a subset. If the user explicitly accepts a partial pass, omit failed files and leave their old contributions and semantic hashes pending. Do not treat partial fragments as complete cache entries. Record real input/output token usage in the chunk; if unavailable report it as unavailable, never invent zero usage.
 
 ```bash
-if [ ! -f graphify-out/.graphify_extract.json ]; then
-    echo '[graphify update] Only deletions -- creating empty extraction for merge.'
-    $(cat graphify-out/.graphify_python) -c "
-import json
+graphify merge-chunks 'graphify-out/.graphify_chunk_*.json' --out graphify-out/.graphify_semantic_new.json
+"$(cat graphify-out/.graphify_python)" -c "
+import json, os
 from pathlib import Path
-Path('graphify-out/.graphify_extract.json').write_text(json.dumps({'nodes':[],'edges':[],'hyperedges':[],'input_tokens':0,'output_tokens':0}), encoding='utf-8')
+from graphify.cache import save_semantic_cache
+new = json.loads(Path('graphify-out/.graphify_semantic_new.json').read_text(encoding='utf-8'))
+unc = Path('graphify-out/.graphify_uncached.txt').read_text(encoding='utf-8').splitlines()
+print('cached', save_semantic_cache(new.get('nodes', []), new.get('edges', []), new.get('hyperedges', []), root=Path('.'), allowed_source_files=unc, prompt_file=os.environ['GRAPHIFY_SPEC_PATH'], mode=os.environ.get('GRAPHIFY_SEMANTIC_MODE') or None), 'files')
 "
-fi
 ```
 
+Run these only when fresh complete chunks exist. `merge-chunks` validates size/IDs, skips invalid chunks with warnings and refuses when none are valid; a zero exit code with skipped chunks is **not** complete acceptance. If all inputs were cached, skip this step and leave the new-result path absent. Cache reads/writes must use the same output-parent root, absolute source paths, prompt and mode.
 
-Then:
+## 3. Merge safely
 
 ```bash
-$(cat graphify-out/.graphify_python) -c "
+graphify merge-semantic --cached graphify-out/.graphify_cached.json --new graphify-out/.graphify_semantic_new.json --out graphify-out/.graphify_semantic.json
+"$(cat graphify-out/.graphify_python)" -c "
 import json
 from pathlib import Path
 from graphify.build import build_merge
+from graphify.cluster import cluster
+from graphify.export import to_json
 from graphify.detect import save_manifest
-
-# Load new extraction and incremental state
-new_extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text(encoding=\"utf-8\"))
-incremental = json.loads(Path('graphify-out/.graphify_incremental.json').read_text(encoding=\"utf-8\"))
-deleted = list(incremental.get('deleted_files', []))
-# prune_sources is ONLY for genuinely DELETED files. Changed/re-extracted files are
-# handled by build_merge's replace-on-re-extract (#1344): every source_file in
-# new_chunks is dropped from the base before merge, so old/stale nodes don't survive.
-# Do NOT add `changed` here: with root= passed, prune_set relativizes to the same base
-# as the freshly merged nodes and would DELETE the re-extracted content (#1178 is moot
-# now that replace — not the dedup pass — reconciles changed files).
-prune = list(deleted) or None
-
-# Use build_merge() — reads graph.json directly without NetworkX round-trip
-# so edge direction (calls, implements, imports) is always preserved (#801).
-# Pass root= so prune_sources (absolute paths from detect_incremental) are
-# relativized to match the graph's relative source_file values; without it
-# nothing is pruned and stale nodes accumulate on every update (#1361).
-# directed=IS_DIRECTED: replace IS_DIRECTED with True if --directed was given, else
-# False. Without it a --directed --update silently rebuilds undirected and collapses
-# reciprocal A<->B edges (#1392).
-G = build_merge(
-    [new_extraction],
-    graph_path='graphify-out/graph.json',
-    prune_sources=prune,
-    root='INPUT_PATH',
-    directed=IS_DIRECTED,
-)
-print(f'[graphify update] Merged: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges')
-
-# Write merged result back to .graphify_extract.json so Step 4 sees the full graph
-merged_out = {
-    'nodes': [{'id': n, **d} for n, d in G.nodes(data=True)],
-    'edges': [
-        # Explicit source/target last so they win over any stale attrs in d.
-        {**{k: val for k, val in d.items() if k not in ('_src', '_tgt', 'source', 'target')},
-         'source': d.get('_src', u), 'target': d.get('_tgt', v)}
-        for u, v, d in G.edges(data=True)
-    ],
-    # G.graph["hyperedges"] holds hyperedges from both existing graph.json
-    # and new_extraction (build_merge combines them). Falling back to
-    # new_extraction only would silently drop prior-run hyperedges (#801).
-    'hyperedges': list(G.graph.get('hyperedges', [])),
-    'input_tokens': new_extraction.get('input_tokens', 0),
-    'output_tokens': new_extraction.get('output_tokens', 0),
-}
-Path('graphify-out/.graphify_extract.json').write_text(json.dumps(merged_out, ensure_ascii=False), encoding=\"utf-8\")
-print(f'[graphify update] Merged extraction written ({len(merged_out[\"nodes\"])} nodes, {len(merged_out[\"edges\"])} edges)')
-
-# Save manifest so next --update diffs against today's state, not the
-# prior run's baseline (prevents ghost-node reports on subsequent updates).
-# root= matches the build_merge call above so the manifest keys stay relative to
-# the scan root — portable across clones/machines, so --update keeps matching
-# cached files instead of missing every one after a move (#1417).
-save_manifest(incremental['files'], root='INPUT_PATH')
-print('[graphify update] Manifest saved.')
+from graphify.cli import _stamped_manifest_files
+p = Path('graphify-out/graph.json')
+old = json.loads(p.read_text(encoding='utf-8')) if p.exists() else {}
+sem = json.loads(Path('graphify-out/.graphify_semantic.json').read_text(encoding='utf-8'))
+det = json.loads(Path('graphify-out/.graphify_detect.json').read_text(encoding='utf-8'))
+prune = list(dict.fromkeys(det.get('deleted_files', []) + det.get('excluded_files', []))) or None
+G = build_merge([sem], graph_path=p, prune_sources=prune, root=Path('INPUT_PATH'), directed=bool(old.get('directed', False)), dedup=False)
+if G.number_of_nodes() == 0:
+    raise SystemExit('ERROR: merged graph is empty; existing graph left untouched')
+if not to_json(G, cluster(G), str(p), force=False):
+    raise SystemExit('ERROR: shrink refused; existing graph and manifest left untouched')
+files = {t: det['files'].get(t, []) for t in ('document', 'paper', 'image')}
+# Media results carry the original video source; require output before stamping too.
+files['document'] = files['document'] + det['files'].get('video', [])
+stamped = _stamped_manifest_files(files, sem, Path('INPUT_PATH'))
+done = {f for fl in stamped.values() for f in fl}
+cleared = {f for fl in files.values() for f in fl} - done
+corpus = {f for fl in det['files'].values() for f in fl}
+save_manifest(stamped, kind='semantic', root=Path('INPUT_PATH'), scan_corpus=corpus, clear_semantic=cleared or None)
+Path('graphify-out/.graphify_root').write_text(str(Path('INPUT_PATH').resolve()), encoding='utf-8')
+print('graph:', G.number_of_nodes(), 'nodes,', G.number_of_edges(), 'edges;', len(done), 'files stamped,', len(cleared), 'pending')
 "
 ```
 
-Then run Steps 4–8 on the merged graph as normal.
+`build_merge` reads the existing graph and replaces only re-extracted sources; absent sources remain, and `prune_sources` removes reviewed deleted/excluded sources. `dedup=False` avoids an incidental fuzzy-dedup loss of existing identities. Edge provenance/direction and untouched hyperedges are retained by the package merge/export APIs, not by a hand-written graph rewrite. The prior directed flag is retained; for an explicitly requested directed **first** build, use `directed=True`.
 
-After Step 4, show the graph diff:
+An empty merged graph always stops. A legitimate semantic reduction can still trigger the node-count shrink guard; do not automatically set `force=bool(prune)`. Report old/new counts and cause, obtain explicit acceptance, then rerun this merge with `force=True` only for that accepted reduction. Never stamp the manifest after a refused write. Only sources producing complete output are stamped; omitted inputs remain pending. Pure-deletion runs can merge empty semantic inputs, but cannot authorize a shrink by themselves.
 
-```bash
-$(cat graphify-out/.graphify_python) -c "
-import json
-from graphify.analyze import graph_diff
-from graphify.build import build_from_json
-from networkx.readwrite import json_graph
-import networkx as nx
-from pathlib import Path
-
-# Load old graph (before update) from backup written before merge
-old_data = json.loads(Path('graphify-out/.graphify_old.json').read_text(encoding=\"utf-8\")) if Path('graphify-out/.graphify_old.json').exists() else None
-new_extract = json.loads(Path('graphify-out/.graphify_extract.json').read_text(encoding=\"utf-8\"))
-G_new = build_from_json(new_extract, directed=IS_DIRECTED)
-
-if old_data:
-    G_old = json_graph.node_link_graph(old_data, edges='links')
-    diff = graph_diff(G_old, G_new)
-    print(diff['summary'])
-    if diff['new_nodes']:
-        print('New nodes:', ', '.join(n['label'] for n in diff['new_nodes'][:5]))
-    if diff['new_edges']:
-        print('New edges:', len(diff['new_edges']))
-"
-```
-
-Before the merge step, save the old graph: `cp graphify-out/graph.json graphify-out/.graphify_old.json`
-Clean up after: `rm -f graphify-out/.graphify_old.json`
-
----
-
-## For --cluster-only
-
-Skip Steps 1–3. Re-run clustering on the existing graph:
+## 4. Cluster and finish
 
 ```bash
-graphify cluster-only .
+graphify cluster-only . --no-label            # graph, analysis, report and HTML
+graphify cluster-only . --no-label --no-viz   # omit expensive HTML
 ```
 
-`graphify cluster-only .` is **self-contained**: it re-clusters, names communities, and regenerates `GRAPH_REPORT.md`, `graph.json`, and `graph.html` from the existing graph. **Do not re-run Steps 5–9** — they read intermediate files (`.graphify_extract.json`, `.graphify_detect.json`, `.graphify_analysis.json`) that a prior build's cleanup (Step 9) already deleted, so they raise `FileNotFoundError` (#1392). When it finishes, present the refreshed `GRAPH_REPORT.md` summary as usual.
+These are self-contained; do not rerun deleted intermediate-file steps. Preserve durable labels, analysis, cache, manifest and interpreter/root sidecars. `--no-label` prevents implicit provider calls. Without it, a first naming pass can auto-select a provider; `graphify label . --backend NAME [--missing-only]` explicitly attempts provider naming and falls back to hub labels if no backend is available. Use provider labeling only with the user's choice, since node labels leave the local workflow.
+
+Report counts before/after, pending/failed inputs, real semantic/label token usage (or unavailable usage), raw cohesion scores and guard warnings. Run only requested exports. Remove this pass's `.graphify_detect.json`, `.graphify_semantic*.json`, `.graphify_semantic_files.txt`, `.graphify_cached.json`, `.graphify_uncached.txt`, `.graphify_transcripts.json` and `.graphify_chunk_*.json` only after a successful handoff; keep failed-pass evidence for recovery. Do not delete durable transcript text or manually rewrite the parent graph.

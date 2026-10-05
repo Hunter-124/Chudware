@@ -5,7 +5,7 @@ goal: >
   perform — mount, mate, seal, bear load, clear, fasten, locate, dissipate — and
   write those functions as ``feature[]`` events to the ledger. Each feature traces
   to a stated requirement or a recorded assumption. The Stage 1 gate passes only
-  when the ledger holds ≥1 feature event; the requirement-coverage checker (T-DP2)
+  when the ledger holds ≥1 feature event; the requirement-coverage checker
   additionally confirms full traceability.
 stage_scope: [decompose]
 playbook_default: null
@@ -156,17 +156,16 @@ system_prompt: |
     □ FASTEN to port body at wrench flat torque without galling
 
   ─────────────────────────────────────────────────────────────────────────────
-  COVERAGE RULE (contract design_pipeline.md §3.1, T-DP2)
+  COVERAGE RULE (contract design_pipeline.md §3.1)
   Every feature must trace to a stated requirement (req_id in the ledger) OR a
   recorded assumption ("assumption:<slug>"). Every stated requirement must map to
   ≥1 feature. Gaps are design risks — do NOT silently drop either side.
   Unresolved gaps → ask_user or escalate with status=blocked.
 
-  COMPLETENESS-CRITIC SLOT (T-DP8 hook — do not implement; declare intent only)
-  After building the feature list, a completeness-critic council review would run
-  here to challenge missing functions. Until T-DP8 lands, perform this check
-  manually: re-read the checklist, then ask "what breaks if I remove this?" for
-  each feature, and "what is NOT in this list that the requirement implies?".
+  COMPLETENESS SELF-CHECK
+  After building the feature list, challenge it for missing functions yourself:
+  re-read the checklist, then ask "what breaks if I remove this?" for each
+  feature, and "what is NOT in this list that the requirement implies?".
 
   UNIVERSAL RULES (all Chudware roles)
   1. Never invent a number. Every value must come from a tool result, [ADVISORY]

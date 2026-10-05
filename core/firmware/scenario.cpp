@@ -4,11 +4,14 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <locale>
 #include <regex>
 #include <set>
 #include <sstream>
 
 #include "firmware/pyfmt.h"
+#include "firmware/bus_models.h"
 
 namespace chudware::firmware {
 namespace {
@@ -30,8 +33,8 @@ const std::map<std::string, AdcStub> kAdcStubs = {
 };
 
 const char* kTrackKinds[] = {"gpio_edges", "button", "quadrature", "i2c_sensor",
-                             "i2c_registers", "i2c_register_stream", "spi_stub",
-                             "uart_rx", "adc_waveform"};
+                             "i2c_registers", "i2c_register_stream", "spi_stub", "spi_peer",
+                             "can_frames", "uart_rx", "adc_waveform"};
 
 std::string track_kinds_joined() {
     std::string out;
@@ -42,7 +45,7 @@ std::string track_kinds_joined() {
     return out;
 }
 
-bool is_num(const nlohmann::json& v) { return v.is_number(); }
+bool is_num(const nlohmann::json& v) { return v.is_number() && std::isfinite(v.get<double>()); }
 
 std::optional<std::string> validate_pin(const nlohmann::json& pin) {
     if (!pin.is_string()) return "pin must be STM32-style 'P<A-K><0-15>', got " + py_repr(pin);
@@ -52,6 +55,17 @@ std::optional<std::string> validate_pin(const nlohmann::json& pin) {
         return "pin must be STM32-style 'P<A-K><0-15>', got " + py_repr(pin);
     if (std::stoi(m[2].str()) > 15) return "pin number out of range in " + py_repr(pin);
     return std::nullopt;
+}
+bool valid_register_map(const nlohmann::json& registers) {
+    if(!registers.is_object() || registers.empty()) return false;
+    for(const auto& [key,value]:registers.items()) {
+        try {
+            size_t consumed=0;
+            int reg=std::stoi(key,&consumed,key.rfind("0x",0)==0?16:10);
+            if(consumed!=key.size() || reg<0 || reg>255 || !value.is_number_integer() || value.get<long long>()<0 || value.get<long long>()>255) return false;
+        } catch(...) {return false;}
+    }
+    return true;
 }
 
 std::vector<std::string> validate_i2c_samples(const nlohmann::json& samples,
@@ -90,7 +104,8 @@ std::vector<std::string> validate_i2c_samples(const nlohmann::json& samples,
                     }
                 }
             }
-            if (!ok) errs.push_back(tag + " needs non-empty 'response' byte list (0-255)");
+            if (!ok && !(s.contains("registers") && valid_register_map(s["registers"])))
+                errs.push_back(tag + " needs non-empty response bytes or complete register map (0-255)");
         }
         ++i;
     }
@@ -166,7 +181,7 @@ std::vector<std::string> validate_track(const nlohmann::json& tr) {
                     }
                 }
             }
-            if (!ok)
+            if (!ok && !(tr.contains("registers") && valid_register_map(tr["registers"])))
                 errs.push_back("i2c_registers needs a non-empty 'response' byte list (0-255) "
                                "or a non-empty 'samples' list of {t_ms, response}");
         }
@@ -175,16 +190,33 @@ std::vector<std::string> validate_track(const nlohmann::json& tr) {
             errs.push_back("i2c_register_stream needs an integer 7-bit 'address'");
         auto samples = tr.find("samples");
         bool have_samples = samples != tr.end() && !samples->is_null();
-        if (!have_samples && tr.contains("response") && tr["response"].is_array()) {
-            // allow a single static response coerced to one sample at t=0
+        if (!have_samples && ((tr.contains("response") && tr["response"].is_array()) ||
+            (tr.contains("registers") && valid_register_map(tr["registers"])))) {
+            // Static maps are a single atomic sample at virtual t=0.
+            if(tr.contains("response")) {
+                const auto invalid=validate_i2c_samples(nlohmann::json::array({{{"t_ms",0},{"response",tr["response"]}}}),kind);
+                errs.insert(errs.end(),invalid.begin(),invalid.end());
+            }
         } else {
             for (auto& e : validate_i2c_samples(have_samples ? *samples : nlohmann::json(),
                                                 kind))
                 errs.push_back(e);
         }
-    } else if (kind == "spi_stub") {
+    } else if (kind == "spi_stub" || kind == "spi_peer") {
         if (!tr.contains("bus") || !tr["bus"].is_string() || tr["bus"].get<std::string>().empty())
-            errs.push_back("spi_stub needs the platform SPI peripheral name in 'bus' (e.g. 'spi1')");
+            errs.push_back(kind + " needs the platform SPI peripheral name in 'bus'");
+    } else if (kind == "can_frames") {
+        if (!tr.contains("events") || !tr["events"].is_array() || tr["events"].empty())
+            errs.push_back("can_frames needs nonempty events");
+        else for(const auto& ev : tr["events"]) {
+            if(!ev.is_object() || !ev.contains("id") || !ev["id"].is_number_integer() ||
+               !is_num(ev.value("t_ms", nlohmann::json())) ||
+               !ev.contains("payload_hex") || !ev["payload_hex"].is_string())
+                errs.push_back("can_frames events require t_ms, unsigned id and payload_hex");
+            else if(ev["id"].get<long long>()<0 || ev["id"].get<long long>()>(ev.value("extended",false)?0x1FFFFFFF:0x7FF) ||
+                    !std::regex_match(ev["payload_hex"].get<std::string>(),std::regex("^(?:[0-9A-Fa-f]{2}){0,8}$")))
+                errs.push_back("CAN id/payload outside classical CAN frame limits");
+        }
     } else if (kind == "uart_rx") {
         auto evs = tr.find("events");
         if (evs == tr.end() || !evs->is_array() || evs->empty()) {
@@ -226,6 +258,36 @@ std::vector<std::string> validate_track(const nlohmann::json& tr) {
             }
         }
     }
+    if(kind.rfind("i2c_",0)==0 && (!tr.contains("address") || !tr["address"].is_number_integer() ||
+       tr["address"].get<long long>()<0 || tr["address"].get<long long>()>127))
+        errs.push_back("I2C address must be in 0..127");
+    if(kind.rfind("i2c_",0)==0 && tr.contains("registers") && !valid_register_map(tr["registers"]))
+        errs.push_back("registers must be a nonempty map of decimal/0x register addresses to byte values");
+    if(tr.contains("register_start") && (!tr["register_start"].is_number_integer() ||
+       tr["register_start"].get<int>()<0 || tr["register_start"].get<int>()>255)) errs.push_back("register_start must be byte address");
+    for(const char* list:{"events","samples","presses","drive_events"}) if(tr.contains(list)&&tr[list].is_array())
+        for(const auto& event:tr[list]) if(event.is_object() && event.contains("t_ms") &&
+           (!is_num(event["t_ms"]) || event["t_ms"].get<double>()<0)) errs.push_back("stimulus t_ms must be finite nonnegative");
+    if(tr.contains("drive_events")) {
+        if(kind!="can_frames" || !tr["drive_events"].is_array()) errs.push_back("drive_events requires CAN array");
+        else for(const auto& event:tr["drive_events"])
+            if(!event.is_object() || !is_num(event.value("t_ms",nlohmann::json())) || !event.contains("endpoint") || !event["endpoint"].is_string() ||
+               !event.contains("state") || !event["state"].is_number_integer() || event["state"].get<int>() < -1 || event["state"].get<int>() > 1)
+                errs.push_back("drive_events requires t_ms,endpoint,state(-1/0/1)");
+    }
+    if(kind=="spi_peer" && !tr.contains("response_hex") && !tr.contains("registers") && !tr.contains("link_id"))
+        errs.push_back("spi_peer requires programmed response_hex/registers or configured link_id peer");
+    if(tr.contains("response_hex") && (!tr["response_hex"].is_string() ||
+       !std::regex_match(tr["response_hex"].get<std::string>(),std::regex("^(?:[0-9A-Fa-f]{2})+$"))))
+        errs.push_back("response_hex must be contiguous complete hex bytes");
+    if(kind.rfind("spi_",0)==0 && tr.contains("registers") && !valid_register_map(tr["registers"]))
+        errs.push_back("SPI registers must map byte addresses to byte values");
+    if(tr.contains("cs_gpio") && (!tr["cs_gpio"].is_string() ||
+       !std::regex_match(tr["cs_gpio"].get<std::string>(),std::regex("^gpioPort[A-K]$")) ||
+       !tr.contains("cs_pin") || !tr["cs_pin"].is_number_integer() || tr["cs_pin"].get<int>()<0 || tr["cs_pin"].get<int>()>15))
+        errs.push_back("SPI CS requires cs_gpio=gpioPortA..K and cs_pin=0..15");
+    if(kind=="uart_rx" && tr.contains("baud_hz") && (!is_num(tr["baud_hz"]) || tr["baud_hz"].get<double>()<=0))
+        errs.push_back("UART baud_hz must be finite positive");
     return errs;
 }
 
@@ -425,6 +487,8 @@ std::pair<nlohmann::json, std::vector<std::string>> load_scenario(
 
 std::vector<std::string> validate_scenario(const nlohmann::json& sc) {
     std::vector<std::string> errors;
+    const auto link_errors = validate_bus_links(sc);
+    errors.insert(errors.end(), link_errors.begin(), link_errors.end());
     if (!sc.is_object() || sc.value("schema", std::string()) != kScenarioSchema) {
         errors.push_back(std::string("schema must be '") + kScenarioSchema + "', got " +
                          py_repr(sc.is_object() ? sc.value("schema", nlohmann::json())
@@ -487,6 +551,19 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
     ScenarioPlan plan;
     plan.errors = validate_scenario(scenario);
     if (!plan.errors.empty()) return plan;
+    plan.resolved_links = resolve_bus_links(scenario, caps, platform_text, plan.errors);
+    if(!plan.errors.empty()) return plan;
+    if(caps.value("family", std::string())=="stm32f4") {
+        plan.aux_files["chudware_buses.cs"] = generated_bus_source(plan.resolved_links);
+        plan.pre_platform_lines.push_back("include @{CHUDWARE_SCENARIO_DIR}/chudware_buses.cs");
+        if(plan.resolved_links.empty())
+            plan.warnings.push_back("Functional bus mode: reset 16MHz HSI peripheral clocks; no calibrated electrical network");
+        for(const auto& link:plan.resolved_links) if(link["protocol"]=="spi") {
+            const auto& peer=link["peer"];
+            if(peer.contains("cs_gpio") && peer.contains("cs_pin"))
+                plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString \""+peer["cs_gpio"].get<std::string>()+": { "+std::to_string(peer["cs_pin"].get<int>())+" -> "+link["bus"].get<std::string>()+"@0 }\"");
+        }
+    }
 
     std::string family = caps.value("family", std::string("?"));
     std::string caps_file = caps.value("file", std::string());
@@ -531,6 +608,21 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
     };
 
     int i2c_seq = 0;
+    auto bus_for = [&](const nlohmann::json& track, const std::string& fallback) {
+        if(track.contains("link_id")) for(const auto& link:plan.resolved_links)
+            if(link["id"]==track["link_id"]) return link["bus"].get<std::string>();
+        return track.value("bus", fallback);
+    };
+    auto register_hex = [](const nlohmann::json& sample, int start) {
+        std::ostringstream out; out << std::hex;
+        if(sample.contains("registers") && sample["registers"].is_object() && !sample["registers"].empty()) {
+            for(const auto& [key,value]:sample["registers"].items())
+                out << std::stoi(key,nullptr, key.rfind("0x",0)==0?16:10) << ":" << value.get<int>() << ",";
+        } else if(sample.contains("response")) {
+            for(const auto& byte:sample["response"]) out << start++ << ":" << byte.get<int>() << ",";
+        }
+        std::string result=out.str();if(!result.empty()) result.pop_back();return result;
+    };
     for (const auto& tr : scenario["tracks"]) {
         std::string kind = tr.value("kind", std::string());
         if (kind == "gpio_edges") {
@@ -559,7 +651,7 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
             }
         } else if (kind == "i2c_sensor" || kind == "i2c_registers" ||
                    kind == "i2c_register_stream") {
-            std::string bus = tr.value("bus", std::string("i2c1"));
+            std::string bus = bus_for(tr, "i2c1");
             if (!caps.value("i2c", false) ||
                 platform_text.find(bus + ":") == std::string::npos) {
                 plan.errors.push_back(
@@ -568,6 +660,30 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
                 continue;
             }
             long long addr = tr["address"].get<long long>();
+            if(family=="stm32f4") {
+                const std::string model=kind=="i2c_sensor" ? "tmp103" : tr.value("device",tr.value("model",std::string("registers")));
+                if(model!="mpu6050" && model!="bmp280" && model!="lis3mdl" && model!="tmp103" && model!="registers") {
+                    plan.errors.push_back("I2C device '"+model+"' has no implemented register model; use supported sensor or explicit generic registers");continue;
+                }
+                plan.setup_lines.push_back("sysbus."+bus+" SetDevice "+std::to_string(addr)+" \""+model+"\"");
+                nlohmann::json samples=tr.value("samples",nlohmann::json::array());
+                if(samples.empty()) samples.push_back({{"t_ms",0.0},{"response",tr.value("response",nlohmann::json::array())},{"registers",tr.value("registers",nlohmann::json::object())}});
+                if(kind=="i2c_sensor") {
+                    int raw=static_cast<int>(std::clamp(tr["temperature_c"].get<double>(),-128.0,127.0));
+                    samples=nlohmann::json::array({{{"t_ms",0.0},{"registers",{{"0",raw&255}}}}});
+                }
+                const int start=tr.value("register_start",0);
+                for(size_t si=0;si<samples.size();++si) {
+                    const auto& sample=samples[si];
+                    std::string command="sysbus."+bus+" SetRegisters "+std::to_string(addr)+" \""+register_hex(sample,start)+"\"";
+                    if(si==0) plan.setup_lines.push_back(command);
+                    if(sample.value("t_ms",0.0)>0) plan.timeline.push_back({sample["t_ms"].get<double>(),command});
+                }
+                ++i2c_seq;continue;
+            }
+            if(kind=="i2c_register_stream" || tr.contains("registers")) {
+                plan.errors.push_back("register-addressed I2C streams require real STM32F4 timed model");continue;
+            }
             if (kind == "i2c_sensor") {
                 std::string name = "aicadTemp" + std::to_string(i2c_seq);
                 plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString \"" + name +
@@ -618,14 +734,26 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
                 }
             }
             ++i2c_seq;
-        } else if (kind == "spi_stub") {
-            std::string bus = tr["bus"].get<std::string>();
+        } else if (kind == "spi_stub" || kind == "spi_peer") {
+            std::string bus = bus_for(tr, "spi1");
             if (!caps.value("spi", false) ||
                 platform_text.find(bus + ":") == std::string::npos) {
                 plan.errors.push_back(
                     "spi stimulus unsupported: platform '" + caps_file + "' (family " + family +
                     ") does not declare SPI bus '" + bus + "' — " + caps_notes);
                 continue;
+            }
+            if(family=="stm32f4") {
+                if(tr.contains("response_hex")) plan.setup_lines.push_back("sysbus."+bus+" SetResponse \""+tr["response_hex"].get<std::string>()+"\"");
+                if(tr.contains("registers")) plan.setup_lines.push_back("sysbus."+bus+" SetRegisters \""+register_hex(tr,0)+"\"");
+                if(kind=="spi_stub" && !tr.contains("response_hex") && !tr.contains("registers"))
+                    plan.setup_lines.push_back("sysbus."+bus+" SetResponse \"00\"");
+                if(tr.contains("cs_gpio") && tr.contains("cs_pin"))
+                    plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString \""+tr["cs_gpio"].get<std::string>()+": { "+std::to_string(tr["cs_pin"].get<int>())+" -> "+bus+"@0 }\"");
+                continue;
+            }
+            if(kind=="spi_peer" || tr.contains("response_hex") || tr.contains("registers")) {
+                plan.errors.push_back("programmable SPI peer requires real STM32F4 timed model");continue;
             }
             std::string name = tr.value("name", std::string("aicadSpiStub"));
             plan.setup_lines.push_back("machine LoadPlatformDescriptionFromString \"" + name +
@@ -636,10 +764,11 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
                 "programmable SPI register models have no documented upstream Renode idiom yet");
         } else if (kind == "uart_rx") {
             std::string uart;
-            if (tr.contains("uart") && tr["uart"].is_string()) {
+            if(tr.contains("link_id")) uart=bus_for(tr,"usart1");
+            else if (tr.contains("uart") && tr["uart"].is_string()) {
                 uart = tr["uart"].get<std::string>();
             } else {
-                static const std::regex uartRe(R"(^(\w+)\s*:\s*UART\.)",
+                static const std::regex uartRe(R"(^(\w+)\s*:\s*(?:UART\.|Chudware\.TimedSTM32UART))",
                                                std::regex_constants::ECMAScript);
                 // multiline search over the platform text
                 std::string text = platform_text;
@@ -653,10 +782,24 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
                     }
                 }
             }
-            if (uart.empty() || !caps.value("uart", false)) {
+            if (uart.empty() || !caps.value("uart", false) || platform_text.find(uart+":")==std::string::npos) {
                 plan.errors.push_back(
                     "uart_rx stimulus unsupported: platform '" + caps_file + "' (family " +
                     family + ") declares no UART — " + caps_notes);
+                continue;
+            }
+            if(family=="stm32f4") {
+                const auto link=std::find_if(plan.resolved_links.begin(),plan.resolved_links.end(),[&](const auto& candidate){return candidate["bus"]==uart;});
+                if(link!=plan.resolved_links.end()) {
+                    if(tr.contains("baud_hz") && tr["baud_hz"]!=(*link)["peer"]["baud_hz"])
+                        plan.warnings.push_back("UART "+uart+" explicit link peer.baud_hz overrides stimulus metadata; firmware BRR remains authoritative for receiver timing");
+                } else if(tr.contains("baud_hz"))
+                    plan.setup_lines.push_back("sysbus."+uart+" ConfigurePeer "+fmt_g(tr["baud_hz"].get<double>())+" 8 \"none\" 1 \"ttl\"");
+                // Monitor strings do not decode JSON escapes. Submit the actual UTF-8
+                // bytes together; the timed peer transmitter serializes their frames.
+                for(const auto& ev:tr["events"])
+                    for(unsigned char byte:ev["text"].get<std::string>())
+                        plan.timeline.push_back({ev["t_ms"].get<double>(),"sysbus."+uart+" ReceiveByte "+fmt_hex(byte)});
                 continue;
             }
             for (const auto& ev : tr["events"]) {
@@ -665,6 +808,18 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
                     plan.timeline.push_back(
                         {t, "sysbus." + uart + " WriteChar " + fmt_hex(ch)});
             }
+        } else if(kind=="can_frames") {
+            std::string bus=bus_for(tr,"can1");
+            if(family!="stm32f4" || !caps.value("can",false) || platform_text.find(bus+":")==std::string::npos) {
+                plan.errors.push_back("CAN stimulus requires generated STM32F4 bxCAN model");continue;
+            }
+            std::string endpoint=tr.value("endpoint",std::string("peer"));
+            if(tr.contains("bitrate_hz"))
+                plan.setup_lines.push_back("sysbus."+bus+" ConfigurePeer \""+endpoint+"\" "+std::to_string(tr["bitrate_hz"].get<unsigned>())+" 0.875 1 "+(tr.value("ack_enabled",true)?"true":"false"));
+            for(const auto& ev:tr["events"])
+                plan.timeline.push_back({ev["t_ms"].get<double>(),"sysbus."+bus+" SubmitFrame \""+endpoint+"\" "+std::to_string(ev["id"].get<unsigned>())+" "+(ev.value("extended",false)?"true":"false")+" "+(ev.value("remote",false)?"true":"false")+" \""+ev["payload_hex"].get<std::string>()+"\""});
+            if(tr.contains("drive_events")) for(const auto& ev:tr["drive_events"])
+                plan.timeline.push_back({ev["t_ms"].get<double>(),"sysbus."+bus+" DriveExternal \""+ev["endpoint"].get<std::string>()+"\" "+std::to_string(ev["state"].get<int>())});
         } else if (kind == "adc_waveform") {
             auto it = kAdcStubs.find(family);
             if (it == kAdcStubs.end()) {
@@ -708,12 +863,19 @@ ScenarioPlan build_scenario_plan(const nlohmann::json& scenario, const nlohmann:
 
 std::vector<std::string> timeline_resc_lines(
     const std::vector<std::pair<double, std::string>>& timeline, double run_seconds) {
+    // Renode 1.16.1 parses exponent notation as whole seconds; emit decimal ns.
+    const auto virtual_seconds = [](double seconds) {
+        std::ostringstream out;
+        out.imbue(std::locale::classic());
+        out << std::fixed << std::setprecision(9) << seconds;
+        return out.str();
+    };
     std::vector<std::string> lines = {"echo \"CHUDWARE_T_MARK 0\""};
     double now_ms = 0.0;
     for (const auto& [t_ms, action] : timeline) {
         double dt = std::max(0.0, t_ms - now_ms);
         if (dt > 0) {
-            lines.push_back("sleep " + fmt_3f(dt / 1000.0));
+            lines.push_back("emulation RunFor \"" + virtual_seconds(dt / 1000.0) + "\"");
             now_ms = t_ms;
             lines.push_back("echo \"CHUDWARE_T_MARK " + fmt_g(now_ms) + "\"");
         }
@@ -721,7 +883,7 @@ std::vector<std::string> timeline_resc_lines(
     }
     double remaining = run_seconds * 1000.0 - now_ms;
     if (remaining > 0) {
-        lines.push_back("sleep " + fmt_3f(remaining / 1000.0));
+        lines.push_back("emulation RunFor \"" + virtual_seconds(remaining / 1000.0) + "\"");
         lines.push_back("echo \"CHUDWARE_T_MARK " + fmt_g(run_seconds * 1000.0) + "\"");
     }
     return lines;
@@ -736,6 +898,7 @@ void materialize_aux_files(ScenarioPlan& plan, const std::string& directory) {
         out << content;
     }
     for (auto& ln : plan.setup_lines) replace_all(ln, "{CHUDWARE_SCENARIO_DIR}", directory);
+    for (auto& ln : plan.pre_platform_lines) replace_all(ln, "{CHUDWARE_SCENARIO_DIR}", directory);
 }
 
 }  // namespace chudware::firmware

@@ -1,4 +1,4 @@
-"""Pipe + fitting dimensional catalog for :mod:`engine.piping`.
+"""Pipe + fitting dimensional catalog for :mod:`services.piping`.
 
 Two data sources:
 
@@ -11,7 +11,7 @@ Two data sources:
   (``data/fittings.csv``). Dimensions are facts (not copyrightable); ASME text is not bundled.
 
 All dimensions returned by this module are in **mm** (fluids' native metres are converted
-here so the rest of engine.piping never touches metres).
+here so the rest of services.piping never touches metres).
 """
 
 from __future__ import annotations

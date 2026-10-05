@@ -14,8 +14,8 @@ deferred: yes
 
 ## Context
 
-Phase 2 of the 3D sketcher plan (`docs/SKETCH3D_PLAN.md`, T-BL45). PARKED until greenlight.
-Depends on P1 (T-BL51).
+Phase 2 of the 3D sketcher plan (`docs/plans/SKETCH3D_PLAN.md`, T-BL45). PARKED until greenlight.
+Depends on P1 (T-BL56).
 
 ## Scope
 

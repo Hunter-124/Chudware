@@ -1,0 +1,22 @@
+{
+  "id": "can-bench",
+  "bus": "can1",
+  "protocol": "can",
+  "controller_clock_hz": 16000000,
+  "peer": {"endpoint": "peer", "bitrate_hz": 500000, "clock_hz": 8000000, "sample_point": 0.875, "sjw_tq": 1, "ack_enabled": true},
+  "electrical": {
+    "signals": [{
+      "name": "can_diff", "mode": "differential", "model": "lumped_rc",
+      "series_r_ohm": 0.2, "wire_capacitance_f": 1e-10,
+      "endpoints": [
+        {"id":"mcu", "at":"controller", "input_capacitance_f":1e-11, "recessive_max_v":0.5, "dominant_min_v":0.9, "drive":"can_dominant", "v_low_v":0, "v_high_v":2.5, "r_low_ohm":20, "r_high_ohm":20, "rise_s":2e-8, "fall_s":2e-8, "tx_delay_s":5e-9, "rx_delay_s":5e-9},
+        {"id":"peer", "at":"remote", "input_capacitance_f":1e-11, "recessive_max_v":0.5, "dominant_min_v":0.9, "drive":"can_dominant", "v_low_v":0, "v_high_v":2.5, "r_low_ohm":20, "r_high_ohm":20, "rise_s":2e-8, "fall_s":2e-8, "tx_delay_s":5e-9, "rx_delay_s":5e-9},
+        {"id":"fault", "role":"external_driver", "at":"controller", "input_capacitance_f":0, "recessive_max_v":0.5, "dominant_min_v":0.9, "drive":"push_pull", "v_low_v":0, "v_high_v":2.5, "r_low_ohm":0.01, "r_high_ohm":0.01, "rise_s":0, "fall_s":0, "tx_delay_s":0, "rx_delay_s":0}
+      ],
+      "bias": [],
+      "terminations": [{"at":"controller", "resistance_ohm":120, "voltage_v":0}, {"at":"remote", "resistance_ohm":120, "voltage_v":0}]
+    }]
+  },
+  "sources": ["Synthetic engineering fixture, not a calibrated transceiver or harness"],
+  "limitations": ["Scalar differential network only; no common-mode, asymmetry, EMC, crosstalk, nonlinear protection or dispersion prediction", "Driver edge times are 10-90 percent"]
+}

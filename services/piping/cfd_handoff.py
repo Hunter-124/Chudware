@@ -10,15 +10,18 @@ Three public entry points:
 
 * :func:`cfd_boundary_from_solve` — translate a ``piping_solve`` result into CFD
   inlet/outlet boundary conditions: inlet velocity (from mean flow in the run) +
-  inlet/outlet pressure (from the node pressures). Pure Python — no kernel needed.
+  inlet/outlet pressure (from the node pressures). Pure Python — no kernel needed
+  (the MCP tools use the core's ``piping_cfd_boundary`` port, ``core/piping/cfd.cpp``).
 
 * :func:`verify_pressure_drop` — compare the 1D network pressure drop (from
-  ``piping_solve``/``pressure_drop_report``) with the CFD-derived pressure drop, flag
-  if the difference exceeds ``tolerance_pct``. Contract-shaped soft failure.
+  ``piping_solve`` / ``piping_report``) with the CFD-derived pressure drop, flag
+  if the difference exceeds ``tolerance_pct``. Contract-shaped soft failure. Used by
+  the ``services.sim.multiphysics_rpc`` verify leg; the MCP tool calls the core's
+  ``piping_verify_cfd`` port.
 
 Design contract:
   - contract-shaped soft failures ``{"ok": False, "reason": ..., "hint": ...}``
-    everywhere (matches ``engine.piping.solve`` / ``catalog.nearest_pipe`` style).
+    everywhere (matches the core ``piping_solve`` / ``catalog.nearest_pipe`` style).
   - build123d / OCP imported lazily (same as ``threed.py``); absent kernel → soft fail.
   - ``fluids`` optional; absent → soft fail on hydraulic calcs only.
   - No new dependencies beyond what T-E1/T-E2 already use.
@@ -221,7 +224,7 @@ def internal_volume(
         bore_override = run.get("bore_mm")
         if bore_override:
             # Explicit inner diameter (mm) beats the NPS/schedule catalog — the SAME
-            # precedence the 1-D solver applies (engine.piping.solve._build_network).
+            # precedence the core 1-D solver applies (build_network, core/piping/solve.cpp).
             # Externally-supplied networks (e.g. the hydraulic→piping handoff, whose
             # hose IDs are SAE dash sizes absent from the catalog) rely on this;
             # ignoring it swept the wrong bore and the extracted fluid volume
@@ -311,7 +314,7 @@ def cfd_boundary_from_solve(
     Parameters
     ----------
     solve_result:
-        Dict returned by ``engine.piping.solve.solve()``.
+        Dict returned by the core ``piping_solve`` RPC.
     inlet_run_id:
         If given, use this link as the inlet. Otherwise pick the link with the
         largest absolute flow.
@@ -429,7 +432,7 @@ def verify_pressure_drop(
     Parameters
     ----------
     solve_result:
-        Output of ``engine.piping.solve.solve()``.
+        Output of the core ``piping_solve`` RPC.
     cfd_result:
         Output of ``run_cfd_flow`` (LBM) or the result dict from a completed
         ``run_cfd_accurate`` job.

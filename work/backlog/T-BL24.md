@@ -17,8 +17,9 @@ blocker: needs live JLCPCB API credentials for an end-to-end signed-request smok
 **Filed 2026-07-03 (Fable advisor, from T-S1 status).** Erik obtained real JLCPCB Open
 API credentials: an `accesskey`/`secretkey` pair for signed requests. The live provider
 in `core/sourcing/quote.cpp` uses the required `appid`/`accesskey`/`secretkey` triple and
-per-request HMAC-SHA256 signing. Raw keys are recorded in `.env` (gitignored); the
-remaining work is the credentialed end-to-end smoke test against JLCPCB.
+per-request HMAC-SHA256 signing. The keys are held outside the repo; the remaining work is
+the credentialed end-to-end smoke test against JLCPCB, supplying them through
+`quote_providers.jlcpcb` in the app config or the `JLCPCB_*` env vars (nothing loads a `.env`).
 
 ## Definition of done
 

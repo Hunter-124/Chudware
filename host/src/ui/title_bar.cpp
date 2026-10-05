@@ -31,7 +31,6 @@
 #include "firmware/fw_workspace.h"  // T-FIN5: ui::firmwareTabVisible
 #include "feature_tree.h"      // ui::featureTreeActivePath (Save vs. Save As gating)
 #include "property_manager.h"  // PropertyManager::active() (used in View sub-menu)
-#include "widgets/interwebz.h" // ui::InterwebzDemoToggle (View > Interwebz demo)
 #include "plm/plm_hub.h"       // ui::plmProjectName (active-project status control)
 #include "tesseract.h"         // ui::drawTesseract (vector brand mark in the title bar)
 #include "widgets/kit.h"       // ui::kit::elide (active-project label capping)
@@ -853,7 +852,6 @@ struct FilMenuDrawer {
             ImGui::MenuItem("Equations",        nullptr, &st.showEquations);
             ImGui::MenuItem("AI Panel",         nullptr, &st.showAIPanel);
             ImGui::MenuItem("Viewport",         nullptr, &st.showViewport);
-            if (ImGui::MenuItem("Interwebz demo")) ui::InterwebzDemoToggle();
             ImGui::Separator();
             bool isLight = (ui::activeTheme == ui::Theme::Light);
             if (ImGui::MenuItem("Light theme (SolidWorks-style)", nullptr, isLight)) {

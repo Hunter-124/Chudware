@@ -1985,14 +1985,6 @@ void Renderer::setSectionPlanes(const float n[][3], const float off[], int count
                   section_.capRgb[2] = capRgb[2]; }
 }
 
-void Renderer::setSectionPlane(const float normal[3], float offset, bool enabled,
-                               const float capRgb[3], bool showCap) {
-    if (!enabled) { section_.count = 0; return; }
-    const float ns[1][3] = {{normal[0], normal[1], normal[2]}};
-    const float offs[1] = {offset};
-    setSectionPlanes(ns, offs, 1, capRgb, showCap);
-}
-
 int Renderer::sectionClip(float normals[3][3], float offsets[3]) const {
     for (int i = 0; i < section_.count && i < kMaxSectionPlanes; ++i) {
         normals[i][0] = section_.normals[i][0];

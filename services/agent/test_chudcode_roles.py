@@ -467,17 +467,13 @@ def test_role_runtime_preserves_explicit_allowed_tool_tristate(
     options,
     expected,
 ):
-    from services.agent import agent_turn
     from services.agent import mission_dispatch as mission
 
     captured = {}
     monkeypatch.setattr(
-        agent_turn, "resolver_for", lambda _dispatch: lambda _name: None
-    )
-    monkeypatch.setattr(
         mission,
-        "linear_role_prompt",
-        lambda *_args, **_kwargs: ("SYSTEM", ["role_tool"], None),
+        "role_prompt",
+        lambda *_args, **_kwargs: ("SYSTEM", ["role_tool"]),
     )
 
     def fake_build_host_tools(context):

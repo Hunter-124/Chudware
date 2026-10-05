@@ -14,9 +14,10 @@
 
 ---
 
-**Status:** Canonical parity standard for AI-opencad. This is the contract the project
-is built to reach: for every functional area, every capability is listed with its
-SolidWorks acceptance condition, our current status, and concrete evidence.
+**Status:** Canonical parity standard for Chudware. This is the contract the project
+is built to reach: every capability keeps its SolidWorks acceptance condition, status,
+and concrete evidence. The dated update above records the original engine push, not
+current test results or current source paths.
 
 **Scope:** Mechanical CAD parity is measured against SolidWorks 2020–2025. The ECAD /
 Electronics area has no SolidWorks analog and is measured against a KiCad-class baseline;
@@ -31,11 +32,18 @@ every ECAD item is a beyond-SW differentiator by definition.
 **Conservatism rule:** where evidence was ambiguous or a sub-condition unverified, the
 capability is scored down. A capability is `done` only when its evidence is concrete.
 
+**Evidence refresh (2026-10-04):** live pointers below name C++ compiler dispatch,
+document ops, worker RPCs, ribbon commands and PropertyManager forms. Artifact presence
+does **not** establish every acceptance sub-condition; unchanged statuses retain the
+prior assessment unless a specific contradiction is identified. Prose without a
+checkable pointer remains explicitly unverifiable in `scripts/parity_audit.py`.
+Historical Python test names and measurements in the dated update are not live evidence.
+
 **Parity %** per area is computed as `(done + beyond + 0.5·partial) / total`.
 
 ---
 
-## Parity scorecard
+## Parity scorecard — historical 2026-06-14 snapshot
 
 | Area | done | partial | missing | beyond | total | Parity % |
 |------|-----:|--------:|--------:|-------:|------:|---------:|
@@ -53,19 +61,11 @@ capability is scored down. A capability is `done` only when its evidence is conc
 | ECAD / Electronics (beyond-SW) | 30 | 6 | 8 | 3 | 47 | **77%** |
 | **TOTAL** | **204** | **126** | **142** | **7** | **479** | **57%** |
 
-**Reading the scorecard.** The mature pillars are the Sketcher (81%), the UI/UX shell
-(69%), Configurations (67%), and the beyond-SW ECAD module (77%). Surfacing jumped from
-0% to 47% in the 2026-06-14 engine push — all 15 surface features now have full engine
-implementations; host PM forms/ribbon are the remaining gate. Part Features climbed from
-46% to 51% as the full SW option matrix landed in engine (end conditions, guide curves,
-tangent propagation, instance skip/vary, parting-line draft, etc.); nearly every feature
-remains `partial` because the host PM form updates are gated on the parallel UI rework.
-The areas that still block real manufacturing workflows outright are **Drawings (37%)** —
-the projection engine is solid and the annotation vocabulary (radial/diameter/angular/
-center marks) is now in engine, but full host rendering + GD&T/balloons/title block is
-largely missing — and **Sheet Metal (39%) / Weldments (36%)** where cuts now propagate to
-flat patterns and corner relief is generated, but miter flange, gauge tables, and
-complete joint trim types remain open.
+The scorecard records the 2026-06-14 assessment; it is not a fresh measurement of
+today's tree. `python3 scripts/parity_audit.py` computes status totals and live-pointer
+coverage from the rows below. It does not run acceptance tests. The current C++ host
+has surfacing ribbon/forms and extended feature controls; their existence alone does
+not promote the inherited `partial` rows to full SolidWorks parity.
 
 The implementation backlog derived from every `partial` and `missing` row below used to
 live in `SW_PARITY_GAPS.md` (pruned 2026-07-23 in bb29af1c); the status rows in this
@@ -73,15 +73,15 @@ document are now the single source of truth.
 
 ---
 
-## 1. Sketcher (2D) — 81%
+## 1. Sketcher (2D)
 
 The sketcher is at roughly SolidWorks 2020 parity on the core workflow: a full entity
 suite over a Newton/LM solver with analytic Jacobians, the complete geometric-constraint
 set (including the P0 curve↔curve tangent gap closed 2026-06-14), Smart Dimension with
 the Modify box (driven dims, equation links, over-define pre-flight, double-click edit),
 and the editing tools (trim/extend/offset/fillet/chamfer/mirror/pattern/convert/move).
-Gaps are at the edges: blocks, pierce, arc-corner fillets, non-primitive entity
-mirror/move, and a dedicated rotate tool.
+Gaps include blocks, pierce, arc-corner fillets and non-primitive entity transforms.
+Rotate Entities now has a dedicated selection/center/angle tool.
 
 | Capability | SW acceptance condition | Status | Evidence |
 |---|---|---|---|
@@ -92,20 +92,20 @@ mirror/move, and a dedicated rotate tool.
 | Rectangle (5 variants) | Corner/center/3-pt-corner/3-pt-center/parallelogram, 4 lines + relations | done | RectCorner..Parallelogram; addQuadLoop |
 | Polygon (N-sided) | Regular inscribed/circumscribed polygon, equal edges | done | SketchTool::Polygon; addPolyLoop equalEdges |
 | Slot (4 variants) | Straight endpoint/centerpoint, arc 3-pt/centerpoint | done | Slot/SlotCtrStr/SlotArcCtr/SlotArc3pt; arc_slot entity |
-| Spline (through-pt, style) | Interpolating + control-pole spline, draggable | done | SketchTool::Spline/StyleSpline; Edge.make_spline |
+| Spline (through-pt, style) | Interpolating + control-pole spline, draggable | done | `host/src/ui/sketch_mode.cpp` SketchTool::Spline/StyleSpline; compiler `sketch`; `core/doc/document.cpp` spline edge construction |
 | Ellipse (full + partial) | Center+axes, partial trims angles | done | Ellipse/EllipsePartial; ellipse/ellipse_arc entities |
 | Conic (parabola, rho) | Parabola vertex/focus; rho conic apex/shoulder | done | Parabola/Conic; rational quadratic Bezier |
 | Equation-driven curve | x(t)/y(t) + range evaluated to fixed geometry | done | SketchTool::EqCurve; eq_curve entity |
-| Sketch text | String at anchor with cap height (reference geometry) | done | SketchTool::Text; build123d Text compiler |
+| Sketch text | String at anchor with cap height (reference geometry) | done | ribbon `sk_text`; `host/src/ui/sketch_mode.cpp` SketchTool::Text; compiler `sketch`; `core/doc/document.cpp` text entities |
 | Sketch point | Standalone constrainable point | done | SketchTool::Point; point entity; dim pick handles it |
 | Construction toggle | Any entity → construction, excluded from regions | done | sketch_toggle_construction; region detection excludes it |
 | Inference snapping | Endpoint/mid/rim/alignment snap with guide lines, master toggle | done | snapPoint() kSnapPx=6, mid/rim prefixes, inferenceOn_ |
 | Auto-relations on placement | Coincident/H/V/tangent/midpoint added on snap | done | kHVDeg auto-relation; tan/rim snap paths |
-| Geometric relations popup | Full context set: coincident…symmetric, fix, point-on, coradial | done | sketch_solver.py _add_constraint full dispatch; sk_relations |
-| Tangent constraint (line/arc) | All combinations: line-circle, arc-arc, line-conic, spline | done | All combinations including arc/spline/conic via curve-curve tangent residuals (mutual-closest-point signed gap + numeric Jacobian); `sketch_solver.py` `_curve_curve_tangent`; `test_sketch_tangent.py` |
+| Geometric relations popup | Full context set: coincident…symmetric, fix, point-on, coradial | done | ribbon `sk_relations`; op `sketch_add_constraint`; `core/sketch/sketch.cpp` add_constraint dispatch |
+| Tangent constraint (line/arc) | All combinations: line-circle, arc-arc, line-conic, spline | done | rpc `sketch_solve`; `core/sketch/sketch.cpp` add_tangent_line_circle/add_tangent_circle_circle/add_tangent_line_conic/add_tangent_line_curve/add_tangent_curve_curve dispatch and mutual-closest-point numeric residual |
 | Smart Dimension (all types) | Aligned/H/V/radius/diameter/angle, typed or =expr, draggable | done | SmartDim; dimCommit; distance/radius/diameter/angle constraints |
 | Driven (reference) dims | Parenthesized, consumes no DOF | done | driven flag; dimLabel parenthesizes; solver skips driven |
-| Equation-linked dims | =Var/=expr links to equation engine | done | dimCommit isExpr; equations.py; _resolve_dim |
+| Equation-linked dims | =Var/=expr links to equation engine | done | op `sketch_set_dim`; `host/src/ui/sketch_mode.cpp` dimCommit; `core/sketch/sketch.cpp` resolve_dim |
 | Dimension min/max | Near/far rim attachment to circle | done | cond field; condShift() anchor move |
 | Over-define pre-flight + dialog | Probe before commit: Make Driven/Leave Driving/Cancel | done | sketch_probe RPC; overDefOpen_/relOverDefOpen_/editOverDefOpen_ |
 | Fully-defined detection + DOF | Under/Fully/Over with DOF count, color-coded entities | done | _overall_status(); statusLine(); entity status field |
@@ -123,7 +123,7 @@ mirror/move, and a dedicated rotate tool.
 | Convert entities | Project model edges/faces into sketch with live link | **partial** | sketch_convert/sketch_project_ref work but link is static fix, not live parametric |
 | Move/Copy entities | From/to or delta; copy adds translated copies | done | sketch_move (copy flag); Move (C54) |
 | Move/Copy of non-primitive types | Move splines/slots/text/ellipses | **missing** | _MP_SUPPORTED guard raises unsupported_entity |
-| Rotate Entities | Dedicated tool: select, center, angle | **missing** | no rotate_entities op / SketchTool::Rotate / ribbon cmd |
+| Rotate Entities | Dedicated tool: select, center, angle | done | op `sketch_rotate`; ribbon `sk_rotate_entities`; `host/src/ui/sketch_mode.cpp` RotateEntities selection, draggable center, ring/typed angle and applyRotateOp; line/circle/arc inputs |
 | Scale Entities | Uniform scale about a base point | **missing** | no scale op anywhere |
 | Sketch Blocks | Create/insert/define/explode named reusable groups | **missing** | no block op/entity/RPC anywhere |
 | Under-defined exit warning | Warn on exiting an under-defined sketch | **partial** | DOF shown in status bar; no exit gate dialog |
@@ -145,59 +145,58 @@ mirror/move, and a dedicated rotate tool.
 
 ---
 
-## 2. Part Features (3D Solid) — 51%
+## 2. Part Features (3D Solid)
 
 A cohesive feature set (extrude/revolve/sweep/loft, fillet/chamfer/shell/draft/rib, Hole
 Wizard, pattern/mirror, reference geometry, helix, boolean, split, Instant3D, rollback,
-suppression, equations). The 2026-06-14 engine push added the full SW option matrix to
-every engine compiler (end conditions, guide curves, tangent propagation, instance skip,
-From-conditions, parting-line draft, face fillet, etc. — 660 tests green). The parity %
-is still limited because host PM forms to *expose* these options are pending the parallel
-UI rework; all upgraded rows stay `partial` with "engine done, host UI pending."
+suppression, equations). The dated engine push described the original option matrix.
+Current engine evidence is `core/doc/document.cpp`, with types validated in
+`core/doc/validate.cpp`; host controls live in `host/src/ui/pm_forms.cpp`. Existing forms
+replace the historical "host UI pending" blanket claim but do not prove full acceptance.
 
 | Capability | SW acceptance condition | Status | Evidence |
 |---|---|---|---|
-| Extrude — end conditions | Blind/Through-All/Mid/Up-To-Next/Surface/Body/Vertex/Offset, Dir1+Dir2, draft, thin, merge/new-body | **partial** | Engine compiler implements Up-To-Surface / Offset-From-Surface / Up-To-Body / Up-To-Vertex + full Dir2 matrix + thin feature + explicit New-Body (`extrude.py`; `test_extrude_ends.py`); host PM ref-pick wells + end-condition combo items pending |
-| Extrude draft + thin feature | Draft per direction + thin-wall shell of profile | **partial** | Engine: thin via concentric Wire.offset_2d rings, both sides (`extrude.py`; `test_extrude_ends.py`); host PM thin-wall group pending |
-| Revolve — full feature set | Dir1+Dir2 angle, Mid/Up-To-Surface, thin, sketch centerline axis | **partial** | Engine: Dir2 angle, Mid-Plane, Up-To-Surface, thin, construction-centerline axis (`revolve.py`; `test_revolve.py`); host PM form pending |
-| Sweep — core | Profile-along-path + guide curves + twist + orientation modes | **partial** | Engine: guide curves + twist (turns/degrees) + orientation modes (follow-path/frenet/keep-normal) + thin via `BRepOffsetAPI_MakePipeShell` (`sweep.py`; `test_sweep.py`); host PM guide/twist wells pending |
-| Loft — core | 2+ sections + guide curves + centerline + start/end tangency + matching | **partial** | Engine: start/end tangency (ThruSections smoothing), centerline + guide curves (MakePipeShell), thin (`loft.py`; `test_loft.py`); host PM guide/tangency wells pending |
+| Extrude — end conditions | Blind/Through-All/Mid/Up-To-Next/Surface/Body/Vertex/Offset, Dir1+Dir2, draft, thin, merge/new-body | **partial** | compiler `extrude`; pm_form `extrude`; `core/doc/document.cpp`; host exposes Direction 2 and reference end wells; complete end-condition matrix still needs acceptance verification |
+| Extrude draft + thin feature | Draft per direction + thin-wall shell of profile | **partial** | compiler `extrude`; pm_form `extrude` draft_outward/draft, thin_thickness/thin_side; per-direction draft acceptance not established by form presence |
+| Revolve — full feature set | Dir1+Dir2 angle, Mid/Up-To-Surface, thin, sketch centerline axis | **partial** | compiler `revolve`; pm_form `revolve` end/dir2/angle2/thin/axis controls; complete option behavior remains unverified |
+| Sweep — core | Profile-along-path + guide curves + twist + orientation modes | **partial** | compiler `sweep`; pm_form `sweep` guides/twist_turns/twist_degrees/orientation; `core/doc/document.cpp`; complete guide/twist/orientation acceptance remains unverified |
+| Loft — core | 2+ sections + guide curves + centerline + start/end tangency + matching | **partial** | compiler `loft`; pm_form `loft` sections/guides/centerline/tangency_start/tangency_end; matching and continuity acceptance remains unverified |
 | Boundary Boss/Cut | Independent guide curves + tangency/curvature per direction | **missing** | no boundary type/compiler/ribbon |
-| Fillet — constant + variable | Constant + variable + face + full-round + conic profiles + tangent prop | **partial** | Engine: face fillet (blend between two face sets), conic profile (rho), tangent propagation (BFS over G1-continuous edges) added (`dress.py`; `test_dress_ext.py`); host PM face-fillet wells + tangent-prop checkbox pending |
-| Chamfer — symmetric/asymmetric | Symmetric/asymmetric/angle×distance/vertex + tangent prop | **partial** | Engine: angle×distance (AddDA) + vertex chamfer (corner-plane cut) added (`dress.py`; `test_dress_ext.py`); host PM form pending |
-| Shell | Uniform wall, remove faces, in/out, multi-thickness | **partial** | Engine: multi-thickness (per-face offset overrides) added (`dress.py`; `test_dress_ext.py`); host PM per-face thickness well pending |
-| Draft | Neutral-plane taper + parting-line + step + pull override | **partial** | Engine: parting-line draft (split + opposite-sign DraftAngle per side) + step draft added (`draft.py`; `test_ribdraft_ext.py`); host PM pull-dir well pending |
-| Rib | Thin wall from open contour, both/one side, draft, flip | **partial** | Engine: explicit drop direction + normal-vs-parallel thicken added (`rib.py`; `test_ribdraft_ext.py`); host PM direction-pick well pending |
+| Fillet — constant + variable | Constant + variable + face + full-round + conic profiles + tangent prop | **partial** | compiler `fillet`; pm_form `fillet` constant/variable only; full-round/face/conic/tangent-propagation acceptance not established by the current controls |
+| Chamfer — symmetric/asymmetric | Symmetric/asymmetric/angle×distance/vertex + tangent prop | **partial** | compiler `chamfer`; pm_form `chamfer` symmetric/asymmetric/distance_angle/vertex controls; tangent-propagation acceptance remains unverified |
+| Shell | Uniform wall, remove faces, in/out, multi-thickness | **partial** | compiler `shell`; pm_form `shell` remove/thickness/outward; per-face thickness overrides not exposed by this form |
+| Draft | Neutral-plane taper + parting-line + step + pull override | **partial** | compiler `draft`; pm_form `draft`; `core/doc/document.cpp`; full parting-line/step/pull matrix remains unverified |
+| Rib | Thin wall from open contour, both/one side, draft, flip | **partial** | compiler `rib`; pm_form `rib`; `core/doc/document.cpp`; complete direction/thickening acceptance remains unverified |
 | Wrap | Project sketch onto curved surface (emboss/deboss/scribe) | **missing** | not in FEATURE_TYPES/compiler/ribbon |
-| Hole Wizard | Simple/cbore/csink/tap; ISO+ANSI+BSP+JIS; multi-position; cosmetic thread | **partial** | Engine: ANSI/UNC/UNF + BSP/NPT thread tables (real tap-drill/major dims), cosmetic-thread annotation record on tapped face, sketch-point hole positions added (`hole.py`; `test_hole_ext.py`); host PM ANSI combo + thread-render display pending |
-| Linear Pattern | 1D/2D grid + skip + vary + curve/sketch/fill/table modes + body pattern | **partial** | Engine: instance skip + vary-instance (per-instance accumulating delta + scale) + geometry_pattern flag added (`pattern.py`; `test_pattern_ext.py`); host PM skip-well + curve/fill modes pending |
-| Circular Pattern | Count/angle/equal-spacing + skip + bidirectional + body pattern | **partial** | Engine: instance skip + bidirectional (second ring) added (`pattern.py`; `test_pattern_ext.py`); host PM skip-well pending |
-| Mirror Feature | Mirror features OR bodies + geometry-pattern + merge | **partial** | Engine: refs.bodies + merge toggle (union vs separate body) added (`pattern.py`; `test_pattern_ext.py`); host PM bodies well + merge checkbox pending |
+| Hole Wizard | Simple/cbore/csink/tap; ISO+ANSI+BSP+JIS; multi-position; cosmetic thread | **partial** | compiler `hole`; pm_form `hole`; `core/doc/document.cpp` hole sizing and positions; complete standards and cosmetic-thread display acceptance remains unverified |
+| Linear Pattern | 1D/2D grid + skip + vary + curve/sketch/fill/table modes + body pattern | **partial** | compiler `linear_pattern`; pm_form `linear_pattern`; `core/doc/document.cpp`; curve/sketch/fill/table mode acceptance not established |
+| Circular Pattern | Count/angle/equal-spacing + skip + bidirectional + body pattern | **partial** | compiler `circular_pattern`; pm_form `circular_pattern`; `core/doc/document.cpp`; complete skip/bidirectional/body behavior remains unverified |
+| Mirror Feature | Mirror features OR bodies + geometry-pattern + merge | **partial** | compiler `mirror`; pm_form `mirror`; `core/doc/validate.cpp` features/bodies refs; complete merge/pattern behavior remains unverified |
 | Sketch/Curve/Fill Pattern | Instances at sketch points / along curve / flood-fill a face | **missing** | no compiler/ribbon/type |
-| Reference — Plane | Offset/angle/3-pt/mid/parallel-at-pt/normal-to-curve/on-surface | **partial** | Engine: parallel-through-point / normal-to-curve / on-surface methods added via BRepAdaptor/ProjectPointOnSurf (`datum.py`; `test_datum_ext.py`); host PM method picker pending |
-| Reference — Axis | Cylinder/2-plane/2-point/edge/on-surface | **partial** | Engine: on-surface axis (normal to surface at picked point) added (`datum.py`; `test_datum_ext.py`); host PM pending |
-| Reference — Point | Vertex/center/on-face/on-curve/intersection/centroid/coordinate | **partial** | Engine: on-curve / intersection / centroid (GProp) / explicit coordinate methods added (`datum.py`; `test_datum_ext.py`); host PM method picker pending |
+| Reference — Plane | Offset/angle/3-pt/mid/parallel-at-pt/normal-to-curve/on-surface | **partial** | compiler `plane`; pm_form `plane`; `core/doc/document.cpp`; complete reference-method acceptance remains unverified |
+| Reference — Axis | Cylinder/2-plane/2-point/edge/on-surface | **partial** | compiler `axis`; pm_form `axis`; `core/doc/document.cpp`; complete reference-method acceptance remains unverified |
+| Reference — Point | Vertex/center/on-face/on-curve/intersection/centroid/coordinate | **partial** | compiler `point`; pm_form `point`; `core/doc/document.cpp`; complete reference-method acceptance remains unverified |
 | Reference — CSYS | Origin + X/Y dir, derived Z (right-hand) | done | pm_form csys; ribbon ref_csys; Gram-Schmidt; PM wells for all three |
-| Helix / Spiral | Pitch/height/turns combos + taper + start angle + CW/CCW + variable pitch + flat spiral | **partial** | Engine: variable-pitch helix (per-region pitch/dia table, integrated height, B-spline) + flat Archimedean spiral added (`curves.py`; `test_helix_ext.py`); host PM variable-pitch table well pending |
+| Helix / Spiral | Pitch/height/turns combos + taper + start angle + CW/CCW + variable pitch + flat spiral | **partial** | compiler `helix`; pm_form `helix`; `core/doc/document.cpp`; variable-pitch/spiral matrix and host editing remain unverified |
 | Multi-body Boolean | Combine/Subtract/Intersect + keep tools, 2+ bodies | done | pm_form boolean; ribbon boolean_combine/boolean_subtract/boolean_intersect; keep_tools |
-| Split | Planar split keep both/above/below, multi-body | **partial** | Engine: non-planar/surface split via BRepAlgoAPI_Splitter (curved-face tool, keep-side by centroid projection) added (`split.py`; `test_split_ext.py`); host PM surface-tool well pending |
+| Split | Planar split keep both/above/below, multi-body | **partial** | compiler `split`; pm_form `split`; `core/doc/document.cpp`; non-planar keep-side acceptance remains unverified |
 | Instant3D — face drag | Drag any sketch-feature face to drive its dim, 1 undo, expr-protected | **partial** | extrude depth/box/cylinder/hole dia/datum offset; no revolve/fillet/chamfer/shell/rib/pattern drag |
-| Rollback Bar | Suppress all features below bar; insert after bar; undo-aware | done | _op_set_rollback; compiler rollback_after; _validate_rollback |
-| Feature Suppression | Suppress/unsuppress, config-specific, greyed | done | _op_set_suppressed; config suppressions dict |
+| Rollback Bar | Suppress all features below bar; insert after bar; undo-aware | done | op `set_rollback`; `core/doc/session.cpp` and `core/doc/document.cpp` rollback_after; host rollback bar |
+| Feature Suppression | Suppress/unsuppress, config-specific, greyed | done | op `set_suppressed`; `core/doc/session.cpp` configuration suppressions; host tree [S] rendering |
 | Configurations (variants) | Per-config param overrides + suppression + design table | **partial** | overrides+suppression done; no design table, no per-config ref geometry |
-| Equations / Design Variables | Global vars + dim refs + cycle detection + eval order | done | equations.py; compiler resolution; eq_set/eq_delete |
+| Equations / Design Variables | Global vars + dim refs + cycle detection + eval order | done | op `eq_set`/`eq_delete`; `core/doc/session.cpp`; expression resolution in `core/doc/document.cpp` |
 | Feature Tree — rename/reorder/folder | Rename, dependency-checked reorder, folders, properties dialog | **partial** | rename/reorder/folder ops done; no Feature Properties dialog |
 | Cosmetic Thread | Annotation marking a cylindrical face threaded | **missing** | thread_callout is BOM-only, not rendered; no standalone cosmetic-thread feature |
-| Tangent Propagation (fillet/chamfer) | Auto-include tangent-connected edges (SW default) | **partial** | Engine: BFS over G1-continuous edges in `dress.py` `_propagate_tangent_edges` (`test_dress_ext.py`); host PM checkbox still emits CheckSoon — host UI pending |
-| Fillet — Face Fillet | Rolling-ball fillet between two non-adjacent faces | **partial** | Engine: face fillet compiler added (blend chain of edges between two face sets) in `dress.py` (`test_dress_ext.py`); host PM face-set wells pending |
-| Extrude From-condition | Start from surface/face/plane/vertex/offset (not just sketch plane) | **partial** | Engine: from_face ref resolves surface/face/plane/vertex offsets in `extrude.py` (`test_extrude_ends.py`); host PM From group pending |
-| Pattern — instance skip | Suppress individual instances in the grid | **partial** | Engine: per-instance skip set + vary-instance (accumulating spacing delta) in `pattern.py` (`test_pattern_ext.py`); host PM skip-instance well pending |
+| Tangent Propagation (fillet/chamfer) | Auto-include tangent-connected edges (SW default) | **partial** | compiler `fillet`/`chamfer`; current forms do not expose tangent propagation; original Python implementation is not current acceptance evidence |
+| Fillet — Face Fillet | Rolling-ball fillet between two non-adjacent faces | **partial** | compiler `fillet`; current pm_form `fillet` exposes edge constant/variable modes, not two face sets; rolling-ball face-fillet acceptance remains unverified |
+| Extrude From-condition | Start from surface/face/plane/vertex/offset (not just sketch plane) | **partial** | compiler `extrude`; pm_form `extrude` start/start_ref/start_offset; complete From-condition acceptance remains unverified |
+| Pattern — instance skip | Suppress individual instances in the grid | **partial** | compiler `linear_pattern`/`circular_pattern`; `core/doc/document.cpp`; host instance-skip editing and complete behavior remain unverified |
 | Pattern — geometry vs feature | Re-solve seed per instance (follow faces) vs rigid copy | **partial** | always geometry pattern; no feature-pattern path |
 | Extrude/Revolve — Selected Contours | Multi-select individual regions in a multi-region sketch (PM UI) | **partial** | engine indexed selection works; PM has single profile well only |
 
 ---
 
-## 3. Assemblies — 55%
+## 3. Assemblies
 
 A solid P0 core: new assembly, insert-with-cache, auto-fix-first, the seven standard
 mates over a Rodrigues-exp-map LM solver with analytic Jacobians, constrained drag,
@@ -207,18 +206,18 @@ advanced/mechanical mates, mirror, flexible sub-assemblies, and in-context editi
 
 | Capability | SW acceptance condition | Status | Evidence |
 |---|---|---|---|
-| New Assembly Document | Blank asm with 3 datum planes, auto-open Insert, first comp fixed | done | _blank_assembly; new_assembly handler; drawAssemblyTree |
+| New Assembly Document | Blank asm with 3 datum planes, auto-open Insert, first comp fixed | done | rpc `doc_new`; op `asm_insert_component`; `core/doc/session.cpp` assembly initialization; host drawAssemblyTree |
 | Insert Component | File picker, place at click/drop, multi-instance, sub-asm | **partial** | text-path input (no browser), origin-only placement, sub-asm flat-loads but no child expansion |
-| Component Suppression | Suppress removes from solve+tessellation; config-specific | done | asm_insert handler; suppressed field on component ops; [S] suffix in tree |
+| Component Suppression | Suppress removes from solve+tessellation; config-specific | done | op `asm_edit_component`; rpc `config_set_suppression`; `core/doc/session.cpp` and `core/doc/assembly.cpp`; host tree [S] |
 | Fixed / Floating | First auto-fixed; RMB Float/Fix toggle | **partial** | op exists; no RMB context-menu toggle in UI |
-| Mate: Coincident | Plane/axis/vertex coincident, aligned/anti, removes 3–4 DOF | done | _coincident_plane/_coincident_axis; addMate; verified |
-| Mate: Parallel | Faces/edges parallel, aligned/anti, 2 DOF | done | _parallel; suggestedMate kPlanePlane |
-| Mate: Perpendicular | Axes/normals orthogonal, 1 DOF | done | _perpendicular; not in auto-suggest list (hidden UX) |
-| Mate: Concentric | Coaxial cylinders, removes 4 DOF | done | _concentric; verified peg-in-hole |
-| Mate: Distance | Signed gap with flip, 1 DOF | done | _distance; DimField |
-| Mate: Angle | Angle between normals/edges with flip, 1 DOF | done | _angle; DimField; not in auto-suggest list |
-| Mate: Tangent | Cylinder-plane / cyl-cyl tangent, 1 DOF | done | _tangent_cyl_plane; not in auto-suggest list |
-| Mate: Lock | Freeze relative 6-DOF | done | _lock (Rodrigues log-map); not in auto-suggest list |
+| Mate: Coincident | Plane/axis/vertex coincident, aligned/anti, removes 3–4 DOF | done | op `asm_add_mate`; `core/mate/mate.cpp` coincident residual dispatch; `core/doc/assembly.cpp` geometry resolution |
+| Mate: Parallel | Faces/edges parallel, aligned/anti, 2 DOF | done | op `asm_add_mate`; `core/mate/mate.cpp` parallel residual dispatch |
+| Mate: Perpendicular | Axes/normals orthogonal, 1 DOF | done | op `asm_add_mate`; `core/mate/mate.cpp` perpendicular residual dispatch |
+| Mate: Concentric | Coaxial cylinders, removes 4 DOF | done | op `asm_add_mate`; `core/mate/mate.cpp` concentric residual dispatch |
+| Mate: Distance | Signed gap with flip, 1 DOF | done | op `asm_add_mate`; `core/mate/mate.cpp` distance residual dispatch |
+| Mate: Angle | Angle between normals/edges with flip, 1 DOF | done | op `asm_add_mate`; `core/mate/mate.cpp` angle residual dispatch |
+| Mate: Tangent | Cylinder-plane / cyl-cyl tangent, 1 DOF | done | op `asm_add_mate`; `core/mate/mate.cpp` tangent residual dispatch |
+| Mate: Lock | Freeze relative 6-DOF | done | op `asm_add_mate`; `core/mate/mate.cpp` lock residual dispatch |
 | Advanced Mate: Symmetric | Mirror two comps about a plane, 3 DOF | **missing** | no symmetric mate type |
 | Advanced Mate: Width | Center tab between groove faces, 1 DOF | **missing** | not implemented |
 | Advanced Mate: Profile Center | Align profile centroids, 2–4 DOF | **missing** | not implemented |
@@ -228,20 +227,20 @@ advanced/mechanical mates, mirror, flexible sub-assemblies, and in-context editi
 | Mechanical: Cam/Follower | Follower tangent to cam profile | **missing** | not implemented |
 | Mechanical: Screw | Translation/rotation pitch coupling | **missing** | not implemented |
 | Mechanical: Linear Coupler | Ratio-coupled translation | **missing** | not implemented |
-| Aligned / Anti-Aligned toggle | Seat/oppose normals, persists on edit | done | self.sign; aligned_ radios; align field |
-| Mate Redundancy / Over-Def detection | Redundant (orange) / conflicting (red), names offender | done | _classify_mates QR rank test; over_defined; mate_status |
-| DOF Summary | "X DOF remaining (N comps, M fixed)" or Fully constrained | done | _dof_summary in ops-response (not yet rendered in UI status bar) |
-| Mate Suppress / Unsuppress | RMB Suppress grays mate, removes from solve | done | _op_asm_edit_mate; tree context menu; [S] |
-| Mate Delete | RMB Delete; cascade on component delete | done | _op_asm_delete_mate/_delete_component |
+| Aligned / Anti-Aligned toggle | Seat/oppose normals, persists on edit | done | op `asm_edit_mate`; `core/mate/mate.cpp`; host mate alignment controls |
+| Mate Redundancy / Over-Def detection | Redundant (orange) / conflicting (red), names offender | done | rpc `doc_solve_mates`; `core/mate/mate.cpp` rank/status classification; complete UI acceptance retains the prior assessment |
+| DOF Summary | "X DOF remaining (N comps, M fixed)" or Fully constrained | done | rpc `doc_solve_mates`; `core/doc/assembly.cpp` and `core/mate/mate.cpp` solver DOF data; complete status rendering retains the prior assessment |
+| Mate Suppress / Unsuppress | RMB Suppress grays mate, removes from solve | done | op `asm_edit_mate`; `core/doc/session.cpp`; host tree context menu |
+| Mate Delete | RMB Delete; cascade on component delete | done | op `asm_delete_mate`/`asm_delete_component`; `core/doc/session.cpp` |
 | Mate Edit | Double-click/RMB Edit reopens PM pre-filled | **missing** | asm_edit_mate op exists; no UI Edit path |
 | Move Component (constrained drag) | Drag floating comp along free DOF, mates hold; rotate triad | **partial** | translation drag verified; no rotate triad |
 | Linear Component Pattern | Direction (edge/axis/vector) + spacing + count, BOM rollup | **partial** | world datum axes only (no edge dir); no 2nd direction; instances view-only |
 | Circular Component Pattern | Count + angle + equal-spacing + axis (edge/datum) | **partial** | world datum axes only; no partial-fill angle option |
 | Mirror Component | Mirror comps across a plane, BOM listed | **missing** | no asm_mirror feature/engine/UI |
 | Exploded View — manual steps | Drag comps with triad to author named steps; animate | **partial** | flat-list steps via op; no triad authoring, no per-step animate/reorder |
-| Exploded View — factor slider | 0→1 interpolation, display-only | done | drawExplode slider; set_explode_state (no rev bump) |
+| Exploded View — factor slider | 0→1 interpolation, display-only | done | rpc `doc_set_explode_state`; `core/doc/session.cpp`; host explode slider |
 | Exploded View — explode lines | Dashed guide rails from exploded to mated pos | **missing** | no line rendering/emission |
-| Interference Detection | Pairwise overlap volume + min clearance, highlight | done | interference(); drawInterference table (no viewport highlight) |
+| Interference Detection | Pairwise overlap volume + min clearance, highlight | done | rpc `eval_interference`; `core/doc/session.cpp`; `host/src/ui/evaluate_dialogs.cpp` inventory/overlay path; complete clearance/highlight acceptance retains the prior assessment |
 | BOM — assembly panel | Live item/name/qty/desc/mass, CSV/annotation | **partial** | Name/Source/Qty/Mass + CSV; no Description/custom props, no balloons, no sort/filter |
 | BOM — drawing integration | Linked auto-updating BOM table + balloons on sheet | **partial** | drawing_bom data exists; no UI table insert, no balloons |
 | Smart Fasteners | Auto-populate bolt/washer/nut stacks from Toolbox | **missing** | no fastener library/Toolbox |
@@ -252,25 +251,24 @@ advanced/mechanical mates, mirror, flexible sub-assemblies, and in-context editi
 | Assembly Rollback Bar | Roll back to before mates/features | **missing** | asm docs have no feature ordering for rollback |
 | Component Appearance Override | RMB Appearance per instance | **partial** | auto-color + op override done; no RMB Appearance menu for components |
 | Drawing Views of Assembly | Ortho+iso+section of assembled model, auto-update | **partial** | whole-asm silhouette; no per-component HLR separation, no exploded views |
-| Component Mass Properties (asm context) | Per-comp mass/CG/inertia in world frame | **partial** | mass local-frame; CG/inertia not transformed to world; no total-asm sum |
-| Multiple Instances of Same Part | Independent transform/mates, shared cached geometry | done | _LOAD_CACHE keyed abspath:mtime; distinct ids |
-| Undo / Redo | Ctrl+Z/Y restores doc incl. solved transforms | done | undo_stack/redo_stack (limit 100); verified |
-| Warm-Start Solve | Reuse last solution as init for fast convergence | done | AssemblyResult.warm; mate_solver warm (t,w) |
+| Component Mass Properties (asm context) | Per-comp mass/CG/inertia in world frame | **partial** | rpc `eval_mass`; `core/doc/session.cpp` gathers world-placed assembly shapes; full per-component/material reporting acceptance remains unverified |
+| Multiple Instances of Same Part | Independent transform/mates, shared cached geometry | done | op `asm_insert_component`; `core/doc/assembly.cpp` g_load_cache shared component geometry with distinct instance ids |
+| Undo / Redo | Ctrl+Z/Y restores doc incl. solved transforms | done | rpc `doc_undo`/`doc_redo`; `core/doc/session.cpp` transactional history |
+| Warm-Start Solve | Reuse last solution as init for fast convergence | done | rpc `doc_solve_mates`; `core/doc/session.cpp` asm_warm state; `core/mate/mate.cpp` warm-start solve |
 | Antipodal / Flip Singularity Escape | Escape 180° rotation saddle | **beyond** | 6 random rotation perturbations when unconverged (SW handles implicitly) |
 | Mate Geometry: Sphere | Sphere-plane / sphere-sphere coincident/tangent | **partial** | sphere MateGeom resolved but no sphere residual block (undefined behavior) |
 
 ---
 
-## 4. Drawings — 37%
+## 4. Drawings
 
 The OCCT HLR projection engine is strong (associative, cached, persistent: base/projected/
 iso views, one-cut section, circular detail, linear/aligned dims, free notes, basic BOM,
-DXF R12 + vector PDF). The 2026-06-14 engine push added circular-arc/circle extraction
-through HLR projection, enabling radial, diameter, angular dimensions and center marks/
-center lines in engine (test_drawing_dims_ext.py). The 37% still reflects that the
-*annotation vocabulary a drafter uses daily* is largely absent — GD&T, balloons, leaders,
-surface-finish/weld symbols, ordinate dims — plus advanced views, title blocks,
-multi-sheet, and table customization. These block manufacturing-drawing workflows.
+DXF R12 + vector PDF). The annotation additions in the 2026-06-14 update are historical.
+Current drawing sessions and annotations live in `core/doc/drawing_session.cpp`,
+projection in `core/doc/drawing.cpp`, rendering in `host/src/ui/drawing_panel.cpp`.
+Inherited statuses are not promoted solely from RPC presence: each full drafting
+acceptance condition still requires its own end-to-end evidence.
 
 | Capability | SW acceptance condition | Status | Evidence |
 |---|---|---|---|
@@ -295,14 +293,14 @@ multi-sheet, and table customization. These block manufacturing-drawing workflow
 | Sheet border + zones | Thick border + A1–D4 zone grid | **missing** | thin margin only |
 | Linear dimension (H/V) | Extension lines + arrows + value | done | add_dim linear_dim; renderDimension |
 | Aligned dimension | True point-to-point distance | done | add_dim aligned_dim; inclined dim line |
-| Radial dimension | R-prefix leader from center to arc | **partial** | Engine: arc/circle entity extraction through HLR + radial annotation in `drawing.py` (`test_drawing_dims_ext.py`); stored via note+kind; host drawing_panel first-class rendering pending |
-| Diameter dimension | Ø with through-center line / leader | **partial** | Engine: circle detection + diameter annotation in `drawing.py` (`test_drawing_dims_ext.py`); stored via note+kind; host rendering pending |
-| Angular dimension | Angle between two lines, arc dim line | **partial** | Engine: angular annotation between two projected lines in `drawing.py` (`test_drawing_dims_ext.py`); stored via note+kind; host rendering pending |
+| Radial dimension | R-prefix leader from center to arc | **partial** | rpc `drawing_add_dim`; `core/doc/drawing_session.cpp` radial annotations; `host/src/ui/drawing_panel.cpp`; complete placement/rendering acceptance remains unverified |
+| Diameter dimension | Ø with through-center line / leader | **partial** | rpc `drawing_add_dim`; `core/doc/drawing_session.cpp` diameter annotations; `host/src/ui/drawing_panel.cpp`; complete placement/rendering acceptance remains unverified |
+| Angular dimension | Angle between two lines, arc dim line | **partial** | rpc `drawing_add_dim`; `core/doc/drawing_session.cpp` angular annotations; `host/src/ui/drawing_panel.cpp`; complete placement/rendering acceptance remains unverified |
 | Ordinate (baseline) dims | Stacked distances from a baseline | **missing** | not in annotation system |
 | Hole callout / smart annotation | Auto note from Hole Wizard data + leader | **missing** | no feature-data linkage |
 | Free-text note with leader | Text anywhere + optional leader | **partial** | floating text placed; no leader geometry |
-| Center mark | Crosshair at circular feature center | **partial** | Engine: center mark annotation (crosshair at arc/circle center) in `drawing.py` (`test_drawing_dims_ext.py`); host drawing_panel rendering pending |
-| Centerline | Dash-dot line through cylindrical axis | **partial** | Engine: centerline annotation through cylindrical axis in `drawing.py` (`test_drawing_dims_ext.py`); host CENTER linetype rendering pending |
+| Center mark | Crosshair at circular feature center | **partial** | `core/doc/drawing_session.cpp` center-mark annotations; `host/src/ui/drawing_panel.cpp`; full placement/rendering acceptance remains unverified |
+| Centerline | Dash-dot line through cylindrical axis | **partial** | `core/doc/drawing_session.cpp` centerline annotations; `host/src/ui/drawing_panel.cpp`; full axis/linetype acceptance remains unverified |
 | GD&T / Feature Control Frame | Symbol + tolerance + datum boxes | **missing** | not in _ANNOTATION_TYPES |
 | Datum feature symbol | Triangle + letter for GD&T datums | **missing** | not implemented |
 | Surface finish symbol | √ with Ra/Rz | **missing** | not implemented |
@@ -339,29 +337,26 @@ multi-sheet, and table customization. These block manufacturing-drawing workflow
 
 ---
 
-## 5. Sheet Metal — 39%
+## 5. Sheet Metal
 
-Core productivity features ship and are tested (base/edge flange, hem, jog, flat-pattern
-unfold with verified bend-allowance math, flat DXF/PDF export, K-factor inheritance). The
-2026-06-14 engine push closed both P0 correctness gaps: cuts now propagate into the flat
-pattern (base-region holes 1:1, flange-wall holes through bend frame) and onto a CUTS
-layer in the exported flat DXF/PDF; corner relief (rectangular/obround/tear) is generated
-at perpendicular adjacent-flange junctions. The remaining gaps are the missing
-manufacturing breadth (miter flange, sketched bend, gauge tables, multi-edge flange,
-properties panel, 12+ ribbon commands).
+Base/edge flange, hem, jog and flat-pattern compilers are live in C++.
+`core/geom/sheetmetal.cpp` develops bend strips; `core/doc/export2d.cpp` exports
+OUTLINE/BEND and inner-wire CUTS. The dated engine push above is not proof that
+the current C++ implementation preserves flange-wall cuts or generates corner relief.
+Those acceptance claims are therefore no longer marked done solely from retired tests.
 
 | Capability | SW acceptance condition | Status | Evidence |
 |---|---|---|---|
-| Base Flange / Tab | Closed-profile blank sets thickness/K/radius; reject open profile | done | pm_form sm_base_flange; ribbon sm_base_flange; tests 1+8 (no separate Tab) |
-| Edge Flange | Bent wall off edge: angle/length/radius/position/flip + bend record | done | pm_form sm_edge_flange; ribbon sm_edge_flange; tests 2–7 (single edge only) |
+| Base Flange / Tab | Closed-profile blank sets thickness/K/radius; reject open profile | done | compiler `sm_base_flange`; pm_form `sm_base_flange`; ribbon `sm_base_flange`; `core/geom/sheetmetal.cpp` (no separate Tab) |
+| Edge Flange | Bent wall off edge: angle/length/radius/position/flip + bend record | done | compiler `sm_edge_flange`; pm_form `sm_edge_flange`; ribbon `sm_edge_flange`; `core/geom/sheetmetal.cpp` (single edge) |
 | Miter Flange | Swept edge-chain with mitered corners | **missing** | not in schema/ribbon/PM (deferred in closeout) |
-| Hem | Closed/open/teardrop fold + bend record | done | pm_form sm_hem; ribbon sm_hem; hem/jog tests 1–5 |
-| Jog | Two opposing bends to a parallel offset | done | pm_form sm_jog; ribbon sm_jog; tests 6–8 |
+| Hem | Closed/open/teardrop fold + bend record | done | compiler `sm_hem`; pm_form `sm_hem`; ribbon `sm_hem`; `core/geom/sheetmetal.cpp` |
+| Jog | Two opposing bends to a parallel offset | done | compiler `sm_jog`; pm_form `sm_jog`; ribbon `sm_jog`; `core/geom/sheetmetal.cpp` |
 | Sketched Bend | Bend along a line on the broad face | **missing** | no sm_sketched_bend |
 | Lofted Bend | Sheet lofted between two profiles | **missing** | no sm_lofted_bend |
-| Flat Pattern / Unfold | BA-based developed length, bend lines, outline, area/vol | done | ribbon sm_flat_pattern; BA verified 60.5553mm |
-| Flat Pattern DXF/PDF Export | OUTLINE + BEND layers, requires Flatten | done | flat_pattern_layers; export_flat_dxf (W14) |
-| Corner Treatments (Corner Relief) | Auto/round/rect/tear relief between adjacent flanges | done | Rectangular/obround/tear relief generated at perpendicular adjacent-flange junctions in `sheetmetal.py`; `test_sheetmetal_cuts.py` |
+| Flat Pattern / Unfold | BA-based developed length, bend lines, outline, area/vol | done | compiler `sm_flat_pattern`; ribbon `sm_flat_pattern`; `core/geom/sheetmetal.cpp` bend allowance development and bend_lines |
+| Flat Pattern DXF/PDF Export | OUTLINE + BEND layers, requires Flatten | done | rpc `export_flat_dxf`; `core/doc/export2d.cpp` OUTLINE/BEND layers and vector PDF |
+| Corner Treatments (Corner Relief) | Auto/round/rect/tear relief between adjacent flanges | **partial** | compiler `sm_edge_flange`; no relief generator found in current `core/geom/sheetmetal.cpp`; retired sheetmetal Python sources/tests do not establish this acceptance |
 | Bend Relief (Auto Relief) | Notch at ends of partial-width flange | **missing** | no relief params/geometry |
 | K-Factor + Bend Tables | K-factor + BA table + BD table + gauge table | **partial** | K-factor formula only; no BA/BD/gauge tables, no .btl import |
 | Sheet Metal Gauge Tables | Material+gauge → thickness/radius/K lookup | **missing** | no gauge data/lookup |
@@ -370,8 +365,8 @@ properties panel, 12+ ribbon commands).
 | Forming Tool | Library punch (louver/dimple) stamp | **missing** | no forming library |
 | Gusset (Sheet Metal) | Stiffening bead in a bend corner | **missing** | only weldment gusset exists |
 | Flat Pattern in Drawing | Named flat-pattern view + bend annotations | **partial** | flat DXF standalone; not a drawing view; no bend notes |
-| Sheet Metal Cut | Cut propagates to flat pattern (holes/slots/notches) | done | Base-region holes develop 1:1, flange-wall holes develop through bend frame (BA + drop) in `sheetmetal_flat.py`; CUTS layer in flat DXF/PDF via `export2d.py`; `test_sheetmetal_cuts.py` |
-| Material/Thickness Propagation | Locked thickness inherited by all flanges | done | _set/_get_sheet_context; inheritance test |
+| Sheet Metal Cut | Cut propagates to flat pattern (holes/slots/notches) | **partial** | compiler `sm_flat_pattern`; rpc `export_flat_dxf`; `core/geom/sheetmetal.cpp` re-extrudes broad face including base inner wires; `core/doc/export2d.cpp` emits CUTS; flange-wall cut development is not established by the current strip construction |
+| Material/Thickness Propagation | Locked thickness inherited by all flanges | done | compiler `sm_base_flange`/`sm_edge_flange`; `core/doc/document.cpp` sheet context and bend records |
 | Part-Level SM Properties Panel | Top-of-tree SM node (thickness/K/relief) + Folded/Unfolded | **missing** | context stored internally, not a tree node |
 | SM Ribbon — Full SW Tab Parity | All ~18 SM commands | **partial** | 6 of 18+ commands (miter/tab/break-corner/sketched-bend/rip/unfold/fold… missing) |
 | Unfold / Fold (individual bend) | Partial unfold of selected bends | **missing** | flat pattern unfolds all bends only |
@@ -382,27 +377,25 @@ properties panel, 12+ ribbon commands).
 
 ---
 
-## 6. Weldments — 36%
+## 6. Weldments
 
-Structural members (6 profiles → now 28-entry catalogue with I/W-beam/T/HSS/pipe/channel/
-angle), mitre trim, gusset, end cap, cut list (engine+UI), and the RPC surface ship and
-are tested. The 2026-06-14 engine push added I/W-beam + T-section profiles and a 28-size
-STANDARD_SIZES catalogue covering HSS/pipe/channel/angle/W/T, plus butt + cope (fish-mouth)
-trim so T/X joints no longer interpenetrate (test_weldment_ext.py). Remaining gaps: notch/
-scribe trim variants, weld beads, cut-list mass/properties, the Solid Bodies folder, and
-full 9-point profile justification.
+Structural members, gussets, end caps and cut-list RPCs have live C++ evidence.
+The profile catalogue and butt/cope claims in the 2026-06-14 update describe the
+historical Python implementation; they are not current verification results.
+Current profile and joint behavior is implemented in `core/geom/weldment.cpp` and
+`core/doc/document.cpp`, with controls in `host/src/ui/pm_forms.cpp`.
 
 | Capability | SW acceptance condition | Status | Evidence |
 |---|---|---|---|
-| Structural Member | Profile swept along sketch segments, one body per segment | done | pm_form weld_member; ribbon weld_member; weld_profiles.py; tests pass (segment multi-pick / multi-sketch not in PM) |
-| Profile library — standard sections | W/S/HSS/pipe/T/Z/angle/channel by designation | **partial** | I/W-beam + T-section profiles + 28-size STANDARD_SIZES catalogue (HSS/pipe/channel/angle/W/T) added (`weld_profiles.py`; `test_weldment_ext.py`); Z-section and user-defined still missing |
+| Structural Member | Profile swept along sketch segments, one body per segment | done | compiler `weld_member`; pm_form `weld_member`; ribbon `weld_member`; `core/geom/weldment.cpp` and `core/doc/document.cpp` segment members |
+| Profile library — standard sections | W/S/HSS/pipe/T/Z/angle/channel by designation | **partial** | compiler `weld_member`; `core/geom/weldment.cpp` profile construction; full designation catalogue acceptance is not established by the retired STANDARD_SIZES claim |
 | Custom / user-defined profile | Import a sketch/DXF as cross-section | **missing** | hard-coded PROFILES dict; no profile_sketch_ref |
-| Corner trim — mitre | Bisector cut at shared vertices | done | _mitre_trim/_half_space; closed-loop test (straight only) |
-| Corner trim — butt/notch/cope/scribe | Trim/Extend joint types per member pair | **partial** | Engine: butt + cope (fish-mouth saddle cut via boolean, any profile) added in `weldment.py` (`test_weldment_ext.py`); notch/scribe variants and host PM joint-type picker pending |
-| Gusset plate | Triangular/polygonal plate at an L-corner | done | pm_form weld_gusset; ribbon weld_gusset; gusset/endcap tests |
-| End cap / closure plate | Outer/inner plate on a hollow member end | done | pm_form weld_end_cap; ribbon weld_end_cap; outer/inner/overhang tests |
+| Corner trim — mitre | Bisector cut at shared vertices | done | compiler `weld_member`; `core/geom/weldment.cpp` mitre trimming; `core/doc/document.cpp` member junction handling |
+| Corner trim — butt/notch/cope/scribe | Trim/Extend joint types per member pair | **partial** | compiler `weld_member`; pm_form `weld_member`; `core/doc/document.cpp`; complete butt/notch/cope/scribe acceptance not established by the retired Python implementation |
+| Gusset plate | Triangular/polygonal plate at an L-corner | done | compiler `weld_gusset`; pm_form `weld_gusset`; ribbon `weld_gusset`; `core/geom/weldment.cpp` |
+| End cap / closure plate | Outer/inner plate on a hollow member end | done | compiler `weld_end_cap`; pm_form `weld_end_cap`; ribbon `weld_end_cap`; `core/geom/weldment.cpp` |
 | Weld bead geometry | Cosmetic/solid bead along joint seam, in cut list | **missing** | no weld_bead type/compiler/UI |
-| Cut list — basic grouping | Item/Profile/Description/Length/Qty/Total, live | done | build_cut_list; weld_cut_list RPC; CutListPanel |
+| Cut list — basic grouping | Item/Profile/Description/Length/Qty/Total, live | done | rpc `weld_cut_list`; `core/doc/session.cpp` cut-list grouping; host CutListPanel |
 | Cut list — mass/weight | Mass column from area×length×density | **missing** | rows have no mass/density (volume stored but not emitted) |
 | Cut list — custom properties | Per-item Description/Material/Finish/Supplier | **missing** | fixed field set; no per-body props store |
 | Cut list — Solid Bodies folder | Named per-member bodies, rename, exclude-from-cutlist | **missing** | weld_member is one tree node; no per-member access |
@@ -418,43 +411,39 @@ full 9-point profile justification.
 
 ---
 
-## 7. Surfacing — 47%
+## 7. Surfacing
 
-The 2026-06-14 engine push (commits 21d3fcb..6128e9b) delivers the complete SW surfacing
-feature set at the engine layer in 4 batches: Batch 0 — the surface-body foundation (body
-`kind` tag, two-sided tessellation, area-not-volume mass); Batch 1 — the four profile-
-driven generators; Batch 2 — offset/ruled/boundary/fill; Batch 3 — knit/thicken/trim/
-untrim/delete_face/replace_face. Full engine/doc suite: **660 passed, 0 failed**. All 15
-surf_* compilers are registered and tested. Host ribbon tab, PM forms, and the Surface
-Bodies tree folder are not yet wired — all rows except Spline on Surface are `partial`
-(engine done, host UI pending). That single `missing` row (Spline on Surface) requires
-3D-sketch-on-face infrastructure that is explicitly deferred.
+The 2026-06-14 surfacing push and its test counts are historical. Current surf_*
+types dispatch in `core/doc/document.cpp`; host forms are present in
+`host/src/ui/pm_forms.cpp` and commands in `host/src/ui/ribbon_def.cpp`.
+The inherited `partial` statuses remain conservative: current source presence is
+not a fresh end-to-end acceptance test, especially for continuity and end conditions.
 
 | Capability | SW acceptance condition | Status | Evidence |
 |---|---|---|---|
-| Surface Bodies folder / surface body concept | Open Shell/Face bodies coexist with solids; folder in tree | **partial** | Engine: body `kind` (solid\|surface) threaded through `compiler.py`, `tessellate.py` (two-sided), `evaluate.py` (area fallback), `formats.py` (3MF guard); `test_surface_bodykind.py`. Host Surface Bodies tree folder pending |
-| Extruded Surface | Open/closed profile → open shell, all end conditions | **partial** | Engine compiler `surf_extrude` registered; BRepPrimAPI_MakePrism on Wire → open side-wall shell; `test_surf_extrude.py`. Host ribbon/PM pending |
-| Revolved Surface | Open profile revolve → shell | **partial** | Engine compiler `surf_revolve` registered; BRepPrimAPI_MakeRevol on Wire → surface of revolution (area = 1250π verified); `test_surf_revolve.py`. Host ribbon/PM pending |
-| Swept Surface | Profile-along-path → shell + guide curves | **partial** | Engine compiler `surf_sweep` registered; `sweep._pipe_shell(make_solid=False)` → open tube wall; `test_surf_sweep.py`. Host ribbon/PM pending |
-| Lofted Surface | 2+ profiles → shell + tangency/guides | **partial** | Engine compiler `surf_loft` registered; `loft._build_thrusections(is_solid=False)` → open lofted wall; ruled vs smooth; `test_surf_loft.py`. Host ribbon/PM pending |
-| Boundary Surface | Two-direction curve net, G1/G2 continuity | **partial** | Engine compiler `surf_boundary` registered; BRepFill_Filling over dir1/dir2 curve net + ThruSections fallback; `test_surf_boundary.py`. Host ribbon/PM pending |
-| Planar Surface | Flat surface from a closed planar loop | **partial** | Engine compiler `surf_planar` registered (canary batch 0); single Face surface body; `test_surface_bodykind.py`. Host ribbon/PM pending |
-| Ruled Surface | Linear blend between two curves | **partial** | Engine compiler `surf_ruled` registered; BRepFill.Face_s (single edge, exact) or ThruSections(ruled); `test_surf_ruled.py`. Host ribbon/PM pending |
-| Offset Surface | Offset faces along normals | **partial** | Engine compiler `surf_offset` registered; BRepOffsetAPI_MakeOffsetShape.PerformBySimple (area=source face, exact for planar/cyl/sph); `test_surf_offset.py`. Host ribbon/PM pending |
-| Fill Surface | Patch a bounded gap with G0/G1/G2 | **partial** | Engine compiler `surf_fill` registered; minimal-energy patch via BRepFill_Filling (g0/g1/g2); `test_surf_fill.py`. Host ribbon/PM pending |
-| Trim Surface | Trim a surface with a tool, keep side | **partial** | Engine compiler `surf_trim` registered; BRepAlgoAPI_Splitter + centroid bucket keep-side; `test_surf_trim.py`. Host ribbon/PM pending |
-| Untrim Surface | Restore natural NURBS domain | **partial** | Engine compiler `surf_untrim` registered (in `surf_trim.py`); BRepLib + ShapeFix_Face regrows face to natural UV domain; `test_surf_trim.py`. Host ribbon/PM pending |
-| Knit Surface | Stitch surface bodies into shell/solid | **partial** | Engine compiler `surf_knit` registered; BRepBuilderAPI_Sewing + ShapeFix; closed shell → SOLID (kind flips solid); verified 6-wall box 9600 vol; `test_surf_knit.py`. Host ribbon/PM pending |
-| Thicken Surface | Offset a surface into a solid | **partial** | Engine compiler `surf_thicken` registered; BRepOffset thickening (one/both/mid); plate 40×40×t2 = 3200 verified; `test_surf_thicken.py`. Host ribbon/PM pending |
-| Replace Face | Swap solid faces with a surface | **partial** | Engine compiler `surf_replace_face` registered; BOP-split + keep-retained-side; box top z10→z6 vol 16000→9600 verified; `test_surf_replace_face.py`. Host ribbon/PM pending |
-| Delete Face | Remove faces, optional fill/patch | **partial** | Engine compiler `surf_delete_face` registered; drop faces → open shell (kind flips surface); box top → 1200 area, 4 free edges verified; `test_surf_delete_face.py`. Host ribbon/PM pending |
-| Extrude end: Up-To-Surface / Offset-From-Surface | Geometry-driven termination | **partial** | Engine: Up-To-Surface + Offset-From-Surface in `extrude.py` `_VALID_ENDS` + face ref resolution (`test_extrude_ends.py`); host PM ref-pick well pending |
-| Extrude From: Surface/Face/Plane | Start offset from a surface | **partial** | Engine: from_face ref in `extrude.py` resolves surface/face/plane/vertex offsets (`test_extrude_ends.py`); host PM From group pending |
+| Surface Bodies folder / surface body concept | Open Shell/Face bodies coexist with solids; folder in tree | **partial** | `core/doc/document.cpp` body kind and surf_* shape construction; `host/src/ui/feature_tree.cpp` body grouping; complete surface-body display/folder acceptance remains unverified |
+| Extruded Surface | Open/closed profile → open shell, all end conditions | **partial** | compiler `surf_extrude`; pm_form `surf_extrude`; ribbon `surf_extrude`; `core/doc/document.cpp`; full end-condition acceptance remains unverified |
+| Revolved Surface | Open profile revolve → shell | **partial** | compiler `surf_revolve`; pm_form `surf_revolve`; ribbon `surf_revolve`; `core/doc/document.cpp`; end-to-end acceptance remains unverified |
+| Swept Surface | Profile-along-path → shell + guide curves | **partial** | compiler `surf_sweep`; pm_form `surf_sweep`; ribbon `surf_sweep`; `core/doc/document.cpp`; complete guide behavior remains unverified |
+| Lofted Surface | 2+ profiles → shell + tangency/guides | **partial** | compiler `surf_loft`; pm_form `surf_loft`; ribbon `surf_loft`; `core/doc/document.cpp`; full tangency/guide acceptance remains unverified |
+| Boundary Surface | Two-direction curve net, G1/G2 continuity | **partial** | compiler `surf_boundary`; pm_form `surf_boundary`; ribbon `surf_boundary`; current form has dir1/dir2 wells, not continuity controls; full G1/G2 acceptance remains unverified |
+| Planar Surface | Flat surface from a closed planar loop | **partial** | compiler `surf_planar`; pm_form `surf_planar`; ribbon `surf_planar`; `core/doc/document.cpp`; end-to-end acceptance remains unverified |
+| Ruled Surface | Linear blend between two curves | **partial** | compiler `surf_ruled`; pm_form `surf_ruled`; ribbon `surf_ruled`; `core/doc/document.cpp`; end-to-end acceptance remains unverified |
+| Offset Surface | Offset faces along normals | **partial** | compiler `surf_offset`; pm_form `surf_offset`; ribbon `surf_offset`; `core/doc/document.cpp`; end-to-end acceptance remains unverified |
+| Fill Surface | Patch a bounded gap with G0/G1/G2 | **partial** | compiler `surf_fill`; pm_form `surf_fill`; ribbon `surf_fill`; current form has boundary well, not continuity controls; full G0/G1/G2 acceptance remains unverified |
+| Trim Surface | Trim a surface with a tool, keep side | **partial** | compiler `surf_trim`; pm_form `surf_trim`; ribbon `surf_trim`; `core/doc/document.cpp`; keep-side acceptance remains unverified |
+| Untrim Surface | Restore natural NURBS domain | **partial** | compiler `surf_untrim`; pm_form `surf_untrim`; ribbon `surf_untrim`; `core/doc/document.cpp`; natural-domain acceptance remains unverified |
+| Knit Surface | Stitch surface bodies into shell/solid | **partial** | compiler `surf_knit`; pm_form `surf_knit`; ribbon `surf_knit`; `core/doc/document.cpp`; shell-to-solid acceptance remains unverified |
+| Thicken Surface | Offset a surface into a solid | **partial** | compiler `surf_thicken`; pm_form `surf_thicken`; ribbon `surf_thicken`; `core/doc/document.cpp`; full thickening acceptance remains unverified |
+| Replace Face | Swap solid faces with a surface | **partial** | compiler `surf_replace_face`; pm_form `surf_replace_face`; ribbon `surf_replace_face`; `core/doc/document.cpp`; topology/keep-side acceptance remains unverified |
+| Delete Face | Remove faces, optional fill/patch | **partial** | compiler `surf_delete_face`; pm_form `surf_delete_face`; ribbon `surf_delete_face`; current form exposes face selection, not fill/patch; complete acceptance remains unverified |
+| Extrude end: Up-To-Surface / Offset-From-Surface | Geometry-driven termination | **partial** | compiler `extrude`; pm_form `extrude` end/up_to/offset controls; `core/doc/document.cpp`; complete termination acceptance remains unverified |
+| Extrude From: Surface/Face/Plane | Start offset from a surface | **partial** | compiler `extrude`; pm_form `extrude` start/start_ref/start_offset; `core/doc/document.cpp`; complete reference behavior remains unverified |
 | Spline on Surface | 3D spline on a model face (UV-projected) | **missing** | sk_spline_surface greyed (deliberately deferred; requires 3D-sketch-on-face infrastructure) |
 
 ---
 
-## 8. Configurations & Design Tables — 67%
+## 8. Configurations & Design Tables
 
 The engine layer is production-quality: non-mutating compile overlay, cache keyed on
 active config, full schema validation, six session ops, .step+ persistence, assembly
@@ -464,20 +453,20 @@ config-specific custom properties and config rename.
 
 | Capability | SW acceptance condition | Status | Evidence |
 |---|---|---|---|
-| Named configurations | Add/Delete (last protected)/Activate, ≥1 always | done | config_add/delete/activate; ConfigPanel; fallback tests |
-| Config-specific param overrides | Independent per-config dim values, non-mutating | done | config_set_override; apply_configuration_to_doc; no-mutate test |
-| Config-specific feature suppression | Suppress per config | done | config_set_suppression; _validate_configurations |
-| Compile cache keyed on active config | Round-trip to a prior config is a cache hit | done | CompileCache; cache_hits==3 test |
-| Config persistence in .step+ | Configs/overrides/suppressions/active pointer round-trip | done | stepplus.py; roundtrip test |
+| Named configurations | Add/Delete (last protected)/Activate, ≥1 always | done | rpc `config_add`/`config_delete`/`config_activate`; `core/doc/session.cpp`; host ConfigPanel |
+| Config-specific param overrides | Independent per-config dim values, non-mutating | done | rpc `config_set_override`; `core/doc/session.cpp` copy/validate/commit; `core/doc/document.cpp` configuration overlay |
+| Config-specific feature suppression | Suppress per config | done | rpc `config_set_suppression`; `core/doc/validate.cpp` validate_configurations |
+| Compile cache keyed on active config | Round-trip to a prior config is a cache hit | done | `core/doc/document.cpp` CompileCache env/config/feature hash chain; cache-hit behavior retains the prior acceptance assessment |
+| Config persistence in .step+ | Configs/overrides/suppressions/active pointer round-trip | done | rpc `doc_save`/`doc_open`; `core/doc/stepplus.cpp` document container persistence |
 | Assembly-level config support | Component suppression + mate-value overrides | **partial** | component suppression done; per-config mate values deferred |
 | Design Table — editable grid | Config rows × driven-param/suppress columns, live | done | design_table_panel.cpp full grid |
 | Design Table — Add Column | Column picker enumerates live Dim fields | done | buildCandidates; pmFindForm enumeration |
-| Design Table — expression cells | =expr stored in override.expr, re-evaluated | done | leading '='→config_set_override expr; equations.py |
+| Design Table — expression cells | =expr stored in override.expr, re-evaluated | done | `host/src/ui/design_table_panel.cpp` expression editing; `core/doc/session.cpp` config_set_override; `core/doc/document.cpp` expression evaluation |
 | Design Table — Add/Delete/Activate config | Toolbar buttons + double-click activate | done | Add/Delete/Activate buttons; copy_from seed |
 | Equations — global variables | Named vars in dependency order + cycle detection | **partial** | engine complete (eq_set/eq_delete); **no host Equations dialog** — tree node is read-only |
 | Equations — dim field expression entry | PM spinner accepts =expr, stored | done | validate_dim expr; compiler eval; pm_forms expr |
 | Equations — dependency-aware rebuild | Change global → dependent dims recompute | done | C++ engine: eq env applied to dim.expr during rebuild; dependency-ordered eval |
-| Equations — in-use guard | Block deleting a referenced equation | done | _op_eq_delete → _eq_referencing(); eq_in_use |
+| Equations — in-use guard | Block deleting a referenced equation | done | op `eq_delete`; `core/doc/session.cpp` equation deletion/reference handling; exact refusal behavior retains the prior assessment |
 | Configuration rename | RMB rename, update all references | **missing** | no config_rename op/RPC/UI |
 | Config-specific custom properties | Per-config Description/PartNo/Revision for BOM | **missing** | no properties field in schema |
 | Display States | Appearance-only variants (color/hide) | **missing** | no display_state concept |
@@ -487,52 +476,52 @@ config-specific custom properties and config rename.
 | Equations — sensor-driven variables | Sensor value as a global variable | **missing** | no sensor concept |
 | Config-panel override display | Compact per-config override/suppression view | done | ConfigPanel selected-row expansion |
 | Config list reflects undo/redo | Panel refreshes on any edit | done | auto-invalidate on docId/revision change |
-| Schema validation for configs | Reject dup names / unknown refs / bad active | done | _validate_configurations; 4 schema tests |
+| Schema validation for configs | Reject dup names / unknown refs / bad active | done | rpc `doc_validate`; `core/doc/validate.cpp` validate_configurations; no current test count asserted |
 
 ---
 
-## 9. Evaluate & Analysis — 43%
+## 9. Evaluate & Analysis
 
-Geometric analysis (mass/section props, measure, interference, geometry check, draft/
-thickness/curvature color maps, zebra, dynamic section) is wired end-to-end, and the FEA
-(linear-static + modal) and LBM CFD are real solvers in a crash-isolated worker. The 43%
-reflects that the analysis tools are mostly *partial* — hardcoded inputs (density, planes,
-pull direction), a tet4-only single-density FEA with only three result scalars, and
-no probe/reaction-force/material-entry UI.
+Geometric analysis is implemented in `core/doc/session.cpp`, with controls and overlays
+in `host/src/ui/evaluate_dialogs.cpp`. Native FEA and flow RPCs dispatch through
+`core/api/libchudware.cpp`; study controls live in `host/src/ui/sim_manager.cpp`.
+The historical tet4-only/hardcoded-density description is obsolete. Existing solver
+and UI paths below are evidence of implementation, not proof of every premium-study,
+mesh-quality, probe or coordinate-system acceptance condition.
 
 | Capability | SW acceptance condition | Status | Evidence |
 |---|---|---|---|
-| Mass Properties | Volume/mass/CoM/inertia + density override + principal axes + CS | **partial** | core done; hardcoded 7.85 density, no override UI, no principal axes/moments, no IPS reformat |
-| Measure | Length/radius/distance/angle/area/vol, accumulate, delta-XYZ | **partial** | core math done; single measurement, no delta-XYZ/diameter/arc-center |
-| Section Properties | Pick plane → area/centroid/2nd-moments in a chosen CS | **partial** | hardcoded plane.top; no plane picker/outline/CS |
-| Interference Detection | Pairwise overlap volume + clearance, highlight, options | **partial** | table done; no viewport highlight, no coincident-as-interference, single-part placeholder |
-| Geometry Check | BRepCheck + free/short/sliver census | done | check(); eval_check; color-coded list (no heal) |
-| Draft Analysis | Pull direction + threshold color map | done | draft_field; eval_draft (pull hardcoded +Z) |
-| Thickness Analysis | Per-vertex wall thickness color map | done | thickness_field; verified |
-| Curvature Analysis | Mean/Gaussian/max curvature color map | done | curvature_field (kind hardcoded mean) |
+| Mass Properties | Volume/mass/CoM/inertia + density override + principal axes + CS | **partial** | rpc `eval_mass`; `core/doc/session.cpp` principal axes/moments; `host/src/ui/evaluate_dialogs.cpp` material/density override and IPS formatting; arbitrary CS acceptance remains unverified |
+| Measure | Length/radius/distance/angle/area/vol, accumulate, delta-XYZ | **partial** | rpc `eval_measure`; `host/src/ui/evaluate_dialogs.cpp` diameter and recent-reading list; full delta-XYZ/arc-center/accumulation acceptance remains unverified |
+| Section Properties | Pick plane → area/centroid/2nd-moments in a chosen CS | **partial** | rpc `eval_section_props`; `host/src/ui/evaluate_dialogs.cpp` three orthogonal draggable section planes; arbitrary datum/face/chosen-CS acceptance remains unverified |
+| Interference Detection | Pairwise overlap volume + clearance, highlight, options | **partial** | rpc `eval_interference`; `host/src/ui/evaluate_dialogs.cpp` interference inventory and overlays; complete clearance/coincident/options acceptance remains unverified |
+| Geometry Check | BRepCheck + free/short/sliver census | done | rpc `eval_check`; `core/doc/session.cpp`; color-coded host list |
+| Draft Analysis | Pull direction + threshold color map | done | rpc `eval_draft`; `host/src/ui/evaluate_dialogs.cpp` Pull X/Y/Z/-Z and angle controls |
+| Thickness Analysis | Per-vertex wall thickness color map | done | rpc `eval_thickness`; `core/doc/session.cpp`; host field overlay |
+| Curvature Analysis | Mean/Gaussian/max curvature color map | done | rpc `eval_curvature`; `host/src/ui/evaluate_dialogs.cpp` mean/Gaussian/max/min controls |
 | Zebra Stripes | Reflected stripes for G1/G2 inspection | done | setZebra; GLSL zebra (W23c) |
-| Symmetry Check | (SW has none) mirror-and-diff symmetry test | **beyond** | symmetry() — exceeds SW (plane hardcoded front) |
-| Dynamic Section View | Up to 3 planes, drag offset, hatch, save view | **partial** | SectionTool presets/multi-plane; no hatch/drag/save |
-| Linear Static FEA | Material/fixtures/loads/mesh + von-Mises/principal/disp/strain/FoS/reactions/probe | **partial** | tet4 + 1 density slider; only vM/disp/FoS; 2 fixtures, 2 loads; no reactions/probe/material-entry/convergence |
-| Modal / Frequency | Fixtures + N modes → frequencies + animated mode shapes | **partial** | scipy eigsh; tet4; only first mode visualized; no export |
-| Thermal/Nonlinear/Fatigue/Buckling/Drop/PV | Premium study types | **missing** | only static + modal exist |
-| FloXpress / Flow Simulation | External/internal CFD: velocity/pressure/temp/cut-plots | **partial** | LBM external-only; drag/Cd + streamlines; no internal/pressure/temp/water |
-| Assembly-level Mass Properties | Aggregate total mass/CoM/inertia of all components | **partial** | returns single component only; no aggregate |
+| Symmetry Check | (SW has none) mirror-and-diff symmetry test | **beyond** | rpc `eval_symmetry`; `core/doc/session.cpp`; `host/src/ui/evaluate_dialogs.cpp` Front/Top/Right plane picker |
+| Dynamic Section View | Up to 3 planes, drag offset, hatch, save view | **partial** | `host/src/ui/section_tool.cpp` SectionTool; full multi-plane/drag/hatch/saved-view acceptance remains unverified |
+| Linear Static FEA | Material/fixtures/loads/mesh + von-Mises/principal/disp/strain/FoS/reactions/probe | **partial** | rpc `sim_run_static`/`sim_run_adaptive`; `core/sim/fea_static.cpp`; tet4/tet10, material and reaction paths exist; full picked-node probe/UI acceptance remains unverified |
+| Modal / Frequency | Fixtures + N modes → frequencies + animated mode shapes | **partial** | rpc `sim_run_modal`; `core/sim/fea_modal.cpp`; `host/src/ui/sim_manager.cpp`; full animation/export acceptance remains unverified |
+| Thermal/Nonlinear/Fatigue/Buckling/Drop/PV | Premium study types | **partial** | rpc `sim_run_thermal`/`sim_run_fatigue`/`sim_run_buckling`; native `core/sim/fea_thermal.cpp`, `core/sim/fea_fatigue.cpp`, `core/sim/fea_buckling.cpp`; full nonlinear/drop/PV acceptance not established |
+| FloXpress / Flow Simulation | External/internal CFD: velocity/pressure/temp/cut-plots | **partial** | rpc `sim_run_flow`; `core/sim/flow_run.cpp`; complete internal/thermal/cut-plot acceptance remains unverified |
+| Assembly-level Mass Properties | Aggregate total mass/CoM/inertia of all components | **partial** | rpc `eval_mass`; `core/doc/session.cpp` gathers world-placed assembly export shapes; complete aggregation/material acceptance remains unverified |
 | Smart Sensors | Watched value + threshold alert in tree | **missing** | no sensor concept |
 | Design Study / Optimization | Parametric sweep/optimizer over sensors | **missing** | no framework |
-| SimulationXpress | Single material/fixture/load static wizard, vM+disp | done | static form matches SimulationXpress scope |
-| FEA Custom Material Entry | Type custom E/nu/density/yield | **missing** | combo over 7 JSON materials only |
+| SimulationXpress | Single material/fixture/load static wizard, vM+disp | done | rpc `sim_run_static`; host static-study form matches the inherited SimulationXpress scope |
+| FEA Custom Material Entry | Type custom E/nu/density/yield | **missing** | `host/src/ui/sim_manager.cpp` addCustomMaterial persists custom materials; complete typed-property entry UI acceptance remains unverified rather than inferred from storage alone |
 | FEA Result Probe / List | Probe stress/disp at a picked node | **missing** | no probe interaction/RPC |
-| FEA Reaction Forces | Reaction force per fixture + balance | **missing** | not computed |
-| FEA Mesh Quality (Jacobian) | Jacobian-ratio check, highlight bad elements | **missing** | no quality check |
-| FEA Local Mesh Controls | Per-face finer mesh | **missing** | single global density |
-| Mass Props Density UI / Material | Material field + override checkbox, doc material | **missing** | no density widget; no part material field |
-| Measure — accumulate | Scrollable list of measurements + totals | **missing** | last result only |
-| Section Props — plane picker | Pick any datum/face/section line | **missing** | hardcoded plane.top |
+| FEA Reaction Forces | Reaction force per fixture + balance | **partial** | rpc `sim_run_static`; `core/sim/fea_static.h` support force/moment result fields and equilibrium_error_pct; complete per-fixture reporting/UI acceptance remains unverified |
+| FEA Mesh Quality (Jacobian) | Jacobian-ratio check, highlight bad elements | **partial** | rpc `sim_mesh`; `core/sim/mesh_quality.cpp` and `core/sim/mesher.h` quality metrics; bad-element highlight acceptance remains unverified |
+| FEA Local Mesh Controls | Per-face finer mesh | **partial** | rpc `sim_mesh`; `core/sim/mesher.h` MeshLocalRefine size-contract delivery; complete per-face GUI editing acceptance remains unverified |
+| Mass Props Density UI / Material | Material field + override checkbox, doc material | **partial** | op `set_material`; rpc `eval_mass`; `host/src/ui/evaluate_dialogs.cpp` material picker and custom density override; exact checkbox interaction acceptance remains unverified |
+| Measure — accumulate | Scrollable list of measurements + totals | **partial** | rpc `eval_measure`; `host/src/ui/evaluate_dialogs.cpp` recent readings and total_length/total_distance displays; totals across retained history not established |
+| Section Props — plane picker | Pick any datum/face/section line | **partial** | rpc `eval_section_props`; `host/src/ui/evaluate_dialogs.cpp` orthogonal offset/drag controls; arbitrary datum/face/line picking acceptance remains unverified |
 
 ---
 
-## 10. Import / Export / Interop — 51%
+## 10. Import / Export / Interop
 
 Neutral-format round-trips work at the engine layer (STEP/IGES/BREP/STL/3MF) with
 mtime-keyed caching, the .step+ native container is robust, and 2D output (DXF/PDF, flat
@@ -549,12 +538,12 @@ Parasolid/ACIS/DWG, and no color/unit/assembly-hierarchy round-trip on STEP.
 | STL export | Mesh export, binary/ASCII, tolerance, count | **partial** | export_stl no quality params; File>Export>STL disabled |
 | STL import | Mesh body, convert-to-solid | **partial** | imports as surface Face (no volume); no mesh→solid |
 | 3MF export | Mesh + name + color for AM | **partial** | Mesher used; no color/quality; File>Export>3MF disabled |
-| BREP export/import | OCC-native round-trip | done | formats.py handles brep; test passes |
-| Native .step+ container | Atomic save/open, thumbnail, drawings, fallback | done | stepplus.py; _doc_save/_doc_open; Save/Open dialogs |
-| Frozen-geometry fallback | All-features-fail → embedded geometry as import | done | _frozen_geometry_fallback; verified |
-| DXF export (drawing sheets) | Multi-layer 2D output | done | dxf.py R12; export_drawing; Save As DXF dialog |
-| DXF export (sheet-metal flat) | OUTLINE + BEND layers | done | export_flat_dxf; sm_export_flat_dxf wired |
-| PDF export (drawing/flat) | Printable vector PDF | done | pdfvec.py; format choice in panel |
+| BREP export/import | OCC-native round-trip | done | rpc `export_file`/`import_file`; `core/doc/formats.cpp` BREP import/export |
+| Native .step+ container | Atomic save/open, thumbnail, drawings, fallback | done | rpc `doc_save`/`doc_open`; `core/doc/stepplus.cpp`; native Save/Open dialogs |
+| Frozen-geometry fallback | All-features-fail → embedded geometry as import | done | rpc `doc_open`; `core/doc/session.cpp` native container restoration; compiler `import`; inherited all-failure fallback acceptance is not proved by artifact presence alone |
+| DXF export (drawing sheets) | Multi-layer 2D output | done | rpc `export_drawing`; `core/doc/export2d.cpp` and `core/doc/dxf.cpp`; Save As DXF dialog |
+| DXF export (sheet-metal flat) | OUTLINE + BEND layers | done | rpc `export_flat_dxf`; `core/doc/export2d.cpp` OUTLINE/BEND layers |
+| PDF export (drawing/flat) | Printable vector PDF | done | rpc `export_drawing`/`export_flat_dxf`; `core/doc/pdfvec.cpp`; format choice in panel |
 | DWG export/import | AutoCAD binary format | **missing** | no DWG reader/writer |
 | Parasolid (x_t/x_b) import | Native Siemens kernel format | **missing** | no Parasolid bridge (most-requested SW exchange format) |
 | ACIS/SAT import | Inventor/Fusion kernel format | **missing** | no SAT reader |
@@ -568,7 +557,7 @@ Parasolid/ACIS/DWG, and no color/unit/assembly-hierarchy round-trip on STEP.
 | Export selected bodies only | Body filter on export | **missing** | always all bodies |
 | Save a copy as | Export without changing session path | **missing** | save always updates path |
 | Pack and Go | Self-contained archive with references | **partial** | .step+ embeds drawings/components; import source_path absolute (breaks off-machine) |
-| ECAD native (.ecad+) | ZIP container save/open | done | ecad/formats.py; ecad_save/open dialogs |
+| ECAD native (.ecad+) | ZIP container save/open | done | rpc `ecad_save`/`ecad_open`; `core/ecad/container.cpp`; native ECAD Save/Open dialogs |
 | KiCad .kicad_sch import | KiCad 6/7/8 schematic parse | done | import_kicad_sch; file filter |
 | KiCad .kicad_pcb import | KiCad 6/7/8 board parse | done | import_kicad_pcb; ecad_open |
 | Gerber / drill export | RS-274X + Excellon | done | ecad_export gerber/drill |
@@ -580,7 +569,7 @@ Parasolid/ACIS/DWG, and no color/unit/assembly-hierarchy round-trip on STEP.
 
 ---
 
-## 11. UI / UX / Interaction — 69%
+## 11. UI / UX / Interaction
 
 The SW-equivalent shell is substantially complete: the FeatureManager tree (suppress,
 rollback, drag-reorder, rename, multi-select, assembly tree, appearance), the data-driven
@@ -597,7 +586,7 @@ and high-DPI ribbon arithmetic.
 | FeatureManager — inline rename | Slow-double-click editor, Enter/Esc | done | s_lastClickId arm; InputText commit/cancel |
 | FeatureManager — drag-reorder | Drop indicator + dependency guard | done | FEATURE_ROW payload; dependency_exists toast |
 | FeatureManager — rollback bar | Drag bar + Rollback-to-Here/Roll-to-End | done | drawRollbackBarLine; rollback ops; rolled-back marker |
-| FeatureManager — folder grouping | Folders + Name&Group | done | set_folder; nameAndGroupFeatures (no manual New Folder) |
+| FeatureManager — folder grouping | Folders + Name&Group | **partial** | op `set_folder`; `host/src/ui/feature_tree.cpp` Features-header Add Folder groups selection or creates a session-only empty drop target; Name&Group is removed, so the combined acceptance is not done |
 | FeatureManager — Ctrl+click multi + reorder | Toggle select + Ctrl+Up/Down | done | s_multiSel; ctrlClicked; Ctrl+Up/Down |
 | FeatureManager — Shift+click range-select | Contiguous range select | **missing** | only plain + Ctrl click |
 | FeatureManager — search/filter | Live name filter | **missing** | no search widget |
@@ -667,7 +656,7 @@ and high-DPI ribbon arithmetic.
 
 ---
 
-## 12. ECAD / Electronics (beyond-SW differentiator) — 77%
+## 12. ECAD / Electronics (beyond-SW differentiator)
 
 SolidWorks has no native PCB capability, so **every item here is beyond-SW by definition**;
 parity is measured against a KiCad-class baseline. The headless engine (schematic capture,
@@ -678,38 +667,38 @@ genuine differentiators KiCad lacks. Gaps: KiCad write-back export, cross-probe,
 
 | Capability | KiCad-class acceptance condition | Status | Evidence |
 |---|---|---|---|
-| Schematic Document Model | Symbols/wires/junctions/labels/buses/power/hier, version-locked | done | schema.py aicad.sch/1; full collections + validate |
-| PCB Document Model | Stackup/outline/footprints/tracks/vias/zones/rules/nets, version-locked | done | schema.py aicad.pcb/1; new_board full |
-| Schematic Capture | Place/wire/junction/label/power/no-connect/annotate, undo | done | ops.py full CRUD; netlist crossing-without-junction rule |
+| Schematic Document Model | Symbols/wires/junctions/labels/buses/power/hier, version-locked | done | rpc `ecad_schema`; `core/ecad/schema.cpp` aicad.sch/1 validation |
+| PCB Document Model | Stackup/outline/footprints/tracks/vias/zones/rules/nets, version-locked | done | rpc `ecad_schema`; `core/ecad/schema.cpp` aicad.pcb/1 validation |
+| Schematic Capture | Place/wire/junction/label/power/no-connect/annotate, undo | done | op `sch_add_symbol`/`sch_add_wire`/`sch_add_junction`/`sch_add_label`/`sch_add_power`/`sch_add_no_connect`/`sch_annotate`; rpc `ecad_undo`; `core/ecad/ops.cpp` |
 | Hierarchical Multi-Sheet | Sheet symbols + pins + hier bridge + ERC | done | sheets/sheet_symbols; netlist hierarchy bridge; erc |
-| Netlist Extraction | Deterministic union-find, name priority, byte-stable | done | netlist.py _UnionFind |
-| Electrical Rules Check (ERC) | Full KiCad-class rule set, advisory | done | erc.py pin/driver/power/hier rules + pin-type matrix |
-| Symbol Library — KiCad Import | Parse .kicad_sym, multi-unit, body graphics | done | sexpr.py + kicad_sym.py |
-| Symbol Library — Clean-Room Starter | Built-in R/L/C/diode/…/IC with IPC-7351 | done | starter.py 25 symbols / 19 footprints |
-| Footprint Library — KiCad Import | Parse .kicad_mod / .pretty | done | kicad_mod.py |
-| Schematic→PCB Update | Idempotent footprint+net population, prune | done | sync.py; _ecad_update_from_sch |
+| Netlist Extraction | Deterministic union-find, name priority, byte-stable | done | `core/ecad/netlist.cpp` extraction; byte stability remains a behavioral acceptance, not a file-presence check |
+| Electrical Rules Check (ERC) | Full KiCad-class rule set, advisory | done | `core/ecad/erc.cpp` electrical rules; unchanged acceptance assessment, not proved by artifact presence alone |
+| Symbol Library — KiCad Import | Parse .kicad_sym, multi-unit, body graphics | done | rpc `ecad_load_symbol_library`; `core/ecad/symlib.cpp` KiCad symbol parsing |
+| Symbol Library — Clean-Room Starter | Built-in R/L/C/diode/…/IC with IPC-7351 | done | `core/ecad/library.cpp` starter library; inherited count/layout acceptance is not a fresh test result |
+| Footprint Library — KiCad Import | Parse .kicad_mod / .pretty | done | `core/ecad/kicad.cpp` footprint parsing |
+| Schematic→PCB Update | Idempotent footprint+net population, prune | done | op `pcb_update_from_sch`; rpc `ecad_update_from_sch`; `core/ecad/sync.cpp` |
 | PCB — Footprint Placement | Place/rotate/flip/ref-value, grid snap | done | pcb_add/edit/delete_footprint; canvas tools |
 | PCB — Manual Track Routing | Segment+arc, layer change via via, net widths | done | pcb_add_track/via; Route tool |
-| PCB Autorouter | Maze/Lee + net classes + rip-up + diff-pair | done | autoroute.py A*; rip-up; diff-pair meander |
-| Copper Zone Fill | Flood + clearance + thermal relief + island removal | done | zonefill.py raster fill |
-| Design Rule Check (DRC) | Net-aware clearance + width/via/ring/hole/edge/unrouted | done | drc.py full rule set |
-| Design for Manufacturing (DFM) | Silk/mask/acid-trap/courtyard/annular/drill | done | dfm.py run_dfm |
+| PCB Autorouter | Maze/Lee + net classes + rip-up + diff-pair | done | rpc `ecad_autoroute`; `core/ecad/autoroute.cpp`; complete routing acceptance is not established by the RPC pointer alone |
+| Copper Zone Fill | Flood + clearance + thermal relief + island removal | done | rpc `ecad_fill_zones`; `core/ecad/zonefill.cpp` |
+| Design Rule Check (DRC) | Net-aware clearance + width/via/ring/hole/edge/unrouted | done | `core/ecad/drc.cpp`; full rule acceptance retains the prior assessment |
+| Design for Manufacturing (DFM) | Silk/mask/acid-trap/courtyard/annular/drill | done | rpc `ecad_dfm`; `core/ecad/dfm.cpp` |
 | Gerber / Fab Output | RS-274X + Excellon + BOM + CPL | done | gerber/excellon/bom/placement |
-| PCB→3D STEP + CAD Bridge | Board substrate+components → STEP into CAD part | done | threed.py board_to_step/board_to_part_doc |
-| Native SPICE — DC/Transient/AC | MNA solver, Newton, no external dep | done | circuit.py; 8 analytic gates verified |
-| Extended Simulation Analyses | Fourier/THD, Monte-Carlo, temp sweep, noise, .tf, .step | done | analysis_ext.py; subckt.py |
-| SPICE Netlist Import / Export | Round-trip R/L/C/V/I/D/BJT/MOS/OPAMP/.subckt | done | spice.py |
-| Signal Integrity — Controlled Impedance | Microstrip/stripline/CPWG/diff-pair Z0 from stackup | done | impedance.py (IPC-2141A); ecad_check_impedance |
+| PCB→3D STEP + CAD Bridge | Board substrate+components → STEP into CAD part | done | rpc `ecad_to_3d`; `core/api/libchudware.cpp` native board export and document import |
+| Native SPICE — DC/Transient/AC | MNA solver, Newton, no external dep | done | rpc `sim_spice`; `core/sim/spice.cpp`; historical analytic gate count is not a current test result |
+| Extended Simulation Analyses | Fourier/THD, Monte-Carlo, temp sweep, noise, .tf, .step | done | rpc `sim_spice`; `core/sim/spice.cpp`; complete analysis matrix retains the prior assessment |
+| SPICE Netlist Import / Export | Round-trip R/L/C/V/I/D/BJT/MOS/OPAMP/.subckt | done | rpc `sim_netlist_parse`/`sim_netlist_to_circuit`; `core/sim/netlist.cpp`; full round-trip acceptance retains the prior assessment |
+| Signal Integrity — Controlled Impedance | Microstrip/stripline/CPWG/diff-pair Z0 from stackup | done | rpc `ecad_impedance`; `core/ecad/impedance.cpp` |
 | KiCad File Interoperability | Import + export .kicad_sch/.kicad_pcb | **partial** | import done; export (kicad_export) raises not_available |
-| Native Container (.ecad+) | ZIP container, forward-compatible | done | ecad/formats.py save/open |
+| Native Container (.ecad+) | ZIP container, forward-compatible | done | rpc `ecad_save`/`ecad_open`; `core/ecad/container.cpp` |
 | PCB Stackup Definition | Copper layers + dielectric + thickness/Er | done | schema stackup; pcb_set_stackup |
-| Session Management | 100-deep undo/redo, transactional ops, multi-doc | done | session.py; apply_ops rollback |
-| AI Schematic Design Orchestrator | NL → ERC-clean, sim-checked schematic | **beyond** | orchestrator.py run_design; ecad_design (no KiCad equivalent) |
+| Session Management | 100-deep undo/redo, transactional ops, multi-doc | done | rpc `ecad_apply_ops`/`ecad_undo`/`ecad_redo`/`ecad_new`; `core/ecad/session.cpp` |
+| AI Schematic Design Orchestrator | NL → ERC-clean, sim-checked schematic | **beyond** | rpc `ecad_design`; `core/ecad/session.cpp`; orchestrated ERC/simulation acceptance is not implied by RPC presence |
 | One-Click AI Board | NL → sch → PCB → route → 3D in one call | **beyond** | ecad_make_board; AI Board button |
-| MCP / AI Tool API | 24 tools with structured state + next_actions | **beyond** | ecad_tools.py rich context |
+| MCP / AI Tool API | 24 tools with structured state + next_actions | **beyond** | `services/mcp/ecad_tools.py` tool context; the historical tool count is not a current catalog measurement |
 | PCB Net Classes / Design Rules | Per-class clearance/width/via, DRC+router aware | done | net_classes; pcb_set_rules |
 | Library Search / Part Finder | Keyword search → ranked libids | done | library search(); ecad_find_part |
-| Ratsnest Visualization | MST airwires per net, live | done | drc.py ratsnest() |
+| Ratsnest Visualization | MST airwires per net, live | done | `core/ecad/drc.cpp` ratsnest extraction; host ECAD canvas |
 | DNP Flag | Exclude from BOM/paste/CPL | done | dnp field; BOM/placement filtering |
 | Zoom-to-Violation | Click ERC/DRC row → pan+zoom+flash | done | EcadCanvas::focusOn (Wave Z) |
 | Simulation GUI — Waveform Plot | Run + plot V/I (transient) / Bode (AC) | **partial** | plotting done; click-wire-to-probe not in GUI |
@@ -730,8 +719,8 @@ genuine differentiators KiCad lacks. Gaps: KiCad write-back export, cross-probe,
 
 ## Maintenance
 
-This standard is regenerated from the per-area parity catalogs. When a capability lands,
-update its status row here (with new concrete evidence) and recompute the affected area's
-scorecard line.
+This standard is maintained in this file. When a capability lands, update its row with
+concrete live evidence. Use `scripts/parity_audit.py` for current status totals and
+pointer coverage; retain the dated scorecard above as history.
 A capability graduates to `done` only when its evidence is concrete and its full SW
 acceptance condition is met — partial credit stays `partial`.

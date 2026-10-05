@@ -1,6 +1,7 @@
-// AICM v1 binary WRITER (pure C++, no OCCT) — C++ port of the encoder half of
-// engine/doc/tessellate.py (write_aicm / _encode_*). Format contract:
-// docs/contracts/mesh_format.md. The host's render/aicm_loader is the consumer.
+// AICM v1 binary WRITER (pure C++, no OCCT). Format contract: contracts/mesh_format.md.
+// Ported from the Python writer in services/sim/tessellate.py (write_aicm / _encode_*),
+// whose BODY/FACE/EDGE/VERT encoding it shares; only this writer emits APRG.
+// The GUI's host/src/render/aicm_loader is the consumer.
 //
 // Kept OCCT-free so it is unit-testable standalone: the OCCT tessellator
 // (geom/tessellate.{h,cpp}) fills these plain structs, this file serializes them.
@@ -141,9 +142,9 @@ struct AicmBody {
     uint32_t total_edge_pts() const { return static_cast<uint32_t>(edge_pts.size() / 3); }
 };
 
-// --- Overlay chunk encoders (mirror engine/doc/tessellate.py scalar/disp/lines) ---
+// --- Overlay chunk encoders (same payloads as services/sim/tessellate.py scalar/disp/lines) ---
 // Each returns a complete length-prefixed chunk (fourcc[4] · u64 len · payload),
-// ready to pass in write_aicm's extra_chunks. The host's render/aicm_loader is the
+// ready to pass in write_aicm's extra_chunks. host/src/render/aicm_loader is the
 // consumer (SCLR/DISP/LINS branches).
 //
 // SCLR payload: u32 body_id · str name · f32 vmin · f32 vmax · u32 count · f32[count]
@@ -164,7 +165,7 @@ std::vector<uint8_t> lines_chunk(const std::string& name,
 
 // Serialize a list of bodies to an AICM v1 byte blob (deterministic). Any
 // pre-encoded `extra_chunks` (SCLR/DISP/LINS …) are appended after the body chunks
-// and counted in the header chunk_count — exactly as tessellate.py's write_aicm.
+// and counted in the header chunk_count — the same order as the Python write_aicm.
 std::vector<uint8_t> write_aicm(const std::vector<AicmBody>& bodies,
                                 const std::vector<std::vector<uint8_t>>& extra_chunks = {});
 

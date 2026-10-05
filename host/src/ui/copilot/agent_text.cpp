@@ -1,6 +1,8 @@
 // agent_text — see agent_text.h for why this is its own GL-free translation unit.
 #include "agent_text.h"
 
+#include "ui/glyph_ranges.h"
+
 #include <cctype>
 
 namespace ui {
@@ -83,27 +85,6 @@ std::string substituteDocIds(const std::string& text,
 // ===========================================================================================
 
 namespace {
-
-// MIRROR of host/src/ui_theme.cpp uiGlyphRanges() (:662) + cadSymbolRanges() (:675). Those are
-// file-static in a TU that pulls in ImGui and GL, so a GL-free unit-testable TU cannot call them.
-// test_agent_text.cpp parses ui_theme.cpp and FAILS if this table drifts from it — do not edit
-// one without the other.
-const unsigned kCovered[] = {
-    // uiGlyphRanges(): Latin-1, general punctuation, superscripts/subscripts.
-    0x0020, 0x00FF,
-    0x2010, 0x2027,
-    0x2070, 0x209F,
-    // cadSymbolRanges(): CADSymbols.ttf merged over the body face.
-    0x2205, 0x2205,
-    0x2225, 0x2225,
-    0x2261, 0x2261,
-    0x2295, 0x2295,
-    0x2299, 0x2299,
-    0x22A5, 0x22A5,
-    0x2300, 0x2300,
-    0x25C6, 0x25C7,
-};
-constexpr std::size_t kCoveredPairs = sizeof(kCovered) / sizeof(kCovered[0]) / 2;
 
 // Uncovered codepoints worth spelling out rather than dropping to '?'. Kept ASCII on purpose:
 // an ASCII replacement is covered by definition and cannot itself need folding.
@@ -190,15 +171,9 @@ bool decodeUtf8(const std::string& s, size_t& i, unsigned& cp) {
 }  // namespace
 
 bool atlasCovers(unsigned cp) {
-    for (std::size_t p = 0; p < kCoveredPairs; ++p)
-        if (cp >= kCovered[p * 2] && cp <= kCovered[p * 2 + 1]) return true;
+    if (glyphs::inAtlas(cp)) return true;
     // Tab / newline are not in any range but are layout, not glyphs — ImGui handles them.
     return cp == '\n' || cp == '\t' || cp == '\r' || cp == 0x1E;
-}
-
-const unsigned* atlasCoveredRanges(std::size_t& pairs) {
-    pairs = kCoveredPairs;
-    return kCovered;
 }
 
 std::string foldToAtlasGlyphs(const std::string& text) {

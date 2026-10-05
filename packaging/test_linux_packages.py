@@ -543,7 +543,8 @@ def test_payload_bytes_and_modes_survive_packaging(appdir: Path, deb: Path, tmp_
 def test_tarball_is_the_same_sysroot_tree(built: Path, deb: Path) -> None:
     """`tar -C / --zstd -xf` must install exactly what the deb installs."""
     tarball = built / artifact_names.canonical_artifact(PRERELEASE, "linux", "x86_64", "tar")
-    with tarfile.open(tarball, mode="r:*") as archive:
+    uncompressed = subprocess.check_output(["zstd", "-dc", str(tarball)])
+    with tarfile.open(fileobj=io.BytesIO(uncompressed), mode="r:") as archive:
         from_tar = {
             (member.name.lstrip("./"), member.mode, member.linkname)
             for member in archive.getmembers()

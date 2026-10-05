@@ -5,6 +5,6 @@ You are working on the **work-system** section of Chudware. Its maintained conte
 
 !`cat work/context/work-system.md 2>/dev/null || echo "(context pack missing — run /work-ctx-refresh or explore with graphify)"`
 
-Use the debugging playbook and graphify starters above BEFORE exploring raw files. If you find the pack stale (moved files, renamed entry points), update work/context/work-system.md as part of your change so the next session benefits.
+Use the entry points and graphify starters to orient before exploring raw files. The pack is a map; code is the authority. Task policy: `work/WORKFLOW.md`; working rules: `.claude/skills/chudware-dev/SKILL.md`. Refresh stale references in work/context/work-system.md within your write-set. Debugging commands are a verification handoff: leaf agents do not run builds, gates, tests, formatters, generated-output refreshes or git commands; the driver verifies the combined change once.
 
 Task: $ARGUMENTS

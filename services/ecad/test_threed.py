@@ -1,15 +1,15 @@
-r"""ECAD → 3D bridge tests (fab_outputs.md §5). House style: main() + asserts.
+r"""ECAD → 3D bridge tests (contracts/ecad/fab_outputs.md §5). House style: main() + asserts.
 
 Run (from repo root):
-    & "$env:APPDATA\Chudware\runtime\venv\Scripts\python.exe" -m engine.ecad.test_threed
+    python -m services.ecad.test_threed
 
-Uses OCP — a full run takes ~10-30s (STEP export/import + part-doc compile). That's expected.
+Uses build123d / OCP for STEP export/import.
 
 Covers:
   1. Board solid volume ≈ outline_area × thickness − drill holes (±2%).
   2. A placed proxy component's centroid x,y ≈ its footprint world position.
-  3. board_to_part_doc validates (engine.doc.schema) AND compiles via the CAD pipeline to a
-     non-empty / non-zero-volume body; the STEP also re-imports to a non-empty shape.
+  3. board_to_part_doc emits a structurally correct import envelope; the generated
+     STEP re-imports to a non-empty shape. Native host compilation is not exercised here.
   4. An empty/open outline raises a clear BoardGeometryError; a no-pad footprint is skipped.
 """
 
@@ -149,9 +149,8 @@ def test_proxy_placement() -> None:
 def test_part_doc_compiles() -> None:
     """board_to_part_doc produces a re-importable STEP + a well-formed aicad.part/1 envelope.
 
-    The Python doc compiler/schema were rewritten into the C++ core (libchudware) and deleted; the
-    actual compile + schema validation of this part doc now happen there when the host opens it.
-    This test keeps the closure-free half: the ECAD->STEP geometry round-trips, and the part-doc
+    Native compile and schema validation happen when the host opens the part document.
+    This test covers the Python half: ECAD->STEP geometry round-trips, and the part-doc
     envelope is structurally correct (one `import` feature referencing the STEP)."""
     from services.formats.formats import import_path, _IMPORT_CACHE
 

@@ -1,6 +1,6 @@
 """Design Rule Check (DRC) + ratsnest — advisory geometry audit over a board document.
 
-Executable form of ``docs/contracts/ecad/pcb_schema.md`` §6 (the DRC rule set) and the ratsnest
+Executable form of ``contracts/ecad/pcb_schema.md`` §6 (the DRC rule set) and the ratsnest
 definition. ``run_drc(board)`` returns a deterministic list of :data:`Violation` dicts; it never
 raises on a "bad" board and never mutates its input. DRC is **advisory** — it surfaces issues in
 the RPC response / AI feedback block but never blocks an op.
@@ -17,10 +17,10 @@ clearance violation, no matter how close they are (that is the whole point of ro
 clearance check only fires between items of *different* nets. ``null``/empty nets are treated as
 distinct from every other net (an unassigned copper island must still clear its neighbours).
 
-Determinism mirrors :mod:`engine.ecad.netlist` / :mod:`engine.ecad.erc`: every iteration is sorted
+Determinism mirrors ``core/ecad/netlist.cpp`` / ``core/ecad/erc.cpp``: every iteration is sorted
 and the final violation list is sorted, so the output is byte-stable for a given board.
 
-Geometry approximations (documented, "reasonable" per the task):
+Geometry approximations:
   * **Track**: a thick segment — distance to another track is the segment-to-segment minimum
     distance minus *half* of each track's width (so the check is edge-to-edge copper spacing).
   * **Round / circle / oval pad, via**: a circle. For a non-round pad the radius is *half the

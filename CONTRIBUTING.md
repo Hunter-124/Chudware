@@ -5,10 +5,12 @@ anything.
 
 ## Prerequisites
 
-- CMake + Ninja + a C++17 toolchain (GCC/Clang on Linux, MSVC/VS 2022 on Windows)
-- Python 3.11 for services/agent/MCP work (managed venv:
-  `~/.local/share/Chudware/mcp-venv/`)
-- The repo knowledge graph: run `graphify update .` after any code change
+- CMake + Ninja + a C++ toolchain with C++20 support (C++17 baseline; the mesh,
+  manufacturing, twin, and print layers need C++20) — GCC/Clang on Linux, MSVC/VS 2022 on
+  Windows. CUDA is optional (`CHUDWARE_WITH_CUDA`, default OFF).
+- Python 3.11 for services/agent/MCP work. The gate resolves the service venv (default
+  `~/.local/share/Chudware/mcp-venv/`; override with `CHUDWARE_GATE_PYTHON`).
+- The repo knowledge graph (`graphify`; see AGENTS.md workflow item 1).
 
 ---
 
@@ -21,10 +23,11 @@ python3 work/tools/work.py ready      # unblocked tasks, priority order
 python3 work/tools/work.py board      # the full board
 ```
 
-Tasks are YAML-front-matter files in `work/tasks/` + `work/backlog/` with `priority`,
-`lane`, `kind` (`fix`|`overhaul`|`new`), `blocked_by`, and `status`. Policy:
-[work/WORKFLOW.md](work/WORKFLOW.md). Solo dev — no claim step; pick a task, do it, mark
-it done yourself.
+Tasks are markdown files with flat YAML front matter in `work/tasks/` + `work/backlog/`
+(`status`, `priority`, `lane`, `kind`, `depends_on`, `deferred`, …) and body sections
+including "Files / areas touched" and "Definition of done". Board policy:
+[work/WORKFLOW.md](work/WORKFLOW.md); task format and lifecycle:
+[work/README.md](work/README.md).
 
 ### 2. Do the work, gate, close
 
@@ -34,23 +37,25 @@ graphify update .           # after code changes (AST-only, no API cost)
 ```
 
 Do not merge work that fails the gate. Environment SKIPs (no OCCT, no venv, no xvfb) are
-honest SKIPs, not failures. Fast stdlib-only gate: `python3 scripts/check.py`.
+honest SKIPs, not failures. Fast source/audit gate: `python3 scripts/check.py` — not
+stdlib-only; the interpreter needs the pinned audit packages (`CHECK_PYTHON` overrides;
+see [docs/reference/CI_RUNNERS.md](docs/reference/CI_RUNNERS.md)).
 
 ---
 
 ## Rules
 
 **Contracts first.** Any new module ships a `contracts/*.md` the same day the module is
-created. Contracts are append-only and integrator-owned.
+created. Contracts are append-only and integrator-owned: hand the draft to the integrator.
 
-**Scoped write-sets.** Each task's `file_list` defines what it may touch; parallel tasks
-must have disjoint file lists. Extending a shared/append-only file (`contracts/*`,
-top-level CMake, `core/api/libchudware.h`, `AGENTS.md`, `scripts/gate.sh`) is the
-integrator's job — coordinate first.
+**Scoped write-sets.** A task's "Files / areas touched" section defines what it may touch;
+parallel tasks must have disjoint write-sets. Extending a shared/append-only file
+(`contracts/*`, top-level CMake, `core/api/libchudware.h`, `AGENTS.md`, `scripts/gate.sh`)
+is the integrator's job — coordinate first.
 
-**New engine functionality lands in `core/` (C++).** The Python engine is deleted
-(T-RF21); `scripts/check.py`'s `oracle_import_audit` fails on any new `engine.*` /
-`engine_oracle.*` import under `services/`.
+**New engine functionality lands in `core/` (C++).** There is no Python engine;
+`scripts/check.py`'s `oracle_import_audit` fails on any `engine.*` / `engine_oracle.*`
+import under `services/`, `scripts/`, or `tools/`.
 
 **Log discovered work, don't absorb it.** Found something out of scope? File a task and
 stop. Scope creep creates overlapping write-sets and merge conflicts.
@@ -61,15 +66,24 @@ stop. Scope creep creates overlapping write-sets and merge conflicts.
 
 ## License guardrails
 
-The product is commercial closed-source. License discipline is non-negotiable; the full
-policy is [contracts/licenses.md](contracts/licenses.md) — read it. The short version:
+The product is commercial closed-source. License discipline is non-negotiable. The
+authoritative ledger is [contracts/licenses.md](contracts/licenses.md): its row for a
+dependency decides that dependency's posture, and its header records the current
+distribution posture and open audit items. Open license debts and pending legal reviews are
+tracked in [contracts/license_debt.md](contracts/license_debt.md). The ledger's rules:
 
-| OK to bundle | Subprocess only (must offer source in installer) | Never |
-|---|---|---|
-| LangGraph, PyNite, Renode, probe-rs, ngspice, Verilator, openNURBS, ezdxf, IfcOpenShell (LGPL, dynamic link) | CalculiX, OpenFOAM, GHDL, Icarus, esptool, Arduino CLI, LibreDWG | AGPL anything, GPL linking, GrabCAD scraping, retailer scraping, bundling IBC/NDS/Eurocode text |
+- **Ledger row before use.** Every dependency — vendored, pip, CMake, external binary, or
+  model weights — gets a row (SPDX identifier, role, posture) before it lands. No row means
+  no classification: do not infer one.
+- **In-process only when license-clean.** Linked or imported dependencies are permissive,
+  or LGPL linked dynamically (as the ledger records for OCCT and Netgen).
+- **Copyleft tools are isolated.** GPL tools are subprocess-only: user-installed or
+  PATH-discovered, never linked, imported in-process, vendored, or bundled; a missing tool
+  degrades gracefully instead of breaking unrelated features.
+- **Excluded rows stay excluded.** A dependency the ledger marks EXCLUDED or RULED OUT
+  (for example AGPL in-process libraries or non-commercial model licenses) is not used.
 
-When adding a dependency: check its SPDX identifier, add it to `contracts/licenses.md`,
-and confirm bundle vs subprocess. If uncertain, ask before merging.
+If a dependency's posture is uncertain, ask before merging.
 
 For format reverse-engineering: interoperability RE is protected under DMCA §1201(f) and
 EU Software Directive Art. 6 **only if clean-room** — the person documenting a format and
@@ -93,10 +107,9 @@ graphify explain "<concept>"            # focused concept lookup
 `python3 services/installer/setup_mcp_clients.py` (Windows: `mcp_setup.bat`) registers it
 with Claude Code, Cursor, VS Code, opencode.
 
-**Work order format for agents:** paste the task file (YAML front matter + body) as the
-work order; `file_list` and `end_condition` define the scope and the finish line.
-
-**After code changes:** `graphify update .`.
+**Work order format for agents:** `python3 work/tools/work.py prompt <ID>` emits the task as
+a self-contained work order; its "Files / areas touched" section is the scope and its
+"Definition of done" checklist is the finish line.
 
 ---
 

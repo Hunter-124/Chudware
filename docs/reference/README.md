@@ -15,16 +15,33 @@ alongside a product with license obligations — see `contracts/licenses.md`).
 The **clean-room CAD-format set** — the three files under **Contents** below —
 describes the public CAD format landscape and the classic AutoCAD-lineage data
 model, then cross-links to where this repo's *actual* interop surface sits
-today. Nothing in that set describes Chudware internals, and the rule in
-**Keeping this clean** governs it.
+today. The public-spec material is background, not a description of Chudware's
+document model; explicitly labelled repo annotations describe the current implementation.
+**Keeping this clean** governs the clean-room format set.
 
 This directory has since also become the home for Chudware's own build,
-packaging and operations references — `HOSTD.md`, `BUILD_WINDOWS.md`,
-`PACKAGING_WINDOWS.md`, `CI_RUNNERS.md`, `serving_runbook.md`, and the demo and
-degradation notes — which is what `docs/README.md` says this folder is for
-("build/packaging guides, CAD data-model and file-format references, runbooks").
+packaging, operations and domain references, which `docs/README.md` indexes as
+"build/packaging guides, CAD data-model and file-format references, runbooks".
 Those files do describe Chudware internals; the clean-room rule does not apply
-to them, and they are not part of the set listed below.
+to them, and they are not part of the clean-room set:
+
+- **[HOSTD.md](HOSTD.md)** — `chudware-hostd` shared engine daemon operator reference.
+- **[BUILD_WINDOWS.md](BUILD_WINDOWS.md)** — building core, host and the Python runtime
+  on Windows.
+- **[PACKAGING_WINDOWS.md](PACKAGING_WINDOWS.md)** — the Windows release/installer
+  pipeline and the manual runtime checklist.
+- **[CI_RUNNERS.md](CI_RUNNERS.md)** — the self-hosted CI runner fleet.
+- **[serving_runbook.md](serving_runbook.md)** — LoRA adapter serving, routing, canary
+  and rollback (T-H9).
+- **[REVENG_DEGRADATION.md](REVENG_DEGRADATION.md)** — Reverse Engineering capability
+  matrix and banners from `services/vision/reveng_provision.py`.
+- **[EM_SIMULATION.md](EM_SIMULATION.md)** — full-wave EM simulation family.
+- **[FIN25_SENSOR_NODE_GOLDEN_DEMO.md](FIN25_SENSOR_NODE_GOLDEN_DEMO.md)** — dated
+  (2026-07-10) STM32 sensor-node golden demo record.
+- **[parts_library_data_coverage.md](parts_library_data_coverage.md)** — dated
+  (2026-07-08) Parts Library data-coverage findings.
+- **[rover_competition_ruleset.md](rover_competition_ruleset.md)** — cached snapshot of
+  the external NASA HERC ruleset.
 
 ## Contents
 
@@ -47,10 +64,17 @@ to them, and they are not part of the set listed below.
 This repo's actual format-interop surface — what's implemented, not just
 referenced — lives here:
 
-- **`core/doc/formats.cpp`** — production format matrix and import/export surface. STEP,
-  IGES, BREP, STL, OBJ, PLY, glTF/GLB, 3MF, Rhino `.3dm`, DXF, and subprocess-isolated
-  DWG conversion are wired according to build capabilities; `services/formats/formats.py`
-  is the Python parity oracle.
+- **`core/doc/formats.cpp`** — production format matrix (`format_registry()`) and
+  import/export surface. STEP, IGES, BREP, STL, OBJ, PLY, glTF/GLB, 3MF and Rhino `.3dm`
+  are wired according to build capabilities (lib3mf/openNURBS are optional at build
+  time); DXF is import-only through a hand-written ASCII parser (no ezdxf; INSERT
+  blocks skipped); DWG is import-only by running a user-installed LibreDWG `dwg2dxf`
+  as a subprocess and reusing the DXF importer.
+- **`services/formats/`** — Python helpers, not the production path:
+  `formats.py` + `formats_dxf.py`/`formats_dwg.py` are the parity oracle (ezdxf,
+  build123d/OCP, trimesh, lib3mf, rhino3dm; the oracle's DWG lane also tries the ODA
+  File Converter), and `services/ecad/threed.py` uses `import_path` to load board
+  3D models.
 - **SolidWorks `.sldprt`/`.sldasm`** are import-only. On Windows, installed SolidWorks
   COM is preferred for an exact STEP/B-rep conversion. On every platform, modern
   SolidWorks 2015+ saved-display triangle strips import as explicitly labelled
@@ -79,10 +103,10 @@ referenced — lives here:
 
 ## Keeping this clean
 
-Do not add anything to this directory that was learned from a proprietary binary,
-decompiled code, or a vendor SDK's internal (non-public) documentation. If a new
-format needs to be added to this reference set, source it the same way the
-original three files were sourced: the format's own public/ISO/ANSI/ASTM
+Do not add anything to the three-file clean-room format set that was learned from
+a proprietary binary, decompiled code, or a vendor SDK's internal (non-public)
+documentation. If a new format needs to be added to this reference set, source it
+the same way the original three files were sourced: the format's own public/ISO/ANSI/ASTM
 specification, or openly published vendor developer docs. This keeps
 `docs/reference/` safe to reference from anywhere in the repo, including from
 work that will eventually ship commercially (see the clean-room posture already

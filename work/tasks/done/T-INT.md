@@ -3,13 +3,18 @@ id: T-INT
 title: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)
 workstream: integration
 owner: Bruh
-status: backlog
+status: dropped
 branch: task/T-INT-integration-demo
 day: 5
 depends_on: [T-A4, T-B4, T-C4, T-D4]
 lane: ai-copilot
 kind: new
 ---
+
+> **2026-10-04 dropped.** Absorbed into T-A5 (done) by Erik on 2026-07-03, as the title
+> says; this card was never worked on its own. The body below is the original day-5
+> sprint brief, kept as history: the `engine_oracle/` and `docs/sessions/` paths it
+> names were retired and no longer exist.
 
 ## Context
 

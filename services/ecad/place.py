@@ -1,11 +1,11 @@
-"""Connectivity-aware deterministic PCB placer (Wave 2a E1).
+"""Connectivity-aware deterministic PCB placer.
 
-Public entry points consumed by Wave 2b ``board_from_schematic``:
+Public entry points used by ``board_from_schematic``:
 
   * :func:`place_board` — pure: deep-copies the board, seats every footprint, returns
     ``{"doc": <placed board>, "report": {...}}``.
   * :func:`autoplace` — convenience wrapper that applies the result to a live
-    :class:`engine.ecad.session.EcadSession` via :func:`session.swap_doc`.
+    :class:`services.mcp.ecad_common._SessionFacade` via :func:`session.swap_doc`.
 
 Algorithm (deterministic for a fixed ``opts['seed']``, default 0):
 
@@ -815,7 +815,7 @@ def autoplace(session: Any, opts: dict | None = None) -> dict:
     """Run :func:`place_board` on ``session.doc`` and write back via ``session.swap_doc``.
 
     Returns the placement report merged with the session ops-response fields
-    (``revision``, ``compile``, …). Wave 2b ``board_from_schematic`` should call
+    (``revision``, ``compile``, …). ``board_from_schematic`` callers can use
     :func:`place_board` for a pure transform, or this helper when a live session
     already owns the board document.
     """

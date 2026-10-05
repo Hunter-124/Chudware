@@ -1,4 +1,4 @@
-"""Building-code compliance engine (T-D4): deterministic rule engine + agentic RAG.
+"""Python building-code compliance helpers: deterministic rules + user-corpus retrieval.
 
 Two-layer approach
 ------------------
@@ -9,15 +9,14 @@ Two-layer approach
    * :func:`check_deflection`  — L/360 live-load limit (IBC 1604.3 / AISC 360).
    * :func:`check_post_span`   — simplified lumber post capacity (NDS ASD; Fc is the
      same public-domain Douglas Fir-Larch No.2 value as ``checks.py``; dressed section
-     areas come from the T-D3 lumber table via
-     :func:`engine.structural.sections.get_lumber_section`).
+     areas come from the dressed-lumber table via
+     :func:`services.structural.sections.get_lumber_section`).
    * :func:`check_fastener_schedule` — our own encoded fastener schedule with IBC table
      citation; not a reproduction of IBC Table 2304.10.1.
 
 2. **Agentic RAG** — :func:`agentic_rag` retrieves jurisdiction-specific citations from
    *user-supplied* PDF documents in a local corpus directory.  It does **not** scrape
-   copyrighted public code viewers at runtime; see ``work/questions/T-D4.md`` for the
-   escalation ruling on that path.
+   copyrighted public code viewers at runtime.
 
 Copyright fence (binding)
 -------------------------
@@ -30,7 +29,7 @@ Building codes (IBC, ASCE 7, AISC 360, NDS full text) are copyrighted.  This mod
 Disclaimer
 ----------
 Every :class:`RuleResult` and the :func:`run_checks` aggregate output carry the same
-mandatory disclaimer as :data:`~engine.structural.checks.DISCLAIMER` (imported, not
+mandatory disclaimer as :data:`~services.structural.checks.DISCLAIMER` (imported, not
 redefined):
 
     "Preliminary check — not sealed engineering. Verify with a licensed structural
@@ -45,8 +44,8 @@ from typing import Optional, Protocol, runtime_checkable
 # Import the byte-exact disclaimer from checks.py — not redefined here.
 from services.structural.checks import DISCLAIMER
 
-# Dressed-lumber section properties come from the T-D3 section library
-# (engine_oracle/data/lumber_table.json — ANSI/AWC PS 20 dressed dims).
+# Dressed-lumber section properties come from the Python section library
+# (services/structural/data/lumber_table.json — ANSI/AWC PS 20 dressed dims).
 from services.structural.sections import get_lumber_section
 
 # --------------------------------------------------------------------------- RuleResult
@@ -73,7 +72,7 @@ class RuleResult:
     detail:
         Human-readable explanation of the result.
     disclaimer:
-        Always :data:`~engine.structural.checks.DISCLAIMER`.
+        Always :data:`~services.structural.checks.DISCLAIMER`.
     """
 
     rule_id: str
@@ -167,8 +166,8 @@ def check_post_span(post_size: str, load_kn: float) -> RuleResult:
     """Simplified NDS ASD compression check for a lumber post (no column stability Cp).
 
     Demand = load_kn (kN).  Capacity = Fc × A (NDS ASD; no load-duration/wet-service
-    factors in v1).  Section area A comes from the T-D3 dressed-lumber table
-    (:func:`engine.structural.sections.get_lumber_section`).
+    factors in v1).  Section area A comes from the dressed-lumber table
+    (:func:`services.structural.sections.get_lumber_section`).
     Citation: "NDS 3.6 column compression / NDS Supplement Table 4D."
 
     Parameters
@@ -333,15 +332,14 @@ class UserCorpusProvider:
     """Default RAG backend: searches user-supplied PDFs in a local corpus directory.
 
     Set ``CHUDWARE_CODE_CORPUS_PATH`` to a directory containing user-licensed PDF copies of
-    building codes.  If the directory is absent or empty, returns an empty citation list
-    with a no-corpus advisory note (graceful no-op — never an error).
+    building codes. If the directory is absent or empty, returns a no-corpus
+    advisory citation with ``confidence="none"`` (never a provider call).
 
-    Text extraction uses ``pdfminer.six`` (MIT) if available (same as T-F2 datasheet
-    path); degrades gracefully when absent.
+    Text extraction uses ``pdfminer.six`` (MIT) if available; degrades gracefully
+    when absent.
 
     **No copyrighted text is bundled or fetched** — the user provides their own licensed
-    documents.  The LLM is called via :func:`engine.research.providers.select_provider`
-    (T-F9 pattern); the API call is optional and skips if no provider key is configured.
+    documents. This backend retrieves local text snippets without an LLM/provider call.
     """
 
     _DEFAULT_CORPUS_DIR = os.path.join(
@@ -485,10 +483,9 @@ def agentic_rag(
 
     Copyright fence
     ---------------
-    The default :class:`UserCorpusProvider` only reads user-supplied PDFs — no code text
-    is scraped or cached by this function.  The live-viewer backend (upcodes.com / ICC
-    public viewer) is deferred pending Fable ruling on the copyright fence; see
-    ``work/questions/T-D4.md``.
+    The default :class:`UserCorpusProvider` only reads user-supplied PDFs.
+    It does not scrape public building-code viewers; retrieved snippets retain
+    their local source citations and the user-supplied confidence classification.
     """
     if provider is None:
         provider = UserCorpusProvider()

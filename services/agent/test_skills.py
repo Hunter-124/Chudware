@@ -228,7 +228,7 @@ def test_keyword_trigger_auto_inject_once(skill_roots):
     assert len(bodies3) == 1
 
 
-def test_reinject_after_compaction(skill_roots):
+def test_reset_session_allows_reinjection(skill_roots):
     _write_skill(
         skill_roots["builtin"], "sim", "sim skill",
         inject="auto", keywords=["fea"],
@@ -238,7 +238,7 @@ def test_reinject_after_compaction(skill_roots):
     sk.reset_session("c1")
     assert sk.activate_for_prompt("run fea now", session_id="c1")
     assert sk.activate_for_prompt("run fea now", session_id="c1") == []
-    sk.mark_compacted("c1")
+    sk.reset_session("c1")
     again = sk.activate_for_prompt("run fea now", session_id="c1")
     assert len(again) == 1
     assert "SIM BODY" in again[0]

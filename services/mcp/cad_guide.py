@@ -95,7 +95,7 @@ run_fea_contact(fixtures, load, material, max_gap_mm, max_iterations, mesh_size_
   (tension-carrying) joints: run_fea_static with study bond_gap_mm — mutually exclusive.
 
 run_fea_frequency_response(fixtures, excitation_dir, sweep_hz, zeta, base_accel_g,
-  psd_breakpoints, vibration_spec, ...) — harmonic + random vibration response (T-BL17).
+  psd_breakpoints, vibration_spec, ...) — harmonic + random vibration response.
   Answers "does this part resonate and fail under the vibe spec", not just "what are its
   natural frequencies". Builds on run_fea_modal's modes via modal superposition:
     Harmonic: SDOF-per-mode transmissibility sweep → response acceleration (g) vs frequency
@@ -169,7 +169,7 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   forces on the selected component's mate faces and runs run_fea_static on it — "is this
   link strong enough at the worst instant" in one call. Conditions are `case`-labelled
   per frame; dry_run=True builds loads + envelope without solving.
-  ECAD → thermal FEA (LIVE, T-FIN16): ecad_thermal_handoff(environment='still_air'|
+  ECAD → thermal FEA (LIVE): ecad_thermal_handoff(environment='still_air'|
   'forced_air'|'cold_plate'|custom h/t_amb, include_trace_heating=…) takes the ACTIVE
   routed board to a solved board-level thermal study in one call — fused board+component
   FEA solid with the FR4/copper stackup HOMOGENIZED to one effective material (in-plane
@@ -182,11 +182,11 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   hand-calc cross-check at a GENEROUS tolerance (JEDEC theta_ja assumes a standard test
   board; minor power contributors get advisories, not pass/fail — neighbor heating is
   invisible to theta_ja). dry_run=True builds geometry + BCs + envelope without solving.
-  ECAD → CHT airflow (LIVE, T-FIN19, coupling ecad_to_cht): when the convection PRESETS
+  ECAD → CHT airflow (LIVE, coupling ecad_to_cht): when the convection PRESETS
   aren't enough (enclosures, fans), ecad_airflow_handoff(inlet_mps=…, inlet_temp_c=…,
   enclosure={"clearance_mm":10,"wall_mm":2}?) exports the board slab + every POWERED
   component as separate watertight STL solids and runs OpenFOAM chtMultiRegionFoam via
-  the T-SIM5 multi-solid seam (per-region volumetric heat sources; optional passive
+  the multi-solid CHT seam (per-region volumetric heat sources; optional passive
   4-wall enclosure duct open along the flow axis), mapping per-region mean/peak °C back
   to component refs. ecad_verify_airflow() then answers "was the film-coefficient
   assumption sane?" — a per-component preset-h vs CHT rise deviation table with
@@ -194,9 +194,9 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   Without OpenFOAM the handoff degrades honestly (skipped:true + full envelope) and
   offers the LBM wind tunnel as a qualitative-flow ADVISORY, clearly labeled
   NON-THERMAL. Budget: even the 'coarse' preset is minutes of meshing + solving.
-  ECAD → structural FEA (LIVE, T-FIN21): ecad_vibe_check(band_lo_hz=20, band_hi_hz=2000,
+  ECAD → structural FEA (LIVE): ecad_vibe_check(band_lo_hz=20, band_hi_hz=2000,
   psd_breakpoints=…, mount_holes=…) — vibration reliability screen of the mounted board:
-  reuses the T-FIN16 fused board+components solid with a mass-corrected effective
+  reuses the ecad_thermal_handoff fused board+components solid with a mass-corrected effective
   density (component masses from package dims x a mold-compound density assumption, or
   eng mass metadata), detects mounting holes (mounting-hole footprints / NPTH pads /
   large un-netted plated holes, or explicit mount_holes=[[x,y],…]) and fixes them, runs
@@ -208,7 +208,7 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   flat 0.04 g^2/Hz screening level (echoed as an assumption); pass the qualification
   spectrum for a spec-true screen. dry_run=True builds mounts + mass model + envelope
   without solving.
-  HEATSINK SELECTION (T-FIN17): heatsink_select(component_ref, tj_target_c |
+  HEATSINK SELECTION: heatsink_select(component_ref, tj_target_c |
   t_case_target_c) closes the "pick a heatsink" loop on the LAST ecad_thermal_handoff
   study. Candidates = curated parts-library heatsinks (part_search domain "thermal",
   datasheet-class theta_sa + mass + cost) PLUS a parametric plain-finned aluminum
@@ -228,7 +228,7 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   a flagged network estimate (Tj = Ta + P*(theta_jc + R_tim + R_sa)).
   Helper builders/validator: services/mcp/simhandoff.py.
 
-SYSTEM POWER BUDGET (aicad.powerbudget/1 — T-FIN23, tool: power_budget):
+SYSTEM POWER BUDGET (aicad.powerbudget/1, tool: power_budget):
   Bookkeeping (NOT SPICE) rail-tree energy budget composing three seams: an
   aicad.boardphys/1 sidecar (ecad_to_3d — per-component supply-rail currents, sequencing,
   optional PDN block from ecad_run_pdn) supplies the LOADS; an aicad.powerprofile/1
@@ -243,13 +243,14 @@ SYSTEM POWER BUDGET (aicad.powerbudget/1 — T-FIN23, tool: power_budget):
   number carries provenance. Also runs inside verify_battery as the 'power_budget'
   check (kwargs power_source / power_converters / board_path / power_profile_path).
 
-GOLDEN DEMO (T-FIN25 — living E2E worked example):
-  scripts/demo_sensor_node.py chains the full FIN surface on an STM32F4 sensor-node
-  board: verification ladder (ERC/DRC/hostcheck/sicheck/FPGA/PDN) → firmware project +
-  co-verify (fw_sim_run with fixture:i2c_temp_tmp103 when Renode is present) →
-  ecad_thermal_handoff → heatsink_select(U1, tj_target_c=85) → power_budget →
-  make_report. Wired into scripts/gate.sh as stage 4.7 (CHUDWARE_SKIP_FIN25=1 to opt out).
-  Narrative + artifacts: docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md. Prefer this script over
+GOLDEN DEMO (living E2E worked example):
+  scripts/demo_sensor_node.py chains the full board → firmware → thermal → power surface
+  on an STM32F4 sensor-node board: verification ladder (ERC/DRC/hostcheck/sicheck/FPGA/
+  PDN) → firmware project + co-verify (fw_sim_run with fixture:i2c_temp_tmp103 when
+  Renode is present) → ecad_thermal_handoff → heatsink_select(U1, tj_target_c=85) →
+  power_budget → make_report. Wired into scripts/gate.sh as stage 4.7
+  (CHUDWARE_SKIP_FIN25=1 to opt out). Narrative + artifacts:
+  docs/reference/FIN25_SENSOR_NODE_GOLDEN_DEMO.md. Prefer this script over
   inventing a new end-to-end recipe when demonstrating the content is finished.
 
 TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ribbon tab, and
@@ -408,13 +409,12 @@ TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ri
       a print gate, and nothing is sliced automatically. Slice the exported surface.stl with
       slice_part; only its passing G-code check makes a part print-ready.
 
-SIMULATE TAB (T-FIN24, host GUI): one multiphysics Simulate workspace hosts every live
+SIMULATE WORKSPACE (host GUI): one multiphysics Simulate workspace hosts every live
   study kind with progressive disclosure by open doc type, plus handoff actions
   (Send board to thermal FEA, Pick heatsink, …) driven by aicad.simhandoff/1. Worker
-  seam: engine_oracle/sim/multiphysics_rpc.py (sim_caps / sim_run_buckling /
-  sim_run_contact / sim_freq_response / ecad_thermal_handoff / heatsink_select /
-  piping_verify_cfd). EM forms wire the live EM backend; deeper EM solvers stay on
-  T-SIM11. Supersedes the deferred T-SIM10 host-path brief.
+  seam: services/sim/multiphysics_rpc.py (sim_caps / sim_run_contact /
+  sim_freq_response / ecad_thermal_handoff / heatsink_select / piping_verify_cfd).
+  EM forms drive the live EM backend.
 """
 
 _MOTION_GUIDE = """\
@@ -567,7 +567,10 @@ WORKFLOW
                                             downstream feature breaks — WITHOUT touching the live
                                             doc. Returns aicad.preflight/1 with advisory_items.
                                             A fail verdict is advisory (never blocks); add_features
-                                            runs preflight automatically (CHUDWARE_PREFLIGHT=1).
+                                            runs preflight automatically on non-trivial batches.
+                                            A suppressed run (trivial batch, CHUDWARE_PREFLIGHT=0,
+                                            or a preflight error) returns verdict "skipped" with
+                                            the reason in skipped/skipped_detail.
   3. render_part()                          SEE it — ONE call returns a 2x2 grid of the four
                                             most useful complementary shots (the planner
                                             measures ~200 cameras in the engine and picks the
@@ -816,7 +819,7 @@ TYPICAL LOOP
   8. cam_post("fanuc") emit the NC program; cam_setup_sheet() for the operator sheet.
   9. Audit: cam_audit — modal parse, envelope, feeds, tool and round-trip checks; ship only ok:true.
 
-FEEDS & SPEEDS ADVISOR (T-W6 — table-driven, aicad.calc/1 contract)
+FEEDS & SPEEDS ADVISOR (table-driven, aicad.calc/1 contract)
   Before cam_add_operation, call feeds_speeds() to get a recommended envelope:
     feeds_speeds("alu_6061", "endmill_flat", 10.0, "roughing")
     → {schema:"aicad.calc/1", answer:{rpm:{min,mid,max}, feed:{min,mid,max},
@@ -898,8 +901,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             "    Open a design first with ecad_new_schematic or ecad_new_pcb.\n\n"
             "  describe_project([run])\n"
             "    Narrates a DAG project run: nodes done/doing/blocked/pending, budget usage,\n"
-            "    and open questions. Feeds WS-A dag_status and the T-F17 mission-control UI.\n"
-            "    Pass run=dag_status()['run'] from your WS-A driver.\n"
+            "    and open questions. Pass run=dag_status()['run'] or run_id=<id>.\n"
             "    See contracts/dag_schema.md for the run dict shape.\n\n"
             "All tools narrate EXISTING numbers only — they never recompute values.\n"
             "See contracts/narration.md for the full style guide (rounding, attribution,\n"
@@ -907,22 +909,14 @@ def cad_guide_text(topic: str = "overview") -> str:
         )
     if topic in ("deliverables", "deliverable", "report", "presentation", "deck", "workbook",
                  "spreadsheet", "artifacts", "artifact"):
-        # The deliverables family (make_report/make_presentation/make_workbook/render_document/
-        # list_artifacts) ships in a separate `deliverables` package (T-F14) so this file stays
-        # read-only w.r.t. that node's write-set; lazy-import so the guide degrades to a pointer
-        # if that package isn't present and picks up the real text the moment it lands.
-        try:
-            from services.deliverables import DELIVERABLES_GUIDE  # noqa: PLC0415
-            return DELIVERABLES_GUIDE
-        except ImportError:
-            return ("Deliverables (spec-driven .pptx/.docx/.pdf/.xlsx with a provenance rule) ship "
-                    "with the deliverables package; make_report/make_presentation/make_workbook/"
-                    "render_document/list_artifacts.")
+        # Imported on demand: only this topic needs the deliverables package.
+        from services.deliverables import DELIVERABLES_GUIDE  # noqa: PLC0415
+        return DELIVERABLES_GUIDE
     if topic in ("parts", "standard_parts", "standard-parts", "library", "catalog",
                  "part_search", "part_get", "part_place", "hardware", "bom_parts",
                  "parts_taxonomy", "taxonomy", "facets", "faceted_search"):
         return (
-            "STANDARD-PARTS LIBRARY — search → get → place (T-P3, aicad.parts/1)\n\n"
+            "STANDARD-PARTS LIBRARY — search → get → place (aicad.parts/1)\n\n"
             "BIAS: always prefer standard parts over custom geometry for hardware.\n"
             "Standard parts are editable, sourced, and BOM-ready out of the box.\n\n"
             "REFERENCE ACQUISITION ORDER:\n"
@@ -1015,15 +1009,9 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  Use bom_rollup after placing multiple parts to get a costed BOM.\n"
         )
     if topic in ("reverse", "re", "recognize", "recon"):
-        # WS-C (wave 3) ships the recognition pipeline in a separate recon_tools module so this
-        # file stays read-only w.r.t. that node's write-set; lazy-import so cad_guide("reverse")
-        # works TODAY (degrades to a pointer) and picks up the real guide the moment it lands.
-        try:
-            from services.mcp.recon_tools import _RE_GUIDE  # noqa: PLC0415
-            return _RE_GUIDE
-        except ImportError:
-            return ("Reverse-engineering guide ships with the recon tools (wave 3); use "
-                    "import_part + describe_part + compare workflow meanwhile.")
+        # Lazy import: recon_tools imports the cad_tools facade, which re-exports this module.
+        from services.mcp.recon_tools import _RE_GUIDE  # noqa: PLC0415
+        return _RE_GUIDE
     if topic in ("requirements", "req", "req_create", "req_update", "req_status", "req_report",
                  "brief", "design_brief", "layout_plan", "layout", "critical_dim"):
         return (
@@ -1047,7 +1035,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             "BIAS: capture requirements BEFORE modeling — req_create at project start, then\n"
             "reference req_id in every verify_battery call so the battery knows what to check.\n"
             "A requirement without a verifier is aspirational; wire them up.\n\n"
-            "LAYOUT-FIRST — MANDATORY before any modeling (T-BL50):\n"
+            "LAYOUT-FIRST — MANDATORY before any modeling:\n"
             "  layout_plan(doc_id,\n"
             "              envelope_x_mm, envelope_y_mm, envelope_z_mm,\n"
             "              critical_dims=[{param, value, unit, tol_plus, tol_minus, why, verify_by},...],\n"
@@ -1070,7 +1058,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  dimensional  → measure_between, measure_part, query_geometry, confirm_dimensions,\n"
             "                  run_fea_static/modal, fit_report\n"
             "  interface    → check_interference, solve_mates, measure_between, fit_report,\n"
-            "                  interface_check (T-BL49, when available)\n\n"
+            "                  interface_check\n\n"
             "FULL LOOP:\n"
             "  1. layout_plan(doc_id, ...)           capture before modeling\n"
             "  2. add_features(...)                  model to the plan\n"
@@ -1352,7 +1340,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             "                                       trace artifact (trace_path) of pin+UART\n"
             "                                       events; QEMU pin events need the project's\n"
             "                                       chudware_trace.h CHUDWARE_GPIO_TRACE macro.\n"
-            "  fw_verify_board(board_doc_ref, ...)  Firmware<->board co-verification (T-FIN6)\n"
+            "  fw_verify_board(board_doc_ref, ...)  Firmware<->board co-verification\n"
             "                                       BEFORE fab: static checks (every PIN_<NET>\n"
             "                                       exists on the MCU/net, strap/reset pins\n"
             "                                       BOOT0/NRST/GPIO0 not repurposed, direction\n"
@@ -1363,12 +1351,12 @@ def cad_guide_text(topic: str = "overview") -> str:
             "                                       Findings use the ERC/DRC violation shape\n"
             "                                       {rule, severity, net, pins, message, fix}.\n"
             "                                       Pass sch_doc_ref for direction checks.\n"
-            "  fw_power_profile(trace_path, ...)    Power/duty-cycle profile (T-FIN7,\n"
-            "                                       aicad.powerprofile/1, contract §11) from\n"
+            "  fw_power_profile(trace_path, ...)    Power/duty-cycle profile\n"
+            "                                       (aicad.powerprofile/1, contract §11) from\n"
             "                                       an existing trace: CPU run/sleep residency\n"
             "                                       (CHUDWARE_CPU_TRACE markers, else assumed\n"
             "                                       active), per-pin GPIO duty, and per-rail\n"
-            "                                       i_avg/i_peak from the board's T-FIN8\n"
+            "                                       i_avg/i_peak from the board's\n"
             "                                       eng.supply.rails currents weighted by duty.\n"
             "                                       BOOKKEEPING not SPICE; nulls stay null.\n"
             "                                       rails[*].schedule = {duty, period_s} — feed\n"
@@ -1379,7 +1367,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             "                                       projects.\n"
             "  fw_flash(elf_path, chip, port)       Flash ELF to target hardware.\n"
             "  fw_debug_start/halt/read_mem(chip)   GDB-over-SWD debug session controls.\n\n"
-            "SUPPORTED TARGETS (T-FIN2 Renode platform pack — what the bundled platform\n"
+            "SUPPORTED TARGETS (Renode platform pack — what the bundled platform\n"
             "actually models; fw_sim_run refuses honestly when an assertion needs a\n"
             "peripheral the platform lacks):\n"
             "  family    emulate  uart gpio-observe i2c  spi  timers adc  notes\n"
@@ -1391,7 +1379,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  cortex-m  renode   no   no           no   no   no     no   generic fallback (CPU+memory); QEMU semihosting path\n"
             "  (no family has an ADC peripheral model upstream — but see adc_waveform below:\n"
             "   a Python-peripheral stub feeds programmed samples on stm32f4/stm32f1)\n\n"
-            "SENSOR STIMULUS SCENARIOS (T-FIN3, aicad.fwscenario/1 — contract §9):\n"
+            "SENSOR STIMULUS SCENARIOS (aicad.fwscenario/1 — contract §9):\n"
             "  fw_sim_run's scenario param drives simulated sensors/GPIO into the emulated\n"
             "  firmware (Renode path only). Pass a fixture name or a JSON object:\n"
             "    fixtures: fixture:i2c_temp_tmp103   I2C TMP103 temp sensor @0x70, 25.5 C\n"
@@ -1412,17 +1400,18 @@ def cad_guide_text(topic: str = "overview") -> str:
             "      ]}',\n"
             "      assertions=['uart:temp=31', 'uart_within:temp=31@2000ms',\n"
             "                  'toggles:PA5>=2', 'period:PA5=100ms+-20ms'])\n"
-            "  New assertion forms (T-FIN3): toggles:<PIN>>=<N> (toggle count),\n"
+            "  Assertion forms: toggles:<PIN>>=<N> (toggle count),\n"
             "  period:<PIN>=<P>ms+-<TOL>ms (mean rising-edge period),\n"
             "  uart_within:<text>@<T>ms (needs scenario time marks). Invalid/unsupported\n"
             "  scenarios refuse honestly (invalid_scenario / scenario_error) — e.g.\n"
             "  adc_waveform on nrf52 explains that no ADC stub window is registered.\n\n"
             "BIAS: always fw_sim_run before fw_flash — catches assertion failures without\n"
             "  hardware.  Link the ECAD board doc so pinmap.h is auto-generated.\n\n"
-            "GOLDEN DEMO (T-FIN25): scripts/demo_sensor_node.py builds an STM32F4 sensor-\n"
+            "GOLDEN DEMO: scripts/demo_sensor_node.py builds an STM32F4 sensor-\n"
             "  node board, runs fw_new_project + fw_verify_board, and fw_sim_run with\n"
             "  fixture:i2c_temp_tmp103 when Renode is provisioned (honest SKIP markers\n"
-            "  otherwise). See docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md + cad_guide('simulation')."
+            "  otherwise). See docs/reference/FIN25_SENSOR_NODE_GOLDEN_DEMO.md +\n"
+            "  cad_guide('simulation')."
         )
     if topic in ("structural", "structure", "struct", "struct_analyze", "struct_check",
                  "struct_estimate", "beam", "frame", "truss", "steel_design"):
@@ -1447,13 +1436,11 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  regen_diagnose(document_json)         Diagnose a doc that failed to rebuild.\n"
             "                                        Returns a verdict card: root cause,\n"
             "                                        proposed fix-ops as an accept/edit/reject\n"
-            "                                        card, and a correction trace (IP-18 log).\n\n"
+            "                                        card, and a correction trace.\n\n"
             "WHEN TO USE: call after add_features returns any feature with ok=false, or when\n"
             "  close_part / export_part / run_fea_* fail with a regen error.\n"
             "WORKFLOW: add_features → check feature ok flags → if any false, regen_diagnose\n"
-            "  → apply the proposed fix-ops → re-run add_features → verify_battery.\n"
-            "NOTE: regen_diagnose is the backend seam; the copilot binding (T-F17) will\n"
-            "  surface it in the desktop UI automatically."
+            "  → apply the proposed fix-ops → re-run add_features → verify_battery."
         )
     if topic in ("code_compliance", "code_check", "building_code", "compliance",
                  "ibc", "asce", "nfpa"):
@@ -1653,7 +1640,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             "A `sketch3d` is a REAL doc feature (doc_schema \u00a73B): free-space entities in\n"
             "world mm (point / line / 3-POINT arc / spline), a constraint solver, and compiled\n"
             "3D wire chains a downstream sweep consumes as path (spine) or guides[] entry.\n"
-            "It persists with the document (save/undo/redo) \u2014 no session store, no ledger.\n"
+            "It persists with the document (save/undo/redo).\n"
             "Full contract: contracts/sketch3d_gui_contract.md.\n\n"
             "\u2500\u2500 AUTHOR A 3D PATH \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
             "  sketch3d_path_from_points(name, points, fit='polyline'|'spline', close=False)\n"
@@ -1740,8 +1727,6 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  \u2022 A sketch3d never produces a body/face \u2014 path/guide material only (no 3D\n"
             "    'profile' extrude in v1). Loft guides do not consume sketch3d yet.\n"
             "  \u2022 Closed 3D wires are valid sweep paths (close=True on path_from_points).\n"
-            "  \u2022 sketch3d_to_ledger / sketch3d_from_ledger are DEPRECATED \u2014 the document\n"
-            "    IS the persistence now; from_ledger migrates old payloads into features.\n"
         )
     # RE-40: Reverse Engineering GUI workspace walkthrough (cad_guide('reveng')).
     # Distinct from cad_guide('reverse'), which is the engine-level STEP/mesh import + recognizer

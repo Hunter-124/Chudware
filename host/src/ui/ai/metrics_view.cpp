@@ -216,7 +216,7 @@ void drawMetricsView(AppState& st) {
             if (warn) ImGui::PopStyleColor();
             ImGui::PopFont();
         };
-        // ">= " in ASCII: U+2265 is outside the font atlas (ui_theme.cpp uiGlyphRanges()).
+        // ">= " in ASCII: U+2265 is outside the font atlas (ui/glyph_ranges.h).
         stat("Total spend", (incomplete ? ">= " : "") + fmtUsd(totalUsd), incomplete);
         stat("Total tokens", fmtTok(totalIn + totalOut), false);
         stat("Sessions tracked", std::to_string((int)sessions.size()), false);

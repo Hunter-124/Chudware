@@ -348,6 +348,24 @@ class TestToolCategories:
         finally:
             reg.reset_policy()
 
+    def test_broken_settings_refuse_policed_tools_but_keep_the_meta_on_ramp(self, monkeypatch):
+        """A Settings read that raises fails CLOSED for every policed tool — even one
+        on the active allow-list — while the meta-tools keep answering."""
+        from services.mcp import tool_registry as reg
+
+        def broken(_cfg, _name):
+            raise RuntimeError("tool_options unreadable")
+
+        monkeypatch.setattr(agent_config, "get_tool_options", broken)
+        reg.set_policy(allow=["describe_part"], deny_risk=None)
+        try:
+            assert reg.is_allowed("describe_part") is False
+            assert "could not be evaluated" in reg.deny_reason("describe_part")
+            assert reg.is_allowed("enable_tools") is True
+            assert reg.is_allowed("list_tool_categories") is True
+        finally:
+            reg.reset_policy()
+
 
 # ---------------------------------------------------------------------------
 # mode_options_from_mapping

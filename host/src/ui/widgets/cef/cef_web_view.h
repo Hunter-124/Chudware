@@ -1,14 +1,12 @@
 // ui::CefWebView — in-process CEF off-screen browser backend (IWebViewBackend).
 //
-// SCAFFOLDING for phase 2 of docs/cef_webview.md. Compiled ONLY when the build
-// is configured with CHUDWARE_ENABLE_CEF (host/cmake/cef.cmake); the default build
-// never sees this header. Not yet verified against a live CEF SDK — the OSR
-// paint/input/cookie bodies in cef_web_view.cpp carry TODO(cef) markers where a
-// real build/verify loop is required.
+// Compiled ONLY when the build is configured with CHUDWARE_ENABLE_CEF
+// (host/cmake/cef.cmake; design: docs/design/cef_webview.md); other builds use
+// NullWebView and never see this header.
 //
-// Contract & threading identical to ScreencastWebView: GL-thread-only public
-// API; CEF's OnPaint delivers BGRA buffers on a CEF thread, which we copy under
-// a mutex and upload to the GL texture on the GL thread in draw().
+// GL-thread-only public API; CEF's OnPaint delivers BGRA buffers on a CEF
+// thread, which we copy under a mutex and upload to the GL texture on the GL
+// thread in draw().
 #pragma once
 
 #include "ui/widgets/web_view_backend.h"
@@ -18,8 +16,6 @@ namespace ui {
 class CefWebView final : public IWebViewBackend {
 public:
     // True when the CEF runtime initialised for this process (see cef_app).
-    // makeWebView() checks this before choosing the CEF backend so any CEF
-    // startup failure degrades to the screencast backend instead of a black box.
     static bool processReady();
 
     CefWebView();

@@ -1,4 +1,4 @@
-"""Tests for T-D4: building-code compliance engine.
+"""Tests for the Python building-code compliance helpers.
 
 Hand-calc validation
 --------------------
@@ -18,8 +18,7 @@ Hand-calc validation
 
 Run::
 
-    /home/hunter/Repositories/CAD/.venv-mcp/bin/python \\
-        -m pytest engine_oracle/structural/test_code_check.py -q
+    python -m pytest services/structural/test_code_check.py -q
 """
 from __future__ import annotations
 

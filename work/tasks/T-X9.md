@@ -45,7 +45,7 @@ cost seam), T-X7 vendor adapters, T-X8 headed sessions.
 ## Driver notes
 
 - graphify rule: `graphify query "<question>"` before raw-file reads (subagents too).
-- Branch task/T-X9-in-app-ordering, worktree ../CAD-T-X9. Stop at status: review.
+- Work on `master` (this repo uses no git worktrees). Stop at status: review.
 - This is the task that makes the parts library "actually pivoted" to Hunter's #4 —
   if scope forces a cut, cut vendors, not the confirmation boundary or the ledger.
 - Python venv for gate: `~/.local/share/Chudware/mcp-venv/bin/python`.

@@ -1,15 +1,15 @@
-"""Host-board rule pack tests (T-FIN9) — seeded violation + clean fixture per rule family.
+"""Host-board rule pack tests — seeded violation + clean fixture per rule family.
 
 House style: ``from __future__ import annotations``, plain ``main()`` + asserts, run as a module.
 Fixtures are self-contained boards built from :func:`schema.new_board` with a STUB library (the
 starter library carries no MCU/regulator/crystal parts — identification must be metadata- and
 convention-driven, which is exactly what these fixtures exercise). Coordinates are mm.
 
-Run:  <venv>/python -m engine.ecad.test_hostboard
+Run:  python -m services.ecad.test_hostboard
 
 Covers, per rule family: a clean board that trips NOTHING, plus one seeded board per rule id:
   host_decoupling_missing / _far / _via, host_bulk_cap,
-  host_sequencing / _unparsed / _unverifiable (consuming T-FIN8 eng.supply.sequencing),
+  host_sequencing / _unparsed / _unverifiable (consuming eng.supply.sequencing),
   host_xtal_loadcap / _loadcap_match / _loop / _keepout,
   host_reset_pull / host_reset_cap, host_bootstrap_float / host_bootstrap_shared.
 Also: determinism (byte-stable output), value parsing, and the honesty rule

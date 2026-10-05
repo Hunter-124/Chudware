@@ -23,7 +23,7 @@ if(NOT CEF_ROOT OR NOT EXISTS "${CEF_ROOT}")
   message(FATAL_ERROR
     "CHUDWARE_ENABLE_CEF=ON but no CEF SDK found. Download a CEF binary distribution "
     "(Chromium ~149 to match the scraper) into extern/cef/ or pass -DCEF_ROOT=<dir>. "
-    "See docs/cef_webview.md.")
+    "See docs/design/cef_webview.md.")
 endif()
 # CEF's cmake macros embed CEF_LIB_* into set_target_properties strings. Windows
 # backslashes are then parsed as CMake escapes (\U, \Y, …) and fail configure.

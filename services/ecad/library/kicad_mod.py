@@ -1,7 +1,7 @@
 """KiCad .kicad_mod footprint importer.
 
 Maps ``(footprint "Name" ...)`` trees to Footprint dicts as specified in
-docs/contracts/ecad/pcb_schema.md §4.
+contracts/ecad/pcb_schema.md §4.
 
 Coordinate convention: KiCad .kicad_mod uses +y-down; we negate y to get +y-up.
 

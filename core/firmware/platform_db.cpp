@@ -30,8 +30,10 @@ nlohmann::json caps_table() {
         {"file", "stm32f4_discovery.repl"}, {"emulation", "renode"},
         {"uart", true}, {"gpio", true}, {"gpio_observe", true},
         {"adc", false}, {"i2c", true}, {"spi", true}, {"timers", true},
+        {"can", true}, {"timed_bus", true}, {"electrical_bus", true},
+        {"bus_models", {"stm32f4-i2c", "stm32f4-uart-ttl", "stm32f4-spi-master", "stm32f4-bxcan"}},
         {"gpio_regmap", {{"base", 0x40020000}, {"stride", 0x400}, {"odr_offset", 0x14}}},
-        {"notes", "USART1/2, GPIO A-E (observed), I2C1-3, SPI1-3, TIM1-5. No ADC model upstream."},
+        {"notes", "USART1/2 TTL, I2C1-3, SPI1-3 master and CAN1/2 use timed STM32F4 models. Explicit bus_links enables linear RC/lossless-line electrical sampling. Default peripheral clock is reset 16MHz HSI; RCC clock changes are not modeled. GPIO A-E observed final state; TIM1-5. No ADC model upstream."},
     };
     t["stm32f1"] = {
         {"file", "stm32f103.repl"}, {"emulation", "renode"},
@@ -72,6 +74,10 @@ nlohmann::json caps_table() {
         {"notes", "Generic fallback: CPU+NVIC+memory only; no peripherals. UART/gpio assertions "
                   "need a specific family platform (or the QEMU semihosting path)."},
     };
+    for(auto& [family,caps]:t.items()) if(family!="stm32f4") {
+        caps["can"]=false;caps["timed_bus"]=false;caps["electrical_bus"]=false;
+        caps["bus_models"]=nlohmann::json::array();
+    }
     return t;
 }
 
@@ -101,7 +107,7 @@ nlohmann::json capability_matrix() {
     for (auto& [family, caps] : table.items()) {
         nlohmann::json view;
         for (const char* k : {"file", "emulation", "uart", "gpio", "gpio_observe",
-                              "adc", "i2c", "spi", "timers", "notes"}) {
+                              "adc", "i2c", "spi", "can", "timed_bus", "electrical_bus", "bus_models", "timers", "notes"}) {
             view[k] = caps[k];
         }
         out[family] = view;

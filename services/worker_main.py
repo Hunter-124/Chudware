@@ -9,18 +9,22 @@ Python:
   run_model (build123d script execution — needs an interpreter by nature),
   editable prompts, the persistent Chudcode agent host and its private control lane,
   vendor-parts registry, deliverables, parts hub FTS, agent GUI seams, reveng,
-  dag steering, subagent RPC, PLM vault, EM (T-SIM11 hold), multi-physics seam.
+  dag steering, subagent RPC, PLM vault, EM (T-SIM11 hold), multi-physics seam,
+  manufacturing printer adapters.
 
-Protocol: newline-delimited JSON-RPC on stdio, identical to engine_oracle/worker.py
-(protocol 2 — contracts/worker_rpc.md). The hostd worker bridge
-(core/hostd/worker_bridge.cpp) spawns this module for engine-unknown methods; during
-the transition it may still spawn ``python -m engine.worker``, which forwards here.
+The agent GUI seams and subagent RPC tables are REQUIRED: if either cannot import, the
+worker fails at startup instead of answering every agent method "unknown method"
+(which the GUI reads as "feature absent"). The other service tables are optional and
+log a warning when their dependencies are missing.
 
-Imports are services.* throughout (the engine_oracle fallback is gone with the oracle).
+Protocol: newline-delimited JSON-RPC on stdio (protocol 2 — contracts/worker_rpc.md).
+The hostd worker bridge (core/hostd/worker_bridge.cpp) spawns this module for
+engine-unknown methods.
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import logging
@@ -89,62 +93,69 @@ _STRUCTURED_ERROR_METHODS: set[str] = set()
 
 
 def _register(
-    label: str, import_paths: list[str], attr: str, structured: bool = False
+    label: str,
+    import_path: str,
+    attr: str,
+    *,
+    structured: bool = False,
+    required: bool = False,
 ) -> None:
-    """Register a WORKER_METHODS-style table from the first importable path (dual-path)."""
-    import importlib
+    """Merge one module's WORKER_METHODS-style table into the dispatch table.
 
-    for path in import_paths:
-        try:
-            mod = importlib.import_module(path)
-            table = getattr(mod, attr)
-            _METHODS.update(table)
-            if structured:
-                _STRUCTURED_ERROR_METHODS.update(table.keys())
-            return
-        except Exception as exc:  # noqa: BLE001 — try the next path, else degrade
-            last = exc
-    log.warning("%s unavailable — its worker methods not registered: %s", label, last)
+    A required table that cannot import raises, failing worker startup visibly; an
+    optional one logs a warning and leaves its methods unregistered.
+    """
+    try:
+        table = getattr(importlib.import_module(import_path), attr)
+    except Exception as exc:  # noqa: BLE001 — optional service tables degrade
+        if required:
+            raise RuntimeError(
+                f"required worker table {label!r} failed to load from {import_path}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        log.warning("%s unavailable — its worker methods not registered: %s", label, exc)
+        return
+    _METHODS.update(table)
+    if structured:
+        _STRUCTURED_ERROR_METHODS.update(table.keys())
 
 
 # ---- Supplier/vendor parts cache (registry only; insert runs in the C++ core) ----
-_register(
-    "vendor_parts", ["services.parts.vendor_parts"], "WORKER_METHODS", structured=True
-)
+_register("vendor_parts", "services.parts.vendor_parts", "WORKER_METHODS", structured=True)
 
 # ---- Deliverables ----
-_register("deliverables", ["services.deliverables.worker_rpc"], "WORKER_METHODS")
+_register("deliverables", "services.deliverables.worker_rpc", "WORKER_METHODS")
 
 # ---- Parts hub FTS + GUI seams ----
-_register("parts", ["services.parts.worker_rpc"], "WORKER_METHODS")
+_register("parts", "services.parts.worker_rpc", "WORKER_METHODS")
 
 # ---- Agent GUI seams (subscription/session/skills/triggers/role_models/bench) ----
-_register("agent_gui", ["services.agent.worker_rpc"], "WORKER_METHODS")
+_register("agent_gui", "services.agent.worker_rpc", "WORKER_METHODS", required=True)
 
 # ---- Reverse engineering ----
-_register("reveng", ["services.reveng.worker_rpc"], "REVENG_WORKER_METHODS")
+_register("reveng", "services.reveng.worker_rpc", "REVENG_WORKER_METHODS")
 
 # ---- DAG steering ----
-_register("dag", ["services.dag.worker_rpc"], "WORKER_METHODS")
+_register("dag", "services.dag.worker_rpc", "WORKER_METHODS")
 
 # ---- Subagent RPC ----
-_register("subagent", ["services.agent.subagent_rpc"], "WORKER_METHODS")
+_register("subagent", "services.agent.subagent_rpc", "WORKER_METHODS", required=True)
 
 # ---- PLM vault ----
-_register("plm", ["services.plm.worker_rpc"], "WORKER_METHODS")
+_register("plm", "services.plm.worker_rpc", "WORKER_METHODS")
 
 # ---- EM (T-SIM11 hold — moved, not worked) ----
-_register("em", ["services.sim.em.worker_rpc"], "WORKER_METHODS")
+_register("em", "services.sim.em.worker_rpc", "WORKER_METHODS")
 
 # ---- Multi-physics seam ----
-_register("multiphysics", ["services.sim.multiphysics_rpc"], "WORKER_METHODS")
+_register("multiphysics", "services.sim.multiphysics_rpc", "WORKER_METHODS")
 
 # ---- Manufacturing printer adapters (Moonraker / OctoPrint / PrusaLink) ----
 # HTTP+WebSocket clients live in Python; the hostd manufacturing lane stays the sole
 # owner of device claims, approval validation, durable seq and events.
 _register(
     "mfg_printers",
-    ["services.manufacturing.printers.worker_rpc"],
+    "services.manufacturing.printers.worker_rpc",
     "WORKER_METHODS",
     structured=True,
 )

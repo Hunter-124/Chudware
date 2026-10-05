@@ -23,7 +23,7 @@ Separation of concerns: **Db** = what's stored, **Ge** = math, **Gi** = "draw me
 not a prescription that Chudware's own document model (`contracts/doc_schema.md`,
 `contracts/doc_ops.md`) must mirror it, though the separation of concerns rhymes:
 Chudware's own document/geometry/tessellation split (`.step+` document JSON →
-build123d/OCCT B-rep → AICM tessellation, see `contracts/stepplus.md` and
+OCCT B-rep rebuilt by the C++ core → AICM tessellation, see `contracts/stepplus.md` and
 `contracts/mesh_format.md`) follows the same logic for different reasons (a
 parametric feature-history CAD kernel rather than a drawing-database editor).
 
@@ -75,13 +75,16 @@ Each entity carries: owner handle, layer, linetype, color, lineweight,
 transparency, and its geometry-defining group codes (documented per-entity in the
 DXF reference).
 
-**Relevance to this repo's DXF importer:** `services/formats/formats_dxf.py` (via ezdxf,
-MIT) currently walks modelspace and converts a subset of this entity catalog —
-LINE, CIRCLE, ARC, LWPOLYLINE/POLYLINE (bulge → true arc), ELLIPSE/SPLINE
-(flattened), and INSERT (exploded recursively) — into build123d planar B-rep.
-TEXT/MTEXT, DIMENSION, HATCH, POINT, and 3D mesh entities are currently skipped
-(counted, reported) rather than converted. See `cad-file-formats.md` §2 for the
-format-level summary and `work/backlog/T-BL02.md` for the interop roadmap.
+**Relevance to this repo's DXF importer:** the production importer in
+`core/doc/formats.cpp` is a hand-written ASCII DXF tag parser (no ezdxf, no
+third-party DXF library). It reads the `ENTITIES` section, honours `$INSUNITS`, and
+converts a subset of this entity catalog — LINE, CIRCLE, ARC, LWPOLYLINE/POLYLINE
+(bulge → true arc), SPLINE and ELLIPSE — into OCCT edges, then planar faces (closed
+wires) or reference wires (open). INSERT, TEXT/MTEXT, DIMENSION, HATCH, POINT and 3D
+mesh entities are skipped and counted, not converted. The Python helper
+`services/formats/formats_dxf.py` (ezdxf, MIT) is the parity oracle and additionally
+explodes INSERT block references; production does not. See `cad-file-formats.md` §2
+for the format-level summary and `work/backlog/T-BL02.md` for the interop roadmap.
 
 ## Geometry (Ge) — the math layer
 
@@ -94,9 +97,11 @@ Standard computational-geometry primitives, independent of persistence:
 
 This is textbook CAGD (Computer-Aided Geometric Design). Sources: any NURBS/CAGD
 text (e.g., Piegl & Tiller, *The NURBS Book*); no vendor code required. Chudware's
-own geometry layer is OpenCASCADE (OCCT, LGPL-2.1) via `build123d`/`cadquery-ocp`
-— see `contracts/licenses.md` — which already implements this layer; this section
-is background for understanding *why* it's shaped the way it is, not a build target.
+own geometry layer is OpenCASCADE (OCCT, LGPL-2.1 per `contracts/licenses.md`),
+used directly by the C++ core (`core/geom/`, `core/doc/`) and through
+`cadquery-ocp`/`build123d` by the Python oracle — it already implements this layer;
+this section is background for understanding *why* it's shaped the way it is, not a
+build target.
 
 ## Graphics (Gi → Gs) — the render pipeline
 

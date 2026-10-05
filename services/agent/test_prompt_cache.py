@@ -113,9 +113,11 @@ def isolated_cache(tmp_path, monkeypatch):
     d.mkdir()
     monkeypatch.setattr(pc, "cache_dir", lambda: d)
     pc._mem.clear()
+    pc._online_mem.clear()
     pc._fp_cache = None
     yield d
     pc._mem.clear()
+    pc._online_mem.clear()
     pc._fp_cache = None
 
 
@@ -273,21 +275,20 @@ def test_linear_lane_prompt_is_byte_identical_to_the_inline_composition(
 
 
 @pytest.mark.parametrize("role", ["general_agent", "sim_engineer"])
-def test_the_linear_lane_carries_the_skills_catalog_and_its_fetch_verb(
-        isolated_cache, linear_tools_memo, role):
+def test_the_online_role_prompt_carries_the_skills_catalog_and_its_fetch_verb(
+        isolated_cache, role):
     """The ONLINE lane's only source of skill visibility.
 
     ``worker_rpc._agent_admin_turn`` and ``chudcode_roles`` both compose their
-    system prompt here and hand it straight to Chudcode, which never consults
-    ``services.agent.skills``. Before this block, a role card's "full procedure:
+    system prompt with ``role_prompt`` and hand it straight to Chudcode, which
+    never consults ``services.agent.skills``. Before this block, a role card's "full procedure:
     skill://assembly-merge" reached a model whose only ``skill://`` resolver was
     Chudcode's own foreign registry — live mission-18d24905b774203f answered
     "Unknown skill: assembly-merge" and fell back to the card's summary.
     """
     from services.agent import mission_dispatch as md
 
-    system_prompt, allowed, _tools = md.linear_role_prompt(
-        role, resolver=at.resolver_for(None))
+    system_prompt, allowed = md.role_prompt(role)
 
     assert "[SKILLS]" in system_prompt, "the online lane lost the skills catalog"
     assert "assembly-merge" in system_prompt and "simulate" in system_prompt
@@ -467,13 +468,15 @@ def test_invalidate_drops_memory_and_disk(isolated_cache):
     pc.invalidate()
     assert not list(isolated_cache.glob("*.json"))
     assert not pc._mem
+    assert not pc._online_mem
 
 
-def test_warm_populates_the_cache(isolated_cache):
+def test_warm_composes_the_online_prompt_in_process(isolated_cache):
     t = pc.warm(background=True)
     t.join(timeout=120)
     assert not t.is_alive(), "warm thread did not finish"
-    assert list(isolated_cache.glob("*.json"))
+    assert "general_agent" in pc._online_mem
+    assert not list(isolated_cache.glob("*.json")), "the online prompt has no disk entry"
 
 
 # --------------------------------------------------------------------------- reporting
@@ -481,13 +484,15 @@ def test_warm_populates_the_cache(isolated_cache):
 def test_baseline_reports_real_tokens_and_a_breakdown(isolated_cache):
     b = pc.baseline()
     assert b["ok"] is True
+    assert b["lane"] == "online"
     assert b["tokens"] > 0
     assert b["chars"] > 0
     labels = {row["label"] for row in b["segments"]}
     # The blocks that dominate a fresh chat must be itemised, or the tooltip
     # cannot explain what is filling the window.
-    assert {"role", "base", "tools"} <= labels
+    assert labels == {"system", "host_tools"}
     assert all(row["tokens"] > 0 for row in b["segments"])
+    assert b["tokens"] == sum(row["tokens"] for row in b["segments"])
 
 
 def test_breakdown_is_ordered_largest_first(isolated_cache):
@@ -504,8 +509,8 @@ def test_breakdown_accounts_for_essentially_all_of_the_prompt(isolated_cache):
     assert abs(itemised - sp.total_tokens) <= 2 + len(sp.segments)
 
 
-def test_baseline_never_raises_when_composition_fails(monkeypatch):
-    monkeypatch.setattr(pc, "get",
+def test_baseline_never_raises_when_composition_fails(isolated_cache, monkeypatch):
+    monkeypatch.setattr(pc, "compose_online",
                         lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
     b = pc.baseline()
     assert b["ok"] is False

@@ -11,7 +11,7 @@ assembles them into a session ``datasheet/`` directory ready for the existing
 
 Reuses existing seams — no reinvention:
   - ``services.research.web_search`` / ``fetch_page`` / ``datasheet_fetch``
-  - ``engine_oracle.spec_sheet_matcher.normalize_mpn``
+  - ``services.parts.normalization.core_normalize_mpn`` (core ``normalize_mpn`` RPC)
   - ``services.vision.datasheet_ingest.ingest_datasheet``
   - ``services.browser`` adapters for authenticated vendor pages (best-effort)
 
@@ -103,12 +103,14 @@ def _get_research_fn(name: str):
     return None
 
 try:
-    # spec_sheet_matcher was deleted (T-RF18); the C++ port answers via core_bridge.
+    # The core's normalize_mpn RPC via the shared parts seam; core call failures
+    # propagate, only an unimportable core bridge degrades to strip.
     from services.mcp.core_bridge import call as _cb_call
+    from services.parts.normalization import core_normalize_mpn
 
     def normalize_mpn(pn: str) -> str:
-        r = _cb_call("normalize_mpn", {"mpn": str(pn or "")})
-        return (r.get("normalized") or str(pn or "").strip()) if isinstance(r, dict) \
+        reply = core_normalize_mpn(str(pn or ""), _cb_call)
+        return (reply.get("normalized") or str(pn or "").strip()) if isinstance(reply, dict) \
             else str(pn or "").strip()
 except Exception:
     def normalize_mpn(pn: str) -> str:  # type: ignore[misc]

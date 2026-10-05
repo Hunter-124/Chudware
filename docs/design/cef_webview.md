@@ -1,9 +1,15 @@
 # In-Panel Browser: CEF Off-Screen Backend
 
-Status: **shipping and load-bearing on Linux and Windows.** CEF backs both the
-in-app browser and, through a separate headless daemon, the fetch primitive used
-by the 100+ Parts Library source adapters. macOS and Web/WASM build with
-`CHUDWARE_ENABLE_CEF=OFF` and use `NullWebView`.
+Status: **implemented native backend, conditional on the CEF build.**
+`host/src/ui/widgets/web_view_backend.cpp::makeWebView` selects `CefWebView` when
+`CHUDWARE_ENABLE_CEF` is enabled, otherwise `NullWebView`. The host CMake option
+defaults ON for native Linux/Windows and is forced OFF for macOS/Web/WASM.
+These source facts are not a current Windows interactive-acceptance result.
+
+Original status claim: "shipping and load-bearing on Linux and Windows" for the
+in-app browser and headless fetch primitive used by "100+ Parts Library source
+adapters". Treat that as historical scope, not a verified current adapter count.
+Current native browser ownership is the factory and `cef/` implementation below.
 
 ## Why
 

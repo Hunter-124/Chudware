@@ -5,8 +5,27 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
+
+
+# Host-call threads bind a caller-owned provider factory, never credential bytes in
+# tool arguments or a process-global actor. A bounded planner retains its provider.
+_HELPER_RUNTIME: ContextVar[Any] = ContextVar("chudware_helper_runtime", default=None)
+
+
+def current_helper_runtime() -> Any:
+    return _HELPER_RUNTIME.get()
+
+
+@contextmanager
+def bind_helper_runtime(runtime: Any) -> Iterator[None]:
+    token = _HELPER_RUNTIME.set(runtime)
+    try:
+        yield
+    finally:
+        _HELPER_RUNTIME.reset(token)
 
 
 def resolve_workspace(raw_params: Mapping[str, Any]) -> tuple[str, str, str | None]:

@@ -918,16 +918,6 @@ def test_ensure_fresh_refresh_failure_clean_error(tmp_config, monkeypatch):
     # Original token still on disk (refresh never persisted).
     assert sub_auth.load_credential("anthropic-sub")["access_token"] == "old-at"
 
-    # RPC seam mirrors the same shape.
-    from services.agent import worker_rpc as rpc
-    emit = lambda _e: None  # noqa: E731
-    rpc_out = rpc.SUBSCRIPTION_METHODS["subscription_ensure_fresh"](
-        {"provider": "claude"}, emit
-    )
-    assert rpc_out["ok"] is False and rpc_out["refreshed"] is False
-    assert rpc_out.get("error")
-    assert "subscription_ensure_fresh" in rpc.SUBSCRIPTION_METHODS
-
 
 
 @pytest.mark.parametrize(

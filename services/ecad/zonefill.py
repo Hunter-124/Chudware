@@ -20,7 +20,7 @@ Polygon booleans without shapely are heavy and error-prone, so we use a robust r
        * inside the board outline (if an outline exists), AND
        * at least ``clearance`` away from every DIFFERENT-net copper item on the zone's layer
          (pads, tracks, vias) — measured edge-to-edge with the same shape abstraction DRC uses
-         (:mod:`engine.ecad.drc`), so the pour respects exactly the spacing DRC enforces, AND
+         (:mod:`services.ecad.drc`), so the pour respects exactly the spacing DRC enforces, AND
        * not inside the *thermal gap ring* of a same-net through-hole / connector pad, UNLESS it
          lies in one of the 4 axis-aligned spoke corridors (so the pad keeps a thin tether to the
          pour but is not a solid heatsink). Same-net SMD pads and same-net tracks/vias are flooded

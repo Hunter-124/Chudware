@@ -1,10 +1,9 @@
 """services/browser/embed.py — reusable embedded-browser backend (CDP screencast).
 
 Runs a real Chromium (Playwright ASYNC API) on a private daemon thread and
-streams its rendered surface as JPEG frames so ANY host surface — the ImGui
-parts-library panel today, anything else tomorrow — can paint a live browser
-and forward input to it over a plain request/response seam (the engine worker
-RPCs in ``engine_oracle/embed_rpc.py``).
+streams its rendered surface as JPEG frames for hosts that consume the
+``services/parts/embed_rpc.py`` worker RPCs. This residual Playwright backend is
+separate from the host's native CEF panel and CEF headless-fetch daemon.
 
 Threading model (the whole point of this module):
 
@@ -925,7 +924,7 @@ class EmbedManager:
 
 
 # --------------------------------------------------------------------------
-# Process-wide singleton (the worker RPCs in engine_oracle/embed_rpc.py use it)
+# Process-wide singleton (services/parts/embed_rpc.py worker RPCs use it)
 
 _MANAGER: EmbedManager | None = None
 _MANAGER_GUARD = threading.Lock()

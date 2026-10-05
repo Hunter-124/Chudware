@@ -43,7 +43,7 @@ void SectionTool::toggle(AppState& st) {
     if (m_active) {
         m_active = false;
         m_collapsed = false;
-        if (st.renderer) st.renderer->setSectionPlane(m_planes[0].normal, 0, false, nullptr, false);
+        if (st.renderer) st.renderer->clearSectionPlanes();
         return;
     }
     m_active = true;
@@ -90,7 +90,7 @@ void SectionTool::pushPlanes(Renderer& renderer) {
         renderer.setSectionPlanes(ns, offs, cnt, cap, m_showCap);
     } else {
         // All planes disabled — clear clipping but leave the tool active.
-        renderer.setSectionPlane(m_planes[0].normal, m_planes[0].offset, false, cap, m_showCap);
+        renderer.clearSectionPlanes();
     }
 }
 
@@ -125,7 +125,7 @@ void SectionTool::updateAndDraw(AppState& st, Renderer& renderer, bool imgHovere
 
     if (inSketch) {
         // Suspend clipping while sketching.
-        renderer.setSectionPlane(m_planes[0].normal, 0, false, nullptr, false);
+        renderer.clearSectionPlanes();
         return;
     }
 

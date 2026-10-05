@@ -21,6 +21,9 @@ struct SimResult {
     double ms = 0.0;
     nlohmann::json gpio_events = nlohmann::json::array();
     std::optional<std::string> trace_path;
+    nlohmann::json bus_events = nlohmann::json::array();
+    nlohmann::json bus_summary = nlohmann::json::object();
+    nlohmann::json uart_events = nlohmann::json::array();
 
     nlohmann::json to_dict() const;
 };
@@ -36,6 +39,8 @@ nlohmann::json parse_gpio_events(const std::string& text);
 // time-stamped from CHUDWARE_T_MARK markers and bounded like GPIO events.
 nlohmann::json parse_uart_events(const std::string& text);
 
+// Precise model-origin CHUDWARE_BUS_EVT evidence, bounded to 4096 events.
+nlohmann::json parse_bus_events(const std::string& text);
 // Renode ODR snapshot blocks → {"PA0": 0, ..., "PA15": 0}.
 nlohmann::json parse_renode_gpio_odr(const std::string& text);
 
@@ -78,6 +83,7 @@ std::string build_resc(const std::string& elf_path, const std::string& platform_
 // `scenario` is a validated aicad.fwscenario/1 dict or null.
 SimResult run_simulation(const std::string& elf_path, const std::string& mcu_family,
                          const std::vector<std::string>& assertions, double timeout_s = 30.0,
-                         const nlohmann::json& scenario = nlohmann::json());
+                         const nlohmann::json& scenario = nlohmann::json(),
+                         double run_s = 0.0, const std::string& backend = "auto");
 
 }  // namespace chudware::firmware

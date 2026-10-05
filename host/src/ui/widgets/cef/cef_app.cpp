@@ -1,6 +1,5 @@
 // cef/cef_app.cpp — CEF process lifecycle + browser-process CefApp.
-// SCAFFOLDING (docs/cef_webview.md phase 2); compiled only with CHUDWARE_ENABLE_CEF.
-// TODO(cef) markers flag the spots that need verification against a live SDK.
+// Compiled only with CHUDWARE_ENABLE_CEF (design: docs/design/cef_webview.md).
 #include "cef_app.h"
 
 #include <atomic>
@@ -91,7 +90,7 @@ public:
 
     void OnBeforeCommandLineProcessing(const CefString& /*process_type*/,
                                        CefRefPtr<CefCommandLine> cmd) override {
-        // COOKIE INTEROP (docs/cef_webview.md): the scraper (Playwright) and this
+        // COOKIE INTEROP (docs/design/cef_webview.md): the scraper (Playwright) and this
         // browser must agree on cookie encryption or sessions won't cross. Pin
         // the Chromium OSCrypt backend to the fixed-key store on both.
         //   → services/browser/stealth.launch_args must add the same flag.

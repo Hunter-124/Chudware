@@ -1,10 +1,10 @@
 // Wave 2 verification: OCCT shape -> geom::tessellate_body -> aicm::write_aicm ->
-// HOST render::parseAicm round-trip. The host loader (host/src/render/aicm_loader)
-// is the contract oracle: if it accepts our bytes and the geometry invariants hold,
-// the C++ emitter is byte-compatible with the format the host consumes.
+// render::parseAicm round-trip through the loader the GUI ships
+// (host/src/render/aicm_loader): if it accepts our bytes and the geometry invariants
+// hold, the C++ emitter is byte-compatible with the format the host consumes.
 //
 // Invariants are OCCT-version-INDEPENDENT (counts/ranges/coverage/bbox), NOT a byte
-// compare against the hand-authored docs/contracts/fixtures/box.aicm.
+// compare against the hand-authored contracts/fixtures/box.aicm.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 

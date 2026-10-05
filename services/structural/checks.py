@@ -1,7 +1,8 @@
-"""Demand/Capacity ratio post-processor for the structural workstream (T-D3).
+"""Typed Python demand/capacity post-processing helpers.
 
-Implements simplified AISC LRFD (steel) and NDS ASD (wood) checks, consuming
-:class:`~engine.structural.analysis.AnalysisResult` member-force output from T-D2.
+Implements simplified AISC LRFD (steel) and NDS ASD (wood) checks on member-force
+values supplied by callers. Native structural analysis and RPCs live in ``core/structural/``;
+this module does not run the C++ physics solver.
 
 Design-basis notes
 ------------------
@@ -26,9 +27,9 @@ Design-basis notes
 **Governing check** — the maximum of the axial and bending D/C ratios; that limit state is reported
 as ``governing_limit``.
 
-Unit conversions (ALL explicit — see work/questions/T-D3.md)
--------------------------------------------------------------
-``check_member`` receives SI AnalysisResult values (N, N·mm) and the section dict (mm², mm³).
+Unit conversions (ALL explicit)
+-------------------------------
+``check_member`` receives SI member-force values (N, N·mm) and the section dict (mm², mm³).
 The ``dc_ratio_axial`` and ``dc_ratio_bending`` helpers accept *caller-consistent* SI units
 (N, mm², MPa → N/mm²; and N·mm, mm³, MPa respectively) to avoid silent scaling bugs.
 
@@ -39,7 +40,7 @@ Every :class:`CheckResult` carries the mandatory disclaimer string (byte-exact):
     "Preliminary check — not sealed engineering. Verify with a licensed structural engineer
     before construction."
 
-This is a non-negotiable field; ``struct_check`` always includes it in its JSON response.
+The native ``struct_check`` RPC has its own checks in ``core/structural/checks.cpp``.
 """
 
 from __future__ import annotations
@@ -216,11 +217,11 @@ def check_member(member_result: dict, section: dict, material: str) -> CheckResu
     Parameters
     ----------
     member_result:
-        One row from ``AnalysisResult.to_dict()``: must contain ``element_id``, ``combo``,
+        Member-force row supplied by the caller: must contain ``element_id``, ``combo``,
         ``axial_n`` (N, +tension), ``moment_nmm`` (N·mm).
     section:
-        Section properties dict from :func:`~engine.structural.sections.get_aisc_section` or
-        :func:`~engine.structural.sections.get_lumber_section`.  Must contain ``A`` (mm²) and
+        Section properties dict from :func:`~services.structural.sections.get_aisc_section` or
+        :func:`~services.structural.sections.get_lumber_section`.  Must contain ``A`` (mm²) and
         ``Sx`` (mm³).
     material:
         Material key (e.g. ``"steel_a36"``, ``"steel_a992"``, ``"df_no2"``, ``"cedar"``).

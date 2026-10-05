@@ -9,6 +9,17 @@ Read in this order. `01_definition_of_done.md` is the authority when two documen
 `10_gateway.md` owns every shared schema and the stable rule ids (`MFG-*`) the other
 documents cite.
 
+These are **design** documents. The landed implementation is a subset with a different file
+layout; [As-built map](#as-built-map) below records, per document, what exists and which proposed
+contracts, trees and tests were never built. A path a design doc names that the map lists as not
+built is a proposal, not a missing file to go looking for.
+
+**Session references are dated evidence, not retrievable specs.** Documents 00, 02, 10–20 and 23
+cite `local://…`, `agent://…` and `history://…` URIs. Those were non-persistent artifacts of the
+authoring agent sessions (some were already empty when cited, e.g. `agent://PrinterMonitoring` in
+`10_gateway.md`); they cannot be opened from the repository. The checked-in documents carry
+everything that survived.
+
 | file | what it is |
 |---|---|
 | `00_decisions.md` | locked product decisions (autonomy, controllers, slicer, printers, model, retention) |
@@ -82,3 +93,30 @@ Cross-domain phases. Gateway-internal wave ids (`W1.1` …) are `10_gateway.md` 
 
 `P7` is operator-attended and hardware-gated by design: nothing before it may advertise
 `execute` on a physical machine.
+
+Phase status above records the cross-domain phase closing; it does not mean every artifact a design
+document proposed was built. The landed subset per document is below.
+
+## As-built map
+
+Verified against the tree on 2026-10-04. "Not built" lists proposed artifacts the design documents
+name that do not exist; design docs are not rewritten to match.
+
+| doc | landed (where it lives) | proposed in the doc, not built |
+|---|---|---|
+| `10_gateway.md` | `contracts/manufacturing_gateway.md`; `core/device/*` (capability, ids, Grbl protocol/adapter, emulator transport); `core/manufacturing/*` (`FreshValue`, journal, result registry, invalidation, tier0, policy, gates, approval, lease, arbiter) built as `chudware_manufacturing` together with `core/hostd/mfg_lane.*` and the deny-by-default transports `services/manufacturing/gateway/{device_allowlist,transport_serial,transport_tcp,transport_ws}.*`; `services/mcp/mfg_tools.py`, `services/mcp/mfg_plan_tools.py`; `services/manufacturing/notify/`; tests `core/tests/test_{mfg_foundation,grbl_protocol,device_lane,mfg_authorization,mfg_lane,transport_serial,transport_net}.cpp`; fixtures `fixtures/mfg/gateway/`; qualification `scripts/qualify_mfg_e3.{py,sh}`, `scripts/qualify_mfg_printer.{py,sh}` | separate `chudware-mfgd` process (standing deviation 1); per-module test files (`test_mfg_arbiter`, `test_mfg_gates`, `test_mfg_policy`, `test_mfg_tier0`, `test_grbl_adapter`, …); `host/src/ui/mfg/**`, `host/src/ui/print/**`; `scripts/qualify_cut_e2.sh`, `scripts/qualify_pnp_q1.sh` |
+| `11_twin.md` | `core/twin/{twin.h,twin.cpp,wide_math.h}` (`chudware_twin`, linked to the shared Grbl codec); `core/tests/test_twin.cpp`; `fixtures/mfg/twin/` | `contracts/manufacturing_twin.md`; split headers `core/twin/{clock,entity,state,faults,grbl_emu,record,vsensor,vcamera}.h`; `core/cam/stock_step.*`; `docs/TWIN.md`; the eleven `test_twin_*` executables; `services/manufacturing/twin/` |
+| `12_metrology.md` | Python only: `services/manufacturing/metrology/` (evidence, tiers, probe, registration, offsets, transform, limits, inspection) with `test_metrology.py`; `fixtures/mfg/metrology/` | `contracts/manufacturing_metrology.md`; `core/metrology/**` (incl. `offsets.cpp`, `session.cpp`); `services/mcp/metrology_tools.py`; `contracts/fixtures/metrology/`; `core/tests/test_metrology_frames.cpp`; `host/src/ui/manufacture/inspectors.cpp` |
+| `13_additive.md` | `core/print/model.{h,cpp}` (`chudware_print`) + `core/tests/test_print_model.cpp`; `services/manufacturing/slicer/` (arms-length argv/file/subprocess seam to an installed PrusaSlicer, vendor-bundle reader, G-code checks); `services/manufacturing/printers/` (Moonraker, OctoPrint, PrusaLink adapters + `worker_rpc.py`); `services/manufacturing/print_media.py`; `fixtures/mfg/{print,printers}/` | `contracts/manufacturing_print.md`; vendored slicer fork (`vendor/slicer/`, `scripts/vendor_slicer.py`); `core/print/gcode_parse`; host print UI (`host/src/ui/print/**`, `host/src/ui/manufacture/print/**`); `services/mcp/mfg_print_tools.py`; `services/gateway/` |
+| `14_perception.md`, `22_perception_model.md` | `services/perception/` (`packet`, `reference`, `config`, `capture/`); `training/perception/` (data, model, train, evaluate, ONNX export, manifest); `fixtures/mfg/perception/` | `contracts/manufacturing_perception.md`; `services/mcp/perception_tools.py`; `services/perception/{service,source,ringbuf,eventizer,grounding,retention}.py`; `core/twin/vcamera.h`; `training/jobs/perception_mldp_*.md`, `training/corpora/perception/` |
+| `15_ux.md` | `host/src/ui/manufacture/` (`manufacture_panel`, `device_panel`, `run_panel`, `approval_dialog`, `attention_panel`, `mfg_mirror`) | `contracts/manufacturing_ux.md`; `manufacture_workspace.cpp`; `host/tests/test_mfg_{fresh,mirror}.cpp`; per-domain panels (print, monitor, turning, cut, PnP, robot) |
+| `16_monitoring.md` | `services/manufacturing/monitor/` (`mtconnect`, `normalize`, `replay`, `opcua/` client/codec/protocol/machine tools/fake server) with tests; `fixtures/mfg/monitor/` | `services/mcp/mfg_monitor_tools.py`; monitor `service`/`model`/`tier0` modules; `collector_opcua/`; `services/manufacturing/rpc/journal_client.py`; host monitor panel; `scripts/mfg_monitor_readonly_gate.sh`, `scripts/qualify_monitor_e{1,2}.sh` |
+| `17_turning.md` | `core/cam/turn/process.{h,cpp}`; `core/tests/test_cam_processes.cpp`; `fixtures/mfg/turn/` | split modules (`turn_profile`, `turn_tool`, `turn_semantics`, `workholding`, `post_turn`, `turn_tier0`); `core/cam/stock_step.*`; `services/manufacturing/turning/`; turning panel; `core/tests/test_cam_turn.cpp`; `scripts/qualify_turn_e2.sh` |
+| `18_cutting.md` | `core/cam/cut/process.{h,cpp}`; `core/tests/test_cam_processes.cpp`; `fixtures/mfg/cut/` | per-process modules (`op_laser`, `op_plasma`, `op_waterjet`, `recipe`, `vector_plan`, `plasma_state`, `parse_gcode`, `post_cut`, `cut_sim`, `emulator`); cut process panel |
+| `19_pnp.md` | Python only: `services/manufacturing/pnp/` (`capability`, `model`, `openpnp`, `simulator`) with tests; `fixtures/mfg/pnp/` | `contracts/mfg_pnp.md`; `core/pnp/**`; `pnp/{rpc,tier0,evidence}.py`; `services/manufacturing/rpc/`; PnP panel; `scripts/qualify_pnp_q1.sh`, `scripts/smoke_pnp_offline.sh` |
+| `20_robot.md` | Python only: `services/manufacturing/robot/` (`capability`, `model`, `urdf`, `kinematics`, `collision`, `trajectory`, `safety_boundary`) with tests; `fixtures/mfg/robot/` | `contracts/mfg_robot.md`; `core/robot/**`; robot panel and mirror; further robot modules (`cell`, `collide`, `determinism`, `evidence`, `export_traj`, `mesh_io`, …); `scripts/qualify_robot_e3.sh` |
+| `21_qualification.md` | `scripts/qualify_mfg_e3.{py,sh}`, `scripts/qualify_mfg_printer.{py,sh}` | — |
+| `25`–`32` viewpoint | `services/viewpoint/**`; `training/viewpoint/**`; `fixtures/viewpoint/` | — |
+
+`00`–`02`, `23`, `24` and `90` are decision, review and research records; they describe no
+separate implementation tree.

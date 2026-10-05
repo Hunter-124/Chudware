@@ -1,11 +1,11 @@
 // cef/cef_web_view.cpp — CefWebView (IWebViewBackend) off-screen render.
 //
-// In-process Chromium Embedded Framework off-screen browser (docs/cef_webview.md
-// phase 2). Compiled only with CHUDWARE_ENABLE_CEF. Contract & threading mirror
-// ScreencastWebView: GL-thread-only public API; CEF's OnPaint delivers BGRA on a
-// CEF thread, copied under a mutex and uploaded to the GL texture in draw().
+// In-process Chromium Embedded Framework off-screen browser
+// (docs/design/cef_webview.md). Compiled only with CHUDWARE_ENABLE_CEF.
+// GL-thread-only public API; CEF's OnPaint delivers BGRA on a CEF thread,
+// copied under a mutex and uploaded to the GL texture in draw().
 //
-// Refcounting (the one thing you MUST NOT mirror mechanically from the scaffold):
+// Refcounting (the one thing you MUST NOT get wrong):
 // the CefClient handed to CreateBrowser is CEF-refcounted (IMPLEMENT_REFCOUNTING,
 // owned by CefRefPtr) — exactly like cef_osr_shot.cpp's ShotClient. It is a
 // DIFFERENT object from the widget-owned GL/status state. They share a plain
@@ -155,7 +155,7 @@ int vkFor(ImGuiKey k) {
 
 // Clipboard + select-all shortcuts: page-focused Ctrl/Cmd + letter → the VK the
 // Chrome runtime turns into a real copy/paste/cut/select-all (native OS
-// clipboard — the whole reason for CEF over the screencast).
+// clipboard).
 int vkForCtrlLetter(ImGuiKey k) {
     switch (k) {
         case ImGuiKey_A: return 0x41;
@@ -711,7 +711,7 @@ struct CefWebView::Impl {
         settings.windowless_frame_rate = 30;
 
         // Per-site request context → its own on-disk cookie jar (cacheDir aligns
-        // with the Playwright profile dir; see docs/cef_webview.md cookie interop).
+        // with the Playwright profile dir; see docs/design/cef_webview.md).
         CefRefPtr<CefRequestContext> ctx;
         if (!cacheDir.empty()) {
             CefRequestContextSettings rc;
@@ -865,7 +865,7 @@ void CefWebView::open(AppState& st, const std::string& siteOrUrl, bool isUrl) {
 
         // Vendor key → resolve its sign-in URL + per-site cache dir over the worker
         // RPC (reuses embed.start_url_for_site + profiles.profile_dir). The callback
-        // runs on the GL/UI thread (same drain as the screencast frame callbacks), so
+        // runs on the GL/UI thread (the worker-RPC callback drain), so
         // CreateBrowser / LoadURL there is TID_UI-safe.
         const std::string req = siteOrUrl;
         impl->pendingUrlReq = req;

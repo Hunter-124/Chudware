@@ -2,10 +2,9 @@
 // -------------------------------------------------------------------------------------------------
 // Chudware GUI metrics — the SINGLE place GUI dimensions are defined.
 //
-// Rationale (docs/GUI_STYLE_GUIDE.md): sizing was scattered as raw pixel literals across ~25 files,
-// which drifted and mis-scaled at HiDPI. This header centralizes the dimensions so they can be
-// changed / recalculated in ONE spot, and so the gui_lint.py "scale" rule recognizes px()/U() as
-// proper scaling. All accessors return DPI-scaled pixels (logical × ui::uiScale).
+// Centralized DPI-scaled dimensions; gui_lint.py's scale rule recognizes px()/U().
+// Accessors return logical sizes multiplied by ui::uiScale. Layout conventions:
+// .claude/skills/gui-theme-layout/SKILL.md.
 //
 // Usage:
 //   ImGui::SetNextItemWidth(ui::metrics::pmLabelCol());

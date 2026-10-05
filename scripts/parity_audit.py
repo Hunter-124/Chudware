@@ -1,40 +1,61 @@
 #!/usr/bin/env python3
-"""Machine-checkable SolidWorks-parity audit for AI-opencad.
+"""Machine-checkable SolidWorks-parity audit for Chudware.
 
-A "typechecker" for the parity standard in docs/SW_PARITY_SPEC.md (its backlog twin
-docs/SW_PARITY_GAPS.md was pruned 2026-07-23; the status rows carry the backlog now).
-The spec is hand-maintained prose: every capability row carries a
-status (`done` / `partial` / `missing` / `beyond`) and an Evidence cell naming the code that
-backs it. Prose drifts — a row can stay `done` after its compiler is renamed, a ribbon command
-deleted, or an RPC method removed. This script re-derives the machine-checkable subset of that
-evidence FROM THE CODE and flags any `done`/`beyond` claim it cannot corroborate.
+A "typechecker" for the parity standard in docs/SW_PARITY_SPEC.md. Every capability row there
+carries a status (`done` / `partial` / `missing` / `beyond`) and an Evidence cell naming the code
+that backs it. Prose drifts — a row can stay `done` after its feature type is removed, a ribbon
+command deleted, or an RPC method retired. This script re-derives the artifact corpus FROM THE
+LIVE CODE and checks the spec's evidence pointers against it.
 
-It is deliberately a SUBSET. Many acceptance conditions ("Newton/LM solver with analytic
-Jacobians", "removes 3-4 DOF") are not mechanically checkable from a grep, and the script never
-pretends otherwise — those rows are scored `unverifiable` (counted, never drift). What IS
-checkable, and what we check, is the existence of the three concrete artifacts the spec's own
-"engine + host where a UI is implied" rule promises:
+It is deliberately a SUBSET check. An artifact existing never proves a SolidWorks acceptance
+condition ("Newton/LM solver with analytic Jacobians", "removes 3-4 DOF"); those stay human
+judgment. What IS checkable is that the artifacts a row names actually exist:
 
-  * an ENGINE COMPILER  — a ``@register("<type>")`` in engine/doc/features/*.py
-  * a RIBBON COMMAND    — a row in host/src/ui/ribbon_def.cpp
-  * a PM FORM           — a ``{ "<type>", ... }`` row / ``pmFindForm("<type>")`` in pm_forms.cpp
-  * a WORKER RPC        — a ``"<method>": _fn`` entry in any engine/**/*.py WORKER_METHODS/METHODS
+  * compiler — a key of ``FEATURE_TYPES`` (core/doc/validate.cpp) that the compiler really
+               dispatches (a ``type``/``ftype`` comparison literal in core/doc/document.cpp or
+               core/doc/assembly.cpp), or an apply-time macro (``expand_<type>(`` in
+               core/doc/session.cpp). Registry-only types (validated but never dispatched) are
+               reported separately and are NOT compiler evidence.
+  * op       — a document op kind in ``kDocOpKinds`` (core/doc/op_registry.cpp) or an ECAD op
+               kind in ``kEcadOpKinds`` (core/ecad/op_registry.cpp).
+  * rpc      — a libchudware dispatch literal (``m == "<method>"`` in core/api/libchudware.cpp);
+               its ``kModeling`` profiler list is cross-checked, not treated as independent dispatch;
+               or a key of a Python services-worker table that services/worker_main.py
+               registers (its ``_METHODS`` literal plus every ``_register(...)`` module table,
+               following ``.update(...)`` merges, ``**`` splats, subscript assignments and
+               name-list comprehensions).
+  * ribbon   — a cmd_id row in host/src/ui/ribbon_def.cpp.
+  * pm_form  — an actual form row in host/src/ui/pm_forms.cpp, not just a lookup call.
 
-A row is matched to evidence by the artifact TOKENS it names (feature-type strings, ribbon
-cmd_ids, RPC method names) appearing in its capability text + Evidence cell. When a `done`/`beyond`
-row names a token whose KIND we can resolve but the artifact is absent from code, that is DRIFT.
+Two ways a row names an artifact:
+
+  * EXPLICIT pointer — a kind keyword immediately followed by backticked ids or bare
+    snake_case ids (also single-word pm_form ids), slash-separated: ``compiler `extrude```,
+    ``op sketch_trim``, ``rpc `doc_push_pull```, ``ribbon sm_hem/sm_jog``, ``pm_form boolean``.
+    In every row except ``missing`` ones, each id MUST exist in its corpus; absence is DRIFT.
+  * implicit token — any multi-segment snake_case identifier in the capability or evidence text
+    that happens to be a harvested artifact id. It corroborates a claim but can never be drift
+    (prose may name things that are not artifacts).
+Repo-relative source paths in evidence cells are also checked for file presence in
+non-missing rows. A present source file alone does not increase artifact coverage.
+
+A ``done``/``beyond`` row is `verified` when it names at least one existing artifact and
+`unverifiable` when it names none — prose evidence is counted, never treated as failure.
+``missing`` rows are not checked: they may legitimately name absent or present artifacts.
 
 Usage:
   python scripts/parity_audit.py                  # text scorecard, exit 0 (clean) / 1 (drift)
   python scripts/parity_audit.py --report md      # markdown report (docs / PR comment)
-  python scripts/parity_audit.py --area Sketcher   # restrict to one area (substring match)
+  python scripts/parity_audit.py --area Sketcher  # restrict to one area (substring match)
   python scripts/parity_audit.py --list-evidence  # dump the harvested code-evidence corpus
 
-Exit code: 0 = no drift, 1 = drift found, 2 = bad invocation / parse error. Stdlib only.
+Exit code: 0 = no drift, 1 = drift found, 2 = bad invocation, unreadable spec, a missing evidence
+source, an unresolvable RPC table, or an empty harvest. Python standard library only.
 """
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import re
 import sys
@@ -42,145 +63,365 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPEC = os.path.join(REPO, "docs", "SW_PARITY_SPEC.md")
 
-# Code locations that back the spec's evidence cells.
-FEATURES_DIR = os.path.join(REPO, "engine", "doc", "features")
+# Live sources of truth that back the spec's evidence cells. Every one is mandatory.
+VALIDATE = os.path.join(REPO, "core", "doc", "validate.cpp")
+DOCUMENT = os.path.join(REPO, "core", "doc", "document.cpp")
+ASSEMBLY = os.path.join(REPO, "core", "doc", "assembly.cpp")
+SESSION = os.path.join(REPO, "core", "doc", "session.cpp")
+DOC_OPS = os.path.join(REPO, "core", "doc", "op_registry.cpp")
+ECAD_OPS = os.path.join(REPO, "core", "ecad", "op_registry.cpp")
+LIBCHUDWARE = os.path.join(REPO, "core", "api", "libchudware.cpp")
+WORKER_MAIN = os.path.join(REPO, "services", "worker_main.py")
 RIBBON = os.path.join(REPO, "host", "src", "ui", "ribbon_def.cpp")
 PM_FORMS = os.path.join(REPO, "host", "src", "ui", "pm_forms.cpp")
-ENGINE_DIR = os.path.join(REPO, "engine")
 
 STATUSES = ("done", "partial", "missing", "beyond")
-# Statuses that make an affirmative code claim we can try to falsify. partial/missing don't:
-# a partial/missing row is allowed to have no (or only stubbed) evidence by definition.
+# Statuses that make an affirmative, falsifiable code claim and are scored for coverage.
 CLAIM_STATUSES = ("done", "beyond")
+# Explicit pointers in these rows must resolve. `missing` rows only describe absence.
+POINTER_CHECKED_STATUSES = ("done", "beyond", "partial")
+KINDS = ("compiler", "op", "rpc", "ribbon", "pm_form")
 
 
-# ====================================================================================================
-# 1. Harvest the code-evidence corpus.
-#
-# Each harvester returns the set of artifact tokens that actually exist in the tree. The audit then
-# asks, per spec row, "does this row name a token of a kind I harvested, and is that token present?"
-# ====================================================================================================
+class SourceError(RuntimeError):
+    """A mandatory evidence source is missing, unparseable, or yielded nothing."""
+
+
+def _rel(path: str) -> str:
+    return os.path.relpath(path, REPO)
+
+
+# Preserve C++ strings/character literals while excluding commented-out artifacts.
+# Keep newlines so table-boundary patterns retain their source-line semantics.
+CPP_COMMENT_RE = re.compile(
+    r'R"(?P<delimiter>[^\s()\\]{0,16})\(.*?\)(?P=delimiter)"'
+    r'|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
+    r'|(?P<comment>//[^\n]*|/\*.*?\*/)', re.S)
+
 
 def _read(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            return fh.read()
-    except OSError:
-        return ""
+            text = fh.read()
+        if path.endswith(".cpp"):
+            text = CPP_COMMENT_RE.sub(
+                lambda m: "\n" * m["comment"].count("\n") if m["comment"] is not None else m[0],
+                text)
+        return text
+    except OSError as exc:
+        raise SourceError(f"evidence source unreadable: {_rel(path)} ({exc.strerror})") from exc
 
 
-def _iter_py(root: str):
-    for dirpath, dirs, files in os.walk(root):
-        # Skip caches / build trees so we only see live source.
-        dirs[:] = [d for d in dirs if d not in ("__pycache__", "build", ".git", "node_modules")]
-        for fn in files:
-            if fn.endswith(".py"):
-                yield os.path.join(dirpath, fn)
+def _nonempty(label: str, items: set[str], source: str) -> set[str]:
+    if not items:
+        raise SourceError(f"harvested 0 {label} from {source} — source format changed?")
+    return items
 
 
-# --- engine feature compilers: @register("<type>") --------------------------------------------------
+def _c_string_array(path: str, name: str) -> set[str]:
+    """String literals of a ``const char* const <name>[] = { ... };`` table."""
+    text = _read(path)
+    m = re.search(r'\b' + re.escape(name) + r'\s*\[\s*\]\s*=\s*\{(.*?)\n\};', text, re.S)
+    if not m:
+        raise SourceError(f"{name} table not found in {_rel(path)}")
+    return _nonempty(name, set(re.findall(r'"([a-z][a-z0-9_]*)"', m.group(1))), _rel(path))
 
-REGISTER_RE = re.compile(r'@register\(\s*["\']([a-zA-Z0-9_]+)["\']\s*\)')
+
+# ====================================================================================================
+# 1. Harvest the code-evidence corpus.
+# ====================================================================================================
+
+# --- feature types: FEATURE_TYPES keys, split by whether the compiler really dispatches them -------
+FEATURE_TYPES_RE = re.compile(r'\bFEATURE_TYPES\s*=\s*\{(.*?)\n\};', re.S)
+FEATURE_KEY_RE = re.compile(r'^\s*\{"([a-z][a-z0-9_]*)",\s*\{', re.M)
+FEATURE_DISPATCH_RE = re.compile(r'\b(?:type|ftype)\s*==\s*"([a-z][a-z0-9_]*)"')
 
 
-def harvest_compilers() -> set[str]:
-    """Every feature-type string with a registered compiler in engine/doc/features/*.py.
+def harvest_feature_types() -> tuple[set[str], set[str], set[str]]:
+    """(compiled, macros, registry_only) feature types.
 
-    This is the authoritative "does an engine compiler exist" oracle — the same decorator the
-    compiler core (base.py register/get_compiler) keys on at runtime.
+    compiled      — FEATURE_TYPES keys with a dispatch literal in document.cpp / assembly.cpp.
+    macros        — FEATURE_TYPES keys expanded at apply time by ``expand_<type>(`` in session.cpp
+                    (they never reach the compiler as themselves).
+    registry_only — validated keys with neither: accepted by validation, backed by no handler.
     """
-    out: set[str] = set()
-    if os.path.isdir(FEATURES_DIR):
-        for fn in os.listdir(FEATURES_DIR):
-            if fn.endswith(".py"):
-                out.update(REGISTER_RE.findall(_read(os.path.join(FEATURES_DIR, fn))))
-    return out
+    m = FEATURE_TYPES_RE.search(_read(VALIDATE))
+    if not m:
+        raise SourceError(f"FEATURE_TYPES map not found in {_rel(VALIDATE)}")
+    keys = _nonempty("FEATURE_TYPES keys", set(FEATURE_KEY_RE.findall(m.group(1))), _rel(VALIDATE))
+    dispatched = _nonempty("document dispatch literals",
+                           set(FEATURE_DISPATCH_RE.findall(_read(DOCUMENT))), _rel(DOCUMENT))
+    dispatched |= _nonempty("assembly dispatch literals",
+                            set(FEATURE_DISPATCH_RE.findall(_read(ASSEMBLY))), _rel(ASSEMBLY))
+    session = _read(SESSION)
+    macros = {"standard_part"} & keys if re.search(
+        r'if\s*\(\s*ftype_early\s*==\s*"standard_part"\s*\).*?\bexpand_standard_part\s*\(',
+        session, re.S) else set()
+    _nonempty("apply-time feature macros", macros, _rel(SESSION))
+    compiled = (keys & dispatched) - macros
+    _nonempty("dispatched feature compilers", compiled, f"{_rel(DOCUMENT)} / {_rel(ASSEMBLY)}")
+    return compiled, macros, keys - compiled - macros
 
 
-# Top-level ``def compile_<name>(...)`` entry points anywhere under engine/ (e.g. compile_document,
-# compile_assembly, compile_boolean). Evidence cells cite these by name; they back a `done` claim
-# just as a registered feature-type does, so a `compile_<x>` pointer is only drift when NEITHER a
-# registered feature-type `<x>` NOR a ``def compile_<x>`` exists.
-COMPILE_DEF_RE = re.compile(r'^\s*def\s+(compile_[a-z][a-z0-9_]+)\s*\(', re.M)
+# --- document + ECAD op kinds -------------------------------------------------------------------------
+
+def harvest_ops() -> tuple[set[str], set[str]]:
+    return _c_string_array(DOC_OPS, "kDocOpKinds"), _c_string_array(ECAD_OPS, "kEcadOpKinds")
 
 
-def harvest_compile_funcs() -> set[str]:
-    """Every ``def compile_<name>`` function defined under engine/ (bare names incl. the prefix)."""
-    out: set[str] = set()
-    for path in _iter_py(ENGINE_DIR):
-        out.update(COMPILE_DEF_RE.findall(_read(path)))
-    return out
+# --- libchudware RPC dispatch -------------------------------------------------------------------------
+# kModeling is a profiler list, not a dispatch table: stale profiler entries must not
+# manufacture RPC evidence. Require the list and corroborate each entry against dispatch.
+NATIVE_RPC_RE = re.compile(r'\bm\s*==\s*"([a-z][a-z0-9_]*)"')
+MODELING_RE = re.compile(r'\bkModeling\s*=\s*\{\{(.*?)\}\};', re.S)
+
+
+def harvest_native_rpc() -> tuple[set[str], set[str]]:
+    text = _read(LIBCHUDWARE)
+    methods = _nonempty("libchudware dispatch literals",
+                        set(NATIVE_RPC_RE.findall(text)), _rel(LIBCHUDWARE))
+    modeling = MODELING_RE.search(text)
+    if not modeling:
+        raise SourceError(f"kModeling table not found in {_rel(LIBCHUDWARE)}")
+    names = _nonempty("kModeling entries", set(re.findall(
+        r'"([a-z][a-z0-9_]*)"', modeling.group(1))), _rel(LIBCHUDWARE))
+    # The profiler list includes legacy names: only its dispatched intersection is evidence.
+    return methods, _nonempty("dispatched kModeling entries", names & methods, _rel(LIBCHUDWARE))
+
+
+# --- Python services-worker RPC tables (static, via ast; nothing is imported) ------------------------
+
+def _module_file(module: str) -> str | None:
+    base = os.path.join(REPO, *module.split("."))
+    for cand in (base + ".py", os.path.join(base, "__init__.py")):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _module_statements(body: list[ast.stmt]):
+    """Module-level statements, descending into try/if/with blocks but not defs or loops."""
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                             ast.For, ast.AsyncFor, ast.While)):
+            continue
+        yield node
+        for field in ("body", "orelse", "finalbody"):
+            sub = getattr(node, field, None)
+            if isinstance(sub, list):
+                yield from _module_statements(sub)
+        for handler in getattr(node, "handlers", ()):
+            yield from _module_statements(handler.body)
+
+
+def _assigned_value(stmt: ast.stmt, name: str) -> ast.expr | None:
+    if isinstance(stmt, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in stmt.targets):
+        return stmt.value
+    if (isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+            and stmt.target.id == name and stmt.value is not None):
+        return stmt.value
+    return None
+
+
+class _PyModule:
+    """One parsed module: its module-level statements and from-import aliases."""
+
+    _cache: dict[str, "_PyModule"] = {}
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        try:
+            tree = ast.parse(_read(path), path)
+        except SyntaxError as exc:
+            raise SourceError(f"cannot parse {_rel(path)}: {exc}") from exc
+        self.stmts = list(_module_statements(tree.body))
+        self.imports: dict[str, tuple[str, str]] = {}
+        for node in self.stmts:
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if node.level:
+                pkg = os.path.dirname(path)
+                for _ in range(node.level - 1):
+                    pkg = os.path.dirname(pkg)
+                module = _rel(pkg).replace(os.sep, ".")
+                if node.module:
+                    module += "." + node.module
+            else:
+                module = node.module or ""
+            for alias in node.names:
+                self.imports[alias.asname or alias.name] = (module, alias.name)
+
+    @classmethod
+    def load(cls, path: str) -> "_PyModule":
+        if path not in cls._cache:
+            cls._cache[path] = cls(path)
+        return cls._cache[path]
+
+    def defines(self, name: str) -> bool:
+        return any(_assigned_value(s, name) is not None for s in self.stmts)
+
+    def fail(self, msg: str) -> SourceError:
+        return SourceError(f"{_rel(self.path)}: {msg}")
+
+
+def _py_strings(mod: _PyModule, node: ast.expr) -> set[str]:
+    """String members of a literal tuple/list/set (or a module-level name bound to one)."""
+    if isinstance(node, ast.Name):
+        for stmt in mod.stmts:
+            value = _assigned_value(stmt, node.id)
+            if value is not None:
+                return _py_strings(mod, value)
+        raise mod.fail(f"cannot resolve name list {node.id}")
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and len(node.args) == 1 \
+            and node.func.id in ("tuple", "list", "set", "frozenset"):
+        return _py_strings(mod, node.args[0])
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)) and all(
+            isinstance(e, ast.Constant) and isinstance(e.value, str) for e in node.elts):
+        return {e.value for e in node.elts}
+    raise mod.fail(f"unsupported RPC name list: {ast.unparse(node)}")
+
+
+def _py_table_value(mod: _PyModule, node: ast.expr, into: str, seen: set) -> set[str]:
+    if isinstance(node, ast.Dict):
+        keys: set[str] = set()
+        for k, v in zip(node.keys, node.values):
+            if k is None:  # **splat
+                keys |= _py_table_value(mod, v, into, seen)
+            elif isinstance(k, ast.Constant) and isinstance(k.value, str):
+                keys.add(k.value)
+            else:
+                raise mod.fail(f"non-literal RPC key in {into}: {ast.unparse(k)}")
+        return keys
+    if isinstance(node, ast.DictComp) and len(node.generators) == 1:
+        gen = node.generators[0]
+        if isinstance(node.key, ast.Name) and isinstance(gen.target, ast.Name) \
+                and node.key.id == gen.target.id and not gen.ifs:
+            return _py_strings(mod, gen.iter)
+    if isinstance(node, ast.Name):
+        if mod.defines(node.id):
+            return _py_table_keys(mod.path, node.id, seen)
+        if node.id in mod.imports:
+            module, attr = mod.imports[node.id]
+            path = _module_file(module)
+            if path is None:
+                raise mod.fail(f"{node.id} is imported from missing module {module}")
+            return _py_table_keys(path, attr, seen)
+    raise mod.fail(f"cannot resolve RPC table expression merged into {into}: {ast.unparse(node)}")
+
+
+def _py_table_keys(path: str, name: str, seen: set | None = None) -> set[str]:
+    """Keys of module-level dispatch table ``name`` in ``path``, following its merges."""
+    seen = set() if seen is None else set(seen)
+    if (path, name) in seen:
+        raise SourceError(f"cyclic RPC table reference: {_rel(path)}.{name}")
+    seen.add((path, name))
+    mod = _PyModule.load(path)
+    keys: set[str] = set()
+    defined = False
+    for stmt in mod.stmts:
+        value = _assigned_value(stmt, name)
+        if value is not None:
+            defined = True
+            keys |= _py_table_value(mod, value, name, seen)
+            continue
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            func = stmt.value.func
+            if (isinstance(func, ast.Attribute) and func.attr == "update"
+                    and isinstance(func.value, ast.Name) and func.value.id == name):
+                for arg in stmt.value.args:
+                    keys |= _py_table_value(mod, arg, name, seen)
+        elif isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+                        and target.value.id == name and isinstance(target.slice, ast.Constant)
+                        and isinstance(target.slice.value, str)):
+                    keys.add(target.slice.value)
+    if not defined:
+        raise mod.fail(f"no module-level RPC table {name}")
+    return keys
+
+
+def _call_arg(call: ast.Call, index: int, keyword: str) -> ast.expr | None:
+    if len(call.args) > index:
+        return call.args[index]
+    return next((kw.value for kw in call.keywords if kw.arg == keyword), None)
+
+
+def harvest_python_rpc() -> dict[str, set[str]]:
+    """Per-table keys of every RPC table services/worker_main.py registers."""
+    main = _PyModule.load(WORKER_MAIN)
+    tables = {"worker_main._METHODS": _py_table_keys(WORKER_MAIN, "_METHODS")}
+    for stmt in main.stmts:
+        call = stmt.value if isinstance(stmt, ast.Expr) else None
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                and call.func.id == "_register"):
+            continue
+        module = _call_arg(call, 1, "import_path")
+        attr = _call_arg(call, 2, "attr")
+        if not (isinstance(module, ast.Constant) and isinstance(module.value, str)
+                and isinstance(attr, ast.Constant) and isinstance(attr.value, str)):
+            raise main.fail(f"unsupported _register call: {ast.unparse(call)}")
+        path = _module_file(module.value)
+        if path is None:
+            raise main.fail(f"_register names missing module {module.value}")
+        tables[f"{module.value}.{attr.value}"] = _py_table_keys(path, attr.value)
+    if len(tables) == 1:
+        raise main.fail("no _register(...) RPC tables found — registration format changed?")
+    for label, keys in tables.items():
+        _nonempty(f"RPC methods in {label}", keys, _rel(WORKER_MAIN))
+    return tables
 
 
 # --- ribbon commands: rows in ribbon_def.cpp --------------------------------------------------------
 # Row shape: { "cmd_id", "Label", "icon", "Tab", "Group", big, sub_of, stretch }
-RIBBON_ROW_RE = re.compile(r'^\s*\{\s*"([a-zA-Z0-9_]+)"\s*,\s*"[^"]*"\s*,\s*"[^"]*"\s*,\s*"[^"]*"\s*,')
+RIBBON_ROW_RE = re.compile(r'^\s*\{\s*"([a-zA-Z0-9_]+)"\s*,\s*"[^"]*"\s*,\s*"[^"]*"\s*,\s*"[^"]*"\s*,', re.M)
 
 
 def harvest_ribbon() -> set[str]:
     """Every cmd_id present as a row in the ribbon table (visible OR stretch-reserved)."""
-    out: set[str] = set()
-    for line in _read(RIBBON).splitlines():
-        m = RIBBON_ROW_RE.match(line)
-        if m:
-            out.add(m.group(1))
-    return out
+    return _nonempty("ribbon rows", set(RIBBON_ROW_RE.findall(_read(RIBBON))), _rel(RIBBON))
 
 
-# --- PM forms: form-type keys + pmFindForm("<type>") in pm_forms.cpp ---------------------------------
+# --- PM forms: actual form-type keys in pm_forms.cpp -------------------------------------------------
 # kForms rows look like:  { "box", "Box", "extrude_boss", { ...fields... }},
-PM_FORM_ROW_RE = re.compile(r'^\s*\{\s*"([a-zA-Z0-9_]+)"\s*,\s*"[^"]*"\s*,\s*"[^"]*"\s*,\s*\{')
-PM_FIND_RE = re.compile(r'pmFindForm\(\s*"([a-zA-Z0-9_]+)"\s*\)')
+PM_FORM_ROW_RE = re.compile(r'^\s*\{\s*"([a-zA-Z0-9_]+)"\s*,\s*"[^"]*"\s*,\s*"[^"]*"\s*,\s*\{', re.M)
 
 
 def harvest_pm_forms() -> set[str]:
-    """Every PropertyManager form-type the host can render (table rows + dispatched names)."""
+    """Every PropertyManager form-type defined by the host (lookup calls alone are not forms)."""
     text = _read(PM_FORMS)
-    out: set[str] = set()
-    for line in text.splitlines():
-        m = PM_FORM_ROW_RE.match(line)
-        if m:
-            out.add(m.group(1))
-    out.update(PM_FIND_RE.findall(text))
-    return out
+    forms = set(PM_FORM_ROW_RE.findall(text))
+    return _nonempty("PM forms", forms, _rel(PM_FORMS))
 
 
-# --- worker RPC methods: "<method>": _fn dict entries across engine/**/*.py -------------------------
-# Catches the worker _METHODS literal, every WORKER_METHODS dict (drawing/instant3d/formats/...),
-# and the ECAD METHODS dict — i.e. the full RPC surface, wherever it is declared. To avoid scooping
-# unrelated ``"key": value`` literals out of plain data dicts, we only mine lines that fall INSIDE a
-# dispatch-dict block: from a ``(WORKER_METHODS|_METHODS|METHODS) = {`` (or ``.update({``) opener
-# down to the matching close. The value must be a bare function reference (``_fn`` / ``fn``), which
-# excludes data rows whose values are strings, numbers, or further dicts.
-RPC_OPEN_RE = re.compile(r'\b(?:WORKER_METHODS|_METHODS|METHODS)\b\s*(?:=|\.update\()\s*\{?\s*$')
-# value is a bare function ref; allow a trailing comma and/or ``# comment`` (worker.py annotates
-# several entries inline, e.g. ``"doc_sketch_regions": _fn,  # C51 ...``).
-RPC_ENTRY_RE = re.compile(r'^\s*"([a-z][a-z0-9_]+)"\s*:\s*_?[A-Za-z][A-Za-z0-9_]*\s*,?\s*(?:#.*)?$')
+class Evidence:
+    """The harvested code corpus, with helpers to classify + look up a token."""
 
+    def __init__(self) -> None:
+        self.compilers, self.macros, self.registry_only = harvest_feature_types()
+        self.doc_ops, self.ecad_ops = harvest_ops()
+        self.native_rpc, self.modeling_rpc = harvest_native_rpc()
+        self.python_rpc = harvest_python_rpc()
+        self.ribbon = harvest_ribbon()
+        self.pm_forms = harvest_pm_forms()
+        rpc: set[str] = set(self.native_rpc)
+        for keys in self.python_rpc.values():
+            rpc |= keys
+        self.by_kind: dict[str, set[str]] = {
+            "compiler": self.compilers | self.macros,
+            "op": self.doc_ops | self.ecad_ops,
+            "rpc": rpc,
+            "ribbon": self.ribbon,
+            "pm_form": self.pm_forms,
+        }
 
-def harvest_rpc() -> set[str]:
-    """Every RPC method name registered in a worker dispatch dict anywhere under engine/."""
-    out: set[str] = set()
-    for path in _iter_py(ENGINE_DIR):
-        text = _read(path)
-        if "WORKER_METHODS" not in text and "_METHODS" not in text and \
-           not re.search(r'^\s*METHODS\s*=', text, re.M):
-            continue
-        depth = 0  # brace depth while inside a dispatch-dict block (0 == outside)
-        for line in text.splitlines():
-            if depth == 0:
-                if RPC_OPEN_RE.search(line):
-                    depth = 1
-                continue
-            # Inside a block: harvest method entries, track nesting so we exit at the close.
-            m = RPC_ENTRY_RE.match(line)
-            if m:
-                out.add(m.group(1))
-            depth += line.count("{") + line.count("(")
-            depth -= line.count("}") + line.count(")")
-            if depth <= 0:
-                depth = 0
-    return out
+    def classify(self, tok: str) -> str | None:
+        """The artifact kind a token belongs to, or None if it is not a harvested artifact id."""
+        for kind in KINDS:
+            if tok in self.by_kind[kind]:
+                return kind
+        return None
 
 
 # ====================================================================================================
@@ -208,16 +449,9 @@ class Row:
         self.evidence = evidence
         self.line = line
 
-    # The text we scan for artifact tokens: capability name + evidence cell. (Acceptance is the
-    # SW condition — prose, no code tokens — so it is intentionally excluded to cut false hits.)
-    def haystack(self) -> str:
-        return f"{self.capability}\n{self.evidence}"
-
 
 def parse_spec() -> list[Row]:
     text = _read(SPEC)
-    if not text:
-        raise RuntimeError(f"could not read spec at {SPEC}")
     rows: list[Row] = []
     area = None
     for n, line in enumerate(text.splitlines(), 1):
@@ -239,136 +473,78 @@ def parse_spec() -> list[Row]:
             continue  # not a real capability row (e.g. the scorecard summary table)
         rows.append(Row(area, cap, acc, sm.group(1).lower(), evid, n))
     if not rows:
-        raise RuntimeError(f"parsed 0 capability rows from {SPEC} — spec format changed?")
+        raise SourceError(f"parsed 0 capability rows from {_rel(SPEC)} — spec format changed?")
     return rows
 
 
 # ====================================================================================================
-# 3. Match a row's named artifact tokens to the harvested evidence, and decide drift.
-#
-# We never demand evidence we cannot identify. A row is only checkable when its text names a token
-# we can classify (a registered feature-type, a known ribbon cmd_id pattern, an RPC method name).
-# If we cannot classify ANY token, the row is `unverifiable` and never counts as drift — that is the
-# conservatism rule applied to the auditor itself: silence is not a violation.
+# 3. Match a row's named artifacts to the harvested evidence, and decide drift.
 # ====================================================================================================
 
-# Tokens that look like artifact ids but are generic English / cross-cutting and must never be
-# treated as a missing-compiler claim (they appear in many evidence cells as plain words).
-TOKEN_STOPWORDS = {
-    "done", "partial", "missing", "beyond", "true", "false", "none", "null", "int", "ref",
-    "value", "expr", "field", "test", "tests", "core", "mode", "mid", "blind", "flip", "merge",
-    "side", "kind", "name", "type", "axis", "edge", "face", "vertex", "plane", "point", "body",
-    "bodies", "and", "the", "via", "per", "for", "with", "from", "into", "over", "only", "not",
-}
+# Bare snake_case tokens are unambiguous; single-word ids require backticks except
+# the existing pm_form notation. Do not parse "op exists" / "compiler resolution" prose.
+_ID = r'(?:`[a-z][a-z0-9_]*`|[a-z][a-z0-9]*(?:_[a-z0-9]+)+)'
+POINTER_RE = re.compile(r'\b(' + "|".join(KINDS) + r')\s+(' + _ID + r'(?:\s*/\s*' + _ID + r')*)'
+                        r'|\b(pm_form)\s+([a-z][a-z0-9_]*(?:\s*/\s*[a-z][a-z0-9_]*)*)')
 
-# Strip source filenames (`sketch_mode.cpp`, `ops.py`) BEFORE tokenising — a filename stem is not
-# an artifact id and `sketch_mode` etc. would otherwise look like an RPC. Also strip C++ scope-
-# qualified names (`SketchTool::Line`) which name host symbols, not our four artifact kinds.
+# Strip source filenames (`sketch_mode.cpp`, `document.cpp`) BEFORE tokenising — a filename stem
+# is not an artifact id. Also strip C++ scope-qualified names (`SketchTool::Line`).
 FILENAME_RE = re.compile(r'\b[A-Za-z0-9_./]+\.(?:cpp|py|h|hpp|cc|md|json)\b')
 CPP_SCOPED_RE = re.compile(r'\b[A-Za-z_]\w*::[A-Za-z_]\w*\b')
-# A bare snake_case identifier (>=2 segments) — the shape every artifact id (feature-type, ribbon
-# cmd_id, RPC method, PM-form key) takes. Single-word camelCase host helpers are intentionally
-# ignored: they are not one of the four machine-checkable artifact kinds.
+# A bare snake_case identifier (>=2 segments) — the shape of every implicit artifact id.
 IDENT_RE = re.compile(r'\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b')
 
 
-def _candidate_tokens(row: Row) -> set[str]:
-    """Snake_case identifiers named in the row's capability + evidence text.
+def explicit_pointers(row: Row) -> list[tuple[str, str]]:
+    """(kind, id) for every explicit pointer in the evidence cell."""
+    out: list[tuple[str, str]] = []
+    for kind, ids, form_kind, form_ids in POINTER_RE.findall(row.evidence):
+        out.extend((kind or form_kind, tok.strip("`"))
+                   for tok in re.split(r'\s*/\s*', ids or form_ids))
+    return out
 
-    Source = capability title + evidence cell, with filenames and C++ scoped names removed first.
-    These multi-segment snake_case tokens are exactly the shape of our four artifact ids; stopwords
-    (generic English / shared param names) are dropped to avoid false matches.
-    """
+
+def _implicit_tokens(row: Row) -> set[str]:
     text = f"{row.capability} {row.evidence}"
     text = FILENAME_RE.sub(" ", text)
     text = CPP_SCOPED_RE.sub(" ", text)
-    toks: set[str] = set()
-    for ident in IDENT_RE.findall(text.lower()):
-        if ident in TOKEN_STOPWORDS:
-            continue
-        toks.add(ident)
-    return toks
-
-
-class Evidence:
-    """The harvested code corpus, with helpers to classify + look up a token."""
-
-    def __init__(self) -> None:
-        self.compilers = harvest_compilers()
-        self.compile_funcs = harvest_compile_funcs()
-        self.ribbon = harvest_ribbon()
-        self.pm_forms = harvest_pm_forms()
-        self.rpc = harvest_rpc()
-
-    def classify(self, tok: str) -> str | None:
-        """Return the artifact kind a token belongs to, or None if it is not an artifact id.
-
-        A token is an artifact id only if it matches something we harvested. This is what keeps
-        unrelated identifiers (`sketch_mode`, `bend_allowance`) from being mistaken for artifacts.
-        """
-        if tok in self.compilers:
-            return "compiler"
-        # `compile_boolean` / `compile_document` style references in evidence cells: a registered
-        # feature-type OR a real top-level compile function both count as a compiler artifact.
-        if tok.startswith("compile_") and (
-                tok in self.compile_funcs or tok[len("compile_"):] in self.compilers):
-            return "compiler"
-        if tok in self.ribbon:
-            return "ribbon"
-        if tok in self.rpc:
-            return "rpc"
-        if tok in self.pm_forms:
-            return "pm_form"
-        return None
-
-
-# A capability is VERIFIED when at least one artifact it names is present in the harvested corpus.
-#
-# Drift detection is deliberately PRECISE rather than fuzzy: the only unambiguous broken pointer we
-# can prove is an explicit ``compile_<type>`` reference whose ``<type>`` has no registered compiler.
-# (Fuzzy "this word looks like an RPC prefix" matching produces false positives — e.g. `sketch_mode`
-# is a host file, not an RPC — so we do not do it.) This keeps every reported drift actionable.
-COMPILE_REF_RE = re.compile(r'\bcompile_([a-z][a-z0-9_]+)\b')
+    return set(IDENT_RE.findall(text.lower()))
 
 
 def audit_row(row: Row, ev: Evidence) -> dict:
     """Classify a single spec row against the code evidence.
 
-    Returns a dict: {result, found:[...], drift:[...], tokens:[...]}.
-      result = "verified"      — a named artifact exists in code (claim corroborated)
-               "unverifiable"  — the row names no machine-checkable artifact (counted, never drift)
-               "drift"         — a done/beyond row names an artifact id provably ABSENT from code
-               "n/a"           — partial/missing: not a falsifiable code claim here
+    Returns a dict: {result, found:[...], drift:[...]}.
+      result = "verified"      — names at least one artifact that exists (acceptance unchecked)
+               "unverifiable"  — a done/beyond row naming no harvested artifact (counted, not drift)
+               "drift"         — an explicit pointer in a non-missing row resolves to nothing
+               "n/a"           — partial/missing row with no drift
     """
-    toks = _candidate_tokens(row)
-    found: list[tuple[str, str]] = []   # (token, kind) present in code
-    drift: list[tuple[str, str]] = []   # (token, expected_kind) named but absent
-
-    for tok in sorted(toks):
+    found: set[tuple[str, str]] = set()
+    drift: list[tuple[str, str]] = []
+    for kind, tok in explicit_pointers(row):
+        if tok in ev.by_kind[kind]:
+            found.add((tok, kind))
+        elif row.status in POINTER_CHECKED_STATUSES:
+            drift.append((tok, kind))
+    if row.status in POINTER_CHECKED_STATUSES:
+        for path in sorted(set(FILENAME_RE.findall(row.evidence))):
+            if "/" in path and not os.path.isfile(os.path.join(REPO, path)):
+                drift.append((path, "source"))
+    for tok in _implicit_tokens(row):
         kind = ev.classify(tok)
         if kind:
-            found.append((tok, kind))
-
-    # Precise drift: an explicit `compile_<type>` pointer that resolves to NEITHER a registered
-    # feature-type NOR a real ``def compile_<type>`` function. Only a done/beyond row's broken
-    # pointer counts (partial/missing rows may legitimately name not-yet-built things).
-    if row.status in CLAIM_STATUSES:
-        for ftype in COMPILE_REF_RE.findall(f"{row.capability} {row.evidence}"):
-            ref = f"compile_{ftype}"
-            if ftype not in ev.compilers and ref not in ev.compile_funcs:
-                drift.append((ref, "compiler"))
+            found.add((tok, kind))
 
     if drift:
         result = "drift"
+    elif row.status not in CLAIM_STATUSES:
+        result = "n/a"
     elif found:
         result = "verified"
-    elif row.status in CLAIM_STATUSES:
-        # done/beyond row but no machine-checkable artifact token was identifiable.
-        result = "unverifiable"
     else:
-        result = "n/a"
-
-    return {"result": result, "found": found, "drift": drift, "tokens": sorted(toks)}
+        result = "unverifiable"
+    return {"result": result, "found": sorted(found), "drift": drift}
 
 
 # ====================================================================================================
@@ -403,7 +579,7 @@ class AreaScore:
 
     @property
     def coverage(self) -> float:
-        """Fraction of claim rows whose code evidence we could actually corroborate."""
+        """Fraction of claim rows that name at least one existing artifact."""
         if not self.claims:
             return 1.0
         return self.verified / self.claims
@@ -414,8 +590,6 @@ def score(rows: list[Row], ev: Evidence) -> dict[str, AreaScore]:
     for row in rows:
         sc = scores.setdefault(row.area, AreaScore(row.area))
         setattr(sc, row.status, getattr(sc, row.status) + 1)
-        if row.status not in CLAIM_STATUSES:
-            continue
         res = audit_row(row, ev)
         if res["result"] == "verified":
             sc.verified += 1
@@ -427,81 +601,95 @@ def score(rows: list[Row], ev: Evidence) -> dict[str, AreaScore]:
     return scores
 
 
+def _total(scores: dict[str, AreaScore]) -> AreaScore:
+    tot = AreaScore("TOTAL")
+    for sc in scores.values():
+        for f in ("done", "partial", "missing", "beyond", "verified", "unverifiable", "drift"):
+            setattr(tot, f, getattr(tot, f) + getattr(sc, f))
+        tot.drift_rows.extend(sc.drift_rows)
+    return tot
+
+
 def _bar(frac: float, width: int = 14) -> str:
     fill = int(round(frac * width))
     return "#" * fill + "-" * (width - fill)
 
 
 def report_text(scores: dict[str, AreaScore], total_rows: int) -> None:
-    print("SolidWorks parity audit — machine-checkable evidence for done/beyond claims\n")
+    print("SolidWorks parity audit — evidence pointers checked against live code\n")
     header = (f"{'Area':<28}{'parity':>8}{'claims':>8}{'verifd':>8}"
               f"{'unver':>7}{'DRIFT':>7}  coverage")
     print(header)
     print("-" * len(header))
-    tot = AreaScore("TOTAL")
     for area in sorted(scores):
         sc = scores[area]
-        for f in ("done", "partial", "missing", "beyond", "verified", "unverifiable", "drift"):
-            setattr(tot, f, getattr(tot, f) + getattr(sc, f))
-        tot.drift_rows.extend(sc.drift_rows)
         flag = "  <-- DRIFT" if sc.drift else ""
         print(f"{sc.area[:27]:<28}{sc.parity*100:>7.0f}%{sc.claims:>8}{sc.verified:>8}"
               f"{sc.unverifiable:>7}{sc.drift:>7}  {_bar(sc.coverage)} {sc.coverage*100:>3.0f}%{flag}")
+    tot = _total(scores)
     print("-" * len(header))
     print(f"{'TOTAL':<28}{tot.parity*100:>7.0f}%{tot.claims:>8}{tot.verified:>8}"
           f"{tot.unverifiable:>7}{tot.drift:>7}  {_bar(tot.coverage)} {tot.coverage*100:>3.0f}%")
 
     print(f"\n{total_rows} capability rows parsed; {tot.claims} make a done/beyond code claim "
-          f"({tot.verified} corroborated, {tot.unverifiable} not machine-checkable).")
+          f"({tot.verified} name an existing artifact, {tot.unverifiable} prose-only). "
+          "An existing artifact does not prove the acceptance condition.")
 
     if tot.drift_rows:
-        print(f"\nDRIFT — {len(tot.drift_rows)} 'done/beyond' row(s) name an artifact absent from code:")
+        print(f"\nDRIFT — {len(tot.drift_rows)} row(s) carry an explicit pointer absent from code:")
         for row, res in tot.drift_rows:
-            miss = ", ".join(f"{t} (expected {k})" for t, k in res["drift"])
+            miss = ", ".join(f"{k} `{t}`" for t, k in res["drift"])
             print(f"  [{row.area}] {row.capability}")
             print(f"      SW_PARITY_SPEC.md:{row.line}  status={row.status}  missing: {miss}")
     else:
-        print("\nNo drift: every machine-checkable done/beyond claim resolved to real code.")
+        print("\nNo drift: every explicit evidence pointer resolved to live code.")
 
 
 def report_md(scores: dict[str, AreaScore], total_rows: int) -> None:
-    drift_rows: list[tuple[Row, dict]] = []
     print("# SolidWorks parity audit\n")
-    print("Machine-checkable evidence check for every `done`/`beyond` capability in "
-          "`docs/SW_PARITY_SPEC.md`. *Coverage* = fraction of claim rows whose named artifact "
-          "(engine compiler / ribbon command / PM form / worker RPC) was found in code.\n")
+    print("Evidence-pointer check for `docs/SW_PARITY_SPEC.md`. *Coverage* = fraction of "
+          "`done`/`beyond` rows naming at least one existing artifact (compiler / op / RPC / "
+          "ribbon command / PM form). It does not prove the SolidWorks acceptance condition.\n")
     print("| Area | Parity % | Claims | Verified | Unverifiable | Drift | Coverage |")
     print("|------|---------:|-------:|---------:|-------------:|------:|---------:|")
-    tot = AreaScore("TOTAL")
     for area in sorted(scores):
         sc = scores[area]
-        for f in ("done", "partial", "missing", "beyond", "verified", "unverifiable", "drift"):
-            setattr(tot, f, getattr(tot, f) + getattr(sc, f))
-        drift_rows.extend(sc.drift_rows)
         print(f"| {sc.area} | {sc.parity*100:.0f}% | {sc.claims} | {sc.verified} | "
               f"{sc.unverifiable} | {sc.drift} | {sc.coverage*100:.0f}% |")
+    tot = _total(scores)
     print(f"| **TOTAL** | **{tot.parity*100:.0f}%** | **{tot.claims}** | **{tot.verified}** | "
           f"**{tot.unverifiable}** | **{tot.drift}** | **{tot.coverage*100:.0f}%** |")
     print(f"\n_{total_rows} capability rows parsed._\n")
-    if drift_rows:
-        print(f"\n## Drift ({len(drift_rows)})\n")
-        print("A `done`/`beyond` row names an artifact id of a known family that is **absent** "
-              "from the code tree:\n")
-        for row, res in drift_rows:
-            miss = ", ".join(f"`{t}` ({k})" for t, k in res["drift"])
+    if tot.drift_rows:
+        print(f"\n## Drift ({len(tot.drift_rows)})\n")
+        print("A row carries an explicit evidence pointer whose artifact is **absent** from the "
+              "code tree:\n")
+        for row, res in tot.drift_rows:
+            miss = ", ".join(f"{k} `{t}`" for t, k in res["drift"])
             print(f"- **{row.area} — {row.capability}** "
                   f"(`SW_PARITY_SPEC.md:{row.line}`, status `{row.status}`): missing {miss}")
     else:
-        print("\n## Drift (0)\n\nNo drift — every machine-checkable claim resolved to real code.")
+        print("\n## Drift (0)\n\nNo drift — every explicit evidence pointer resolved to live code.")
 
 
 def report_evidence(ev: Evidence) -> None:
     print("Harvested code-evidence corpus:\n")
-    for label, items in (("engine compilers (@register)", ev.compilers),
-                         ("compile_* functions (engine/**)", ev.compile_funcs),
-                         ("ribbon commands (ribbon_def.cpp)", ev.ribbon),
-                         ("PM forms (pm_forms.cpp)", ev.pm_forms),
-                         ("worker RPC methods (engine/**)", ev.rpc)):
+    sections = [
+        (f"compilers (FEATURE_TYPES dispatched in {_rel(DOCUMENT)} / {_rel(ASSEMBLY)})",
+         ev.compilers),
+        (f"feature macros (expand_<type> in {_rel(SESSION)})", ev.macros),
+        ("registry-only feature types (validated, no handler; NOT compiler evidence)",
+         ev.registry_only),
+        (f"document ops (kDocOpKinds, {_rel(DOC_OPS)})", ev.doc_ops),
+        (f"ECAD ops (kEcadOpKinds, {_rel(ECAD_OPS)})", ev.ecad_ops),
+        (f"native RPC (dispatch literals, {_rel(LIBCHUDWARE)})", ev.native_rpc),
+        (f"modeling RPC (kModeling corroborated by dispatch, {_rel(LIBCHUDWARE)})",
+         ev.modeling_rpc),
+    ]
+    sections += [(f"python RPC ({label})", keys) for label, keys in ev.python_rpc.items()]
+    sections += [(f"ribbon commands ({_rel(RIBBON)})", ev.ribbon),
+                 (f"PM forms ({_rel(PM_FORMS)})", ev.pm_forms)]
+    for label, items in sections:
         print(f"## {label} — {len(items)}")
         for it in sorted(items):
             print(f"  {it}")
@@ -513,14 +701,7 @@ def report_evidence(ev: Evidence) -> None:
 # ====================================================================================================
 
 def main(argv) -> int:
-    # This auditor harvests code-evidence from the host/ ribbon (ribbon_def.cpp). It needs
-    # re-pointing to host/src/ after the ui/imgui retirement. Skip cleanly when RIBBON is
-    # absent rather than fail the gate.
-    if not os.path.exists(RIBBON):
-        print("parity_audit: SKIPPED — ribbon_def.cpp not found; re-point evidence harvest to "
-              "host/src/ (ui/imgui + ui/abstract retired — see docs/PORT_LEDGER.md).")
-        return 0
-    ap = argparse.ArgumentParser(description="AI-opencad SolidWorks-parity drift auditor")
+    ap = argparse.ArgumentParser(description="Chudware SolidWorks-parity drift auditor")
     ap.add_argument("--report", default="text", choices=["text", "md"],
                     help="output format (default text)")
     ap.add_argument("--area", default=None,
@@ -529,23 +710,14 @@ def main(argv) -> int:
                     help="dump the harvested code-evidence corpus and exit")
     args = ap.parse_args(argv)
 
-    if not os.path.exists(SPEC):
-        print(f"parity_audit: spec not found at {SPEC}", file=sys.stderr)
-        return 2
-
-    ev = Evidence()
-    if not ev.compilers:
-        print(f"parity_audit: WARNING — harvested 0 feature compilers from {FEATURES_DIR}; "
-              "evidence matching will be unreliable", file=sys.stderr)
-
-    if args.list_evidence:
-        report_evidence(ev)
-        return 0
-
     try:
+        ev = Evidence()
+        if args.list_evidence:
+            report_evidence(ev)
+            return 0
         rows = parse_spec()
-    except Exception as exc:  # noqa: BLE001
-        print(f"parity_audit: {exc}", file=sys.stderr)
+    except SourceError as exc:
+        print(f"parity_audit: FATAL — {exc}", file=sys.stderr)
         return 2
 
     if args.area:

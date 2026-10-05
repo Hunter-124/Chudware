@@ -1,8 +1,5 @@
-// Smoke tests for the C++ mate solver (chudware::mate). Mirrors the spirit of
-// engine/doc/test_mate_solver.py: rotation log/exp round-trips, the peg-in-hole
-// 1-DOF scenario, and align-flip. The full Python-vs-C++ parity lives in the
-// differential corpus harness (tools/mate_diff.py); this file just proves the
-// solver builds and behaves under MSVC.
+// C++ mate-solver behavior: rotation log/exp round-trips, peg-in-hole degrees
+// of freedom, align-flip, and persisted reference frames.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 

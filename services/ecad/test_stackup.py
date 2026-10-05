@@ -1,8 +1,8 @@
-"""Tests for the stackup advisor (services.ecad.stackup, T-FIN12).
+"""Tests for the stackup advisor (services.ecad.stackup).
 
-House style: plain main() + asserts, runnable as ``python -m engine.ecad.test_stackup``.
+House style: plain main() + asserts, runnable as ``python -m services.ecad.test_stackup``.
 
-REFERENCE VALIDATION (Definition of Done): the 4-layer 50R/100R solve is checked against the
+REFERENCE VALIDATION: the 4-layer 50R/100R solve is checked against the
 PUBLISHED JLCPCB JLC04161H-7628 controlled-impedance stackup:
 
   * Stackup layers/heights: https://jlcpcb.com/impedance — JLC04161H-7628: outer Cu 0.035 mm,
@@ -122,7 +122,7 @@ def test_apply_solution_wires_net_classes():
 
     # The C++ autoroute (core/ecad/autoroute.cpp) reads width/gap/via/clearance straight
     # from these net-class keys — assert the contract keys directly (its own ctest covers
-    # the reading; the oracle's private accessors were deleted with engine.ecad.autoroute).
+    # the reading).
     cls_se = board["net_classes"]["se_50"]
     cls_df = board["net_classes"]["diff_100"]
     assert cls_se["track_width"] == sol["geometries"]["se_50"]["track_width"]

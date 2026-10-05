@@ -27,11 +27,12 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
 
-from services.mcp.private_hostd import private_daemon
+from services.mcp import private_hostd
 
 # Opt OUT of the root conftest's in-process engine isolation. That fixture forces
 # CHUDWARE_ENGINE_DAEMON=0 for every other suite (no shared daemon can exist, so no
@@ -83,6 +84,16 @@ def _hermetic_config():
         agent_config._cfg_cache_mtime_ns = None
         shutil.rmtree(tmp, ignore_errors=True)
 
+@pytest.fixture(autouse=True)
+def _no_helper_model_process(monkeypatch, tmp_path):
+    """Empty config does not disable chud autodetection: refuse model processes.
+
+    Limit the pin to MCP tests so mixed agent/MCP runs cannot poison other suites'
+    process-free host doubles. Runtime tests explicitly inject their client factory.
+    """
+    monkeypatch.setenv("CHUDWARE_CHUDCODE_BIN", str(tmp_path / "no-model-runtime"))
+
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _private_engine_daemon(_hermetic_config):
@@ -105,15 +116,22 @@ def _private_engine_daemon(_hermetic_config):
     """
     import os
 
-    with private_daemon() as isolated:
+    with ExitStack() as stack:
+        # The private daemon and any workers it spawns inherit the same refusal.
+        # Restore the parent environment once spawned; each MCP test pins its own.
+        with pytest.MonkeyPatch.context() as env:
+            env.setenv("CHUDWARE_CHUDCODE_BIN",
+                       str(_hermetic_config.parent / "no-model-runtime"))
+            isolated = stack.enter_context(private_hostd.private_daemon())
         if not isolated and not os.environ.get("CHUDWARE_HOSTD_SOCKET") \
                 and os.environ.get("CHUDWARE_ENGINE_DAEMON") != "0":
             pytest.skip(
                 "services/mcp needs a PRIVATE chudware-hostd and one could not be "
-                "started, so this suite would otherwise attach to the user's live "
-                "daemon and deposit documents in their open app. Build the daemon "
-                "(./build.sh daemon, giving core/build-occt-linux/bin/chudware-hostd), "
-                "or set CHUDWARE_ENGINE_DAEMON=0 to accept in-process mode explicitly "
+                f"started ({private_hostd.last_failure}), so this suite would otherwise "
+                "attach to the user's live daemon and deposit documents in their open "
+                "app. Build the daemon (./build.sh daemon) or set CHUDWARE_HOSTD_BIN to "
+                "the chudware-hostd built beside the engine under test, or set "
+                "CHUDWARE_ENGINE_DAEMON=0 to accept in-process mode explicitly "
                 "(single shared document pool — expect order-dependent failures).",
                 allow_module_level=True)
         yield isolated

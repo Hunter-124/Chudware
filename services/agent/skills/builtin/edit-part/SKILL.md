@@ -22,7 +22,7 @@ How to model one solid part in Chudware. Prefer standard editable features over 
    - `describe_part` or `measure_part` on the affected geometry
    - `check_feature_overlap` after boolean-heavy work
 6. **Standard parts** — fasteners, bearings, inserts: `part_search(query)` then `part_place(part_id)`. Never approximate a catalog part.
-7. **Done gate** — `verify_battery` must show no FAILs before you report done (pass `doc_id` when multi-doc). See `cad_skill("edit-part", path="<file>")` resources and `cad_guide('verify')`.
+7. **Done gate** — `verify_battery` must show no FAILs before you report done (pass `doc_id` when multi-doc). See `cad_guide('verify')`.
 
 ## Rules
 

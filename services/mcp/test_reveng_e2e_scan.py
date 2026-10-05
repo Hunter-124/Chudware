@@ -5,7 +5,7 @@ Walks the honest scan pipeline (contracts/reveng.md §8):
     reveng_start_session -> reveng_add_images -> reveng_reconstruct (RE-17 DAG launcher)
     -> scale (RE-05 ArUco solver) -> reveng_build_parametric
 
-**Provisioning-aware.**  pycolmap / OpenMVS are NOT installed in this environment, so real
+**Provisioning-aware.**  Where pycolmap / OpenMVS are not installed, real
 reconstruction returns the honest ``backend_not_provisioned`` envelope.  The test therefore
 asserts two things that *do* hold here:
 
@@ -57,8 +57,6 @@ def _caps() -> dict:
 
 
 _CAPS = _caps()
-_HAS_RECON = bool(_CAPS.get("sparse") or _CAPS.get("dense"))
-_HAS_DENSE = bool(_CAPS.get("dense"))
 
 requires_backends = pytest.mark.skipif(
     not (_CAPS.get("sparse") and _CAPS.get("dense")),
@@ -100,6 +98,22 @@ def reveng_env(tmp_path, monkeypatch):
     # Import inside the env so the session-store helpers pick up CHUDWARE_REVENG_DIR.
     from services.mcp import reveng_tools as rt
     return rt
+
+
+@pytest.fixture
+def no_reconstruction_backends(monkeypatch):
+    """Exercise missing-backend behavior without launching installed native SfM."""
+    from services.mcp import reveng_common, reveng_build_tools, reveng_session_tools
+    from services.vision import colmap_pipeline, ffwd_sfm
+
+    unavailable = {"ok": True, "capabilities": {"sparse": False, "dense": False,
+                   "splat": False, "single_photo": False, "webcam": False, "gpu": False},
+                   "provisioning": {}, "banners": [], "missing": []}
+    for module in (reveng_common, reveng_build_tools, reveng_session_tools):
+        monkeypatch.setattr(module, "_reveng_status", lambda: unavailable)
+    monkeypatch.setattr(colmap_pipeline, "_import_pycolmap", lambda: None)
+    monkeypatch.setattr(ffwd_sfm, "_vggt_available", lambda: False)
+    monkeypatch.setattr(ffwd_sfm, "_mapanything_available", lambda: False)
 
 
 # A tiny recording MCP shim: reveng_tools registers @mcp.tool() functions; we capture
@@ -176,36 +190,37 @@ def test_session_and_capture(tools, fixture_dir, ground_truth):
     assert added["session"]["stages"]["capture"] == "done"
 
 
-def test_reconstruct_degrades_honestly(tools, fixture_dir):
+def test_reconstruct_degrades_honestly(tools, fixture_dir, no_reconstruction_backends):
     """reveng_reconstruct returns the honest backend_not_provisioned envelope here."""
     sid = _call(tools, "reveng_start_session", name="recon")["session_id"]
     _call(tools, "reveng_add_images", session_id=sid, dir=str(fixture_dir))
     res = _call(tools, "reveng_reconstruct", session_id=sid, quality="normal")
-    if _HAS_RECON:
-        assert res["ok"], res
-        assert "run_id" in res
-    else:
-        assert res["ok"] is False
-        assert res["reason"] == "backend_not_provisioned"
-        assert res.get("hint")  # actionable, not a traceback
+    assert res["ok"] is False
+    assert res["reason"] == "backend_not_provisioned"
+    assert res.get("hint")  # actionable, not a traceback
 
 
-def test_build_parametric_degrades_honestly(tools, fixture_dir):
+def test_build_parametric_degrades_honestly(tools, fixture_dir, no_reconstruction_backends):
     """reveng_build_parametric degrades honestly when no dense/mesh backend."""
     sid = _call(tools, "reveng_start_session", name="param")["session_id"]
     _call(tools, "reveng_add_images", session_id=sid, dir=str(fixture_dir))
     res = _call(tools, "reveng_build_parametric", session_id=sid)
-    if _HAS_DENSE:
-        assert res["ok"], res
-    else:
-        assert res["ok"] is False
-        assert res["reason"] == "backend_not_provisioned"
+    assert res["ok"] is False
+    assert res["reason"] == "backend_not_provisioned"
 
 
-def test_mission_partial_run_with_stage_events(reveng_env, tools, fixture_dir):
+def test_mission_partial_run_with_stage_events(reveng_env, tools, fixture_dir, no_reconstruction_backends):
     """A mission started with backends absent produces a clear PARTIAL run + stage events,
     not a hang.  This drives RE-17's DAG launcher directly (bypassing the provisioning
-    gate on the tool) to prove the executor degrades honestly and emits reveng events."""
+    gate on the tool) to prove the executor degrades honestly and emits reveng events.
+
+    Bypassing the gate means nothing stops the sparse node from running whatever SfM the
+    interpreter can import: with pycolmap provisioned it ran unbounded in-process native
+    reconstruction inside the test runner. Absence is therefore pinned at the backend
+    boundaries (``colmap_pipeline`` and the feed-forward weights probes), so this test
+    exercises the degradation path it names on every box. Provisioned reconstruction is
+    ``test_full_reconstruction_numbers``' job."""
+
     sid = _call(tools, "reveng_start_session", name="mission")["session_id"]
     _call(tools, "reveng_add_images", session_id=sid, dir=str(fixture_dir))
 

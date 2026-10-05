@@ -1,4 +1,4 @@
-"""Provision Renode for firmware emulation (engine_oracle/firmware).
+"""Provision Renode for native firmware emulation (core/firmware).
 
 Renode is MIT-licensed and driven as a **subprocess only** (never linked / vendored
 into the C++ core — contracts/licenses.md). Discovery is PATH-first; known install

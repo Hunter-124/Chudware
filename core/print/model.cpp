@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "manufacturing/result_registry.h"
+#include "util/sha256.h"
 
 namespace chudware::print {
 namespace {
@@ -397,7 +398,7 @@ bool valid_sha256(std::string_view value) {
     });
 }
 
-std::string sha256_bytes(std::string_view bytes) { return device::detail::sha256_hex(bytes); }
+std::string sha256_bytes(std::string_view bytes) { return util::sha256_hex(bytes); }
 
 void to_json(json& j, const Vec2& v) { j = {{"x", v.x}, {"y", v.y}}; }
 void from_json(const json& j, Vec2& v) { j.at("x").get_to(v.x); j.at("y").get_to(v.y); }

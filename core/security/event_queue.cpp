@@ -20,6 +20,7 @@ extern "C" {
 #include "util/tweetnacl.h"
 }
 #include "util/secret_store.h"
+#include "util/time_local.h"
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -153,11 +154,7 @@ std::string batchId() {
 std::string rfc3339Utc(std::int64_t seconds) {
     const std::time_t value = static_cast<std::time_t>(seconds);
     std::tm utc{};
-#if defined(_WIN32)
-    if (gmtime_s(&utc, &value) != 0) return {};
-#else
-    if (gmtime_r(&value, &utc) == nullptr) return {};
-#endif
+    if (!chudware::util::gmTime(value, utc)) return {};
     std::ostringstream out;
     out << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ");
     return out.str();

@@ -87,6 +87,11 @@ _monotonic = time.monotonic
 _CATALOG_REFRESH_SECONDS = 2 * 60 * 60.0
 _CATALOG_RETRY_SECONDS = 5 * 60.0
 _CATALOG_COMMAND_TIMEOUT_SECONDS = 90
+# One CAD helper model step (regen diagnosis, ECAD topology planning): a tool-free,
+# history-free completion. It is bounded on its own; it never bounds a conversation.
+_HELPER_TIMEOUT_SECONDS = 180.0
+# Cancel/deadline re-check interval while a helper completion runs.
+_HELPER_WAIT_SLICE_SECONDS = 0.5
 
 #: Chudcode builtins a CAD conversation uses. CAD's own tools arrive as host tools
 #: (set_custom_tools), which this list does not restrict. Memory tools are added per the
@@ -97,6 +102,14 @@ CAD_SESSION_TOOLS = (
 )
 
 _LOG = logging.getLogger(__name__)
+
+
+class HelperCompletionError(RuntimeError):
+    """A tool-free helper completion produced no usable text (cancelled, over budget,
+    model rejected, provider failure or runtime error). The message is the runtime's own
+    reason; callers report it rather than fabricating a model answer."""
+
+
 _BYOK_PROVIDER_ENV = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
@@ -415,6 +428,9 @@ class ChudcodeSessionHost:
         self._service_client: Any = None
         self._service_memory_backend: str | None = None
         self._service_lock = threading.Lock()
+        # Live tool-free helper processes (``complete_text``): disposable per call,
+        # tracked only so shutdown() stops them with everything else this worker owns.
+        self._helper_clients: set[Any] = set()
         self._shutdown = False
         self._catalog_refresh_lock = threading.Lock()
         self._catalog_refreshing = False
@@ -621,6 +637,39 @@ class ChudcodeSessionHost:
                 observed_contexts = _bind_host_call_observer(
                     params.get("host_tools"), observe_host_call
                 )
+                from services.agent.providers.chudcode_provider import ChudcodeProvider
+
+                helper_params = _client_launch_params(params)
+                helper_settings = dict(params.get("settings") or {})
+                for key in ("provider", "model", "thinking", "reasoning_effort",
+                            "auto_compaction", "auto_retry"):
+                    if key in params:
+                        helper_settings[key] = params[key]
+                helper_params["provider_session_id"] = session_id
+
+                def helper_runtime(role, *, cancel=None, timeout=None):
+                    # Preserve this caller's model/actor/OAuth scope, including nested
+                    # calls. Role defaults never override an explicit turn selection.
+                    def stopped():
+                        return run.cancel_requested or bool(callable(cancel) and cancel())
+
+                    inherited_settings = dict(helper_settings)
+                    for key in ("auto_compaction", "auto_retry"):
+                        value = getattr(session, key)
+                        if value is not None:
+                            inherited_settings.setdefault(key, value)
+                    return ChudcodeProvider(
+                        host=self,
+                        provider=helper_settings.get("provider"),
+                        model=helper_settings.get("model"),
+                        compaction_settings=dict(session.compaction_settings),
+                        runtime_params={**helper_params, "settings": inherited_settings},
+                        cancel=stopped,
+                        timeout=timeout,
+                    )
+
+                for context in observed_contexts:
+                    context["helper_runtime"] = helper_runtime
                 if params.get("interactive_questions"):
 
                     def emit_question_frame(frame: dict[str, Any]) -> None:
@@ -774,6 +823,7 @@ class ChudcodeSessionHost:
             for context in observed_contexts:
                 context.pop("host_call_observer", None)
                 context.pop("ask_human", None)
+                context.pop("helper_runtime", None)
             dispose = False
             with self._lock:
                 if session is not None:
@@ -1411,6 +1461,8 @@ class ChudcodeSessionHost:
             self._sessions.clear()
             self._service_client = None
             self._service_memory_backend = None
+            helpers = tuple(self._helper_clients)
+            self._helper_clients.clear()
             for session in sessions:
                 session.closed = True
                 session.dispose_started = True
@@ -1427,6 +1479,8 @@ class ChudcodeSessionHost:
             _stop_client(session.client)
         if service_client is not None:
             _stop_client(service_client)
+        for client in helpers:
+            _stop_client(client)
 
     def transient_call(self, command, params=None, emit=None) -> dict[str, Any]:
         """Run a bounded service-level command without creating a saved session."""
@@ -1456,6 +1510,195 @@ class ChudcodeSessionHost:
         if command_name not in _MEMORY_SHAPES:
             raise ValueError(f"unsupported agent-service memory command: {command_name!r}")
         return self.transient_call(command_name, params)
+
+    def complete_text(
+        self,
+        system: str,
+        prompt: str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        timeout: float = _HELPER_TIMEOUT_SECONDS,
+        cancel: Callable[[], bool] | None = None,
+        compaction_settings: Mapping[str, Any] | None = None,
+        runtime_params: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Run one private, tool-free, unsaved helper through compiled RPC v2.
+
+        Auth, provider requests and retry remain runtime-owned. The helper has a private
+        cwd, no tools/skills/rules, memory off and the selected compaction policy.
+        Explicit model rejection never substitutes a model. The positive helper budget
+        covers startup, selection and prompt; cancellation/shutdown disposes its process.
+        RPC startup/stop have their own bounded transport grace. No conversation is
+        created or capped; RPC v2 exposes no per-request output-token limit.
+        """
+        message = _nonempty_string(prompt)
+        if message is None:
+            raise ValueError("helper completion prompt is empty")
+        budget = _turn_budget_seconds(timeout)
+        if budget is None:
+            raise ValueError("helper completion requires a positive finite timeout")
+        provider_id = _nonempty_string(provider)
+        model_id = _nonempty_string(model)
+        if model_id and not provider_id and "/" in model_id:
+            provider_id, model_id = model_id.split("/", 1)
+        if bool(provider_id) != bool(model_id):
+            raise HelperCompletionError("helper completion model selection needs both provider and model")
+        if provider_id:
+            provider_id = _CHUDCODE_PROVIDER_ALIASES.get(provider_id, provider_id)
+        if cancel is not None and cancel():
+            raise HelperCompletionError("helper completion cancelled")
+        with self._lock:
+            if self._shutdown:
+                raise HelperCompletionError("agent service host is shut down")
+
+        client = None
+        registered = False
+        workdir = None
+        unsubscribe = None
+        credential_dir = None
+        worker = None
+        done = threading.Event()
+        outcome: dict[str, Any] = {}
+        deadline = _monotonic() + budget
+        try:
+            factory = self._rpc_factory()
+            binary = self._resolve_binary(required=self._client_factory is None)
+            if compaction_settings is None:
+                from services.agent.config import online_compaction_settings
+
+                _, compaction_settings = online_compaction_settings()
+            workdir = tempfile.TemporaryDirectory(prefix="chudware-helper-")
+            kwargs: dict[str, Any] = {
+                "tools": [],
+                "no_session": True,
+                "no_skills": True,
+                "no_rules": True,
+                "rpc_defaults": True,
+                "startup_timeout": min(30.0, budget),
+                "request_timeout": min(30.0, budget),
+                "cwd": workdir.name,
+            }
+            scoped_params = runtime_params or {}
+            provider_session_id = _nonempty_string(scoped_params.get("provider_session_id"))
+            if provider_session_id is not None:
+                kwargs["provider_session_id"] = provider_session_id
+            if _credential_scope(scoped_params) is not None:
+                credential_dir, _, clean_env = _credential_client_scope(
+                    scoped_params, workdir.name, None)
+                kwargs["env"] = clean_env
+            system_text = _nonempty_string(system)
+            if system_text is not None:
+                kwargs["append_system_prompt"] = system_text
+            if binary is not None:
+                kwargs["executable"] = binary
+                if not _binary_supports_flag(binary, "--config"):
+                    raise HelperCompletionError("helper runtime requires --config support")
+                overlay = _cad_session_overlay("off", compaction_settings)
+                if overlay is None:
+                    raise HelperCompletionError("helper runtime settings overlay unavailable")
+                extra = ("--no-lsp", "--config", overlay)
+                if _binary_supports_flag(binary, "--no-mcp"):
+                    extra += ("--no-mcp",)
+                kwargs["extra_args"] = extra
+            client = factory(**kwargs)
+            client._chudware_tempdir = credential_dir or workdir
+            # Serialize startup against shutdown: no client may spawn after shutdown
+            # has already disposed it. RpcClient.start has a bounded handshake timeout.
+            with self._lock:
+                if self._shutdown:
+                    raise HelperCompletionError("agent service host is shut down")
+                self._helper_clients.add(client)
+                registered = True
+                _start_client(client)
+
+            frames: deque[dict[str, Any]] = deque(maxlen=256)
+
+            def record(event: Any) -> None:
+                frame = _json_value(event)
+                if isinstance(frame, dict) and (
+                    frame.get("type") in _RETRY_FAILED_FRAMES
+                    or frame.get("type") in _ASSISTANT_OUTPUT_FRAMES
+                ):
+                    frames.append(frame)
+
+            unsubscribe = _register_listener(client, record)
+
+            def complete() -> None:
+                try:
+                    if provider_id and model_id:
+                        try:
+                            client.set_model(provider_id, model_id)
+                        except Exception as exc:
+                            raise HelperCompletionError(
+                                _describe_model_rejection(client, provider_id, model_id, exc)
+                            ) from exc
+                    settings = scoped_params.get("settings") or {}
+                    thinking = settings.get("reasoning_effort") or settings.get("thinking")
+                    if thinking and thinking != "auto":
+                        thinking = _catalog_effort(client, provider_id, model_id, thinking)
+                        if thinking:
+                            client.set_thinking_level(thinking)
+                    for key in ("auto_compaction", "auto_retry"):
+                        if isinstance(settings.get(key), bool):
+                            getattr(client, "set_" + key)(settings[key])
+                    remaining = deadline - _monotonic()
+                    if remaining <= 0 or (cancel is not None and cancel()):
+                        return
+                    turn = client.prompt_and_wait(message, timeout=remaining)
+                    failure = _unrecovered_provider_failure(frames)
+                    if failure is not None:
+                        raise HelperCompletionError(failure)
+                    text = turn.assistant_text
+                    if not isinstance(text, str) or not text.strip():
+                        raise HelperCompletionError("helper completion returned no assistant text")
+                    outcome["text"] = text
+                except Exception as exc:  # one failure class at the public boundary
+                    outcome["error"] = exc
+                finally:
+                    done.set()
+
+            worker = threading.Thread(target=complete, name="chudware-helper", daemon=True)
+            worker.start()
+            while True:
+                with self._lock:
+                    if self._shutdown:
+                        raise HelperCompletionError("agent service host is shut down")
+                if cancel is not None and cancel():
+                    raise HelperCompletionError("helper completion cancelled")
+                remaining = deadline - _monotonic()
+                if remaining <= 0:
+                    raise HelperCompletionError(
+                        f"helper completion exceeded its {budget:g} s budget"
+                    )
+                if done.wait(min(_HELPER_WAIT_SLICE_SECONDS, remaining)):
+                    if "error" in outcome:
+                        raise outcome["error"]
+                    if "text" in outcome:
+                        return outcome["text"]
+        except HelperCompletionError:
+            raise
+        except Exception as exc:  # setup, transport and protocol failures are honest result data
+            raise HelperCompletionError(f"{type(exc).__name__}: {exc}") from exc
+        finally:
+            if unsubscribe is not None:
+                try:
+                    unsubscribe()
+                except Exception as exc:
+                    _LOG.warning("Helper unsubscription failed (%s)", type(exc).__name__)
+            if client is not None:
+                with self._lock:
+                    owned = client in self._helper_clients
+                    self._helper_clients.discard(client)
+                    # Shutdown already owns clients removed from the registry.
+                    if owned or not registered:
+                        _stop_client(client)
+                if worker is not None:
+                    worker.join(timeout=5.0)
+            if credential_dir is not None:
+                credential_dir.cleanup()
+            if workdir is not None:
+                workdir.cleanup()
 
     def session_call(self, session_id, command, params=None, *, compaction_settings=None) -> dict[str, Any]:
         """Call one named live session; these calls never create or resume sessions."""
@@ -1696,6 +1939,19 @@ class ChudcodeSessionHost:
         victim.dispose_started = True
         return victim
 
+    def _rpc_factory(self) -> Any:
+        """The injected client factory, else the pinned ``chudcode_rpc.RpcClient``."""
+        if self._client_factory is not None:
+            return self._client_factory
+        try:
+            from chudcode_rpc import RpcClient  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "Agent service RPC support is unavailable; install the managed "
+                "chudcode-rpc==0.3.0 runtime dependency"
+            ) from exc
+        return RpcClient
+
     def _make_client(
         self,
         params: Mapping[str, Any],
@@ -1703,16 +1959,7 @@ class ChudcodeSessionHost:
         no_session: bool,
         resume_file: str | None = None,
     ) -> Any:
-        factory = self._client_factory
-        if factory is None:
-            try:
-                from chudcode_rpc import RpcClient  # type: ignore
-            except ImportError as exc:
-                raise RuntimeError(
-                    "Agent service RPC support is unavailable; install the managed "
-                    "chudcode-rpc==0.3.0 runtime dependency"
-                ) from exc
-            factory = RpcClient
+        factory = self._rpc_factory()
 
         binary = self._resolve_binary(required=self._client_factory is None)
         session_dir = _nonempty_string(params.get("chudcode_session_dir"))

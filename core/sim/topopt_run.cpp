@@ -1,12 +1,13 @@
 // Topology optimization native adapter — see sim/topopt_run.h.
 #include "sim/topopt_run.h"
 
-#include "device/device_id.h" // header-only streaming SHA-256
 #include "sim/progress.h"
 #include "sim/topopt_manufacturing.h"
 #include "sim/topopt_optimizer.h"
 #include "sim/topopt_reanalysis.h"
 #include "sim/topopt_surface.h"
+#include "util/sha256.h"
+#include "util/time_local.h"
 #include "version_info.h" // CHUDWARE_HOSTD_BUILD_ID
 
 #include <algorithm>
@@ -62,30 +63,16 @@ namespace {
 std::string utc_stamp(const char *format) {
   const std::time_t now = std::time(nullptr);
   std::tm parts{};
-#if defined(_WIN32)
-  gmtime_s(&parts, &now);
-#else
-  gmtime_r(&now, &parts);
-#endif
+  if (!chudware::util::gmTime(now, parts))
+    return std::string();
   char buf[40] = {0};
   if (std::strftime(buf, sizeof(buf), format, &parts) == 0)
     return std::string();
   return buf;
 }
 
-std::string hex_digest(device::detail::Sha256 &sha) {
-  const auto digest = sha.finish();
-  static constexpr char hex[] = "0123456789abcdef";
-  std::string out(64, '0');
-  for (std::size_t i = 0; i < digest.size(); ++i) {
-    out[2 * i] = hex[digest[i] >> 4];
-    out[2 * i + 1] = hex[digest[i] & 0x0f];
-  }
-  return out;
-}
-
 std::string sha256_text(std::string_view bytes) {
-  return device::detail::sha256_hex(bytes);
+  return util::sha256_hex(bytes);
 }
 
 // Canonical digest: nlohmann::json objects are key-sorted std::maps, so dump()
@@ -97,7 +84,7 @@ std::string sha256_file(const fs::path &path, std::uint64_t *bytes) {
   if (!f)
     refuse("source_unreadable",
            "cannot read " + path.string() + ": " + std::strerror(errno));
-  device::detail::Sha256 sha;
+  util::Sha256 sha;
   std::vector<std::uint8_t> buffer(1 << 20);
   std::uint64_t total = 0;
   for (;;) {
@@ -117,7 +104,7 @@ std::string sha256_file(const fs::path &path, std::uint64_t *bytes) {
   std::fclose(f);
   if (bytes)
     *bytes = total;
-  return hex_digest(sha);
+  return sha.finish_hex();
 }
 
 json to_array(const Eigen::VectorXd &v) {
@@ -2280,7 +2267,7 @@ nlohmann::json fea_run_topology(const nlohmann::json &study) {
     }
     json provenance = provenance_base(study);
     {
-      device::detail::Sha256 mesh_sha;
+      util::Sha256 mesh_sha;
       const auto &pts = prep.source_mesh->points;
       const auto &tets = prep.source_mesh->tets;
       mesh_sha.update(reinterpret_cast<const std::uint8_t *>(pts.data()),
@@ -2298,7 +2285,7 @@ nlohmann::json fea_run_topology(const nlohmann::json &study) {
           {"material", sha256_json(study["material"])},
           {"physics_setup", sha256_json(setup)},
           {"normalized_spec", artifacts["normalized_spec"]["sha256"]},
-          {"mesh", hex_digest(mesh_sha)}};
+          {"mesh", mesh_sha.finish_hex()}};
     }
     provenance["source"] = std::move(source);
     provenance["run_id"] = dir->run_id;

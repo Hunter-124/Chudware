@@ -64,7 +64,7 @@ run_fea_contact(fixtures, load, material, max_gap_mm, max_iterations, mesh_size_
   (tension-carrying) joints: run_fea_static with study bond_gap_mm — mutually exclusive.
 
 run_fea_frequency_response(fixtures, excitation_dir, sweep_hz, zeta, base_accel_g,
-  psd_breakpoints, vibration_spec, ...) — harmonic + random vibration response (T-BL17).
+  psd_breakpoints, vibration_spec, ...) — harmonic + random vibration response.
   Answers "does this part resonate and fail under the vibe spec", not just "what are its
   natural frequencies". Builds on run_fea_modal's modes via modal superposition:
     Harmonic: SDOF-per-mode transmissibility sweep → response acceleration (g) vs frequency
@@ -138,7 +138,7 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   forces on the selected component's mate faces and runs run_fea_static on it — "is this
   link strong enough at the worst instant" in one call. Conditions are `case`-labelled
   per frame; dry_run=True builds loads + envelope without solving.
-  ECAD → thermal FEA (LIVE, T-FIN16): ecad_thermal_handoff(environment='still_air'|
+  ECAD → thermal FEA (LIVE): ecad_thermal_handoff(environment='still_air'|
   'forced_air'|'cold_plate'|custom h/t_amb, include_trace_heating=…) takes the ACTIVE
   routed board to a solved board-level thermal study in one call — fused board+component
   FEA solid with the FR4/copper stackup HOMOGENIZED to one effective material (in-plane
@@ -151,11 +151,11 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   hand-calc cross-check at a GENEROUS tolerance (JEDEC theta_ja assumes a standard test
   board; minor power contributors get advisories, not pass/fail — neighbor heating is
   invisible to theta_ja). dry_run=True builds geometry + BCs + envelope without solving.
-  ECAD → CHT airflow (LIVE, T-FIN19, coupling ecad_to_cht): when the convection PRESETS
+  ECAD → CHT airflow (LIVE, coupling ecad_to_cht): when the convection PRESETS
   aren't enough (enclosures, fans), ecad_airflow_handoff(inlet_mps=…, inlet_temp_c=…,
   enclosure={"clearance_mm":10,"wall_mm":2}?) exports the board slab + every POWERED
   component as separate watertight STL solids and runs OpenFOAM chtMultiRegionFoam via
-  the T-SIM5 multi-solid seam (per-region volumetric heat sources; optional passive
+  the multi-solid CHT seam (per-region volumetric heat sources; optional passive
   4-wall enclosure duct open along the flow axis), mapping per-region mean/peak °C back
   to component refs. ecad_verify_airflow() then answers "was the film-coefficient
   assumption sane?" — a per-component preset-h vs CHT rise deviation table with
@@ -163,9 +163,9 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   Without OpenFOAM the handoff degrades honestly (skipped:true + full envelope) and
   offers the LBM wind tunnel as a qualitative-flow ADVISORY, clearly labeled
   NON-THERMAL. Budget: even the 'coarse' preset is minutes of meshing + solving.
-  ECAD → structural FEA (LIVE, T-FIN21): ecad_vibe_check(band_lo_hz=20, band_hi_hz=2000,
+  ECAD → structural FEA (LIVE): ecad_vibe_check(band_lo_hz=20, band_hi_hz=2000,
   psd_breakpoints=…, mount_holes=…) — vibration reliability screen of the mounted board:
-  reuses the T-FIN16 fused board+components solid with a mass-corrected effective
+  reuses the ecad_thermal_handoff fused board+components solid with a mass-corrected effective
   density (component masses from package dims x a mold-compound density assumption, or
   eng mass metadata), detects mounting holes (mounting-hole footprints / NPTH pads /
   large un-netted plated holes, or explicit mount_holes=[[x,y],…]) and fixes them, runs
@@ -177,7 +177,7 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   flat 0.04 g^2/Hz screening level (echoed as an assumption); pass the qualification
   spectrum for a spec-true screen. dry_run=True builds mounts + mass model + envelope
   without solving.
-  HEATSINK SELECTION (T-FIN17): heatsink_select(component_ref, tj_target_c |
+  HEATSINK SELECTION: heatsink_select(component_ref, tj_target_c |
   t_case_target_c) closes the "pick a heatsink" loop on the LAST ecad_thermal_handoff
   study. Candidates = curated parts-library heatsinks (part_search domain "thermal",
   datasheet-class theta_sa + mass + cost) PLUS a parametric plain-finned aluminum
@@ -197,7 +197,7 @@ CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   a flagged network estimate (Tj = Ta + P*(theta_jc + R_tim + R_sa)).
   Helper builders/validator: services/mcp/simhandoff.py.
 
-SYSTEM POWER BUDGET (aicad.powerbudget/1 — T-FIN23, tool: power_budget):
+SYSTEM POWER BUDGET (aicad.powerbudget/1, tool: power_budget):
   Bookkeeping (NOT SPICE) rail-tree energy budget composing three seams: an
   aicad.boardphys/1 sidecar (ecad_to_3d — per-component supply-rail currents, sequencing,
   optional PDN block from ecad_run_pdn) supplies the LOADS; an aicad.powerprofile/1
@@ -212,13 +212,14 @@ SYSTEM POWER BUDGET (aicad.powerbudget/1 — T-FIN23, tool: power_budget):
   number carries provenance. Also runs inside verify_battery as the 'power_budget'
   check (kwargs power_source / power_converters / board_path / power_profile_path).
 
-GOLDEN DEMO (T-FIN25 — living E2E worked example):
-  scripts/demo_sensor_node.py chains the full FIN surface on an STM32F4 sensor-node
-  board: verification ladder (ERC/DRC/hostcheck/sicheck/FPGA/PDN) → firmware project +
-  co-verify (fw_sim_run with fixture:i2c_temp_tmp103 when Renode is present) →
-  ecad_thermal_handoff → heatsink_select(U1, tj_target_c=85) → power_budget →
-  make_report. Wired into scripts/gate.sh as stage 4.7 (CHUDWARE_SKIP_FIN25=1 to opt out).
-  Narrative + artifacts: docs/FIN25_SENSOR_NODE_GOLDEN_DEMO.md. Prefer this script over
+GOLDEN DEMO (living E2E worked example):
+  scripts/demo_sensor_node.py chains the full board → firmware → thermal → power surface
+  on an STM32F4 sensor-node board: verification ladder (ERC/DRC/hostcheck/sicheck/FPGA/
+  PDN) → firmware project + co-verify (fw_sim_run with fixture:i2c_temp_tmp103 when
+  Renode is present) → ecad_thermal_handoff → heatsink_select(U1, tj_target_c=85) →
+  power_budget → make_report. Wired into scripts/gate.sh as stage 4.7
+  (CHUDWARE_SKIP_FIN25=1 to opt out). Narrative + artifacts:
+  docs/reference/FIN25_SENSOR_NODE_GOLDEN_DEMO.md. Prefer this script over
   inventing a new end-to-end recipe when demonstrating the content is finished.
 
 TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ribbon tab, and
@@ -375,12 +376,11 @@ TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ri
       a print gate, and nothing is sliced automatically. Slice the exported surface.stl with
       slice_part; only its passing G-code check makes a part print-ready.
 
-SIMULATE TAB (T-FIN24, host GUI): one multiphysics Simulate workspace hosts every live
+SIMULATE WORKSPACE (host GUI): one multiphysics Simulate workspace hosts every live
   study kind with progressive disclosure by open doc type, plus handoff actions
   (Send board to thermal FEA, Pick heatsink, …) driven by aicad.simhandoff/1. Worker
-  seam: engine_oracle/sim/multiphysics_rpc.py (sim_caps / sim_run_buckling /
-  sim_run_contact / sim_freq_response / ecad_thermal_handoff / heatsink_select /
-  piping_verify_cfd). EM forms wire the live EM backend; deeper EM solvers stay on
-  T-SIM11. Supersedes the deferred T-SIM10 host-path brief.
+  seam: services/sim/multiphysics_rpc.py (sim_caps / sim_run_contact /
+  sim_freq_response / ecad_thermal_handoff / heatsink_select / piping_verify_cfd).
+  EM forms drive the live EM backend.
 ```
 

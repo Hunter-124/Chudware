@@ -8,8 +8,9 @@ and print how many hits the adapter's parser extracted from that exact page —
 a fixture whose markup drifted past the parser is caught here, at refresh
 time, instead of silently in production.
 
-Dev-only: needs Playwright plus a saved browser profile per site
-(``browser_login('<site>')``). Captured HTML is intentionally gitignored.
+Dev-only: needs the explicitly provisioned browser backend selected by
+``services.browser.driver.headless_client`` and a user-owned saved site profile.
+Captured HTML is intentionally gitignored.
 
 Usage:
     python3 scripts/refresh_adapter_fixtures.py

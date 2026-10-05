@@ -1,13 +1,29 @@
 # Agent Design Pipeline — the guided design-thinking architecture
 
-**Status:** architecture of record (Hunter directive, 2026-07-05). This is the source of
-truth for how Chudware drives a design from intent to a coherent, verified model — especially
-on **local 24k–48k-context models**, while never choking frontier models (Opus/Sonnet).
-Workstream **DP** implements it (T-DP1…T-DP14). It refines, it does not replace, the existing
+**Original status (2026-07-05):** architecture of record (Hunter directive).
+The paragraphs below record the intended design pipeline, especially for local
+24k–48k-context models without choking frontier models (Opus/Sonnet).
+Workstream **DP** implemented the associated tasks (initially T-DP1…T-DP14).
+The original plan refines, rather than replaces, the existing
 phase machine (`services/agent/pipeline/phases.py`), role roster (`services/agent/roles/`),
 advisory layer (`contracts/advisor.md`), councils (`services/agent/councils.py`),
 buildgraph (`aicad.buildgraph/1`), delegation/routing (`aicad.delegation/1`), effort tiers
 (`aicad.effort/1`), mission workspace (`aicad.mission`), and PLM vault (`aicad.plm/1`).
+
+**Board status (2026-10-04):** adopted. `T-DP1` through `T-DP19` are all `status: done`
+(`work/tasks/done/`). The text below is the dated architecture intent, not an as-built spec.
+Later changes:
+
+- **§3.6 effort and auto-mode.** Superseded by the 2026-09-07 Copilot-preferences cutover
+  (`docs/REFACTOR_LOG.md`, "Copilot preferences and Auto resolver — overhaul Phases 0–1").
+  `services/agent/preferences.py` now owns Auto. The `ai_effort` preset API,
+  `effort_presets.yaml` and the gym preset tuner/scaffold selection were retired.
+  The log's intermediate `effort.py` task-evidence wrapper has since been removed;
+  use `preferences.py` rather than that obsolete path.
+- **Online model execution.** Since 2026-08-31, online model execution for pipeline roles
+  runs inside the embedded Chudcode RPC runtime. Stages, roles, councils and delegation
+  governance stay Chudware-owned
+  ([omp-integration/01-DECISIONS.md, 2026-08-31 section](../omp-integration/01-DECISIONS.md#2026-08-31--superseding-architecture-chudcode-rpc-is-the-only-online-runtime)).
 
 ---
 

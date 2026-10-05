@@ -11,10 +11,11 @@ Harness pattern copied from scripts/demo_sensor_node.py / bench_flight_computer.
 with actual wall-times. main() returns 0 when no FAIL (SKIP allowed).
 
 Simulation legs use the same MNA solver as ecad_simulate(backend='mna')
-(engine.sim.circuit.simulate). Behavioral B/S devices (4-pin VSWITCH, B-source
-current taper) are not expressible via the 2-pin library Switch symbol, so those
-circuits are built as structured SPICE and solved with the shared backend; a
-companion ecad_simulate call on a library-backed sense/rail schematic still
+(services.mcp.ecad_common._sim_run → the core sim_spice RPC). Behavioral B/S
+devices (4-pin VSWITCH, B-source current taper) are not expressible via the 2-pin
+library Switch symbol, so those circuits are built as structured SPICE and solved
+with the shared backend; a companion ecad_simulate call on a library-backed
+sense/rail schematic still
 exercises the MCP tool surface.
 
 Env:
@@ -59,7 +60,7 @@ I_OCP = 2.0         # over-current protect (A)
 R_SENSE = 0.05      # current-sense (ohm)
 V_OTP_REF = 1.0     # NTC divider ref; trip when Vdiv < ref (hot)
 
-# Library parts the pack must resolve (engine.ecad.library.starter).
+# Library parts the pack must resolve (services.ecad.library starter symbols).
 REQUIRED_PARTS: list[tuple[str, str]] = [
     ("Battery_Management:MCP73831", "MCP73831"),
     ("Battery_Management:SwitchingCharger_SOP8", "SwitchingCharger"),
@@ -327,8 +328,13 @@ def build_sense_sim_schematic(tools: dict, name: str = "bc_sense_sim") -> str:
 
 def _mna_simulate(circuit: dict, study: dict) -> dict:
     """Run the shared MNA backend (same as ecad_simulate backend='mna')."""
-    from engine.sim.circuit import simulate as sim_run
-    return sim_run(circuit, study, backend="mna")
+    from services.mcp.ecad_common import _sim_run
+    result = _sim_run(circuit, study, backend="mna")
+    for analysis in study["analyses"]:
+        kind = analysis["type"]
+        if not result.get("convergence", {}).get(kind):
+            raise RuntimeError(f"MNA {kind} did not converge: {result}")
+    return result
 
 
 def _dc_trip(x: list, y: list, *, high_to_low: bool = True,
@@ -408,7 +414,7 @@ def _charger_power_profile(duty: float = 0.5) -> dict:
 
 CHARGE_SM_C = r'''/* Battery charge state machine — B2 bench firmware.
  * States: PRECHARGE -> CC -> CV -> DONE; any safety trip -> FAULT.
- * Bare-metal (no newlib printf/sbrk): bit-bang USART1 DR so the template
+ * Bare-metal (no newlib printf/sbrk): poll USART1 DR so the template
  * links with the stock cmake_arm linker script.
  * Safety: ADC1 DR stub samples — low counts = OTP, high = OVP.
  */
@@ -418,6 +424,7 @@ CHARGE_SM_C = r'''/* Battery charge state machine — B2 bench firmware.
 #define USART1_BASE 0x40011000u
 #define USART_SR  (*(volatile uint32_t *)(USART1_BASE + 0x00u))
 #define USART_DR  (*(volatile uint32_t *)(USART1_BASE + 0x04u))
+#define USART_BRR (*(volatile uint32_t *)(USART1_BASE + 0x08u))
 #define USART_CR1 (*(volatile uint32_t *)(USART1_BASE + 0x0Cu))
 #define USART_TXE (1u << 7)
 #define USART_UE  (1u << 13)
@@ -425,7 +432,7 @@ CHARGE_SM_C = r'''/* Battery charge state machine — B2 bench firmware.
 
 #define GPIO_BASE   0x40020000u
 #define GPIO_ODR    (*(volatile uint32_t *)(GPIO_BASE + 0x14u))
-/* ADC1 stub window (engine.firmware.scenario STM32F4 map) */
+/* ADC1 stub window (core/firmware/scenario.cpp STM32F4 map) */
 #define ADC1_BASE   0x40012000u
 #define ADC1_SR     (*(volatile uint32_t *)(ADC1_BASE + 0x00u))
 #define ADC1_DR     (*(volatile uint32_t *)(ADC1_BASE + 0x4Cu))
@@ -484,13 +491,19 @@ static void set_state(charge_state_t st)
 
 static void enter_fault(const char *tag)
 {
+    /* A latched fault is one transition, not a UART message on every ADC poll. */
+    if (g_state == ST_FAULT) {
+        return;
+    }
     uart_puts(tag);
     set_state(ST_FAULT);
+    uart_puts("FAULT_HOLD\r\n");
 }
 
 int main(void)
 {
-    /* Enable USART1 transmitter (Renode model ignores baud). */
+    /* 115200 baud from the STM32F4 reset 16MHz HSI peripheral clock. */
+    USART_BRR = (16000000u + 115200u / 2u) / 115200u;
     USART_CR1 = USART_UE | USART_TE;
     set_state(ST_PRECHARGE);
     uart_puts("CHG_SM_BOOT\r\n");
@@ -517,7 +530,6 @@ int main(void)
             __asm__ volatile("nop");
         }
         if (g_state == ST_FAULT) {
-            uart_puts("FAULT_HOLD\r\n");
             for (volatile uint32_t d = 0; d < 20000u; ++d) {
                 __asm__ volatile("nop");
             }
@@ -610,7 +622,7 @@ def main() -> int:
     def leg_parts(leg: Leg) -> None:
         resolved: dict[str, Any] = {}
         missing: list[str] = []
-        from engine.ecad import library as lib
+        from services.ecad import library as lib
         for libid, query in REQUIRED_PARTS:
             r = _call(tools, "ecad_find_part", query=query, limit=10)
             hits = r.get("hits") or []
@@ -653,7 +665,7 @@ def main() -> int:
         if n_comp < 12:
             leg.fail(f"expected >=12 components, got {n_comp}")
             return
-        from engine.ecad import session as ecad_session
+        from services.mcp.ecad_common import ecad_session
         sch_path = OUT_DIR / "battery_charger_sch.json"
         sch_path.write_text(
             json.dumps(ecad_session.get_session(sid).doc, indent=2),
@@ -690,7 +702,7 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             leg.fail(f"MNA CC-CV simulate raised: {exc}")
             return
-        if not (res.get("convergence") or {}).get("tran", True):
+        if not (res.get("convergence") or {}).get("tran"):
             leg.fail(f"CC-CV tran did not converge: {res.get('log')}")
             return
         tr = (res.get("tran") or {}).get("traces") or {}
@@ -713,6 +725,9 @@ def main() -> int:
             "ok": mcp.get("ok"), "converged": mcp.get("converged"),
             "error": mcp.get("error"), "device_count": mcp.get("device_count"),
         }
+        if not mcp.get("ok") or not mcp.get("converged"):
+            leg.fail(f"companion ecad_simulate OP failed: {mcp}")
+            return
         art = {
             "v_end": v_end, "v_max": v_max, "i_early": i_early, "i_late": i_late,
             "V_CV": V_CV, "I_CC": I_CC, "mcp_op": state["sim_charge_mcp"],
@@ -808,6 +823,9 @@ def main() -> int:
                                 "converged": mcp.get("converged"),
                                 "error": mcp.get("error"),
                                 "analysis": mcp.get("analysis")}
+        if not mcp.get("ok") or not mcp.get("converged"):
+            leg.fail(f"companion ecad_simulate DC failed: {mcp}")
+            return
         leg.pass_(
             f"LVD disconnect ok: Vload(<{V_LVD})={v_lo:.3f} "
             f"Vload(>{V_LVD})={v_hi:.3f} connect@={connect}; "
@@ -977,9 +995,10 @@ def main() -> int:
         if placed < 8:
             leg.fail(f"placed={placed} (<8)")
             return
-        from engine.ecad import session as ecad_session
+        from services.mcp.ecad_common import ecad_session
         board_path = OUT_DIR / "battery_charger_board.json"
-        board_doc = ecad_session.get_session(bid).doc
+        board_sess = ecad_session.get_session(bid)
+        board_doc = board_sess.doc
         # board_from_schematic sometimes leaves outline empty — thermal needs Edge.Cuts.
         board_doc["outline"] = _ensure_board_outline(board_doc)
         n_wide = _widen_power_tracks(board_doc, min_width=0.5)
@@ -997,6 +1016,10 @@ def main() -> int:
                 eng.setdefault("theta_c_per_w", {"ja": 80.0, "jc": 15.0})
                 eng.setdefault("limits_c", {"tj_max": 150.0, "ta_max": 85.0})
                 fp["eng_overrides"] = eng
+        # The board lives in the C++ core: write the edits back so DRC, impedance and
+        # the thermal handoff below read the same document this JSON records.
+        ecad_session.swap_doc(board_sess, board_doc)
+        board_doc = board_sess.doc
         board_path.write_text(json.dumps(board_doc, indent=2), encoding="utf-8")
         state["board_path"] = str(board_path)
 
@@ -1054,9 +1077,12 @@ def main() -> int:
             leg.skip("build123d not installed — FEA solid path unavailable")
             return
         # Re-assert outline on the live session (board leg already wrote it).
-        from engine.ecad import session as ecad_session
-        doc = ecad_session.get_session(bid).doc
-        doc["outline"] = _ensure_board_outline(doc)
+        from services.mcp.ecad_common import ecad_session
+        sess = ecad_session.get_session(bid)
+        outline = _ensure_board_outline(sess.doc)
+        if outline != sess.doc.get("outline"):
+            doc = dict(sess.doc, outline=outline)
+            ecad_session.swap_doc(sess, doc)
         r = _call(tools, "ecad_thermal_handoff", doc_id=bid,
                   dry_run=True, mesh_fineness=0.3,
                   path=str(OUT_DIR / "charger_fea.step"))
@@ -1118,14 +1144,17 @@ def main() -> int:
             return
         state["fw_project_id"] = pid
 
-        from engine.firmware import project as fw_project
-        proj = fw_project.load(pid)
-        main_c = proj.root_dir / "src" / "main.c"
-        main_c.write_text(CHARGE_SM_C, encoding="utf-8")
-        _call(tools, "fw_sources", project_id=pid, add=["src/main.c"])
+        w = _call(tools, "fw_sources", project_id=pid,
+                  write={"src/main.c": CHARGE_SM_C})
+        root = w.get("root_dir")
+        if w.get("error") or not root or not any(
+                entry.get("path") == "src/main.c" for entry in w.get("written", [])):
+            leg.fail(f"fw_sources write failed: {w.get('error') or w}")
+            return
+        root_dir = Path(root)
 
         # Ensure linker provides `end` for any residual newlib; bare SM avoids sbrk.
-        ld = proj.root_dir / "linker.ld"
+        ld = root_dir / "linker.ld"
         if ld.is_file():
             txt = ld.read_text(encoding="utf-8")
             if "PROVIDE(end" not in txt and "end =" not in txt:
@@ -1143,15 +1172,8 @@ def main() -> int:
         stderr = str(b.get("stderr") or "")
         detail = (f"project={pid}; fw_build success={b.get('success')} "
                   f"rc={rc} err={stderr[-200:]}")
-        if rc == -1 or "not found" in stderr.lower():
-            leg.warn(detail + " (cross-toolchain may be absent)",
-                     artifact={"project": r, "build": b})
-            return
-        # SM source is on disk even if link fails — WARN not PASS without ELF.
-        if main_c.is_file() and "STATE:FAULT" in main_c.read_text(encoding="utf-8"):
-            leg.warn(detail + "; SM source written, no ELF",
-                     artifact={"project": r, "build": b,
-                               "main_c": str(main_c)})
+        if rc == -1 and "toolchain_not_found:" in stderr:
+            leg.skip(detail + " (external cross-toolchain unavailable)")
             return
         leg.fail(detail)
 
@@ -1196,21 +1218,28 @@ def main() -> int:
             "ok": sc_tool.get("ok"), "n_tracks": sc_tool.get("n_tracks"),
             "error": sc_tool.get("error"), "devices": sc_tool.get("devices"),
         }
+        if sc_tool.get("error") or sc_tool.get("n_tracks") != 1:
+            leg.fail(f"fw_sensor_scenario failed: {sc_tool}")
+            return
         (OUT_DIR / "safety_scenario.json").write_text(
             json.dumps({"adc_safety": scenario,
                         "sensor_tool": state["fw_sensor_scenario"]},
                        indent=2), encoding="utf-8")
 
         if not pid:
-            leg.skip("no fw project")
+            leg.fail("no fw project")
             return
         if not (b.get("success") and elf):
-            leg.skip(f"no ELF for sim (build success={b.get('success')})")
+            firmware_leg = next(l for l in LEGS if l.name == "firmware")
+            if firmware_leg.status == "SKIP":
+                leg.skip(firmware_leg.detail)
+            else:
+                leg.fail(f"no ELF for safety simulation: {b}")
             return
 
         t0 = time.time()
         s = _call(tools, "fw_sim_run", project_id=pid, elf_path=elf,
-                  scenario=json.dumps(scenario),
+                  scenario=json.dumps(scenario), timeout_s=SIM_BUDGET_S,
                   assertions=["uart:FAULT", "uart:STATE:FAULT"])
         sim_ms = int((time.time() - t0) * 1000)
         state["fw_sim"] = s
@@ -1222,22 +1251,10 @@ def main() -> int:
                "error": s.get("error")}
 
         if sim_ms > SIM_BUDGET_S * 1000:
-            leg.skip(f"sim wall {sim_ms}ms > budget {SIM_BUDGET_S}s")
+            leg.fail(f"sim wall {sim_ms}ms > budget {SIM_BUDGET_S}s")
             return
         if s.get("skipped") or "not installed" in uart.lower():
             leg.skip(f"emulator unavailable: {uart[:120]}")
-            return
-        # Integration bug: Renode 1.16.1 cannot resolve I2C.STM32F1_I2C in
-        # engine/firmware/templates/renode_platforms/stm32f4_discovery.repl (E04).
-        if ("could not resolve type" in uart.lower()
-                or "stm32f1_i2c" in uart.lower()
-                or "error e0" in uart.lower()
-                or ("loadplatformdescription" in uart.lower()
-                    and "error" in uart.lower())):
-            leg.skip(
-                "Renode platform load failed (I2C.STM32F1_I2C unresolved in "
-                "stm32f4_discovery.repl on Renode 1.16.1) — integration bug; "
-                f"uart={uart[:160]}")
             return
         if "renode" in uart.lower() and s.get("passed") is False and (
                 "not found" in uart.lower() or "not installed" in uart.lower()
@@ -1247,7 +1264,7 @@ def main() -> int:
         # Assert firmware entered FAULT
         fault_seen = ("STATE:FAULT" in uart) or ("FAULT:OTP" in uart) \
             or ("FAULT:OVP" in uart) or ("FAULT" in uart)
-        if s.get("passed") or fault_seen:
+        if s.get("passed") and fault_seen:
             leg.pass_(f"safety-in-loop FAULT ok ({sim_ms} ms); "
                       f"uart_has_FAULT={fault_seen} passed={s.get('passed')}",
                       artifact=art)
@@ -1256,7 +1273,7 @@ def main() -> int:
             # Ran but did not hit FAULT — real defect
             leg.fail(f"sim ran but FAULT not observed; uart={uart[:200]}")
             return
-        leg.skip(f"sim unavailable: {s.get('error') or uart[:100]}")
+        leg.fail(f"fw_sim_run failed: {s.get('error') or uart[:100]}")
 
     run_leg("safety_loop", leg_safety_loop)
 

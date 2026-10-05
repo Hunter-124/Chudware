@@ -3,6 +3,7 @@
 #include "manufacturing/gateway/transport_serial.h"
 #include "manufacturing/gateway/transport_tcp.h"
 #include "manufacturing/gateway/transport_ws.h"
+#include "util/sha256.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1552,7 +1553,7 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
                              {"terminal", true}, {"raw", terminal_state}});
                 const std::string attention_id =
                     "attention:printer:" +
-                    device::detail::sha256_hex(device_id_.str() + affected_run +
+                    util::sha256_hex(device_id_.str() + affected_run +
                                                terminal_state).substr(0, 16);
                 json attention{{"action", "raised"}, {"id", attention_id},
                                {"severity", "critical"}, {"device", device_id_.str()},
@@ -1666,12 +1667,12 @@ LaneRpcResult ManufacturingLane::route(std::string_view method, const json& para
         }
         if (content.empty()) return refuse("mfg_artifact_empty", "artifact content is empty");
         artifact.bytes = content.size();
-        artifact.hash_sha256 = device::detail::sha256_hex(content);
+        artifact.hash_sha256 = util::sha256_hex(content);
         if (input.contains("hash_sha256") && input.at("hash_sha256") != artifact.hash_sha256)
             return refuse("mfg_artifact_hash_mismatch", "caller hash does not match artifact bytes");
         artifact.post_profile_id = input.value("post_profile_id", "emulator-default");
         artifact.post_profile_hash = input.value("post_profile_hash",
-                                                 device::detail::sha256_hex("emulator-default"));
+                                                 util::sha256_hex("emulator-default"));
         artifact.slicer_profile_hash = input.value("slicer_profile_hash", std::string{});
         const auto expected = journal_.head() + 1;
         artifact.seq = expected;

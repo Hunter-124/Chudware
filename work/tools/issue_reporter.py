@@ -100,7 +100,7 @@ def run_claude_elaborate(draft, extra_context="", timeout=180):
 
 def submit_report(final):
     """Blocking — call from a worker thread. Files GH issue + backlog task + DAG
-    regen + team broadcast. Returns (summary_text, task_id, issue_url_or_None)."""
+    regen. Returns (summary_text, task_id, issue_url_or_None)."""
     lines = []
     body = "\n".join([
         final.get("description_full") or "",
@@ -163,14 +163,6 @@ Suggested workstream: {ws} (AI guess — human should confirm before scheduling)
                           capture_output=True, text=True, timeout=30)
     lines.append("DAG regenerated." if dag.returncode == 0
                  else f"DAG regen warning: {dag.stderr.strip()}")
-
-    msg = (f"New issue filed: {tid} \"{final['title']}\" "
-           f"({issue_url or 'no gh'}) — check before starting overlapping work")
-    sync = subprocess.run([PY, str(TOOLS_DIR / "teamsync.py"), "send",
-                           "--agent", "issue-reporter", "--text", msg],
-                          cwd=str(REPO), capture_output=True, text=True, timeout=30)
-    lines.append("Team notified." if sync.returncode == 0
-                 else f"Team notify warning: {sync.stderr.strip()}")
 
     return "\n".join(lines), tid, issue_url
 

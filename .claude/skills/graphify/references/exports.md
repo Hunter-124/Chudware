@@ -1,87 +1,48 @@
-# graphify reference: extra exports and benchmark
+# graphify reference: exports, tree, benchmark and MCP
 
-Load this when the user passed one of the export flags (`--wiki`, `--neo4j`, `--neo4j-push`, `--falkordb`, `--falkordb-push`, `--svg`, `--graphml`, `--mcp`), or when the corpus is large enough for the token-reduction benchmark. Each step runs only for its own flag.
+These are operations on an existing graph, not `extract` flags. Slash-command export flags in SKILL.md map to the commands below. Run only requested exports, from the directory containing `graphify-out/`; they never require re-extraction. Keep `.graphify_labels.json` and `.graphify_analysis.json` as durable sidecars.
 
-### Step 6b - Wiki (only if --wiki flag)
-
-**Only run this step if `--wiki` was explicitly given in the original command.**
-
-Run this before Step 9 (cleanup) so `.graphify_labels.json` is still available.
+## File exports
 
 ```bash
-graphify export wiki
+graphify export html                         # graph.html; warn above 5,000 nodes
+graphify export html --node-limit 5000       # aggregate a larger graph
+graphify export obsidian                     # graphify-out/obsidian/
+graphify export obsidian --dir /absolute/vault/path
+graphify export wiki                         # requires nonempty .graphify_analysis.json
+graphify export svg
+graphify export graphml
+graphify export neo4j                        # local Cypher artifact
+graphify export falkordb                     # local Cypher artifact
+graphify export callflow-html                # structural callflow report, not runtime trace
+graphify tree                               # collapsible tree HTML
 ```
 
-### Step 7 - Neo4j export (only if --neo4j or --neo4j-push flag)
+Exports accept `--graph PATH`; label-aware exports also accept `--labels PATH`. `tree` accepts `--graph PATH` and `--output HTML`. For a missing wiki analysis sidecar, `graphify cluster-only . --no-label --no-viz` regenerates community data without provider calls. Do not automatically recluster a read-only query to repair an export. Neo4j and FalkorDB use the same `cypher.txt` filename: preserve separate destinations if both artifacts are requested.
 
-**If `--neo4j`** - generate a Cypher file for manual import:
+## Database pushes (explicit request only)
 
-```bash
-graphify export neo4j
-```
-
-**If `--neo4j-push <uri>`** - push directly to a running Neo4j instance. Ask the user for credentials if not provided:
+A push transmits graph contents and mutates an external database. Confirm the user-selected destination; never push as part of a local export or question. Use already configured environment credentials, not literal passwords in argv or chat:
 
 ```bash
-graphify export neo4j --push bolt://localhost:7687 --user neo4j --password PASSWORD
-```
-
-Default URI is `bolt://localhost:7687`, default user is `neo4j`. Uses MERGE - safe to re-run without creating duplicates.
-
-### Step 7a - FalkorDB export (only if --falkordb or --falkordb-push flag)
-
-**If `--falkordb`** - generate a Cypher file. The statements are OpenCypher, but FalkorDB's `GRAPH.QUERY` runs one statement at a time (no bulk script import like Neo4j's `cypher-shell`), so prefer `--falkordb-push` to load a graph. Use this only when you want the portable `cypher.txt` artifact:
-
-```bash
-graphify export falkordb
-```
-
-**If `--falkordb-push <uri>`** - push directly to a running FalkorDB instance. Credentials are optional; ask the user only if the instance requires auth:
-
-```bash
+graphify export neo4j --push bolt://localhost:7687 --user neo4j
 graphify export falkordb --push falkordb://localhost:6379
 ```
 
-Default URI is `falkordb://localhost:6379` (the scheme is informational - `redis://` or a bare `host:port` work too), auth is optional, and the target graph defaults to `graphify`. Uses MERGE - safe to re-run without creating duplicates.
+The installed exporter reads `NEO4J_PASSWORD` or `FALKORDB_PASSWORD`. Do not read, print or request those values. If authentication is unavailable, deliver the local Cypher artifact instead. `MERGE` avoids duplicate identities on repeat pushes; it does not promise deletion reconciliation or a transaction-free overwrite. FalkorDB runs one OpenCypher statement at a time rather than importing a whole script with `cypher-shell`.
 
-### Step 7b - SVG export (only if --svg flag)
-
-```bash
-graphify export svg
-```
-
-### Step 7c - GraphML export (only if --graphml flag)
+## MCP server (explicit request only)
 
 ```bash
-graphify export graphml
+"$(cat graphify-out/.graphify_python)" -m graphify.serve graphify-out/graph.json
 ```
 
-### Step 7d - MCP server (only if --mcp flag)
+This starts a long-lived stdio server, not an export file. Use the installed graphify interpreter; system Python may not import a uv-tool package. For client configuration, supply that interpreter's absolute path as `command` and `[-m, graphify.serve, /absolute/path/to/graphify-out/graph.json]` as separate string arguments. Clients do not evaluate `$(...)`. Do not silently modify client settings or replace an existing server. The server includes `query_graph`, `get_node`, `get_neighbors`, `get_community`, `god_nodes`, `graph_stats` and `shortest_path`; use its advertised tool schema rather than assuming this list is exhaustive.
 
-```bash
-$(cat graphify-out/.graphify_python) -m graphify.serve graphify-out/graph.json
-```
-
-This starts a stdio MCP server that exposes tools: `query_graph`, `get_node`, `get_neighbors`, `get_community`, `god_nodes`, `graph_stats`, `shortest_path`. Add to Claude Desktop or any MCP-compatible agent orchestrator so other agents can query the graph live.
-
-To configure in Claude Desktop, add to `claude_desktop_config.json`. Claude Desktop can't run `$(...)`, and under `uv tool install` the system `python3` can't import graphify — so set `command` to the **absolute interpreter path** printed by `cat graphify-out/.graphify_python`:
-```json
-{
-  "mcpServers": {
-    "graphify": {
-      "command": "<absolute path from: cat graphify-out/.graphify_python>",
-      "args": ["-m", "graphify.serve", "/absolute/path/to/graphify-out/graph.json"]
-    }
-  }
-}
-```
-
-### Step 8 - Token reduction benchmark (only if total_words > 5000)
-
-If `total_words` from `graphify-out/.graphify_detect.json` is greater than 5,000, run:
+## Benchmark
 
 ```bash
 graphify benchmark
 ```
 
-Print the output directly in chat. If `total_words <= 5000`, skip silently - the graph value is structural clarity, not token compression, for small corpora.
+When requested, or after a build whose detected `total_words` exceeds 5,000, report the command's actual output. Token-reduction estimates are not measured downstream LLM savings. Small corpora need no automatic benchmark.

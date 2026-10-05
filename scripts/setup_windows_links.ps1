@@ -1,24 +1,25 @@
 <#
 .SYNOPSIS
-  Make the repo's compat symlinks work on Windows by replacing them with directory junctions.
+  Replace any git-tracked symlinks with directory junctions on a Windows checkout.
 
 .DESCRIPTION
-  The repo exposes short top-level names via git symlinks (engine->engine_oracle,
-  agent->services/agent, dag->services/dag, corpus->corpora/sketch, ...). On a Windows
-  checkout with core.symlinks=false these are committed as 13-byte TEXT FILES, not
-  directories, which breaks `import engine.x`, `python -m engine.x` subprocesses, and file
-  access under corpus/ etc.
+  The repository currently tracks no symlinks (mode 120000): Python packages and fixture
+  corpora are referenced by their canonical services/... and corpora/... paths, so a default
+  Windows checkout needs no junction setup and this script reports "nothing to do".
+  CI and scripts/build_windows.ps1 still run it as a guard: should a tracked symlink ever be
+  reintroduced, a checkout with core.symlinks=false would materialize it as a small TEXT
+  FILE rather than a directory, breaking imports and data paths that traverse it.
 
-  This script replaces each with a real NTFS directory JUNCTION (mklink /J) — no admin /
-  Developer Mode required — so imports, subprocesses, and data paths all work like Linux.
-  Each path is marked skip-worktree so the junction doesn't show up as a git change.
+  This script reads every mode-120000 entry from the index and replaces each with a real
+  NTFS directory JUNCTION (mklink /J) — no admin / Developer Mode required. Each path is
+  marked skip-worktree so the junction doesn't show up as a git change.
 
   Idempotent: re-running only fixes entries that aren't already correct junctions.
 
 .NOTES
   To undo:  git update-index --no-skip-worktree <name>; git checkout -- <name>
-  See docs/BUILD_WINDOWS.md (T-G11). Alternative: `git config core.symlinks true` +
-  Windows Developer Mode, then re-clone.
+  See docs/reference/BUILD_WINDOWS.md ("Checkout portability"). Alternative:
+  `git config core.symlinks true` + Windows Developer Mode, then re-clone.
 #>
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path

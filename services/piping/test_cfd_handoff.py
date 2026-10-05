@@ -7,9 +7,9 @@ Test groups:
   4. MCP tool smoke test (piping_internal_volume, piping_cfd_handoff, piping_verify_cfd).
 
 Run from repo root:
-    python -m engine.piping.test_cfd_handoff
+    python -m services.piping.test_cfd_handoff
     # or via pytest:
-    ~/.local/share/Chudware/mcp-venv/bin/pytest engine/piping/test_cfd_handoff.py -q
+    python -m pytest services/piping/test_cfd_handoff.py -q
 """
 
 from __future__ import annotations

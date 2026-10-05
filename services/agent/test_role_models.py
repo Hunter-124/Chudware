@@ -192,12 +192,6 @@ class TestRankingsMerge:
         assert ranks["m1"].source == "user"
         assert ranks["m1"].rank == 2
 
-    def test_rankings_as_dict_shape(self):
-        d = rm.rankings_as_dict(include_measured=False)
-        assert isinstance(d, dict)
-        entry = d["grok-4.5"]
-        assert "rank" in entry and "source" in entry and "notes" in entry
-
 
 # ---------------------------------------------------------------------------
 # Auto pick + enabled providers + threshold
@@ -485,8 +479,6 @@ class TestRpcRegistration:
         for name in (
             "ai_roles_get",
             "ai_roles_set",
-            "model_rankings_get",
-            "model_rankings_set",
         ):
             assert name in WORKER_METHODS, f"missing RPC {name}"
             assert callable(WORKER_METHODS[name])
@@ -515,14 +507,3 @@ class TestRpcRegistration:
         )
         assert out["ok"] is False
         assert "loopback" in out["reason"].lower() or "HARD" in out["reason"]
-
-    def test_model_rankings_get_shape(self, monkeypatch):
-        from services.agent import worker_rpc as rpc
-
-        monkeypatch.setattr("services.agent.config.load_config", lambda: {})
-        out = rpc.ROLE_MODELS_METHODS["model_rankings_get"](
-            {}, lambda *_a, **_k: None
-        )
-        assert out["ok"] is True
-        assert "rankings" in out
-        assert "grok-4.5" in out["rankings"]

@@ -1,3 +1,8 @@
+> **HISTORICAL — do not paste.** This is the 2026-07-03 multi-agent fleet handoff (Fable
+> foreman + drivers, worktrees, board claiming). That workflow is retired: the board is now
+> solo, with no foreman, claim step or worktrees (`work/WORKFLOW.md`). The board state and
+> files referenced below (e.g. `work/prompts/FOREMAN.md`, since removed) describe that date only.
+
 # Session handoff prompts — post-T-G12-round-1 sprint (updated 2026-07-03, late)
 
 Copy/paste these to relaunch the fleet. One Fable foreman + N drivers. Fable runs

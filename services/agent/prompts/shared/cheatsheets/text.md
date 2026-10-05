@@ -73,7 +73,3 @@ COMMON MISTAKES:
    fall back to "unmarked". Use depth ≈ 0.3–2 mm with a sensible height.
 3. mode defaults to "engrave" (recessed). Pass mode:"emboss" for raised lettering.
 4. A failed mark is NOT an error — it warns and leaves the clean part. That is by design.
-
-Confirmed against: validate.cpp FEATURE_TYPES `text` entry, document.cpp text handler,
-geom/text.cpp (emboss_text + resolve_font_path), and test_document.cpp case 13
-(engrave + emboss on a box top face, real geometry verified).

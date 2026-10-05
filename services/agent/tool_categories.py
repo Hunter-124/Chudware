@@ -98,7 +98,6 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "sketch3d_preview",
         "sketch3d_pipe",
         "sketch3d_as_sweep_guide",
-        "sketch3d_to_ledger",
         "doc_sketch_contact_sheet",
         # Displaced from the capped `family:cad` expansion by the 2026-08-26
         # drawing-overhaul registrations — see the modeling pack note.

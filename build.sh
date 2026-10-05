@@ -2,7 +2,7 @@
 # ===========================================================================
 #  Chudware build script (Linux / macOS) — thin wrapper around CMake/Ninja.
 # ---------------------------------------------------------------------------
-#  Builds the native CMake/Ninja projects that make up Chudware (formerly Billet / AI-CAD):
+#  Builds the native CMake/Ninja projects that make up Chudware:
 #    core -> the C++ OCCT kernel (libchudware.$SHLIB_EXT)
 #    app  -> Chudware host GUI (cmake -S host -B host/build-$PLATFORM_SUFFIX + ninja Chudware)
 #
@@ -12,26 +12,32 @@
 #  libchudware.dylib on an Apple-silicon Mac. Windows is not built from here —
 #  use CMakePresets.json's windows-* presets from an x64 Native Tools prompt.
 #
-#  The ui/imgui / ui/abstract (AI-CAD2) app is retired. host/ is the single
-#  cross-platform GUI target (builds on Linux with GCC/Clang, macOS with
-#  AppleClang, and Windows with MSVC). Binary:
+#  host/ is the single cross-platform GUI target (builds on Linux with
+#  GCC/Clang, macOS with AppleClang, and Windows with MSVC). Binary:
 #  host/build-$PLATFORM_SUFFIX/bin/chudware
 #
 #  Usage:
 #    ./build.sh            Default: build the host GUI.
 #    ./build.sh app        Same as default.
-#    ./build.sh core       Only the C++ kernel (this host's core preset).
-#    ./build.sh all        core, then host GUI.
+#    ./build.sh core       Rebuild libchudware (plus chudware-hostd and the polymesh
+#                          CLI where the tree declares them) in every configured
+#                          consumed core tree (core/build-occt-$PLATFORM_SUFFIX,
+#                          core/build-$PLATFORM_SUFFIX). With neither configured,
+#                          configures and builds this host's core preset instead.
+#    ./build.sh daemon     Build libchudware + chudware-hostd in the configured
+#                          core/build-occt-$PLATFORM_SUFFIX tree (the full engine the
+#                          live daemon serves). Fails if that tree is not configured.
+#    ./build.sh all        core, then host GUI, then daemon.
 #    ./build.sh wasm       Emscripten WASM host (full app); stages to
 #                          ~/chudware-web/app/. Requires emsdk (~/.emsdk).
 #                          Linux-only (GNU sed / sha1sum).
 #    ./build.sh stage      Deploy libchudware, its optional lib3mf/advisor runtime,
-#                          and chudware-hostd
-#                          daemon from core/build-occt-$PLATFORM_SUFFIX/bin into
+#                          chudware-hostd and (when built) the polymesh CLI from
+#                          core/build-occt-$PLATFORM_SUFFIX/bin (falls back to the slim
+#                          core/build-$PLATFORM_SUFFIX tree with a warning) into
 #                          services/dist/Chudware/ — the dist dir core_bridge/daemon_bridge
-#                          resolve first. This replaces the old doc'd manual cp+mv;
-#                          both binaries MUST come from the same build tree or
-#                          clients compute different hostd instance keys.
+#                          resolve first. Engine and daemon MUST come from the same
+#                          build tree or clients compute different hostd instance keys.
 #    ./build.sh clean      Wipe host/build-$PLATFORM_SUFFIX (core kept — OCCT is
 #                          expensive to reconfigure), then run the default build.
 #
@@ -82,7 +88,7 @@ case "$(uname -s)" in
     *)
         echo "[build] ERROR: unsupported platform '$(uname -s)' — this script builds Linux"
         echo "[build]        and macOS. Windows builds run 'cmake --preset windows-occt' from"
-        echo "[build]        an x64 Native Tools Command Prompt (see docs/BUILD_WINDOWS.md)."
+        echo "[build]        an x64 Native Tools Command Prompt (see docs/reference/BUILD_WINDOWS.md)."
         exit 1
         ;;
 esac
@@ -287,7 +293,8 @@ build_core() {
     if [ "$built" -eq 0 ]; then
         echo "[build] no configured core tree found — configuring the $CORE_PRESET preset."
         echo "[build] NOTE: build/$CORE_PRESET is NOT read by gate.sh, the GUI, or"
-        echo "[build]       CHUDWARE_LIBCHUDWARE. Run ./build.sh all for a tree they load."
+        echo "[build]       CHUDWARE_LIBCHUDWARE. For a tree they load, configure"
+        echo "[build]       ${CORE_OCCT_BUILD#"$ROOT"/} once: cmake -S core -B ${CORE_OCCT_BUILD#"$ROOT"/} -DCHUDWARE_WITH_OCCT=ON"
         cmake --preset "$CORE_PRESET" -DPOLYMESH_SOURCE_DIR="${CHUDWARE_POLYMESH_ROOT:-}" \
             && cmake --build --preset "$CORE_PRESET" || rc=$?
         report_engine_staleness
@@ -416,7 +423,9 @@ build_wasm() {
 # The tree is configured once; this function performs the incremental build.
 build_daemon() {
     if [ ! -f "$CORE_OCCT_BUILD/CMakeCache.txt" ]; then
-        echo "[build] ERROR: ${CORE_OCCT_BUILD#"$ROOT"/} is not configured (OCCT tree; see docs/HOSTD.md)"
+        echo "[build] ERROR: ${CORE_OCCT_BUILD#"$ROOT"/} is not configured — configure it once:"
+        echo "[build]        cmake -S core -B ${CORE_OCCT_BUILD#"$ROOT"/} -DCHUDWARE_WITH_OCCT=ON"
+        echo "[build]        (daemon/engine layout: docs/reference/HOSTD.md)"
         return 1
     fi
     cmake --build "$CORE_OCCT_BUILD" --target chudware chudware-hostd
@@ -594,8 +603,8 @@ stage_libchudware_next_to_host() {
 # dir that core_bridge's _lib_candidates and daemon_bridge's resolve_hostd_bin
 # try FIRST). Every file is deployed copy-to-temp + atomic `mv` in the target
 # dir — NEVER `cp` over a live in-use image (SIGBUS in the mmap'ed
-# process; see docs/HOSTD.md "Upgrades"). The running daemon notices the mtime
-# flip and self-drains; MCP engines reload on respawn.
+# process; see docs/reference/HOSTD.md "Installer integration" → Upgrades). The
+# running daemon notices the mtime flip and self-drains; MCP engines reload on respawn.
 stage_dist() {
     local src=""
     if [ -f "$CORE_OCCT_BUILD/bin/$LIBCHUDWARE" ]; then

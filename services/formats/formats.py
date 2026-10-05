@@ -1,4 +1,4 @@
-"""Export / import surface for all supported geometry formats (M8 / C21).
+"""Python geometry import/export helpers for ECAD and other service callers.
 
 Formats supported
 -----------------
@@ -23,20 +23,12 @@ Public API
     ``(name, shape)`` pairs.  Names come from STEP product labels when available, fall back to
     "Body1", "Body2", …
 
-Worker RPC handlers
+Native document RPCs
 -------------------
-``WORKER_METHODS`` — a dict mapping method names to handler callables.  The orchestrator
-registers these via ``_METHODS.update(formats.WORKER_METHODS)``.  The handlers follow the
-worker_rpc.md calling convention: ``handler(params, emit) -> result_dict``  where *emit* is a
-callable for streaming events.
-
-    ``doc_formats {}``
-        Returns the import/export format matrix (``list_formats()``) so the host can build
-        Open/Import/Export filters.
-
-``import_file`` / ``export_file`` were removed from Python when the doc engine moved to the
-C++ core (host routes them via the doc-cpp / minting rule).  The pure helpers
-``import_path()`` / ``export_document()`` above remain for ECAD and other Python callers.
+``doc_formats``, ``import_file`` and ``export_file`` run in the C++ core;
+``core/doc/formats.cpp`` owns the format matrix and native document I/O.
+The Python ``import_path()`` / ``export_document()`` helpers above operate on
+Python shapes and do not register document RPC handlers.
 """
 
 from __future__ import annotations
@@ -47,7 +39,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Callable
 
-# ---- lazy imports to keep engine.doc.__init__ OCP-free -----------------------
+# ---- lazy imports to keep this module OCP-free at import time ----------------
 # (imported inside functions as needed)
 
 
@@ -509,7 +501,7 @@ def _export_3mf_lib3mf(session_bodies: list[tuple[str, Any]], path: Path) -> str
 # -- unified mesh lane (trimesh) ----------------------------------------------
 # All mesh formats (STL / OBJ / PLY / 3MF / glTF) share one trimesh-backed reader → MeshBody and
 # one trimesh-backed writer. trimesh (MIT, already a dependency) reads/writes every one of these
-# robustly; the resulting MeshBody renders + re-exports through the FORMATS_PLAN §2 D1 pipeline.
+# robustly; the resulting MeshBody re-exports through the Python format helpers.
 
 
 def _trimesh_color(geom) -> tuple | None:
@@ -717,17 +709,12 @@ def _cached_import(path: str, format: str | None) -> list[tuple[str, Any]]:  # n
     return _IMPORT_CACHE[key]
 
 
-# --------------------------------------------------------------------------- worker RPC handlers
+# --------------------------------------------------------------------------- native document boundary
 
 
 EmitFn = Callable[[dict], None]
 
 
-# NOTE: import_file / export_file handlers were removed — they applied import/export ops through
-# the Python doc closure (session/compiler), which is gone. Both RPCs now run in the C++ core
-# (host routes them by the doc-cpp / minting rule). The pure helpers above — import_path() and
-# export_document() — survive and stay closure-free (engine.ecad.threed imports import_path).
-#
-# doc_formats + FORMAT_REGISTRY/list_formats were REMOVED 2026-07-22 (T-RF19): the format
-# matrix is C++ (core/doc/formats.cpp, byte-parity pinned by core/tests/test_formats_registry.cpp).
-# _detect_format/_EXT_TO_FORMAT below stay — the remaining import/export helpers use them.
+# Native document import/export and the format matrix live in core/doc/formats.cpp.
+# These Python helpers stay closure-free; services.ecad.threed imports import_path.
+# _detect_format/_EXT_TO_FORMAT above serve the remaining Python import/export helpers.

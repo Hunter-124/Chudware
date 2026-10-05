@@ -5905,3 +5905,19 @@ with zero errors (two pre-existing advisories). Three behavior regressions cover
 rejection of an aliased metered runner, acceptance of an aliased private runner,
 and rejection of an alias leaking from a previous document; all passed.
 The policy workflow runs these regressions and watches their source path.
+
+## 2026-10-05 — full portable QEMU suite with measured meshing headroom
+
+Run `37289792754` passed all three native rows, including 123 native Mac core
+tests and the Windows engine-dependent UI scenario. ARM Linux compiled and
+linked the full engine against its validated aarch64 SDK and passed 116 tests;
+the mesh test then exceeded its 1,800-second limit, and the whole suite stopped
+at 3,600 seconds. Native mesh and advanced-mesher took 279 and 546 seconds.
+The Linux ARM suite now gets 180 minutes total and at most 120 per test,
+within a 240-minute job (237-minute deadline). Explicit native test timeouts
+receive eightfold emulation headroom capped at 7,200 seconds, only for Linux
+aarch64 cross-tests; native timeouts and existing serialization are unchanged.
+An actual CMake configure/CTest metadata smoke proved native 600/3,600/90,000
+second allowances remain unchanged while ARM resolves them to 4,800/7,200/7,200.
+No portable test or meshing assertion is excluded. SDK recipes remain unchanged,
+so this correction does not invalidate the genuine qualified SDK cache.

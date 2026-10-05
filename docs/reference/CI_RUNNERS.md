@@ -243,13 +243,13 @@ macOS has no GNU `timeout`), which runs the command in its own process group
 and on overrun sends that group SIGTERM, then SIGKILL 15 s later, and exits
 124; a failing command's own status passes through. Every SDK fetch gets
 10 min, configure 15 min and install 10 min; core configure 15 min; the
-emulated ctest run 60 min with 1,800 s per test. Build budgets differ by row
+emulated ctest run 180 min with 7,200 s per test. Build budgets differ by row
 because the Intel Mac test account compiles with one process
 (`CMAKE_BUILD_PARALLEL_LEVEL=1`):
 
 | Row | OCCT build (other SDK builds) | Whole SDK step | Core build | Job (deadline) |
 |---|---|---|---|---|
-| `Linux aarch64 (QEMU-emulated tests)` | 30 min (30 min) | 60 min | 30 min | 90 min (87) |
+| `Linux aarch64 (QEMU-emulated tests)` | 30 min (30 min) | 60 min | 30 min | 240 min (237) |
 | `macOS arm64 (cross-compiled, compile-only)` | 200 min (30 min) | 230 min | 120 min | 330 min (327) |
 
 The Mac budgets are measured, not guessed: a cold darwin-arm64 OCCT build
@@ -264,6 +264,14 @@ SDK that leaves too little time for the rest fails that step with 124 rather
 than running into Actions' hard stop. Changing `build_arm_sdk.sh` (budgets
 included) changes the recipe id, so the next run of each row rebuilds its SDK
 cold. The cross presets build with `CHUDWARE_LTO=OFF`: nothing they build ships.
+
+The native Mac's mesh and advanced-mesher tests took 279 and 546 seconds;
+ARM emulation exceeded the former 1,800-second mesh cap after the other 116
+tests passed. The unchanged serial meshing fixtures need roughly eightfold
+headroom: 180 minutes for the entire suite, at most 120 per test, inside a
+237-minute job deadline. Existing explicit native test timeouts receive the
+same eightfold allowance capped at 7,200 seconds only for Linux aarch64
+cross-tests. No test, meshing assertion or existing serialization is removed.
 
 The ARM dependencies come from `scripts/build_arm_sdk.sh <linux-aarch64|darwin-arm64>`,
 which builds pinned sources into the runner account's own
@@ -300,8 +308,8 @@ bounded as in CI):
 export CHUDWARE_ARM_SDK="$(python3 scripts/run_bounded.py 3600 scripts/build_arm_sdk.sh linux-aarch64)"
 python3 scripts/run_bounded.py 900 cmake --preset linux-aarch64-qemu
 python3 scripts/run_bounded.py 1800 cmake --build --preset linux-aarch64-qemu
-python3 scripts/run_bounded.py 3600 ctest --test-dir build/linux-aarch64-qemu/core \
-  --output-on-failure --parallel "$(nproc)" --timeout 1800
+python3 scripts/run_bounded.py 10800 ctest --test-dir build/linux-aarch64-qemu/core \
+  --output-on-failure --parallel "$(nproc)" --timeout 7200
 ```
 
 and the compile-only arm64 build on an Intel Mac with the Command Line Tools:

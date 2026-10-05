@@ -2704,16 +2704,20 @@ if(TARGET chudware_mesh)
   add_test(NAME fea_prepare COMMAND test_fea_prepare)
 endif()
 
-# The emulated ARM suite still registers every portable core test. A test's
-# explicit TIMEOUT takes precedence over ctest --timeout, so cap those overrides
-# without changing the longer native allowance for mesher_advanced.
+# The emulated ARM suite still registers every portable core test. Explicit
+# native TIMEOUT values override ctest's default: allow eightfold emulation
+# overhead, capped at two hours, without changing any native test allowance.
 if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
    CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
   get_property(_chudware_arm_tests DIRECTORY PROPERTY TESTS)
   foreach(_test IN LISTS _chudware_arm_tests)
     get_property(_timeout TEST "${_test}" PROPERTY TIMEOUT)
-    if(_timeout AND _timeout GREATER 1800)
-      set_tests_properties("${_test}" PROPERTIES TIMEOUT 1800)
+    if(_timeout)
+      math(EXPR _timeout "${_timeout} * 8")
+      if(_timeout GREATER 7200)
+        set(_timeout 7200)
+      endif()
+      set_tests_properties("${_test}" PROPERTIES TIMEOUT "${_timeout}")
     endif()
   endforeach()
 endif()

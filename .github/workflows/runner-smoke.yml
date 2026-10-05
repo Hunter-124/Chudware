@@ -46,11 +46,14 @@
 # timeout. Provisioning rows come from the same inventory, so an offline
 # endpoint is never queued for provisioning either. This repository has no
 # CI_RUNNER_ADMIN_TOKEN secret, so the inventory step degrades to scheduling
-# the full fleet and saying so — a missing PAT must never turn the daily smoke
-# into a failed run. That fallback list is the REGISTERED fleet and nothing
-# else: dell-optiplex-7040 was de-registered (docs/reference/CI_RUNNERS.md) and
-# listing it here queued a row that no runner could ever claim, so every
-# fallback run hung until timeout.
+# the registered fleet and saying so — a missing PAT must never turn the daily
+# smoke into a failed run. That fallback list is the REGISTERED fleet and
+# nothing else: dell-optiplex-7040 was de-registered (docs/reference/
+# CI_RUNNERS.md) and listing it here queued a row that no runner could ever
+# claim, so every fallback run hung in the queue. For the same reason the
+# fallback also leaves out rows marked `may_be_offline` (the M2, usually
+# offline), whose queued row would otherwise hold every daily run open for
+# GitHub's 24-hour queue limit; dispatching its runner_label probes it.
 #
 # A dispatch can name one runner_label instead of `all`. Only that endpoint is
 # provisioned and probed, so a newly isolated runner is qualified without
@@ -95,6 +98,8 @@ on:
           - cc-mac-intel
           - cc-mac-chudware-intel
           - cc-mac-chudware-intel-bootstrap
+          - cc-mac-chudware-gate-intel
+          - cc-mac-chudware-gate-intel-bootstrap
           - cc-mac-arm
           - cc-mac-chudware-arm
           - cc-mac-chudware-arm-bootstrap
@@ -161,7 +166,11 @@ jobs:
              bootstrap_label:"cc-mac-chudware-intel-bootstrap",
              mac_user:"ccci-chudware", ci_home:"/Library/CloudCastleCI/ccci-chudware",
              runner_root:"/Library/CloudCastleCI/ccci-chudware/actions-runner", product:"Chudware"},
-            {label:"macbook-air-m2",       runner_os:"macOS",  runner_arch:"ARM64", runner_label:"cc-mac-arm",          role:"builder", provision:true},
+            {label:"imac-intel-chudware-gate-test", runner_os:"macOS", runner_arch:"X64", runner_label:"cc-mac-chudware-gate-intel", role:"builder", provision:false,
+             bootstrap_label:"cc-mac-chudware-gate-intel-bootstrap",
+             mac_user:"ccci-chudware-gate", ci_home:"/Library/CloudCastleCI/ccci-chudware-gate",
+             runner_root:"/Library/CloudCastleCI/ccci-chudware-gate/actions-runner-gate", product:"Chudware"},
+            {label:"macbook-air-m2",       runner_os:"macOS",  runner_arch:"ARM64", runner_label:"cc-mac-arm",          role:"builder", provision:true, may_be_offline:true},
             {label:"macbook-air-m2-chudware-test", runner_os:"macOS", runner_arch:"ARM64", runner_label:"cc-mac-chudware-arm", role:"builder", provision:false,
              bootstrap_label:"cc-mac-chudware-arm-bootstrap", registered:false,
              mac_user:"ccci-chudware", ci_home:"/Library/CloudCastleCI/ccci-chudware",
@@ -200,10 +209,24 @@ jobs:
             } >> "$GITHUB_OUTPUT"
           }
 
+          # Without the inventory nothing knows what is online. A row for an
+          # offline endpoint never starts, so timeout-minutes never applies and
+          # it waits in the queue for GitHub's 24-hour limit, holding the run
+          # open. Rows for hardware that is routinely offline (the M2) are
+          # therefore left out of an unconfirmed fleet run; dispatching their
+          # runner_label still queues them deliberately.
           schedule_everything() {
-            echo "::warning title=Fleet inventory unavailable::$1; every selected endpoint will be queued and an offline one will fail on its own timeout"
+            local skipped=''
+            if [ "${target}" = all ]; then
+              skipped=$(printf '%s' "$fleet" | jq -r '.[] | select(.may_be_offline) | "- \(.label) (`\(.runner_label)`): **not scheduled** — online status unknown and this endpoint is often offline; dispatch runner_label=\(.runner_label) to probe it"')
+              fleet=$(printf '%s' "$fleet" | jq -c '[.[] | select(.may_be_offline | not)]')
+            fi
+            echo "::warning title=Fleet inventory unavailable::$1; every other selected endpoint will be queued, and an offline one waits in the queue until it returns or GitHub drops the job"
             printf '### Fleet inventory\n\n- **all %s selected endpoints queued** — %s\n' \
               "$(printf '%s' "$fleet" | jq 'length')" "$1" >> "$GITHUB_STEP_SUMMARY"
+            if [ -n "${skipped}" ]; then
+              printf '%s\n' "${skipped}" >> "$GITHUB_STEP_SUMMARY"
+            fi
             emit "$fleet"
           }
 

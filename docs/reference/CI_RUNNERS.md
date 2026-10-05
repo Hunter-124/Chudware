@@ -57,18 +57,19 @@ Labels as registered after the private-lane migration:
 | `ryzen-7900x3d` | Windows X64 | `cloudcastle-ci`, `cc-win-primary`, `cc-win-package`, `cc-win-ryzen`, `cc-win-chudware` | `C:\actions-runner-cad` (work folder `D:\ChudwareCI\Windows\w`) |
 | `imac-intel` | macOS X64 | `cloudcastle-ci`, `cc-mac-intel` | `~/actions-runner-cad` (operator/signer lane: GUI account, login keychain, signing identities, Homebrew owner) |
 | `imac-intel-chudware-test` | macOS X64 | `cloudcastle-ci`, `cc-mac-chudware-intel-bootstrap`, `cc-mac-chudware-intel` | `/Library/CloudCastleCI/ccci-chudware/actions-runner` (system LaunchDaemon `com.cloudcastle.ci.runner.chudware` as the hidden `ccci-chudware` account) |
+| `imac-intel-chudware-gate-test` | macOS X64 | `cc-mac-chudware-gate-intel-bootstrap`; `cloudcastle-ci` and `cc-mac-chudware-gate-intel` after qualification | `/Library/CloudCastleCI/ccci-chudware-gate/actions-runner-gate` (system LaunchDaemon `com.cloudcastle.ci.runner.chudware.gate` as the hidden UID 423 `ccci-chudware-gate` account) |
 | `macbook-air-m2` | macOS ARM64 | offline, not currently registered; ordinary checks do not route here | `~/actions-runner-cad` (operator lane: GUI account, Homebrew owner) |
 | `macbook-air-m2-chudware-test` | macOS ARM64 | **not registered yet** — will register with only `cc-mac-chudware-arm-bootstrap`; `cloudcastle-ci` and `cc-mac-chudware-arm` only after qualification. No ordinary workflow routes at it (see [ARM coverage without ARM hardware](#arm-coverage-without-arm-hardware)) | `/Library/CloudCastleCI/ccci-chudware/actions-runner` on the M2 (system LaunchDaemon `com.cloudcastle.ci.runner.chudware` as the hidden `ccci-chudware` account) |
 
 The ordinary native-build matrix uses product-specific labels, rather than
 requiring another product's generic runner label.
 
-**`cc-linux-build` has no runner until `chudware-ryzen-linux` is qualified.**
+**`cc-linux-build` is on the qualified `chudware-ryzen-linux` utility VM.**
 It used to be carried by `livingroom-pc`, which is also the production gateway
 host; it was removed there so build legs stop landing on production. Jobs
 routed at `cc-linux-build` (fast-gate's Linux row, linux-gate, site-build,
-stripe-sandbox, release prep, nightly-release's `linux-beta`) queue until the
-guest is promoted. Native-build uses `cc-linux-chudware` directly. The legacy shared
+stripe-sandbox, release prep, nightly-release's `linux-beta`) now use the
+private Chudware guest. Native-build uses `cc-linux-chudware` directly. The legacy shared
 `cc-linux-ryzen`/`cc-nvme-bootstrap` guest is drained and offline and is not
 part of the fleet.
 
@@ -100,7 +101,7 @@ expectations follow from it:
 
 | Role | Labels | Must have |
 |---|---|---|
-| **builder** | `cc-linux-build`, `cc-linux-chudware`, `cc-linux-hunter`, `cc-win-primary`, `cc-win-package`, `cc-win-ryzen`, `cc-mac-arm`, `cc-mac-intel`, `cc-mac-chudware-intel`, `cc-mac-chudware-arm` | git, Python >= 3.11, cmake, ninja, ctest, a C++ toolchain that compiles, links and runs, >= 20 GiB free |
+| **builder** | `cc-linux-build`, `cc-linux-chudware`, `cc-linux-hunter`, `cc-win-primary`, `cc-win-package`, `cc-win-ryzen`, `cc-mac-arm`, `cc-mac-intel`, `cc-mac-chudware-intel`, `cc-mac-chudware-gate-intel`, `cc-mac-chudware-arm` | git, Python >= 3.11, cmake, ninja, ctest, a C++ toolchain that compiles, links and runs, >= 20 GiB free |
 | **control** | `cc-linux-livingroom`, `cc-prod-control`, `cc-artifact-host`, `cc-infra-webservice` | git and python, nothing else |
 
 `cloudcastle-server` is control-only: it publishes artifacts and operates
@@ -155,10 +156,16 @@ leg at the generic `cloudcastle-ci` pool without also pinning a builder label.
   CMake's default search path. The prefix is owned by the operator account;
   the private test account reads it and never writes it.
 - **Ordinary Mac tests run on the private test accounts.** fast-gate's macOS
-  row routes at `[self-hosted, macOS, X64, cloudcastle-ci, cc-mac-chudware-intel]`.
+  row routes at `[self-hosted, macOS, X64, cloudcastle-ci, cc-mac-chudware-gate-intel]`
+  as `ccci-chudware-gate` (hidden UID 423) with its own 0700 home
+  `/Library/CloudCastleCI/ccci-chudware-gate`, runner root
+  `actions-runner-gate`, and private work/temp/cache state. This separate
+  lightweight slot prevents a long native/ARM qualification build from
+  holding the source gate in the runner queue. It shares only read-only
+  host tooling; no other product or operator/signer account is borrowed.
   Native-build's `macOS x86_64` and compile-only `macOS arm64` rows use
   `[self-hosted, macOS, X64, cc-mac-chudware-intel]`.
-  Before anything compiles they fail unless they run as `ccci-chudware` with the
+  Before anything compiles native-build fails unless it runs as `ccci-chudware` with the
   `CC_CI_PRODUCT=Chudware`, `CC_CI_LANE=test` identity its LaunchDaemon
   exports; native-build additionally requires the runner architecture to be
   the machine's native one (`X64`/`x86_64`, never Rosetta translation or a
@@ -363,22 +370,26 @@ present — it repairs a gap, it never upgrades a working builder underneath a
 release. It runs only on the operator lanes (`cc-mac-intel`, `cc-mac-arm`),
 which own Homebrew.
 
-The private Mac test accounts `imac-intel-chudware-test` and (once it exists)
+The private Mac test accounts `imac-intel-chudware-test`,
+`imac-intel-chudware-gate-test` and (once it exists)
 `macbook-air-m2-chudware-test` are never provisioned (`provision:false`; the
 provision step also refuses any `CC_CI_LANE=test` account). Their probe only
 CHECKS the same formulae, Python >= 3.11 and a real compile/link/ctest, and
-asserts the isolation contract: account `ccci-chudware` in the hidden 420-499
-uid range, running natively on the Mac's own architecture (no Rosetta, no VM),
-`HOME` `/Library/CloudCastleCI/ccci-chudware` at mode 0700, workspace under
-`/Library/CloudCastleCI/ccci-chudware/actions-runner/_work`, `TMPDIR` and the
+asserts the isolation contract: the row's `ccci-chudware` or
+`ccci-chudware-gate` account in the hidden 420-499 uid range, running natively
+on the Mac's own architecture (no Rosetta, no VM), the row's private `HOME`
+at mode 0700 and workspace under its declared runner root, `TMPDIR` and the
 XDG directories inside that home, `CC_CI_PRODUCT=Chudware`, `CC_CI_LANE=test`,
 numeric `CMAKE_BUILD_PARALLEL_LEVEL`/`CC_CI_BUILD_JOBS`, serial ctest, and a
 Homebrew prefix it does not own. A missing formula is fixed from that Mac's
 operator lane (`runner-provision.yml` with `cc-mac-intel` or `cc-mac-arm`).
-Promotion order: the runner registers with only its
-`cc-mac-chudware-<intel|arm>-bootstrap` label; dispatch that label (the row
-keeps `self-hosted`, `macOS` and its architecture), and only after it is green
-add `cloudcastle-ci` and `cc-mac-chudware-<intel|arm>`.
+Promotion order: the runner registers with only its bootstrap label
+(`cc-mac-chudware-<intel|arm>-bootstrap` for builders,
+`cc-mac-chudware-gate-intel-bootstrap` for the source gate); dispatch that
+label (the row keeps `self-hosted`, `macOS` and its architecture), and only
+after it is green add `cloudcastle-ci` and the matching product routing label.
+CloudCastle's manager creates the gate with `--product Chudware --gate`;
+that mode cannot purge accounts, run legacy cleanup or install Rust.
 
 `macbook-air-m2-chudware-test` carries `registered:false` in runner-smoke's
 fleet list: a cron or `all` run reports it under *Pending registration* rather

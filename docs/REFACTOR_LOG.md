@@ -5921,3 +5921,24 @@ An actual CMake configure/CTest metadata smoke proved native 600/3,600/90,000
 second allowances remain unchanged while ARM resolves them to 4,800/7,200/7,200.
 No portable test or meshing assertion is excluded. SDK recipes remain unchanged,
 so this correction does not invalidate the genuine qualified SDK cache.
+
+## 2026-10-05 — independent lightweight Mac gate capacity
+
+The macOS fast-gate row now uses `cc-mac-chudware-gate-intel` as the separate
+hidden UID 423 `ccci-chudware-gate` account. Its 0700 home, runner root,
+work/temp/cache state and system daemon are separate from the native/ARM
+builder's `ccci-chudware` account; only host tooling is shared read-only.
+The CloudCastle manager's `--product Chudware --gate` mode cannot purge
+accounts, run legacy cleanup or install Rust. The runner registers on its
+bootstrap label; runner-smoke declares and checks its actual identity before
+promotion. Native/ARM builds and operator signing keep their existing lanes.
+The actual Mac manager qualified native C/C++, Objective-C, Python venv and
+CMake/CTest consumers and sealed sibling/operator homes without restarting
+the active builder. This adds no native Apple Silicon or signing proof.
+
+The completed cold Darwin ARM SDK and full 623-action core build in run
+`37289792754` passed on the private Intel account; the resulting engine is
+thin arm64 Mach-O. The native Linux row's advisory clang-tidy command was
+not analyzing sources: LLVM 18 rejected `--quiet` and `-source-filter`.
+It now uses the supported `-quiet` and positional source regex arguments,
+without changing the existing advisory policy or source coverage.

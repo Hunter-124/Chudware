@@ -713,10 +713,10 @@ jobs:
             }
           done
           clang-tidy --version | head -n 1
-          run-clang-tidy -p build/linux-core -j 0 --quiet \
-            -source-filter='.*[/\\]core[/\\]'
-          run-clang-tidy -p ${{ matrix.host_build_dir }} -j 0 --quiet \
-            -source-filter='.*[/\\](host|core|platform)[/\\]'
+          run-clang-tidy -p build/linux-core -j 0 -quiet \
+            '.*[/\\]core[/\\]'
+          run-clang-tidy -p ${{ matrix.host_build_dir }} -j 0 -quiet \
+            '.*[/\\](host|core|platform)[/\\]'
 
       - name: ctest host GUI (Windows)
         if: matrix.build_host && runner.os == 'Windows'

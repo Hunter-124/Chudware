@@ -231,8 +231,9 @@ into the temp directory.
 
 QEMU runs the FP-heavy mesh/FEA code far slower than native. Every registered
 portable core test executes; a slow test is a failure, not an exclusion or
-native-only claim. Each emulated test has a 600-second limit, including tests
-whose native CTest allowance is longer. Native test allowances are unchanged.
+native-only claim. Emulated tests are capped at 1,800 seconds; shorter explicit
+allowances are retained. Numerical tests that exceeded 600 seconds are not
+excluded, and native test allowances are unchanged.
 The row's summary distinguishes registered/executed tests from ARM hardware
 qualification.
 
@@ -242,7 +243,7 @@ and on overrun sends that group SIGTERM, then SIGKILL 15 s later, and exits
 124; a failing command's own status passes through. Budgets: each SDK fetch
 10 min, configure 15 min, build 30 min, install 10 min; the whole SDK step
 60 min; core configure 15 min and build 30 min; the emulated ctest run
-30 min with 600 s per test. Both ARM rows have a 90-minute job budget, and a
+60 min with 1,800 s per test. Both ARM rows have a 90-minute job budget, and a
 job-wide deadline three minutes short of it caps every bounded command, so a
 cold SDK that leaves too little time for the rest fails that step with 124
 rather than running into Actions' hard stop. The cross presets build with

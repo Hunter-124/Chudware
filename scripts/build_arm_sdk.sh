@@ -45,7 +45,7 @@
 # (macOS has no GNU timeout): a step that overruns its budget below has its
 # whole process group stopped and the script fails with status 124; a failing
 # step fails it with that step's status. Bound the whole run too (native-build
-# gives it 60 minutes).
+# gives linux-aarch64 60 minutes and darwin-arm64 230 minutes).
 set -euo pipefail
 # fd 3 is the caller's stdout and carries only the prefix.
 exec 3>&1 1>&2
@@ -65,7 +65,7 @@ EXPAT_COMMIT=4b3f0b06f39fb5529cead381694f8929901bc273
 FONTCONFIG_VERSION=2.16.0
 FONTCONFIG_SHA256=6a33dc555cc9ba8b10caf7695878ef134eeb36d0af366041f639b1da9b6ed220
 
-# Per-step wall-clock budgets, in seconds.
+# Per-step wall-clock budgets, in seconds. Only OCCT needs the longer Darwin build.
 FETCH_SECONDS=600
 CONFIGURE_SECONDS=900
 BUILD_SECONDS=1800
@@ -80,10 +80,16 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 case "$target" in
   linux-aarch64)
     [ "$(uname -s)" = Linux ] || die "linux-aarch64 is built on a Linux host"
-    toolchain=$repo/cmake/toolchains/aarch64-linux-gnu.cmake ;;
+    toolchain=$repo/cmake/toolchains/aarch64-linux-gnu.cmake
+    OCCT_BUILD_SECONDS=$BUILD_SECONDS ;;
   darwin-arm64)
     [ "$(uname -s)" = Darwin ] || die "darwin-arm64 is built on a Mac"
-    toolchain=$repo/cmake/toolchains/darwin-arm64.cmake ;;
+    toolchain=$repo/cmake/toolchains/darwin-arm64.cmake
+    # The Intel Mac test account builds with one compiler process
+    # (CMAKE_BUILD_PARALLEL_LEVEL=1). Cold, OCCT reached 1241 of 5476 Ninja
+    # actions in 30 minutes (about 1.45 s each, slowly rising), so its build
+    # alone needs about 133 minutes; 200 minutes allow 2.2 s per action.
+    OCCT_BUILD_SECONDS=12000 ;;
   *) die "unknown target '$target' (linux-aarch64|darwin-arm64)" ;;
 esac
 
@@ -164,15 +170,15 @@ fetch() {
   [ "$(git -C "$1" rev-parse HEAD)" = "$4" ] || die "$2 $3 is not commit $4"
 }
 
-cmake_target() { # SRC BUILD [ARGS...]: configure, build and install with the target toolchain
-  src=$1 build=$2
-  shift 2
+cmake_target() { # SRC BUILD SECONDS [ARGS...]: configure, build and install with the target toolchain
+  local src=$1 build=$2 build_seconds=$3
+  shift 3
   bounded "$CONFIGURE_SECONDS" cmake -S "$src" -B "$build" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$toolchain" -DCHUDWARE_ARM_SDK="$prefix" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib \
     -DCMAKE_INSTALL_RPATH="$prefix/lib" -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
     -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF -DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF "$@"
-  bounded "$BUILD_SECONDS" cmake --build "$build" --parallel "$jobs"
+  bounded "$build_seconds" cmake --build "$build" --parallel "$jobs"
   bounded "$INSTALL_SECONDS" cmake --install "$build"
 }
 
@@ -344,7 +350,7 @@ if [ "$target" = linux-aarch64 ]; then
 
   log "curl $CURL_TAG"
   fetch "$work/curl" https://github.com/curl/curl.git "refs/tags/$CURL_TAG" "$CURL_COMMIT"
-  cmake_target "$work/curl" "$work/curl-build" \
+  cmake_target "$work/curl" "$work/curl-build" "$BUILD_SECONDS" \
     -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF \
     -DBUILD_LIBCURL_DOCS=OFF -DBUILD_MISC_DOCS=OFF -DENABLE_CURL_MANUAL=OFF \
     -DCURL_USE_OPENSSL=ON -DOPENSSL_ROOT_DIR="$prefix" -DOPENSSL_USE_STATIC_LIBS=ON \
@@ -355,7 +361,7 @@ fi
 
 log "FreeType $FREETYPE_TAG"
 fetch "$work/freetype" https://gitlab.freedesktop.org/freetype/freetype.git "refs/tags/$FREETYPE_TAG" "$FREETYPE_COMMIT"
-cmake_target "$work/freetype" "$work/freetype-build" \
+cmake_target "$work/freetype" "$work/freetype-build" "$BUILD_SECONDS" \
   -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -DFT_DISABLE_ZLIB=ON -DFT_DISABLE_BZIP2=ON -DFT_DISABLE_PNG=ON \
   -DFT_DISABLE_HARFBUZZ=ON -DFT_DISABLE_BROTLI=ON
@@ -364,7 +370,7 @@ occt_link=()
 if [ "$target" = linux-aarch64 ]; then
   log "Expat $EXPAT_TAG"
   fetch "$work/expat" https://github.com/libexpat/libexpat.git "refs/tags/$EXPAT_TAG" "$EXPAT_COMMIT"
-  cmake_target "$work/expat/expat" "$work/expat-build" \
+  cmake_target "$work/expat/expat" "$work/expat-build" "$BUILD_SECONDS" \
     -DEXPAT_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DEXPAT_BUILD_TOOLS=OFF -DEXPAT_BUILD_EXAMPLES=OFF -DEXPAT_BUILD_TESTS=OFF \
     -DEXPAT_BUILD_DOCS=OFF -DEXPAT_BUILD_FUZZERS=OFF
@@ -398,7 +404,7 @@ bounded "$INSTALL_SECONDS" cp -R "$work/rapidjson/include/rapidjson" "$prefix/in
 
 log "OCCT $OCCT_TAG"
 fetch "$work/occt" https://github.com/Open-Cascade-SAS/OCCT.git "refs/tags/$OCCT_TAG" "$OCCT_COMMIT"
-cmake_target "$work/occt" "$work/occt-build" \
+cmake_target "$work/occt" "$work/occt-build" "$OCCT_BUILD_SECONDS" \
   -DINSTALL_DIR="$prefix" -DINSTALL_DIR_LAYOUT=Unix -DINSTALL_DIR_WITH_VERSION=OFF \
   -DINSTALL_DIR_LIB=lib -DINSTALL_DIR_CMAKE=lib/cmake/opencascade -DBUILD_LIBRARY_TYPE=Shared \
   -DBUILD_MODULE_FoundationClasses=ON -DBUILD_MODULE_ModelingData=ON \

@@ -5875,3 +5875,33 @@ After the concurrent user edit, another guarded local AST update completed at 86
 197071 edges and 2562 communities, without semantic-provider calls or a shrink override.
 Publication uses 494 explicit whole-file paths and six index-only mixed-file projections;
 initial and later user edits remain outside the cleanup commit.
+
+## 2026-10-05 — MSVC-safe firmware embedding and measured Darwin ARM deadlines
+
+`core/cmake/EmbedFirmwareBuses.cmake` now emits constexpr character-byte arrays
+instead of oversized raw string literals. The five maintained bus sources retain
+their exact bytes, symbol names, array types, static storage and trailing NUL;
+`bus_models.cpp` requires no additional runtime concatenation or consumer change. A real
+MSVC 19.44 / toolset 14.44.35207 consumer compiled and executed on the Windows
+builder, checking all five arrays byte-for-byte against the original files
+(18,236 / 27,810 / 31,208 / 26,189 / 48,761 bytes) and their NUL terminators.
+The concurrently published firmware feature remains enabled.
+
+The Intel Mac's single-worker cold OCCT ARM SDK reached only 1,241 of 5,476
+actions in the former 30-minute limit; its cold native core build took 69 minutes.
+Darwin-specific caps now allow 200 minutes for OCCT, 230 for the whole SDK,
+120 for the core build and 330 for the job (327-minute process-group deadline).
+Other SDK builds remain capped at 30 minutes; Linux ARM and native-row budgets
+are unchanged. SDK exports, consumer validation, compiler-width caps and test
+coverage are unchanged. Native rows have no ARM dependency, and this Darwin
+lane checks arm64 compile/link architecture only, not native ARM execution or
+signing. These caps correct observed failures; full workflow qualification is
+reported by the corresponding Actions run, not inferred from the new limits.
+
+The dependency-free workflow policy parser now resolves document-local block
+anchors and aliases, so the native/ARM shared-step workflow is inspected rather
+than rejected as unexpected indentation. The real-tree policy command passed
+with zero errors (two pre-existing advisories). Three behavior regressions cover
+rejection of an aliased metered runner, acceptance of an aliased private runner,
+and rejection of an alias leaking from a previous document; all passed.
+The policy workflow runs these regressions and watches their source path.

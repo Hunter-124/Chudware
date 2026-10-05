@@ -241,14 +241,29 @@ qualification.
 Every ARM command is hard-bounded by `scripts/run_bounded.py` (stdlib Python;
 macOS has no GNU `timeout`), which runs the command in its own process group
 and on overrun sends that group SIGTERM, then SIGKILL 15 s later, and exits
-124; a failing command's own status passes through. Budgets: each SDK fetch
-10 min, configure 15 min, build 30 min, install 10 min; the whole SDK step
-60 min; core configure 15 min and build 30 min; the emulated ctest run
-60 min with 1,800 s per test. Both ARM rows have a 90-minute job budget, and a
-job-wide deadline three minutes short of it caps every bounded command, so a
-cold SDK that leaves too little time for the rest fails that step with 124
-rather than running into Actions' hard stop. The cross presets build with
-`CHUDWARE_LTO=OFF`: nothing they build ships.
+124; a failing command's own status passes through. Every SDK fetch gets
+10 min, configure 15 min and install 10 min; core configure 15 min; the
+emulated ctest run 60 min with 1,800 s per test. Build budgets differ by row
+because the Intel Mac test account compiles with one process
+(`CMAKE_BUILD_PARALLEL_LEVEL=1`):
+
+| Row | OCCT build (other SDK builds) | Whole SDK step | Core build | Job (deadline) |
+|---|---|---|---|---|
+| `Linux aarch64 (QEMU-emulated tests)` | 30 min (30 min) | 60 min | 30 min | 90 min (87) |
+| `macOS arm64 (cross-compiled, compile-only)` | 200 min (30 min) | 230 min | 120 min | 330 min (327) |
+
+The Mac budgets are measured, not guessed: a cold darwin-arm64 OCCT build
+reached 1,241 of its 5,476 Ninja actions in 30 minutes (about 1.45 s each,
+slowly rising), so it needs about 133 minutes; 200 minutes allow 2.2 s per
+action. The cold native `macos-x86_64` core build on the same account took
+69 minutes (with LTO), so the cross core build gets 120. A cold SDK plus the
+core build is about 215 minutes against a 327-minute deadline; a cached SDK
+reruns only its consumer check before the core build. The job-wide deadline,
+three minutes short of the job budget, caps every bounded command, so a cold
+SDK that leaves too little time for the rest fails that step with 124 rather
+than running into Actions' hard stop. Changing `build_arm_sdk.sh` (budgets
+included) changes the recipe id, so the next run of each row rebuilds its SDK
+cold. The cross presets build with `CHUDWARE_LTO=OFF`: nothing they build ships.
 
 The ARM dependencies come from `scripts/build_arm_sdk.sh <linux-aarch64|darwin-arm64>`,
 which builds pinned sources into the runner account's own
@@ -285,16 +300,16 @@ bounded as in CI):
 export CHUDWARE_ARM_SDK="$(python3 scripts/run_bounded.py 3600 scripts/build_arm_sdk.sh linux-aarch64)"
 python3 scripts/run_bounded.py 900 cmake --preset linux-aarch64-qemu
 python3 scripts/run_bounded.py 1800 cmake --build --preset linux-aarch64-qemu
-python3 scripts/run_bounded.py 1800 ctest --test-dir build/linux-aarch64-qemu/core \
-  --output-on-failure --parallel "$(nproc)" --timeout 600
+python3 scripts/run_bounded.py 3600 ctest --test-dir build/linux-aarch64-qemu/core \
+  --output-on-failure --parallel "$(nproc)" --timeout 1800
 ```
 
 and the compile-only arm64 build on an Intel Mac with the Command Line Tools:
 
 ```bash
-export CHUDWARE_ARM_SDK="$(python3 scripts/run_bounded.py 3600 scripts/build_arm_sdk.sh darwin-arm64)"
+export CHUDWARE_ARM_SDK="$(python3 scripts/run_bounded.py 13800 scripts/build_arm_sdk.sh darwin-arm64)"
 python3 scripts/run_bounded.py 900 cmake --preset macos-arm64-cross
-python3 scripts/run_bounded.py 1800 cmake --build --preset macos-arm64-cross
+python3 scripts/run_bounded.py 7200 cmake --build --preset macos-arm64-cross
 ```
 
 ### Provisioning and qualification: `runner-smoke.yml`

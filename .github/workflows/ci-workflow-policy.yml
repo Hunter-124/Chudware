@@ -36,10 +36,12 @@ on:
     paths:
       - '.github/workflows/**'
       - 'scripts/verify-ci-workflows.py'
+      - 'scripts/test_verify_ci_workflows.py'
   pull_request:
     paths:
       - '.github/workflows/**'
       - 'scripts/verify-ci-workflows.py'
+      - 'scripts/test_verify_ci_workflows.py'
   workflow_dispatch:
 
 permissions:
@@ -252,6 +254,10 @@ jobs:
           done
 
           echo "both validators fire on seeded defects and pass clean input"
+
+      - name: Check YAML alias runner policy boundaries
+        shell: bash
+        run: python3 scripts/test_verify_ci_workflows.py
 
       - name: Lint every workflow with actionlint
         shell: bash

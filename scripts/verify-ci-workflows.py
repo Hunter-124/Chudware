@@ -548,13 +548,13 @@ def _parse_scalar(text: str, lineno: int) -> Any:
     return _plain_scalar(text)
 
 
-def _parse_node(lines: List[_Line], i: int, indent: int) -> Tuple[Any, int]:
+def _parse_node(lines: List[_Line], i: int, indent: int, anchors: Dict[str, Any]) -> Tuple[Any, int]:
     if _is_seq_item(lines[i].text):
-        return _parse_seq(lines, i, indent)
-    return _parse_map(lines, i, indent)
+        return _parse_seq(lines, i, indent, anchors)
+    return _parse_map(lines, i, indent, anchors)
 
 
-def _parse_seq(lines: List[_Line], i: int, indent: int) -> Tuple[Sequence, int]:
+def _parse_seq(lines: List[_Line], i: int, indent: int, anchors: Dict[str, Any]) -> Tuple[Sequence, int]:
     seq = Sequence(lines[i].lineno)
     while i < len(lines):
         line = lines[i]
@@ -570,7 +570,7 @@ def _parse_seq(lines: List[_Line], i: int, indent: int) -> Tuple[Sequence, int]:
         if not rest:
             j = i + 1
             if j < len(lines) and lines[j].indent > indent:
-                value, i = _parse_node(lines, j, lines[j].indent)
+                value, i = _parse_node(lines, j, lines[j].indent, anchors)
             else:
                 value, i = None, j
         elif line.block is not None and _split_key_value(rest) is None:
@@ -597,12 +597,12 @@ def _parse_seq(lines: List[_Line], i: int, indent: int) -> Tuple[Sequence, int]:
             # so ``- name: x`` / ``  uses: y`` reads as one mapping.
             content_indent = indent + 2 + offset
             lines[i] = _Line(content_indent, rest, line.lineno, line.block)
-            value, i = _parse_node(lines, i, content_indent)
+            value, i = _parse_node(lines, i, content_indent, anchors)
         seq.append(value)
     return seq, i
 
 
-def _parse_map(lines: List[_Line], i: int, indent: int) -> Tuple[Mapping, int]:
+def _parse_map(lines: List[_Line], i: int, indent: int, anchors: Dict[str, Any]) -> Tuple[Mapping, int]:
     mapping = Mapping(lines[i].lineno)
     while i < len(lines):
         line = lines[i]
@@ -619,17 +619,29 @@ def _parse_map(lines: List[_Line], i: int, indent: int) -> Tuple[Mapping, int]:
         if key in mapping:
             raise WorkflowParseError("duplicate key {0!r}".format(key), line.lineno)
 
+        # Shared block steps are valid Actions YAML. Resolve them in this
+        # document so policy checks inspect the inherited steps, not a string.
+        anchor_match = re.fullmatch(r"&([A-Za-z0-9_-]+)", raw_value)
+        if anchor_match:
+            raw_value = ""
+
         if line.block is not None:
             value: Any = line.block
             i += 1
         elif raw_value == "":
             j = i + 1
             if j < len(lines) and lines[j].indent > indent:
-                value, i = _parse_node(lines, j, lines[j].indent)
+                value, i = _parse_node(lines, j, lines[j].indent, anchors)
             elif j < len(lines) and lines[j].indent == indent and _is_seq_item(lines[j].text):
-                value, i = _parse_seq(lines, j, indent)
+                value, i = _parse_seq(lines, j, indent, anchors)
             else:
                 value, i = None, j
+        elif raw_value.startswith("*"):
+            alias_match = re.fullmatch(r"\*([A-Za-z0-9_-]+)", raw_value)
+            if alias_match is None or alias_match[1] not in anchors:
+                raise WorkflowParseError("unknown YAML alias {0!r}".format(raw_value), line.lineno)
+            value = anchors[alias_match[1]]
+            i += 1
         elif raw_value[0] in "[{" and not _flow_balanced(raw_value):
             acc = raw_value
             j = i + 1
@@ -644,6 +656,9 @@ def _parse_map(lines: List[_Line], i: int, indent: int) -> Tuple[Mapping, int]:
             value = _parse_scalar(raw_value, line.lineno)
             i += 1
 
+        if anchor_match:
+            anchors[anchor_match[1]] = value
+
         mapping[key] = value
         mapping.key_lines[key] = line.lineno
     return mapping, i
@@ -654,7 +669,7 @@ def parse_workflow(text: str) -> Mapping:
     lines = _tokenize(text)
     if not lines:
         raise WorkflowParseError("document is empty")
-    document, index = _parse_node(lines, 0, lines[0].indent)
+    document, index = _parse_node(lines, 0, lines[0].indent, {})
     if index < len(lines):
         raise WorkflowParseError("unexpected content after the document", lines[index].lineno)
     if not isinstance(document, Mapping):

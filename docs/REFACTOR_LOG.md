@@ -5942,3 +5942,26 @@ thin arm64 Mach-O. The native Linux row's advisory clang-tidy command was
 not analyzing sources: LLVM 18 rejected `--quiet` and `-source-filter`.
 It now uses the supported `-quiet` and positional source regex arguments,
 without changing the existing advisory policy or source coverage.
+
+## 2026-10-05 — ARM FMA parity repair without weakening mesh contracts
+
+The revised full run `37326030572` passed all three native rows and the complete
+Darwin arm64 compile/link row. QEMU passed 119 core tests, but advanced meshing
+failed six native-speed assertions and three genuine STEP-bar size/element-count
+contracts; the enforced three-hour suite deadline then stopped the remaining
+serial fixtures. The QEMU step now supplies the existing wall-scale value 8 and
+allows 210 minutes within the unchanged 237-minute job deadline. Native ceilings,
+per-test caps, serialization and all functional checks remain unchanged.
+
+The numerical failures came from the pinned Polyhedral-FEA ray-parity
+determinant: ARM GCC contracts it into FMA, and the independently anchored
+expressions could both reject a shared face-diagonal ray. The source-only
+`cad-fill-progress` revision `274503cca6a8fc29bdb7d41cd58cbaf7bc72f68c`
+canonically orders edge endpoints and negates the reverse direction, preserving
+watertight parity with FMA still enabled. No global floating-point flags,
+tolerances, mesh expectations, allocations or size special cases were added.
+Actual ARM/QEMU proof: the retained classifier regression failed three of 48
+assertions before and passed all 48 after; the real STEP-bar consumer passed all
+47 original assertions. The upstream standalone product's separate release
+history and the user's local branch/index were not changed.
+

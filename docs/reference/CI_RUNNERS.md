@@ -272,13 +272,22 @@ than running into Actions' hard stop. Changing `build_arm_sdk.sh` (budgets
 included) changes the recipe id, so the next run of each row rebuilds its SDK
 cold. The cross presets build with `CHUDWARE_LTO=OFF`: nothing they build ships.
 
-The native Mac's mesh and advanced-mesher tests took 279 and 546 seconds;
-ARM emulation exceeded the former 1,800-second mesh cap after the other 116
-tests passed. The unchanged serial meshing fixtures need roughly eightfold
-headroom: 180 minutes for the entire suite, at most 120 per test, inside a
-237-minute job deadline. Existing explicit native test timeouts receive the
-same eightfold allowance capped at 7,200 seconds only for Linux aarch64
-cross-tests. No test, meshing assertion or existing serialization is removed.
+The complete QEMU run measured 3,203 seconds for `mesh` and 5,667 for
+`mesher_advanced`; the 180-minute suite cap then stopped the remaining serial
+fixtures. The suite now has a 210-minute bound, still at most 120 per test
+and clipped by the unchanged 237-minute job deadline. Existing explicit native
+test timeouts receive an eightfold allowance capped at 7,200 seconds only for
+Linux aarch64 cross-tests. That row also sets the existing
+`CHUDWARE_TEST_WALL_SCALE=8`: per-part assertions retain finite 720-second
+ceilings (2,160 for the bore), while native ceilings remain unchanged. No test,
+meshing assertion or existing serialization is removed.
+
+The same run exposed an ARM FMA shared-edge parity defect, not an emulation
+tolerance issue. The pinned Polyhedral-FEA classifier now canonically orders
+edge endpoints so neighboring triangles receive bitwise-opposite signs. Its
+retained public-classifier regression failed before and passed all 48 assertions
+after on actual aarch64 binaries under QEMU; the STEP-bar consumer passed all
+47 original assertions without relaxing requested-size or element-count bounds.
 
 The ARM dependencies come from `scripts/build_arm_sdk.sh <linux-aarch64|darwin-arm64>`,
 which builds pinned sources into the runner account's own
@@ -315,8 +324,8 @@ bounded as in CI):
 export CHUDWARE_ARM_SDK="$(python3 scripts/run_bounded.py 3600 scripts/build_arm_sdk.sh linux-aarch64)"
 python3 scripts/run_bounded.py 900 cmake --preset linux-aarch64-qemu
 python3 scripts/run_bounded.py 1800 cmake --build --preset linux-aarch64-qemu
-python3 scripts/run_bounded.py 10800 ctest --test-dir build/linux-aarch64-qemu/core \
-  --output-on-failure --parallel "$(nproc)" --timeout 7200
+CHUDWARE_TEST_WALL_SCALE=8 python3 scripts/run_bounded.py 12600 \
+  ctest --test-dir build/linux-aarch64-qemu/core --output-on-failure --parallel "$(nproc)" --timeout 7200
 ```
 
 and the compile-only arm64 build on an Intel Mac with the Command Line Tools:

@@ -19,7 +19,7 @@
 # The standalone product's master may advance independently. Keep the public
 # repository as the credential-free default so CAD CI never depends on private
 # source access; local maintenance trees opt in through POLYMESH_SOURCE_DIR.
-set(POLYMESH_COMMIT "ef464dc1236666770985c75a8fb50a512a463f62"
+set(POLYMESH_COMMIT "274503cca6a8fc29bdb7d41cd58cbaf7bc72f68c"
     CACHE STRING "Polyhedral-FEA commit to build" FORCE)
 set(POLYMESH_REPOSITORY "https://github.com/Hunter-124/Polyhedral-FEA.git"
     CACHE STRING

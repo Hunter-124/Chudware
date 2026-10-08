@@ -1,0 +1,18 @@
+{
+  "schema": "aicad.civil/1", "name": "Civil reference O'Brien #99",
+  "fixture_provenance": "Hand-authored. Horizontal clothoids independently integrated using scipy 1.17 quad k=s/1000 and .01-s/1000 over 10 m. Profile PVI(0,100),(30,103,L20),(60,100) gives grades +.1,-.1 and PVC/PVT(20,102),(40,102). Sanitary pipe has direction (3,4,-3), depth sqrt(34), radius .2. IFC authoring reference: buildingSMART IFC4X3_ADD2 design parameters.",
+  "crs": {"horizontal":"EPSG:26915", "vertical":"EPSG:5703", "local":{"origin_x":500000,"origin_y":4500000,"rotation_rad":0.2,"scale_factor":0.9996},"notes":"Local engineering grid"},
+  "alignments": [{"id":"road","name":"Road","start_station":0,"horizontal":[
+    {"type":"line","start":[0,0],"end":[10,0]},
+    {"type":"spiral","start":[10,0],"start_heading":0,"length":10,"radius_start":null,"radius_end":100,"dir":"ccw"},
+    {"type":"arc","start":[19.997500289335157,0.16663690712922566],"end":[39.73997928771962,3.150420775561386],"center":[14.999583362267323,100.04166294662586],"radius":100,"dir":"ccw"},
+    {"type":"spiral","start":[39.73997928771962,3.150420775561386],"start_heading":0.25,"length":10,"radius_start":100,"radius_end":null,"dir":"ccw"},
+    {"type":"line","start":[49.34020068739754,5.945689809346931],"end":[58.8935655786536,8.900891875960326]}
+  ],"vertical":{"pvis":[{"station":0,"elevation":100,"curve_length":0},{"station":30,"elevation":103,"curve_length":20},{"station":60,"elevation":100,"curve_length":0}]}}],
+  "gravity_networks":[
+    {"id":"sanitary","name":"Sanitary","kind":"sanitary","nodes":[{"id":"M1","type":"manhole","x":0,"y":0,"rim":12,"invert":10,"diameter":1.2},{"id":"M2","type":"manhole","x":3,"y":4,"rim":9,"invert":7,"diameter":1.2}],"conduits":[{"id":"P1","from":"M1","to":"M2","shape":"circular","diameter":0.4,"length":5,"inlet_invert":10,"outlet_invert":7,"vertices":[]}]},
+    {"id":"storm","name":"Storm","kind":"storm","nodes":[{"id":"S1","type":"junction","x":10,"y":0,"rim":12,"invert":10},{"id":"S2","type":"outfall","x":20,"y":0,"rim":11,"invert":9}],"conduits":[{"id":"P1","from":"S1","to":"S2","shape":"circular","diameter":0.5,"inlet_invert":10,"outlet_invert":9,"vertices":[]}]}
+  ],
+  "water_networks":[{"id":"water","name":"Water","junctions":[{"id":"J1","x":0,"y":10,"elevation":20},{"id":"J2","x":10,"y":10,"elevation":20}],"reservoirs":[],"tanks":[],"pipes":[{"id":"P1","from":"J1","to":"J2","diameter":0.2,"vertices":[[5,10]]}],"pumps":[],"valves":[]}],
+  "surfaces":[],"points":[],"catchments":[],"structures":[],"tie_ins":[]
+}

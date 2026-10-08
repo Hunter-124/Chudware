@@ -1,0 +1,293 @@
+; EPA EPANET Example Network 1 (Net1), copied from WNTR 1.5.0.
+; Source: https://github.com/USEPA/WNTR/blob/1.5.0/wntr/library/networks/Net1.inp
+; Original INP content follows unchanged, including tank-level pump CONTROLS.
+; EPA public-domain notice: https://www.epa.gov/water-research/epanet
+; EPA EPANET 2.2 repository identifies its distribution as MIT licensed:
+; https://github.com/USEPA/EPANET2.2
+; WNTR distribution is Revised BSD; its bundled EPANET is MIT.
+; The installed WNTR license/third-party notices are retained below.
+; Copyright Notice
+; =================
+; 
+; Copyright 2024 National Technology & Engineering Solutions of Sandia, LLC 
+; (NTESS). Under the terms of Contract DE-NA0003525 with NTESS, the U.S. 
+; Government retains certain rights in this software.
+; 
+; License Notice
+; =================
+; 
+; This software is distributed under the Revised BSD License (see below).
+; WNTR also leverages a variety of third-party software packages, which
+; have separate licensing policies.  
+; 
+; Revised BSD License
+; -------------------
+; 
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions
+; are met:
+; 
+; * Redistributions of source code must retain the above copyright notice, this 
+;   list of conditions and the following disclaimer.
+; * Redistributions in binary form must reproduce the above copyright notice, 
+;   this list of conditions and the following disclaimer in the documentation 
+;   and/or other materials provided with the distribution.
+; * Neither the name of Sandia National Laboratories, nor the names of
+;   its contributors may be used to endorse or promote products derived from
+;   this software without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+; "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+; LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+; A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+; OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+; SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+; TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+; PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+; LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+; NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+; SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+; 
+; 
+; Third-Party Libraries
+; =================================
+; WNTR includes source code from the following third-party libraries:
+; 
+; Numpy
+; -----
+; 
+; Copyright (c) 2005-2019, NumPy Developers.
+; All rights reserved.
+; 
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are
+; met:
+; 
+;     * Redistributions of source code must retain the above copyright
+;        notice, this list of conditions and the following disclaimer.
+; 
+;     * Redistributions in binary form must reproduce the above
+;        copyright notice, this list of conditions and the following
+;        disclaimer in the documentation and/or other materials provided
+;        with the distribution.
+; 
+;     * Neither the name of the NumPy Developers nor the names of any
+;        contributors may be used to endorse or promote products derived
+;        from this software without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+; "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+; LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+; A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+; OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+; SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+; LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+; DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+; THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+; (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+; OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+; 
+; EPANET
+; ------
+; 
+; MIT License
+; 
+; Copyright (c) 2019 (See AUTHORS, https://github.com/OpenWaterAnalytics/EPANET/blob/dev/AUTHORS)
+; 
+; Permission is hereby granted, free of charge, to any person obtaining a copy
+; of this software and associated documentation files (the "Software"), to deal
+; in the Software without restriction, including without limitation the rights
+; to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+; copies of the Software, and to permit persons to whom the Software is
+; furnished to do so, subject to the following conditions:
+; 
+; The above copyright notice, list of authors, and this permission notice shall 
+; be included in all copies or substantial portions of the Software. 
+; 
+; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+; SOFTWARE.
+; 
+
+[TITLE]
+ EPANET Example Network 1
+A simple example of modeling chlorine decay. Both bulk and
+wall reactions are included. 
+
+[JUNCTIONS]
+;ID              	Elev        	Demand      	Pattern         
+ 10              	710         	0           	                	;
+ 11              	710         	150         	                	;
+ 12              	700         	150         	                	;
+ 13              	695         	100         	                	;
+ 21              	700         	150         	                	;
+ 22              	695         	200         	                	;
+ 23              	690         	150         	                	;
+ 31              	700         	100         	                	;
+ 32              	710         	100         	                	;
+
+[RESERVOIRS]
+;ID              	Head        	Pattern         
+ 9               	800         	                	;
+
+[TANKS]
+;ID              	Elevation   	InitLevel   	MinLevel    	MaxLevel    	Diameter    	MinVol      	VolCurve        	Overflow
+ 2               	850         	120         	100         	150         	50.5        	0           	                	;
+
+[PIPES]
+;ID              	Node1           	Node2           	Length      	Diameter    	Roughness   	MinorLoss   	Status
+ 10              	10              	11              	10530       	18          	100         	0           	Open  	;
+ 11              	11              	12              	5280        	14          	100         	0           	Open  	;
+ 12              	12              	13              	5280        	10          	100         	0           	Open  	;
+ 21              	21              	22              	5280        	10          	100         	0           	Open  	;
+ 22              	22              	23              	5280        	12          	100         	0           	Open  	;
+ 31              	31              	32              	5280        	6           	100         	0           	Open  	;
+ 110             	2               	12              	200         	18          	100         	0           	Open  	;
+ 111             	11              	21              	5280        	10          	100         	0           	Open  	;
+ 112             	12              	22              	5280        	12          	100         	0           	Open  	;
+ 113             	13              	23              	5280        	8           	100         	0           	Open  	;
+ 121             	21              	31              	5280        	8           	100         	0           	Open  	;
+ 122             	22              	32              	5280        	6           	100         	0           	Open  	;
+
+[PUMPS]
+;ID              	Node1           	Node2           	Parameters
+ 9               	9               	10              	HEAD 1	;
+
+[VALVES]
+;ID              	Node1           	Node2           	Diameter    	Type	Setting     	MinorLoss   
+
+[TAGS]
+
+[DEMANDS]
+;Junction        	Demand      	Pattern         	Category
+
+[STATUS]
+;ID              	Status/Setting
+
+[PATTERNS]
+;ID              	Multipliers
+;Demand Pattern
+ 1               	1.0         	1.2         	1.4         	1.6         	1.4         	1.2         
+ 1               	1.0         	0.8         	0.6         	0.4         	0.6         	0.8         
+
+[CURVES]
+;ID              	X-Value     	Y-Value
+;PUMP: Pump Curve for Pump 9
+ 1               	1500        	250         
+
+[CONTROLS]
+ LINK 9 OPEN IF NODE 2 BELOW 110
+ LINK 9 CLOSED IF NODE 2 ABOVE 140
+
+
+[RULES]
+
+[ENERGY]
+ Global Efficiency  	75
+ Global Price       	0.0
+ Demand Charge      	0.0
+
+[EMITTERS]
+;Junction        	Coefficient
+
+[QUALITY]
+;Node            	InitQual
+ 10              	0.5
+ 11              	0.5
+ 12              	0.5
+ 13              	0.5
+ 21              	0.5
+ 22              	0.5
+ 23              	0.5
+ 31              	0.5
+ 32              	0.5
+ 9               	1.0
+ 2               	1.0
+
+[SOURCES]
+;Node            	Type        	Quality     	Pattern
+
+[REACTIONS]
+;Type     	Pipe/Tank       	Coefficient
+
+
+[REACTIONS]
+ Order Bulk            	1
+ Order Tank            	1
+ Order Wall            	1
+ Global Bulk           	-.5
+ Global Wall           	-1
+ Limiting Potential    	0.0
+ Roughness Correlation 	0.0
+
+[MIXING]
+;Tank            	Model
+
+[TIMES]
+ Duration           	24:00 
+ Hydraulic Timestep 	1:00 
+ Quality Timestep   	0:05 
+ Pattern Timestep   	2:00 
+ Pattern Start      	0:00 
+ Report Timestep    	1:00 
+ Report Start       	0:00 
+ Start ClockTime    	12 am
+ Statistic          	None
+
+[REPORT]
+ Status             	Yes
+ Summary            	No
+ Page               	0
+
+[OPTIONS]
+ Units              	GPM
+ Headloss           	H-W
+ Specific Gravity   	1.0
+ Viscosity          	1.0
+ Trials             	40
+ Accuracy           	0.001
+ CHECKFREQ          	2
+ MAXCHECK           	10
+ DAMPLIMIT          	0
+ Unbalanced         	Continue 10
+ Pattern            	1
+ Demand Multiplier  	1.0
+ Emitter Exponent   	0.5
+ Quality            	Chlorine mg/L
+ Diffusivity        	1.0
+ Tolerance          	0.01
+
+[COORDINATES]
+;Node            	X-Coord           	Y-Coord
+10              	20.000            	70.000            
+11              	30.000            	70.000            
+12              	50.000            	70.000            
+13              	70.000            	70.000            
+21              	30.000            	40.000            
+22              	50.000            	40.000            
+23              	70.000            	40.000            
+31              	30.000            	10.000            
+32              	50.000            	10.000            
+9               	10.000            	70.000            
+2               	50.000            	90.000            
+
+[VERTICES]
+;Link            	X-Coord           	Y-Coord
+
+[LABELS]
+;X-Coord             Y-Coord             Label & Anchor Node
+6.990             	73.630            	"Source"	
+13.480            	68.130            	"Pump"	
+43.850            	91.210            	"Tank"	
+
+[BACKDROP]
+  DIMENSIONS  	7.000             	6.000             	73.000            	94.000            
+ UNITS          	None
+ FILE           	
+ OFFSET         	0.00            	0.00            
+
+[END]

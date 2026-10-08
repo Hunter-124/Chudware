@@ -1,0 +1,20 @@
+{
+  "provenance": {
+    "unit_hydrograph": "USDA NRCS, NEH Part 630 Chapter 16, March 2007, Table 16-1 (PRF 484), https://hydrocad.net/neh/630ch16.pdf",
+    "storms_i_ia": "NRCS TR-55 program-file ordinates reproduced in County of El Dorado Drainage Manual (2020), Table 2.3.2, p. 2-10, https://www.eldoradocounty.ca.gov/files/assets/county/v/1/documents/services/roads-amp-transportation/drainage-manual-2020-web-version.pdf",
+    "storms_ii_iii": "SCS 24-hour distributions, FHWA HDS-2 Second Edition (2002), section 6.2.2, https://www.fhwa.dot.gov/engineering/hydraulics/pubs/hif02001.pdf; numerical ordinates reproduced in https://help2.innovyze.com/infoworksicm/Content/HTML/ICM_ILCM/Design_Rainfall_Generators.htm, Table 1 (SCS Cumulative dimensionless 24-hour storms)",
+    "rights": "Numerical government-method table transcription; no third-party software or proprietary curve-fitting implementation included."
+  },
+  "unit_hydrograph": {
+    "t_over_tp": [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2, 2.2, 2.4, 2.6, 2.8, 3, 3.2, 3.4, 3.6, 3.8, 4, 4.5, 5],
+    "q_over_qp": [0, 0.03, 0.1, 0.19, 0.31, 0.47, 0.66, 0.82, 0.93, 0.99, 1, 0.99, 0.93, 0.86, 0.78, 0.68, 0.56, 0.46, 0.39, 0.33, 0.28, 0.207, 0.147, 0.107, 0.077, 0.055, 0.04, 0.029, 0.021, 0.015, 0.011, 0.005, 0]
+  },
+  "storms": {
+    "time_step_s": 1800,
+    "duration_s": 86400,
+    "scs_type_i": [0, 0.008, 0.017, 0.026, 0.035, 0.045, 0.055, 0.065, 0.076, 0.087, 0.099, 0.112, 0.126, 0.14, 0.156, 0.174, 0.194, 0.219, 0.254, 0.303, 0.515, 0.583, 0.624, 0.655, 0.682, 0.706, 0.728, 0.748, 0.766, 0.783, 0.799, 0.815, 0.83, 0.844, 0.857, 0.87, 0.882, 0.893, 0.905, 0.916, 0.926, 0.936, 0.946, 0.956, 0.965, 0.974, 0.983, 0.992, 1],
+    "scs_type_ia": [0, 0.01, 0.022, 0.036, 0.051, 0.067, 0.083, 0.099, 0.116, 0.135, 0.156, 0.179, 0.204, 0.233, 0.268, 0.31, 0.425, 0.48, 0.52, 0.55, 0.577, 0.601, 0.623, 0.644, 0.664, 0.683, 0.701, 0.719, 0.736, 0.753, 0.769, 0.785, 0.8, 0.815, 0.83, 0.844, 0.858, 0.871, 0.884, 0.896, 0.908, 0.92, 0.932, 0.944, 0.956, 0.967, 0.978, 0.989, 1],
+    "scs_type_ii": [0, 0.005, 0.011, 0.016, 0.022, 0.028, 0.035, 0.041, 0.048, 0.056, 0.063, 0.071, 0.08, 0.089, 0.098, 0.109, 0.12, 0.133, 0.147, 0.162, 0.181, 0.204, 0.235, 0.283, 0.663, 0.735, 0.772, 0.799, 0.82, 0.838, 0.854, 0.868, 0.88, 0.891, 0.902, 0.912, 0.921, 0.929, 0.937, 0.945, 0.952, 0.959, 0.965, 0.972, 0.978, 0.984, 0.989, 0.995, 1],
+    "scs_type_iii": [0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.031, 0.037, 0.043, 0.05, 0.057, 0.064, 0.072, 0.081, 0.091, 0.102, 0.114, 0.128, 0.146, 0.166, 0.189, 0.212, 0.25, 0.298, 0.5, 0.702, 0.75, 0.784, 0.811, 0.834, 0.854, 0.872, 0.886, 0.898, 0.91, 0.92, 0.928, 0.936, 0.943, 0.95, 0.957, 0.963, 0.969, 0.975, 0.981, 0.986, 0.991, 0.996, 1]
+  }
+}

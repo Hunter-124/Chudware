@@ -649,6 +649,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
     # power does not need it. advertised_tool_audit, 2026-07-30.
     "fluid": [
         "hydraulic_new",
+        "hydraulic_templates",
         "hydraulic_add_component",
         "hydraulic_add_hose",
         "hydraulic_size_pump",
@@ -665,6 +666,32 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "piping_report",
         "piping_verify_cfd",
         "piping_cfd_handoff",
+        # Piping design + industrial sizing (2026-10-05): orthogonal obstacle-avoiding
+        # routing, ASME B31.3 spec check, BOM/spools, persisted-network reload, VIII-1
+        # vessel and equal-friction duct sizing, and native internal-flow CFD over a pipe
+        # bore. cad_guide('piping') / cad_guide('industrial') and the piping-design skill
+        # name them as one workflow, so they ride the same pack as piping_solve.
+        "piping_route",
+        "piping_edit",
+        "piping_fitting_k",
+        "piping_fitting_k_cfd",
+        "piping_spec_check",
+        "piping_bom",
+        "piping_load",
+        "vessel_size",
+        "duct_size",
+        "run_pipe_flow",
+        # Fluid power design + simulation (2026-10-05): transient circuit simulation under a
+        # valve schedule, hydraulic-motor sizing, electric pump-drive sizing (hydraulic or a
+        # piping network's centrifugal pump), and persisted-circuit reload. cad_guide
+        # ('hydraulic') and the hydraulic-design skill name them in one workflow with the
+        # circuit-building tools above, so they ride the same pack.
+        "hydraulic_simulate",
+        "hydraulic_size_motor",
+        "pump_drive_size",
+        "hydraulic_load",
+        "hydraulic_layout_3d",
+        "piping_pump_drive",
     ],
     # Requirements + layout plan. cad_guide's LAYOUT playbook is an ordered chain
     # (layout_plan -> req_update -> req_verify_by_id -> req_report) whose middle and end
@@ -699,6 +726,43 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "measure_part",
         "export_part",
     ],
+    # Civil / site / utility infrastructure (contracts/civil_schema.md): CRS-aware site model,
+    # terrain + grading, alignments, water distribution + fire flow, sewer/storm + hydrology
+    # + detention + culverts, buried pipe / thrust / supports, QTO/cost/schedule and the
+    # plant tie-in coupling to piping. cad_guide('civil') and the civil-design skill name
+    # them as one workflow; registry family `sim`, so the pack lists them explicitly.
+    "civil": [
+        "civil_site_new",
+        "civil_load",
+        "civil_site_edit",
+        "civil_site_summary",
+        "civil_import",
+        "civil_export",
+        "civil_crs_transform",
+        "civil_surface_build",
+        "civil_surface_analyze",
+        "civil_grade_pad",
+        "civil_watershed",
+        "civil_alignment",
+        "civil_alignment_analyze",
+        "civil_quantities",
+        "civil_cost_estimate",
+        "civil_schedule",
+        "civil_water_solve",
+        "civil_fire_flow",
+        "civil_gravity_analyze",
+        "civil_gravity_design",
+        "civil_open_channel",
+        "civil_hydrology",
+        "civil_detention_route",
+        "civil_culvert",
+        "civil_buried_pipe_check",
+        "civil_thrust_restraint",
+        "civil_pipe_supports",
+        "civil_piping_couple",
+        "civil_fea_handoff",
+        "civil_requirement_evidence",
+    ],
 }
 
 _CATEGORY_DESCS: dict[str, str] = {
@@ -721,7 +785,13 @@ _CATEGORY_DESCS: dict[str, str] = {
     "advisor": "Stage advisory checks and dispute",
     "delegate": "Subagents, ask_user, ledger/dag/buildgraph, mission + org coordination",
     "plm": "Item lifecycle, checkpoints/rollback, release, product-graph queries",
-    "fluid": "Hydraulic circuits and piping networks: size, solve, verify",
+    "fluid": ("Hydraulic circuits (build, size pumps/motors/cylinders and drives, transient "
+              "simulate), piping networks (route/solve/B31.3 check/BOM, pipe-bore CFD) and "
+              "vessel/duct sizing"),
+    "civil": ("Civil/site/utility design: CRS + GIS/LandXML/IFC exchange, terrain/grading/"
+              "earthwork, alignments, water distribution + fire flow, sewer/storm hydraulics, "
+              "hydrology/detention/culverts, buried pipe/thrust/supports, QTO/cost/schedule, "
+              "plant tie-in coupling to piping"),
     "requirements": "Layout plan, requirements capture and auto-verification",
     "office": "PDF/DOCX read, extract, edit and render",
     "sheetmetal": "Sheet-metal flanges/bends via add_features + bend calcs",

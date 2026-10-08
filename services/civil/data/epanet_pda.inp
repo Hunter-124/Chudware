@@ -1,0 +1,50 @@
+; Original pressure-dependent-demand civil hydraulic verification case.
+; SI input: LPS flows, metres elevations/lengths/pressure heads, millimetres diameter.
+; Reference results are generated independently by WNTR 1.5.0 / EPANET 2.2.
+[TITLE]
+Deficient-head pressure-dependent demand with exponent 0.5
+
+[JUNCTIONS]
+;ID Elevation RequestedDemand
+J 0 10
+
+[RESERVOIRS]
+;ID Head
+R 10
+
+[PIPES]
+;ID Node1 Node2 Length Diameter Roughness MinorLoss Status
+RJ R J 1000 100 130 0 OPEN
+
+[OPTIONS]
+UNITS LPS
+HEADLOSS H-W
+DEMAND MODEL PDA
+MINIMUM PRESSURE 0
+REQUIRED PRESSURE 20
+PRESSURE EXPONENT 0.5
+SPECIFIC GRAVITY 1
+VISCOSITY 1
+TRIALS 200
+ACCURACY 0.000001
+UNBALANCED STOP
+DEMAND MULTIPLIER 1
+
+[TIMES]
+DURATION 0
+HYDRAULIC TIMESTEP 1:00
+PATTERN TIMESTEP 1:00
+REPORT TIMESTEP 1:00
+REPORT START 0:00
+
+[REPORT]
+STATUS YES
+SUMMARY YES
+NODES ALL
+LINKS ALL
+
+[COORDINATES]
+R 0 0
+J 1000 0
+
+[END]

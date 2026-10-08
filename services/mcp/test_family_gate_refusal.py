@@ -351,7 +351,7 @@ class TestSuiteIsHermetic(unittest.TestCase):
                     "utf8",
                     "-m",
                     "pytest",
-                    "services/mcp/test_recon_tools.py::test_reverse_engineer_stl_smoke_is_honest",
+                    "services/mcp/test_recon_tools.py::test_reverse_engineer_turned_shaft_via_revolve",
                     "-q",
                     "-p",
                     "no:randomly",

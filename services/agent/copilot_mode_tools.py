@@ -268,6 +268,7 @@ JOB_POLL_FLOOR: dict[str, frozenset[str]] = {
         "run_fea_frequency_response",
         "run_fea_modal",
         "run_fea_static",
+        "run_pipe_flow",
         "run_topology_optimization",
     }),
 }

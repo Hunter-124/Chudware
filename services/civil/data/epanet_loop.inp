@@ -1,0 +1,51 @@
+; Original hand-checkable civil hydraulic verification case.
+; SI input: LPS flows, metres elevations/lengths, millimetres pipe diameters.
+; Reference results are generated independently by WNTR 1.5.0 / EPANET 2.2.
+[TITLE]
+Symmetric Hazen-Williams loop: equal demands, zero cross-link flow
+
+[JUNCTIONS]
+;ID Elevation Demand
+A 0 5
+B 0 5
+
+[RESERVOIRS]
+;ID Head
+R 60
+
+[PIPES]
+;ID Node1 Node2 Length Diameter Roughness MinorLoss Status
+RA R A 1000 200 130 0 OPEN
+RB R B 1000 200 130 0 OPEN
+AB A B 1000 200 130 0 OPEN
+
+[OPTIONS]
+UNITS LPS
+HEADLOSS H-W
+DEMAND MODEL DDA
+SPECIFIC GRAVITY 1
+VISCOSITY 1
+TRIALS 200
+ACCURACY 0.000001
+UNBALANCED STOP
+DEMAND MULTIPLIER 1
+
+[TIMES]
+DURATION 0
+HYDRAULIC TIMESTEP 1:00
+PATTERN TIMESTEP 1:00
+REPORT TIMESTEP 1:00
+REPORT START 0:00
+
+[REPORT]
+STATUS YES
+SUMMARY YES
+NODES ALL
+LINKS ALL
+
+[COORDINATES]
+R 0 0
+A 1000 0
+B 0 1000
+
+[END]

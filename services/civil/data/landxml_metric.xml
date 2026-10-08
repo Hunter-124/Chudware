@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Hand-authored LandXML 1.2. Clothoid coordinates independently integrated
+     using scipy 1.17 quad, k(s)=s/1000 and k(s)=.01-s/1000, lengths 10 m.
+     Alignment station lengths: 10+10+20+10+10 = 60 m.
+     North/east coordinate order is intentional. Surface point ids are not ordinal. -->
+<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2" date="2026-10-07" time="00:00:00">
+  <Units><Metric linearUnit="meter" elevationUnit="meter" diameterUnit="millimeter" areaUnit="squareMeter" volumeUnit="cubicMeter" temperatureUnit="celsius" pressureUnit="HPA" directionUnit="decimal degrees" angularUnit="radians"/></Units>
+  <CgPoints name="Survey"><CgPoint name="BM1" desc="Benchmark">200 100 10</CgPoint></CgPoints>
+  <Surfaces><Surface name="Existing ground" OID="eg"><Definition surfType="TIN">
+    <Pnts><P id="10">200 100 10</P><P id="20">200 110 11</P><P id="30">210 110 12</P><P id="40">210 100 11</P><P id="50">205 105 11</P></Pnts>
+    <Faces><F>10 20 50</F><F>20 30 50</F><F>30 40 50</F><F>40 10 50</F></Faces>
+  </Definition></Surface></Surfaces>
+  <Alignments><Alignment name="Road centreline" oID="a1" staStart="0" length="60"><CoordGeom>
+    <Line length="10"><Start>0 0</Start><End>0 10</End></Line>
+    <Spiral spiType="clothoid" rot="ccw" length="10" radiusStart="INF" radiusEnd="100" dirStart="90">
+      <Start>0 10</Start><PI>0 16.667539891526665</PI><End>0.16663690712922566 19.997500289335157</End>
+    </Spiral>
+    <Curve rot="ccw" radius="100" length="20"><Start>0.16663690712922566 19.997500289335157</Start><Center>100.04166294662586 14.999583362267323</Center><End>3.150420775561386 39.73997928771962</End></Curve>
+    <Spiral spiType="clothoid" rot="ccw" length="10" radiusStart="100" radiusEnd="INF" dirStart="75.67605512172942">
+      <Start>3.150420775561386 39.73997928771962</Start><PI>3.9752970426802503 42.97045653632155</PI><End>5.945689809346931 49.34020068739754</End>
+    </Spiral>
+    <Line length="10"><Start>5.945689809346931 49.34020068739754</Start><End>8.900891875960326 58.8935655786536</End></Line>
+  </CoordGeom><Profile name="Road profile"><ProfAlign name="Design"><PVI>0 100</PVI><ParaCurve length="20">30 103</ParaCurve><PVI>60 100</PVI></ProfAlign></Profile></Alignment></Alignments>
+  <PipeNetworks><PipeNetwork name="Sanitary" oID="g1" pipeNetType="sanitary"><Structs>
+    <Struct name="MH1" elevRim="105" elevSump="100"><Center>200 100</Center><CircStruct diameter="1200"/><Invert refPipe="P1" elev="100" flowDir="out"/></Struct>
+    <Struct name="MH2" elevRim="104" elevSump="98.5"><Center>200 200</Center><CircStruct diameter="1200"/><Invert refPipe="P1" elev="99" flowDir="in"/></Struct>
+  </Structs><Pipes><Pipe name="P1" refStart="MH1" refEnd="MH2" length="100" slope="0.01"><CircPipe diameter="300" material="PVC"/></Pipe></Pipes></PipeNetwork></PipeNetworks>
+</LandXML>

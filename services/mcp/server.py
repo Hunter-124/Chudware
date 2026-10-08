@@ -109,8 +109,9 @@ _LITE_INSTRUCTIONS = (
     "script; call whatever you need, in whatever order the task wants, and skip what you don't.\n"
     "ENTRY: call cad_guide() for the engine's op vocabulary + worked examples, and "
     "cad_guide(topic) for depth on a subsystem (simulation, review, gsl, cam, ecad, parts, "
-    "sourcing, cost, piping, hydraulic, firmware, structural, sketch3d, reverse, deliverables, "
-    "requirements, tolerance_stackup, …). Don't recall op syntax from memory — cad_guide has it.\n"
+    "sourcing, cost, piping, industrial, hydraulic, firmware, structural, sketch3d, reverse, "
+    "deliverables, requirements, tolerance_stackup, …). Don't recall op syntax from memory — "
+    "cad_guide has it.\n"
     "CONVENTIONS THAT MATTER: address geometry in PLAIN WORDS ('the top face', 'the vertical "
     "edges', 'the largest round face') — never face numbers or raw coordinates. Build with the "
     "feature a person would use (sketch+revolve for round bodies, loft for blended shapes). "
@@ -228,7 +229,15 @@ _FULL_INSTRUCTIONS = (
         "ti_6al4v, abs, pla, nylon_pa12, cast_iron_gray, inconel_718, …). "
         "cam_audit — deterministic G-code verification; run after cam_post.\n"
         "DOMAIN TOOLS: cam_* (machining toolpaths — cad_guide('cam')), ecad_* (schematic/PCB), "
-        "piping_* (pipe networks — cad_guide('piping')), hydraulic_* (ISO 1219 circuits — "
+        "piping_* (pipe networks: piping_route obstacle-avoiding routing -> piping_solve -> "
+        "piping_spec_check ASME B31.3 -> piping_bom spools, run_pipe_flow internal-flow CFD, "
+        "persisted per doc and reloaded with piping_load, piping_pump_drive sizes a network "
+        "pump's electric motor — cad_guide('piping')), vessel_size "
+        "(ASME VIII-1 pressure vessels) and duct_size (HVAC/process ducts) — "
+        "cad_guide('industrial'), hydraulic_* (ISO 1219 fluid power: hydraulic_new -> "
+        "add_component/add_hose -> size_cylinder/size_pump/size_motor -> pump_drive_size "
+        "(electric motor) -> hydraulic_simulate transient under a valve schedule -> bom, "
+        "persisted per doc and reloaded with hydraulic_load — "
         "cad_guide('hydraulic')), fw_* (firmware build/sim/flash — cad_guide('firmware')), "
         "struct_* (beam/frame analysis — cad_guide('structural')), "
         "code_check() (building-code compliance — cad_guide('code_compliance')).\n"
@@ -261,8 +270,8 @@ _FULL_INSTRUCTIONS = (
         "24k-context local models. Every role should cold-start from ledger_get, not chat history.\n"
         "All cad_guide topics: overview, simulation, review, intake, gsl, cam, narration, parts, "
         "reverse, reveng, deliverables, requirements, dag, verify, interaction, sourcing, cost, "
-        "spec, piping, hydraulic, firmware, structural, regen, code_compliance, serving, "
-        "design_review, doc_diff, plm, tolerance_stackup, sketch3d.\n"
+        "spec, piping, industrial, hydraulic, firmware, structural, regen, code_compliance, "
+        "serving, design_review, doc_diff, plm, tolerance_stackup, sketch3d.\n"
         "REBUILD FAILURE? A failed add_features batch may carry a `regen_diagnosis` fix-preview "
         "card (diagnosis + editable fix_ops + verifier verdict). Record your verdict with "
         "regen_resolve(card, 'accept'|'edit'|'reject') — accept/edit returns the fixed document; "
@@ -491,6 +500,15 @@ register_piping_tools(_reg.view(mcp, "sim"))
 # Hydraulic (ISO 1219 circuit design + component sizing).
 from services.mcp.hydraulic_tools import register_hydraulic_tools
 register_hydraulic_tools(_reg.view(mcp, "sim"))
+
+# Civil / site / utility infrastructure (contracts/civil_schema.md, aicad.civil/1): terrain,
+# alignments, water + gravity networks, hydrology, structures, QTO and the piping tie-in.
+from services.mcp.civil_tools import register_civil_tools
+register_civil_tools(_reg.view(mcp, "sim"))
+from services.mcp.civil_hydro_tools import register_civil_hydro_tools
+register_civil_hydro_tools(_reg.view(mcp, "sim"))
+from services.mcp.civil_link_tools import register_civil_link_tools
+register_civil_link_tools(_reg.view(mcp, "sim"))
 
 # Photo capture + photogrammetry entry path for reverse_engineer (Pillar 10 v2).
 # DEFAULT OFF — start_capture_session MCP tool starts the local listener on demand.

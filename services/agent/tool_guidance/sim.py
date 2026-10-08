@@ -174,6 +174,47 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "refresh the pump margin."
         ),
     },
+    "hydraulic_simulate": {
+        "prompt_note": (
+            "Transient of the active circuit (or doc / doc_id's saved one): every port wired, "
+            "required params set, valve_schedule [{t_s, component_id, position a|b|center|0..1}], "
+            "loads per cylinder/motor. Cite summary (peak_pressure_bar, stroke_time_s, "
+            "steady_speed_rpm, efficiency) and ratings.exceeded; series are cut to <=400 points "
+            "— series_path holds full resolution. missing_params/unconnected_port name the fix; "
+            "pass doc_id to save the run in the hydraulic_circuit study."
+        ),
+        "timeout_s": 300,
+    },
+    "hydraulic_size_motor": {
+        "prompt_note": (
+            "pressure_bar is the DIFFERENTIAL across the motor (supply minus back pressure). "
+            "Put the returned standard displacement (result field standard_displacement_cc_rev) "
+            "on the motor_hydraulic component and feed "
+            "flow_lpm to hydraulic_size_pump; doc_id saves it under results.sizing.motors."
+        ),
+    },
+    "hydraulic_load": {
+        "prompt_note": (
+            "Restore a hydraulic_circuit study (doc_id, optional circuit name) as the active "
+            "circuit, with its saved sizing/bom/simulate and valve schedule; call it after a "
+            "reopen instead of rebuilding the circuit from chat memory."
+        ),
+    },
+    "hydraulic_layout_3d": {
+        "prompt_note": (
+            "Place circuit components in 3D (mm) for the GUI's Hydraulics > 3D Layout: positions "
+            "{component_id: [x, y, z]} merge into the saved study's layout3d (doc_id persists it; "
+            "results are kept). hydraulic_load returns the full layout including defaults."
+        ),
+    },
+    "pump_drive_size": {
+        "prompt_note": (
+            "Electric motor for a pump: kind=hydraulic (flow_lpm + pressure_bar) or centrifugal "
+            "(flow_m3h + head_m). Rounds shaft power x service_factor up the IEC kW or NEMA hp "
+            "ladder; quote motor_rating, poles, frame and full_load_current_a. For a solved "
+            "piping network use piping_pump_drive instead."
+        ),
+    },
     "motion_fea_handoff": {
         "prompt_note": (
             "One-call worst-frame stress check on an assembly link (needs "
@@ -254,6 +295,27 @@ ENTRIES: dict[str, dict[str, Any]] = {
         ),
         "timeout_s": 3600,
     },
+    "piping_edit": {
+        "prompt_note": (
+            "Atomic draw/edit: add_run paths in mm auto-create elbows/tees; add_fitting "
+            "inserts valves/orifices/custom K. Pass doc_id to persist, then re-solve."
+        ),
+    },
+    "piping_fitting_k": {
+        "prompt_note": (
+            "Deterministic K preview and Reynolds curve. Quote the returned method; "
+            "custom fittings need a k_model, not an invented default."
+        ),
+    },
+    "piping_fitting_k_cfd": {
+        "prompt_note": (
+            "Shared GUI/agent CFD K pipeline: quick=2 Re points at 12 cells across. "
+            "Use background=True; poll this tool with job_id, cancel=True to stop. "
+            "apply=True + fitting_id writes params.k_model; doc_id saves the network. "
+            "Only elbows generate bores; other fittings require a closed fluid-volume geometry."
+        ),
+        "timeout_s": 60,
+    },
     "piping_cfd_handoff": {
         "prompt_note": (
             "Solve -> bore STEP -> LBM CFD in one call; use background=True "
@@ -261,6 +323,14 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "piping_verify_cfd."
         ),
         "timeout_s": 600,
+    },
+    "piping_bom": {
+        "prompt_note": (
+            "Line list, pipe/fitting/flange quantities with masses, and shop spools "
+            "broken at flanges and max_spool_length_mm; pass the routed piping (or "
+            "a session network name) and doc_id to merge the BOM into the doc's "
+            "piping_network study."
+        ),
     },
     "piping_fluid": {
         "prompt_note": (
@@ -274,6 +344,20 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Geometry bridge to CFD: import the STEP as a part, then "
             "run_cfd_flow. piping_cfd_handoff already does this whole "
             "chain."
+        ),
+    },
+    "piping_load": {
+        "prompt_note": (
+            "Restore a piping_network study persisted in a doc (doc_id, optional "
+            "network name) into the session before re-solving or re-checking; a "
+            "doc with several networks refuses and lists their names."
+        ),
+    },
+    "piping_pump_drive": {
+        "prompt_note": (
+            "Reads the pump run's flow_m3h + pump_head_m from the network's last piping_solve "
+            "(solve with pumps=[...] first; run_id when several pumps) and sizes its electric "
+            "motor via pump_drive_size; doc_id saves it in the piping_network study."
         ),
     },
     "piping_operating_point": {
@@ -304,6 +388,24 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "not flow fields."
         ),
     },
+    "piping_route": {
+        "prompt_note": (
+            "Orthogonal obstacle-avoiding route (mm) between start/end points; dir is "
+            "the travel direction (start: nozzle outward normal, end: MINUS the end "
+            "nozzle's outward normal); doc_id injects every solid body as an obstacle "
+            "(ignore_bodies exempts the equipment you connect to). Elbows are added "
+            "at each bend; no_route means widen the gap, lower clearance_mm or "
+            "change grid_mm, never hand-draw through solids."
+        ),
+    },
+    "piping_spec_check": {
+        "prompt_note": (
+            "ASME B31.3 eq. 3a wall check per run plus B16.5 flange rating and "
+            "support span; design_pressure_kpa is gauge, design_temp_c in °C. Cite "
+            "t_required_mm/mawp_kpa/utilization per run; all_pass:false is a "
+            "finding to fix (schedule, material, class), not a warning."
+        ),
+    },
     "run_cfd_accurate": {
         "prompt_note": (
             "OpenFOAM external-aero RANS; the tool capability-checks first and returns "
@@ -311,6 +413,17 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "poll get_job. Inputs are velocity m/s, aoa degrees, fluid air|water. Start "
             "preset='coarse', then refine; only quote Cd/Cl when converged is true."
         ),
+    },
+    "run_pipe_flow": {
+        "prompt_note": (
+            "Native D3Q19 internal flow through a fluid-volume solid (pipe bore, "
+            "e.g. piping + run_id derives it); inlet/outlet normals point INTO the "
+            "domain. Quote dp_pa only with converged:true and read caveats when "
+            "physical Re is under-resolved; compare against darcy_estimate_pa and "
+            "re-run at a higher cells_across (default 20) before trusting a fitting dP. "
+            "background=True returns job_id for get_job."
+        ),
+        "timeout_s": 300,
     },
     "run_cfd_flow": {
         "prompt_note": (
@@ -477,6 +590,24 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Rate-table budget figures, not vendor prices (those are "
             "bom_price — don't mix). Same structure doc as struct_check."
+        ),
+    },
+    "vessel_size": {
+        "prompt_note": (
+            "ASME VIII-1 UG-27 shell + UG-32 head thickness from inner_diameter_mm and "
+            "tan_tan_length_mm or volume_m3; design_pressure_kpa gauge, temps °C, "
+            "corrosion allowance included. Quote t_nominal_mm, mawp_kpa and "
+            "hydrotest_kpa from the result; doc_id+name persists a vessel study. "
+            "Model the vessel afterwards with the returned thicknesses."
+        ),
+    },
+    "duct_size": {
+        "prompt_note": (
+            "Equal-friction duct sizing over a parent-linked segment tree (airflow_m3s, "
+            "length_m, k_fittings); returns standard round or rect sizes, velocity, "
+            "pressure drops, the critical path and fan_static_pa. A velocity warning "
+            "means lower friction_pa_per_m (bigger duct) or split the branch, not "
+            "ignore it."
         ),
     },
 }

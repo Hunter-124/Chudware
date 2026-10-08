@@ -239,10 +239,16 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "piping_solve", "piping_report", "piping_operating_point",
         "piping_fluid", "piping_internal_volume",
         "piping_cfd_handoff", "piping_verify_cfd",
+        "piping_route", "piping_spec_check", "piping_bom", "piping_load",
+        "run_pipe_flow", "piping_pump_drive",
+    },
+    "industrial": {
+        "vessel_size", "duct_size",
     },
     "hydraulic": {
         "hydraulic_new", "hydraulic_add_component", "hydraulic_add_hose",
         "hydraulic_size_cylinder", "hydraulic_size_pump", "hydraulic_bom",
+        "hydraulic_size_motor", "pump_drive_size", "hydraulic_simulate", "hydraulic_load",
     },
     "firmware": {
         "fw_new_project", "fw_build", "fw_sources", "fw_sim_run", "fw_verify_board",
@@ -335,6 +341,7 @@ _FAMILY_SIGNALS: dict[str, list[str]] = {
     "cost":          ["cam_cost_estimate", "cad_guide('cost')", "cost"],
     "spec":          ["match_part_number", "spec_sheet_match", "cad_guide('spec')"],
     "piping":        ["piping_solve", "cad_guide('piping')", "piping"],
+    "industrial":    ["vessel_size", "duct_size", "cad_guide('industrial')"],
     "hydraulic":     ["hydraulic_new", "cad_guide('hydraulic')", "hydraulic"],
     "firmware":      ["fw_new_project", "fw_build", "cad_guide('firmware')", "firmware"],
     "structural":    ["struct_analyze", "cad_guide('structural')", "structural"],
@@ -389,7 +396,7 @@ def _build_coverage_corpus() -> str:
             "overview", "simulation", "motion", "review", "intake", "gsl", "cam",
             "narration", "parts", "reverse", "deliverables",
             "requirements", "dag", "verify", "interaction", "sourcing",
-            "cost", "spec", "piping", "hydraulic", "firmware", "structural",
+            "cost", "spec", "piping", "industrial", "hydraulic", "firmware", "structural",
             "regen", "code_compliance", "serving", "design_review", "doc_diff", "plm",
             "tolerance_stackup",
             "mechanical",
@@ -471,7 +478,14 @@ class TestMCPFreshness(unittest.TestCase):
             "design_review",                        # geometry battery
             "cam_new_job",                          # CAM entry point
             "piping_solve",                         # piping
+            "piping_route", "piping_spec_check",    # piping design
+            "piping_bom", "piping_load",
+            "run_pipe_flow",                        # internal-flow CFD
+            "vessel_size", "duct_size",             # industrial sizing
             "hydraulic_new",                        # hydraulic
+            "hydraulic_simulate", "hydraulic_load",  # fluid-power transient + reload
+            "hydraulic_size_motor", "pump_drive_size",
+            "piping_pump_drive",                    # network pump electric drive
             "fw_new_project",                       # firmware
             "struct_analyze",                       # structural
             "code_check",                           # compliance
@@ -501,7 +515,7 @@ class TestMCPFreshness(unittest.TestCase):
             return
         required_in_fallback = [
             "requirements", "dag", "verify", "interaction", "sourcing",
-            "cost", "spec", "piping", "hydraulic", "firmware", "structural",
+            "cost", "spec", "piping", "industrial", "hydraulic", "firmware", "structural",
             "regen", "code_compliance", "serving", "design_review", "doc_diff", "plm",
             "tolerance_stackup",
             "mechanical",
@@ -518,7 +532,7 @@ class TestMCPFreshness(unittest.TestCase):
         required_families = {
             "cad", "gsl", "recon", "intake", "interaction", "ecad", "cam",
             "doc_diff", "req", "verify", "research", "deliverables",
-            "sourcing", "cost", "spec", "piping", "hydraulic", "firmware",
+            "sourcing", "cost", "spec", "piping", "industrial", "hydraulic", "firmware",
             "structural", "parts", "serving", "regen", "code_compliance",
             "dag", "design_review", "ledger", "tolerance_stackup", "mechanical",
             "sim", "mission", "plm", "reveng",

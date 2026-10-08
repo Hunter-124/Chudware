@@ -1,0 +1,18 @@
+{
+  "reference": "FHWA-HIF-12-026, Hydraulic Design of Highway Culverts, HDS-5 Third Edition (April 2012), Appendix A Table A.1 and eqs. A.1–A.3; entrance losses Appendix C Table C.2. https://www.fhwa.dot.gov/engineering/hydraulics/pubs/12026/hif12026.pdf",
+  "notes": "Coefficient table is A.1, not C.1 (which lists natural-channel Manning n). Ku=1.811 in SI. Ks=-0.5 except mitered inlet +0.7. Form 2 has no unsubmerged slope correction. ke values apply to square edges at the crown unless bevel/chamfer is named. Government numerical table transcription.",
+  "inlets": {
+    "concrete_pipe_square_edge_headwall": {"shape": "circular", "chart": 1, "form": 1, "K": 0.0098, "M": 2.0, "c": 0.0398, "Y": 0.67, "Ks": -0.5, "ke": 0.5},
+    "concrete_pipe_groove_end_headwall": {"shape": "circular", "chart": 1, "form": 1, "K": 0.0018, "M": 2.0, "c": 0.0292, "Y": 0.74, "Ks": -0.5, "ke": 0.2},
+    "concrete_pipe_groove_end_projecting": {"shape": "circular", "chart": 1, "form": 1, "K": 0.0045, "M": 2.0, "c": 0.0317, "Y": 0.69, "Ks": -0.5, "ke": 0.2},
+    "cmp_headwall": {"shape": "circular", "chart": 2, "form": 1, "K": 0.0078, "M": 2.0, "c": 0.0379, "Y": 0.69, "Ks": -0.5, "ke": 0.5},
+    "cmp_mitered": {"shape": "circular", "chart": 2, "form": 1, "K": 0.0210, "M": 1.33, "c": 0.0463, "Y": 0.75, "Ks": 0.7, "ke": 0.7},
+    "cmp_projecting": {"shape": "circular", "chart": 2, "form": 1, "K": 0.0340, "M": 1.5, "c": 0.0553, "Y": 0.54, "Ks": -0.5, "ke": 0.9},
+    "concrete_box_wingwall_30_75": {"shape": "rectangular", "chart": 8, "form": 1, "K": 0.026, "M": 1.0, "c": 0.0347, "Y": 0.81, "Ks": -0.5, "ke": 0.4},
+    "concrete_box_wingwall_90_15": {"shape": "rectangular", "chart": 8, "form": 1, "K": 0.061, "M": 0.75, "c": 0.0400, "Y": 0.80, "Ks": -0.5, "ke": 0.5},
+    "concrete_box_wingwall_0": {"shape": "rectangular", "chart": 8, "form": 1, "K": 0.061, "M": 0.75, "c": 0.0423, "Y": 0.82, "Ks": -0.5, "ke": 0.7},
+    "concrete_box_headwall_chamfer_19mm": {"shape": "rectangular", "chart": 10, "form": 2, "K": 0.515, "M": 0.667, "c": 0.0375, "Y": 0.79, "Ks": -0.5, "ke": 0.5},
+    "concrete_box_headwall_bevel_45": {"shape": "rectangular", "chart": 10, "form": 2, "K": 0.495, "M": 0.667, "c": 0.0314, "Y": 0.82, "Ks": -0.5, "ke": 0.2},
+    "concrete_box_headwall_bevel_33_7": {"shape": "rectangular", "chart": 10, "form": 2, "K": 0.486, "M": 0.667, "c": 0.0252, "Y": 0.865, "Ks": -0.5, "ke": 0.2}
+  }
+}

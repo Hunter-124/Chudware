@@ -1,0 +1,237 @@
+{
+  "schema": "aicad.civil.epanet-reference/1",
+  "ok": true,
+  "warnings": [],
+  "assumptions": [
+    "Independent EPANET engine reference, not the civil implementation.",
+    "Hazen-Williams water hydraulics with input options recorded below."
+  ],
+  "method": {
+    "name": "EPANET 2.2 Global Gradient Algorithm",
+    "reference": "https://usepa.github.io/EPANET2.2/"
+  },
+  "engine": {
+    "wrapper": "WNTR",
+    "wrapper_version": "1.5.0",
+    "simulator": "EpanetSimulator",
+    "requested_version": "2.2",
+    "toolkit_version_code": 20200,
+    "toolkit_version": "2.2.0",
+    "library": "libepanet22.so",
+    "library_sha256": "3a49fa2eb1aecdf4d7a83c9a26667bacc418d285ed1d3a45becec52e7556d73f"
+  },
+  "provenance": {
+    "kind": "independent_engine_reference",
+    "input_file": "epanet_prv.inp",
+    "input_sha256": "0ee0f03a91a4eb09202de4721c36071945ad2dea64509022a744b19f9211c3f8",
+    "engine_input_sha256": "fe3cc8cd0a586d5c94ed3d1d448971f989f07c1a806c54299306fbfe1f617187",
+    "generation": "wntr.network.WaterNetworkModel(input); wntr.sim.EpanetSimulator(model).run_sim(version=2.2, convergence_error=True)",
+    "engine_input_note": "WNTR serializes the imported model to an EPANET 2.2 INP before calling the compiled toolkit; the fixture itself is not replaced by that serialization.",
+    "created_at": "2026-10-07",
+    "source": "Original explicit SI verification case specified for this civil package",
+    "source_url": null,
+    "license": {
+      "epa_public_domain_notice": "https://www.epa.gov/water-research/epanet",
+      "epanet_mit_notice": "https://github.com/USEPA/EPANET2.2",
+      "wntr_license": "BSD-3-Clause",
+      "wntr_license_url": "https://github.com/USEPA/WNTR/blob/1.5.0/LICENSE.md",
+      "input_note": "Original case, not copied from a third-party benchmark."
+    },
+    "derivations": [
+      "headloss_m is signed upstream head_m minus downstream head_m, using the reported node heads; pumps therefore have negative headloss_m.",
+      "reported_headloss is the WNTR-converted EPANET binary value: m/m pipe gradient, m pump or valve headloss.",
+      "Tank level_m is reported head_m minus model tank elevation_m.",
+      "requested_demand_m3s comes from WNTR expected_demand(base demands, patterns, multiplier); delivered_demand_m3s is EPANET binary node demand.",
+      "EPANET reservoir/tank demand_m3s is signed exchange flow, not customer demand."
+    ],
+    "controls": [],
+    "result_numeric_precision": "EPANET binary output stores float32; JSON preserves the converted output without decimal rounding."
+  },
+  "input_options": {
+    "time": {
+      "duration": 0.0,
+      "hydraulic_timestep": 3600,
+      "quality_timestep": 360,
+      "rule_timestep": 360,
+      "pattern_timestep": 3600,
+      "pattern_start": 0.0,
+      "report_timestep": 3600,
+      "report_start": 0.0,
+      "start_clocktime": 0.0,
+      "statistic": "NONE",
+      "pattern_interpolation": false
+    },
+    "hydraulic": {
+      "headloss": "H-W",
+      "hydraulics": null,
+      "hydraulics_filename": null,
+      "viscosity": 1.0,
+      "specific_gravity": 1.0,
+      "pattern": null,
+      "demand_multiplier": 1.0,
+      "demand_model": "DDA",
+      "minimum_pressure": 0.0,
+      "required_pressure": 0.07,
+      "pressure_exponent": 0.5,
+      "emitter_exponent": 0.5,
+      "trials": 200,
+      "accuracy": 1e-06,
+      "unbalanced": "STOP",
+      "unbalanced_value": null,
+      "checkfreq": 2,
+      "maxcheck": 10,
+      "damplimit": 0.0,
+      "headerror": 0.0,
+      "flowchange": 0.0,
+      "inpfile_units": "LPS",
+      "inpfile_pressure_units": null
+    },
+    "report": {
+      "pagesize": null,
+      "report_filename": null,
+      "status": "YES",
+      "summary": "YES",
+      "energy": "NO",
+      "nodes": true,
+      "links": true,
+      "report_params": {
+        "elevation": false,
+        "demand": true,
+        "head": true,
+        "pressure": true,
+        "quality": true,
+        "length": false,
+        "diameter": false,
+        "flow": true,
+        "velocity": true,
+        "headloss": true,
+        "position": false,
+        "setting": false,
+        "reaction": false,
+        "f-factor": false
+      },
+      "param_opts": {
+        "elevation": {},
+        "demand": {},
+        "head": {},
+        "pressure": {},
+        "quality": {},
+        "length": {},
+        "diameter": {},
+        "flow": {},
+        "velocity": {},
+        "headloss": {},
+        "position": {},
+        "setting": {},
+        "reaction": {},
+        "f-factor": {}
+      }
+    },
+    "quality": {
+      "parameter": "NONE",
+      "trace_node": null,
+      "chemical_name": "CHEMICAL",
+      "diffusivity": 1.0,
+      "tolerance": 0.01,
+      "inpfile_units": "mg/L"
+    },
+    "reaction": {
+      "bulk_order": 1.0,
+      "wall_order": 1.0,
+      "tank_order": 1.0,
+      "bulk_coeff": 0.0,
+      "wall_coeff": 0.0,
+      "limiting_potential": null,
+      "roughness_correl": null
+    },
+    "energy": {
+      "global_price": 0,
+      "global_pattern": null,
+      "global_efficiency": null,
+      "demand_charge": null
+    },
+    "graphics": {
+      "dimensions": null,
+      "units": "NONE",
+      "offset": null,
+      "image_filename": null,
+      "map_filename": null
+    },
+    "user": {}
+  },
+  "input_units": {
+    "flow": "LPS",
+    "head_and_length": "m",
+    "diameter": "mm",
+    "pressure": "m"
+  },
+  "units": {
+    "time_s": "s",
+    "head_m": "m",
+    "pressure_m": "m water head",
+    "demand_m3s": "m3/s",
+    "requested_demand_m3s": "m3/s",
+    "delivered_demand_m3s": "m3/s",
+    "flow_m3s": "m3/s",
+    "velocity_ms": "m/s",
+    "headloss_m": "m",
+    "level_m": "m",
+    "status_code": "WNTR simplified link state: 0=closed, 1=open, 2=active"
+  },
+  "timesteps": [
+    {
+      "time_s": 0,
+      "nodes": {
+        "A": {
+          "type": "junction",
+          "head_m": 59.98196029663086,
+          "pressure_m": 59.98196029663086,
+          "demand_m3s": 0.0,
+          "requested_demand_m3s": 0.0,
+          "delivered_demand_m3s": 0.0
+        },
+        "B": {
+          "type": "junction",
+          "head_m": 20.0,
+          "pressure_m": 20.0,
+          "demand_m3s": 0.005000000353902578,
+          "requested_demand_m3s": 0.005,
+          "delivered_demand_m3s": 0.005000000353902578
+        },
+        "R": {
+          "type": "reservoir",
+          "head_m": 60.0,
+          "pressure_m": -1.8676757918001385e-06,
+          "demand_m3s": -0.005000000353902578
+        }
+      },
+      "links": {
+        "RA": {
+          "type": "pipe",
+          "from": "R",
+          "to": "A",
+          "flow_m3s": 0.005000000353902578,
+          "velocity_ms": 0.15915408730506897,
+          "headloss_m": 0.018039703369140625,
+          "reported_headloss": 0.0001803610794013366,
+          "reported_headloss_units": "m/m",
+          "status": "open",
+          "status_code": 1
+        },
+        "V": {
+          "type": "valve",
+          "from": "A",
+          "to": "B",
+          "flow_m3s": 0.005000000353902578,
+          "velocity_ms": 0.15915408730506897,
+          "headloss_m": 39.98196029663086,
+          "reported_headloss": 39.98196029663086,
+          "reported_headloss_units": "m",
+          "status": "active",
+          "status_code": 2
+        }
+      },
+      "tanks": {}
+    }
+  ]
+}

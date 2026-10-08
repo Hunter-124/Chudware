@@ -127,6 +127,8 @@ Domain seams:
 - `structural_schema.md` — structural documents (`aicad.structure/1`).
 - `hydraulic_schema.md` — ISO 1219 hydraulic circuits (`aicad.hydraulic/1`).
 - `piping_schema.md` — piping documents (`aicad.piping/1`).
+- `civil_schema.md` — civil / site / utility infrastructure model (`aicad.civil/1`):
+  terrain, alignments, water + gravity networks, hydrology, structures, plant tie-ins.
 - `deliverables.md` — spec-driven deliverable authoring (`deliverables/1`).
 - `office.md` — reading and editing existing office files (`office/1`).
 - `parts.md` — unified parts library (`aicad.parts/1`).

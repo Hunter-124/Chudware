@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<!-- International foot = 0.3048 m exactly (1959 international yard and pound). -->
+<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2" date="2026-10-07" time="00:00:00">
+  <Units><Imperial linearUnit="foot" elevationUnit="feet" diameterUnit="inch" areaUnit="squareFoot" volumeUnit="cubicFeet" temperatureUnit="fahrenheit" pressureUnit="inchHG"/></Units>
+  <CgPoints><CgPoint name="P1">2000 1000 100</CgPoint></CgPoints>
+  <Surfaces><Surface name="Feet TIN"><Definition surfType="TIN"><Pnts><P id="1">0 0 100</P><P id="2">0 10 100</P><P id="3">10 0 110</P></Pnts><Faces><F>1 2 3</F></Faces></Definition></Surface></Surfaces>
+  <PipeNetworks><PipeNetwork name="Water" pipeNetType="water"><Structs><Struct name="J1" elevSump="100"><Center>0 0</Center><Connection/><Invert refPipe="W1" elev="100" flowDir="out"/></Struct><Struct name="J2" elevSump="90"><Center>0 100</Center><Connection/><Invert refPipe="W1" elev="90" flowDir="in"/></Struct></Structs><Pipes><Pipe name="W1" refStart="J1" refEnd="J2" length="100"><CircPipe diameter="12"/></Pipe></Pipes></PipeNetwork></PipeNetworks>
+</LandXML>

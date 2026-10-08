@@ -109,6 +109,20 @@ run_fea_frequency_response(fixtures, excitation_dir, sweep_hz, zeta, base_accel_
   Response is acceleration amplification only: mode shapes are unit-normalized, so physical
   displacement/stress amplitudes are NOT recovered (see result.limitations).
 
+HUMAN HYDRAULICS (Simulate -> Hydraulics):
+  New Circuit -> Start: choose a power unit, cylinder circuit, motor circuit or blank.
+  Nonblank templates include connected components and editable simulation setup. Drag components
+  from the canvas toolbar onto the schematic; click two compatible ports or drag between
+  them to connect immediately. Select a component or hose and press Delete; Ctrl+Z undoes.
+  Circuit -> Design -> Simulate -> Results separates editing, sizing, setup and outcomes.
+  Ribbon Simulate runs when ready and opens Results -> Outcome; otherwise it shows the
+  setup blocker. Results also contains BOM and To Piping.
+  3D Layout shows shaded component glyphs and pressure-coloured hoses in the native viewport.
+  Its plane, offset, grid, snap and placement card appears only in 3D view; the selected
+  component editor also retains 3D position fields and Place in 3D.
+  Positions persist in params.layout3d; moving a component preserves simulation results.
+  Agents share that layout through hydraulic_layout_3d. Glyphs are not manufactured CAD.
+
 run_cfd_flow(velocity, aoa, fluid) — LBM wind tunnel over the whole part/assembly.
   velocity m/s, aoa degrees, fluid "air"|"water". Returns drag (N), lift (N), Cd, frontal
   area, and Reynolds number. Coarse grid by default — a directional estimate, raise `cells`
@@ -383,10 +397,19 @@ TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ri
     Runs made on other geometry are marked stale; model-tool runs are flagged unverified
     against the editor's geometry digest.
 
+  Return to CAD: Results → Result geometry and export → Continue in CAD. A valid,
+    available, non-stale surface opens as a separate solid in Model / Feature Manager;
+    the source part and retained study remain unchanged. Add or cut features, then save
+    the new part as .step+. The imported base is faceted geometry, not recovered sketches
+    or smooth parametric history. Coplanar triangles share planar faces for selection.
+    Solver convergence and feasibility do NOT establish valid reconstructed geometry;
+    disconnected/invalid results cannot continue in CAD. DFAM checks remain separate.
+
   Model workflow: topology_capabilities → run_topology_optimization(study=…, background=True)
     (saved into the document as type "topology" BEFORE the solve, so the GUI shows it) →
-    wait_job / get_job → sim_cancel(job_id) to stop → read ok / converged / feasible
-    separately, result.constraints, the reanalysis, manufacturing checks and artifacts.
+    wait_job (standalone tool call, not a long-running eval cell) / get_job →
+    sim_cancel(job_id) to stop → read ok / converged / feasible separately,
+    result.constraints, the reanalysis, manufacturing checks and artifacts.
     run_topology_optimization(study_id=…) re-runs a GUI-authored study exactly as stored.
 
   Model limits:
@@ -409,12 +432,57 @@ TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ri
       a print gate, and nothing is sliced automatically. Slice the exported surface.stl with
       slice_part; only its passing G-code check makes a part print-ready.
 
-SIMULATE WORKSPACE (host GUI): one multiphysics Simulate workspace hosts every live
-  study kind with progressive disclosure by open doc type, plus handoff actions
-  (Send board to thermal FEA, Pick heatsink, …) driven by aicad.simhandoff/1. Worker
-  seam: services/sim/multiphysics_rpc.py (sim_caps / sim_run_contact /
-  sim_freq_response / ecad_thermal_handoff / heatsink_select / piping_verify_cfd).
-  EM forms drive the live EM backend.
+SIMULATE WORKSPACE (host GUI): every live simulation family has guided setup plus
+  exact numeric fields and an expandable native-parameter editor. Gestures are
+  additive conveniences, not substitutes for solver parameters:
+    Structural / modal / buckling / contact / fatigue / frequency-response /
+      thermal FEA: drag a model face into a boundary well, or drag a compatible
+      fixture/load/thermal tool onto a face. Boundary chips identify targets;
+      exact vectors, magnitudes, materials, mesh and solver controls remain editable.
+    Topology: target wells cover all supported physics, preserve/exclude regions
+      and manufacturing controls; the complete native definition stays editable.
+    External flow / thermal CFD: fluid and surface palettes, direction/axis
+      controls and drag-adjustable operating values retain exact custom inputs.
+    Motion: click or drag a mate into a driver, reorder drivers, and edit exact
+      sweep/dynamics controls. Driver identity follows the mate, not its row index.
+    EM: click/drop waveguide presets or an STL, then edit custom geometry,
+      excitation, spectrum, ports, boundaries and supported solver controls.
+    Electronics: device/source/probe palettes complement exact operating-point,
+      DC, AC and transient settings; PCB thermal and heatsink handoffs retain
+      their native mesh, schedule, source and thermal-interface parameters.
+    Firmware: the simulation panel and Firmware workspace share editable native
+      scenarios, event tracks and assertions; JSON files can be loaded/dropped.
+    Hydraulics: choose a Start template (power unit, cylinder circuit, motor circuit)
+      or blank; drag components from the canvas toolbar and click two ports to connect.
+      Delete removes a selection; Ctrl+Z undoes. Ribbon Simulate runs when ready and
+      opens Results. The 3D Layout placement card appears only in 3D view; selected
+      component editors retain 3D position fields. Components, hoses, fluid, simulation
+      settings and handoff parameters remain fully editable.
+    Piping: drop model faces into route endpoint wells; click/drop named ports
+      into network/internal-flow boundaries; vessel and duct presets retain
+      custom geometry, operating conditions and native solver definitions.
+  Apply validates and commits a native draft atomically; Revert reloads the
+    current definition. Invalid/stale drafts are retained for correction, not
+    silently substituted. Unknown metadata and inactive settings survive edits.
+    Native run requests use the committed supported parameters; document/source
+    identity and resource-governor limits are not user-overridable solver fields.
+  Background capability/project discovery does not interrupt a drag or Apply.
+    Active document requests and solves still block conflicting setup changes.
+  Leaving solver results or changing their setup restores the editable model
+    and face picking. Temporary result meshes never replace the part's model cache.
+  Drag payloads are fenced to their originating document/study or panel
+    generation. Repeating the same face in the same boundary role does not
+    duplicate its load; dropping it into a different role is an independent BC.
+  Face unions use {facesets:[...]} with nonempty terminal children, preserving
+    each child's points/tolerance/normal/surface rather than flattening disjoint
+    samples into one envelope. One authored force stays one force over the union.
+  Setup remains editable when an optional backend is unavailable; Run reports
+    that capability limit rather than changing physics. Thermal CFD needs
+    OpenFOAM; full-wave openEMS modes need openEMS. Contact/proxy, qualitative
+    flow and firmware electrical-model limitations remain explicit in results.
+  Multiphysics handoffs use aicad.simhandoff/1. Worker seam:
+    services/sim/multiphysics_rpc.py (sim_caps / sim_run_contact /
+    sim_freq_response / ecad_thermal_handoff / heatsink_select / piping_verify_cfd).
 """
 
 _MOTION_GUIDE = """\
@@ -1214,105 +1282,258 @@ def cad_guide_text(topic: str = "overview") -> str:
             "BIAS: use match_part_number before custom geometry — if the MPN resolves, you get\n"
             "  an editable, pre-sourced part in one call."
         )
+    if topic in ("civil", "civil_engineering", "site", "site_design", "terrain", "grading",
+                 "earthwork", "alignment", "water_distribution", "fire_flow", "sewer",
+                 "stormwater", "storm", "drainage", "hydrology", "detention", "culvert",
+                 "buried_pipe", "thrust_block", "landxml", "gis", "infrastructure"):
+        from services.mcp.civil_guide import GUIDE_TEXT  # noqa: PLC0415
+        return GUIDE_TEXT
     if topic in ("piping", "pipe", "pipe_network", "fluid", "pressure_drop",
-                 "piping_solve", "piping_report"):
+                 "piping_solve", "piping_report", "piping_route", "piping_spec_check",
+                 "piping_bom", "piping_load", "run_pipe_flow", "pipe_routing", "b31.3"):
         return (
-            "PIPING — routed pipe networks: steady-state 1-D hydraulic solve + CFD handoff\n\n"
-            "Tools: piping_solve / piping_report / piping_operating_point / piping_fluid /\n"
-            "       piping_internal_volume / piping_cfd_handoff / piping_verify_cfd\n\n"
-            "WORKFLOW (signatures verified against the tools 2026-07-30 — steps 1/3/7/8\n"
-            "used to be written in shapes the tools reject):\n"
-            "  1. Build the aicad.piping/1 doc yourself (contracts/piping_schema.md):\n"
-            "     runs[] = {id:'r1', path:[[x,y,z],...] (>=2 pts, mm), nps, schedule, end_type}\n"
-            "     fittings[] = {id:'ft1', type:'elbow'|'tee'|'reducer'|'flange',\n"
-            "                   origin:[x,y,z], orient:[deg,deg,deg], nps, schedule, ...}\n"
-            "     There is no piping_new / part_place path — the doc is a plain JSON object\n"
-            "     you pass to every tool below.\n"
-            "  2. piping_fluid(name, T=<K>, P=<Pa>)  Resolve fluid properties (T in KELVIN).\n"
-            "  3. piping_solve(doc, boundary)         1-D solve: flows + pressure map.\n"
-            "     boundary entries name a node AND carry one condition, e.g.\n"
+            "PIPING — route, solve, code-check, bill and verify pipe systems\n\n"
+            "Tools: piping_route / piping_solve / piping_report / piping_spec_check /\n"
+            "       piping_bom / piping_load / run_pipe_flow / piping_operating_point /\n"
+            "       piping_pump_drive / piping_fluid / piping_internal_volume /\n"
+            "       piping_cfd_handoff / piping_verify_cfd\n\n"
+            "UNITS: lengths mm (run paths, clearances), pressures kPa GAUGE, temperatures\n"
+            "  degC (piping_fluid alone takes T in KELVIN and P in Pa), flows m3/h in\n"
+            "  boundary demands, m3/s in run_pipe_flow, velocities m/s.\n\n"
+            "THE NETWORK: an aicad.piping/1 JSON doc (contracts/piping_schema.md):\n"
+            "  runs[] = {id:'r1', path:[[x,y,z],...] (>=2 pts, mm), nps, schedule, material,\n"
+            "            end_type}; fittings[] = {id:'ft1', type:'elbow'|'tee'|'reducer'|\n"
+            "            'flange', origin:[x,y,z], nps, params}. piping_route writes runs and\n"
+            "  their elbows for you; every tool below takes that doc inline OR the name of\n"
+            "  a network already in the session (omitted = the last one).\n\n"
+            "WORKFLOW:\n"
+            "  0. piping_load(doc_id, network=None)  Resume: restore a network persisted in a\n"
+            "                                        doc (after save/reopen) into the session.\n"
+            "                                        Several networks in one doc -> it refuses\n"
+            "                                        and lists their names; pass network=.\n"
+            "  1. piping_route(start={'point':[x,y,z],'dir':[dx,dy,dz]},\n"
+            "                  end={'point':[x,y,z],'dir':[...]}, nps, schedule='40',\n"
+            "                  material=None, obstacles=[{'min':[..],'max':[..]}],\n"
+            "                  clearance_mm=50, grid_mm=None, bend_penalty=None, piping=None,\n"
+            "                  name=None, doc_id=None, ignore_bodies=None, network=None,\n"
+            "                  fresh=False)\n"
+            "     Orthogonal obstacle-avoiding A* (bends penalised). doc_id makes every solid\n"
+            "     body of that doc an obstacle — list the equipment you connect TO in\n"
+            "     ignore_bodies — and persists the network there. `dir` (optional, snapped to\n"
+            "     the nearest axis) is the direction of TRAVEL: start.dir = the way the pipe\n"
+            "     leaves start (= that nozzle's outward normal); end.dir = the way it arrives\n"
+            "     at end (= MINUS the end nozzle's outward normal). A bare [x,y,z] works too.\n"
+            "     The run is APPENDED to piping= / the session network / the doc's saved\n"
+            "     network (fresh=True starts a new one); name= names the run.\n"
+            "     Returns piping (new run + 90-deg LR elbow at every bend), run_id, path,\n"
+            "     length_mm, bends, min_clearance_mm. Refusals: no_route (blocked: widen\n"
+            "     the corridor, lower clearance_mm, change grid_mm), start_inside_obstacle /\n"
+            "     end_inside_obstacle (move the point to the nozzle face or ignore that body).\n"
+            "  2. piping_fluid(name, T=<K>, P=<Pa>)  Resolve fluid properties (sourced values).\n"
+            "  3. piping_solve(doc, boundary, fluid=None, pumps=None, doc_id=None, network=None)\n"
+            "     1-D steady solve: flows + pressure map. boundary entries name a node AND\n"
+            "     carry one condition, e.g.\n"
             "       {'run':'r1','end':'start','pressure':400}   (kPa gauge — fixes it)\n"
             "       {'run':'r1','end':'end','demand':20}        (m3/h, + leaves)\n"
             "     Node ids ('n0','n1') are DERIVED by snapping run endpoints, so they only\n"
             "     exist AFTER a solve (result.node_menu lists them). Address the first\n"
-            "     boundary by {'run','end'}; a failed reference now returns\n"
+            "     boundary by {'run','end'}; a failed reference returns\n"
             "     addressable_endpoints. At least one node must fix pressure or head.\n"
             "  4. piping_report()                     Per-segment K-factor + dP table (no args\n"
             "                                         = report on the last solve).\n"
-            "  5. piping_operating_point(pump_curve=<CSV text/path>,\n"
+            "  5. piping_spec_check(design_pressure_kpa, piping=None, design_temp_c=40,\n"
+            "                       corrosion_allowance_mm=1.5, mill_tolerance_frac=0.125,\n"
+            "                       joint_factor=1.0, fluid_density_kgm3=1000,\n"
+            "                       insulation_kgm=0, doc_id=None, network=None)\n"
+            "     ASME B31.3 eq. 3a wall t = PD/(2(SEW+PY)), Y=0.4, allowable stress vs\n"
+            "     temperature (A106-B, A53-B, A312-TP304/316), B16.5 flange P-T rating and\n"
+            "     support span (2.5 mm sag / bending limit, pipe+fluid+insulation weight).\n"
+            "     Per run: t_required_mm vs t_nominal_mm, mawp_kpa, utilization,\n"
+            "     support_span_m, pass. all_pass:false -> raise the schedule, change\n"
+            "     material or flange class and re-check; never ship a failing line.\n"
+            "  6. piping_bom(piping, max_spool_length_mm=12000, doc_id=None, network=None)\n"
+            "     Line list, pipe/elbow/tee/reducer/flange quantities with masses, shop\n"
+            "     spools broken at flanges and at max spool length, shop/field weld counts.\n"
+            "  7. run_pipe_flow(...)                  3-D internal-flow check of a CRITICAL\n"
+            "     fitting or manifold (native D3Q19 LBM over the bore). Geometry: either\n"
+            "     piping=<doc or network> + run_id (bore and inlet/outlet planes derived from\n"
+            "     the run ends) or stl_path / doc_id(+body) of a fluid-volume solid with\n"
+            "     inlet={'point','normal'} / outlet={...} (normals point INTO the domain).\n"
+            "     fluid='water' (or density_kgm3 + viscosity_pas), mean_velocity_ms or\n"
+            "     flow_m3s; resolution cells_across=20 (voxels across the hydraulic\n"
+            "     diameter; raise it to refine) or an explicit voxel_mm; max_steps;\n"
+            "     background=True -> poll get_job(job_id).\n"
+            "     Returns dp_pa, reynolds, regime, converged, pressure_profile and\n"
+            "     darcy_estimate_pa; quote dp only when converged and read `caveats` (an\n"
+            "     unresolvable physical Re is stated, never hidden). doc_id+name persist a\n"
+            "     pipe_flow study.\n"
+            "  8. piping_operating_point(pump_curve=<CSV text/path>,\n"
             "                           system={'static_head_m':h0,'k':k})\n"
-            "                                        Intersect pump + system curves -> duty point.\n"
-            "  6. piping_internal_volume(doc)         Bore STEP + volume_mm3 (line-sizing/purge).\n"
-            "  7. piping_cfd_handoff(doc, boundary)   1-D solve -> bore STEP -> LBM CFD in one\n"
-            "                                         call. `boundary` is REQUIRED, same shape\n"
-            "                                         as step 3.\n"
-            "  8. piping_verify_cfd(solve_result, cfd_result)\n"
-            "                                        1-D vs 3-D dP verdict. BOTH arguments are\n"
-            "                                        required; cfd_result is a run_cfd_flow\n"
-            "                                        result, not the handoff envelope.\n\n"
+            "                                        Pump duty point + NPSH margin.\n"
+            "  9. piping_pump_drive(network=<name>, run_id=None, speed_rpm=1500,\n"
+            "                       standard='IEC'|'NEMA', doc_id=...)\n"
+            "     Electric motor for the pump from the last solve's pump run (flow_m3h +\n"
+            "     pump_head_m, solve fluid density) via pump_drive_size; flow_m3h + head_m\n"
+            "     override it with a piping_operating_point duty point. Saved as\n"
+            "     results.pump_drive.<run_id> in the piping_network study.\n\n"
+            "1-D vs 3-D: piping_solve is the sizing truth for straight runs and catalogue\n"
+            "  fittings (fast, deterministic). Use run_pipe_flow only where the K-factor\n"
+            "  model is doubtful — close-coupled fittings, manifolds, tees with strong\n"
+            "  branch flow, custom transitions — and compare its dp_pa with the 1-D link\n"
+            "  dP. piping_cfd_handoff(doc, boundary) + piping_verify_cfd(solve_result,\n"
+            "  cfd_result) remain the one-call bore -> run_cfd_flow chain with a 1-D vs\n"
+            "  3-D verdict; piping_internal_volume(doc) gives the bore STEP + volume_mm3.\n\n"
+            "GEOMETRY: piping_route paths are centrelines. To model a line as CAD, feed its\n"
+            "  path to sketch3d_path_from_points(name, points) then sketch3d_pipe(id,\n"
+            "  diameter_mm=<OD>) (cad_guide('sketch3d')).\n\n"
+            "PERSISTENCE: pass doc_id (+ network, default 'piping') on route / solve /\n"
+            "  spec_check / bom and the network plus its solve, spec_check and bom results\n"
+            "  land in that doc's `piping_network` study; save_part() writes it into the\n"
+            "  .step+ and piping_load restores it. Cite study results, not chat memory.\n\n"
             "EXTERNALLY-SUPPLIED NETWORKS: piping_solve(source_handoff=<aicad.simhandoff/1\n"
             "  handoff envelope>) consumes a network generated by another domain — e.g.\n"
             "  hydraulic_piping_handoff hands its hose runs over as an inline piping doc with\n"
             "  boundary + fluid in the envelope meta; runs may carry an explicit bore_mm to\n"
             "  bypass the NPS schedule catalog (hydraulic hose IDs aren't catalog pipes).\n\n"
-            "BIAS: use piping_solve first (fast, deterministic); escalate to CFD only when\n"
-            "  3-D effects (mixing, cavitation, complex geometry) matter."
+            "Vessels, ducts and pipe-rack/skid frames: cad_guide('industrial'). Decision\n"
+            "  procedure: cad_skill('piping-design')."
+        )
+    if topic in ("industrial", "industrial_design", "plant", "vessel", "pressure_vessel",
+                 "tank", "vessel_size", "duct", "ducting", "hvac", "duct_size", "skid",
+                 "pipe_rack"):
+        return (
+            "INDUSTRIAL — pressure vessels, duct systems, skids and pipe racks\n\n"
+            "Tools: vessel_size / duct_size / piping_route ... (cad_guide('piping')) /\n"
+            "       struct_analyze / struct_check / struct_estimate / add_features\n"
+            "       (weld_member frames) / run_pipe_flow\n\n"
+            "UNITS: mm for geometry, kPa GAUGE for pressure, degC, m3/s for air/fluid flow,\n"
+            "  m for duct segment lengths, Pa for duct pressure drops.\n\n"
+            "PRESSURE VESSELS — vessel_size(inner_diameter_mm, design_pressure_kpa,\n"
+            "  tan_tan_length_mm=None | volume_m3=None, design_temp_c=40, material='SA-516-70'\n"
+            "  (also SA-240-304, SA-240-316, SA-285-C), corrosion_allowance_mm=3,\n"
+            "  joint_efficiency=0.85, head_type='ellipsoidal_2_1'|'hemispherical'|\n"
+            "  'torispherical', fluid_density_kgm3=1000, fill_fraction=0.8,\n"
+            "  orientation='vertical'|'horizontal', doc_id=None, name=None)\n"
+            "  ASME VIII-1: shell UG-27(c)(1) t = PR/(SE-0.6P), heads UG-32; nominal\n"
+            "  thickness rounded up to standard plate. Returns shell/heads t_required_mm,\n"
+            "  t_nominal_mm, mawp_kpa, head depth_mm, hydrotest_kpa (UG-99(b)), volume_m3,\n"
+            "  tan_tan_length_mm and empty/operating/full-of-water masses.\n"
+            "  Then MODEL it: revolve the shell+head profile at the returned thicknesses\n"
+            "  (cad_guide('overview')), add nozzles, and route piping to the nozzle faces\n"
+            "  with piping_route(doc_id=..., ignore_bodies=[<vessel body>]).\n\n"
+            "DUCTS — duct_size(segments=[{id, parent=None, airflow_m3s, length_m,\n"
+            "  k_fittings=0, shape='round'|'rect', aspect_ratio=2}, ...],\n"
+            "  method='equal_friction', friction_pa_per_m=1.0, max_velocity_ms=10,\n"
+            "  air_temp_c=20, roughness_mm=0.09, doc_id=None, name=None)\n"
+            "  Segments form a tree through `parent` (the fan end has none). Standard round\n"
+            "  sizes, Huebscher equivalent diameter for rectangular ducts, Colebrook/\n"
+            "  Clamond friction. Returns per-segment size, velocity, Reynolds, friction and\n"
+            "  fitting dP, the critical_path and fan_static_pa (size the fan from it).\n\n"
+            "SKIDS, PIPE RACKS, SUPPORTS — structural frames:\n"
+            "  geometry: sketch member centrelines, then add_features with a weld_member op\n"
+            "  (real stock profile, miter/butt/cope; cad_skill('weldment-frame')).\n"
+            "  analysis: build an aicad.structure/1 doc (part_place(domain='section') for\n"
+            "  AISC sections) carrying the pipe/vessel operating loads, then\n"
+            "  struct_check(doc_path) for AISC LRFD D/C ratios and struct_analyze for raw\n"
+            "  member forces; struct_estimate for a rate-table budget. Pipe support spacing\n"
+            "  comes from piping_spec_check support_span_m — place supports at or inside it.\n\n"
+            "PERSISTENCE: doc_id + name on vessel_size / duct_size persist a `vessel` /\n"
+            "  `duct_system` study in that doc (saved into the .step+ by save_part).\n"
+            "  Decision procedure: cad_skill('piping-design')."
         )
     if topic in ("hydraulic", "hydraulics", "iso1219", "hydraulic_circuit",
-                 "hydraulic_new", "cylinder", "pump"):
+                 "hydraulic_new", "cylinder", "pump", "fluid_power", "hpu", "power_unit",
+                 "hydraulic_simulate", "hydraulic_motor", "pump_drive"):
         return (
-            "HYDRAULIC — ISO 1219 circuit design + component sizing\n\n"
-            "Tools: hydraulic_new / hydraulic_add_component / hydraulic_add_hose /\n"
-            "       hydraulic_size_cylinder / hydraulic_size_pump / hydraulic_bom /\n"
-            "       hydraulic_piping_handoff / hydraulic_verify_piping /\n"
-            "       hydraulic_fea_handoff / hydraulic_verify_fea\n\n"
-            "WORKFLOW (numbered, signatures verified against the tools 2026-07-30 — the old\n"
-            "text passed `doc` first to tools that have no `doc`, and named component types\n"
-            "the schema rejects):\n"
-            "  1. hydraulic_new(name)               Create the circuit; it becomes the ACTIVE\n"
-            "                                       doc, so every later call may omit `doc`.\n"
-            "  2. hydraulic_size_cylinder(bore_mm, pressure_bar, stroke_mm, rod_mm=0,\n"
-            "                             velocity_mm_s=50, efficiency=0.95)\n"
-            "     FORWARD sizing (bore -> force), NOT force -> bore: it returns\n"
-            "     extend_force_kn / retract_force_kn / flow_extend_lpm / cycle_time_s. To hit\n"
-            "     a required force, pick a bore from F = pi/4 d^2 P and confirm here.\n"
-            "     No `doc` argument.\n"
-            "  3. hydraulic_size_pump(flow_lpm, pressure_bar, efficiency=0.85,\n"
-            "                         speed_rpm=1500)\n"
-            "     Feed it step 2's flow_extend_lpm -> displacement_cc_rev, shaft_power_kw,\n"
-            "     torque_nm. No `doc` argument.\n"
-            "  4. hydraulic_add_component(type, name='', x=0, y=0, params={}, sourcing={},\n"
-            "                             doc=None)\n"
+            "HYDRAULIC — ISO 1219 fluid power: circuit, sizing, electric drive, transient\n"
+            "simulation, rigid lines, BOM\n\n"
+            "Units: bar (gauge), L/min, mm, N, N·m, rpm, kW, s. Decision procedure:\n"
+            "  cad_skill('hydraulic-design').\n\n"
+            "WORKFLOW (signatures match the live tools):\n"
+            "  0. hydraulic_load(doc_id, name=None)   After a reopen: restore the saved\n"
+            "     circuit (+ sizing / bom / simulate + valve schedule) as the ACTIVE circuit.\n"
+            "     Never rebuild a saved circuit from chat memory.\n"
+            "  1. hydraulic_new(name, doc_id=None)    Create the circuit; it becomes the\n"
+            "     ACTIVE circuit, so later calls may omit `doc`. Pass the CAD doc_id on this\n"
+            "     and EVERY later call: the circuit and each analysis merge into that doc's\n"
+            "     `hydraulic_circuit` study (saved into the .step+ by save_part).\n"
+            "  2. hydraulic_add_component(type, name='', x=0, y=0, params={}, sourcing={},\n"
+            "                             doc=None, doc_id=None)\n"
             "     `type` is a frozen ISO 1219 member: pump, cylinder_linear, cylinder_rotary,\n"
             "     valve_directional, valve_check, valve_relief, valve_flow_control,\n"
             "     accumulator, reservoir, motor_hydraulic, filter, heat_exchanger.\n"
             "     Common spellings map on (cylinder->cylinder_linear, motor->motor_hydraulic,\n"
             "     check_valve->valve_check, tank->reservoir), but a bare 'valve' is REFUSED —\n"
             "     four valve types exist. Returns component_id ('c1', 'c2', ...).\n"
-            "  5. hydraulic_add_hose(net_name, connections, doc=None)\n"
+            "     Params the simulator needs (defaults in parens):\n"
+            "       pump displacement_cc_rev + speed_rpm (or flow_lpm), vol_efficiency (0.95),\n"
+            "         compensator_bar for a pressure-compensated pump, max_pressure_bar rating\n"
+            "       cylinder_linear bore_mm, stroke_mm, rod_mm (0), actuator_type\n"
+            "       motor_hydraulic displacement_cc_rev, vol/mech_efficiency (0.95/0.9)\n"
+            "       valve_relief set_pressure_bar (override_bar 10 % of set)\n"
+            "       valve_directional center_condition closed|tandem|open|float, capacity\n"
+            "         Kv | Cv | orifice_area_mm2 | rated_flow_lpm + rated_dp_bar\n"
+            "       valve_flow_control set_flow_lpm | Kv | Cv; valve_check cracking_pressure_bar\n"
+            "       accumulator volume_l + pre_charge_bar; reservoir pressure_bar (0)\n"
+            "  3. hydraulic_add_hose(net_name, connections, doc=None, doc_id=None)\n"
             "     connections is a LIST of ports, not from/to:\n"
-            "       [{'component_id':'c1','port':'p1'}, {'component_id':'c2','port':'p1'}]\n"
-            "     Port types: pressure, tank, work_a, work_b, drain, generic.\n"
-            "  6. hydraulic_bom(doc=None)           BOM lines + missing_mpn summary.\n\n"
-            "CROSS-SIM COUPLINGS (aicad.simhandoff/1 — cad_guide('simulation')):\n"
-            "  hydraulic_piping_handoff(supply_pressure_bar, flow_lpm, load_pressure_bar)\n"
-            "      Hand the circuit's hose runs to the piping 1-D solver for REAL per-line\n"
-            "      pressure drops at the operating point (each hose keeps its exact bore).\n"
-            "      Solves live when the 'fluids' lib is installed (else stage 'solve_pending'\n"
-            "      + piping_solve(source_handoff=...) elsewhere); real losses feed the pump\n"
-            "      margin back (margin.pump_margin_solved_bar).\n"
-            "  hydraulic_verify_piping(handoff, solve_result)\n"
-            "      Per-hose Darcy estimate vs piping solve deviation verdict + margin.\n"
-            "  hydraulic_fea_handoff(bore_mm, max_pressure_bar, rod_mm=0, axis=[0,0,1], ...)\n"
-            "      Cylinder mount loads at max pressure → static-FEA load cases (extend/\n"
-            "      retract, case-labelled). Returns run_fea_static-ready fea_args per case.\n"
-            "      `axis` takes a 3-vector or a signed-axis word (\"z\", \"-x\", \"up\").\n"
-            "  hydraulic_verify_fea(handoff, fea_result)\n"
-            "      Independent area×pressure recompute vs the envelope's force conditions.\n\n"
-            "BIAS: size with hydraulic_size_cylinder/size_pump (steps 2-3) BEFORE placing\n"
-            "  components — it confirms the pressure/flow budget is achievable; once hoses are\n"
-            "  routed, hydraulic_piping_handoff replaces per-hose loss estimates with a real\n"
-            "  solve."
+            "       [{'component_id':'c1','port':'P'}, {'component_id':'c2','port':'P'}]\n"
+            "     Port names (case-insensitive): pump P/T/L; cylinder_linear A (cap)/B (rod);\n"
+            "     motor_hydraulic A/B/L; valve_directional P/T/A/B; valve_relief P/T;\n"
+            "     check/flow-control/filter/heat_exchanger IN/OUT; reservoir/accumulator any.\n"
+            "     Rated hoses carry max_pressure_bar (+ id_mm/length_mm for the piping leg).\n"
+            "  4. SIZE (no circuit needed; component_id + doc_id file the result under\n"
+            "     results.sizing.<kind>.<component_id>):\n"
+            "     hydraulic_size_cylinder(bore_mm, pressure_bar, stroke_mm, rod_mm=0,\n"
+            "                             velocity_mm_s=50, efficiency=0.95)\n"
+            "       FORWARD sizing (bore -> force): extend/retract_force_kn, flow_extend_lpm,\n"
+            "       cycle_time_s. For a required force pick d from F = pi/4 d^2 P, confirm.\n"
+            "     hydraulic_size_motor(torque_nm, speed_rpm, pressure_bar, mech_efficiency=0.9,\n"
+            "                          vol_efficiency=0.95, type=gear|vane|piston|orbital)\n"
+            "       pressure_bar is the DIFFERENTIAL across the motor. Returns exact\n"
+            "       displacement_cc_rev + standard_displacement_cc_rev (catalog step), flow_lpm.\n"
+            "     hydraulic_size_pump(flow_lpm, pressure_bar, efficiency=0.85, speed_rpm=1500)\n"
+            "       Sum the actuator flows that run together -> displacement, shaft kW, torque.\n"
+            "  5. pump_drive_size(kind='hydraulic', flow_lpm, pressure_bar, speed_rpm=1500,\n"
+            "                     standard='IEC'|'NEMA', service_factor=1.15, voltage_v=400,\n"
+            "                     phases=3, frequency_hz=50, efficiency_class='IE3')\n"
+            "     The electric motor: required_motor_kw, motor_rating_kw (IEC) or\n"
+            "     motor_rating_hp (NEMA), poles, sync_speed_rpm, frame, full_load_current_a.\n"
+            "     kind='centrifugal' takes flow_m3h + head_m; for a SOLVED piping network use\n"
+            "     piping_pump_drive (cad_guide('piping')).\n"
+            "  6. hydraulic_simulate(duration_s=5, valve_schedule=[...], loads={...},\n"
+            "                        fluid={density_kgm3, bulk_modulus_bar, viscosity_cst},\n"
+            "                        initial={...}, output_dt_s=0.01, doc_id=None)\n"
+            "     Lumped-parameter transient: hose nets are capacitive nodes, orifice valve\n"
+            "     flow, relief override, cylinder/motor dynamics with end stops, polytropic\n"
+            "     accumulators, energy bookkeeping.\n"
+            "       valve_schedule [{'t_s':0.1,'component_id':'c3','position':'a'}]\n"
+            "         (a | b | center | 0..1 proportional)\n"
+            "       loads {'c4':{'force_n':10000,'mass_kg':200}} / {'c6':{'torque_nm':80}}\n"
+            "     Read summary: peak_pressure_bar, relief_open_time_s, cylinders.<id>\n"
+            "     stroke_time_s / max_velocity_mms / end_reached, motors.<id> steady_speed_rpm,\n"
+            "     pumps.<id> mean_power_kw, efficiency, heat_kj. Series are cut to <=400 points;\n"
+            "     series_path is the full-resolution JSON. Refusals name the fix:\n"
+            "     unconnected_port, unknown_port, missing_params (missing:['c4.bore_mm']),\n"
+            "     unknown_component, invalid_schedule, no_pressure_source.\n"
+            "  7. CHECK: peak_pressure_bar vs the relief set pressure (+ override) and every\n"
+            "     rating — `ratings.exceeded` lists components/hoses whose peak node pressure\n"
+            "     passes their max_pressure_bar. Stroke time vs requirement; relief open\n"
+            "     during a move = wasted power (heat_kj). Fix the circuit, re-simulate.\n"
+            "  8. hydraulic_piping_handoff(supply_pressure_bar, flow_lpm, load_pressure_bar)\n"
+            "     Rigid tube / hose runs -> the piping 1-D solver for REAL per-line pressure\n"
+            "     drops (each hose keeps its bore); losses feed the pump margin\n"
+            "     (margin.pump_margin_solved_bar). Verify: hydraulic_verify_piping(). The\n"
+            "     generated network re-solves with piping_solve(source_handoff=...).\n"
+            "  9. hydraulic_bom(doc=None, doc_id=None)   BOM lines + missing_mpn summary.\n\n"
+            "MOUNT LOADS: hydraulic_fea_handoff(bore_mm, max_pressure_bar, rod_mm=0, axis=...)\n"
+            "  -> run_fea_static-ready fea_args per case (extend/retract at max pressure;\n"
+            "  axis takes [x,y,z] or 'z'/'-x'/'up'), then hydraulic_verify_fea(handoff,\n"
+            "  fea_result) — cad_guide('simulation') CROSS-SIM HANDOFF.\n\n"
+            "PERSISTENCE: with doc_id each tool merges into the doc's `hydraulic_circuit`\n"
+            "  study (one per circuit name). Editing the circuit drops its stored simulate /\n"
+            "  bom (they described the old circuit); sizing is kept. The Hydraulics panel\n"
+            "  opens the same study."
         )
     if topic in ("firmware", "fw", "embedded", "mcu", "fw_build", "fw_new_project",
                  "flash", "debug", "fw_sim_run", "fw_verify_board", "coverify",
@@ -1861,6 +2082,7 @@ def cad_guide_text(topic: str = "overview") -> str:
         if (_prompts_dir() / "shared" / "cheatsheets").is_dir() else []
     return (f"No guide for {topic!r}. Topics: overview, simulation, motion, review, intake, gsl, "
             f"cam, narration, parts, reverse, reveng, deliverables, requirements, dag, verify, "
-            f"interaction, sourcing, cost, spec, piping, hydraulic, firmware, structural, mechanical, "
+            f"interaction, sourcing, cost, spec, piping, industrial, hydraulic, firmware, structural, "
+            f"mechanical, "
             f"regen, code_compliance, serving, design_review, doc_diff, plm, tolerance_stackup, "
             f"evaluate, measure, sketch3d; or a feature cheatsheet: {avail}")

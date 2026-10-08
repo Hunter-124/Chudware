@@ -526,27 +526,71 @@
   ],
   "sim": [
    "bearing_life",
+   "civil_alignment",
+   "civil_alignment_analyze",
+   "civil_buried_pipe_check",
+   "civil_cost_estimate",
+   "civil_crs_transform",
+   "civil_culvert",
+   "civil_detention_route",
+   "civil_export",
+   "civil_fea_handoff",
+   "civil_fire_flow",
+   "civil_grade_pad",
+   "civil_gravity_analyze",
+   "civil_gravity_design",
+   "civil_hydrology",
+   "civil_import",
+   "civil_load",
+   "civil_open_channel",
+   "civil_pipe_supports",
+   "civil_piping_couple",
+   "civil_quantities",
+   "civil_requirement_evidence",
+   "civil_schedule",
+   "civil_site_edit",
+   "civil_site_new",
+   "civil_site_summary",
+   "civil_surface_analyze",
+   "civil_surface_build",
+   "civil_thrust_restraint",
+   "civil_water_solve",
+   "civil_watershed",
+   "duct_size",
    "gear_check",
    "hydraulic_add_component",
    "hydraulic_add_hose",
    "hydraulic_bom",
    "hydraulic_fea_handoff",
+   "hydraulic_layout_3d",
+   "hydraulic_load",
    "hydraulic_new",
    "hydraulic_piping_handoff",
+   "hydraulic_simulate",
    "hydraulic_size_cylinder",
+   "hydraulic_size_motor",
    "hydraulic_size_pump",
    "hydraulic_verify_fea",
    "hydraulic_verify_piping",
    "motion_fea_handoff",
    "motion_fea_handoff_sweep",
+   "piping_bom",
    "piping_cfd_handoff",
+   "piping_edit",
+   "piping_fitting_k",
+   "piping_fitting_k_cfd",
    "piping_fluid",
    "piping_internal_volume",
+   "piping_load",
    "piping_operating_point",
+   "piping_pump_drive",
    "piping_report",
+   "piping_route",
    "piping_solve",
+   "piping_spec_check",
    "piping_verify_cfd",
    "polymesh_cli",
+   "pump_drive_size",
    "run_cfd_accurate",
    "run_cfd_flow",
    "run_fea_adaptive",
@@ -558,6 +602,7 @@
    "run_fea_modal",
    "run_fea_static",
    "run_fea_thermal",
+   "run_pipe_flow",
    "run_topology_optimization",
    "sim_cancel",
    "sim_evidence_packet",
@@ -572,7 +617,8 @@
    "struct_estimate",
    "sweep_envelope",
    "topology_capabilities",
-   "verify_packet"
+   "verify_packet",
+   "vessel_size"
   ],
   "workspace": [
    "delegate",
@@ -660,6 +706,36 @@
   "check_sketch": "Check whether a sketch is well-constrained (fully defined) and report what's missing.",
   "check_sketch3d": "Check whether a 3D sketch is well-constrained — the sketch3d twin of check_sketch.",
   "check_symmetry": "Is the part mirror-symmetric about a principal datum plane? Returns the deviation.",
+  "civil_alignment": "Create/update a highway alignment from PIs/radii/spirals or explicit horizontal segments. UNITS: SI m for stations/elevations/radii …",
+  "civil_alignment_analyze": "Analyze alignment profile/design_vs_existing, sight_distance, sections or earthwork. UNITS: SI m, m², m³; speed km/h, cross-slope % …",
+  "civil_buried_pipe_check": "Check buried pipe earth/live loads, Iowa deflection, buckling and flotation.",
+  "civil_cost_estimate": "Price stored qto with sourced/dated user unit rates, escalation and contingency. UNITS: quantity SI m/m²/m³/each; price_book entries …",
+  "civil_crs_transform": "Transform XY/XYZ point arrays between CRS codes or civil CRS/local-grid records. UNITS: projected m, geographic degrees; XYZ elevation m is …",
+  "civil_culvert": "Evaluate HDS-5 controlling culvert headwater or a supplied flow-performance curve.",
+  "civil_detention_route": "Route a real inflow through level-pool detention with Modified Puls continuity.",
+  "civil_export": "Export landxml, geojson, geopackage, ifc, epanet, swmm, qto_csv, cost_csv or msproject. UNITS: site SI m/m³/s; adapters report foreign …",
+  "civil_fea_handoff": "Translate stored thrust/buried loads into a validated static FEA handoff.",
+  "civil_fire_flow": "Test fixed fire withdrawal or find the system-wide residual-pressure flow limit.",
+  "civil_grade_pad": "Grade a pad to existing terrain with cut/fill daylight slopes and exact volumes. UNITS: SI m, m³; cut_slope/fill_slope are positive …",
+  "civil_gravity_analyze": "Accumulate gravity inflows, screen HGL/EGL and apply site design-criteria checks.",
+  "civil_gravity_design": "Choose the smallest feasible supplied circular conduit sizes under site criteria.",
+  "civil_hydrology": "Compute rational/CN runoff, Tc, unit hydrograph, storm, runoff hydrograph or IDF.",
+  "civil_import": "Import LandXML, GeoJSON/GeoPackage, EPANET/SWMM, or dem_ascii/dem_xyz. UNITS: converts foreign coordinates/flows to SI m, m³/s; records …",
+  "civil_load": "Restore a document civil_site model and all stored engineering results. UNITS: SI m, m³/s, kPa. Read-only; activates the restored session …",
+  "civil_open_channel": "Compute normal/critical depth, standard-step profile, jump or channel capacity.",
+  "civil_pipe_supports": "Plan pipe supports at bends, branches and fittings and fill span-limited gaps.",
+  "civil_piping_couple": "Couple civil water supply with a real native plant piping solve to convergence.",
+  "civil_quantities": "Measure pipe/structure/trench quantities and stored surface/alignment earthwork. UNITS: SI m, m², m³; trench requires …",
+  "civil_requirement_evidence": "Map stored civil check rows to requirement evidence without inventing a pass.",
+  "civil_schedule": "Compute CPM construction schedule and link tasks to model elements for 4D. UNITS: continuous workdays; tasks duration_d and …",
+  "civil_site_edit": "Apply atomic upsert/remove, set_crs/set_criteria, or rename operations. UNITS: SI m, m³/s, kPa; ops=[{op, collection, element|id}, ...]. …",
+  "civil_site_new": "Create and activate an editable civil site, optionally persisted as civil_site. UNITS: SI m, m², m³, m³/s, kPa; CRS horizontal axes must be …",
+  "civil_site_summary": "Summarize site geometry, network counts, CRS, validation and stored results. UNITS: SI m, m³/s, kPa. No model mutation; doc_id also …",
+  "civil_surface_analyze": "Analyze contours, slope, profile, volume, volume_to_elevation or stage_storage. UNITS: SI m; volumes m³, slopes %, contour …",
+  "civil_surface_build": "Build/update a constrained TIN from XYZ points or an ESRI ASCII DEM path. UNITS: SI m for points, breaklines, boundary and raster …",
+  "civil_thrust_restraint": "Compute hydrostatic fitting thrust, optional bearing block and restrained legs.",
+  "civil_water_solve": "Solve a site's pressurized water network and screen its jurisdictional limits.",
+  "civil_watershed": "Delineate an ASCII DEM watershed and create/update its routed site catchment. UNITS: SI m/m²; outlet_xy is projected XY. Uses depression …",
   "close_part": "Close a part document and free it. Clears the current part if it was current.",
   "code_check": "Run building-code compliance checks on a structural document.",
   "compare_parts": "Boolean-compare two documents' solids: how much volume they share and where they differ. The ground-truth check behind reverse_engineer — …",
@@ -690,6 +766,7 @@
   "doc_sketch_contact_sheet": "Multi-view contact sheet of the whole doc INCLUDING all sketches-in-progress.",
   "draft_analysis": "Moldability check: which faces lack enough DRAFT to release from the mold?",
   "drawing_bom": "Return stable item/name/quantity/source BOM rows from a drawing's source assembly.",
+  "duct_size": "Size an HVAC/process duct tree (equal friction): diameters, velocities, pressure drops, fan static.",
   "ecad_add_power": "Drop a power/ground port (e.g. net='GND', 'VCC', '+5V') at ``(x, y)``.",
   "ecad_add_zone": "Add a copper pour (zone) bound to ``net`` on ``layer`` — usually a ground/power plane.",
   "ecad_airflow_handoff": "Hand the active board's thermal problem to OpenFOAM conjugate heat transfer (CHT) — the check for when convection PRESETS aren't enough …",
@@ -807,9 +884,13 @@
   "hydraulic_add_hose": "Add a hose/line net connecting two or more hydraulic component ports.",
   "hydraulic_bom": "Extract a sourcing bill of materials from the active hydraulic circuit.",
   "hydraulic_fea_handoff": "Turn cylinder/actuator mount loads at max pressure into static-FEA load cases on the mounting geometry (companion of the motion→FEA …",
+  "hydraulic_layout_3d": "Merge component positions (mm) into the document's hydraulic 3D layout.",
+  "hydraulic_load": "Restore a hydraulic circuit saved in a document (with its sizing, BOM and simulation).",
   "hydraulic_new": "Create a new ``aicad.hydraulic/1`` hydraulic circuit document.",
   "hydraulic_piping_handoff": "Hand the circuit's hose/tube runs to the piping 1-D solver for REAL per-line pressure drops at the operating point — replacing per-hose …",
+  "hydraulic_simulate": "Transient simulation of the hydraulic circuit: pressures, cylinder/motor motion, flows, energy.",
   "hydraulic_size_cylinder": "Size a hydraulic cylinder: extend/retract force, flow, and cycle time.",
+  "hydraulic_size_motor": "Size a hydraulic motor: displacement (exact + catalog step), flow, output/input power.",
   "hydraulic_size_pump": "Size a hydraulic pump: displacement, hydraulic power, shaft power, torque.",
   "hydraulic_verify_fea": "Verify step for the hydraulic→FEA coupling: recompute the mount forces independently (area × max pressure from the envelope's recorded …",
   "hydraulic_verify_piping": "Verify step for the hydraulic→piping coupling: per-hose Darcy estimate vs piping 1-D solve, per line, plus the pump-margin feedback.",
@@ -901,12 +982,20 @@
   "part_search": "Search the unified standard-parts library (all domains federated), with V2 taxonomy routing + faceted filtering.",
   "part_source": "Source candidate parts for a plain-language need — deterministic fan-out (no LLM inside): taxonomy match -> facet extraction -> routed …",
   "parts_taxonomy": "Browse the parts-library category taxonomy (Parts Library V2).",
+  "piping_bom": "Piping line list + bill of materials (pipe, elbows, tees, reducers, flanges with masses) + shop spools.",
   "piping_cfd_handoff": "One-click 3D CFD handoff for pipe internals.",
+  "piping_edit": "Draw and edit a 3-D pipe network atomically, including connected branches and inline fittings.",
+  "piping_fitting_k": "Preview a fitting's deterministic loss coefficient K and Reynolds curve without a CFD solve.",
+  "piping_fitting_k_cfd": "Compute a fitting's CFD loss curve K(Re), optionally apply it to the saved network.",
   "piping_fluid": "Sourced thermophysical properties for a named fluid at ``T`` (K), ``P`` (Pa absolute).",
   "piping_internal_volume": "Extract the internal fluid-domain solid (bore) from a pipe run and write it as STEP.",
+  "piping_load": "Restore a piping network saved in a document (with its solve, spec check and BOM) into the session.",
   "piping_operating_point": "Pump duty (operating) point + NPSH margin: intersect the pump curve with the system curve.",
+  "piping_pump_drive": "Size the electric motor for a network pump from its solved duty point (pump_drive_size).",
   "piping_report": "Per-segment pressure-drop report with an explicit K-factor breakdown.",
+  "piping_route": "Auto-route a new pipe run between two points: orthogonal, obstacle-avoiding, LR elbows at every bend.",
   "piping_solve": "Solve an ``aicad.piping/1`` pipe network for node pressures/heads and link flows.",
+  "piping_spec_check": "ASME B31.3 pressure-design check of every run (wall, MAWP, utilization), flange ratings and support spans.",
   "piping_verify_cfd": "DAG verify node: compare 1D pipe-network pressure drop with 3D CFD pressure drop.",
   "plm_add_remote": "Register a team-sync profile with optional account identity.",
   "plm_checkpoint": "Save a named checkpoint the user can return to. ``message`` describes the change in plain language. Returns ``{ok, commit, entry}``.",
@@ -950,6 +1039,7 @@
   "print_media_inventory": "Read-only inventory of printer media (USB stick / SD card): every file, which G-code is selectable.",
   "project_into_sketch": "\"Convert entities\" INTO an existing sketch — SolidWorks-style edge/face projection that appends real (or construction) geometry to a sketch …",
   "publish_print_media": "Publish a project's COMPLETE verified print set to printer media; retire its old managed G-code.",
+  "pump_drive_size": "Size the electric motor driving a pump (hydraulic or centrifugal): kW/hp, poles, frame, current.",
   "query_adjacency": "The face-adjacency graph (W3): which faces touch which, and whether each shared edge is a CONVEX outside-corner or a CONCAVE …",
   "query_geometry": "Resolve a STRUCTURED face/edge query against the part — explore/confirm geometry.",
   "read_native_file": "Read a saved .step+ file's feature tree, components, mates, materials and metadata WITHOUT opening it.",
@@ -1027,6 +1117,7 @@
   "run_fea_modal": "Modal FEA — the natural frequencies (Hz) of the held part. Returns the first n_modes.",
   "run_fea_static": "Linear-static stress FEA on the current part. Returns max stress, displacement, and FoS.",
   "run_fea_thermal": "Thermal conduction on the real part tet mesh using the C++ engine.",
+  "run_pipe_flow": "3-D internal-flow CFD (LBM) through a pipe bore / duct / manifold: pressure drop, Re, regime, profile.",
   "run_shell": "Run a shell command and capture combined stdout+stderr (byte-capped).",
   "run_topology_optimization": "Mutating. Run topology optimization on the active part as a persisted, GUI-visible study.",
   "save_part": "Save the part as Chudware's NATIVE .step+ — the editable, reopenable format. PREFER THIS.",
@@ -1044,7 +1135,7 @@
   "set_process": "Bind the manufacturing ProcessProfile to the part (persisted in the .step+).",
   "set_titleblock": "Fill the drawing's title block. doc_id = drawing_doc_id. fields is a dict of any of: title, drawn_by, date, material, finish, scale, rev …",
   "set_view": "Move, rescale, reorient, and/or toggle hidden lines for a view.",
-  "show_in_app": "Push the current part to the OPEN Chudware desktop app's 3D viewport so the user can see it.",
+  "show_in_app": "Make sure the OPEN Chudware desktop app can show the part to the user.",
   "sim_cancel": "Terminate a sim_run job's solver process (SIGTERM, then SIGKILL) and prove it died.",
   "sim_evidence_packet": "Write ONE released-result evidence packet and pre-fill the runbook checklist.",
   "sim_jobs": "List recent sim_run jobs (newest first) with their reconciled state and elapsed time. Jobs persist across agent turns, so this also shows …",
@@ -1096,6 +1187,7 @@
   "verify_battery": "Run deterministic checks on one explicit document.",
   "verify_gcode": "Deterministically check a G-code file before it goes to a printer.",
   "verify_packet": "Check ONE evidence-packet folder for mutual consistency BEFORE citing it.",
+  "vessel_size": "Size a pressure vessel to ASME VIII-1: shell + head thickness, MAWP, hydrotest, volume and masses.",
   "wait_job": "Block until a background job (get_job id) finishes or timeout_s passes — use instead of sleep/poll loops.",
   "wall_thickness": "How THIN is the thinnest wall? Inward ray-cast wall-thickness over the whole part.",
   "workspace_doc_events": "Return per-doc event stream entries starting at *since_seq*.",
@@ -1136,7 +1228,7 @@
    "prompt_note": "Add one base/projected view to a make_drawing doc; x/y are sheet mm. Set show_hidden deliberately and use orientation controls only when the canonical directions do not expose the specified feature."
   },
   "add_features": {
-   "prompt_note": "Batch related ops in ONE call and read the reply's interpreted, per-feature status and changes fields plus its overlap and attachment warnings (floating/overhanging features) before anything else; a heavy op may return {job_id} — poll get_job."
+   "prompt_note": "Batch related ops in ONE call and read the reply's interpreted, per-feature status and changes fields plus its overlap and attachment warnings (floating/overhanging features) before anything else; a heavy op may return {job_id} — poll get_job. op rename relabels a FEATURE by id; no op renames the part — name it in new_part(name=…) and its file in save_part(path=…)."
   },
   "add_gdt": {
    "prompt_note": "Declare add_datum/add_datum_target references first; row2 creates a composite frame and datum/material modifiers must match the ledger. Re-check placement with review_drawing and coverage with audit_drawing."
@@ -1438,6 +1530,9 @@
   },
   "drawing_bom": {
    "prompt_note": "Read live assembly item/name/quantity/source rows before add_balloon or a BOM table; preserve item-number linkage instead of retyping a prose list."
+  },
+  "duct_size": {
+   "prompt_note": "Equal-friction duct sizing over a parent-linked segment tree (airflow_m3s, length_m, k_fittings); returns standard round or rect sizes, velocity, pressure drops, the critical path and fan_static_pa. A velocity warning means lower friction_pa_per_m (bigger duct) or split the branch, not ignore it."
   },
   "ecad_add_power": {
    "prompt_note": "Drop on a pin's world xy (from ecad_place_symbol's pin list) to bond it to the rail wire-free; undriven-power ERC clears only via a port."
@@ -1830,14 +1925,27 @@
   "hydraulic_fea_handoff": {
    "prompt_note": "Only builds run_fea_static arg sets — it never solves. Pass fea_args to run_fea_static, then close the chain with hydraulic_verify_fea."
   },
+  "hydraulic_layout_3d": {
+   "prompt_note": "Place circuit components in 3D (mm) for the GUI's Hydraulics > 3D Layout: positions {component_id: [x, y, z]} merge into the saved study's layout3d (doc_id persists it; results are kept). hydraulic_load returns the full layout including defaults."
+  },
+  "hydraulic_load": {
+   "prompt_note": "Restore a hydraulic_circuit study (doc_id, optional circuit name) as the active circuit, with its saved sizing/bom/simulate and valve schedule; call it after a reopen instead of rebuilding the circuit from chat memory."
+  },
   "hydraulic_new": {
    "prompt_note": "First call of the hydraulic workflow — the returned doc becomes the implicit session doc for all later hydraulic_* calls."
   },
   "hydraulic_piping_handoff": {
    "prompt_note": "Runs the real piping solve inline and returns the simhandoff envelope — pass load_pressure_bar for the pump margin; verify with hydraulic_verify_piping."
   },
+  "hydraulic_simulate": {
+   "prompt_note": "Transient of the active circuit (or doc / doc_id's saved one): every port wired, required params set, valve_schedule [{t_s, component_id, position a|b|center|0..1}], loads per cylinder/motor. Cite summary (peak_pressure_bar, stroke_time_s, steady_speed_rpm, efficiency) and ratings.exceeded; series are cut to <=400 points — series_path holds full resolution. missing_params/unconnected_port name the fix; pass doc_id to save the run in the hydraulic_circuit study.",
+   "timeout_s": 300
+  },
   "hydraulic_size_cylinder": {
    "prompt_note": "Pure sizing hand-calc, no document needed; rod_mm=0 makes retract=extend. Feed the recommended flow to hydraulic_size_pump next."
+  },
+  "hydraulic_size_motor": {
+   "prompt_note": "pressure_bar is the DIFFERENTIAL across the motor (supply minus back pressure). Put the returned standard displacement (result field standard_displacement_cc_rev) on the motor_hydraulic component and feed flow_lpm to hydraulic_size_pump; doc_id saves it under results.sizing.motors."
   },
   "hydraulic_size_pump": {
    "prompt_note": "Hand-calc counterpart to hydraulic_size_cylinder; displacement scales inversely with speed_rpm, so set the real motor speed."
@@ -2123,9 +2231,22 @@
   "parts_taxonomy": {
    "prompt_note": "Browse here when the user names a category loosely; a node's effective facets are exactly the facet keys part_search(facets=...) accepts there."
   },
+  "piping_bom": {
+   "prompt_note": "Line list, pipe/fitting/flange quantities with masses, and shop spools broken at flanges and max_spool_length_mm; pass the routed piping (or a session network name) and doc_id to merge the BOM into the doc's piping_network study."
+  },
   "piping_cfd_handoff": {
    "prompt_note": "Solve -> bore STEP -> LBM CFD in one call; use background=True on big grids. RANS accuracy needs a manual run_cfd_accurate + piping_verify_cfd.",
    "timeout_s": 600
+  },
+  "piping_edit": {
+   "prompt_note": "Atomic draw/edit: add_run paths in mm auto-create elbows/tees; add_fitting inserts valves/orifices/custom K. Pass doc_id to persist, then re-solve."
+  },
+  "piping_fitting_k": {
+   "prompt_note": "Deterministic K preview and Reynolds curve. Quote the returned method; custom fittings need a k_model, not an invented default."
+  },
+  "piping_fitting_k_cfd": {
+   "prompt_note": "Shared GUI/agent CFD K pipeline: quick=2 Re points at 12 cells across. Use background=True; poll this tool with job_id, cancel=True to stop. apply=True + fitting_id writes params.k_model; doc_id saves the network. Only elbows generate bores; other fittings require a closed fluid-volume geometry.",
+   "timeout_s": 60
   },
   "piping_fluid": {
    "prompt_note": "Pre-flight the fluid before piping_solve — same sourced values the solver uses; unknown names return ok:false with a hint, never invented numbers."
@@ -2133,14 +2254,26 @@
   "piping_internal_volume": {
    "prompt_note": "Geometry bridge to CFD: import the STEP as a part, then run_cfd_flow. piping_cfd_handoff already does this whole chain."
   },
+  "piping_load": {
+   "prompt_note": "Restore a piping_network study persisted in a doc (doc_id, optional network name) into the session before re-solving or re-checking; a doc with several networks refuses and lists their names."
+  },
   "piping_operating_point": {
    "prompt_note": "Pump-curve CSV (flow m3/h, head m) as text or path; omit system to derive the system curve from a piping doc + boundary."
+  },
+  "piping_pump_drive": {
+   "prompt_note": "Reads the pump run's flow_m3h + pump_head_m from the network's last piping_solve (solve with pumps=[...] first; run_id when several pumps) and sizes its electric motor via pump_drive_size; doc_id saves it in the piping_network study."
   },
   "piping_report": {
    "prompt_note": "No-arg call re-reads the most recent piping_solve — cheapest K-factor breakdown; pass doc+boundary only for a fresh network."
   },
+  "piping_route": {
+   "prompt_note": "Orthogonal obstacle-avoiding route (mm) between start/end points; dir is the travel direction (start: nozzle outward normal, end: MINUS the end nozzle's outward normal); doc_id injects every solid body as an obstacle (ignore_bodies exempts the equipment you connect to). Elbows are added at each bend; no_route means widen the gap, lower clearance_mm or change grid_mm, never hand-draw through solids."
+  },
   "piping_solve": {
    "prompt_note": "At least one fixed pressure/head node is required; node ids come from snapped run endpoints — read them from the result before writing boundary entries."
+  },
+  "piping_spec_check": {
+   "prompt_note": "ASME B31.3 eq. 3a wall check per run plus B16.5 flange rating and support span; design_pressure_kpa is gauge, design_temp_c in °C. Cite t_required_mm/mawp_kpa/utilization per run; all_pass:false is a finding to fix (schedule, material, class), not a warning."
   },
   "piping_verify_cfd": {
    "prompt_note": "Verify node after piping_cfd_handoff (reuses its stored result with no args); compares dP budgets at tolerance_pct, not flow fields."
@@ -2275,6 +2408,9 @@
   },
   "publish_print_media": {
    "prompt_note": "The only way G-code goes onto printer media — never cp/fs_write it there. jobs = the COMPLETE project set of print_ready slice_part manifests; media_idle=True only after the user confirms no printer is using the media. Report the returned PRINT/<project>/R<rev><part>_*.gcode names and any unmanaged printables left; never call the media clean while they remain."
+  },
+  "pump_drive_size": {
+   "prompt_note": "Electric motor for a pump: kind=hydraulic (flow_lpm + pressure_bar) or centrifugal (flow_m3h + head_m). Rounds shaft power x service_factor up the IEC kW or NEMA hp ladder; quote motor_rating, poles, frame and full_load_current_a. For a solved piping network use piping_pump_drive instead."
   },
   "query_adjacency": {
    "prompt_note": "Reach for it to reason about a shared edge — convex outside-corner vs concave pocket edge — which the flat per-face read-back never carries."
@@ -2534,6 +2670,10 @@
    "prompt_note": "Steady and transient use the real part tet mesh in the engine. hot_faces/cold_faces entries need {face,temperature °C}; loads support flux_w_m2 or h_w_m2k/t_amb_c. Steady requires a fixed-temperature or convection datum and non-zero thermal excitation, returns temperature extrema, flux_max_w_m2, mesh_quality/provenance, and supports vtu_path. Steady needs conductivity_w_mk/k_w_mk in W/(m·K). transient={t_end_s,dt_s,...} additionally supports schedules; flux-only heat-up is valid and needs conductivity, density_g_cm3, and cp_j_kgk/specific_heat_j_kgk in J/(kg·K).",
    "timeout_s": 420
   },
+  "run_pipe_flow": {
+   "prompt_note": "Native D3Q19 internal flow through a fluid-volume solid (pipe bore, e.g. piping + run_id derives it); inlet/outlet normals point INTO the domain. Quote dp_pa only with converged:true and read caveats when physical Re is under-resolved; compare against darcy_estimate_pa and re-run at a higher cells_across (default 20) before trusting a fitting dP. background=True returns job_id for get_job.",
+   "timeout_s": 300
+  },
   "run_shell": {
    "prompt_note": "Use for builds/tests/scripts; prefer fs_read/fs_grep/fs_glob/fs_write for plain file work. Stateless per call — pass cwd each time; pipe noisy output through head; check exit_code/timed_out."
   },
@@ -2586,7 +2726,7 @@
    "prompt_note": "Use review_drawing sheet mm to fix layout; x/y/scale move or resize, while show_hidden/orientation change the projection. Re-review and re-audit after."
   },
   "show_in_app": {
-   "prompt_note": "Force-push the doc to the open desktop viewport; modeling tools already do this per change — a silent no-op when the app isn't running."
+   "prompt_note": "Daemon mode: the open app already mirrors every part live (reply live:true); it cannot switch the user's active tab. Legacy engine: writes the handoff file."
   },
   "sim_cancel": {
    "prompt_note": "job_id from sim_run. Really terminates the solver process, not a flag flip; sim_status then reports cancelled. The last partial snapshot survives, so sim_results(partial=True) may still have something."
@@ -2748,8 +2888,11 @@
   "verify_packet": {
    "prompt_note": "Read a packet folder back and check its files describe one run (same input hash, same engine build, result.json matching the hash convergence.md cites, reduction fields present). Run it before citing a packet; ok:false means do not cite it."
   },
+  "vessel_size": {
+   "prompt_note": "ASME VIII-1 UG-27 shell + UG-32 head thickness from inner_diameter_mm and tan_tan_length_mm or volume_m3; design_pressure_kpa gauge, temps °C, corrosion allowance included. Quote t_nominal_mm, mawp_kpa and hydrotest_kpa from the result; doc_id+name persists a vessel study. Model the vessel afterwards with the returned thicknesses."
+  },
   "wait_job": {
-   "prompt_note": "Block on a get_job/sim job_id until it finishes (timeout_s ≤ 900, default 120) instead of sleep/ps loops or repeated get_job polls. still_running:true means call it again; waiting never cancels the job (sim_cancel does).",
+   "prompt_note": "Block on a get_job/sim job_id until it finishes (timeout_s ≤ 900, default 120) instead of sleep/ps loops or repeated get_job polls. still_running:true means call it again; waiting never cancels the job (sim_cancel does). Call it directly, never inside eval: the cell timeout counts the wait and can expire before the job finishes. Retrieve its result with get_job, then use a short eval.",
    "timeout_s": 960
   },
   "wall_thickness": {

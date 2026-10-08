@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<!-- US survey foot = 1200/3937 m exactly (NIST SP 811 Appendix B).
+     The omitted elevationUnit explicitly exercises adapter provenance for XYZ
+     elevations expressed in the same survey-foot units as the plan coordinates. -->
+<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2" date="2026-10-07" time="00:00:00">
+  <Units><Imperial linearUnit="USSurveyFoot" diameterUnit="USSurveyFoot" areaUnit="squareFoot" volumeUnit="cubicFeet" temperatureUnit="fahrenheit" pressureUnit="inchHG"/></Units>
+  <CgPoints><CgPoint name="P1">2000 1000 100</CgPoint></CgPoints>
+  <Surfaces><Surface name="Survey-foot TIN"><Definition surfType="TIN"><Pnts><P id="1">0 0 100</P><P id="2">0 10 100</P><P id="3">10 0 110</P></Pnts><Faces><F>1 2 3</F></Faces></Definition></Surface></Surfaces>
+</LandXML>

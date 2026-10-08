@@ -598,7 +598,9 @@ nlohmann::json mesh_read_raw(const std::string& path, const std::string& fmt);
 nlohmann::json doc_formats();
 
 // Persist the session to `path` (or its current path if `path` is empty) as a
-// .step+ container. Clears the dirty flag, records the path. Returns {"path": ...}.
+// .step+ container. Clears the dirty flag, records the path. Returns {"path": ...,
+// "cache": {written, entries, skipped_reason?, checkpoints, ...}} (contracts/stepplus.md §9):
+// the build state (display cache + per-feature compile checkpoints) is saved with the file.
 // Throws OpError("io_error") if no path is available, or on a write failure.
 // preserve_path writes a nonbinding snapshot from cached scratch state: the live
 // path, dirty flag, tree and revision are unchanged, and snapshot-only relative
@@ -606,8 +608,10 @@ nlohmann::json doc_formats();
 nlohmann::json doc_save(const std::string& doc_id, const std::string& path,
                         bool preserve_path = false);
 
-// Open a document at `path` into a FRESH session, rebuild it, and return the ops-response
-// + "doc_id" + "warnings". A native .step+ container is read as a feature tree; ANY OTHER
+// Open a document at `path` into a FRESH session and return the ops-response + "doc_id" +
+// "warnings" + "cache_hit"/"warm"/"cache_miss_reason". A valid saved cache hydrates the
+// compiled state (no feature rebuild); otherwise the tree rebuilds. A native .step+
+// container is read as a feature tree; ANY OTHER
 // file (.step/.iges/.stl/.obj/…) is IMPORTED as a fresh part doc instead (so manual
 // File>Open/Import of a neutral file works). `as_solid` promotes a closed mesh to a solid
 // on import. Throws OpError("io_error") on a bad file. `detach_path` is for opening

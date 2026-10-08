@@ -82,7 +82,15 @@ bool is_known_entry(const std::string& name, bool owns_geometry_step) {
 }
 
 bool is_geometry_cache(const std::string& name) {
-    return name == "cache.json" || name == "cache.aicm" || name == "cache.brep";
+    return name == "cache.json" || name == "cache.aicm" || name == "cache.brep" ||
+           name == "cache.ckpt";
+}
+
+// Caches the writer admits only into the archive budget left after every essential and
+// forward-compatible payload (mesh first, then build checkpoints, in name order). Both
+// are large binary blobs written STORED.
+bool is_optional_cache(const std::string& name) {
+    return name == "cache.aicm" || name == "cache.ckpt";
 }
 
 // An exclusive staging directory prevents unrelated saves from sharing "<path>.tmp".
@@ -191,6 +199,44 @@ std::string canonical_doc_json(const json& doc,
     return filtered.dump(2);
 }
 
+// meta.json for a fresh write (timestamps are fixed-width, so its size does not depend
+// on the moment it is built — the budget estimate below relies on that).
+json container_meta(const json& doc, const std::string& container, const std::string& kind) {
+    const std::string now = iso_utc_now();
+    return {
+        {"container", container},
+        {"app_version", kAppVersion},
+        {"kind", kind},
+        {"created", now},
+        {"modified", now},
+        {"units", doc.contains("units") ? doc["units"] : json{{"system", "MMGS"}}},
+        {"name", doc.value("name", std::string("Untitled"))},
+    };
+}
+
+// Expanded archive bytes left for the optional caches once document/meta/thumbnail,
+// geometry.step and every other preserved entry are reserved (the reader admits caches
+// only into this same remainder, so a cache that does not fit here is never written).
+mz_uint64 optional_cache_budget(std::size_t document_bytes, std::size_t meta_bytes,
+                                std::size_t thumb_bytes,
+                                const std::map<std::string, std::string>& extra,
+                                bool owns_geometry_step) {
+    mz_uint64 budget = kMaxArchiveExpandedBytes;
+    auto reserve_payload = [&](std::size_t bytes) {
+        budget = bytes > budget ? 0 : budget - bytes;
+    };
+    reserve_payload(document_bytes);
+    reserve_payload(meta_bytes);
+    reserve_payload(thumb_bytes);
+    for (const auto& [name, data] : extra) {
+        if ((owns_geometry_step && name == "geometry.step") ||
+            (!is_known_entry(name, owns_geometry_step) &&
+             !(owns_geometry_step && is_optional_cache(name))))
+            reserve_payload(data.size());
+    }
+    return budget;
+}
+
 }  // namespace
 std::string editable_document_json(const json& doc) {
     return canonical_doc_json(doc);
@@ -203,7 +249,8 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
                                     const std::string& container, const std::string& kind,
                                     const std::string& format_name,
                                     const json* preserved_meta = nullptr,
-                                    bool exclusive = false) {
+                                    bool exclusive = false,
+                                    std::vector<std::string>* dropped = nullptr) {
     const bool owns_geometry_step = container.rfind("aicad.step+/", 0) == 0;
     namespace fs = std::filesystem;
     fs::path out_path(path);
@@ -230,16 +277,7 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
         tmp_path = stage.directory / "container.tmp";
     }
 
-    const std::string now = iso_utc_now();
-    json meta = {
-        {"container", container},
-        {"app_version", kAppVersion},
-        {"kind", kind},
-        {"created", now},
-        {"modified", now},
-        {"units", doc.contains("units") ? doc["units"] : json{{"system", "MMGS"}}},
-        {"name", doc.value("name", std::string("Untitled"))},
-    };
+    json meta = container_meta(doc, container, kind);
     if (preserved_meta) {
         meta = *preserved_meta;
         if (doc.contains("name")) meta["name"] = doc["name"];
@@ -254,20 +292,11 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
     auto th = extra.find("thumbnail.png");
     thumb = (th != extra.end()) ? th->second : (preserved_meta ? std::string() : placeholder_png());
 
-    // Essential/forward-compatible payloads have priority over the optional mesh.
-    // Reserve their expanded bytes before deciding whether its STORED blob fits.
-    mz_uint64 mesh_cache_budget = kMaxArchiveExpandedBytes;
-    auto reserve_payload = [&](std::size_t bytes) {
-        mesh_cache_budget = bytes > mesh_cache_budget ? 0 : mesh_cache_budget - bytes;
-    };
-    reserve_payload(document.size());
-    reserve_payload(meta_json.size());
-    reserve_payload(thumb.size());
-    for (const auto& [name, data] : extra) {
-        if ((owns_geometry_step && name == "geometry.step") ||
-            (!is_known_entry(name, owns_geometry_step) && name != "cache.aicm"))
-            reserve_payload(data.size());
-    }
+    // Essential/forward-compatible payloads have priority over the optional caches
+    // (cache.aicm, cache.ckpt). Reserve their expanded bytes before deciding whether each
+    // STORED optional blob fits.
+    mz_uint64 cache_budget = optional_cache_budget(document.size(), meta_json.size(),
+                                                   thumb.size(), extra, owns_geometry_step);
 
     if (out_path.has_parent_path()) {
         std::error_code ec;
@@ -318,14 +347,25 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
     // open self-time (measured mz_crc32 47% + tinfl_decompress 34% of doc_open). Any zip
     // reader still reads a STORED entry transparently, so this stays fully back/forward
     // compatible; the cache is display-only + hash-gated, so the skipped zip CRC is fine.
+    // cache.ckpt (CBOR + BinTools build checkpoints) follows the same rule.
     for (const auto& [name, data] : extra) {
         if (is_known_entry(name, owns_geometry_step)) continue;
-        // Display caches are optional. Never persist one that the bounded
-        // reader would have to discard before allocating its payload.
-        if (owns_geometry_step && name == "cache.aicm" && data.size() > mesh_cache_budget)
-            continue;
-        // cache.aicm + studies/*/results.npz are large binary blobs — STORED (no deflate).
-        const bool stored = preserved_meta || (name == "cache.aicm") ||
+        // Optional caches: never persist one that the bounded reader would have to
+        // discard before allocating its payload. The drop is reported to the caller.
+        if (owns_geometry_step && is_optional_cache(name)) {
+            if (data.size() > cache_budget) {
+                if (dropped) dropped->push_back(name);
+                continue;
+            }
+            cache_budget -= data.size();
+        }
+        // Optional caches + studies/*/results.npz are large binary blobs — STORED (no
+        // deflate). A geometry cache above the reader's per-entry limit for COMPRESSED
+        // entries is STORED too, so the reader admits it against the aggregate budget
+        // instead of skipping it.
+        const bool stored = preserved_meta || is_optional_cache(name) ||
+                            (owns_geometry_step && is_geometry_cache(name) &&
+                             data.size() > kMaxEntryExpandedBytes) ||
                             (name.rfind("studies/", 0) == 0 && name.find("/results.") != std::string::npos);
         add(name, data, /*stored=*/stored);
     }
@@ -356,10 +396,24 @@ std::string editable_container_save(const json& doc, const std::string& path,
 }
 
 std::string stepplus_save(const json& doc, const std::string& path,
-                          const std::map<std::string, std::string>& extra) {
+                          const std::map<std::string, std::string>& extra,
+                          std::vector<std::string>* dropped) {
     const std::string schema = doc.value("schema", std::string());
     const std::string kind = (schema == "aicad.asm/1") ? "assembly" : "part";
-    return editable_container_save(doc, path, extra, kContainer, kind, ".step+");
+    return editable_container_save_impl(doc, path, extra, kContainer, kind, ".step+",
+                                        nullptr, false, dropped);
+}
+
+std::size_t stepplus_optional_cache_budget(const json& doc,
+                                           const std::map<std::string, std::string>& extra) {
+    const std::string schema = doc.value("schema", std::string());
+    const std::string kind = (schema == "aicad.asm/1") ? "assembly" : "part";
+    static const std::size_t placeholder_bytes = placeholder_png().size();
+    const auto th = extra.find("thumbnail.png");
+    const std::size_t thumb_bytes = th != extra.end() ? th->second.size() : placeholder_bytes;
+    return static_cast<std::size_t>(optional_cache_budget(
+        editable_document_json(doc).size(), container_meta(doc, kContainer, kind).dump(2).size(),
+        thumb_bytes, extra, /*owns_geometry_step=*/true));
 }
 
 // ---------------------------------------------------------------- shared editable-container open
@@ -409,9 +463,10 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
             std::strcmp(st.m_filename, "meta.json") != 0 &&
             std::strcmp(st.m_filename, "document.json") != 0) continue;
         if (mode == NativeReadMode::Relocate && is_geometry_cache(st.m_filename)) continue;
-        // Admit the optional mesh only after all required/unknown payloads have
-        // passed their unchanged limits and reserved the aggregate byte budget.
-        if (owns_geometry_step && std::strcmp(st.m_filename, "cache.aicm") == 0)
+        // Admit the optional geometry caches only after all required/unknown payloads have
+        // passed their unchanged limits and reserved the aggregate byte budget. A cache that
+        // is inadmissible is skipped (and reported) below — it never fails the open.
+        if (owns_geometry_step && is_geometry_cache(st.m_filename))
             continue;
         if (st.m_uncomp_size > kMaxEntryExpandedBytes) {
             mz_zip_reader_end(&zip);
@@ -502,17 +557,23 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
                 continue;
             }
         } else if (is_known_entry(name, owns_geometry_step)) continue;
-        if (owns_geometry_step && name == "cache.aicm") {
-            // A STORED mesh cannot expand during decompression. It may use the
-            // remaining bounded archive budget; compressed meshes retain the
+        if (owns_geometry_step && is_geometry_cache(name)) {
+            // A STORED cache cannot expand during decompression. It may use the
+            // remaining bounded archive budget; compressed caches retain the
             // ordinary per-entry and compression-ratio caps.
             const bool stored = st.m_method == 0 && st.m_comp_size == st.m_uncomp_size;
             const mz_uint64 entry_limit = stored ? kMaxArchiveExpandedBytes : kMaxEntryExpandedBytes;
-            if (st.m_uncomp_size > entry_limit ||
-                st.m_uncomp_size > kMaxArchiveExpandedBytes - aggregate_expanded ||
-                (st.m_uncomp_size != 0 && (st.m_comp_size == 0 ||
-                    st.m_uncomp_size / st.m_comp_size > kMaxCompressionRatio)))
+            const char* refused = nullptr;
+            if (st.m_uncomp_size > entry_limit) refused = "entry_limit";
+            else if (st.m_uncomp_size > kMaxArchiveExpandedBytes - aggregate_expanded)
+                refused = "aggregate_limit";
+            else if (st.m_uncomp_size != 0 && (st.m_comp_size == 0 ||
+                         st.m_uncomp_size / st.m_comp_size > kMaxCompressionRatio))
+                refused = "compression_ratio";
+            if (refused) {
+                result.skipped[name] = refused;
                 continue;
+            }
             aggregate_expanded += st.m_uncomp_size;
         }
         // STORED entries (method 0 — e.g. cache.aicm) carry the persisted-geometry mesh. Extract
@@ -527,6 +588,7 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
                 mz_zip_reader_end(&zip);
                 io_error("native relocate: cannot preserve entry '" + name + "'");
             }
+            if (owns_geometry_step && is_geometry_cache(name)) result.skipped[name] = "extract_failed";
             continue;
         }
         result.extra.emplace(name, std::move(data));
@@ -1216,7 +1278,9 @@ std::string stepplus_cache_engine_key() {
     // split seams.
     // /6 re-attributes face/edge owners through op histories (a dress-up feature owns only
     // the faces it generates); cached display responses carry the old owner_map.
-    static constexpr const char* kCacheSchema = "chudware-geomcache/6";
+    // /7 builds closed mesh imports directly and merges coplanar triangles into planar
+    // faces; older source-mesh snapshots carry per-triangle topology.
+    static constexpr const char* kCacheSchema = "chudware-geomcache/7";
 #ifdef OCC_VERSION_COMPLETE
     return std::string(kCacheSchema) + ";occt=" OCC_VERSION_COMPLETE;
 #else

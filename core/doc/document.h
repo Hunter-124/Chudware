@@ -193,6 +193,56 @@ std::shared_ptr<CompileCache> copy_compile_cache(const CompileCache& source);
 // features_executed, compiles} since engine start (process-wide, all docs).
 nlohmann::json compile_cache_stats();
 
+// --- persisted build state (the `.step+` `cache.ckpt` entry; contracts/stepplus.md §4) ---
+// Serialize the per-feature checkpoints of `cache` that still match `doc`'s compile chain
+// (env + active config + `quality` + feature json), so a reopened document restores them
+// and its first edit executes only the divergent tail instead of the whole tree. Every
+// shape of every checkpoint is written into ONE BinTools set (sub-shape and geometry
+// sharing survive the round trip, so TopExp ordinals and owner attribution are
+// unchanged); results/statuses/owner maps are pooled so shared slots are written once.
+// Only checkpoints after a run of successful features are kept (the prefix before the
+// first failed feature); the full result is included when every feature succeeded and
+// the cache's identical-inputs entry is current. Larger than `budget_bytes` -> the
+// OLDEST checkpoints are dropped (halving the kept span each step, deterministic), then
+// the full result, until it fits. Returns "" when nothing is written. `report` always
+// receives {written, bytes, checkpoints_total, checkpoints_written, checkpoints_dropped,
+// full_result, reason?} — `reason` names why something was dropped or not written.
+std::string compile_cache_encode(const CompileCache& cache, const nlohmann::json& doc,
+                                 const nlohmann::json& env, ::geom::DisplayQuality quality,
+                                 const std::string& engine_key, const std::string& doc_hash,
+                                 std::size_t budget_bytes, nlohmann::json& report);
+// Restore a `cache.ckpt` blob into a fresh cache for `doc` compiled at `quality`.
+// Validity is content-addressed per checkpoint: only the prefix whose stored chain
+// equals `doc`'s chain (recomputed at the saved display quality) is restored, and it is
+// re-keyed to `quality` (checkpoints hold exact B-rep without triangulation, so a tier
+// change only re-meshes). The saved full result is restored only for an identical
+// chain + appearances at the same quality AND when `aicm` (the container's cache.aicm,
+// may be null) is byte-identical to the mesh it was built with. Returns nullptr when
+// nothing is usable; `report` receives {restored, checkpoints, matched_features, features,
+// full_result, full_result_reason?, reason?}; reason/full_result_reason name the miss:
+// engine_key, decode_error, chain_mismatch, not_saved, display_quality, appearance_changed,
+// mesh_mismatch. Never throws.
+std::shared_ptr<CompileCache> compile_cache_decode(const std::string& blob,
+                                                   const nlohmann::json& doc,
+                                                   const nlohmann::json& env,
+                                                   ::geom::DisplayQuality quality,
+                                                   const std::string& engine_key,
+                                                   const std::string* aicm,
+                                                   nlohmann::json& report);
+// The identical-inputs result held by `cache` (nullptr when none).
+std::shared_ptr<const CompileResult> compile_cache_full_result(const CompileCache& cache);
+// A process-unique stamp that changes whenever the cache's contents change (commit or
+// restore); copies share it. Lets a saver reuse an encoding of unchanged contents.
+uint64_t compile_cache_stamp(const CompileCache& cache);
+
+// Display tessellation of already-solved bodies without executing any feature: meshes
+// r.shapes at `quality` with the doc's body/face appearances (same tiers, colors and AICM
+// layout as compile_document's surviving-body pass) and refreshes r.aicm, r.bodies_info
+// stats (names/kinds must already be set) and r.volume. With `tessellate=false` only the
+// per-body stats are recomputed (r.aicm untouched) from the exact geometry.
+void tessellate_solved_bodies(const nlohmann::json& doc, CompileResult& r,
+                              ::geom::DisplayQuality quality, bool tessellate = true);
+
 // Shared configuration interpretation for compilation and dependency inspection.
 // The resolved configuration pointer borrows from doc; null means implicit Default.
 std::pair<std::string, const nlohmann::json*> resolve_active_config(const nlohmann::json& doc);

@@ -287,6 +287,12 @@ struct Session {
     // on every click (measured ~190 ms/click on a modest part before this cache).
     std::shared_ptr<CompileResult> compiled;
     long compiled_rev = -1;
+    // True when `compiled` was hydrated on open from the display cache of a file without
+    // build checkpoints (cache.json + cache.brep + cache.aicm): shapes, statuses, owner map,
+    // datums and mesh are exact, but the compile-only side channels (tool_recs,
+    // weld_members, sheet_metal_flat) were never persisted. Readers of those channels go
+    // through ensure_compiled_full, which compiles once instead of reading empty data.
+    bool compiled_partial = false;
     // Sampling many faces must not re-describe the entire shape for every selector.
     // Retain only the last shape; revision and exact identity protect rebuilt,
     // transformed, and assembly geometry even when a view rebuild keeps the revision.
@@ -308,6 +314,13 @@ struct Session {
     // redo/config switches can never be served stale geometry. Accessed only under
     // the per-doc mutex (DocLock).
     std::shared_ptr<chudware::doc::CompileCache> compile_cache = chudware::doc::make_compile_cache();
+    // Last cache.ckpt encoding of `compile_cache` (doc_save): reused while the cache's
+    // contents stamp and the document hash are unchanged (an unedited reopen or repeated
+    // autosave never re-serializes the same checkpoints).
+    std::shared_ptr<const std::string> ckpt_memo;
+    json ckpt_memo_report;
+    uint64_t ckpt_memo_stamp = 0;
+    std::string ckpt_memo_doc_hash;
 
     // C20 — assembly state. asm_result is the last assembly compile; asm_warm seeds the
     // next mate solve; explode_active/explode_factor drive tessellation-time offsets.
@@ -4159,8 +4172,16 @@ const CompileResult& ensure_compiled(Session& s) {
     if (!s.compiled || s.compiled_rev != s.revision) {
         s.compiled = std::make_shared<CompileResult>(compile_session(s));
         s.compiled_rev = s.revision;
+        s.compiled_partial = false;
     }
     return *s.compiled;
+}
+
+// ensure_compiled for readers of the compile-only side channels (tool_recs, weld_members,
+// sheet_metal_flat): a display-cache hydration (compiled_partial) never carried them.
+const CompileResult& ensure_compiled_full(Session& s) {
+    if (s.compiled_partial) s.compiled.reset();
+    return ensure_compiled(s);
 }
 
 json ops_response(Session& s, const CompileResult& r, const json& id_map, bool with_tess);
@@ -4175,6 +4196,7 @@ json warm_and_respond(Session& s, CompileResult r, const json& id_map, bool with
     json resp = ops_response(s, r, id_map, with_tess);
     s.compiled = std::make_shared<CompileResult>(std::move(r));
     s.compiled_rev = s.revision;
+    s.compiled_partial = false;
     // Cross-doc dependency notify (feat(xdoc)): stamp dependents stale when this doc
     // rebuilds. Called unlocked-variant since DocLock is already held by the caller.
     if (s.owns_journal) dep_notify_unlocked(s.doc_id, s.revision);
@@ -5781,6 +5803,17 @@ static void seed_cached_scratch(Session& scratch, const Session& live) {
     }
     scratch.asm_warm = live.asm_warm;
     scratch.compile_cache = copy_compile_cache(*live.compile_cache);
+    // A current read-cache compile is a frozen payload too: sharing it means a preserve_path
+    // snapshot save (hostd autosave) or a dry run never recompiles the live revision.
+    if (live.compiled && live.compiled_rev == live.revision) {
+        scratch.compiled = live.compiled;
+        scratch.compiled_rev = live.compiled_rev;
+        scratch.compiled_partial = live.compiled_partial;
+    }
+    scratch.ckpt_memo = live.ckpt_memo;
+    scratch.ckpt_memo_report = live.ckpt_memo_report;
+    scratch.ckpt_memo_stamp = live.ckpt_memo_stamp;
+    scratch.ckpt_memo_doc_hash = live.ckpt_memo_doc_hash;
 }
 
 static void absolutize_component_paths(json& doc, const std::filesystem::path& base) {
@@ -13002,7 +13035,7 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
 json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    const CompileResult& r = ensure_compiled(s);
+    const CompileResult& r = ensure_compiled_full(s);  // reads tool_recs
 
     bool has_filter = false;
     std::set<std::string> filter;
@@ -13152,7 +13185,7 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
                     {"skip_reason", "assembly document — feature attachment is checked per part"},
                     {"summary", "Skipped: assembly document (check each part)."},
                     {"features", json::array()}, {"flagged", json::array()}};
-    const CompileResult& r = ensure_compiled(s);
+    const CompileResult& r = ensure_compiled_full(s);  // reads tool_recs
     const auto t_start = std::chrono::steady_clock::now();
 
     bool has_filter = false;
@@ -15266,7 +15299,7 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
         // studies/attachments survive; the drawing set is refreshed separately.
         for (const auto& [name, data] : live.extra_entries)
             if (name != "cache.json" && name != "cache.aicm" &&
-                name != "cache.brep" && name != "geometry.step" &&
+                name != "cache.brep" && name != "cache.ckpt" && name != "geometry.step" &&
                 name.rfind("drawings/", 0) != 0)
                 snapshot->extra_entries.emplace(name, data);
         const auto base = live.path.empty() ? std::filesystem::current_path()
@@ -15299,27 +15332,38 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
     }
 
     // Persisted geometry cache (fast cold-open): embed the compiled tessellation + ops-response
-    // as additive cache.* entries so a later doc_open can skip the full compile_document rebuild.
-    // DISPLAY-ONLY + SAFE: document.json (the parametric source of truth) is untouched; open uses
-    // the cache ONLY when the doc hash + engine key still match, and the first edit recompiles
-    // from features. Always erase first so a failed/again-uncached save never ships a stale cache.
+    // as additive cache.* entries so a later doc_open can skip the full compile_document rebuild,
+    // plus the per-feature build checkpoints (cache.ckpt) so the reopened session is warm and its
+    // first edit executes only the edited tail. document.json (the parametric source of truth)
+    // is untouched; open uses each entry only when its keys still match (contracts/stepplus.md
+    // §4). Always erase first so a failed/again-uncached save never ships a stale cache. Every
+    // entry that is not written is named in the result's `cache` diagnostics — never silent.
     //
     // geometry.step (contracts/stepplus.md §1) rides the SAME gate and the same erase-first
     // discipline: it is the AP214 snapshot of the last successful rebuild, so it is written only
     // after a fully-ok rebuild of the tree we are about to write as document.json. Carrying an
     // older snapshot forward instead would hand every foreign STEP reader geometry that
     // disagrees with the document beside it — the one thing the member exists to prevent.
-    s.extra_entries.erase("cache.json");
-    s.extra_entries.erase("cache.aicm");
-    s.extra_entries.erase("cache.brep");
+    static const char* const kCacheEntries[] = {"cache.json", "cache.aicm", "cache.brep",
+                                                "cache.ckpt"};
+    for (const char* name : kCacheEntries) s.extra_entries.erase(name);
     s.extra_entries.erase("geometry.step");
+    json cache_diag = {{"written", false}, {"entries", json::array()}};
+    auto drop_caches = [&s]() {
+        for (const char* name : kCacheEntries) s.extra_entries.erase(name);
+        s.extra_entries.erase("geometry.step");
+    };
+    const bool is_part =
+        s.doc.is_object() && s.doc.value("schema", std::string()) == "aicad.part/1";
     try {
-        if (s.doc.is_object() && s.doc.value("schema", std::string()) == "aicad.part/1") {
+        if (is_part) {
             const CompileResult& cr = ensure_compiled(s);
-            bool all_ok = !cr.aicm.empty();
+            json failed = json::array();
             for (const FeatureStatus& st : cr.statuses)
-                if (!st.ok) { all_ok = false; break; }
-            if (all_ok) {
+                if (!st.ok) failed.push_back(st.id);
+            const std::string doc_hash = stepplus_doc_hash(s.doc);
+            std::size_t budget = 0;
+            if (failed.empty() && !cr.aicm.empty()) {
                 json cached = ops_response(s, cr, json::object(), /*with_tess=*/true);
                 if (cached.contains("tess") && cached["tess"].is_object())
                     cached["tess"].erase("aicm_path");  // machine/temp-specific; rebuilt on open
@@ -15327,25 +15371,78 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
                 // a fully-ok rebuild, and stepplus_save is atomic (tmp+rename) — a crash mid-
                 // rebuild can never persist a half-built cache. Readers treat absence as false.
                 json header = {{"engine", stepplus_cache_engine_key()},
-                               {"doc_hash", stepplus_doc_hash(s.doc)},
+                               {"doc_hash", doc_hash},
                                {"solved", true},
                                // cache.aicm is a DISPLAY mesh, so the tier it was meshed at
                                // is part of its validity (contracts/doc_ops.md §7).
                                {"display_quality",
                                 ::geom::display_quality_name(s.display_quality)},
-                               {"response", cached}};
+                               {"response", std::move(cached)}};
                 s.extra_entries["cache.json"] = header.dump();
-                s.extra_entries["cache.aicm"] =
-                    std::string(reinterpret_cast<const char*>(cr.aicm.data()), cr.aicm.size());
-                // Solved-bodies BREP (with triangulation): lets an assembly load this part as
-                // a component without re-running compile_document or BRepMesh.
+                // Solved bodies (exact B-rep, no triangulation): an assembly loads this part
+                // as a component, and a reopen without checkpoints hydrates its session,
+                // without re-running compile_document.
                 s.extra_entries["cache.brep"] = brep_cache_encode(cr.shapes);
                 // geometry.step: the AP214 snapshot foreign CAD opens (contracts/stepplus.md
                 // §1). The bodies are the ones this fully-ok rebuild just produced.
                 std::string geometry_step = stepplus_geometry_step_bytes(cr.shapes);
                 if (!geometry_step.empty())
                     s.extra_entries["geometry.step"] = std::move(geometry_step);
+                // The mesh is optional: admitted only into the archive budget every other
+                // entry leaves (the bounded reader would discard a larger one).
+                budget = stepplus_optional_cache_budget(s.doc, s.extra_entries);
+                if (cr.aicm.size() <= budget) {
+                    s.extra_entries["cache.aicm"] = std::string(
+                        reinterpret_cast<const char*>(cr.aicm.data()), cr.aicm.size());
+                    budget -= cr.aicm.size();
+                } else {
+                    header["aicm"] = "budget";  // the open names this miss `budget`
+                    s.extra_entries["cache.json"] = header.dump();
+                    budget = stepplus_optional_cache_budget(s.doc, s.extra_entries);
+                    cache_diag["skipped_reason"] = "budget";
+                    cache_diag["dropped"] = json::array(
+                        {{{"entry", "cache.aicm"}, {"reason", "budget"},
+                          {"bytes", cr.aicm.size()}, {"budget_bytes", budget}}});
+                }
+            } else {
+                // No display cache for a partially failed / empty rebuild; the build
+                // checkpoints of the features that succeeded are still persisted below.
+                cache_diag["skipped_reason"] = failed.empty() ? "empty_mesh" : "feature_failed";
+                if (!failed.empty()) cache_diag["failed_features"] = failed;
+                budget = stepplus_optional_cache_budget(s.doc, s.extra_entries);
             }
+            // Build checkpoints (cache.ckpt): the incremental-rebuild state that makes the
+            // first edit after reopen execute only the affected tail.
+            json ckpt_report;
+            if (!inc_rebuild_enabled()) {
+                ckpt_report = {{"written", false}, {"reason", "inc_rebuild_disabled"}};
+            } else {
+                const uint64_t stamp = compile_cache_stamp(*s.compile_cache);
+                const bool reuse = s.ckpt_memo && s.ckpt_memo_stamp == stamp &&
+                                   s.ckpt_memo_doc_hash == doc_hash &&
+                                   s.ckpt_memo->size() <= budget;
+                if (reuse) {
+                    ckpt_report = s.ckpt_memo_report;
+                    s.extra_entries["cache.ckpt"] = *s.ckpt_memo;
+                } else {
+                    std::string blob = compile_cache_encode(
+                        *s.compile_cache, s.doc, env_from_doc(s.doc), s.display_quality,
+                        stepplus_cache_engine_key(), doc_hash, budget, ckpt_report);
+                    s.ckpt_memo.reset();
+                    if (!blob.empty()) {
+                        // A budget-trimmed encoding is never memoized: a later save with
+                        // more room re-encodes the full set.
+                        if (ckpt_report.value("reason", std::string()) != "budget") {
+                            s.ckpt_memo = std::make_shared<const std::string>(blob);
+                            s.ckpt_memo_report = ckpt_report;
+                            s.ckpt_memo_stamp = stamp;
+                            s.ckpt_memo_doc_hash = doc_hash;
+                        }
+                        s.extra_entries["cache.ckpt"] = std::move(blob);
+                    }
+                }
+            }
+            cache_diag["checkpoints"] = std::move(ckpt_report);
         } else if (s.doc.is_object() && s.doc.value("schema", std::string()) == "aicad.asm/1") {
             // A cache-hit open leaves asm_result empty; rebuild here so a plain re-save
             // doesn't strip the cache (components are hot in the load cache, so it's cheap).
@@ -15355,10 +15452,17 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
             // engine key AND every component file (path+size+mtime) are unchanged — display-
             // only, asm_result stays empty until the first interactive op lazily rebuilds.
             const AssemblyResult& ar = *s.asm_result;
-            bool all_ok = !ar.bodies.empty() && ar.converged;
+            json failed = json::array();
             for (const AsmComponentStatus& cs : ar.component_status)
-                if (!cs.ok) { all_ok = false; break; }
-            if (all_ok) {
+                if (!cs.ok) failed.push_back(cs.id);
+            if (ar.bodies.empty()) {
+                cache_diag["skipped_reason"] = "empty_mesh";
+            } else if (!ar.converged) {
+                cache_diag["skipped_reason"] = "not_converged";
+            } else if (!failed.empty()) {
+                cache_diag["skipped_reason"] = "component_failed";
+                cache_diag["failed_components"] = failed;
+            } else {
                 // geometry.step for an assembly is the FLATTENED placed set: each component
                 // body in world coordinates, exactly as gather_export_shapes feeds every
                 // other writer (an assembly doc has no features of its own).
@@ -15385,23 +15489,326 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
                     s.extra_entries["cache.json"] = header.dump();
                     s.extra_entries["cache.aicm"] =
                         std::string(reinterpret_cast<const char*>(blob.data()), blob.size());
+                } else {
+                    cache_diag["skipped_reason"] = "empty_mesh";
                 }
             }
         }
+    } catch (const std::exception& e) {
+        drop_caches();  // never let cache generation break a save — but say so
+        cache_diag["skipped_reason"] = "error";
+        cache_diag["error"] = e.what();
     } catch (...) {
-        s.extra_entries.erase("cache.json");  // never let cache generation break a save
-        s.extra_entries.erase("cache.aicm");
-        s.extra_entries.erase("cache.brep");
-        s.extra_entries.erase("geometry.step");
+        drop_caches();
+        cache_diag["skipped_reason"] = "error";
+        cache_diag["error"] = "unknown error while building the persisted cache";
     }
 
-    std::string out = stepplus_save(s.is_assembly() ? saved_doc : s.doc, target, s.extra_entries);
+    std::vector<std::string> dropped;
+    std::string out = stepplus_save(s.is_assembly() ? saved_doc : s.doc, target, s.extra_entries,
+                                    &dropped);
+    for (const std::string& name : dropped) {
+        s.extra_entries.erase(name);
+        if (!cache_diag.contains("dropped")) cache_diag["dropped"] = json::array();
+        cache_diag["dropped"].push_back({{"entry", name}, {"reason", "budget"}});
+        if (name == "cache.aicm" && !cache_diag.contains("skipped_reason"))
+            cache_diag["skipped_reason"] = "budget";
+        if (name == "cache.ckpt" && cache_diag.contains("checkpoints")) {
+            cache_diag["checkpoints"]["written"] = false;
+            cache_diag["checkpoints"]["reason"] = "budget";
+        }
+    }
+    // The caches are regenerated by every save and read only by doc_open, so the session
+    // does not keep a second copy of them alive after they are on disk.
+    for (const char* name : kCacheEntries) {
+        if (!s.extra_entries.erase(name)) continue;
+        cache_diag["entries"].push_back(name);
+        if (std::string(name) == "cache.json") cache_diag["written"] = true;
+    }
     if (s.is_assembly()) s.doc = std::move(saved_doc);
     s.path = out;
     s.dirty = false;
-    json result = {{"path", out}};
+    if (snapshot && snapshot->ckpt_memo && live.compile_cache &&
+        snapshot->ckpt_memo_stamp == compile_cache_stamp(*live.compile_cache)) {
+        // The snapshot encoded the live session's (shared, unchanged) checkpoints.
+        live.ckpt_memo = snapshot->ckpt_memo;
+        live.ckpt_memo_report = snapshot->ckpt_memo_report;
+        live.ckpt_memo_stamp = snapshot->ckpt_memo_stamp;
+        live.ckpt_memo_doc_hash = snapshot->ckpt_memo_doc_hash;
+    }
+    json result = {{"path", out}, {"cache", std::move(cache_diag)}};
     if (preserve_path) result["preserve_path"] = true;
     return result;
+}
+
+// Body names (AICM BODY chunks, in body order) of a persisted cache.aicm. A part's body
+// name is its surviving solid id — the one piece of compile state a pre-checkpoint display
+// cache records nowhere else. False on a malformed blob.
+static bool aicm_body_names(const std::string& blob, std::vector<std::string>& out) {
+    auto le = [&](std::size_t pos, int bytes) -> uint64_t {
+        uint64_t v = 0;
+        for (int i = 0; i < bytes; ++i)
+            v |= static_cast<uint64_t>(static_cast<unsigned char>(blob[pos + i])) << (8 * i);
+        return v;
+    };
+    if (blob.size() < 12 || blob.compare(0, 4, "AICM") != 0) return false;
+    const uint64_t chunks = le(8, 4);
+    std::size_t pos = 12;
+    for (uint64_t c = 0; c < chunks; ++c) {
+        if (blob.size() - pos < 12) return false;
+        const uint64_t len = le(pos + 4, 8);
+        const std::size_t payload = pos + 12;
+        if (len > blob.size() - payload) return false;
+        if (blob.compare(pos, 4, "BODY") == 0) {
+            if (len < 6) return false;
+            const std::size_t name_len = static_cast<std::size_t>(le(payload + 4, 2));
+            if (6 + name_len > len) return false;
+            out.push_back(blob.substr(payload + 6, name_len));
+        }
+        pos = payload + static_cast<std::size_t>(len);
+    }
+    return true;
+}
+
+// Rebuild the session's read-cache compile from a display cache written before build
+// checkpoints existed (cache.brep bodies + the saved ops-response + cache.aicm body
+// names). Shapes, statuses, owner map and datums are exactly the saved compile's; the
+// compile-only side channels are absent, so the result is flagged partial. With
+// `retessellate` the bodies are re-meshed at the session's display tier (the saved mesh
+// was another tier); otherwise the saved mesh is reused. Throws on any malformed input.
+static std::shared_ptr<CompileResult> hydrate_from_display_cache(const Session& s,
+                                                                 const json& response,
+                                                                 const std::string& brep,
+                                                                 const std::string& aicm,
+                                                                 bool retessellate) {
+    auto r = std::make_shared<CompileResult>();
+    r->shapes = brep_cache_decode(brep);
+    std::vector<std::string> names;
+    if (!aicm_body_names(aicm, names) || names.size() != r->shapes.size())
+        throw OpError("io_error", "cache.aicm: body names do not match cache.brep");
+    const json& bodies = response.at("tess").at("bodies");
+    if (!bodies.is_array() || bodies.size() != r->shapes.size())
+        throw OpError("io_error", "cache.json: body list does not match cache.brep");
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        BodyInfo bi;
+        bi.name = names[i];
+        bi.kind = bodies[i].value("kind", std::string("solid"));
+        r->bodies_info.push_back(std::move(bi));
+    }
+    std::map<std::string, std::string> types;
+    if (s.doc.contains("features") && s.doc["features"].is_array())
+        for (const json& f : s.doc["features"])
+            if (f.is_object()) types[f.value("id", std::string())] = f.value("type", std::string());
+    const json& rebuild = response.at("rebuild");
+    r->ok = true;
+    for (const json& f : rebuild.at("feature_status")) {
+        FeatureStatus st;
+        st.id = f.at("id").get<std::string>();
+        st.type = types[st.id];
+        st.ok = f.at("ok").get<bool>();
+        st.error = f.value("error", json()).is_string() ? f["error"].get<std::string>() : "";
+        st.warning = f.value("warning", json()).is_string() ? f["warning"].get<std::string>() : "";
+        st.ms = f.value("ms", 0.0);
+        st.data = f.value("data", json());
+        st.reused = true;
+        r->ok = r->ok && st.ok;
+        r->statuses.push_back(std::move(st));
+    }
+    r->owner_map = response.value("owner_map", json::object());
+    r->datums = response.value("datums", json::array());
+    r->active_configuration = rebuild.value("doc_status", json::object())
+                                  .value("active_configuration", std::string("Default"));
+    r->features_reused = static_cast<int>(r->statuses.size());
+    r->features_executed = 0;
+    tessellate_solved_bodies(s.doc, *r, s.display_quality, retessellate);
+    if (!retessellate) {
+        r->aicm.assign(aicm.begin(), aicm.end());
+        r->volume = response.value("volume", r->volume);
+    }
+    return r;
+}
+
+// A part reopened against its persisted caches (contracts/stepplus.md §4).
+struct PartCacheOpen {
+    json resp;
+    bool hit = false;            // display served from cache.json + cache.aicm
+    bool warm = false;           // compiled is current and no feature executed during open
+    std::string miss_reason;     // absent|engine_key|doc_hash|unsolved|display_quality|budget|decode_error
+    json diag = json::object();  // per-entry status, checkpoint restore report, hydration
+};
+
+static PartCacheOpen open_part_from_caches(Session& s,
+                                           const std::map<std::string, std::string>& skipped) {
+    PartCacheOpen out;
+    auto entry = [&](const char* name) -> const std::string* {
+        auto it = s.extra_entries.find(name);
+        return it == s.extra_entries.end() ? nullptr : &it->second;
+    };
+    auto missing = [&](const char* name) -> std::string {
+        return skipped.count(name) ? "budget" : "absent";
+    };
+    json entries = json::object();
+    for (const char* name : {"cache.json", "cache.aicm", "cache.brep", "cache.ckpt"}) {
+        auto sk = skipped.find(name);
+        entries[name] = sk != skipped.end() ? "skipped:" + sk->second
+                                            : (entry(name) ? "present" : "absent");
+    }
+    out.diag["entries"] = std::move(entries);
+
+    const std::string* cj = entry("cache.json");
+    const std::string* ca = entry("cache.aicm");
+    const std::string* cb = entry("cache.brep");
+    const std::string* ck = entry("cache.ckpt");
+    const std::string engine = stepplus_cache_engine_key();
+    const std::string doc_hash = stepplus_doc_hash(s.doc);
+
+    // Display-cache verdict, in contract order (contracts/stepplus.md §4).
+    json header;
+    std::string miss;
+    if (!cj) {
+        miss = missing("cache.json");
+    } else {
+        try {
+            header = json::parse(*cj);
+            if (!header.is_object()) miss = "decode_error";
+        } catch (const std::exception&) {
+            miss = "decode_error";
+        }
+    }
+    if (miss.empty()) {
+        if (header.value("engine", std::string()) != engine) miss = "engine_key";
+        else if (header.value("doc_hash", std::string()) != doc_hash) miss = "doc_hash";
+        else if (!header.value("solved", false)) miss = "unsolved";
+        else if (!header.contains("response") || !header["response"].is_object())
+            miss = "decode_error";
+    }
+    // From here the saved bodies/statuses/owner map describe THIS document; the mesh
+    // additionally needs the same display tier and must be present.
+    const bool geometry_ok = miss.empty();
+    if (miss.empty() && header.value("display_quality", std::string()) !=
+                            ::geom::display_quality_name(s.display_quality))
+        miss = "display_quality";
+    if (miss.empty() && !ca)
+        miss = header.value("aicm", std::string()) == "budget" ? std::string("budget")
+                                                               : missing("cache.aicm");
+
+    // Build checkpoints: content-addressed per feature (compile chain), so they serve even
+    // when the display cache cannot (another tier, a tree edited outside Chudware).
+    std::shared_ptr<CompileCache> restored;
+    bool seed_memo = false;
+    uint64_t restored_stamp = 0;
+    if (!inc_rebuild_enabled()) {
+        out.diag["checkpoints"] = {{"restored", false}, {"reason", "inc_rebuild_disabled"}};
+    } else if (!ck) {
+        out.diag["checkpoints"] = {{"restored", false}, {"reason", missing("cache.ckpt")}};
+    } else {
+        json rep;
+        restored = compile_cache_decode(*ck, s.doc, env_from_doc(s.doc), s.display_quality,
+                                        engine, ca, rep);
+        if (restored) {
+            s.compile_cache = restored;
+            // The loaded bytes ARE the encoding of this exact cache: a re-save of the
+            // unedited document writes them back without re-serializing.
+            restored_stamp = compile_cache_stamp(*restored);
+            seed_memo = geometry_ok &&
+                        rep.value("matched_features", -1) == rep.value("features", -2) &&
+                        (rep.value("full_result", false) ||
+                         rep.value("full_result_reason", std::string()) == "not_saved");
+        }
+        out.diag["checkpoints"] = std::move(rep);
+    }
+
+    if (miss.empty()) {
+        out.hit = true;
+        out.resp = header["response"];
+        // T-PERF10: re-materialize cached mesh via aicm-shm (same handoff as live rebuilds).
+        std::vector<uint8_t> blob(ca->begin(), ca->end());
+        std::string ap = publish_doc_aicm(s.doc_id, s.revision, blob);
+        if (!ap.empty()) {
+            if (!out.resp.contains("tess") || !out.resp["tess"].is_object())
+                out.resp["tess"] = json::object();
+            out.resp["tess"]["aicm_path"] = ap;
+        }
+        out.resp["revision"] = s.revision;  // override the cached (save-time) revision
+        out.resp["tree"] = s.doc;
+        // Warm the session: the first activate/pick/measure/save serves this result.
+        std::shared_ptr<const CompileResult> full =
+            restored ? compile_cache_full_result(*restored) : nullptr;
+        if (full) {
+            auto c = std::make_shared<CompileResult>(*full);
+            for (FeatureStatus& st : c->statuses) st.reused = true;
+            c->features_reused = static_cast<int>(c->statuses.size());
+            c->features_executed = 0;
+            s.compiled = std::move(c);
+            s.compiled_rev = s.revision;
+            s.compiled_partial = false;
+            out.warm = true;
+            out.diag["hydrated_from"] = "cache.ckpt";
+        } else if (cb) {
+            try {
+                s.compiled = hydrate_from_display_cache(s, header["response"], *cb, *ca,
+                                                        /*retessellate=*/false);
+                s.compiled_rev = s.revision;
+                s.compiled_partial = true;
+                out.warm = true;
+                out.diag["hydrated_from"] = "cache.brep";
+            } catch (const std::exception& e) {
+                out.diag["hydrate_error"] = e.what();
+            }
+        } else {
+            out.diag["hydrate_error"] = "cache.brep " + missing("cache.brep");
+        }
+        out.diag["features_executed"] = 0;
+    } else {
+        out.miss_reason = miss;
+        bool done = false;
+        // A tier mismatch on a file without usable checkpoints: the saved bodies are still
+        // this document's exact geometry, so only the display mesh is rebuilt.
+        if (!restored && geometry_ok && cb && ca) {
+            try {
+                auto c = hydrate_from_display_cache(s, header["response"], *cb, *ca,
+                                                    /*retessellate=*/true);
+                out.resp = ops_response(s, *c, json::object(), /*with_tess=*/true);
+                s.compiled = std::move(c);
+                s.compiled_rev = s.revision;
+                s.compiled_partial = true;
+                out.warm = true;
+                out.diag["hydrated_from"] = "cache.brep";
+                out.diag["features_executed"] = 0;
+                done = true;
+            } catch (const std::exception& e) {
+                out.diag["hydrate_error"] = e.what();
+            }
+        }
+        if (!done) {
+            CompileResult r = compile_session(s);
+            const int executed = r.features_executed;
+            out.resp = warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
+            out.warm = executed == 0;
+            out.diag["features_executed"] = executed;
+        }
+    }
+
+    // Only while the cache still holds exactly what was restored (an open that compiled —
+    // another tier, a partial match — committed new contents under a new stamp).
+    if (seed_memo && restored && s.compile_cache == restored &&
+        compile_cache_stamp(*s.compile_cache) == restored_stamp) {
+        s.ckpt_memo = std::make_shared<const std::string>(std::move(s.extra_entries["cache.ckpt"]));
+        s.ckpt_memo_report = {{"written", true},
+                              {"bytes", s.ckpt_memo->size()},
+                              {"checkpoints_total", out.diag["checkpoints"].value("checkpoints", 0)},
+                              {"checkpoints_written", out.diag["checkpoints"].value("checkpoints", 0)},
+                              {"checkpoints_dropped", 0},
+                              {"full_result", out.diag["checkpoints"].value("full_result", false)},
+                              {"reused_from_open", true}};
+        s.ckpt_memo_stamp = compile_cache_stamp(*s.compile_cache);
+        s.ckpt_memo_doc_hash = doc_hash;
+    }
+    // doc_save regenerates every cache entry; holding the loaded bytes would only pin a
+    // second copy of mesh/B-rep/checkpoints for the session's lifetime.
+    for (const char* name : {"cache.json", "cache.aicm", "cache.brep", "cache.ckpt"})
+        s.extra_entries.erase(name);
+    return out;
 }
 
 json doc_open(const std::string& path, bool as_solid, bool detach_path) {
@@ -15460,7 +15867,12 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     }
     Session& stored = lk.acquire(sid);
 
-    CompileResult r;
+    // Cache verdict surfaced on every open (contracts/stepplus.md §4): cache_hit, warm and,
+    // on a miss, cache_miss_reason — never a silent full rebuild.
+    bool cache_hit = false;
+    bool warm = false;
+    std::string miss_reason;
+    json cache_diag = json::object();
     if (stored.is_assembly()) {
         // Migrate legacy bindings even if a persisted display cache avoids compilation.
         bind_assembly_reference_frames(stored.doc);
@@ -15474,68 +15886,38 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
         // fingerprints), replay the saved response + mesh without loading a single
         // component. asm_result stays empty — the first interactive op that needs real
         // geometry lazily rebuilds (every consumer already guards with rebuild_assembly).
-        bool asm_cache_hit = false;
-        {
-            auto cj = stored.extra_entries.find("cache.json");
-            auto ca = stored.extra_entries.find("cache.aicm");
-            if (cj != stored.extra_entries.end() && ca != stored.extra_entries.end()) {
-                try {
-                    json header = json::parse(cj->second);
-                    const std::string base_dir =
-                        std::filesystem::path(path).parent_path().string();
-                    if (header.value("engine", std::string()) == stepplus_cache_engine_key() &&
-                        header.value("doc_hash", std::string()) ==
-                            stepplus_doc_hash(stored.doc) &&
-                        header.value("solved", false) &&
-                        header.value("assembly_appearance", 0) == 1 &&
-                        header.value("display_quality", std::string()) ==
-                            ::geom::display_quality_name(stored.display_quality) &&
-                        header.contains("response") && header["response"].is_object() &&
-                        asm_fingerprints_match(stored.doc, base_dir,
-                                               header.value("components", json()))) {
-                        resp = header["response"];
-                        std::vector<uint8_t> blob(ca->second.begin(), ca->second.end());
-                        std::string ap = publish_doc_aicm(stored.doc_id, stored.revision, blob);
-                        if (!ap.empty()) {
-                            if (!resp.contains("tess") || !resp["tess"].is_object())
-                                resp["tess"] = json::object();
-                            resp["tess"]["aicm_path"] = ap;
-                        }
-                        resp["revision"] = stored.revision;
-                        resp["tree"] = stored.doc;
-                        resp["cache_hit"] = true;
-                        asm_cache_hit = true;
-                    }
-                } catch (...) {
-                    asm_cache_hit = false;  // stale/corrupt cache -> full rebuild
-                }
-            }
-        }
-        if (!asm_cache_hit) {
-            rebuild_assembly(stored);
-            resp = ops_response_assembly(stored, json::object());
-        }
-    } else {
-    // Fast cold-open via the persisted geometry cache: if the container carries a valid
-    // cache.json/cache.aicm (engine key + doc hash both match the loaded tree), return the
-    // cached ops-response + mesh WITHOUT re-running compile_document. stored.compiled is left
-    // empty, so the FIRST edit/pick recompiles from features (document.json is authoritative).
-    bool cache_hit = false;
-    {
         auto cj = stored.extra_entries.find("cache.json");
         auto ca = stored.extra_entries.find("cache.aicm");
-        if (cj != stored.extra_entries.end() && ca != stored.extra_entries.end()) {
+        auto missing = [&](const char* name) -> std::string {
+            return loaded.skipped.count(name) ? "budget" : "absent";
+        };
+        if (cj == stored.extra_entries.end()) {
+            miss_reason = missing("cache.json");
+        } else if (ca == stored.extra_entries.end()) {
+            miss_reason = missing("cache.aicm");
+        } else {
             try {
                 json header = json::parse(cj->second);
-                if (header.value("engine", std::string()) == stepplus_cache_engine_key() &&
-                    // cache.aicm was meshed at the saving session's display tier; a
-                    // different tier here must re-mesh instead of showing a stale mesh.
-                    header.value("display_quality", std::string()) ==
-                        ::geom::display_quality_name(stored.display_quality) &&
-                    header.contains("response") && header["response"].is_object()) {
+                const std::string base_dir =
+                    std::filesystem::path(path).parent_path().string();
+                if (!header.is_object() || !header.contains("response") ||
+                    !header["response"].is_object())
+                    miss_reason = "decode_error";
+                else if (header.value("engine", std::string()) != stepplus_cache_engine_key() ||
+                         header.value("assembly_appearance", 0) != 1)
+                    miss_reason = "engine_key";
+                else if (header.value("doc_hash", std::string()) != stepplus_doc_hash(stored.doc))
+                    miss_reason = "doc_hash";
+                else if (!header.value("solved", false))
+                    miss_reason = "unsolved";
+                else if (header.value("display_quality", std::string()) !=
+                         ::geom::display_quality_name(stored.display_quality))
+                    miss_reason = "display_quality";
+                else if (!asm_fingerprints_match(stored.doc, base_dir,
+                                                 header.value("components", json())))
+                    miss_reason = "components_changed";
+                if (miss_reason.empty()) {
                     resp = header["response"];
-                    // T-PERF10: re-materialize cached mesh via aicm-shm (same handoff as
-                    // live rebuilds). Avoids /tmp/chudware_cpp_docs storm on cold open.
                     std::vector<uint8_t> blob(ca->second.begin(), ca->second.end());
                     std::string ap = publish_doc_aicm(stored.doc_id, stored.revision, blob);
                     if (!ap.empty()) {
@@ -15543,22 +15925,36 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
                             resp["tess"] = json::object();
                         resp["tess"]["aicm_path"] = ap;
                     }
-                    resp["revision"] = stored.revision;  // override the cached (save-time) revision
+                    resp["revision"] = stored.revision;
                     resp["tree"] = stored.doc;
-                    resp["cache_hit"] = true;
                     cache_hit = true;
                 }
             } catch (...) {
-                cache_hit = false;  // any parse/IO hiccup -> fall through to a full rebuild
+                miss_reason = "decode_error";  // stale/corrupt cache -> full rebuild
             }
         }
-    }
-
-    if (!cache_hit) {
-        r = compile_session(stored);
-        resp = warm_and_respond(stored, std::move(r), json::object(), /*with_tess=*/true);
-    }
+        if (!cache_hit) {
+            rebuild_assembly(stored);
+            resp = ops_response_assembly(stored, json::object());
+            warm = true;
+        }
+        for (const auto& [name, why] : loaded.skipped) cache_diag["skipped"][name] = why;
+    } else {
+        // Warm cold-open via the persisted build state: replay the saved display AND hand
+        // the session its compile (checkpoints / solved bodies), so neither the open nor the
+        // first activate/pick/measure/save runs the feature tree, and the first edit executes
+        // only the edited tail (document.json stays authoritative: every entry is keyed).
+        PartCacheOpen po = open_part_from_caches(stored, loaded.skipped);
+        resp = std::move(po.resp);
+        cache_hit = po.hit;
+        warm = po.warm;
+        miss_reason = std::move(po.miss_reason);
+        cache_diag = std::move(po.diag);
     }  // end part-vs-assembly branch
+    resp["cache_hit"] = cache_hit;
+    resp["warm"] = warm;
+    if (!cache_hit) resp["cache_miss_reason"] = miss_reason;
+    resp["cache"] = std::move(cache_diag);
     resp["doc_id"] = stored.doc_id;
     if (stored.doc.is_object())
         resp["name"] = stored.doc.value("name", std::string());
@@ -15573,8 +15969,9 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     json warnings = json::array();
     for (const std::string& w : loaded.warnings) warnings.push_back(w);
     std::vector<std::string> failed;
-    for (const FeatureStatus& st : r.statuses)
-        if (!st.ok) failed.push_back(st.id);
+    if (!stored.is_assembly() && stored.compiled && stored.compiled_rev == stored.revision)
+        for (const FeatureStatus& st : stored.compiled->statuses)
+            if (!st.ok) failed.push_back(st.id);
     if (!failed.empty()) {
         std::string msg = std::to_string(failed.size()) + " feature(s) failed to rebuild: [";
         for (std::size_t i = 0; i < failed.size(); ++i) {

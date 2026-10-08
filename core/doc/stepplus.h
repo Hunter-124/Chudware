@@ -29,13 +29,25 @@ struct StepPlusDoc {
     nlohmann::json doc;                            // the parsed document.json tree
     std::vector<std::string> warnings;             // non-fatal load notes
     std::map<std::string, std::string> extra;      // unknown entries (name -> raw bytes)
+    // Geometry caches (cache.json/.aicm/.brep/.ckpt) present in the archive but not
+    // admitted: name -> entry_limit | aggregate_limit | compression_ratio | extract_failed.
+    // A skipped cache is a cache miss the caller reports; it never fails the open.
+    std::map<std::string, std::string> skipped;
 };
 
 // Write `doc` to `path` as a .step+ container. `extra` carries unknown entries to
 // preserve verbatim (forward-compat). Atomic: writes "<path>.tmp" then replaces.
-// Returns the final path. Throws OpError("io_error", ...) on any failure.
+// Returns the final path. Throws OpError("io_error", ...) on any failure. Optional
+// caches (cache.aicm, cache.ckpt) that do not fit the archive budget left by every
+// other entry are not written; their names are appended to `dropped` when given.
 std::string stepplus_save(const nlohmann::json& doc, const std::string& path,
-                          const std::map<std::string, std::string>& extra);
+                          const std::map<std::string, std::string>& extra,
+                          std::vector<std::string>* dropped = nullptr);
+// Expanded bytes stepplus_save(doc, ..., extra) leaves for the optional caches once
+// every other entry of `extra` (and document/meta/thumbnail) is reserved. The writer
+// admits cache.aicm first, then cache.ckpt, against this same remainder.
+std::size_t stepplus_optional_cache_budget(const nlohmann::json& doc,
+                                           const std::map<std::string, std::string>& extra);
 
 // Read a .step+ container at `path`. Validates the container version (major == 1).
 // Throws OpError("io_error", ...) if the file is missing/corrupt or not a .step+ .
@@ -70,10 +82,11 @@ nlohmann::json native_file_operations(const nlohmann::json& params);
 
 // --- persisted-geometry cache keys (fast cold-open) --------------------------------
 // doc_save may embed the compiled tessellation + ops-response as extra `cache.aicm` /
-// `cache.json` entries so a later doc_open can return them WITHOUT re-running
-// compile_document (rebuild-on-open is the dominant cold-open cost). The cache is
-// display-only: it never touches document.json (the parametric source of truth), and the
-// first edit recompiles from features. Validity is gated on TWO stable keys:
+// `cache.json` entries, the solved bodies as `cache.brep` and the per-feature build
+// checkpoints as `cache.ckpt`, so a later doc_open returns the display AND a warm
+// session WITHOUT re-running compile_document; the first edit after reopen executes
+// only the features after the deepest restored checkpoint. The caches never touch
+// document.json (the parametric source of truth). Validity is gated on TWO stable keys:
 
 // A run-stable 64-bit FNV-1a hash of the CANONICAL document json (same canonicalization
 // stepplus_save writes), so open can prove the geometry matches the exact saved tree. Not

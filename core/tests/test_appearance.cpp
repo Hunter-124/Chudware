@@ -600,3 +600,272 @@ TEST_CASE("selected face finish: an older display-cache epoch cannot hide a save
     CHECK(red == Approx(0.9));
     REQUIRE(doc_close(reopened.at("doc_id").get<std::string>()));
 }
+
+// ---------------------------------------------------------------- persisted build state
+// cache.ckpt + warm open (contracts/stepplus.md §4): a reopened part never re-runs its
+// feature tree while its caches are valid, its first edit executes only the edited tail,
+// and every cache skip is visible in the RPC result.
+namespace {
+
+// Box + two independent boxes: three features, three bodies.
+std::string make_three_box_part() {
+    using namespace chudware::doc;
+    const std::string id = make_box_doc();
+    doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {
+            {"type", "box"}, {"name", "Second"}, {"params", {
+                {"length", 10}, {"width", 10}, {"height", 10},
+                {"at", {60, 0, 0}}, {"mode", "new"}}}}}},
+        {{"op", "add_feature"}, {"feature", {
+            {"type", "box"}, {"name", "Third"}, {"params", {
+                {"length", 8}, {"width", 8}, {"height", 8},
+                {"at", {-60, 0, 0}}, {"mode", "new"}}}}}},
+    }), false);
+    return id;
+}
+
+constexpr double kThreeBoxVolume = 40.0 * 24.0 * 12.0 + 1000.0 + 512.0;
+
+long long executed_since(const json& before) {
+    return chudware::doc::compile_cache_stats().at("features_executed").get<long long>() -
+           before.at("features_executed").get<long long>();
+}
+
+bool has_entry(const json& cache, const std::string& name) {
+    for (const json& e : cache.at("entries"))
+        if (e == name) return true;
+    return false;
+}
+
+// Rewrite a saved container with `edit` applied to its document/extra entries.
+template <typename Edit>
+void rewrite_container(const std::filesystem::path& path, Edit edit) {
+    auto stored = chudware::doc::stepplus_open(path.string());
+    edit(stored);
+    chudware::doc::stepplus_save(stored.doc, path.string(), stored.extra);
+}
+
+}  // namespace
+
+TEST_CASE("persisted build state: a saved part reopens warm and its first op executes no feature") {
+    using namespace chudware::doc;
+    const std::string id = make_three_box_part();
+    AppearanceFiles files(id);
+    const auto path = files.dir / "warm.step+";
+    const json saved = doc_save(id, path.string());
+    const json& cache = saved.at("cache");
+    INFO(saved.dump());
+    CHECK(cache.at("written") == true);
+    CHECK(has_entry(cache, "cache.ckpt"));
+    CHECK(has_entry(cache, "cache.brep"));
+    CHECK(cache.at("checkpoints").at("written") == true);
+    CHECK(cache.at("checkpoints").at("full_result") == true);
+    CHECK(cache.at("checkpoints").at("checkpoints_written") == 3);
+    REQUIRE(doc_close(id));
+
+    const json before = compile_cache_stats();
+    const json opened = doc_open(path.string());
+    INFO(opened.at("cache").dump());
+    CHECK(opened.at("cache_hit") == true);
+    CHECK(opened.at("warm") == true);
+    CHECK_FALSE(opened.contains("cache_miss_reason"));
+    CHECK(opened.at("cache").at("hydrated_from") == "cache.ckpt");
+    CHECK(opened.at("volume").get<double>() == Approx(kThreeBoxVolume));
+    const std::string nid = opened.at("doc_id").get<std::string>();
+
+    // The first activate (tab switch) and even a forced rebuild serve the restored build.
+    const json activated = doc_activate(nid);
+    CHECK(activated.at("rebuild").at("doc_status").at("features_executed") == 0);
+    const json rebuilt = doc_rebuild(nid);
+    CHECK(rebuilt.at("rebuild").at("doc_status").at("features_executed") == 0);
+    CHECK(rebuilt.at("volume").get<double>() == Approx(kThreeBoxVolume));
+    CHECK(executed_since(before) == 0);
+
+    // An unedited re-save writes the same checkpoints back without a compile.
+    const json resaved = doc_save(nid, path.string());
+    CHECK(resaved.at("cache").at("checkpoints").at("written") == true);
+    CHECK(executed_since(before) == 0);
+    REQUIRE(doc_close(nid));
+}
+
+TEST_CASE("persisted build state: editing the last feature after reopen executes only the tail") {
+    using namespace chudware::doc;
+    const std::string id = make_three_box_part();
+    AppearanceFiles files(id);
+    const auto path = files.dir / "tail.step+";
+    doc_save(id, path.string());
+    const std::string last = doc_tree(id).at("tree").at("features").back().at("id");
+    REQUIRE(doc_close(id));
+
+    const json opened = doc_open(path.string());
+    REQUIRE(opened.at("warm") == true);
+    const std::string nid = opened.at("doc_id").get<std::string>();
+    const json before = compile_cache_stats();
+    const json edited = doc_apply_ops(nid, -1, json::array({
+        {{"op", "edit_feature"}, {"id", last},
+         {"params", {{"length", {{"value", 16}, {"expr", nullptr}}}}}},
+    }), false);
+    INFO(edited.at("rebuild").dump());
+    CHECK(edited.at("rebuild").at("doc_status").at("features_executed") == 1);
+    CHECK(edited.at("rebuild").at("doc_status").at("features_reused") == 2);
+    CHECK(executed_since(before) == 1);
+    CHECK(edited.at("volume").get<double>() == Approx(40.0 * 24.0 * 12.0 + 1000.0 + 16.0 * 8.0 * 8.0));
+    REQUIRE(doc_close(nid));
+}
+
+TEST_CASE("persisted build state: a changed document hash is a reported miss") {
+    using namespace chudware::doc;
+    const std::string id = make_three_box_part();
+    AppearanceFiles files(id);
+    const auto path = files.dir / "renamed.step+";
+    doc_save(id, path.string());
+    REQUIRE(doc_close(id));
+    // Edited outside Chudware (here: a rename), so the saved display cache no longer
+    // describes document.json byte for byte.
+    rewrite_container(path, [](StepPlusDoc& stored) { stored.doc["name"] = "RenamedOutside"; });
+
+    const json before = compile_cache_stats();
+    const json opened = doc_open(path.string());
+    INFO(opened.at("cache").dump());
+    CHECK(opened.at("cache_hit") == false);
+    CHECK(opened.at("cache_miss_reason") == "doc_hash");
+    // The features are unchanged, so the content-addressed checkpoints still serve the
+    // build: the miss is reported, yet no feature re-executes.
+    CHECK(opened.at("warm") == true);
+    CHECK(opened.at("cache").at("features_executed") == 0);
+    CHECK(executed_since(before) == 0);
+    CHECK(opened.at("volume").get<double>() == Approx(kThreeBoxVolume));
+    REQUIRE(doc_close(opened.at("doc_id").get<std::string>()));
+}
+
+TEST_CASE("persisted build state: a file saved before cache.ckpt still opens warm from cache.brep") {
+    using namespace chudware::doc;
+    const std::string id = make_three_box_part();
+    AppearanceFiles files(id);
+    const auto path = files.dir / "legacy.step+";
+    doc_save(id, path.string());
+    REQUIRE(doc_close(id));
+    rewrite_container(path, [](StepPlusDoc& stored) { stored.extra.erase("cache.ckpt"); });
+
+    const json before = compile_cache_stats();
+    const json opened = doc_open(path.string());
+    INFO(opened.at("cache").dump());
+    CHECK(opened.at("cache_hit") == true);
+    CHECK(opened.at("warm") == true);
+    CHECK(opened.at("cache").at("hydrated_from") == "cache.brep");
+    CHECK(opened.at("cache").at("checkpoints").at("reason") == "absent");
+    const std::string nid = opened.at("doc_id").get<std::string>();
+    // Activation, picking and edge expansion read the hydrated compile.
+    const json activated = doc_activate(nid);
+    CHECK(activated.at("rebuild").at("doc_status").at("features_executed") == 0);
+    CHECK(activated.at("volume").get<double>() == Approx(kThreeBoxVolume));
+    CHECK(activated.at("tess").at("bodies").size() == 3);
+    CHECK_FALSE(doc_face_edges(nid, 1, 1).at("edges").empty());
+    CHECK(executed_since(before) == 0);
+    REQUIRE(doc_close(nid));
+}
+
+TEST_CASE("persisted build state: an inadmissible cache entry is a reported skip, never a failed open") {
+    using namespace chudware::doc;
+    const std::string id = make_three_box_part();
+    AppearanceFiles files(id);
+    const auto path = files.dir / "padded.step+";
+    doc_save(id, path.string());
+    REQUIRE(doc_close(id));
+    // A cache.json whose deflate ratio exceeds the reader's bound: before, the archive
+    // pre-scan rejected the whole document; now only the cache entry is skipped.
+    rewrite_container(path, [](StepPlusDoc& stored) {
+        json header = json::parse(stored.extra.at("cache.json"));
+        header["padding"] = std::string(8u * 1024u * 1024u, ' ');
+        stored.extra["cache.json"] = header.dump();
+    });
+
+    const json before = compile_cache_stats();
+    json opened;
+    REQUIRE_NOTHROW(opened = doc_open(path.string()));
+    INFO(opened.at("cache").dump());
+    CHECK(opened.at("cache_hit") == false);
+    CHECK(opened.at("cache_miss_reason") == "budget");
+    CHECK(opened.at("cache").at("entries").at("cache.json") == "skipped:compression_ratio");
+    CHECK(opened.at("warm") == true);  // the admitted checkpoints still carry the build
+    CHECK(executed_since(before) == 0);
+    CHECK(opened.at("volume").get<double>() == Approx(kThreeBoxVolume));
+    REQUIRE(doc_close(opened.at("doc_id").get<std::string>()));
+}
+
+TEST_CASE("persisted build state: a partially failed rebuild persists the succeeded prefix") {
+    using namespace chudware::doc;
+    const std::string id = make_box_doc();
+    AppearanceFiles files(id);
+    json tree = doc_tree(id).at("tree");
+    REQUIRE(doc_close(id));
+    tree["features"].push_back({{"id", "f90"}, {"type", "import"}, {"name", "Ghost"},
+                                {"params", {{"source_path", "/no/such/dir/ghost-part.step"},
+                                            {"format", "step"}}},
+                                {"refs", json::object()}});
+    const auto path = files.dir / "partial.step+";
+    stepplus_save(tree, path.string(), {});
+    const json first = doc_open(path.string());
+    CHECK(first.at("cache_miss_reason") == "absent");
+    const std::string fid = first.at("doc_id").get<std::string>();
+    const json saved = doc_save(fid, path.string());
+    INFO(saved.dump());
+    CHECK(saved.at("cache").at("written") == false);
+    CHECK(saved.at("cache").at("skipped_reason") == "feature_failed");
+    CHECK(has_entry(saved.at("cache"), "cache.ckpt"));
+    CHECK(saved.at("cache").at("checkpoints").at("reason") == "feature_failed");
+    CHECK(saved.at("cache").at("checkpoints").at("checkpoints_written") == 1);
+    REQUIRE(doc_close(fid));
+
+    const json before = compile_cache_stats();
+    const json reopened = doc_open(path.string());
+    INFO(reopened.at("cache").dump());
+    CHECK(reopened.at("cache_miss_reason") == "absent");
+    CHECK(reopened.at("cache").at("checkpoints").at("checkpoints") == 1);
+    // Only the failing feature is re-attempted; the box restores from its checkpoint.
+    CHECK(reopened.at("cache").at("features_executed") == 1);
+    CHECK(executed_since(before) == 1);
+    CHECK(reopened.at("warnings").size() == 1);
+    REQUIRE(doc_close(reopened.at("doc_id").get<std::string>()));
+}
+
+TEST_CASE("persisted build state: over-budget checkpoints drop oldest first, then report") {
+    using namespace chudware::doc;
+    const std::string id = make_three_box_part();
+    const json tree = doc_tree(id).at("tree");
+    REQUIRE(doc_close(id));
+    auto cache = make_compile_cache();
+    const auto compiled = compile_document(tree, json::object(), cache.get());
+    REQUIRE(compiled.ok);
+    const auto quality = ::geom::DisplayQuality::Fine;
+    json full_report;
+    const std::string full = compile_cache_encode(*cache, tree, json::object(), quality,
+                                                  stepplus_cache_engine_key(), "hash",
+                                                  std::size_t(1) << 30, full_report);
+    REQUIRE(!full.empty());
+    CHECK(full_report.at("checkpoints_written") == 3);
+    CHECK_FALSE(full_report.contains("reason"));
+
+    json trimmed_report;
+    const std::string trimmed = compile_cache_encode(*cache, tree, json::object(), quality,
+                                                     stepplus_cache_engine_key(), "hash",
+                                                     full.size() - 1, trimmed_report);
+    INFO(trimmed_report.dump());
+    REQUIRE(!trimmed.empty());
+    CHECK(trimmed.size() < full.size());
+    CHECK(trimmed_report.at("reason") == "budget");
+    CHECK(trimmed_report.at("checkpoints_dropped").get<int>() > 0);
+    // The deepest checkpoint survives: a decoded trimmed cache still restores the tail.
+    json decoded;
+    auto restored = compile_cache_decode(trimmed, tree, json::object(), quality,
+                                         stepplus_cache_engine_key(), nullptr, decoded);
+    REQUIRE(restored);
+    CHECK(decoded.at("matched_features") == 3);
+
+    json none_report;
+    CHECK(compile_cache_encode(*cache, tree, json::object(), quality, stepplus_cache_engine_key(),
+                               "hash", 16, none_report).empty());
+    CHECK(none_report.at("written") == false);
+    CHECK(none_report.at("reason") == "budget");
+    CHECK(none_report.at("checkpoints_dropped") == 3);
+}

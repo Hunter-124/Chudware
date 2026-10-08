@@ -63,6 +63,9 @@
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepTools.hxx>
 #include <BRepTools_History.hxx>
+#include <BinTools.hxx>                // cache.ckpt: one shared-topology shape set
+#include <BinTools_FormatVersion.hxx>
+#include <BinTools_ShapeSet.hxx>
 #include <TopLoc_Location.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
@@ -233,6 +236,9 @@ public:
 
     Slot operator[](const std::string& id) { return Slot{m_[id]}; }
     Slot operator[](std::string&& id) { return Slot{m_[std::move(id)]}; }
+    // Install an existing frozen slot (persisted-cache restore shares one decoded result
+    // across every checkpoint that held it, exactly as live checkpoints do).
+    void put_shared(const std::string& id, FeatureResultPtr p) { m_[id] = std::move(p); }
 
     iterator find(const std::string& id) { return m_.find(id); }
     const_iterator find(const std::string& id) const { return m_.find(id); }
@@ -307,6 +313,42 @@ static uint64_t cc_fnv1a(const std::string& s, uint64_t seed = 14695981039346656
 // far outside every real workload — the cache degrades to the old full rebuild).
 constexpr std::size_t kCompileCacheMaxFeatures = 1024;
 
+// The compile-input chain (see CompileCache): h0 folds env, active configuration,
+// display tier and compile mode; h[i+1] folds feature i's json into h[i]. Shared by
+// compile_document and the persisted-cache codec so both key checkpoints identically.
+std::vector<uint64_t> cc_chain(const json& features, const json& env_json,
+                               const std::string& active_configuration,
+                               ::geom::DisplayQuality quality, bool with_display,
+                               bool with_owners) {
+    const std::size_t n = features.is_array() ? features.size() : 0;
+    std::vector<uint64_t> chain;
+    chain.reserve(n + 1);
+    uint64_t h = cc_fnv1a(env_json.is_object() && !env_json.empty() ? env_json.dump()
+                                                                    : std::string());
+    h = cc_fnv1a(active_configuration, h);
+    // Display quality bakes into the AICM this result carries, so it belongs in the
+    // chain seed: switching quality is a cache MISS (full and prefix) and re-meshes.
+    h = cc_fnv1a(::geom::display_quality_name(quality), h);
+    h = cc_fnv1a(with_display ? "display" : "component_geometry", h);
+    if (with_owners) h = cc_fnv1a("owners", h);
+    chain.push_back(h);
+    for (std::size_t i = 0; i < n; ++i)
+        chain.push_back(cc_fnv1a(features[i].dump(), chain.back()));
+    return chain;
+}
+
+// Full-result key: the chain tail folded with the doc's body + face appearances (they
+// bake into the post-loop AICM colors only).
+uint64_t cc_full_key(const json& doc, uint64_t chain_tail) {
+    return cc_fnv1a(
+        doc.contains("appearances") ? doc["appearances"].dump() : std::string(),
+        cc_fnv1a(doc.contains("face_appearances") ? doc["face_appearances"].dump() : std::string(),
+                 chain_tail));
+}
+
+std::atomic<uint64_t> g_cc_stamp{0};
+uint64_t cc_next_stamp() { return g_cc_stamp.fetch_add(1, std::memory_order_relaxed) + 1; }
+
 // Process-wide cache accounting for the profiler (all docs, since engine start).
 static std::atomic<uint64_t> g_cc_compiles{0};
 static std::atomic<uint64_t> g_cc_full_hits{0};
@@ -347,6 +389,9 @@ struct CompileCache {
     // the set that survived, so a discarded body's mesh is freed.
     std::map<std::tuple<const void*, bool, uint64_t>,
              std::shared_ptr<const CachedBody>> body_cache;
+    // Process-unique contents stamp (compile_cache_stamp): renewed on every commit and
+    // restore, copied with the struct, so an encoding of unchanged contents is reusable.
+    uint64_t stamp = 0;
 };
 
 std::shared_ptr<CompileCache> make_compile_cache() { return std::make_shared<CompileCache>(); }
@@ -2491,24 +2536,11 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     std::vector<uint64_t> chain;
     std::size_t start_at = 0;
     if (use_cache) {
-        chain.reserve(n_features + 1);
-        uint64_t h = cc_fnv1a(env_json.is_object() && !env_json.empty() ? env_json.dump()
-                                                                        : std::string());
-        h = cc_fnv1a(result.active_configuration, h);
-        // Display quality bakes into the AICM this result carries, so it belongs in the
-        // chain seed: switching quality is a cache MISS (full and prefix) and re-meshes.
-        h = cc_fnv1a(::geom::display_quality_name(quality), h);
-        h = cc_fnv1a(with_display ? "display" : "component_geometry", h);
-        if (with_owners) h = cc_fnv1a("owners", h);
-        chain.push_back(h);
-        for (std::size_t i = 0; i < n_features; ++i)
-            chain.push_back(cc_fnv1a(features[i].dump(), chain.back()));
+        chain = cc_chain(features, env_json, result.active_configuration, quality,
+                         with_display, with_owners);
         // (a) FULL match — same env/config/features and same appearances (they bake into
         // the post-loop AICM colors) -> serve the whole previous result.
-        const uint64_t full_key = cc_fnv1a(
-            doc.contains("appearances") ? doc["appearances"].dump() : std::string(),
-            cc_fnv1a(doc.contains("face_appearances") ? doc["face_appearances"].dump() : std::string(),
-                     chain.back()));
+        const uint64_t full_key = cc_full_key(doc, chain.back());
         if (cache->last_result && cache->full_key == full_key &&
             cache->chain == chain) {
             CompileResult out = *cache->last_result;
@@ -9318,11 +9350,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         stored->features_executed = static_cast<int>(n_features);
         cache->chain = std::move(chain);
         cache->snaps = std::move(new_snaps);
-        cache->full_key = cc_fnv1a(
-            doc.contains("appearances") ? doc["appearances"].dump() : std::string(),
-            cc_fnv1a(doc.contains("face_appearances") ? doc["face_appearances"].dump() : std::string(),
-                     cache->chain.back()));
+        cache->full_key = cc_full_key(doc, cache->chain.back());
         cache->last_result = std::move(stored);
+        cache->stamp = cc_next_stamp();
     }
 
     return result;
@@ -9384,6 +9414,736 @@ std::vector<int> face_edges(const CompileResult& r, int body_id, int face_topo_i
 
 std::vector<int> face_edges(const json& doc, const json& env, int body_id, int face_topo_id) {
     return face_edges(compile_document(doc, env), body_id, face_topo_id);
+}
+
+// ============================================================ persisted build state
+// The `.step+` `cache.ckpt` codec (contracts/stepplus.md §4). Layout: the 8-byte magic
+// "AICCKPT1" + one CBOR document. Every shape referenced by any persisted checkpoint or
+// the full result is written into ONE BinTools shape set (no
+// triangulation — restored triangulation sends BRepMesh into runaway refinement, see
+// brep_cache_encode), so TShape/geometry/location sharing between checkpoints, results
+// and tool bodies is reproduced exactly: TopExp ordinals, the owner maps keyed by them,
+// and the geometry-identity owner fallback of the NEXT executed feature all behave as
+// they would against the live checkpoint. Shared slots (feature results, statuses, owner
+// maps, tool records, JSON side channels, ids) are pooled and referenced by index.
+namespace {
+
+constexpr char kCkptMagic[] = "AICCKPT1";
+constexpr std::size_t kCkptMagicLen = 8;
+constexpr int kCkptFormat = 1;
+
+uint64_t ckpt_bytes_hash(const unsigned char* p, std::size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+json ckpt_plane(const chudware::geom::SketchPlane& p) {
+    return json::array({p.origin.x(), p.origin.y(), p.origin.z(),
+                        p.uAxis.x(), p.uAxis.y(), p.uAxis.z(),
+                        p.vAxis.x(), p.vAxis.y(), p.vAxis.z(),
+                        p.normal.x(), p.normal.y(), p.normal.z()});
+}
+
+Eigen::Vector3d ckpt_vec(const json& j, std::size_t k) {
+    return Eigen::Vector3d(j.at(k).get<double>(), j.at(k + 1).get<double>(),
+                           j.at(k + 2).get<double>());
+}
+
+chudware::geom::SketchPlane ckpt_plane_from(const json& j) {
+    chudware::geom::SketchPlane p;
+    p.origin = ckpt_vec(j, 0);
+    p.uAxis = ckpt_vec(j, 3);
+    p.vAxis = ckpt_vec(j, 6);
+    p.normal = ckpt_vec(j, 9);
+    return p;
+}
+
+json ckpt_vec_json(const Eigen::Vector3d& v) { return json::array({v.x(), v.y(), v.z()}); }
+
+json ckpt_status(const FeatureStatus& st) {
+    return json::array({st.id, st.type, st.ok, st.error, st.warning, st.ms, st.data});
+}
+
+FeatureStatus ckpt_status_from(const json& j) {
+    FeatureStatus st;
+    st.id = j.at(0).get<std::string>();
+    st.type = j.at(1).get<std::string>();
+    st.ok = j.at(2).get<bool>();
+    st.error = j.at(3).get<std::string>();
+    st.warning = j.at(4).get<std::string>();
+    st.ms = j.at(5).get<double>();
+    st.data = j.at(6);
+    return st;
+}
+
+// Encoder state for one cache.ckpt payload.
+class CkptWriter {
+public:
+    int shape(const TopoDS_Shape& s) {
+        if (s.IsNull()) return -1;
+        auto& bucket = shape_index_[{static_cast<const void*>(s.TShape().get()),
+                                     static_cast<int>(s.Orientation())}];
+        for (const auto& [loc, idx] : bucket)
+            if (loc.IsEqual(s.Location())) return idx;
+        const int idx = static_cast<int>(shapes_.size());
+        shapes_.push_back(s);
+        bucket.emplace_back(s.Location(), idx);
+        return idx;
+    }
+    int str(const std::string& s) {
+        auto [it, fresh] = string_index_.emplace(s, static_cast<int>(strings_.size()));
+        if (fresh) strings_.push_back(s);
+        return it->second;
+    }
+    int blob(const json& j) {
+        auto [it, fresh] = blob_index_.emplace(j.dump(), static_cast<int>(blobs_.size()));
+        if (fresh) blobs_.push_back(j);
+        return it->second;
+    }
+    int status(const std::shared_ptr<const FeatureStatus>& st) {
+        auto [it, fresh] = status_index_.emplace(st.get(), static_cast<int>(statuses_.size()));
+        if (fresh) statuses_.push_back(ckpt_status(*st));
+        return it->second;
+    }
+    int tool_rec(const ToolRec& tr) {
+        const auto key = std::make_tuple(str(tr.feature_id), str(tr.role), shape(tr.tool));
+        auto [it, fresh] = tool_index_.emplace(key, static_cast<int>(tool_recs_.size()));
+        if (fresh)
+            tool_recs_.push_back(json::array({std::get<0>(key), std::get<1>(key), std::get<2>(key)}));
+        return it->second;
+    }
+    int owners(const std::map<int, std::string>& m) {
+        uint64_t h = 1469598103934665603ULL;
+        for (const auto& [k, v] : m) h = cc_fnv1a(v, cc_fnv1a(std::to_string(k), h));
+        auto& bucket = owner_index_[h];
+        for (int idx : bucket)
+            if (*owner_reps_[static_cast<std::size_t>(idx)] == m) return idx;
+        const int idx = static_cast<int>(owner_reps_.size());
+        owner_reps_.push_back(&m);
+        bucket.push_back(idx);
+        json enc = json::array();
+        for (const auto& [k, v] : m) enc.push_back(json::array({k, str(v)}));
+        owner_pool_.push_back(std::move(enc));
+        return idx;
+    }
+    int result(const FeatureResultPtr& r) {
+        auto [it, fresh] = result_index_.emplace(r.get(), static_cast<int>(results_.size()));
+        if (!fresh) return it->second;
+        results_.push_back(nullptr);  // reserve the slot before nested interning
+        json enc;
+        std::visit([&](const auto& v) {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, SketchResult>) {
+                json faces = json::array();
+                for (const TopoDS_Face& f : v.faces) faces.push_back(shape(f));
+                enc = {{"k", 0}, {"faces", std::move(faces)}, {"plane", ckpt_plane(v.plane)},
+                       {"entities", v.entities}};
+            } else if constexpr (std::is_same_v<T, SolidResult>) {
+                enc = {{"k", 1}, {"shape", shape(v.shape)}};
+            } else if constexpr (std::is_same_v<T, PlaneResult>) {
+                enc = {{"k", 2}, {"plane", ckpt_plane(v.plane)}, {"csys", v.is_csys}};
+            } else if constexpr (std::is_same_v<T, AxisResult>) {
+                enc = {{"k", 3}, {"p", ckpt_vec_json(v.point)}, {"d", ckpt_vec_json(v.dir)}};
+            } else if constexpr (std::is_same_v<T, PointResult>) {
+                enc = {{"k", 4}, {"p", ckpt_vec_json(v.pt)}};
+            } else if constexpr (std::is_same_v<T, CurveResult>) {
+                enc = {{"k", 5}, {"wire", shape(v.wire)}, {"plane", ckpt_plane(v.base)}};
+            } else {
+                static_assert(std::is_same_v<T, Sketch3DResult>);
+                json wires = json::array();
+                for (const TopoDS_Wire& w : v.wires) wires.push_back(shape(w));
+                enc = {{"k", 6}, {"wires", std::move(wires)}, {"entities", v.entities}};
+            }
+        }, *r);
+        results_[static_cast<std::size_t>(it->second)] = std::move(enc);
+        return it->second;
+    }
+
+    json snap(std::size_t index, const CompileCkpt& ck) {
+        auto str_pairs = [&](const std::map<std::string, std::string>& m) {
+            json a = json::array();
+            for (const auto& [k, v] : m) a.push_back(json::array({str(k), str(v)}));
+            return a;
+        };
+        auto str_list = [&](const auto& seq) {
+            json a = json::array();
+            for (const std::string& s : seq) a.push_back(str(s));
+            return a;
+        };
+        auto owner_list = [&](const OwnerTopoMap& m) {
+            json a = json::array();
+            for (const auto& [sid, om] : m) a.push_back(json::array({str(sid), owners(om)}));
+            return a;
+        };
+        json res = json::array();
+        for (const auto& [id, ptr] : ck.results)
+            res.push_back(json::array({str(id), ptr ? result(ptr) : -1}));
+        json tool_bodies = json::array();
+        for (const auto& [id, s] : ck.tool_body_of)
+            tool_bodies.push_back(json::array({str(id), shape(s)}));
+        json bends = json::array();
+        for (const ::geom::BendRecord& b : ck.bend_records)
+            bends.push_back(json::array({b.angle, b.radius, b.thickness, b.bend_allowance,
+                                         b.wall_length, b.position, ckpt_vec_json(b.p_start),
+                                         ckpt_vec_json(b.p_end), ckpt_vec_json(b.e_dir),
+                                         ckpt_vec_json(b.length_dir)}));
+        json imports = json::array();
+        for (const auto& [h, shapes] : ck.import_cache) {
+            json idx = json::array();
+            for (const TopoDS_Shape& s : shapes) idx.push_back(shape(s));
+            imports.push_back(json::array({h, std::move(idx)}));
+        }
+        json sts = json::array();
+        for (const auto& st : ck.statuses) sts.push_back(status(st));
+        json trs = json::array();
+        for (const ToolRec& tr : ck.tool_recs) trs.push_back(tool_rec(tr));
+        return {{"i", index},
+                {"r", std::move(res)},
+                {"c", str_list(ck.consumed)},
+                {"sb", str_pairs(ck.superseded_by)},
+                {"so", str_list(ck.solid_order)},
+                {"bk", str_pairs(ck.body_kinds)},
+                {"src", str_pairs(ck.source_of)},
+                {"tb", std::move(tool_bodies)},
+                {"op", str_pairs(ck.feature_op_of)},
+                {"sn", str_list(ck.seen_names)},
+                {"sh", json::array({ck.sheet_active, ck.sheet_thickness, ck.sheet_k_factor,
+                                    ck.sheet_default_bend_radius})},
+                {"br", std::move(bends)},
+                {"ic", std::move(imports)},
+                {"st", std::move(sts)},
+                {"tr", std::move(trs)},
+                {"wm", blob(ck.weld_members)},
+                {"sm", blob(ck.sheet_metal_flat)},
+                {"fo", owner_list(ck.face_owners)},
+                {"eo", owner_list(ck.edge_owners)}};
+    }
+
+    json full(const CompileResult& r, uint64_t full_key) {
+        json sts = json::array();
+        for (const FeatureStatus& st : r.statuses) sts.push_back(ckpt_status(st));
+        json infos = json::array();
+        for (const BodyInfo& b : r.bodies_info)
+            infos.push_back(json::array({b.name, b.kind, b.volume, b.area, b.n_faces, b.n_edges}));
+        json shapes = json::array();
+        for (const TopoDS_Shape& s : r.shapes) shapes.push_back(shape(s));
+        json trs = json::array();
+        for (const ToolRec& tr : r.tool_recs) trs.push_back(tool_rec(tr));
+        return {{"full_key", full_key},
+                {"statuses", std::move(sts)},
+                {"body_count", r.body_count},
+                {"volume", r.volume},
+                {"bodies_info", std::move(infos)},
+                {"owner_map", r.owner_map},
+                {"shapes", std::move(shapes)},
+                {"tool_recs", std::move(trs)},
+                {"wm", blob(r.weld_members)},
+                {"sm", blob(r.sheet_metal_flat)},
+                {"datums", r.datums},
+                {"ok", r.ok},
+                {"active_configuration", r.active_configuration},
+                {"timing", json::array({r.loop_ms, r.tess_ms, r.owner_ms, r.tess_mesh_ms,
+                                        r.tess_extract_ms, r.tess_write_ms})},
+                {"aicm_size", static_cast<uint64_t>(r.aicm.size())},
+                {"aicm_hash", ckpt_bytes_hash(r.aicm.data(), r.aicm.size())}};
+    }
+
+    std::string finish(json root) {
+        // One set, then one reference per table entry (BinTools::Write's own layout,
+        // repeated): never wraps the live shapes in a compound, which would freeze them.
+        BinTools_ShapeSet set;
+        set.SetWithTriangles(Standard_False);
+        set.SetWithNormals(Standard_False);
+        set.SetFormatNb(BinTools_FormatVersion_VERSION_3);
+        for (const TopoDS_Shape& s : shapes_) set.Add(s);
+        std::ostringstream os(std::ios::binary);
+        set.Write(os);
+        for (const TopoDS_Shape& s : shapes_) set.Write(s, os);
+        const std::string brep = os.str();
+        root["nshapes"] = shapes_.size();
+        root["brep"] = json::binary(std::vector<std::uint8_t>(brep.begin(), brep.end()));
+        root["strings"] = strings_;
+        root["blobs"] = std::move(blobs_);
+        root["statuses"] = std::move(statuses_);
+        root["tool_recs"] = std::move(tool_recs_);
+        root["owners"] = std::move(owner_pool_);
+        root["results"] = std::move(results_);
+        std::string out(kCkptMagic, kCkptMagicLen);
+        json::to_cbor(root, out);
+        return out;
+    }
+
+private:
+    std::map<std::pair<const void*, int>, std::vector<std::pair<TopLoc_Location, int>>> shape_index_;
+    std::vector<TopoDS_Shape> shapes_;
+    std::unordered_map<std::string, int> string_index_;
+    std::vector<std::string> strings_;
+    std::unordered_map<std::string, int> blob_index_;
+    json blobs_ = json::array();
+    std::unordered_map<const FeatureStatus*, int> status_index_;
+    json statuses_ = json::array();
+    std::map<std::tuple<int, int, int>, int> tool_index_;
+    json tool_recs_ = json::array();
+    std::unordered_map<uint64_t, std::vector<int>> owner_index_;
+    std::vector<const std::map<int, std::string>*> owner_reps_;
+    json owner_pool_ = json::array();
+    std::unordered_map<const FeatureResult*, int> result_index_;
+    json results_ = json::array();
+};
+
+// Decoder pools for one cache.ckpt payload. Any malformed field throws; the public
+// entry point turns every throw into a `decode_error` cache miss.
+class CkptReader {
+public:
+    explicit CkptReader(const json& root) : root_(root) {
+        const auto& bin = root.at("brep").get_binary();
+        std::istringstream is(std::string(bin.begin(), bin.end()), std::ios::binary);
+        BinTools_ShapeSet set;
+        set.SetWithTriangles(Standard_True);  // as BinTools::Read: honors the stream's flag
+        set.Read(is);
+        const std::size_t count = root.at("nshapes").get<std::size_t>();
+        shapes_.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            TopoDS_Shape s;
+            set.ReadSubs(s, is, set.NbShapes());
+            if (s.IsNull() || !is) throw std::runtime_error("cache.ckpt: truncated shape set");
+            shapes_.push_back(std::move(s));
+        }
+        if (shapes_.size() != root.at("nshapes").get<std::size_t>())
+            throw std::runtime_error("cache.ckpt: shape count mismatch");
+        strings_ = root.at("strings").get<std::vector<std::string>>();
+        for (const json& j : root.at("blobs")) blobs_.push_back(j);
+        for (const json& j : root.at("statuses"))
+            statuses_.push_back(std::make_shared<const FeatureStatus>(ckpt_status_from(j)));
+        for (const json& j : root.at("tool_recs"))
+            tool_recs_.push_back(ToolRec{str(j.at(0)), str(j.at(1)), shape(j.at(2))});
+        for (const json& j : root.at("owners")) {
+            std::map<int, std::string> m;
+            for (const json& kv : j) m.emplace(kv.at(0).get<int>(), str(kv.at(1)));
+            owners_.push_back(std::move(m));
+        }
+        results_.resize(root.at("results").size());
+    }
+
+    TopoDS_Shape shape(const json& j) const {
+        const long long i = j.get<long long>();
+        if (i < 0) return TopoDS_Shape();
+        return shapes_.at(static_cast<std::size_t>(i));
+    }
+    const std::string& str(const json& j) const { return strings_.at(j.get<std::size_t>()); }
+    const json& blob(const json& j) const { return blobs_.at(j.get<std::size_t>()); }
+    const ToolRec& tool_rec(const json& j) const { return tool_recs_.at(j.get<std::size_t>()); }
+
+    FeatureResultPtr result(const json& j) {
+        const long long i = j.get<long long>();
+        if (i < 0) return nullptr;
+        FeatureResultPtr& slot = results_.at(static_cast<std::size_t>(i));
+        if (slot) return slot;
+        const json& e = root_.at("results").at(static_cast<std::size_t>(i));
+        switch (e.at("k").get<int>()) {
+            case 0: {
+                SketchResult v;
+                for (const json& f : e.at("faces")) v.faces.push_back(TopoDS::Face(shape(f)));
+                v.plane = ckpt_plane_from(e.at("plane"));
+                v.entities = e.at("entities");
+                slot = std::make_shared<FeatureResult>(std::move(v));
+                break;
+            }
+            case 1: slot = std::make_shared<FeatureResult>(SolidResult{shape(e.at("shape"))}); break;
+            case 2:
+                slot = std::make_shared<FeatureResult>(
+                    PlaneResult{ckpt_plane_from(e.at("plane")), e.at("csys").get<bool>()});
+                break;
+            case 3:
+                slot = std::make_shared<FeatureResult>(
+                    AxisResult{ckpt_vec(e.at("p"), 0), ckpt_vec(e.at("d"), 0)});
+                break;
+            case 4: slot = std::make_shared<FeatureResult>(PointResult{ckpt_vec(e.at("p"), 0)}); break;
+            case 5: {
+                const TopoDS_Shape w = shape(e.at("wire"));
+                slot = std::make_shared<FeatureResult>(
+                    CurveResult{w.IsNull() ? TopoDS_Wire() : TopoDS::Wire(w),
+                                ckpt_plane_from(e.at("plane"))});
+                break;
+            }
+            case 6: {
+                Sketch3DResult v;
+                for (const json& w : e.at("wires")) v.wires.push_back(TopoDS::Wire(shape(w)));
+                v.entities = e.at("entities");
+                slot = std::make_shared<FeatureResult>(std::move(v));
+                break;
+            }
+            default: throw std::runtime_error("cache.ckpt: unknown result kind");
+        }
+        return slot;
+    }
+
+    std::shared_ptr<const CompileCkpt> snap(const json& e) {
+        auto ck = std::make_shared<CompileCkpt>();
+        auto pairs_into = [&](const json& a, std::map<std::string, std::string>& m) {
+            for (const json& kv : a) m.emplace(str(kv.at(0)), str(kv.at(1)));
+        };
+        auto owners_into = [&](const json& a, OwnerTopoMap& m) {
+            for (const json& kv : a) m.emplace(str(kv.at(0)), owners_.at(kv.at(1).get<std::size_t>()));
+        };
+        for (const json& kv : e.at("r")) ck->results.put_shared(str(kv.at(0)), result(kv.at(1)));
+        for (const json& s : e.at("c")) ck->consumed.insert(str(s));
+        pairs_into(e.at("sb"), ck->superseded_by);
+        for (const json& s : e.at("so")) ck->solid_order.push_back(str(s));
+        pairs_into(e.at("bk"), ck->body_kinds);
+        pairs_into(e.at("src"), ck->source_of);
+        for (const json& kv : e.at("tb")) ck->tool_body_of.emplace(str(kv.at(0)), shape(kv.at(1)));
+        pairs_into(e.at("op"), ck->feature_op_of);
+        for (const json& s : e.at("sn")) ck->seen_names.insert(str(s));
+        const json& sh = e.at("sh");
+        ck->sheet_active = sh.at(0).get<bool>();
+        ck->sheet_thickness = sh.at(1).get<double>();
+        ck->sheet_k_factor = sh.at(2).get<double>();
+        ck->sheet_default_bend_radius = sh.at(3).get<double>();
+        for (const json& b : e.at("br")) {
+            ::geom::BendRecord r;
+            r.angle = b.at(0).get<double>();
+            r.radius = b.at(1).get<double>();
+            r.thickness = b.at(2).get<double>();
+            r.bend_allowance = b.at(3).get<double>();
+            r.wall_length = b.at(4).get<double>();
+            r.position = b.at(5).get<std::string>();
+            r.p_start = ckpt_vec(b.at(6), 0);
+            r.p_end = ckpt_vec(b.at(7), 0);
+            r.e_dir = ckpt_vec(b.at(8), 0);
+            r.length_dir = ckpt_vec(b.at(9), 0);
+            ck->bend_records.push_back(std::move(r));
+        }
+        for (const json& kv : e.at("ic")) {
+            std::vector<TopoDS_Shape> shapes;
+            for (const json& s : kv.at(1)) shapes.push_back(shape(s));
+            ck->import_cache.emplace(kv.at(0).get<uint64_t>(), std::move(shapes));
+        }
+        for (const json& s : e.at("st")) ck->statuses.push_back(statuses_.at(s.get<std::size_t>()));
+        for (const json& t : e.at("tr")) ck->tool_recs.push_back(tool_rec(t));
+        ck->weld_members = blob(e.at("wm"));
+        ck->sheet_metal_flat = blob(e.at("sm"));
+        owners_into(e.at("fo"), ck->face_owners);
+        owners_into(e.at("eo"), ck->edge_owners);
+        return ck;
+    }
+
+    std::shared_ptr<const CompileResult> full(const json& e, std::vector<uint8_t> aicm) const {
+        auto r = std::make_shared<CompileResult>();
+        for (const json& s : e.at("statuses")) r->statuses.push_back(ckpt_status_from(s));
+        r->aicm = std::move(aicm);
+        r->body_count = e.at("body_count").get<int>();
+        r->volume = e.at("volume").get<double>();
+        for (const json& b : e.at("bodies_info"))
+            r->bodies_info.push_back(BodyInfo{b.at(0).get<std::string>(), b.at(1).get<std::string>(),
+                                              b.at(2).get<double>(), b.at(3).get<double>(),
+                                              b.at(4).get<int>(), b.at(5).get<int>()});
+        r->owner_map = e.at("owner_map");
+        for (const json& s : e.at("shapes")) r->shapes.push_back(shape(s));
+        for (const json& t : e.at("tool_recs")) r->tool_recs.push_back(tool_rec(t));
+        r->weld_members = blob(e.at("wm"));
+        r->sheet_metal_flat = blob(e.at("sm"));
+        r->datums = e.at("datums");
+        r->ok = e.at("ok").get<bool>();
+        r->active_configuration = e.at("active_configuration").get<std::string>();
+        const json& t = e.at("timing");
+        r->loop_ms = t.at(0).get<double>();
+        r->tess_ms = t.at(1).get<double>();
+        r->owner_ms = t.at(2).get<double>();
+        r->tess_mesh_ms = t.at(3).get<double>();
+        r->tess_extract_ms = t.at(4).get<double>();
+        r->tess_write_ms = t.at(5).get<double>();
+        r->features_reused = 0;
+        r->features_executed = static_cast<int>(r->statuses.size());
+        return r;
+    }
+
+private:
+    const json& root_;
+    std::vector<TopoDS_Shape> shapes_;
+    std::vector<std::string> strings_;
+    std::vector<json> blobs_;
+    std::vector<std::shared_ptr<const FeatureStatus>> statuses_;
+    std::vector<ToolRec> tool_recs_;
+    std::vector<std::map<int, std::string>> owners_;
+    std::vector<FeatureResultPtr> results_;
+};
+
+// The compile inputs of the session-display lane for `doc` (what compile_session hashes).
+struct CkptInputs {
+    json features;
+    std::string active_configuration;
+};
+
+CkptInputs ckpt_inputs(const json& doc) {
+    static const json empty = json::array();
+    const json& base = doc.contains("features") && doc.at("features").is_array()
+                           ? doc.at("features") : empty;
+    auto [cfg_name, cfg] = resolve_active_config(doc);
+    return {config_effective_features(base, cfg), cfg_name};
+}
+
+}  // namespace
+
+std::shared_ptr<const CompileResult> compile_cache_full_result(const CompileCache& cache) {
+    return cache.last_result;
+}
+
+uint64_t compile_cache_stamp(const CompileCache& cache) { return cache.stamp; }
+
+std::string compile_cache_encode(const CompileCache& cache, const json& doc, const json& env,
+                                 ::geom::DisplayQuality quality, const std::string& engine_key,
+                                 const std::string& doc_hash, std::size_t budget_bytes,
+                                 json& report) {
+    report = {{"written", false}, {"bytes", 0}, {"checkpoints_total", 0},
+              {"checkpoints_written", 0}, {"checkpoints_dropped", 0}, {"full_result", false}};
+    const CkptInputs in = ckpt_inputs(doc);
+    const std::size_t n = in.features.size();
+    if (n == 0) {
+        report["reason"] = "no_features";
+        return {};
+    }
+    if (n > kCompileCacheMaxFeatures) {
+        report["reason"] = "too_many_features";
+        return {};
+    }
+    const std::vector<uint64_t> chain =
+        cc_chain(in.features, env, in.active_configuration, quality, true, false);
+    // Deepest index whose chain still matches the cached compile: only those checkpoints
+    // describe THIS document (the cache holds the last compile, which doc_save just ran).
+    std::size_t m = 0;
+    bool any = false;
+    for (std::size_t i = 0; i < std::min(chain.size(), cache.chain.size()); ++i) {
+        if (chain[i] != cache.chain[i]) break;
+        m = i;
+        any = true;
+    }
+    if (!any) {
+        report["reason"] = "not_built_this_session";
+        return {};
+    }
+    // Checkpoints only after an unbroken run of successful features: a feature that
+    // failed is re-attempted on reopen instead of replaying its recorded failure.
+    std::size_t ok_prefix = m;
+    for (std::size_t i = m; i >= 1; --i) {
+        if (i < cache.snaps.size() && cache.snaps[i]) {
+            const auto& sts = cache.snaps[i]->statuses;
+            for (std::size_t k = 0; k < sts.size() && k < ok_prefix; ++k)
+                if (!sts[k]->ok) { ok_prefix = k; break; }
+            break;
+        }
+    }
+    std::vector<std::size_t> keep;
+    for (std::size_t i = 1; i <= ok_prefix && i < cache.snaps.size(); ++i)
+        if (cache.snaps[i]) keep.push_back(i);
+    const std::size_t total = keep.size();
+    bool full = m == n && cache.last_result && cache.last_result->ok &&
+                cache.full_key == cc_full_key(doc, chain.back());
+    std::string reason;
+    if (ok_prefix < m) {
+        reason = "feature_failed";
+        report["omitted_after_failure"] = m - ok_prefix;
+    } else if (m < n) {
+        reason = "partial_build";
+    }
+    if (keep.empty() && !full) {
+        report["reason"] = reason.empty() ? "no_checkpoints" : reason;
+        return {};
+    }
+    report["checkpoints_total"] = total;
+    for (;;) {
+        CkptWriter w;
+        json root = {{"format", kCkptFormat},
+                     {"engine", engine_key},
+                     {"doc_hash", doc_hash},
+                     {"quality", ::geom::display_quality_name(quality)},
+                     {"chain", std::vector<uint64_t>(cache.chain.begin(),
+                                                     cache.chain.begin() + static_cast<std::ptrdiff_t>(m + 1))}};
+        json snaps = json::array();
+        for (std::size_t i : keep) snaps.push_back(w.snap(i, *cache.snaps[i]));
+        root["snaps"] = std::move(snaps);
+        root["full"] = full ? w.full(*cache.last_result, cache.full_key) : json(nullptr);
+        std::string out = w.finish(std::move(root));
+        if (out.size() <= budget_bytes) {
+            report["written"] = true;
+            report["bytes"] = out.size();
+            report["checkpoints_written"] = keep.size();
+            report["checkpoints_dropped"] = total - keep.size();
+            report["full_result"] = full;
+            if (!reason.empty()) report["reason"] = reason;
+            return out;
+        }
+        // Over the container budget: drop the OLDEST half of the kept checkpoints (the
+        // deepest ones serve the common tail edit), then the full result.
+        reason = "budget";
+        if (!keep.empty()) {
+            keep.erase(keep.begin(), keep.begin() + static_cast<std::ptrdiff_t>((keep.size() + 1) / 2));
+            continue;
+        }
+        if (full) {
+            full = false;
+            continue;
+        }
+        report["checkpoints_dropped"] = total;
+        report["reason"] = reason;
+        return {};
+    }
+}
+
+std::shared_ptr<CompileCache> compile_cache_decode(const std::string& blob, const json& doc,
+                                                   const json& env, ::geom::DisplayQuality quality,
+                                                   const std::string& engine_key,
+                                                   const std::string* aicm, json& report) {
+    report = {{"restored", false}, {"checkpoints", 0}, {"matched_features", 0},
+              {"full_result", false}};
+    try {
+        if (blob.size() < kCkptMagicLen || blob.compare(0, kCkptMagicLen, kCkptMagic) != 0) {
+            report["reason"] = "decode_error";
+            return nullptr;
+        }
+        const json root = json::from_cbor(blob.begin() + kCkptMagicLen, blob.end());
+        if (root.at("format").get<int>() != kCkptFormat) {
+            report["reason"] = "decode_error";
+            return nullptr;
+        }
+        if (root.at("engine").get<std::string>() != engine_key) {
+            report["reason"] = "engine_key";
+            return nullptr;
+        }
+        ::geom::DisplayQuality saved_quality = quality;
+        if (!::geom::display_quality_parse(root.at("quality").get<std::string>(), saved_quality)) {
+            report["reason"] = "decode_error";
+            return nullptr;
+        }
+        const CkptInputs in = ckpt_inputs(doc);
+        const std::size_t n = in.features.size();
+        if (n == 0 || n > kCompileCacheMaxFeatures) {
+            report["reason"] = "chain_mismatch";
+            return nullptr;
+        }
+        const auto stored = root.at("chain").get<std::vector<uint64_t>>();
+        const std::vector<uint64_t> saved_chain =
+            cc_chain(in.features, env, in.active_configuration, saved_quality, true, false);
+        std::size_t m = 0;
+        bool any = false;
+        for (std::size_t i = 0; i < std::min(stored.size(), saved_chain.size()); ++i) {
+            if (stored[i] != saved_chain[i]) break;
+            m = i;
+            any = true;
+        }
+        if (!any) {
+            report["reason"] = "chain_mismatch";
+            return nullptr;
+        }
+        // Re-key the matching prefix to the session's display tier: checkpoints carry exact
+        // B-rep only, so a different tier simply re-meshes the surviving bodies.
+        std::vector<uint64_t> chain = saved_quality == quality
+            ? saved_chain
+            : cc_chain(in.features, env, in.active_configuration, quality, true, false);
+        chain.resize(m + 1);
+
+        CkptReader rd(root);
+        auto cache = std::make_shared<CompileCache>();
+        cache->snaps.resize(m + 1);
+        std::size_t restored = 0;
+        for (const json& e : root.at("snaps")) {
+            const std::size_t i = e.at("i").get<std::size_t>();
+            if (i == 0 || i > m) continue;
+            cache->snaps[i] = rd.snap(e);
+            ++restored;
+        }
+        cache->chain = std::move(chain);
+        report["matched_features"] = m;
+        report["features"] = n;
+        report["checkpoints"] = restored;
+
+        const json& full = root.at("full");
+        std::string why_not_full;
+        if (full.is_null()) why_not_full = "not_saved";
+        else if (m != n) why_not_full = "chain_mismatch";
+        else if (saved_quality != quality) why_not_full = "display_quality";
+        else if (full.at("full_key").get<uint64_t>() != cc_full_key(doc, cache->chain.back()))
+            why_not_full = "appearance_changed";
+        else if (!aicm || aicm->size() != full.at("aicm_size").get<uint64_t>() ||
+                 ckpt_bytes_hash(reinterpret_cast<const unsigned char*>(aicm->data()),
+                                 aicm->size()) != full.at("aicm_hash").get<uint64_t>())
+            why_not_full = "mesh_mismatch";
+        if (why_not_full.empty()) {
+            cache->last_result = rd.full(full, std::vector<uint8_t>(aicm->begin(), aicm->end()));
+            cache->full_key = full.at("full_key").get<uint64_t>();
+            report["full_result"] = true;
+        } else {
+            report["full_result_reason"] = why_not_full;
+        }
+        if (restored == 0 && !cache->last_result) {
+            report["reason"] = m < n ? "chain_mismatch" : why_not_full;
+            return nullptr;
+        }
+        if (m < n) report["reason"] = "chain_mismatch";  // partial: only the matching prefix
+        cache->stamp = cc_next_stamp();
+        report["restored"] = true;
+        return cache;
+    } catch (...) {
+        report = {{"restored", false}, {"checkpoints", 0}, {"matched_features", 0},
+                  {"full_result", false}, {"reason", "decode_error"}};
+        return nullptr;
+    }
+}
+
+void tessellate_solved_bodies(const json& doc, CompileResult& r, ::geom::DisplayQuality quality,
+                              bool tessellate) {
+    if (r.bodies_info.size() != r.shapes.size())
+        throw std::runtime_error("tessellate_solved_bodies: one body record per shape required");
+    const auto t0 = std::chrono::steady_clock::now();
+    if (tessellate) ::geom::tess_timing_reset();
+    std::vector<aicm::AicmBody> bodies;
+    const float color[3] = {0.71f, 0.76f, 0.82f};  // default dielectric grey (as compile)
+    const bool has_appearances = doc.contains("appearances") && doc["appearances"].is_object();
+    r.volume = 0.0;
+    for (std::size_t i = 0; i < r.shapes.size(); ++i) {
+        const TopoDS_Shape& shape = r.shapes[i];
+        BodyInfo& bi = r.bodies_info[i];
+        const bool is_surface = bi.kind == "surface";
+        const uint32_t body_num = static_cast<uint32_t>(i + 1);
+        if (tessellate) {
+            float bcolor[3] = {color[0], color[1], color[2]};
+            float bmetal = 0.0f, brough = 0.5f;
+            if (has_appearances) apply_doc_appearance(doc, body_num, bcolor, bmetal, brough);
+            const ::geom::DisplayDeflections defl = ::geom::display_deflections(quality, shape);
+            aicm::AicmBody b = ::geom::tessellate_body(shape, body_num, bi.name, bcolor,
+                                                       defl.lin, defl.ang, bmetal, brough);
+            apply_doc_face_appearances(doc, body_num, shape, b);
+            bodies.push_back(std::move(b));
+        }
+        double vol = 0.0;
+        if (!is_surface) {
+            GProp_GProps gp;
+            BRepGProp::VolumeProperties(shape, gp, /*OnlyClosed=*/Standard_False,
+                                        /*SkipShared=*/Standard_False,
+                                        /*UseTriangulation=*/tessellate ? Standard_True
+                                                                        : Standard_False);
+            vol = gp.Mass();
+        }
+        bi.volume = vol;
+        bi.area = ::geom::shape_area(shape);
+        bi.n_faces = ::geom::shape_face_count(shape);
+        bi.n_edges = ::geom::shape_edge_count(shape);
+        r.volume += vol;
+    }
+    r.body_count = static_cast<int>(r.shapes.size());
+    if (!tessellate) return;
+    const auto tw = std::chrono::steady_clock::now();
+    r.aicm = aicm::write_aicm(bodies);
+    const auto t1 = std::chrono::steady_clock::now();
+    r.tess_write_ms = std::chrono::duration<double, std::milli>(t1 - tw).count();
+    r.tess_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const ::geom::TessTiming tt = ::geom::tess_timing_read();
+    r.tess_mesh_ms = tt.mesh_ms;
+    r.tess_extract_ms = tt.extract_ms;
 }
 
 // --------------------------------------------------------------- push-pull (Instant3D)

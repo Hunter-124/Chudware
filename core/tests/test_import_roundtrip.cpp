@@ -24,11 +24,14 @@
 #include <vector>
 #include <miniz.h>
 
+#include <BRepAlgoAPI_Cut.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepCheck_Analyzer.hxx>
 #include <BRepGProp.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
@@ -527,7 +530,7 @@ TEST_CASE("modern SolidWorks part becomes native geometry and meshes with Polyhe
             CHECK(std::max({ax, ay, az}) == doctest::Approx(1.0).epsilon(1e-6));
         }
     }
-    CHECK(faces_with_normals == 12);  // six quads, two triangles each
+    CHECK(faces_with_normals == 6);  // six quads, each one planar face of two triangles
 
     json imported = doc_import_file(source.string(), "", false, "sldprt");
     REQUIRE(body_count(imported) == 1);
@@ -587,9 +590,12 @@ TEST_CASE("modern SolidWorks assembly preserves instances and transforms") {
 
 // A faceted cylinder wound INSIDE-OUT — exactly the shape a SolidWorks saved-display import
 // arrived in (signed volume -374963 mm³ on a 375017 mm³ spacer, so eval_mass was 28% wrong).
-// mesh_to_shape must hand back a solid with POSITIVE volume, and it must give the curved
-// wall smooth per-vertex normals while keeping the 90 deg wall/cap crease flat.
-TEST_CASE("mesh_to_shape re-orients an inverted soup and smooths its curved wall") {
+// mesh_to_shape must hand back a solid with POSITIVE volume, merge each coplanar facet set
+// into ONE planar face (each wall quad's two triangles, each cap's 48-triangle fan — a cap
+// left as 48 slivers is how a topology result's clamped end face came back as a 3.6 mm²
+// pick), and give the curved wall smooth per-vertex normals while keeping the 90 deg
+// wall/cap crease flat.
+TEST_CASE("mesh_to_shape re-orients an inverted soup, merges coplanar facets, smooths its wall") {
     using chudware::doc::MeshData;
     using chudware::doc::mesh_to_shape;
 
@@ -618,6 +624,8 @@ TEST_CASE("mesh_to_shape re-orients an inverted soup and smooths its curved wall
 
     const TopoDS_Shape shape = mesh_to_shape(mesh);
     REQUIRE(!shape.IsNull());
+    CHECK(TopExp_Explorer(shape, TopAbs_SOLID).More());
+    CHECK(BRepCheck_Analyzer(shape).IsValid());
     const double expect = 0.5 * kSides * std::sin(2.0 * kPi / kSides) * kR * kR * kH;
     CHECK(vol(shape) == doctest::Approx(expect).epsilon(1e-6));  // POSITIVE: re-oriented
 
@@ -629,7 +637,7 @@ TEST_CASE("mesh_to_shape re-orients an inverted soup and smooths its curved wall
     const double pitch = 2.0 * kPi / kSides;
     using PosKey = std::array<long long, 3>;
     std::map<PosKey, gp_Vec> wall_normal;  // welded wall position -> its one shared normal
-    int wall_faces = 0, cap_faces = 0;
+    int wall_faces = 0, cap_faces = 0, triangles = 0;
     double max_tilt = 0.0;  // biggest angle between a node normal and its own facet normal
     for (TopExp_Explorer fx(shape, TopAbs_FACE); fx.More(); fx.Next()) {
         const TopoDS_Face face = TopoDS::Face(fx.Current());
@@ -637,50 +645,82 @@ TEST_CASE("mesh_to_shape re-orients an inverted soup and smooths its curved wall
         Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(face, loc);
         REQUIRE(!tri.IsNull());
         REQUIRE(tri->HasNormals());
-        REQUIRE(tri->NbNodes() == 3);
         const double sign = (face.Orientation() == TopAbs_REVERSED) ? -1.0 : 1.0;
-        gp_Pnt p[3];
-        gp_Vec n[3];
-        for (int ni = 0; ni < 3; ++ni) {
-            p[ni] = tri->Node(ni + 1);
-            gp_Dir nv = tri->Normal(ni + 1);
-            if (!loc.IsIdentity()) {
-                p[ni].Transform(loc.Transformation());
-                nv.Transform(loc.Transformation());
+        bool wall = true;
+        for (int ni = 1; ni <= tri->NbNodes(); ++ni)
+            wall = wall && std::abs(tri->Normal(ni).Z()) < 1e-6;
+        wall ? ++wall_faces : ++cap_faces;
+        for (int ti = 1; ti <= tri->NbTriangles(); ++ti) {
+            ++triangles;
+            int idx[3];
+            tri->Triangle(ti).Get(idx[0], idx[1], idx[2]);
+            gp_Pnt p[3];
+            gp_Vec n[3];
+            for (int k = 0; k < 3; ++k) {
+                p[k] = tri->Node(idx[k]);
+                gp_Dir nv = tri->Normal(idx[k]);
+                if (!loc.IsIdentity()) {
+                    p[k].Transform(loc.Transformation());
+                    nv.Transform(loc.Transformation());
+                }
+                n[k] = gp_Vec(sign * nv.X(), sign * nv.Y(), sign * nv.Z());
+                // Outward: away from the body centre.
+                CHECK(n[k].Dot(gp_Vec(gp_Pnt(0.0, 0.0, kH / 2.0), p[k])) > 1e-9);
             }
-            n[ni] = gp_Vec(sign * nv.X(), sign * nv.Y(), sign * nv.Z());
-            // Outward: away from the body centre.
-            CHECK(n[ni].Dot(gp_Vec(gp_Pnt(0.0, 0.0, kH / 2.0), p[ni])) > 1e-9);
-        }
-        // The facet's own flat normal, under the same winding the tessellator emits.
-        gp_Vec flat = gp_Vec(p[0], p[1]).Crossed(gp_Vec(p[0], p[2])) * sign;
-        flat.Normalize();
-        for (int ni = 0; ni < 3; ++ni)
-            max_tilt = std::max(max_tilt, n[ni].Angle(flat));
-        const bool wall = std::abs(n[0].Z()) < 1e-6 && std::abs(n[1].Z()) < 1e-6 &&
-                          std::abs(n[2].Z()) < 1e-6;
-        if (!wall) {
-            for (int ni = 0; ni < 3; ++ni)
-                CHECK(std::abs(n[ni].Z()) == doctest::Approx(1.0).epsilon(1e-6));
-            ++cap_faces;
-            continue;
-        }
-        ++wall_faces;
-        for (int ni = 0; ni < 3; ++ni) {
-            const double r = std::hypot(p[ni].X(), p[ni].Y());
-            CHECK(r == doctest::Approx(kR).epsilon(1e-9));
-            CHECK(n[ni].Dot(gp_Vec(p[ni].X() / r, p[ni].Y() / r, 0.0)) > std::cos(pitch));
-            const PosKey key{std::llround(p[ni].X() * 1e6), std::llround(p[ni].Y() * 1e6),
-                             std::llround(p[ni].Z() * 1e6)};
-            const auto seen = wall_normal.emplace(key, n[ni]);
-            if (!seen.second) CHECK(seen.first->second.Angle(n[ni]) < 1e-6);
+            // The facet's own flat normal, under the same winding the tessellator emits.
+            gp_Vec flat = gp_Vec(p[0], p[1]).Crossed(gp_Vec(p[0], p[2])) * sign;
+            flat.Normalize();
+            for (int k = 0; k < 3; ++k) max_tilt = std::max(max_tilt, n[k].Angle(flat));
+            if (!wall) {
+                for (int k = 0; k < 3; ++k)
+                    CHECK(std::abs(n[k].Z()) == doctest::Approx(1.0).epsilon(1e-6));
+                continue;
+            }
+            for (int k = 0; k < 3; ++k) {
+                const double r = std::hypot(p[k].X(), p[k].Y());
+                CHECK(r == doctest::Approx(kR).epsilon(1e-9));
+                CHECK(n[k].Dot(gp_Vec(p[k].X() / r, p[k].Y() / r, 0.0)) > std::cos(pitch));
+                const PosKey key{std::llround(p[k].X() * 1e6), std::llround(p[k].Y() * 1e6),
+                                 std::llround(p[k].Z() * 1e6)};
+                const auto seen = wall_normal.emplace(key, n[k]);
+                if (!seen.second) CHECK(seen.first->second.Angle(n[k]) < 1e-6);
+            }
         }
     }
-    CHECK(wall_faces == 2 * kSides);
-    CHECK(cap_faces == 2 * kSides);
+    CHECK(wall_faces == kSides);  // one planar face per wall quad
+    CHECK(cap_faces == 2);        // one planar face per cap fan
+    CHECK(triangles == 4 * kSides);  // every source triangle still displayed
     // Both rim rings, each welded position carrying exactly ONE normal.
     CHECK(static_cast<int>(wall_normal.size()) == 2 * kSides);
     CHECK(max_tilt > 0.1 * pitch);
+
+    // The import stays editable: a through bore cut across both merged caps leaves a valid
+    // solid with exactly the bore's volume removed, and it survives the embedded-BREP blob a
+    // saved .step+ rebuilds the import from.
+    const TopoDS_Shape bore =
+        BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(0.0, 0.0, -1.0), gp_Dir(0.0, 0.0, 1.0)), 4.0,
+                                 kH + 2.0)
+            .Shape();
+    BRepAlgoAPI_Cut cut(shape, bore);
+    REQUIRE(cut.IsDone());
+    const TopoDS_Shape bored = cut.Shape();
+    CHECK(BRepCheck_Analyzer(bored).IsValid());
+    CHECK(vol(bored) == doctest::Approx(expect - kPi * 16.0 * kH).epsilon(1e-6));
+    const TopoDS_Shape reopened =
+        chudware::doc::brep_b64_to_shape(chudware::doc::shape_to_brep_b64(bored));
+    REQUIRE(!reopened.IsNull());
+    CHECK(vol(reopened) == doctest::Approx(vol(bored)).epsilon(1e-12));
+    TopTools_IndexedMapOfShape bored_faces, reopened_faces;
+    TopExp::MapShapes(bored, TopAbs_FACE, bored_faces);
+    TopExp::MapShapes(reopened, TopAbs_FACE, reopened_faces);
+    CHECK(reopened_faces.Extent() == bored_faces.Extent());
+
+    // An open soup (one triangle missing) keeps the sewing lane: a shell, never a solid.
+    MeshData open = mesh;
+    open.tris.resize(open.tris.size() - 3);
+    const TopoDS_Shape shell = mesh_to_shape(open);
+    REQUIRE(!shell.IsNull());
+    CHECK_FALSE(TopExp_Explorer(shell, TopAbs_SOLID).More());
 }
 
 TEST_CASE("DXF HEADER units scale imported geometry into millimetres") {

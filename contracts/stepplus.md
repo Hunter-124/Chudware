@@ -98,3 +98,66 @@ The current semantic key is `chudware-geomcache/6` plus the OCCT version.
 Epoch 6 re-attributes `owner_map` faces/edges through operation history (a
 dress-up or boolean feature owns only the faces it generates); cached display
 responses from epoch 5 carry the old owner map and are a cache miss.
+
+## 9. Build checkpoints, warm open and cache diagnostics (2026-10-05)
+
+Additive to §4; the engine key stays `chudware-geomcache/6` (no stored format of an
+existing entry changed). Files without the new entry still open warm from `cache.brep`.
+
+| entry | doc kind | contents |
+|---|---|---|
+| `cache.ckpt` | part | the incremental-rebuild checkpoints: `"AICCKPT1"` magic · one CBOR document `{format:1, engine, doc_hash, quality, chain:[u64], snaps:[…], full, results, statuses, owners, tool_recs, blobs, strings, nshapes, brep}`. `chain` is the compile-input hash chain (h0 = env + active configuration + display tier + compile mode; h[i+1] = h[i] folded with feature i's JSON). Each snap is the compiler's complete loop-carried state after feature i. Every shape of every snap and of `full` lives in ONE BinTools shape set (`brep`, format VERSION_3, **no triangulation**), so TShape/geometry/location sharing — and with it TopExp ordinals and owner attribution — round-trips exactly. `full` is the identical-inputs result (statuses, bodies, owner map, datums, tool records, side channels) plus `aicm_size`/`aicm_hash` (FNV-1a) of the `cache.aicm` it was built with. STORED uncompressed |
+
+Writing (`doc_save`, parts only):
+
+- Written on every save, including a partially failed rebuild: only checkpoints after an
+  unbroken run of successful features are kept (the failed feature is re-attempted on
+  reopen, never replayed from a recorded failure); `full` only when every feature succeeded.
+  `cache.json`/`cache.aicm`/`cache.brep`/`geometry.step` keep the fully-ok gate of §4.
+- `cache.aicm` then `cache.ckpt` are admitted into the archive budget left by every other
+  entry (the reader's same remainder). An over-budget `cache.ckpt` drops its OLDEST half of
+  checkpoints repeatedly (the deepest serve the tail edit), then `full`, until it fits; an
+  over-budget `cache.aicm` is omitted and `cache.json` records `"aicm": "budget"`.
+- A geometry cache above the 64 MiB compressed per-entry cap is written STORED.
+
+Reading (`doc_open`, parts):
+
+- The display cache (`cache.json` + `cache.aicm`) is validated in this order: present →
+  parses → `engine` → `doc_hash` → `solved` → `display_quality` → mesh present.
+- `cache.ckpt` is validated independently: `engine` must match; then each checkpoint is
+  content-addressed — only the prefix whose stored `chain` equals the chain recomputed
+  from the opened `document.json` (at the saved tier) is restored, re-keyed to the
+  session's display tier. `full` is restored only for an identical chain + appearances at
+  the same tier and a byte-identical `cache.aicm`. So checkpoints also serve a document
+  edited outside Chudware (matching prefix) or opened at another display tier (re-mesh only).
+- On a display hit the session's compile is hydrated (from `full`, else from `cache.brep` +
+  the saved response + `cache.aicm` body names, flagged partial so tool-record/weldment/
+  flat-pattern readers compile once): the open and the first activate/pick/measure/save
+  execute no feature, and the first edit executes only the features after the deepest
+  restored checkpoint. On a display miss with usable checkpoints the open compiles from
+  them (re-mesh only when the whole chain matched). A tier mismatch without checkpoints
+  re-meshes the saved `cache.brep` bodies instead of recompiling.
+- A geometry cache entry beyond the reader limits (per-entry, aggregate, compression
+  ratio) or that fails to extract is skipped and reported; it never fails the open.
+
+Result fields (additive):
+
+- `doc_open` → `cache_hit` (bool, display served from the cache), `warm` (bool: the session
+  holds the current compile and no feature executed during the open; assemblies: false on a
+  hit, whose `asm_result` is rebuilt lazily), `cache_miss_reason` (only when `cache_hit` is
+  false) in `absent | engine_key | doc_hash | unsolved | display_quality | budget |
+  decode_error`, plus `components_changed` for assemblies, and `cache` diagnostics:
+  parts `{entries:{<name>: present|absent|skipped:<limit>}, checkpoints:{restored,
+  checkpoints, matched_features, features, full_result, full_result_reason?, reason?},
+  hydrated_from?: cache.ckpt|cache.brep, hydrate_error?, features_executed}`; assemblies
+  `{skipped?:{<name>: <limit>}}`. `budget` covers both a reader-limit skip and a writer omission.
+- `doc_save` → `cache: {written (cache.json written), entries:[names written],
+  skipped_reason? (feature_failed|empty_mesh|budget|not_converged|component_failed|error),
+  failed_features?, failed_components?, error?, dropped?:[{entry, reason, …}],
+  checkpoints:{written, bytes, checkpoints_total, checkpoints_written, checkpoints_dropped,
+  full_result, omitted_after_failure?, reason? (feature_failed|partial_build|budget|
+  no_features|too_many_features|not_built_this_session|no_checkpoints|inc_rebuild_disabled)}}`.
+
+`CHUDWARE_INC_REBUILD=0` disables writing and restoring `cache.ckpt` with the rest of the
+incremental-rebuild cache. Relocation (`native_file_operations`) invalidates `cache.ckpt`
+with the other geometry caches.

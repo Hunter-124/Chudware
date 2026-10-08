@@ -74,6 +74,7 @@
 #include "doc/solidworks_tessellation.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -99,10 +100,13 @@
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepBuilderAPI_Sewing.hxx>
+#include <BRepLib.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRep_Builder.hxx>
+#include <Bnd_Box.hxx>
+#include <Geom_Plane.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepTools.hxx>
 #include <BRepTools_ReShape.hxx>
@@ -120,6 +124,7 @@
 #include <IGESControl_Writer.hxx>
 #include <Interface_Static.hxx>
 #include <Message_ProgressRange.hxx>
+#include <Precision.hxx>
 #include <Poly_Triangulation.hxx>
 #include <RWGltf_CafReader.hxx>
 #include <RWGltf_CafWriter.hxx>
@@ -139,6 +144,7 @@
 #include <TopExp_Explorer.hxx>
 #include <TopLoc_Location.hxx>
 #include <TopTools_FormatVersion.hxx>
+#include <TopTools_ListOfShape.hxx>
 #include <TopTools_HSequenceOfShape.hxx>
 #include <TopTools_MapOfShape.hxx>
 #include <TopoDS.hxx>
@@ -146,6 +152,7 @@
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shell.hxx>
+#include <TopoDS_Solid.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <TopoDS_Wire.hxx>
 #include <Standard_Failure.hxx>
@@ -153,6 +160,7 @@
 #include <XCAFDoc_DocumentTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
 #include <gp_Ax2.hxx>
+#include <gp_Pln.hxx>
 #include <gp_Circ.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
@@ -1869,13 +1877,14 @@ MeshWeldKey mesh_weld_key(double x, double y, double z) {
 
 // Smooth per-corner shading normals for a triangle soup, split across creases.
 //
-// The mesh lane sews one planar FACE per triangle, so the display tessellator
-// (core/geom/tessellate.cpp) would otherwise compute a single flat normal per triangle and
-// a curved import renders as discrete facets. Authored per-vertex normals are NOT used to
-// fix that: the SolidWorks saved-display normal arrays measured WRONG on real parts (a
-// turned spacer carried nothing but (0,0,±1) on all 2208 vertices; on another part the
-// authored sign disagreed with the triangle winding for 1040 of 1176 triangles), so they
-// are no longer parsed at all. These normals come from the geometry instead.
+// The mesh lane's faces are planar facets (one per triangle, or one per coplanar triangle
+// set), so the display tessellator (core/geom/tessellate.cpp) would otherwise compute one
+// flat normal per face and a curved import renders as discrete facets. Authored per-vertex
+// normals are NOT used to fix that: the SolidWorks saved-display normal arrays measured
+// WRONG on real parts (a turned spacer carried nothing but (0,0,±1) on all 2208 vertices; on
+// another part the authored sign disagreed with the triangle winding for 1040 of 1176
+// triangles), so they are no longer parsed at all. These normals come from the geometry
+// instead.
 //
 // Math. n_t = (p1-p0) x (p2-p0) is twice the triangle's area times its unit normal, so
 // summing raw cross products IS an area-weighted average. For corner k of triangle t the
@@ -2089,10 +2098,275 @@ double shape_signed_volume(const TopoDS_Shape& s) {
     }
 }
 
+// Closed-mesh lane: a welded, closed, consistently wound, edge-connected triangle mesh is
+// built into B-rep topology DIRECTLY, with adjacent coplanar triangles merged into one planar
+// face. Two reasons it does not take the per-triangle + sewing path below:
+//   * Sewing rediscovers adjacency the mesh already states. The indices name every shared
+//     vertex and edge, so the shell is assembled from ONE shared TopoDS_Edge per mesh edge.
+//   * One face per triangle splits every flat region of the part into slivers. A topology-
+//     optimization surface (c247 Optimized_Bending_Beam) came in as 26,496 triangle faces:
+//     its 960 mm^2 clamped and loaded end faces were 264 triangles each, so a "-x" face pick
+//     resolved to one 3.6 mm^2 sliver, and the baked import blob, the AICM owner map and every
+//     boolean carried the same 26k faces. A planar face per coplanar region keeps the exact
+//     surface (vertices within `tol` of the region plane) and leaves curved regions faceted.
+// Returns a null shape when the mesh is not a single closed oriented 2-manifold, or when a
+// coplanar region cannot be bounded unambiguously and splitting it fails too, so the caller
+// keeps the general sewing lane for open, cracked, multi-shell or inconsistent soups.
+TopoDS_Shape closed_mesh_solid(const MeshData& mesh, const MeshSmoothNormals& sn) {
+    const std::size_t nt = mesh.triangle_count();
+    const std::size_t npos = sn.at_off.empty() ? 0 : sn.at_off.size() - 1;
+    if (nt < 4 || npos < 4) return TopoDS_Shape();
+
+    // Welded positions (first soup vertex of each weld bucket).
+    std::vector<gp_Pnt> pos(npos);
+    std::vector<char> pos_set(npos, 0);
+    for (std::size_t v = 0; v < sn.vert_pos.size(); ++v) {
+        const std::uint32_t p = sn.vert_pos[v];
+        if (pos_set[p]) continue;
+        pos[p] = gp_Pnt(mesh.verts[3 * v], mesh.verts[3 * v + 1], mesh.verts[3 * v + 2]);
+        pos_set[p] = 1;
+    }
+    Bnd_Box box;
+    for (const gp_Pnt& p : pos) box.Add(p);
+    // Coplanarity tolerance: the relative precision mesh formats store (STL/3MF/OBJ hold
+    // float32 positions, ~6e-8 relative) with headroom, scaled by the part size.
+    const double tol = std::max(1e-7, 1e-6 * std::sqrt(box.SquareExtent()));
+
+    // Welded triangles, unit normals, areas. A degenerate triangle leaves a hole in the
+    // closed mesh, so it sends the mesh to the sewing lane.
+    std::vector<std::array<std::uint32_t, 3>> tri(nt);
+    std::vector<gp_Dir> nrm(nt);
+    std::vector<double> area(nt);
+    for (std::size_t t = 0; t < nt; ++t) {
+        for (int k = 0; k < 3; ++k) tri[t][k] = sn.vert_pos[mesh.tris[3 * t + k]];
+        const gp_Vec c = gp_Vec(pos[tri[t][0]], pos[tri[t][1]]).Crossed(
+            gp_Vec(pos[tri[t][0]], pos[tri[t][2]]));
+        if (tri[t][0] == tri[t][1] || tri[t][1] == tri[t][2] || tri[t][0] == tri[t][2] ||
+            c.Magnitude() < 1e-12)
+            return TopoDS_Shape();
+        nrm[t] = gp_Dir(c);
+        area[t] = 0.5 * c.Magnitude();
+    }
+
+    // Edge table: each undirected edge used by exactly two triangles, once in each direction.
+    struct MeshEdge {
+        std::int64_t tri[2] = {-1, -1};
+        TopoDS_Edge shape;  // built lazily, only for edges that bound a face
+    };
+    auto edge_key = [](std::uint32_t a, std::uint32_t b) {
+        return (static_cast<std::uint64_t>(std::min(a, b)) << 32) | std::max(a, b);
+    };
+    std::unordered_map<std::uint64_t, MeshEdge> edges;
+    edges.reserve(nt * 2);
+    for (std::size_t t = 0; t < nt; ++t)
+        for (int k = 0; k < 3; ++k) {
+            const std::uint32_t a = tri[t][k], b = tri[t][(k + 1) % 3];
+            MeshEdge& e = edges[edge_key(a, b)];
+            const int slot = a < b ? 0 : 1;  // slot 0: traversed low->high
+            if (e.tri[slot] >= 0) return TopoDS_Shape();  // non-manifold or mis-wound
+            e.tri[slot] = static_cast<std::int64_t>(t);
+        }
+    for (const auto& kv : edges)
+        if (kv.second.tri[0] < 0 || kv.second.tri[1] < 0) return TopoDS_Shape();  // open
+    auto neighbour = [&](std::size_t t, int k) {
+        const MeshEdge& e = edges.at(edge_key(tri[t][k], tri[t][(k + 1) % 3]));
+        return static_cast<std::size_t>(e.tri[0] == static_cast<std::int64_t>(t) ? e.tri[1]
+                                                                                  : e.tri[0]);
+    };
+    {  // one edge-connected shell; several shells keep the sewing lane's handling
+        std::vector<char> seen(nt, 0);
+        std::vector<std::size_t> stack{0};
+        seen[0] = 1;
+        std::size_t reached = 1;
+        while (!stack.empty()) {
+            const std::size_t t = stack.back();
+            stack.pop_back();
+            for (int k = 0; k < 3; ++k) {
+                const std::size_t u = neighbour(t, k);
+                if (!seen[u]) { seen[u] = 1; ++reached; stack.push_back(u); }
+            }
+        }
+        if (reached != nt) return TopoDS_Shape();
+    }
+
+    // Coplanar regions, seeded largest triangle first so each region plane comes from its
+    // best-conditioned facet; a neighbour joins when all three corners lie within `tol` of
+    // the seed plane on the same side.
+    std::vector<std::size_t> order(nt);
+    for (std::size_t t = 0; t < nt; ++t) order[t] = t;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](std::size_t a, std::size_t b) { return area[a] > area[b]; });
+    std::vector<std::int64_t> region(nt, -1);
+    std::vector<std::vector<std::size_t>> regions;
+    std::vector<gp_Pln> planes;
+    for (const std::size_t s : order) {
+        if (region[s] >= 0) continue;
+        const std::int64_t r = static_cast<std::int64_t>(regions.size());
+        const gp_Pln pln(pos[tri[s][0]], nrm[s]);
+        regions.emplace_back();
+        planes.push_back(pln);
+        std::vector<std::size_t> stack{s};
+        region[s] = r;
+        while (!stack.empty()) {
+            const std::size_t t = stack.back();
+            stack.pop_back();
+            regions.back().push_back(t);
+            for (int k = 0; k < 3; ++k) {
+                const std::size_t u = neighbour(t, k);
+                if (region[u] >= 0 || nrm[u].Dot(nrm[s]) <= 0.0) continue;
+                bool flat = true;
+                for (int c = 0; c < 3 && flat; ++c)
+                    flat = pln.Distance(pos[tri[u][c]]) <= tol;
+                if (!flat) continue;
+                region[u] = r;
+                stack.push_back(u);
+            }
+        }
+    }
+
+    BRep_Builder bb;
+    std::vector<TopoDS_Vertex> vtx(npos);
+    auto vertex = [&](std::uint32_t p) -> const TopoDS_Vertex& {
+        if (vtx[p].IsNull()) bb.MakeVertex(vtx[p], pos[p], Precision::Confusion());
+        return vtx[p];
+    };
+    // The face-bounding edge a->b, oriented along the traversal.
+    auto oriented_edge = [&](std::uint32_t a, std::uint32_t b) {
+        MeshEdge& e = edges.at(edge_key(a, b));
+        if (e.shape.IsNull()) {
+            const std::uint32_t lo = std::min(a, b), hi = std::max(a, b);
+            e.shape = BRepBuilderAPI_MakeEdge(vertex(lo), vertex(hi));
+        }
+        return a < b ? e.shape : TopoDS::Edge(e.shape.Reversed());
+    };
+    // One planar face over `tris` (all on plane `pln`), bounded by its boundary loops; null
+    // when the boundary pinches (a vertex starting two boundary edges) or has no single outer
+    // loop, which the caller resolves by splitting the region into triangles.
+    auto planar_face = [&](const std::vector<std::size_t>& tris, const gp_Pln& pln,
+                           std::int64_t r) -> TopoDS_Face {
+        std::unordered_map<std::uint32_t, std::uint32_t> next;  // boundary a -> b
+        for (const std::size_t t : tris)
+            for (int k = 0; k < 3; ++k) {
+                if (region[neighbour(t, k)] == r) continue;
+                if (!next.emplace(tri[t][k], tri[t][(k + 1) % 3]).second) return TopoDS_Face();
+            }
+        TopoDS_Face face;
+        bb.MakeFace(face, new Geom_Plane(pln), Precision::Confusion());
+        const gp_Dir axis = pln.Axis().Direction();
+        int outer = 0;
+        std::unordered_map<std::uint32_t, char> used;
+        TopTools_ListOfShape face_edges;
+        for (const auto& start : next) {
+            if (used.count(start.first)) continue;
+            TopoDS_Wire wire;
+            bb.MakeWire(wire);
+            gp_XYZ newell(0.0, 0.0, 0.0);
+            std::uint32_t a = start.first;
+            do {
+                used.emplace(a, 1);
+                const auto it = next.find(a);
+                if (it == next.end()) return TopoDS_Face();
+                const std::uint32_t b = it->second;
+                const TopoDS_Edge e = oriented_edge(a, b);
+                bb.Add(wire, e);
+                face_edges.Append(e);
+                newell += pos[a].XYZ().Crossed(pos[b].XYZ());
+                a = b;
+            } while (a != start.first);
+            wire.Closed(Standard_True);
+            if (newell.Dot(axis.XYZ()) > 0.0) ++outer;  // counter-clockwise: the outer loop
+            bb.Add(face, wire);
+        }
+        if (outer != 1 || used.size() != next.size()) return TopoDS_Face();
+        BRepLib::BuildPCurveForEdgesOnPlane(face_edges, face);
+        // Region corners sit up to `tol` off the plane: widen their edges/vertices to match.
+        double dev = 0.0;
+        for (const std::size_t t : tris)
+            for (int k = 0; k < 3; ++k) dev = std::max(dev, pln.Distance(pos[tri[t][k]]));
+        if (dev > Precision::Confusion()) {
+            for (TopTools_ListIteratorOfListOfShape it(face_edges); it.More(); it.Next()) {
+                const TopoDS_Edge& e = TopoDS::Edge(it.Value());
+                bb.UpdateEdge(e, 1.01 * dev);
+                TopoDS_Vertex v0, v1;
+                TopExp::Vertices(e, v0, v1);
+                bb.UpdateVertex(v0, 1.01 * dev);
+                bb.UpdateVertex(v1, 1.01 * dev);
+            }
+        }
+        // Display triangulation: the region's own triangles with the soup's smooth corner
+        // normals (core/geom/tessellate.cpp keeps a normal-bearing triangulation as is).
+        std::unordered_map<std::uint32_t, int> node;
+        for (const std::size_t t : tris)
+            for (int k = 0; k < 3; ++k) node.emplace(tri[t][k], 0);
+        Handle(Poly_Triangulation) pt = new Poly_Triangulation(
+            static_cast<int>(node.size()), static_cast<int>(tris.size()), Standard_False,
+            Standard_True);
+        int n = 0;
+        for (auto& kv : node) {
+            kv.second = ++n;
+            pt->SetNode(n, pos[kv.first]);
+            pt->SetNormal(n, axis);
+        }
+        int i = 0;
+        for (const std::size_t t : tris) {
+            int id[3];
+            for (int k = 0; k < 3; ++k) {
+                id[k] = node.at(tri[t][k]);
+                const float* c = &sn.corner[9 * t + 3 * k];
+                const double sq = (double)c[0] * c[0] + (double)c[1] * c[1] + (double)c[2] * c[2];
+                if (sq >= 1e-12) pt->SetNormal(id[k], gp_Dir(c[0], c[1], c[2]));
+            }
+            pt->SetTriangle(++i, Poly_Triangle(id[0], id[1], id[2]));
+        }
+        bb.UpdateFace(face, pt);
+        return face;
+    };
+
+    TopoDS_Shell shell;
+    bb.MakeShell(shell);
+    for (std::size_t r = 0; r < regions.size(); ++r) {
+        const std::int64_t rid = static_cast<std::int64_t>(r);
+        TopoDS_Face face = planar_face(regions[r], planes[r], rid);
+        if (!face.IsNull()) {
+            bb.Add(shell, face);
+            continue;
+        }
+        // Unbounded region: one face per triangle on its own plane.
+        for (const std::size_t t : regions[r]) {
+            const std::int64_t own = -2 - static_cast<std::int64_t>(t);
+            region[t] = own;
+            face = planar_face({t}, gp_Pln(pos[tri[t][0]], nrm[t]), own);
+            if (face.IsNull()) return TopoDS_Shape();
+            bb.Add(shell, face);
+        }
+    }
+    shell.Closed(Standard_True);
+    TopoDS_Solid solid;
+    bb.MakeSolid(solid);
+    bb.Add(solid, shell);
+    if (shape_signed_volume(solid) > 0.0) return solid;
+    // Inward-wound soup: the same faces explored complemented (see mesh_to_shape).
+    TopoDS_Solid flipped;
+    bb.MakeSolid(flipped);
+    bb.Add(flipped, shell.Reversed());
+    return shape_signed_volume(flipped) > 0.0 ? TopoDS_Shape(flipped) : TopoDS_Shape();
+}
+
 }  // namespace
 
 TopoDS_Shape mesh_to_shape(const MeshData& mesh) {
     if (mesh.triangle_count() == 0) return TopoDS_Shape();
+    const MeshSmoothNormals sn = compute_mesh_smooth_normals(mesh);
+    // A clean closed mesh takes the direct lane (closed_mesh_solid). Its result must pass
+    // BRepCheck before it replaces the proven sewing lane, which still handles everything
+    // else. Measured on the c247 topology beam (26,496 triangles): direct 0.2 s + 1.0 s
+    // check -> 14,290 faces, against 8.1 s of sewing -> 26,496 faces, same volume.
+    try {
+        const TopoDS_Shape solid = closed_mesh_solid(mesh, sn);
+        if (!solid.IsNull() && BRepCheck_Analyzer(solid).IsValid()) return solid;
+    } catch (const Standard_Failure&) {
+        // fall through to sewing
+    }
     // Build one triangular FACE per triangle (degenerate ones dropped), sew them into a
     // shell, then promote to a SOLID when the shell is closed (the "as_solid" path). The
     // resulting B-rep carries a real volume/bbox so it flows through the import feature
@@ -2151,7 +2425,7 @@ TopoDS_Shape mesh_to_shape(const MeshData& mesh) {
     // Smooth shading for every mesh import (SolidWorks saved-display, STL, OBJ, PLY, 3MF,
     // 3DM): one planar face per triangle otherwise renders as discrete facets. A 40 deg
     // crease keeps genuinely flat geometry flat, so a boxy STL is unchanged.
-    attach_mesh_smooth_normals(result, mesh, compute_mesh_smooth_normals(mesh));
+    attach_mesh_smooth_normals(result, mesh, sn);
     return result;
 }
 

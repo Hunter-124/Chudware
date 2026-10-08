@@ -54,7 +54,7 @@ This document extends what already ships. It does **not** invent a greenfield fo
 | `studies/<id>.json` | no | Study definitions (also mirrored / primarily stored as top-level `studies[]` in the doc JSON) |
 | `studies/<id>/results.npz` | no | Cached FEA/CFD solve payload (**AICRES1** blob, **20 MB cap** per study) |
 | `studies/<id>/overlay.aicm` | no | Instant result overlay for reopen |
-| `cache.json` + `cache.aicm` + `cache.brep` | no | Display/build acceleration only (2026-07-12 additive) |
+| `cache.json` + `cache.aicm` + `cache.brep` + `cache.ckpt` | no | Display/build acceleration only (2026-07-12 additive; `cache.ckpt` build checkpoints 2026-10-05, `contracts/stepplus.md` §9) |
 | `ai/memory.json` | no | Design intent / decisions digests |
 | unknown entries | — | Preserved verbatim |
 
@@ -82,7 +82,7 @@ Canonical `document.json` rules (`doc_schema.md` Appendix A / T-H2):
 2. Parse `document.json` → full rebuild (`compile_document` / assembly solve).
 3. If rebuild fails: offer `geometry.step` as frozen import (when present); leave broken JSON on disk.
 4. `studies/*` load **lazily** when Simulation opens; overlays tagged “cached — re-run to refresh.”
-5. Optional: if `cache.json` engine key + `doc_hash` (+ asm component fingerprints) match → skip rebuild and show `cache.aicm` immediately; first edit recompiles.
+5. Optional: if `cache.json` engine key + `doc_hash` (+ asm component fingerprints) match → skip rebuild and show `cache.aicm` immediately. Parts also hydrate the session's compile (from `cache.ckpt`, else `cache.brep`), so the first activate/pick/measure/save executes no feature, and restore the per-feature checkpoints from `cache.ckpt`, so the **first edit executes only the edited tail** (not the whole tree). Every miss/skip is named in the `doc_open` result (`cache_miss_reason`, `cache`; `contracts/stepplus.md` §9).
 
 ### 1.5 What works well
 
@@ -218,7 +218,8 @@ Roles (stable strings; unknown roles preserved):
 | Artifact | When written | Validity |
 |---|---|---|
 | `cache.brep` | After fully-ok part rebuild | `engine` + `doc_hash` + `solved:true` |
-| `cache.aicm` | Same | Same |
+| `cache.aicm` | Same | Same (+ `display_quality`) |
+| `cache.ckpt` | Every part save (only the checkpoints before the first failed feature; full result only after a fully-ok rebuild) | `engine` + per-checkpoint compile chain (content-addressed) + `cache.aicm` hash for the full result |
 | `geometry.step` | After fully-ok rebuild (**live**; erase-first, same gate as `cache.*`) | Same doc_hash optional sidecar note in `cache.json` |
 | Tess in `ops_response` | Session only unless cached | — |
 
@@ -350,8 +351,8 @@ Default `doc_open` = Document + Cache (validate) + preserve entry names for unkn
 |---|---|---|---|---|
 | Store only ops log, replay always | high | perfect history | small | no |
 | Store tree snapshot, rebuild geometry | medium | perfect (deterministic compile) | small | **yes (today)** |
-| Store tree + BREP/tess cache | low | first edit rebuilds | medium | **yes (today)** |
-| Store tree + incremental feature cache | lowest | complex invalidation | high | later if profiles demand |
+| Store tree + BREP/tess cache | low | first edit rebuilds whole tree | medium | superseded |
+| Store tree + incremental feature cache (`cache.ckpt`) | lowest | first edit executes only the edited tail; content-addressed per feature | high | **yes (today, 2026-10-05)** |
 
 Do **not** introduce a persistent op log for load performance; PLM + AI-VC already version snapshots.
 
@@ -361,8 +362,8 @@ Do **not** introduce a persistent op log for load performance; PLM + AI-VC alrea
 |---|---|---|
 | Feature tree | authored | — |
 | Solved sketch coords | last solved in tree | re-solve on edit |
-| B-rep bodies | `cache.brep` | compile_document on miss/edit |
-| Tessellation | `cache.aicm` | tessellate on miss/edit |
+| B-rep bodies | `cache.brep` + `cache.ckpt` | compile_document from the deepest valid checkpoint on miss/edit |
+| Tessellation | `cache.aicm` | tessellate on miss/edit (a display-tier change re-meshes only) |
 | Mate solves | optional in asm cache response | solve_mates on edit |
 | HLR drawing curves | optional later | every drawing_get |
 | FEA results | if &lt; cap | re-run study |

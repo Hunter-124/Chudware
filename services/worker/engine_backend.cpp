@@ -85,9 +85,11 @@ bool isAgentLongRunMethod(const std::string& method) {
 
 bool isSimLongRunMethod(const std::string& method) {
     return method == "sim_mesh" || method == "sim_run_static" ||
-           method == "sim_run_modal" || method == "sim_run_fatigue" ||
+           method == "sim_run_adaptive" || method == "sim_run_modal" ||
+           method == "sim_run_fatigue" ||
            method == "sim_run_buckling" || method == "sim_run_thermal" ||
-           method == "sim_run_flow" || method == "sim_run_topology";
+           method == "sim_run_flow" || method == "sim_run_pipe_flow" ||
+           method == "sim_run_topology";
 }
 
 // Lazily open (and reuse) a dedicated long-run connection. nullptr + err on connect failure.
@@ -179,8 +181,8 @@ std::string hostdBinHint() {
 
 namespace {
 
-// One-shot startup latency probe: N pings over the socket, logged to stderr so
-// the number lands in the app log/console (Phase 4 deliverable: <0.5 ms/call).
+// Explicit diagnostic only: normal startup must not spend 200 synchronous round trips
+// measuring the connection before the GUI can use it.
 void logPingLatency(chudware_ipc::EngineClient& c) {
     json r;
     std::string e;
@@ -273,7 +275,8 @@ void initOnce() {
     g_daemon = true;
     std::fprintf(stderr, "[engine] daemon mode: connected to chudware-hostd (state=%s)\n",
                  c->serverInfo().value("state", std::string("?")).c_str());
-    logPingLatency(*c);
+    const char* pingBench = std::getenv("CHUDWARE_PING_BENCH");
+    if (pingBench && pingBench[0] == '1' && pingBench[1] == '\0') logPingLatency(*c);
 #endif
 }
 

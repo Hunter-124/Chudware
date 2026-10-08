@@ -344,7 +344,9 @@ private:
     bool running_ = false;
     std::string workerModule_ = "services.worker_main";
     bool poisoned_ = false;
-    std::mutex callMtx_;             // serialize concurrent call()s
+    // Local stdio and primary document calls serialize here. Allowlisted GUI
+    // background queries bypass it and use EngineClient's private per-thread sockets.
+    std::mutex callMtx_;
     // Daemon-mode long runs (agent_admin_turn / agent_run_v2 / agent_mission_v1)
     // serialize on THIS mutex instead of callMtx_: they stream on engine_backend's
     // dedicated run connection, so holding callMtx_ for an hours-long turn only

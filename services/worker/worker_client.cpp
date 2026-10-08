@@ -305,13 +305,16 @@ bool routeDocToCpp(const std::string &method, const json &params) {
   static const char *const kR4e6[] = {
       // hydraulic (core/hydraulic)
       "hydraulic_new",
+      "hydraulic_templates",
       "hydraulic_add_component",
       "hydraulic_add_hose",
       "hydraulic_size_cylinder",
       "hydraulic_size_pump",
       "hydraulic_size_accumulator",
       "hydraulic_valve_flow",
-      "hydraulic_fmu_simulate",
+      "hydraulic_simulate",
+      "hydraulic_size_motor",
+      "pump_drive_size",
       "hydraulic_bom",
       "hydraulic_piping_handoff",
       "hydraulic_verify_piping",
@@ -324,6 +327,13 @@ bool routeDocToCpp(const std::string &method, const json &params) {
       "piping_fluid",
       "piping_cfd_boundary",
       "piping_verify_cfd",
+      "piping_route",
+      "piping_edit",
+      "piping_fitting_k",
+      "piping_spec_check",
+      "piping_bom",
+      "vessel_size",
+      "duct_size",
       // structural (core/structural)
       "struct_analyze",
       "struct_check",
@@ -506,8 +516,8 @@ bool routeAgentToCpp(const std::string &method, const json &params) {
   return engine::ensureLoaded(lerr);
 }
 // --- C++ SIM (FEA/flow) routing ---------------------------------------------
-// Route the host's simulation RPCs (sim_mesh / sim_run_static / sim_run_modal /
-// sim_run_fatigue / sim_run_thermal / sim_run_flow / sim_cancel) to the
+// Route the host's simulation RPCs (sim_mesh / sim_run_static / sim_run_adaptive /
+// sim_run_modal / sim_run_fatigue / sim_run_thermal / sim_run_flow / sim_cancel) to the
 // pure-C++ core (libchudware); FEA and flow run on the C++ core only
 // (R5a/T-RF21). sim_cancel is C++-dispatched in core (T-RF16,
 // core/sim/sim_cancel.cpp).
@@ -526,7 +536,7 @@ bool routeAgentToCpp(const std::string &method, const json &params) {
 // a proxy to an unrelated services method of the same name.
 bool isNativeOnlySimMethod(const std::string &method) {
   return method == "sim_run_buckling" || method == "sim_run_topology" ||
-         method == "topology_capabilities";
+         method == "topology_capabilities" || method == "sim_netlist_to_circuit";
 }
 
 bool isTopologyMethod(const std::string &method) {
@@ -537,8 +547,10 @@ bool routeSimToCpp(const std::string &method, const json & /*params*/) {
   if (isNativeOnlySimMethod(method))
     return true;
   if (!(method == "sim_mesh" || method == "sim_run_static" ||
-        method == "sim_run_modal" || method == "sim_run_fatigue" ||
+        method == "sim_run_adaptive" || method == "sim_run_modal" ||
+        method == "sim_run_fatigue" ||
         method == "sim_run_thermal" || method == "sim_run_flow" ||
+        method == "sim_run_pipe_flow" ||
         method == "sim_cancel"))
     return false; // sim_caps + everything else stays Python (services worker)
   if (!engine::available()) {
@@ -1929,7 +1941,14 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
        method == "agent_answer");
   const bool isCppSimCancel =
       (method == "sim_cancel" && routeSimToCpp(method, params));
-  const bool bypassCallMutex = isAgentControl || isCppSimCancel;
+  auto *sharedClient = engine::daemonMode() ? engine::client() : nullptr;
+  // Document-free GUI background queries own a private EngineClient connection.
+  // Holding the stdio/document mutex here would reintroduce the startup freeze
+  // before the independent socket is reached (notably doc_new behind model probes).
+  const bool backgroundQuery =
+      sharedClient && sharedClient->usesBackgroundConnection(method, params);
+  const bool bypassCallMutex =
+      isAgentControl || isCppSimCancel || backgroundQuery;
   // The long streaming runs keep full serialization among themselves, per lane:
   // two agent runs must never overlap (they would interleave ops on the same doc
   // in the daemon), and simulation solves share engine_backend's single
@@ -1958,9 +1977,8 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   std::unique_lock<std::mutex> lk(daemonLongRun ? laneMtx : callMtx_,
                                   std::defer_lock);
   if (isCppSimCancel && engine::daemonMode()) {
-    // The shared EngineClient serializes socket calls internally, so it is
-    // blocked behind the solve even after bypassing callMtx_. Use the same
-    // short-lived daemon side channel as agent Stop/Steer.
+    // Keep cancellation on an independent socket even if a solve's dedicated
+    // connection was unavailable; it must never queue behind the work it stops.
     return callViaSideClient(method, params, result, err, timeoutMs, onEvent);
   }
   if (daemonLongRun && lane == engine::RunLane::Sim &&
@@ -2299,6 +2317,8 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
         err = cerr;
       else if (method == "sim_run_buckling")
         err = "Engine linear buckling is unavailable";
+      else if (method == "sim_netlist_to_circuit")
+        err = "Native circuit conversion is unavailable";
       else
         err = "Engine topology optimization is unavailable";
       if (errorSink_)

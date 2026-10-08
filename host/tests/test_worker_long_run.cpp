@@ -35,6 +35,10 @@
 //   ✓ a discarding connection (the private simulation lane) delivers agent.event live to
 //     onEvent yet retains nothing of thousands of unrelated pushes, mid-call or idle
 //   ✓ a default connection still queues every unconsumed push for drainEvents(), in order
+//   ✓ a held GUI background catalog query never blocks primary document calls or a second
+//     background thread's query on the same EngineClient
+//   ✓ background query EOF/timeout leaves primary liveness/generation intact and reconnects
+//     only that side connection; disconnect wakes every active background call
 //
 // Idle bursts larger than the socket buffer only finish sending while the client reads, so
 // the idle checks consume through pollAlive/drainEvents CONCURRENTLY with the sender
@@ -188,6 +192,23 @@ public:
         std::lock_guard<std::mutex> lk(mtx_);
         return meshesServed_;
     }
+    void holdMetadata() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        releaseMetadata_ = false;
+    }
+    bool releaseMetadata() {
+        std::unique_lock<std::mutex> lk(mtx_);
+        releaseMetadata_ = true;
+        cv_.notify_all();
+        return cv_.wait_for(lk, std::chrono::seconds(5), [&] { return heldMetadata_ == 0; });
+    }
+    bool waitMetadataStarted(int n, int timeoutMs) {
+        return waitCount(metadataStarted_, n, timeoutMs);
+    }
+    int metadataStarted() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return metadataStarted_;
+    }
 
 private:
     bool waitCount(const int& counter, int n, int timeoutMs) {
@@ -248,13 +269,16 @@ private:
                 return;
             }
             connFds_.push_back(fd);
-            connThreads_.emplace_back([this, fd] { serve(fd); });
+            const int clientId = nextClientId_++;
+            connThreads_.emplace_back([this, fd, clientId] { serve(fd, clientId); });
         }
     }
 
     // nullopt = hang up without replying.
-    std::optional<json> handle(int fd, const std::string& method, const json& params) {
-        if (method == "hello") return json{{"state", "ready"}, {"client_id", 1}};
+    std::optional<json> handle(int fd, int clientId, const std::string& method,
+                               const json& params) {
+        if (method == "hello")
+            return json{{"state", "ready"}, {"client_id", clientId}};
         if (method == "worker_control_info")
             return json{{"transport", "unix"},
                         {"endpoint", "/nonexistent/chudware-test-control.sock"},
@@ -269,7 +293,30 @@ private:
             --activeTurns_;
             return json{{"ok", true}, {"text", "done"}};
         }
-        if (method == "subscription_accounts") return json{{"accounts", json::array()}};
+        if (method == "subscription_accounts") {
+            {
+                std::unique_lock<std::mutex> lk(mtx_);
+                ++metadataStarted_;
+                if (params.value("hold_metadata", false)) {
+                    ++heldMetadata_;
+                    cv_.notify_all();
+                    // A broken client must fail this test, not wedge the whole suite:
+                    // release automatically after 10 s if the main thread queued behind us.
+                    cv_.wait_for(lk, std::chrono::seconds(10),
+                                 [&] { return releaseMetadata_ || stopping_; });
+                    --heldMetadata_;
+                }
+                cv_.notify_all();
+            }
+            if (!script(fd, params)) return std::nullopt;
+            return json{{"accounts", json::array()},
+                        {"tag", params.value("tag", 0)},
+                        {"client_id", clientId}};
+        }
+        if (method == "doc_list")
+            return json{{"docs", json::array()}, {"client_id", clientId}};
+        if (method == "doc_new")
+            return json{{"doc_id", "doc-cpp00000003"}, {"client_id", clientId}};
         if (method == "doc_activate")
             return json{{"doc_id", "doc-cpp00000002"}, {"revision", 1}, {"tree", json::object()}};
         if (method == "sim_mesh") {
@@ -316,7 +363,7 @@ private:
         ::close(fd);
     }
 
-    void serve(int fd) {
+    void serve(int fd, int clientId) {
         std::string buf;
         char chunk[4096];
         for (;;) {
@@ -332,7 +379,7 @@ private:
                 json params = req.value("params", json::object());
                 if (!params.is_object()) params = json::object();
                 const std::string method = req.value("method", std::string());
-                const std::optional<json> result = handle(fd, method, params);
+                const std::optional<json> result = handle(fd, clientId, method, params);
                 if (!result) {
                     closeConn(fd);
                     return;
@@ -364,6 +411,10 @@ private:
     bool stopping_ = false;
     bool releaseTurns_ = true;
     bool releaseSims_ = true;
+    bool releaseMetadata_ = true;
+    int heldMetadata_ = 0;
+    int metadataStarted_ = 0;
+    int nextClientId_ = 1;
     int turnsStarted_ = 0;
     int activeTurns_ = 0;
     int maxConcurrent_ = 0;
@@ -680,10 +731,11 @@ static void agentAndTopologyLanesAreIndependent(FakeHostd& hostd) {
 // ---- EngineClient transport ---------------------------------------------------------------
 using chudware_ipc::EngineClient;
 
-static bool connectProbe(EngineClient& c, bool discardUnconsumedEvents) {
+static bool connectProbe(EngineClient& c, bool discardUnconsumedEvents,
+                          const char* clientKind = "test") {
     EngineClient::Options o;
     o.hostdBin = engine::hostdBinHint();
-    o.clientKind = "test";
+    o.clientKind = clientKind;
     o.allowSpawn = false;
     o.discardUnconsumedEvents = discardUnconsumedEvents;
     std::string e;
@@ -693,6 +745,166 @@ static bool connectProbe(EngineClient& c, bool discardUnconsumedEvents) {
 }
 
 static int probeTag(const json& r) { return r.is_object() ? r.value("tag", 0) : 0; }
+static int probeClientId(const json& r) {
+    return r.is_object() ? r.value("client_id", 0) : 0;
+}
+
+// Server-side holds establish ordering; no sleep is used to guess whether a query started.
+// The slow query stays gated until both independent calls have finished, then also spends
+// 2 s silent. Time checks have a generous margin and are secondary to the ordering checks.
+static void backgroundQueriesDoNotBlockPrimary(FakeHostd& hostd) {
+    EngineClient c;
+    CHECK(connectProbe(c, false, "gui"));
+    const int primaryId = probeClientId(c.serverInfo());
+    CHECK(primaryId != 0);
+    hostd.holdMetadata();
+    const int before = hostd.metadataStarted();
+    std::atomic<bool> slowDone{false};
+    bool slowOk = false;
+    json slowResult;
+    Clock::time_point slowEnd{};
+    const auto started = Clock::now();
+    std::thread slow([&] {
+        std::string e;
+        slowOk = c.call("subscription_accounts",
+                        json{{"hold_metadata", true}, {"silent_ms", 2000}, {"tag", 1}},
+                        slowResult, e, 15000);
+        slowEnd = Clock::now();
+        slowDone = true;
+    });
+    CHECK(hostd.waitMetadataStarted(before + 1, 5000));
+
+    json r;
+    std::string e;
+    const auto primaryStarted = Clock::now();
+    CHECK(c.call("doc_list", json::object(), r, e, 5000));
+    CHECK(probeClientId(r) == primaryId);
+    CHECK(c.call("doc_new", json{{"name", "startup"}}, r, e, 5000));
+    CHECK(probeClientId(r) == primaryId);
+    const auto primaryEnd = Clock::now();
+    CHECK(primaryEnd - primaryStarted < std::chrono::milliseconds(1500));
+    CHECK(!slowDone.load());
+
+    bool secondOk = false;
+    json secondResult;
+    Clock::time_point secondEnd{};
+    const auto secondStarted = Clock::now();
+    std::thread second([&] {
+        std::string err;
+        secondOk = c.call("subscription_accounts", json{{"tag", 2}},
+                          secondResult, err, 5000);
+        secondEnd = Clock::now();
+    });
+    second.join();
+    CHECK(secondOk);
+    CHECK(probeTag(secondResult) == 2);
+    CHECK(probeClientId(secondResult) != primaryId);
+    CHECK(secondEnd - secondStarted < std::chrono::milliseconds(1500));
+    CHECK(!slowDone.load());
+
+    CHECK(hostd.releaseMetadata());
+    slow.join();
+    CHECK(slowOk);
+    CHECK(probeTag(slowResult) == 1);
+    CHECK(probeClientId(slowResult) != primaryId);
+    CHECK(probeClientId(slowResult) != probeClientId(secondResult));
+    CHECK(slowEnd > primaryEnd && slowEnd > secondEnd);
+    CHECK(slowEnd - started >= std::chrono::milliseconds(2000));
+}
+
+// Keep failure and reconnect on the SAME background thread so it reuses the side slot.
+// Pause between them while the primary thread checks that its own socket was untouched.
+static void backgroundQueryFailureIsIsolated(bool eof) {
+    EngineClient c;
+    CHECK(connectProbe(c, false, "gui"));
+    const int primaryId = probeClientId(c.serverInfo());
+    CHECK(primaryId != 0);
+    const auto generation = c.reconnectGeneration();
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool failed = false, resume = false;
+    bool firstOk = false, failureOk = true, reconnectOk = false;
+    json firstResult, reconnectResult;
+    std::string failureErr;
+    std::thread background([&] {
+        std::string err;
+        firstOk = c.call("subscription_accounts", json{{"tag", 3}}, firstResult, err, 5000);
+        json r;
+        failureOk = c.call("subscription_accounts",
+                           eof ? json{{"close", true}}
+                               : json{{"silent_ms", 2000}, {"tag", 4}},
+                           r, failureErr, eof ? 5000 : 250);
+        {
+            std::unique_lock<std::mutex> lk(mtx);
+            failed = true;
+            cv.notify_all();
+            cv.wait(lk, [&] { return resume; });
+        }
+        reconnectOk = c.call("subscription_accounts", json{{"tag", 5}},
+                             reconnectResult, err, 5000);
+    });
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        CHECK(cv.wait_for(lk, std::chrono::seconds(10), [&] { return failed; }));
+    }
+    CHECK(c.connected());
+    CHECK(c.pollAlive());
+    CHECK(c.reconnectGeneration() == generation);
+    json r;
+    std::string err;
+    CHECK(c.call("doc_list", json::object(), r, err, 5000));
+    CHECK(probeClientId(r) == primaryId);
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        resume = true;
+    }
+    cv.notify_all();
+    background.join();
+    CHECK(firstOk);
+    CHECK(!failureOk);
+    CHECK(eof ? failureErr == "daemon connection closed"
+              : failureErr.find("timed out") != std::string::npos);
+    CHECK(reconnectOk);
+    CHECK(probeTag(reconnectResult) == 5);  // never the timed-out call's stale tag 4
+    CHECK(probeClientId(firstResult) != primaryId);
+    CHECK(probeClientId(reconnectResult) != primaryId);
+    CHECK(probeClientId(firstResult) != probeClientId(reconnectResult));
+    CHECK(c.connected());
+    CHECK(c.reconnectGeneration() == generation);
+}
+
+static void backgroundQueryEofIsIsolated() { backgroundQueryFailureIsIsolated(true); }
+static void backgroundQueryTimeoutIsIsolated() { backgroundQueryFailureIsIsolated(false); }
+
+static void disconnectWakesAllBackgroundQueries(FakeHostd& hostd) {
+    EngineClient c;
+    CHECK(connectProbe(c, false, "gui"));
+    hostd.holdMetadata();
+    const int before = hostd.metadataStarted();
+    bool ok[2] = {true, true};
+    std::string err[2];
+    Clock::time_point ended[2];
+    auto query = [&](int i) {
+        json r;
+        ok[i] = c.call("subscription_accounts", json{{"hold_metadata", true}},
+                       r, err[i], -1);
+        ended[i] = Clock::now();
+    };
+    std::thread first(query, 0);
+    std::thread second(query, 1);
+    CHECK(hostd.waitMetadataStarted(before + 2, 5000));
+    const auto disconnected = Clock::now();
+    c.disconnect();
+    first.join();
+    second.join();
+    CHECK(!c.connected());
+    for (int i = 0; i < 2; ++i) {
+        CHECK(!ok[i]);
+        CHECK(err[i] == "aborted");
+        CHECK(ended[i] - disconnected < std::chrono::milliseconds(1500));
+    }
+    CHECK(hostd.releaseMetadata());
+}
 
 // An unbounded wait outlives silence but still ends when the peer hangs up, and the next
 // call reconnects.
@@ -894,6 +1106,10 @@ int main() {
 
     {
         FakeHostd hostd(sock);
+        backgroundQueriesDoNotBlockPrimary(hostd);
+        backgroundQueryEofIsIsolated();
+        backgroundQueryTimeoutIsIsolated();
+        disconnectWakesAllBackgroundQueries(hostd);
         longRunsNeverOverlap(hostd);
         silentTopologySolveStaysPending(hostd);
         unboundedWaitEndsOnEof();

@@ -105,8 +105,89 @@ namespace chudware_ipc {
 
 using nlohmann::json;
 
+bool EngineClient::usesBackgroundConnection(const std::string& method,
+                                            const json& params) const {
+    if (clientKind_ != "gui" || std::this_thread::get_id() == primaryThread_ ||
+        (params.is_object() && params.contains("doc_id")))
+        return false;
+    // Server::clientLoop dispatches synchronously: sharing one socket would still
+    // queue the GUI behind cold worker/provider calls even without a client mutex.
+    // These exact names are document-free catalogs/status (worker_rpc.py's
+    // subscription, Chudcode, skills and prompt handlers; fw_projects/status and
+    // engine capability queries). Do NOT generalize to prefixes: unknown methods,
+    // mints, document reads/edits and all registry/hold/subscription RPCs retain the
+    // primary client identity, including its ro/CAS and edit-hold semantics.
+    static constexpr const char* queries[] = {
+        "ping", "daemon_status", "worker_control_info", "agent_list_models",
+        "subscription_accounts", "subscription_status", "subscription_usage",
+        "chudcode_provider_list", "chudcode_auth_state", "chudcode_models_list",
+        "chudcode_session_stats", "chudcode_stt_status", "skills_list", "skills_get",
+        "ai_prompt_baseline", "ai_tool_catalog", "fw_projects", "fw_status",
+        "em_status", "sim_caps", "topology_capabilities"
+    };
+    for (const char* name : queries)
+        if (method == name) return true;
+    return false;
+}
+
+EngineClient* EngineClient::backgroundClient() {
+    std::lock_guard<std::mutex> lk(backgroundMtx_);
+    auto& slot = backgroundClients_[std::this_thread::get_id()];
+    if (!slot) {
+        slot = std::make_unique<EngineClient>();
+        slot->sockPath_ = sockPath_;
+        slot->clientKind_ = "gui-background";
+        slot->userId_ = userId_;
+        slot->userDisplay_ = userDisplay_;
+        // The primary socket is the GUI's event subscriber. Hostd also broadcasts
+        // on private sockets; retaining those duplicates would leak an idle queue.
+        slot->discardEvents_ = true;
+    }
+    // No I/O under backgroundMtx_: each calling thread connects/handshakes/replies
+    // on its own socket and mutex. A side EOF/timeout cannot invalidate the primary
+    // socket, advance its reconnectGeneration or change the unreachable chip.
+    // gui-background never pins an idle daemon like gui (Server::pinningClients).
+    return slot.get();
+}
+
+void EngineClient::pollBackgroundClients() {
+    std::unique_lock<std::mutex> lk(backgroundMtx_, std::try_to_lock);
+    if (!lk.owns_lock()) return;
+    for (const auto& entry : backgroundClients_) entry.second->pollAlive();
+}
+
+void EngineClient::closeConnection() {
+    std::lock_guard<std::mutex> lk(socketMtx_);
+    connected_.store(false, std::memory_order_release);
+    conn_.close();
+}
+
+void EngineClient::abortPending() {
+    abort_.store(true, std::memory_order_release);
+    connected_.store(false, std::memory_order_release);
+    {
+        // shutdown wakes an active read without modifying its read buffer/handle.
+        // The read owner closes it; idle sockets can be closed here immediately.
+        std::lock_guard<std::mutex> lk(socketMtx_);
+        conn_.shutdown();
+    }
+    {
+        std::unique_lock<std::mutex> lk(mtx_, std::try_to_lock);
+        if (lk.owns_lock()) closeConnection();
+    }
+    std::lock_guard<std::mutex> lk(backgroundMtx_);
+    for (const auto& entry : backgroundClients_) entry.second->abortPending();
+}
+
+void EngineClient::disconnect() {
+    // Drop the entire logical GUI client, not just its primary/event connection.
+    abortPending();
+}
+
 bool EngineClient::tryConnect(std::string& err) {
+    std::lock_guard<std::mutex> lk(socketMtx_);
     conn_ = connectTo(sockPath_, err);
+    connected_.store(conn_.valid(), std::memory_order_release);
     if (conn_.valid()) {
         // Fresh socket after abortPending() — allow subsequent call()s again.
         abort_.store(false, std::memory_order_release);
@@ -183,6 +264,7 @@ bool EngineClient::connectInner(const Options& opts, std::string& err) {
     const std::string key = instanceKey(keyBin);
     sockPath_ = socketPath(key);
     clientKind_ = opts.clientKind;
+    primaryThread_ = std::this_thread::get_id();
     userId_ = opts.userId;
     userDisplay_ = opts.userDisplay;
     discardEvents_ = opts.discardUnconsumedEvents;
@@ -249,7 +331,7 @@ bool EngineClient::readResponse(int id, json& out, std::string& err, int timeout
     for (;;) {
         if (abort_.load(std::memory_order_acquire)) {
             err = "aborted";
-            conn_.close();
+            closeConnection();
             return false;
         }
         int wait = -1;
@@ -266,6 +348,7 @@ bool EngineClient::readResponse(int id, json& out, std::string& err, int timeout
             // abortPending() half-closes the socket, which reads as EOF: report the abort.
             if (abort_.load(std::memory_order_acquire)) continue;
             if (conn_.eof() || !conn_.valid()) {
+                closeConnection();
                 err = "daemon connection closed";
                 return false;
             }
@@ -279,7 +362,7 @@ bool EngineClient::readResponse(int id, json& out, std::string& err, int timeout
             // err-only (no {code} in result), same transport-error shape as a
             // connection failure, so callers toast it.
             err = "engine call timed out after " + std::to_string(timeoutMs) + "ms";
-            conn_.close();
+            closeConnection();
             return false;
         }
         json msg = json::parse(line, nullptr, /*allow_exceptions=*/false);
@@ -324,7 +407,7 @@ bool EngineClient::reconnectLocked(std::string& err) {
         err = "not connected to hostd";
         return false;
     }
-    conn_.close();
+    closeConnection();
     std::string cerr;
     if (!tryConnect(cerr)) {
         err = "not connected to hostd (reconnect failed: " + cerr + ")";
@@ -340,6 +423,7 @@ bool EngineClient::reconnectLocked(std::string& err) {
                 {"method", "hello"},
                 {"params", hparams}};
     if (!conn_.writeLine(req.dump())) {
+        closeConnection();
         err = "daemon write failed (reconnect hello)";
         return false;
     }
@@ -347,7 +431,7 @@ bool EngineClient::reconnectLocked(std::string& err) {
     if (!readResponse(id, resp, err, /*timeoutMs=*/5000)) return false;
     if (!resp.contains("result")) {
         err = "hello failed on reconnect";
-        conn_.close();
+        closeConnection();
         return false;
     }
     serverInfo_ = resp["result"];
@@ -382,6 +466,7 @@ bool EngineClient::tryReconnectNonBlocking(std::string& err, bool* deferred) {
         // reconnectLocked guards on a non-empty sockPath_. clientKind_ is "gui";
         // the gateway asserts the real per-user identity into the hello anyway.
         clientKind_ = "gui";
+        primaryThread_ = std::this_thread::get_id();
         sockPath_ = socketPath(instanceKey(std::string()));
         if (sockPath_.empty()) sockPath_ = "ws://engine";  // sentinel; path unused in wasm
     }
@@ -391,8 +476,11 @@ bool EngineClient::tryReconnectNonBlocking(std::string& err, bool* deferred) {
 bool EngineClient::pollAlive() {
     // try_lock: same rule as drainEvents — never block the GUI behind a long RPC.
     std::unique_lock<std::mutex> lk(mtx_, std::try_to_lock);
-    if (!lk.owns_lock()) return conn_.valid() && !conn_.eof();
-    if (!conn_.valid() || conn_.eof()) return false;
+    if (!lk.owns_lock()) return connected();
+    if (!conn_.valid() || conn_.eof()) {
+        connected_.store(false, std::memory_order_release);
+        return false;
+    }
     // 0 ms poll: if the peer died, readLine sets eof_ on HUP/read-0.
     // Any push events that arrive are queued for the next drainEvents.
     std::string line;
@@ -400,12 +488,16 @@ bool EngineClient::pollAlive() {
         json msg = json::parse(line, nullptr, false);
         if (!msg.is_discarded() && msg.contains("event")) retainEvent(std::move(msg));
     }
-    return conn_.valid() && !conn_.eof();
+    const bool alive = conn_.valid() && !conn_.eof();
+    connected_.store(alive, std::memory_order_release);
+    return alive;
 }
 
 bool EngineClient::call(const std::string& method, const json& params, json& result,
                         std::string& err, int timeoutMs,
                         const std::function<void(const json&)>& onEvent) {
+    if (usesBackgroundConnection(method, params))
+        return backgroundClient()->call(method, params, result, err, timeoutMs, onEvent);
 #ifdef __EMSCRIPTEN__
     // Browser MAIN thread: a hard mutex wait would busy-block the event loop, so the
     // AsyncRpc-worker call currently holding mtx_ can never receive its WS onmessage to
@@ -427,6 +519,7 @@ bool EngineClient::call(const std::string& method, const json& params, json& res
     const int id = nextId_++;
     json req = {{"id", id}, {"method", method}, {"params", params}};
     if (!conn_.writeLine(req.dump())) {
+        closeConnection();
         err = "daemon write failed";
         return false;
     }
@@ -442,6 +535,7 @@ bool EngineClient::call(const std::string& method, const json& params, json& res
 }
 
 std::vector<json> EngineClient::drainEvents() {
+    pollBackgroundClients();
     // try_lock: the GUI thread drains per frame while call()s run on the async
     // worker thread; a long solve holding mtx_ must never stall the render loop.
     // Events arriving mid-call are queued by readResponse and picked up on the
@@ -455,6 +549,8 @@ std::vector<json> EngineClient::drainEvents() {
         if (!msg.is_discarded() && msg.contains("event")) retainEvent(std::move(msg));
         // Orphan responses (no waiter) are dropped.
     }
+    if (!conn_.valid() || conn_.eof())
+        connected_.store(false, std::memory_order_release);
     std::vector<json> out;
     out.swap(events_);
     return out;

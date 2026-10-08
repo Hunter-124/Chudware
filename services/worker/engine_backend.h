@@ -17,11 +17,11 @@
 //                   latched for the whole process: a hostd that was merely
 //                   restarting at launch used to cost the entire session.
 //
-// Threading: engine::call() runs on the async_rpc worker thread (EngineClient
-// serializes internally). engine::client()->drainEvents() is called from the
-// GUI thread each frame (host/src/core/engine_events.cpp) — EngineClient is
-// internally locked and drainEvents try-locks so a long-running solve on the
-// worker thread never stalls the render loop.
+// Threading: GUI document calls share their primary daemon connection and its
+// registry identity. Allowlisted document-free queries from background threads
+// use independent EngineClient sockets; slow catalog/auth discovery cannot hold
+// the GUI's document socket. drainEvents() try-locks every socket it polls and
+// preserves the primary event stream. Long agent/simulation runs keep their lanes.
 #pragma once
 
 #include <string>

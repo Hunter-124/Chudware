@@ -44,6 +44,11 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
 - **Doc GC is separate.** Unattached docs have a **90 s** base grace; agent/MCP
   origins have a **1800 s** floor. That grace keeps finished mission parts openable
   while the GUI exists, but does not pin the daemon through shutdown.
+- **GUI background queries.** Document-free metadata/worker-bridged queries from non-primary
+  GUI threads use per-thread `gui-background` connections via the exact IPC allowlist;
+  document-scoped and unknown methods retain the primary socket. Side-connection EOF/timeouts
+  do not invalidate the primary connection. Background sockets do not receive the unconditional
+  `gui` pin; recent/in-flight RPCs still count as work under the ordinary non-GUI rules.
 - **CLI**:
   - `chudware-hostd --foreground` — run serving in the current terminal (dev).
   - `chudware-hostd --status` — JSON status of the running instance (`state`,
@@ -79,6 +84,8 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
 | `CHUDWARE_HOSTD_DRAIN_GRACE_S` | Explicit drain deadline, default 20 s, minimum 1 s. |
 | `CHUDWARE_HOSTD_CONNECT_BUDGET_S` | MCP bridge connect/spawn budget, default 15 s. |
 | `CHUDWARE_ENGINE_DAEMON_RETRY_MS` | GUI outer retry-wait budget, default 2850 ms; separate from the underlying IPC spawn budget. |
+| `CHUDWARE_STARTUP_TRACE` | Exact `1` enables desktop stderr startup milestones in milliseconds from main entry, through first presentation, daemon readiness and starter visibility. Unset by default. |
+| `CHUDWARE_PING_BENCH` | Exact `1` enables the desktop daemon-connect diagnostic of 200 synchronous pings and logs mean round-trip latency. Disabled during normal startup. |
 | `CHUDWARE_DOC_GC_GRACE_S` | Base unattached-document grace, default 90 s. |
 | `CHUDWARE_DOC_GC_AGENT_GRACE_S` | Agent/MCP-origin grace floor, default 1800 s. |
 | `CHUDWARE_DOC_GC` | `0` disables doc GC, not daemon idle-exit. |

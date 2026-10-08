@@ -5,19 +5,23 @@
 // swap backends without signature churn. Adds connect-or-spawn discovery and a
 // queue of daemon push events (doc.changed etc., drained by the GUI per frame).
 //
-// Threading: call() is serialized by an internal mutex (one outstanding request
-// per connection, matching the daemon's v1 contract). Event lines that arrive
-// while waiting for a response are queued (or dropped, on a connection opened with
-// Options::discardUnconsumedEvents); drainEvents() also does a 0 ms poll so pushes
-// arrive even when the client is idle.
+// Threading: hostd processes each connection sequentially. GUI document calls
+// keep the primary connection's attachment/hold/subscription identity; explicitly
+// allowed document-free background queries use a lazily opened connection per
+// calling thread, so cold worker discovery never holds the GUI socket mutex.
+// Events on the primary connection are queued for drainEvents(); private query
+// connections discard duplicate broadcasts but keep live call() callbacks.
 #pragma once
 
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
+#include <thread>
 
 #include <nlohmann/json.hpp>
 
@@ -49,18 +53,17 @@ public:
     // allowed). Performs the hello handshake. False + err on failure.
     bool connectOrSpawn(const Options& opts, std::string& err);
 
-    bool connected() const { return conn_.valid() && !conn_.eof(); }
-    void disconnect() { conn_.close(); }
-    // Teardown abort: flip a flag the in-flight readResponse loop polls, then
-    // half-close and close the socket so a blocked agent_run or solve wakes at once
-    // (shutdown wakes a thread parked in poll(); close alone does not) instead of
-    // hanging app quit until the multi-minute run finishes. One-way; next call()
-    // reconnects. Safe from any thread.
-    void abortPending() {
-        abort_.store(true, std::memory_order_release);
-        conn_.shutdown();
-        conn_.close();
-    }
+    bool connected() const { return connected_.load(std::memory_order_acquire); }
+    void disconnect();
+    // Teardown abort: wake every in-flight primary/background read without
+    // waiting for its round trip. The next call may reconnect. Safe from any thread.
+    void abortPending();
+
+    // Shared with WorkerClient: these GUI background queries need neither its
+    // stdio-pipe call mutex nor the primary document connection. Unknown methods,
+    // any doc_id parameter, and calls on the primary thread always return false.
+    bool usesBackgroundConnection(const std::string& method,
+                                  const nlohmann::json& params) const;
 
     // The hello response: {proto, abi, engine_path, git_rev, daemon_pid, state, id_remap}.
     const nlohmann::json& serverInfo() const { return serverInfo_; }
@@ -140,9 +143,13 @@ private:
                       const std::function<void(const nlohmann::json&)>& onEvent = {});
     // Queue an unconsumed push for drainEvents(), or drop it on a discarding lane.
     void retainEvent(nlohmann::json&& msg);
+    EngineClient* backgroundClient();
+    void pollBackgroundClients();
+    void closeConnection();
 
     IpcConn conn_;
-    std::mutex mtx_;                     // serialize call()s + event queue access
+    std::mutex mtx_;                     // primary round trips + event queue access
+    std::mutex socketMtx_;               // socket replacement/close vs teardown shutdown
     std::vector<nlohmann::json> events_;
     nlohmann::json serverInfo_;
     std::string sockPath_;
@@ -153,6 +160,11 @@ private:
     int nextId_ = 1;
     std::atomic<bool> abort_{false};     // set by abortPending(); readResponse returns fast
     std::atomic<uint64_t> reconnectGen_{0};  // bumped by reconnectLocked (see accessor)
+    std::atomic<bool> connected_{false};
+    std::thread::id primaryThread_ = std::this_thread::get_id();
+    // Held only for slot/config access, never a connect/hello/RPC round trip.
+    std::mutex backgroundMtx_;
+    std::map<std::thread::id, std::unique_ptr<EngineClient>> backgroundClients_;
 };
 
 }  // namespace chudware_ipc

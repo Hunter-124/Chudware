@@ -28,9 +28,11 @@
 name: deploy-prod
 on:
   # Master pushes drive production directly. CI fan-out is reported but does
-  # not block it: native-build includes the offline ARM Mac, while linux-gate
-  # can take hours. The fast-gate now uses the online Intel Mac, but its queued
-  # runs can still lag; the source audits run inline before promotion instead.
+  # not block it: native-build runs only for release tags and its Linux rows
+  # queue on one builder (the emulated aarch64 row alone is bounded at 90
+  # minutes), and linux-gate can take hours. The fast-gate now uses the online
+  # Intel Mac, but its queued runs can still lag; the source audits run inline
+  # before promotion instead.
   push:
     branches: [master]
   workflow_dispatch:
@@ -230,11 +232,13 @@ jobs:
           # ---------------------------------------------------------------
           # THE GATE.
           #
-          # CI fan-out is reported, not a deploy prerequisite. native-build's
-          # core-only ARM Mac leg still waits for an offline runner. linux-gate
-          # can take hours and covers many non-web suites. fast-gate now runs on
-          # the online Intel Mac but can queue behind older runs; its source
-          # audits also run inline here at the commit being promoted.
+          # CI fan-out is reported, not a deploy prerequisite. native-build
+          # runs only for release tags, its Linux rows queue on one builder
+          # (the emulated aarch64 row alone is bounded at 90 minutes), and
+          # linux-gate can take hours and covers many non-web suites.
+          # fast-gate now runs on the online Intel Mac but can queue behind
+          # older runs; its source audits also run inline here at the commit
+          # being promoted.
           #
           # Waiting for every unrelated CI job would leave production stale;
           # these three states are read and REPORTED below, not silently

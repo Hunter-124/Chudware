@@ -15,15 +15,13 @@
 #
 # LICENSE: BSD-3-Clause, statically linked.
 
-# Pin an immutable, publicly fetchable CAD integration revision (cad-fill-progress).
-# The standalone product's master may advance independently. Keep the public
-# repository as the credential-free default so CAD CI never depends on private
-# source access; local maintenance trees opt in through POLYMESH_SOURCE_DIR.
-set(POLYMESH_COMMIT "ef464dc1236666770985c75a8fb50a512a463f62"
+# Pin an immutable commit on the single public Polyhedral-FEA line (master). There is no
+# private fork: all polymesh work lands publicly, and CAD moves this pin to a master commit.
+# Local maintenance trees opt in through POLYMESH_SOURCE_DIR (CHUDWARE_POLYMESH_ROOT).
+set(POLYMESH_COMMIT "a9fe080daf6e15187ab9d31ce7acedb93d6d7fe7"
     CACHE STRING "Polyhedral-FEA commit to build" FORCE)
 set(POLYMESH_REPOSITORY "https://github.com/Hunter-124/Polyhedral-FEA.git"
-    CACHE STRING
-    "Polyhedral-FEA fetch repository (public default; private mirror is maintenance-only)")
+    CACHE STRING "Polyhedral-FEA fetch repository")
 
 # Files this module WRITES into the managed checkout (see the ONNX Runtime digest block
 # below). Git refuses to move HEAD over a locally modified tracked file, so without a
@@ -180,9 +178,13 @@ endif()
 # it. The mesher itself (polymesh::pipeline) has no such constraint, so mirror upstream's
 # platform predicate here and build the pipeline WITHOUT the learned advisor rather than
 # refusing to configure at all. Keep this condition identical to upstream's `_ort_archive`
-# selection: a build that satisfies it is exactly a build that can fetch and stage ORT.
-if((WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8) OR
-   (UNIX AND NOT APPLE AND CMAKE_SIZEOF_VOID_P EQUAL 8))
+# selection, narrowed to the x86-64 processors those two archives contain: upstream picks
+# the linux-x64 archive for any 64-bit Unix, so an aarch64 Linux build would fetch x86-64
+# ONNX Runtime and fail to link it. A build that satisfies this is exactly a build that can
+# fetch and stage ORT.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND
+   ((WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8) OR
+    (UNIX AND NOT APPLE AND CMAKE_SIZEOF_VOID_P EQUAL 8)))
   set(_pm_advisor_enabled ON)
 else()
   set(_pm_advisor_enabled OFF)

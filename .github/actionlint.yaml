@@ -6,6 +6,8 @@ self-hosted-runner:
     - cc-win-chudware
     - cc-mac-chudware-intel
     - cc-mac-chudware-intel-bootstrap
+    - cc-mac-chudware-gate-intel
+    - cc-mac-chudware-gate-intel-bootstrap
     - cc-linux-build
     - cc-linux-livingroom
     - cc-mac-intel

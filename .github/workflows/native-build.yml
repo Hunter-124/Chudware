@@ -66,6 +66,8 @@ jobs:
             preset: linux-core
             test_mode: native
             arm_sdk: ''
+            arm_sdk_seconds: 0
+            arm_build_seconds: 0
             timeout_minutes: 180
             build_host: true
             host_build_dir: host/build-linux
@@ -78,6 +80,8 @@ jobs:
             preset: windows-occt
             test_mode: native
             arm_sdk: ''
+            arm_sdk_seconds: 0
+            arm_build_seconds: 0
             timeout_minutes: 180
             build_host: true
             host_build_dir: host/build-windows
@@ -102,6 +106,8 @@ jobs:
             preset: macos-x86_64
             test_mode: native
             arm_sdk: ''
+            arm_sdk_seconds: 0
+            arm_build_seconds: 0
             timeout_minutes: 180
             build_host: false
             host_build_dir: ''
@@ -405,13 +411,13 @@ jobs:
       # for the target architecture. Cached per runner account under its own
       # RUNNER_TOOL_CACHE (never an operator Homebrew, another product's
       # account or a shared prefix) and rebuilt only when the recipe changes.
-      # A cold build gets at most an hour; reuse takes seconds.
+      # A cold build gets the row's arm_sdk_seconds; reuse takes seconds.
       - name: Build or reuse the ${{ matrix.arm_sdk }} SDK (POSIX, bounded)
         if: matrix.arm_sdk != '' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          sdk="$(python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" 3600 \
+          sdk="$(python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" ${{ matrix.arm_sdk_seconds }} \
             scripts/build_arm_sdk.sh ${{ matrix.arm_sdk }})"
           echo "CHUDWARE_ARM_SDK=${sdk}" >> "$GITHUB_ENV"
           {
@@ -446,7 +452,7 @@ jobs:
           set -euo pipefail
           python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" 900 \
             cmake --preset ${{ matrix.preset }}
-          python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" 1800 \
+          python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" ${{ matrix.arm_build_seconds }} \
             cmake --build --preset ${{ matrix.preset }}
 
       # A cross build that silently produced host binaries would make the
@@ -584,17 +590,30 @@ jobs:
             exit 1
           fi
 
-          # All registered portable core tests run: 30 minutes per test and
-          # 60 minutes total, capped again by the shared job deadline.
+          # Measured on 1a14f8311 (cached SDK, tests from minute 8 of the
+          # job): the parallel phase took 752 s, then the RUN_SERIAL chain
+          # firmware/mesh/mesher_advanced/tet10_thin_wall/mesh_mechanism ran
+          # 3+3203+5667+444+545 s, so mesh_mechanism ended at 10745 s. Left:
+          # mesh_sector (25.7 s native, about 850 s at the ~33x emulation the
+          # serial mesh tests showed), import_roundtrip and platform_parity
+          # (a few seconds native each), about 11950 s in all. 210 minutes
+          # (12600 s) covers that; minute 8 + 210 stays inside the 237-minute
+          # job deadline, which still clips a slower (cold SDK) start. Every
+          # test still runs, RUN_SERIAL stays, two hours per test.
+          #
+          # mesher_advanced's mesh+solve wall ceilings (90 s, 270 s for the
+          # bore) measured 92-1636 s here with identical element counts and
+          # physics; scale them eightfold for this emulated step only.
+          export CHUDWARE_TEST_WALL_SCALE=8
           registered="$(ctest --test-dir "${tree}" -N | awk '/^Total Tests:/ {print $3}')"
 
           # A directory a timed-out (SIGKILLed) wrapper could not remove stays
           # in the job's own temp, which the runner wipes.
           export TMPDIR="${RUNNER_TEMP}"
           status=0
-          python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" 3600 \
+          python3 scripts/run_bounded.py --not-after "${CHUDWARE_JOB_DEADLINE}" 12600 \
             ctest --test-dir "${tree}" --output-on-failure --parallel "$(nproc)" \
-            --timeout 1800 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
+            --timeout 7200 2>&1 | tee "${log}" || status=${PIPESTATUS[0]}
 
           if grep -qE 'No tests were found' "${log}"; then
             echo "::error::ctest found no tests in ${tree}; the configure did not register the suite"
@@ -606,7 +625,7 @@ jobs:
             echo '## ctest — ${{ matrix.label }} (${{ matrix.preset }}, qemu-user)'
             echo ''
             if [ "${status}" -eq 124 ]; then
-              echo "**Incomplete: the run hit its 60-minute bound (or the job deadline) and was stopped.**"
+              echo "**Incomplete: the run hit its 210-minute bound (or the job deadline) and was stopped.**"
             fi
             echo "Ran ${ran:-an incomplete set} of ${registered} registered core tests as aarch64 under qemu-user on the x86_64 builder; emulation, not ARM hardware. No portable core test is excluded."
             echo '```text'
@@ -706,10 +725,10 @@ jobs:
             }
           done
           clang-tidy --version | head -n 1
-          run-clang-tidy -p build/linux-core -j 0 --quiet \
-            -source-filter='.*[/\\]core[/\\]'
-          run-clang-tidy -p ${{ matrix.host_build_dir }} -j 0 --quiet \
-            -source-filter='.*[/\\](host|core|platform)[/\\]'
+          run-clang-tidy -p build/linux-core -j 0 -quiet \
+            '.*[/\\]core[/\\]'
+          run-clang-tidy -p ${{ matrix.host_build_dir }} -j 0 -quiet \
+            '.*[/\\](host|core|platform)[/\\]'
 
       - name: ctest host GUI (Windows)
         if: matrix.build_host && runner.os == 'Windows'
@@ -855,8 +874,9 @@ jobs:
         include:
           # These same-account cross builds start only after native baselines.
           # The pinned, validated SDK lives in the account's RUNNER_TOOL_CACHE.
-          # A cold build and the core suite share one 87-minute hard deadline;
-          # insufficient budget fails 124 instead of skipping portable tests.
+          # A row's cold SDK, core build and (Linux) core suite share one hard
+          # deadline, timeout_minutes less three: 237 minutes on Linux, 327 on
+          # the Mac. Insufficient budget fails 124 instead of skipping tests.
           - label: Linux aarch64 (QEMU-emulated tests)
             runner_os: Linux
             runner_arch: X64
@@ -864,7 +884,9 @@ jobs:
             preset: linux-aarch64-qemu
             test_mode: qemu
             arm_sdk: linux-aarch64
-            timeout_minutes: 90
+            arm_sdk_seconds: 3600
+            arm_build_seconds: 1800
+            timeout_minutes: 240
             build_host: false
             host_build_dir: ''
           # arm64 macOS from the same Intel test account: AppleClang and the
@@ -873,7 +895,12 @@ jobs:
           # scripts/build_arm_sdk.sh builds into the account's own
           # RUNNER_TOOL_CACHE. The Intel Mac has no Rosetta and could not run
           # arm64 code anyway: the row checks the Mach-O architecture and
-          # executes nothing. 90 minutes hold a cold SDK plus the core build.
+          # executes nothing. It builds with the account's one compiler
+          # process. Cold OCCT measured about 1.45 s per Ninja action (1241 of
+          # 5476 in 30 minutes, about 133 minutes in all) and the cold native
+          # macos-x86_64 core build took 69 minutes, so the SDK gets 230
+          # minutes, the core build 120 and the row 330: a cold SDK plus the
+          # core is about 215 minutes; a cached SDK leaves only the core build.
           - label: macOS arm64 (cross-compiled, compile-only)
             runner_os: macOS
             runner_arch: X64
@@ -882,7 +909,9 @@ jobs:
             preset: macos-arm64-cross
             test_mode: compile-only
             arm_sdk: darwin-arm64
-            timeout_minutes: 90
+            arm_sdk_seconds: 13800
+            arm_build_seconds: 7200
+            timeout_minutes: 330
             build_host: false
             host_build_dir: ''
     steps: *build_steps

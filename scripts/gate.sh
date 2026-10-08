@@ -591,13 +591,21 @@ stage_pytest() {
 
         echo -n "  $dir ... "
         local rc=0
-        "$venv_py" -m pytest "$dir" -q --tb=no >"$out_file" 2>&1 || rc=$?
+        "$venv_py" -m pytest "$dir" -q --tb=short >"$out_file" 2>&1 || rc=$?
 
         # exit 5 = no tests collected in this unit — an environment SKIP, not a pass
         if [ "$rc" -eq 5 ]; then
             echo "no tests collected (SKIP)"
             skip_stage env "pytest/$dir" "no tests collected in $dir"
             continue
+        fi
+
+        # Runner temp is removed after the job. Preserve failures in unmetered
+        # CI logs, including collection crashes, without artifacts or a rerun.
+        if [ "$rc" -ne 0 ]; then
+            printf '\n--- pytest failure diagnostics: %s (exit %s) ---\n' "$dir" "$rc"
+            cat "$out_file"
+            printf '%s\n' '--- end pytest failure diagnostics ---'
         fi
 
         # Parse summary line: pytest outputs "N passed, M failed, K errors in Xs"

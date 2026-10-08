@@ -10,6 +10,10 @@
 # via the standard CMake config search. Shared objects resolve through the system
 # loader, so the DLL-staging helper is a no-op.
 #
+# Cross presets (linux-aarch64-qemu, macos-arm64-cross) take the same Linux/macOS
+# branch: their toolchain files (cmake/toolchains/) confine find_package to the
+# target-architecture OCCT that scripts/build_arm_sdk.sh builds into CHUDWARE_ARM_SDK.
+#
 # Pinned to OCCT 7.9.3 on Windows (vc14/x64, VS2022-ABI-compatible). NOT 7.9.x->8.0:
 # OCCT 8.0 changed BRepMesh_IncrementalMesh's API that our tessellation path depends
 # on. On Linux we accept the distro's 7.9.x (Fedora 44 ships 7.9.3).

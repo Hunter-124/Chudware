@@ -79,14 +79,14 @@ jobs:
             runner_os: Windows
             runner_arch: X64
             runner_label: cc-win-primary
-          # The private Chudware Mac TEST account (hidden ccci-chudware, no
-          # keychain, signing identity, sudo or GUI session), never the
-          # signer/operator lane that carries cc-mac-intel.
+          # The private lightweight gate account has its own runner slot,
+          # home and mutable state. Native/ARM qualification on the same Mac
+          # cannot hold these source audits; the signer lane stays separate.
           - label: macOS
             runner_os: macOS
             runner_arch: X64
-            runner_label: cc-mac-chudware-intel
-            ci_user: ccci-chudware
+            runner_label: cc-mac-chudware-gate-intel
+            ci_user: ccci-chudware-gate
     steps:
       # Before checkout: a missing or too-old Python otherwise surfaces as a
       # confusing traceback from an audit script rather than as the runner

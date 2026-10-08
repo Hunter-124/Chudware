@@ -44,6 +44,9 @@ Canonical guidance:
   - `prompt_preview.tool_catalog()` → `ai_tool_catalog` feeds Settings → AI → Tools.
   - `tools/gen_tool_panel_tables.py` bakes the offline fallback
     `host/src/ui/tool_panel_tables.h` + `.snapshot.json`.
+  - CAD guidance distinguishes feature rename from document naming and daemon live
+    mirroring from legacy handoff publication. `wait_job` is a standalone tool call;
+    eval's separate deadline includes bridged waits even when the solve remains running.
 - Local execution and non-turn helpers:
   - `agent_turn.run_turn` is the explicit-offline/test provider loop, entered via
     `chudcode_roles._run_offline` → `mission_dispatch.run_linear_role_turn` and gated by

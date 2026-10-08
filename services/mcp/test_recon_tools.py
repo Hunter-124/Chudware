@@ -8,9 +8,7 @@ against the STAGED libchudware:
     applied or reported as candidates) at >= 97% boolean match;
   - the recovered hole is EDITABLE: d6 -> d8 recompiles and the match drops
     (compare_parts proves the rebuild is live parametric geometry, not a dumb copy);
-  - a turned stepped shaft round-trips >= 95% via an analytic revolve;
-  - STL (facet) input completes HONESTLY: 0% match, the facet-yield note, every source
-    face reported unclaimed, and no features invented.
+  - a turned stepped shaft round-trips >= 95% via an analytic revolve.
 
 Skipped cleanly when the core library isn't built/staged.
 
@@ -218,40 +216,6 @@ def test_reverse_engineer_turned_shaft_via_revolve():
     bases = [f for f in re_res["features"] if f["role"] == "base"]
     assert len(bases) == 1 and bases[0]["type"] == "revolve", re_res["features"]
     assert re_res["rejected"] == [], re_res["rejected"]
-
-
-# ---------------------------------------------------------------- STL smoke
-
-
-def test_reverse_engineer_stl_smoke_is_honest():
-    """Facet (STL) input completes without inventing anything: ok:true with a 0% match,
-    the facet-yield note, EVERY source face reported unclaimed (the §3.4 rule: heuristics
-    never suppress the raw face list), and a clean 'no features rebuilt' summary instead
-    of a compare error."""
-    r, _ = _call("new_part", {"name": "re_stl"})
-    doc = r["doc_id"]
-    rb, _ = _call("add_features", {"doc_id": doc, "ops": [
-        cb.feat("box", "B", {"length": cb.dim(30), "width": cb.dim(20),
-                             "height": cb.dim(10)})]})
-    assert rb["ok"], rb
-    path = _export(doc, "stl")
-    try:
-        re_res, _ = _call("reverse_engineer", {"source": path})
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-    assert re_res["ok"], re_res  # honest completion, not an error
-    assert re_res["match_pct"] == 0.0, re_res
-    notes = " ".join(re_res["notes"])
-    assert "facet geometry: expect low deterministic yield" in notes, notes
-    assert re_res["features"] == [], re_res["features"]
-    assert "no features rebuilt" in re_res["summary"], re_res["summary"]
-    rec = re_res["recognition"]
-    assert rec["face_count"] > 0, rec
-    assert len(rec["unclaimed"]) == rec["face_count"], (len(rec["unclaimed"]),
-                                                        rec["face_count"])
 
 
 if __name__ == "__main__":

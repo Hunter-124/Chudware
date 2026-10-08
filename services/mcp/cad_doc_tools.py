@@ -3624,7 +3624,7 @@ def _normalize_op_target(op: dict, kind: str, notes: list) -> dict:
             return out
     if kind == "rename":
         # {"op":"rename","name":"aa_battery_cassette"} with no target is a model naming the
-        # PART (live c245 batch head); session.cpp only answers «rename: no feature».
+        # PART (live c245 and c247 batch heads); session.cpp only answers «rename: no feature».
         raise ValueError(
             f'rename renames a FEATURE by id: {{"op":"rename","id":"f1","name":'
             f'"{op.get("name") or "NewName"}"}} (feature ids come from get_part(summary=true) '
@@ -3633,7 +3633,8 @@ def _normalize_op_target(op: dict, kind: str, notes: list) -> dict:
             f"that renames the open part/document: its name is set when it is created — "
             f'new_part(name="…"), or a leading {{"op":"new_part","name":"…"}} in a batch '
             f'that has no doc yet — and save_part(path="<name>.step+") writes the file '
-            f"under the name you want.")
+            f"under the name you want. An already-saved .step+ can be copied under a new "
+            f"display name with relocate_native_files.")
     return op
 
 
@@ -7546,6 +7547,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             rib, split, thread, text, import, script, plane, axis, point, csys, sketch3d, …
           WRONG: {"op":"box",…} / {"op":"sketch",…} / {"op":"extrude",…} / {"op":"cylinder",…}
           RIGHT: {"op":"add_feature","feature":{"type":"box"|"cylinder"|"sketch"|…, …}}
+          rename relabels ONE FEATURE and needs its id: {"op":"rename","id":"f1","name":"Base"}.
+            No op renames the part/document: name it at creation (new_part(name="…")) and
+            name its file with save_part(path="<name>.step+").
           A leading {"op":"new_part","name":…} (or bare {"type":"new_part",…}) is also
             accepted as a convenience: it mints the document and the rest of the batch
             builds into it, so you can create-and-build in one call. Everywhere else
@@ -8462,14 +8466,31 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def show_in_app(doc_id: Optional[str] = None) -> str:
-        """Push the current part to the OPEN Chudware desktop app's 3D viewport so the user can see it.
+        """Make sure the OPEN Chudware desktop app can show the part to the user.
 
-        Modeling tools already do this automatically after each change; call this to force a refresh
-        (e.g. after switching the current part). No-op effect if the desktop app isn't running — the
-        part is written to the handoff folder and shown whenever the app next opens.
+        Daemon mode (the default): the app shares the engine's documents live — every open
+        part is mirrored in its own tab and redrawn after each change, so there is nothing to
+        push. The reply is {ok, doc_id, name, revision, live: true}. It does not switch the
+        user's active tab: the app reveals an agent part's tab by itself, waits while the user
+        is mid-edit, and keeps a tab the user closed closed.
+        Legacy in-process engine (CHUDWARE_ENGINE_DAEMON=0): writes the part to the handoff
+        folder the app loads — shown whenever the app next opens if it is not running now.
         """
         try:
             d = _doc(doc_id)
+            if cb.active_daemon_mode():
+                # The GUI mirrors daemon docs from hostd's doc.opened/doc.changed events and
+                # ignores handoff files, so _publish_current deliberately does nothing here;
+                # reporting that as "could not publish" failed a doc the user could see (c247).
+                entry = next((e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                              if isinstance(e, dict) and e.get("doc_id") == d), None)
+                if entry is None:
+                    return _dumps({"ok": False, "doc_id": d,
+                                   "error": f"{d} is not open in the shared engine"})
+                return _dumps({"ok": True, "doc_id": d, "name": entry.get("name"),
+                               "revision": entry.get("revision"), "live": True,
+                               "note": "The desktop app mirrors this document live; "
+                                       "no publish is needed."})
             pub = _publish_current(d)
             if not pub:
                 return _dumps({"ok": False, "error": "could not publish (no geometry yet?)"})
@@ -8858,6 +8879,12 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
         Waiting does not cancel the underlying job. A host-supplied cancel callable
         interrupts only this wait; call wait_job again to retrieve its eventual result.
+        timeout_s is clamped to 0..900 s; still_running:true means the job is still going.
+
+        Call wait_job as its OWN tool call, not from eval code. An eval cell's timeout counts
+        time spent inside tool calls (and the runtime may clamp the timeout you ask for), so
+        a long wait interrupts the cell before the job finishes. The finished result stays
+        retrievable (get_job(job_id)), so read it in a short eval afterwards.
         """
         timeout_s = max(0.0, min(900.0, timeout_s))
         poll_s = max(0.5, min(30.0, poll_s))

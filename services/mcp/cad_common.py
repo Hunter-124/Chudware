@@ -7360,32 +7360,19 @@ def _resolve_face_points(doc_id: str, query: Union[str, dict]) -> list:
 
 
 def _merge_face_sets(faces: list) -> dict:
-    """Merge multiple doc_face_points sets into ONE faceset dict for a single load/BC.
+    """One boundary/load over the union of the resolved CAD faces.
 
-    Points concatenate. Geometry hints survive only where they stay valid for EVERY
-    merged face: face_normal/perp_tol from the first set (matches of one query share
-    orientation), and the analytic ``surface`` descriptor only when ALL sets carry an
-    IDENTICAL one (e.g. a hole split into two half-cylinder faces at the seam — the same
-    cylinder), because keeping one face's surface would make the tight distance-to-surface
-    test silently reject every node of the other faces. tol_mm takes the MAX of the sets
-    so the trimmed-extent proximity test still bridges each face's sample spacing."""
-    merged: dict = {"points": []}
-    for f in faces:
-        merged["points"].extend(f.get("points", []))
+    A singleton keeps the terminal native encoding. Multiple faces retain each
+    complete point cloud and its own tolerances, normal and analytic surface in
+    ``facesets``; concatenating clouds loses heterogeneous oracle hints and can
+    select geometry between the faces. Native membership/quadrature deduplicates
+    the union, so the authored force is applied once, not once per child.
+    """
     if not faces:
-        return merged
-    first = faces[0]
-    tols = [f["tol_mm"] for f in faces if "tol_mm" in f]
-    if tols:
-        merged["tol_mm"] = max(tols)
-    if "face_normal" in first:
-        merged["face_normal"] = first["face_normal"]
-    if "perp_tol_mm" in first:
-        merged["perp_tol_mm"] = first["perp_tol_mm"]
-    surfs = [f.get("surface") for f in faces]
-    if surfs[0] is not None and all(s == surfs[0] for s in surfs):
-        merged["surface"] = surfs[0]
-    return merged
+        raise ValueError("A simulation boundary requires at least one resolved face.")
+    if len(faces) == 1:
+        return dict(faces[0])
+    return {"facesets": [dict(face) for face in faces]}
 
 
 def _persist_study(doc_id: str, record: dict) -> Optional[str]:

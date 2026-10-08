@@ -1159,8 +1159,8 @@ def register_recon_tools(mcp: FastMCP) -> None:
                     return _dumps({"ok": False, "error": f"import of {path!r} produced no "
                                    "document"})
                 if is_mesh_src:
-                    notes.append("facet geometry: expect low deterministic yield (mesh "
-                                 "facets rarely satisfy the exact-surface passes)")
+                    notes.append("mesh input: coplanar regions may recover planar features; "
+                                 "curved facets do not recover exact analytic surfaces")
             else:
                 ref_doc = _doc(src)
 

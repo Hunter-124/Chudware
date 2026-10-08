@@ -45,6 +45,13 @@ Canonical guidance:
 - `services/mcp/cad_common.py` — doc registry/handoff, `_publish_current`, autosave (daemon
   mode: hostd is the only autosave authority), `save_touched_docs`, durable jobs;
   `cad_guide.py` `cad_guide_text(topic)` backs the `cad_guide` tool.
+  - `show_in_app` in daemon mode confirms the document is open and returns `live:true`;
+    it does not publish a handoff file or force the user's active tab. Legacy mode still
+    writes the handoff.
+  - Call `wait_job` directly, not inside eval: the cell deadline includes the wait and can
+    expire before the job finishes. Cancelling the wait leaves the job/result retrievable.
+    `add_features` rename requires a feature id; document/file names use `new_part`,
+    `save_part`, or a saved-native copy through `relocate_native_files`.
 - Per-family modules. `cad_tools.py`, `ecad_tools.py` and `reveng_tools.py` are
   compat facades for importers only. New tools go to the matching family module, never
   into a facade.
@@ -53,6 +60,9 @@ Canonical guidance:
   - ECAD: `ecad_{sch,pcb,sim,qa}_tools.py` over `ecad_common.py`. ECAD docs live in
     `core/ecad`; the facade is RPC-backed.
   - Reverse engineering: `reveng_{session,build}_tools.py` over `reveng_common.py`.
+    `recon_tools` recognizes imported native topology: coplanar closed-mesh regions
+    can recover planar features, while curved facets do not recover exact analytic
+    surfaces. Do not assume every STL import has zero reconstruction yield.
   - Others: `gsl_tools`, `recon_tools`, `intake_tools`, `cam_tools`, `cam_audit`,
     `print_tools` (`slice_part`, print media), `mfg_tools`/`mfg_plan_tools`,
     `topology_tools`, `sim_evidence_tools`, `fs_tools` (`fs_*`, `run_shell`), `plm_tools`,

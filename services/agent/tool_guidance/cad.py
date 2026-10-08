@@ -180,7 +180,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Batch related ops in ONE call and read the reply's interpreted, per-feature "
             "status and changes fields plus its overlap and attachment warnings "
-            "(floating/overhanging features) before anything else; a heavy op may return {job_id} — poll get_job."
+            "(floating/overhanging features) before anything else; a heavy op may return {job_id} — poll get_job. "
+            "op rename relabels a FEATURE by id; no op renames the part — name it in "
+            "new_part(name=…) and its file in save_part(path=…)."
         ),
     },
     "add_gdt": {
@@ -428,7 +430,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Block on a get_job/sim job_id until it finishes (timeout_s ≤ 900, default "
             "120) instead of sleep/ps loops or repeated get_job polls. still_running:true "
-            "means call it again; waiting never cancels the job (sim_cancel does)."
+            "means call it again; waiting never cancels the job (sim_cancel does). Call it "
+            "directly, never inside eval: the cell timeout counts the wait and can expire "
+            "before the job finishes. Retrieve its result with get_job, then use a short eval."
         ),
         "timeout_s": 960,
     },
@@ -821,8 +825,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "show_in_app": {
         "prompt_note": (
-            "Force-push the doc to the open desktop viewport; modeling tools already do "
-            "this per change — a silent no-op when the app isn't running."
+            "Daemon mode: the open app already mirrors every part live (reply live:true); "
+            "it cannot switch the user's active tab. Legacy engine: writes the handoff file."
         ),
     },
     "sketch3d_add_constraints": {

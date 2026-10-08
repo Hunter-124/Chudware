@@ -1,0 +1,41 @@
+---
+title: Piping, hydraulics, and process equipment
+description: Route pipe, size lines, pumps, and motors, design and simulate hydraulic circuits, run internal-flow CFD, and size vessels and ducts.
+section: Simulate
+order: 65
+---
+## Start a pipe network
+
+Open the Simulate workspace and select the **Piping** ribbon tab. Choose **New Network**, then set the design pressure and temperature. These are the conditions that the code checks use. Every result is saved in the part as a study, so the network, routes, and checks reopen with the file.
+
+## Route pipe around equipment
+
+Choose **Route Pipe**. Set the start and end points and directions by typing them or by picking nozzle faces. Then set the nominal size, schedule, material, and clearance. The router treats every solid body in the model as an obstacle. It returns an orthogonal path with long-radius elbows at each bend, the total length, and the minimum clearance it achieved. If no path exists it says so, and the model is not changed.
+
+For manual layout, **Draw Pipe** places connected runs on a working plane, with grid/pipe snapping and risers; the viewport shows shaded pipes and bends. **Fittings** adds inline fittings and edits their loss coefficient using correlations, constant K, 2-K/3-K or Cv models, with a K(Re) preview. **Compute K from CFD** calculates a curve to inspect and apply; elbows supply their bore automatically, while other fittings need a fluid-volume body or STL and inlet/outlet definitions. Re-solve to colour pipes by pressure or velocity.
+
+## Solve, check, and take off material
+
+- **Solve** runs a steady 1-D network solve for liquids or gases. It uses Darcy–Weisbach friction, fitting losses, and pump curves, and reports flow, velocity, and pressure for every line and node.
+- **Spec Check** checks wall thickness against ASME B31.3 (eq. 3a, including corrosion allowance and mill tolerance). It also checks flange class ratings against ASME B16.5 and reports the maximum support span. A failing line names a schedule that would pass.
+- **BOM** lists the lines, pipe and fitting quantities with their masses, and shop and field welds. Spools are split at flanges and at shipping length.
+
+## Simulate flow through a component
+
+Use **Internal CFD** for a fitting, manifold, or bend where the 1-D loss coefficients are not enough. It runs a lattice-Boltzmann solve through the pipe bore with a velocity inlet and a pressure outlet. It reports the pressure drop, the Reynolds number and flow regime, and a pressure profile along the run, next to the 1-D Darcy estimate for comparison. Read the caveats in the result before you use the number.
+
+## Size vessels and ducts
+
+**Vessel** sizes a cylindrical pressure vessel to ASME VIII-1 (UG-27 shell, UG-32 heads). It reports the required and nominal thicknesses, MAWP, the hydrotest pressure, volume, and empty, operating, and full masses. **Duct Sizing** sizes a branched duct tree by the equal-friction method and reports the critical path and the fan static pressure.
+
+## Design hydraulic circuits
+
+The **Hydraulics** tab, also in the Simulate workspace, builds an ISO 1219 circuit from pumps, valves, cylinders, motors, accumulators, and hoses, and shows it as a schematic. Use the sizing forms to choose cylinder bores, pump and hydraulic-motor displacements, and the electric motor that drives the pump (IEC or NEMA rating and frame, efficiency class, and full-load current). **Simulate** runs a transient solve of the circuit against a valve schedule and actuator loads. It plots node pressures and actuator motion, and reports peak pressure, stroke times, efficiency, and heat. **To Piping** turns the rigid lines into a pipe network.
+
+Use **Pump Drive** on the Piping tab to size the motor for a centrifugal pump at its solved duty point.
+
+## Working with an agent
+
+Agents work in the same engine through the `piping-design` and `hydraulic-design` skills, and they write to the same saved studies. Anything an agent leaves in the part appears in the Piping and Hydraulics tabs, and an agent can pick up a network or circuit you started.
+
+Code checks are design aids. A qualified engineer remains responsible for the design basis, the code edition of record, and final sign-off.

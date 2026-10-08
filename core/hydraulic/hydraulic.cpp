@@ -7,8 +7,11 @@
 
 #include "hydraulic/bom.h"
 #include "hydraulic/handoff.h"
+#include "hydraulic/motor.h"
 #include "hydraulic/schema.h"
+#include "hydraulic/sim.h"
 #include "hydraulic/solve.h"
+#include "hydraulic/templates.h"
 #include "piping/simhandoff.h"
 #include "piping/solve.h"
 
@@ -116,17 +119,9 @@ ojson independent_line_margins(double supply_pressure_bar,
 
 ojson m_new(const ojson& params) {
     const ojson name = get(params, "name");
-    const ojson doc = new_hydraulic(name.is_string() ? name.get<std::string>()
-                                                     : "Hydraulic Circuit");
-    ojson out = ojson::object();
-    out["ok"] = true;
-    out["doc"] = doc;
-    out["warnings"] = ojson::array();
-    out["hint"] = "Use hydraulic_add_component to add ISO 1219 components.";
-    out["next_actions"] = ojson::array(
-        {"call hydraulic_add_component to add pumps, cylinders, valves, etc.",
-         "call hydraulic_size_cylinder / hydraulic_size_pump to size components"});
-    return out;
+    const ojson template_id = get(params, "template");
+    return new_from_template(name.is_string() ? name.get<std::string>() : "Hydraulic Circuit",
+                             template_id.is_null() ? "blank" : py_str(template_id));
 }
 
 ojson m_add_component(const ojson& params) {
@@ -603,6 +598,10 @@ bool call(const std::string& method, const ojson& params, ojson& result) {
         result = m_new(params);
         return true;
     }
+    if (method == "hydraulic_templates") {
+        result = hydraulic_templates();
+        return true;
+    }
     if (method == "hydraulic_add_component") {
         result = m_add_component(params);
         return true;
@@ -632,9 +631,16 @@ bool call(const std::string& method, const ojson& params, ojson& result) {
                             num(get(params, "fluid_sg"), 0.87));
         return true;
     }
-    if (method == "hydraulic_fmu_simulate") {
-        result = fmu_simulate(get(params, "doc"), get(params, "fmu_path"),
-                              num(get(params, "stop_time"), 10.0));
+    if (method == "hydraulic_simulate") {
+        result = simulate(params);
+        return true;
+    }
+    if (method == "hydraulic_size_motor") {
+        result = size_motor(params);
+        return true;
+    }
+    if (method == "pump_drive_size") {
+        result = pump_drive_size(params);
         return true;
     }
     if (method == "hydraulic_bom") {

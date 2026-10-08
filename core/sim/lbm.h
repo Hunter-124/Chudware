@@ -22,6 +22,7 @@
 // reproduce engine/sim/lbm.py's _EQ / _W / _OPP exactly (see lbm.cpp).
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -68,6 +69,8 @@ struct LbmResult {
     // area collapses is that a thin feature falls below the voxel pitch. Surfaced so the caller can
     // warn instead of silently trusting an unresolved solve.
     double voxel_mm = 0.0;          // grid pitch (mm)
+    // Grid corner in the rotated LBM frame, mm; supplied by run_wind_tunnel.
+    std::array<double, 3> grid_origin_mm{0.0, 0.0, 0.0};
     double ref_length_mm = 0.0;     // characteristic length used for Reynolds (longest part span)
     double min_feature_mm = 0.0;    // smallest part bbox dimension (mm)
     int min_feature_voxels = 0;     // how many voxels span that smallest dimension
@@ -88,11 +91,12 @@ struct LbmResult {
 // Runs macros -> feq -> Smagorinsky-BGK collision -> stream -> inlet -> outlet ->
 // specular lateral slip -> bounce-back -> zero-solid, then momentum-exchange
 // drag/Cd. Never throws; a bad mask/params returns ok=false with an error string.
-// `on_progress(step, n_steps)` (optional) is invoked at the convergence checkpoints and
-// once with (n_steps,n_steps) after a successful early stop so job progress reaches 100%.
-// `should_cancel()` (optional) is polled at the same checkpoints; when it returns true the
-// run stops early with ok=false, error "cancelled by sim_cancel at step ...", and steps_run =
-// the steps completed so far.
+// `on_progress(step, n_steps)` (optional) is invoked at start, approximately every
+// second (at completed CPU steps), and at completion; progress does not change
+// convergence sampling. A successful early stop finishes with (n_steps,n_steps).
+// `should_cancel()` (optional) is polled at the convergence checkpoints; when true
+// the run returns ok=false, error "cancelled by sim_cancel at step ...", and the
+// actual completed step count in steps_run.
 LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
                   const LbmParams& p, int n_steps,
                   const std::function<void(int, int)>& on_progress = {},

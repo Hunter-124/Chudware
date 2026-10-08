@@ -16,9 +16,9 @@ namespace chudware::hydraulic {
 
 // Methods: hydraulic_new, hydraulic_add_component, hydraulic_add_hose,
 // hydraulic_size_cylinder, hydraulic_size_pump, hydraulic_size_accumulator,
-// hydraulic_valve_flow, hydraulic_fmu_simulate, hydraulic_bom,
-// hydraulic_piping_handoff, hydraulic_verify_piping, hydraulic_fea_handoff,
-// hydraulic_verify_fea.
+// hydraulic_valve_flow, hydraulic_simulate (sim.h), hydraulic_size_motor and
+// pump_drive_size (motor.h), hydraulic_bom, hydraulic_piping_handoff,
+// hydraulic_verify_piping, hydraulic_fea_handoff, hydraulic_verify_fea.
 bool call(const std::string& method, const pyutil::ojson& params, pyutil::ojson& result);
 
 }  // namespace chudware::hydraulic

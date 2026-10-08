@@ -138,11 +138,28 @@ std::map<TriFaceKey, int> face_owner_counts(const std::vector<int>& tets, int st
 
 int selected_exterior_faces(const std::vector<int>& tets, int stride,
                             const std::map<TriFaceKey, int>& owners,
-                            const std::unordered_set<int>& nodes) {
+                            const std::unordered_set<int>& nodes,
+                            const std::vector<std::size_t>& exterior_face_ids) {
+    const std::size_t n_elems = tets.size() / static_cast<std::size_t>(stride);
+    if (!exterior_face_ids.empty()) {
+        if (!std::is_sorted(exterior_face_ids.begin(), exterior_face_ids.end()) ||
+            std::adjacent_find(exterior_face_ids.begin(), exterior_face_ids.end()) !=
+                exterior_face_ids.end())
+            return -1;
+        for (const std::size_t id : exterior_face_ids) {
+            if (id / 4 >= n_elems) return -1;
+            const int* el = &tets[(id / 4) * static_cast<std::size_t>(stride)];
+            const FaceTab& ft = kTetFaces[id % 4];
+            const auto own = owners.find(tri_face_key(el, ft));
+            if (own == owners.end() || own->second != 1) return -1;
+            for (int i = 0; i < 3; ++i)
+                if (!nodes.count(el[ft.corner[i]])) return -1;
+        }
+        return static_cast<int>(exterior_face_ids.size());
+    }
     int selected = 0;
-    const int n_elems = static_cast<int>(tets.size() / static_cast<size_t>(stride));
-    for (int e = 0; e < n_elems; ++e) {
-        const int* el = &tets[static_cast<size_t>(e) * stride];
+    for (std::size_t e = 0; e < n_elems; ++e) {
+        const int* el = &tets[e * static_cast<std::size_t>(stride)];
         for (const FaceTab& ft : kTetFaces) {
             const auto own = owners.find(tri_face_key(el, ft));
             if (own == owners.end() || own->second != 1) continue;
@@ -276,9 +293,9 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
                 res.error = "fea_thermal: flux node index out of range";
                 return res;
             }
-        if (!fl.nodes.empty()) {
+        if (!fl.nodes.empty() || !fl.exterior_face_ids.empty()) {
             const std::unordered_set<int> ns(fl.nodes.begin(), fl.nodes.end());
-            if (selected_exterior_faces(tets, stride, face_owners, ns) == 0) {
+            if (selected_exterior_faces(tets, stride, face_owners, ns, fl.exterior_face_ids) <= 0) {
                 res.error = "fea_thermal: flux selection contains no exterior mesh face";
                 return res;
             }
@@ -299,7 +316,7 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
             return res;
         }
         const std::unordered_set<int> ns(cv.nodes.begin(), cv.nodes.end());
-        if (selected_exterior_faces(tets, stride, face_owners, ns) == 0) {
+        if (selected_exterior_faces(tets, stride, face_owners, ns, cv.exterior_face_ids) <= 0) {
             res.error = "fea_thermal: convection selection contains no exterior mesh face";
             return res;
         }
@@ -341,14 +358,7 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
     // ── Singularity guard: a floating datum. A pure-Neumann problem (no Dirichlet node AND
     // no convection face) has no unique steady temperature — reject it up front. (The
     // advisor precheck lints this before dispatch; this is the belt-and-suspenders backstop.)
-    bool has_convection = false;
-    for (const auto& cv : convections) {
-        const std::unordered_set<int> ns(cv.nodes.begin(), cv.nodes.end());
-        if (selected_exterior_faces(tets, stride, face_owners, ns) > 0) {
-            has_convection = true;
-            break;
-        }
-    }
+    const bool has_convection = !convections.empty();  // every film was validated above
     if (fixed_nodes.empty() && !has_convection) {
         res.error = "fea_thermal: no fixed-temperature node and no convection — singular "
                     "(temperature datum undefined). Add a fixed temperature or a convection BC.";
@@ -472,25 +482,35 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
     // all inside the target node set. We add:
     //   flux:        f_i += q · ∫N_i dS
     //   convection:  K_ij += h · ∫N_i N_j dS ; f_i += h·T_amb · ∫N_i dS
-    auto surface_pass = [&](const std::unordered_set<int>& node_set, bool do_flux,
+    auto surface_pass = [&](const std::unordered_set<int>& node_set,
+                            const std::vector<std::size_t>& exterior_face_ids, bool do_flux,
                             double q, bool do_conv, double h, double t_amb) {
-        for (int e = 0; e < n_elems; ++e) {
-            if ((e & 255) == 0 && cancelled()) return true;
-            const int* el = &tets[e * stride];
-            for (int fidx = 0; fidx < 4; ++fidx) {
-                const auto own =
-                    face_owners.find(tri_face_key(el, kTetFaces[fidx]));
-                if (own == face_owners.end() || own->second != 1) continue;
+        const bool filtered = !exterior_face_ids.empty();
+        const std::size_t visits = filtered ? exterior_face_ids.size() :
+                                             static_cast<std::size_t>(n_elems);
+        for (std::size_t visit = 0; visit < visits; ++visit) {
+            if ((visit & 255) == 0 && cancelled()) return true;
+            const std::size_t e = filtered ? exterior_face_ids[visit] / 4 : visit;
+            const int first_face = filtered ? static_cast<int>(exterior_face_ids[visit] % 4) : 0;
+            const int end_face = filtered ? first_face + 1 : 4;
+            const int* el = &tets[e * static_cast<std::size_t>(stride)];
+            for (int fidx = first_face; fidx < end_face; ++fidx) {
+                if (!filtered) {
+                    const auto own = face_owners.find(tri_face_key(el, kTetFaces[fidx]));
+                    if (own == face_owners.end() || own->second != 1) continue;
+                }
                 const FaceTab& ft = kTetFaces[fidx];
                 int fn[6] = {el[ft.corner[0]], el[ft.corner[1]],
                              el[ft.corner[2]], -1, -1, -1};
                 bool all_in = true;
-                for (int i = 0; i < 3; ++i)
-                    if (!node_set.count(fn[i])) {
-                        all_in = false;
-                        break;
-                    }
-                if (!all_in) continue;
+                if (!filtered) {
+                    for (int i = 0; i < 3; ++i)
+                        if (!node_set.count(fn[i])) {
+                            all_in = false;
+                            break;
+                        }
+                    if (!all_in) continue;
+                }
                 if (tet10)
                     for (int i = 0; i < 3; ++i) fn[3 + i] = el[ft.mid[i]];
                 const int nfn = tet10 ? 6 : 3;
@@ -523,16 +543,18 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
     // study carried more than one flux load; see the C3 defect note in the header).
     for (const auto& fl : fluxes) {
         if (fl.nodes.empty() || fl.q == 0.0) continue;
-        std::unordered_set<int> fs(fl.nodes.begin(), fl.nodes.end());
-        if (!surface_pass(fs, /*do_flux*/ true, fl.q, /*do_conv*/ false,
+        std::unordered_set<int> fs;
+        if (fl.exterior_face_ids.empty()) fs.insert(fl.nodes.begin(), fl.nodes.end());
+        if (!surface_pass(fs, fl.exterior_face_ids, /*do_flux*/ true, fl.q, /*do_conv*/ false,
                           0.0, 0.0)) {
             res.error = "fea_thermal: invalid exterior surface element";
             return res;
         }
     }
     for (const auto& cv : convections) {
-        std::unordered_set<int> cs(cv.nodes.begin(), cv.nodes.end());
-        if (!surface_pass(cs, /*do_flux*/ false, 0.0, /*do_conv*/ true,
+        std::unordered_set<int> cs;
+        if (cv.exterior_face_ids.empty()) cs.insert(cv.nodes.begin(), cv.nodes.end());
+        if (!surface_pass(cs, cv.exterior_face_ids, /*do_flux*/ false, 0.0, /*do_conv*/ true,
                           cv.h, cv.t_amb)) {
             res.error = "fea_thermal: invalid exterior surface element";
             return res;
@@ -886,9 +908,9 @@ ThermalTransientResult fea_thermal_transient(
     };
     const auto face_owners = face_owner_counts(tets, stride);
     for (const auto& fl : fluxes) {
-        if (fl.nodes.empty()) continue;
+        if (fl.nodes.empty() && fl.exterior_face_ids.empty()) continue;
         const std::unordered_set<int> ns(fl.nodes.begin(), fl.nodes.end());
-        if (selected_exterior_faces(tets, stride, face_owners, ns) == 0) {
+        if (selected_exterior_faces(tets, stride, face_owners, ns, fl.exterior_face_ids) <= 0) {
             res.error =
                 "fea_thermal_transient: flux selection contains no exterior mesh face";
             return res;
@@ -896,7 +918,7 @@ ThermalTransientResult fea_thermal_transient(
     }
     for (const auto& cv : convections) {
         const std::unordered_set<int> ns(cv.nodes.begin(), cv.nodes.end());
-        if (selected_exterior_faces(tets, stride, face_owners, ns) == 0) {
+        if (selected_exterior_faces(tets, stride, face_owners, ns, cv.exterior_face_ids) <= 0) {
             res.error =
                 "fea_thermal_transient: convection selection contains no exterior mesh face";
             return res;
@@ -1060,13 +1082,22 @@ ThermalTransientResult fea_thermal_transient(
         return true;
     };
     bool surface_valid = true;
-    auto surface_flux_vec = [&](const std::vector<int>& nodes, double q) {
+    auto surface_flux_vec = [&](const std::vector<int>& nodes, double q,
+                                const std::vector<std::size_t>& exterior_face_ids) {
         Eigen::VectorXd fv = Eigen::VectorXd::Zero(n_free);
-        const std::unordered_set<int> node_set(nodes.begin(), nodes.end());
-        for (int e = 0; e < n_elems && surface_valid; ++e) {
-            const int* el = &tets[static_cast<size_t>(e) * stride];
-            for (int fidx = 0; fidx < 4; ++fidx) {
-                if (!selected_face(el, fidx, node_set)) continue;
+        const bool filtered = !exterior_face_ids.empty();
+        std::unordered_set<int> node_set;
+        if (!filtered) node_set.insert(nodes.begin(), nodes.end());
+        const std::size_t visits = filtered ? exterior_face_ids.size() :
+                                             static_cast<std::size_t>(n_elems);
+        for (std::size_t visit = 0; visit < visits && surface_valid; ++visit) {
+            if ((visit & 255) == 0 && cancelled()) return fv;
+            const std::size_t e = filtered ? exterior_face_ids[visit] / 4 : visit;
+            const int first_face = filtered ? static_cast<int>(exterior_face_ids[visit] % 4) : 0;
+            const int end_face = filtered ? first_face + 1 : 4;
+            const int* el = &tets[e * static_cast<std::size_t>(stride)];
+            for (int fidx = first_face; fidx < end_face; ++fidx) {
+                if (!filtered && !selected_face(el, fidx, node_set)) continue;
                 const FaceTab& ft = kTetFaces[fidx];
                 int fn[6] = {el[ft.corner[0]], el[ft.corner[1]],
                              el[ft.corner[2]], -1, -1, -1};
@@ -1092,11 +1123,19 @@ ThermalTransientResult fea_thermal_transient(
     };
 
     for (const auto& cv : convections) {
-        const std::unordered_set<int> nodes(cv.nodes.begin(), cv.nodes.end());
-        for (int e = 0; e < n_elems; ++e) {
-            const int* el = &tets[static_cast<size_t>(e) * stride];
-            for (int fidx = 0; fidx < 4; ++fidx) {
-                if (!selected_face(el, fidx, nodes)) continue;
+        const bool filtered = !cv.exterior_face_ids.empty();
+        std::unordered_set<int> nodes;
+        if (!filtered) nodes.insert(cv.nodes.begin(), cv.nodes.end());
+        const std::size_t visits = filtered ? cv.exterior_face_ids.size() :
+                                             static_cast<std::size_t>(n_elems);
+        for (std::size_t visit = 0; visit < visits; ++visit) {
+            if ((visit & 255) == 0 && cancelled()) return cancel_result();
+            const std::size_t e = filtered ? cv.exterior_face_ids[visit] / 4 : visit;
+            const int first_face = filtered ? static_cast<int>(cv.exterior_face_ids[visit] % 4) : 0;
+            const int end_face = filtered ? first_face + 1 : 4;
+            const int* el = &tets[e * static_cast<std::size_t>(stride)];
+            for (int fidx = first_face; fidx < end_face; ++fidx) {
+                if (!filtered && !selected_face(el, fidx, nodes)) continue;
                 const FaceTab& ft = kTetFaces[fidx];
                 int fn[6] = {el[ft.corner[0]], el[ft.corner[1]],
                              el[ft.corner[2]], -1, -1, -1};
@@ -1129,7 +1168,7 @@ ThermalTransientResult fea_thermal_transient(
         if (fl.nodes.empty() || fl.q == 0.0)
             flux_vecs.emplace_back(Eigen::VectorXd::Zero(n_free));
         else
-            flux_vecs.push_back(surface_flux_vec(fl.nodes, fl.q));
+            flux_vecs.push_back(surface_flux_vec(fl.nodes, fl.q, fl.exterior_face_ids));
     }
     if (!surface_valid) {
         res.error = "fea_thermal_transient: invalid exterior surface element";

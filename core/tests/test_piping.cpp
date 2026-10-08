@@ -11,17 +11,21 @@
 
 #define _USE_MATH_DEFINES
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <map>
 #include <limits>
 #include <vector>
 
+#include "piping/bom.h"
 #include "piping/catalog.h"
 #include "piping/cfd.h"
 #include "piping/fluid_properties.h"
 #include "piping/piping.h"
+#include "piping/route.h"
 #include "piping/schema.h"
 #include "piping/solve.h"
+#include "piping/spec.h"
 
 using namespace chudware::piping;
 using chudware::pyutil::ojson;
@@ -177,7 +181,7 @@ TEST_CASE("schema: validators") {
     ojson ftdoc = doc;
     ftdoc["fittings"].push_back(
         new_fitting("ft1", "elbow", 2, ojson::array({1000, 0, 0}), "40", "Fitting",
-                    ojson::parse(R"({"angle": 30})")));
+                    ojson::parse(R"({"angle": 180})")));
     errs = validate_piping(ftdoc);
     CHECK(std::find_if(errs.begin(), errs.end(), [](const std::string& e) {
         return e.find("ELBOW_ANGLES") != std::string::npos;
@@ -830,4 +834,630 @@ TEST_CASE("dispatch: piping_fluid + piping_report + verify_cfd envelopes") {
     REQUIRE(call("piping_verify_cfd",
                  ojson::object({{"solve_result", ojson::object({{"ok", false}})}}), result));
     CHECK(result["reason"] == "cfd_result is required");
+}
+
+// ── routing, B31.3 spec check, BOM (contracts/piping_schema.md §8) ──────────
+
+using Mat3 = std::array<std::array<double, 3>, 3>;
+using P3 = std::array<double, 3>;
+
+// build123d Rot(rx, ry, rz) (intrinsic XYZ) = Rx·Ry·Rz, degrees — the
+// fitting `orient` convention of services/piping/threed.py _place.
+static Mat3 rot_xyz(double ax, double ay, double az) {
+    const double k = M_PI / 180.0;
+    const double ca = std::cos(ax * k), sa = std::sin(ax * k);
+    const double cb = std::cos(ay * k), sb = std::sin(ay * k);
+    const double cc = std::cos(az * k), sc = std::sin(az * k);
+    const Mat3 rx = {{{1, 0, 0}, {0, ca, -sa}, {0, sa, ca}}};
+    const Mat3 ry = {{{cb, 0, sb}, {0, 1, 0}, {-sb, 0, cb}}};
+    const Mat3 rz = {{{cc, -sc, 0}, {sc, cc, 0}, {0, 0, 1}}};
+    auto mul = [](const Mat3& a, const Mat3& b) {
+        Mat3 c{};
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                for (int m = 0; m < 3; ++m) c[i][j] += a[i][m] * b[m][j];
+        return c;
+    };
+    return mul(mul(rx, ry), rz);
+}
+
+static P3 pt3(const ojson& p) { return {p[0].get<double>(), p[1].get<double>(), p[2].get<double>()}; }
+
+// Does the axis-aligned segment a-b enter the open box (lo, hi)?
+static bool enters_open_box(const P3& a, const P3& b, const P3& lo, const P3& hi) {
+    for (int k = 0; k < 3; ++k) {
+        const double s0 = std::min(a[k], b[k]);
+        const double s1 = std::max(a[k], b[k]);
+        if (s1 <= lo[k] + 1e-6 || s0 >= hi[k] - 1e-6) return false;
+    }
+    return true;
+}
+
+TEST_CASE("route: orthogonal detour around a box with nozzle stubs, clearance and elbows") {
+    const ojson params = ojson::parse(R"({
+        "start": {"point": [0, 0, 0], "dir": [1, 0, 0]},
+        "end": {"point": [1000, 0, 0], "dir": [1, 0, 0]},
+        "nps": 2, "schedule": "40", "clearance_mm": 50,
+        "obstacles": [{"min": [400, -200, -200], "max": [600, 200, 200], "name": "skid"}]})");
+    ojson r;
+    REQUIRE(call("piping_route", params, r));
+    REQUIRE(r["ok"] == true);
+    CHECK(validate_piping(r["piping"]).empty());
+
+    // NPS 2 Sch 40: OD 60.3 → the centreline keeps 50 + 30.15 mm off the box.
+    const double inflate = 50.0 + 60.3 / 2.0;
+    const P3 lo = {400 - inflate, -200 - inflate, -200 - inflate};
+    const P3 hi = {600 + inflate, 200 + inflate, 200 + inflate};
+    const ojson& path = r["path"];
+    // start, stub corner (rise), two corners over the box, drop corner, end
+    REQUIRE(path.size() == 6);
+    CHECK(path.front() == ojson::parse("[0.0, 0.0, 0.0]"));
+    CHECK(path.back() == ojson::parse("[1000.0, 0.0, 0.0]"));
+    double len = 0.0;
+    for (size_t i = 0; i + 1 < path.size(); ++i) {
+        const P3 a = pt3(path[i]);
+        const P3 b = pt3(path[i + 1]);
+        int moving = 0;
+        for (int k = 0; k < 3; ++k) moving += std::abs(a[k] - b[k]) > 1e-9 ? 1 : 0;
+        CHECK(moving == 1);  // orthogonal
+        CHECK_FALSE(enters_open_box(a, b, lo, hi));
+        len += std::abs(a[0] - b[0]) + std::abs(a[1] - b[1]) + std::abs(a[2] - b[2]);
+    }
+    CHECK(r["length_mm"].get<double>() == doctest::Approx(len).epsilon(1e-6));
+    // Shortest detour hugs the clearance envelope: 1000 + 2·(200 + 80.15).
+    CHECK(len == doctest::Approx(1000.0 + 2.0 * (200.0 + inflate)));
+    // Leaves travelling +X past the B16.9 NPS 2 LR take-out (A = 76.2 mm)
+    // and arrives travelling +X (end.dir) after the same take-out.
+    CHECK(path[1][1].get<double>() == 0.0);
+    CHECK(path[1][2].get<double>() == 0.0);
+    CHECK(path[1][0].get<double>() >= 76.2 - 1e-6);
+    CHECK(path[4][1].get<double>() == 0.0);
+    CHECK(path[4][2].get<double>() == 0.0);
+    CHECK(path[4][0].get<double>() <= 1000.0 - 76.2 + 1e-6);
+    CHECK(r["bends"] == 4);
+    CHECK(r["min_clearance_mm"].get<double>() >= 50.0 - 1e-6);
+    CHECK(r["min_clearance_mm"].get<double>() == doctest::Approx(50.0));
+    CHECK(r["nearest_obstacle"] == "skid");
+
+    const ojson& run = r["piping"]["runs"][0];
+    CHECK(run["id"] == "r1");
+    CHECK(run["bend_radius"].get<double>() == doctest::Approx(76.2));
+    const ojson& fts = r["piping"]["fittings"];
+    REQUIRE(fts.size() == 4);
+    CHECK(r["elbow_ids"] == ojson::parse(R"(["ft1","ft2","ft3","ft4"])"));
+    for (size_t i = 1; i + 1 < path.size(); ++i) {
+        const ojson& ft = fts[i - 1];
+        CHECK(ft["type"] == "elbow");
+        CHECK(ft["params"]["angle"] == 90);
+        CHECK(ft["params"]["radius"] == "LR");
+        CHECK(ft["origin"] == path[i]);
+        // orient carries the canonical elbow (in +X, out +Y) onto the turn.
+        const P3 a = pt3(path[i - 1]), b = pt3(path[i]), c = pt3(path[i + 1]);
+        P3 din{}, dout{};
+        const double l0 = std::abs(b[0] - a[0]) + std::abs(b[1] - a[1]) + std::abs(b[2] - a[2]);
+        const double l1 = std::abs(c[0] - b[0]) + std::abs(c[1] - b[1]) + std::abs(c[2] - b[2]);
+        for (int k = 0; k < 3; ++k) {
+            din[k] = (b[k] - a[k]) / l0;
+            dout[k] = (c[k] - b[k]) / l1;
+        }
+        const Mat3 R = rot_xyz(ft["orient"][0].get<double>(), ft["orient"][1].get<double>(),
+                               ft["orient"][2].get<double>());
+        for (int k = 0; k < 3; ++k) {
+            CHECK(R[k][0] == doctest::Approx(din[k]));
+            CHECK(R[k][1] == doctest::Approx(dout[k]));
+        }
+    }
+
+    // A second route appends to the same document with fresh ids.
+    ojson p2 = params;
+    p2["piping"] = r["piping"];
+    p2["start"]["point"] = ojson::array({0, 0, 1000});
+    p2["end"]["point"] = ojson::array({1000, 0, 1000});
+    ojson r2;
+    REQUIRE(call("piping_route", p2, r2));
+    REQUIRE(r2["ok"] == true);
+    CHECK(r2["run_id"] == "r2");
+    CHECK(r2["bends"] == 0);
+    CHECK(r2["piping"]["runs"].size() == 2);
+    CHECK(r2["piping"]["fittings"].size() == 4);
+    CHECK(validate_piping(r2["piping"]).empty());
+}
+
+TEST_CASE("route: refusals — boxed-in start, start inside a solid, bad params") {
+    // Six 50 mm slabs enclose the start: no orthogonal path can leave.
+    ojson cage = ojson::array();
+    for (int k = 0; k < 3; ++k) {
+        for (int sgn : {1, -1}) {
+            ojson lo = ojson::array({-350.0, -350.0, -350.0});
+            ojson hi = ojson::array({350.0, 350.0, 350.0});
+            if (sgn > 0) lo[k] = 300.0;
+            else hi[k] = -300.0;
+            cage.push_back({{"min", lo}, {"max", hi}});
+        }
+    }
+    ojson params = ojson::object();
+    params["start"] = {{"point", {0, 0, 0}}};
+    params["end"] = {{"point", {2000, 0, 0}}};
+    params["nps"] = 2;
+    params["obstacles"] = cage;
+    ojson r;
+    REQUIRE(call("piping_route", params, r));
+    CHECK(r["ok"] == false);
+    CHECK(r["reason"] == "no_route");
+    CHECK(r.contains("hint"));
+
+    params["obstacles"] = ojson::parse(R"([{"min":[-10,-10,-10],"max":[10,10,10],"name":"tank"}])");
+    REQUIRE(call("piping_route", params, r));
+    CHECK(r["reason"] == "start_inside_obstacle");
+    CHECK(r["hint"].get<std::string>().find("tank") != std::string::npos);
+    // ...unless the body is ignored.
+    params["ignore_bodies"] = ojson::array({"tank"});
+    REQUIRE(call("piping_route", params, r));
+    CHECK(r["ok"] == true);
+
+    REQUIRE(call("piping_route", ojson::parse(R"({"start":{"point":[0,0,0]},
+                                                 "end":{"point":[1,0,0]}})"),
+                 r));
+    CHECK(r["reason"] == "invalid_params");
+}
+
+static ojson spec_doc(const char* schedule) {
+    ojson doc = new_piping("spec");
+    doc["runs"].push_back(new_pipe_run("r1", ojson::parse("[[0,0,0],[6000,0,0]]"), 4, schedule));
+    return doc;
+}
+
+TEST_CASE("spec_check: B31.3 eq. (3a) hand calc, MAWP, undersized schedule") {
+    // NPS 4 Sch 40 A106-B (D = 114.3, t = 6.02 mm) at 2000 kPa / 100 °C.
+    // Table A-1: S = 20.0 ksi (flat to 400 °F); E = W = 1, Y = 0.4,
+    // c = 1.5 mm, mill tolerance 12.5 %.
+    const double S = 20.0 * 6.894757293168361;  // 137.90 MPa
+    const double P = 2.0;                        // MPa
+    const double D = 114.3;
+    const double t = P * D / (2.0 * (S + P * 0.4));       // 0.8241 mm
+    const double t_req = (t + 1.5) / (1.0 - 0.125);       // 2.656 mm
+    const double t_av = 6.02 * 0.875 - 1.5;               // 3.7675 mm
+    const double mawp = 2.0 * S * t_av / (D - 2.0 * 0.4 * t_av) * 1000.0;  // ≈ 9337 kPa
+    CHECK(t_req == doctest::Approx(2.656).epsilon(1e-3));
+
+    ojson r;
+    REQUIRE(call("piping_spec_check",
+                 ojson::object({{"piping", spec_doc("40")},
+                                {"design_pressure_kpa", 2000},
+                                {"design_temp_c", 100}}),
+                 r));
+    REQUIRE(r["ok"] == true);
+    CHECK(r["code"] == "ASME B31.3");
+    const ojson& run = r["runs"][0];
+    CHECK(std::abs(run["t_required_mm"].get<double>() - t_req) / t_req < 0.01);
+    CHECK(run["allowable_mpa"].get<double>() == doctest::Approx(137.9).epsilon(1e-3));
+    CHECK(run["mawp_kpa"].get<double>() == doctest::Approx(mawp).epsilon(1e-3));
+    CHECK(run["pass"] == true);
+    CHECK(r["all_pass"] == true);
+    // Support span: positive, and no longer than the 2.5 mm-sag span.
+    CHECK(run["support_span_m"].get<double>() > 3.0);
+    CHECK(run["support_span_m"].get<double>() < 15.0);
+
+    // 10 MPa exceeds the Sch 40 MAWP: fails, Sch 80 (8.56 mm) is suggested.
+    REQUIRE(call("piping_spec_check",
+                 ojson::object({{"piping", spec_doc("40")},
+                                {"design_pressure_kpa", 10000},
+                                {"design_temp_c", 100}}),
+                 r));
+    REQUIRE(r["ok"] == true);
+    CHECK(r["runs"][0]["pass"] == false);
+    CHECK(r["all_pass"] == false);
+    CHECK(r["runs"][0]["suggested_schedule"] == "80");
+    REQUIRE(call("piping_spec_check",
+                 ojson::object({{"piping", spec_doc("80")},
+                                {"design_pressure_kpa", 10000},
+                                {"design_temp_c", 100}}),
+                 r));
+    CHECK(r["runs"][0]["pass"] == true);
+
+    // Allowable stress interpolation (B31.3-2024 Table A-1C: 550 °F midway
+    // 500 °F 19.0 / 600 °F 17.9 ksi → 19.0 + 0.5·(17.9 − 19.0) = 18.45 ksi) and
+    // the stainless lower row (316 at 212 °F: 17.3 + 0.12·(15.6 − 17.3)).
+    const ojson a = b31_3_allowable("A106-B", (550.0 - 32.0) / 1.8);
+    CHECK(a["allowable_ksi"].get<double>() == doctest::Approx(18.45));
+    const ojson s316 = b31_3_allowable("A312-316", 100.0);
+    CHECK(s316["material"] == "A312-TP316");
+    CHECK(s316["allowable_ksi"].get<double>() == doctest::Approx(17.096).epsilon(1e-4));
+    CHECK(b31_3_allowable("A106-B", 500.0)["reason"] == "temperature_out_of_range");
+
+    // Unknown material refuses by name.
+    ojson pvc = spec_doc("40");
+    pvc["material"] = "PVC";
+    REQUIRE(call("piping_spec_check",
+                 ojson::object({{"piping", pvc}, {"design_pressure_kpa", 500}}), r));
+    CHECK(r["ok"] == false);
+    CHECK(r["reason"] == "unknown_material");
+    CHECK(r["hint"].get<std::string>().find("PVC") != std::string::npos);
+}
+
+TEST_CASE("spec_check: B16.5 flange rating — class 150 exceeded, class 300 passes") {
+    // B16.5-2025 Table 2-1.1, group 1.1 at 100 °C: class 150 = 17.7 bar, class 300 = 46.7 bar.
+    CHECK(b16_5_rating(150, "1.1", 100.0)["rating_kpa"].get<double>() == doctest::Approx(1770.0));
+    // 75 °C midway 50 °C (19.1 bar) / 100 °C (17.7 bar): (19.1 + 17.7)/2 = 18.4 bar = 1840 kPa.
+    CHECK(b16_5_rating(150, "1.1", 75.0)["rating_kpa"].get<double>() == doctest::Approx(1840.0));
+    // Class 900 = class-600 row × 900/600: 102.0 bar × 1.5 = 153.0 bar = 15300 kPa.
+    CHECK(b16_5_rating(900, "1.1", 38.0)["rating_kpa"].get<double>() ==
+          doctest::Approx(102.0 * 1.5 * 100.0));
+    CHECK(b16_5_rating(400, "1.1", 38.0)["reason"] == "unknown_flange_class");
+
+    auto doc_with_flange = [](int cls) {
+        ojson doc = spec_doc("40");
+        doc["fittings"].push_back(new_fitting("ft1", "flange", 4, ojson::parse("[0,0,0]"), "40",
+                                              "F1", ojson::object({{"flange_class", cls}})));
+        return doc;
+    };
+    ojson r;
+    REQUIRE(call("piping_spec_check",
+                 ojson::object({{"piping", doc_with_flange(150)},
+                                {"design_pressure_kpa", 2000},
+                                {"design_temp_c", 100}}),
+                 r));
+    REQUIRE(r["ok"] == true);
+    CHECK(r["runs"][0]["pass"] == true);
+    REQUIRE(r["flanges"].size() == 1);
+    CHECK(r["flanges"][0]["rating_kpa"].get<double>() == doctest::Approx(1770.0));
+    CHECK(r["flanges"][0]["pass"] == false);
+    CHECK(r["all_pass"] == false);
+    REQUIRE(call("piping_spec_check",
+                 ojson::object({{"piping", doc_with_flange(300)},
+                                {"design_pressure_kpa", 2000},
+                                {"design_temp_c", 100}}),
+                 r));
+    CHECK(r["flanges"][0]["pass"] == true);
+    CHECK(r["all_pass"] == true);
+}
+
+static const ojson* find_item(const ojson& items, const char* kind) {
+    for (const auto& it : items)
+        if (it["kind"] == kind) return &it;
+    return nullptr;
+}
+
+TEST_CASE("bom: take-outs, elbow/flange counts, welds and masses") {
+    ojson doc = new_piping("bom");
+    doc["runs"].push_back(new_pipe_run(
+        "r1", ojson::parse("[[0,0,0],[2000,0,0],[2000,2000,0],[2000,2000,2000]]"), 4, "40"));
+    const ojson elbow = ojson::object({{"angle", 90}, {"radius", "LR"}});
+    doc["fittings"].push_back(new_fitting("ft1", "elbow", 4, ojson::parse("[2000,0,0]"), "40", "E1", elbow));
+    doc["fittings"].push_back(new_fitting("ft2", "elbow", 4, ojson::parse("[2000,2000,0]"), "40", "E2", elbow));
+    doc["fittings"].push_back(new_fitting("ft3", "flange", 4, ojson::parse("[0,0,0]"), "40", "F1",
+                                          ojson::object({{"flange_class", 150}})));
+    ojson r;
+    REQUIRE(call("piping_bom", ojson::object({{"piping", doc}}), r));
+    REQUIRE(r["ok"] == true);
+
+    // Cut length = 6000 − 2 elbows × 2 × A (152.4, B16.9 NPS 4 LR) − flange 23.88.
+    const ojson& ll = r["line_list"][0];
+    CHECK(ll["length_mm"].get<double>() == doctest::Approx(6000.0));
+    CHECK(ll["cut_length_mm"].get<double>() == doctest::Approx(6000.0 - 4 * 152.4 - 23.88).epsilon(1e-4));
+
+    const ojson pipe = nearest_pipe(4, "40");
+    const double aw = M_PI / 4.0 *
+                      (std::pow(pipe["outer_dia"].get<double>(), 2) - std::pow(pipe["inner_dia"].get<double>(), 2));
+    const ojson* p = find_item(r["items"], "pipe");
+    const ojson* e = find_item(r["items"], "elbow");
+    const ojson* f = find_item(r["items"], "flange");
+    REQUIRE(p != nullptr);
+    REQUIRE(e != nullptr);
+    REQUIRE(f != nullptr);
+    CHECK((*p)["unit_mass_kg"].get<double>() == doctest::Approx(aw * 1e-6 * 7850.0).epsilon(1e-3));  // ≈16.07 kg/m
+    CHECK((*e)["qty"] == 2);
+    // Pappus: wall annulus × R·θ (R = 152.4 mm, θ = π/2) × 7850 kg/m3.
+    CHECK((*e)["unit_mass_kg"].get<double>() ==
+          doctest::Approx(aw * 1e-6 * (152.4 * M_PI / 2.0 * 1e-3) * 7850.0).epsilon(1e-3));
+    CHECK((*f)["qty"] == 1);
+    CHECK((*f)["flange_class"] == 150);
+
+    // 2 elbows × 2 butt welds + 1 weld-neck weld, all in the one spool.
+    CHECK(r["totals"]["shop_welds"] == 5);
+    CHECK(r["totals"]["field_welds"] == 0);
+    REQUIRE(r["spools"].size() == 1);
+    CHECK(r["spools"][0]["fitting_ids"].size() == 3);
+    CHECK(r["spools"][0]["shop_welds"] == 5);
+}
+
+TEST_CASE("bom: spools split at max length and at flanged joints") {
+    ojson doc = new_piping("long");
+    doc["runs"].push_back(new_pipe_run("r1", ojson::parse("[[0,0,0],[30000,0,0]]"), 6, "40"));
+    ojson r;
+    REQUIRE(call("piping_bom", ojson::object({{"piping", doc}, {"max_spool_length_mm", 12000}}), r));
+    REQUIRE(r["ok"] == true);
+    REQUIRE(r["spools"].size() == 3);
+    CHECK(r["spools"][0]["length_mm"].get<double>() == doctest::Approx(12000.0));
+    CHECK(r["spools"][1]["length_mm"].get<double>() == doctest::Approx(12000.0));
+    CHECK(r["spools"][2]["length_mm"].get<double>() == doctest::Approx(6000.0));
+    for (const auto& s : r["spools"]) CHECK(s["run_ids"] == ojson::array({"r1"}));
+    CHECK(r["totals"]["field_welds"] == 2);
+    CHECK(r["totals"]["shop_welds"] == 0);
+    CHECK(r["totals"]["pipe_length_m"].get<double>() == doctest::Approx(30.0));
+
+    // Two runs bolted through a flange pair: two spools, one weld per flange.
+    ojson fl = new_piping("flanged");
+    fl["runs"].push_back(new_pipe_run("r1", ojson::parse("[[0,0,0],[3000,0,0]]"), 4, "40"));
+    fl["runs"].push_back(new_pipe_run("r2", ojson::parse("[[3000,0,0],[6000,0,0]]"), 4, "40"));
+    for (const char* id : {"ft1", "ft2"}) {
+        fl["fittings"].push_back(new_fitting(id, "flange", 4, ojson::parse("[3000,0,0]"), "40", id,
+                                             ojson::object({{"flange_class", 150}})));
+    }
+    REQUIRE(call("piping_bom", ojson::object({{"piping", fl}}), r));
+    REQUIRE(r["ok"] == true);
+    CHECK(r["spools"].size() == 2);
+    CHECK(r["totals"]["flanged_joints"] == 1);
+    CHECK(r["totals"]["shop_welds"] == 2);
+    CHECK(r["totals"]["field_welds"] == 0);
+    // Each run loses one flange thickness, not two.
+    CHECK(r["line_list"][0]["cut_length_mm"].get<double>() == doctest::Approx(3000.0 - 23.88).epsilon(1e-4));
+    CHECK(r["line_list"][1]["cut_length_mm"].get<double>() == doctest::Approx(3000.0 - 23.88).epsilon(1e-4));
+
+    // Butt-welded joint without a flange keeps both runs in one spool.
+    ojson bw = new_piping("welded");
+    bw["runs"].push_back(new_pipe_run("r1", ojson::parse("[[0,0,0],[3000,0,0]]"), 4, "40"));
+    bw["runs"].push_back(new_pipe_run("r2", ojson::parse("[[3000,0,0],[6000,0,0]]"), 4, "40"));
+    REQUIRE(call("piping_bom", ojson::object({{"piping", bw}}), r));
+    CHECK(r["spools"].size() == 1);
+    CHECK(r["totals"]["shop_welds"] == 1);
+}
+
+TEST_CASE("dispatch: route/spec/bom/vessel/duct methods are owned by piping::call") {
+    ojson result;
+    for (const char* m : {"piping_route", "piping_spec_check", "piping_bom", "vessel_size", "duct_size"}) {
+        CHECK(call(m, ojson::object(), result));
+        CHECK(result["ok"] == false);
+    }
+}
+
+TEST_CASE("edit: add_run on empty document creates an L run and a 90 degree elbow") {
+    ojson result;
+    REQUIRE(call("piping_edit", ojson::parse(R"({"ops":[{"op":"add_run",
+        "path":[[0,0,0],[500,0,0],[1000,0,0],[1000,1000,0]]}]})"), result));
+    REQUIRE(result["ok"] == true);
+    const auto& doc = result["piping"];
+    REQUIRE(doc["runs"].size() == 1);
+    REQUIRE(doc["fittings"].size() == 1);
+    CHECK(doc["runs"][0]["path"].size() == 3);
+    CHECK(doc["fittings"][0]["type"] == "elbow");
+    CHECK(doc["fittings"][0]["params"]["angle"].get<double>() == doctest::Approx(90));
+    CHECK(doc["fittings"][0]["run_id"] == doc["runs"][0]["id"]);
+    CHECK(validate_piping(doc).empty());
+}
+
+TEST_CASE("edit: mid-run branch splits a run adds a tee and conserves network mass") {
+    ojson result;
+    REQUIRE(call("piping_edit", ojson::parse(R"({"ops":[
+        {"op":"add_run","path":[[0,0,0],[10000,0,0]]},
+        {"op":"add_run","path":[[5000,0,0],[5000,5000,0]]}]})"), result));
+    REQUIRE(result["ok"] == true);
+    const auto doc = result["piping"];
+    REQUIRE(doc["runs"].size() == 3);
+    REQUIRE(doc["fittings"].size() == 1);
+    const auto tee = doc["fittings"][0];
+    CHECK(tee["type"] == "tee");
+    REQUIRE(tee["params"]["run_ids"].size() == 2);
+    const auto pair = tee["params"]["run_ids"];
+    const auto branch = tee["params"]["branch_run"];
+    CHECK(tee["run_id"] == branch);
+    REQUIRE(call("piping_solve", {{"doc", doc}, {"boundary", ojson::parse(R"([
+        {"at":[0,0,0],"pressure":300},{"at":[10000,0,0],"pressure":100},
+        {"at":[5000,5000,0],"pressure":100}])")}}, result));
+    REQUIRE(result["ok"] == true);
+    std::map<std::string, double> flows;
+    for (const auto& link : result["links"])
+        flows[link["id"].get<std::string>()] = link["flow_m3h"].get<double>();
+    CHECK(flows[pair[1].get<std::string>()] > 0);
+    CHECK(flows[branch.get<std::string>()] > 0);
+    CHECK(std::abs(flows[pair[0].get<std::string>()] -
+                   flows[pair[1].get<std::string>()] - flows[branch.get<std::string>()]) < 1e-3);
+    const auto up = run_loss_1d(nlohmann::json(doc), pair[0].get<std::string>(), 998.2, 0.001, 0.001, -1);
+    const auto down = run_loss_1d(nlohmann::json(doc), pair[1].get<std::string>(), 998.2, 0.001, 0.001, -1);
+    const auto side = run_loss_1d(nlohmann::json(doc), branch.get<std::string>(), 998.2, 0.001, 0.001, -1);
+    REQUIRE(up["ok"] == true);
+    REQUIRE(down["ok"] == true);
+    REQUIRE(side["ok"] == true);
+    CHECK(up["fittings"].empty());
+    REQUIRE(down["fittings"].size() == 1);
+    REQUIRE(side["fittings"].size() == 1);
+    CHECK(side["fittings_K"].get<double>() == doctest::Approx(3 * down["fittings_K"].get<double>()));
+}
+
+TEST_CASE("fitting_k: gate valve at NPS 2 schedule 40 is eight Crane fT") {
+    ojson result;
+    REQUIRE(call("piping_fitting_k", ojson::parse(R"({"fitting":{
+        "type":"valve","nps":2,"params":{"valve_type":"gate"}},"schedule":"40"})"), result));
+    REQUIRE(result["ok"] == true);
+    const double d = 0.05248;
+    const double fT = 1 / std::pow(-2 * std::log10(0.0000457 / (3.7*d)), 2);
+    CHECK(std::abs(result["K"].get<double>() / (8*fT) - 1) < 0.01);
+    CHECK(result["fT"].get<double>() == doctest::Approx(fT));
+    CHECK(result["inner_dia_mm"].get<double>() == doctest::Approx(52.48));
+    CHECK(result["method"].get<std::string>().find("Crane") != std::string::npos);
+    REQUIRE(result["curve"].size() == 24);
+    CHECK(result["curve"].front()["re"].get<double>() == doctest::Approx(1e3));
+    CHECK(result["curve"].back()["re"].get<double>() == doctest::Approx(1e7));
+}
+
+TEST_CASE("fitting_k: two_k three_k cv and log Reynolds table models") {
+    ojson args = ojson::parse(R"({"fitting":{"type":"custom","nps":2,"params":{}},
+                                 "reynolds":10000})");
+    const double inches = 52.48 / 25.4;
+    ojson result;
+    args["fitting"]["params"]["k_model"] = {{"kind","two_k"},{"K1",1000},{"Kinf",0.5}};
+    REQUIRE(call("piping_fitting_k", args, result));
+    REQUIRE(result["ok"] == true);
+    CHECK(result["K"].get<double>() == doctest::Approx(0.1 + 0.5*(1 + 1/inches)));
+    args["fitting"]["params"]["k_model"] = {{"kind","three_k"},{"K1",1000},{"Ki",0.2},{"Kd",2}};
+    REQUIRE(call("piping_fitting_k", args, result));
+    REQUIRE(result["ok"] == true);
+    CHECK(result["K"].get<double>() == doctest::Approx(0.1 + 0.2*(1 + 2/std::pow(inches,0.3))));
+    args["fitting"]["params"]["k_model"] = {{"kind","cv"},{"Cv",20}};
+    REQUIRE(call("piping_fitting_k", args, result));
+    REQUIRE(result["ok"] == true);
+    CHECK(result["K"].get<double>() == doctest::Approx(890.3*std::pow(inches,4)/400));
+    args["fitting"]["params"]["k_model"] = ojson::parse(R"({"kind":"table","source":"cfd",
+        "points":[{"re":1000,"K":4},{"re":100000,"K":2}]})");
+    REQUIRE(call("piping_fitting_k", args, result));
+    REQUIRE(result["ok"] == true);
+    CHECK(result["K"].get<double>() == doctest::Approx(3));
+    args["reynolds"] = 100;
+    REQUIRE(call("piping_fitting_k", args, result));
+    CHECK(result["K"].get<double>() == doctest::Approx(4));
+    args["reynolds"] = 1e7;
+    REQUIRE(call("piping_fitting_k", args, result));
+    CHECK(result["K"].get<double>() == doctest::Approx(2));
+    const auto doc = single_pipe_doc();
+    REQUIRE(call("piping_edit", {{"piping",doc},{"ops",ojson::array({{
+        {"op","add_fitting"},{"type","custom"},{"at",ojson::array({5000,0,0})},
+        {"params",args["fitting"]["params"]}}})}}, result));
+    REQUIRE(result["ok"] == true);
+    const double flow = 10000 * 0.001 * M_PI * 0.05248 / (4 * 998.2);
+    const auto loss = run_loss_1d(nlohmann::json(result["piping"]), "r1", 998.2, 0.001, flow, -1);
+    REQUIRE(loss["ok"] == true);
+    CHECK(loss["fittings_K"].get<double>() == doctest::Approx(3));
+}
+
+TEST_CASE("edit: custom fitting without k_model refuses invalid_k_model") {
+    ojson result;
+    REQUIRE(call("piping_edit", {{"piping",single_pipe_doc()},
+        {"ops",ojson::parse(R"([{"op":"add_fitting","type":"custom","at":[5000,0,0]}])")}}, result));
+    CHECK(result["ok"] == false);
+    CHECK(result["reason"] == "invalid_k_model");
+    CHECK(result["op_index"] == 0);
+    REQUIRE(call("piping_fitting_k", ojson::parse(R"({"fitting":{"type":"custom","params":{}}})"), result));
+    CHECK(result["reason"] == "invalid_k_model");
+}
+
+TEST_CASE("edit: invalid second operation is atomic and reports op_index one") {
+    const auto doc = single_pipe_doc();
+    ojson params = {{"piping",doc},{"ops",ojson::parse(R"([
+        {"op":"set_run","id":"r1","name":"Changed"},
+        {"op":"split_run","run_id":"r999","point":[5000,0,0]}])")}};
+    ojson result;
+    REQUIRE(call("piping_edit", params, result));
+    CHECK(result["ok"] == false);
+    CHECK(result["reason"] == "unknown_run");
+    CHECK(result["op_index"] == 1);
+    CHECK(params["piping"] == doc);
+    CHECK_FALSE(result.contains("piping"));
+}
+
+TEST_CASE("edit: remove branch merges collinear split runs back") {
+    ojson result;
+    REQUIRE(call("piping_edit", ojson::parse(R"({"ops":[
+        {"op":"add_run","path":[[0,0,0],[10000,0,0]]},
+        {"op":"add_run","path":[[5000,0,0],[5000,5000,0]]}]})"), result));
+    REQUIRE(result["ok"] == true);
+    const auto doc = result["piping"];
+    const auto branch = doc["fittings"][0]["params"]["branch_run"];
+    REQUIRE(call("piping_edit", {{"piping",doc},{"ops",ojson::array({{
+        {"op","remove_run"},{"id",branch}}})}}, result));
+    REQUIRE(result["ok"] == true);
+    REQUIRE(result["piping"]["runs"].size() == 1);
+    CHECK(result["piping"]["fittings"].empty());
+    CHECK(result["piping"]["runs"][0]["path"] == ojson::parse("[[0,0,0],[10000,0,0]]"));
+    CHECK(result["removed"].size() == 3);
+}
+
+TEST_CASE("edit: moving a vertex keeps connected endpoint attached") {
+    ojson result;
+    REQUIRE(call("piping_edit", ojson::parse(R"({"ops":[
+        {"op":"add_run","path":[[0,0,0],[1000,0,0]]},
+        {"op":"add_run","path":[[1000,0,0],[1000,1000,0]]},
+        {"op":"move_vertex","run_id":"r1","index":1,"point":[1200,100,0]}]})"), result));
+    REQUIRE(result["ok"] == true);
+    const auto& doc = result["piping"];
+    CHECK(doc["runs"][0]["path"].back() == ojson::array({1200,100,0}));
+    CHECK(doc["runs"][1]["path"].front() == doc["runs"][0]["path"].back());
+    REQUIRE(doc["fittings"].size() == 1);
+    CHECK(doc["fittings"][0]["origin"] == doc["runs"][0]["path"].back());
+    CHECK(doc["fittings"][0]["params"]["angle"].get<double>() > 90);
+}
+
+TEST_CASE("edit: inline reducer splits run and attributes fitting to only one link") {
+    ojson result;
+    REQUIRE(call("piping_edit", {{"piping",single_pipe_doc()},
+        {"ops",ojson::parse(R"([{"op":"add_fitting","type":"reducer","at":[5000,10,0],"nps2":1}])")}}, result));
+    REQUIRE(result["ok"] == true);
+    const auto& doc = result["piping"];
+    REQUIRE(doc["runs"].size() == 2);
+    CHECK(doc["runs"][1]["nps"] == 1);
+    REQUIRE(doc["fittings"].size() == 1);
+    CHECK(doc["fittings"][0]["run_id"] == "r1");
+    CHECK(doc["fittings"][0]["origin"] == ojson::array({5000,0,0}));
+    const auto a = run_loss_1d(nlohmann::json(doc),"r1",998.2,0.001,0.001,-1);
+    const auto b = run_loss_1d(nlohmann::json(doc),"r2",998.2,0.001,0.001,-1);
+    REQUIRE(a["ok"] == true);
+    REQUIRE(b["ok"] == true);
+    CHECK(a["fittings"].size() == 1);
+    CHECK(b["fittings"].empty());
+}
+
+TEST_CASE("edit: reducer outlet update propagates downstream specification") {
+    ojson result;
+    REQUIRE(call("piping_edit", {{"piping",single_pipe_doc()},
+        {"ops",ojson::parse(R"([
+            {"op":"add_fitting","type":"reducer","at":[5000,0,0],"nps2":1},
+            {"op":"add_fitting","type":"valve","run_id":"r2","at":[7500,0,0],"params":{"valve_type":"gate"}},
+            {"op":"update_fitting","id":"ft1","params":{"nps2":1.5}}])")}}, result));
+    REQUIRE(result["ok"] == true);
+    const auto& doc = result["piping"];
+    CHECK(doc["fittings"][0]["nps2"] == 1.5);
+    CHECK_FALSE(doc["fittings"][0]["params"].contains("nps2"));
+    CHECK(doc["runs"][1]["nps"] == 1.5);
+    CHECK(doc["fittings"][1]["nps"] == 1.5);
+}
+
+TEST_CASE("edit: fourth run at a tee refuses node_full atomically") {
+    ojson result;
+    REQUIRE(call("piping_edit", ojson::parse(R"({"ops":[
+        {"op":"add_run","path":[[0,0,0],[10000,0,0]]},
+        {"op":"add_run","path":[[5000,0,0],[5000,5000,0]]}]})"), result));
+    REQUIRE(result["ok"] == true);
+    const auto doc = result["piping"];
+    REQUIRE(call("piping_edit", {{"piping",doc},{"ops",ojson::parse(R"([
+        {"op":"add_run","path":[[5000,0,0],[5000,-5000,0]]}])")}}, result));
+    CHECK(result["ok"] == false);
+    CHECK(result["reason"] == "node_full");
+    CHECK_FALSE(result.contains("piping"));
+}
+
+TEST_CASE("edit: updating elbow radius retains the shared solver correlation") {
+    ojson result;
+    REQUIRE(call("piping_edit", ojson::parse(R"({"ops":[
+        {"op":"add_run","path":[[0,0,0],[1000,0,0],[1000,1000,0]]},
+        {"op":"update_fitting","id":"ft1","params":{"radius":"SR"}}]})"), result));
+    REQUIRE(result["ok"] == true);
+    const auto doc = result["piping"];
+    CHECK(doc["runs"][0]["bend_radius"].get<double>() == doctest::Approx(50.8));
+    const auto loss = run_loss_1d(nlohmann::json(doc),"r1",998.2,0.001,0.001,-1);
+    REQUIRE(loss["ok"] == true);
+    REQUIRE(loss["fittings"].size() == 1);
+    CHECK(loss["fittings"][0]["method"].get<std::string>().find("SR") != std::string::npos);
+    REQUIRE(call("piping_fitting_k", {{"fitting",doc["fittings"][0]},
+        {"reynolds",loss["reynolds"].get<double>()}}, result));
+    REQUIRE(result["ok"] == true);
+    // Preview uses clean-steel roughness 0.0457 mm, run uses material 0.046 mm.
+    CHECK(std::abs(result["K"].get<double>() / loss["fittings_K"].get<double>() - 1) < 0.01);
+}
+
+TEST_CASE("fitting_k: invalid tables and orifice ratios refuse rather than falling back") {
+    ojson result;
+    for (const auto& model : ojson::parse(R"([
+        {"kind":"constant","K":-1},
+        {"kind":"cv","Cv":0},
+        {"kind":"table","source":"user","points":[{"re":10000,"K":1},{"re":1000,"K":2}]},
+        {"kind":"table","source":"user","points":[]},
+        {"kind":"not_a_model"}
+    ])")) {
+        REQUIRE(call("piping_fitting_k", {{"fitting",{{"type","custom"},{"params",{{"k_model",model}}}}}}, result));
+        CHECK(result["ok"] == false);
+        CHECK(result["reason"] == "invalid_k_model");
+    }
+    REQUIRE(call("piping_fitting_k", ojson::parse(R"({"fitting":{"type":"orifice",
+        "params":{"beta":2,"bore_mm":10}}})"), result));
+    CHECK(result["ok"] == false);
+    CHECK(result["reason"] == "invalid_params");
 }

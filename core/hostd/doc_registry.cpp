@@ -45,6 +45,9 @@ bool DocRegistry::isReadOnlyMethod(const std::string& m) {
         "sketch_health", "sketch3d_health", "sketch_probe",
         "drawing_get", "drawing_bom", "drawing_model_items", "drawing_render_png",
         "cam_describe", "cam_tree", "cam_extract", "ecad_describe", "ecad_tree",
+        // Piping RPCs return networks/K without editing the CAD doc; piping_route
+        // also reads world body boxes as obstacles. Persistence uses sim_study_*.
+        "piping_route", "piping_edit", "piping_fitting_k",
     };
     static const std::vector<std::string> kPrefixes = {
         "doc_face_",   // face_points / face_edges / face_wires

@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -59,15 +58,6 @@ std::vector<double> surface_verts(const aicm::AicmBody& bt) {
     return out;
 }
 
-// Publish overlay AICM via shared-mem handoff (file fallback inside publish).
-std::string publish_overlay_aicm(const aicm::AicmBody& bt,
-                                 const std::vector<std::vector<uint8_t>>& chunks) {
-    static std::atomic<unsigned long long> seq{0};
-    unsigned long long n = seq.fetch_add(1);
-    std::vector<uint8_t> blob = aicm::write_aicm({bt}, chunks);
-    if (blob.empty()) return {};
-    return chudware::aicm_handoff::publish("overlay_" + std::to_string(n), blob);
-}
 
 bool finite_f32(double x) {
     return std::isfinite(x) &&

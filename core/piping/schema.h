@@ -30,6 +30,8 @@ bool is_piping(const ojson& doc);
 std::string next_id(const ojson& doc, const std::string& prefix);
 
 // Validators — each returns a list of error strings (empty = valid).
+std::vector<std::string> validate_k_model(const ojson& model,
+                                         const std::string& loc = "k_model");
 std::vector<std::string> validate_run(const ojson& run, const std::string& loc = "run");
 std::vector<std::string> validate_fitting(const ojson& ft,
                                           const std::string& loc = "fitting");

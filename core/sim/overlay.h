@@ -14,6 +14,7 @@
 // vectors are passed in as plain doubles, so there is no link dep on the mesher libs.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -21,8 +22,21 @@
 #include <nlohmann/json.hpp>
 
 #include "geom/aicm.h"
+#include "util/aicm_handoff.h"
 
 namespace chudware::sim {
+
+// OCCT-free publisher shared by FEA and fluid overlays. The writer/handoff are
+// already linked by the numerical simulation library.
+inline std::string publish_overlay_aicm(
+    const aicm::AicmBody& body, const std::vector<std::vector<uint8_t>>& chunks) {
+    static std::atomic<unsigned long long> sequence{0};
+    const auto blob = aicm::write_aicm({body}, chunks);
+    if (blob.empty()) return {};
+    return chudware::aicm_handoff::publish(
+        "overlay_" + std::to_string(sequence.fetch_add(1)), blob);
+}
+
 
 // The FEA boundary surface extracted from the VOLUME tet mesh: an AICM body whose
 // vertices are the unique boundary nodes of the volume mesh (so a result plot has

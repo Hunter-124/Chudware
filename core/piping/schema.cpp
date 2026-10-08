@@ -15,7 +15,8 @@ using pyutil::py_repr;
 const std::set<std::string> kSchedules = {"5",  "5S", "10", "10S", "20", "30",
                                           "40", "40S", "60", "80", "80S", "100",
                                           "120", "140", "160", "STD", "XS", "XXS"};
-const std::set<std::string> kFittingTypes = {"elbow", "tee", "reducer", "flange"};
+const std::set<std::string> kFittingTypes = {"elbow", "tee", "reducer", "flange",
+                                          "valve", "orifice", "custom"};
 const std::set<std::string> kElbowRadii = {"LR", "SR"};
 const std::set<std::string> kFlangeFaces = {"RF", "FF", "RTJ"};
 const std::set<std::string> kMaterials = {"A106-B", "A53-B", "A312-304", "A312-316",
@@ -241,6 +242,52 @@ std::vector<std::string> validate_run(const ojson& run, const std::string& loc) 
     return errs;
 }
 
+std::vector<std::string> validate_k_model(const ojson& model, const std::string& loc) {
+    if (!model.is_object() || !model.value("kind", ojson(nullptr)).is_string())
+        return {loc + ": requires a model object and kind"};
+    std::vector<std::string> errs;
+    const std::string kind = model["kind"].get<std::string>();
+    auto number = [&](const char* key, bool positive = false) {
+        const auto v = model.value(key, ojson(nullptr));
+        if (!is_num(v) || (positive ? v.get<double>() <= 0 : v.get<double>() < 0))
+            errs.push_back(loc + "." + key + ": requires a finite " +
+                           (positive ? "positive" : "nonnegative") + " number");
+    };
+    if (kind == "constant") number("K");
+    else if (kind == "two_k") { number("K1"); number("Kinf"); }
+    else if (kind == "three_k") { number("K1"); number("Ki"); number("Kd"); }
+    else if (kind == "cv") number("Cv", true);
+    else if (kind == "table") {
+        const auto points = model.value("points", ojson(nullptr));
+        if (!points.is_array() || points.empty())
+            errs.push_back(loc + ".points: requires at least one point");
+        else {
+            double last = 0;
+            for (const auto& p : points) {
+                if (!p.is_object() || !is_num(p.value("re", ojson(nullptr))) ||
+                    !is_num(p.value("K", ojson(nullptr))) ||
+                    p["re"].get<double>() <= last || p["K"].get<double>() < 0) {
+                    errs.push_back(loc + ".points: positive increasing re and nonnegative K required");
+                    break;
+                }
+                last = p["re"].get<double>();
+            }
+        }
+        const auto source = model.value("source", ojson(nullptr));
+        if (source != "cfd" && source != "user")
+            errs.push_back(loc + ".source: requires cfd or user");
+        if (model.contains("fit")) {
+            auto fit = model["fit"];
+            if (fit.is_object()) fit["kind"] = "two_k";
+            const auto fit_errs = validate_k_model(fit, loc + ".fit");
+            errs.insert(errs.end(), fit_errs.begin(), fit_errs.end());
+        }
+        if (model.contains("provenance") && !model["provenance"].is_object())
+            errs.push_back(loc + ".provenance: requires an object");
+    } else errs.push_back(loc + ".kind: unknown K model");
+    return errs;
+}
+
 std::vector<std::string> validate_fitting(const ojson& ft, const std::string& loc) {
     std::vector<std::string> errs;
     if (!ft.is_object()) return {loc + ": not an object"};
@@ -274,13 +321,16 @@ std::vector<std::string> validate_fitting(const ojson& ft, const std::string& lo
     }
     if (ftype.is_string() && ftype.get<std::string>() == "elbow") {
         const ojson ang = params.value("angle", ojson(nullptr));
-        if (!ang.is_null() && !in_num_set(ang, {45, 90})) {
-            errs.push_back(loc + ".params.angle: " + py_repr(ang) + " not in ELBOW_ANGLES");
+        if (!ang.is_null() && (!is_num(ang) || ang.get<double>() <= 0 || ang.get<double>() >= 180)) {
+            errs.push_back(loc + ".params.angle: " + py_repr(ang) + " not in ELBOW_ANGLES (0,180)");
         }
         const ojson rad = params.value("radius", ojson(nullptr));
         if (!rad.is_null() && !(rad.is_string() && kElbowRadii.count(rad.get<std::string>()))) {
             errs.push_back(loc + ".params.radius: " + py_repr(rad) + " not in ELBOW_RADII");
         }
+        const auto radius_mm = params.value("radius_mm", ojson(nullptr));
+        if (!radius_mm.is_null() && (!is_num(radius_mm) || radius_mm.get<double>() <= 0))
+            errs.push_back(loc + ".params.radius_mm: requires a positive finite radius");
     } else if (ftype.is_string() && ftype.get<std::string>() == "flange") {
         const ojson fc = params.value("flange_class", ojson(nullptr));
         if (!fc.is_null() && !in_num_set(fc, {150, 300, 600, 900, 1500, 2500})) {
@@ -292,6 +342,37 @@ std::vector<std::string> validate_fitting(const ojson& ft, const std::string& lo
             errs.push_back(loc + ".params.flange_face: " + py_repr(ff) +
                            " not in FLANGE_FACES");
         }
+    }
+    if (ft.contains("run_id") &&
+        (!ft["run_id"].is_string() || !id_matches(ft["run_id"].get<std::string>(), "r", true)))
+        errs.push_back(loc + ".run_id: requires r<n>");
+    if (params.contains("k_model")) {
+        const auto km = validate_k_model(params["k_model"], loc + ".params.k_model");
+        errs.insert(errs.end(), km.begin(), km.end());
+    } else if (ftype == "custom") {
+        errs.push_back(loc + ".params.k_model: required for custom");
+    }
+    if (ftype == "valve") {
+        static const std::set<std::string> valves = {"gate", "globe", "angle", "ball", "plug",
+                                                     "butterfly", "check_swing", "check_lift"};
+        const auto vt = params.value("valve_type", ojson(nullptr));
+        if (!vt.is_string() || !valves.count(vt.get<std::string>()))
+            errs.push_back(loc + ".params.valve_type: unknown valve type");
+    }
+    if (ftype == "orifice") {
+        const auto beta = params.value("beta", ojson(nullptr));
+        const auto bore = params.value("bore_mm", ojson(nullptr));
+        if (!beta.is_null() ? !(is_num(beta) && beta.get<double>() > 0 && beta.get<double>() < 1) :
+                             !(is_num(bore) && bore.get<double>() > 0))
+            errs.push_back(loc + ".params: requires 0<beta<1 or positive bore_mm");
+    }
+    if (ftype == "tee" && params.contains("run_ids")) {
+        const auto ids = params["run_ids"];
+        const auto branch = params.value("branch_run", ojson(nullptr));
+        if (!ids.is_array() || ids.size() != 2 || !ids[0].is_string() ||
+            !ids[1].is_string() || !branch.is_string() || ids[0] == ids[1] ||
+            ids[0] == branch || ids[1] == branch)
+            errs.push_back(loc + ".params: tee requires two distinct run_ids and branch_run");
     }
     return errs;
 }
@@ -330,6 +411,26 @@ std::vector<std::string> validate_piping(const ojson& doc) {
     for (size_t i = 0; i < fittings.size(); ++i) {
         for (auto& e : validate_fitting(fittings[i], "fittings[" + std::to_string(i) + "]"))
             errs.push_back(std::move(e));
+    }
+    std::set<std::string> run_ids;
+    for (const auto& run : runs)
+        if (run.is_object() && run.value("id", ojson(nullptr)).is_string())
+            run_ids.insert(run["id"].get<std::string>());
+    for (size_t i = 0; i < fittings.size(); ++i) {
+        const auto& ft = fittings[i];
+        if (!ft.is_object()) continue;
+        const std::string loc = "fittings[" + std::to_string(i) + "]";
+        auto reference = [&](const ojson& id, const std::string& key) {
+            if (!id.is_string() || !run_ids.count(id.get<std::string>()))
+                errs.push_back(loc + "." + key + ": unknown run");
+        };
+        if (ft.contains("run_id")) reference(ft["run_id"], "run_id");
+        const auto params = ft.value("params", ojson(nullptr));
+        if (params.is_object() && ft.value("type", ojson(nullptr)) == "tee" &&
+            params.contains("run_ids") && params["run_ids"].is_array()) {
+            for (const auto& id : params["run_ids"]) reference(id, "params.run_ids");
+            reference(params.value("branch_run", ojson(nullptr)), "params.branch_run");
+        }
     }
     return errs;
 }

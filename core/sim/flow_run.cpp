@@ -4,6 +4,9 @@
 #include "sim/flow_run.h"
 #include "sim/sim_cache.h"
 #include "sim/sim_cancel.h"
+#include "sim/progress.h"
+#include "sim/overlay.h"
+#include "util/thread_pool.h"
 
 #include <nlohmann/json.hpp>
 
@@ -58,13 +61,21 @@ inline bool tri_x_at(double py, double pz, const V3& A, const V3& B, const V3& C
     return true;
 }
 
-// X-scanline parity fill one body's triangles into `mask` (OR), domain grid (Nx,Ny,Nz), cells of
-// `voxel` mm with origin at 0. pos = flat 3*nverts, idx = flat 3*ntris.
+}  // namespace
+
+// X-scanline parity fill one body's triangles into `mask` (OR) — see flow_run.h.
 void voxelize_body(const std::vector<float>& pos, const std::vector<uint32_t>& idx,
-                   std::vector<uint8_t>& mask, int Nx, int Ny, int Nz, double voxel) {
+                   std::vector<uint8_t>& mask, int Nx, int Ny, int Nz, double voxel,
+                   bool center_sample) {
     // crossings[(iy*Nz)+iz] = sorted x-intersections for that column.
     std::vector<std::vector<double>> col((size_t)Ny * Nz);
     const size_t ntri = idx.size() / 3;
+    const auto plan = chudware::governor::plan_for(
+        static_cast<uint64_t>(mask.size()) + static_cast<uint64_t>(col.size()) * 24,
+        "flow voxelization");
+    const int slabs = std::max(1, std::min({Nz, plan.workers, 8}));
+    chudware::pool::shared().parallel_for(slabs, [&](int slab) {
+    const int zfirst = Nz * slab / slabs, zlast = Nz * (slab + 1) / slabs;
     for (size_t t = 0; t < ntri; ++t) {
         uint32_t i0 = idx[3 * t], i1 = idx[3 * t + 1], i2 = idx[3 * t + 2];
         if (3u * i0 + 2 >= pos.size() || 3u * i1 + 2 >= pos.size() || 3u * i2 + 2 >= pos.size())
@@ -76,8 +87,8 @@ void voxelize_body(const std::vector<float>& pos, const std::vector<uint32_t>& i
         double zmin = std::min({A.z, B.z, C.z}), zmax = std::max({A.z, B.z, C.z});
         int iy0 = std::max(0, (int)std::floor(ymin / voxel));
         int iy1 = std::min(Ny - 1, (int)std::ceil(ymax / voxel));
-        int iz0 = std::max(0, (int)std::floor(zmin / voxel));
-        int iz1 = std::min(Nz - 1, (int)std::ceil(zmax / voxel));
+        int iz0 = std::max(zfirst, (int)std::floor(zmin / voxel));
+        int iz1 = std::min(zlast - 1, (int)std::ceil(zmax / voxel));
         for (int iy = iy0; iy <= iy1; ++iy) {
             double yc = (iy + 0.5) * voxel;
             for (int iz = iz0; iz <= iz1; ++iz) {
@@ -88,7 +99,7 @@ void voxelize_body(const std::vector<float>& pos, const std::vector<uint32_t>& i
         }
     }
     for (int iy = 0; iy < Ny; ++iy)
-        for (int iz = 0; iz < Nz; ++iz) {
+        for (int iz = zfirst; iz < zlast; ++iz) {
             auto& xs = col[(size_t)iy * Nz + iz];
             if (xs.size() < 2) continue;
             std::sort(xs.begin(), xs.end());
@@ -102,17 +113,24 @@ void voxelize_body(const std::vector<float>& pos, const std::vector<uint32_t>& i
                     xs[out++] = x;
             }
             xs.resize(out);
-            // Fill between consecutive entry/exit pairs (parity).
+            // Fill between consecutive entry/exit pairs (parity). The default fill is
+            // conservative along X (any cell the interior span touches); center_sample keeps
+            // only cells whose CENTER lies inside, matching the Y/Z center sampling.
             for (size_t k = 0; k + 1 < xs.size(); k += 2) {
-                int ix0 = std::max(0, (int)std::floor(xs[k] / voxel));
-                int ix1 = std::min(Nx - 1, (int)std::floor(xs[k + 1] / voxel));
+                int ix0, ix1;
+                if (center_sample) {
+                    ix0 = std::max(0, (int)std::ceil(xs[k] / voxel - 0.5));
+                    ix1 = std::min(Nx - 1, (int)std::floor(xs[k + 1] / voxel - 0.5));
+                } else {
+                    ix0 = std::max(0, (int)std::floor(xs[k] / voxel));
+                    ix1 = std::min(Nx - 1, (int)std::floor(xs[k + 1] / voxel));
+                }
                 for (int ix = ix0; ix <= ix1; ++ix)
                     mask[((size_t)ix * Ny + iy) * Nz + iz] = 1;
             }
         }
+    });
 }
-
-}  // namespace
 
 namespace {
 
@@ -138,6 +156,7 @@ nlohmann::json lbm_to_json(const LbmResult& R) {
         {"mass_imbalance", R.mass_imbalance},
         {"converged", R.converged},
         {"voxel_mm", R.voxel_mm},
+        {"grid_origin_mm", R.grid_origin_mm},
         {"ref_length_mm", R.ref_length_mm},
         {"min_feature_mm", R.min_feature_mm},
         {"min_feature_voxels", R.min_feature_voxels},
@@ -169,6 +188,8 @@ LbmResult lbm_from_json(const nlohmann::json& j) {
     R.mass_imbalance = j.value("mass_imbalance", -1.0);
     R.converged = j.value("converged", false);
     R.voxel_mm = j.value("voxel_mm", 0.0);
+    if (j.contains("grid_origin_mm"))
+        R.grid_origin_mm = j["grid_origin_mm"].get<std::array<double, 3>>();
     R.ref_length_mm = j.value("ref_length_mm", 0.0);
     R.min_feature_mm = j.value("min_feature_mm", 0.0);
     R.min_feature_voxels = j.value("min_feature_voxels", 0);
@@ -191,7 +212,7 @@ std::string cfd_input_hash(const std::vector<std::vector<float>>& body_pos,
         bodies.push_back(std::move(body));
     }
     nlohmann::json inputs = {
-        {"solver_revision", 5},
+        {"solver_revision", 6},
         {"bodies", bodies},
         {"velocity_ms", fp.velocity_ms},
         {"aoa_deg", fp.aoa_deg},
@@ -305,6 +326,23 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
     std::function<bool()> should_cancel;
     if (cancel_tok) should_cancel = [cancel_tok] { return cancel_tok->load(); };
 
+    auto on_progress = [&](int step, int total) {
+        const int pct = total > 0 ? (int)std::lround(100.0 * step / total) : 0;
+        if (progress_enabled()) {
+            auto event = progress_detail::event("lbm_solve", std::nullopt);
+            event["pct"] = pct;
+            event["step"] = step;
+            event["n_steps"] = total;
+            progress_detail::emit(event);
+        }
+        if (!fp.progress_path.empty()) {
+            // Windows rename cannot replace an existing file. Readers ignore a torn
+            // JSON snapshot and retain the preceding progress value.
+            std::ofstream file(fp.progress_path, std::ios::binary | std::ios::trunc);
+            if (file) file << "{\"pct\":" << pct << ",\"step\":" << step
+                           << ",\"n_steps\":" << total << ",\"stage\":\"lbm_solve\"}";
+        }
+    };
     const std::string input_hash = cfd_input_hash(body_pos, body_idx, fp);
     {
         auto hit = chudware::sim::cache::lookup(chudware::sim::cache::Kind::Cfd, input_hash);
@@ -328,6 +366,7 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
                         ? fp.velocity_ms * (longest * 1e-3) / fp.nu_fluid
                         : 0.0;
             }
+            on_progress(fp.n_steps, fp.n_steps);
             return R;
         }
     }
@@ -448,7 +487,7 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
     double off[3] = {up - lo[0], lat - lo[1], lat - lo[2]};
     std::vector<uint8_t> mask(ncell, 0);
     for (size_t b = 0; b < pos.size(); ++b) {
-        std::vector<float> shifted = pos[b];
+        auto& shifted = pos[b];  // working copy is no longer needed in the unshifted frame
         for (size_t i = 0; i + 2 < shifted.size(); i += 3) {
             shifted[i] += (float)off[0]; shifted[i + 1] += (float)off[1]; shifted[i + 2] += (float)off[2];
         }
@@ -494,31 +533,14 @@ LbmResult run_wind_tunnel(const std::vector<std::vector<float>>& body_pos,
     lp.dt_s = dt_s;
     lp.rho_air = fp.rho_fluid;
 
-    // Optional live-progress side-channel: write a tiny JSON file at each LBM checkpoint so a
-    // background run can be polled (get_job) like the OpenFOAM path. Atomic (tmp + rename) so a
-    // reader never sees a half-written file. No-op when no progress_path was supplied.
-    std::function<void(int, int)> on_progress;
-    if (!fp.progress_path.empty()) {
-        const std::string path = fp.progress_path;
-        on_progress = [path](int step, int total) {
-            const int pct = (total > 0) ? (int)std::lround(100.0 * step / total) : 0;
-            char buf[160];
-            std::snprintf(buf, sizeof(buf),
-                          "{\"pct\":%d,\"step\":%d,\"n_steps\":%d,\"stage\":\"lbm_solve\"}",
-                          pct, step, total);
-            // Overwrite in place each checkpoint. (NOT tmp+rename: std::rename does not replace an
-            // existing file on Windows, which would freeze the file at the first write.) A torn
-            // read is harmless — the poller ignores an unparseable file and keeps the last value.
-            std::ofstream f(path, std::ios::binary | std::ios::trunc);
-            if (f) f << buf;
-        };
-    }
+    // The kernel schedules wall-clock heartbeats independently of convergence.
     const auto t_solve0 = std::chrono::steady_clock::now();
     chudware::prof::phases::add("voxelize", std::chrono::duration<double, std::milli>(
                                              t_solve0 - t_setup0).count());
     R = lbm_run(mask, Nx, Ny, Nz, lp, fp.n_steps, on_progress, should_cancel);
     chudware::prof::phases::add("solve", std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - t_solve0).count());
+    R.grid_origin_mm = {-off[0], -off[1], -off[2]};
 
     // Resolution diagnostics. The grid pitch is set from the DOMAIN's longest span, so a thin
     // feature (a 4 mm wing/tail edge) can fall below one voxel and vanish — the real cause of
@@ -590,9 +612,10 @@ FlowPreset flow_preset(const std::string& name, bool& known) {
     return {48, 1500};
 }
 
-// Load an STL (binary or ASCII, units = mm) into a triangle soup: pos = flat 3*nverts, idx =
-// flat 3*ntris sequential (no vertex dedup — the X-scanline voxelizer indexes per-triangle,
-// so sharing vertices would not save work). Returns false with `err` on any malformed input.
+}  // namespace
+
+// Load an STL (binary or ASCII, units = mm) into a triangle soup — see flow_run.h. No vertex
+// dedup: the X-scanline voxelizer indexes per-triangle, so sharing vertices saves no work.
 bool load_stl_soup(const std::string& path, std::vector<float>& pos,
                    std::vector<uint32_t>& idx, std::string& err) {
     std::ifstream f(path, std::ios::binary);
@@ -651,6 +674,8 @@ bool load_stl_soup(const std::string& path, std::vector<float>& pos,
     return true;
 }
 
+namespace {
+
 struct Vec3 { double x, y, z; };
 Vec3 vcross(const Vec3& a, const Vec3& b) {
     return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
@@ -680,6 +705,160 @@ Vec3 compose_flow_dir(const Vec3& base, double aoa_deg, double sideslip_deg) {
 nlohmann::json flow_error(const std::string& code, const std::string& msg) {
     return nlohmann::json{{"ok", false}, {"error", msg}, {"code", code}, {"message", msg}};
 }
+
+// Package the solved field without repeating voxelization. Zero density marks
+// the solid nodes (lbm_run clears their populations before its final macros).
+std::string flow_overlay(const std::vector<float>& model_pos,
+                         const std::vector<float>& rotated_pos,
+                         const std::vector<uint32_t>& idx, const LbmResult& R,
+                         const Vec3& drag, const Vec3& side, const Vec3& lift,
+                         double speed_ms) {
+    if (idx.size() / 3 > kMaxOverlayTris || R.nx < 2 || R.ny < 2 ||
+        R.nz < 2 || R.voxel_mm <= 0.0) return {};
+    const size_t cells = (size_t)R.nx * R.ny * R.nz;
+    if (R.rho.size() != cells || R.ux.size() != cells ||
+        R.uy.size() != cells || R.uz.size() != cells) return {};
+    auto cell = [&](int x, int y, int z) {
+        return ((size_t)x * R.ny + y) * R.nz + z;
+    };
+    auto world = [&](const Vec3& p) {
+        const double x = R.grid_origin_mm[0] + (p.x + 0.5) * R.voxel_mm;
+        const double y = R.grid_origin_mm[1] + (p.y + 0.5) * R.voxel_mm;
+        const double z = R.grid_origin_mm[2] + (p.z + 0.5) * R.voxel_mm;
+        return Vec3{drag.x * x + lift.x * y + side.x * z,
+                    drag.y * x + lift.y * y + side.y * z,
+                    drag.z * x + lift.z * y + side.z * z};
+    };
+    auto inside = [&](const Vec3& p) {
+        return p.x >= 0.0 && p.x < R.nx - 1 && p.y >= 0.0 &&
+               p.y < R.ny - 1 && p.z >= 0.0 && p.z < R.nz - 1;
+    };
+    auto velocity = [&](const Vec3& p, Vec3& u) {
+        if (!inside(p)) return false;
+        const int ix = (int)std::lround(p.x), iy = (int)std::lround(p.y),
+                  iz = (int)std::lround(p.z);
+        if (R.rho[cell(ix, iy, iz)] <= 0.0f) return false;
+        const int x = (int)std::floor(p.x), y = (int)std::floor(p.y),
+                  z = (int)std::floor(p.z);
+        const double tx = p.x - x, ty = p.y - y, tz = p.z - z;
+        u = {0.0, 0.0, 0.0};
+        double weight = 0.0;
+        for (int a = 0; a < 2; ++a)
+            for (int b = 0; b < 2; ++b)
+                for (int c = 0; c < 2; ++c) {
+                    const size_t i = cell(x + a, y + b, z + c);
+                    if (R.rho[i] <= 0.0f) continue;
+                    const double w = (a ? tx : 1.0 - tx) *
+                                     (b ? ty : 1.0 - ty) * (c ? tz : 1.0 - tz);
+                    u.x += w * R.ux[i]; u.y += w * R.uy[i]; u.z += w * R.uz[i];
+                    weight += w;
+                }
+        if (weight <= 0.0) return false;
+        u = vscale(u, 1.0 / weight);
+        return vnorm(u) > 1e-9;
+    };
+    aicm::AicmBody body;
+    body.body_id = 1;
+    body.name = "Flow surface";
+    body.pos.insert_end(model_pos.begin(), model_pos.end());
+    body.idx.insert_end(idx.begin(), idx.end());
+    body.nrm.assign(model_pos.size(), 0.0f);
+    body.faces.push_back({1, 0, (uint32_t)(idx.size() / 3), 6});
+    for (size_t t = 0; t + 2 < idx.size(); t += 3) {
+        const size_t a = (size_t)idx[t] * 3, b = (size_t)idx[t + 1] * 3,
+                     c = (size_t)idx[t + 2] * 3;
+        const Vec3 n = vcross({model_pos[b] - model_pos[a], model_pos[b+1] - model_pos[a+1],
+                              model_pos[b+2] - model_pos[a+2]},
+                             {model_pos[c] - model_pos[a], model_pos[c+1] - model_pos[a+1],
+                              model_pos[c+2] - model_pos[a+2]});
+        for (size_t v : {a, b, c}) {
+            body.nrm[v] += (float)n.x;
+            body.nrm[v + 1] += (float)n.y;
+            body.nrm[v + 2] += (float)n.z;
+        }
+    }
+    std::vector<float> cp(model_pos.size() / 3), speed(cp.size());
+    Vec3 lo{1e30, 1e30, 1e30}, hi{-1e30, -1e30, -1e30};
+    double speed_max = speed_ms;
+    for (size_t v = 0; v < cp.size(); ++v) {
+        const size_t k = v * 3;
+        const Vec3 p{(rotated_pos[k] - R.grid_origin_mm[0]) / R.voxel_mm - 0.5,
+                     (rotated_pos[k + 2] - R.grid_origin_mm[1]) / R.voxel_mm - 0.5,
+                     (rotated_pos[k + 1] - R.grid_origin_mm[2]) / R.voxel_mm - 0.5};
+        lo.x = std::min(lo.x, p.x); lo.y = std::min(lo.y, p.y); lo.z = std::min(lo.z, p.z);
+        hi.x = std::max(hi.x, p.x); hi.y = std::max(hi.y, p.y); hi.z = std::max(hi.z, p.z);
+        const int x = (int)std::lround(p.x), y = (int)std::lround(p.y), z = (int)std::lround(p.z);
+        size_t nearest = cells;
+        double best = std::numeric_limits<double>::infinity();
+        for (int radius = 0; radius <= 4; ++radius) {
+            for (int a = std::max(0, x-radius); a <= std::min(R.nx-1, x+radius); ++a)
+                for (int b = std::max(0, y-radius); b <= std::min(R.ny-1, y+radius); ++b)
+                    for (int c = std::max(0, z-radius); c <= std::min(R.nz-1, z+radius); ++c) {
+                        const size_t i = cell(a,b,c);
+                        if (R.rho[i] <= 0.0f) continue;
+                        const double d = (a-p.x)*(a-p.x) + (b-p.y)*(b-p.y) + (c-p.z)*(c-p.z);
+                        if (d < best) { best = d; nearest = i; }
+                    }
+            if (best < (radius + 0.5) * (radius + 0.5)) break;
+        }
+        if (nearest == cells) return {};  // no fabricated wall sample
+        cp[v] = (float)std::clamp((2.0 / 3.0) * (R.rho[nearest] - 1.0) / (0.05 * 0.05), -3.0, 1.5);
+        speed[v] = (float)(vnorm({R.ux[nearest], R.uy[nearest], R.uz[nearest]}) * speed_ms / 0.05);
+        speed_max = std::max(speed_max, (double)speed[v]);
+        const double n = vnorm({body.nrm[k], body.nrm[k+1], body.nrm[k+2]});
+        if (n > 0.0) for (size_t a = 0; a < 3; ++a) body.nrm[k+a] /= (float)n;
+    }
+    std::vector<std::vector<float>> streams, stream_speed, slices, slice_speed;
+    streams.reserve(180); stream_speed.reserve(180);
+    auto append = [&](std::vector<float>& line, std::vector<float>& values, const Vec3& p, double s) {
+        const Vec3 w = world(p);
+        line.insert(line.end(), {(float)w.x, (float)w.y, (float)w.z});
+        values.push_back((float)(s * speed_ms / 0.05));
+    };
+    // 180 seeds, at most 450 points each: <81k segments even on a very fine grid.
+    for (int a = 0; a < 15; ++a) for (int b = 0; b < 12; ++b) {
+        Vec3 p{std::max(1.0, lo.x - 3.0),
+               std::clamp(lo.y + (hi.y-lo.y) * (-0.25 + 1.5 * (a+0.5)/15), 1.0, (double)R.ny-2),
+               std::clamp(lo.z + (hi.z-lo.z) * (-0.25 + 1.5 * (b+0.5)/12), 1.0, (double)R.nz-2)};
+        std::vector<float> line, values;
+        line.reserve(450*3); values.reserve(450);
+        for (int j = 0; j < 450; ++j) {
+            Vec3 u;
+            if (!velocity(p,u)) break;
+            const double s = vnorm(u), dt = 0.65 / s;
+            append(line,values,p,s);
+            const Vec3 mid{p.x+0.5*dt*u.x, p.y+0.5*dt*u.y, p.z+0.5*dt*u.z};
+            Vec3 um;
+            if (!velocity(mid,um)) break;
+            const double h = std::min(dt, 0.65 / vnorm(um));
+            p = {p.x+h*um.x, p.y+h*um.y, p.z+h*um.z};
+        }
+        if (values.size() >= 2) {
+            streams.push_back(std::move(line)); stream_speed.push_back(std::move(values));
+        }
+    }
+    // Mid-span velocity vectors: sampled field data, speed in m/s on both endpoints.
+    for (int a = 0; a < 40; ++a) for (int b = 0; b < 24; ++b) {
+        const Vec3 p{1.0+(R.nx-3.0)*(a+0.5)/40,
+                     1.0+(R.ny-3.0)*(b+0.5)/24, 0.5*(lo.z+hi.z)};
+        Vec3 u;
+        if (!velocity(p,u)) continue;
+        const double s = vnorm(u);
+        const Vec3 end{p.x+u.x/s, p.y+u.y/s, p.z+u.z/s};
+        Vec3 unused;
+        if (!velocity(end,unused)) continue;
+        std::vector<float> line, values;
+        append(line,values,p,s); append(line,values,end,s);
+        slices.push_back(std::move(line)); slice_speed.push_back(std::move(values));
+    }
+    std::vector<std::vector<uint8_t>> chunks;
+    chunks.push_back(aicm::scalar_chunk(1,"pressure_cp",cp,-3.0f,1.5f));
+    chunks.push_back(aicm::scalar_chunk(1,"velocity",speed,0.0f,(float)speed_max));
+    chunks.push_back(aicm::lines_chunk("streamlines",streams,&stream_speed));
+    chunks.push_back(aicm::lines_chunk("slices",slices,&slice_speed));
+    return publish_overlay_aicm(body,chunks);
+}
+
 
 }  // namespace
 
@@ -758,6 +937,8 @@ nlohmann::json run_flow_stl(const nlohmann::json& params) {
     const Vec3 lift_dir = vscale(vcross(drag_dir, side_dir),
                                  1.0 / (vnorm(vcross(drag_dir, side_dir)) + 1e-12));
     // p_rot = M p with M's rows = (drag_dir, side_dir, lift_dir).
+    const bool want_overlay = params.value("overlay", true);
+    const std::vector<float> model_pos = want_overlay ? pos : std::vector<float>{};
     for (size_t i = 0; i + 2 < pos.size(); i += 3) {
         const double x = pos[i], y = pos[i + 1], z = pos[i + 2];
         pos[i]     = (float)(drag_dir.x * x + drag_dir.y * y + drag_dir.z * z);
@@ -859,8 +1040,17 @@ nlohmann::json run_flow_stl(const nlohmann::json& params) {
     notes.insert(notes.begin(), nbuf);
     notes.push_back(
         "QUALITATIVE LBM (Smagorinsky LES, half-way bounce-back) - not a validated CFD result.");
-    notes.push_back("Flow overlay (Cp colormap / streamlines / slice PNGs) not yet ported to the "
-                    "C++ core — forces only this run.");
+    std::string overlay_path;
+    if (want_overlay) {
+        try {
+            overlay_path = flow_overlay(model_pos, pos, idx, R, drag_dir, side_dir, lift_dir, speed_mps);
+        } catch (const std::exception& e) {
+            notes.push_back(std::string("Flow overlay could not be packaged: ") + e.what());
+        }
+        if (overlay_path.empty())
+            notes.push_back("Flow overlay unavailable: surface exceeded the display budget, "
+                            "wall samples were unavailable, or publishing failed.");
+    }
     if (!R.warning.empty()) notes.push_back(R.warning);
 
     std::string reynolds_note;
@@ -896,8 +1086,9 @@ nlohmann::json run_flow_stl(const nlohmann::json& params) {
         {"cp_max", 1.5},
         {"vmax_mps", vmax_mps},
         {"solver_notes", notes},
-        {"scalar_fields", nlohmann::json::array()},
-        {"overlay_pending", true},  // honest marker: no overlay_aicm/lines_aicm/slice_pngs yet
+        {"scalar_fields", overlay_path.empty() ? nlohmann::json::array()
+                                             : nlohmann::json{"pressure_cp", "velocity"}},
+        {"overlay_aicm", overlay_path},
         {"steps_run", R.steps_run},
         {"converged", R.converged},
         {"residual", R.residual},

@@ -3,11 +3,17 @@
 // legs of piping_cfd_handoff, which stay MCP-side in T-RF20).
 #include "piping/piping.h"
 
+#include "piping/bom.h"
 #include "piping/cfd.h"
+#include "piping/duct.h"
+#include "piping/edit.h"
 #include "piping/fluid_properties.h"
+#include "piping/route.h"
 #include "piping/schema.h"
 #include "piping/simhandoff.h"
 #include "piping/solve.h"
+#include "piping/spec.h"
+#include "piping/vessel.h"
 
 namespace chudware::piping {
 namespace {
@@ -241,6 +247,14 @@ ojson m_piping_verify_cfd(const ojson& params) {
 }  // namespace
 
 bool call(const std::string& method, const ojson& params, ojson& result) {
+    if (method == "piping_edit") {
+        result = piping_edit(params);
+        return true;
+    }
+    if (method == "piping_fitting_k") {
+        result = piping_fitting_k(params);
+        return true;
+    }
     if (method == "piping_solve") {
         result = m_piping_solve(params);
         return true;
@@ -263,6 +277,26 @@ bool call(const std::string& method, const ojson& params, ojson& result) {
     }
     if (method == "piping_verify_cfd") {
         result = m_piping_verify_cfd(params);
+        return true;
+    }
+    if (method == "piping_route") {
+        result = piping_route(params);
+        return true;
+    }
+    if (method == "piping_spec_check") {
+        result = piping_spec_check(params);
+        return true;
+    }
+    if (method == "piping_bom") {
+        result = piping_bom(params);
+        return true;
+    }
+    if (method == "vessel_size") {
+        result = vessel_size(params);
+        return true;
+    }
+    if (method == "duct_size") {
+        result = duct_size(params);
         return true;
     }
     return false;

@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -423,6 +424,8 @@ LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz
 
     const int sample_every = std::max(1, n_steps / 50);
     std::vector<double> drag_hist;
+    auto last_progress = std::chrono::steady_clock::now();
+    if (on_progress) on_progress(0, n_steps);
 
     for (int step = 1; step <= n_steps; ++step) {
         collide_kernel<<<blocks, threads>>>(d_f, d_solid, nx, ny, nz, omega_s, nu0,
@@ -440,8 +443,17 @@ LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz
             return fail(std::string("kernel launch failed: ") +
                         cudaGetErrorString(launch_error));
         }
+        if (on_progress && step % sample_every != 0 && step != n_steps &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                           last_progress).count() >= 1.0) {
+            // Do not call queued kernel launches completed work. A heartbeat-only
+            // sync changes neither the lattice nor convergence sampling.
+            if (cudaDeviceSynchronize() != cudaSuccess)
+                return fail("progress heartbeat sync failed");
+            on_progress(step, n_steps);
+            last_progress = std::chrono::steady_clock::now();
+        }
         if (step % sample_every == 0 || step == n_steps) {
-            if (on_progress) on_progress(step, n_steps);
             // Cooperative cancel (sim_cancel): drain the queued kernels, free, and report a
             // terminal cancel (NOT a fallback — the caller checks should_cancel before the
             // CPU fallback). Takes effect at the next checkpoint, like the CPU path.
@@ -460,6 +472,10 @@ LbmResult lbm_run_cuda(const std::vector<uint8_t>& solid, int nx, int ny, int nz
             double drag_sample = 0.0, lift_sample = 0.0, side_sample = 0.0;
             momentum_exchange_host(h_f, drag_sample, lift_sample, side_sample);
             drag_hist.push_back(drag_sample);
+            if (on_progress) {
+                on_progress(step, n_steps);
+                last_progress = std::chrono::steady_clock::now();
+            }
         }
     }
     if (cudaDeviceSynchronize() != cudaSuccess)

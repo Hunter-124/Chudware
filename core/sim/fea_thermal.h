@@ -46,20 +46,25 @@
 // kg/m^3 · J/(kg·K) → J/(mm^3·K)).
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 #include "sim/sim_cancel.h"
 
 namespace chudware::sim {
 
-// A convection (Robin) film boundary applied to a set of mesh nodes: every ELEMENT SURFACE
-// FACE whose corner nodes are all in `nodes` receives h·∫N N dS into K and h·T_amb·∫N dS
-// into f. `nodes` is the resolved node set for the face (corners for tet4, corners+mid-side
-// for tet10 — the glue completes the mid-side nodes just as the static loader does).
+// A convection (Robin) film boundary applied to exterior mesh faces: with no explicit
+// exterior_face_ids, every exterior face whose corners belong to `nodes` receives
+// h·∫N N dS into K and h·T_amb·∫N dS into f. A compound faceset supplies exact face IDs
+// to prevent corner-node unions from selecting a face not present in any child.
+// `nodes` includes corners and, for tet10, the completed mid-side nodes.
 struct ThermalConvection {
     std::vector<int> nodes;   // mesh node indices on the convection face(s)
     double h = 0.0;           // film coefficient, W/(L^2·K) (L = mesh length unit)
     double t_amb = 0.0;       // ambient/bulk temperature, K or °C (same scale as t_fixed)
+    // Optional sorted, unique element*4+local-face IDs. Empty selects by nodes alone.
+    // A nonempty filter must contain exterior faces whose corners belong to nodes.
+    std::vector<std::size_t> exterior_face_ids;
 };
 
 struct ThermalResult {
@@ -127,6 +132,8 @@ struct ThermalFluxLoad {
     std::vector<int> nodes;   // mesh nodes on the loaded face(s)
     double q = 0.0;           // flux magnitude, W/L^2 (q>0 = heat INTO the body)
     ThermalSchedule schedule; // time modulation of q (empty = constant)
+    // Narrows node-union selection to these exterior facets; same contract as convection.
+    std::vector<std::size_t> exterior_face_ids;
 };
 
 // Steady-state conduction with N independent flux loads, each with its OWN node set and

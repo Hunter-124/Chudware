@@ -93,6 +93,7 @@
 #include "prof/phases.h"
 #include "prof/sampler.h"
 #include "sim/flow_run.h"
+#include "sim/pipe_flow.h"
 #ifdef CHUDWARE_WITH_POLYMESH
 #include "sim/fea_adaptive.h"
 #include "sim/fea_fatigue.h"
@@ -108,6 +109,8 @@
 #include "mechanical/mechanical.h"
 #include "parts/place.h"
 #include "piping/piping.h"
+#include "piping/fluid_properties.h"
+#include "piping/solve.h"
 #include "sim/fea_modal.h"
 #include "sim/fea_static.h"
 #include "sim/lbm.h"
@@ -3338,6 +3341,74 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 if (!r.warning.empty()) flow["warning"] = r.warning;
                 return emit(std::move(flow), out_json, 0);
             }
+            if (m == "sim_run_pipe_flow") {
+                // Native internal-flow LBM over a closed fluid volume (core/sim/pipe_flow.h):
+                // {stl_path | doc_id (+body)}, inlet/outlet planes, fluid, velocity or flow,
+                // optional piping + run_id for the fittings-aware 1-D comparison
+                // (piping::run_loss_1d — piping_solve's friction + K-factors).
+                json p = params;
+                // Fluid: explicit density_kgm3 + viscosity_pas win; otherwise a piping
+                // fluid_properties name (default water) at temp_c / gauge pressure_kpa.
+                if (!(p.contains("density_kgm3") && p.contains("viscosity_pas"))) {
+                    if (p.contains("fluid") && !p["fluid"].is_null() && !p["fluid"].is_string())
+                        return emit(json{{"ok", false},
+                                         {"reason", "invalid_params"},
+                                         {"hint", "fluid must be a name (water, air, methane, "
+                                                  "natural_gas, nitrogen, carbon_dioxide); pass "
+                                                  "density_kgm3 + viscosity_pas for a custom fluid"}},
+                                    out_json, 0);
+                    const std::string name = p.value("fluid", std::string("water"));
+                    const double t_k = p.value("temp_c", 20.0) + chudware::piping::T0_C;
+                    const double p_pa =
+                        p.value("pressure_kpa", 0.0) * 1000.0 + chudware::piping::P_ATM;
+                    const auto fp = chudware::piping::fluid_properties(
+                        chudware::piping::ojson(name), t_k, p_pa);
+                    if (!fp.value("ok", false))
+                        return emit(json{{"ok", false},
+                                         {"reason", "unknown_fluid"},
+                                         {"hint", fp.value("reason", std::string()) + "; " +
+                                                      fp.value("hint", std::string())}},
+                                    out_json, 0);
+                    p["density_kgm3"] = fp["rho"].get<double>();
+                    p["viscosity_pas"] = fp["mu"].get<double>();
+                    p["fluid"] = fp.value("name", name);
+                }
+                json r;
+                if (p.contains("stl_path") && p["stl_path"].is_string() &&
+                    !p["stl_path"].get<std::string>().empty()) {
+                    r = chudware::sim::run_pipe_flow_stl(p, &chudware::piping::run_loss_1d);
+                } else {
+                    const std::string doc_id = p.value("doc_id", std::string());
+                    if (doc_id.empty())
+                        return emit(json{{"ok", false},
+                                         {"reason", "invalid_params"},
+                                         {"hint", "pass stl_path or doc_id (+ optional body) of "
+                                                  "the closed fluid volume"}},
+                                    out_json, 0);
+                    const std::string body = p.value("body", std::string());
+                    std::vector<chudware::sim::PipeFlowShell> shells;
+                    json names = json::array();
+                    for (const auto& b : chudware::doc::doc_tessellate_bodies(doc_id)) {
+                        names.push_back(b.name);
+                        if (!body.empty() && b.name != body) continue;
+                        shells.push_back({std::vector<float>(b.pos.begin(), b.pos.end()),
+                                          std::vector<uint32_t>(b.idx.begin(), b.idx.end())});
+                    }
+                    if (shells.empty())
+                        return emit(
+                            json{{"ok", false},
+                                 {"reason", body.empty() ? "no_geometry" : "unknown_body"},
+                                 {"hint", body.empty()
+                                              ? "doc " + doc_id + " has no solid fluid volume"
+                                              : "no body named '" + body + "'; bodies: " +
+                                                    names.dump()}},
+                            out_json, 0);
+                    r = chudware::sim::run_pipe_flow(shells, p, &chudware::piping::run_loss_1d);
+                }
+                if (r.value("ok", false) && r.contains("provenance"))
+                    r["provenance"]["engine_build_id"] = CHUDWARE_HOSTD_BUILD_ID;
+                return emit(std::move(r), out_json, 0);
+            }
             if (m == "sim_cancel") {
                 // T-RF16: cancel a registered sim job (core/sim/sim_cancel.cpp — same
                 // registry semantics as agent cancel: idempotent, miss = cancelled:false).
@@ -4295,6 +4366,52 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             if (chudware::parts::place_call(m, params, pl_result, pl_err, ps)) {
                 return emit(std::move(pl_result), out_json, 0);
             }
+        }
+        // piping_route over a live document: every solid body of `doc_id` (world AABB, minus
+        // `ignore_bodies` names/components) joins the caller's `obstacles` before the module
+        // dispatch below routes around them.
+        if (m == "piping_route" && params.contains("doc_id") && params["doc_id"].is_string() &&
+            !params["doc_id"].get<std::string>().empty()) {
+            if (params.contains("obstacles") && !params["obstacles"].is_array())
+                return emit(json{{"ok", false},
+                                 {"reason", "invalid_params"},
+                                 {"hint", "obstacles must be a list of {min,max,name?}"}},
+                            out_json, 0);
+            std::vector<std::string> ignore;
+            if (params.contains("ignore_bodies")) {
+                if (!params["ignore_bodies"].is_array())
+                    return emit(json{{"ok", false},
+                                     {"reason", "invalid_params"},
+                                     {"hint", "ignore_bodies must be a list of body names"}},
+                                out_json, 0);
+                for (const auto& n : params["ignore_bodies"])
+                    if (n.is_string()) ignore.push_back(n.get<std::string>());
+            }
+            json world;
+            try {
+                world = chudware::doc::doc_asm_world_bodies(params["doc_id"].get<std::string>());
+            } catch (const chudware::doc::OpError& e) {
+                return emit(json{{"ok", false},
+                                 {"reason", e.code.empty() ? "unknown_doc" : e.code},
+                                 {"hint", std::string(e.what()) +
+                                              " (piping_route doc_id must be an open document)"}},
+                            out_json, 0);
+            }
+            json obstacles = params.value("obstacles", json::array());
+            for (const auto& b : world.value("bodies", json::array())) {
+                const std::string name = b.value("name", std::string());
+                const std::string comp = b.value("component", std::string());
+                if (std::find(ignore.begin(), ignore.end(), name) != ignore.end() ||
+                    (!comp.empty() &&
+                     std::find(ignore.begin(), ignore.end(), comp) != ignore.end()))
+                    continue;
+                const json& bb = b.contains("bbox") ? b["bbox"] : json(nullptr);
+                if (!bb.is_object() || !bb.contains("min") || !bb.contains("max")) continue;
+                obstacles.push_back({{"min", bb["min"]},
+                                     {"max", bb["max"]},
+                                     {"name", name.empty() ? comp : name}});
+            }
+            params["obstacles"] = std::move(obstacles);
         }
         // --- T-RF19 leaf 4: hydraulic + piping (core/hydraulic, core/piping) ---
         // ojson preserves dict-insertion-order fidelity the Python envelopes rely on;

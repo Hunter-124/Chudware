@@ -512,6 +512,31 @@ bool validate_faceset_input(const json& fs, std::string& error) {
         error = "faceset must be an object";
         return false;
     }
+    if (fs.contains("facesets")) {
+        for (const char* key : {"points", "tol_mm", "perp_tol_mm", "face_normal", "surface"}) {
+            if (fs.contains(key)) {
+                error = std::string("compound faceset cannot contain ") + key +
+                        "; geometry belongs on each terminal faceset";
+                return false;
+            }
+        }
+        const auto& children = fs["facesets"];
+        if (!children.is_array() || children.empty()) {
+            error = "compound faceset requires a non-empty facesets array";
+            return false;
+        }
+        for (size_t i = 0; i < children.size(); ++i) {
+            if (children[i].is_object() && children[i].contains("facesets")) {
+                error = "compound faceset children must be terminal facesets";
+                return false;
+            }
+            if (!validate_faceset_input(children[i], error)) {
+                error = "compound faceset child " + std::to_string(i) + ": " + error;
+                return false;
+            }
+        }
+        return true;
+    }
     if (!fs.contains("points") || !fs["points"].is_array() ||
         fs["points"].empty()) {
         error = "faceset requires a non-empty points array";
@@ -1282,6 +1307,19 @@ bool tri6_face_weights(const std::vector<double>& points, const int* el,
     return std::isfinite(area) && area > 0.0;
 }
 
+// A compound keeps one oracle per CAD face. Facets must pass ONE complete
+// child's oracle, never a mixture of corners selected by different children.
+struct FacesetFacetGroup {
+    std::vector<int> nodes;
+    FacesetSurface surface;
+};
+using FacesetFacetGroups = std::vector<FacesetFacetGroup>;
+FacesetFacetGroups compound_faceset_groups(const json& fs,
+                                          const std::vector<double>& points);
+bool faceset_facet_matches(const FacesetFacetGroups& groups,
+                           const std::vector<double>& points,
+                           const int* element, const int* face, int corners);
+
 // Visit every exterior element face whose CORNER nodes are ALL in `node_set`, in
 // element/face order, as one BoundaryFacet (fea_prepare.h) carrying the consistent
 // boundary integrals of that face:
@@ -1305,7 +1343,8 @@ template <bool kFull, class Visit>
 double visit_selected_boundary_faces(const std::vector<double>& points,
                                      const std::vector<int>& tets, int nodes_per_elem,
                                      const std::unordered_set<int>& node_set,
-                                     std::string& fold_detail, Visit&& visit) {
+                                     std::string& fold_detail, Visit&& visit,
+                                     const FacesetFacetGroups& groups = {}) {
     // P5: a boundary face needs ALL 3 (tet) / 4 (hex) corners in the set — under 3 nodes
     // no face can qualify, so the loaded area is exactly 0 and the whole element sweep is
     // a no-op. Exact short-circuit (the caller's w_sum fallback branch fires, as before);
@@ -1346,6 +1385,8 @@ double visit_selected_boundary_faces(const std::vector<double>& points,
                 if (!node_set.count(cn[i])) { all_in = false; break; }
             }
             if (!all_in) continue;
+            if (!groups.empty() &&
+                !faceset_facet_matches(groups, points, el, fc, fk)) continue;
             facet.element = static_cast<int>(e);
             facet.face = f;
             if (tet10) {
@@ -1457,7 +1498,8 @@ double visit_selected_boundary_faces(const std::vector<double>& points,
 double accumulate_face_weights(const std::vector<double>& points, const std::vector<int>& tets,
                                int nodes_per_elem, const std::unordered_set<int>& node_set,
                                std::vector<double>& node_w, std::vector<double>& node_nw,
-                               std::string& fold_detail) {
+                               std::string& fold_detail,
+                               const FacesetFacetGroups& groups = {}) {
     const bool tet10 = (nodes_per_elem == 10);
     return visit_selected_boundary_faces<false>(
         points, tets, nodes_per_elem, node_set, fold_detail,
@@ -1479,7 +1521,7 @@ double accumulate_face_weights(const std::vector<double>& points, const std::vec
                 node_nw[node * 3 + 1] += w * facet.normal[1];
                 node_nw[node * 3 + 2] += w * facet.normal[2];
             }
-        });
+        }, groups);
 }
 
 // Complete a tet10 loaded-face node set with its MID-SIDE (mid-edge) nodes.
@@ -1502,7 +1544,8 @@ double accumulate_face_weights(const std::vector<double>& points, const std::vec
 // nodes). After this, every midside node needed by either flat or curved tri6 quadrature is
 // in node_ids and the consistent resultant is preserved.
 void add_midside_face_nodes(const std::vector<int>& tets, int nodes_per_elem,
-                            std::unordered_set<int>& node_set) {
+                            std::unordered_set<int>& node_set,
+                            const FacesetFacetGroups& groups = {}) {
     if (nodes_per_elem != 10) return;  // tet4 / hex8 have no mid-side nodes — unchanged.
     // P5: an edge completes only when BOTH endpoint corners are in the set — with fewer
     // than 2 nodes nothing can ever be added, so skip the full element sweep. Exact
@@ -1518,7 +1561,13 @@ void add_midside_face_nodes(const std::vector<int>& tets, int nodes_per_elem,
         const int* el = &tets[e * stride];
         for (const auto& ee : kEdgeEnds) {
             const int a = el[ee[1]], b = el[ee[2]];
-            if (node_set.count(a) && node_set.count(b)) node_set.insert(el[ee[0]]);
+            if (!node_set.count(a) || !node_set.count(b)) continue;
+            if (!groups.empty() &&
+                std::none_of(groups.begin(), groups.end(), [&](const auto& group) {
+                    return std::binary_search(group.nodes.begin(), group.nodes.end(), a) &&
+                           std::binary_search(group.nodes.begin(), group.nodes.end(), b);
+                })) continue;
+            node_set.insert(el[ee[0]]);
         }
     }
 }
@@ -2129,22 +2178,32 @@ std::vector<int> faceset_membership(const nlohmann::json& fs,
         }
     }
 
-    const std::vector<double> sample = faceset_sample_local(fs.value("points", nlohmann::json::array()));
-    const double tol = fs.value("tol_mm", 1.0);
     std::vector<int> ids;
-    FacesetSurface surf;
-    if (faceset_surface(fs, surf)) {
-        const double perp0 = fs.value("perp_tol_mm", 1.5);
-        if (std::isfinite(perp0) && perp0 > 0.0)
-            ids = nodes_in_faceset_surface(points, sample, tol, surf, perp0);
+    if (fs.contains("facesets")) {
+        for (const auto& child : fs["facesets"]) {
+            auto child_ids = faceset_membership(child, points);
+            ids.insert(ids.end(), child_ids.begin(), child_ids.end());
+        }
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     } else {
-        std::array<double, 3> fn{};
-        double perp_tol = 0.0;
-        const bool has_fn = faceset_normal_local(fs, fn, perp_tol);
-        if (has_fn)
-            ids = nodes_in_faceset(points, sample, tol, fn.data(), perp_tol);
-        else
-            ids = nodes_in_faceset(points, sample, tol, nullptr, 0.0);
+        const std::vector<double> sample =
+            faceset_sample_local(fs.value("points", nlohmann::json::array()));
+        const double tol = fs.value("tol_mm", 1.0);
+        FacesetSurface surf;
+        if (faceset_surface(fs, surf)) {
+            const double perp0 = fs.value("perp_tol_mm", 1.5);
+            if (std::isfinite(perp0) && perp0 > 0.0)
+                ids = nodes_in_faceset_surface(points, sample, tol, surf, perp0);
+        } else {
+            std::array<double, 3> fn{};
+            double perp_tol = 0.0;
+            const bool has_fn = faceset_normal_local(fs, fn, perp_tol);
+            if (has_fn)
+                ids = nodes_in_faceset(points, sample, tol, fn.data(), perp_tol);
+            else
+                ids = nodes_in_faceset(points, sample, tol, nullptr, 0.0);
+        }
     }
     {
         std::lock_guard<std::mutex> lk(cache_mtx);
@@ -2159,13 +2218,68 @@ std::vector<int> faceset_membership(const nlohmann::json& fs,
     return ids;
 }
 
+namespace {
+FacesetFacetGroups compound_faceset_groups(const json& fs,
+                                          const std::vector<double>& points) {
+    FacesetFacetGroups groups;
+    if (!fs.contains("facesets")) return groups;
+    groups.reserve(fs["facesets"].size());
+    for (const auto& child : fs["facesets"]) {
+        FacesetFacetGroup group;
+        group.nodes = faceset_membership(child, points);
+        faceset_surface(child, group.surface);
+        groups.push_back(std::move(group));
+    }
+    return groups;
+}
+
+bool faceset_group_facet_matches(const FacesetFacetGroup& group,
+                                 const std::vector<double>& points,
+                                 const int* element, const int* face, int corners) {
+    for (int i = 0; i < corners; ++i)
+        if (!std::binary_search(group.nodes.begin(), group.nodes.end(), element[face[i]]))
+            return false;
+    if (group.surface.kind == FacesetSurface::kNone) return true;
+    double center[3] = {};
+    for (int i = 0; i < corners; ++i)
+        for (int c = 0; c < 3; ++c)
+            center[c] += points[static_cast<size_t>(element[face[i]]) * 3 + c] / corners;
+    const double* p0 = &points[static_cast<size_t>(element[face[0]]) * 3];
+    const double* p1 = &points[static_cast<size_t>(element[face[1]]) * 3];
+    const double* p2 = &points[static_cast<size_t>(element[face[2]]) * 3];
+    const double a[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+    const double b[3] = {p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+    const double normal[3] = {a[1] * b[2] - a[2] * b[1],
+                              a[2] * b[0] - a[0] * b[2],
+                              a[0] * b[1] - a[1] * b[0]};
+    const double norm = std::sqrt(normal[0] * normal[0] + normal[1] * normal[1] +
+                                  normal[2] * normal[2]);
+    double analytic_normal[3];
+    if (!(norm > 1e-12) ||
+        !faceset_surface_normal(group.surface, center, analytic_normal)) return false;
+    const double alignment = std::fabs(normal[0] * analytic_normal[0] +
+                                        normal[1] * analytic_normal[1] +
+                                        normal[2] * analytic_normal[2]) / norm;
+    return alignment >= 0.5;
+}
+
+bool faceset_facet_matches(const FacesetFacetGroups& groups,
+                           const std::vector<double>& points,
+                           const int* element, const int* face, int corners) {
+    return std::any_of(groups.begin(), groups.end(), [&](const auto& group) {
+        return faceset_group_facet_matches(group, points, element, face, corners);
+    });
+}
+}  // namespace
+
 // Face selections describe the exterior skin. Analytic/planar tolerances are
 // deliberately wider than a fine volume-mesh layer, so applying them to every
 // volume node also captures near-surface interior nodes. Intersect the geometric
 // match with nodes that actually belong to an exterior element face.
 std::vector<int> boundary_faceset_membership(
     const nlohmann::json& fs, const std::vector<double>& points,
-    const std::vector<int>& tets, int nodes_per_elem) {
+    const std::vector<int>& tets, int nodes_per_elem,
+    const FacesetFacetGroups& prepared_groups = {}) {
     std::vector<int> ids = faceset_membership(fs, points);
     if (ids.empty() || tets.empty()) return ids;
     const bool hex = nodes_per_elem == 8;
@@ -2189,12 +2303,31 @@ std::vector<int> boundary_faceset_membership(
     }
     FacesetSurface analytic_surface;
     const bool has_analytic_surface = faceset_surface(fs, analytic_surface);
+    const auto owned_groups = prepared_groups.empty()
+                                  ? compound_faceset_groups(fs, points) : FacesetFacetGroups{};
+    const auto& groups = prepared_groups.empty() ? owned_groups : prepared_groups;
     std::unordered_set<int> boundary;
     for (size_t e = 0; e < tets.size() / stride; ++e) {
         const int* element = &tets[e * stride];
         for (int face = 0; face < nfaces; ++face) {
             const int* table = hex ? kHexFaces[face] : kTetFaces[face].corner;
             if (owners[key_for(element, table)] != 1) continue;
+            if (!groups.empty()) {
+                for (const auto& group : groups) {
+                    if (group.surface.kind != FacesetSurface::kNone &&
+                        !faceset_group_facet_matches(group, points, element, table,
+                                                     corners_per_face)) continue;
+                    auto admit = [&](int node) {
+                        if (std::binary_search(group.nodes.begin(), group.nodes.end(), node))
+                            boundary.insert(node);
+                    };
+                    for (int i = 0; i < corners_per_face; ++i) admit(element[table[i]]);
+                    if (nodes_per_elem == 10)
+                        for (int i = 0; i < 3; ++i)
+                            admit(element[kTetFaces[face].mid[i]]);
+                }
+                continue;
+            }
             if (has_analytic_surface) {
                 // A curved faceset owns facets, not isolated near-surface
                 // nodes. A chamfer can have a radial normal and a midside
@@ -2397,8 +2530,9 @@ json deposit_mechanical_load_list(
             if ((type == "force" && !nonzero3(load["vector"])) ||
                 (type == "pressure" && load["magnitude"].get<double>() == 0.0))
                 continue;
+            const auto groups = compound_faceset_groups(faces, points);
             std::vector<int> node_ids =
-                boundary_faceset_membership(faces, points, tets, nodes_per_elem);
+                boundary_faceset_membership(faces, points, tets, nodes_per_elem, groups);
             if (node_ids.empty())
                 return json{{"ok", false},
                             {"error", ctx + ": load faces resolved to 0 mesh nodes "
@@ -2413,7 +2547,7 @@ json deposit_mechanical_load_list(
             // or w_sum collapses to ~0 and the force degenerates to a wrong, non-convergent
             // corner split (Bug Z1). add_midside_face_nodes inserts every mid-edge node whose
             // two endpoint corners are already selected; no-op for tet4/hex8.
-            add_midside_face_nodes(tets, nodes_per_elem, node_set);
+            add_midside_face_nodes(tets, nodes_per_elem, node_set, groups);
             // Re-materialise node_ids from the completed set (sorted, unique) so the force /
             // pressure deposition loops below land on the SAME nodes the weights were put on.
             node_ids.assign(node_set.begin(), node_set.end());
@@ -2432,7 +2566,7 @@ json deposit_mechanical_load_list(
                 std::string fold_detail;
                 loaded_area = accumulate_face_weights(points, tets, nodes_per_elem,
                                                       node_set, node_w, node_nw,
-                                                      fold_detail);
+                                                      fold_detail, groups);
                 if (!std::isfinite(loaded_area))
                     return json{{"ok", false},
                                 {"error", ctx + ": invalid or folded quadratic "
@@ -2760,8 +2894,15 @@ json cad_contact_preflight(const json& study) {
         // The samples above can PROVE a selector spans two bodies, but cannot
         // prove absence on a small unsampled patch. Use a conservative bounding
         // envelope for fixture exclusion and unique load-body attribution.
-        auto possible_bodies = [&](const json& selector) {
+        auto possible_bodies = [&](auto&& self, const json& selector) -> std::set<int> {
             std::set<int> possible;
+            if (selector.contains("facesets")) {
+                for (const auto& child : selector["facesets"]) {
+                    const auto child_bodies = self(self, child);
+                    possible.insert(child_bodies.begin(), child_bodies.end());
+                }
+                return possible;
+            }
             const auto cloud = faceset_sample_local(selector.value("points", json::array()));
             const double tol = selector.value("tol_mm", 1.0);
             std::array<double, 3> normal{};
@@ -2809,13 +2950,13 @@ json cad_contact_preflight(const json& study) {
             if (selected.empty()) return nullptr;
             if (auto out = span(selected, selector_label(fixture, "fixtures", i), "fixture"); !out.is_null())
                 return out;
-            for (int body : possible_bodies(fixture)) fixed[body] = true;
+            for (int body : possible_bodies(possible_bodies, fixture)) fixed[body] = true;
         }
         std::vector<std::array<double, 3>> loads(count);
         if (study.contains("loads")) for (std::size_t i = 0; i < study["loads"].size(); ++i) {
             const auto& load = study["loads"][i];
             const auto& faces = load.value("faces", json::object());
-            const auto selected = possible_bodies(faces);
+            const auto selected = possible_bodies(possible_bodies, faces);
             if (auto out = span(selected_bodies(faces), selector_label(faces, "loads", i), "load"); !out.is_null())
                 return out;
             if (selected.size() != 1 || load.value("type", "force") != "force" ||
@@ -5190,12 +5331,16 @@ namespace {
 // consistent weights (identical treatment to fea_run_static's load loop). Returns sorted
 // unique node ids; empty when the faceset resolves to nothing.
 std::vector<int> resolve_face_nodes(const json& faces, const std::vector<double>& points,
-                                    const std::vector<int>& tets, int nodes_per_elem) {
+                                    const std::vector<int>& tets, int nodes_per_elem,
+                                    const FacesetFacetGroups& prepared_groups = {}) {
+    const auto owned_groups = prepared_groups.empty()
+                                  ? compound_faceset_groups(faces, points) : FacesetFacetGroups{};
+    const auto& groups = prepared_groups.empty() ? owned_groups : prepared_groups;
     std::vector<int> ids =
-        boundary_faceset_membership(faces, points, tets, nodes_per_elem);
+        boundary_faceset_membership(faces, points, tets, nodes_per_elem, groups);
     if (ids.empty()) return ids;
     std::unordered_set<int> node_set(ids.begin(), ids.end());
-    add_midside_face_nodes(tets, nodes_per_elem, node_set);
+    add_midside_face_nodes(tets, nodes_per_elem, node_set, groups);
     ids.assign(node_set.begin(), node_set.end());
     std::sort(ids.begin(), ids.end());
     return ids;
@@ -5478,7 +5623,9 @@ bool resolve_boundary_selection(const json& faceset, const PreparedMesh& mesh,
         std::string faceset_error;
         if (!validate_faceset_input(faceset, faceset_error))
             return prepare_refuse(error, label + ": " + faceset_error);
-        out.nodes = resolve_face_nodes(faceset, mesh.points, mesh.tets, mesh.nodes_per_elem);
+        const auto groups = compound_faceset_groups(faceset, mesh.points);
+        out.nodes = resolve_face_nodes(faceset, mesh.points, mesh.tets, mesh.nodes_per_elem,
+                                       groups);
         if (out.nodes.empty())
             return prepare_refuse(
                 error, label + ": faces resolved to 0 exterior mesh nodes (tol=" +
@@ -5502,7 +5649,7 @@ bool resolve_boundary_selection(const json& faceset, const PreparedMesh& mesh,
                     out.node_area_mm2[static_cast<std::size_t>(it - out.nodes.begin())] +=
                         facet.weights[i];
                 }
-            });
+            }, groups);
         if (!std::isfinite(area))
             return prepare_refuse(error, label + ": invalid or folded quadratic boundary "
                                                  "face" + fold_detail);
@@ -5893,12 +6040,32 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                 return json{{"ok", false},
                             {"error", "fea_thermal: load " + std::to_string(i) +
                                           " has invalid tol_mm"}};
+            const auto groups = compound_faceset_groups(faces, points);
             std::vector<int> ids =
-                resolve_face_nodes(faces, points, tets, nodes_per_elem);
+                resolve_face_nodes(faces, points, tets, nodes_per_elem, groups);
             if (ids.empty())
                 return json{{"ok", false},
                             {"error", "fea_thermal: load " + std::to_string(i) +
                                           " resolved to 0 mesh nodes"}};
+            std::vector<std::size_t> exterior_face_ids;
+            if (faces.contains("facesets")) {
+                const std::unordered_set<int> node_set(ids.begin(), ids.end());
+                std::string fold_detail;
+                const double area = visit_selected_boundary_faces<false>(
+                    points, tets, nodes_per_elem, node_set, fold_detail,
+                    [&](const BoundaryFacet& facet) {
+                        exterior_face_ids.push_back(static_cast<std::size_t>(facet.element) * 4 +
+                                                    static_cast<std::size_t>(facet.face));
+                    }, groups);
+                if (!std::isfinite(area))
+                    return json{{"ok", false},
+                                {"error", "fea_thermal: invalid or folded compound boundary" +
+                                              fold_detail}};
+                if (exterior_face_ids.empty())
+                    return json{{"ok", false},
+                                {"error", "fea_thermal: compound load " + std::to_string(i) +
+                                              " selects no complete exterior mesh face"}};
+            }
             if (!load.contains("type") || !load["type"].is_string())
                 return json{{"ok", false},
                             {"error", "fea_thermal: load " + std::to_string(i) +
@@ -5918,6 +6085,7 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                                               std::to_string(i) +
                                               " requires a finite non-zero magnitude"}};
                 chudware::sim::ThermalFluxLoad fl;
+                fl.exterior_face_ids = std::move(exterior_face_ids);
                 fl.nodes = ids;
                 fl.q = q_wm2 / 1.0e6;
                 std::string serr;
@@ -5952,8 +6120,12 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                                 {"error", "fea_thermal: convection h must be finite "
                                           "and positive and ambient temperature must "
                                           "be finite"}};
-                convections.push_back(
-                    chudware::sim::ThermalConvection{ids, h / 1.0e6, ambient});
+                chudware::sim::ThermalConvection cv;
+                cv.nodes = std::move(ids);
+                cv.h = h / 1.0e6;
+                cv.t_amb = ambient;
+                cv.exterior_face_ids = std::move(exterior_face_ids);
+                convections.push_back(std::move(cv));
             } else {
                 return json{{"ok", false},
                             {"error", "fea_thermal: unsupported load type '" + type +

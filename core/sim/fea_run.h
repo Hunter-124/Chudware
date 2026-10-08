@@ -83,9 +83,13 @@ std::vector<int> nodes_in_faceset_surface(const std::vector<double>& points,
 //   OR points[n*3] + tets[m*K] inline
 //   fineness (0..1), mesh_order (1=tet4, 2=tet10)
 //   material: {E_mpa, nu, yield_mpa, density_g_cm3}
-//   fixtures: [{points:[[x,y,z]...], tol_mm}]
-//   loads:    [{faces:{points,tol_mm}, type:"force"|"pressure",
+//   fixtures: [faceset]
+//   loads:    [{faces:faceset, type:"force"|"pressure",
 //               vector:[x,y,z]|null, magnitude:<float>|null}]
+// A faceset is a terminal {points:[[x,y,z]...], tol_mm, normal?, surface?}
+// or {facesets:[terminal,...]} with at least one child, no nesting and no parent
+// points/tol_mm/normal/surface. Nodes and facets are deduplicated; one force is
+// distributed over the union once. A facet must belong wholly to one child.
 // Returns {ok, displacement, disp_magnitude, von_mises, summary_node, n_dof,
 //          summary:{max_von_mises_mpa,max_disp_mm,min_fos,...}, solver_notes}.
 // Summary scalars are rounded to match the oracle (vm .4, disp .6, fos .4).

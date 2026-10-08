@@ -22,6 +22,8 @@ using pyutil::ojson;
 inline constexpr double kG = 9.80665;        // m/s²
 inline constexpr double kSnapTolMm = 1.0;    // endpoint snap tolerance
 
+// Deterministic fitting loss preview; uses the same K evaluator as network/pipe_flow.
+ojson piping_fitting_k(const ojson& params);
 // Import a pump-curve CSV (text or path) with affinity-law scaling
 // (Q' = Q·r, H' = H·r²). {"ok": true, "points": [[Q_m3h, H_m], ...],
 // "shutoff_head", "max_flow", "speed_ratio"} or contract-shaped failure.
@@ -48,6 +50,20 @@ ojson solve_gas(const ojson& doc, const ojson& boundary, const ojson& fluid = nu
 ojson pressure_drop_report(const ojson& doc, const ojson& result = nullptr,
                            const ojson& boundary = nullptr, const ojson& fluid = nullptr,
                            const ojson& pumps = nullptr, double tol_mm = kSnapTolMm);
+
+// 1-D pressure-loss estimate of ONE run at a given flow, with exactly the friction law and
+// fitting K-factors piping_solve applies to that link (Clamond/Colebrook or 64/Re over the
+// corner-to-corner centreline length; Rennels bends, Crane fittings and explicit K models;
+// run_id/tee-role attribution, or legacy origin-on-path). A corner with no elbow is still a
+// swept bend (run.bend_radius, null = 1.5·OD) and adds a Rennels bend K.
+// roughness_mm < 0 keeps the run's material roughness. Plain nlohmann::json in/out so the
+// sim layer can take it as a callback (sim::PipeRunLossFn).
+// {ok, run_id, inner_dia_mm, velocity_ms, reynolds, friction_factor, roughness_mm,
+//  material_roughness_mm, dynamic_pressure_pa, centreline_length_mm, bend_radius_mm, bends,
+//  friction_pa, fittings:[{id,type,K,method,dp_pa}], fittings_K, fittings_pa, total_pa}
+//  | {ok:false, reason, hint}.
+nlohmann::json run_loss_1d(const nlohmann::json& doc, const std::string& run_id, double rho,
+                           double mu, double flow_m3s, double roughness_mm);
 
 // Pump duty point + NPSH margin. pump_curve: CSV text/path or a
 // load_pump_curve result. system: {"static_head_m", "k"}; derived from

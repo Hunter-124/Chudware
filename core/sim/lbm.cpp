@@ -143,6 +143,28 @@ float pairwise_sum_f32(const float* a, std::size_t n) {
     return pairwise_sum_f32(a, n2) + pairwise_sum_f32(a + n2, n - n2);
 }
 
+// Static, disjoint slabs preserve each cell's arithmetic and reduction order. OpenMP
+// builds avoid queue allocations; portable builds use the existing bounded shared pool.
+template <class Body>
+void lattice_for(std::size_t count, int threads, const Body& body) {
+    const int slabs = static_cast<int>(std::min<std::size_t>(count, threads));
+    auto slab = [&](int s) {
+        const std::size_t first = count * s / slabs;
+        const std::size_t last = count * (s + 1) / slabs;
+        for (std::size_t i = first; i < last; ++i) body(i);
+    };
+    if (slabs <= 1) {
+        for (std::size_t i = 0; i < count; ++i) body(i);
+        return;
+    }
+#ifdef CHUDWARE_HAVE_OPENMP
+#pragma omp parallel for schedule(static) num_threads(slabs)
+    for (int s = 0; s < slabs; ++s) slab(s);
+#else
+    chudware::pool::shared().parallel_for(slabs, slab);
+#endif
+}
+
 }  // namespace
 
 LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
@@ -264,32 +286,22 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     std::vector<float> f(ncell * NQ, 0.0f);
     std::vector<float> fstream(ncell * NQ, 0.0f);
 
-    // P3/F3: worker threads for the per-step lattice loops. Budget comes from the
-    // shared governor + pool so nested solves cannot oversubscribe; tiny lattices
-    // stay serial (spawn overhead > work). CHUDWARE_LBM_THREADS overrides for
-    // benchmarking. Every parallel loop below writes DISJOINT indices and computes
-    // each cell with the exact serial arithmetic, so results stay bit-identical to
-    // the oracle parity gate.
+    // The benchmark preference may lower the governor budget, never bypass the
+    // CHUDWARE_SIM_THREADS cap. Nested shared-pool solves stay on their worker.
     const int lbm_threads = [&]() -> int {
-#ifndef CHUDWARE_HAVE_OPENMP
-        return 1;
-#else
-        if (ncell < 64 * 1024) return 1;
-        if (const char* e = std::getenv("CHUDWARE_LBM_THREADS")) {
-            const int n = std::atoi(e);
-            if (n >= 1) return n;
-        }
-        // Estimate lattice peak (~256 B/cell: f+scratch+macros) so plan_for can
-        // grade under memory pressure; ample RAM keeps full allotted cores.
+        if (ncell < 64 * 1024 || chudware::pool::shared().in_worker()) return 1;
         const uint64_t est = static_cast<uint64_t>(ncell) * 256ull;
         const auto plan = chudware::governor::plan_for(est, "lbm", 0);
-        const int n = std::max(1, std::min(plan.workers, 8));
-        // Align shared pool with this op's budget (nested solves share one cap).
-        chudware::pool::shared().set_max_workers(n);
-        return n;
+        int n = std::max(1, std::min(plan.workers, 8));
+        if (const char* e = std::getenv("CHUDWARE_LBM_THREADS")) {
+            const int requested = std::atoi(e);
+            if (requested >= 1) n = std::min(n, requested);
+        }
+#ifndef CHUDWARE_HAVE_OPENMP
+        n = std::min(n, chudware::pool::shared().max_workers());
 #endif
+        return n;
     }();
-    (void)lbm_threads;
     // macro fields
     std::vector<float> rho(ncell, 1.0f), ux(ncell, u_lat), uy(ncell, 0.0f), uz(ncell, 0.0f);
 
@@ -321,8 +333,8 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     // rho = sum_q f_q ; rho_safe = rho>1e-10 ? rho : 1 ; u = sum_q f_q*e_q / rho_safe.
     // Sequential float32 reduction over q (numpy naive sum for 19<128).
     auto macros = [&](const std::vector<float>& F) {
-        float prod[NQ];
-        for (std::size_t c = 0; c < ncell; ++c) {
+        lattice_for(ncell, lbm_threads, [&](std::size_t c) {
+            float prod[NQ];
             const std::size_t base = c * sz_q;
             // rho = f.sum(axis=-1) — numpy pairwise_sum over the 19 contiguous f.
             const float sr = pairwise_sum19(&F[base]);
@@ -339,38 +351,42 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             ux[c] = sx / rho_safe;
             uy[c] = sy / rho_safe;
             uz[c] = sz / rho_safe;
-        }
+        });
     };
 
     // ---- _stream(f): g[...,q] = np.roll(f[...,q], shift=(ex,ey,ez), axis=(0,1,2))
     // np.roll positive shift moves data toward higher index with wrap:
     //   g[x,y,z,q] = f[(x-ex) mod Nx, (y-ey) mod Ny, (z-ez) mod Nz, q].
-    // P3: pure gather — every (q,x,y,z) writes its own slot in G from a snapshot F, so
-    // the (q,x) collapse parallelizes with zero interaction (bit-identical copies).
+    // Destination-cell gather writes a contiguous 19-population row, rather than
+    // striding the entire AoS lattice nineteen times. Reads and wrap semantics are
+    // unchanged; X slabs keep the innermost Z rows contiguous.
     auto stream = [&](const std::vector<float>& F, std::vector<float>& G) {
-#if defined(CHUDWARE_HAVE_OPENMP)
-#pragma omp parallel for collapse(2) schedule(static) num_threads(lbm_threads) \
-    if (lbm_threads > 1)
-#endif
-        for (int q = 0; q < NQ; ++q) {
-            for (int x = 0; x < nx; ++x) {
-                const int ex = EQ[q][0], ey = EQ[q][1], ez = EQ[q][2];
-                int sx = x - ex;
-                sx %= nx;
-                if (sx < 0) sx += nx;
-                for (int y = 0; y < ny; ++y) {
-                    int sy = y - ey;
-                    sy %= ny;
-                    if (sy < 0) sy += ny;
-                    for (int z = 0; z < nz; ++z) {
-                        int sz_ = z - ez;
-                        sz_ %= nz;
-                        if (sz_ < 0) sz_ += nz;
-                        G[fidx(x, y, z, q)] = F[fidx(sx, sy, sz_, q)];
+        lattice_for(static_cast<std::size_t>(nx), lbm_threads, [&](std::size_t xx) {
+            const int x = static_cast<int>(xx);
+            int sx[NQ];
+            for (int q = 0; q < NQ; ++q) {
+                sx[q] = x - EQ[q][0];
+                if (sx[q] < 0) sx[q] += nx;
+                else if (sx[q] >= nx) sx[q] -= nx;
+            }
+            for (int y = 0; y < ny; ++y) {
+                int sy[NQ];
+                for (int q = 0; q < NQ; ++q) {
+                    sy[q] = y - EQ[q][1];
+                    if (sy[q] < 0) sy[q] += ny;
+                    else if (sy[q] >= ny) sy[q] -= ny;
+                }
+                for (int z = 0; z < nz; ++z) {
+                    const std::size_t base = fidx(x, y, z, 0);
+                    for (int q = 0; q < NQ; ++q) {
+                        int sz = z - EQ[q][2];
+                        if (sz < 0) sz += nz;
+                        else if (sz >= nz) sz -= nz;
+                        G[base + q] = F[fidx(sx[q], sy[q], sz, q)];
                     }
                 }
             }
-        }
+        });
     };
 
     // ---- initialise: f = feq(1, u_lat, 0, 0); zero solid cells --------------------
@@ -428,6 +444,9 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     // (float64 sum of float32 f values per the oracle's np.sum -> np.float64). Resolve
     // all three lattice axes so public flow results do not fabricate a zero side force.
     std::vector<float> gather;  // scratch for the gathered f_q values per link
+    std::size_t max_link_cells = 0;
+    for (const Link& lk : links) max_link_cells = std::max(max_link_cells, lk.cells.size());
+    gather.reserve(max_link_cells);
     auto momentum_exchange = [&](const std::vector<float>& F, double& drag_lat,
                                  double& lift_lat, double& side_lat) {
         // The oracle accumulates into np.float64 force components. For each link:
@@ -483,6 +502,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     std::vector<std::array<double, 3>> force_hist;
     const int convergence_window = std::max(50, n_steps / 5);
     const int force_window_samples = std::max(5, (convergence_window + 9) / 10);
+    force_hist.reserve(static_cast<std::size_t>(force_window_samples) + 1);
     std::array<double, 3> mean_force_lat{0.0, 0.0, 0.0};
     double force_drift = std::numeric_limits<double>::infinity();
 
@@ -491,6 +511,8 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     chudware::prof::phases::add("init", std::chrono::duration<double, std::milli>(
                                          t_loop0 - t_init0).count());
     double convergence_ms = 0.0;  // accumulated checkpoint-sampling time inside the loop
+    auto last_progress = std::chrono::steady_clock::now();
+    if (on_progress) on_progress(0, n_steps);
 
     int step = 0;
     for (step = 1; step <= n_steps; ++step) {
@@ -502,11 +524,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         // (pairwise sums, float32 expression order) is exactly the old sequence, so the
         // lattice walk stays bit-identical to the oracle; cells write disjoint slots, so
         // the OpenMP split changes nothing.
-#if defined(CHUDWARE_HAVE_OPENMP)
-#pragma omp parallel for schedule(static) num_threads(lbm_threads) if (lbm_threads > 1)
-#endif
-        for (std::int64_t ci = 0; ci < static_cast<std::int64_t>(ncell); ++ci) {
-            const std::size_t c = static_cast<std::size_t>(ci);
+        lattice_for(ncell, lbm_threads, [&](std::size_t c) {
             const std::size_t base = c * sz_q;
             // _macros for this cell (same pairwise reductions as the macros() lambda).
             float prod[NQ];
@@ -553,7 +571,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
                 for (int q = 0; q < NQ; ++q)
                     f[base + q] = f[base + q] - omega_s * (f[base + q] - feq_c[q]);
             }
-        }
+        });
         // f.astype(np.float32) — already float32; no-op.
 
         // --- Streaming ---
@@ -643,7 +661,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             }
             convergence_ms += std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - t_cv0).count();
-            if (on_progress) on_progress(step, n_steps);
+            // Progress is independent of force sampling, below.
             if (should_cancel && should_cancel()) {
                 R.ok = false;
                 R.steps_run = step;
@@ -696,6 +714,12 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
             }
         }
 
+        const auto now = std::chrono::steady_clock::now();
+        if (on_progress && (step == n_steps ||
+            std::chrono::duration<double>(now - last_progress).count() >= 1.0)) {
+            on_progress(step, n_steps);
+            last_progress = now;
+        }
         // Match the production solver's early-stop contract.  Once the force-window
         // drift settles, verify continuity on the current post-bounce field; continuing
         // far past this point can move a periodic wake into a different lattice phase
@@ -745,10 +769,7 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
 
     // ---- Post-processing: final macros + drag/Cd --------------------------------
     macros(f);
-    R.rho = rho;
-    R.ux = ux;
-    R.uy = uy;
-    R.uz = uz;
+    // Keep fields local until the final diagnostics finish, then transfer ownership.
     bool finite_fields = true;
     for (std::size_t c = 0; c < ncell; ++c) {
         if (!std::isfinite(rho[c]) || !std::isfinite(ux[c]) ||
@@ -837,6 +858,10 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
     }
 
     R.ok = !R.diverged;
+    R.rho = std::move(rho);
+    R.ux = std::move(ux);
+    R.uy = std::move(uy);
+    R.uz = std::move(uz);
     if (R.ok && on_progress && step < n_steps) on_progress(n_steps, n_steps);
     return R;
     } catch (const std::bad_alloc&) {

@@ -1,26 +1,33 @@
 // core/tests/test_hydraulic.cpp — hydraulic core (OCCT-free, offline): ISO
 // 1219 circuit schema, cylinder/pump/accumulator/valve sizing hand-calcs,
-// BOM, and the dispatch envelopes (incl. the hydraulic→piping and
-// hydraulic→FEA handoff + verify flows end-to-end). Mirrors the Python
-// oracle suite engine_oracle/hydraulic/test_hydraulic.py plus the
-// services/mcp/test_hydraulic_handoff.py flow; byte-identical envelope parity
-// is proven separately by the /tmp harness driving rpc_cli.
+// the hydraulic_simulate transient solver against analytic steady states,
+// motor / pump-drive sizing, BOM, and the dispatch envelopes (incl. the
+// hydraulic→piping and hydraulic→FEA handoff + verify flows end-to-end).
+// Mirrors the Python oracle suite engine_oracle/hydraulic/test_hydraulic.py
+// plus the services/mcp/test_hydraulic_handoff.py flow; byte-identical
+// envelope parity is proven separately by the /tmp harness driving rpc_cli.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #define _USE_MATH_DEFINES
+#include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <set>
 
 #include "hydraulic/bom.h"
 #include "hydraulic/handoff.h"
 #include "hydraulic/hydraulic.h"
 #include "hydraulic/schema.h"
+#include "hydraulic/sim.h"
 #include "hydraulic/solve.h"
 #include "piping/simhandoff.h"
 
 using namespace chudware::hydraulic;
 using chudware::pyutil::ojson;
+
+#include "hydraulic/motor_selftest.inc"
 
 // ── schema factories + validation (test_hydraulic.py) ────────────────────────
 
@@ -203,12 +210,451 @@ TEST_CASE("valve_flow: Kv conversion + guards") {
     CHECK(valve_flow(5, std::numeric_limits<double>::infinity())["ok"] == false);
 }
 
-TEST_CASE("fmu_simulate: always the soft-fail skipped envelope (no FMI runtime)") {
-    const ojson r = fmu_simulate(new_hydraulic("FMU test"));
+// ── hydraulic_simulate: transient solve vs analytic steady states ────────────
+
+namespace {
+
+struct SimCircuit {
+    ojson doc = new_hydraulic("sim");
+    void comp(const std::string& id, const std::string& type, const ojson& params) {
+        doc["components"].push_back(new_component(id, type, "", 0.0, 0.0, params));
+    }
+    void hose(const std::string& id,
+              std::initializer_list<std::pair<const char*, const char*>> ends) {
+        ojson conns = ojson::array();
+        for (const auto& [cid, port] : ends)
+            conns.push_back(ojson::object({{"component_id", cid}, {"port", port}}));
+        doc["hoses"].push_back(new_hose(id, "", conns));
+    }
+};
+
+double at(const ojson& series, const ojson& time, double t) {
+    for (size_t k = 0; k < time.size(); ++k)
+        if (time[k].get<double>() >= t - 1e-9) return series[k].get<double>();
+    return series.back().get<double>();
+}
+
+// Pump (10 cc × 1500 rpm × ηv 0.95 = 14.25 L/min) → 4/3 closed-centre valve
+// (30 L/min @ 5 bar per path) → Ø50/28 × 200 mm cylinder; relief 200 bar,
+// 10 bar override at 14.25 L/min.
+ojson cylinder_circuit() {
+    SimCircuit c;
+    c.comp("c1", "pump", {{"displacement_cc_rev", 10}, {"speed_rpm", 1500},
+                          {"vol_efficiency", 0.95}, {"mech_efficiency", 0.9}});
+    c.comp("c2", "valve_relief",
+           {{"set_pressure_bar", 200}, {"override_bar", 10}, {"rated_flow_lpm", 14.25}});
+    c.comp("c3", "valve_directional", {{"center_condition", "closed"},
+                                       {"rated_flow_lpm", 30}, {"rated_dp_bar", 5}});
+    c.comp("c4", "cylinder_linear", {{"bore_mm", 50}, {"rod_mm", 28}, {"stroke_mm", 200}});
+    c.comp("c5", "reservoir", ojson::object());
+    c.hose("h1", {{"c1", "P"}, {"c2", "P"}, {"c3", "P"}});
+    c.hose("h2", {{"c3", "A"}, {"c4", "A"}});
+    c.hose("h3", {{"c3", "B"}, {"c4", "B"}});
+    c.hose("h4", {{"c2", "T"}, {"c3", "T"}, {"c5", "T"}});
+    return c.doc;
+}
+
+// Pump (30 L/min delivered) → motor 20 cc/rev, ηv 0.9, ηm 0.85, driving a
+// 30 N·m constant torque + 0.1 N·m·s/rad viscous load; relief 280 bar.
+ojson motor_params() {
+    SimCircuit c;
+    c.comp("c1", "pump", {{"flow_lpm", 30}, {"vol_efficiency", 0.95}});
+    c.comp("c2", "valve_relief",
+           {{"set_pressure_bar", 280}, {"override_bar", 10}, {"rated_flow_lpm", 30}});
+    c.comp("c3", "motor_hydraulic", {{"displacement_cc_rev", 20}, {"vol_efficiency", 0.9},
+                                     {"mech_efficiency", 0.85}, {"inertia_kgm2", 0.005}});
+    c.comp("c4", "reservoir", ojson::object());
+    c.hose("h1", {{"c1", "P"}, {"c2", "P"}, {"c3", "A"}});
+    c.hose("h2", {{"c3", "B"}, {"c2", "T"}, {"c4", "T"}});
+    return ojson::object(
+        {{"doc", c.doc},
+         {"duration_s", 3.0},
+         {"loads", {{"c3", {{"torque_nm", 30}, {"inertia_kgm2", 0.02}, {"viscous_nms", 0.1}}}}}});
+}
+
+void check_template_simulation(const char* template_id) {
+    INFO(template_id);
+    ojson created;
+    REQUIRE(call("hydraulic_new", {{"name", "Template study"}, {"template", template_id}}, created));
+    REQUIRE(created["ok"] == true);
+    CHECK(created["template"] == template_id);
+    const ojson& doc = created["doc"];
+    CHECK(doc["name"] == "Template study");
+    CHECK(validate_hydraulic(doc).empty());
+    REQUIRE(created["simulation"].is_object());
+    CHECK(!created["simulation"].contains("doc"));
+
+    std::set<std::pair<std::string, std::string>> connected;
+    for (const auto& h : doc["hoses"]) {
+        CHECK(!h["net_name"].get<std::string>().empty());
+        CHECK(h["length_mm"].get<double>() > 0.0);
+        CHECK(h["id_mm"].get<double>() > 0.0);
+        CHECK(h["rating_bar"].get<double>() > 0.0);
+        for (const auto& end : h["connections"])
+            connected.emplace(end["component_id"].get<std::string>(), end["port"].get<std::string>());
+    }
+    const std::map<std::string, std::vector<std::string>> required = {
+        {"reservoir", {"T", "S"}}, {"pump", {"P", "T"}},
+        {"valve_relief", {"P", "T"}}, {"filter", {"IN", "OUT"}},
+        {"valve_directional", {"P", "T", "A", "B"}},
+        {"cylinder_linear", {"A", "B"}}, {"motor_hydraulic", {"A", "B"}}};
+    double relief_bar = 0.0;
+    std::string actuator_id, actuator_type, filter_id;
+    for (const auto& c : doc["components"]) {
+        const std::string id = c["id"].get<std::string>();
+        const std::string type = c["type"].get<std::string>();
+        CHECK(!c["name"].get<std::string>().empty());
+        REQUIRE(required.count(type) == 1);
+        for (const auto& port : required.at(type)) {
+            INFO(id, ".", port);
+            CHECK(connected.count({id, port}) == 1);
+        }
+        REQUIRE(!c["ports"].empty());
+        for (const auto& port : c["ports"])
+            CHECK(connected.count({id, port["id"].get<std::string>()}) == 1);
+        if (type == "valve_relief") relief_bar = c["params"]["set_pressure_bar"].get<double>();
+        if (type == "filter") filter_id = id;
+        if (type == "cylinder_linear" || type == "motor_hydraulic") {
+            actuator_id = id;
+            actuator_type = type;
+            CHECK(c["position"][1].get<double>() > 180.0);
+        }
+    }
+    for (size_t i = 0; i < doc["components"].size(); ++i) {
+        const auto& a = doc["components"][i]["position"];
+        for (size_t j = i + 1; j < doc["components"].size(); ++j) {
+            const auto& b = doc["components"][j]["position"];
+            CHECK(std::hypot(a[0].get<double>() - b[0].get<double>(),
+                             a[1].get<double>() - b[1].get<double>()) >= 100.0);
+        }
+    }
+
+    ojson params = created["simulation"];
+    params["doc"] = doc;
+    ojson r;
+    REQUIRE(call("hydraulic_simulate", params, r));
+    INFO(r.dump());
+    REQUIRE(r["ok"] == true);
+    CHECK(r["warnings"].empty());
+    const double peak_bar = r["summary"]["peak_pressure_bar"].get<double>();
+    CHECK(std::isfinite(peak_bar));
+    CHECK(peak_bar > 0.0);
+    // 10 bar relief override plus 20 bar for return backpressure / switching transients.
+    CHECK(peak_bar <= relief_bar + 30.0);
+    for (const auto& n : r["nodes"])
+        for (const auto& p : n["pressure_bar"]) CHECK(std::isfinite(p.get<double>()));
+    for (const auto& c : r["components"])
+        for (const auto& series : c["series"])
+            for (const auto& value : series) CHECK(std::isfinite(value.get<double>()));
+    REQUIRE(!filter_id.empty());
+    CHECK(r["components"][filter_id]["series"]["flow_lpm"].back().get<double>() > 0.0);
+    if (!actuator_id.empty()) {
+        const auto& setup = created["simulation"];
+        REQUIRE(setup["valve_schedule"].size() == 3);
+        CHECK(setup["valve_schedule"][0]["t_s"] == 0.0);
+        CHECK(setup["valve_schedule"][0]["position"] == "a");
+        CHECK(setup["valve_schedule"][1]["t_s"].get<double>() ==
+              doctest::Approx(setup["duration_s"].get<double>() / 2.0));
+        CHECK(setup["valve_schedule"][1]["position"] == "b");
+        CHECK(setup["valve_schedule"][2]["t_s"] == 2.5);
+        CHECK(r["summary"]["useful_work_kj"].get<double>() > 1.0);
+        CHECK(r["summary"]["efficiency"].get<double>() > 0.1);
+        const auto& series = r["components"][actuator_id]["series"];
+        if (actuator_type == "cylinder_linear") {
+            CHECK(setup["loads"][actuator_id]["force_n"] == 10000.0);
+            CHECK(setup["loads"][actuator_id]["mass_kg"] == 50.0);
+            const auto& position = series["position_mm"];
+            const auto& motion = r["summary"]["cylinders"][actuator_id];
+            CHECK(motion["end_reached"] == true);
+            REQUIRE(motion["stroke_time_s"].is_number());
+            CHECK(std::isfinite(motion["stroke_time_s"].get<double>()));
+            CHECK(motion["stroke_time_s"].get<double>() > 0.0);
+            REQUIRE(motion["end_reached_at_s"].is_number());
+            CHECK(motion["end_reached_at_s"].get<double>() <
+                  setup["valve_schedule"][1]["t_s"].get<double>());
+            CHECK(at(position, r["time_s"], 2.0) == doctest::Approx(300.0).epsilon(0.001));
+            CHECK(position.back().get<double>() > 100.0);
+            CHECK(position.back().get<double>() < 250.0);
+            CHECK(setup["valve_schedule"][2]["position"] == "center");
+        } else {
+            CHECK(setup["loads"][actuator_id]["torque_nm"] == 50.0);
+            CHECK(at(series["speed_rpm"], r["time_s"], 1.2) > 100.0);
+            CHECK(at(series["speed_rpm"], r["time_s"], 2.4) < -100.0);
+            CHECK(setup["valve_schedule"][2]["position"] == "a");
+            const double delivered_lpm = doc["components"][1]["params"]["displacement_cc_rev"].get<double>() *
+                                         doc["components"][1]["params"]["speed_rpm"].get<double>() *
+                                         doc["components"][1]["params"]["vol_efficiency"].get<double>() / 1000.0;
+            const auto& motor = doc["components"][5]["params"];
+            const double steady_rpm = delivered_lpm * 1000.0 *
+                                      motor["vol_efficiency"].get<double>() /
+                                      motor["displacement_cc_rev"].get<double>();
+            CHECK(r["summary"]["motors"][actuator_id]["steady_speed_rpm"].get<double>() ==
+                  doctest::Approx(steady_rpm).epsilon(0.01));
+            CHECK(r["summary"]["motors"][actuator_id]["max_speed_rpm"].get<double>() <=
+                  motor["max_speed_rpm"].get<double>());
+            for (size_t k = 0; k < r["time_s"].size(); ++k)
+                if (r["time_s"][k].get<double>() >= 0.9 * setup["duration_s"].get<double>())
+                    CHECK(series["speed_rpm"][k].get<double>() ==
+                          doctest::Approx(steady_rpm).epsilon(0.01));
+        }
+    } else {
+        CHECK(r["summary"]["relief_open_time_s"].get<double>() > 0.5);
+    }
+}
+
+}  // namespace
+
+TEST_CASE("simulate: pump → relief deadhead settles at cracking + override, P = p·Q") {
+    SimCircuit c;
+    c.comp("c1", "pump", {{"displacement_cc_rev", 10}, {"speed_rpm", 1500},
+                          {"vol_efficiency", 0.95}});
+    c.comp("c2", "valve_relief",
+           {{"set_pressure_bar", 150}, {"override_bar", 10}, {"rated_flow_lpm", 14.25}});
+    c.comp("c3", "reservoir", ojson::object());
+    c.hose("h1", {{"c1", "P"}, {"c2", "P"}});
+    c.hose("h2", {{"c2", "T"}, {"c3", "T"}});
+    const ojson r = simulate(ojson::object({{"doc", c.doc}, {"duration_s", 1.0}}));
+    REQUIRE(r["ok"] == true);
+    const double p_end = r["nodes"]["h1"]["pressure_bar"].back().get<double>();
+    CHECK(p_end == doctest::Approx(160.0).epsilon(0.005));  // 150 cracking + 10 override
+    const ojson& pump = r["components"]["c1"]["series"];
+    CHECK(pump["flow_lpm"].back().get<double>() == doctest::Approx(14.25).epsilon(0.002));
+    // hydraulic power = p·Q = 160e5 Pa × 14.25/60000 m³/s = 3.80 kW
+    CHECK(pump["power_kw"].back().get<double>() == doctest::Approx(3.80).epsilon(0.005));
+    CHECK(r["components"]["c2"]["series"]["flow_lpm"].back().get<double>() ==
+          doctest::Approx(14.25).epsilon(0.005));
+    CHECK(r["summary"]["relief_open_time_s"].get<double>() > 0.95);
+    CHECK(r["summary"]["peak_pressure_bar"].get<double>() < 175.0);
+    CHECK(r["nodes"]["h2"]["boundary"] == true);
+    // all pump power ends as heat across the relief
+    const double pump_kj = r["summary"]["pump_energy_kj"].get<double>();
+    CHECK(r["summary"]["heat_kj"].get<double>() == doctest::Approx(pump_kj).epsilon(0.01));
+}
+
+TEST_CASE("simulate: 4/3 valve extends a loaded cylinder at Q·ηv/A, then hits the stop") {
+    const ojson r = simulate(ojson::object(
+        {{"doc", cylinder_circuit()},
+         {"duration_s", 3.0},
+         {"valve_schedule", ojson::parse(R"([{"t_s":0.1,"component_id":"c3","position":"a"}])")},
+         {"loads", {{"c4", {{"force_n", 10000}, {"mass_kg", 100}, {"viscous_ns_m", 2000}}}}}}));
+    REQUIRE(r["ok"] == true);
+    const ojson& time = r["time_s"];
+    const ojson& cyl = r["components"]["c4"]["series"];
+    const double a_bore = M_PI / 4.0 * 0.05 * 0.05;
+    const double a_rod = M_PI / 4.0 * (0.05 * 0.05 - 0.028 * 0.028);
+    const double q = 10e-6 * 1500.0 / 60.0 * 0.95;  // m³/s
+    const double v = q / a_bore;                      // 0.12096 m/s
+    CHECK(at(cyl["velocity_mms"], time, 1.0) == doctest::Approx(v * 1e3).epsilon(0.03));
+    // p_A·A_bore = F + c·v + p_B·A_rod; valve Δp = 5 bar·(Q/30 L/min)² per path
+    const double dp_pa = 5e5 * std::pow(q / (30.0 / 60000.0), 2);
+    const double dp_bt = 5e5 * std::pow(q * a_rod / a_bore / (30.0 / 60000.0), 2);
+    const double p_a = (10000.0 + 2000.0 * v + dp_bt * a_rod) / a_bore;
+    CHECK(at(cyl["pressure_a_bar"], time, 1.0) == doctest::Approx(p_a / 1e5).epsilon(0.03));
+    CHECK(at(r["components"]["c1"]["series"]["pressure_bar"], time, 1.0) ==
+          doctest::Approx((p_a + dp_pa) / 1e5).epsilon(0.03));
+    const ojson& cs = r["summary"]["cylinders"]["c4"];
+    REQUIRE(cs["end_reached"] == true);
+    CHECK(cs["stroke_time_s"].get<double>() == doctest::Approx(0.2 / v).epsilon(0.05));
+    CHECK(cyl["position_mm"].back().get<double>() == doctest::Approx(200.0).epsilon(0.002));
+    // at the end stop all pump flow crosses the relief: 200 + 10 bar
+    CHECK(r["components"]["c1"]["series"]["pressure_bar"].back().get<double>() ==
+          doctest::Approx(210.0).epsilon(0.01));
+    CHECK(r["summary"]["relief_open_time_s"].get<double>() > 0.5);
+}
+
+TEST_CASE("simulate: hydraulic motor speed Q·ηv/D and pressure 2πT/(D·ηm)") {
+    const ojson r = simulate(motor_params());
+    REQUIRE(r["ok"] == true);
+    const double w = 30.0 / 60000.0 * 0.9 / (20e-6 / (2.0 * M_PI));  // rad/s
+    const double rpm = w * 60.0 / (2.0 * M_PI);                     // 1350 rpm
+    const double torque = 30.0 + 0.1 * w;
+    const ojson& ms = r["summary"]["motors"]["c3"];
+    CHECK(ms["steady_speed_rpm"].get<double>() == doctest::Approx(rpm).epsilon(0.03));
+    CHECK(ms["steady_torque_nm"].get<double>() == doctest::Approx(torque).epsilon(0.03));
+    const double dp_bar = 2.0 * M_PI * torque / (20e-6 * 0.85) / 1e5;  // ≈163 bar
+    const ojson& mser = r["components"]["c3"]["series"]["pressure_bar"];
+    double tail = 0.0;
+    const size_t n = mser.size();
+    for (size_t k = n - n / 10; k < n; ++k) tail += mser[k].get<double>();
+    CHECK(tail / static_cast<double>(n / 10) == doctest::Approx(dp_bar).epsilon(0.03));
+}
+
+TEST_CASE("simulate: accumulator discharge follows the polytropic gas law") {
+    SimCircuit c;
+    c.comp("c1", "accumulator",
+           {{"volume_l", 4.0}, {"pre_charge_bar", 50.0}, {"polytropic_n", 1.4}});
+    c.comp("c2", "valve_flow_control", {{"Kv", 0.5}});
+    c.comp("c3", "reservoir", ojson::object());
+    c.hose("h1", {{"c1", "P"}, {"c2", "IN"}});
+    c.hose("h2", {{"c2", "OUT"}, {"c3", "T"}});
+    const ojson r = simulate(ojson::object({{"doc", c.doc},
+                                            {"duration_s", 4.0},
+                                            {"output_dt_s", 0.01},
+                                            {"initial", {{"c1", {{"pressure_bar", 150.0}}}}}}));
+    REQUIRE(r["ok"] == true);
+    const ojson& acc = r["components"]["c1"]["series"];
+    const double patm = 1.01325, p0 = 50.0 + patm;
+    // initial oil volume: V0·(1 − (p0/p1)^(1/n)) = 2.158 L at 150 bar
+    CHECK(acc["gas_volume_l"][0].get<double>() ==
+          doctest::Approx(4.0 * std::pow(p0 / (150.0 + patm), 1.0 / 1.4)).epsilon(1e-4));
+    int checked = 0;
+    for (size_t k = 0; k < acc["pressure_bar"].size(); ++k) {
+        const double p = acc["pressure_bar"][k].get<double>();
+        if (p < 52.0) continue;
+        const double vg = 4.0 * std::pow(p0 / (p + patm), 1.0 / 1.4);
+        CHECK(acc["gas_volume_l"][k].get<double>() == doctest::Approx(vg).epsilon(0.002));
+        ++checked;
+    }
+    CHECK(checked > 20);
+    // mass conservation: ∫Q dt out of the accumulator = gas expansion
+    double out_l = 0.0;
+    const ojson& time = r["time_s"];
+    for (size_t k = 1; k < time.size(); ++k) {
+        const double dt = time[k].get<double>() - time[k - 1].get<double>();
+        out_l -= 0.5 * (acc["flow_lpm"][k].get<double>() + acc["flow_lpm"][k - 1].get<double>()) *
+                 dt / 60.0;
+    }
+    const double expanded =
+        acc["gas_volume_l"].back().get<double>() - acc["gas_volume_l"][0].get<double>();
+    CHECK(out_l == doctest::Approx(expanded).epsilon(0.02));
+    // fully discharged: gas back at the pre-charge volume, node bled to tank
+    CHECK(acc["gas_volume_l"].back().get<double>() == doctest::Approx(4.0).epsilon(1e-3));
+    CHECK(r["nodes"]["h1"]["pressure_bar"].back().get<double>() < 50.0);
+}
+
+TEST_CASE("simulate: energy balance pump = useful work + heat") {
+    const ojson r = simulate(motor_params());
+    REQUIRE(r["ok"] == true);
+    const ojson& s = r["summary"];
+    const double pump = s["pump_energy_kj"].get<double>();
+    const double useful = s["useful_work_kj"].get<double>();
+    const double heat = s["heat_kj"].get<double>();
+    CHECK(pump > 10.0);
+    CHECK(useful + heat == doctest::Approx(pump).epsilon(0.02));
+    CHECK(s["energy_balance_error_pct"].get<double>() < 0.1);
+    // steady useful power = 30 N·m × ω; ≈ 0.52 of the hydraulic input
+    CHECK(s["efficiency"].get<double>() == doctest::Approx(useful / pump));
+    CHECK(s["efficiency"].get<double>() > 0.4);
+    CHECK(s["efficiency"].get<double>() < 0.6);
+}
+
+TEST_CASE("simulate: refusals name the unconnected port, unknown ids, missing params") {
+    // rod side of a double-acting cylinder left unconnected
+    ojson doc = cylinder_circuit();
+    doc["hoses"].erase(2);  // h3 (c3.B ↔ c4.B)
+    ojson r = simulate(ojson::object({{"doc", doc}}));
     CHECK(r["ok"] == false);
-    CHECK(r["skipped"] == true);
-    CHECK(r["reason"] == "fmpy not installed");
-    CHECK(r.contains("hint"));
+    CHECK(r["reason"] == "unconnected_port");
+    CHECK(r["component_id"] == "c3");
+    CHECK(r["port"] == "B");
+
+    r = simulate(ojson::object(
+        {{"doc", cylinder_circuit()},
+         {"valve_schedule",
+          ojson::parse(R"([{"t_s":0.1,"component_id":"c99","position":"a"}])")}}));
+    CHECK(r["ok"] == false);
+    CHECK(r["reason"] == "unknown_component");
+    CHECK(r["component_id"] == "c99");
+
+    r = simulate(ojson::object(
+        {{"doc", cylinder_circuit()},
+         {"valve_schedule", ojson::parse(R"([{"t_s":0.1,"component_id":"c4","position":"a"}])")}}));
+    CHECK(r["reason"] == "invalid_schedule");
+
+    doc = cylinder_circuit();
+    doc["hoses"][1]["connections"][1]["port"] = "p1";
+    r = simulate(ojson::object({{"doc", doc}}));
+    CHECK(r["reason"] == "unknown_port");
+
+    doc = cylinder_circuit();
+    doc["components"][3]["params"].erase("bore_mm");
+    r = simulate(ojson::object({{"doc", doc}}));
+    CHECK(r["reason"] == "missing_params");
+    CHECK(r["missing"] == ojson::array({"c4.bore_mm"}));
+
+    // fixed pump dead-heading a closed centre with no relief
+    doc = cylinder_circuit();
+    doc["components"].erase(1);
+    for (auto& h : doc["hoses"]) {
+        ojson keep = ojson::array();
+        for (const auto& cn : h["connections"])
+            if (cn["component_id"] != "c2") keep.push_back(cn);
+        h["connections"] = keep;
+    }
+    r = simulate(ojson::object({{"doc", doc}, {"duration_s", 0.5}}));
+    CHECK(r["reason"] == "pressure_runaway");
+
+    r = simulate(ojson::object({{"doc", cylinder_circuit()}, {"duration_s", -1}}));
+    CHECK(r["reason"] == "invalid_settings");
+}
+
+TEST_CASE("dispatch: hydraulic_simulate routes; the retired FMU stub is gone") {
+    ojson result;
+    REQUIRE(call("hydraulic_simulate",
+                 ojson::object({{"doc", cylinder_circuit()}, {"duration_s", 0.2}}), result));
+    CHECK(result["ok"] == true);
+    CHECK(result["solver"]["steps"].get<long>() > 0);
+    CHECK(!call("hydraulic_fmu_simulate", ojson::object(), result));
+    REQUIRE(call("hydraulic_size_motor",
+                 ojson::parse(R"({"torque_nm":100,"speed_rpm":500,"pressure_bar":200})"),
+                 result));
+    CHECK(result["ok"] == true);
+    REQUIRE(call("pump_drive_size",
+                 ojson::parse(R"({"kind":"hydraulic","flow_lpm":30,"pressure_bar":200})"),
+                 result));
+    CHECK(result["ok"] == true);
+}
+
+TEST_CASE("dispatch: hydraulic_templates catalog and blank defaults") {
+    ojson catalog;
+    REQUIRE(call("hydraulic_templates", ojson::object(), catalog));
+    REQUIRE(catalog["ok"] == true);
+    REQUIRE(catalog["templates"].size() == 4);
+    const std::vector<std::string> ids = {"blank", "power_unit", "cylinder_circuit", "motor_circuit"};
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const auto& entry = catalog["templates"][i];
+        CHECK(entry["id"] == ids[i]);
+        CHECK(!entry["name"].get<std::string>().empty());
+        CHECK(!entry["description"].get<std::string>().empty());
+        ojson created;
+        REQUIRE(call("hydraulic_new", {{"template", ids[i]}}, created));
+        REQUIRE(created["ok"] == true);
+        CHECK(created["doc"]["components"].size() == entry["components"].get<size_t>());
+        CHECK(created["doc"]["hoses"].size() == entry["hoses"].get<size_t>());
+    }
+    ojson blank;
+    REQUIRE(call("hydraulic_new", ojson::object(), blank));
+    REQUIRE(blank["ok"] == true);
+    CHECK(blank["template"] == "blank");
+    CHECK(blank["doc"]["components"].empty());
+    CHECK(blank["doc"]["hoses"].empty());
+    CHECK(blank["simulation"]["valve_schedule"].empty());
+    CHECK(blank["simulation"]["loads"].empty());
+    CHECK(blank["hint"] == "Use hydraulic_add_component to add ISO 1219 components.");
+}
+
+TEST_CASE("templates: power_unit validates and simulates") {
+    check_template_simulation("power_unit");
+}
+
+TEST_CASE("templates: cylinder_circuit validates and simulates both directions") {
+    check_template_simulation("cylinder_circuit");
+}
+
+TEST_CASE("templates: motor_circuit validates and simulates both directions") {
+    check_template_simulation("motor_circuit");
+}
+
+TEST_CASE("dispatch: hydraulic_new refuses an unknown template") {
+    ojson result;
+    REQUIRE(call("hydraulic_new", {{"template", "not_a_template"}}, result));
+    REQUIRE(result["ok"] == false);
+    CHECK(result["reason"] == "unknown_template");
+    const std::string hint = result["hint"].get<std::string>();
+    for (const char* id : {"blank", "power_unit", "cylinder_circuit", "motor_circuit"})
+        CHECK(hint.find(id) != std::string::npos);
+    CHECK(!result.contains("doc"));
+    CHECK(!result.contains("simulation"));
 }
 
 // ── BOM helpers (test_hydraulic.py) ──────────────────────────────────────────

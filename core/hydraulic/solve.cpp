@@ -181,18 +181,4 @@ ojson valve_flow(double Cv, double pressure_drop_bar, double fluid_sg) {
     return out;
 }
 
-ojson fmu_simulate(const ojson& /*circuit_doc*/, const ojson& /*fmu_path*/,
-                   double /*stop_time*/) {
-    // The C++ core has no FMI runtime — always the oracle's fmpy-absent shape.
-    ojson out = ojson::object();
-    out["ok"] = false;
-    out["skipped"] = true;
-    out["reason"] = "fmpy not installed";
-    out["hint"] =
-        "pip install fmpy; provide a compiled OpenHydraulics FMU via fmu_path. "
-        "OpenHydraulics Modelica source: https://openmodelica.org/; "
-        "compile with OpenModelica (omc) or Dymola to produce an .fmu file.";
-    return out;
-}
-
 }  // namespace chudware::hydraulic

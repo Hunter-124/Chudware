@@ -109,6 +109,7 @@ struct Link {
     double fd = 0.02;
     double mu = 0.0;   // fluid viscosity (0 = unknown → laminar closed form off)
     double rho = 0.0;
+    bool mass_flow = false;
 };
 
 struct NetCtx {
@@ -171,13 +172,66 @@ double contraction_conical_rennels(double Di1, double Di2, double l, double fd) 
 }
 
 // K-factor for a fitting on a pipe of inner-dia d_m (m) at friction fd.
-std::pair<double, std::string> fitting_K(const ojson& ft, double d_m, double fd) {
+std::pair<double, std::string> fitting_K(const ojson& ft, double d_m, double fd,
+                                         double Re, const std::string& run_id = "") {
     const std::string ftype = ft.value("type", std::string());
     const ojson params = ft.value("params", ojson::object());
     const auto getp = [&](const char* k) -> ojson {
         return params.is_object() ? params.value(k, ojson(nullptr)) : ojson(nullptr);
     };
 
+    const double d_in = d_m / 0.0254;
+    const double fT = 1.0 / std::pow(-2.0 * std::log10(0.0000457 / (3.7 * d_m)), 2);
+    const auto km = getp("k_model");
+    if (km.is_object()) {
+        const std::string kind = km.value("kind", "");
+        if (kind == "constant") return {km["K"].get<double>(), "k_model(constant)"};
+        if (kind == "two_k")
+            return {km["K1"].get<double>() / std::max(Re, 1e-6) +
+                    km["Kinf"].get<double>() * (1 + 1 / d_in), "Hooper(two_k)"};
+        if (kind == "three_k")
+            return {km["K1"].get<double>() / std::max(Re, 1e-6) +
+                    km["Ki"].get<double>() * (1 + km["Kd"].get<double>() / std::pow(d_in, 0.3)),
+                    "Darby(three_k)"};
+        if (kind == "cv")
+            return {890.3 * std::pow(d_in, 4) / std::pow(km["Cv"].get<double>(), 2), "Cv(US)"};
+        if (kind == "table") {
+            const auto& points = km["points"];
+            double K = points.front()["K"].get<double>();
+            for (size_t i = 1; i < points.size(); ++i) {
+                const double lo = points[i-1]["re"].get<double>();
+                const double hi = points[i]["re"].get<double>();
+                if (Re <= lo) break;
+                const double t = std::clamp(std::log(Re / lo) / std::log(hi / lo), 0.0, 1.0);
+                K = points[i-1]["K"].get<double>() +
+                    t * (points[i]["K"].get<double>() - points[i-1]["K"].get<double>());
+                if (Re <= hi) break;
+            }
+            return {K, "table(log-Re," + km.value("source", "user") + ")"};
+        }
+    }
+    if (ftype == "valve") {
+        const std::string type = params.value("valve_type", "gate");
+        double factor = 8;
+        if (type == "globe") factor = 340;
+        else if (type == "angle") factor = 150;
+        else if (type == "ball") factor = 3;
+        else if (type == "plug") factor = 18;
+        else if (type == "butterfly") {
+            const double nps = ft.value("nps", 2.0);
+            factor = nps <= 8 ? 45 : nps < 16 ? 35 : 25;
+        } else if (type == "check_swing") factor = 100;
+        else if (type == "check_lift") factor = 600;
+        return {factor * fT, "Crane TP-410(" + type + ")"};
+    }
+    if (ftype == "orifice") {
+        const auto beta_value = getp("beta");
+        const double beta = beta_value.is_number() ? beta_value.get<double>() :
+                            params["bore_mm"].get<double>() / (d_m * 1000);
+        constexpr double C = 0.61;
+        const double ratio = std::sqrt(1 - std::pow(beta, 4) * (1 - C*C)) / (C * beta * beta);
+        return {std::pow(ratio - 1, 2), "sharp-edged orifice (Rennels, C=0.61)"};
+    }
     if (ftype == "elbow") {
         const ojson angj = getp("angle");
         // params.get("angle", 90) or 90 — the resolved value feeds both the
@@ -190,7 +244,9 @@ std::pair<double, std::string> fitting_K(const ojson& ft, double d_m, double fd)
         std::string up = radius;
         std::transform(up.begin(), up.end(), up.begin(),
                        [](unsigned char c) { return std::toupper(c); });
-        const double bd = up == "LR" ? 1.5 : 1.0;
+        const auto radius_mm = getp("radius_mm");
+        const double bd = radius_mm.is_number() ? radius_mm.get<double>() / (d_m * 1000) :
+                                                up == "LR" ? 1.5 : 1.0;
         try {
             return {bend_rounded_rennels(d_m, angle, fd, bd),
                     "bend_rounded(" + radius + "," + pyutil::py_str(angle_v) + "deg)"};
@@ -220,6 +276,12 @@ std::pair<double, std::string> fitting_K(const ojson& ft, double d_m, double fd)
         return {kKReducer, "default(reducer)"};
     }
     if (ftype == "tee") {
+        if (ft.value("run_id", ojson(nullptr)).is_string() &&
+            getp("branch_run").is_string() && getp("run_ids").is_array()) {
+            const bool branch = params["branch_run"] == run_id;
+            return {(branch ? 60 : 20) * fT,
+                    branch ? "Crane TP-410(tee_branch)" : "Crane TP-410(tee_run)"};
+        }
         const ojson branch = getp("branch_nps");
         const ojson nps = ft.value("nps", ojson(nullptr));
         const double nps_v = py_truthy(nps) ? pyutil::to_double(nps) : 0.0;
@@ -235,8 +297,10 @@ std::pair<double, std::string> fitting_K(const ojson& ft, double d_m, double fd)
 void refresh_link_fittings(Link& lk) {
     lk.kfit = 0.0;
     lk.kbreak.clear();
+    const double Re = lk.mu > 0 && lk.area > 0 ?
+        std::abs(lk.flow) * lk.d_m * (lk.mass_flow ? 1.0 : lk.rho) / (lk.area * lk.mu) : 1e5;
     for (const auto& ft : lk.fittings) {
-        auto [K, method] = fitting_K(ft, lk.d_m, lk.fd);
+        auto [K, method] = fitting_K(ft, lk.d_m, lk.fd, Re, lk.id);
         lk.kfit += K;
         ojson kb = ojson::object();
         kb["fitting"] = ft.value("id", ojson(nullptr));
@@ -312,6 +376,7 @@ NetCtx build_network(const ojson& doc, const ojson& fluid, double tol) {
         lk.rho = fluid.is_object() && py_truthy(fluid.value("rho", ojson(nullptr)))
                      ? pyutil::to_double(fluid["rho"])
                      : 0.0;
+        lk.mass_flow = fluid.value("phase", std::string()) == "gas";
         if (lk.length_m <= 0) {
             ctx.warnings.push_back(lk.id + ": zero-length run skipped");
             continue;
@@ -333,11 +398,22 @@ NetCtx build_network(const ojson& doc, const ojson& fluid, double tol) {
         if (ft.value("suppressed", false)) continue;
         const Vec3 origin = to_vec3(ft.value("origin", ojson::array({0.0, 0.0, 0.0})));
         bool placed = false;
+        const auto owner = ft.value("run_id", ojson(nullptr));
+        const auto params = ft.value("params", ojson::object());
+        const bool attributed_tee = owner.is_string() && ft.value("type", "") == "tee" &&
+            params.value("run_ids", ojson(nullptr)).is_array() &&
+            params.value("branch_run", ojson(nullptr)).is_string();
         for (size_t i = 0; i < ctx.links.size() && i < nonzero_runs.size(); ++i) {
-            if (point_on_polyline(origin, (*nonzero_runs[i])["path"], tol)) {
+            const auto& id = ctx.links[i].id;
+            const bool owns = attributed_tee ?
+                (params["branch_run"] == id || (params["run_ids"].size() == 2 &&
+                                               params["run_ids"][1] == id)) :
+                owner.is_string() ? owner == id :
+                point_on_polyline(origin, (*nonzero_runs[i])["path"], tol);
+            if (owns) {
                 ctx.links[i].fittings.push_back(ft);
                 placed = true;
-                break;
+                if (!attributed_tee) break;
             }
         }
         if (!placed) {
@@ -1211,6 +1287,138 @@ ojson solve(const ojson& doc, const ojson& boundary, const ojson& fluid,
     const int iterations_run = nfree ? std::min(it, max_iter) : 0;
     return assemble_result(ctx, nodes, links, H, fl, converged,
                            iterations_run, max_imbalance);
+}
+
+nlohmann::json run_loss_1d(const nlohmann::json& doc_in, const std::string& run_id, double rho,
+                           double mu, double flow_m3s, double roughness_mm) {
+    auto fail = [](const std::string& reason, const std::string& hint) {
+        return nlohmann::json{{"ok", false}, {"reason", reason}, {"hint", hint}};
+    };
+    if (!doc_in.is_object() || !doc_in.value("runs", nlohmann::json()).is_array())
+        return fail("invalid_piping", "piping must be an aicad.piping/1 document with runs");
+    if (!(std::isfinite(rho) && rho > 0 && std::isfinite(mu) && mu > 0 &&
+          std::isfinite(flow_m3s) && flow_m3s > 0))
+        return fail("invalid_params", "the 1-D estimate needs positive rho, mu and flow");
+    const ojson doc(doc_in);
+    const ojson* run = nullptr;
+    ojson ids = ojson::array();
+    for (const auto& r : doc["runs"]) {
+        if (!r.is_object() || r.value("suppressed", false)) continue;
+        ids.push_back(r.value("id", ojson(nullptr)));
+        if (r.value("id", ojson(nullptr)) == ojson(run_id)) run = &r;
+    }
+    if (!run)
+        return fail("unknown_run", "no unsuppressed run '" + run_id + "' in the piping document; "
+                                   "runs: " + ids.dump());
+    ojson fluid = ojson::object();
+    fluid["rho"] = rho;
+    fluid["mu"] = mu;
+    NetCtx ctx = build_network(doc, fluid, kSnapTolMm);
+    if (!ctx.ok)
+        return fail("invalid_piping", ctx.err.value("reason", std::string("piping network build "
+                                                                          "failed")) +
+                                          "; " + ctx.err.value("hint", std::string()));
+    auto lk_it = std::find_if(ctx.links.begin(), ctx.links.end(),
+                              [&](const Link& l) { return l.id == run_id; });
+    if (lk_it == ctx.links.end())
+        return fail("degenerate_run", "run '" + run_id + "' has zero length");
+    const Link& lk = *lk_it;
+
+    // Same friction law and fitting K-factors piping_solve applies to this link, evaluated at
+    // the given flow. roughness_mm < 0 keeps the run's material roughness.
+    const double v = flow_m3s / lk.area;
+    const double Re = reynolds(v, lk.d_m, rho, mu);
+    const double eps_m = roughness_mm >= 0.0 ? roughness_mm * 1e-3 : lk.eps;
+    const double fd = Re < 2100 ? std::max(64.0 / std::max(Re, 1e-6), 1e-4)
+                                : clamond(Re, eps_m / lk.d_m);
+    const double q = 0.5 * rho * v * v;
+
+    // Friction over the run's centreline measured corner to corner — the length piping_solve
+    // (and Crane practice) uses — plus the K of every fitting on the run. A path corner with no
+    // elbow fitting is still a swept bend in the bore (run.bend_radius, null = 1.5·OD, as
+    // services/piping/threed.py and cfd_handoff.py sweep it), so it adds a Rennels bend K.
+    double od_mm = lk.d_m * 1000.0;
+    if (!py_truthy(run->value("bore_mm", ojson(nullptr)))) {
+        const ojson spec = nearest_pipe(run->value("nps", ojson(nullptr)),
+                                        run->value("schedule", std::string("40")));
+        if (spec.value("ok", false) && spec["outer_dia"].is_number())
+            od_mm = spec["outer_dia"].get<double>();
+    }
+    const ojson br = run->value("bend_radius", ojson(nullptr));
+    const double bend_r_mm = br.is_number() && br.get<double>() > 0 ? br.get<double>() : 1.5 * od_mm;
+    const ojson& path = (*run)["path"];
+    const double poly_mm = polyline_length_mm(path);
+    int bends = 0;
+    nlohmann::json fittings = nlohmann::json::array();
+    double k_sum = 0.0;
+    auto add_fitting = [&](const nlohmann::json& id, const std::string& type, double K,
+                           const std::string& method) {
+        k_sum += K;
+        fittings.push_back({{"id", id}, {"type", type}, {"K", K}, {"method", method},
+                            {"dp_pa", K * q}});
+    };
+    for (const auto& ft : lk.fittings) {
+        const auto [K, method] = fitting_K(ft, lk.d_m, fd, std::abs(Re), lk.id);
+        add_fitting(nlohmann::json(ft.value("id", ojson(nullptr))),
+                    ft.value("type", std::string()), K, method);
+    }
+    // Swept-arc take-out R·tan(θ/2) at each corner: what is left of the straight end legs.
+    std::vector<double> takeout(path.size(), 0.0);
+    for (size_t i = 1; i + 1 < path.size(); ++i) {
+        const Vec3 a = to_vec3(path[i - 1]), b = to_vec3(path[i]), c = to_vec3(path[i + 1]);
+        const double lab = dist3(a, b), lbc = dist3(b, c);
+        if (lab <= 0.0 || lbc <= 0.0) continue;
+        double cosang = 0.0;
+        for (int k = 0; k < 3; ++k) cosang += (b[k] - a[k]) * (c[k] - b[k]);
+        cosang = std::clamp(cosang / (lab * lbc), -1.0, 1.0);
+        const double theta_deg = std::acos(cosang) * 180.0 / M_PI;
+        if (theta_deg < 0.5) continue;
+        ++bends;
+        takeout[i] = bend_r_mm * std::tan(0.5 * theta_deg * M_PI / 180.0);
+        bool has_elbow = false;
+        for (const auto& ft : lk.fittings)
+            if (ft.value("type", std::string()) == "elbow" &&
+                dist3(to_vec3(ft.value("origin", ojson::array({0.0, 0.0, 0.0}))), b) <= kSnapTolMm)
+                has_elbow = true;
+        if (!has_elbow) {  // a swept corner with no elbow fitting still turns the flow
+            const double rd = bend_r_mm / (lk.d_m * 1000.0);
+            add_fitting(nullptr, "bend", bend_rounded_rennels(lk.d_m, theta_deg, fd, rd),
+                        "bend_rounded(path corner," + fmt_g(theta_deg, 4) + "deg,r/D=" +
+                            fmt_g(rd, 3) + ")");
+        }
+    }
+    // Straight run from each end to the first bend's tangent point (the whole path if none).
+    auto end_straight = [&](bool from_start) {
+        double s = 0.0;
+        const size_t n = path.size();
+        for (size_t k = 1; k < n; ++k) {
+            const size_t i = from_start ? k : n - 1 - k;  // vertex reached
+            const size_t j = from_start ? k - 1 : n - k;  // vertex left
+            s += dist3(to_vec3(path[j]), to_vec3(path[i]));
+            if (takeout[i] > 0.0) return std::max(0.0, s - takeout[i]);
+        }
+        return s;
+    };
+    const double friction_pa = fd * (poly_mm * 1e-3) / lk.d_m * q;
+    return {{"ok", true},
+            {"run_id", run_id},
+            {"inner_dia_mm", lk.d_m * 1000.0},
+            {"velocity_ms", v},
+            {"reynolds", Re},
+            {"friction_factor", fd},
+            {"roughness_mm", eps_m * 1000.0},
+            {"material_roughness_mm", lk.eps * 1000.0},
+            {"dynamic_pressure_pa", q},
+            {"centreline_length_mm", poly_mm},
+            {"bend_radius_mm", bend_r_mm},
+            {"bends", bends},
+            {"inlet_straight_mm", end_straight(true)},
+            {"outlet_straight_mm", end_straight(false)},
+            {"friction_pa", friction_pa},
+            {"fittings", fittings},
+            {"fittings_K", k_sum},
+            {"fittings_pa", k_sum * q},
+            {"total_pa", friction_pa + k_sum * q}};
 }
 
 ojson pressure_drop_report(const ojson& doc, const ojson& result_in,
@@ -2212,4 +2420,66 @@ ojson operating_point(const ojson& pump_curve, const ojson& system_in, const ojs
     return out;
 }
 
+}  // namespace chudware::piping
+
+namespace chudware::piping {
+ojson piping_fitting_k(const ojson& args) {
+    auto fail = [](const std::string& reason, const std::string& hint) {
+        return ojson{{"ok", false}, {"reason", reason}, {"hint", hint}};
+    };
+    try {
+        if (!args.is_object() || !args.value("fitting", ojson(nullptr)).is_object())
+            return fail("invalid_params", "pass a fitting object");
+        const auto input = args["fitting"];
+        if (input.contains("params") && !input["params"].is_object())
+            return fail("invalid_params", "fitting params must be an object");
+        const auto nps = args.value("nps", input.value("nps", ojson(2)));
+        const auto schedule = args.value("schedule", std::string("40"));
+        const auto spec = nearest_pipe(nps, schedule);
+        if (!spec.value("ok", false)) return fail("invalid_params", "use a catalog NPS/schedule");
+        auto ft = new_fitting("ft1", input.value("type", std::string()), nps, nullptr,
+                              schedule, "Preview", input.value("params", ojson::object()));
+        ft["nps2"] = input.value("nps2", ojson(nullptr));
+        if (input.contains("run_id")) ft["run_id"] = input["run_id"];
+        const auto errors = validate_fitting(ft);
+        if (!errors.empty()) {
+            const auto p = ft["params"];
+            const bool invalid_model = (ft["type"] == "custom" && !p.contains("k_model")) ||
+                (p.contains("k_model") && !validate_k_model(p["k_model"]).empty());
+            return fail(invalid_model ? "invalid_k_model" : "invalid_params", errors.front());
+        }
+        const double d = spec["inner_dia"].get<double>() / 1000;
+        if (ft["type"] == "orifice" && ft["params"].value("beta", ojson(nullptr)).is_null() &&
+            ft["params"]["bore_mm"].get<double>() >= d * 1000)
+            return fail("invalid_params", "orifice bore must be smaller than pipe ID");
+        double Re = 1e5;
+        if (args.contains("reynolds")) {
+            if (!finite_number(args["reynolds"]) || args["reynolds"].get<double>() <= 0)
+                return fail("invalid_params", "reynolds must be finite and positive");
+            Re = args["reynolds"].get<double>();
+        } else if (args.contains("velocity_ms")) {
+            if (!finite_number(args["velocity_ms"]))
+                return fail("invalid_params", "velocity_ms must be finite");
+            const auto fl = resolve_solver_fluid(args.value("fluid", ojson(nullptr)));
+            if (!fl.value("ok", true)) return fl;
+            Re = std::max(std::abs(args["velocity_ms"].get<double>()) *
+                          d * fl["rho"].get<double>() / fl["mu"].get<double>(), 1e-6);
+        }
+        const double fT = 1 / std::pow(-2 * std::log10(0.0000457 / (3.7*d)), 2);
+        auto evaluate = [&](double re) {
+            return fitting_K(ft, d, re < 2100 ? 64/re : clamond(re, 0.0000457/d), re,
+                             ft.value("run_id", std::string()));
+        };
+        const auto [K, method] = evaluate(Re);
+        ojson curve = ojson::array();
+        for (int i = 0; i < 24; ++i) {
+            const double re = std::pow(10.0, 3.0 + 4.0 * i / 23.0);
+            curve.push_back({{"re", re}, {"K", evaluate(re).first}});
+        }
+        return {{"ok", true}, {"K", K}, {"method", method}, {"fT", fT},
+                {"inner_dia_mm", d*1000}, {"reynolds", Re}, {"curve", std::move(curve)}};
+    } catch (const nlohmann::json::exception&) {
+        return fail("invalid_params", "check fitting and numeric parameter types");
+    }
+}
 }  // namespace chudware::piping

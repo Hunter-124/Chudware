@@ -288,6 +288,7 @@ add_library(chudware_sim STATIC
   sim/netlist.cpp
   sim/lbm.cpp
   sim/flow_run.cpp
+  sim/pipe_flow.cpp
   sim/sim_cache.cpp
   sim/sim_cancel.cpp
   sim/spice_sweep.cpp)
@@ -580,6 +581,7 @@ enable_testing()
 add_executable(test_sim tests/test_sim.cpp)
 target_include_directories(test_sim PRIVATE ${doctest_SOURCE_DIR})
 target_link_libraries(test_sim PRIVATE chudware_sim)
+target_link_libraries(test_sim PRIVATE chudware_piping)
 set_target_properties(test_sim PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME sim COMMAND test_sim)
@@ -1076,13 +1078,19 @@ add_test(NAME dfm COMMAND test_dfm)
 # like a fluids-present box. Each family owns its methods behind a single
 # call(method, params, result) dispatch entry for the libchudware glue.
 add_library(chudware_piping STATIC
+  piping/bom.cpp
   piping/catalog.cpp
   piping/cfd.cpp
+  piping/duct.cpp
   piping/fluid_properties.cpp
   piping/piping.cpp
+  piping/route.cpp
+  piping/edit.cpp
   piping/schema.cpp
   piping/simhandoff.cpp
-  piping/solve.cpp)
+  piping/solve.cpp
+  piping/spec.cpp
+  piping/vessel.cpp)
 target_include_directories(chudware_piping PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_piping PUBLIC nlohmann_json::nlohmann_json)
 if(MSVC)
@@ -1094,7 +1102,10 @@ add_library(chudware_hydraulic STATIC
   hydraulic/bom.cpp
   hydraulic/handoff.cpp
   hydraulic/hydraulic.cpp
+  hydraulic/motor.cpp
   hydraulic/schema.cpp
+  hydraulic/sim.cpp
+  hydraulic/templates.cpp
   hydraulic/solve.cpp)
 target_include_directories(chudware_hydraulic PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_hydraulic PUBLIC chudware_piping nlohmann_json::nlohmann_json)
@@ -1108,6 +1119,14 @@ target_link_libraries(test_piping PRIVATE chudware_piping)
 set_target_properties(test_piping PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME piping COMMAND test_piping)
+
+# Industrial process sizing (ASME VIII-1 vessels, equal-friction duct systems).
+add_executable(test_industrial tests/test_industrial.cpp)
+target_include_directories(test_industrial PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_industrial PRIVATE chudware_piping)
+set_target_properties(test_industrial PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME industrial COMMAND test_industrial)
 
 add_executable(test_hydraulic tests/test_hydraulic.cpp)
 target_include_directories(test_hydraulic PRIVATE ${doctest_SOURCE_DIR})
@@ -2704,16 +2723,20 @@ if(TARGET chudware_mesh)
   add_test(NAME fea_prepare COMMAND test_fea_prepare)
 endif()
 
-# The emulated ARM suite still registers every portable core test. A test's
-# explicit TIMEOUT takes precedence over ctest --timeout, so cap those overrides
-# without changing the longer native allowance for mesher_advanced.
+# The emulated ARM suite still registers every portable core test. Explicit
+# native TIMEOUT values override ctest's default: allow eightfold emulation
+# overhead, capped at two hours, without changing any native test allowance.
 if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
    CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
   get_property(_chudware_arm_tests DIRECTORY PROPERTY TESTS)
   foreach(_test IN LISTS _chudware_arm_tests)
     get_property(_timeout TEST "${_test}" PROPERTY TIMEOUT)
-    if(_timeout AND _timeout GREATER 1800)
-      set_tests_properties("${_test}" PROPERTIES TIMEOUT 1800)
+    if(_timeout)
+      math(EXPR _timeout "${_timeout} * 8")
+      if(_timeout GREATER 7200)
+        set(_timeout 7200)
+      endif()
+      set_tests_properties("${_test}" PROPERTIES TIMEOUT "${_timeout}")
     endif()
   endforeach()
 endif()

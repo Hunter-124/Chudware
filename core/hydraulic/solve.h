@@ -23,9 +23,4 @@ ojson size_accumulator(double pre_charge_bar, double max_pressure_bar,
 
 ojson valve_flow(double Cv, double pressure_drop_bar, double fluid_sg = 0.87);
 
-// FMU simulation is a soft-fail seam: the C++ core never has fmpy, so this
-// always returns the oracle's fmpy-absent skipped envelope.
-ojson fmu_simulate(const ojson& circuit_doc, const ojson& fmu_path = nullptr,
-                   double stop_time = 10.0);
-
 }  // namespace chudware::hydraulic

@@ -74,6 +74,8 @@
 | pandoc (T-F14, optional) | GPL-2+ | markup conversion | **subprocess-only**, PATH-discovered, never bundled (mere aggregation — same isolation policy as ngspice) |
 | LibreOffice headless (T-F14, optional) | MPL-2.0 | office → PDF for `render_document` previews | **subprocess-only**, PATH-discovered, never bundled |
 | pypdf (T-office) | BSD-3 | PDF metadata + page ops (read/rotate/delete/merge, `services/mcp/office_tools.py` office_edit_pdf) | ok. In-process, pure-Python, permissive — same posture as pypdfium2 above. |
+| pyproj / PROJ (civil) | MIT / MIT | CRS transforms + grid/combined scale factors (`services/civil/crs.py`) | ok. In-process, permissive. EPSG dataset use per its terms of use (identifiers only; no dataset redistribution beyond the PROJ wheel). |
+| civil V&V fixtures (`services/civil/data/`) | US-government public domain / MIT | EPA EPANET Net1 `.inp` (EPANET 2.2, MIT; notices retained in-file), reference results generated with WNTR 1.5 (BSD-3) + EPA SWMM 5.2 via pyswmm, NRCS NEH/TR-55 and FHWA HDS-5 coefficient tables, NOAA Atlas 14 PFDS sample | ok — test data only. WNTR / pyswmm / IfcOpenShell (LGPL-3) were used **out of tree** to generate or check fixtures and are **not** dependencies, imported, or bundled. |
 | **BOLTS** (boltsparts) | **GPL-3.0** | standard-part spec reference | **NEVER vendored or linked** (T-B4). Same clean-room posture as KiCad: we learn the `.blt` *format* (documented → interop) and reimplement; no BOLTS data or code enters the tree. A user may point our loader at their own BOLTS checkout (their license, their choice). |
 | clean-room ISO/DIN part tables (`engine_oracle/data/bolts/*.blt.yaml`) | project (dimensional data) | deterministic spec-sheet lookup (T-B4) | ok — published ISO/DIN **nominal dimensions are not copyrightable** (same posture as the IPC-7351 row below); transcribed from our own `services/agent/prompts/shared/cheatsheets/hardware.md` + `core/parts/parts_data.h`, NOT from BOLTS. GPL-clean. |
 | **fluids** | **MIT** | piping module: ASME B36.10M/B36.19M pipe schedule tables (`fluids.piping.nearest_pipe`) for `services/piping/catalog.py` | ok. Pure-Python (numpy/scipy dep already present); optional at runtime — `catalog.nearest_pipe` degrades contract-shaped when absent. Fitting geometry is our own CSV of public manufacturer dims — ASME standard text is **not** bundled (dimensions are facts, not copyrightable). |
@@ -187,3 +189,8 @@ No CalculiX executable, deck generator, or parser is used for buckling. This add
 no dependency: the existing Eigen/Spectra and optional CHOLMOD solver stack is
 reused. CalculiX retains its existing subprocess-only posture for remaining
 non-buckling tools and validation scenarios.
+
+**2026-10 — hydraulic circuit simulation is native.** `hydraulic_simulate`
+(`core/hydraulic/sim.cpp`, contracts/hydraulic_schema.md §8) replaced the
+`hydraulic_fmu_simulate` stub. The **fmpy** row above is retired: no FMU runtime is
+loaded or probed, and the native solver adds no dependency.

@@ -15,5 +15,8 @@ in-app modeling guide, and the frozen contract set — see `tools/manual_gen.py`
 - [Guide: Narration](guide-narration.md)
 - [Guide: Deliverables](guide-deliverables.md)
 - [Guide: Reverse](guide-reverse.md)
+- [Guide: Piping](guide-piping.md)
+- [Guide: Industrial](guide-industrial.md)
+- [Guide: Civil](guide-civil.md)
 - [Contracts Summary](contracts.md)
 

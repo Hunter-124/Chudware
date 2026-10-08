@@ -1,6 +1,6 @@
 # Contracts Summary
 
-49 frozen contracts under `contracts/`:
+52 frozen contracts under `contracts/`:
 
 - `README.md` — contracts/ — frozen interface seams
 - `advisor.md` — contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.7)
@@ -9,12 +9,14 @@
 - `box_mirror.md` — Box.com mirror seam (`aicad.box_mirror/1`)
 - `cad_graph.md` — Contract: CAD Project Graph — v1
 - `cam.md` — Contract: CAM simulation frames, audit, machines, job diff
+- `civil_schema.md` — Contract: `aicad.civil/1` — civil / site / utility infrastructure model
 - `copilot_modes.md` — Copilot modes — Agent|Plan|Swarm|Edit|Ask tool gating (aicad.copilot_modes/1)
 - `dag_schema.md` — Contract: DAG Orchestrator Schema — `aicad.dag/1`
 - `deliverables.md` — Contract: Deliverables — `deliverables/1`
 - `design_pipeline.md` — contracts/design_pipeline.md — Design pipeline contract (`aicad.designpipe/1`)
 - `doc_ops.md` — Contract: Document Ops — v1.1
 - `doc_schema.md` — Contract: Document Schema — `aicad.part/1` · `aicad.asm/1` · `aicad.drawing/1`
+- `drives_schema.md` — Contract: hydraulic motor sizing and pump drive selection
 - `events.md` — Contract: Event Stream — v2
 - `fabrication_services.md` — Contract: Fabrication Services — quote-your-own-geometry (`aicad.fab/1`)
 - `feature_params.md` — Contract: Feature Parameters — v1
@@ -23,6 +25,7 @@
 - `gsl_ser.md` — gsl-ser/v1 — canonical GSL text serialization (Pillar 13, stage 0)
 - `hydraulic_schema.md` — Contract: `aicad.hydraulic/1` — ISO 1219 Hydraulic Circuit Schema
 - `icons.md` — Contract: Icon Pipeline — v1
+- `industrial_schema.md` — Contract: industrial process sizing RPCs (`vessel_size`, `duct_size`)
 - `interaction.md` — Contract: Interaction — `ask_user` — v1
 - `leaderboard.md` — Contract: Model Leaderboard (`aicad.leaderboard/1`)
 - `license_debt.md` — License debt register — cleanroom-before-SaaS

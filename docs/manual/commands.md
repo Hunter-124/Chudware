@@ -1,6 +1,6 @@
 # Commands Reference
 
-Every ribbon command (379 total), grouped by tab and ribbon group.
+Every ribbon command (512 total), grouped by tab and ribbon group.
 
 ## Annotation
 
@@ -128,6 +128,16 @@ _Available from the Appearance ▸ Material ribbon group._
 
 ## EM
 
+### Boundaries
+
+#### EM BCs
+
+_Available from the EM ▸ Boundaries ribbon group._
+
+#### Ports
+
+_Available from the EM ▸ Boundaries ribbon group._
+
 ### Reference
 
 #### Coord. Sys.
@@ -146,9 +156,19 @@ _Available from the EM ▸ Reference ribbon group._
 
 _Available from the EM ▸ Reference ribbon group._
 
+### Results
+
+#### Results
+
+_Available from the EM ▸ Results ribbon group._
+
 ### Run
 
 #### Results
+
+_Available from the EM ▸ Run ribbon group._
+
+#### Run
 
 _Available from the EM ▸ Run ribbon group._
 
@@ -166,6 +186,10 @@ _Available from the EM ▸ Setup ribbon group._
 
 _Available from the EM ▸ Setup ribbon group._
 
+#### Freq Range
+
+_Available from the EM ▸ Setup ribbon group._
+
 #### Ports
 
 _Available from the EM ▸ Setup ribbon group._
@@ -176,7 +200,19 @@ _Available from the EM ▸ Setup ribbon group._
 
 _Available from the EM ▸ Study ribbon group._
 
+#### Eigenmode
+
+_Available from the EM ▸ Study ribbon group._
+
 #### Freq Sweep
+
+_Available from the EM ▸ Study ribbon group._
+
+#### Freq Sweep
+
+_Available from the EM ▸ Study ribbon group._
+
+#### Time Domain
 
 _Available from the EM ▸ Study ribbon group._
 
@@ -250,7 +286,25 @@ _Available from the Evaluate ▸ Performance ribbon group._
 
 ## Fatigue
 
+### Boundaries
+
+#### Fixture
+
+_Available from the Fatigue ▸ Boundaries ribbon group._
+
+#### Force
+
+_Available from the Fatigue ▸ Boundaries ribbon group._
+
+#### Pressure
+
+_Available from the Fatigue ▸ Boundaries ribbon group._
+
 ### Mesh
+
+#### Mesh
+
+_Available from the Fatigue ▸ Mesh ribbon group._
 
 #### Mesh
 
@@ -274,6 +328,12 @@ _Available from the Fatigue ▸ Reference ribbon group._
 
 _Available from the Fatigue ▸ Reference ribbon group._
 
+### Results
+
+#### Results
+
+_Available from the Fatigue ▸ Results ribbon group._
+
 ### Run
 
 #### Results
@@ -284,9 +344,29 @@ _Available from the Fatigue ▸ Run ribbon group._
 
 _Available from the Fatigue ▸ Run ribbon group._
 
+#### Run
+
+_Available from the Fatigue ▸ Run ribbon group._
+
 ### Setup
 
+#### Loading
+
+_Available from the Fatigue ▸ Setup ribbon group._
+
 #### Loading / S-N
+
+_Available from the Fatigue ▸ Setup ribbon group._
+
+#### Loading / S-N
+
+_Available from the Fatigue ▸ Setup ribbon group._
+
+#### Material
+
+_Available from the Fatigue ▸ Setup ribbon group._
+
+#### Material
 
 _Available from the Fatigue ▸ Setup ribbon group._
 
@@ -468,11 +548,27 @@ _Available from the Features ▸ Sketch ribbon group._
 
 ## Flow
 
+### Boundaries
+
+#### Boundaries
+
+_Available from the Flow ▸ Boundaries ribbon group._
+
+#### Flow BCs
+
+_Available from the Flow ▸ Boundaries ribbon group._
+
 ### Grid
 
 #### Resolution
 
 _Available from the Flow ▸ Grid ribbon group._
+
+### Mesh
+
+#### Resolution
+
+_Available from the Flow ▸ Mesh ribbon group._
 
 ### Reference
 
@@ -492,9 +588,19 @@ _Available from the Flow ▸ Reference ribbon group._
 
 _Available from the Flow ▸ Reference ribbon group._
 
+### Results
+
+#### Results
+
+_Available from the Flow ▸ Results ribbon group._
+
 ### Run
 
 #### Results
+
+_Available from the Flow ▸ Run ribbon group._
+
+#### Run
 
 _Available from the Flow ▸ Run ribbon group._
 
@@ -512,11 +618,137 @@ _Available from the Flow ▸ Setup ribbon group._
 
 _Available from the Flow ▸ Setup ribbon group._
 
+#### Fluid
+
+_Available from the Flow ▸ Setup ribbon group._
+
 ### Study
 
 #### New Study
 
 _Available from the Flow ▸ Study ribbon group._
+
+## Hydraulics
+
+### Analysis
+
+#### BOM
+
+_Available from the Hydraulics ▸ Analysis ribbon group._
+
+#### Simulate
+
+_Available from the Hydraulics ▸ Analysis ribbon group._
+
+#### Simulate
+
+_Available from the Hydraulics ▸ Analysis ribbon group._
+
+#### To Piping
+
+_Available from the Hydraulics ▸ Analysis ribbon group._
+
+### Circuit
+
+#### Add Component
+
+_Available from the Hydraulics ▸ Circuit ribbon group._
+
+#### Add Component
+
+_Available from the Hydraulics ▸ Circuit ribbon group._
+
+#### Connect
+
+_Available from the Hydraulics ▸ Circuit ribbon group._
+
+#### Connect
+
+_Available from the Hydraulics ▸ Circuit ribbon group._
+
+#### New Circuit
+
+_Available from the Hydraulics ▸ Circuit ribbon group._
+
+#### New Circuit
+
+_Available from the Hydraulics ▸ Circuit ribbon group._
+
+### Design
+
+#### Pump Drive
+
+_Available from the Hydraulics ▸ Design ribbon group._
+
+#### Size Cylinder
+
+_Available from the Hydraulics ▸ Design ribbon group._
+
+#### Size Motor
+
+_Available from the Hydraulics ▸ Design ribbon group._
+
+#### Size Pump
+
+_Available from the Hydraulics ▸ Design ribbon group._
+
+### Reference
+
+#### Coord. Sys.
+
+_Available from the Hydraulics ▸ Reference ribbon group._
+
+#### Ref. Axis
+
+_Available from the Hydraulics ▸ Reference ribbon group._
+
+#### Ref. Plane
+
+_Available from the Hydraulics ▸ Reference ribbon group._
+
+#### Ref. Point
+
+_Available from the Hydraulics ▸ Reference ribbon group._
+
+### Results
+
+#### 3D Layout
+
+_Available from the Hydraulics ▸ Results ribbon group._
+
+#### BOM
+
+_Available from the Hydraulics ▸ Results ribbon group._
+
+#### Plots
+
+_Available from the Hydraulics ▸ Results ribbon group._
+
+#### Schematic
+
+_Available from the Hydraulics ▸ Results ribbon group._
+
+#### To Piping
+
+_Available from the Hydraulics ▸ Results ribbon group._
+
+### Sizing
+
+#### Pump Drive
+
+_Available from the Hydraulics ▸ Sizing ribbon group._
+
+#### Size Cylinder
+
+_Available from the Hydraulics ▸ Sizing ribbon group._
+
+#### Size Motor
+
+_Available from the Hydraulics ▸ Sizing ribbon group._
+
+#### Size Pump
+
+_Available from the Hydraulics ▸ Sizing ribbon group._
 
 ## Manufacture
 
@@ -670,7 +902,17 @@ _Available from the Manufacture ▸ Turning ribbon group._
 
 ## Modal
 
+### Boundaries
+
+#### Fixture
+
+_Available from the Modal ▸ Boundaries ribbon group._
+
 ### Mesh
+
+#### Mesh
+
+_Available from the Modal ▸ Mesh ribbon group._
 
 #### Mesh
 
@@ -700,6 +942,12 @@ _Available from the Modal ▸ Reference ribbon group._
 
 _Available from the Modal ▸ Reference ribbon group._
 
+### Results
+
+#### Results
+
+_Available from the Modal ▸ Results ribbon group._
+
 ### Run
 
 #### Results
@@ -710,13 +958,37 @@ _Available from the Modal ▸ Run ribbon group._
 
 _Available from the Modal ▸ Run ribbon group._
 
+#### Run
+
+_Available from the Modal ▸ Run ribbon group._
+
 ### Setup
+
+#### Excitation
+
+_Available from the Modal ▸ Setup ribbon group._
 
 #### Fixture
 
 _Available from the Modal ▸ Setup ribbon group._
 
+#### Frequencies
+
+_Available from the Modal ▸ Setup ribbon group._
+
 #### Material
+
+_Available from the Modal ▸ Setup ribbon group._
+
+#### Material
+
+_Available from the Modal ▸ Setup ribbon group._
+
+#### Material
+
+_Available from the Modal ▸ Setup ribbon group._
+
+#### Modes
 
 _Available from the Modal ▸ Setup ribbon group._
 
@@ -746,6 +1018,12 @@ _Available from the Motion ▸ Reference ribbon group._
 
 _Available from the Motion ▸ Reference ribbon group._
 
+### Results
+
+#### Results
+
+_Available from the Motion ▸ Results ribbon group._
+
 ### Run
 
 #### Playback
@@ -756,9 +1034,21 @@ _Available from the Motion ▸ Run ribbon group._
 
 _Available from the Motion ▸ Run ribbon group._
 
+#### Run
+
+_Available from the Motion ▸ Run ribbon group._
+
 ### Setup
 
 #### Driver / Time
+
+_Available from the Motion ▸ Setup ribbon group._
+
+#### Driver / Time
+
+_Available from the Motion ▸ Setup ribbon group._
+
+#### Drivers
 
 _Available from the Motion ▸ Setup ribbon group._
 
@@ -841,6 +1131,110 @@ _Available from the PCB Design ▸ Outputs ribbon group._
 #### Gerbers
 
 _Available from the PCB Design ▸ Outputs ribbon group._
+
+## Piping
+
+### Analysis
+
+#### BOM
+
+_Available from the Piping ▸ Analysis ribbon group._
+
+#### Internal CFD
+
+_Available from the Piping ▸ Analysis ribbon group._
+
+#### Solve
+
+_Available from the Piping ▸ Analysis ribbon group._
+
+#### Solve
+
+_Available from the Piping ▸ Analysis ribbon group._
+
+#### Spec Check
+
+_Available from the Piping ▸ Analysis ribbon group._
+
+#### Spec Check
+
+_Available from the Piping ▸ Analysis ribbon group._
+
+### Design
+
+#### Duct Sizing
+
+_Available from the Piping ▸ Design ribbon group._
+
+#### Vessel
+
+_Available from the Piping ▸ Design ribbon group._
+
+### Equipment
+
+#### Duct Sizing
+
+_Available from the Piping ▸ Equipment ribbon group._
+
+#### Vessel
+
+_Available from the Piping ▸ Equipment ribbon group._
+
+### Flow
+
+#### Internal CFD
+
+_Available from the Piping ▸ Flow ribbon group._
+
+### Network
+
+#### Draw Pipe
+
+_Available from the Piping ▸ Network ribbon group._
+
+#### Fittings
+
+_Available from the Piping ▸ Network ribbon group._
+
+#### New Network
+
+_Available from the Piping ▸ Network ribbon group._
+
+#### New Network
+
+_Available from the Piping ▸ Network ribbon group._
+
+#### Route Pipe
+
+_Available from the Piping ▸ Network ribbon group._
+
+#### Route Pipe
+
+_Available from the Piping ▸ Network ribbon group._
+
+### Reference
+
+#### Coord. Sys.
+
+_Available from the Piping ▸ Reference ribbon group._
+
+#### Ref. Axis
+
+_Available from the Piping ▸ Reference ribbon group._
+
+#### Ref. Plane
+
+_Available from the Piping ▸ Reference ribbon group._
+
+#### Ref. Point
+
+_Available from the Piping ▸ Reference ribbon group._
+
+### Results
+
+#### BOM
+
+_Available from the Piping ▸ Results ribbon group._
 
 ## Reverse Eng
 
@@ -1064,6 +1458,20 @@ _Available from the Sheet Metal ▸ Flat Pattern ribbon group._
 
 ## Simulation
 
+### Boundaries
+
+#### Fixture
+
+_Available from the Simulation ▸ Boundaries ribbon group._
+
+#### Force
+
+_Available from the Simulation ▸ Boundaries ribbon group._
+
+#### Pressure
+
+_Available from the Simulation ▸ Boundaries ribbon group._
+
 ### Fixtures
 
 #### Fixture
@@ -1092,9 +1500,21 @@ _Available from the Simulation ▸ Materials ribbon group._
 
 _Available from the Simulation ▸ Mesh ribbon group._
 
+#### Mesh
+
+_Available from the Simulation ▸ Mesh ribbon group._
+
 ### Reference
 
 #### Coord. Sys.
+
+_Available from the Simulation ▸ Reference ribbon group._
+
+#### Coord. Sys.
+
+_Available from the Simulation ▸ Reference ribbon group._
+
+#### Ref. Axis
 
 _Available from the Simulation ▸ Reference ribbon group._
 
@@ -1106,9 +1526,23 @@ _Available from the Simulation ▸ Reference ribbon group._
 
 _Available from the Simulation ▸ Reference ribbon group._
 
+#### Ref. Plane
+
+_Available from the Simulation ▸ Reference ribbon group._
+
 #### Ref. Point
 
 _Available from the Simulation ▸ Reference ribbon group._
+
+#### Ref. Point
+
+_Available from the Simulation ▸ Reference ribbon group._
+
+### Results
+
+#### Results
+
+_Available from the Simulation ▸ Results ribbon group._
 
 ### Run
 
@@ -1119,6 +1553,16 @@ _Available from the Simulation ▸ Run ribbon group._
 #### Run
 
 _Available from the Simulation ▸ Run ribbon group._
+
+#### Run
+
+_Available from the Simulation ▸ Run ribbon group._
+
+### Setup
+
+#### Material
+
+_Available from the Simulation ▸ Setup ribbon group._
 
 ### Study
 
@@ -1131,6 +1575,10 @@ _Available from the Simulation ▸ Study ribbon group._
 _Available from the Simulation ▸ Study ribbon group._
 
 #### Modal Study
+
+_Available from the Simulation ▸ Study ribbon group._
+
+#### Motion Study
 
 _Available from the Simulation ▸ Study ribbon group._
 
@@ -1434,6 +1882,20 @@ _Available from the Sketch3D ▸ Working Plane ribbon group._
 
 ## Static
 
+### Boundaries
+
+#### Fixture
+
+_Available from the Static ▸ Boundaries ribbon group._
+
+#### Force
+
+_Available from the Static ▸ Boundaries ribbon group._
+
+#### Pressure
+
+_Available from the Static ▸ Boundaries ribbon group._
+
 ### Loads
 
 #### Force
@@ -1449,6 +1911,10 @@ _Available from the Static ▸ Loads ribbon group._
 _Available from the Static ▸ Loads ribbon group._
 
 ### Mesh
+
+#### Mesh
+
+_Available from the Static ▸ Mesh ribbon group._
 
 #### Mesh
 
@@ -1472,6 +1938,12 @@ _Available from the Static ▸ Reference ribbon group._
 
 _Available from the Static ▸ Reference ribbon group._
 
+### Results
+
+#### Results
+
+_Available from the Static ▸ Results ribbon group._
+
 ### Run
 
 #### Results
@@ -1482,13 +1954,33 @@ _Available from the Static ▸ Run ribbon group._
 
 _Available from the Static ▸ Run ribbon group._
 
+#### Run
+
+_Available from the Static ▸ Run ribbon group._
+
 ### Setup
+
+#### Contact
+
+_Available from the Static ▸ Setup ribbon group._
 
 #### Fixture
 
 _Available from the Static ▸ Setup ribbon group._
 
 #### Material
+
+_Available from the Static ▸ Setup ribbon group._
+
+#### Material
+
+_Available from the Static ▸ Setup ribbon group._
+
+#### Material
+
+_Available from the Static ▸ Setup ribbon group._
+
+#### Modes
 
 _Available from the Static ▸ Setup ribbon group._
 
@@ -1568,6 +2060,30 @@ _Available from the Surfaces ▸ Edit ribbon group._
 
 ## Thermal
 
+### Boundaries
+
+#### Fixed Temp
+
+_Available from the Thermal ▸ Boundaries ribbon group._
+
+#### Fixture
+
+_Available from the Thermal ▸ Boundaries ribbon group._
+
+#### Heat Load
+
+_Available from the Thermal ▸ Boundaries ribbon group._
+
+#### Heat Load
+
+_Available from the Thermal ▸ Boundaries ribbon group._
+
+### Mesh
+
+#### Mesh
+
+_Available from the Thermal ▸ Mesh ribbon group._
+
 ### Reference
 
 #### Coord. Sys.
@@ -1586,6 +2102,12 @@ _Available from the Thermal ▸ Reference ribbon group._
 
 _Available from the Thermal ▸ Reference ribbon group._
 
+### Results
+
+#### Results
+
+_Available from the Thermal ▸ Results ribbon group._
+
 ### Run
 
 #### Results
@@ -1596,9 +2118,25 @@ _Available from the Thermal ▸ Run ribbon group._
 
 _Available from the Thermal ▸ Run ribbon group._
 
+#### Run
+
+_Available from the Thermal ▸ Run ribbon group._
+
 ### Setup
 
+#### Conduction
+
+_Available from the Thermal ▸ Setup ribbon group._
+
 #### Heat Loads
+
+_Available from the Thermal ▸ Setup ribbon group._
+
+#### Material
+
+_Available from the Thermal ▸ Setup ribbon group._
+
+#### Material
 
 _Available from the Thermal ▸ Setup ribbon group._
 
@@ -1616,11 +2154,27 @@ _Available from the Thermal ▸ Study ribbon group._
 
 _Available from the Topology ▸ Boundaries ribbon group._
 
+#### Fixture
+
+_Available from the Topology ▸ Boundaries ribbon group._
+
+#### Force
+
+_Available from the Topology ▸ Boundaries ribbon group._
+
 #### Force
 
 _Available from the Topology ▸ Boundaries ribbon group._
 
 #### Heat / Flow
+
+_Available from the Topology ▸ Boundaries ribbon group._
+
+#### Heat / Flow
+
+_Available from the Topology ▸ Boundaries ribbon group._
+
+#### Pressure
 
 _Available from the Topology ▸ Boundaries ribbon group._
 
@@ -1635,6 +2189,10 @@ _Available from the Topology ▸ Boundaries ribbon group._
 _Available from the Topology ▸ Manufacturing ribbon group._
 
 ### Mesh
+
+#### Mesh
+
+_Available from the Topology ▸ Mesh ribbon group._
 
 #### Mesh
 
@@ -1674,6 +2232,14 @@ _Available from the Topology ▸ Regions ribbon group._
 
 _Available from the Topology ▸ Results ribbon group._
 
+#### Compare
+
+_Available from the Topology ▸ Results ribbon group._
+
+#### Results
+
+_Available from the Topology ▸ Results ribbon group._
+
 #### Results
 
 _Available from the Topology ▸ Results ribbon group._
@@ -1684,13 +2250,45 @@ _Available from the Topology ▸ Results ribbon group._
 
 _Available from the Topology ▸ Run ribbon group._
 
+#### Run
+
+_Available from the Topology ▸ Run ribbon group._
+
 ### Setup
+
+#### Exclude
+
+_Available from the Topology ▸ Setup ribbon group._
+
+#### Material
+
+_Available from the Topology ▸ Setup ribbon group._
+
+#### Material
+
+_Available from the Topology ▸ Setup ribbon group._
 
 #### Material
 
 _Available from the Topology ▸ Setup ribbon group._
 
 #### Method
+
+_Available from the Topology ▸ Setup ribbon group._
+
+#### Method
+
+_Available from the Topology ▸ Setup ribbon group._
+
+#### Mfg. Rules
+
+_Available from the Topology ▸ Setup ribbon group._
+
+#### Preserve
+
+_Available from the Topology ▸ Setup ribbon group._
+
+#### Settings
 
 _Available from the Topology ▸ Setup ribbon group._
 

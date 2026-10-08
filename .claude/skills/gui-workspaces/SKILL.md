@@ -30,7 +30,8 @@ ReverseEng and Firmware have their own shots.
 | **Reverse Eng.** | `host/src/ui/reveng/`: `reveng_workspace.cpp` (shell), `reveng_widgets.h/.cpp` (shared visual kit), `sources_panel.cpp`, `webcam_capture.cpp`, `stage_panels.cpp`, `dim_review.cpp`, `image_gallery.cpp`, `img_tex.cpp` | Native live/video Gaussian reconstruction plus the separate six-stage measured-CAD wizard (`contracts/reveng.md` §13). **Every panel draws with `ui::reveng::kit`** and uses `ui::metrics::re*()`. Camera seam: `host/src/platform/camera.h` v2. Native splat/point rendering reads `kit::previewSlotRect` and `previewSlotClip`. Full breakdown below. |
 | **AI / Activity** | `host/src/ui/ai/ai_workspace.cpp/.h` shell/nav + `ai/agent_dag.cpp/.h` execution graph, `ai/current_run_view.cpp/.h` roster/single docked inspector, `ai/{plan_board,docs_panel,active_work,metrics_view,activity_view,insights_view}.cpp`, plus `host/src/ui/copilot/` chat modules (reuse hooks in `copilot.h`) | Current Run / Plan / Activity / Sessions / Insights / Options, project chip; project scoping via `convProjectDir(st)`; events per `contracts/agent_events.md` |
 | **Drawing** | `host/src/ui/drawing_panel.cpp` | Sheet layout, views, DXF export |
-| **Simulation** | `host/src/ui/sim_manager.cpp/.h`, `host/src/ui/evaluate_dialogs.cpp`; topology: `host/src/ui/sim_topology.cpp/.h`, `host/src/ui/sim_topology_bc.cpp/.h` | Study tree, fixtures/loads, results; Evaluate dialogs (measure, mass props, …). The **Topology** ribbon tab (Simulate only, `ribbon_def.cpp` `sim_new_topology`/`sim_topology_*`) drives topology studies; see "Simulation: Topology tab" below |
+| **Simulation** | `host/src/ui/sim_manager.h` + `sim_manager.cpp` (core: study JSON, refresh/persist, CRUD, `handleCommand` routing incl. piping/hydraulic/EM/topology dispatch, materials, probes) and `host/src/ui/sim/`: `sim_manager_tree.cpp` (left-pane tree, panel header, study rows, new-study picker), `sim_manager_forms.cpp` (material/fixtures/loads/mesh/fatigue forms, checklist, `drawForm`), `sim_manager_run.cpp` (run dispatch, static/modal/thermal/contact/FRF prep, `tick`, `drainSimClientJob`), `sim_manager_results.cpp` (result overlays, view sync, result controls, advisor, provenance, advanced results), `sim_manager_viewport.cpp` (face picks, BC previews, mesh preview, indicator glyphs), `sim_manager_flow.cpp`, `sim_manager_motion.cpp`, `sim_manager_em.cpp`, `sim_manager_topology.cpp`, `sim_manager_electronics.cpp` (circuit/emulation/ECAD thermal hand-off); helpers shared by 2+ TUs live in `sim/sim_manager_internal.h` (`ui::simmgr`, `inline`), single-TU helpers stay file-local; `host/src/ui/evaluate_dialogs.cpp`; topology: `host/src/ui/sim_topology.cpp/.h`, `host/src/ui/sim_topology_bc.cpp/.h` | Study tree, fixtures/loads, results; Evaluate dialogs (measure, mass props, …). The **Topology** ribbon tab (Simulate only, `ribbon_def.cpp` `sim_new_topology`/`sim_topology_*`) drives topology studies; see "Simulation: Topology tab" below |
+| **Simulation: Piping / Hydraulics** | `host/src/ui/piping_panel.cpp/.h`; `hydraulic_panel.cpp/.h` (shell/state/RPC/mutations/undo, owned by `SimManager`), `sim/hydraulic_forms.cpp` (forms), `sim/hydraulic_canvas.cpp` (schematic/plots/HUD), `sim/hydraulic_internal.h` (`ui::hydint` helpers), `sim/hydraulic_canvas_state.h` (`ui::hydcanvas::State`); `sim/sim_scene.h/.cpp` dispatcher, `sim/pipe_scene.cpp`, `pipe_mesh.*`, `pipe_sketch.*`, `hydraulic_scene.cpp` producers | `Piping` (tab 22) / `Hydraulics` (tab 23), Simulate only; `sim_piping_*` / `sim_hyd_*` route through `SimManager::handleCommand`. Piping Draw Pipe/Fittings author shaded networks; fitting editor previews native K(Re) and runs CFD-K. Hydraulics: Circuit · Design · Simulate · Results (Outcome · BOM · To Piping); Schematic/Plots own the central panel, 3D Layout uses the native viewport. Persist `piping_network`/`pipe_flow`/`vessel`/`duct_system`/`hydraulic_circuit` studies under "Piping, hydraulics & industrial"; hydraulic positions are `params.layout3d`, shared with MCP `hydraulic_layout_3d`. Engine `code` is a design-code string; a protocol error is `code` WITHOUT `ok`. Shots: `piping`, `pipedraw`, `hydraulics` (incl. `hydraulics_09_template.png`), `hydraulics3d`. |
 | **Firmware** | `host/src/ui/firmware/fw_workspace.cpp/.h` | Project rail + sources, build console (parsed warnings), Emulate scenario editor + Engineering evidence, UART/GPIO viewer; same native `fw_sim_run` as agents (operational details below); fw_status-gated Flash/Debug; tab is progressively disclosed (`ui::firmwareTabVisible`); shot: `CHUDWARE_SHOT=firmware` |
 | **Manufacture** | `host/src/ui/manufacture/{manufacture_panel,device_panel,run_panel,approval_dialog,attention_panel,mfg_mirror}.cpp/.h` | Capability-truth chips, gate-report rendering; rail/mode-strip layout in "CAM / Manufacture internals" below. Bodies draw with `ui::kit` — cards, tone chips, `keyValueRow`, `emptyState`/`blockedState`, `inlineStatus` — never bespoke text dumps. **Tone convention: Offline Simulation is the SAFE state and reads calm (`Tone::Ok` dot chip on neutral glass); LIVE MACHINE is the hazardous one and is the only state that gets the `statusErr` wash + danger button.** Shot: `CHUDWARE_SHOT=manufacture` (the rail opens on Attention for that shot only — `layout.cpp` resolves the shot tab ONCE from `CHUDWARE_SHOT`, so `cam` keeps the Job Manager default) |
 
@@ -272,11 +273,125 @@ and `hint`, never a bare "failed".
 `reveng_recon` (mid-run at 45 %), `reveng_review` (canned dims + deviation), `reveng_model`,
 `reveng_deliver`. All but the first seed a canned session via `seedRevengCanned` in `app.cpp`.
 
+### Simulation: UI standard (every sim surface)
+
+- **Pane anatomy.** `kit::panelBegin` → `panelHeader` (via `simPanelHeader`/`drawPanelHeader`;
+  close label "Done"; title = record name only) → `stepper` Setup → Run → Results (studies; setup
+  sub-chips from `setupSteps()`, the single readiness model also used by tree rows) or `formTabs`
+  (Piping/Hydraulics/EM; labels match the ribbon) → body → `actionFooter` with the one primary
+  action, its blocker inline (≤ 2 lines, action-first), progress + Cancel while running. A Results
+  step without results keeps "Run <type>" as primary; the body never adds a second Run button.
+- **Run state** comes from `SimManager::runUi()/runBlocker()/requestCancel()`; stage text from
+  `simStageLabel/simStageFraction` (never raw engine stage ids). Ribbon setup commands route through
+  `openSetup(node, focus)` + `requestFocus/takeFocus` so the matching card scrolls into view.
+- **Hydraulics workflow.** Circuit's Start card reads native `hydraulic_templates` and adopts
+  `hydraulic_new(template)` (power unit, cylinder circuit, motor circuit or blank, with editable
+  simulation setup). Canvas palette supports drag/drop and click placement; clicking two ports
+  or dragging between them calls `connectPorts` immediately, including tee extension at an
+  occupied port. No footer staging; Connect manually has its own button. Ribbon Simulate runs
+  when `simulateBlocker()` is empty, otherwise reveals setup/blockers; completion opens
+  Results → Outcome. Simulate is setup-only; Results has Outcome · BOM · To Piping.
+  The 3D layout card (plane/offset/grid/snap/frame/placement) appears only in 3D view;
+  the selected component editor retains its 3D position fields and Place in 3D button.
+- **Content.** kit_form fields with explicit ids (pane-wide label column, unit lane), face wells
+  via `faceWellControls` + `kit::removableChip` (hover → `ui::claimViewportHoverFace`), repeated
+  items as `removableCard`, results as outcome card (chips once) → key metrics → display controls →
+  collapsed details; plots via `kit::linePlot/barPlot`; no editable multi-column tables in the side
+  pane; human labels only (raw tokens in tooltips). Shared non-UI helpers: `sim/sim_common.h`
+  (JSON/RPC/`StudyRecordStore`), pump drive form `sim/sim_pump_drive.h`.
+- **Interactive setup.** `sim/sim_interaction.h` owns document/revision-scoped face/tool
+  payloads. `sim_manager_viewport.cpp` routes compatible delivered tools; face wells consume
+  delivered faces additively and deduplicate the same boundary role. `viewport_panel.cpp`
+  retains blank-click orbit/navigation and ordinary picking; simulation face-source/tool-drop
+  reads use `IdPass::render(camera, true)`. The GPU face-only mode skips edge/vertex IDs and
+  participates in the frame-cache key, so normal picks cannot reuse that buffer.
+- **3D network seam.** `sim/sim_scene.h/.cpp` (`ui::simscene`) is the only viewport
+  dispatcher: `active/collect/toolArmed/handleViewport/onPlaneChip` forward to the open
+  panel's `ui::pipescene` or `ui::hydscene`. Cached lit/line batches use keys
+  `0x1000..0x1FFF` / `0x2000..0x2FFF`, revisions change only with buffer content.
+  Collect/render even WITHOUT `st.hasDocMesh`: empty parts are valid network canvases.
+  Armed tools own plain left clicks and Esc/Enter/Backspace/Tab, not navigation drags;
+  reference-plane chips select the working plane. Pointer hover must use
+  `ImGuiHoveredFlags_NoNavOverride` so keyboard navigation cannot hide it. Renderer
+  auxiliary bounds frame networks; see gui-viewport for the camera/render contract.
+  Transient batches (ghost, rubber band, plane patch, grid) set `bounds=false` — otherwise
+  mouse motion rescales zoom. Pipe planes: `DrawSettings::autoPlane` (camera-facing plane
+  through the last point) vs `plane` (last explicit pick); Tab cycles XY→XZ→YZ→Auto.
+  Pipe sketch finish queues through a pending save, retaining cancellation; its
+  centred hint publishes `viewportHudRect` so the triad/dimensions avoid it.
+- **Network owners/tools.** `pipe_mesh.*` builds shaded bends/fitting glyphs and solved
+  pressure/velocity colour; `pipe_sketch.*` owns planes, risers, snaps and typed lengths.
+  Atomic edits and deterministic K live in `core/piping/edit.cpp` / `solve.cpp`
+  (`piping_edit`, `piping_fitting_k`, `contracts/piping_schema.md` §9). MCP:
+  `services/mcp/piping_tools.py`; CFD-K: `services/piping/fitting_cfd.py`,
+  `worker_rpc.py` (`piping_fitting_k_cfd_start/_status/_cancel`, agent tool
+  `piping_fitting_k_cfd`; poll that tool, NOT `get_job`). Hydraulic glyphs/pressure
+  hoses/placement live in `hydraulic_scene.cpp`; MCP layout in `hydraulic_tools.py`.
+  `hydraulic_panel.cpp` owns `commitCircuitMutation` and bounded circuit/layout undo/redo;
+  forms, schematic drag release and 3D placement use this seam. Header/canvas buttons and
+  owner-aware Delete/Ctrl+Z/Ctrl+Shift+Z/Ctrl+Y edit circuit history. `app.cpp` skips global CAD
+  Ctrl+Z/Ctrl+Y while Simulate is active and the Hydraulics panel is open.
+- **Native customization.** `SimManager::drawParameterEditor/configureActiveStudy` preserve
+  canonical definitions plus typed baselines. Pristine drafts refresh by generation; dirty
+  drafts retain their exact base and refuse stale Apply. Apply is atomic, Revert reloads current
+  data, and single-edited mesh aliases synchronize without accepting genuinely conflicting
+  pairs. Per-load and mate-ID baselines prevent reorder from moving unrelated native metadata.
+  `sim_manager_run.cpp` uses an immutable merged request; managed identities/governor fields
+  remain protected. Pure `worker_normalize_face_query` precedes native document resolution.
+  Compound face sets keep terminal geometry separate through native facet/node selection,
+  including explicit thermal exterior facets; one authored force is not multiplied by children.
+  EM/Electronics typed controls remain primary; raw customization is collapsed under
+  "Advanced (native parameters)", with outcome cards and kit plots, not JSON result dumps.
+  Flow fidelity in `sim_manager_flow.cpp` writes native `flow.cells/n_steps`:
+  Quick preview 58/667 (new-study default in `sim_manager.cpp`), Standard 96/2000,
+  Accurate 144/3000; show ETA and face-normal inlet direction. Accurate is still LBM,
+  not OpenFOAM. Native flow display packaging is `core/sim/flow_run.cpp`:
+  `pressure_cp`/`velocity`, `streamlines`/`slices`, optional `overlay:false`.
+- **Family owners.** Structural/mesh cards: `sim_manager_forms.cpp`; flow controls:
+  `sim_manager_flow.cpp`; mate drivers: `sim_manager_motion.cpp`; EM:
+  `sim_manager_em.cpp`; circuit/board/heatsink/emulation: `sim_manager_electronics.cpp`.
+  `sim/sim_fw_scenario.h` is the shared native scenario/event editor used there and by
+  `firmware/fw_workspace.cpp`. Hydraulic forms/native editors live in `sim/hydraulic_forms.cpp`,
+  canvas palette/gestures in `sim/hydraulic_canvas.cpp`, metadata/ports/mutations in
+  `hydraulic_panel.cpp`, shared helpers in `sim/hydraulic_internal.h` (`ui::hydint`);
+  piping endpoints/ports/presets and native definitions remain in `piping_panel.*`.
+  Capture payload context once at drag start; source/study/panel generations fence delivery.
+  Optional-backend absence keeps setup editable and blocks Run honestly; never substitute physics.
+- **Queue scope.** `core::AsyncRpc::interactionBusy()` excludes only exact global metadata
+  discovery/status methods. Document reads, mutations, solves and unknown methods still block.
+  Simulation gesture/edit/run guards use it; scheduling, refresh and teardown retain `busy()`
+  (all queued/executing/undrained work). Preserve both counters through callbacks and shutdown.
+- **Result/model boundary.** Full simulation overlays load with `cacheAsModel=false`;
+  keep the session's editable tessellation and parked GPU model intact. Same-document
+  setup invalidation/deletion calls `restoreModelMesh` before dropping result visibility.
+  Restore geometry and face-pick/overlay caches together; binding shaded GPU buffers
+  alone leaves FEA meshes unpickable. A cached model bind cancels pending visible loads,
+  and skips rebuilding/copying shaded mesh arrays already bound on the GPU.
+- **Circuit palette seam.** Compiled schematic conversion is a native core diagnostic,
+  not a services-worker method. Keep its explicit native-only route in
+  `services/worker/worker_client.cpp`, and expose engine conversion errors in the palette.
+- **Gates.** `CHUDWARE_SHOT=simaudit` must complete every registered state with 0 ID conflicts
+  and 0 overflows, including real disclosure clicks and fully framed native editors.
+  `CHUDWARE_SHOT=siminteractive` exercises actual mouse/keyboard drag/drop, atomic Apply/Revert,
+  stale/busy/document fences and native parameter-to-solver fidelity. These are input-driven
+  proofs, not injected payloads or command-only setup checks. `CHUDWARE_IDAUDIT=1` with
+  `fea|flow|motion|topology|piping|hydraulics` covers the corresponding result surfaces
+  (fea/flow print PASS and exit non-zero on failure). Backend-specific run coverage must be
+  reported separately from setup/render coverage.
+  Opt-in item snapshots retain `native_label` beside the human semantic label: footer
+  actions have stable `###kit_af_primary` IDs even when a page tab has the same caption.
+  Resolve that action identity rather than clicking the first matching tab. Read actual
+  disclosure state offscreen and visit pinned input tabs once per navigation phase;
+  repeated tab clicks reset the wheel search for long native editors.
+  `pipedraw` and `hydraulics3d` are real-input self-checking scenarios registered in
+  `app.cpp`'s `pointerShot` and `ui_audit.cpp`'s observed-item path. The `piping` shot
+  also pixel-checks routed geometry visibility; do not replace it with a route JSON check.
+
 ### Simulation: Topology tab
 
 - **Ownership split.** `sim_topology.*` owns the scalar `topology{}` editor (method, physics,
   objective, scalar keys), run gating (`validateTopology`), and the results/compare panel
-  (`drawTopologyResults` → `ResultsAction` ShowRun / ExportArtifact / ApplyRunSettings).
+  (`drawTopologyResults` → `ResultsAction` ShowRun / ExportArtifact / ContinueInCad / ApplyRunSettings).
   `sim_topology_bc.*` owns everything outside `topology{}`: face wells (fixtures, loads,
   load cases, preserve/exclude faces or boxes, thermal fixtures/flux/power/convection,
   flow inlets/outlets/walls), the material and mesh checks (`validateBoundaries`), and
@@ -299,6 +414,14 @@ and `hint`, never a bare "failed".
   `source_unverified`. The panel reports recorded DFAM checks (GUI runs report "not run"),
   but never promotes topology output to print-ready, including legacy records claiming it:
   only `slice_part`'s passing G-code check establishes that. It never rewrites a retained run.
+- **Return to editable CAD.** Results → Result geometry and export → Continue in CAD
+  asynchronously imports the valid, available, non-stale `surface_stl` as a separate
+  solid, activates its document tab, clears the result overlay/legend, and enters Model /
+  Feature Manager. Source geometry and retained studies are not mutated. Save the new
+  part as `.step+`; the base remains faceted, not reconstructed sketch/NURBS history.
+  Closed single-shell mesh import shares edges and merges coplanar faces, so planar pads
+  can be selected as whole faces instead of individual cap triangles. Invalid geometry
+  blocks continuation independently of convergence/feasibility; DFAM is not a CAD gate.
 - **Shot:** `CHUDWARE_SHOT=topology` (`scenarios.cpp` `runTopology`) builds a 120×40×40 mm
   domain and runs the study for real, writing `scratch/topology_shots/topology_report.json`
   plus captures.

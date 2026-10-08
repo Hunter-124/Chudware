@@ -5480,6 +5480,45 @@ so the pin-in-bore region shipped jacobian_min 0.0479 on macOS. `core/sim/mesher
 faces in canonical sorted order and iterates to convergence (floors met, or no repair and no
 improvement of the deficient-quality multiset); `chudware-simcache/7`.
 
+## 2026-10-01 — responsive AI workspace, bounded authoring and consistent Explorer operations
+
+Implemented three independently owned UI slices in parallel, then built and exercised the
+integrated native application. `host/src/ui/ai/ai_workspace.cpp` retains the existing
+three-column layout when chat, navigation and a useful compartment fit; smaller logical
+widths use a full-width Chat/Workspace switch and a selector for all six compartments.
+The existing conversation, draft and selected-compartment state is shared across layouts;
+run-follow processing remains active while the compact Chat pane hides the utility view.
+`host/src/ui/ai/rules_authoring.cpp` uses the shared command-dialog placement helper every
+frame, keeps its close row fixed, and scrolls authoring content instead of clipping input,
+preview or actions after resize. Hints and errors wrap; Enter remains a newline and
+Ctrl+Enter submits. `host/src/ui/file_explorer.cpp` gives the Files tree an explicit height
+based on the outer pane, uses path-stable tree IDs across label elision, reveals a new folder
+through its ancestors before focusing inline rename, and keeps reveal pending through
+Loading listings. Successful renames remap tracked Explorer paths at folder boundaries.
+Folder paste refuses self/descendant destinations, and copy collisions preserve the entire
+dotted folder name rather than treating its final component as a file extension.
+
+Verification: native default-target build succeeded; host CTest passed all 30 tests.
+Isolated Xvfb application interaction reproduced the original cramped 640x480 workspace
+and offscreen authoring popup, then exercised all six compact compartments, draft retention
+across Chat/Workspace and 640x480/800x600/1340x838 resize, the wide layout, and the compact
+layout at 2x scale. Actual rule creation persisted its pack and keywords; multiline input,
+Back, Create another, duplicate-create errors and reachable close controls were exercised.
+Explorer interaction verified expansion across pane resize, new-folder reveal/rename,
+creation and clipboard paste after parent rename, refusal of self/descendant paste, and
+`Rev 1.2 (copy)` / `Rev 1.2 (copy 2)` with byte-identical copied payloads. These were native
+runtime checks; browser asynchronous-listing behavior was not visually exercised.
+
+The broader gate additionally passed the native core/host builds, scratch WASM bundle build,
+all 111 core CTests, hostd smoke, web parity and UI style checks. Its system-Python audit
+and packaging invocations lacked `mcp` and `pytest`, respectively; running those checks with
+the provisioned service interpreter passed all nine source gates and all 22 packaging tests.
+The full gate is **not green**: manual regeneration reported drift, the Python sweep recorded
+17 failures across agent tool guidance, DFAM, MCP intake/hostd hold, worker streaming and DVC
+tests, and the sensor-node golden demo reached the gate's 3600-second deadline after nine
+passing legs through thermal. No global PASS is claimed, and those non-UI failures were not
+changed or suppressed by this UI work.
+
 ## 2026-10-01 — real slicing pipeline, deterministic DFAM checks, G-code floating-extrusion proof
 
 Trigger: an agent sliced the 17-part 6-axis arm for an Ender 3 with no slicer integration —
@@ -5545,6 +5584,12 @@ Final desktop checks made baseline/final metrics, constraint limits and manufact
 Final affected model/job regression sweep: 176 passed across `test_cad_sim_tools`, `test_topology_tools`, `test_compiled_sim_jobs` and `sim/test_jobs`. A second interactive desktop reopen into native document `doc-cpp00000002` retained the result overlay and enabled artifact exports; clicking Export produced the same 2,610,122-byte VTU and recorded SHA-256. Verification processes used private HOME/runtime/socket paths and never controlled the user's daemon.
 
 The full repository gate is **not wholly green**: it built native/desktop/WASM, passed core CTest, hostd and web-parity smoke, and completed the service/tools/training sweep, but its 3,600-second command deadline expired during the unrelated FIN25 sensor-node demo. The sweep recorded one live-preview event timeout (`test_ro_gui_sees_mcp_edits_and_can_upgrade`; all three live-preview tests passed afterward in an isolated native daemon) and two flywheel DVC round-trip failures at `dvc init`. The initial audit/manual/packaging interpreter failures were resolved by the separately passing provisioned-interpreter checks above. No failure was suppressed or reclassified as a full-gate pass.
+
+## 2026-10-03 — Explorer workspace files before separate recents
+
+`host/src/ui/file_explorer.cpp` now keeps the active workspace directory tree in Files and places recent files in an independent, initially collapsed Recent card below it. Collapsing Files no longer hides Recent; the tree reserves space for the Recent header. Directory listings include all non-hidden files, with folders first and case-insensitive name ordering, rather than filtering to CAD/ECAD extensions and sorting by modification time. Unsupported file types retain file-management actions but do not advertise a CAD Open action. Existing inline-rename, folder-reveal and clipboard changes were preserved.
+
+Verification: `./build.sh` and `python3 scripts/gui_lint.py --rule all` passed. An isolated GLFW/ImGui smoke rendered the real Explorer at 405×810 and exercised header clicks: CAD, Markdown, CSV and folders appeared in Files; external recents stayed outside the tree; the collapsed Recent header remained visible; Recent expanded independently while Files stayed collapsed; switching working directories replaced cached rows. Captures: `scratch/explorer-files-smoke.png`, `scratch/explorer-recent-smoke.png`. The successful smoke opted out of daemon mode and hard-exited after assertions to avoid linked runtime teardown hanging; temporary source, object, binary and fixture directories were removed.
 
 ## 2026-10-03 — transactional chat message editing and runtime rewind
 
@@ -5648,15 +5693,6 @@ Verification: `./build.sh`, `test_magic_keywords`, `test_ask_answers`, gui_lint 
 dupe/glyph/theme clean, light/dark/narrow/AI-workspace captures. The working-line shimmer and a
 live question form were not captured headlessly (they need a running turn).
 
-## 2026-10-04 — desktop caption controls match native window conventions
-
-`host/src/ui/title_bar.cpp` now reserves and draws three desktop caption buttons:
-minimize, maximize/restore, and close. Removed the extra exclusive-fullscreen button,
-its glyph/toggle helper, and unused `WinBtn::BTN_FULL` / `AppState::isFullscreen` state
-from `host/src/core/app_state.h`; refreshed `title_bar.h`'s desktop/browser contract.
-The WASM app bar still delegates window controls to browser chrome. Verification:
-native `Chudware` target built, theme/glyph lint clean, and an isolated Xvfb GUI smoke
-exited successfully with all three buttons visible and no fourth button or unused gap.
 ## 2026-10-04 — visible compaction and provider stalls; c245 tool-failure fixes
 
 Run c245 (GPT-6.1-Sol, 272k window) looked frozen for 10–28 min at a time. Evidence
@@ -5680,6 +5716,15 @@ project-root first (listing every candidate on a miss) and accepts face/edge sid
 Chudcode's "No such tool: xd://<menu tool>" should point at `enable_tools`; the eval kernel
 lacks `shapely`/`fitz`; `research_web_search` has only DDG configured (`provider_blocked`).
 
+## 2026-10-04 — desktop caption controls match native window conventions
+
+`host/src/ui/title_bar.cpp` now reserves and draws three desktop caption buttons:
+minimize, maximize/restore, and close. Removed the extra exclusive-fullscreen button,
+its glyph/toggle helper, and unused `WinBtn::BTN_FULL` / `AppState::isFullscreen` state
+from `host/src/core/app_state.h`; refreshed `title_bar.h`'s desktop/browser contract.
+The WASM app bar still delegates window controls to browser chrome. Verification:
+native `Chudware` target built, theme/glyph lint clean, and an isolated Xvfb GUI smoke
+exited successfully with all three buttons visible and no fourth button or unused gap.
 
 ## 2026-10-04 — evidence-backed project deslop pass
 
@@ -5875,3 +5920,372 @@ After the concurrent user edit, another guarded local AST update completed at 86
 197071 edges and 2562 communities, without semantic-provider calls or a shrink override.
 Publication uses 494 explicit whole-file paths and six index-only mixed-file projections;
 initial and later user edits remain outside the cleanup commit.
+
+## 2026-10-05 — MSVC-safe firmware embedding and measured Darwin ARM deadlines
+
+`core/cmake/EmbedFirmwareBuses.cmake` now emits constexpr character-byte arrays
+instead of oversized raw string literals. The five maintained bus sources retain
+their exact bytes, symbol names, array types, static storage and trailing NUL;
+`bus_models.cpp` requires no additional runtime concatenation or consumer change. A real
+MSVC 19.44 / toolset 14.44.35207 consumer compiled and executed on the Windows
+builder, checking all five arrays byte-for-byte against the original files
+(18,236 / 27,810 / 31,208 / 26,189 / 48,761 bytes) and their NUL terminators.
+The concurrently published firmware feature remains enabled.
+
+The Intel Mac's single-worker cold OCCT ARM SDK reached only 1,241 of 5,476
+actions in the former 30-minute limit; its cold native core build took 69 minutes.
+Darwin-specific caps now allow 200 minutes for OCCT, 230 for the whole SDK,
+120 for the core build and 330 for the job (327-minute process-group deadline).
+Other SDK builds remain capped at 30 minutes; Linux ARM and native-row budgets
+are unchanged. SDK exports, consumer validation, compiler-width caps and test
+coverage are unchanged. Native rows have no ARM dependency, and this Darwin
+lane checks arm64 compile/link architecture only, not native ARM execution or
+signing. These caps correct observed failures; full workflow qualification is
+reported by the corresponding Actions run, not inferred from the new limits.
+
+The dependency-free workflow policy parser now resolves document-local block
+anchors and aliases, so the native/ARM shared-step workflow is inspected rather
+than rejected as unexpected indentation. The real-tree policy command passed
+with zero errors (two pre-existing advisories). Three behavior regressions cover
+rejection of an aliased metered runner, acceptance of an aliased private runner,
+and rejection of an alias leaking from a previous document; all passed.
+The policy workflow runs these regressions and watches their source path.
+
+## 2026-10-05 — full portable QEMU suite with measured meshing headroom
+
+Run `37289792754` passed all three native rows, including 123 native Mac core
+tests and the Windows engine-dependent UI scenario. ARM Linux compiled and
+linked the full engine against its validated aarch64 SDK and passed 116 tests;
+the mesh test then exceeded its 1,800-second limit, and the whole suite stopped
+at 3,600 seconds. Native mesh and advanced-mesher took 279 and 546 seconds.
+The Linux ARM suite now gets 180 minutes total and at most 120 per test,
+within a 240-minute job (237-minute deadline). Explicit native test timeouts
+receive eightfold emulation headroom capped at 7,200 seconds, only for Linux
+aarch64 cross-tests; native timeouts and existing serialization are unchanged.
+An actual CMake configure/CTest metadata smoke proved native 600/3,600/90,000
+second allowances remain unchanged while ARM resolves them to 4,800/7,200/7,200.
+No portable test or meshing assertion is excluded. SDK recipes remain unchanged,
+so this correction does not invalidate the genuine qualified SDK cache.
+
+## 2026-10-05 — independent lightweight Mac gate capacity
+
+The macOS fast-gate row now uses `cc-mac-chudware-gate-intel` as the separate
+hidden UID 423 `ccci-chudware-gate` account. Its 0700 home, runner root,
+work/temp/cache state and system daemon are separate from the native/ARM
+builder's `ccci-chudware` account; only host tooling is shared read-only.
+The CloudCastle manager's `--product Chudware --gate` mode cannot purge
+accounts, run legacy cleanup or install Rust. The runner registers on its
+bootstrap label; runner-smoke declares and checks its actual identity before
+promotion. Native/ARM builds and operator signing keep their existing lanes.
+The actual Mac manager qualified native C/C++, Objective-C, Python venv and
+CMake/CTest consumers and sealed sibling/operator homes without restarting
+the active builder. This adds no native Apple Silicon or signing proof.
+
+The completed cold Darwin ARM SDK and full 623-action core build in run
+`37289792754` passed on the private Intel account; the resulting engine is
+thin arm64 Mach-O. The native Linux row's advisory clang-tidy command was
+not analyzing sources: LLVM 18 rejected `--quiet` and `-source-filter`.
+It now uses the supported `-quiet` and positional source regex arguments,
+without changing the existing advisory policy or source coverage.
+
+## 2026-10-05 — persisted build state, piping/hydraulics/industrial design, internal-flow CFD
+
+**Build state in the file.** `doc_save` now writes per-feature compile checkpoints
+(`cache.ckpt`, contracts/stepplus.md §9) beside `cache.json/aicm/brep`. A valid
+cache makes `doc_open` hydrate `compiled` and `compile_cache` (`warm:true`), so the
+first activate/pick/save after reopen runs 0 features and the first edit only the
+tail. Before this change a cache-hit open was cold, and the first op re-ran the whole
+tree: `claw_gear_drive.step+` took 2.5 s on its first `doc_activate`, and large parts
+took minutes. Skips are now reported (`cache.skipped_reason`, `cache_miss_reason`)
+instead of swallowed. An oversized entry is a cache miss, never a failed open.
+`seed_cached_scratch` shares `compiled`, so autosave snapshots never recompile.
+The GUI open/activate timeouts follow the engine's long tier
+(`core::kLongEngineCallTimeoutMs`), and the tree shows elapsed time plus whether the
+open was a cache hit or why it missed. The engine key is not bumped. Files saved
+before this change open warm from `cache.brep`, but the first geometric query
+still compiles once, until they are saved again.
+
+**Fluid/process design.** New native RPCs, each a study the GUI and agents share:
+- `piping_route`: orthogonal A* around doc bodies.
+- `piping_spec_check`: B31.3 eq. 3a, B16.5 P-T ratings, support span.
+- `piping_bom`: spools and welds.
+- `vessel_size`: ASME VIII-1.
+- `duct_size`: equal friction.
+- `sim_run_pipe_flow`: D3Q19 internal flow with a mixing-length RANS model and a
+  Spalding wall function (lattice coefficient 0.6, fitted to Colebrook).
+  Straight pipes land within about 10% of Colebrook at Re 1e4–1e6. Bends come out
+  1.5–1.85× the Rennels K at 16 cells. The result reports `one_d_estimate_pa`
+  (friction plus fitting K) and `cfd_over_one_d`.
+- `hydraulic_simulate`: lumped-parameter implicit transient that replaces the
+  dead `hydraulic_fmu_simulate` stub.
+- `hydraulic_size_motor`.
+- `pump_drive_size`: IEC/NEMA ladders and frames, IE2–IE4.
+
+The code tables were audited against B31.3-2024, B16.5-2025 and II-D 2023
+(CodeTableAudit). The GUI gains a Simulate › Piping tab and a Hydraulics tab;
+Hydraulics shows its schematic and plots in the central area. Agents use the
+`piping-design` and `hydraulic-design` skills. Shots: `CHUDWARE_SHOT=piping`,
+`hydraulics`.
+
+Gotchas:
+- Engine envelopes carry a design-code string in `code`; a protocol error is
+  `code` without `ok`.
+- `services/piping` bore and 3-D sweeps let an end segment use its full take-out.
+  The old 0.49 clamp mis-swept the last elbow of every route.
+
+Deferred:
+- AsyncRpc has one FIFO lane, so a multi-minute cold open still queues other async
+  RPCs.
+- Bends are over-predicted on stepped voxel walls.
+## 2026-10-05 — ARM FMA parity repair without weakening mesh contracts
+
+The revised full run `37326030572` passed all three native rows and the complete
+Darwin arm64 compile/link row. QEMU passed 119 core tests, but advanced meshing
+failed six native-speed assertions and three genuine STEP-bar size/element-count
+contracts; the enforced three-hour suite deadline then stopped the remaining
+serial fixtures. The QEMU step now supplies the existing wall-scale value 8 and
+allows 210 minutes within the unchanged 237-minute job deadline. Native ceilings,
+per-test caps, serialization and all functional checks remain unchanged.
+
+The numerical failures came from the pinned Polyhedral-FEA ray-parity
+determinant: ARM GCC contracts it into FMA, and the independently anchored
+expressions could both reject a shared face-diagonal ray. The source-only
+`cad-fill-progress` revision `274503cca6a8fc29bdb7d41cd58cbaf7bc72f68c`
+canonically orders edge endpoints and negates the reverse direction, preserving
+watertight parity with FMA still enabled. No global floating-point flags,
+tolerances, mesh expectations, allocations or size special cases were added.
+Actual ARM/QEMU proof: the retained classifier regression failed three of 48
+assertions before and passed all 48 after; the real STEP-bar consumer passed all
+47 original assertions. The upstream standalone product's separate release
+history and the user's local branch/index were not changed.
+
+## 2026-10-05 — retain strict-gate Python failure diagnostics
+
+The completed strict Linux gate `37331563747` passed native core/host/WASM builds,
+core tests, daemon/parity/packaging, the sensor-node demo and GUI shots, but six
+Python tests failed across agent, MCP, simulation and tools units. Its wrapper
+printed only counts with `--tb=no`; runner-temp cleanup then removed both failure
+identities and their diagnostics. No retained artifacts or pytest failure cache
+were available.
+
+The per-unit sweep now records short tracebacks and copies failed-unit output
+into unmetered CI logs, including collection errors. Passing units remain quiet;
+test enumeration, suite separation, failure verdicts and skip policy are unchanged.
+The actual stage was exercised with real pytest: the original hid an assertion
+failure's identity, the revised stage emitted its name/source/assertion details,
+collection errors remained fatal with diagnostics, and all-passing units stayed
+green without failure blocks. Temporary smoke fixtures were removed.
+
+
+## 2026-10-06 — Simulation GUI overhaul onto one standard
+
+User-reported ImGui "conflicting ID" errors (Hydraulics: two `Name` fields both resolving
+to `PushID(label)`+`##v`) led to a full simulation-section overhaul.
+- `sim_manager.cpp` (13.7k lines) is split into `host/src/ui/sim/sim_manager_*.cpp` by
+  concern, with shared helpers in `sim_manager_internal.h`.
+- New kit vocabulary:
+  - `widgets/kit_form` (explicit-id fields, pane-wide label column/unit lane, unit
+    spellings, number formatting);
+  - `kit_plot` (`linePlot`/`barPlot`, chip flow, `removableChip`, result cards, adaptive
+    `metricTable`);
+  - `kit_panel` (`panelBegin` scaffold, `panelHeader`, `formTabs`, `stepper`,
+    `actionFooter`, `removableCard`, `canvasFrame`, `groupedPicker`).
+- Shared panel helpers: `sim/sim_common` (JSON/RPC/`StudyRecordStore`) and
+  `sim/sim_pump_drive`.
+- Every study editor, Piping, Hydraulics, EM/Electronics/Firmware/Handoff, topology
+  settings/BCs/results, the Evaluate dialogs and the legend use them.
+- The Simulate ribbon follows Study · Setup · Boundaries · Mesh · Run · Results · Reference;
+  "New Study" opens one grouped picker on every tab.
+- The Thermal tab is Thermal FEA (the desktop flow backend has no OpenFOAM).
+- 33 new icons were added via `icon_pipeline.ensure_cells`.
+- The Simulate left column is its own `SimulationManager##LeftPane` window, with a wider
+  default.
+- Framing fits the model in `ui::viewportClearRect()`. The legend reserves its own width,
+  and the renderer LUT and legend share `result_ramp.h`.
+- Gate: `IMGUI_ENABLE_TEST_ENGINE` is defined on the app's imgui sources; `ui_audit.cpp`
+  hooks every ItemAdd.
+  - `CHUDWARE_SHOT=simaudit` covers 78 states and requires 0 conflicts and 0 overflows.
+  - `CHUDWARE_IDAUDIT=1` gates any scenario.
+- The `fea`/`flow` shots had never completed: there was no frame-5 gate and no engine-idle
+  wait. They now print PASS and exit non-zero on failure.
+
+Deferred: the glass refraction wedge in the legend pill (ui_theme glassPanel); the Firmware
+UART log is still a raw child with a pill scrollbar (no kit log widget).
+
+## 2026-10-06 — c247 tool reliability and topology-to-CAD continuation
+
+Investigated the exact c247 trace and ME-490/Showcase/Topology_Bending artifacts.
+The main trace recorded four tool failures: a document rename sent to feature-only
+`add_features`, daemon-mode `show_in_app` reporting a failed legacy publication,
+a 900-second job wait inside an eval cell capped at 600 seconds, and a later
+`NameError` after SIGINT killed/replaced the Python session.
+
+- `cad_doc_tools.py` reports an existing daemon document as live without a file
+  handoff or stealing the active tab. Feature rename requires an id; native-file
+  naming guidance points to `relocate_native_files`, not a fake document rename.
+  Job waits are standalone calls; interrupted cells recover results via `get_job`.
+  Tool guidance, context packs and generated tool-panel descriptions were updated.
+- The canonical Chudcode repository (`Repositories/omp`) preserves the Python
+  session on SIGINT during both synchronous work and top-level async waits.
+  Cancellation wakes the selector and retains prior globals; it does not pretend
+  the interrupted assignment completed or cancel an independent simulation job.
+  Regressions cover both cases. The matching native addon and runtime binary built;
+  the compiled binary passed `--smoke-test`. Release pins/global installs were not changed.
+- Topology Results has **Continue in CAD** for a valid, available, non-stale
+  reconstructed surface. It imports a separate solid, activates a new document,
+  clears the stress overlay/legend, and returns to Model / Feature Manager.
+  Source geometry and retained studies are unchanged. Invalid reconstructed geometry
+  is prominently reported even when the optimizer converged and was feasible.
+- Closed, consistently wound single-shell mesh import now shares edges directly
+  and combines coplanar triangles into planar faces. BRepCheck gates the direct
+  lane; open, disconnected or otherwise unsupported meshes retain the sewing lane.
+  Curved areas remain faceted: no recovered sketches, NURBS or parametric base history.
+  The geometry-cache epoch advances to 7; existing baked BREP imports are not rewritten.
+- Updated `cad_guide` simulation workflow, generated manual and GUI workspace skill.
+
+Verification: real GUI activation from the retained final 3D run, source-tab return,
+and a separate daemon edit/save/reopen of that same beam. The imported solid has
+14,290 faces (26,496 source triangles); its left cap resolves as one 960 mm² face.
+Adding a 10×16×60 mm mounting pad and a 3 mm-radius, 17 mm-long axial cut preserves
+one sound/watertight solid and changes volume from 72,759.746816 to 81,879.083358 mm³.
+All three native features and the final volume survive `.step+` reopen. Original
+project/result/surface SHA-256 hashes and source document tree are unchanged.
+Focused checks: five native suites, 83 Python tests plus 15 subtests, five rename
+cases, and 12 Chudcode runner cases (three existing skips). Native/GUI builds used
+the supported local `CHUDWARE_POLYMESH_ROOT` override to preserve the user's dirty
+dependency checkout; no dependency reset/stash/checkout was performed.
+
+Limits: the two extrusion-tied results genuinely reconstruct 21 and 18 bodies;
+optimization feasibility is not geometric validity. The final 3D run reconstructs
+one valid body. Fine FEA remeshing still exceeded bounded probes on both import
+lanes; this change does not claim that meshing stall is resolved.
+
+Broad gate evidence: source audits, manual freshness, native/GUI/WASM builds, all
+native suites, hostd lifecycle, web parity and Linux packaging passed. Its Python
+sweep exposed an obsolete test requiring a triangulated box to reconstruct zero
+features, plus the hermeticity test invoking it. Removed the implementation/wording
+pin rather than changing it to 100%; hermeticity now invokes the existing analytic
+shaft reconstruction case. Both affected files pass together (17 tests). A real
+MCP smoke independently recovers the closed mesh box as a 10 mm extrude with a
+6,000 mm³ volume and 100% geometric match; mesh notes distinguish planar recovery
+from curved facets. The full gate timed out at 3,600 seconds in the sensor-node
+demo, after the Python sweep, so no complete green gate is claimed.
+
+## 2026-10-07 — Interactive, fully customizable simulation setup
+
+- Simulation setup uses document-scoped drag/drop in addition to the existing
+  precise forms: model faces into boundary wells, compatible boundary tools onto
+  model faces, motion joints into drivers, circuit/emulation tracks into setups,
+  hydraulic components onto the schematic, and piping endpoints/ports/presets
+  into their respective forms. Repeated same-role face drops deduplicate rather
+  than toggling or multiplying loads. Ordinary selection, blank-space navigation,
+  Explorer file drops and the user's open sessions remain intact.
+- Coverage includes structural/static/modal/buckling/contact/fatigue/frequency
+  response and mesh, steady/transient thermal FEA, all topology physics boundary
+  editors, external flow and thermal CFD, motion, electromagnetics, circuit/PCB
+  thermal/heatsink setup, firmware emulation in both workspaces, hydraulics,
+  and piping/network/internal-flow/vessel/duct setup.
+- Exact native editors retain unsupported/unknown metadata and inactive modes
+  without pretending that unknown fields extend a solver. Apply validates and
+  commits atomically; Revert reloads current data. Dirty drafts refuse stale
+  commits; pristine drafts refresh. Managed identities/result evidence remain
+  read-only. Native run requests merge authored supported parameters rather
+  than reconstructing a reduced subset. Single-edited mesh aliases synchronize;
+  genuinely conflicting aliases are refused.
+- Face/tool and palette payloads capture their source context once; document,
+  revision, panel/study generation and busy-state fences prevent stale delivery.
+  A face-only GPU ID-pass mode avoids edge/vertex priority stealing a face drop
+  and participates in the existing render-cache key.
+- Exact global capability/account/catalog polling no longer interrupts a setup
+  gesture: `AsyncRpc::interactionBusy()` maintains a separate conservative counter.
+  Document reads, mutations, solves and unknown RPCs remain blocking; scheduling,
+  refresh and teardown retain the original all-work `busy()` contract. A real
+  queued `doc_tree` refused a setup edit atomically; an actual `fw_projects` call
+  between mouse press/release did not cancel native-editor Apply.
+  Firmware toolbar/rail controls now adapt to measured content bounds. Document
+  tab lanes use logical as well as drawing clips and reveal the active tab/close
+  control without accepting clicks beneath Copilot or pinned overflow controls.
+- Native face-query resolution handles prose, query objects, raw SIDs, sampled
+  points and terminal compound sets. Compound children retain independent
+  geometry, union nodes/facets without phantom cross-child faces, and apply one
+  authored force once. Thermal flux/convection use explicit validated exterior
+  facets when supplied. Firmware shares one native scenario/event editor;
+  hydraulic and piping exact definitions preserve authored zeros/nulls/aliases
+  according to their native contracts.
+- Updated canonical `cad_guide` simulation instructions, generated manual and
+  GUI workspace ownership map. Toolkit audit hooks observe actual controls,
+  disclosure state, text-only errors and clipping only during opt-in QA. Native
+  multiline fields use readable stacked layout when the pane is too narrow.
+
+Native verification: five core simulation suites and the host topology CPU
+suite passed; static/thermal Python suites passed 101 tests, including compound
+boundary behavior. EM/heatsink checks passed 41 tests plus 47 subtests (one
+optional-backend skip). Real native EM runs exercised analytical/FDFD paths
+and explicit excitation fidelity. A compiled STM32F4 program ran in Renode
+against two edited GPIO schedules and produced the expected final output states.
+
+The final input-driven `simaudit` completed 114 states with zero ID conflicts and
+zero overflows, including expanded native editors, firmware metadata and motion
+playback. Its three explicit exclusions remain schema-reserved Torque, custom
+material creation, and the separate solver-result matrix; it runs static and
+motion solves, not every solver. Existing async-RPC and long-worker suites also
+passed. Native/desktop and private-staged WASM builds passed; GUI lint was clean,
+all nine standards gates passed, and the generated manual had 509/509 coverage
+with no drift. User sessions and the dirty Polyhedral-FEA checkout were preserved.
+
+The input-driven native-editor round trips also completed eight actual solves:
+modal sampled points, prose, query objects and stable face IDs; static prose,
+query objects and duplicate-leaf compound sets; and steady thermal convection.
+Edited mesh aliases matched actual element order; compound sets matched the
+reference solution without multiplying the authored force. The thermal slab
+retained 160 W/m·K conductivity, 10 W/m²·K film coefficient and 75°C ambient,
+producing 20°C minimum and 20.2055°C maximum against its one-dimensional analytic
+solution. The same real Apply gesture refused document-busy edits atomically
+and survived project discovery queued between mouse press and release.
+
+The same real-input run placed hydraulic components on the schematic, connected
+compatible ports and persisted native parameters. All seven invalid fluid
+drafts were refused without changing the saved circuit. A zero-length return
+hose retained its exact value and the native ODE solve produced 23.2 L/min at
+zero pressure difference, matching the pressure-dependent leakage model.
+The structural handoff retained explicit zero load-pressure and tolerance.
+Seven piping-fluid alias and gas-temperature variants persisted and solved;
+a held port drag kept its immutable origin and refused stale-generation delivery.
+
+Post-solve setup transitions now restore the editable model and face-pick
+buffers together. Full scalar/displacement result loads preserve the part's
+CPU/GPU model cache; cached model restoration invalidates queued visible-load
+generations without copying already-bound shaded arrays. Same-document setup
+edits/deletion restore the model before clearing result visibility. The actual
+face-source probe recovered six B-rep faces after the eight native solves;
+dragging one into a piping endpoint persisted its selector. Vessel preset and
+firmware stimulus drops also completed with native parameter checks.
+
+The complete isolated `siminteractive` passed with 185 checkpoint evaluations
+(71 distinct assertion names), 16 real drag/drop deliveries, no skips and zero
+ID conflicts. Native RC probe copying is duplicate-safe; its schematic palette
+uses the compiled circuit translator through the native-only worker route, with
+no nonexistent Python-method fallback. Conversion failures expose the engine
+error. Two additional transient thermal runs proved native schedules/frame times
+and changed final maximum temperature from 20.0834°C to 20.2533°C when duty was
+increased. Flow-direction, topology-face, EM-standard and real motion-driver
+reorder checks retained their exact native parameters. Setup checks for circuit,
+EM, topology, motion and 3D CFD are not claimed as numerical solver execution.
+
+Limits: optional OpenFOAM/OpenEMS availability is reported and gates the relevant
+Run action; no substitute physics is silently used. External-flow LBM and contact
+proxies retain their existing qualitative limits. Renode 1.16.1 cannot install
+the requested timestamped GPIO hook, so timestamped assertions are refused;
+final-state assertions were exercised. Firmware bus summaries remain ideal
+functional models, not calibrated electrical/latency simulation. These changes
+improve setup and preserve native capabilities; they do not claim new solvers.
+
+Handoff (2026-10-07 — native simulation scenes, pipe drawing and hydraulic layout): `host/src/ui/sim/sim_scene.*` now dispatches cached shaded/line batches and viewport tools to `pipe_scene.cpp` / `hydraulic_scene.cpp`; `viewport_panel.cpp` renders them through `Overlays::drawSimulationLitTriangles` even without `st.hasDocMesh`, fixing invisible routed pipes on empty parts. Renderer auxiliary bounds, auxiliary-aware camera clamps, first-source luminance bootstrap and corrected blur-downsample UVs preserve framing, zoom and glass contrast. `pipe_mesh.*` / `pipe_sketch.*` add shaded bends/fittings, working-plane drawing, risers, snapping, typed lengths and cancellable queued finishes; `piping_panel.cpp` adds fitting placement, deterministic K(Re), CFD-derived K and pressure/velocity colouring. Native `core/piping/edit.cpp` / `solve.cpp` and MCP `piping_edit`, `piping_fitting_k`, `piping_fitting_k_cfd` share the §9 contract and CFD start/status/cancel pipeline (`services/piping/{fitting_cfd,worker_rpc}.py`). Hydraulics 3D Layout persists component positions as `params.layout3d`, shared with MCP `hydraulic_layout_3d`, and renders pressure-coloured hoses. `core/sim/flow_run.cpp` packages pressure/velocity and streamline/slice AICM overlays (`overlay:false` opts out); voxelization/LBM/pipe-flow performance work retains approximately one-second progress heartbeats. Flow fidelity is Quick preview 58/667 (new-study default), Standard 96/2000 or Accurate 144/3000 with ETA and face-normal inlet direction; `sim_run_adaptive` routes natively in `services/worker/{worker_client,engine_backend}.cpp`. EM/Electronics prioritize typed forms, collapsed Advanced native parameters and outcome plots. Real-input `pipedraw` / `hydraulics3d` shots join pointer/audit registration; `piping` pixel-checks route visibility. Session measurements: quick CFD-K for an NPS 2 LR 90° elbow (two Re points, 12 cells) ≈9.5 s; flow-shot solve ≈1.9 s (not general runtime guarantees). Manuals, GUI skills, hydraulic-design skill and a proportionate website paragraph document the human/agent workflows. Build gotcha: core reconfigure currently fails PINNED FETCH because the uncommitted `POLYMESH_COMMIT` bump to `274503c` conflicts with local modifications in `third_party/polymesh/src` at `ef464dc`; this session built with `CHUDWARE_POLYMESH_ROOT=$PWD/third_party/polymesh/src` (LOCAL SOURCE), not a validated public-pin build. Deferred: none known beyond that.
+
+Handoff (2026-10-08 — civil / site / utility infrastructure, `aicad.civil/1`): new pure-Python engine package `services/civil/` (contract `contracts/civil_schema.md`, SI metres) — `schema`/`criteria` (GLUMRB Ten States 2014 + Water Works 2018 profile, exact customary conversions), `crs` (pyproj, new pinned dep 3.7.2, MIT), `gis_io` (GeoJSON RFC 7946 + stdlib-sqlite GeoPackage), `landxml` (1.2 surfaces/alignments/pipe networks, US survey foot), `ifc_export` (dependency-free IFC4X3_ADD2 alignments + distribution systems; parsed by IfcOpenShell 0.9 out of tree), `terrain` (constrained TIN by Sloan flips, contours, exact cut/fill, stage–storage, pad grading), `dem` (priority-flood, D8, watersheds), `alignment` (clothoids, PI layout, vertical curves, AASHTO SSD/K, sections, AEA/prismoidal, mass haul), `water` (Todini–Pilati GGA, EPS, PDA, valves, fire flow; Net1/loop/PDA/PRV fixtures from EPANET 2.2 via WNTR), `epanet_inp`, `gravity` (partial flow, Manning, HGL screening with the HEC-22 §9.1.6.6 caveat, design sizing, standard step, jumps; SWMM 5.2 steady fixture), `swmm_inp`, `hydrology` (rational, CN, TR-55 Tc, NRCS UH, SCS storms, NOAA PFDS IDF, modified Puls), `culvert` (HDS-5 Table A.1 inlet/outlet control), `buried` (prism/Marston, live load, Iowa, buckling, flotation, thrust, DIPRA restraint), `supports` (spans/reactions from `aicad.piping/1`), `planning` (QTO, user price-book cost, CPM/4D, MSPDI, requirement evidence), `piping_link` (fixed-point civil↔piping tie-in coupling, simhandoff couplings `civil_to_piping`/`piping_to_civil`/`civil_to_fea`). 30 `civil_*` MCP tools in `services/mcp/civil_{tools,hydro_tools,link_tools}.py` over shared `civil_common.py` persist one `civil_site` study per model (results dropped on model change; renames keep the study id); registered as family `sim`, pack `civil`, Plan mode, `cad_guide('civil')` (`civil_guide.py`), skill `civil-design`, manual `guide-civil.md`. 700 tests (`services/civil`, `services/mcp/test_civil_*`). Runtime smoke against in-process libchudware: water solve → `civil_piping_couple` with the native `piping_solve` converged in 6 iterations with a passing verify envelope, thrust → FEA handoff, `.step+` save/reopen → `civil_load` restored model + results. Deferred: no GUI panel (the concurrent UI owner can consume `civil_site` studies via `doc.studies_changed`); `piping_tools.network_from_handoff` still accepts only `hydraulic_to_piping`, so `piping_solve(source_handoff=civil_to_piping)` refuses (the coupling tool uses the solver directly); coupling is steady DDA only; HGL is screening, not dynamic-wave routing.
+
+Handoff (2026-10-08 — single public Polyhedral-FEA line, stable pipe-sketch framing): Polyhedral-FEA is one public repository. `Hunter-124/Polyhedral-FEA` `master` now merges `cad-fill-progress` (ARM FMA watertight predicates, 274503c) and the private fork's history (9554579..9737e10, content already published squashed in ef464dc; the variant test "adapt stops before the predicted next-pass growth" lives only in that history), plus `09924b7` making polymesh subproject-safe (`PROJECT_SOURCE_DIR`; CPack only when top-level — as a CAD subproject it looked for `core/LICENSE` and failed configure). `Polyhedral-FEA-private` is archived on GitHub (reversible); the local clone and bare mirror now point at the public repo. `core/cmake/ProvisionPolymesh.cmake` pins `9f6595e` and the configure log says PINNED FETCH; the previous configure failure was the uncommitted pin bump colliding with byte-identical uncommitted copies of 274503c in `third_party/polymesh/src` (discarded after an identity check). CAD core CTest (123 tests, `tet10_thin_wall` excluded for its solve budget) passed against this source. Pipe sketch: transient scene batches set `ui::simscene::{Lit,Line}Batch::bounds=false`, framing grows in 25 % bands, never shrinks while a tool is armed, compensates zoom exactly and uses reciprocal wheel steps, so cursor motion no longer rescales the view; `DrawSettings::autoPlane` follows the camera-facing axis plane through the last point, Tab cycles XY→XZ→YZ→Auto mid-run, and three-axis ray–line inference gives risers without Shift (`host/src/ui/sim/pipe_sketch.*`, `viewport_panel.cpp`, `renderer.*`, `piping_panel.*`).
+
+Handoff (2026-10-08 — desktop startup, primary/background IPC separation): `host/src/main.cpp`, `app.cpp`, `core/startup_trace.h` and `ui/doc_tabs.cpp` present the native shell before worker/daemon startup and poll readiness asynchronously after recovery bootstrap before offering the disposable starter; deliberate New/open activity cancels that offer. `services/ipc/ipc_client.*` routes exact document-free queries from non-primary GUI threads through per-thread `gui-background` sockets; document/unknown methods keep the primary identity, and side EOF/timeouts do not invalidate it. `services/worker/engine_backend.cpp` makes the 200-ping diagnostic opt-in (`CHUDWARE_PING_BENCH=1`); `ui/copilot/settings.cpp`, `composer.cpp`, `provider_usage.cpp`, `settings_modal.cpp` and `firmware/fw_workspace.cpp` defer automatic discovery until startup settles and share subscription-status polling. Before-state on the real Wayland display under strace: a 3.2 s main-thread mutex stall (2.0–5.2 s; another launch stalled 0.16 s), repeated GUI model/firmware discovery and 200 startup pings at 146 us/call; Xvfb showed the starter at about 4 s. These are baseline measurements, not an after-change speedup claim. Deferred: integrated build/runtime checks and cold-launch trace comparison (`CHUDWARE_STARTUP_TRACE=1`); `test_worker_long_run` adds background-query nonblocking, EOF/timeout isolation and disconnect-wakeup cases. Gotchas: background sockets avoid the unconditional GUI pin but recent/in-flight work still pins; shots, web readiness and crash recovery retain their existing paths. No user daemon/session should be stopped to obtain a cold launch.
+
+Handoff (2026-10-08 — Hydraulics workflow and native templates): `host/src/ui/hydraulic_panel.cpp/.h` now owns shell/state/RPC/mutations/undo; `sim/hydraulic_forms.cpp`, `hydraulic_canvas.cpp`, `hydraulic_internal.h` (`ui::hydint`) and `hydraulic_canvas_state.h` (`ui::hydcanvas::State`) split forms, canvas and shared state, registered in `host/CMakeLists.txt`. Before-state was staged port selection followed by an explicit Connect action and setup-only ribbon simulation; no pre-change interaction timing was recorded. Circuit · Design · Simulate · Results (Outcome · BOM · To Piping) now separates editing/setup/outcomes; Start adopts native templates, the canvas has a draggable/click-placement palette, click/drag port gestures call `connectPorts` immediately, and ribbon Simulate runs when ready or reveals its blocker. `core/hydraulic/templates.*`, `hydraulic.cpp`, `core/CMakeLists.txt`, `services/mcp/hydraulic_tools.py`, the hydraulic contract/agent skill, `worker_client.cpp` and `tool_categories.py` expose one blank/power-unit/cylinder/motor catalog with editable suggested simulation setup to GUI and agents. `commitCircuitMutation` owns bounded circuit/layout undo; `app.cpp` suppresses global CAD undo while Simulate/Hydraulics owns it, and `hydraulic_scene.cpp` handles owner-aware 3D keys. `scenarios.cpp` adds the template run and `hydraulics_09_template.png`; native/MCP tests cover templates. Deferred: integrated checks and manual regeneration (`python3 -m tools.manual_gen`) from `services/mcp/cad_guide.py`, not edits to generated pages. Gotchas: only the 3D layout card is view-gated; selected component editors retain 3D fields/Place in 3D. Layout edits preserve simulation; circuit edits invalidate it. Templates are starting designs, not manufactured component CAD.

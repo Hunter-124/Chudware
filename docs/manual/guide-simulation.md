@@ -78,6 +78,20 @@ run_fea_frequency_response(fixtures, excitation_dir, sweep_hz, zeta, base_accel_
   Response is acceleration amplification only: mode shapes are unit-normalized, so physical
   displacement/stress amplitudes are NOT recovered (see result.limitations).
 
+HUMAN HYDRAULICS (Simulate -> Hydraulics):
+  New Circuit -> Start: choose a power unit, cylinder circuit, motor circuit or blank.
+  Nonblank templates include connected components and editable simulation setup. Drag components
+  from the canvas toolbar onto the schematic; click two compatible ports or drag between
+  them to connect immediately. Select a component or hose and press Delete; Ctrl+Z undoes.
+  Circuit -> Design -> Simulate -> Results separates editing, sizing, setup and outcomes.
+  Ribbon Simulate runs when ready and opens Results -> Outcome; otherwise it shows the
+  setup blocker. Results also contains BOM and To Piping.
+  3D Layout shows shaded component glyphs and pressure-coloured hoses in the native viewport.
+  Its plane, offset, grid, snap and placement card appears only in 3D view; the selected
+  component editor also retains 3D position fields and Place in 3D.
+  Positions persist in params.layout3d; moving a component preserves simulation results.
+  Agents share that layout through hydraulic_layout_3d. Glyphs are not manufactured CAD.
+
 run_cfd_flow(velocity, aoa, fluid) — LBM wind tunnel over the whole part/assembly.
   velocity m/s, aoa degrees, fluid "air"|"water". Returns drag (N), lift (N), Cd, frontal
   area, and Reynolds number. Coarse grid by default — a directional estimate, raise `cells`
@@ -347,13 +361,24 @@ TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ri
     (surfaces only when geometry is valid); Compare sets a baseline run (metrics compare only
     for the same physics, objective and units); "Use these settings" restores a run's scalar
     settings. Every run is retained in the study, and the setup stays editable (locked only
-    while a run is active). Runs made on other geometry are marked stale; model-tool runs are
-    flagged unverified against the editor's geometry digest.
+    while a run is active). Reopening or renaming unchanged geometry keeps retained runs
+    current; runtime document IDs and study history are excluded from the source digest.
+    Runs made on other geometry are marked stale; model-tool runs are flagged unverified
+    against the editor's geometry digest.
+
+  Return to CAD: Results → Result geometry and export → Continue in CAD. A valid,
+    available, non-stale surface opens as a separate solid in Model / Feature Manager;
+    the source part and retained study remain unchanged. Add or cut features, then save
+    the new part as .step+. The imported base is faceted geometry, not recovered sketches
+    or smooth parametric history. Coplanar triangles share planar faces for selection.
+    Solver convergence and feasibility do NOT establish valid reconstructed geometry;
+    disconnected/invalid results cannot continue in CAD. DFAM checks remain separate.
 
   Model workflow: topology_capabilities → run_topology_optimization(study=…, background=True)
     (saved into the document as type "topology" BEFORE the solve, so the GUI shows it) →
-    wait_job / get_job → sim_cancel(job_id) to stop → read ok / converged / feasible
-    separately, result.constraints, the reanalysis, manufacturing checks and artifacts.
+    wait_job (standalone tool call, not a long-running eval cell) / get_job →
+    sim_cancel(job_id) to stop → read ok / converged / feasible separately,
+    result.constraints, the reanalysis, manufacturing checks and artifacts.
     run_topology_optimization(study_id=…) re-runs a GUI-authored study exactly as stored.
 
   Model limits:
@@ -376,11 +401,56 @@ TOPOLOGY OPTIMIZATION (study type "topology"; Simulate workspace → Topology ri
       a print gate, and nothing is sliced automatically. Slice the exported surface.stl with
       slice_part; only its passing G-code check makes a part print-ready.
 
-SIMULATE WORKSPACE (host GUI): one multiphysics Simulate workspace hosts every live
-  study kind with progressive disclosure by open doc type, plus handoff actions
-  (Send board to thermal FEA, Pick heatsink, …) driven by aicad.simhandoff/1. Worker
-  seam: services/sim/multiphysics_rpc.py (sim_caps / sim_run_contact /
-  sim_freq_response / ecad_thermal_handoff / heatsink_select / piping_verify_cfd).
-  EM forms drive the live EM backend.
+SIMULATE WORKSPACE (host GUI): every live simulation family has guided setup plus
+  exact numeric fields and an expandable native-parameter editor. Gestures are
+  additive conveniences, not substitutes for solver parameters:
+    Structural / modal / buckling / contact / fatigue / frequency-response /
+      thermal FEA: drag a model face into a boundary well, or drag a compatible
+      fixture/load/thermal tool onto a face. Boundary chips identify targets;
+      exact vectors, magnitudes, materials, mesh and solver controls remain editable.
+    Topology: target wells cover all supported physics, preserve/exclude regions
+      and manufacturing controls; the complete native definition stays editable.
+    External flow / thermal CFD: fluid and surface palettes, direction/axis
+      controls and drag-adjustable operating values retain exact custom inputs.
+    Motion: click or drag a mate into a driver, reorder drivers, and edit exact
+      sweep/dynamics controls. Driver identity follows the mate, not its row index.
+    EM: click/drop waveguide presets or an STL, then edit custom geometry,
+      excitation, spectrum, ports, boundaries and supported solver controls.
+    Electronics: device/source/probe palettes complement exact operating-point,
+      DC, AC and transient settings; PCB thermal and heatsink handoffs retain
+      their native mesh, schedule, source and thermal-interface parameters.
+    Firmware: the simulation panel and Firmware workspace share editable native
+      scenarios, event tracks and assertions; JSON files can be loaded/dropped.
+    Hydraulics: choose a Start template (power unit, cylinder circuit, motor circuit)
+      or blank; drag components from the canvas toolbar and click two ports to connect.
+      Delete removes a selection; Ctrl+Z undoes. Ribbon Simulate runs when ready and
+      opens Results. The 3D Layout placement card appears only in 3D view; selected
+      component editors retain 3D position fields. Components, hoses, fluid, simulation
+      settings and handoff parameters remain fully editable.
+    Piping: drop model faces into route endpoint wells; click/drop named ports
+      into network/internal-flow boundaries; vessel and duct presets retain
+      custom geometry, operating conditions and native solver definitions.
+  Apply validates and commits a native draft atomically; Revert reloads the
+    current definition. Invalid/stale drafts are retained for correction, not
+    silently substituted. Unknown metadata and inactive settings survive edits.
+    Native run requests use the committed supported parameters; document/source
+    identity and resource-governor limits are not user-overridable solver fields.
+  Background capability/project discovery does not interrupt a drag or Apply.
+    Active document requests and solves still block conflicting setup changes.
+  Leaving solver results or changing their setup restores the editable model
+    and face picking. Temporary result meshes never replace the part's model cache.
+  Drag payloads are fenced to their originating document/study or panel
+    generation. Repeating the same face in the same boundary role does not
+    duplicate its load; dropping it into a different role is an independent BC.
+  Face unions use {facesets:[...]} with nonempty terminal children, preserving
+    each child's points/tolerance/normal/surface rather than flattening disjoint
+    samples into one envelope. One authored force stays one force over the union.
+  Setup remains editable when an optional backend is unavailable; Run reports
+    that capability limit rather than changing physics. Thermal CFD needs
+    OpenFOAM; full-wave openEMS modes need openEMS. Contact/proxy, qualitative
+    flow and firmware electrical-model limitations remain explicit in results.
+  Multiphysics handoffs use aicad.simhandoff/1. Worker seam:
+    services/sim/multiphysics_rpc.py (sim_caps / sim_run_contact /
+    sim_freq_response / ecad_thermal_handoff / heatsink_select / piping_verify_cfd).
 ```
 

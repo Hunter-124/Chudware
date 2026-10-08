@@ -18,6 +18,7 @@ view commands belong to `gui-ribbon-commands`. Shared-file ownership, waves and 
 | `host/src/renderer.cpp/.h` | Core OpenGL renderer: orbit camera, mesh render, shaders, thumbnail/transparent render path (used by the icon pipeline) |
 | `host/src/render/id_pass.cpp/.h` | ID-pass picking: renders face/edge IDs to an offscreen buffer; a click reads back the ID under the cursor |
 | `host/src/render/overlays.cpp/.h` | Native GL scene overlays: selection washes, simulation indicators, and timed/glowing CAM path batches |
+| `host/src/ui/sim/sim_scene.h/.cpp` | Viewport↔simulation scene dispatcher (`ui::simscene`); producers `sim/pipe_scene.cpp` / `hydraulic_scene.cpp`, piping geometry/tool `pipe_mesh.*` / `pipe_sketch.*` |
 | `host/src/render/splat_renderer.cpp/.h`, `re_points.cpp` | Gaussian-splat / point-cloud rendering (reverse-engineering capture views) |
 | `host/src/render/aicm_loader.cpp` | Loads `.aicm` mesh artifacts |
 | `host/src/mesh.cpp` | Host `Mesh` data (vertices, faces, normals) |
@@ -38,6 +39,42 @@ classified world-space segments, global timing, direction glyphs, stock and simu
 CAM overlays are Manufacture-only, excluded from the ID pass, section-clipped, and depth-aware.
 The remnant-stock aux mesh cache key is `{camSimGen(), frameIndex}` so a new simulation can never
 reuse the old frame-zero upload.
+
+## Simulation scene seam and framing
+
+- `ui::simscene::{active,collect,toolArmed,handleViewport,onPlaneChip}` dispatches to
+  the open Simulate panel's `ui::pipescene` / `ui::hydscene`; the viewport never
+  reaches into those panels. `collect` returns cached world-mm lit/line batches,
+  revision-bumped only when geometry/normals/colours change. Keys:
+  piping `0x1000..0x1FFF`, hydraulics `0x2000..0x2FFF`; viewport batches stay below.
+- Collect, bounds and overlay drawing run **without a document mesh**. Do not gate
+  them on `st.hasDocMesh`: that hid routed pipes on empty parts. Lit batches use
+  `Overlays::drawSimulationLitTriangles` in the existing colour FBO; opaque bodies
+  write depth, translucent previews blend without depth writes. Producers own
+  screen-space network hits; these are not document B-rep IDs.
+- A tool consumes a press+release only if it stays below ImGui's drag threshold.
+  Left drags, MMB and wheel remain navigation. `toolArmed` suppresses ordinary
+  selection/box-select and viewport Esc while the hovered tool owns
+  Esc/Enter/Backspace/Tab; reference-plane chips route through `onPlaneChip` first.
+  Use `ImGuiHoveredFlags_NoNavOverride` for scene pointer hover: keyboard navigation
+  otherwise hides it after Enter/Backspace/Tab until the mouse moves.
+- `updateSimulationSceneBounds` caches batch AABBs by document scope/key/revision,
+  merges them before bbox requests/camera ticking and calls
+  `Renderer::setAuxSceneBounds` (or clears absent bounds). `effectiveSceneRadius`
+  enlarges model/empty framing without moving the orbit centre; radius changes
+  rescale zoom and animation endpoints to preserve the user's current view.
+  `maxSceneZoom` preserves the closest absolute view of the original model/empty
+  scene; wheel/pinch/area/framing and camera-animation clamps must use that limit,
+  not a hard-coded 10. Empty-part networks can then frame and zoom normally.
+- Pipe drawing's centred hint publishes `publishViewportHudRect` /
+  `viewportHudRect`, shared with CAM; bottom-left triad/dimensions must respect it.
+  Backdrop contrast in `renderer.cpp` bootstraps a new source's first luminance grid,
+  then uses the async ring; blur-downsample UVs are destination-normalized. Preserve
+  both when changing render targets or the full-screen resolve path.
+- Input/visibility proofs: `CHUDWARE_SHOT=pipedraw` and `hydraulics3d` (pointerShot +
+  ui_audit observed items), plus `piping`'s routed-pipe pixel check. Inspect their
+  reports under `scratch/{pipedraw,hydraulics3d,piping}_shots`; route JSON alone is
+  not visibility evidence.
 
 ## Gaussian reference rendering
 
@@ -76,6 +113,15 @@ reuse the old frame-zero upload.
   `scripts/gui_lint.py --rule color` fails the gate otherwise.
 - Headless render modes exist for testing: `chudware --render <in.stl> <out.png>` and
   `--contact <in.stl> <out.png>`.
+- Framing: the 3D image is full-bleed behind the glass panes; `viewport_panel.cpp` computes the
+  clear region (between `overlayColumnEdge(0/1)`, below `docTabBandBottom()`) each frame and calls
+  `Renderer::setFramingRegion(shiftX, shiftY, scale)` so zoom=1 fits and centres the model there
+  (lens shift in `cam_.mvp`; picking/overlays follow). `ui::viewportClearRect()` publishes it;
+  wheel/area zoom pivot on its centre, and scene-scale setup overlays are scissored to it
+  (`Overlays::beginScreenClip`).
+- Pane chips that stand for a face (FEA/topology wells) call `ui::claimViewportHoverFace(body,
+  face)` every hovered frame; the viewport draws it as the hover highlight. Never write
+  `AppState::hover` from UI code.
 
 ## In-context component edit (ghost mesh)
 

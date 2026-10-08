@@ -64,6 +64,7 @@ python3 scripts/check.py         # source/audit gates; use the provisioned runti
 scripts/provision_venv.sh        # .venv-mcp; gate.sh resolves its python (override CHUDWARE_GATE_PYTHON)
 ./build.sh stage                 # dist is FIRST in hostd lookup: stale dist = stale daemon
 CHUDWARE_SHOT=<scenario> ./host/build-linux/bin/chudware --ui-screenshot scratch/smoke.png   # headless runtime smoke
+CHUDWARE_STARTUP_TRACE=1 ./host/build-linux/bin/chudware   # stderr startup milestones, milliseconds from main entry
 scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware/Sessions --prompt-file p.md   # headless agent turn; --resume
 ```
 
@@ -77,8 +78,10 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   tree, but before shipping an API change validate the public pin in
   `core/cmake/ProvisionPolymesh.cmake` with no override: the configure log must say
   **PINNED FETCH**, not **LOCAL SOURCE** (clear `POLYMESH_SOURCE_DIR`, reset an overridden
-  `POLYMESH_ROOT` to `<CAD>/third_party/polymesh`). The public `cad-fill-progress` branch is
-  the integration line; never publish private history to move the pin.
+  `POLYMESH_ROOT` to `<CAD>/third_party/polymesh`). There is ONE public repository
+  (`Hunter-124/Polyhedral-FEA`, branch `master`); the private fork is retired. Land polymesh
+  work on public `master` first, then move the pin to that commit. polymesh must stay
+  subproject-safe (`PROJECT_SOURCE_DIR`, CPack only when top-level).
 
 ## Resource safety
 
@@ -119,6 +122,13 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   never raw `status_.clients`: a `gui` client always pins; others pin only with an engine call
   in flight, an attached doc, or an RPC inside the idle window
   (`test_hostd_registry.py::test_parked_client_does_not_pin_the_daemon` + `…_attached_client_still_pins_the_daemon`).
+- **Background GUI queries stay off the primary socket.** Document-free metadata/worker-
+  bridged queries from non-primary threads use per-thread `gui-background` sockets (exact
+  allowlist in `services/ipc/ipc_client.cpp`, reached through `services/worker/engine_backend.cpp`);
+  document/unknown methods stay primary. Background clients never get the unconditional
+  `gui` pin; recent/in-flight RPCs still pin like other non-GUI clients. Pinned by
+  `test_worker_long_run`: `backgroundQueriesDoNotBlockPrimary`, `backgroundQueryEofIsIsolated`,
+  `backgroundQueryTimeoutIsIsolated`, `disconnectWakesAllBackgroundQueries`.
 - **Drains are bounded.** `Server::beginDrain(deadlineSecs)`: `daemon_drain`/`--stop`/tray
   Quit/SIGTERM are hard stops with a deadline (`CHUDWARE_HOSTD_DRAIN_GRACE_S`, default 20 s;
   tray Quit 5 s). The stale-binary self-drain passes `0` (soft; refuses new connects only),
@@ -153,6 +163,12 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
 
 - **hostd is the only autosave authority in daemon mode**; the guard sits at the single write
   in `cad_common._autosave()`, not its callers. The standalone MCP server keeps snapshots.
+- **The build state is saved with the file.** `doc_save` writes `cache.json/aicm/brep` plus
+  per-feature compile checkpoints `cache.ckpt` (contracts/stepplus.md §9); `doc_open` hydrates
+  `compiled` + `compile_cache` from them, so a valid cache opens warm (first op executes 0
+  features, first edit only the tail). Every skip is reported (`cache.skipped_reason`,
+  `cache_miss_reason`), never swallowed; an oversized cache entry is a miss, never a failed
+  open (`test_appearance` "persisted build state" cases).
 - **Mission docs are saved, never closed.** `cad_common.save_touched_docs()` runs at every
   turn terminal (`mission_dispatch.run_linear_role_turn`) and in the crash-path `finally`
   (`worker_rpc._agent_admin_turn`), writing docs hostd would retire into
@@ -244,6 +260,12 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   `_mesh_topo_index`; never alias one body's faces onto another.
 - **An agent's sim is a study the user can open:** `run_fea_*`/`simulate_motion` persist via
   `_persist_study` and hostd fans `doc.studies_changed`; new agent sim tools do the same.
+  Piping/hydraulic/industrial work persists the same way: `piping_network`, `pipe_flow`,
+  `hydraulic_circuit`, `vessel`, `duct_system` studies, shared by the GUI Piping/Hydraulics
+  panels and the `piping_*`/`hydraulic_*` tools (`piping_load`/`hydraulic_load` restore).
+  Civil/site work (`services/civil/`, `contracts/civil_schema.md`, SI metres) persists one
+  `civil_site` study per model through `services/mcp/civil_common.py` (a changed model drops
+  its results; `civil_load` restores); the `civil_*` tools have no GUI panel yet.
 - **Assemblies report honestly:** bbox/mass/import gather world solids (`measure_part` is the
   MCP mass tool); `check_interference` refuses an empty doc and reports `pairs_checked`;
   `validated: true` needs every component's solids and an exact round trip; a no-op

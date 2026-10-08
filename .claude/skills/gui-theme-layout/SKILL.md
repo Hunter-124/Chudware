@@ -37,6 +37,20 @@ in `.claude/skills/gui-orchestrator/SKILL.md`.
   `inlineStatus`, `progressBar`, `spinner`, `emptyState/blockedState`, `dimText/keyValueRow/elide`,
   `rule/gapRow/gapSection`, `fmtBytes/fmtAgo/fmtCount/fmtDuration`, and `Tone` +
   `toneU32/toneVec/toneOn` (the meaning→color map, so "failed" looks identical everywhere).
+- Extended kit (same namespace, included by `kit.h`): `kit_form.h` — explicit-id fields
+  (`fieldNumber/Int/Text/Path/Checkbox/Enum/Combo/Vec3/Range/Slider/Readout`, `FieldGroup`,
+  `FieldOpts`, pane-wide label column + unit lane, `Unit`/`unitText`, `fmtValue/fmtQuantity/
+  fmtQuantityScaled/fmtDelta`, `tooltip/itemTooltip`); `kit_plot.h` — `linePlot/barPlot`,
+  `seriesColor`, `chipFlowBegin/End` + `flow*Chip`, `removableChip`, `keyValueRowId`,
+  `keyValueCard`, adaptive `metricTable`, `table*`; `kit_panel.h` — `panelBegin/BodyBegin/
+  BodyEnd/FooterBegin/End` (pinned header, pill-lane body, measured footer), `panelHeader`,
+  `formTabs`, `stepper/stepperCompact`, `actionFooter` (inline 2-line blocker, progress+Cancel),
+  `removableCard`, `canvasFrame/canvasEmpty`, `groupedPicker`. Every interactive primitive takes
+  an explicit id — never rely on label text for ID uniqueness.
+- **ID-conflict gate.** `IMGUI_ENABLE_TEST_ENGINE` is defined on the app's imgui sources and
+  `ui_audit.cpp` implements the item hooks: `CHUDWARE_SHOT=simaudit` walks 78 simulation states
+  and fails on any duplicate ID or clipped item; `CHUDWARE_IDAUDIT=1` adds the same check to any
+  `CHUDWARE_SHOT` scenario (`idaudit: done conflicts=N`, non-zero exit on conflicts).
 - **Workspace kits are thin wrappers.** Per-workspace helpers (`ui/reveng/reveng_widgets.h`
   `ui::reveng::kit`, `ui/plm/plm_hub.h`, `ui/parts/parts_widgets.h`, `ui/copilot/ui_common.cpp`)
   keep their names and signatures — call sites spell them `plmEmptyState` / `awEmptyState` /

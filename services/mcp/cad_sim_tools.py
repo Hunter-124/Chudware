@@ -1239,8 +1239,8 @@ def _build_load_specs(d: str, loads: list, analysis: str) -> list:
                 "to ignore them. Mechanical loads accept face + exactly one of force or "
                 "pressure."
             )
-        # Merge multiple face-point sets for this load (keeps face_normal/surface
-        # hints exactly when they stay valid — see _merge_face_sets).
+        # Preserve each matched CAD face's complete geometric oracle under one
+        # authored load; native union quadrature never multiplies its resultant.
         merged = _merge_face_sets(_sim_face_points(d, ld["face"]))
         merged["selector"] = _selector_text(ld["face"])
         spec: dict = {"faces": merged}
@@ -1280,19 +1280,15 @@ def _reject_fully_constrained_loads(
     fixture_sets: list, load_specs: list, analysis: str
 ) -> None:
     """A load entirely on fixed sample points becomes a reaction-only zero field."""
-    fixed = {
-        tuple(float(c) for c in point)
-        for fs in fixture_sets
-        for point in (fs.get("points") or [])
-        if isinstance(point, (list, tuple)) and len(point) == 3
-    }
+    def sample_points(faceset):
+        for leaf in faceset.get("facesets", [faceset]):
+            for point in (leaf.get("points") or []):
+                if isinstance(point, (list, tuple)) and len(point) == 3:
+                    yield tuple(float(c) for c in point)
+
+    fixed = {point for fs in fixture_sets for point in sample_points(fs)}
     for i, spec in enumerate(load_specs):
-        points = spec.get("faces", {}).get("points") or []
-        loaded = {
-            tuple(float(c) for c in point)
-            for point in points
-            if isinstance(point, (list, tuple)) and len(point) == 3
-        }
+        loaded = set(sample_points(spec.get("faces", {})))
         if loaded and loaded.issubset(fixed):
             raise _StudyRefusal(
                 {
@@ -5653,19 +5649,20 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             cp = mat.get("cp_j_kgk")
 
             def _faceset(q):
-                merged = _merge_face_sets(_sim_face_points(d, q))
-                # Planar CAD boundaries are exact mesh planes. A millimetre-scale
-                # picking tolerance would prescribe temperatures on interior layers.
-                normal = merged.get("face_normal")
-                points = merged["points"]
-                if normal and points:
-                    norm = math.sqrt(sum(v * v for v in normal))
-                    if norm > 0.0 and all(
-                        abs(sum((p[i] - points[0][i]) * normal[i] for i in range(3)))
-                        <= 1e-6 * norm for p in points
-                    ):
-                        merged["perp_tol_mm"] = 1e-6
-                return merged if merged["points"] else None
+                faces = _sim_face_points(d, q)
+                # Tighten each planar oracle separately before forming the union:
+                # differently oriented planes must never share one normal.
+                for face in faces:
+                    normal = face.get("face_normal")
+                    points = face.get("points")
+                    if normal and points:
+                        norm = math.sqrt(sum(v * v for v in normal))
+                        if norm > 0.0 and all(
+                            abs(sum((p[i] - points[0][i]) * normal[i] for i in range(3)))
+                            <= 1e-6 * norm for p in points
+                        ):
+                            face["perp_tol_mm"] = 1e-6
+                return _merge_face_sets(faces)
 
             fixtures = []
             thermal_driving = False

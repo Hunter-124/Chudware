@@ -222,6 +222,111 @@ class TestOpenEmsPipeline(unittest.TestCase):
         with self.assertRaises(EmSolverError):
             ad.build_plan({"standard": "WR90", "f_start_ghz": 10, "f_stop_ghz": 10})
 
+    def test_timedomain_explicit_excitation_resolves_upper_band(self):
+        ad = OpenEmsAdapter()
+        spec = {"standard": "WR90", "length_mm": 50,
+                "f_start_ghz": 8, "f_stop_ghz": 12, "n_freq": 57}
+        baseline = ad.build_plan(spec, broadband=True)
+        plan = ad.build_plan({**spec, "f0_ghz": 60, "bw_ghz": 5}, broadband=True)
+        self.assertEqual(plan["excitation"],
+                         {"type": "gaussian", "f0_hz": 60e9, "fc_hz": 5e9})
+        self.assertEqual(plan["freq"], {"start_hz": 8e9, "stop_hz": 12e9, "n": 57})
+        # The actual mesh, not an echoed requested setting, resolves the same
+        # f0 + 4*bw upper frequency used by analytic.timedomain_response.
+        max_step = analytic.C0 / 80e9 * 1e3 / 20
+        for axis in "xyz":
+            self.assertLessEqual(max(np.diff(plan["mesh"][axis])), max_step + 1e-6)
+            self.assertGreater(len(plan["mesh"][axis]), len(baseline["mesh"][axis]))
+
+    def test_timedomain_mesh_resolves_spectrum_when_it_is_higher(self):
+        plan = OpenEmsAdapter().build_plan(
+            {"standard": "WR90", "f0_ghz": 10, "bw_ghz": 2,
+             "f_start_ghz": 8, "f_stop_ghz": 80}, broadband=True)
+        max_step = analytic.C0 / 80e9 * 1e3 / 20
+        for axis in "xyz":
+            self.assertLessEqual(max(np.diff(plan["mesh"][axis])), max_step + 1e-6)
+        self.assertEqual(plan["excitation"]["f0_hz"], 10e9)
+        self.assertEqual(plan["excitation"]["fc_hz"], 2e9)
+
+    def test_timedomain_default_spectrum_tracks_requested_pulse(self):
+        ad = OpenEmsAdapter()
+        pulse = {"standard": "WR90", "f0_ghz": 30, "bw_ghz": 2}
+        plan = ad.build_plan(pulse, broadband=True)
+        self.assertEqual(plan["freq"]["start_hz"], 28e9)
+        self.assertEqual(plan["freq"]["stop_hz"], 32e9)
+        # Each supplied boundary wins independently over the pulse-derived default.
+        plan = ad.build_plan({**pulse, "f_start_ghz": 27}, broadband=True)
+        self.assertEqual(plan["freq"]["start_hz"], 27e9)
+        self.assertEqual(plan["freq"]["stop_hz"], 32e9)
+        plan = ad.build_plan({**pulse, "f_stop_ghz": 35}, broadband=True)
+        self.assertEqual(plan["freq"]["start_hz"], 28e9)
+        self.assertEqual(plan["freq"]["stop_hz"], 35e9)
+
+    def test_timedomain_partial_pulse_parameters_and_explicit_spectrum(self):
+        ad = OpenEmsAdapter()
+        default = ad.build_plan({"standard": "WR90"}, broadband=True)
+        center_only = ad.build_plan({"standard": "WR90", "f0_ghz": 15}, broadband=True)
+        self.assertEqual(center_only["excitation"]["f0_hz"], 15e9)
+        self.assertEqual(center_only["excitation"]["fc_hz"],
+                         default["excitation"]["fc_hz"])
+        width_only = ad.build_plan({"standard": "WR90", "bw_ghz": 2}, broadband=True)
+        self.assertEqual(width_only["excitation"]["f0_hz"],
+                         default["excitation"]["f0_hz"])
+        self.assertEqual(width_only["excitation"]["fc_hz"], 2e9)
+        sweep = ad.build_plan(
+            {"standard": "WR90", "f_start_ghz": 8, "f_stop_ghz": 12},
+            broadband=True)
+        self.assertEqual(sweep["freq"]["start_hz"], 8e9)
+        self.assertEqual(sweep["freq"]["stop_hz"], 12e9)
+
+    def test_timedomain_accepts_bandwidth_at_or_above_center(self):
+        ad = OpenEmsAdapter()
+        for bandwidth in (10, 14):
+            with self.subTest(bandwidth=bandwidth):
+                plan = ad.build_plan(
+                    {"standard": "WR90", "f0_ghz": 10, "bw_ghz": bandwidth},
+                    broadband=True)
+                self.assertEqual(plan["excitation"]["f0_hz"], 10e9)
+                self.assertEqual(plan["excitation"]["fc_hz"], bandwidth * 1e9)
+                self.assertGreater(plan["freq"]["start_hz"], 0)
+                self.assertGreater(plan["freq"]["stop_hz"], plan["freq"]["start_hz"])
+
+    def test_timedomain_rejects_malformed_explicit_pulse_by_name(self):
+        ad = OpenEmsAdapter()
+        spec = {"standard": "WR90", "f0_ghz": 10, "bw_ghz": 2}
+        bad_values = (None, "bad", [], {}, True, False, 0, -1,
+                      math.nan, math.inf, -math.inf, 1e300, 10**400)
+        for key in ("f0_ghz", "bw_ghz"):
+            for value in bad_values:
+                with self.subTest(key=key, value=value):
+                    with self.assertRaisesRegex(EmSolverError, key):
+                        ad.build_plan({**spec, key: value}, broadband=True)
+
+    def test_timedomain_rejects_degenerate_or_extreme_pulse_ranges(self):
+        ad = OpenEmsAdapter()
+        for center, width in ((10, 1e-300), (1e299, 1e299), (1e-320, 1e-320)):
+            with self.subTest(center=center, width=width):
+                with self.assertRaisesRegex(EmSolverError, "bw_ghz"):
+                    ad.build_plan(
+                        {"standard": "WR90", "f0_ghz": center, "bw_ghz": width},
+                        broadband=True)
+        with self.assertRaises(EmSolverError):
+            ad.build_plan({"standard": "WR90", "f0_ghz": 1e6, "bw_ghz": 2},
+                          broadband=True)
+        with self.assertRaisesRegex(EmSolverError, "f_start_ghz"):
+            ad.build_plan({"standard": "WR90", "f0_ghz": 8, "bw_ghz": 2,
+                           "f_start_ghz": 11}, broadband=True)
+
+    def test_driven_plan_ignores_time_domain_pulse_fields(self):
+        ad = OpenEmsAdapter()
+        spec = {"standard": "WR90", "f_start_ghz": 8, "f_stop_ghz": 12}
+        baseline = ad.build_plan(spec)
+        self.assertEqual(baseline["excitation"],
+                         {"type": "gaussian", "f0_hz": 10e9, "fc_hz": 2e9})
+        self.assertEqual(ad.build_plan({**spec, "f0_ghz": 60, "bw_ghz": 5}), baseline)
+        self.assertEqual(ad.build_plan({**spec, "f0_ghz": None, "bw_ghz": math.nan}),
+                         baseline)
+
     def test_driven_pipeline_matches_analytic(self):
         ad = _MockedOpenEms()
         res = ad.driven({"standard": "WR-90", "length_mm": 100,

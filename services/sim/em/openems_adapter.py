@@ -74,6 +74,13 @@ class OpenEmsAdapter(EmAdapter):
 
         The plan is plain data: mm-unit mesh lines, two rectangular-waveguide
         modal ports along +z, PEC side walls, PML_8 ends, Gaussian excitation.
+
+        Time-domain f0_ghz/bw_ghz map directly to SetGaussExcite's centre and
+        Gaussian bandwidth parameter (not a full-width conversion), matching
+        the analytic backend. Missing pulse fields retain the sweep-derived
+        defaults. Explicit spectrum boundaries are never widened; absent ones
+        sample the requested nominal pulse band. The mesh resolves f0 + 4*bw,
+        matching the analytic backend's time-domain frequency margin.
         """
         cs = resolve_cross_section(spec)
         if cs["shape"] != "rectangular":
@@ -82,25 +89,77 @@ class OpenEmsAdapter(EmAdapter):
         md = dominant_mode(cs, spec.get("mode"))
         fc_hz = md["fc_hz"]
         length_mm = _finite_float(spec.get("length_mm", 50.0), "length_mm", positive=True)
-        start_ghz, stop_ghz = _positive_range(
-            spec, "f_start_ghz", "f_stop_ghz",
-            fc_hz / 1e9 * 0.8, fc_hz / 1e9 * 2.0)
+        explicit_pulse = broadband and ("f0_ghz" in spec or "bw_ghz" in spec)
+        if explicit_pulse:
+            # Validate ordering after absent boundaries have been derived from
+            # the pulse; a high explicit start may exceed the old default stop.
+            start_ghz = _finite_float(
+                spec.get("f_start_ghz", fc_hz / 1e9 * 0.8),
+                "f_start_ghz", positive=True)
+            stop_ghz = _finite_float(
+                spec.get("f_stop_ghz", fc_hz / 1e9 * 2.0),
+                "f_stop_ghz", positive=True)
+        else:
+            start_ghz, stop_ghz = _positive_range(
+                spec, "f_start_ghz", "f_stop_ghz",
+                fc_hz / 1e9 * 0.8, fc_hz / 1e9 * 2.0)
         f_start, f_stop = start_ghz * 1e9, stop_ghz * 1e9
         if not math.isfinite(f_start) or not math.isfinite(f_stop):
             raise EmSolverError("frequency range is outside the supported numeric range")
-        if broadband:
+        if broadband and "f_start_ghz" not in spec:
             f_start = min(f_start, fc_hz * 0.5)
-        fbw = 0.5 * (f_stop - f_start)
-        f0 = f_start + fbw
-        if not math.isfinite(f0) or not math.isfinite(fbw) or fbw <= 0.0:
+        excitation_start = min(f_start, fc_hz * 0.5) if broadband else f_start
+        fbw = 0.5 * (f_stop - excitation_start)
+        f0 = excitation_start + fbw
+        if not explicit_pulse and (
+                not math.isfinite(f0) or not math.isfinite(fbw) or fbw <= 0.0):
             raise EmSolverError("openEMS excitation bandwidth is degenerate")
+        mesh_frequency = f_stop
+        if explicit_pulse:
+            pulse = {}
+            for key, default_hz in (("f0_ghz", f0), ("bw_ghz", fbw)):
+                if key not in spec:
+                    pulse[key] = default_hz
+                    continue
+                if isinstance(spec[key], bool):
+                    raise EmSolverError(f"{key} must be a number, not a boolean")
+                try:
+                    value = _finite_float(spec[key], key, positive=True) * 1e9
+                except OverflowError as exc:
+                    raise EmSolverError(
+                        f"{key} is outside the supported numeric range") from exc
+                if not math.isfinite(value) or value <= 0.0:
+                    raise EmSolverError(f"{key} is outside the supported numeric range")
+                pulse[key] = value
+            f0, fbw = pulse["f0_ghz"], pulse["bw_ghz"]
+            if not math.isfinite(f0) or f0 <= 0.0:
+                raise EmSolverError("f0_ghz produces a degenerate excitation centre")
+            if not math.isfinite(fbw) or fbw <= 0.0:
+                raise EmSolverError("bw_ghz produces a degenerate excitation bandwidth")
+            upper_band = f0 + 4.0 * fbw
+            if not math.isfinite(upper_band) or upper_band <= f0:
+                raise EmSolverError(
+                    "f0_ghz/bw_ghz produce a non-finite or degenerate excitation range")
+            # Positive bandwidth alone is insufficient at floating-point extremes:
+            # the envelope duration must also be representable, as in gaussian_pulse.
+            envelope_time = (9.0 / (2.0 * math.pi)) / fbw
+            if not math.isfinite(envelope_time) or envelope_time <= 0.0:
+                raise EmSolverError("bw_ghz produces a degenerate Gaussian envelope")
+            if "f_start_ghz" not in spec:
+                f_start = f0 - fbw if f0 > fbw else min(f_start, f0)
+            if "f_stop_ghz" not in spec:
+                f_stop = f0 + fbw
+            if f_stop <= f_start:
+                raise EmSolverError(
+                    "f_start_ghz/f_stop_ghz do not define a positive range for f0_ghz/bw_ghz")
+            mesh_frequency = max(f_stop, upper_band)
 
         a_mm, b_mm = cs["a_m"] * 1e3, cs["b_m"] * 1e3
         # Resolve both the shortest wavelength and the narrow wall; the old a-only
         # limit left fewer than 15 cells across b in every canonical WR guide.
         cells_per_wavelength = _bounded_int(
             spec.get("cells_per_wavelength", 20), "cells_per_wavelength", 10, 200)
-        lam_min_mm = C0 / (f_stop * math.sqrt(cs["eps_r"])) * 1e3
+        lam_min_mm = C0 / (mesh_frequency * math.sqrt(cs["eps_r"])) * 1e3
         res_mm = min(lam_min_mm / cells_per_wavelength, a_mm / 15.0, b_mm / 15.0)
         if not math.isfinite(res_mm) or res_mm <= 0.0:
             raise EmSolverError("openEMS mesh resolution is degenerate")

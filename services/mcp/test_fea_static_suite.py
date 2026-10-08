@@ -541,3 +541,292 @@ def test_a_stated_band_floor_resolves_a_feature_the_default_floor_refuses(tools)
     assert "min_size_mm" in coarse_floor["error"], coarse_floor["error"]
     assert "mesh_size_mm" in coarse_floor["error"], coarse_floor["error"]
     assert "job_id" not in coarse_floor, "a refused setup must not start a solve"
+
+
+# ------------------------------- lossless compound CAD-face boundary unions
+
+_UNION_POINTS = [
+    [0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
+]
+
+
+def _union_plane(axis, *, npe=4):
+    coordinates = list(_UNION_POINTS)
+    if npe == 10:
+        coordinates += [
+            [0.5, 0.0, 0.0], [0.5, 0.5, 0.0], [0.0, 0.5, 0.0],
+            [0.0, 0.0, 0.5], [0.0, 0.5, 0.5], [0.5, 0.0, 0.5],
+        ]
+    normal = [0.0, 0.0, 0.0]
+    normal[axis] = -1.0
+    return {
+        "points": [point for point in coordinates if point[axis] == 0.0],
+        "tol_mm": 2.0, "face_normal": normal, "perp_tol_mm": 1e-8,
+    }
+
+
+def _union_study(*, npe=4):
+    points = list(_UNION_POINTS)
+    if npe == 10:
+        points += [
+            [0.5, 0.0, 0.0], [0.5, 0.5, 0.0], [0.0, 0.5, 0.0],
+            [0.0, 0.0, 0.5], [0.0, 0.5, 0.5], [0.5, 0.0, 0.5],
+        ]
+    return {
+        "points": [value for point in points for value in point],
+        "tets": list(range(npe)), "nodes_per_elem": npe,
+        "material": dict(fsc.STEEL),
+        "fixtures": [_union_plane(0, npe=npe)],
+    }
+
+
+def _native_union_static(tmp_path, name, faces, load, *, npe=4):
+    path = tmp_path / f"{name}.json"
+    study = _union_study(npe=npe)
+    study.update(loads=[dict(load, faces=faces)], export_system_path=str(path))
+    out = fsc._cb().call("sim_run_static", {"study": study})
+    assert out.get("ok"), out
+    return out, json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("npe", [4, 10])
+def test_faceset_union_force_is_once_and_shared_membership_is_deduplicated(tmp_path, npe):
+    """Two orthogonal faces share an edge, but impose ONE authored force."""
+    from services.mcp.cad_common import _merge_face_sets
+
+    y, z = _union_plane(1, npe=npe), _union_plane(2, npe=npe)
+    force = [120.0, -240.0, 360.0]
+    fields = []
+    for ordinal, leaves in enumerate(([y, z], [z, y, y, z])):
+        out, system = _native_union_static(
+            tmp_path, f"force_{npe}_{ordinal}", _merge_face_sets(leaves),
+            {"type": "force", "vector": force}, npe=npe)
+        nodal = system["nodal_forces"]
+        assert [sum(row[c] for row in nodal) for c in range(3)] == pytest.approx(
+            force, abs=1e-10)
+        assert out["reactions"]["applied_force_n"] == pytest.approx(force, abs=1e-8)
+        assert out["reactions"]["reaction_force_n"] == pytest.approx(
+            [-value for value in force], abs=1e-7)
+        if npe == 4:
+            for row in nodal:
+                assert row == pytest.approx([value / 4 for value in force])
+        else:
+            # Edge 2--3 is not on either selected face, even though BOTH of its
+            # endpoints belong to the union. Never complete/load this phantom edge.
+            assert nodal[8] == pytest.approx([0.0, 0.0, 0.0], abs=1e-10)
+            assert nodal[4] == pytest.approx([value / 3 for value in force], abs=1e-9)
+        fields.append([value for row in nodal for value in row])
+    assert fields[1] == pytest.approx(fields[0], abs=1e-10)
+
+
+@pytest.mark.parametrize("npe", [4, 10])
+def test_faceset_union_pressure_does_not_invent_unselected_facets(tmp_path, npe):
+    """Union nodes cover all four corners; ONLY y=0 and z=0 facets carry pressure."""
+    from services.mcp.cad_common import _merge_face_sets
+
+    y, z = _union_plane(1, npe=npe), _union_plane(2, npe=npe)
+    out, system = _native_union_static(
+        tmp_path, f"pressure_{npe}", _merge_face_sets([y, z, y]),
+        {"type": "pressure", "magnitude": 6.0}, npe=npe)
+    nodal = system["nodal_forces"]
+    assert [sum(row[c] for row in nodal) for c in range(3)] == pytest.approx(
+        [0.0, 3.0, 3.0], abs=1e-10)
+    assert out["reactions"]["applied_force_n"] == pytest.approx([0.0, 3.0, 3.0])
+    if npe == 10:
+        assert nodal[8] == pytest.approx([0.0, 0.0, 0.0], abs=1e-10)
+    else:
+        expected = [[0, 1, 1], [0, 1, 1], [0, 0, 1], [0, 1, 0]]
+        for actual, reference in zip(nodal, expected):
+            assert actual == pytest.approx(reference, abs=1e-10)
+
+
+def test_faceset_union_retains_heterogeneous_analytic_and_planar_oracles(tmp_path):
+    """A sphere's triangular skin facet and a plane retain separate tight tests."""
+    from services.mcp.cad_common import _merge_face_sets
+
+    sphere = {
+        "points": _UNION_POINTS[1:], "tol_mm": 2.0, "perp_tol_mm": 1e-8,
+        "surface": {"type": "sphere", "origin": [0, 0, 0], "radius": 1.0},
+    }
+    plane = _union_plane(2)
+    out, system = _native_union_static(
+        tmp_path, "sphere_plane", _merge_face_sets([sphere, plane, sphere]),
+        {"type": "pressure", "magnitude": 6.0})
+    # Oblique facet: -p*A*n = [-3,-3,-3]. z=0: [0,0,3].
+    # Collapsing the sphere descriptor or planar normal gives a different resultant.
+    assert [sum(row[c] for row in system["nodal_forces"]) for c in range(3)] == (
+        pytest.approx([-3.0, -3.0, 0.0], abs=1e-10))
+    assert out["reactions"]["applied_force_n"] == pytest.approx([-3.0, -3.0, 0.0])
+
+
+_BAD_UNIONS = [
+    {"facesets": []},
+    {"facesets": {}},
+    {"facesets": [None]},
+    {"facesets": [{"points": []}]},
+    {"facesets": [{"points": [0.0, 1.0]}]},
+    {"facesets": [{"points": [[0.0, 0.0, 0.0]], "tol_mm": 0.0}]},
+    {"facesets": [{"facesets": [_union_plane(1)]}]},
+    *[dict(facesets=[_union_plane(1)], **{key: value}) for key, value in (
+        ("points", []), ("tol_mm", 1.0), ("perp_tol_mm", 1e-6),
+        ("face_normal", [0, 1, 0]),
+        ("surface", {"type": "sphere", "origin": [0, 0, 0], "radius": 1.0}),
+    )],
+    {"facesets": [{"points": [[0.0, None, 0.0]]}]},
+    {"facesets": [{"points": [[0.0, 0.0, 0.0]], "face_normal": [1e308, 0, 0]}]},
+]
+
+
+@pytest.mark.parametrize("faces", _BAD_UNIONS)
+@pytest.mark.parametrize("route", ["static_load", "static_fixture", "thermal_load",
+                                  "thermal_fixture"])
+def test_faceset_union_malformed_or_ambiguous_boundaries_are_refused(faces, route):
+    study = _union_study()
+    if route.startswith("static"):
+        study["loads"] = [{"type": "force", "vector": [1, 2, 3],
+                           "faces": faces if route.endswith("load") else _union_plane(1)}]
+        if route.endswith("fixture"):
+            study["fixtures"] = [faces]
+        method = "sim_run_static"
+    else:
+        study["material"] = {"k_w_mk": 1000.0}
+        study["fixtures"] = [dict(
+            faces if route.endswith("fixture") else _union_plane(0), temp_c=0.0)]
+        study["loads"] = [{"type": "flux", "magnitude": 1e6,
+                           "faces": faces if route.endswith("load") else _union_plane(1)}]
+        method = "sim_run_thermal"
+    out = fsc._cb().call(method, {"study": study})
+    assert out.get("ok") is False, out
+    assert "faceset" in out["error"], out
+
+
+@pytest.mark.parametrize("capacitance", ["lumped", "consistent"])
+def test_faceset_union_transient_flux_conserves_heat_and_ignores_duplicate_faces(capacitance):
+    """q=1 W/mm² over two 0.5 mm² faces: ΔTmean=Q/(rho_cp*V)=6 K."""
+    from services.mcp.cad_common import _merge_face_sets
+
+    fields = []
+    for leaves in ([_union_plane(1), _union_plane(2)],
+                   [_union_plane(2), _union_plane(1), _union_plane(1)]):
+        study = _union_study()
+        study.update(
+            fixtures=[], material={"k_w_mk": 1000.0, "cp_j_kgk": 1000.0,
+                                   "rho_kg_m3": 1e6},
+            loads=[{"faces": _merge_face_sets(leaves), "type": "flux", "magnitude": 1e6}],
+            transient={"t_end_s": 1.0, "dt_s": 0.1, "t_init_c": 0.0,
+                       "capacitance": capacitance, "frame_times_s": [1.0]})
+        out = fsc._cb().call("sim_run_thermal", {"study": study})
+        assert out.get("ok"), out
+        temperatures = out["temperature"]
+        # Each linear tetra node owns V/4 for both capacitance formulations.
+        assert sum(temperatures) / 4 == pytest.approx(6.0, abs=1e-9)
+        fields.append(temperatures)
+    assert fields[1] == pytest.approx(fields[0], abs=1e-9)
+
+
+def test_faceset_union_steady_convection_uses_only_authored_external_faces():
+    """Convection union area=1, balanced by unit flux over the oblique √3/2 face."""
+    from services.mcp.cad_common import _merge_face_sets
+
+    study = _union_study()
+    study.update(
+        fixtures=[], material={"k_w_mk": 1000.0},
+        loads=[
+            {"type": "convection", "h": 1e6, "t_amb_c": 10.0,
+             "faces": _merge_face_sets([_union_plane(1), _union_plane(2), _union_plane(1)])},
+            {"type": "flux", "magnitude": 1e6,
+             "faces": {"points": _UNION_POINTS[1:], "tol_mm": 1e-8}},
+        ])
+    out = fsc._cb().call("sim_run_thermal", {"study": study})
+    assert out.get("ok"), out
+    weights = [1 / 3, 1 / 3, 1 / 6, 1 / 6]
+    boundary_mean = sum(weight * temp for weight, temp in zip(weights, out["temperature"]))
+    assert boundary_mean == pytest.approx(10.0 + math.sqrt(3) / 2, abs=1e-9)
+
+
+def test_faceset_union_thermal_fixed_nodes_match_separate_terminal_boundaries():
+    """Sparse terminal leaves remain valid: a compound is not a full-face-only fixture."""
+    from services.mcp.cad_common import _merge_face_sets
+
+    leaves = [{"points": [point], "tol_mm": 1e-8} for point in _UNION_POINTS[:2]]
+    fields = []
+    for fixtures in ([dict(_merge_face_sets(leaves), temp_c=0.0)],
+                     [dict(leaf, temp_c=0.0) for leaf in leaves]):
+        study = _union_study()
+        study.update(material={"k_w_mk": 1000.0}, fixtures=fixtures,
+                     loads=[{"faces": _union_plane(2), "type": "flux", "magnitude": 1e6}])
+        out = fsc._cb().call("sim_run_thermal", {"study": study})
+        assert out.get("ok"), out
+        assert out["temperature"][:2] == pytest.approx([0.0, 0.0], abs=1e-10)
+        assert out["temperature"][2] > 0.0
+        fields.append(out["temperature"])
+    assert fields[1] == pytest.approx(fields[0], abs=1e-10)
+
+
+def test_high_level_mcp_multiface_force_retains_one_authored_resultant(tools):
+    doc = _box_doc(tools, "mcp_multiface_union")
+    force = [120.0, -240.0, -360.0]
+    try:
+        out = _finish(tools, _json(tools["run_fea_static"](
+            doc_id=doc, fixtures=["bottom"], material="steel", mesh_size_mm=10.0,
+            loads=[{"face": {"of": "face"}, "force": force}])), "summary")
+        assert out.get("ok"), out
+        assert out["reactions"]["applied_force_n"] == pytest.approx(force, abs=1e-7)
+        assert out["reactions"]["reaction_force_n"] == pytest.approx(
+            [-value for value in force], abs=1e-5)
+    finally:
+        fsc.close_doc(doc)
+
+
+def test_high_level_mcp_thermal_multiface_union_reaches_uniform_equilibrium(tools):
+    doc = _box_doc(tools, "mcp_thermal_multiface_union")
+    try:
+        out = _json(tools["run_fea_thermal"](
+            doc_id=doc, hot_faces=[], cold_faces=[], material="steel",
+            mesh_fineness=0.25,
+            loads=[{"face": {"of": "face"}, "flux_w_m2": 1000.0},
+                   {"face": {"of": "face"}, "h_w_m2k": 100.0, "t_amb_c": 20.0}]))
+        assert out.get("ok"), out
+        assert out["temperature_min_c"] == pytest.approx(30.0, abs=1e-6)
+        assert out["temperature_max_c"] == pytest.approx(30.0, abs=1e-6)
+    finally:
+        fsc.close_doc(doc)
+
+
+def test_faceset_union_transient_convection_preserves_one_boundary_energy_balance():
+    """One backward-Euler step balances stored heat with the two-face film flux."""
+    from services.mcp.cad_common import _merge_face_sets
+
+    study = _union_study()
+    study.update(
+        fixtures=[], material={"k_w_mk": 1000.0, "cp_j_kgk": 1000.0,
+                               "rho_kg_m3": 1e6},
+        loads=[{"type": "convection", "h": 1e6, "t_amb_c": 10.0,
+                "faces": _merge_face_sets([_union_plane(1), _union_plane(2),
+                                           _union_plane(2)])}],
+        transient={"t_end_s": 1.0, "dt_s": 1.0, "t_init_c": 0.0,
+                   "frame_times_s": [1.0]})
+    out = fsc._cb().call("sim_run_thermal", {"study": study})
+    assert out.get("ok"), out
+    temperature = out["temperature"]
+    weights = [1 / 3, 1 / 3, 1 / 6, 1 / 6]
+    film_boundary_integral = sum(w * t for w, t in zip(weights, temperature))
+    # C's column sum per node is rho_cp*V/4 = 1/24 W·s/K.
+    # Stored heat + dt*h*∫T dA = dt*h*T_amb*A; A=1, dt=h=1.
+    assert sum(temperature) / 24 + film_boundary_integral == pytest.approx(10.0, abs=1e-9)
+
+
+@pytest.mark.parametrize("kind", ["flux", "convection"])
+def test_faceset_union_thermal_load_without_a_complete_facet_is_refused(kind):
+    from services.mcp.cad_common import _merge_face_sets
+
+    leaves = [{"points": [point], "tol_mm": 1e-8} for point in _UNION_POINTS[:2]]
+    load = {"faces": _merge_face_sets(leaves), "type": kind}
+    load.update({"magnitude": 1e6} if kind == "flux" else {"h": 1e6, "t_amb_c": 10.0})
+    study = _union_study()
+    study.update(material={"k_w_mk": 1000.0},
+                 fixtures=[dict(_union_plane(0), temp_c=0.0)], loads=[load])
+    out = fsc._cb().call("sim_run_thermal", {"study": study})
+    assert out.get("ok") is False, out
+    assert "selects no complete exterior mesh face" in out["error"], out

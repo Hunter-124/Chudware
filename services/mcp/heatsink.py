@@ -272,8 +272,9 @@ def gather_candidates(env_name: str, h_w_m2k: float,
         notices.append(f"{len(cands) - max_candidates} candidate(s) beyond "
                        f"max_candidates={max_candidates} dropped (kept the spread).")
         # Keep an even spread across the theta range rather than one end.
-        idx = [round(i * (len(cands) - 1) / (max_candidates - 1))
-               for i in range(max_candidates)]
+        idx = ([0] if max_candidates == 1 else
+               [round(i * (len(cands) - 1) / (max_candidates - 1))
+                for i in range(max_candidates)])
         cands = [cands[i] for i in sorted(set(idx))]
     return cands, notices
 
@@ -288,11 +289,18 @@ def heatsink_select_impl(component_ref: str,
                          tim_k_w_mk: float = TIM_K_W_MK_DEFAULT,
                          include_library: bool = True,
                          include_parametric: bool = True,
-                         max_candidates: int = 8) -> dict:
+                         max_candidates: int = 8,
+                         doc_id: Optional[str] = None,
+                         handoff_id: Optional[str] = None) -> dict:
     """Pick a heatsink for a hot component: candidates re-solved to a Tj target.
 
     Returns a dict (not JSON). Worker seam (T-FIN24 multiphysics_rpc) and the MCP
     tool both call this; the MCP tool wraps with json.dumps.
+
+    Optional worker ownership: doc_id and handoff_id (the source result.simhandoff.id)
+    must match the single captured last thermal context before any candidate work.
+    Omit both to intentionally select from the last thermal study, as legacy MCP
+    calls do. max_candidates must be a positive integer; 1 keeps the smallest sink.
     """
     warnings: list = []
     try:
@@ -307,6 +315,12 @@ def heatsink_select_impl(component_ref: str,
                 "hint": "Use a finite non-negative bondline thickness and a finite "
                         "positive TIM conductivity.",
                 "next_actions": []}
+    if (isinstance(max_candidates, bool)
+            or not isinstance(max_candidates, int) or max_candidates < 1):
+        return {"ok": False, "reason": "invalid_max_candidates",
+                "error": f"max_candidates must be a positive integer (got {max_candidates!r})",
+                "warnings": [], "hint": "Set max_candidates to an integer >= 1.",
+                "next_actions": []}
     ctx = et._THERMAL.get("last_ctx")
     if not isinstance(ctx, dict):
         return {"ok": False, "error": "no thermal context — run ecad_thermal_handoff() first",
@@ -315,6 +329,25 @@ def heatsink_select_impl(component_ref: str,
                         "there is nothing cached yet.",
                 "next_actions": ["ecad_thermal_handoff()",
                                  "heatsink_select('U1', tj_target_c=85)"]}
+    expected_source = {"doc_id": doc_id, "handoff_id": handoff_id}
+    current_source = {"doc_id": ctx.get("doc_id"),
+                      "handoff_id": ctx.get("handoff_envelope_id")}
+    for key, reason in (("doc_id", "thermal_source_doc_mismatch"),
+                        ("handoff_id", "thermal_source_handoff_mismatch")):
+        expected = expected_source[key]
+        if expected is not None and expected != current_source[key]:
+            return {
+                "ok": False, "reason": reason,
+                "error": f"Thermal source {key} mismatch: requested {expected!r}, "
+                         f"but the cached study belongs to {current_source[key]!r}. "
+                         "Heatsink selection was refused before candidate work.",
+                "expected_source": expected_source, "current_source": current_source,
+                "warnings": [],
+                "hint": "Run the thermal handoff again for the selected board, then "
+                        "select its new result as the heatsink source.",
+                "next_actions": ["ecad_thermal_handoff(doc_id=<selected board>)",
+                                 "Select the new thermal result and retry heatsink selection"],
+            }
     if tj_target_c is None and t_case_target_c is None:
         return {"ok": False, "error": "pass a target: tj_target_c or t_case_target_c",
                 "warnings": [], "hint": "pass a target: tj_target_c or t_case_target_c",
@@ -550,7 +583,7 @@ def heatsink_select_impl(component_ref: str,
 
 
 def heatsink_select_from_params(params: dict) -> dict:
-    """Worker-friendly params-dict entry for multiphysics_rpc (T-FIN24)."""
+    """Worker params entry; optional doc_id/handoff_id pin the source thermal study."""
     p = params or {}
     return heatsink_select_impl(
         component_ref=str(p.get("component_ref") or ""),
@@ -562,7 +595,9 @@ def heatsink_select_from_params(params: dict) -> dict:
                     else TIM_K_W_MK_DEFAULT),
         include_library=bool(p.get("include_library", True)),
         include_parametric=bool(p.get("include_parametric", True)),
-        max_candidates=int(p.get("max_candidates") or 8),
+        max_candidates=p.get("max_candidates", 8),
+        doc_id=p.get("doc_id"),
+        handoff_id=p.get("handoff_id"),
     )
 
 

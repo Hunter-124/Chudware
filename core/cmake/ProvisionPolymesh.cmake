@@ -15,15 +15,13 @@
 #
 # LICENSE: BSD-3-Clause, statically linked.
 
-# Pin an immutable, publicly fetchable CAD integration revision (cad-fill-progress).
-# The standalone product's master may advance independently. Keep the public
-# repository as the credential-free default so CAD CI never depends on private
-# source access; local maintenance trees opt in through POLYMESH_SOURCE_DIR.
-set(POLYMESH_COMMIT "274503cca6a8fc29bdb7d41cd58cbaf7bc72f68c"
+# Pin an immutable commit on the single public Polyhedral-FEA line (master). There is no
+# private fork: all polymesh work lands publicly, and CAD moves this pin to a master commit.
+# Local maintenance trees opt in through POLYMESH_SOURCE_DIR (CHUDWARE_POLYMESH_ROOT).
+set(POLYMESH_COMMIT "a9fe080daf6e15187ab9d31ce7acedb93d6d7fe7"
     CACHE STRING "Polyhedral-FEA commit to build" FORCE)
 set(POLYMESH_REPOSITORY "https://github.com/Hunter-124/Polyhedral-FEA.git"
-    CACHE STRING
-    "Polyhedral-FEA fetch repository (public default; private mirror is maintenance-only)")
+    CACHE STRING "Polyhedral-FEA fetch repository")
 
 # Files this module WRITES into the managed checkout (see the ONNX Runtime digest block
 # below). Git refuses to move HEAD over a locally modified tracked file, so without a

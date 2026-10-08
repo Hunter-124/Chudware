@@ -377,3 +377,65 @@ does not fail, warn or log: `recolorIconAtlas` finds no cells, returns, and the
 user's accent silently stops reaching the 3D tiles — the same shape as the
 `raster_only` bug that made icons "break every rebuild". A new pipeline-owned key
 must be added to that tuple in the same commit that starts writing it.
+
+## 2026-10-05 append — Simulation GUI overhaul
+
+27 procedural line-art glyphs, appended LAST in `make_icons.py` `CONTRACT_NAMES`.
+Simulate tabs/commands had been borrowing unrelated glyphs: Topology and EM used
+`study_static`, Heat Loads used `load_pressure`, Flow/EM boundaries used `fixture`,
+Piping used `sweep`, and Hydraulics sizing used library-category glyphs. Added
+through the byte-preserving `icon_pipeline.ensure_cells()` path, so all 554 prior
+cells are pixel-identical (atlas re-laid 280x1904 -> 336x1734). They are glyphs
+only, so they are NOT in `RENDERED_RECIPE_NAMES`/`raster_only`. Roles: `p.stroke`
+is the structure, primary/accent is what the command acts on, and secondary/accent2
+is the direction or extent cue (load, flow, size).
+
+**Study kinds (tab + New Study).**
+
+- `study_topology` — topology optimisation: accent truss load path inside a dashed design space, load arrow from above.
+- `study_em` — electromagnetics: antenna mast radiating wavefronts.
+- `study_buckling` — buckling: column on a fixed base under axial load, bowed mode shape in accent.
+- `study_contact` — contact: roller pressed onto a block, accent contact patch.
+- `study_vibration` — vibration / frequency response: spring-mass on a base with motion marks.
+- `study_thermal_fea` — thermal FEA (conduction in a solid): meshed block heated from its base, heat rising off the top.
+- `study_thermal_cfd` — thermal CFD (conjugate heat transfer): streamlines over a hot plate. Distinct from `study_thermal` (plain thermometer, kept unchanged).
+- `study_piping` — piping: pipe run through a 90° elbow, flanged ends.
+- `study_hydraulics` — hydraulics: ISO pump feeding a double-acting cylinder.
+
+**Setup / boundary commands.**
+
+- `load_heat` — heat load: wavy heat-flux arrows entering a face (replaces `load_pressure` on Heat Loads).
+- `fluid` — fluid properties: droplet (replaces `material` on Flow → Fluid).
+- `flow_bc` — flow boundaries: channel with an inlet arrow in and an outlet arrow out (replaces `fixture`).
+- `em_port` — EM excitation port: coax end with an incident wave.
+- `em_boundary` — EM boundary (radiation/PEC box): dashed accent enclosure around the body.
+- `freq_range` — frequency range: chirp between two band markers (replaces `settings`).
+
+**Piping / Hydraulics commands.** `new_*` reuse the tab's study motif plus the accent plus, as one pattern for "New <X>".
+
+- `new_network` — New Network: `study_piping` elbow, reduced, with a plus (replaces `new_doc`).
+- `new_circuit` — New Circuit: `study_hydraulics` pump + cylinder, reduced, with a plus (replaces `new_doc`).
+- `route_pipe` — Route Pipe: laid pipe with its dashed centreline routed on to a waypoint (replaces `sweep`).
+- `size_actuator` — Size Cylinder/actuator: cylinder under a double-headed extent arrow.
+- `size_pump` — Size Pump: ISO pump symbol under the extent arrow.
+- `size_motor` — Size Motor: ISO hydraulic-motor symbol (triangle pointing in) under the extent arrow.
+- `pump_drive` — Pump Drive: electric motor (finned housing, foot, accent shaft, lightning tick).
+- `vessel` — Vessel: vertical pressure vessel with dished heads, nozzle, legs (replaces `revolve_boss`).
+- `duct` — Duct Sizing: rectangular duct section with airflow arrow (replaces `flow_arrow`).
+- `spec_check` — Spec/code check: standard's page with an accent check badge (distinct from `check`).
+- `schematic` — schematic view: sheet with a pump wired to a valve block.
+- `plots_view` — plots: axes with two response curves (distinct from the `results` bar chart).
+
+## 2026-10-05 append — Motion playback transport
+
+6 procedural glyphs for the Motion playback bar, appended LAST in `CONTRACT_NAMES`
+via `icon_pipeline.ensure_cells()`; all 608 prior cells pixel-identical (atlas
+re-laid 336x1734 -> 336x1768). Glyph-only (not in `raster_only`). Roles: primary
+accent fill for triangles/pause bars, `p.stroke` outline and end-stop bars.
+
+- `media_first` — go to first frame: |◀.
+- `media_prev` — step back one frame: ◀|.
+- `media_play` — play: ▶.
+- `media_pause` — pause: ‖.
+- `media_next` — step forward one frame: |▶.
+- `media_last` — go to last frame: ▶|.

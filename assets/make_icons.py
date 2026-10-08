@@ -132,6 +132,18 @@ CONTRACT_NAMES: list[str] = [
     "ecad_drc", "ecad_update",
     "sch_new", "sch_symbol", "sch_wire", "sch_power", "sch_label", "sch_erc",
     "sch_simulate",
+    # ---- 2026-10-05 Simulation GUI overhaul (append-only; appended LAST so every
+    # pre-existing row keeps its packed order). Simulate tabs/commands borrowed
+    # unrelated glyphs (Topology/EM on study_static, Heat Loads on load_pressure,
+    # Piping on sweep, Hydraulics sizing on library categories). Line-art. ----
+    "study_topology", "study_em", "study_buckling", "study_contact",
+    "study_vibration", "study_thermal_fea", "study_thermal_cfd",
+    "study_piping", "study_hydraulics",
+    "load_heat", "fluid", "flow_bc", "em_port", "em_boundary", "freq_range",
+    "new_network", "new_circuit", "route_pipe",
+    "size_actuator", "size_pump", "size_motor", "pump_drive",
+    "vessel", "duct", "spec_check", "schematic", "plots_view",
+    "media_first", "media_prev", "media_play", "media_pause", "media_next", "media_last",
 ]
 
 # FM + ribbon-adjacent refresh scope (Agent 3 — fm_copilot_gui_rectify).
@@ -4566,6 +4578,612 @@ def draw_sch_simulate(d, cell, p):
     polyline(d, pts, p.accent, lw)
 
 
+# ---- 2026-10-05 Simulation GUI overhaul (append-only) ----------------------
+# Every Simulate tab / command used to borrow a glyph from an unrelated physics
+# or from the modelling tabs (Topology/EM on study_static, Flow BCs on fixture,
+# Heat Loads on load_pressure, Piping on sweep, Hydraulics sizing on library
+# categories). Line-art in the sim idiom: p.stroke is the body/structure,
+# p.accent is what the study or command acts on (the result, the hot face, the
+# working fluid), p.accent2 is a direction or extent cue (load, flow, size).
+# Tuned at @20 first: one motif per tile, nothing thinner than half a stroke.
+
+def _pipe_path(d, pts, p, lw, bore):
+    """Hollow pipe along `pts`: a stroke-coloured wall `bore` wide with a lightly
+    filled bore, curved joints so bends read as elbows rather than mitres."""
+    d.line(pts, fill=p.stroke, width=int(bore), joint="curve")
+    d.line(pts, fill=_rgba(p.stroke, 34), width=max(1, int(bore - 2 * lw)), joint="curve")
+
+
+def _elbow_pts(x0, y0, cx, cy, x1, y1, r, n=10):
+    """Polyline (x0,y0) -> corner (cx,cy) -> (x1,y1) with the corner rounded by
+    radius r. Legs must be axis-aligned (orthogonal pipe routing)."""
+    def unit(ax, ay, bx, by):
+        l = math.hypot(bx - ax, by - ay) or 1.0
+        return (bx - ax) / l, (by - ay) / l
+    ux0, uy0 = unit(cx, cy, x0, y0)     # corner -> start
+    ux1, uy1 = unit(cx, cy, x1, y1)     # corner -> end
+    a = (cx + ux0 * r, cy + uy0 * r)
+    b = (cx + ux1 * r, cy + uy1 * r)
+    # arc centre sits diagonally inside the bend
+    ocx, ocy = cx + (ux0 + ux1) * r, cy + (uy0 + uy1) * r
+    a0 = math.atan2(a[1] - ocy, a[0] - ocx)
+    a1 = math.atan2(b[1] - ocy, b[0] - ocx)
+    da = (a1 - a0 + math.pi) % (2 * math.pi) - math.pi
+    arc = [(ocx + r * math.cos(a0 + da * i / n), ocy + r * math.sin(a0 + da * i / n))
+           for i in range(n + 1)]
+    return [(x0, y0)] + arc + [(x1, y1)]
+
+
+def _pump_symbol(d, cx, cy, r, p, lw, inward=False):
+    """ISO 1219 pump (triangle on the rim pointing OUT) or motor (pointing IN)."""
+    circle(d, cx, cy, r, fill=_rgba(p.stroke, 24), outline=p.stroke, lw=lw)
+    h = r * 0.62
+    if inward:
+        tri = [(cx, cy - r + lw * 0.5 + h), (cx - h * 0.62, cy - r + lw * 0.5),
+               (cx + h * 0.62, cy - r + lw * 0.5)]
+    else:
+        tri = [(cx, cy - r + lw * 0.5), (cx - h * 0.62, cy - r + lw * 0.5 + h),
+               (cx + h * 0.62, cy - r + lw * 0.5 + h)]
+    d.polygon(tri, fill=p.accent)
+
+
+def _size_arrow(d, x0, x1, y, p, lw):
+    """Double-headed extent arrow with end ticks: the shared size_* cue."""
+    arrow(d, (x0 + x1) * 0.5, y, x0, y, p.accent2, lw)
+    arrow(d, (x0 + x1) * 0.5, y, x1, y, p.accent2, lw)
+    t = lw * 1.6
+    d.line([(x0, y - t), (x0, y + t)], fill=p.accent2, width=max(1, lw // 2))
+    d.line([(x1, y - t), (x1, y + t)], fill=p.accent2, width=max(1, lw // 2))
+
+
+def _wavy(x0, y0, x1, y1, amp, waves=1.5, n=24):
+    """Sine-wiggled polyline from (x0,y0) to (x1,y1) (heat / radiation cue)."""
+    dx, dy = x1 - x0, y1 - y0
+    l = math.hypot(dx, dy) or 1.0
+    nx, ny = -dy / l, dx / l
+    return [(x0 + dx * t + nx * amp * math.sin(t * waves * 2 * math.pi),
+             y0 + dy * t + ny * amp * math.sin(t * waves * 2 * math.pi))
+            for t in (i / n for i in range(n + 1))]
+
+
+def _plus_badge(d, s, p, lw):
+    """Top-right accent plus shared by the new_* commands."""
+    plus_sign(d, s * 0.80, s * 0.20, s * 0.12, p.accent, lw)
+
+
+@icon("study_topology")
+def draw_study_topology(d, cell, p):
+    """Topology optimisation: the optimised load path (an accent truss) left
+    inside the dashed design space, loaded from above."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    x0, y0, x1, y1 = s * 0.08, s * 0.38, s * 0.92, s * 0.86
+    dash = s * 0.07
+    for (ax, ay, bx, by) in ((x0, y0, x1, y0), (x1, y0, x1, y1), (x1, y1, x0, y1), (x0, y1, x0, y0)):
+        l = math.hypot(bx - ax, by - ay)
+        k = 0.0
+        while k < l:
+            e = min(l, k + dash)
+            d.line([(ax + (bx - ax) * k / l, ay + (by - ay) * k / l),
+                    (ax + (bx - ax) * e / l, ay + (by - ay) * e / l)],
+                   fill=_rgba(p.stroke, 170), width=max(1, lw // 2))
+            k += dash * 1.9
+    # surviving material: chords + Warren diagonals, thick enough to read as solid
+    mw = int(lw * 1.5)
+    ty, by_ = y0 + lw * 1.6, y1 - lw * 1.6
+    lx, rx = x0 + lw * 1.6, x1 - lw * 1.6
+    xs = [lx + (rx - lx) * f for f in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    d.line([(lx, ty), (rx, ty)], fill=p.accent, width=mw)
+    d.line([(lx, by_), (rx, by_)], fill=p.accent, width=mw)
+    zig = [(xs[0], by_), (xs[1], ty), (xs[2], by_), (xs[3], ty), (xs[4], by_)]
+    d.line(zig, fill=p.accent, width=mw, joint="curve")
+    arrow(d, s * 0.50, s * 0.06, s * 0.50, y0 - lw * 0.5, p.accent2, lw)
+
+
+@icon("study_em")
+def draw_study_em(d, cell, p):
+    """Electromagnetics: an antenna mast radiating wavefronts to both sides."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, top = s * 0.50, s * 0.42
+    d.line([(cx, top), (cx, s * 0.86)], fill=p.stroke, width=lw)
+    d.line([(cx - s * 0.16, s * 0.86), (cx + s * 0.16, s * 0.86)], fill=p.stroke, width=lw)
+    d.line([(cx, s * 0.58), (cx - s * 0.12, s * 0.86)], fill=p.stroke, width=max(1, lw // 2))
+    d.line([(cx, s * 0.58), (cx + s * 0.12, s * 0.86)], fill=p.stroke, width=max(1, lw // 2))
+    filled_circle(d, cx, top, lw * 1.1, p.accent)
+    for r in (0.17, 0.32):
+        arc_segment(d, cx, top, s * r, 140, 220, p.accent, lw)
+        arc_segment(d, cx, top, s * r, 320, 40, p.accent, lw)
+
+
+@icon("study_buckling")
+def draw_study_buckling(d, cell, p):
+    """Buckling: a column between a fixed base and a compressive load, its
+    straight ghost and the bowed buckled mode shape (accent)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    by = s * 0.86
+    d.line([(s * 0.22, by), (s * 0.78, by)], fill=p.stroke, width=lw)
+    for xi in range(4):
+        x = s * (0.28 + xi * 0.15)
+        d.line([(x, by), (x - s * 0.07, by + s * 0.09)], fill=p.stroke, width=max(1, lw // 2))
+    ty = s * 0.30
+    d.line([(s * 0.50, ty), (s * 0.50, by)], fill=_rgba(p.stroke, 110), width=max(1, lw // 2))
+    pts = [(s * 0.50 + s * 0.20 * math.sin(math.pi * t), ty + (by - ty) * t)
+           for t in (i / 20 for i in range(21))]
+    polyline(d, pts, p.accent, lw)
+    d.line([(s * 0.38, ty), (s * 0.62, ty)], fill=p.stroke, width=lw)
+    arrow(d, s * 0.50, s * 0.06, s * 0.50, ty - lw * 0.6, p.accent2, lw)
+
+
+@icon("study_contact")
+def draw_study_contact(d, cell, p):
+    """Contact: a roller pressed onto a block, the contact patch in accent."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rectangle([s * 0.12, s * 0.62, s * 0.88, s * 0.86], fill=_rgba(p.stroke, 30),
+                outline=p.stroke, width=lw)
+    cx, cy, r = s * 0.50, s * 0.38, s * 0.24
+    circle(d, cx, cy, r, fill=_rgba(p.stroke, 30), outline=p.stroke, lw=lw)
+    filled_circle(d, cx, cy, lw * 0.9, p.stroke)
+    # flattened contact patch + pressure fan
+    d.ellipse([cx - s * 0.16, s * 0.58, cx + s * 0.16, s * 0.68], fill=p.accent)
+    for ang in (-35, 35):
+        a = math.radians(90 + ang)
+        d.line([(cx + math.cos(a) * s * 0.07, s * 0.68 + math.sin(a) * s * 0.02),
+                (cx + math.cos(a) * s * 0.20, s * 0.68 + math.sin(a) * s * 0.12)],
+               fill=p.accent, width=max(1, lw // 2))
+
+
+@icon("study_vibration")
+def draw_study_vibration(d, cell, p):
+    """Vibration / frequency response: a mass on a spring over a base, with
+    accent motion marks either side of the mass."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    by = s * 0.88
+    d.line([(s * 0.24, by), (s * 0.76, by)], fill=p.stroke, width=lw)
+    # spring zig-zag from the base up to the mass
+    top = s * 0.46
+    n = 6
+    pts = [(s * 0.50, by)]
+    for i in range(1, n):
+        y = by - (by - top) * i / n
+        pts.append((s * 0.50 + (s * 0.11 if i % 2 else -s * 0.11), y))
+    pts.append((s * 0.50, top))
+    polyline(d, pts, p.stroke, lw)
+    d.rectangle([s * 0.30, s * 0.16, s * 0.70, top], fill=p.accent)
+    for x, sgn in ((0.16, -1), (0.84, 1)):
+        for k in (0.0, 1.0):
+            xx = s * x + sgn * k * s * 0.07
+            d.line([(xx, s * 0.20), (xx, s * 0.42)], fill=_rgba(p.accent, 255 - int(k * 90)),
+                   width=max(1, lw // 2) if k else lw)
+
+
+@icon("study_thermal_fea")
+def draw_study_thermal_fea(d, cell, p):
+    """Thermal FEA (conduction in a solid): a meshed block heated from its base,
+    the hot elements accent, heat rising off the top."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    x0, y0, x1, y1 = s * 0.14, s * 0.42, s * 0.86, s * 0.86
+    ym = (y0 + y1) * 0.5
+    d.rectangle([x0, ym, x1, y1], fill=p.accent)
+    d.rectangle([x0, y0, x1, ym], fill=_rgba(p.accent, 70))
+    d.rectangle([x0, y0, x1, y1], outline=p.stroke, width=lw)
+    d.line([(x0, ym), (x1, ym)], fill=p.stroke, width=max(1, lw // 2))
+    for fx in (1 / 3, 2 / 3):
+        x = x0 + (x1 - x0) * fx
+        d.line([(x, y0), (x, y1)], fill=p.stroke, width=max(1, lw // 2))
+    for x in (0.32, 0.50, 0.68):
+        polyline(d, _wavy(s * x, s * 0.34, s * x, s * 0.08, s * 0.035, waves=1.0), p.stroke,
+                 max(1, int(lw * 0.75)))
+
+
+@icon("study_thermal_cfd")
+def draw_study_thermal_cfd(d, cell, p):
+    """Thermal CFD (conjugate heat transfer): streamlines carrying heat away
+    from a hot plate — the lowest, hot-washed streamline is accent."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rectangle([s * 0.26, s * 0.76, s * 0.74, s * 0.88], fill=p.accent)
+    for oy, col in ((0.20, p.stroke), (0.40, p.stroke), (0.60, p.accent)):
+        pts = [(s * (0.08 + i * 0.07), s * oy - s * 0.06 * math.exp(-((i - 6) / 2.6) ** 2)
+                * (1.0 if oy > 0.5 else 0.6)) for i in range(13)]
+        polyline(d, pts, col, lw)
+    arrow(d, s * 0.80, s * 0.60, s * 0.93, s * 0.60, p.accent, lw)
+
+
+def _piping_motif(d, ox, oy, k, p, lw):
+    """Pipe run through a 90-degree elbow with flanged ends, drawn in the box
+    (ox, oy, ox+k, oy+k). Shared by study_piping and new_network."""
+    bore = k * 0.20
+    pts = _elbow_pts(ox + k * 0.10, oy + k * 0.70, ox + k * 0.68, oy + k * 0.70,
+                     ox + k * 0.68, oy + k * 0.12, k * 0.20)
+    _pipe_path(d, pts, p, lw, bore)
+    fl = bore * 0.5 + lw * 1.2
+    d.line([(ox + k * 0.10, oy + k * 0.70 - fl), (ox + k * 0.10, oy + k * 0.70 + fl)],
+           fill=p.accent, width=lw * 2)
+    d.line([(ox + k * 0.68 - fl, oy + k * 0.12), (ox + k * 0.68 + fl, oy + k * 0.12)],
+           fill=p.accent, width=lw * 2)
+
+
+def _hydraulics_motif(d, ox, oy, k, p, lw):
+    """ISO pump feeding a double-acting cylinder, drawn in the box
+    (ox, oy, ox+k, oy+k). Shared by study_hydraulics and new_circuit."""
+    d.rectangle([ox + k * 0.10, oy + k * 0.12, ox + k * 0.64, oy + k * 0.40],
+                fill=_rgba(p.stroke, 30), outline=p.stroke, width=lw)
+    d.line([(ox + k * 0.42, oy + k * 0.12), (ox + k * 0.42, oy + k * 0.40)], fill=p.stroke, width=lw)
+    d.rectangle([ox + k * 0.64, oy + k * 0.22, ox + k * 0.92, oy + k * 0.30], fill=p.accent)
+    r = k * 0.20
+    cx, cy = ox + k * 0.28, oy + k * 0.74
+    d.line([(cx, cy - r), (cx, oy + k * 0.40)], fill=p.accent2, width=lw)
+    _pump_symbol(d, cx, cy, r, p, lw)
+
+
+@icon("study_piping")
+def draw_study_piping(d, cell, p):
+    """Piping: a pipe run turning through a 90-degree elbow, flanged ends."""
+    s = cell * SS
+    _piping_motif(d, 0.0, 0.0, s, p, stroke_width(cell))
+
+
+@icon("study_hydraulics")
+def draw_study_hydraulics(d, cell, p):
+    """Hydraulics: a pump (ISO symbol) feeding a double-acting cylinder."""
+    s = cell * SS
+    _hydraulics_motif(d, 0.0, s * 0.04, s, p, stroke_width(cell))
+
+
+@icon("load_heat")
+def draw_load_heat(d, cell, p):
+    """Heat load: wavy heat-flux arrows entering a face (cf. load_pressure's
+    straight arrows)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    sy = s * 0.80
+    d.line([(s * 0.12, sy), (s * 0.88, sy)], fill=p.stroke, width=lw * 2)
+    for x in (0.26, 0.50, 0.74):
+        pts = _wavy(s * x, s * 0.12, s * x, sy - lw * 2.2, s * 0.05, waves=1.25)
+        polyline(d, pts, p.accent, lw)
+        tip = (s * x, sy - lw * 1.0)
+        head = lw * 2.4
+        d.polygon([tip, (tip[0] - head * 0.75, tip[1] - head),
+                   (tip[0] + head * 0.75, tip[1] - head)], fill=p.accent)
+
+
+@icon("fluid")
+def draw_fluid(d, cell, p):
+    """Fluid (working-fluid properties): a droplet with a highlight."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy, r = s * 0.50, s * 0.62, s * 0.25
+    tip = (cx, s * 0.08)
+    # tangent points from the tip onto the round base
+    dist = cy - tip[1]
+    a = math.acos(r / dist)
+    pts = [tip]
+    a0 = -math.pi / 2 + a
+    a1 = -math.pi / 2 - a + 2 * math.pi
+    for i in range(33):
+        t = a0 + (a1 - a0) * i / 32
+        pts.append((cx + r * math.cos(t), cy + r * math.sin(t)))
+    d.polygon(pts, fill=_rgba(p.accent, 90))
+    d.line(pts + [pts[0], pts[1]], fill=p.accent, width=lw, joint="curve")
+    arc_segment(d, cx, cy, r * 0.62, 110, 170, _rgba((255, 255, 255), 210), lw)
+
+
+@icon("flow_bc")
+def draw_flow_bc(d, cell, p):
+    """Flow boundaries: a channel with the inlet arrow entering and the outlet
+    arrow leaving."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    for y in (0.26, 0.74):
+        d.line([(s * 0.30, s * y), (s * 0.70, s * y)], fill=p.stroke, width=lw)
+    d.line([(s * 0.30, s * 0.26), (s * 0.30, s * 0.74)], fill=_rgba(p.accent2, 150),
+           width=max(1, lw // 2))
+    d.line([(s * 0.70, s * 0.26), (s * 0.70, s * 0.74)], fill=_rgba(p.accent, 150),
+           width=max(1, lw // 2))
+    arrow(d, s * 0.04, s * 0.50, s * 0.42, s * 0.50, p.accent2, lw)
+    arrow(d, s * 0.58, s * 0.50, s * 0.96, s * 0.50, p.accent, lw)
+
+
+@icon("em_port")
+def draw_em_port(d, cell, p):
+    """EM excitation port: a coax end (outer ring, accent centre conductor) with
+    the incident wave arriving from the left."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy = s * 0.64, s * 0.50
+    circle(d, cx, cy, s * 0.26, fill=_rgba(p.stroke, 26), outline=p.stroke, lw=lw)
+    filled_circle(d, cx, cy, s * 0.09, p.accent)
+    polyline(d, _wavy(s * 0.04, cy, s * 0.30, cy, s * 0.06, waves=1.5), p.accent2, lw)
+    head = lw * 2.4
+    d.polygon([(s * 0.38, cy), (s * 0.38 - head, cy - head * 0.75),
+               (s * 0.38 - head, cy + head * 0.75)], fill=p.accent2)
+
+
+@icon("em_boundary")
+def draw_em_boundary(d, cell, p):
+    """EM boundary (radiation / PEC box): an accent dashed enclosure around the
+    radiating body."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    x0, y0, x1, y1 = s * 0.10, s * 0.10, s * 0.90, s * 0.90
+    seg = s * 0.13
+    for (ax, ay, bx, by) in ((x0, y0, x1, y0), (x1, y0, x1, y1), (x1, y1, x0, y1), (x0, y1, x0, y0)):
+        l = math.hypot(bx - ax, by - ay)
+        k = 0.0
+        while k < l:
+            e = min(l, k + seg)
+            d.line([(ax + (bx - ax) * k / l, ay + (by - ay) * k / l),
+                    (ax + (bx - ax) * e / l, ay + (by - ay) * e / l)], fill=p.accent, width=lw)
+            k += seg * 1.75
+    d.rectangle([s * 0.38, s * 0.38, s * 0.62, s * 0.62], fill=_rgba(p.stroke, 40),
+                outline=p.stroke, width=lw)
+    arc_segment(d, s * 0.50, s * 0.50, s * 0.24, 300, 60, p.stroke, max(1, lw // 2))
+    arc_segment(d, s * 0.50, s * 0.50, s * 0.24, 120, 240, p.stroke, max(1, lw // 2))
+
+
+@icon("freq_range")
+def draw_freq_range(d, cell, p):
+    """Frequency range: a chirp (rising frequency) between two band markers."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    x0, x1 = s * 0.20, s * 0.80
+    cy = s * 0.50
+    pts = []
+    n = 60
+    for i in range(n + 1):
+        t = i / n
+        ph = 2 * math.pi * (1.0 * t + 1.6 * t * t)
+        pts.append((x0 + (x1 - x0) * t, cy - s * 0.20 * math.sin(ph)))
+    polyline(d, pts, p.accent, lw)
+    for x in (s * 0.10, s * 0.90):
+        d.line([(x, s * 0.18), (x, s * 0.82)], fill=p.accent2, width=lw)
+    d.line([(s * 0.10, s * 0.86), (s * 0.90, s * 0.86)], fill=p.stroke, width=max(1, lw // 2))
+
+
+@icon("new_network")
+def draw_new_network(d, cell, p):
+    """New piping network: the study_piping elbow, reduced, with a plus."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _piping_motif(d, 0.0, s * 0.22, s * 0.78, p, lw)
+    _plus_badge(d, s, p, lw)
+
+
+@icon("new_circuit")
+def draw_new_circuit(d, cell, p):
+    """New hydraulic circuit: the study_hydraulics pump + cylinder, reduced,
+    with a plus."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _hydraulics_motif(d, 0.0, s * 0.24, s * 0.76, p, lw)
+    _plus_badge(d, s, p, lw)
+
+
+@icon("route_pipe")
+def draw_route_pipe(d, cell, p):
+    """Route pipe: a laid pipe ending at an elbow, its dashed centreline routed
+    on to the next waypoint (accent target)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    pts = _elbow_pts(s * 0.08, s * 0.76, s * 0.46, s * 0.76, s * 0.46, s * 0.46, s * 0.16)
+    _pipe_path(d, pts, p, lw, s * 0.18)
+    d.line([(s * 0.46, s * 0.46), (s * 0.46, s * 0.24)], fill=p.accent2, width=lw)
+    x = s * 0.46
+    while x < s * 0.74:
+        d.line([(x, s * 0.24), (min(s * 0.74, x + s * 0.08), s * 0.24)], fill=p.accent2, width=lw)
+        x += s * 0.14
+    circle(d, s * 0.84, s * 0.24, s * 0.08, fill=p.accent, outline=p.accent, lw=lw)
+
+
+@icon("size_actuator")
+def draw_size_actuator(d, cell, p):
+    """Size actuator: a hydraulic cylinder under a stroke-length dimension."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rectangle([s * 0.08, s * 0.46, s * 0.58, s * 0.78], fill=_rgba(p.stroke, 30),
+                outline=p.stroke, width=lw)
+    d.line([(s * 0.36, s * 0.46), (s * 0.36, s * 0.78)], fill=p.stroke, width=lw)
+    d.rectangle([s * 0.58, s * 0.58, s * 0.92, s * 0.66], fill=p.accent)
+    _size_arrow(d, s * 0.08, s * 0.92, s * 0.22, p, lw)
+
+
+@icon("size_pump")
+def draw_size_pump(d, cell, p):
+    """Size pump: the ISO pump symbol under a size dimension."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _pump_symbol(d, s * 0.50, s * 0.64, s * 0.24, p, lw)
+    _size_arrow(d, s * 0.12, s * 0.88, s * 0.16, p, lw)
+
+
+@icon("size_motor")
+def draw_size_motor(d, cell, p):
+    """Size hydraulic motor: the ISO motor symbol (triangle pointing in) under a
+    size dimension."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _pump_symbol(d, s * 0.50, s * 0.64, s * 0.24, p, lw, inward=True)
+    # output-shaft rotation arrow
+    arc_segment(d, s * 0.50, s * 0.64, s * 0.32, 30, 100, p.accent2, max(1, lw // 2))
+    _size_arrow(d, s * 0.12, s * 0.88, s * 0.16, p, lw)
+
+
+@icon("pump_drive")
+def draw_pump_drive(d, cell, p):
+    """Pump drive: an electric motor — finned housing on a foot, accent shaft."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rounded_rectangle([s * 0.10, s * 0.28, s * 0.66, s * 0.72], radius=int(s * 0.06),
+                        fill=_rgba(p.stroke, 30), outline=p.stroke, width=lw)
+    for x in (0.24, 0.36, 0.48):
+        d.line([(s * x, s * 0.36), (s * x, s * 0.64)], fill=p.stroke, width=max(1, lw // 2))
+    d.rectangle([s * 0.66, s * 0.38, s * 0.74, s * 0.62], fill=p.stroke)
+    d.rectangle([s * 0.74, s * 0.46, s * 0.94, s * 0.54], fill=p.accent)
+    d.line([(s * 0.18, s * 0.72), (s * 0.12, s * 0.84), (s * 0.64, s * 0.84), (s * 0.58, s * 0.72)],
+           fill=p.stroke, width=lw)
+    # lightning tick = electric
+    polyline(d, [(s * 0.40, s * 0.06), (s * 0.32, s * 0.18), (s * 0.44, s * 0.18),
+                 (s * 0.36, s * 0.28)], p.accent, max(1, lw // 2) + lw // 4)
+
+
+@icon("vessel")
+def draw_vessel(d, cell, p):
+    """Pressure vessel: a vertical shell with dished heads, top nozzle, legs."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    x0, x1 = s * 0.30, s * 0.70
+    yt, yb = s * 0.26, s * 0.70
+    hh = s * 0.10
+    body = []
+    for i in range(17):  # bottom head (semi-ellipse)
+        t = math.pi * i / 16
+        body.append(((x0 + x1) / 2 - (x1 - x0) / 2 * math.cos(t), yb + hh * math.sin(t)))
+    for i in range(17):  # top head
+        t = math.pi * i / 16
+        body.append(((x0 + x1) / 2 + (x1 - x0) / 2 * math.cos(t), yt - hh * math.sin(t)))
+    d.polygon(body, fill=_rgba(p.stroke, 30))
+    d.line(body + [body[0]], fill=p.stroke, width=lw, joint="curve")
+    d.line([(x0, s * 0.48), (x1, s * 0.48)], fill=_rgba(p.stroke, 150), width=max(1, lw // 2))
+    # nozzle
+    d.rectangle([s * 0.45, s * 0.06, s * 0.55, yt - hh + lw * 0.5], fill=p.accent)
+    d.line([(s * 0.40, s * 0.07), (s * 0.60, s * 0.07)], fill=p.accent, width=lw)
+    # legs
+    for x in (0.36, 0.64):
+        d.line([(s * x, yb + hh * 0.6), (s * x, s * 0.92)], fill=p.stroke, width=lw)
+
+
+@icon("duct")
+def draw_duct(d, cell, p):
+    """Duct: a rectangular duct section receding from its accent mouth, the
+    airflow arrow running along it."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    fx0, fy0, fx1, fy1 = s * 0.08, s * 0.46, s * 0.50, s * 0.88   # mouth (front)
+    ox, oy = s * 0.40, -s * 0.34                                   # recede up-right
+    tl, tr, br = (fx0 + ox, fy0 + oy), (fx1 + ox, fy0 + oy), (fx1 + ox, fy1 + oy)
+    d.polygon([(fx0, fy0), tl, tr, (fx1, fy0)], fill=_rgba(p.stroke, 40))
+    d.polygon([(fx1, fy0), tr, br, (fx1, fy1)], fill=_rgba(p.stroke, 22))
+    d.line([(fx0, fy0), tl, tr, br, (fx1, fy1)], fill=p.stroke, width=lw)
+    d.line([tr, (fx1, fy0)], fill=p.stroke, width=lw)
+    d.rectangle([fx0, fy0, fx1, fy1], fill=_rgba(p.accent, 50), outline=p.accent, width=lw)
+    cx, cy = (fx0 + fx1) * 0.5, (fy0 + fy1) * 0.5
+    arrow(d, cx, cy, cx + ox * 0.62, cy + oy * 0.62, p.accent2, lw)
+
+
+@icon("spec_check")
+def draw_spec_check(d, cell, p):
+    """Spec / code check: a standard's page (text rules) with an accent check
+    badge — the design checked against the code."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    x0, y0, x1, y1 = s * 0.12, s * 0.06, s * 0.68, s * 0.86
+    d.rectangle([x0, y0, x1, y1], fill=_rgba(p.stroke, 22), outline=p.stroke, width=lw)
+    rlw = max(1, lw // 2)
+    for y, xe in ((0.22, 0.54), (0.36, 0.54), (0.50, 0.42)):
+        d.line([(s * 0.24, s * y), (s * xe, s * y)], fill=p.stroke, width=rlw)
+    cx, cy, r = s * 0.70, s * 0.70, s * 0.22
+    filled_circle(d, cx, cy, r + lw * 0.6, (0, 0, 0, 0))
+    filled_circle(d, cx, cy, r, p.accent)
+    check_mark(d, cx, cy + s * 0.01, r * 0.62, (255, 255, 255), lw)
+
+
+@icon("schematic")
+def draw_schematic(d, cell, p):
+    """Schematic view: a sheet carrying a pump wired to a valve block."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _sheet_rect(d, s, p, lw)
+    _pump_symbol(d, s * 0.34, s * 0.64, s * 0.11, p, max(1, lw // 2) + lw // 4)
+    d.rectangle([s * 0.52, s * 0.28, s * 0.72, s * 0.44], outline=p.accent, width=max(1, lw // 2) + lw // 4)
+    arrow(d, s * 0.55, s * 0.40, s * 0.69, s * 0.32, p.accent, max(1, lw // 2))
+    polyline(d, [(s * 0.34, s * 0.53), (s * 0.34, s * 0.36), (s * 0.52, s * 0.36)], p.stroke,
+             max(1, lw // 2) + lw // 4)
+
+
+@icon("plots_view")
+def draw_plots_view(d, cell, p):
+    """Plots: axes carrying two response curves (cf. `results` bar chart)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    ox, oy = s * 0.14, s * 0.84
+    d.line([(ox, s * 0.12), (ox, oy), (s * 0.90, oy)], fill=p.stroke, width=lw)
+    a = [(ox + s * 0.04 + s * 0.72 * t,
+          oy - s * 0.10 - s * 0.52 * (1 - math.exp(-4 * t))) for t in (i / 24 for i in range(25))]
+    b = [(ox + s * 0.04 + s * 0.72 * t,
+          oy - s * 0.18 - s * 0.16 * math.sin(t * 2.4 * math.pi)) for t in (i / 24 for i in range(25))]
+    polyline(d, b, _rgba(p.stroke, 200), max(1, lw // 2) + lw // 4)
+    polyline(d, a, p.accent, lw)
+
+
+def _media_tri(d, s, p, lw, x0, x1, cy, h, right=True):
+    """Filled accent transport triangle with a stroke outline."""
+    tip, base = (x1, x0) if right else (x0, x1)
+    pts = [(base, cy - h), (tip, cy), (base, cy + h)]
+    d.polygon(pts, fill=p.accent)
+    polyline(d, pts + [pts[0]], p.stroke, max(1, lw // 2))
+
+
+def _media_bar(d, s, p, lw, x, cy, h):
+    d.line([(x, cy - h), (x, cy + h)], fill=p.stroke, width=lw + lw // 2)
+
+
+@icon("media_first")
+def draw_media_first(d, cell, p):
+    """Go to first frame: |◀."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _media_bar(d, s, p, lw, s * 0.24, s * 0.5, s * 0.28)
+    _media_tri(d, s, p, lw, s * 0.34, s * 0.78, s * 0.5, s * 0.28, right=False)
+
+
+@icon("media_prev")
+def draw_media_prev(d, cell, p):
+    """Step back one frame: ◀|."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _media_tri(d, s, p, lw, s * 0.20, s * 0.64, s * 0.5, s * 0.28, right=False)
+    _media_bar(d, s, p, lw, s * 0.76, s * 0.5, s * 0.28)
+
+
+@icon("media_play")
+def draw_media_play(d, cell, p):
+    """Play: ▶."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _media_tri(d, s, p, lw, s * 0.28, s * 0.80, s * 0.5, s * 0.32)
+
+
+@icon("media_pause")
+def draw_media_pause(d, cell, p):
+    """Pause: ‖ (two accent bars)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    for x0 in (0.26, 0.58):
+        d.rectangle([s * x0, s * 0.20, s * (x0 + 0.16), s * 0.80], fill=p.accent,
+                    outline=p.stroke, width=max(1, lw // 2))
+
+
+@icon("media_next")
+def draw_media_next(d, cell, p):
+    """Step forward one frame: |▶."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _media_bar(d, s, p, lw, s * 0.24, s * 0.5, s * 0.28)
+    _media_tri(d, s, p, lw, s * 0.36, s * 0.80, s * 0.5, s * 0.28)
+
+
+@icon("media_last")
+def draw_media_last(d, cell, p):
+    """Go to last frame: ▶|."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    _media_tri(d, s, p, lw, s * 0.22, s * 0.66, s * 0.5, s * 0.28)
+    _media_bar(d, s, p, lw, s * 0.76, s * 0.5, s * 0.28)
 
 
 # ---------------------------------------------------------------------------

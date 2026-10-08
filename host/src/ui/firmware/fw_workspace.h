@@ -8,6 +8,9 @@
 // worker call in a draw path (known GL-thread freeze bug), and no per-frame focus grabs.
 #pragma once
 
+#include <string>
+#include <nlohmann/json_fwd.hpp>
+
 struct AppState;
 
 namespace ui {
@@ -24,10 +27,18 @@ void drawFirmwareWorkspace(AppState& st);
 bool firmwareTabVisible(AppState& st);
 
 namespace firmware {
-// CHUDWARE_SHOT=firmware fixture: seeds a canned project + build console + emulation UART
-// log + GPIO trace so the headless scenario shot exercises the full workspace rendering
-// path without requiring arm-none-eabi-gcc / Renode on the box.
+// CHUDWARE_SHOT=firmware fixture: seeds a canned project/build console, native
+// editable GPIO/UART scenario, UART log and GPIO trace, and opens Emulate.
+// This exercises setup rendering without requiring compiler/emulator tooling.
 void seedFirmwareShotFixture();
+
+// Same canonical scenario and draft consumed by Emulate's fw_sim_run; useful for
+// observable gesture smoke checks without relying on a particular emulator install.
+nlohmann::json firmwareScenarioDefinition();
+std::string firmwareScenarioRawText();
+bool firmwareScenarioDraftValid();
+bool configureFirmwareScenario(const nlohmann::json& definition, std::string& error);
+void openFirmwareEmulationSetup();
 }  // namespace firmware
 
 }  // namespace ui

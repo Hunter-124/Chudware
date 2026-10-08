@@ -19,6 +19,7 @@
 
 #include "core/app_state.h"
 #include "ui_theme.h"    // palette / uiScale / adaptivePanel / glassPanel / glassRowBackground
+#include "ui/layout.h"   // bounded placement, including live viewport / DPI changes
 #include "ui/metrics.h"  // cpMenu* / cpChat* rhythm tokens
 #include "ui/copilot/copilot_internal.h"  // userFacingRpcError / kAvailableAfterRun / aiTurnActive
 
@@ -489,15 +490,17 @@ void drawComposer(AppState& st, AuthoringUi& A) {
         ImGui::SetKeyboardFocusHere();
         A.focusInput = false;
     }
+    const float contentW = ImGui::GetContentRegionAvail().x;
+    const bool inlineSend = contentW >= btnW + gap + ImGui::GetTextLineHeight() * 6.0f;
     ImGui::InputTextMultiline("##rules_auth_in", A.input, sizeof(A.input),
-                              ImVec2(ImGui::GetContentRegionAvail().x - btnW - gap, boxH));
+                              ImVec2(inlineSend ? contentW - btnW - gap : contentW, boxH));
     // Ctrl+Enter sends (a bare Enter has to stay a newline: two of the steps are multi-line).
     const bool ctrlEnter = ImGui::IsItemFocused() && ImGui::GetIO().KeyCtrl &&
                            ImGui::IsKeyPressed(ImGuiKey_Enter, false);
-    ImGui::SameLine(0.0f, gap);
+    if (inlineSend) ImGui::SameLine(0.0f, gap);
     const bool canSend = !trim(std::string(A.input)).empty();
     ImGui::BeginDisabled(!canSend);
-    const bool clicked = ImGui::Button("Send", ImVec2(btnW, boxH));
+    const bool clicked = ImGui::Button("Send", ImVec2(btnW, inlineSend ? boxH : 0.0f));
     ImGui::EndDisabled();
     if ((clicked || (ctrlEnter && canSend))) send(A);
 
@@ -510,7 +513,7 @@ void drawComposer(AppState& st, AuthoringUi& A) {
     (void)st;
 }
 
-void drawPreviewPane(AppState& st, AuthoringUi& A) {
+void drawPreviewPane(AppState& st, AuthoringUi& A, float boxH) {
     ImGui::PushStyleColor(ImGuiCol_Text, v4(ui::palette.textDim));
     ImGui::TextWrapped("Will write  %s", A.previewPath.c_str());
     ImGui::PopStyleColor();
@@ -521,7 +524,6 @@ void drawPreviewPane(AppState& st, AuthoringUi& A) {
     }
     ImGui::Dummy(ImVec2(0.0f, ui::metrics::cpMenuLabelGap()));
 
-    const float boxH = ImGui::GetTextLineHeightWithSpacing() * 7.0f;
     ImGui::InputTextMultiline("##rules_auth_preview", A.previewText.data(), A.previewText.size(),
                               ImVec2(-1.0f, boxH), ImGuiInputTextFlags_ReadOnly);
 
@@ -533,6 +535,7 @@ void drawPreviewPane(AppState& st, AuthoringUi& A) {
     }
 
     const float gap = ui::metrics::cpMenuRowGap();
+    const float actionRight = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
     if (A.donePath.empty()) {
         // Saving shares the service a running agent run holds: say when it opens instead of
         // firing a call that is refused.
@@ -541,7 +544,8 @@ void drawPreviewPane(AppState& st, AuthoringUi& A) {
                                    runBusy ? kAvailableAfterRun : nullptr,
                                    ImVec2(ui::metrics::px(96.0f), 0.0f)))
             create(st, A);
-        ImGui::SameLine(0.0f, gap);
+        if (ImGui::GetItemRectMax().x + gap + ui::metrics::px(72.0f) <= actionRight)
+            ImGui::SameLine(0.0f, gap);
         if (ImGui::Button("Back", ImVec2(ui::metrics::px(72.0f), 0.0f))) {
             A.preview = false;
             A.error.clear();
@@ -551,7 +555,9 @@ void drawPreviewPane(AppState& st, AuthoringUi& A) {
             A.focusInput = true;
         }
         if (A.saving) {
-            ImGui::SameLine(0.0f, gap);
+            if (ImGui::GetItemRectMax().x + gap +
+                ImGui::CalcTextSize("saving\xe2\x80\xa6").x <= actionRight)
+                ImGui::SameLine(0.0f, gap);
             ImGui::PushStyleColor(ImGuiCol_Text, v4(ui::palette.textDim));
             ImGui::TextUnformatted("saving\xe2\x80\xa6");
             ImGui::PopStyleColor();
@@ -575,11 +581,13 @@ void drawRulesAuthoringPopup(AppState& st, bool* open) {
     }
     if (!A.opened) return;
 
-    const float S = ui::uiScale;
-    ImGui::SetNextWindowSize(ImVec2(460.0f * S, 470.0f * S), ImGuiCond_Appearing);
+    setNextCommandDialogPlacement(kPopupId,
+        ImVec2(ui::metrics::px(460.0f), ui::metrics::px(470.0f)),
+        ImVec2(ui::metrics::px(320.0f), ui::metrics::px(240.0f)));
     if (!ImGui::BeginPopupModal(kPopupId, nullptr,
                                 ImGuiWindowFlags_NoSavedSettings |
-                                    ImGuiWindowFlags_NoTitleBar)) {
+                                    ImGuiWindowFlags_NoTitleBar |
+                                    ImGuiWindowFlags_NoScrollbar)) {
         // Dismissed by Esc / click-away.
         A.opened = false;
         *open = false;
@@ -610,16 +618,27 @@ void drawRulesAuthoringPopup(AppState& st, bool* open) {
         }
     }
     ImGui::Dummy(ImVec2(0.0f, ui::metrics::cpMenuLabelGap()));
+
+    // Keep the close row fixed; all authoring content can scroll when the visible band is too
+    // short for wrapped hints, errors or high-DPI controls. Symmetric padding keeps widgets out
+    // of the body's pill-scrollbar lane without changing their available width between frames.
+    const float lane = ui::metrics::px(ui::kChatScrollbarLane);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(lane, ui::metrics::cpMenuRowPadY()));
+    ImGui::BeginChild("##rules_auth_body",
+                      ImVec2(0.0f, std::max(1.0f, ImGui::GetContentRegionAvail().y)),
+                      ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
+    const float bodyH = ImGui::GetContentRegionAvail().y;
     drawKindTabs(A);
     ImGui::Dummy(ImVec2(0.0f, ui::metrics::cpMenuHeadGap()));
 
     // ---- transcript ----
-    // Reserve the bottom band for the composer / preview so the scrolling log takes the rest.
-    const float bandH = A.preview ? ImGui::GetTextLineHeightWithSpacing() * 12.0f
-                                  : ImGui::GetTextLineHeight() * 5.5f +
-                                        ImGui::GetFrameHeightWithSpacing();
-    const float logH = std::max(ImGui::GetContentRegionAvail().y - bandH,
-                                ImGui::GetTextLineHeightWithSpacing() * 3.0f);
+    // Transcript and preview share the visible height instead of reserving a fixed bottom band.
+    // Their minimums remain readable; any unavoidable overflow belongs to the scrolling body,
+    // never to the popup itself (which would scroll the close button out of reach).
+    const float lineH = ImGui::GetTextLineHeightWithSpacing();
+    const float logH = std::clamp(bodyH * 0.35f, lineH * 3.0f, lineH * 8.0f);
+    const float previewH = std::clamp(bodyH * 0.30f, lineH * 3.0f, lineH * 7.0f);
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::cpMenuRowPadY()));
@@ -654,9 +673,13 @@ void drawRulesAuthoringPopup(AppState& st, bool* open) {
 
     // ---- composer or preview ----
     if (A.preview)
-        drawPreviewPane(st, A);
+        drawPreviewPane(st, A, previewH);
     else
         drawComposer(st, A);
+
+    drawWindowPillScrollbarV(surf, ui::kChatScrollbar);
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
 
     ImGui::EndPopup();
 }

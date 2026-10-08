@@ -97,8 +97,8 @@ bool wellExists(const nlohmann::json &study, const std::string &pointer);
 int toggleFace(nlohmann::json &study, const std::string &pointer,
                const nlohmann::json &selector, std::uint32_t body,
                std::uint32_t topo, std::size_t *countAfter = nullptr);
-// Append selectors (de-duplicated by _pick identity). Returns how many were
-// added.
+// Append selectors (de-duplicated by _pick identity, or canonical selector
+// when either side lacks viewport identity). Returns how many were added.
 std::size_t appendFaces(nlohmann::json &study, const std::string &pointer,
                         const std::vector<nlohmann::json> &selectors);
 
@@ -151,6 +151,15 @@ std::vector<std::string> requiredMaterialKeys(const std::string &physics);
 // preparation stays authoritative.
 std::vector<Issue> validateBoundaries(const nlohmann::json &study,
                                       const MaterialLookup &lookup);
+// Transactional canonical definition edit. Keeps record identity/history and
+// omitted unknown or inactive-physics sections. Checks native field types,
+// capabilities and boundary ranges before changing `study`; error names the
+// rejected parameter. Geometry resolution/buildRunEnvelope remain run gates.
+bool applyStudyDefinition(nlohmann::json &study,
+                          const nlohmann::json &definition,
+                          const Capabilities &caps,
+                          const MaterialLookup &lookup, std::string &error);
+
 
 // ---- run envelope
 // --------------------------------------------------------------------------------
@@ -189,12 +198,25 @@ nlohmann::json compactResult(const nlohmann::json &result);
 
 // ---- views
 // -------------------------------------------------------------------------------------
+// Numeric drafts and parse errors live in the kit field store (kit_form.h).
+// This per-study view carries document-safe face gestures, the armed well,
+// the load case new loads land in and the one-shot scroll focus.
 struct BcView {
+  // Integration owner stamps the active document before drawing. Empty IDs
+  // never accept or publish geometry payloads.
+  std::string docId;
   std::string armedPointer; // faces array receiving viewport picks ("" none)
-  std::string editingId, editText; // the one active numeric text field
-  std::map<std::string, std::string>
-      fieldErrors;   // parse errors of uncommitted input
-  int loadCase = -1; // selected load case in the editor (-1 = shared)
+  int loadCase = -1; // load case last edited in the editor (-1 = shared)
+  // One-shot scroll focus (ribbon commands, "Fix" actions): a JSON pointer of
+  // an entry, a value inside one ("/loads/0/faces", "/loads/0/vec") or a list
+  // ("/fixtures"). The next editor draw that shows the deepest matching entry
+  // card (or the list's section) scrolls it into view, then clears it; a
+  // pointer the drawn section does not show is cleared unconsumed. Arming a
+  // well from outside the editor (armedPointer changed between draws) focuses
+  // it the same way.
+  std::string focusPointer;
+  std::string seenArmed; // editor bookkeeping: armedPointer at the last draw
+  int focusFrames = 0;   // editor bookkeeping: frames the focus has been held
 };
 
 struct BcResult {
@@ -204,8 +226,11 @@ struct BcResult {
 };
 
 enum class BcSection { Boundaries, Regions, Material };
-// Draws the section editor for the study's physics. `lockedReason` (non-null)
-// renders it read-only (a run owns the study).
+// Draws the section editor for the study's physics. Set view.docId to the
+// active document first: every active well accepts additive face copies and
+// picked face chips are draggable. `lockedReason` (non-null) renders it
+// read-only (a run owns the study). Numeric controls and region boxes remain
+// canonical inputs; unknown fields and other physics sections are retained.
 BcResult drawBoundaryEditor(
     AppState &st, nlohmann::json &study, BcSection section, BcView &view,
     const MaterialLookup &lookup,

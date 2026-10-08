@@ -547,6 +547,16 @@ bool DocMirror::adoptOpenResponse(const nlohmann::json& res, std::string& err) {
         lastOpenedAicm_ = jstr(res["tess"], "aicm_path");
     lastOpenedVolume_ = (res.contains("volume") && res["volume"].is_number())
                             ? res["volume"].get<double>() : 1.0;
+    // How the engine served the open: saved build cache vs. full rebuild, and whether its
+    // session is already warm (applyOpenedDoc then skips any follow-up activation).
+    {
+        const auto hit = res.find("cache_hit");
+        lastOpenedCacheReported_ = hit != res.end() && hit->is_boolean();
+        lastOpenedCacheHit_ = lastOpenedCacheReported_ && hit->get<bool>();
+        const auto warm = res.find("warm");
+        lastOpenedWarm_ = warm != res.end() && warm->is_boolean() && warm->get<bool>();
+        lastOpenedCacheMissReason_ = jstr(res, "cache_miss_reason");
+    }
     // W12+ — stash any restored drawings so the open caller can re-create their Drawing tabs.
     if (res.contains("drawings") && res["drawings"].is_array())
         lastOpenedDrawings_ = res["drawings"];
@@ -562,7 +572,8 @@ bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err,
     // only when asSolid is set do we add the optional engine flag that sews a mesh import into a solid.
     nlohmann::json params = {{"path", path}};
     if (asSolid) params["as_solid"] = true;
-    if (!w.call("doc_open", params, res, err)) return false;
+    // doc_open runs in hostd's long tier: a cache-miss rebuild may legitimately take minutes.
+    if (!w.call("doc_open", params, res, err, kLongEngineCallTimeoutMs)) return false;
     return adoptOpenResponse(res, err);
 }
 
@@ -576,7 +587,8 @@ bool DocMirror::activate(WorkerClient& w, const std::string& docId, std::string&
     // warm — it is the one cheap call that hands us a fresh mesh path for an arbitrary
     // already-open doc, so the viewport can refresh on switch. (doc_tree has no tess block;
     // doc_rebuild is the forced-recompile variant this replaced.) Never bumps the revision.
-    if (!w.call("doc_activate", {{"doc_id", docId}}, res, err, 60000)) return false;
+    if (!w.call("doc_activate", {{"doc_id", docId}}, res, err, kLongEngineCallTimeoutMs))
+        return false;
     if (res.contains("code")) { err = jstr(res, "message"); return false; }
     docId_ = docId;
     revision_ = jint(res, "revision");

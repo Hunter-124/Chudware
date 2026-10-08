@@ -23,15 +23,17 @@
 //      the matrix does not list as supported.
 //   2. Settings. Each frame the setup form is visible:
 //          bool commit = drawTopologySettings(st, study["topology"], caps,
-//          settingsView, locked);
+//          settingsView, locked, groups);
+//      `groups` (SettingsGroup bits) picks the sections: kGroupsSolver on the
+//      Study page, kGroupsManufacturing on the Regions/Manufacturing page.
 //      `topology` is edited IN PLACE. Only `method`, `physics`, `objective` and
 //      the keys of the scalar table (scalarKeys()) are ever written or erased;
 //      every other key — agent-authored, prior results, future fields — is
 //      preserved untouched. A field cleared to empty ERASES its key (the solver
 //      then applies its own documented default); nothing is silently defaulted.
-//      Returns true exactly once per committed edit (text field deactivated
-//      with a changed value, combo pick, toggle, Remove) — persist the study
-//      then. Keystrokes in an active field are not committed. `locked` (nullptr
+//      Returns true exactly once per committed edit (field committed on
+//      deactivation with a changed value, combo pick, toggle, Remove) — persist
+//      the study then. Keystrokes in an active field are not committed. `locked` (nullptr
 //      = editable) renders the form read-only with that reason, e.g. while a
 //      run owns the study.
 //   3. Run gating. Before starting a run call validateTopology(topology, caps)
@@ -102,7 +104,7 @@
 //   { run_id:str, label?:str, started_utc?:unix seconds, settings:{topology
 //   snapshot used},
 //     result:{RESULT JSON} }
-#include <map>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -161,6 +163,13 @@ std::string physicsLabel(const std::string &id,
                          const Capabilities *caps = nullptr);
 std::string objectiveLabel(const std::string &objective,
                            const std::string &physics);
+// Result vocabulary for users: a termination token ("max_iterations" ->
+// "Iteration limit"), a solver formulation string ("mma(svanberg1987; ...)" ->
+// "Method of moving asymptotes (MMA)") and a convergence criterion formula
+// in words ("" when the format is unknown). Raw text belongs in a tooltip.
+std::string terminationLabel(const std::string &termination);
+std::string formulationLabel(const std::string &formulation);
+std::string criterionText(const std::string &criterion);
 // Every scalar key this TU owns (written/erased by the editor), excluding
 // method/physics/objective.
 const std::vector<std::string> &scalarKeys();
@@ -171,7 +180,11 @@ enum class Severity { Blocking, Warning };
 struct Issue {
   std::string key; // offending key; empty for whole-setup issues
   Severity severity = Severity::Blocking;
-  std::string message; // user-facing
+  std::string message; // user-facing (names its entry: footer, run blocker)
+  // Short form for the issue line under the field INSIDE its entry's card,
+  // where the card title already names the entry ("Needs a force vector.").
+  // Empty = use `message`.
+  std::string fieldMessage;
 };
 
 // Validates `topology` against the contract ranges and the capability matrix.
@@ -272,26 +285,50 @@ std::vector<MetricDelta> compareRuns(const nlohmann::json &baselineRun,
 // ---- views
 // -----------------------------------------------------------------------------------------
 struct SettingsView {
-  std::string editingKey, editText; // the one active text field
-  std::map<std::string, std::string>
-      fieldErrors; // parse errors of uncommitted input
-  double direction[3] = {0.0, 0.0, 0.0};
-  bool directionEditing = false,
-       directionDirty = false; // build-direction triple in edit
-  std::string switchNote;      // last method/physics switch consequence
-  // One-shot: the next fully drawn form scrolls its manufacturing groups
-  // (symmetry, extrusion, additive) to the top of the caller's scrolling child,
-  // then clears.
+  // Build direction: "Custom" was chosen, so the X/Y/Z cells stay visible even
+  // while the stored vector equals a preset (or nothing has been typed yet).
+  bool customDirection = false;
+  std::string switchNote; // last method/physics switch consequence
+  // One-shot: the next draw that includes the manufacturing groups (symmetry,
+  // extrusion, additive) scrolls them to the top of the caller's scrolling
+  // child, then clears.
   bool focusManufacturing = false;
+  // Disclosure of the collapsed "Formulation" card under Problem (the solver's
+  // formulation and validity text; collapsed so Objective stays above the fold).
+  bool formulationOpen = false;
+};
+
+// Which parts of the settings form drawTopologySettings draws. The Study page
+// draws the solver groups; the Regions/Manufacturing page draws only the
+// manufacturing groups (no second Problem block).
+enum SettingsGroup : unsigned {
+  kGroupProblem = 1u << 0,     // physics, method, objective (+ switch note)
+  kGroupGoal = 1u << 1,        // volume budget
+  kGroupLimits = 1u << 2,      // response limits
+  kGroupConvergence = 1u << 3, // iterations, tolerance, move limit
+  kGroupFilter = 1u << 4,      // filter and projection
+  kGroupMethod = 1u << 5,      // method-specific parameters
+  kGroupSymmetry = 1u << 6,    // symmetry, extrusion, passive skin depths
+  kGroupAdditive = 1u << 7,    // additive manufacturing
+  kGroupsSolver = kGroupProblem | kGroupGoal | kGroupLimits |
+                  kGroupConvergence | kGroupFilter | kGroupMethod,
+  kGroupsManufacturing = kGroupSymmetry | kGroupAdditive,
+  kGroupsAll = kGroupsSolver | kGroupsManufacturing,
 };
 
 // Run ids: a record's run_id, or "#<index>" when the record carries none.
 struct ResultsView {
   std::string selectedRunId, baselineRunId, plotSeries;
-  // One-shot: the next draw that shows "Compare runs" scrolls it to the top of
-  // the caller's scrolling child, then clears (cleared too when fewer than two
-  // runs exist).
+  // The ribbon's Compare command shows the Compare view (baseline vs selected
+  // run) INSTEAD of the results; with fewer than two runs it is an empty state
+  // that says so. Cleared by the owner on any other navigation.
+  bool compareMode = false;
+  // One-shot: the next draw of the Compare view scrolls to its top, then clears.
   bool focusCompare = false;
+  // Disclosure of the collapsed detail cards (run details, setup snapshot,
+  // mesh quality, provenance).
+  bool detailsOpen = false, setupOpen = false, meshOpen = false,
+       provenanceOpen = false;
 };
 
 struct ResultsAction {
@@ -300,6 +337,7 @@ struct ResultsAction {
     ShowRun,        // display runId's density overlay / fields in the viewport
     ExportArtifact, // export runs[runId].result.artifacts[artifactKey] (owner
                     // picks path)
+    ContinueInCad,  // import the validated surface into a new editable solid
     ApplyRunSettings, // applyRunSettings(study.topology, run.settings), then
                       // persist
   };
@@ -309,11 +347,25 @@ struct ResultsAction {
 
 // ---- drawing (GUI thread; draws into the caller's current window/child)
 // ---------------------
+// `groups` (SettingsGroup bits) selects the sections drawn; the locked banner
+// and whole-setup issues are drawn with the Problem group.
 bool drawTopologySettings(AppState &st, nlohmann::json &topology,
                           const Capabilities &caps, SettingsView &view,
-                          const char *lockedReason = nullptr);
-ResultsAction drawTopologyResults(AppState &st, const nlohmann::json &runs,
-                                  const Capabilities &caps, ResultsView &view);
+                          const char *lockedReason = nullptr,
+                          unsigned groups = kGroupsAll);
+// Results order (standard §5): outcome card, key metrics, then the caller's
+// `displayControls` (viewport field selector; may be empty), the runs list
+// (+ "Compare runs" with two or more), then the details (constraints, history,
+// manufacturing, export, collapsed run details / setup / mesh / provenance).
+// With view.compareMode and >= 2 runs it draws ONLY the Compare view.
+ResultsAction
+drawTopologyResults(AppState &st, const nlohmann::json &runs,
+                    const Capabilities &caps, ResultsView &view,
+                    const std::function<void()> &displayControls = {});
+// X/Y/Z kit checkboxes on one frame-height row: the value of a kit field
+// (between kit::fieldBegin and kit::fieldEnd). Symmetry axes and fixture DOFs
+// share this one control. `tips` (3 entries) may be null. True when toggled.
+bool axisToggles(bool on[3], const char *const *tips = nullptr);
 
 } // namespace topology
 } // namespace ui

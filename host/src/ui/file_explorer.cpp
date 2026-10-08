@@ -1,4 +1,4 @@
-// Explorer: working-project PLM changes and a browsable CAD/ECAD file tree.
+// Explorer: working-project PLM changes, workspace files and separate recents.
 // Vault status/checkpoints are async; filesystem browsing uses FsBackend
 // snapshots. Explicit revision-named sibling files group only in the view:
 // every original path remains available for open, rename, copy and delete.
@@ -24,6 +24,7 @@
 #include "feature_tree.h"   // featureTreeOpenPath / featureTreeActivePath
 #include "icons.h"          // getIcon / IconUV
 #include "layout.h"         // kLeftPaneExplorer
+#include "metrics.h"
 
 #include "../core/app_state.h"
 #include "../core/fs_backend.h"
@@ -90,8 +91,8 @@ static std::string s_renameId;         // path being inline-renamed ("" = none)
 static char        s_renameBuf[260] = {0};
 static bool        s_renameFocus = false;
 static std::string s_pendingDelete;    // path queued for the delete-confirm modal ("" = none)
-static std::string s_clipboardPath;    // Explorer copy/paste stash (a file path)
-static std::string s_pendingNewFolder; // a just-created folder to auto-enter inline-rename next frame
+static std::string s_clipboardPath;    // Explorer copy/paste stash (a file or folder path)
+static std::string s_pendingNewFolder; // reveal intent, retained until the inline rename is visible
 // UI caches hold filtered/sorted rows; backend snapshots own refresh scheduling.
 // Shared ownership keeps a tree walk valid when a child mutation invalidates the
 // cache while its parent's rows are still being iterated.
@@ -105,7 +106,7 @@ struct DirListCache {
     chudware::FsReadState state = chudware::FsReadState::Loading;
     std::string error;
     std::vector<std::string> dirs;   // full paths, name-sorted (case-insensitive)
-    std::vector<std::string> files;  // full paths, mtime-desc (unknown mtime = oldest)
+    std::vector<std::string> files;  // full paths, name-sorted (case-insensitive)
     std::vector<int> fileGroup;  // -1 for ungrouped; otherwise index into legacyGroups
     std::vector<LegacyFileGroup> legacyGroups;
 };
@@ -277,12 +278,12 @@ static void itemPathTooltip(const std::string& name, const std::string& fullPath
 
 // TreeNodeEx label for a row about to be submitted at the cursor: the name elided with "…" to
 // the width left after the arrow/icon slot, so a long filename never runs under the pane edge
-// (itemPathTooltip carries the full name). A fixed "##row" id keeps the node stable as the pane
-// resizes; callers PushID the path/index first.
+// (itemPathTooltip carries the full name). A fixed "###row" id excludes the elided label from
+// the node identity as the pane resizes; callers PushID the path/index first.
 static std::string rowLabel(const std::string& name) {
     const float w = ImGui::GetContentRegionAvail().x - ImGui::GetTreeNodeToLabelSpacing() -
                     ImGui::GetStyle().FramePadding.x;
-    return ui::kit::elide(name.c_str(), w) + "##row";
+    return ui::kit::elide(name.c_str(), w) + "###row";
 }
 
 
@@ -359,6 +360,7 @@ void ensureWorkspaceDir(AppState& st) {
         s_currentFolder = st.workspaceDir;
         s_selectedPath.clear();
         s_renameId.clear();
+        s_renameFocus = false;
         s_pendingDelete.clear();
         s_pendingNewFolder.clear();
         s_clipboardPath.clear();
@@ -379,6 +381,8 @@ static void commitRename(AppState& st, const std::string& root) {
     while (!newName.empty() && (newName.front() == ' ')) newName.erase(newName.begin());
     while (!newName.empty() && (newName.back()  == ' ')) newName.pop_back();
     s_renameId.clear();
+    s_renameFocus = false;
+    if (s_pendingNewFolder == oldP) s_pendingNewFolder.clear();
     if (newName.empty() || newName == pathFilename(oldP)) return;
     if (newName.find_first_of("\\/:*?\"<>|") != std::string::npos) {
         st.toast(ui::ToastLevel::Warn, "Invalid characters in name");
@@ -399,18 +403,27 @@ static void commitRename(AppState& st, const std::string& root) {
         invalidateDirListCache();
         invalidateExplorerPlm();
         st.addLog("[explorer] renamed " + pathFilename(oldP) + " -> " + newName);
-        if (s_selectedPath == oldP) s_selectedPath = newP;
+        auto remap = [&](std::string& path) {
+            if (!path.empty() && withinWorkspace(oldP, path))
+                path.replace(0, oldP.size(), newP);
+        };
+        remap(s_selectedPath);
+        remap(s_currentFolder);
+        remap(s_clipboardPath);
+        remap(s_pendingNewFolder);
+        remap(s_pendingDelete);
     }
 }
 
 // ---- copy / paste (filesystem) -------------------------------------------
-// Build a collision-free destination by appending " (copy)" (then " (copy 2)", ...) before the
-// extension until the name is free.
-static std::string uniqueDest(const std::string& dir, const std::string& src, std::string& err) {
+// Build a collision-free destination by appending " (copy)" (then " (copy 2)", ...) before a
+// file's extension, or after a folder's complete name, until the name is free.
+static std::string uniqueDest(const std::string& dir, const std::string& src, bool isDir,
+                              std::string& err) {
     auto& fsb = chudware::fsBackend();
     std::string fname = pathFilename(src);
-    std::string stem = pathStem(fname);
-    std::string ext  = pathExtension(fname);
+    std::string stem = isDir ? fname : pathStem(fname);
+    std::string ext  = isDir ? std::string() : pathExtension(fname);
     std::string cand = pathJoin(dir, fname);
     if (!fsb.stat(cand, err).exists) return err.empty() ? cand : std::string();
     for (int n = 1; n < 1000; ++n) {
@@ -431,7 +444,11 @@ static bool doPaste(AppState& st, const std::string& root, const std::string& de
     if (!err.empty()) { st.toast(ui::ToastLevel::Error, "Paste failed: " + err); return false; }
     if (!source.exists) { st.toast(ui::ToastLevel::Warn, "Copied file no longer exists"); return false; }
     if (!withinWorkspace(root, destDir)) { st.toast(ui::ToastLevel::Warn, "Paste blocked outside the workspace"); return false; }
-    std::string dest = uniqueDest(destDir, src, err);
+    if (source.isDir && withinWorkspace(src, destDir)) {
+        st.toast(ui::ToastLevel::Warn, "Cannot paste a folder into itself or its descendants");
+        return false;
+    }
+    std::string dest = uniqueDest(destDir, src, source.isDir, err);
     if (!err.empty()) { st.toast(ui::ToastLevel::Error, "Paste failed: " + err); return false; }
     if (!fsb.copy(src, dest, /*recursive=*/source.isDir, err)) {
         st.toast(ui::ToastLevel::Error, "Paste failed: " + err);
@@ -459,6 +476,8 @@ static void createNewFolder(AppState& st, const std::string& root, const std::st
         cand = pathJoin(dir, "New Folder " + std::to_string(++n));
     if (!err.empty()) { st.toast(ui::ToastLevel::Error, "New Folder failed: " + err); return; }
     if (fsb.mkdir(cand, err)) {
+        s_renameId.clear();
+        s_renameFocus = false;
         s_pendingNewFolder = cand;
         s_currentFolder = dir;
         st.addLog("[explorer] new folder " + cand);
@@ -636,10 +655,11 @@ static void drawFileRow(AppState& st, const std::string& root, const std::string
             s_currentFolder = pathParent(p);
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) requestOpen(st, p);
         }
-        // Drag SOURCE: dragging a known-extension row onto the viewport opens it (the viewport is the
-        // matching drop target). The payload is the absolute path INCLUDING its NUL terminator so the
-        // target can read it straight back as a C string. Drag preview = the filename.
-        if (isKnownExt(ext) && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+        // Drag model files to the viewport, or JSON scenarios to simulation setup.
+        // The absolute path includes its NUL terminator; each target validates
+        // the formats it accepts. Drag preview = the filename.
+        if ((isKnownExt(ext) || ext == ".json") &&
+            ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
             ImGui::SetDragDropPayload(kFileDragPayload, pathStr.c_str(), pathStr.size() + 1);
             ImGui::TextUnformatted(fname.c_str());
             ImGui::EndDragDropSource();
@@ -649,7 +669,7 @@ static void drawFileRow(AppState& st, const std::string& root, const std::string
         if (ImGui::BeginPopupContextItem("##fctx")) {
             s_selectedPath = pathStr;
             s_currentFolder = pathParent(p);
-            if (ImGui::MenuItem("Open"))   requestOpen(st, p);
+            if (ImGui::MenuItem("Open", nullptr, false, isKnownExt(ext))) requestOpen(st, p);
             if (status && !status->itemId.empty()) {
                 if (ImGui::MenuItem("History"))
                     openPlm(st, PlmPage::Files, status->itemId);
@@ -658,6 +678,7 @@ static void drawFileRow(AppState& st, const std::string& root, const std::string
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Rename", "F2")) {
+                s_pendingNewFolder.clear();
                 s_renameId = pathStr;
                 std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", fname.c_str());
                 s_renameFocus = true;
@@ -780,10 +801,8 @@ static void drawDirectoryFiles(AppState& st, const std::string& root,
     }
 }
 
-// Recursively draw a directory: a tree node that lazy-lists its children on open. Folders first
-// (name-sorted), then known files (mtime-desc). Hidden/dot entries and unknown extensions are
-// skipped. Children come from s_dirListCache (TTL + mutation bust) so open folders don't re-stat
-// every frame.
+// Recursively draw a directory: lazy-list children on open, folders before files.
+// Hide dot entries, not non-CAD files. Backend snapshots own refresh scheduling.
 static void drawDirNode(AppState& st, const std::string& root, const std::string& dir, bool isRoot) {
     auto& fsb = chudware::fsBackend();
     // The "Workspace" section rule above the tree already names the section; the root row just
@@ -794,6 +813,12 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth |
                                ImGuiTreeNodeFlags_FramePadding;   // pill-height node
     if (isRoot) flags |= ImGuiTreeNodeFlags_DefaultOpen;
+    if (!isRoot && s_pendingNewFolder == dir && s_renameId != dir) {
+        s_renameId = dir;
+        std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", pathFilename(dir).c_str());
+        s_renameFocus = true;
+        s_selectedPath = dir;
+    }
     const bool dirSelected = (s_selectedPath == dir);
 
     ImGui::PushID(dir.c_str());
@@ -805,11 +830,22 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
         ui::fmTreeIcon("body_folder", "[D]");
         ImGui::SameLine(0, 4.0f * ui::uiScale);
         ImGui::SetNextItemWidth(-1);
-        if (s_renameFocus) { ImGui::SetKeyboardFocusHere(); s_renameFocus = false; }
+        const bool revealing = (s_pendingNewFolder == dir);
+        if (s_renameFocus) ImGui::SetKeyboardFocusHere();
         if (ImGui::InputText("##rnd", s_renameBuf, sizeof(s_renameBuf),
                              ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
             commitRename(st, root);
         if (ImGui::IsItemDeactivated()) commitRename(st, root);
+        if (revealing) {
+            ImGui::SetScrollHereY(0.5f);
+            // A clipped row needs another frame after scrolling before reveal is consumed.
+            if (ImGui::IsItemVisible()) {
+                s_pendingNewFolder.clear();
+                s_renameFocus = false;
+            }
+        } else {
+            s_renameFocus = false;
+        }
         ui::fmRowPillEnd(rr, dirSelected);
         ImGui::PopID();
         return;
@@ -820,6 +856,8 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
     ui::FmRowRect rr = ui::fmRowPill(dirSelected);
     ui::fmTreeIcon("body_folder", "[D]");
     ImGui::SameLine(0, 4.0f * ui::uiScale);
+    if (!s_pendingNewFolder.empty() && withinWorkspace(dir, s_pendingNewFolder))
+        ImGui::SetNextItemOpen(true, ImGuiCond_Always);
     bool open = ImGui::TreeNodeEx(rowLabel(label).c_str(), flags);
     ui::fmRowPillEnd(rr, dirSelected);
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
@@ -841,6 +879,7 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
         if (!isRoot) {
             ImGui::Separator();
             if (ImGui::MenuItem("Rename", "F2")) {
+                s_pendingNewFolder.clear();
                 s_renameId = dir;
                 std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s", pathFilename(dir).c_str());
                 s_renameFocus = true;
@@ -860,15 +899,14 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
             fresh->state = snapshot.state;
             fresh->error = snapshot.error;
             const auto& entries = snapshot.entries;
-            std::vector<std::pair<std::string, int64_t>> filePairs;  // path, mtime
+            fresh->files.reserve(entries.size());
             for (const auto& e : entries) {
                 if (e.name.empty() || e.name[0] == '.') continue;
                 std::string full = pathJoin(dir, e.name);
                 if (e.isDir) {
                     fresh->dirs.push_back(std::move(full));
-                } else if (isKnownExt(lowerExt(e.name))) {
-                    // mtime==0 (unknown/error) sorts as oldest per contract.
-                    filePairs.emplace_back(std::move(full), e.mtime);
+                } else {
+                    fresh->files.push_back(std::move(full));
                 }
             }
             auto byName = [](const std::string& a, const std::string& b) {
@@ -878,21 +916,25 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
                 return an < bn;
             };
             std::sort(fresh->dirs.begin(), fresh->dirs.end(), byName);
-            // Newest first; tie-break by name for stable order when mtimes match.
-            std::sort(filePairs.begin(), filePairs.end(),
-                      [&](const std::pair<std::string, int64_t>& a,
-                          const std::pair<std::string, int64_t>& b) {
-                          if (a.second != b.second) return a.second > b.second;
-                          return byName(a.first, b.first);
-                      });
-            fresh->files.reserve(filePairs.size());
-            for (auto& fp : filePairs) fresh->files.push_back(std::move(fp.first));
+            std::sort(fresh->files.begin(), fresh->files.end(), byName);
             groupLegacyFiles(*fresh);
             cached = std::move(fresh);
         }
         const auto rows = cached;
         for (const auto& d : rows->dirs) drawDirNode(st, root, d, /*isRoot=*/false);
         drawDirectoryFiles(st, root, *rows);
+        // Loading is not absence: web mutations invalidate listings before their async refresh.
+        // Stop forcing ancestors only when a completed listing cannot contain the reveal target.
+        if (!s_pendingNewFolder.empty() && withinWorkspace(dir, s_pendingNewFolder) &&
+            rows->state != chudware::FsReadState::Loading &&
+            (rows->state != chudware::FsReadState::Ready ||
+             std::none_of(rows->dirs.begin(), rows->dirs.end(), [](const std::string& child) {
+                 return withinWorkspace(child, s_pendingNewFolder);
+             }))) {
+            if (s_renameId == s_pendingNewFolder) s_renameId.clear();
+            s_pendingNewFolder.clear();
+            s_renameFocus = false;
+        }
         if (rows->state == chudware::FsReadState::Error)
             ImGui::TextWrapped("Unable to read folder: %s", rows->error.c_str());
         else if (rows->state == chudware::FsReadState::Missing)
@@ -907,11 +949,14 @@ static void drawDirNode(AppState& st, const std::string& root, const std::string
 }
 
 // ---- Recent section -------------------------------------------------------
+static bool s_recentOpen = false;
 static void drawRecentSection(AppState& st) {
     if (st.recentFiles.empty()) return;
     auto& fsb = chudware::fsBackend();
-    // FM-style section rule (the "Reference"/"Features" treatment) instead of a CollapsingHeader.
-    ui::fmSectionDivider("Recent");
+    if (!kit::cardBegin("##explorer_recent", "Recent", "history", &s_recentOpen)) {
+        kit::cardEnd();
+        return;
+    }
 #ifndef __EMSCRIPTEN__
     static std::map<std::string, chudware::FsStatSnapshot> recentStats;
     static double checkedAt = -1e9;
@@ -950,8 +995,8 @@ static void drawRecentSection(AppState& st) {
         ui::fmRowPillEnd(rr, false);
         if (ImGui::IsItemClicked() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && exists)
             requestOpen(st, rp);
-        // Drag a Recent row onto the viewport to open it (same payload as the tree rows).
-        if (exists && isKnownExt(ext) &&
+        // Recent files use the same model/scenario payload as directory rows.
+        if (exists && (isKnownExt(ext) || ext == ".json") &&
             ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
             ImGui::SetDragDropPayload(kFileDragPayload, rp.c_str(), rp.size() + 1);
             ImGui::TextUnformatted(fname.c_str());
@@ -960,6 +1005,7 @@ static void drawRecentSection(AppState& st) {
         itemPathTooltip(fname, rp);
         ImGui::PopID();
     }
+    kit::cardEnd();
 }
 
 // ---- delete confirm modal -------------------------------------------------
@@ -1038,23 +1084,25 @@ void drawFileExplorerBody(AppState& st) {
                         "Choose a working folder to see its PLM changes.");
     }
 
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        s_pendingNewFolder.clear();
+        s_renameId.clear();
+        s_renameFocus = false;
+    }
+
+    // Capture the OUTER pane's bottom before the auto-sized Files card changes the window.
+    const float explorerBottom = ImGui::GetCursorScreenPos().y + ImGui::GetContentRegionAvail().y;
     const bool filesOpen = kit::cardBegin("##explorer_files", "Files", "body_folder",
                                           &s_plm.filesOpen);
     if (!filesOpen) {
         kit::cardEnd();
+        drawRecentSection(st);
         drawDeleteModal(st, root);
         return;
     }
 
-    // A just-created folder enters inline rename on the next frame (after the tree expands it).
-    if (!s_pendingNewFolder.empty()) {
-        s_renameId = s_pendingNewFolder;
-        std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s",
-                      pathFilename(s_pendingNewFolder).c_str());
-        s_renameFocus = true;
-        s_selectedPath = s_pendingNewFolder;
-        s_pendingNewFolder.clear();
-    }
+    // Reveal remains pending through Loading snapshots; drawDirNode consumes it at the input row.
 
     std::string current = s_currentFolder.empty() ? root : s_currentFolder;
     const auto currentStat = fsb.pollStat(current);
@@ -1115,14 +1163,13 @@ void drawFileExplorerBody(AppState& st) {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", current.c_str());
     }
 
-    drawRecentSection(st);
-
     // Keyboard: F2 rename / Del delete on the current selection (only when this pane owns nav and no
     // text field is focused — the inline-rename InputText sets WantTextInput, so this won't fire mid
     // rename).
     if (!s_selectedPath.empty() && !ImGui::GetIO().WantTextInput &&
         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
         if (ImGui::IsKeyPressed(ImGuiKey_F2, false)) {
+            s_pendingNewFolder.clear();
             s_renameId = s_selectedPath;
             std::snprintf(s_renameBuf, sizeof(s_renameBuf), "%s",
                           pathFilename(s_selectedPath).c_str());
@@ -1132,12 +1179,22 @@ void drawFileExplorerBody(AppState& st) {
         }
     }
 
-    ImGui::BeginChild("##fx_tree", ImVec2(0, 0), ImGuiChildFlags_None,
+    // Keep the separate Recent header visible; expanded recents use the outer scrollbar.
+    const float recentHeaderHeight = st.recentFiles.empty() ? 0.0f :
+        kit::padY() * 2.0f +
+        std::max(ImGui::GetTextLineHeight(), metrics::iconHeader()) +
+        ImGui::GetStyle().ItemSpacing.y;
+    const float treeHeight = std::max(96.0f * ui::uiScale,
+        explorerBottom - ImGui::GetCursorScreenPos().y -
+        ImGui::GetStyle().WindowPadding.y - ImGui::GetStyle().ItemSpacing.y -
+        recentHeaderHeight);
+    ImGui::BeginChild("##fx_tree", ImVec2(0, treeHeight), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar);
     drawDirNode(st, root, root, /*isRoot=*/true);
     ui::drawWindowPillScrollbarV(explorerSurf());
     ImGui::EndChild();
     kit::cardEnd();
+    drawRecentSection(st);
 
     drawDeleteModal(st, root);
 }

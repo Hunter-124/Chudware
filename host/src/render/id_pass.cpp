@@ -279,7 +279,7 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
     return true;
 }
 
-bool IdPass::render(const Renderer::CameraXform& cam) {
+bool IdPass::render(const Renderer::CameraXform& cam, bool facesOnly) {
     if (!built_ || cam.ssWidth <= 0 || cam.ssHeight <= 0) return false;
 
     // Fingerprint every input consulted by the draw. The viewport invokes this only when it is
@@ -299,6 +299,7 @@ bool IdPass::render(const Renderer::CameraXform& cam) {
     }
     key.hiddenHash = idPassHiddenHash(hidden_);
     key.docGen = docGen_;
+    key.facesOnly = facesOnly;
     if (haveCachedFrame_ && key == lastKey_) return true;
 
     allocTargets(cam.ssWidth, cam.ssHeight);
@@ -338,6 +339,7 @@ bool IdPass::render(const Renderer::CameraXform& cam) {
     }
     glDisable(GL_POLYGON_OFFSET_FILL);
 
+    if (!facesOnly) {
     // Edges over faces: a fat line so they're pickable, and a small negative depth-range bias so
     // an edge on a face surface reads as the edge. One draw call per body.
     glDepthRange(0.0, 0.999);
@@ -362,6 +364,7 @@ bool IdPass::render(const Renderer::CameraXform& cam) {
         if (bodyHiddenId(v.body_id)) continue;  // hidden body: unpickable
         glBindVertexArray(v.vao);
         glDrawArrays(GL_POINTS, 0, v.count);
+    }
     }
 
     glDepthRange(0.0, 1.0);

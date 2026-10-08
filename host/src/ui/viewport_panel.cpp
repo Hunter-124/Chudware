@@ -41,6 +41,8 @@
 #include "dragdrop.h"      // kFileDragPayload (Explorer drag source -> viewport drop target)
 #include "property_manager.h"  // C27-A: in-viewport parameter callouts
 #include "sim_manager.h"        // simulation fixture/load previews in the viewport
+#include "sim/sim_interaction.h"
+#include "sim/sim_scene.h"
 #include "evaluate_dialogs.h"  // Measure/Mass viewport overlays + body alpha
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
 #include "drawing_panel.h"  // DRAWINGS: 2D sheet renderer for a Drawing tab
@@ -49,6 +51,7 @@
 #include "copilot/context_chips.h"  // ui::addContextRef — context-cube picks → chat chips
 #include "file_dialog.h"   // revealInFileManager (assembly component ctx "Open Part Location")
 #include "layout.h"        // ui::overlayColumnEdge — HUD dodges the pinned glass columns
+#include "metrics.h"       // ui::metrics::U — clear-region gutter
 
 namespace ui {
 
@@ -58,6 +61,29 @@ static ShortcutBar   s_shortcutBar;
 static ViewSelector  s_viewSelector;   // C25 W2-E: glass-box view selector (Space)
 static SectionTool   s_sectionTool;    // C25 W3-J: section-view (impl owned by section_tool agent)
 static float         s_huFade = 0.25f; // heads-up toolbar idle opacity (ramps on hover)
+// Clear (un-occluded) region of the full-bleed 3D image this frame (screen coords) — see the
+// computation after renderer.resize(). Published through viewportClearRect().
+static ImVec2        s_clearMin(0.0f, 0.0f), s_clearMax(0.0f, 0.0f);
+// Face-well chip hover claim (claimViewportHoverFace): drawn as the hover highlight while the
+// claim was renewed this or the previous frame.
+static render::PickHit s_uiHoverFace;
+static int             s_uiHoverFrame = -10;
+
+void claimViewportHoverFace(uint32_t bodyId, uint32_t faceId) {
+    if (bodyId == 0 || faceId == 0) return;
+    s_uiHoverFace = render::PickHit{};
+    s_uiHoverFace.body_id = bodyId;
+    s_uiHoverFace.topo_id = faceId;
+    s_uiHoverFace.kind = render::PickKind::Face;
+    s_uiHoverFrame = ImGui::GetFrameCount();
+}
+
+bool viewportClearRect(ImVec2& outMin, ImVec2& outMax) {
+    if (s_clearMax.x <= s_clearMin.x || s_clearMax.y <= s_clearMin.y) return false;
+    outMin = s_clearMin;
+    outMax = s_clearMax;
+    return true;
+}
 
 #ifdef __EMSCRIPTEN__
 // Touch points belong to shell.html and are canvas-local CSS coordinates.
@@ -119,7 +145,8 @@ static bool wasmViewportTouches(AppState& st, Renderer& renderer, ImVec2 min,
         st.pan[0] += (-camera.right.x * moveX + camera.up.x * moveY) * worldPerPixel;
         st.pan[1] += (-camera.right.y * moveX + camera.up.y * moveY) * worldPerPixel;
         st.pan[2] += (-camera.right.z * moveX + camera.up.z * moveY) * worldPerPixel;
-        st.zoom = std::clamp(st.zoom * distance / previousDistance, 0.1f, 10.0f);
+        st.zoom = std::clamp(st.zoom * distance / previousDistance, 0.1f,
+                             renderer.maxSceneZoom());
     }
     previousMid = mid;
     previousDistance = distance;
@@ -602,8 +629,8 @@ void drawNewDocChooser(AppState& st) {
             if (newDocTile("##sim_fluids", "Fluids", "Flow field study", 6, ImVec2(tileW, tileH))) {
                 runSimulationChoice(st, "sim_new_flow"); finish();
             } next();
-            if (newDocTile("##sim_thermal", "Thermal", "Heat transfer / cooling study", 6, ImVec2(tileW, tileH))) {
-                runSimulationChoice(st, "sim_new_thermal"); finish();
+            if (newDocTile("##sim_thermal", "Thermal FEA", "Steady heat conduction in the part", 6, ImVec2(tileW, tileH))) {
+                runSimulationChoice(st, "sim_new_thermal_fea"); finish();
             } next();
             if (newDocTile("##sim_electrical", "Electrical", "Circuit simulation", 7, ImVec2(tileW, tileH))) {
                 st.showPcbTools = true; st.showRibbon = true; st.ribbonTab = AppState::RT_PCB;
@@ -649,6 +676,13 @@ static bool   s_sketchRotated  = false;
 // C37-C: LMB drag-threshold state — suppress orbit micro-movement on click-selects.
 static bool   s_lmbDragActive  = false;  // true once the 4px threshold has been crossed
 static ImVec2 s_lmbDragOrigin  = {0, 0}; // screen position of the LMB press
+struct SimulationFaceDrag {
+    std::string docId;
+    nlohmann::json selector;
+    render::PickHit hit;
+    long revision = -1;
+};
+static SimulationFaceDrag s_simFaceDrag;
 
 // Evaluate Section Props: which plane handle is being dragged along its normal (-1 = none).
 // Owns the mouse while >= 0 so orbit/pan/pick never fight the cut-plane drag.
@@ -1100,6 +1134,112 @@ static void dirToYawPitch(float nx, float ny, float nz, float& yawDeg, float& pi
     pitchDeg = pitch / kPiOver180;
 }
 
+static uint64_t simulationDocumentScope(const AppState& st) {
+    uint64_t scope = 1469598103934665603ull;
+    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+        scope ^= (uint64_t)(st.activeTab + 1);
+        scope *= 1099511628211ull;
+        for (unsigned char c : st.docTabs[st.activeTab].docId) {
+            scope ^= c;
+            scope *= 1099511628211ull;
+        }
+    }
+    return scope;
+}
+
+// Bounds share the producers' immutable batch revisions, just like their retained GL buffers.
+// Unchanged frames merge small AABBs, never walk the triangle/line payloads again.
+static void updateSimulationSceneBounds(AppState& st, const simscene::Scene& scene,
+                                        uint64_t documentScope, bool toolArmed) {
+    Renderer& renderer = *st.renderer;
+    const float previousRadius = renderer.effectiveSceneRadius();
+    struct BatchBounds {
+        uint64_t key = 0, revision = 0;
+        float lo[3]{}, hi[3]{};
+        bool lines = false, valid = false, seen = false;
+    };
+    static std::vector<BatchBounds> batches;
+    static uint64_t previousScope = 0;
+    static const Renderer* previousRenderer = nullptr;
+    if (previousScope != documentScope || previousRenderer != &renderer) {
+        batches.clear();
+        previousScope = documentScope;
+        previousRenderer = &renderer;
+    }
+    for (auto& batch : batches) batch.seen = false;
+    float lo[3]{}, hi[3]{};
+    bool haveBounds = false;
+    auto include = [&](uint64_t key, uint64_t revision, const std::vector<float>* xyz,
+                       bool lines) {
+        BatchBounds* bounds = nullptr;
+        for (auto& batch : batches) {
+            if (batch.key == key && batch.lines == lines) {
+                bounds = &batch;
+                break;
+            }
+        }
+        const bool added = bounds == nullptr;
+        if (added) {
+            batches.emplace_back();
+            bounds = &batches.back();
+            bounds->key = key;
+            bounds->lines = lines;
+        }
+        bounds->seen = true;
+        if (added || bounds->revision != revision) {
+            bounds->revision = revision;
+            bounds->valid = xyz && xyz->size() >= 3;
+            if (bounds->valid) {
+                for (int k = 0; k < 3; ++k) bounds->lo[k] = bounds->hi[k] = (*xyz)[k];
+                for (size_t i = 3; i + 2 < xyz->size(); i += 3) {
+                    for (int k = 0; k < 3; ++k) {
+                        bounds->lo[k] = std::min(bounds->lo[k], (*xyz)[i + k]);
+                        bounds->hi[k] = std::max(bounds->hi[k], (*xyz)[i + k]);
+                    }
+                }
+            }
+        }
+        if (!bounds->valid) return;
+        for (int k = 0; k < 3; ++k) {
+            lo[k] = haveBounds ? std::min(lo[k], bounds->lo[k]) : bounds->lo[k];
+            hi[k] = haveBounds ? std::max(hi[k], bounds->hi[k]) : bounds->hi[k];
+        }
+        haveBounds = true;
+    };
+    for (const auto& batch : scene.lit)
+        if (batch.bounds) include(batch.key, batch.revision, batch.xyz, false);
+    for (const auto& batch : scene.lines)
+        if (batch.bounds) include(batch.key, batch.revision, batch.xyz, true);
+    batches.erase(std::remove_if(batches.begin(), batches.end(),
+                                 [](const BatchBounds& batch) { return !batch.seen; }),
+                  batches.end());
+    if (haveBounds) renderer.setAuxSceneBounds(lo, hi);
+    else            renderer.clearAuxSceneBounds();
+    // Read the exact cached bounds radius without the retained authoring floor.
+    renderer.setAuxSceneRadiusFloor(0.0f);
+    const float requiredRadius = renderer.effectiveSceneRadius();
+    float framingRadius = previousRadius;
+    if (requiredRadius > previousRadius ||
+        (!toolArmed && requiredRadius < previousRadius * 0.7f)) {
+        const float baseRadius = renderer.modelRadius() > 0.0f
+            ? renderer.modelRadius() : Renderer::kEmptySceneRadius;
+        // Geometric 25% bands leave headroom for small edits without repeatedly resizing
+        // the datums. Compute bands only at a grow/shrink threshold, never for mouse motion.
+        const float band = std::ceil(std::log(requiredRadius / baseRadius) / std::log(1.25f));
+        const float nextRadius = std::max(requiredRadius, baseRadius * std::pow(1.25f, band));
+        float minimumZoom = st.zoom;
+        if (st.animActive)
+            minimumZoom = std::min(minimumZoom, std::min(st.animZoom0, st.animZoom1));
+        // Clamping after radius compensation would visibly jump at the 0.1 zoom limit.
+        // Retain the old radius until both the live view and animation can shrink exactly.
+        if (nextRadius > previousRadius ||
+            (nextRadius < previousRadius * 0.7f &&
+             minimumZoom * (nextRadius / previousRadius) >= 0.1f))
+            framingRadius = nextRadius;
+    }
+    renderer.setAuxSceneRadiusFloor(framingRadius);
+}
+
 // C37-C: shared AABB-framing helper — pan to bbox center, zoom to fit bbox radius (animated).
 // Used by Zoom to Selection (Shift+F), st.zoomToBBoxRequested, and can be called directly.
 // bboxMin/Max are world-space. Uses the same math as ZoomFit (zoom=1 frames scene radius r;
@@ -1114,21 +1254,13 @@ static void frameBBox(AppState& st, const float bboxMin[3], const float bboxMax[
     float dy = bboxMax[1] - bboxMin[1];
     float dz = bboxMax[2] - bboxMin[2];
     float bboxR = 0.5f * std::sqrt(dx * dx + dy * dy + dz * dz);
-    // Scene radius — the Renderer's modelRadius drives ZoomFit (zoom=1 shows sceneR at full view).
-    float sceneR = st.renderer ? st.renderer->modelRadius() : 1.0f;
-    if (sceneR < 1e-5f) sceneR = 1.0f;
-    float targetZoom;
-    if (bboxR < 1e-5f) {
-        // Degenerate (vertex/edge selection): zoom in close.
-        targetZoom = 4.0f;
-    } else {
-        targetZoom = sceneR / bboxR;
-        // Cap zoom: never more than 8× (avoids extreme zoom for tiny features) and never less than
-        // the ZoomFit value (framing the full scene is always the minimum zoom).
-        const float kMaxZoom = 8.0f;
-        if (targetZoom > kMaxZoom) targetZoom = kMaxZoom;
-        if (targetZoom < 1.0f) targetZoom = 1.0f;
-    }
+    // Use the same auxiliary-aware framing sphere and zoom limits as orbit navigation.
+    const float sceneR = st.renderer ? st.renderer->effectiveSceneRadius()
+                                    : Renderer::kEmptySceneRadius;
+    const float maxZoom = st.renderer ? st.renderer->maxSceneZoom() : 10.0f;
+    // Degenerate (vertex/edge selection): zoom in close.
+    const float targetZoom = std::clamp(bboxR < 1e-5f ? 4.0f : sceneR / bboxR,
+                                        0.1f, maxZoom);
     Vec3 mc = st.renderer ? st.renderer->modelCenter() : Vec3{0, 0, 0};
     float pan[3] = {cx - mc.x, cy - mc.y, cz - mc.z};
     requestCameraAnimation(st, st.yaw, st.pitch, targetZoom, pan);
@@ -2025,6 +2157,29 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     st.pickReady = false;
     if (!st.renderer) return;
     Renderer& renderer = *st.renderer;
+    const bool sceneActive = st.activeWorkspace == AppState::Workspace::Simulate &&
+                             ui::simscene::active(st);
+    const bool sceneToolArmed = sceneActive && ui::simscene::toolArmed(st);
+    const uint64_t sceneDocumentScope = simulationDocumentScope(st);
+    static ui::simscene::Scene simulationScene;
+    simulationScene.clear();  // retain capacities across frames and document switches
+    if (sceneActive) ui::simscene::collect(st, simulationScene);
+    // Collect before bbox requests and camera ticking: a producer may request framing while it
+    // publishes new geometry. Changing only R/zoom leaves the view and orbit center untouched.
+    const float previousSceneRadius = renderer.effectiveSceneRadius();
+    updateSimulationSceneBounds(st, simulationScene, sceneDocumentScope, sceneToolArmed);
+    const float sceneRadius = renderer.effectiveSceneRadius();
+    if (sceneRadius != previousSceneRadius) {
+        const float ratio = sceneRadius / previousSceneRadius;
+        // Both projection scales and the orbit distance depend only on R/zoom. The bounds
+        // helper already deferred unsafe shrinking; maxSceneZoom scales by the same ratio.
+        // Do not clamp here: doing so would alter the absolute view (or the animated path).
+        st.zoom *= ratio;
+        if (st.animActive) {
+            st.animZoom0 *= ratio;
+            st.animZoom1 *= ratio;
+        }
+    }
     // Liquid-glass v2 (H6a): st.renderer is a stable singleton for the app's lifetime (set once
     // in run_gui), so refreshing this pointer + registering the sampler here covers every branch
     // below (live 3D, Drawing tab, hidden dock tab) with one call.
@@ -2048,6 +2203,22 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         if (ImGui::Begin(title.c_str())) {
             vpDockStripDraw(st);   // hide the redundant dock tab; app.cpp owns the filename strip
             ui::drawDrawingSheet(st);
+        }
+        ImGui::End();
+        invalidateViewportBackdrop();
+        return;
+    }
+
+    // ---------- Simulate > Hydraulics (hook): while the Hydraulics panel shows its Schematic or
+    // Plots view, the central Viewport window paints that full-size 2D canvas instead of the 3D
+    // scene — the same branch shape as the Drawing sheet above. SimManager/HydraulicPanel own the
+    // content; the panel's "3D" toggle makes this false and the normal 3D path below runs.
+    if (st.showViewport && st.activeWorkspace == AppState::Workspace::Simulate && st.simManager &&
+        st.simManager->centralViewActive()) {
+        const std::string title = viewportTitle();
+        if (ImGui::Begin(title.c_str())) {
+            vpDockStripDraw(st);
+            st.simManager->drawCentralView(st);
         }
         ImGui::End();
         invalidateViewportBackdrop();
@@ -2177,6 +2348,31 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         int vw = (int)mainVp->Size.x > 64 ? (int)mainVp->Size.x : 64;
         int vh = (int)(winBotY - winTopY) > 64 ? (int)(winBotY - winTopY) : 64;
         renderer.resize(vw, vh);
+        // Clear (un-occluded) region of the full-bleed 3D image: between the pinned FeatureManager /
+        // Simulation column (overlayColumnEdge(0)) and the Copilot column (overlayColumnEdge(1)),
+        // below the floating doc-tab band, inset by a small gutter. Framing (lens shift + zoom=1
+        // fit), wheel/area zoom pivots and scene-scale setup overlays all key off this rect so the
+        // model is never framed under a glass pane. Falls back to the full image when the columns
+        // are hidden or would leave a degenerate strip.
+        const float imgX0 = mainVp->Pos.x, imgX1 = imgX0 + (float)vw;
+        const float imgY0 = winTopY, imgY1 = winTopY + (float)vh;
+        ImVec2 clr0(imgX0, imgY0), clr1(imgX1, imgY1);
+        {
+            const float gut = ui::metrics::U(3.0f);
+            const float minSpan = ui::metrics::U(40.0f);
+            const float le = ui::overlayColumnEdge(0);
+            const float re = ui::overlayColumnEdge(1);
+            const float tb = ui::docTabBandBottom();
+            if (le > imgX0 && le < imgX1) clr0.x = le + gut;
+            if (re > clr0.x && re < imgX1) clr1.x = re - gut;
+            if (tb > imgY0 && tb < imgY1) clr0.y = tb + gut;
+            clr1.y = imgY1 - gut;
+            if (clr1.x - clr0.x < minSpan) { clr0.x = imgX0; clr1.x = imgX1; }
+            if (clr1.y - clr0.y < minSpan) { clr0.y = imgY0; clr1.y = imgY1; }
+        }
+        s_clearMin = clr0;
+        s_clearMax = clr1;
+        const ImVec2 clrC((clr0.x + clr1.x) * 0.5f, (clr0.y + clr1.y) * 0.5f);
         // T-RF13: feed the adaptive quality ladder this frame's cadence (io.DeltaTime carries
         // the vsync-cliff signal the ladder keys on). No-op unless adaptive is enabled.
         renderer.noteFrame(ImGui::GetIO().DeltaTime * 1000.0f);
@@ -2514,22 +2710,29 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         } else {
             renderer.clearPreviewIsolation();
         }
-        // W2 full-bleed viewport: re-center the part horizontally in the un-occluded region between
-        // the side panes via an asymmetric-frustum lens shift (NOT by moving pan_, so the published
-        // cam_.mvp — and thus the id-pass picks + every overlay — stays pixel-exact). The visible
-        // region IS the central dock node = this window's content rect [cr0,cr1]; deriving the shift
-        // from it makes a hidden / floating / tabbed pane fall out automatically (the node spans that
-        // edge), and the no-side-panes case computes offset 0 -> lens shift 0 (identical to before).
-        // cx = leftW + (fullW-leftW-rightW)/2 expressed via the content rect: the node's centre.
+        // W2 full-bleed viewport: frame the part in the CLEAR region (clr0..clr1: between the pinned
+        // columns, below the doc-tab band) via an asymmetric-frustum lens shift plus a zoom=1 fit
+        // scale — NOT by moving pan_, so the published cam_.mvp/halfHeight (and thus the id-pass
+        // picks, every overlay, pan/zoom math) stay pixel-exact. zoom=1 (Zoom to Fit, first display)
+        // then fits the model's framing sphere into the clear region's shorter side, centred in it,
+        // and a hidden/collapsed column falls out automatically (its edge is unpublished).
+        // A result legend in the clear rect's bottom-right corner takes its width out of the
+        // framing rect (not the published clear rect — overlays/HUD still use the full region),
+        // so the fitted model sits beside the legend instead of under it.
         {
-            const float fullW = mainVp->Size.x;
-            if (fullW > 1.0f) {
-                const float cx = (cr0.x + cr1.x) * 0.5f - mainVp->Pos.x;   // visible centre, window-relative
-                const float offsetNDC = 2.0f * (cx - fullW * 0.5f) / fullW;
-                renderer.setLensShiftX(-offsetNDC);
-            } else {
-                renderer.setLensShiftX(0.0f);
-            }
+            const float fullW = (float)vw, fullH = (float)vh;
+            float frameX1 = clr1.x;
+            const float legendW = ui::legendReserveWidth();
+            if (legendW > 0.0f && (clr1.x - legendW) - clr0.x >= ui::metrics::U(40.0f))
+                frameX1 = clr1.x - legendW;
+            const float cw = frameX1 - clr0.x, ch = clr1.y - clr0.y;
+            const float frameCx = (clr0.x + frameX1) * 0.5f;
+            const float offX = 2.0f * (frameCx - (imgX0 + fullW * 0.5f)) / fullW;   // NDC, +right
+            const float offY = 2.0f * (clrC.y - (imgY0 + fullH * 0.5f)) / fullH;   // px-down units
+            const float fitSide = std::min(cw, ch);
+            const float scale = fitSide > 1.0f ? std::clamp(fullH / fitSide, 1.0f, 4.0f) : 1.0f;
+            // Shift sign: drawCurrent moves the image by -shift in NDC (NDC y is up, screen y down).
+            renderer.setFramingRegion(-offX, offY, scale);
         }
         // Projection mode: live AppState mirror (persisted via Settings::orthographic).
         renderer.setOrthographic(st.orthographic);
@@ -2568,22 +2771,27 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
         // ---- topology picking (C15): id pass + overlay highlights drawn over the shaded view ----
         const bool picking = st.hasDocMesh && st.idPass && st.overlays;
+        if (sceneToolArmed) {
+            // A simulation line tool owns clicks/box gestures, never navigation drags.
+            s_zoomAreaArmed = false;
+            s_zoomAreaDragging = false;
+        }
         // Refresh lazily at the point of read. render() validates the complete draw key, so this is
         // a no-op for an unchanged hover while frames woken by typing or other panels do no ID-pass
         // work at all. Re-sample section state here because a section interaction may change it
         // after the visual overlay was configured earlier in the frame.
-        auto ensurePickFresh = [&]() {
+        auto ensurePickFresh = [&](bool facesOnly = false) {
             float pickClipN[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
             float pickClipOff[3] = {0,0,0};
             const int pickClipCount = renderer.sectionClip(pickClipN, pickClipOff);
             st.idPass->setSectionClip(pickClipCount, pickClipN, pickClipOff);
-            st.pickReady = st.idPass->render(renderer.camera());
+            st.pickReady = st.idPass->render(renderer.camera(), facesOnly);
         };
-        if (picking) {
+        if (st.overlays) {
             float clipN[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
             float clipOff[3] = {0,0,0};
             int clipCount = renderer.sectionClip(clipN, clipOff);
-            st.idPass->setSectionClip(clipCount, clipN, clipOff);
+            if (picking) st.idPass->setSectionClip(clipCount, clipN, clipOff);
             st.overlays->setSectionClip(clipCount, clipN, clipOff);
             // HiDPI: overlay line/point widths are authored in logical px; the overlays draw into
             // the supersampled FBO, so fold BOTH the supersample factor and the UI scale in.
@@ -2593,7 +2801,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                                        ui::uiScale);
             // The scripted center-pick consumer runs after this panel, so satisfy that explicit
             // demand here. Normal mouse hover/picks refresh at their read sites below.
-            if (st.wantPick) ensurePickFresh();
+            if (picking && st.wantPick) ensurePickFresh();
             // Re-draw hover + selection highlights into the studio color FBO before it's sampled.
             renderer.beginOverlay();
             // C37-C item 4: draw feature-highlight faces first (underneath selection/hover) using
@@ -2601,7 +2809,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // silently skipped inside drawFeatureHighlight. Suppressed while a PM edit preview is
             // ghosting: the translucent feature already marks itself, and an opaque tint on top of
             // the ghost would read muddy.
-            if (!st.featureHighlightFaces.empty() && !pmPreviewing) {
+            if (picking && !st.featureHighlightFaces.empty() && !pmPreviewing) {
                 if (st.activeWorkspace == AppState::Workspace::Simulate && st.simManager &&
                     st.simManager->motionCollisionHighlightActive()) {
                     const float collisionColor[4] = {
@@ -2625,7 +2833,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             std::vector<uint64_t> topoPreserve, topoExclude, topoPorts;
             std::vector<float> topoPreserveBox, topoExcludeBox;
             std::vector<float> loadSegs, fixSegs, loadTris, fixTris;
-            std::vector<float> arrowSegs, domainSegs, inletSegs, arrowTris;
+            std::vector<float> arrowSegs, inletSegs, arrowTris;
             std::vector<ui::SimManager::FlowLineBatch> flowBatches;
             bool meshPreview = false;
             if (simPreview) {
@@ -2638,27 +2846,17 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 meshPreview = st.simManager->hasMeshPreview(st);
             }
             if (flowSetup)
-                st.simManager->collectFlowSetup(st, arrowSegs, domainSegs, inletSegs,
-                                                &arrowTris);
+                st.simManager->collectFlowSetup(st, arrowSegs, inletSegs, &arrowTris);
             if (flowResult) st.simManager->collectFlowResultLines(st, flowBatches);
 
-            const bool hasSimulationFrame = simPreview || flowSetup || flowResult;
+            const bool hasSimulationFrame = simPreview || flowSetup || flowResult || sceneActive;
             uint64_t simulationGeneration = 0;
             if (hasSimulationFrame) {
-                simulationGeneration = st.simManager->overlayGeneration();
+                simulationGeneration = st.simManager ? st.simManager->overlayGeneration() : 0;
                 // Scope the GL cache to the active worker document as well as its manager
                 // generation. This prevents equal generation values in different tabs from
                 // retaining one another's mesh/result buffers.
-                uint64_t documentScope = 1469598103934665603ull;
-                if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
-                    documentScope ^= (uint64_t)(st.activeTab + 1);
-                    documentScope *= 1099511628211ull;
-                    for (unsigned char c : st.docTabs[st.activeTab].docId) {
-                        documentScope ^= c;
-                        documentScope *= 1099511628211ull;
-                    }
-                }
-                st.overlays->beginSimulationFrame(simulationGeneration, documentScope);
+                st.overlays->beginSimulationFrame(simulationGeneration, sceneDocumentScope);
             } else {
                 st.overlays->clearSimulationBuffers();
             }
@@ -2668,7 +2866,6 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             constexpr uint64_t kSimLoadTriangles = 3;
             constexpr uint64_t kSimFixtureTriangles = 4;
             constexpr uint64_t kSimMeshSegments = 5;
-            constexpr uint64_t kSimFlowDomainSegments = 6;
             constexpr uint64_t kSimFlowInletSegments = 7;
             constexpr uint64_t kSimFlowArrowSegments = 8;
             constexpr uint64_t kSimFlowArrowTriangles = 9;
@@ -2724,31 +2921,45 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         st.simManager->meshPreviewSegments(), vpal.simMesh, 1.0f, true,
                         simulationGeneration);
             }
-            // Flow-study setup preview: incoming-flow arrows + the wind-tunnel domain box + inlet
-            // plane, sized and oriented to the study. These generated batches are fingerprinted.
+            // Flow-study setup preview: quiet incoming-flow arrows and inlet/outlet outlines.
+            // Scissor scene-scale annotations to the clear region, away from the glass panes.
             if (flowSetup) {
                 const auto& vpal = ui::palette;
-                if (!domainSegs.empty())
-                    st.overlays->drawSimulationSegments(renderer.camera(),
-                                                        kSimFlowDomainSegments, domainSegs,
-                                                        vpal.flowDomain, 1.2f);
+                float inletCol[4], arrowCol[4];
+                for (int k = 0; k < 4; ++k) {
+                    inletCol[k] = vpal.flowInlet[k];
+                    arrowCol[k] = vpal.flowArrow[k];
+                }
+                inletCol[3] *= 0.55f;
+                arrowCol[3] *= 0.70f;
+                st.overlays->beginScreenClip(renderer.camera(),
+                                             (clr0.x - imgX0) / (float)vw,
+                                             (clr0.y - imgY0) / (float)vh,
+                                             (clr1.x - imgX0) / (float)vw,
+                                             (clr1.y - imgY0) / (float)vh);
                 if (!inletSegs.empty())
                     st.overlays->drawSimulationSegments(renderer.camera(),
                                                         kSimFlowInletSegments, inletSegs,
-                                                        vpal.flowInlet, 1.5f);
+                                                        inletCol, 1.0f);
                 if (!arrowSegs.empty())
                     st.overlays->drawSimulationSegments(renderer.camera(),
                                                         kSimFlowArrowSegments, arrowSegs,
-                                                        vpal.flowArrow, 2.5f);
+                                                        arrowCol, 1.5f);
                 if (!arrowTris.empty())
                     st.overlays->drawSimulationTriangles(renderer.camera(),
                                                          kSimFlowArrowTriangles, arrowTris,
-                                                         vpal.flowArrow);
+                                                         arrowCol);
+                st.overlays->endScreenClip();
             }
             // Flow-study result: speed-colored streamlines + velocity slices drawn over the
             // Cp-colored model. Stable logical batch keys plus overlayGeneration avoid both
             // per-frame uploads and payload scans for these potentially large retained vectors.
             if (flowResult) {
+                st.overlays->beginScreenClip(renderer.camera(),
+                                             (clr0.x - imgX0) / (float)vw,
+                                             (clr0.y - imgY0) / (float)vh,
+                                             (clr1.x - imgX0) / (float)vw,
+                                             (clr1.y - imgY0) / (float)vh);
                 for (size_t i = 0; i < flowBatches.size(); ++i) {
                     const auto& fb = flowBatches[i];
                     if (fb.segs && !fb.segs->empty())
@@ -2756,12 +2967,34 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             renderer.camera(), kSimFlowResultBase + (uint64_t)i,
                             *fb.segs, fb.color, 2.0f, true, simulationGeneration);
                 }
+                st.overlays->endScreenClip();
+            }
+            if (sceneActive) {
+                for (const auto& batch : simulationScene.lit) {
+                    if (batch.xyz && batch.nrm)
+                        st.overlays->drawSimulationLitTriangles(
+                            renderer.camera(), batch.key, *batch.xyz, *batch.nrm, batch.rgb,
+                            batch.rgba, batch.revision);
+                }
+                // Clip annotations, not shaded pipe/component geometry, to the clear viewport.
+                st.overlays->beginScreenClip(renderer.camera(),
+                                             (clr0.x - imgX0) / (float)vw,
+                                             (clr0.y - imgY0) / (float)vh,
+                                             (clr1.x - imgX0) / (float)vw,
+                                             (clr1.y - imgY0) / (float)vh);
+                for (const auto& batch : simulationScene.lines) {
+                    if (batch.xyz)
+                        st.overlays->drawSimulationSegments(
+                            renderer.camera(), batch.key, *batch.xyz, batch.rgba, batch.width,
+                            batch.overSurface, batch.revision);
+                }
+                st.overlays->endScreenClip();
             }
             if (hasSimulationFrame) st.overlays->endSimulationFrame();
             // CAM geometry is a Manufacture-only native overlay. Path batches stay in their
             // original CPU buffers: drawCamSegments uploads each class once, then selects the
             // completed prefix and pending suffix with GL ranges using the end-time array.
-            if (inManufacture) {
+            if (picking && inManufacture) {
                 if (const ui::CamBackplot* bp = ui::camActiveBackplot()) {
                     const auto& vpal = ui::palette;
                     const bool progressing = ui::camSimHudActive();
@@ -2794,7 +3027,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                                               1.2f, false);
             }
             // Evaluate Measure / Mass Properties markers (distance lines, COM cross, I/J axes).
-            if (st.evaluateDialogs) {
+            if (picking && st.evaluateDialogs) {
                 st.evaluateDialogs->prepareFrame(st);
                 const auto& es = st.evaluateDialogs->overlaySegments();
                 if (!es.empty()) {
@@ -2917,29 +3150,26 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (st.renderer)
                     st.renderer->setBodyAlpha(st.evaluateDialogs->requestedBodyAlpha());
             }
-            std::vector<render::PickHit> selHits;
-            selHits.reserve(st.selection.size());
-            for (const auto& it : st.selection.items()) selHits.push_back(it.hit);
-            // Highlight EVERY pick in the active edge/face well (a fillet's whole edge set), not just
-            // the last-clicked one in st.selection — so the user can always see what's selected,
-            // including when the round preview breaks (radius too large / a stale pick). Stale ids
-            // after a successful rebuild just fail findEdge() and skip silently.
-            if (st.propertyManager && st.propertyManager->active()) {
-                std::vector<std::array<uint32_t, 3>> wellHl;
-                st.propertyManager->collectActiveWellHighlights(wellHl);
-                for (const auto& h : wellHl) {
-                    render::PickHit ph;
-                    ph.body_id = h[0]; ph.topo_id = h[1]; ph.kind = (render::PickKind)h[2];
-                    selHits.push_back(ph);
+            if (picking) {
+                std::vector<render::PickHit> selHits;
+                selHits.reserve(st.selection.size());
+                for (const auto& it : st.selection.items()) selHits.push_back(it.hit);
+                // Highlight every pick in the active edge/face well, including when an edit
+                // preview fails. Stale topology after rebuilding is skipped by the overlay.
+                if (st.propertyManager && st.propertyManager->active()) {
+                    std::vector<std::array<uint32_t, 3>> wellHl;
+                    st.propertyManager->collectActiveWellHighlights(wellHl);
+                    for (const auto& h : wellHl) {
+                        render::PickHit ph;
+                        ph.body_id = h[0]; ph.topo_id = h[1]; ph.kind = (render::PickKind)h[2];
+                        selHits.push_back(ph);
+                    }
                 }
+                // Pane face-well chips claim hover without changing the viewport pick.
+                const bool uiHoverLive = s_uiHoverFrame >= ImGui::GetFrameCount() - 1;
+                st.overlays->draw(renderer.camera(), uiHoverLive ? s_uiHoverFace : st.hover, selHits);
             }
-            st.overlays->draw(renderer.camera(), st.hover, selHits);
             renderer.endOverlay();
-        }
-        else if (st.overlays) {
-            // No active document mesh means no simulation geometry is eligible to render. Release
-            // retained batches immediately rather than waiting for a later pickable frame.
-            st.overlays->clearSimulationBuffers();
         }
 
         // W2 full-bleed viewport: the shaded 3D is composited on the BACKGROUND draw list so it sits
@@ -2991,9 +3221,47 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         const bool touchOwnsNavigation = wasmViewportTouches(
             st, renderer, cr0, cr1, vh, !inSketch && !inSketch3d);
         const bool imgHovered = ImGui::IsItemHovered() && !touchOwnsNavigation;
+        const bool imgMouseOver =
+            ImGui::IsItemHovered(ImGuiHoveredFlags_NoNavOverride) && !touchOwnsNavigation;
 #else
         const bool imgHovered = ImGui::IsItemHovered();
+        // Enter/Backspace/Tab are ImGui nav keys: pressing one hides mouse hover until the mouse
+        // moves, so a pipe tool finishing with Enter would see "not hovered". Scene tools read the
+        // real pointer state instead.
+        const bool imgMouseOver = ImGui::IsItemHovered(ImGuiHoveredFlags_NoNavOverride);
 #endif
+        // Capture the actual press face before hover can move into an overlay column. Left-drag
+        // on geometry in Simulate copies a face; blank-space left-drag and MMB keep navigation.
+        const bool simGestures = st.activeWorkspace == AppState::Workspace::Simulate &&
+            st.simManager && picking && !sceneToolArmed && !inSketch && !inSketch3d &&
+            !st.sketchPlanePickActive &&
+            !(st.propertyManager && st.propertyManager->active()) && !s_zoomAreaArmed &&
+            !s_viewSelector.active() && !tabModelLoading(st) && !st.colormapOn &&
+            !st.rpc.interactionBusy() && !st.simManager->runUi().running &&
+            ImGui::GetTopMostPopupModal() == nullptr;
+        if (!simGestures || s_simFaceDrag.docId != st.docMirror.docId() ||
+            s_simFaceDrag.revision != static_cast<long>(st.docMirror.revision()) ||
+            (!sceneToolArmed && ImGui::IsKeyPressed(ImGuiKey_Escape)))
+            s_simFaceDrag = {};
+        if (simGestures && imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            !io.KeyCtrl && !io.KeyShift && !io.KeyAlt && st.vpDragMode == 0) {
+            s_simFaceDrag = {};
+            ensurePickFresh(true);
+            const auto face = st.idPass->pickFinal(static_cast<int>(io.MousePos.x - vr0.x),
+                static_cast<int>(io.MousePos.y - vr0.y), vw, vh);
+            if (face.valid() && face.kind == render::PickKind::Face) {
+                std::string error;
+                const std::string resolved = st.docMirror.resolvePick(st.worker, face.body_id,
+                    "face", face.topo_id, error);
+                auto selector = nlohmann::json::parse(resolved, nullptr, false);
+                if (ui::sim::validFace(selector, face.body_id, face.topo_id)) {
+                    s_simFaceDrag.docId = st.docMirror.docId();
+                    s_simFaceDrag.revision = static_cast<long>(st.docMirror.revision());
+                    s_simFaceDrag.selector = std::move(selector);
+                    s_simFaceDrag.hit = face;
+                }
+            }
+        }
         // Drop TARGET (Wave 3A item 5): dropping an in-app Explorer file row onto the viewport opens
         // it. The payload is the dragged file's absolute path (NUL-terminated); we hand it to the
         // GL-thread request pump via st.requestOpenPath, which routes CAD vs ECAD by extension — the
@@ -3007,8 +3275,39 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (pl->Data && pl->DataSize > 0)
                     st.requestOpenPath = std::string(static_cast<const char*>(pl->Data));
             }
+            if (simGestures) {
+                if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload(ui::sim::kSetupToolDragPayload)) {
+                    if (pl->IsDelivery() && ui::sim::setupToolDragDocument() == st.docMirror.docId() &&
+                        pl->Data && pl->DataSize > 1 &&
+                        static_cast<const char*>(pl->Data)[pl->DataSize - 1] == '\0' &&
+                        io.MousePos.x >= cr0.x && io.MousePos.x < cr1.x &&
+                        io.MousePos.y >= cr0.y && io.MousePos.y < cr1.y) {
+                        // Setup tools consume the real triangle face at the exact drop pixel,
+                        // not a coincident edge/vertex painted over it for ordinary selection.
+                        ensurePickFresh(true);
+                        const auto face = st.idPass->pickFinal(
+                            static_cast<int>(io.MousePos.x - vr0.x),
+                            static_cast<int>(io.MousePos.y - vr0.y), vw, vh);
+                        if (face.valid() && face.kind == render::PickKind::Face) {
+                            std::string error;
+                            auto selector = nlohmann::json::parse(st.docMirror.resolvePick(
+                                st.worker, face.body_id, "face", face.topo_id, error), nullptr, false);
+                            if (ui::sim::validFace(selector, face.body_id, face.topo_id))
+                                st.simManager->routeSetupDrop(st,
+                                    std::string(static_cast<const char*>(pl->Data), pl->DataSize - 1),
+                                    selector, face.body_id, face.topo_id);
+                        }
+                    }
+                }
+            }
             ImGui::EndDragDropTarget();
         }
+        if (simGestures && s_simFaceDrag.hit.valid())
+            ui::sim::faceDragSource(s_simFaceDrag.docId, s_simFaceDrag.selector,
+                s_simFaceDrag.hit.body_id, s_simFaceDrag.hit.topo_id, "Model face");
+        const bool simFaceOwnsDrag = simGestures && s_simFaceDrag.hit.valid() &&
+                                     ImGui::IsMouseDown(ImGuiMouseButton_Left);
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) s_simFaceDrag = {};
         // Tab-switch loading state: while the ACTIVE part/asm tab's async activation + mesh load
         // are still on the way, frost the wiped scene and center a brand mark + "Loading <tab>…"
         // so the click reads as registered. Painted before the HUD chrome so status pills (busy,
@@ -3033,6 +3332,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Manufacture owns every CAM screen-space overlay just as it owns the native geometry.
         if (inManufacture && ui::camSimHudActive())
             ui::camDrawViewportHud(st, vr0, ImVec2(vr1.x - vr0.x, vr1.y - vr0.y));
+        // Simulate > Hydraulics (hook): the panel's Schematic | Plots | 3D toggle over the 3D view.
+        if (st.activeWorkspace == AppState::Workspace::Simulate && st.simManager)
+            st.simManager->drawViewportHud(st);
         // C25 W2-D: camera navigation. All of it is suppressed while sketching (camera is
         // plane-locked) except the wheel zoom, which stays usable. Any drag-navigation cancels an
         // in-flight tween so the user takes over instantly.
@@ -3094,8 +3396,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     float ry1 = s_zoomAreaP0.y > s_zoomAreaP1.y ? s_zoomAreaP0.y : s_zoomAreaP1.y;
                     float rw = rx1 - rx0, rh = ry1 - ry0;
                     if (rw > 4 && rh > 4) {
-                        // Center of the rect in viewport-relative px (origin = viewport center).
-                        float vcx = (cr0.x + cr1.x) * 0.5f, vcy = (cr0.y + cr1.y) * 0.5f;
+                        // Center of the rect relative to the framed centre (the clear region's
+                        // centre, where the lens shift puts the orbit target).
+                        float vcx = clrC.x, vcy = clrC.y;
                         float rcx = (rx0 + rx1) * 0.5f - vcx;
                         float rcy = (ry0 + ry1) * 0.5f - vcy;
                         // Pan shift: move target so rect center lands at view center.
@@ -3105,12 +3408,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         st.pan[0] += (R.x * rcx - U.x * rcy) * k;
                         st.pan[1] += (R.y * rcx - U.y * rcy) * k;
                         st.pan[2] += (R.z * rcx - U.z * rcy) * k;
-                        // Zoom: scale so rect extent maps to ~90% of viewport.
-                        float vExt = (float)(vw < vh ? vw : vh) * 0.9f;
+                        // Zoom: scale so rect extent maps to ~90% of the clear region.
+                        float vExt = std::min(clr1.x - clr0.x, clr1.y - clr0.y) * 0.9f;
                         float rExt = rw < rh ? rw : rh;
                         if (rExt > 0.0f) {
-                            st.zoom *= vExt / rExt;
-                            st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10.0f ? 10.0f : st.zoom);
+                            st.zoom = std::clamp(st.zoom * vExt / rExt, 0.1f,
+                                                 renderer.maxSceneZoom());
                         }
                         float newPan[3] = {st.pan[0], st.pan[1], st.pan[2]};
                         requestCameraAnimation(st, st.yaw, st.pitch, st.zoom, newPan);
@@ -3156,8 +3459,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // Owns the mouse while active (orbit/pan/pick all skip while s_asmDrag.active). Runs
             // BEFORE push-pull so it wins in assemblies; the push-pull/dim blocks below also gate on
             // !s_asmDrag.active so the two gestures never fight.
-            if (st.hasDocMesh && docIsAssembly(st) && !st.sketchPlanePickActive && !ppPmOpen &&
-                !s_zoomAreaArmed) {
+            if (st.hasDocMesh && docIsAssembly(st) && !sceneToolArmed && !simFaceOwnsDrag &&
+                !st.sketchPlanePickActive && !ppPmOpen && !s_zoomAreaArmed) {
                 // Press: require a single-component selection and a press on its geometry.
                 if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_asmDrag.active &&
                     st.selection.size() == 1) {
@@ -3231,7 +3534,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // While armed it owns the mouse for the drag's whole lifetime (orbit/pan/pick all skip).
             const bool ppEditing = st.propertyManager && st.propertyManager->isEditMode() &&
                                    st.propertyManager->hasPreviewTarget();
-            if (st.hasDocMesh && !st.sketchPlanePickActive && ppEditing && !s_zoomAreaArmed &&
+            if (st.hasDocMesh && !sceneToolArmed && !st.sketchPlanePickActive && ppEditing &&
+                !s_zoomAreaArmed &&
                 !s_asmDrag.active && !st.inSimulation()) {
                 // Simulation lockout: no Instant3D push-pull while a study is open (the model is frozen
                 // so fixtures/loads/results stay valid). Press: hit-test the handle arrow. We use the
@@ -3331,7 +3635,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const bool pmDimActive = ppPmOpen && st.propertyManager &&
                                      st.propertyManager->hasPreviewTarget();
             const std::string dimFid = pmDimActive ? st.propertyManager->targetId() : std::string();
-            if (st.hasDocMesh && !st.sketchPlanePickActive && pmDimActive && !s_zoomAreaArmed &&
+            if (st.hasDocMesh && !sceneToolArmed && !st.sketchPlanePickActive && pmDimActive &&
+                !s_zoomAreaArmed &&
                 !s_pp.active && !s_asmDrag.active) {
                 // Press: hit-test every dimension handle of the feature under edit.
                 if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_dim.active) {
@@ -3494,7 +3799,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // Press near a plane's arrow-tip handle (screen-space square drawn in the HUD pass),
             // project mouse delta onto the normal's screen direction, convert px→mm, and call
             // dragSectionPlane for live re-eval. Never fires while orbit/pan/PM/sketch own the mouse.
-            if (st.evaluateDialogs && st.evaluateDialogs->sectionDragActive() &&
+            if (!sceneToolArmed && st.evaluateDialogs && st.evaluateDialogs->sectionDragActive() &&
                 st.hasDocMesh && !st.sketchPlanePickActive && !inSketch && !inSketch3d &&
                 !s_zoomAreaArmed && !s_pp.active && !s_dim.active && !s_asmDrag.active) {
                 const bool secPmOpen = st.propertyManager && st.propertyManager->active();
@@ -3568,7 +3873,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // C37-C: only starts dragging once the 4px threshold is crossed (s_lmbDragActive).
             // Instant3D: a push-pull OR dimension drag owns the mouse — never orbit/pan while active.
             if (!s_pp.active && !s_dim.active && !s_asmDrag.active && !s_zoomAreaArmed &&
-                s_sectionDragIdx < 0 &&
+                s_sectionDragIdx < 0 && !simFaceOwnsDrag &&
                 s_lmbDragActive && (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
                 cancelCameraAnimation();
                 if (st.vpDragMode == 1) {
@@ -3595,8 +3900,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     applyPan(io.MouseDelta.x, io.MouseDelta.y);
                 } else if (shift) {
                     // Drag up = zoom in. exp keeps each pixel a constant multiplicative step.
-                    st.zoom *= std::exp(-io.MouseDelta.y * 0.005f);
-                    st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
+                    st.zoom = std::clamp(st.zoom * std::exp(-io.MouseDelta.y * 0.005f),
+                                         0.1f, renderer.maxSceneZoom());
                 } else {
                     st.yaw += io.MouseDelta.x * 0.4f;
                     st.pitch += io.MouseDelta.y * 0.4f;   // free orbit: no pitch clamp
@@ -3613,12 +3918,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (io.MouseWheel != 0) {
                 cancelCameraAnimation();
                 float oldZoom = st.zoom < 0.05f ? 0.05f : st.zoom;
-                st.zoom *= (1.0f + io.MouseWheel * 0.1f);
-                st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
+                st.zoom = std::clamp(st.zoom * std::pow(1.1f, io.MouseWheel),
+                                     0.1f, renderer.maxSceneZoom());
                 float newZoom = st.zoom;
                 if (newZoom != oldZoom) {
-                    float cxp = io.MousePos.x - (cr0.x + cr1.x) * 0.5f;
-                    float cyp = io.MousePos.y - (cr0.y + cr1.y) * 0.5f;
+                    float cxp = io.MousePos.x - clrC.x;
+                    float cyp = io.MousePos.y - clrC.y;
                     // worldPerPx is inversely proportional to zoom; the target must move so the
                     // cursor ray hits the same world point. delta = cursorOffset * (1/old - 1/new)
                     // in world units, projected onto the camera plane (R right, U up; y is down).
@@ -3656,8 +3961,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     st.pan[1] += (-R.y * io.MouseDelta.x + U.y * io.MouseDelta.y) * worldPerPx;
                     st.pan[2] += (-R.z * io.MouseDelta.x + U.z * io.MouseDelta.y) * worldPerPx;
                 } else if (shift) {
-                    st.zoom *= std::exp(-io.MouseDelta.y * 0.005f);
-                    st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
+                    st.zoom = std::clamp(st.zoom * std::exp(-io.MouseDelta.y * 0.005f),
+                                         0.1f, renderer.maxSceneZoom());
                 } else {
                     st.yaw += io.MouseDelta.x * 0.4f;
                     st.pitch += io.MouseDelta.y * 0.4f;   // free orbit: no pitch clamp
@@ -3665,8 +3970,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
             }
             if (!skDrag && io.MouseWheel != 0) {
-                st.zoom *= (1.0f + io.MouseWheel * 0.1f);
-                st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
+                st.zoom = std::clamp(st.zoom * std::pow(1.1f, io.MouseWheel),
+                                     0.1f, renderer.maxSceneZoom());
             }
         }
 
@@ -3705,9 +4010,32 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
                 // Esc: cancel in-flight camera tween (selection-clear Esc handling lives in the
                 // picking block below; canceling here is harmless when there is no animation).
-                if (ImGui::IsKeyPressed(ImGuiKey_Escape) && cameraAnimating()) cancelCameraAnimation();
+                if (!sceneToolArmed && ImGui::IsKeyPressed(ImGuiKey_Escape) &&
+                    cameraAnimating()) cancelCameraAnimation();
             }
         }
+
+        bool sceneConsumedClick = false;
+        if (sceneActive) {
+            ui::simscene::ViewportCtx sceneViewport;
+            sceneViewport.cam = renderer.camera();
+            sceneViewport.imgMin = vr0;
+            sceneViewport.imgMax = vr1;
+            sceneViewport.vw = vw;
+            sceneViewport.vh = vh;
+            sceneViewport.hovered = imgMouseOver &&
+                !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
+                ImGui::GetTopMostPopupModal() == nullptr;
+            sceneViewport.navigating = s_lmbDragActive ||
+                ImGui::IsMouseDragging(ImGuiMouseButton_Left) ||
+                ImGui::IsMouseDragging(ImGuiMouseButton_Middle);
+            sceneConsumedClick = ui::simscene::handleViewport(
+                st, sceneViewport, ImGui::GetWindowDrawList());
+        }
+        // Keep the frame-start armed state even if Esc just disarmed the tool; that Esc must
+        // not fall through to selection clearing or another viewport tool in the same frame.
+        const bool sceneOwnsClick = sceneToolArmed || sceneConsumedClick;
+        const bool selectionHovered = imgHovered && !sceneOwnsClick;
 
         // ---- C18: sketch overlay owns the mouse while a sketch is being edited ----
         // C37-C item 5: also call drawOverlay during sketchPlanePickActive (no active sketch yet,
@@ -3757,7 +4085,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         bool regionPickerHot = false;
         if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
             !s_dim.active && !s_pp.active)
-            regionPickerHot = sketch->drawRegionPicker(st, io, vr0, vr1, vw, vh, imgHovered);
+            regionPickerHot = sketch->drawRegionPicker(st, io, vr0, vr1, vw, vh, selectionHovered);
 
         // ---- Wave4: origin triad pick priority (before any plane hit-test) ----
         // With planes force-shown the three origin quads all pass through the world origin, so a
@@ -3770,7 +4098,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             auto* pm = st.propertyManager;
             const bool pmOwnsAxisPlane = pm && pm->active() &&
                 (pm->activeWellWantsAxis() || pm->activeWellWantsPlane());
-            if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && imgHovered &&
+            if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && selectionHovered &&
                 !s_viewSelector.active() && !s_lmbDragActive && !pmOwnsAxisPlane &&
                 st.originVisEff) {
                 // Pick hitbox stays a generous fixed pixel radius (not zoom-dependent).
@@ -3846,7 +4174,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // returned hot over the whole quad).
             const bool pmOwnsPlaneWell = pm && pm->active() && pm->activeWellWantsPlane();
             const bool pmOwnsAxisWell  = pm && pm->active() && pm->activeWellWantsAxis();
-            if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && imgHovered &&
+            if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && selectionHovered &&
                 !s_viewSelector.active() && !s_lmbDragActive && !originPickHot &&
                 !pmOwnsAxisWell && !pmOwnsPlaneWell && !s_pp.active && !s_dim.active) {
                 ImVec2 a, b;
@@ -3875,7 +4203,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // steals the ~10 px axis band while routing into the well.
             if (pmOwnsAxisWell && sketch != nullptr && !inSketch && !inSketch3d &&
                 !st.sketchPlanePickActive && !originPickHot)
-                axisPickerHot = sketch->drawAxisPicker(st, io, vr0, vr1, vw, vh, imgHovered);
+                axisPickerHot = sketch->drawAxisPicker(st, io, vr0, vr1, vw, vh, selectionHovered);
         }
 
         // ---- datum-plane picker (feature PM well OR plain graphics-area select) ----
@@ -3885,21 +4213,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         bool planePickerHot = false;
         if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
             !originPickHot && !axisSelectHot && !axisPickerHot)
-            planePickerHot = sketch->drawPlanePicker(st, io, vr0, vr1, vw, vh, imgHovered);
+            planePickerHot = sketch->drawPlanePicker(st, io, vr0, vr1, vw, vh, selectionHovered);
 
         // ---- datum-axis picker (revolve "Axis", circular-pattern axis) ----
         // Already handled above when a PM axis well is open. Non-well path keeps a no-op call
         // site for any future non-PM axis-picker consumers (currently always false without a well).
         if (!axisPickerHot && sketch != nullptr && !inSketch && !inSketch3d &&
             !st.sketchPlanePickActive && !originPickHot && !planePickerHot)
-            axisPickerHot = sketch->drawAxisPicker(st, io, vr0, vr1, vw, vh, imgHovered);
+            axisPickerHot = sketch->drawAxisPicker(st, io, vr0, vr1, vw, vh, selectionHovered);
 
         // ---- datum-point picker (world origin / user point-datum into a point well) ----
         // Wave4: also suppressed while the origin grab radius owns the cursor (origin wins).
         bool pointPickerHot = false;
         if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
             !originPickHot && !planePickerHot && !axisPickerHot)
-            pointPickerHot = sketch->drawPointPicker(st, io, vr0, vr1, vw, vh, imgHovered);
+            pointPickerHot = sketch->drawPointPicker(st, io, vr0, vr1, vw, vh, selectionHovered);
 
         // ---- sweep/loft path picker (click a displayed helix / curve to set it as the path) ----
         // Runs when a feature PM with an active path/centerline well is open. Returns true while the
@@ -3908,7 +4236,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         bool curvePickerHot = false;
         if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
             !originPickHot && !planePickerHot && !axisPickerHot && !pointPickerHot)
-            curvePickerHot = sketch->drawCurvePathPicker(st, io, vr0, vr1, vw, vh, imgHovered);
+            curvePickerHot = sketch->drawCurvePathPicker(st, io, vr0, vr1, vw, vh, selectionHovered);
 
         // ---- general datum selection: planes / user points (axes handled above) ----
         // Runs in the normal (non-sketch, no-PM-picker) flow. Skipped while an axis is hot so
@@ -3918,13 +4246,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
             !originPickHot && !planePickerHot && !axisPickerHot && !pointPickerHot &&
             !curvePickerHot && !axisSelectHot)
-            datumSelectHot = sketch->drawDatumSelect(st, io, vr0, vr1, vw, vh, imgHovered);
+            datumSelectHot = sketch->drawDatumSelect(st, io, vr0, vr1, vw, vh, selectionHovered);
 
         // ---- fillet/chamfer dashed old-edge overlay (deselect targets over the live round) ----
         bool blendDeselectHot = false;
         if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && !originPickHot &&
             !planePickerHot && !axisPickerHot && !pointPickerHot && !axisSelectHot && !datumSelectHot)
-            blendDeselectHot = drawBlendEdgeOverlay(st, renderer, io, vr0, vr1, vw, vh, imgHovered);
+            blendDeselectHot = drawBlendEdgeOverlay(st, renderer, io, vr0, vr1, vw, vh,
+                                                   selectionHovered);
 
         // ---- hover + click selection (once per frame; only while a doc mesh is loaded) ----
         // C25 W2-E: suppressed while the glass-box View Selector is up (it owns the click).
@@ -3976,7 +4305,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // C37-C item 3: guard against micro-orbit clicks — only fire if drag was not active.
             // C51: a click consumed by the region picker never falls through to model selection.
             // Instant3D: a click that started a push-pull / dimension drag is NOT a selection.
-            if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            if (selectionHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                 !s_lmbDragActive && !originPickHot && !regionPickerHot && !planePickerHot &&
                 !axisPickerHot && !pointPickerHot && !curvePickerHot && !axisSelectHot &&
                 !datumSelectHot &&
@@ -3997,7 +4326,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // selection. Otherwise ESC clears the selection while the viewport is focused/hovered.
             // C37-C item 5: do NOT consume Esc while sketchPlanePickActive (guard above already
             // prevents this block from running in that case, so this Esc is safe).
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            if (!sceneToolArmed && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
                 if (s_pp.active) ppCancel(st);
                 else if (s_dim.active) {
                     // Cancel the in-progress dim drag: restore the field to its press-time value
@@ -4033,7 +4362,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // branch, empty-space clicks never clear selectedFeatureId/planeEmphasis and the plane
         // selection sticks. Same click-vs-drag threshold as the mesh path (s_lmbDragActive).
         if (!picking && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
-            !s_viewSelector.active() && imgHovered &&
+            !s_viewSelector.active() && selectionHovered &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !s_lmbDragActive &&
             !originPickHot && !regionPickerHot && !planePickerHot && !axisPickerHot &&
             !pointPickerHot && !curvePickerHot && !axisSelectHot && !datumSelectHot &&
@@ -5461,7 +5790,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 // per frame keeps the label riding a visible outer corner, SolidWorks-style.
                 Vec3 c4[4];
                 if (!renderer.planeQuad(p, c4)) continue;
-                const float vcx = (vr0.x + vr1.x) * 0.5f, vcy = (vr0.y + vr1.y) * 0.5f;
+                const float vcx = clrC.x, vcy = clrC.y;
                 ImVec2 sp; float bestD2 = -1.0f;
                 for (int ci = 0; ci < 4; ++ci) {
                     ImVec2 cand;
@@ -5473,12 +5802,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (bestD2 < 0.0f) continue;  // every corner behind the camera
                 const char* nm = kPlaneName[p];
                 ImVec2 ts = ImGui::CalcTextSize(nm);
-                // keep the chip inside the viewport rect
+                // Keep the chip inside the clear region so it never shows through a glass pane.
                 float x0 = sp.x, y0 = sp.y;
-                if (x0 + ts.x + 12 > cr1.x) x0 = cr1.x - ts.x - 12;
-                if (x0 < cr0.x + 2) x0 = cr0.x + 2;
-                if (y0 + ts.y + 6 > cr1.y) y0 = cr1.y - ts.y - 6;
-                if (y0 < cr0.y + 2) y0 = cr0.y + 2;
+                if (x0 + ts.x + 12 > clr1.x) x0 = clr1.x - ts.x - 12;
+                if (x0 < clr0.x + 2) x0 = clr0.x + 2;
+                if (y0 + ts.y + 6 > clr1.y) y0 = clr1.y - ts.y - 6;
+                if (y0 < clr0.y + 2) y0 = clr0.y + 2;
                 ImVec2 q0(x0, y0), q1(x0 + ts.x + 12, y0 + ts.y + 6);
                 // C43: during plane-pick the label chips are CLICK TARGETS (the quads overlap
                 // heavily near the origin; the labels are unambiguous). Outside a pick — and outside
@@ -5486,7 +5815,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 // plane in the graphics area (SolidWorks "select a plane, then Sketch"): the click
                 // sets it as the FeatureManager selection so the ribbon "New Sketch" starts on it.
                 bool pmOwnsPlanes = st.propertyManager && st.propertyManager->active();
-                bool chipClickable = st.sketchPlanePickActive || !pmOwnsPlanes;
+                bool chipClickable = sceneToolArmed || st.sketchPlanePickActive || !pmOwnsPlanes;
                 bool chipHovered = chipClickable && ImGui::IsMouseHoveringRect(q0, q1);
                 static const char* kPlaneSel[3] = {"plane.front", "plane.top", "plane.right"};
                 bool chipSelected = !st.sketchPlanePickActive &&
@@ -5501,6 +5830,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
                               ImVec2(x0 + 6 * ui::uiScale, y0 + 3 * ui::uiScale), planeSurf, nm);
                 if (chipHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    static constexpr ui::simscene::Plane scenePlanes[3] = {
+                        ui::simscene::Plane::XZ, ui::simscene::Plane::XY, ui::simscene::Plane::YZ};
+                    if (sceneToolArmed && ui::simscene::onPlaneChip(st, scenePlanes[p]))
+                        continue;
                     if (st.sketchPlanePickActive && st.sketchMode) {
                         st.sketchPlanePickActive = false;
                         st.sketchMode->consumePlanePick(st, kPlaneSel[p]);

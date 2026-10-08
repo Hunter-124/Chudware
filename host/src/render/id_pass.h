@@ -96,10 +96,11 @@ struct IdPassFrameKey {
     float clipOff[3] = {0};
     uint64_t hiddenHash = 0;
     uint64_t docGen = 0;  // bumped on every setDoc() so a rebuilt doc always re-renders
+    bool facesOnly = false;  // face-only consumers must never reuse a full-topology buffer
 
     bool operator==(const IdPassFrameKey& o) const {
         if (w != o.w || h != o.h || clipCount != o.clipCount || hiddenHash != o.hiddenHash ||
-            docGen != o.docGen)
+            docGen != o.docGen || facesOnly != o.facesOnly)
             return false;
         for (int i = 0; i < 16; ++i)
             if (mvp[i] != o.mvp[i]) return false;
@@ -122,8 +123,9 @@ public:
 
     // Render the id buffer for the given camera (matches a Renderer::camera() frame), sizing the
     // R32UI attachment to cam.ssWidth x cam.ssHeight. Returns true when a current frame is available;
-    // unchanged inputs reuse the existing frame without issuing draw calls.
-    bool render(const Renderer::CameraXform& cam);
+    // unchanged inputs reuse the existing frame without issuing draw calls. Face-only consumers
+    // opt into triangle IDs without coincident edge/vertex IDs; ordinary picking keeps all kinds.
+    bool render(const Renderer::CameraXform& cam, bool facesOnly = false);
     // Pick the pixel at (px, py) in FINAL (non-supersampled) viewport coordinates, top-left
     // origin (ImGui convention). Internally scales by the supersample factor and flips to GL's
     // bottom-left origin. The caller must call render() with the current camera immediately before

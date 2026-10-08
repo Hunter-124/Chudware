@@ -25,17 +25,6 @@
 
 namespace ui {
 
-// Human-readable stage labels that match the sim worker's stage token vocabulary.
-static std::string prettySimStage(const std::string& s) {
-    if (s == "voxelize") return "Voxelizing";
-    if (s == "mesh")     return "Meshing";
-    if (s == "assemble") return "Assembling";
-    if (s == "solve")    return "Solving";
-    if (s == "stream")   return "Streaming results";
-    if (s == "post")     return "Post-processing";
-    return s.empty() ? "Solving" : s;
-}
-
 // Clip a label to `maxW` with a real ellipsis, respecting UTF-8 boundaries. The right cluster
 // measures its own tokens (they are laid out at an absolute X), so anything it has to shrink
 // instead of drop goes through this rather than relying on a clip rect that does not exist.
@@ -314,20 +303,22 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         ImGui::PopStyleColor();
     }
     // ---- Simulation progress chip (BOTTOM-LEFT, visible while a FEA/CFD solve runs) --------
-    // Shows: animated spinner | pretty stage label | last log line | elapsed seconds.
-    // Uses the same glass-background pill as the agent livePhase chip above so the two styles
-    // are consistent.  The text pulses slightly so it is obviously alive even when stage is
-    // stuck on "Solving" for a long static analysis.
+    // Shows: animated spinner | human stage label (shared simStageLabel: the same text as the
+    // study footer, never a raw stage id or developer log line) | elapsed seconds. This chip is
+    // the ONE place the status bar reports a running solve (the right cluster's Simulate token
+    // stays quiet while it shows). Uses the same glass-background pill as the agent livePhase
+    // chip above so the two styles are consistent. The text pulses slightly so it is obviously
+    // alive even when stage is stuck on "Solving" for a long static analysis.
     const bool simForce = std::getenv("CHUDWARE_SIMPROG") != nullptr;  // headless smoke: force the chip
-    if ((st.simClient && st.simClient->busy()) || simForce) {
+    const bool simChip = (st.simClient && st.simClient->busy()) || simForce;
+    if (simChip) {
         const bool live = st.simClient && st.simClient->busy();
         std::string stg = live ? st.simClient->stage() : std::string("solve");
         std::string lg  = live ? st.simClient->recentLog()
                                : std::string("assembling stiffness matrix (12,480 nodes)");
         float elapsed   = live ? st.simClient->elapsedSeconds() : 7.0f;
-        std::string chip = "Sim  " + prettySimStage(stg);
-        if (!lg.empty()) chip += "  \xe2\x80\x94  " + lg;  // em-dash separator before detail
-        chip += "  (" + std::to_string(static_cast<int>(elapsed)) + "s)";
+        std::string chip = "Simulation \xc2\xb7 " + simStageLabel(stg, lg) + " \xc2\xb7 " +
+                           std::to_string(static_cast<int>(elapsed)) + " s";
         ImGui::SameLine();
         const float box = ImGui::GetTextLineHeight();
         const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
@@ -450,13 +441,9 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     bool wsTokLive = false;   // true => tint statusOk (something is actively running)
     switch (st.activeWorkspace) {
         case AppState::Workspace::Simulate:
-            if (st.simClient && st.simClient->busy()) {
-                wsTok = "Solver: " + prettySimStage(st.simClient->stage()) + " (" +
-                        std::to_string((int)st.simClient->elapsedSeconds()) + "s)";
-                wsTokLive = true;
-            } else {
-                wsTok = "Solver idle";
-            }
+            // A running solve is reported once, by the bottom-left progress chip; this token
+            // only says the solver is idle.
+            if (!simChip) wsTok = "Solver idle";
             break;
         case AppState::Workspace::PartsLibrary: {
             int n = 0;

@@ -176,5 +176,14 @@ inline float camBtnH()        { return px(28.0f); }    // toolbar / action butto
 inline float camBtnGap()      { return px(6.0f); }     // between toolbar buttons
 inline float camTreeIndent()  { return px(12.0f); }    // per-level tree indent
 inline float camCaptionGap()  { return px(3.0f); }     // row -> its sub-caption ("extracted stock ...")
+
+// ---- Simulate workspace left column (layout.cpp drawLeftPane) -----------------------------------
+// Default WINDOW width of the Simulation Manager column in the Simulate workspace. Sim forms
+// (label column + value + unit suffix, face wells, result cards) wrapped/clipped at the shared
+// 320dp FeatureManager default (~280 px of content after the 8dp window + 12dp body insets); 380dp
+// yields ~340 px of content, inside the standard's <= ~360 px side-pane budget. layout.cpp clamps
+// it to a fraction of the overlay band so the viewport stays usable on narrow windows; user
+// resizes persist per workspace and "Reset layout" restores this value.
+inline float simManagerPaneW() { return px(380.0f); }
 }  // namespace metrics
 }  // namespace ui

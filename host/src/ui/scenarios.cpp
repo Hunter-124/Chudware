@@ -20,9 +20,12 @@
 #include <limits>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <mutex>
 #include <vector>
 
 #include "../core/app_state.h"
+#include "../core/sim_client.h"  // simaudit: mesh-preview idle wait (SimClient::busy)
 #include "../renderer.h"  // T-G15 iconpipe: transparent thumbnail render + FBO readback
 #include "../render/splat_renderer.h"  // RE-28: 3DGS splat renderer
 #include "cam/cam_panel.h"  // camLoadJob (CAM copilot fast-path scenario)
@@ -35,6 +38,14 @@
 #include "sim_topology.h"
 #include "sketch_mode.h"
 #include "sketch3d_mode.h"
+#include "ui_audit.h"  // simaudit + CHUDWARE_IDAUDIT: test-engine-hook ID-conflict / clipping audit
+#include "viewport_panel.h"
+#include "sim/sim_scene.h"
+#include "../ui_theme.h"
+#include <array>
+#include "../render/id_pass.h"
+#include <imgui_internal.h>
+#include "firmware/fw_workspace.h"
 
 namespace {
 
@@ -52,11 +63,4963 @@ void writeBackbufferPng(const char* path, int dw, int dh, const char* mirrorPath
     if (mirrorPath) stbi_write_png(mirrorPath, dw, dh, 4, flip.data(), dw * 4);
 }
 
+// Use the exact published image rectangle and last renderer camera, including lens shift.
+// The invisible input item covers only the content; it is not the full-bleed image origin.
+bool sceneShotViewport(AppState& st, ui::simscene::ViewportCtx& vp) {
+    if (!st.renderer || !ui::viewportBackdrop().valid()) return false;
+    vp.cam = st.renderer->camera();
+    vp.imgMin = ui::viewportBackdrop().screenMin;
+    vp.imgMax = ui::viewportBackdrop().screenMax;
+    vp.vw = vp.cam.vpWidth; vp.vh = vp.cam.vpHeight;
+    return vp.vw > 0 && vp.vh > 0;
+}
+
+bool sceneShotPoint(AppState& st, const float world[3], ImVec2& screen) {
+    ui::simscene::ViewportCtx vp;
+    ImVec2 lo, hi;
+    return sceneShotViewport(st, vp) && ui::viewportClearRect(lo, hi) &&
+        ui::simscene::worldToScreen(vp, world, screen) &&
+        screen.x > lo.x + 16 && screen.x < hi.x - 16 &&
+        screen.y > lo.y + 36 && screen.y < hi.y - 36;
+}
+
+// Read the actual shaded viewport FBO, not chrome/schematic pixels. Count foreground
+// in projected geometry patches against a same-row background sample (the studio
+// background has a vertical gradient). Patches away from the obstacle keep the original
+// piping shot from passing merely because its solid box is visible.
+nlohmann::json sceneShotPixels(AppState& st, const std::vector<std::array<float, 3>>& points) {
+    ui::simscene::ViewportCtx vp;
+    ImVec2 lo, hi;
+    if (!sceneShotViewport(st, vp) || !ui::viewportClearRect(lo, hi))
+        return {{"ok", false}, {"reason", "no_rendered_viewport"}};
+    const int w = vp.cam.ssWidth, h = vp.cam.ssHeight;
+    if (w <= 0 || h <= 0) return {{"ok", false}, {"reason", "empty_framebuffer"}};
+    std::vector<unsigned char> pixels(static_cast<size_t>(w) * h * 4);
+    st.renderer->beginOverlay();
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    st.renderer->endOverlay();
+    auto pixel = [&](float x, float y) {
+        const int ix = std::clamp((int)((x - vp.imgMin.x) * w / vp.vw), 0, w - 1);
+        const int iy = std::clamp(h - 1 - (int)((y - vp.imgMin.y) * h / vp.vh), 0, h - 1);
+        return &pixels[(static_cast<size_t>(iy) * w + ix) * 4];
+    };
+    int different = 0, sampled = 0, patches = 0, visiblePatches = 0;
+    for (const auto& p : points) {
+        ImVec2 s;
+        if (!sceneShotPoint(st, p.data(), s)) continue;
+        ++patches;
+        const int before = different;
+        for (int y = -8; y <= 8; ++y) for (int x = -8; x <= 8; ++x) {
+            const auto* a = pixel(s.x + x, s.y + y);
+            const auto* b = pixel(lo.x + 4, s.y + y);
+            int delta = 0;
+            for (int c = 0; c < 3; ++c) delta = std::max(delta, std::abs(int(a[c]) - int(b[c])));
+            ++sampled;
+            if (delta > 24) ++different;
+        }
+        if (different - before >= 20) ++visiblePatches;
+    }
+    return {{"ok", patches > 0 && different >= 40}, {"foreground_pixels", different},
+            {"sampled_pixels", sampled}, {"projected_patches", patches}, {"visible_patches", visiblePatches},
+            {"clear_rect", {lo.x, lo.y, hi.x, hi.y}}, {"source", "rendered_viewport_fbo"}};
+}
+
+struct SceneShotInput {
+    int phase = 0;
+    ImVec2 point;
+    bool click(ImVec2 p, bool shift = false) {
+        auto& io = ImGui::GetIO();
+        if (phase == 0) point = p;
+        io.AddMousePosEvent(point.x, point.y);
+        io.AddKeyEvent(ImGuiMod_Shift, shift);
+        if (phase == 1) io.AddMouseButtonEvent(0, true);
+        if (phase == 2) io.AddMouseButtonEvent(0, false);
+        if (++phase < 5) return false;
+        io.AddKeyEvent(ImGuiMod_Shift, false);
+        phase = 0;
+        return true;
+    }
+    bool key(ImGuiKey k) {
+        auto& io = ImGui::GetIO();
+        // Headless backends may report an absent mouse between injected gestures.
+        // Enter/Tab belong to the scene only while the last clicked point stays hovered.
+        io.AddMousePosEvent(point.x, point.y);
+        io.AddKeyEvent(k, phase == 0);
+        if (++phase < 3) return false;
+        phase = 0;
+        return true;
+    }
+};
+
+// ---------- piping scenario (CHUDWARE_SHOT=piping) ----------
+// A fresh part with a 200 mm box in the way opens Simulate > Piping; a 2" sch 40 pipe is routed
+// from -X to +X (the engine injects the box as an obstacle through doc_id, so the route has to
+// bend around it), then Solve, ASME B31.3 Spec Check and BOM run through the panel's own button
+// entry points. The network must come back from sim_study_list as a piping_network study holding
+// all three results (so it saves with the .step+). Each panel state is captured to
+// scratch/piping_shots with a JSON report; a failure exits non-zero. State is file-local because
+// the scenario drives only public SimManager / PipingPanel entry points.
+struct PipingShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, settle = 0, captureWait = 0, idleFrames = 0;
+    std::string dir, capture, queued;
+    nlohmann::json report;
+    double waitStart = 0.0;
+};
+PipingShot g_piping;
+
+double pipingNow() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void pipingFail(const std::string& code, const std::string& detail) {
+    std::printf("piping: FAILED [%s] %s\n", code.c_str(), detail.c_str());
+    std::fflush(stdout);
+    g_piping.report["ok"] = false;
+    g_piping.report["failure"] = {{"code", code}, {"detail", detail}, {"step", g_piping.step}};
+    g_piping.failed = true;
+    g_piping.done = true;
+    g_piping.queued.clear();
+    g_piping.capture = g_piping.dir + "/piping_FAILED.png";
+}
+
+void pipingShotTick(AppState& st) {
+    PipingShot& P = g_piping;
+    if (!P.init) {
+        P.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        P.want = st.shot && mode && std::strcmp(mode, "piping") == 0;
+        if (P.want) {
+            const char* repo = std::getenv("CHUDWARE_REPO");
+            P.dir = std::string(repo ? repo : ".") + "/scratch/piping_shots";
+            std::error_code ec;
+            std::filesystem::create_directories(P.dir, ec);
+            P.report = {{"scenario", "piping"}, {"ok", false},
+                        {"checks", nlohmann::json::array()}, {"captures", nlohmann::json::array()}};
+        }
+    }
+    if (!P.want || P.done) return;
+    if (!st.workerStarted || st.frame < 5) return;
+    if (!P.capture.empty()) return;  // endFrame consumes it
+    if (P.settle > 0) { --P.settle; return; }
+    if (!P.queued.empty()) {
+        P.capture = P.queued;
+        P.queued.clear();
+        return;
+    }
+
+    const int kSettle = 8;
+    const double kTimeoutS = 180.0;
+    auto shoot = [&](const char* name) {
+        P.queued = P.dir + "/" + name;
+        P.settle = kSettle * 2;
+    };
+    ui::SimManager* sm = st.simManager;
+    if (P.step > 1 && !sm) {
+        pipingFail("no_sim_manager", "the part lost its Simulation manager");
+        return;
+    }
+    // True while the panel's request (or its study save) is still in flight.
+    auto waiting = [&](const char* what) -> bool {
+        if (!sm->piping().busy() && !st.rpc.busy()) return false;
+        if (pipingNow() - P.waitStart > kTimeoutS)
+            pipingFail(std::string(what) + "_timeout",
+                       "no answer after " + std::to_string((int)kTimeoutS) + " s");
+        return true;
+    };
+    auto launch = [&](const char* cmd, bool (ui::PipingPanel::*run)(AppState&), const char* what) {
+        sm->handleCommand(st, cmd);
+        if (!(sm->piping().*run)(st)) {
+            pipingFail(std::string(what) + "_not_started", sm->piping().lastError());
+            return;
+        }
+        P.waitStart = pipingNow();
+        ++P.step;
+    };
+    auto refused = [&](const char* what) -> bool {
+        if (sm->piping().lastError().empty()) return false;
+        pipingFail(std::string(what) + "_refused", sm->piping().lastError());
+        return true;
+    };
+
+    switch (P.step) {
+        case 0: {  // part with a 200 mm cube centred on the origin: the obstacle
+            std::string err;
+            if (!st.docMirror.newPart(st.worker, err)) { pipingFail("new_part", err); return; }
+            st.clearViewportForNewDoc();
+            st.addDocTab(false);
+            auto dim = [](double v) { return nlohmann::json{{"value", v}, {"expr", nullptr}}; };
+            nlohmann::json ops = nlohmann::json::array();
+            ops.push_back({{"op", "add_feature"}, {"feature", {
+                {"type", "box"}, {"name", "Obstacle"},
+                {"params", {{"length", dim(200.0)}, {"width", dim(200.0)}, {"height", dim(200.0)}}},
+                {"centered", true}}}});
+            auto r = st.docMirror.applyOps(st.worker, ops);
+            if (!r.ok) { pipingFail("obstacle", r.error_message); return; }
+            if (r.aicm_path.empty() || !st.loadDocMesh(r.aicm_path, err)) {
+                pipingFail("obstacle_mesh", err.empty() ? "obstacle returned no mesh" : err); return;
+            }
+            std::printf("piping: obstacle box 200 mm at the origin (rev %d)\n", r.revision);
+            std::fflush(stdout);
+            st.yaw = 35; st.pitch = 30; st.zoom = 0.6f;
+            P.settle = 3;
+            P.idleFrames = 0;
+            ++P.step;
+            return;
+        }
+        case 1: {  // Simulate workspace, Piping tab, new network
+            if (!sm) {
+                if (++P.idleFrames > 120) pipingFail("no_sim_manager", "the part has no Simulation manager");
+                return;
+            }
+            if (st.rpc.busy()) return;
+            st.activeWorkspace = AppState::Workspace::Simulate;
+            st.leftPaneTab = AppState::LP_Simulation;
+            st.showRibbon = true;
+            st.showSimulationTools = true;
+            sm->handleCommand(st, "sim_piping_new");
+            if (!sm->piping().isOpen()) { pipingFail("panel", "sim_piping_new did not open the panel"); return; }
+            P.waitStart = pipingNow();
+            ++P.step;
+            return;
+        }
+        case 2: {  // route a 2" line straight through where the box is
+            if (waiting("new_network")) return;
+            const double start[3] = {-400.0, 0.0, 0.0}, end[3] = {400.0, 0.0, 0.0};
+            const double dir[3] = {1.0, 0.0, 0.0};
+            sm->piping().setRouteEndpoints(start, dir, end, dir);
+            sm->piping().setRouteSpec(2.0, "40", "A106-B", 50.0);
+            launch("sim_piping_route", &ui::PipingPanel::runRoute, "route");
+            return;
+        }
+        case 3: {
+            if (waiting("route")) return;
+            if (refused("route")) return;
+            const nlohmann::json& rt = sm->piping().lastRoute();
+            const int bends = rt.value("bends", 0);
+            const double clearance = rt.value("min_clearance_mm", -1.0);
+            const nlohmann::json& net = sm->piping().network();
+            const auto runs = net.is_object() ? net.value("runs", nlohmann::json::array())
+                                              : nlohmann::json::array();
+            std::printf("piping: routed %s length %.1f mm, %d bends, min clearance %.1f mm, %zu run(s)\n",
+                        rt.value("run_id", std::string("?")).c_str(), rt.value("length_mm", 0.0), bends,
+                        clearance, runs.size());
+            std::fflush(stdout);
+            P.report["route"] = rt;
+            if (runs.size() != 1) { pipingFail("route_runs", "expected 1 run, got " + std::to_string(runs.size())); return; }
+            if (bends < 2) { pipingFail("route_straight", "the route did not bend around the box"); return; }
+            if (clearance < 49.9) { pipingFail("route_clearance", "min clearance " + std::to_string(clearance) + " mm < 50 mm"); return; }
+            shoot("piping_01_route.png");
+            ++P.step;
+            return;
+        }
+        case 4:
+            launch("sim_piping_solve", &ui::PipingPanel::runSolve, "solve");
+            return;
+        case 5: {
+            if (waiting("solve")) return;
+            if (refused("solve")) return;
+            const nlohmann::json& s = sm->piping().solveResult();
+            const auto links = s.value("links", nlohmann::json::array());
+            std::printf("piping: solve converged=%d links=%zu\n", (int)s.value("converged", false), links.size());
+            std::fflush(stdout);
+            P.report["solve"] = s;
+            if (!s.value("converged", false) || links.empty()) { pipingFail("solve_result", s.dump()); return; }
+            shoot("piping_02_solve.png");
+            ++P.step;
+            return;
+        }
+        case 6:
+            launch("sim_piping_spec", &ui::PipingPanel::runSpecCheck, "spec");
+            return;
+        case 7: {
+            if (waiting("spec")) return;
+            if (refused("spec")) return;
+            const nlohmann::json& s = sm->piping().specResult();
+            const auto runs = s.value("runs", nlohmann::json::array());
+            std::printf("piping: B31.3 all_pass=%d runs=%zu\n", (int)s.value("all_pass", false), runs.size());
+            std::fflush(stdout);
+            P.report["spec_check"] = s;
+            if (runs.empty()) { pipingFail("spec_result", s.dump()); return; }
+            shoot("piping_03_spec.png");
+            ++P.step;
+            return;
+        }
+        case 8:
+            launch("sim_piping_bom", &ui::PipingPanel::runBom, "bom");
+            return;
+        case 9: {
+            if (waiting("bom")) return;
+            if (refused("bom")) return;
+            const nlohmann::json& b = sm->piping().bomResult();
+            const auto items = b.value("items", nlohmann::json::array());
+            std::printf("piping: BOM items=%zu totals=%s\n", items.size(),
+                        b.value("totals", nlohmann::json::object()).dump().c_str());
+            std::fflush(stdout);
+            P.report["bom"] = b;
+            if (items.empty()) { pipingFail("bom_result", b.dump()); return; }
+            shoot("piping_04_bom.png");
+            ++P.step;
+            return;
+        }
+        case 10: {  // the network and all three results are a study of the document
+            if (st.rpc.busy()) return;
+            const std::string id = sm->piping().networkStudyId();
+            nlohmann::json res;
+            std::string err;
+            if (!st.worker.call("sim_study_list", {{"doc_id", st.docMirror.docId()}}, res, err, 15000) ||
+                !res.is_object()) {
+                pipingFail("study_list", err);
+                return;
+            }
+            nlohmann::json found;
+            for (const auto& s : res.value("studies", nlohmann::json::array()))
+                if (s.is_object() && s.value("id", std::string()) == id) found = s;
+            if (id.empty() || !found.is_object() || found.value("type", std::string()) != "piping_network") {
+                pipingFail("study_missing", "no piping_network study '" + id + "' in sim_study_list");
+                return;
+            }
+            const auto results = found.value("results", nlohmann::json::object());
+            for (const char* k : {"solve", "spec_check", "bom"})
+                if (!results.contains(k)) {
+                    pipingFail("study_incomplete", std::string("persisted network lacks results.") + k);
+                    return;
+                }
+            P.report["study_id"] = id;
+            std::printf("piping: study %s persisted with solve + spec_check + bom\n", id.c_str());
+            std::fflush(stdout);
+            P.report["ok"] = true;
+            P.done = true;
+            P.capture = P.dir + "/piping_05_final.png";
+            return;
+        }
+        default:
+            return;
+    }
+}
+
+// Per-step capture + frame-loop control for the piping scenario. Returns false when the scenario
+// is not active; otherwise `breakLoop` says whether the run is over.
+bool pipingShotEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    PipingShot& P = g_piping;
+    if (!P.want) return false;
+    ++st.frame;
+    if (!P.capture.empty() && (!st.rpc.busy() || ++P.captureWait > 600)) {
+        std::error_code ec;
+        std::filesystem::create_directories(P.dir, ec);
+        if (!P.failed && P.capture.find("01_route") != std::string::npos) {
+            std::vector<std::array<float, 3>> points;
+            for (const auto& run : st.simManager->piping().network().value("runs", nlohmann::json::array())) {
+                const auto path = run.value("path", nlohmann::json::array());
+                for (size_t i = 1; i < path.size(); ++i) for (float t : {0.25f, 0.5f, 0.75f}) {
+                    std::array<float, 3> p;
+                    for (int k = 0; k < 3; ++k)
+                        p[k] = path[i-1][k].get<float>() * (1-t) + path[i][k].get<float>() * t;
+                    if (std::fabs(p[0]) > 220) points.push_back(p);
+                }
+            }
+            auto check = sceneShotPixels(st, points);
+            check["name"] = "routed_pipe_visible";
+            P.report["checks"].push_back(check);
+            if (!check.value("ok", false)) pipingFail("routed_pipe_invisible", check.dump());
+        }
+        writeBackbufferPng(P.capture.c_str(), dw, dh, P.done ? screenshotPath : nullptr);
+        std::printf("piping: screenshot -> %s (%dx%d)\n", P.capture.c_str(), dw, dh);
+        std::fflush(stdout);
+        P.report["captures"].push_back(P.capture);
+        P.capture.clear();
+        P.captureWait = 0;
+    }
+    glfwSwapBuffers(st.win);
+    breakLoop = false;
+    if (P.done && P.capture.empty()) {
+        const std::string path = P.dir + "/piping_report.json";
+        std::ofstream out(path, std::ios::trunc);
+        out << P.report.dump(2) << '\n';
+        out.close();
+        std::printf("piping: report -> %s ok=%d\n", path.c_str(), (int)P.report.value("ok", false));
+        std::fflush(stdout);
+        if (P.failed || !out) {
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+        breakLoop = true;
+    }
+    return true;
+}
+
+// ---------- hydraulics scenario (CHUDWARE_SHOT=hydraulics) ----------
+// A fresh part (a base plate to carry the study) opens Simulate > Hydraulics and builds, through
+// the panel's own button entry points (the same engine RPCs the agent tools call), a circuit of a
+// reservoir, a gear pump, a relief valve, a 4/3 tandem-centre directional valve and a
+// double-acting cylinder joined by six hoses (the pressure line is a three-way tee). The cylinder
+// is sized (63/36 mm at 160 bar, applied to the component) and the pump's electric drive is
+// sized. A 3 s transient then extends the cylinder against a 10 kN load after the valve shifts
+// to "a" at 0.2 s: the rod must move. The BOM and the hose-to-piping handoff run next, and the
+// circuit must come back from sim_study_list holding simulate, BOM, piping handoff and sizing.
+// A second record then adopts the native cylinder_circuit template through the Start-card path
+// and runs its included setup. Captures and hydraulics_report.json land in scratch/hydraulics_shots.
+struct HydraulicsShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, sub = 0, settle = 0, captureWait = 0, idleFrames = 0;
+    std::string dir, capture, queued;
+    nlohmann::json report;
+    double waitStart = 0.0, started = 0.0;
+    bool view3d = false;
+    SceneShotInput input;
+    std::string placedId;
+    nlohmann::json beforePosition;
+};
+HydraulicsShot g_hyd;
+
+void hydFail(const std::string& code, const std::string& detail) {
+    std::printf("hydraulics: FAILED [%s] %s\n", code.c_str(), detail.c_str());
+    std::fflush(stdout);
+    g_hyd.report["ok"] = false;
+    g_hyd.report["failure"] = {{"code", code}, {"detail", detail}, {"step", g_hyd.step}};
+    g_hyd.failed = true;
+    g_hyd.done = true;
+    g_hyd.queued.clear();
+    g_hyd.capture = g_hyd.dir + "/hydraulics_FAILED.png";
+}
+
+void hydraulicsShotTick(AppState& st) {
+    HydraulicsShot& H = g_hyd;
+    if (!H.init) {
+        H.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        H.view3d = mode && std::strcmp(mode, "hydraulics3d") == 0;
+        H.want = st.shot && mode && (std::strcmp(mode, "hydraulics") == 0 || H.view3d);
+        if (H.want) {
+            const char* repo = std::getenv("CHUDWARE_REPO");
+            H.dir = std::string(repo ? repo : ".") + (H.view3d ? "/scratch/hydraulics3d_shots" : "/scratch/hydraulics_shots");
+            std::error_code ec;
+            std::filesystem::create_directories(H.dir, ec);
+            H.report = {{"scenario", H.view3d ? "hydraulics3d" : "hydraulics"}, {"ok", false},
+                        {"checks", nlohmann::json::array()}, {"captures", nlohmann::json::array()}};
+            H.started = pipingNow();
+        }
+    }
+    if (!H.want || H.done) return;
+    if (H.view3d && pipingNow() - H.started > 600) {
+        hydFail("scenario_timeout", "3D layout scenario exceeded 600 s"); return;
+    }
+    if (!st.workerStarted || st.frame < 5) return;
+    if (!H.capture.empty()) return;  // endFrame consumes it
+    if (H.settle > 0) { --H.settle; return; }
+    if (!H.queued.empty()) {
+        H.capture = H.queued;
+        H.queued.clear();
+        return;
+    }
+
+    const int kSettle = 8;
+    const double kTimeoutS = 300.0;
+    auto shoot = [&](const char* name) {
+        H.queued = H.dir + "/" + name;
+        H.settle = kSettle * 2;
+    };
+    ui::SimManager* sm = st.simManager;
+    if (H.step > 1 && !sm) {
+        hydFail("no_sim_manager", "the part lost its Simulation manager");
+        return;
+    }
+    // True while a panel request (or its study save) is still in flight.
+    auto waiting = [&](const char* what) -> bool {
+        if (!sm->hydraulic().busy() && !st.rpc.busy()) return false;
+        if (pipingNow() - H.waitStart > kTimeoutS)
+            hydFail(std::string(what) + "_timeout", "no answer after " + std::to_string((int)kTimeoutS) + " s");
+        return true;
+    };
+    auto refused = [&](const char* what) -> bool {
+        if (sm->hydraulic().lastError().empty()) return false;
+        hydFail(std::string(what) + "_refused", sm->hydraulic().lastError());
+        return true;
+    };
+    auto started = [&](bool ok, const char* what) {
+        if (!ok) {
+            hydFail(std::string(what) + "_not_started", sm->hydraulic().lastError());
+            return;
+        }
+        H.waitStart = pipingNow();
+    };
+    auto id = [&](const char* name) { return sm->hydraulic().componentIdByName(name); };
+
+    struct Comp {
+        const char* type;
+        const char* name;
+        double x, y;
+        nlohmann::json params;
+    };
+    static const std::vector<Comp> kComps = {
+        {"reservoir", "Tank", 0.0, -150.0, {{"volume_l", 60.0}}},
+        {"pump", "Pump", 0.0, 0.0,
+         {{"pump_type", "gear"}, {"displacement_cc_rev", 16.0}, {"speed_rpm", 1450.0},
+          {"vol_efficiency", 0.95}, {"mech_efficiency", 0.9}}},
+        {"valve_relief", "Relief", 180.0, 0.0, {{"set_pressure_bar", 160.0}}},
+        {"valve_directional", "DCV 4/3", 0.0, 160.0,
+         {{"ways", 4}, {"positions", 3}, {"center_condition", "tandem"}, {"actuator", "solenoid"},
+          {"response_ms", 30.0}}},
+        {"cylinder_linear", "Lift cylinder", 0.0, 320.0,
+         {{"actuator_type", "double_acting"}, {"bore_mm", 50.0}, {"rod_mm", 28.0},
+          {"stroke_mm", 300.0}, {"piston_mass_kg", 5.0}}},
+    };
+    struct Hose {
+        const char* net;
+        std::vector<std::pair<const char*, const char*>> ends;  // component name, port
+        double lengthMm, idMm, ratingBar;
+    };
+    static const std::vector<Hose> kHoses = {
+        {"Pressure", {{"Pump", "P"}, {"Relief", "P"}, {"DCV 4/3", "P"}}, 800.0, 12.7, 280.0},
+        {"Relief return", {{"Relief", "T"}, {"Tank", "T"}}, 600.0, 19.0, 40.0},
+        {"Return", {{"DCV 4/3", "T"}, {"Tank", "T2"}}, 1200.0, 19.0, 40.0},
+        {"Suction", {{"Tank", "S"}, {"Pump", "T"}}, 400.0, 25.4, 10.0},
+        {"Cylinder A", {{"DCV 4/3", "A"}, {"Lift cylinder", "A"}}, 1500.0, 12.7, 280.0},
+        {"Cylinder B", {{"DCV 4/3", "B"}, {"Lift cylinder", "B"}}, 1500.0, 12.7, 280.0},
+    };
+
+    switch (H.step) {
+        case 0: {  // a part to carry the study: a 300 x 200 x 20 mm base plate
+            std::string err;
+            if (!st.docMirror.newPart(st.worker, err)) { hydFail("new_part", err); return; }
+            st.clearViewportForNewDoc();
+            st.addDocTab(false);
+            if (H.view3d) {
+                st.planesUserToggled = st.axesUserToggled = st.originUserToggled = true;
+                for (auto& p : st.showPlane) p = false;
+                for (const char* id : {"axis.x", "axis.y", "axis.z", "point.origin"}) st.hiddenFeatures.insert(id);
+                H.settle = 3; ++H.step; return;
+            }
+            auto dim = [](double v) { return nlohmann::json{{"value", v}, {"expr", nullptr}}; };
+            nlohmann::json ops = nlohmann::json::array();
+            ops.push_back({{"op", "add_feature"}, {"feature", {
+                {"type", "box"}, {"name", "Power unit base"},
+                {"params", {{"length", dim(300.0)}, {"width", dim(200.0)}, {"height", dim(20.0)}}},
+                {"centered", true}}}});
+            auto r = st.docMirror.applyOps(st.worker, ops);
+            if (!r.ok) { hydFail("base_plate", r.error_message); return; }
+            if (r.aicm_path.empty() || !st.loadDocMesh(r.aicm_path, err)) {
+                hydFail("base_plate_mesh", err.empty() ? "base plate returned no mesh" : err); return;
+            }
+            std::printf("hydraulics: base plate part (rev %d)\n", r.revision);
+            std::fflush(stdout);
+            H.settle = 3;
+            H.idleFrames = 0;
+            ++H.step;
+            return;
+        }
+        case 1: {  // Simulate workspace, Hydraulics tab, New Circuit
+            if (!sm) {
+                if (++H.idleFrames > 120) hydFail("no_sim_manager", "the part has no Simulation manager");
+                return;
+            }
+            if (st.rpc.busy()) return;
+            st.activeWorkspace = AppState::Workspace::Simulate;
+            st.leftPaneTab = AppState::LP_Simulation;
+            st.showRibbon = true;
+            st.showSimulationTools = true;
+            sm->handleCommand(st, "sim_hyd_new");
+            if (!sm->hydraulic().isOpen()) { hydFail("panel", "sim_hyd_new did not open the panel"); return; }
+            H.waitStart = pipingNow();
+            ++H.step;
+            return;
+        }
+        case 2: {
+            if (waiting("new_circuit")) return;
+            if (refused("new_circuit")) return;
+            if (!sm->hydraulic().circuit().is_object()) { hydFail("new_circuit", "no circuit after hydraulic_new"); return; }
+            H.sub = 0;
+            ++H.step;
+            return;
+        }
+        case 3: {  // Add Component x5
+            if (waiting("add_component")) return;
+            if (refused("add_component")) return;
+            if (H.sub < (int)kComps.size()) {
+                const Comp& c = kComps[H.sub];
+                sm->handleCommand(st, "sim_hyd_add");
+                started(sm->hydraulic().addComponent(st, c.type, c.name, c.x, c.y, c.params), "add_component");
+                ++H.sub;
+                return;
+            }
+            const auto comps = sm->hydraulic().circuit().value("components", nlohmann::json::array());
+            if (comps.size() != kComps.size()) {
+                hydFail("components", "expected " + std::to_string(kComps.size()) + " components, got " +
+                                          std::to_string(comps.size()));
+                return;
+            }
+            for (const auto& c : kComps)
+                if (id(c.name).empty()) { hydFail("component_missing", c.name); return; }
+            std::printf("hydraulics: %zu components added\n", comps.size());
+            std::fflush(stdout);
+            shoot("hydraulics_01_components.png");
+            H.sub = 0;
+            ++H.step;
+            return;
+        }
+        case 4: {  // Connect x6 (the pressure line is a three-way tee)
+            if (waiting("connect")) return;
+            if (refused("connect")) return;
+            if (H.sub < (int)kHoses.size()) {
+                const Hose& h = kHoses[H.sub];
+                std::vector<std::pair<std::string, std::string>> ends;
+                for (const auto& e : h.ends) ends.push_back({id(e.first), e.second});
+                sm->handleCommand(st, "sim_hyd_hose");
+                started(sm->hydraulic().addHose(st, h.net, ends, h.lengthMm, h.idMm, h.ratingBar), "connect");
+                ++H.sub;
+                return;
+            }
+            const auto hoses = sm->hydraulic().circuit().value("hoses", nlohmann::json::array());
+            if (hoses.size() != kHoses.size()) {
+                hydFail("hoses", "expected " + std::to_string(kHoses.size()) + " hoses, got " +
+                                     std::to_string(hoses.size()));
+                return;
+            }
+            for (const auto& h : hoses)
+                if (!h.value("id_mm", 0.0) || !h.value("length_mm", 0.0)) {
+                    hydFail("hose_geometry", "hose " + h.value("id", std::string("?")) + " lost its id_mm/length_mm");
+                    return;
+                }
+            H.report["circuit"] = sm->hydraulic().circuit();
+            std::printf("hydraulics: %zu hoses connected\n", hoses.size());
+            std::fflush(stdout);
+            shoot("hydraulics_02_circuit.png");
+            ++H.step;
+            return;
+        }
+        case 5:  // Size Cylinder: 63/36 mm at 160 bar, 300 mm stroke, 100 mm/s
+            sm->handleCommand(st, "sim_hyd_size_cyl");
+            sm->hydraulic().setCylinderInputs(id("Lift cylinder"), 63.0, 36.0, 160.0, 300.0, 100.0);
+            started(sm->hydraulic().runSizeCylinder(st), "size_cylinder");
+            ++H.step;
+            return;
+        case 6: {
+            if (waiting("size_cylinder")) return;
+            if (refused("size_cylinder")) return;
+            const nlohmann::json& r = sm->hydraulic().cylinderResult();
+            const double fkn = r.value("extend_force_kn", 0.0);
+            std::printf("hydraulics: cylinder extend %.2f kN retract %.2f kN flow %.2f L/min\n", fkn,
+                        r.value("retract_force_kn", 0.0), r.value("flow_extend_lpm", 0.0));
+            std::fflush(stdout);
+            H.report["cylinder_sizing"] = r;
+            // 63 mm bore at 160 bar, 95 %: pi/4 * 0.063^2 * 160e5 * 0.95 = 47.4 kN.
+            if (std::fabs(fkn - 47.37) > 0.5) { hydFail("cylinder_force", r.dump()); return; }
+            if (!sm->hydraulic().applyCylinderSizing(st)) { hydFail("cylinder_apply", sm->hydraulic().lastError()); return; }
+            const auto comps = sm->hydraulic().circuit().value("components", nlohmann::json::array());
+            double bore = 0.0;
+            for (const auto& c : comps)
+                if (c.value("name", std::string()) == "Lift cylinder")
+                    bore = c.value("params", nlohmann::json::object()).value("bore_mm", 0.0);
+            if (std::fabs(bore - 63.0) > 1e-9) { hydFail("cylinder_apply", "bore_mm is " + std::to_string(bore)); return; }
+            H.waitStart = pipingNow();
+            shoot("hydraulics_03_cylinder.png");
+            ++H.step;
+            return;
+        }
+        case 7:  // Pump Drive for the gear pump (flow from its displacement, pressure = relief)
+            if (waiting("apply_cylinder")) return;
+            sm->handleCommand(st, "sim_hyd_drive");
+            sm->hydraulic().setDriveFromPump(id("Pump"));
+            started(sm->hydraulic().runPumpDrive(st), "pump_drive");
+            ++H.step;
+            return;
+        case 8: {
+            if (waiting("pump_drive")) return;
+            if (refused("pump_drive")) return;
+            const nlohmann::json& r = sm->hydraulic().driveResult();
+            const double kw = r.value("motor_rating_kw", 0.0);
+            std::printf("hydraulics: pump drive %.2f kW motor, %d poles, shaft %.2f kW\n", kw,
+                        r.value("poles", 0), r.value("shaft_power_kw", 0.0));
+            std::fflush(stdout);
+            H.report["pump_drive"] = r;
+            // 22.04 L/min at 160 bar = 5.88 kW hydraulic: the shaft and the rated motor exceed it.
+            if (!(kw > r.value("shaft_power_kw", 0.0)) || !(r.value("shaft_power_kw", 0.0) > 5.8)) {
+                hydFail("pump_drive_result", r.dump());
+                return;
+            }
+            shoot("hydraulics_04_drive.png");
+            ++H.step;
+            return;
+        }
+        case 9: {  // Simulate 3 s: valve to "a" at 0.2 s, extending against 10 kN + 200 kg
+            ui::HydraulicPanel& hp = sm->hydraulic();
+            hp.clearSchedule();
+            hp.addScheduleRow(0.0, id("DCV 4/3"), "center");
+            hp.addScheduleRow(0.2, id("DCV 4/3"), "a");
+            hp.setLoad(id("Lift cylinder"), 10000.0, 200.0);
+            hp.setDuration(3.0);
+            sm->handleCommand(st, "sim_hyd_simulate");
+            if (!hp.busy()) { hydFail("simulate_not_started", hp.lastError()); return; }
+            H.waitStart = pipingNow();
+            H.sub = 0;
+            ++H.step;
+            return;
+        }
+        case 10: {
+            if (waiting("simulate")) return;
+            if (refused("simulate")) return;
+            if (H.sub == 1) {  // second pass, after the schematic capture: the full-size plots
+                sm->hydraulic().setCentralView(ui::HydraulicPanel::CentralView::Plots);
+                if (!sm->centralViewActive()) { hydFail("central_plots", "the Plots view does not own the central view"); return; }
+                shoot("hydraulics_05b_plots.png");
+                H.sub = 0;
+                ++H.step;
+                return;
+            }
+            const nlohmann::json& r = sm->hydraulic().simulateResult();
+            const auto t = r.value("time_s", nlohmann::json::array());
+            const std::string cyl = id("Lift cylinder");
+            const auto series = r.value("components", nlohmann::json::object())
+                                    .value(cyl, nlohmann::json::object())
+                                    .value("series", nlohmann::json::object());
+            const auto pos = series.value("position_mm", nlohmann::json::array());
+            double xmax = 0.0;
+            for (const auto& v : pos)
+                if (v.is_number()) xmax = std::max(xmax, v.get<double>());
+            const auto summary = r.value("summary", nlohmann::json::object());
+            std::printf("hydraulics: simulated %zu samples, cylinder max %.1f mm, peak %.1f bar\n", t.size(),
+                        xmax, summary.value("peak_pressure_bar", 0.0));
+            std::fflush(stdout);
+            H.report["simulate_summary"] = summary;
+            H.report["simulate_solver"] = r.value("solver", nlohmann::json::object());
+            H.report["cylinder_max_position_mm"] = xmax;
+            if (t.size() < 2 || pos.size() != t.size()) { hydFail("simulate_series", "missing time / position series"); return; }
+            if (!(xmax > 10.0)) { hydFail("cylinder_did_not_extend", "max position " + std::to_string(xmax) + " mm"); return; }
+            if (!summary.contains("peak_pressure_bar")) { hydFail("simulate_summary", summary.dump()); return; }
+            if (H.view3d) {
+                sm->handleCommand(st, "sim_hyd_view_3d");
+                if (sm->centralViewActive() || sm->hydraulic().centralView() != ui::HydraulicPanel::CentralView::View3D) {
+                    hydFail("central_3d", "3D Layout did not return the central view to the native viewport"); return;
+                }
+                H.report["checks"].push_back({{"name", "native_viewport_not_schematic"}, {"ok", true}});
+                shoot("hydraulics3d_01_simulated.png");
+                H.step = 20;
+                return;
+            }
+            // Results in place: the full-size schematic first (node peaks on its nets), then the plots.
+            sm->hydraulic().setCentralView(ui::HydraulicPanel::CentralView::Schematic);
+            if (!sm->centralViewActive()) { hydFail("central_schematic", "the Schematic view does not own the central view"); return; }
+            shoot("hydraulics_05a_schematic.png");
+            H.sub = 1;
+            return;
+        }
+        case 11:  // BOM
+            sm->handleCommand(st, "sim_hyd_bom");
+            started(sm->hydraulic().runBom(st), "bom");
+            ++H.step;
+            return;
+        case 12: {
+            if (waiting("bom")) return;
+            if (refused("bom")) return;
+            const auto lines = sm->hydraulic().bomResult().value("bom_lines", nlohmann::json::array());
+            if (lines.size() != kComps.size()) { hydFail("bom_lines", sm->hydraulic().bomResult().dump()); return; }
+            shoot("hydraulics_06_bom.png");
+            ++H.step;
+            return;
+        }
+        case 13:  // To Piping: every hose becomes a solved pipe run
+            sm->handleCommand(st, "sim_hyd_piping");
+            started(sm->hydraulic().runPipingHandoff(st), "piping_handoff");
+            ++H.step;
+            return;
+        case 14: {
+            if (waiting("piping_handoff")) return;
+            if (refused("piping_handoff")) return;
+            const nlohmann::json& r = sm->hydraulic().handoffResult();
+            const auto runs = r.value("piping_doc", nlohmann::json::object()).value("runs", nlohmann::json::array());
+            std::printf("hydraulics: piping handoff %zu runs, stage %s\n", runs.size(),
+                        r.value("stage", std::string("?")).c_str());
+            std::fflush(stdout);
+            H.report["piping_handoff_stage"] = r.value("stage", std::string());
+            if (runs.size() != kHoses.size()) { hydFail("piping_runs", "expected one run per hose"); return; }
+            shoot("hydraulics_07_piping.png");
+            ++H.step;
+            return;
+        }
+        case 15: {  // the circuit and every result are a hydraulic_circuit study of the document
+            if (waiting("study_save")) return;
+            const std::string sid = sm->hydraulic().studyId();
+            nlohmann::json res;
+            std::string err;
+            if (!st.worker.call("sim_study_list", {{"doc_id", st.docMirror.docId()}}, res, err, 15000) ||
+                !res.is_object()) {
+                hydFail("study_list", err);
+                return;
+            }
+            nlohmann::json found;
+            for (const auto& s : res.value("studies", nlohmann::json::array()))
+                if (s.is_object() && s.value("id", std::string()) == sid) found = s;
+            if (sid.empty() || !found.is_object() || found.value("type", std::string()) != "hydraulic_circuit") {
+                hydFail("study_missing", "no hydraulic_circuit study '" + sid + "' in sim_study_list");
+                return;
+            }
+            const auto results = found.value("results", nlohmann::json::object());
+            for (const char* k : {"simulate", "bom", "piping_handoff", "sizing"})
+                if (!results.contains(k)) {
+                    hydFail("study_incomplete", std::string("persisted circuit lacks results.") + k);
+                    return;
+                }
+            const auto sim = results["simulate"];
+            if (!sim.is_object() || !sim.contains("summary") ||
+                sim.value("time_s", nlohmann::json::array()).size() >
+                    (std::size_t)ui::HydraulicPanel::kMaxStoredSamples) {
+                hydFail("study_simulate", "persisted simulate lacks a summary or exceeds the sample cap");
+                return;
+            }
+            const auto sizing = results["sizing"];
+            if (!sizing.value("cylinders", nlohmann::json::object()).contains(id("Lift cylinder")) ||
+                !sizing.value("drives", nlohmann::json::object()).contains(id("Pump"))) {
+                hydFail("study_sizing", "persisted sizing lacks the cylinder or the pump drive: " + sizing.dump());
+                return;
+            }
+            const auto params = found.value("params", nlohmann::json::object());
+            if (params.value("circuit", nlohmann::json::object()).value("hoses", nlohmann::json::array()).size() !=
+                    kHoses.size() ||
+                params.value("valve_schedule", nlohmann::json::array()).size() != 2) {
+                hydFail("study_params", "persisted params lack the circuit hoses or the valve schedule");
+                return;
+            }
+            H.report["study_id"] = sid;
+            std::printf("hydraulics: study %s persisted with simulate + bom + piping_handoff + sizing\n", sid.c_str());
+            std::fflush(stdout);
+            sm->hydraulic().openResults();
+            sm->hydraulic().setCentralView(ui::HydraulicPanel::CentralView::Plots);
+            H.queued = H.dir + "/hydraulics_08_final.png";
+            H.settle = kSettle * 2;
+            ++H.step;
+            return;
+        }
+        case 16: {  // start a second record, then use the exact Start-card template adoption path
+            if (waiting("study_save")) return;
+            if (refused("study_save")) return;
+            started(sm->hydraulic().newCircuit(st, "Cylinder template circuit"), "template_new");
+            ++H.step;
+            return;
+        }
+        case 17:
+            if (waiting("template_new")) return;
+            if (refused("template_new")) return;
+            started(sm->hydraulic().applyTemplate(st, "cylinder_circuit"), "template_apply");
+            ++H.step;
+            return;
+        case 18: {
+            if (waiting("template_apply")) return;
+            if (refused("template_apply")) return;
+            auto& hp = sm->hydraulic();
+            const auto setup = hp.simulationDefinition();
+            if (hp.studyId().empty() || hp.studyId() == H.report.value("study_id", std::string()) ||
+                hp.circuit().value("components", nlohmann::json::array()).empty() ||
+                hp.circuit().value("hoses", nlohmann::json::array()).empty() ||
+                setup.value("valve_schedule", nlohmann::json::array()).empty()) {
+                hydFail("template_setup", "template did not create a second connected circuit with its schedule");
+                return;
+            }
+            H.report["template_setup"] = setup;
+            sm->handleCommand(st, "sim_hyd_simulate");
+            if (!hp.busy()) { hydFail("template_run_not_started", hp.lastError()); return; }
+            H.waitStart = pipingNow();
+            ++H.step;
+            return;
+        }
+        case 19: {
+            if (waiting("template_simulate")) return;
+            if (refused("template_simulate")) return;
+            const auto& result = sm->hydraulic().simulateResult();
+            if (!result.value("ok", false) || !result.contains("summary") ||
+                result.value("time_s", nlohmann::json::array()).size() < 2) {
+                hydFail("template_simulate", result.dump());
+                return;
+            }
+            H.report["checks"].push_back({{"name", "cylinder_template_simulation"}, {"ok", true},
+                {"study_id", sm->hydraulic().studyId()}, {"summary", result["summary"]}});
+            H.report["ok"] = true;
+            H.done = true;
+            H.capture = H.dir + "/hydraulics_09_template.png";
+            return;
+        }
+        case 20: {
+            if (waiting("layout")) return;
+            auto& hp = sm->hydraulic();
+            H.placedId = id("Pump");
+            for (const auto& c : hp.circuit()["components"]) if (c.value("id", std::string()) == H.placedId) {
+                float p[3]; hp.componentPosition3d(c, p);
+                H.beforePosition = {p[0], p[1], p[2]};
+            }
+            hp.selectComponent3d(H.placedId);
+            hp.placementPlane = ui::simscene::Plane::XY;
+            hp.placementGridMm = 10;
+            hp.armPlacement3d(true);
+            if (!hp.placing3d()) { hydFail("placement_not_armed", "pump placement tool did not arm"); return; }
+            H.waitStart = pipingNow();
+            ++H.step;
+            return;
+        }
+        case 21: {
+            const float world[3] = {120, 100, 0};
+            ImVec2 p;
+            if (!sceneShotPoint(st, world, p)) { hydFail("placement_projection", "plane point outside clear viewport"); return; }
+            if (!H.input.click(p)) return;
+            H.report["checks"].push_back({{"name", "real_plane_click"}, {"ok", true},
+                {"world", {world[0], world[1], world[2]}}, {"screen", {p.x, p.y}}});
+            H.waitStart = pipingNow(); ++H.step;
+            return;
+        }
+        case 22: {
+            if (waiting("placement_save")) return;
+            auto& hp = sm->hydraulic();
+            const auto pos = hp.layout3d().value(H.placedId, nlohmann::json());
+            if (pos == H.beforePosition || !pos.is_array() || pos.size() != 3 ||
+                std::fabs(pos[0].get<double>() - 120) > 0.1 ||
+                std::fabs(pos[1].get<double>() - 100) > 0.1 || std::fabs(pos[2].get<double>()) > 0.1) {
+                hydFail("placement_input", "real viewport click did not move pump: " + pos.dump()); return;
+            }
+            hp.armPlacement3d(false);
+            nlohmann::json list, found; std::string error;
+            if (!st.worker.call("sim_study_list", {{"doc_id", st.docMirror.docId()}}, list, error, 15000)) {
+                hydFail("layout_study_list", error); return;
+            }
+            for (const auto& s : list.value("studies", nlohmann::json::array()))
+                if (s.value("id", std::string()) == hp.studyId()) found = s;
+            if (!found.is_object() || found.value("type", std::string()) != "hydraulic_circuit" ||
+                found.value("params", nlohmann::json::object()).value("layout3d", nlohmann::json::object()).value(H.placedId, nlohmann::json()) != pos ||
+                !found.value("results", nlohmann::json::object()).contains("simulate")) {
+                hydFail("layout_not_persisted", found.dump()); return;
+            }
+            H.report["checks"].push_back({{"name", "real_click_layout_persisted"}, {"ok", true},
+                {"before", H.beforePosition}, {"after", pos}, {"study_id", hp.studyId()}});
+            shoot("hydraulics3d_02_placed.png");
+            ++H.step;
+            return;
+        }
+        case 23:
+            H.report["ok"] = true; H.done = true;
+            H.capture = H.dir + "/hydraulics3d_03_final.png";
+            return;
+        default:
+            return;
+    }
+}
+
+bool hydraulicsShotEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    HydraulicsShot& H = g_hyd;
+    if (!H.want) return false;
+    ++st.frame;
+    if (!H.capture.empty() && (!st.rpc.busy() || ++H.captureWait > 600)) {
+        std::error_code ec;
+        std::filesystem::create_directories(H.dir, ec);
+        if (H.view3d && !H.failed && H.capture.find("3d_01_") != std::string::npos) {
+            std::vector<std::array<float, 3>> points;
+            for (const auto& c : st.simManager->hydraulic().circuit()["components"]) {
+                std::array<float, 3> p;
+                st.simManager->hydraulic().componentPosition3d(c, p.data());
+                points.push_back(p);
+            }
+            auto check = sceneShotPixels(st, points);
+            check["name"] = "component_glyphs_visible";
+            check["ok"] = check.value("ok", false) && check.value("visible_patches", 0) >= 2 && !st.hasDocMesh;
+            check["has_doc_mesh"] = st.hasDocMesh;
+            H.report["checks"].push_back(check);
+            if (!check.value("ok", false)) hydFail("glyphs_invisible", check.dump());
+        }
+        const bool last = H.done || (!H.view3d && H.step >= 16);
+        writeBackbufferPng(H.capture.c_str(), dw, dh, last ? screenshotPath : nullptr);
+        std::printf("hydraulics: screenshot -> %s (%dx%d)\n", H.capture.c_str(), dw, dh);
+        std::fflush(stdout);
+        H.report["captures"].push_back(H.capture);
+        H.capture.clear();
+        H.captureWait = 0;
+    }
+    glfwSwapBuffers(st.win);
+    breakLoop = false;
+    if (H.done && H.capture.empty() && H.queued.empty()) {
+        const std::string path = H.dir + (H.view3d ? "/hydraulics3d_report.json" : "/hydraulics_report.json");
+        std::ofstream out(path, std::ios::trunc);
+        out << H.report.dump(2) << '\n';
+        out.close();
+        std::printf("hydraulics: report -> %s ok=%d\n", path.c_str(), (int)H.report.value("ok", false));
+        std::fflush(stdout);
+        if (H.failed || !out) {
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+        breakLoop = true;
+    }
+    return true;
+}
+
+// ---------- simulation UI audit (CHUDWARE_SHOT=simaudit) ----------
+// A UI correctness gate for the whole Simulate workspace. A 60 x 40 x 10 mm box part (plus, at the
+// end, a two-part assembly for Motion) is driven through every simulation surface state via the
+// public SimManager / PipingPanel / HydraulicPanel / EvaluateDialogs entry points — the same
+// sim_* commands the ribbon dispatches: each study type's New Study and setup forms, the run
+// panel and the Results nodes, the EM, Topology, Piping and Hydraulics panels (every form and
+// the central Schematic / Plots / 3D views) and the Evaluate dialogs. Per state: wait until the
+// engine and panels are idle, settle, run a ui::audit pass (ImGui test-engine item hooks see every
+// item of every window: ID conflicts + horizontally clipped items, no pointer involved), capture
+// scratch/simaudit/<nn>_<state>.png and rewrite scratch/simaudit/report.json {states:[{name,
+// conflicts, overflows, items_seen, ...}], skipped, totals}. One "simaudit: <state> conflicts=N"
+// line per state; the process exits non-zero when any ID conflict was found (or setup failed).
+// CHUDWARE_SIMAUDIT_FRAMES: frames recorded per state (default 4); CHUDWARE_SIMAUDIT_MAX_FRAMES:
+// per-state cap including ID-stack path resolution (default 240, 0 = unlimited).
+enum class SaEnter { Done, Again, Skip };
+struct SimAuditShot;
+using SaEnterFn = std::function<SaEnter(AppState&, ui::SimManager&, SimAuditShot&)>;
+using SaReadyFn = std::function<bool(AppState&, ui::SimManager&)>;
+
+struct SaStep {
+    std::string name;
+    unsigned regions = 0;  // ui::audit regions reported on top of LeftPane | Floating
+    SaEnterFn enter;       // Again = call next frame (multi-frame setup); Skip = reason in note
+    SaReadyFn ready;       // null = engine + panels idle
+    double timeoutS = 20.0;
+};
+
+// Shot-only navigation: observations select the real scrollable ancestor, while input remains
+// mouse hover + wheel. Never mutate ImGui Scroll/ScrollTarget or application form state.
+struct ShotNavigation {
+    std::string target;
+    ImGuiID window = 0;
+    int ticks = 0, wheels = 0;
+    float direction = -1.0f;
+    nlohmann::json evidence = nlohmann::json::array();
+};
+ShotNavigation g_simNavigation;
+
+bool shotLabel(const nlohmann::json& item, const char* label) {
+    const auto& raw = item["label"].get_ref<const std::string&>();
+    const size_t length = std::strlen(label);
+    return raw == label || (raw.size() > length && raw.compare(0, length, label) == 0 &&
+                           raw.compare(length, 2, "##") == 0);
+}
+
+const nlohmann::json* shotItem(const char* label, bool visibleOnly = true,
+                               const char* window = nullptr) {
+    for (const auto& item : ui::audit::observedItems()) {
+        if (!item.value("enabled", true)) continue; // disabled controls are evidence, never pointer targets
+        if (!shotLabel(item, label)) continue;
+        const auto& name = item["window"].get_ref<const std::string&>();
+        if (window && name.find(window) == std::string::npos) continue;
+        if (visibleOnly) {
+            if (!item.value("visible", false)) continue;
+            const auto& r = item["rect"];
+            if (r[2].get<float>() - r[0].get<float>() < 6.0f ||
+                r[3].get<float>() - r[1].get<float>() < 6.0f) continue;
+        }
+        return &item;
+    }
+    return nullptr;
+}
+
+ImVec2 shotPoint(const nlohmann::json& item) {
+    const auto& r = item["rect"];
+    const float x = (r[0].get<float>() + r[2].get<float>()) * 0.5f;
+    const float y = (r[1].get<float>() + r[3].get<float>()) * 0.5f;
+    return ImVec2(x, y);
+}
+
+void shotScrollTo(const char* label, const char* window = nullptr, bool frameWholeItem = false) {
+    auto& N = g_simNavigation;
+    if (N.target != label) { N = ShotNavigation(); N.target = label; }
+    if (N.wheels >= 96) return;  // Existing step deadlines report the bounded search failure.
+    const auto* target = shotItem(label, false, window);
+    const nlohmann::json* pane = nullptr;
+    size_t depth = 0;
+    for (const auto& w : ui::audit::observedWindows()) {
+        if (!w.value("wheel_enabled", false) || w.value("scroll_max_y", 0.0f) <= 0.0f) continue;
+        const auto& name = w["window"].get_ref<const std::string&>();
+        if (target) {
+            const auto& owner = (*target)["window"].get_ref<const std::string&>();
+            if (owner != name && (owner.size() <= name.size() ||
+                owner.compare(0, name.size(), name) != 0 || owner[name.size()] != '/')) continue;
+        } else if (name.find("SimulationManager") == std::string::npos &&
+                   name.find("Firmware") == std::string::npos &&
+                   name.find("firmware") == std::string::npos) continue;
+        // With a submitted target use its nearest scrolling ancestor. Without one, scan the
+        // outer setup body rather than trapping wheel input inside a multiline JSON editor.
+        if (!pane || (target ? name.size() > depth : name.size() < depth)) {
+            pane = &w;
+            depth = name.size();
+        }
+    }
+    if (!pane) return;
+    const ImGuiID id = (*pane)["id"].get<ImGuiID>();
+    if (N.window != id) { N.window = id; N.direction = -1.0f; N.ticks = 0; }
+    const float y = pane->value("scroll_y", 0.0f), max = pane->value("scroll_max_y", 0.0f);
+    float wheel = N.direction;
+    if (target) {
+        const auto& r = (*target)["full_rect"];
+        const auto& clip = (*pane)["rect"];
+        N.direction = r[1].get<float>() < clip[1].get<float>() ? 1.0f : -1.0f;
+        wheel = N.direction;
+        if (frameWholeItem) {
+            // Fine alignment still uses real wheel input, with the submitted ancestor's actual
+            // ImGui wheel displacement. Whole-field capture must not oscillate in full wheel steps.
+            const float step = pane->value("wheel_step_y", 0.0f);
+            if (step <= 0.0f) return;
+            const float delta = (r[1].get<float>() + r[3].get<float>() -
+                                 clip[1].get<float>() - clip[3].get<float>()) * 0.5f;
+            wheel = std::max(-1.0f, std::min(1.0f, -delta / step));
+        }
+    } else if (y >= max - 0.5f) wheel = N.direction = 1.0f;
+    else if (y <= 0.5f) wheel = N.direction = -1.0f;
+    // Hover the observed scrollbar, not an independently scrolling child JSON editor.
+    const auto& wheelPoint = (*pane)["wheel_point"];
+    const ImVec2 center(wheelPoint[0].get<float>(), wheelPoint[1].get<float>());
+    ImGuiIO& io = ImGui::GetIO();
+    // Hover on one frame before wheeling; ImGui routes the wheel using the hovered window.
+    io.AddMousePosEvent(center.x, center.y);
+    if (N.ticks++ % 4 != 1) return;
+    io.AddMouseWheelEvent(0.0f, wheel);
+    ++N.wheels;
+    if (N.evidence.size() >= 64) N.evidence.erase(N.evidence.begin());
+    N.evidence.push_back({{"target", label}, {"window", (*pane)["window"]},
+                         {"scroll_y", y}, {"scroll_max_y", max}, {"wheel", wheel},
+                         {"hover", {center.x, center.y}}});
+}
+
+nlohmann::json shotNavigationEvidence() {
+    return {{"target", g_simNavigation.target}, {"wheel_events", g_simNavigation.wheels},
+            {"scrolls", g_simNavigation.evidence}, {"windows", ui::audit::observedWindows()},
+            {"items", ui::audit::observedItems()}};
+}
+
+struct SimAuditShot {
+    bool init = false, want = false, done = false, failed = false, motionOk = false;
+    int setup = 0, stage = 0, settle = 0, sub = 0, captureWait = 0, idleFrames = 0, shotNo = 0;
+    int lastRibbonTab = -1, auditFrames = 4, maxFrames = 240, totalConflicts = 0, totalOverflows = 0;
+    int motionStudiesBefore = 0;
+    double waitStart = 0.0, subStart = 0.0, t0 = 0.0;
+    size_t idx = 0;
+    std::string dir, capture, queued, note, asmDoc;
+    std::string topoStructId;  // the structural topology study (re-selected after topology_heat_flow)
+    bool meshWait = false;  // the current mesh state's preview started (waits for the SimClient)
+    int partTab = -1;
+    std::string schematicDoc, boardDoc;
+    ImVec2 inputPoint;
+    const ui::SimManager* partSm = nullptr;  // the box part's manager (motion waits for the re-seat)
+    nlohmann::json faces = nlohmann::json::object();
+    nlohmann::json report;
+    std::vector<SaStep> steps;
+};
+SimAuditShot g_sa;
+
+// Ribbon tab indices of the per-type simulation tabs (widgets/ribbon.cpp kRibbonTabs[] 13..19).
+constexpr int kSaTabStatic = 13, kSaTabModal = 14, kSaTabFlow = 15, kSaTabThermal = 16,
+              kSaTabFatigue = 17, kSaTabMotion = 18, kSaTabEm = 19;
+constexpr double kSaIdleTimeoutS = 20.0;
+
+void saWriteReport(SimAuditShot& A) {
+    A.report["total_conflicts"] = A.totalConflicts;
+    A.report["total_overflows"] = A.totalOverflows;
+    std::error_code ec;
+    std::filesystem::create_directories(A.dir, ec);
+    std::ofstream out(A.dir + "/report.json", std::ios::trunc);
+    out << A.report.dump(2) << '\n';
+}
+
+void saFail(const std::string& code, const std::string& detail) {
+    SimAuditShot& A = g_sa;
+    std::printf("simaudit: FAILED [%s] %s\n", code.c_str(), detail.c_str());
+    std::fflush(stdout);
+    A.report["failure"] = {{"code", code}, {"detail", detail}};
+    A.report["navigation_at_failure"] = shotNavigationEvidence();
+    A.failed = true;
+    A.done = true;
+    A.queued.clear();
+    A.capture = A.dir + "/simaudit_FAILED.png";
+}
+
+void saSkip(SimAuditShot& A, const std::string& name, const std::string& why) {
+    A.report["skipped"].push_back({{"name", name}, {"reason", why}});
+    std::printf("simaudit: %s SKIPPED (%s)\n", name.c_str(), why.c_str());
+    std::fflush(stdout);
+}
+
+bool saIdle(AppState& st, ui::SimManager& sm) {
+    return !st.rpc.busy() && !sm.piping().busy() && !sm.hydraulic().busy();
+}
+
+// The box face of `role` lands in st.selection exactly as a viewport click resolves it.
+void saPick(AppState& st, const SimAuditShot& A, const char* role) {
+    st.selection.clear();
+    if (!A.faces.contains(role)) return;
+    core::SelItem it;
+    it.hit.body_id = 1;
+    it.hit.kind = render::PickKind::Face;
+    it.hit.topo_id = A.faces[role]["tid"].get<uint32_t>();
+    it.selector = A.faces[role]["sel"].dump();
+    it.pending_resolve = false;
+    st.selection.mutableItems().push_back(it);
+}
+
+// The ribbon command on `tab`, re-asserting the tab (study commands keep whatever tab was up).
+void saRun(AppState& st, ui::SimManager& sm, int tab, const char* cmd) {
+    if (tab >= 0) st.ribbonTab = tab;
+    sm.handleCommand(st, cmd);
+    if (tab >= 0) st.ribbonTab = tab;
+}
+
+// Why the last Run was refused: SimManager::run only toasts + logs the gate ("[sim] run blocked:
+// …" / "[motion] run blocked: …"), it never sets st.status. "Run refused: <reason>" from the
+// newest such log line (the refusal that just happened logs one).
+std::string saRunRefusal(AppState& st) {
+    std::lock_guard<std::mutex> lk(st.logMtx);
+    for (auto it = st.log.rbegin(); it != st.log.rend(); ++it) {
+        const size_t p = it->find("run blocked:");
+        if (p == std::string::npos) continue;
+        const size_t b = it->find_first_not_of(' ', p + 12);
+        return "Run refused: " + (b == std::string::npos ? std::string("(no reason logged)") : it->substr(b));
+    }
+    return "Run refused (no reason logged)";
+}
+
+SaStep saCmd(const char* name, int tab, const char* cmd, unsigned regions = 0) {
+    SaStep s;
+    s.name = name;
+    s.regions = regions;
+    s.enter = [tab, cmd](AppState& st, ui::SimManager& sm, SimAuditShot&) {
+        saRun(st, sm, tab, cmd);
+        return SaEnter::Done;
+    };
+    return s;
+}
+
+
+// Public commands open the form; real pointer input opens the expanded disclosure/palette.
+// Explicit button disclosures supply their real opened label and frame the native JSON field;
+// cards/popovers retain the semantic Openable/Opened proof from their completed-frame annotation.
+SaStep saExpanded(const char* name, int tab, const char* cmd, const char* title, unsigned regions = 0,
+                  const char* openedTitle = nullptr, const char* setupTitle = nullptr) {
+    SaStep step;
+    step.name = name;
+    step.regions = regions;
+    step.enter = [name, tab, cmd, title, openedTitle, setupTitle](AppState& st, ui::SimManager& sm, SimAuditShot& A) {
+        ui::audit::observedItems();
+        ImGuiIO& io = ImGui::GetIO();
+        if (std::strncmp(name, "firmware_workspace", 18) == 0)
+            st.activeWorkspace = AppState::Workspace::Firmware;
+        if (A.sub == 0) {
+            io.AddKeyEvent(ImGuiKey_Escape, true);
+            g_simNavigation = ShotNavigation();
+            A.subStart = pipingNow();
+            if (A.report["expansions"].is_object()) A.report["expansions"].erase(name);
+            if (cmd) saRun(st, sm, tab, cmd);
+            A.sub = 1;
+            // A palette can cover the parent's wheel target. Dismiss it with a real
+            // click on the already selected ribbon tab before revealing the next control.
+            if (tab >= 0 && ImGui::IsPopupOpen(nullptr,
+                    ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+                const char* tabLabel = tab == kSaTabStatic ? "Static" : tab == kSaTabModal ? "Modal" :
+                    tab == kSaTabFlow ? "Flow" : tab == kSaTabThermal ? "Thermal" :
+                    tab == kSaTabFatigue ? "Fatigue" : tab == kSaTabMotion ? "Motion" :
+                    tab == kSaTabEm ? "EM" : nullptr;
+                if (const auto* control = tabLabel ? shotItem(tabLabel, true, "##RibbonBar") : nullptr) {
+                    A.inputPoint = shotPoint(*control);
+                    io.AddMousePosEvent(A.inputPoint.x, A.inputPoint.y);
+                    io.AddMouseButtonEvent(0, true);
+                    A.sub = -1;
+                }
+            }
+            return SaEnter::Again;
+        }
+        if (A.sub == -1) {
+            io.AddKeyEvent(ImGuiKey_Escape, false);
+            io.AddMousePosEvent(A.inputPoint.x, A.inputPoint.y);
+            io.AddMouseButtonEvent(0, false);
+            A.sub = 1;
+            return SaEnter::Again;
+        }
+        if (A.sub == -3) {
+            const auto* control = shotItem(setupTitle);
+            if (!control) { A.sub = 1; return SaEnter::Again; }
+            A.inputPoint = shotPoint(*control);
+            io.AddMousePosEvent(A.inputPoint.x, A.inputPoint.y);
+            io.AddMouseButtonEvent(0, true);
+            A.sub = -2;
+            return SaEnter::Again;
+        }
+        if (A.sub == -2) {
+            io.AddMousePosEvent(A.inputPoint.x, A.inputPoint.y);
+            io.AddMouseButtonEvent(0, false);
+            A.sub = 6;
+            return SaEnter::Again;
+        }
+        if (pipingNow() - A.subStart > kSaIdleTimeoutS) {
+            saFail(A.sub == 5 ? "expanded_editor_not_framed" : "expanded_target_missing",
+                   std::string(name) + ": " + (A.sub == 5 ? "native JSON field" : title));
+            return SaEnter::Done;
+        }
+        auto annotatedOpen = [&]() {
+            const auto* item = shotItem(title);
+            if (!item || !item->value("openable", false) || !item->value("opened", false)) return false;
+            A.report["expansions"][name] = {{"control", *item}, {"proof", "Openable/Opened"}};
+            return true;
+        };
+        if (A.sub == 1 || A.sub == 6) {
+            io.AddKeyEvent(ImGuiKey_Escape, false);
+            if (A.sub == 1 && setupTitle) {
+                if (const auto* control = shotItem(setupTitle)) {
+                    A.inputPoint = shotPoint(*control);
+                    io.AddMousePosEvent(A.inputPoint.x, A.inputPoint.y);
+                    A.sub = -3;
+                    return SaEnter::Again;
+                }
+                shotScrollTo(setupTitle);
+                return SaEnter::Again;
+            }
+            if (const auto* control = openedTitle ? shotItem(openedTitle, false) : nullptr) {
+                A.report["expansions"][name]["control"] = *control;
+                A.sub = 5;
+                return SaEnter::Again;
+            }
+            if (annotatedOpen()) return SaEnter::Done;
+            if (const auto* item = shotItem(title)) {
+                A.inputPoint = shotPoint(*item);
+                io.AddMousePosEvent(A.inputPoint.x, A.inputPoint.y);
+                A.sub = 2;
+                return SaEnter::Again;
+            }
+            shotScrollTo(openedTitle ? openedTitle : title);
+            return SaEnter::Again;
+        }
+        if (A.sub == 2) {
+            const auto* item = shotItem(title);
+            if (!item) { A.sub = 1; return SaEnter::Again; }
+            A.inputPoint = shotPoint(*item);
+            io.AddMousePosEvent(A.inputPoint.x, A.inputPoint.y);
+            io.AddMouseButtonEvent(0, true);
+            A.sub = 3;
+            return SaEnter::Again;
+        }
+        if (A.sub == 3) {
+            io.AddMousePosEvent(A.inputPoint.x, A.inputPoint.y);
+            io.AddMouseButtonEvent(0, false);
+            A.sub = 4;
+            return SaEnter::Again;
+        }
+        if (A.sub == 5) {
+            const auto* control = shotItem(openedTitle, false);
+            // The observed open disclosure may scroll offscreen while framing its
+            // editor. Retain that proof, but require live field/apply rectangles.
+            if (!control && A.report["expansions"].contains(name))
+                control = &A.report["expansions"][name]["control"];
+            if (!control) { shotScrollTo(openedTitle); return SaEnter::Again; }
+            const auto& parent = (*control)["window"].get_ref<const std::string&>();
+            // The native card can be below the submitted toggle and not drawn yet. Reveal it
+            // before resolving its multiline field; don't accept an open button alone.
+            const auto* apply = shotItem("Apply parameters", false, parent.c_str());
+            if (!apply) { shotScrollTo("Apply parameters", parent.c_str()); return SaEnter::Again; }
+            const auto& owner = (*apply)["window"].get_ref<const std::string&>();
+            const auto* editor = shotItem("##t", false, owner.c_str());
+            if (!editor) { shotScrollTo("Apply parameters", owner.c_str()); return SaEnter::Again; }
+            const auto& full = (*editor)["full_rect"];
+            const auto& clip = (*editor)["clip"];
+            const bool framed = editor->value("visible", false) &&
+                full[0].get<float>() >= clip[0].get<float>() - 1.0f &&
+                full[1].get<float>() >= clip[1].get<float>() - 1.0f &&
+                full[2].get<float>() <= clip[2].get<float>() + 1.0f &&
+                full[3].get<float>() <= clip[3].get<float>() + 1.0f;
+            if (!framed) { shotScrollTo("##t", owner.c_str(), true); return SaEnter::Again; }
+            A.report["expansions"][name] = {{"control", *control}, {"editor", *editor},
+                                           {"apply", *apply}, {"proof", "opened button and fully visible native editor"}};
+            return SaEnter::Done;
+        }
+        if (const auto* control = openedTitle ? shotItem(openedTitle, false) : nullptr) {
+            A.report["expansions"][name]["control"] = *control;
+            A.sub = 5;
+            return SaEnter::Again;
+        }
+        if (annotatedOpen()) return SaEnter::Done;
+        // Observe the post-release disclosure state instead of assuming a click opened it.
+        A.sub = 1;
+        return SaEnter::Again;
+    };
+    return step;
+}
+
+SaStep saPickCmd(const char* name, int tab, const char* role, const char* cmd) {
+    SaStep s;
+    s.name = name;
+    s.enter = [tab, role, cmd](AppState& st, ui::SimManager& sm, SimAuditShot& A) {
+        saPick(st, A, role);
+        saRun(st, sm, tab, cmd);
+        st.selection.clear();
+        return SaEnter::Done;
+    };
+    return s;
+}
+
+// A panel form opened by its ribbon command, then filled by the panel's own button entry point
+// (an engine RPC); `act` returns false when the panel refused to start.
+SaStep saAction(const char* name, int tab, const char* cmd,
+                std::function<bool(AppState&, ui::SimManager&)> act, double timeoutS,
+                unsigned regions = 0) {
+    SaStep s;
+    s.name = name;
+    s.regions = regions;
+    s.timeoutS = timeoutS;
+    s.enter = [tab, cmd, act](AppState& st, ui::SimManager& sm, SimAuditShot& A) {
+        if (cmd) saRun(st, sm, tab, cmd);
+        if (!act(st, sm)) A.note = "action not started";
+        return SaEnter::Done;
+    };
+    return s;
+}
+
+// Hydraulic circuit the Hydraulics states run on (the hydraulics scenario's power unit).
+struct SaHydComp {
+    const char* type;
+    const char* name;
+    double x, y;
+    nlohmann::json params;
+};
+struct SaHydHose {
+    const char* net;
+    std::vector<std::pair<const char*, const char*>> ends;  // component name, port
+    double lengthMm, idMm, ratingBar;
+};
+const std::vector<SaHydComp>& saHydComps() {
+    static const std::vector<SaHydComp> k = {
+        {"reservoir", "Tank", 0.0, -150.0, {{"volume_l", 60.0}}},
+        {"pump", "Pump", 0.0, 0.0,
+         {{"pump_type", "gear"}, {"displacement_cc_rev", 16.0}, {"speed_rpm", 1450.0},
+          {"vol_efficiency", 0.95}, {"mech_efficiency", 0.9}}},
+        {"valve_relief", "Relief", 180.0, 0.0, {{"set_pressure_bar", 160.0}}},
+        {"valve_directional", "DCV 4/3", 0.0, 160.0,
+         {{"ways", 4}, {"positions", 3}, {"center_condition", "tandem"}, {"actuator", "solenoid"},
+          {"response_ms", 30.0}}},
+        {"cylinder_linear", "Lift cylinder", 0.0, 320.0,
+         {{"actuator_type", "double_acting"}, {"bore_mm", 50.0}, {"rod_mm", 28.0},
+          {"stroke_mm", 300.0}, {"piston_mass_kg", 5.0}}},
+    };
+    return k;
+}
+const std::vector<SaHydHose>& saHydHoses() {
+    static const std::vector<SaHydHose> k = {
+        {"Pressure", {{"Pump", "P"}, {"Relief", "P"}, {"DCV 4/3", "P"}}, 800.0, 12.7, 280.0},
+        {"Relief return", {{"Relief", "T"}, {"Tank", "T"}}, 600.0, 19.0, 40.0},
+        {"Return", {{"DCV 4/3", "T"}, {"Tank", "T2"}}, 1200.0, 19.0, 40.0},
+        {"Suction", {{"Tank", "S"}, {"Pump", "T"}}, 400.0, 25.4, 10.0},
+        {"Cylinder A", {{"DCV 4/3", "A"}, {"Lift cylinder", "A"}}, 1500.0, 12.7, 280.0},
+        {"Cylinder B", {{"DCV 4/3", "B"}, {"Lift cylinder", "B"}}, 1500.0, 12.7, 280.0},
+    };
+    return k;
+}
+
+// Base + arm parts, an assembly with the arm on a distance mate (the motion scenario's rig).
+// Synchronous worker calls; "" on success, else the reason.
+std::string saBuildMotionAssembly(AppState& st, SimAuditShot& A) {
+    auto dim = [](double v) { return nlohmann::json{{"value", v}, {"expr", nullptr}}; };
+    auto makePart = [&](const char* name, double l, double w, double h, const std::string& path) -> std::string {
+        nlohmann::json res, ap, sv, cl;
+        std::string err;
+        if (!st.worker.call("doc_new", {{"kind", "part"}, {"name", name}}, res, err)) return "doc_new: " + err;
+        const std::string did = res.value("doc_id", std::string());
+        nlohmann::json ops = nlohmann::json::array();
+        ops.push_back({{"op", "add_feature"}, {"feature", {
+            {"type", "box"}, {"name", name}, {"suppressed", false},
+            {"params", {{"length", dim(l)}, {"width", dim(w)}, {"height", dim(h)}, {"centered", true}}},
+            {"refs", nlohmann::json::object()}}}});
+        if (!st.worker.call("doc_apply_ops", {{"doc_id", did}, {"base_revision", res.value("revision", 0)}, {"ops", ops}},
+                            ap, err))
+            return "doc_apply_ops: " + err;
+        if (!st.worker.call("doc_save", {{"doc_id", did}, {"path", path}}, sv, err)) return "doc_save: " + err;
+        st.worker.call("doc_close", {{"doc_id", did}}, cl, err);
+        return "";
+    };
+    const std::string basePath = A.dir + "/simaudit_motion_base.step+";
+    const std::string armPath = A.dir + "/simaudit_motion_arm.step+";
+    std::string why = makePart("Base", 60, 40, 10, basePath);
+    if (why.empty()) why = makePart("Arm", 10, 10, 50, armPath);
+    if (!why.empty()) return why;
+    std::string err;
+    if (!st.docMirror.newAssembly(st.worker, err)) return "new_assembly: " + err;
+    // Seat the assembly's tab + DocSession now, as the tree toolbar's New Assembly does. Without
+    // it the mate's synchronous mesh load below parked the assembly mesh on the PART's session
+    // (the tab only appeared on the next frame's ensureActiveTab, with an empty cache), so Motion's
+    // Run stayed refused with "Assembly geometry is still loading".
+    st.clearViewportForNewDoc();
+    st.addDocTab(/*isAssembly=*/true);
+    A.asmDoc = st.docMirror.docId();
+    const nlohmann::json off = nlohmann::json::array({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 60, 0, 0, 0, 1});
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", basePath}}}, {"name", "Ground"}, {"fixed", true}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", armPath}}}, {"name", "Arm"}, {"fixed", false},
+         {"transform", off}},
+    }));
+    const std::string k1 = r.id_map.value("$0", std::string()), k2 = r.id_map.value("$1", std::string());
+    if (!r.ok || k1.empty() || k2.empty()) return "component insert: " + r.error_message;
+    const nlohmann::json refs = nlohmann::json::array({
+        {{"component", k1}, {"selector", {{"kind", "face"}, {"centroid", nlohmann::json::array({0.0, 0.0, 5.0})}}}},
+        {{"component", k2}, {"selector", {{"kind", "face"}, {"centroid", nlohmann::json::array({0.0, 0.0, 25.0})}}}},
+    });
+    auto m = st.docMirror.applyOps(st.worker, nlohmann::json::array({{
+        {"op", "asm_add_mate"},
+        {"mate", {{"type", "distance"}, {"value", dim(60.0)}, {"align", "aligned"}, {"suppressed", false}, {"refs", refs}}},
+    }}));
+    if (!m.ok || m.id_map.value("$0", std::string()).empty()) return "distance mate: " + m.error_message;
+    // The newest tessellation (the mate's, else the insert's) becomes the assembly's viewport mesh;
+    // without one the pushed doc.changed refresh loads it (motion_run waits for it, bounded).
+    const std::string& aicm = !m.aicm_path.empty() ? m.aicm_path : r.aicm_path;
+    std::string le;
+    if (!aicm.empty() && !st.loadDocMesh(aicm, le)) return "assembly mesh: " + le;
+    return "";
+}
+
+void saBuildSteps(SimAuditShot& A) {
+    using HP = ui::HydraulicPanel;
+    const unsigned VP = ui::audit::RegionViewport;
+    const int topoTab = AppState::RT_Topology;
+    const int pipeTab = ui::kRibbonTabPiping;
+    const int hydTab = ui::kRibbonTabHydraulics;
+    std::vector<SaStep>& S = A.steps;
+    // sim_mesh meshes + shows the wireframe only when the SimClient is free (a still-running
+    // solve keeps it busy), so the state waits for the SimClient only when the preview started.
+    auto mesh = [&](const char* name, int tab) {
+        SaStep s;
+        s.name = name;
+        s.timeoutS = 30.0;
+        s.enter = [tab](AppState& st, ui::SimManager& sm, SimAuditShot& A) {
+            A.meshWait = !(st.simClient && st.simClient->busy());
+            saRun(st, sm, tab, "sim_mesh");
+            return SaEnter::Done;
+        };
+        s.ready = [](AppState& st, ui::SimManager& sm) {
+            return saIdle(st, sm) && !(g_sa.meshWait && st.simClient && st.simClient->busy());
+        };
+        S.push_back(std::move(s));
+    };
+    auto custom = [&](const char* name, unsigned regions, SaEnterFn enter, SaReadyFn ready = nullptr,
+                      double timeoutS = kSaIdleTimeoutS) {
+        SaStep s;
+        s.name = name;
+        s.regions = regions;
+        s.enter = std::move(enter);
+        s.ready = std::move(ready);
+        s.timeoutS = timeoutS;
+        S.push_back(std::move(s));
+    };
+
+    // ---- Simulation Manager + Static ----
+    custom("sim_manager_empty", VP, [](AppState& st, ui::SimManager&, SimAuditShot&) {
+        st.ribbonTab = kSaTabStatic;
+        return SaEnter::Done;
+    });
+    custom("new_study_picker", 0, [](AppState& st, ui::SimManager& sm, SimAuditShot&) {
+        st.ribbonTab = kSaTabStatic;
+        sm.shotForcePicker = true;  // the "+ New Study" picker, held open
+        return SaEnter::Done;
+    });
+    S.push_back(saCmd("static_new", kSaTabStatic, "sim_new_static"));
+    custom("static_material", 0, [](AppState& st, ui::SimManager& sm, SimAuditShot&) {
+        saRun(st, sm, kSaTabStatic, "sim_material");
+        sm.configureActive(st, 0.2f, "steel_1018");  // persisted before the run state
+        return SaEnter::Done;
+    });
+    S.push_back(saPickCmd("static_fixture", kSaTabStatic, "min_x", "sim_fixture"));
+    S.push_back(saPickCmd("static_force", kSaTabStatic, "max_x", "sim_load_force"));
+    S.push_back(saPickCmd("static_pressure", kSaTabStatic, "max_z", "sim_load_pressure"));
+    mesh("static_mesh", kSaTabStatic);
+    S.push_back(saExpanded("static_mesh_advanced", kSaTabStatic, "sim_mesh", "Advanced"));
+    S.push_back(saExpanded("static_mesh_adaptive", kSaTabStatic, nullptr, "Adaptive refinement"));
+    S.push_back(saCmd("static_complete_parameters", kSaTabStatic, "sim_parameters"));
+    // The Run page is captured WHILE the solve is in flight (progress + Cancel); the result lands
+    // during static_results, which waits for the colormap.
+    custom("static_run", 0,
+           [](AppState& st, ui::SimManager& sm, SimAuditShot& A) {
+               saRun(st, sm, kSaTabStatic, "sim_run");
+               if (!sm.runUi().running && !st.colormapOn)
+                   A.note = saRunRefusal(st);
+               return SaEnter::Done;
+           },
+           [](AppState& st, ui::SimManager& sm) {
+               return sm.runUi().running || st.colormapOn || !g_sa.note.empty();
+           }, 25.0);
+    custom("static_results", VP,
+           [](AppState& st, ui::SimManager& sm, SimAuditShot&) {
+               saRun(st, sm, kSaTabStatic, "sim_results");
+               return SaEnter::Done;
+           },
+           [](AppState& st, ui::SimManager&) { return st.colormapOn; }, 25.0);
+
+    // ---- Modal ----
+    S.push_back(saCmd("modal_new", kSaTabModal, "sim_new_modal"));
+    S.push_back(saCmd("modal_material", kSaTabModal, "sim_material"));
+    S.push_back(saPickCmd("modal_fixture", kSaTabModal, "min_x", "sim_fixture"));
+    S.push_back(saCmd("modal_frequencies", kSaTabModal, "sim_modal_options"));
+    mesh("modal_mesh", kSaTabModal);
+    S.push_back(saCmd("modal_complete_parameters", kSaTabModal, "sim_parameters"));
+    S.push_back(saCmd("modal_results", kSaTabModal, "sim_results"));
+
+    // ---- Flow ----
+    S.push_back(saCmd("flow_new", kSaTabFlow, "sim_new_flow"));
+    S.push_back(saCmd("flow_fluid", kSaTabFlow, "sim_fluid"));
+    S.push_back(saExpanded("flow_fluid_palette", kSaTabFlow, "sim_fluid", "Fluid presets"));
+    S.push_back(saExpanded("flow_surface_palette", kSaTabFlow, "sim_fluid", "Surface presets"));
+    S.push_back(saCmd("flow_boundaries", kSaTabFlow, "sim_flow_bc"));
+    S.push_back(saCmd("flow_resolution", kSaTabFlow, "sim_flow_res"));
+    S.push_back(saCmd("flow_complete_parameters", kSaTabFlow, "sim_parameters"));
+    S.push_back(saCmd("flow_results", kSaTabFlow, "sim_results"));
+
+    // ---- Thermal (the Thermal tab is Thermal FEA; Thermal CFD is reachable only from the picker) ----
+    S.push_back(saCmd("thermal_new", kSaTabThermal, "sim_new_thermal_fea"));
+    S.push_back(saPickCmd("thermal_fixed_temp", kSaTabThermal, "min_x", "sim_fixture"));
+    S.push_back(saPickCmd("thermal_heat_loads", kSaTabThermal, "max_x", "sim_load_heat"));
+    S.push_back(saCmd("thermal_fea_complete_parameters", kSaTabThermal, "sim_parameters"));
+    S.push_back(saCmd("thermal_results", kSaTabThermal, "sim_results"));
+    S.push_back(saCmd("thermal_cfd_new", kSaTabThermal, "sim_new_thermal"));
+    S.push_back(saCmd("thermal_cfd_boundaries", kSaTabThermal, "sim_flow_bc"));
+    S.push_back(saCmd("thermal_cfd_complete_parameters", kSaTabThermal, "sim_parameters"));
+
+    // ---- Fatigue ----
+    S.push_back(saCmd("fatigue_new", kSaTabFatigue, "sim_new_fatigue"));
+    S.push_back(saCmd("fatigue_material", kSaTabFatigue, "sim_material"));
+    S.push_back(saCmd("fatigue_loading_sn", kSaTabFatigue, "sim_fatigue_setup"));
+    mesh("fatigue_mesh", kSaTabFatigue);
+    S.push_back(saCmd("fatigue_complete_parameters", kSaTabFatigue, "sim_parameters"));
+    S.push_back(saCmd("fatigue_results", kSaTabFatigue, "sim_results"));
+
+    // ---- study kinds reached from the "+ New Study" picker ----
+    S.push_back(saCmd("buckling_new", kSaTabStatic, "sim_new_buckling"));
+    S.push_back(saCmd("buckling_complete_parameters", kSaTabStatic, "sim_parameters"));
+    S.push_back(saCmd("contact_new", kSaTabStatic, "sim_new_contact"));
+    S.push_back(saCmd("contact_complete_parameters", kSaTabStatic, "sim_parameters"));
+    S.push_back(saCmd("freq_response_new", kSaTabModal, "sim_new_freqresp"));
+    S.push_back(saCmd("freq_response_complete_parameters", kSaTabModal, "sim_parameters"));
+
+    // ---- EM (the first command probes the em_* backend, so it is issued again once answered) ----
+    custom("em_eigenmode", 0, [](AppState& st, ui::SimManager& sm, SimAuditShot& A) {
+        if (A.sub == 0) {
+            saRun(st, sm, kSaTabEm, "sim_em_eigen");
+            A.sub = 1;
+            A.subStart = pipingNow();
+            return SaEnter::Again;
+        }
+        if (st.rpc.busy() && pipingNow() - A.subStart < kSaIdleTimeoutS) return SaEnter::Again;
+        saRun(st, sm, kSaTabEm, "sim_em_eigen");
+        return SaEnter::Done;
+    });
+    // Time domain first, then the driven sweep the setup focus commands act on: each of ports /
+    // boundaries / range then scrolls a different card of the same driven form into view.
+    S.push_back(saCmd("em_time_domain", kSaTabEm, "sim_em_time"));
+    S.push_back(saExpanded("em_time_exact_parameters", kSaTabEm, "sim_em_time", "Advanced (native parameters)"));
+    S.push_back(saCmd("em_freq_sweep", kSaTabEm, "sim_em_sweep"));
+    S.push_back(saExpanded("em_waveguide_palette", kSaTabEm, "sim_em_sweep", "Standard waveguide palette"));
+    S.push_back(saExpanded("em_sweep_exact_parameters", kSaTabEm, "sim_em_sweep", "Advanced (native parameters)"));
+    S.push_back(saCmd("em_ports", kSaTabEm, "sim_em_ports"));
+    S.push_back(saCmd("em_boundaries", kSaTabEm, "sim_em_boundary"));
+    S.push_back(saCmd("em_freq_range", kSaTabEm, "sim_em_range"));
+    S.push_back(saCmd("em_results", kSaTabEm, "sim_em_results"));
+
+    // ---- Topology (the capability matrix is fetched first; nothing is assumed) ----
+    custom("topology_new", 0, [topoTab](AppState& st, ui::SimManager& sm, SimAuditShot& A) {
+        using State = ui::topology::Capabilities::State;
+        if (A.sub == 0) {
+            st.ribbonTab = topoTab;
+            A.sub = 1;
+            A.subStart = pipingNow();
+            return SaEnter::Again;
+        }
+        if (sm.topologyCapabilities().state == State::Loading && pipingNow() - A.subStart < 30.0)
+            return SaEnter::Again;
+        if (st.rpc.busy() && pipingNow() - A.subStart < 30.0) return SaEnter::Again;
+        saRun(st, sm, topoTab, "sim_new_topology");
+        A.topoStructId = sm.activeStudyId();
+        if (sm.topologyCapabilities().state != State::Ready)
+            A.note = "topology capabilities not ready: " + sm.topologyCapabilities().error;
+        return SaEnter::Done;
+    });
+    S.push_back(saCmd("topology_method", topoTab, "sim_topology_setup"));
+    S.push_back(saCmd("topology_complete_parameters", topoTab, "sim_parameters"));
+    S.push_back(saPickCmd("topology_fixture", topoTab, "min_x", "sim_fixture"));
+    S.push_back(saPickCmd("topology_force", topoTab, "max_x", "sim_load_force"));
+    // Heat / Flow boundaries only exist on thermal / flow physics: a second (thermal) topology
+    // study with a temperature fixture, so the Boundaries page shows the heat-transfer editor.
+    custom("topology_heat_flow", 0, [topoTab](AppState& st, ui::SimManager& sm, SimAuditShot& A) {
+        nlohmann::json cfg = ui::topology::newTopologyConfig(sm.topologyCapabilities(), "thermal");
+        if (cfg.empty()) {
+            A.note = "no topology method supports thermal physics; structural Boundaries page shown";
+            saRun(st, sm, topoTab, "sim_topology_boundaries");
+            return SaEnter::Done;
+        }
+        const int before = sm.studyCount();
+        saRun(st, sm, topoTab, "sim_new_topology");
+        if (sm.studyCount() != before + 1 ||
+            !sm.configureActiveTopology(st, {{"name", "Heat spreader topology"}, {"topology", cfg}})) {
+            A.note = "thermal topology study not created: " + st.status;
+            return SaEnter::Done;
+        }
+        saPick(st, A, "min_x");
+        saRun(st, sm, topoTab, "sim_fixture");  // thermal physics: a temperature fixture
+        st.selection.clear();
+        saRun(st, sm, topoTab, "sim_topology_boundaries");
+        return SaEnter::Done;
+    });
+    // The remaining topology states run on the structural study again.
+    auto topoStep = [&](const char* name, const char* role, const char* cmd) {
+        custom(name, 0, [topoTab, role, cmd](AppState& st, ui::SimManager& sm, SimAuditShot& A) {
+            if (!A.topoStructId.empty() && sm.activeStudyId() != A.topoStructId &&
+                !sm.selectStudyById(st, A.topoStructId))
+                A.note = "structural topology study not found";
+            if (role) saPick(st, A, role);
+            if (std::strcmp(cmd, "sim_mesh") == 0)
+                A.meshWait = !(st.simClient && st.simClient->busy());
+            saRun(st, sm, topoTab, cmd);
+            st.selection.clear();
+            return SaEnter::Done;
+        });
+    };
+    topoStep("topology_preserve", "max_z", "sim_topology_preserve");
+    topoStep("topology_exclude", nullptr, "sim_topology_exclude");
+    topoStep("topology_manufacturing", nullptr, "sim_topology_manufacturing");
+    topoStep("topology_mesh", nullptr, "sim_mesh");
+    S.back().timeoutS = 30.0;
+    S.back().ready = [](AppState& st, ui::SimManager& sm) {
+        return saIdle(st, sm) && !(g_sa.meshWait && st.simClient && st.simClient->busy());
+    };
+    topoStep("topology_results", nullptr, "sim_results");
+    topoStep("topology_compare", nullptr, "sim_topology_compare");
+
+    // ---- Piping: every form; route / solve / spec / BOM through the panel's own buttons ----
+    S.push_back(saCmd("piping_network", pipeTab, "sim_piping_new"));
+    S.push_back(saExpanded("piping_network_native_parameters", pipeTab, nullptr, "Edit native parameters",
+                            0, "Hide native parameters"));
+    S.push_back(saAction("piping_route", pipeTab, "sim_piping_route",
+                         [](AppState& st, ui::SimManager& sm) {
+                             const double a[3] = {-400.0, 0.0, 0.0}, b[3] = {400.0, 0.0, 0.0};
+                             const double dir[3] = {1.0, 0.0, 0.0};
+                             sm.piping().setRouteEndpoints(a, dir, b, dir);
+                             sm.piping().setRouteSpec(2.0, "40", "A106-B", 50.0);
+                             return sm.piping().runRoute(st);
+                         }, 60.0, VP));
+    S.push_back(saAction("piping_solve", pipeTab, "sim_piping_solve",
+                         [](AppState& st, ui::SimManager& sm) { return sm.piping().runSolve(st); }, 60.0));
+    S.push_back(saAction("piping_spec_check", pipeTab, "sim_piping_spec",
+                         [](AppState& st, ui::SimManager& sm) { return sm.piping().runSpecCheck(st); }, 60.0));
+    S.push_back(saAction("piping_bom", pipeTab, "sim_piping_bom",
+                         [](AppState& st, ui::SimManager& sm) { return sm.piping().runBom(st); }, 60.0));
+    S.push_back(saExpanded("piping_solve_native_parameters", pipeTab, "sim_piping_solve", "Edit native parameters",
+                            0, "Hide native parameters", "Conditions"));
+    S.push_back(saCmd("piping_internal_cfd", pipeTab, "sim_piping_flow"));
+    S.push_back(saExpanded("piping_flow_native_parameters", pipeTab, "sim_piping_flow", "Edit native parameters",
+                            0, "Hide native parameters", "Setup"));
+    S.push_back(saCmd("piping_vessel", pipeTab, "sim_piping_vessel"));
+    S.push_back(saExpanded("piping_vessel_native_parameters", pipeTab, "sim_piping_vessel", "Edit native parameters",
+                            0, "Hide native parameters", "Setup"));
+    S.push_back(saCmd("piping_duct", pipeTab, "sim_piping_duct"));
+    S.push_back(saExpanded("piping_duct_native_parameters", pipeTab, "sim_piping_duct", "Edit native parameters",
+                            0, "Hide native parameters", "Segments"));
+
+    // ---- Hydraulics: build the circuit through the panel, then every side form + central view ----
+    custom("hyd_circuit", VP, [hydTab](AppState& st, ui::SimManager& sm, SimAuditShot& A) {
+        HP& hp = sm.hydraulic();
+        if (A.sub > 0 && (hp.busy() || st.rpc.busy())) {
+            if (pipingNow() - A.subStart < 60.0) return SaEnter::Again;
+            A.note = "circuit build timed out at step " + std::to_string(A.sub);
+            return SaEnter::Done;
+        }
+        if (A.sub > 1 && !hp.lastError().empty() && A.note.empty()) A.note = "refused: " + hp.lastError();
+        A.subStart = pipingNow();
+        const auto& comps = saHydComps();
+        const auto& hoses = saHydHoses();
+        if (A.sub == 0) {
+            saRun(st, sm, hydTab, "sim_hyd_new");
+            ++A.sub;
+            return SaEnter::Again;
+        }
+        const int c = A.sub - 1;
+        if (c < (int)comps.size()) {
+            saRun(st, sm, hydTab, "sim_hyd_add");
+            hp.addComponent(st, comps[c].type, comps[c].name, comps[c].x, comps[c].y, comps[c].params);
+            ++A.sub;
+            return SaEnter::Again;
+        }
+        const int h = c - (int)comps.size();
+        if (h < (int)hoses.size()) {
+            std::vector<std::pair<std::string, std::string>> ends;
+            for (const auto& e : hoses[h].ends) ends.push_back({hp.componentIdByName(e.first), e.second});
+            saRun(st, sm, hydTab, "sim_hyd_hose");
+            hp.addHose(st, hoses[h].net, ends, hoses[h].lengthMm, hoses[h].idMm, hoses[h].ratingBar);
+            ++A.sub;
+            return SaEnter::Again;
+        }
+        hp.setCentralView(HP::CentralView::Schematic);
+        return SaEnter::Done;
+    }, nullptr, 60.0);
+    S.push_back(saCmd("hyd_add_component", hydTab, "sim_hyd_add", VP));
+    S.push_back(saCmd("hyd_connect", hydTab, "sim_hyd_hose"));
+    S.push_back(saAction("hyd_size_cylinder", hydTab, "sim_hyd_size_cyl",
+                         [](AppState& st, ui::SimManager& sm) {
+                             HP& hp = sm.hydraulic();
+                             hp.setCylinderInputs(hp.componentIdByName("Lift cylinder"), 63.0, 36.0, 160.0, 300.0,
+                                                  100.0);
+                             return hp.runSizeCylinder(st);
+                         }, 60.0));
+    S.push_back(saCmd("hyd_size_pump", hydTab, "sim_hyd_size_pump"));
+    S.push_back(saCmd("hyd_size_motor", hydTab, "sim_hyd_size_motor"));
+    S.push_back(saAction("hyd_pump_drive", hydTab, "sim_hyd_drive",
+                         [](AppState& st, ui::SimManager& sm) {
+                             HP& hp = sm.hydraulic();
+                             hp.setDriveFromPump(hp.componentIdByName("Pump"));
+                             return hp.runPumpDrive(st);
+                         }, 60.0));
+    S.push_back(saAction("hyd_simulate_schematic", hydTab, nullptr,
+                         [](AppState& st, ui::SimManager& sm) {
+                             HP& hp = sm.hydraulic();
+                             hp.openSimulationSetup();
+                             const std::string dcv = hp.componentIdByName("DCV 4/3");
+                             hp.clearSchedule();
+                             hp.addScheduleRow(0.0, dcv, "center");
+                             hp.addScheduleRow(0.2, dcv, "a");
+                             hp.setLoad(hp.componentIdByName("Lift cylinder"), 10000.0, 200.0);
+                             hp.setDuration(3.0);
+                             hp.setCentralView(HP::CentralView::Schematic);
+                             return hp.runSimulate(st);
+                         }, 90.0, VP));
+    S.push_back(saAction("hyd_results_outcome", hydTab, nullptr,
+                         [](AppState&, ui::SimManager& sm) {
+                             sm.hydraulic().openResults();
+                             return true;
+                         }, kSaIdleTimeoutS, VP));
+    S.push_back(saAction("hyd_simulate_plots", hydTab, nullptr,
+                         [](AppState&, ui::SimManager& sm) {
+                             sm.hydraulic().setCentralView(HP::CentralView::Plots);
+                             return true;
+                         }, kSaIdleTimeoutS, VP));
+    S.push_back(saCmd("hyd_view_3d", hydTab, "sim_hyd_view_3d", VP));
+    S.push_back(saAction("hyd_bom", hydTab, "sim_hyd_bom",
+                         [](AppState& st, ui::SimManager& sm) {
+                             sm.hydraulic().setCentralView(HP::CentralView::Schematic);
+                             return sm.hydraulic().runBom(st);
+                         }, 60.0));
+    S.push_back(saAction("hyd_to_piping", hydTab, "sim_hyd_piping",
+                         [](AppState& st, ui::SimManager& sm) { return sm.hydraulic().runPipingHandoff(st); },
+                         60.0));
+    S.push_back(saAction("hyd_simulate_setup", hydTab, nullptr,
+                         [](AppState&, ui::SimManager& sm) {
+                             sm.hydraulic().openSimulationSetup();
+                             return true;
+                         }, kSaIdleTimeoutS, VP));
+    S.push_back(saExpanded("hyd_simulate_native_parameters", hydTab, nullptr,
+                            "All simulation parameters (native JSON)", VP));
+    S.push_back(saExpanded("hyd_handoff_native_parameters", hydTab, "sim_hyd_piping",
+                            "All piping handoff inputs (native JSON)", VP));
+
+    // Author a real native schematic. The CAD manager remains active while its circuit panel
+    // targets the separate schematic tab by stable identity; no probe/netlist data is fabricated.
+    custom("circuit_operating_point", 0, [](AppState& st, ui::SimManager&, SimAuditShot& A) {
+        if (A.sub == 0) {
+            A.partTab = st.activeTab;
+            nlohmann::json res;
+            std::string err;
+            if (!st.worker.call("ecad_design", {{"request", "RC low-pass filter with 1000 Hz cutoff"},
+                                                {"name", "Simulation audit RC"}}, res, err) ||
+                !res.is_object() || res.contains("code") || !res.value("ok", false)) {
+                saFail("circuit_recipe", err.empty() ? res.dump() : err);
+                return SaEnter::Done;
+            }
+            A.schematicDoc = res.value("doc_id", std::string());
+            st.addEcadTab("sch", A.schematicDoc, res.value("revision", 0), "Simulation audit RC");
+            st.switchToTab(A.partTab);
+            A.sub = 1;
+            return SaEnter::Again;
+        }
+        if (st.rpc.busy() || st.activeTab != A.partTab || !st.simManager) return SaEnter::Again;
+        st.simManager->handleCommand(st, "sim_circuit_op");
+        A.note = "Real native RC schematic; setup only, not a claimed circuit solve.";
+        return SaEnter::Done;
+    });
+    S.push_back(saCmd("circuit_dc_sweep", -1, "sim_circuit_dc"));
+    S.push_back(saCmd("circuit_ac_sweep", -1, "sim_circuit_ac"));
+    S.push_back(saCmd("circuit_transient", -1, "sim_circuit_tran"));
+    S.push_back(saExpanded("circuit_transient_native_parameters", -1, "sim_circuit_tran",
+                            "Advanced (native parameters)"));
+    S.push_back(saCmd("simulate_firmware_setup", -1, "sim_firmware_setup"));
+    S.push_back(saExpanded("simulate_firmware_metadata", -1, "sim_firmware_setup",
+                            "Scenario metadata and electrical links", 0, nullptr, "GPIO edges"));
+    custom("board_thermal_setup", 0, [](AppState& st, ui::SimManager&, SimAuditShot& A) {
+        if (A.sub == 0) {
+            nlohmann::json res, applied;
+            std::string err;
+            if (!st.worker.call("ecad_new", {{"kind", "pcb"}, {"name", "Simulation audit board"}}, res, err) ||
+                !res.is_object() || res.contains("code")) {
+                saFail("board_new", err.empty() ? res.dump() : err); return SaEnter::Done;
+            }
+            A.boardDoc = res.value("doc_id", std::string());
+            const auto outline = nlohmann::json::array({
+                {{"type", "line"}, {"p1", {0.0, 0.0}}, {"p2", {80.0, 0.0}}},
+                {{"type", "line"}, {"p1", {80.0, 0.0}}, {"p2", {80.0, 50.0}}},
+                {{"type", "line"}, {"p1", {80.0, 50.0}}, {"p2", {0.0, 50.0}}},
+                {{"type", "line"}, {"p1", {0.0, 50.0}}, {"p2", {0.0, 0.0}}}});
+            const auto ops = nlohmann::json::array({{{"op", "pcb_set_outline"},
+                                                     {"closed", true}, {"shapes", outline}}});
+            if (!st.worker.call("ecad_apply_ops", {{"doc_id", A.boardDoc},
+                        {"base_revision", res.value("revision", 0)}, {"ops", ops}}, applied, err) ||
+                applied.contains("code")) {
+                saFail("board_outline", err.empty() ? applied.dump() : err); return SaEnter::Done;
+            }
+            st.addEcadTab("pcb", A.boardDoc, applied.value("revision", 0), "Simulation audit board");
+            st.switchToTab(A.partTab);
+            A.sub = 1;
+            return SaEnter::Again;
+        }
+        if (st.rpc.busy() || st.activeTab != A.partTab || !st.simManager) return SaEnter::Again;
+        st.simManager->handleCommand(st, "sim_board_thermal_setup");
+        A.note = "Real outlined PCB; no powered-result palette or thermal solve fabricated.";
+        return SaEnter::Done;
+    });
+    custom("firmware_workspace_interactive_setup", VP, [](AppState& st, ui::SimManager&, SimAuditShot& A) {
+        ui::firmware::seedFirmwareShotFixture();
+        ui::firmware::openFirmwareEmulationSetup();
+        st.activeWorkspace = AppState::Workspace::Firmware;
+        A.note = "Explicit workspace rendering fixture with editable native tracks; emulator NOT RUN.";
+        return SaEnter::Done;
+    });
+    S.push_back(saExpanded("firmware_workspace_metadata", -1, nullptr,
+                            "Scenario metadata and electrical links", VP));
+
+    // ---- Evaluate dialogs over the Simulate workspace ----
+    auto evalStep = [&](const char* name, const char* cmd, const char* pickRole) {
+        custom(name, 0, [cmd, pickRole](AppState& st, ui::SimManager&, SimAuditShot& A) {
+            if (!st.evaluateDialogs) {
+                A.note = "no Evaluate dialogs for the active document";
+                return SaEnter::Skip;
+            }
+            if (pickRole) saPick(st, A, pickRole);
+            st.evaluateDialogs->handleCommand(st, cmd);
+            return SaEnter::Done;
+        });
+    };
+    evalStep("eval_mass_properties", "eval_mass_props", nullptr);
+    evalStep("eval_section_properties", "eval_section_props", nullptr);
+    evalStep("eval_measure", "eval_measure", "max_z");
+
+    // ---- Motion (needs an assembly with a drivable mate: built here, last) ----
+    custom("motion_new", 0, [](AppState& st, ui::SimManager& sm, SimAuditShot& A) {
+        if (A.sub == 0) {
+            st.selection.clear();
+            A.partSm = &sm;
+            const std::string why = saBuildMotionAssembly(st, A);
+            if (!why.empty()) {
+                A.note = "assembly setup failed: " + why;
+                return SaEnter::Skip;
+            }
+            A.sub = 1;
+            A.subStart = pipingNow();
+            return SaEnter::Again;
+        }
+        // The assembly's own SimManager must be seated and the engine idle before newStudy.
+        if ((st.docMirror.docId() != A.asmDoc || &sm == A.partSm || st.rpc.busy()) &&
+            pipingNow() - A.subStart < kSaIdleTimeoutS)
+            return SaEnter::Again;
+        const int before = sm.studyCount();
+        saRun(st, sm, kSaTabMotion, "sim_new_motion");
+        A.motionOk = sm.studyCount() == before + 1;
+        if (!A.motionOk) A.note = "Motion study was not created: " + st.status;
+        else sm.configureActiveMotion(st, 60.0f, 100.0f, 24);
+        return SaEnter::Done;
+    });
+    auto motionStep = [&](const char* name, const char* cmd, unsigned regions, SaReadyFn ready, double timeoutS) {
+        custom(name, regions, [cmd](AppState& st, ui::SimManager& sm, SimAuditShot& A) {
+            if (!A.motionOk) {
+                A.note = "no Motion study (see motion_new)";
+                return SaEnter::Skip;
+            }
+            saRun(st, sm, kSaTabMotion, cmd);
+            return SaEnter::Done;
+        }, std::move(ready), timeoutS);
+    };
+    motionStep("motion_driver_time", "sim_motion_setup", 0, nullptr, kSaIdleTimeoutS);
+    motionStep("motion_complete_parameters", "sim_parameters", 0, nullptr, kSaIdleTimeoutS);
+    // Run: first wait (bounded) until the assembly's parsed viewport mesh is cached on its session
+    // (Motion samples that mesh and refuses Run until it exists), then
+    // re-issue Run every 0.5 s while the engine finishes the setup saves. A mesh that never lands
+    // or a refusal that outlasts the timeout is reported in the state note.
+    custom("motion_run", 0, [](AppState& st, ui::SimManager& sm, SimAuditShot& A) {
+        constexpr double kMeshTimeoutS = 30.0;
+        if (!A.motionOk) {
+            A.note = "no Motion study (see motion_new)";
+            return SaEnter::Skip;
+        }
+        const double now = pipingNow();
+        if (A.sub == 0) {
+            A.sub = 1;
+            A.subStart = now;
+            A.waitStart = 0.0;
+        }
+        if (A.sub == 1) {
+            const DocSession* ses = st.activeSession();
+            // Study saves bump the revision without re-tessellating; Run's own gate compares the
+            // geometry for that case, so only the cached mesh itself is awaited here.
+            const bool meshReady = st.docMirror.docId() == A.asmDoc && ses && ses->cachedDocMesh &&
+                                   !ses->cachedDocMesh->empty() && ses->cachedMirror.valid();
+            if (!meshReady) {
+                if (now - A.subStart < kMeshTimeoutS) return SaEnter::Again;
+                A.note = "the assembly mesh did not load within " + std::to_string((int)kMeshTimeoutS) + " s";
+                std::printf("simaudit: motion_run NOT RUN (%s)\n", A.note.c_str());
+                std::fflush(stdout);
+                return SaEnter::Done;
+            }
+            std::printf("simaudit: motion_run assembly mesh ready after %.1f s\n", now - A.subStart);
+            std::fflush(stdout);
+            A.sub = 2;
+            A.subStart = now;
+        }
+        if (A.waitStart == 0.0 || now - A.waitStart >= 0.5) {
+            A.waitStart = now;
+            saRun(st, sm, kSaTabMotion, "sim_run");
+            if (sm.runUi().running || sm.motionHasResult()) return SaEnter::Done;
+        }
+        if (now - A.subStart < kSaIdleTimeoutS) return SaEnter::Again;
+        A.note = saRunRefusal(st);
+        std::printf("simaudit: motion_run REFUSED (%s)\n", A.note.c_str());
+        std::fflush(stdout);
+        return SaEnter::Done;
+    }, [](AppState& st, ui::SimManager& sm) {
+        return !st.rpc.busy() && (sm.motionHasResult() || !sm.runUi().running);
+    }, 30.0);
+    motionStep("motion_playback", "sim_results", VP, nullptr, kSaIdleTimeoutS);
+}
+
+// Part + faces, then the Simulate workspace. Returns once setup is complete (A.setup == 2).
+void saSetup(AppState& st, SimAuditShot& A) {
+    if (A.setup == 0) {
+        std::string err;
+        if (!st.docMirror.newPart(st.worker, err)) { saFail("new_part", err); return; }
+        auto dim = [](double v) { return nlohmann::json{{"value", v}, {"expr", nullptr}}; };
+        nlohmann::json ops = nlohmann::json::array();
+        ops.push_back({{"op", "add_feature"}, {"feature", {
+            {"type", "box"}, {"name", "AuditBox"},
+            {"params", {{"length", dim(60.0)}, {"width", dim(40.0)}, {"height", dim(10.0)}}},
+            {"centered", true}}}});
+        auto r = st.docMirror.applyOps(st.worker, ops);
+        if (!r.ok) { saFail("box", r.error_message); return; }
+        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        // min_x / max_x end faces and the max_z top face, by centroid.
+        double ext[3] = {1e30, 1e30, 1e30};
+        const char* roles[3] = {"min_x", "max_x", "max_z"};
+        for (uint32_t tid = 1; tid <= 12; ++tid) {
+            std::string se;
+            const std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
+            if (s.empty()) continue;
+            nlohmann::json o = nlohmann::json::parse(s, nullptr, false);
+            if (!o.is_object() || !o.contains("centroid") || !o["centroid"].is_array() || o["centroid"].size() != 3)
+                continue;
+            const double key[3] = {o["centroid"][0].get<double>(), -o["centroid"][0].get<double>(),
+                                   -o["centroid"][2].get<double>()};
+            for (int k = 0; k < 3; ++k)
+                if (key[k] < ext[k]) {
+                    ext[k] = key[k];
+                    A.faces[roles[k]] = {{"tid", tid}, {"sel", o}};
+                }
+        }
+        for (const char* role : roles)
+            if (!A.faces.contains(role)) { saFail("faces", std::string("no '") + role + "' face resolved"); return; }
+        std::printf("simaudit: box 60x40x10 mm (rev %d), faces resolved\n", r.revision);
+        std::fflush(stdout);
+        st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
+        A.settle = 3;
+        A.setup = 1;
+        A.waitStart = pipingNow();
+        return;
+    }
+    if (!st.simManager) {
+        if (pipingNow() - A.waitStart > 30.0) saFail("no_sim_manager", "the part has no Simulation manager");
+        return;
+    }
+    st.activeWorkspace = AppState::Workspace::Simulate;
+    st.leftPaneTab = AppState::LP_Simulation;
+    st.showRibbon = true;
+    st.showSimulationTools = true;
+    st.ribbonTab = kSaTabStatic;
+    A.setup = 2;
+    A.waitStart = 0.0;
+    A.settle = 8;
+}
+
+void simAuditTick(AppState& st) {
+    SimAuditShot& A = g_sa;
+    if (!A.init) {
+        A.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        A.want = st.shot && mode && std::strcmp(mode, "simaudit") == 0;
+        if (A.want) {
+            const char* repo = std::getenv("CHUDWARE_REPO");
+            A.dir = std::string(repo ? repo : ".") + "/scratch/simaudit";
+            std::error_code ec;
+            std::filesystem::create_directories(A.dir, ec);
+            if (const char* f = std::getenv("CHUDWARE_SIMAUDIT_FRAMES")) A.auditFrames = std::max(1, std::atoi(f));
+            if (const char* f = std::getenv("CHUDWARE_SIMAUDIT_MAX_FRAMES")) A.maxFrames = std::max(0, std::atoi(f));
+            A.t0 = pipingNow();
+            A.report = {{"scenario", "simaudit"},
+                        {"ok", false},
+                        {"audit", {{"detector", "imgui_test_engine_item_hooks"},
+                                   {"frames", A.auditFrames},
+                                   {"max_frames", A.maxFrames}}},
+                        {"states", nlohmann::json::array()},
+                        {"skipped", nlohmann::json::array()},
+                        {"total_conflicts", 0},
+                        {"total_overflows", 0}};
+            saBuildSteps(A);
+            // Surfaces that exist but are not reachable without a click or a long solve.
+            saSkip(A, "static_torque",
+                   "schema-reserved: the Torque ribbon row is disabled and SimManager::handleCommand has no "
+                   "sim_load_torque handler");
+            saSkip(A, "material_new_custom_popup",
+                   "material creation is outside this simulation-setup gesture and native-parameter audit");
+            saSkip(A, "solver_results_modal_flow_thermal_fatigue_em_topology_pipecfd",
+                   "the audit runs only the static and motion solves (the external-flow solve is covered by "
+                   "CHUDWARE_SHOT=flow); their Results nodes are audited in the no-result state");
+        }
+    }
+    if (!A.want || A.done) return;
+    if (!st.workerStarted || st.frame < 5) return;
+    if (!A.capture.empty()) return;  // endFrame consumes it
+    if (ui::audit::active()) return;  // the audit is recording; keep the state still
+    if (A.settle > 0) { --A.settle; return; }
+    if (!A.queued.empty()) {
+        A.capture = A.queued;
+        A.queued.clear();
+        return;
+    }
+    if (A.setup < 2) {
+        saSetup(st, A);
+        return;
+    }
+    if (A.idx >= A.steps.size()) {
+        if (st.simManager) st.simManager->shotForcePicker = false;
+        A.report["ok"] = A.totalConflicts == 0 && A.totalOverflows == 0;
+        A.report["seconds"] = std::round((pipingNow() - A.t0) * 10.0) / 10.0;
+        A.done = true;
+        return;
+    }
+    if (!st.simManager) {  // the assembly's manager is re-seated after the document switch
+        if (++A.idleFrames > 600) saFail("no_sim_manager", "the active document lost its Simulation manager");
+        return;
+    }
+    A.idleFrames = 0;
+    ui::SimManager& sm = *st.simManager;
+    const SaStep& step = A.steps[A.idx];
+
+    switch (A.stage) {
+        case 0:  // the engine and panels go idle first (newStudy refuses while an RPC is in flight)
+            if (A.waitStart == 0.0) A.waitStart = pipingNow();
+            if (!saIdle(st, sm) && pipingNow() - A.waitStart < kSaIdleTimeoutS) return;
+            A.stage = 1;
+            A.sub = 0;
+            A.note.clear();
+            [[fallthrough]];
+        case 1: {
+            st.activeWorkspace = AppState::Workspace::Simulate;
+            st.leftPaneTab = AppState::LP_Simulation;
+            st.showRibbon = true;
+            sm.shotForcePicker = false;
+            const SaEnter r = step.enter(st, sm, A);
+            if (A.failed || r == SaEnter::Again) return;
+            if (r == SaEnter::Skip) {
+                saSkip(A, step.name, A.note);
+                saWriteReport(A);
+                ++A.idx;
+                A.stage = 0;
+                A.waitStart = 0.0;
+                return;
+            }
+            A.stage = 2;
+            A.waitStart = pipingNow();
+            return;
+        }
+        case 2: {  // settle into the state
+            const bool ready = step.ready ? step.ready(st, sm) : saIdle(st, sm);
+            if (!ready) {
+                if (pipingNow() - A.waitStart < step.timeoutS) return;
+                if (!A.note.empty()) A.note += "; ";
+                A.note += "not settled after " + std::to_string((int)step.timeoutS) + " s";
+            }
+            const std::string perr = sm.piping().isOpen()      ? sm.piping().lastError()
+                                     : sm.hydraulic().isOpen() ? sm.hydraulic().lastError()
+                                                               : std::string();
+            if (!perr.empty()) A.note += (A.note.empty() ? "panel: " : "; panel: ") + perr;
+            A.stage = 3;
+            A.settle = 8;
+            return;
+        }
+        case 3: {  // audit
+            ui::audit::AuditOptions o;
+            o.regions = ui::audit::RegionLeftPane | ui::audit::RegionFloating | step.regions;
+            if (st.ribbonTab != A.lastRibbonTab) {  // each ribbon tab is reported once
+                o.regions |= ui::audit::RegionRibbon;
+                A.lastRibbonTab = st.ribbonTab;
+            }
+            o.frames = A.auditFrames;
+            o.maxFrames = A.maxFrames;
+            if (!ui::audit::begin(step.name, o)) { saFail("audit", "ui::audit::begin refused " + step.name); return; }
+            A.stage = 4;
+            return;
+        }
+        case 4: {  // record, then capture the settled state
+            nlohmann::json res = ui::audit::lastResult();
+            char file[160];
+            std::snprintf(file, sizeof(file), "%02d_%s.png", A.shotNo + 1, step.name.c_str());
+            res["capture"] = A.dir + "/" + file;
+            res["ribbon_tab"] = st.ribbonTab;
+            if (!A.note.empty()) res["note"] = A.note;
+            const int nc = (int)res.value("conflicts", nlohmann::json::array()).size();
+            const int no = (int)res.value("overflows", nlohmann::json::array()).size();
+            A.totalConflicts += nc;
+            A.totalOverflows += no;
+            std::printf("simaudit: %s conflicts=%d overflows=%d items_seen=%d%s%s%s\n", step.name.c_str(), nc, no,
+                        res.value("items_seen", 0), res.value("truncated", false) ? " (capped)" : "",
+                        A.note.empty() ? "" : " note: ", A.note.c_str());
+            std::fflush(stdout);
+            A.report["states"].push_back(std::move(res));
+            saWriteReport(A);
+            A.queued = A.dir + "/" + file;
+            A.settle = 1;
+            ++A.shotNo;
+            ++A.idx;
+            A.stage = 0;
+            A.waitStart = 0.0;
+            return;
+        }
+        default:
+            return;
+    }
+}
+
+bool simAuditEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    SimAuditShot& A = g_sa;
+    if (!A.want) return false;
+    ++st.frame;
+    if (!A.capture.empty() && (!st.rpc.busy() || ++A.captureWait > 120)) {
+        std::error_code ec;
+        std::filesystem::create_directories(A.dir, ec);
+        const bool last = A.done || A.idx >= A.steps.size();
+        writeBackbufferPng(A.capture.c_str(), dw, dh, last ? screenshotPath : nullptr);
+        A.capture.clear();
+        A.captureWait = 0;
+    }
+    glfwSwapBuffers(st.win);
+    breakLoop = false;
+    if (A.done && A.capture.empty() && A.queued.empty()) {
+        if (A.failed) A.report["ok"] = false;
+        saWriteReport(A);
+        std::printf("simaudit: total_conflicts=%d total_overflows=%d states=%zu skipped=%zu report=%s/report.json\n",
+                    A.totalConflicts, A.totalOverflows, A.report["states"].size(), A.report["skipped"].size(),
+                    A.dir.c_str());
+        std::fflush(stdout);
+        const int idConflicts = ui::audit::idAuditFinish();  // CHUDWARE_IDAUDIT summary (0 when off)
+        if (A.failed || A.totalConflicts > 0 || A.totalOverflows > 0 || idConflicts > 0) {
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+        breakLoop = true;
+    }
+    return true;
+}
+
+// CHUDWARE_SHOT=fea / flow bookkeeping (file-local so scenarios.h stays untouched). Waits are
+// wall-clock bounded; a failure prints "<tag>: FAILED [code] detail", still captures the frame,
+// then exits non-zero (studyShotExit) like simaudit.
+struct StudyShot {
+    std::string docId;       // the part this scenario built; it must stay the active document
+    double t0 = 0.0;         // scenario start
+    double stepStart = 0.0;  // start of the current bounded wait
+    double lastTry = 0.0;    // last sim_run attempt
+    double idleSince = 0.0;  // first moment the run was seen not running without a result (0 = n/a)
+    bool failed = false;
+};
+StudyShot g_feaShot, g_flowShot;
+
+void studyShotFail(StudyShot& S, const char* tag, const char* code, const std::string& detail) {
+    std::printf("%s: FAILED [%s] %s\n", tag, code, detail.c_str());
+    std::fflush(stdout);
+    S.failed = true;
+}
+
+// After the final capture: a failed scenario exits non-zero (the CHUDWARE_IDAUDIT summary first).
+void studyShotExit(const StudyShot& S) {
+    if (!S.failed) return;
+    ui::audit::idAuditFinish();
+    std::fflush(nullptr);
+    std::_Exit(EXIT_FAILURE);
+}
+
+// New part with one centred box, created through the same path as the tree toolbar's New Part
+// (the tab and its DocSession exist before the first mesh load binds to it). "" on success.
+std::string studyShotBox(AppState& st, StudyShot& S, const char* name, double l, double w, double h,
+                         int& revision) {
+    std::string err;
+    if (!st.docMirror.newPart(st.worker, err)) return "new part: " + err;
+    st.clearViewportForNewDoc();
+    st.addDocTab(/*isAssembly=*/false);
+    S.docId = st.docMirror.docId();
+    auto dim = [](double v) { return nlohmann::json{{"value", v}, {"expr", nullptr}}; };
+    nlohmann::json ops = nlohmann::json::array();
+    ops.push_back({{"op", "add_feature"}, {"feature", {
+        {"type", "box"}, {"name", name},
+        {"params", {{"length", dim(l)}, {"width", dim(w)}, {"height", dim(h)}}},
+        {"centered", true}}}});
+    auto r = st.docMirror.applyOps(st.worker, ops);
+    revision = r.revision;
+    if (!r.ok) return "box: " + r.error_message;
+    if (!r.aicm_path.empty()) {
+        std::string le;
+        if (!st.loadDocMesh(r.aicm_path, le)) return "box mesh: " + le;
+    }
+    return "";
+}
+
+// The scenario's part is active, its Simulation manager is seated and the engine is idle
+// (newStudy / run refuse while an RPC is in flight). Fails after `timeoutS`.
+bool studyShotReady(AppState& st, StudyShot& S, const char* tag, double timeoutS) {
+    if (st.docMirror.docId() != S.docId) {
+        studyShotFail(S, tag, "doc_switched",
+                      "the active document changed to '" + st.docMirror.docId() + "' (expected " +
+                          S.docId + ")");
+        return false;
+    }
+    if (st.simManager && !st.rpc.busy()) return true;
+    if (pipingNow() - S.stepStart > timeoutS)
+        studyShotFail(S, tag, "engine_busy",
+                      std::string(st.simManager ? "the engine stayed busy" : "no Simulation manager") +
+                          " for " + std::to_string((int)timeoutS) + " s");
+    return false;
+}
+
+// One sim_run attempt every 0.5 s until the run starts (`started`) or `timeoutS` passes; the
+// refusal the SimManager logged is the failure detail. True once started.
+bool studyShotRun(AppState& st, StudyShot& S, const char* tag, double timeoutS,
+                  const std::function<bool()>& started) {
+    const double now = pipingNow();
+    if (now - S.lastTry < 0.5) return false;
+    S.lastTry = now;
+    if (!st.rpc.busy()) {
+        st.simManager->handleCommand(st, "sim_run");
+        if (started()) return true;
+    }
+    if (now - S.stepStart > timeoutS)
+        studyShotFail(S, tag, "run_refused",
+                      st.rpc.busy() ? std::string("the engine stayed busy") : saRunRefusal(st));
+    return false;
+}
+
+// Real input-driven simulation setup smoke. No payloads or selection entries are injected:
+// the source face is found in the rendered ID buffer and the UI owns every drag and delivery.
+struct SimInteractiveShot {
+    bool init = false, want = false, done = false, failed = false;
+    bool metadataDuringApply = false, metadataQueued = false;
+    bool pipingInputVisited = false;
+    bool nativeEditorLocated = false, pipingEditorOpened = false;
+    int step = 0, settle = 0, gesture = 0, phase = 0, textPhase = 0, fidelityCase = 0;
+    double started = 0.0, stepStarted = 0.0;
+    int partTab = -1;
+    double pulsedFinalC = 0.0;
+    ImVec2 source, target, facePoint;
+    ImGuiID sourceItemId = 0;
+    render::PickHit face;
+    std::string dir, capture, doc, study, text, pump, tank, mateA, mateB, dragTarget, editorWindow, hose, fixtureSid;
+    nlohmann::json before, edited, report, faceSelector, fidelityBase, terminalFixture, terminalLoad,
+                   modalReference, staticReference, staticSetup, dragOrigin, pipeBase;
+    std::function<void(AppState&)> afterCapture;
+};
+SimInteractiveShot g_si;
+
+bool siItem(const char* label, ImVec2& point, const char* window = nullptr) {
+    if (const auto* item = shotItem(label, true, window)) {
+        point = shotPoint(*item);
+        return true;
+    }
+    return false;
+}
+
+void siFail(const char* code, const std::string& detail) {
+    auto& I = g_si;
+    I.failed = I.done = true;
+    I.report["failure"] = {{"code", code}, {"detail", detail}, {"step", I.step}};
+    I.report["visible_items_at_failure"] = ui::audit::observedItems();
+    I.report["navigation_at_failure"] = shotNavigationEvidence();
+    I.capture = I.dir + "/FAILED.png";
+    ImGui::GetIO().AddMouseButtonEvent(0, false);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+    std::printf("siminteractive: FAILED [%s] %s\n", code, detail.c_str());
+    std::fflush(stdout);
+}
+
+void siNext() {
+    auto& I = g_si;
+    ++I.step;
+    I.stepStarted = pipingNow();
+    I.pipingInputVisited = false;
+    I.nativeEditorLocated = I.pipingEditorOpened = false;
+    g_simNavigation = ShotNavigation();
+    I.settle = 3;
+}
+
+bool siSeek(const char* label, ImVec2& point, const char* window = nullptr) {
+    if (siItem(label, point, window)) return true;
+    shotScrollTo(label, window);
+    return false;
+}
+
+bool siFooterAction(const char* label, ImVec2& point) {
+    for (const auto& item : ui::audit::observedItems()) {
+        if (!item.value("enabled", true) || !item.value("visible", false) || !shotLabel(item, label)) continue;
+        const auto& native = item["native_label"].get_ref<const std::string&>();
+        const auto suffix = native.find("###");
+        if (suffix == std::string::npos || native.compare(suffix, std::string::npos, "###kit_af_primary") != 0) continue;
+        point = shotPoint(item);
+        return true;
+    }
+    return false;
+}
+
+const nlohmann::json* siStatusPrefix(const char* prefix, bool visibleOnly = true) {
+    for (const auto& item : ui::audit::observedItems()) {
+        if (!item.value("text_only", false) || (visibleOnly && !item.value("visible", false))) continue;
+        const auto& label = item["label"].get_ref<const std::string&>();
+        if (label.compare(0, std::strlen(prefix), prefix) == 0) return &item;
+    }
+    return nullptr;
+}
+
+void siGesture(ImVec2 source, ImVec2 target, bool drag, const char* action) {
+    auto& I = g_si;
+    I.source = source; I.target = target; I.gesture = drag ? 2 : 1; I.phase = 0;
+    I.metadataDuringApply = false; I.metadataQueued = false;
+    I.sourceItemId = 0;
+    for (const auto& item : ui::audit::observedItems()) {
+        if (!item.value("visible", false) || !item.value("enabled", true) ||
+            item.value("text_only", false) || !item.value("id", 0u)) continue;
+        const ImVec2 center = shotPoint(item);
+        if (std::fabs(center.x - source.x) <= 1.0f &&
+            std::fabs(center.y - source.y) <= 1.0f) {
+            I.sourceItemId = item["id"].get<ImGuiID>();
+            break;
+        }
+    }
+    I.dragTarget.clear();
+    I.report["actions"].push_back({{"action", action}, {"source", {source.x, source.y}},
+                                   {"target", {target.x, target.y}},
+                                   {"source_navigation", g_simNavigation.evidence}});
+    ImGui::GetIO().AddMousePosEvent(source.x, source.y);
+}
+
+// Source and destination need not fit in the same scroll viewport. Start from a live source,
+// then keep the real drag held while wheel-navigation exposes its live destination.
+bool siDragItems(const char* source, const char* target, const char* action) {
+    ImVec2 p, q;
+    if (!siSeek(source, p)) return false;
+    const bool visible = siItem(target, q);
+    siGesture(p, visible ? q : p, true, action);
+    g_si.dragTarget = target;
+    return true;
+}
+
+bool siExpand(const char* title, const char* action) {
+    const auto* item = shotItem(title, false);
+    // Read real disclosure state even when scrolling its editor hides the header.
+    if (item && item->value("openable", false) && item->value("opened", false)) return true;
+    if (!item || !item->value("visible", false)) { shotScrollTo(title); return false; }
+    const ImVec2 point = shotPoint(*item);
+    siGesture(point, point, false, action);
+    return false;
+}
+
+bool siGestureTick(AppState& st) {
+    auto& I = g_si;
+    if (!I.gesture) return false;
+    if (pipingNow() - I.stepStarted > 90.0) {
+        siFail("gesture_target_timeout", shotNavigationEvidence().dump());
+        return true;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    // A queued event is not a completed input frame (ImGui may trickle a backlog).
+    // Observe position/press/release before advancing; never compress a click into
+    // frames that have not consumed its events.
+    // Wheel/caret navigation can still move a control after its rectangle was
+    // observed. Follow its live rectangle, then wait for an actual hovered frame
+    // before pressing; a cursor event alone does not prove the control is ready.
+    if (I.phase == 0 && I.sourceItemId) {
+        for (const auto& item : ui::audit::observedItems()) {
+            if (item.value("id", 0u) != I.sourceItemId) continue;
+            if (!item.value("visible", false)) {
+                shotScrollTo(item["label"].get_ref<const std::string&>().c_str());
+                return true;
+            }
+            I.source = shotPoint(item);
+            if (I.gesture == 1) I.target = I.source;
+            I.report["actions"].back()["source"] = {I.source.x, I.source.y};
+            if (I.gesture == 1)
+                I.report["actions"].back()["target"] = {I.target.x, I.target.y};
+            break;
+        }
+        if (GImGui->HoveredId != I.sourceItemId) {
+            io.AddMousePosEvent(I.source.x, I.source.y);
+            return true;
+        }
+    }
+    if (I.phase == 0 &&
+        (std::fabs(io.MousePos.x - I.source.x) > 2.0f ||
+         std::fabs(io.MousePos.y - I.source.y) > 2.0f)) {
+        io.AddMousePosEvent(I.source.x, I.source.y);
+        return true;
+    }
+    if (I.phase == 1 && !io.MouseDown[0]) return true;
+    if (I.phase == (I.gesture == 2 ? 5 : 2) && io.MouseDown[0]) return true;
+    if (I.phase == 1 && I.metadataDuringApply && !I.metadataQueued) {
+        // Real global discovery can arrive between press and release. It must
+        // not cancel Apply; document work still has a separate blocking proof.
+        st.rpc.call("fw_projects", nlohmann::json::object(), [](const core::RpcResult& r) {
+            g_si.report["metadata_poll_completed"] = r.ok;
+        });
+        I.metadataQueued = st.rpc.busy() && !st.rpc.interactionBusy();
+    }
+    if (I.gesture == 2 && I.phase == 2 && !I.dragTarget.empty()) {
+        ImVec2 live;
+        if (!siItem(I.dragTarget.c_str(), live)) {
+            shotScrollTo(I.dragTarget.c_str());
+            return true;
+        }
+        I.target = live;
+        I.dragTarget.clear();
+        I.report["actions"].back()["target"] = {live.x, live.y};
+        I.report["actions"].back()["navigation"] = g_simNavigation.evidence;
+    }
+    if (I.step == 263 && I.gesture == 2 && I.phase == 4) {
+        auto& pp = st.simManager->piping();
+        if (st.rpc.busy() || pp.busy()) return true;
+        const auto* payload = ImGui::GetDragDropPayload();
+        const auto frozen = payload && payload->DataSize > 1 ?
+            nlohmann::json::parse(static_cast<const char*>(payload->Data),
+                static_cast<const char*>(payload->Data) + payload->DataSize - 1, nullptr, false) :
+            nlohmann::json();
+        const bool immutable = frozen == I.dragOrigin &&
+            !pp.acceptsSetupDrag(st, ui::PipingPanel::Form::Solve, frozen) &&
+            pp.acceptsSetupDrag(st, ui::PipingPanel::Form::Solve,
+                                pp.setupDragOrigin(st, ui::PipingPanel::Form::Solve));
+        I.report["checks"].push_back({{"name", "piping_held_drag_origin_immutable_across_native_refresh"},
+                                     {"ok", immutable}, {"evidence", frozen}});
+        if (!immutable) { siFail("piping_drag_origin_not_frozen", frozen.dump()); return true; }
+    }
+    ++I.phase;
+    const ImVec2 mouse = I.gesture == 2 && I.phase >= 3 ? I.target : I.source;
+    io.AddMousePosEvent(mouse.x, mouse.y);
+    if (I.phase == 1) io.AddMouseButtonEvent(0, true);
+    else if (I.gesture == 2 && I.phase == 2)
+        io.AddMousePosEvent(I.source.x + 12.0f, I.source.y + 2.0f);
+    else if (I.gesture == 2 && I.phase == 3) io.AddMousePosEvent(I.target.x, I.target.y);
+    else if (I.gesture == 2 && I.phase == 4) {
+        const ImGuiPayload* payload = ImGui::GetDragDropPayload();
+        if (!payload) { siFail("drag_source", "real pointer gesture produced no ImGui payload"); return true; }
+        I.report["actions"].back()["payload_type"] = payload->DataType;
+        if (I.step == 3) {
+            const auto definition = st.simManager->activeStudyDefinition();
+            const bool untouched = definition.value("fixtures", nlohmann::json::array()).empty();
+            I.report["checks"].push_back({{"name", "face_preview_does_not_mutate"}, {"ok", untouched}});
+            if (!untouched) { siFail("face_preview_mutated", "fixture changed before drop delivery"); return true; }
+        }
+        if (I.step == 263) {
+            auto& pp = st.simManager->piping();
+            if (std::strcmp(payload->DataType, "CHUDWARE_PIPE_PORT") != 0 || payload->DataSize <= 1) {
+                siFail("piping_drag_source_type", payload->DataType); return true;
+            }
+            I.dragOrigin = nlohmann::json::parse(static_cast<const char*>(payload->Data),
+                static_cast<const char*>(payload->Data) + payload->DataSize - 1, nullptr, false);
+            if (I.dragOrigin.is_discarded() ||
+                !pp.acceptsSetupDrag(st, ui::PipingPanel::Form::Solve, I.dragOrigin)) {
+                siFail("piping_drag_origin_initial_context", I.dragOrigin.dump()); return true;
+            }
+            nlohmann::json listed, record, written;
+            std::string error;
+            if (!st.worker.call("sim_study_list", {{"doc_id", I.doc}}, listed, error)) {
+                siFail("piping_agent_refresh_read", error); return true;
+            }
+            for (const auto& candidate : listed.value("studies", nlohmann::json::array()))
+                if (candidate.value("id", std::string()) == pp.networkStudyId()) record = candidate;
+            if (!record.is_object()) { siFail("piping_agent_refresh_record", listed.dump()); return true; }
+            record["params"]["design"]["pressure_kpa"] =
+                record["params"].value("design", nlohmann::json::object()).value("pressure_kpa", 1000.0) + 17.0;
+            // This is a real agent-style edit in the native store while the user is dragging,
+            // not an injected mirror/selection/payload. The ordinary refresh adopts it.
+            if (!st.worker.call("sim_study_edit", {{"doc_id", I.doc}, {"study_id", pp.networkStudyId()},
+                                                  {"study", record}}, written, error) || written.contains("code")) {
+                siFail("piping_agent_refresh_edit", error.empty() ? written.dump() : error); return true;
+            }
+            st.simManager->markStudiesStale();
+            st.simManager->refresh(st);
+            I.report["piping_drag_external_edit"] = {{"native_record", record}, {"native_reply", written}};
+        }
+    }
+    else if (I.phase == (I.gesture == 2 ? 5 : 2)) io.AddMouseButtonEvent(0, false);
+    else if (I.phase >= (I.gesture == 2 ? 7 : 4)) {
+        I.gesture = 0;
+        I.settle = 3;
+    }
+    return true;
+}
+
+bool siWriteText(const std::string& text, const char* field = "##sim_parameter_json", const char* window = nullptr) {
+    auto& I = g_si;
+    ImGuiIO& io = ImGui::GetIO();
+    if (I.textPhase == 0) {
+        ImVec2 p;
+        if (!siSeek(field, p, window)) return false;
+        siGesture(p, p, false, "Focus complete native parameter JSON");
+        I.text = text;
+        I.textPhase = 1;
+        return false;
+    }
+    if (I.textPhase == 1) {
+        io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        io.AddKeyEvent(ImGuiKey_A, true);
+        I.textPhase = 2;
+    } else if (I.textPhase == 2) {
+        io.AddKeyEvent(ImGuiKey_A, false);
+        io.AddKeyEvent(ImGuiMod_Ctrl, false);
+        I.textPhase = 3;
+    } else if (I.textPhase == 3) {
+        io.AddInputCharactersUTF8(I.text.c_str());
+        I.textPhase = 4;
+    } else {
+        I.textPhase = 0;
+        return true;
+    }
+    return false;
+}
+
+// Read the live ImGui edit buffer only after a real focus gesture. This is observation, not
+// mutation of the draft or a substitute for typing/Apply.
+bool siReadDraft(nlohmann::json& draft, const char* field = "##sim_parameter_json", const char* window = nullptr) {
+    const auto* item = shotItem(field, true, window);
+    if (!item) { shotScrollTo(field, window); return false; }
+    const auto* state = ImGui::GetInputTextState(item->value("id", ImGuiID(0)));
+    if (!state || state->TextA.empty()) return false;
+    draft = nlohmann::json::parse(state->TextA.Data, nullptr, false);
+    return !draft.is_discarded();
+}
+
+bool siFocusDraft(const char* field = "##sim_parameter_json", const char* window = nullptr) {
+    ImVec2 point;
+    if (!siSeek(field, point, window)) return false;
+    siGesture(point, point, false, "Inspect real rendered native parameter draft");
+    return true;
+}
+
+void siGo(int step) {
+    g_si.step = step - 1;
+    siNext();
+}
+
+bool siNativeEditor(const char* apply) {
+    auto& I = g_si;
+    if (!I.nativeEditorLocated) {
+        const auto* item = shotItem(apply, false);
+        if (!item) { shotScrollTo(apply); return false; }
+        I.editorWindow = item->value("window", std::string());
+        I.nativeEditorLocated = true;
+    }
+    ImVec2 point;
+    return siSeek("##t", point, I.editorWindow.c_str());
+}
+
+bool siPipingEditor() {
+    auto& I = g_si;
+    ImVec2 point;
+    if (I.pipingEditorOpened || shotItem("Hide native parameters", false) || shotItem("Apply parameters", false)) {
+        I.pipingEditorOpened = true;
+        return siNativeEditor("Apply parameters");
+    }
+    if (!I.pipingInputVisited) {
+        // Pinned page tabs need one real visit, not a click every time an offscreen editor is sought.
+        I.pipingInputVisited = true;
+        for (const char* tab : {"Conditions", "Setup", "Segments", "Design basis"}) {
+            if (!siItem(tab, point)) continue;
+            siGesture(point, point, false, "Return to actual piping input page");
+            return false;
+        }
+    }
+    if (siSeek("Edit native parameters", point)) {
+        I.pipingEditorOpened = true;
+        siGesture(point, point, false, "Open actual piping canonical JSON editor");
+    }
+    return false;
+}
+
+bool siStudy(AppState& st, const std::string& doc, const std::string& id, nlohmann::json& found) {
+    nlohmann::json list;
+    std::string err;
+    if (!st.worker.call("sim_study_list", {{"doc_id", doc}}, list, err, 15000) ||
+        !list.is_object() || list.contains("code")) {
+        siFail("study_store", err.empty() ? list.dump() : err);
+        return false;
+    }
+    for (const auto& s : list.value("studies", nlohmann::json::array()))
+        if (s.is_object() && s.value("id", std::string()) == id) { found = s; return true; }
+    siFail("study_missing", id);
+    return false;
+}
+
+bool siFacePoint(AppState& st) {
+    auto& I = g_si;
+    ImVec2 lo, hi;
+    auto& probe = I.report["face_source_probe"];
+    probe = {{"has_doc_mesh", st.hasDocMesh}, {"has_id_pass", st.idPass != nullptr},
+             {"has_renderer", st.renderer != nullptr}, {"face_cache_count", st.faceNormalCache.size()},
+             {"body_ids", st.docBodyIds}, {"body_visible", st.bodyVisible}};
+    if (!st.hasDocMesh || !st.idPass || !st.renderer || !ui::viewportClearRect(lo, hi)) {
+        probe["stage"] = "viewport_unavailable";
+        return false;
+    }
+    probe["clear_rect"] = {lo.x, lo.y, hi.x, hi.y};
+    ImGuiWindow* viewport = nullptr;
+    for (const auto& item : ui::audit::observedItems())
+        if (item.value("visible", false) && shotLabel(item, "##viewport3d")) {
+            viewport = ImGui::FindWindowByName(item["window"].get_ref<const std::string&>().c_str());
+            break;
+        }
+    if (!viewport) { probe["stage"] = "viewport_item_unavailable"; return false; }
+    const auto& camera = st.renderer->camera();
+    const float x0 = ImGui::GetMainViewport()->Pos.x, y0 = viewport->Pos.y;
+    const int w = camera.vpWidth, h = camera.vpHeight;
+    probe["camera_size"] = {w, h};
+    probe["viewport_origin"] = {x0, y0};
+    if (w <= 0 || h <= 0 || !st.idPass->render(camera, true)) {
+        probe["stage"] = "face_buffer_unavailable";
+        return false;
+    }
+    probe["stage"] = "no_face_in_clear_rect";
+    probe["hit_counts"] = nlohmann::json::object();
+    for (int y = 1; y < 20; ++y) for (int x = 1; x < 20; ++x) {
+        const ImVec2 p(lo.x + (hi.x - lo.x) * x / 20.0f, lo.y + (hi.y - lo.y) * y / 20.0f);
+        const auto hit = st.idPass->pickFinal((int)(p.x - x0), (int)(p.y - y0), w, h);
+        auto& count = probe["hit_counts"][std::to_string(static_cast<int>(hit.kind))];
+        count = count.is_number_integer() ? count.get<int>() + 1 : 1;
+        if (hit.kind != render::PickKind::Face || !hit.body_id || !hit.topo_id) continue;
+        I.facePoint = p; I.face = hit;
+        probe["stage"] = "face_found";
+        I.report["picked_face"] = {{"body", hit.body_id}, {"topo", hit.topo_id},
+                                   {"pixel", {p.x, p.y}}};
+        return true;
+    }
+    return false;
+}
+
+void simInteractiveTick(AppState& st) {
+    auto& I = g_si;
+    if (!I.init) {
+        I.init = true;
+        const char* shot = std::getenv("CHUDWARE_SHOT");
+        I.want = st.shot && shot && std::strcmp(shot, "siminteractive") == 0;
+        if (I.want) {
+            const char* repo = std::getenv("CHUDWARE_REPO");
+            I.dir = std::string(repo ? repo : ".") + "/scratch/siminteractive";
+            std::error_code ec; std::filesystem::create_directories(I.dir, ec);
+            I.started = I.stepStarted = pipingNow();
+            I.report = {{"scenario", "siminteractive"}, {"ok", false},
+                        {"actions", nlohmann::json::array()}, {"checks", nlohmann::json::array()},
+                        {"skipped", nlohmann::json::array()}, {"not_run", nlohmann::json::array()},
+                        {"captures", nlohmann::json::array()},
+                        {"scope", "Bounded isolated real setup gestures and canonical persistence/draft conflicts; numerical native static/modal prose/object/SID/compound, thermal, hydraulic and piping evidence. CFD null/custom-pair cases prove JSON validation/persistence, not 3D CFD execution; not general solver certification"}};
+            const char* daemon = std::getenv("CHUDWARE_ENGINE_DAEMON");
+            if (!daemon || daemon[0] != '0') {
+                siFail("isolation_required", "Use CHUDWARE_ENGINE_DAEMON=0 and short isolated XDG directories; this shot must not mutate a running user daemon.");
+                return;
+            }
+        }
+    }
+    if (!I.want || I.done) return;
+    ui::audit::observedItems();
+    if (pipingNow() - I.started > 1200.0) { siFail("timeout", "scenario exceeded 1200 s including additional real FEA, hydraulic and piping solves"); return; }
+    if (!st.workerStarted || st.frame < 5) return;
+    if (siGestureTick(st)) return;
+    if (I.settle > 0) { --I.settle; return; }
+    // Native forms need bounded wheel/trickle-input navigation even at low offscreen render FPS.
+    if (pipingNow() - I.stepStarted > 90.0) {
+        siFail("step_timeout", shotNavigationEvidence().dump());
+        return;
+    }
+    if (st.rpc.busy() || (st.simManager && !saIdle(st, *st.simManager))) return;
+    if (I.afterCapture) {
+        if (!I.capture.empty()) return;
+        auto action = std::move(I.afterCapture);
+        I.afterCapture = {};
+        action(st);
+        I.settle = 3;
+        return;
+    }
+    if (I.step > 0 && (!st.simManager || st.docMirror.docId() != I.doc)) {
+        if (!st.simManager) return;
+        siFail("document_changed", "the isolated scenario part lost focus"); return;
+    }
+    auto check = [&](const char* name, bool ok, const nlohmann::json& evidence) {
+        I.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+        if (!ok) siFail(name, evidence.dump());
+        return ok;
+    };
+    auto placedAt = [&](const nlohmann::json& component, double x, double y) {
+        const auto position = component.find("position");
+        if (position == component.end() || !position->is_array() || position->size() != 2 ||
+            !(*position)[0].is_number() || !(*position)[1].is_number()) return false;
+        const auto& panel = st.simManager->hydraulic();
+        const auto origin = panel.schematicScreenPosition(x, y);
+        const auto unit = panel.schematicScreenPosition(x + 1.0, y + 1.0);
+        const double px = (*position)[0].get<double>(), py = (*position)[1].get<double>();
+        // ImGui quantizes pointer positions to whole pixels; native coordinates remain exact doubles.
+        return std::isfinite(px) && std::isfinite(py) &&
+               std::abs((px - x) * (unit.first - origin.first)) <= 1.0 &&
+               std::abs((py - y) * (unit.second - origin.second)) <= 1.0;
+    };
+    ImVec2 p, q;
+    switch (I.step) {
+    case 0: {
+        std::string err;
+        if (!st.docMirror.newPart(st.worker, err)) { siFail("new_part", err); return; }
+        st.clearViewportForNewDoc();
+        st.addDocTab(false);
+        I.partTab = st.activeTab;
+        auto dim = [](double v) { return nlohmann::json{{"value", v}, {"expr", nullptr}}; };
+        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({{
+            {"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Interactive setup domain"},
+            {"params", {{"length", dim(60.0)}, {"width", dim(40.0)}, {"height", dim(10.0)},
+                        {"centered", true}}}, {"refs", nlohmann::json::object()}}}}}));
+        if (!r.ok) { siFail("box", r.error_message); return; }
+        if (!r.aicm_path.empty() && !st.loadDocMesh(r.aicm_path, err)) { siFail("mesh", err); return; }
+        I.doc = st.docMirror.docId();
+        st.activeWorkspace = AppState::Workspace::Simulate;
+        st.leftPaneTab = AppState::LP_Simulation;
+        st.showRibbon = st.showSimulationTools = true;
+        st.settings.copilotCollapsed = true;
+        st.ribbonTab = kSaTabStatic;
+        st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
+        nlohmann::json fwStatus;
+        std::string probeError;
+        const bool fwProbe = st.worker.call("fw_status", nlohmann::json::object(), fwStatus, probeError, 10000);
+        I.report["capabilities"]["firmware"] = {{"rpc_ok", fwProbe}, {"result", fwStatus}, {"error", probeError}};
+        if (fwProbe && fwStatus.is_object() && !fwStatus.contains("code")) {
+            const auto cortex = fwStatus.value("families", nlohmann::json::object()).value("cortex-m", nlohmann::json::object());
+            if (cortex.contains("can_emulate") && cortex["can_emulate"].is_boolean() && !cortex["can_emulate"].get<bool>())
+                I.report["skipped"].push_back({{"name", "firmware_cortex_m_backend"},
+                    {"reason", "Native fw_status reports Cortex-M emulation unavailable."}, {"evidence", cortex}});
+        }
+        I.report["not_run"].push_back({{"name", "other_family_solver_execution"},
+            {"reason", "External/internal CFD, circuit, EM, topology and motion checks prove setup/native store values, not solver execution. Real static/modal query/compound reruns, transient/steady thermal, hydraulic zero-length simulation, zero-load handoff and piping fluid-temperature solves are run."}});
+        siNext(); break;
+    }
+    case 1:
+        st.simManager->handleCommand(st, "sim_new_static");
+        I.study = st.simManager->activeStudyId();
+        if (I.study.empty()) { siFail("new_study", st.status); return; }
+        st.simManager->configureActive(st, 0.25f, "steel_1018");
+        st.selection.clear();
+        st.simManager->handleCommand(st, "sim_fixture");
+        siNext(); break;
+    case 2:
+        if (st.simManager->wantsViewportFacePick(st)) {
+            if (!siSeek("Picking\xe2\x80\xa6", p)) return;
+            siGesture(p, p, false, "Stop armed click picking before testing face drop");
+            return;
+        }
+        if (!siSeek("Drop faces here", q) || !siFacePoint(st)) return;
+        siGesture(I.facePoint, q, true, "Drag rendered face to fixture well");
+        siNext(); break;
+    case 3: {
+        if (!siSeek("Face 1", p)) return;
+        nlohmann::json persisted;
+        if (!siStudy(st, I.doc, I.study, persisted)) return;
+        const auto fixtures = persisted.value("fixtures", nlohmann::json::array());
+        if (!check("face_drop_persisted", fixtures.size() == 1 &&
+                   fixtures[0].value("_pick", nlohmann::json()) ==
+                       nlohmann::json({{"body", I.face.body_id}, {"topo", I.face.topo_id}}), persisted)) return;
+        I.before = persisted;
+        I.faceSelector = fixtures[0];
+        if (!siDragItems("Face 1", "Drop faces here", "Copy fixture face chip back to its well")) return;
+        siNext(); break;
+    }
+    case 4: {
+        nlohmann::json persisted;
+        if (!siStudy(st, I.doc, I.study, persisted)) return;
+        if (!check("duplicate_safe_copy", persisted.value("fixtures", nlohmann::json::array()) ==
+                   I.before["fixtures"], persisted["fixtures"])) return;
+        st.simManager->handleCommand(st, "sim_parameters");
+        siNext(); break;
+    }
+    case 5:
+        if (!siSeek("Force", p)) return;
+        siGesture(p, I.facePoint, true, "Drag force setup tool onto rendered face");
+        siNext(); break;
+    case 6: {
+        nlohmann::json persisted;
+        if (!siStudy(st, I.doc, I.study, persisted)) return;
+        const auto loads = persisted.value("loads", nlohmann::json::array());
+        if (!check("palette_face_load_persisted", loads.size() == 1 &&
+                   loads[0].value("type", std::string()) == "force" &&
+                   loads[0].value("faces", nlohmann::json::array()).size() == 1 &&
+                   loads[0]["faces"][0].value("_pick", nlohmann::json()) ==
+                       nlohmann::json({{"body", I.face.body_id}, {"topo", I.face.topo_id}}), persisted)) return;
+        I.before = st.simManager->activeStudyDefinition();
+        st.simManager->handleCommand(st, "sim_parameters");
+        I.capture = I.dir + "/01_face_and_palette.png";
+        siGo(60); break;
+    }
+    case 7:
+        if (siWriteText(I.edited.dump(2))) siNext();
+        break;
+    case 8:
+        if (!siSeek("Apply parameters", p)) return;
+        siGesture(p, p, false, "Apply invalid native mesh order");
+        siNext(); break;
+    case 9:
+        if (!siSeek("/mesh_order must be 1 or 2.", p)) return;
+        if (!check("invalid_edit_reports_native_schema_error",
+                   shotItem("/mesh_order must be 1 or 2.") != nullptr, ui::audit::observedItems())) return;
+        if (!check("invalid_edit_is_atomic", st.simManager->activeStudyDefinition() == I.before,
+                   st.simManager->activeStudyDefinition())) return;
+        I.edited = I.before;
+        I.edited["mesh_order"] = 1;
+        I.edited["mesh_fineness"] = 0.25;
+        I.edited["loads"][0]["vec"] = {0.0, 0.0, -321.0};
+        I.edited["metadata"]["siminteractive"] = {{"owner", "agent"}, {"note", "retained-not-executed"}};
+        siNext(); break;
+    case 10:
+        if (siWriteText(I.edited.dump(2))) siNext();
+        break;
+    case 11:
+        if (!siSeek("Apply parameters", p)) return;
+        siGesture(p, p, false, "Apply exact native parameters with retained agent metadata");
+        siNext(); break;
+    case 12: {
+        nlohmann::json persisted;
+        if (!siStudy(st, I.doc, I.study, persisted)) return;
+        if (!check("valid_edit_native_store", persisted.value("mesh_order", 0) == 1 &&
+                   std::abs(persisted.value("mesh_fineness", 0.0) - 0.25) < 1e-6 &&
+                   persisted["loads"][0]["vec"] == I.edited["loads"][0]["vec"] &&
+                   persisted.value("metadata", nlohmann::json()) == I.edited["metadata"] &&
+                   persisted["fixtures"] == I.before["fixtures"] &&
+                   persisted["id"] == I.before["id"] && persisted["type"] == I.before["type"], persisted)) return;
+        I.edited = persisted;
+        I.capture = I.dir + "/02_native_parameters.png";
+        std::string err;
+        if (!st.docMirror.save(st.worker, I.dir + "/interactive.step+", err)) { siFail("save", err); return; }
+        nlohmann::json reopened;
+        if (!st.worker.call("doc_open", {{"path", I.dir + "/interactive.step+"}}, reopened, err) ||
+            reopened.contains("code")) { siFail("reopen", err.empty() ? reopened.dump() : err); return; }
+        const std::string did = reopened.value("doc_id", std::string());
+        nlohmann::json roundtrip, closed;
+        const bool read = siStudy(st, did, I.study, roundtrip);
+        st.worker.call("doc_close", {{"doc_id", did}}, closed, err);
+        if (!read) return;
+        if (!check("save_reopen_native_values", roundtrip["fixtures"] == persisted["fixtures"] &&
+                   roundtrip["loads"] == persisted["loads"] && roundtrip["metadata"] == persisted["metadata"] &&
+                   roundtrip["mesh_order"] == persisted["mesh_order"], roundtrip)) return;
+        I.fidelityBase = persisted;
+        I.edited = persisted;
+        I.edited["metadata"]["siminteractive"]["note"] = "dirty-draft-must-survive";
+        siGo(100); break;
+    }
+    case 60:
+        if (siFocusDraft()) siNext();
+        break;
+    case 61: {
+        nlohmann::json draft;
+        if (!siReadDraft(draft)) return;
+        if (!check("pristine_draft_reload_after_gesture", draft == I.before,
+                   {{"rendered_draft", draft}, {"native_setup", I.before}})) return;
+        I.edited = I.before;
+        I.edited["mesh_order"] = 0;
+        siGo(7); break;
+    }
+    case 100:
+        if (siWriteText(I.edited.dump(2))) siNext();
+        break;
+    case 101:
+        if (!siSeek("Pressure", p)) return;
+        siGesture(p, I.facePoint, true, "Add a distinct pressure boundary while a genuinely edited native draft is open");
+        siNext(); break;
+    case 102: {
+        nlohmann::json persisted;
+        if (!siStudy(st, I.doc, I.study, persisted)) return;
+        if (!check("dirty_conflict_has_actual_native_edit",
+                   persisted["loads"].size() == I.fidelityBase["loads"].size() + 1, persisted)) return;
+        I.before = st.simManager->activeStudyDefinition();
+        if (siFocusDraft()) siNext();
+        break;
+    }
+    case 103: {
+        nlohmann::json draft;
+        if (!siReadDraft(draft)) return;
+        if (!check("dirty_draft_preserved_after_gesture", draft == I.edited,
+                   {{"rendered_draft", draft}, {"native_setup", I.before}})) return;
+        if (!siSeek("Apply parameters", p)) return;
+        siGesture(p, p, false, "Refuse Apply of stale dirty draft without overwriting real gesture");
+        siNext(); break;
+    }
+    case 104: {
+        const char* conflict = "Setup changed while this draft was open. Revert to reload current parameters.";
+        if (!siSeek(conflict, p)) return;
+        nlohmann::json persisted;
+        if (!siStudy(st, I.doc, I.study, persisted)) return;
+        if (!check("dirty_draft_stale_apply_refused", shotItem(conflict) != nullptr &&
+                   st.simManager->activeStudyDefinition() == I.before &&
+                   persisted["loads"] == I.before["loads"],
+                   {{"native_setup", persisted}, {"rendered_items", ui::audit::observedItems()}})) return;
+        if (siFocusDraft()) siNext();
+        break;
+    }
+    case 105: {
+        nlohmann::json draft;
+        if (!siReadDraft(draft)) return;
+        if (!check("dirty_draft_preserved_after_refusal", draft == I.edited, draft)) return;
+        if (!siSeek("Revert", p)) return;
+        siGesture(p, p, false, "Explicitly reload current native setup after stale draft refusal");
+        siNext(); break;
+    }
+    case 106:
+        if (siFocusDraft()) siNext();
+        break;
+    case 107: {
+        nlohmann::json draft;
+        if (!siReadDraft(draft)) return;
+        if (!check("dirty_draft_revert_reloads_current", draft == I.before, draft)) return;
+        I.fidelityCase = 0;
+        siGo(120); break;
+    }
+    case 120: {
+        if (I.fidelityCase == 1) {
+            st.simManager->handleCommand(st, "sim_new_fatigue");
+            I.study = st.simManager->activeStudyId();
+        }
+        I.before = st.simManager->activeStudyDefinition();
+        I.edited = I.before;
+        if (I.fidelityCase == 0) I.edited["material"] = "alu_6061";
+        else {
+            const char* tokens[] = {"reversed", "zero_based", "ratio", "ratio"};
+            I.edited["fatigue"] = {{"load_type", tokens[I.fidelityCase - 1]}};
+            if (I.fidelityCase >= 3)
+                I.edited["fatigue"]["load_ratio"] = I.fidelityCase == 3 ? 0.2 : -0.4;
+        }
+        st.simManager->handleCommand(st, "sim_parameters");
+        siNext(); break;
+    }
+    case 121:
+        if (siWriteText(I.edited.dump(2))) siNext();
+        break;
+    case 122:
+        if (!siSeek("Apply parameters", p)) return;
+        siGesture(p, p, false, I.fidelityCase == 0 ? "Apply library material string through native editor" :
+                                                     "Apply native fatigue spectrum token without overriding cycle factors");
+        siNext(); break;
+    case 123: {
+        nlohmann::json persisted;
+        if (!siStudy(st, I.doc, I.study, persisted)) return;
+        if (I.fidelityCase == 0) {
+            if (!check("library_material_string_updates_document_and_setup",
+                       st.docMirror.tree().value("material", nlohmann::json::object()).value("key", std::string()) == "alu_6061" &&
+                       persisted.value("material", nlohmann::json()) == "alu_6061" &&
+                       st.simManager->activeStudyDefinition().value("material", nlohmann::json()) == "alu_6061",
+                       {{"document_material", st.docMirror.tree().value("material", nlohmann::json())},
+                        {"native_setup", persisted}})) return;
+        } else {
+            const auto spectrum = persisted.value("fatigue", nlohmann::json::object());
+            if (!check("fatigue_native_token_accepted_without_cycle_override", spectrum == I.edited["fatigue"] &&
+                       !spectrum.contains("lmin") && !spectrum.contains("lmax"), persisted)) return;
+            std::string err;
+            const std::string path = I.dir + "/fatigue_" + std::to_string(I.fidelityCase) + ".step+";
+            if (!st.docMirror.save(st.worker, path, err)) { siFail("fatigue_save", err); return; }
+            nlohmann::json opened, roundtrip, closed;
+            if (!st.worker.call("doc_open", {{"path", path}}, opened, err) || opened.contains("code")) {
+                siFail("fatigue_reopen", err.empty() ? opened.dump() : err); return;
+            }
+            const std::string did = opened.value("doc_id", std::string());
+            const bool read = siStudy(st, did, I.study, roundtrip);
+            st.worker.call("doc_close", {{"doc_id", did}}, closed, err);
+            if (!read || !check("fatigue_native_token_reopened_without_cycle_override",
+                               roundtrip.value("fatigue", nlohmann::json()) == spectrum, roundtrip)) return;
+        }
+        if (++I.fidelityCase < 5) siGo(120);
+        else {
+            st.simManager->handleCommand(st, "sim_new_static");
+            I.study = st.simManager->activeStudyId();
+            I.before = st.simManager->activeStudyDefinition();
+            I.edited = I.before;
+            I.edited.erase("order");
+            I.edited["mesh_order"] = 1;
+            std::string error;
+            if (!st.simManager->configureActiveStudy(st, I.edited, error)) { siFail("alias_baseline", error); return; }
+            I.before = st.simManager->activeStudyDefinition();
+            I.edited = I.before;
+            I.edited["mesh_order"] = 2;
+            I.edited["order"] = 1; // independently added alias conflicts with edited canonical key
+            st.simManager->handleCommand(st, "sim_parameters");
+            siGo(125);
+        }
+        break;
+    }
+    case 125:
+        if (siWriteText(I.edited.dump(2))) siNext();
+        break;
+    case 126:
+        if (!siSeek("Apply parameters", p)) return;
+        siGesture(p, p, false, "Refuse independently conflicting native mesh aliases");
+        siNext(); break;
+    case 127: {
+        const char* prefix = "/mesh_order and /order conflict; give both the same element order.";
+        const auto* status = siStatusPrefix(prefix, false);
+        if (!status) return;
+        const auto label = status->value("label", std::string());
+        if (!siSeek(label.c_str(), p)) return;
+        if (!check("mesh_alias_conflict_reports_actual_error", siStatusPrefix(prefix) != nullptr &&
+                   st.simManager->activeStudyDefinition() == I.before, ui::audit::observedItems())) return;
+        I.fidelityCase = 0;
+        siGo(140); break;
+    }
+    case 140: {
+        // Eight additional real FEA solves: sampled modal reference, prose/object/SID modal
+        // reruns, prose/object/terminal-compound static reruns and nondefault-ambient thermal.
+        // Query fixture authoring is canonical; every changed definition still uses UI Apply/Run.
+        const bool modal = I.fidelityCase <= 2 || I.fidelityCase == 5, thermal = I.fidelityCase == 7;
+        if (I.fidelityCase == 0) {
+            nlohmann::json queried, sampled;
+            std::string error;
+            if (!st.worker.call("doc_query", {{"doc_id", I.doc},
+                       {"query", {{"of", "face"}, {"side", "left"}}}}, queried, error) ||
+                queried.contains("code") || queried.value("matches", nlohmann::json::array()).size() != 1) {
+                siFail("modal_reference_face_query", error.empty() ? queried.dump() : error); return;
+            }
+            if (!st.worker.call("doc_face_points", {{"doc_id", I.doc}, {"selector", queried["matches"][0]}},
+                                sampled, error) || sampled.contains("code") ||
+                sampled.value("points", nlohmann::json::array()).empty()) {
+                siFail("modal_reference_sampling", error.empty() ? sampled.dump() : error); return;
+            }
+            I.terminalFixture = sampled;
+            I.report["modal_reference_boundary"] = {{"query_matches", queried}, {"sampled_faceset", sampled}};
+            I.fixtureSid = queried["matches"][0].value("sid", std::string());
+            if (I.fixtureSid.empty()) { siFail("modal_reference_stable_sid", queried.dump()); return; }
+            if (!st.worker.call("doc_query", {{"doc_id", I.doc},
+                    {"query", {{"of", "face"}, {"side", "right"}}}}, queried, error) ||
+                queried.contains("code") || queried.value("matches", nlohmann::json::array()).size() != 1 ||
+                !st.worker.call("doc_face_points", {{"doc_id", I.doc}, {"selector", queried["matches"][0]}},
+                                sampled, error) || sampled.contains("code") ||
+                sampled.value("points", nlohmann::json::array()).empty()) {
+                siFail("compound_reference_load_sampling", error.empty() ? queried.dump() : error); return;
+            }
+            I.terminalLoad = sampled;
+            I.report["static_reference_load_boundary"] = {{"query_matches", queried}, {"sampled_faceset", sampled}};
+        }
+        st.simManager->handleCommand(st, thermal ? "sim_new_thermal_fea" :
+                                            modal ? "sim_new_modal" : "sim_new_static");
+        I.study = st.simManager->activeStudyId();
+        I.edited = st.simManager->activeStudyDefinition();
+        I.edited["mesh_order"] = modal ? 2 : 1;
+        I.edited["order"] = modal ? 2 : 1;
+        I.edited["fineness"] = 0.2;
+        I.edited["learned_advisor"] = false;
+        I.edited["material"] = thermal ?
+            nlohmann::json{{"k_w_mk", 160.0}, {"cp_j_kgk", 900.0}, {"density_g_cm3", 2.7}} :
+            nlohmann::json{{"E_mpa", 210000.0}, {"nu", 0.3}, {"density_g_cm3", 7.85}, {"yield_mpa", 250.0}};
+        nlohmann::json fixture;
+        if (I.fidelityCase == 0) fixture = I.terminalFixture;
+        else if (I.fidelityCase == 5) fixture = {{"face", I.fixtureSid}};
+        else if (I.fidelityCase == 6) fixture = {{"facesets", {I.terminalFixture, I.terminalFixture}}};
+        else if (I.fidelityCase == 2 || I.fidelityCase == 4)
+            fixture = {{"face", {{"of", "face"}, {"side", "left"}}}};
+        else fixture = {{"face", "left"}};
+        if (thermal) fixture["temp_c"] = 20.0;
+        I.edited["fixtures"] = nlohmann::json::array({fixture});
+        I.edited["loads"] = nlohmann::json::array();
+        if (!modal) {
+            const nlohmann::json face = I.fidelityCase == 4 ?
+                nlohmann::json{{"of", "face"}, {"side", "right"}} : nlohmann::json("right");
+            I.edited["loads"].push_back(thermal ?
+                nlohmann::json{{"type", "convection"}, {"face", face}, {"h", 10.0}, {"ambient_c", 50.0}} :
+                nlohmann::json{{"type", "force"}, {"face", face}, {"force", {0.0, 0.0, -100.0}}});
+            if (I.fidelityCase == 6)
+                I.edited["loads"] = nlohmann::json::array({{{"type", "force"},
+                    {"faces", nlohmann::json::array({{{"facesets", {I.terminalLoad, I.terminalLoad}}}})},
+                    {"force", {0.0, 0.0, -100.0}}}});
+        }
+        if (thermal) I.edited.erase("transient");
+        else I.edited["n_modes"] = 3;
+        std::string error;
+        if (!st.simManager->configureActiveStudy(st, I.edited, error)) {
+            siFail("native_boundary_fixture", error); return;
+        }
+        if (I.fidelityCase == 0) {
+            const auto before = st.simManager->activeStudyDefinition();
+            auto blocked = before;
+            blocked["mesh_order"] = 1; blocked["order"] = 1;
+            st.rpc.call("doc_tree", {{"doc_id", I.doc}}, [](const core::RpcResult& r) {
+                g_si.report["document_read_probe_completed"] = r.ok;
+            });
+            const bool refused = !st.simManager->configureActiveStudy(st, blocked, error);
+            nlohmann::json persisted;
+            if (!siStudy(st, I.doc, I.study, persisted)) return;
+            if (!check("document_request_blocks_setup_edit_atomically",
+                       refused && st.simManager->activeStudyDefinition() == before &&
+                       persisted.value("mesh_order", 0) == before.value("mesh_order", 0) &&
+                       persisted.value("order", 0) == before.value("order", 0), persisted)) return;
+        }
+        I.edited = st.simManager->activeStudyDefinition();
+        // Deliberately change just one of an already-retained pair. Apply must synchronize
+        // the other name, and the real solver's mesh_quality.order must agree, not just JSON.
+        if (!thermal) I.edited[I.fidelityCase == 1 || I.fidelityCase == 3 ? "order" : "mesh_order"] = modal ? 1 : 2;
+        else I.edited["loads"][0]["ambient_c"] = 75.0;
+        st.simManager->handleCommand(st, "sim_parameters");
+        siNext(); break;
+    }
+    case 141:
+        if (siWriteText(I.edited.dump(2))) siNext();
+        break;
+    case 142: {
+        if (!siSeek("Apply parameters", p)) return;
+        nlohmann::json draft;
+        if (!siReadDraft(draft)) return;
+        if (!check("query_rerun_rendered_draft_matches_authored", draft == I.edited,
+                   {{"case", I.fidelityCase}, {"rendered_draft", draft}, {"authored", I.edited}})) return;
+        siGesture(p, p, false, "Apply canonical query boundaries and native mesh/ambient aliases");
+        I.metadataDuringApply = I.fidelityCase == 0;
+        siNext(); break;
+    }
+    case 143: {
+        const auto definition = st.simManager->activeStudyDefinition();
+        const bool applied = definition["fixtures"] == I.edited["fixtures"] &&
+            definition["loads"] == I.edited["loads"] &&
+            (I.fidelityCase == 7 ||
+             (definition.value("mesh_order", 0) == (I.fidelityCase <= 2 || I.fidelityCase == 5 ? 1 : 2) &&
+              definition.value("order", 0) == (I.fidelityCase <= 2 || I.fidelityCase == 5 ? 1 : 2)));
+        if (I.fidelityCase == 0 &&
+            !check("global_metadata_poll_does_not_cancel_native_apply",
+                   I.metadataQueued && applied, definition)) return;
+        if (!check("query_rerun_native_editor_applied", applied,
+                   {{"case", I.fidelityCase}, {"definition", definition}, {"authored", I.edited},
+                    {"observed_items", ui::audit::observedItems()}})) return;
+        const char* run = I.fidelityCase <= 2 || I.fidelityCase == 5 ? "Run Modal" :
+                          I.fidelityCase == 7 ? "Run Thermal FEA" : "Run Static";
+        if (!siSeek(run, p)) return;
+        siGesture(p, p, false, "Run actual native solver from observed GUI footer with authored boundaries");
+        siNext(); break;
+    }
+    case 144: {
+        if (st.simManager->runUi().running || !st.simClient) return;
+        // Structural results are projected into Study fields rather than advResult. Observe
+        // the shared native completion verbatim, but only once THIS study has its own result.
+        if (st.simManager->activeStudyDefinition().value("result_summary", std::string()).empty()) return;
+        nlohmann::json result;
+        {
+            auto& job = st.simClient->job();
+            std::lock_guard<std::mutex> lock(job.mtx);
+            const char* expected = I.fidelityCase <= 2 || I.fidelityCase == 5 ? "sim_run_modal" :
+                                   I.fidelityCase == 7 ? "sim_run_thermal" : "sim_run_static";
+            if (job.ownerDocId != I.doc || job.method != expected) return;
+            if (!job.ok) { siFail("fidelity_solver_refused", job.error); return; }
+            result = job.result;
+        }
+        if (!result.is_object() || result.empty()) return;
+        if (!check("fidelity_rerun_native_result_ok", result.value("ok", false) &&
+                   result.value("mesh_quality", nlohmann::json::object()).value("n_elems", 0) > 0, result)) return;
+        if (I.fidelityCase <= 2 || I.fidelityCase == 5) {
+            const auto freqs = result.value("freqs_hz", nlohmann::json::array());
+            bool finite = freqs.size() >= 3;
+            for (const auto& f : freqs) finite &= f.is_number() && std::isfinite(f.get<double>()) && f.get<double>() > 1.0;
+            if (!check("modal_fixture_resolves_positive_native_modes", finite, result)) return;
+            if (I.fidelityCase == 0) I.modalReference = result;
+            else {
+                const auto reference = I.modalReference.value("freqs_hz", nlohmann::json::array());
+                bool equal = reference.size() == freqs.size();
+                if (equal) for (size_t k = 0; k < freqs.size(); ++k)
+                    equal &= std::abs(freqs[k].get<double>() - reference[k].get<double>()) <=
+                             std::max(1e-5, std::abs(reference[k].get<double>()) * 1e-6);
+                if (!check(I.fidelityCase == 1 ? "modal_free_text_query_matches_sampled_boundary_solver" :
+                           I.fidelityCase == 5 ? "modal_stable_sid_query_matches_sampled_boundary_solver" :
+                                                "modal_structured_query_matches_sampled_boundary_solver",
+                           equal, {{"reference_native_result", I.modalReference}, {"query_native_result", result},
+                                   {"sampled_reference_boundary", I.terminalFixture}})) return;
+            }
+        } else if (I.fidelityCase < 7) {
+            const auto reactions = result.value("reactions", nlohmann::json::object());
+            const auto applied = reactions.value("applied_force_n", nlohmann::json::array());
+            const auto reaction = reactions.value("reaction_force_n", nlohmann::json::array());
+            const double displacement = result.value("summary", nlohmann::json::object()).value("max_disp_mm", 0.0);
+            const bool balanced = applied.size() == 3 && reaction.size() == 3 &&
+                std::abs(applied[0].get<double>()) < 1e-6 && std::abs(applied[1].get<double>()) < 1e-6 &&
+                std::abs(applied[2].get<double>() + 100.0) < 1e-5 &&
+                std::abs(reaction[2].get<double>() - 100.0) < 0.1 &&
+                reactions.value("equilibrium_error_pct", 100.0) < 0.1 &&
+                std::isfinite(displacement) && displacement > 0.0;
+            if (!check(I.fidelityCase == 3 ? "static_free_text_fixture_load_queries_execute" :
+                       I.fidelityCase == 6 ? "static_terminal_compound_fixture_load_executes_one_resultant" :
+                                            "static_structured_fixture_load_queries_execute", balanced, result)) return;
+            if (I.fidelityCase == 4) {
+                I.staticReference = result;
+                I.staticSetup = st.simManager->activeStudyDefinition();
+            }
+            if (I.fidelityCase == 6) {
+                const double reference = I.staticReference["summary"].value("max_disp_mm", 0.0);
+                if (!check("static_compound_duplicate_leaves_match_native_reference_solution",
+                           reference > 0.0 && std::abs(displacement - reference) < std::max(1e-6, reference * 1e-5),
+                           {{"reference_native_result", I.staticReference}, {"compound_native_result", result}})) return;
+            }
+        } else {
+            bool ambientResolved = false;
+            for (const auto& boundary : result.value("flux_summary", nlohmann::json::array()))
+                ambientResolved |= boundary.value("type", std::string()) == "convection" &&
+                    boundary.value("n_nodes", 0) > 0 &&
+                    std::abs(boundary.value("t_amb_c", 0.0) - 75.0) < 1e-8 &&
+                    std::abs(boundary.value("h_w_m2k", 0.0) - 10.0) < 1e-8;
+            const auto summary = result.value("summary", nlohmann::json::object());
+            // A nonzero film/fixture temperature difference is required by the
+            // native steady solver. Check the exact insulated 1-D slab solution,
+            // which also detects loss of the authored conductivity or ambient.
+            const double expectedMax = (160.0 / 0.06 * 20.0 + 10.0 * 75.0) /
+                                       (160.0 / 0.06 + 10.0);
+            if (!check("thermal_ambient_alias_native_boundary_and_slab_solution", ambientResolved &&
+                       !result.value("transient", false) &&
+                       std::abs(summary.value("max_temp_c", 0.0) - expectedMax) < 1e-3 &&
+                       std::abs(summary.value("min_temp_c", 0.0) - 20.0) < 1e-3, result)) return;
+        }
+        if (I.fidelityCase < 7 &&
+            !check("edited_mesh_aliases_match_actual_native_element_order",
+                   result["mesh_quality"].value("order", 0) == (I.fidelityCase <= 2 || I.fidelityCase == 5 ? 1 : 2),
+                   {{"native_setup", st.simManager->activeStudyDefinition()}, {"native_result", result}})) return;
+        I.report["native_fidelity_runs"].push_back({{"case", I.fidelityCase},
+            {"definition", st.simManager->activeStudyDefinition()}, {"native_result", result}});
+        I.capture = I.dir + "/fidelity_" + std::to_string(I.fidelityCase) + "_native_result.png";
+        if (++I.fidelityCase < 8) {
+            I.afterCapture = [](AppState&) { siGo(140); };
+        } else {
+            I.afterCapture = [](AppState&) { g_si.fidelityCase = 0; siGo(150); };
+        }
+        break;
+    }
+    case 150:
+        st.simManager->handleCommand(st, "sim_new_static");
+        I.study = st.simManager->activeStudyId();
+        I.edited = st.simManager->activeStudyDefinition();
+        I.edited["material"] = I.staticSetup["material"];
+        I.edited["mesh_order"] = 2;
+        I.edited["order"] = 2;
+        I.edited["fineness"] = 0.2;
+        I.edited["fixtures"] = nlohmann::json::array({I.terminalFixture});
+        I.edited["loads"] = nlohmann::json::array({{{"type", "force"},
+            {"faces", nlohmann::json::array({I.terminalLoad})}, {"force", {0.0, 0.0, -100.0}}}});
+        if (I.fidelityCase == 0)
+            I.edited["fixtures"] = nlohmann::json::array({{{"facesets", nlohmann::json::array()}}});
+        else if (I.fidelityCase == 1)
+            I.edited["fixtures"] = nlohmann::json::array({{{"facesets",
+                nlohmann::json::array({{{"facesets", nlohmann::json::array({I.terminalFixture})}}})}}});
+        else
+            I.edited["loads"][0]["faces"] = nlohmann::json::array({{{"facesets", {I.terminalLoad}}, {"tol_mm", 1.0}}});
+        st.simManager->handleCommand(st, "sim_parameters");
+        siNext(); break;
+    case 151:
+        if (siWriteText(I.edited.dump(2))) siNext();
+        break;
+    case 152:
+        if (!siSeek("Apply parameters", p)) return;
+        siGesture(p, p, false, "Apply malformed compound fixture/load to inspect real disabled Run readiness");
+        siNext(); break;
+    case 153: {
+        const auto definition = st.simManager->activeStudyDefinition();
+        if (!check("malformed_compound_native_editor_definition_applied",
+                   definition["fixtures"] == I.edited["fixtures"] && definition["loads"] == I.edited["loads"],
+                   definition)) return;
+        nlohmann::json disabled;
+        for (const auto& item : ui::audit::observedItems())
+            if (shotLabel(item, "Run Static") && item.value("visible", false) && !item.value("enabled", true))
+                disabled = item;
+        if (!check("malformed_compound_real_rendered_run_disabled", disabled.is_object() &&
+                   !disabled.empty() && !st.simManager->runUi().running,
+                   {{"case", I.fidelityCase}, {"rendered_run_control", disabled},
+                    {"rendered_items", ui::audit::observedItems()}, {"native_setup", definition}})) return;
+        I.capture = I.dir + "/malformed_compound_" + std::to_string(I.fidelityCase) + "_run_disabled.png";
+        if (++I.fidelityCase < 3) I.afterCapture = [](AppState&) { siGo(150); };
+        else I.afterCapture = [](AppState& state) {
+            state.simManager->handleCommand(state, "sim_hyd_new");
+            state.ribbonTab = ui::kRibbonTabHydraulics;
+            siGo(13);
+        };
+        break;
+    }
+    case 13: {
+        auto& hp = st.simManager->hydraulic();
+        if (!hp.circuit().is_object() || hp.circuit().value("components", nlohmann::json::array()).is_null()) return;
+        if (!hp.lastError().empty()) { siFail("hydraulic_new", hp.lastError()); return; }
+        if (!check("hydraulic_canvas_gestures_start_blank",
+                   hp.circuit().value("components", nlohmann::json::array()).empty() &&
+                   hp.circuit().value("hoses", nlohmann::json::array()).empty(), hp.circuit())) return;
+        st.simManager->handleCommand(st, "sim_hyd_add");
+        hp.setCentralView(ui::HydraulicPanel::CentralView::Schematic);
+        siNext(); break;
+    }
+    case 14: {
+        if (!siSeek("###hyd_canvas_palette_pump", p, "hyd_canvas_palette")) {
+            if (pipingNow() - I.stepStarted > 10.0)
+                siFail("hydraulic_canvas_pump_toolbar_missing", ui::audit::observedItems().dump());
+            return;
+        }
+        bool palette = false;
+        for (const auto& item : ui::audit::observedItems())
+            if (item.value("native_label", std::string()) == "###hyd_canvas_palette_pump" &&
+                item.value("visible", false) && item.value("enabled", true)) {
+                p = shotPoint(item); palette = true; break;
+            }
+        if (!check("hydraulic_canvas_pump_toolbar_source", palette, ui::audit::observedItems())) return;
+        const auto pos = st.simManager->hydraulic().schematicScreenPosition(-80.0, 0.0);
+        siGesture(p, ImVec2(pos.first, pos.second), true, "Drag Pump from the in-canvas ISO toolbar");
+        siNext(); break;
+    }
+    case 15: {
+        const auto& components = st.simManager->hydraulic().circuit().value("components", nlohmann::json::array());
+        if (!check("hydraulic_palette_placement", components.size() == 1 &&
+                   components[0].value("type", std::string()) == "pump" &&
+                   placedAt(components[0], -80.0, 0.0), components)) return;
+        I.pump = components[0].value("id", std::string());
+        if (!siSeek("###hyd_canvas_palette_reservoir", p, "hyd_canvas_palette")) {
+            if (pipingNow() - I.stepStarted > 10.0)
+                siFail("hydraulic_canvas_reservoir_toolbar_missing", ui::audit::observedItems().dump());
+            return;
+        }
+        bool palette = false;
+        for (const auto& item : ui::audit::observedItems())
+            if (item.value("native_label", std::string()) == "###hyd_canvas_palette_reservoir" &&
+                item.value("visible", false) && item.value("enabled", true)) {
+                p = shotPoint(item); palette = true; break;
+            }
+        if (!check("hydraulic_canvas_reservoir_toolbar_source", palette, ui::audit::observedItems())) return;
+        // The schematic fits the first component; keep the second drop inside that visible view.
+        const auto pos = st.simManager->hydraulic().schematicScreenPosition(-20.0, 0.0);
+        siGesture(p, ImVec2(pos.first, pos.second), true, "Drag Reservoir from the in-canvas ISO toolbar");
+        siNext(); break;
+    }
+    case 16: {
+        auto& hp = st.simManager->hydraulic();
+        const auto components = hp.circuit().value("components", nlohmann::json::array());
+        bool positioned = false;
+        for (const auto& c : components)
+            if (c.value("type", std::string()) == "reservoir") {
+                I.tank = c.value("id", std::string());
+                positioned = placedAt(c, -20.0, 0.0);
+            }
+        if (!check("hydraulic_second_placement", components.size() == 2 && positioned, components)) return;
+        I.report["hydraulic_before_click_connection"] = hp.circuit();
+        const auto pos = hp.portScreenPosition(I.pump, "T");
+        siGesture(ImVec2(pos.first, pos.second), ImVec2(pos.first, pos.second), false, "Pick pump T port");
+        siNext(); break;
+    }
+    case 17: {
+        const auto& hp = st.simManager->hydraulic();
+        if (!check("hydraulic_first_port_click_stages_without_hose",
+                   hp.selectedComponentId() == I.pump &&
+                   hp.circuit() == I.report["hydraulic_before_click_connection"],
+                   {{"selected_component", hp.selectedComponentId()}, {"circuit", hp.circuit()}})) return;
+        const auto pos = st.simManager->hydraulic().portScreenPosition(I.tank, "S");
+        siGesture(ImVec2(pos.first, pos.second), ImVec2(pos.first, pos.second), false, "Pick reservoir suction port");
+        siNext(); break;
+    }
+    case 18: {
+        const auto hoses = st.simManager->hydraulic().circuit().value("hoses", nlohmann::json::array());
+        const auto expected = nlohmann::json::array({
+            {{"component_id", I.pump}, {"port", "T"}},
+            {{"component_id", I.tank}, {"port", "S"}}});
+        if (!check("hydraulic_second_port_click_connects", hoses.size() == 1 &&
+                   hoses[0].value("connections", nlohmann::json::array()) == expected, hoses)) return;
+        siNext(); break;
+    }
+    case 19: {
+        auto& hp = st.simManager->hydraulic();
+        const auto hoses = hp.circuit().value("hoses", nlohmann::json::array());
+        const auto expectedEnds = nlohmann::json::array({
+            {{"component_id", I.pump}, {"port", "T"}},
+            {{"component_id", I.tank}, {"port", "S"}}});
+        if (!check("hydraulic_port_connection", hoses.size() == 1 &&
+                   hoses[0].value("connections", nlohmann::json::array()) == expectedEnds, hoses)) return;
+        nlohmann::json stored;
+        if (!siStudy(st, I.doc, hp.studyId(), stored)) return;
+        if (!check("hydraulic_native_store", stored.at("params").at("circuit") == hp.circuit(), stored)) return;
+        I.before = hp.circuit();
+        nlohmann::json cad;
+        std::string error;
+        if (!st.worker.call("doc_tree", {{"doc_id", I.doc}}, cad, error, 15000) ||
+            cad.contains("code") || !cad.contains("tree") || !cad["tree"].is_object() ||
+            !cad.contains("revision") || !cad["revision"].is_number_integer()) {
+            siFail("hydraulic_cad_history_baseline_read", error.empty() ? cad.dump() : error); return;
+        }
+        auto geometry = cad["tree"];
+        geometry.erase("studies");
+        I.report["hydraulic_keyboard_cad_baseline"] = {
+            {"scope", "CAD geometry/mirror history must remain unchanged; each native hydraulic study save intentionally advances the document revision once."},
+            {"doc_id", I.doc}, {"native_revision", cad["revision"]},
+            {"mirror_revision", st.docMirror.revision()}, {"geometry", std::move(geometry)},
+            {"mirror_features", st.docMirror.tree().value("features", nlohmann::json::array())}};
+        I.report["hydraulic_connected_before_delete"] = I.before;
+        const auto centre = hp.schematicScreenPosition(-80.0, 0.0);
+        p = ImVec2(centre.first, centre.second);
+        siGesture(p, p, false, "Select canvas pump before pressing Delete");
+        siGo(300); break;
+    }
+    case 300: {
+        auto& hp = st.simManager->hydraulic();
+        if (!check("hydraulic_canvas_pump_selected_for_delete",
+                   hp.selectedComponentId() == I.pump && hp.canUndo(),
+                   {{"selected_component", hp.selectedComponentId()}, {"pump", I.pump},
+                    {"can_undo", hp.canUndo()}})) return;
+        auto& io = ImGui::GetIO();
+        io.AddMousePosEvent(I.source.x, I.source.y);
+        io.AddKeyEvent(ImGuiKey_Delete, true);
+        I.report["actions"].push_back({{"action", "Delete the selected pump using the canvas keyboard"},
+                                       {"key", "Delete"}, {"pointer", {I.source.x, I.source.y}}});
+        siNext(); break;
+    }
+    case 301: {
+        auto& io = ImGui::GetIO();
+        io.AddMousePosEvent(I.source.x, I.source.y);
+        if (!ImGui::IsKeyDown(ImGuiKey_Delete)) return;
+        io.AddKeyEvent(ImGuiKey_Delete, false);
+        siNext(); break;
+    }
+    case 302: {
+        if (ImGui::IsKeyDown(ImGuiKey_Delete)) return;
+        auto& hp = st.simManager->hydraulic();
+        const auto& circuit = hp.circuit();
+        const auto components = circuit.value("components", nlohmann::json::array());
+        const auto hoses = circuit.value("hoses", nlohmann::json::array());
+        if (!check("hydraulic_canvas_delete_removes_component_and_dangling_hose",
+                   components.size() == 1 && components[0].value("id", std::string()) == I.tank &&
+                   hoses.empty(), circuit)) return;
+        nlohmann::json stored;
+        if (!siStudy(st, I.doc, hp.studyId(), stored)) return;
+        if (!check("hydraulic_canvas_delete_persisted", stored.at("params").at("circuit") == circuit, stored)) return;
+        auto& io = ImGui::GetIO();
+        io.AddMousePosEvent(I.source.x, I.source.y);
+        io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        io.AddKeyEvent(ImGuiKey_Z, true);
+        I.report["actions"].push_back({{"action", "Undo canvas Delete using Ctrl+Z"},
+                                       {"key", "Ctrl+Z"}, {"pointer", {I.source.x, I.source.y}}});
+        siNext(); break;
+    }
+    case 303: {
+        auto& io = ImGui::GetIO();
+        io.AddMousePosEvent(I.source.x, I.source.y);
+        if (!io.KeyCtrl || !ImGui::IsKeyDown(ImGuiKey_Z)) return;
+        io.AddKeyEvent(ImGuiKey_Z, false);
+        io.AddKeyEvent(ImGuiMod_Ctrl, false);
+        siNext(); break;
+    }
+    case 304: {
+        if (ImGui::GetIO().KeyCtrl || ImGui::IsKeyDown(ImGuiKey_Z)) return;
+        auto& hp = st.simManager->hydraulic();
+        if (!check("hydraulic_canvas_ctrl_z_restores_exact_circuit", hp.circuit() == I.before,
+                   {{"before_delete", I.before}, {"restored", hp.circuit()}})) return;
+        nlohmann::json stored;
+        if (!siStudy(st, I.doc, hp.studyId(), stored)) return;
+        if (!check("hydraulic_canvas_ctrl_z_restoration_persisted",
+                   stored.at("params").at("circuit") == I.before, stored)) return;
+        nlohmann::json cad;
+        std::string error;
+        if (!st.worker.call("doc_tree", {{"doc_id", I.doc}}, cad, error, 15000) ||
+            cad.contains("code") || !cad.contains("tree") || !cad["tree"].is_object()) {
+            siFail("hydraulic_cad_history_after_undo_read", error.empty() ? cad.dump() : error); return;
+        }
+        auto geometry = cad["tree"];
+        geometry.erase("studies");
+        const auto& baseline = I.report["hydraulic_keyboard_cad_baseline"];
+        const auto mirrorFeatures = st.docMirror.tree().value("features", nlohmann::json::array());
+        if (!check("hydraulic_canvas_ctrl_z_preserves_cad_document_history",
+                   st.docMirror.docId() == I.doc &&
+                   st.docMirror.revision() == baseline["mirror_revision"] &&
+                   mirrorFeatures == baseline["mirror_features"] && geometry == baseline["geometry"],
+                   {{"baseline", baseline}, {"mirror_revision_after", st.docMirror.revision()},
+                    {"native_revision_after", cad.value("revision", -1)},
+                    {"mirror_features_after", mirrorFeatures}, {"geometry_after", geometry}})) return;
+        auto& io = ImGui::GetIO();
+        io.AddMousePosEvent(I.source.x, I.source.y);
+        io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        io.AddKeyEvent(ImGuiKey_Z, true);
+        I.report["actions"].push_back({{"action", "Undo the two-click connection using Ctrl+Z before drag-connect"},
+                                       {"key", "Ctrl+Z"}, {"pointer", {I.source.x, I.source.y}}});
+        siNext(); break;
+    }
+    case 305: {
+        auto& io = ImGui::GetIO();
+        io.AddMousePosEvent(I.source.x, I.source.y);
+        if (!io.KeyCtrl || !ImGui::IsKeyDown(ImGuiKey_Z)) return;
+        io.AddKeyEvent(ImGuiKey_Z, false);
+        io.AddKeyEvent(ImGuiMod_Ctrl, false);
+        siNext(); break;
+    }
+    case 306: {
+        if (ImGui::GetIO().KeyCtrl || ImGui::IsKeyDown(ImGuiKey_Z)) return;
+        auto& hp = st.simManager->hydraulic();
+        if (!check("hydraulic_canvas_ctrl_z_removes_click_connection",
+                   hp.circuit() == I.report["hydraulic_before_click_connection"],
+                   {{"before_click_connection", I.report["hydraulic_before_click_connection"]},
+                    {"after_undo", hp.circuit()}})) return;
+        const auto a = hp.portScreenPosition(I.pump, "T");
+        const auto b = hp.portScreenPosition(I.tank, "S");
+        if (!check("hydraulic_canvas_drag_connection_port_positions",
+                   std::isfinite(a.first) && std::isfinite(a.second) &&
+                   std::isfinite(b.first) && std::isfinite(b.second) &&
+                   (a.first != 0.0f || a.second != 0.0f) && (b.first != 0.0f || b.second != 0.0f) &&
+                   std::hypot(a.first - b.first, a.second - b.second) > ImGui::GetIO().MouseDragThreshold,
+                   {{"pump_T", {a.first, a.second}}, {"reservoir_S", {b.first, b.second}}})) return;
+        I.source = ImVec2(a.first, a.second);
+        I.target = ImVec2(b.first, b.second);
+        I.phase = 0;
+        I.report["actions"].push_back({
+            {"action", "Drag directly from pump suction port to reservoir suction port"},
+            {"input", "held_pointer_drag_without_imgui_payload"},
+            {"source", {I.source.x, I.source.y}}, {"target", {I.target.x, I.target.y}}});
+        ImGui::GetIO().AddMousePosEvent(I.source.x, I.source.y);
+        siGo(308); break;
+    }
+    case 308: {
+        auto& io = ImGui::GetIO();
+        const auto at = [&](ImVec2 point) {
+            return std::fabs(io.MousePos.x - point.x) <= 2.0f &&
+                   std::fabs(io.MousePos.y - point.y) <= 2.0f;
+        };
+        const ImVec2 midpoint((I.source.x + I.target.x) * 0.5f,
+                              (I.source.y + I.target.y) * 0.5f);
+        // Port wiring tracks a held pointer, not an ImGui drag/drop payload.
+        // Consume each input frame and hold over the target before releasing.
+        if (I.phase == 0) {
+            if (!at(I.source)) {
+                io.AddMousePosEvent(I.source.x, I.source.y);
+                return;
+            }
+            io.AddMouseButtonEvent(0, true);
+            I.phase = 1;
+        } else if (I.phase == 1) {
+            if (!io.MouseDown[0]) return;
+            auto& hp = st.simManager->hydraulic();
+            if (!check("hydraulic_canvas_drag_press_stages_without_hose",
+                       hp.selectedComponentId() == I.pump &&
+                       hp.circuit() == I.report["hydraulic_before_click_connection"],
+                       {{"selected_component", hp.selectedComponentId()}, {"circuit", hp.circuit()}})) return;
+            io.AddMousePosEvent(midpoint.x, midpoint.y);
+            I.phase = 2;
+        } else if (I.phase == 2) {
+            if (!io.MouseDown[0] || !at(midpoint)) return;
+            io.AddMousePosEvent(I.target.x, I.target.y);
+            I.phase = 3;
+        } else if (I.phase == 3) {
+            if (!io.MouseDown[0] || !at(I.target)) return;
+            const auto& circuit = st.simManager->hydraulic().circuit();
+            const ImVec2 delta = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+            if (!check("hydraulic_canvas_drag_held_over_target_before_release",
+                       ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
+                       circuit == I.report["hydraulic_before_click_connection"],
+                       {{"drag_delta", {delta.x, delta.y}}, {"circuit", circuit}})) return;
+            I.phase = 4;
+        } else if (I.phase == 4) {
+            io.AddMouseButtonEvent(0, false);
+            I.phase = 5;
+        } else {
+            if (io.MouseDown[0]) return;
+            siGo(307);
+        }
+        break;
+    }
+    case 307: {
+        auto& hp = st.simManager->hydraulic();
+        const auto hoses = hp.circuit().value("hoses", nlohmann::json::array());
+        const auto expectedEnds = nlohmann::json::array({
+            {{"component_id", I.pump}, {"port", "T"}},
+            {{"component_id", I.tank}, {"port", "S"}}});
+        if (!check("hydraulic_canvas_drag_release_connects_ports",
+                   hoses.size() == 1 && hoses[0].value("connections", nlohmann::json::array()) == expectedEnds &&
+                   hp.circuit().value("components", nlohmann::json::array()) == I.before["components"],
+                   hp.circuit())) return;
+        nlohmann::json stored;
+        if (!siStudy(st, I.doc, hp.studyId(), stored)) return;
+        if (!check("hydraulic_canvas_drag_connection_persisted",
+                   stored.at("params").at("circuit") == hp.circuit(), stored)) return;
+        I.hose = hoses[0].value("id", std::string());
+        I.report["hydraulic_drag_created_hose"] = hoses[0];
+        if (!check("hydraulic_drag_created_hose_identity",
+                   !I.hose.empty() && !hoses[0].value("net_name", std::string()).empty(),
+                   hoses[0])) return;
+        I.fidelityCase = 0;
+        I.capture = I.dir + "/03_hydraulic_gestures.png";
+        siGo(200); break;
+    }
+    case 200:
+        if (!st.simManager->hydraulic().setComponentParams(st, I.pump,
+                {{"pump_type", "gear"}, {"displacement_cc_rev", 16.0}, {"speed_rpm", 1450.0},
+                 {"vol_efficiency", 0.95}, {"mech_efficiency", 0.9}})) {
+            siFail("hydraulic_pump_fixture", st.simManager->hydraulic().lastError()); return;
+        }
+        siGo(197); break;
+    case 197:
+        if (!st.simManager->hydraulic().setComponentParams(st, I.tank, {{"volume_l", 60.0}})) {
+            siFail("hydraulic_reservoir_fixture", st.simManager->hydraulic().lastError()); return;
+        }
+        siNext(); break;
+    case 198:
+        if (!st.simManager->hydraulic().addHose(st, "Native return",
+                {{I.pump, "P"}, {I.tank, "T"}}, 1000.0, 12.7, 40.0)) {
+            siFail("hydraulic_return_fixture", st.simManager->hydraulic().lastError()); return;
+        }
+        siNext(); break;
+    case 199: {
+        auto& hp = st.simManager->hydraulic();
+        auto definition = hp.simulationDefinition();
+        definition["duration_s"] = 0.02;
+        definition["output_dt_s"] = 0.01;
+        definition["max_step_s"] = 0.01;
+        definition["fluid"] = {{"density_kgm3", 870.0}, {"bulk_modulus_bar", 15000.0},
+                                {"viscosity_cst", 32.0}, {"air_fraction", 0.002},
+                                {"native_note", "retained-fluid-metadata"}};
+        std::string error;
+        // Author the runnable fixture canonically; bad edits and Runs use real GUI controls.
+        if (!hp.configureSimulation(st, definition, error)) { siFail("hydraulic_sim_fixture", error); return; }
+        hp.openSimulationSetup();
+        siGo(201); break;
+    }
+    case 201: {
+        auto& hp = st.simManager->hydraulic();
+        if (!siExpand("All simulation parameters (native JSON)", "Expand actual hydraulic simulation JSON")) return;
+        if (!siNativeEditor("Apply JSON")) return;
+        const char* keys[] = {"density_kgm3", "density_kgm3", "density_kgm3", "density_kgm3",
+                              "bulk_modulus_bar", "viscosity_cst", "air_fraction"};
+        const nlohmann::json bad[] = {"bad", true, 0.0, -1.0, "bad", false, 0.2};
+        I.before = hp.simulationDefinition();
+        I.edited = I.before;
+        I.edited["fluid"][keys[I.fidelityCase]] = bad[I.fidelityCase];
+        siNext(); break;
+    }
+    case 202:
+        if (siWriteText(I.edited.dump(2), "##t", I.editorWindow.c_str())) siNext();
+        break;
+    case 203:
+        if (!siSeek("Apply JSON", p, I.editorWindow.c_str())) return;
+        siGesture(p, p, false, "Reject malformed modeled hydraulic fluid through real JSON Apply");
+        siNext(); break;
+    case 204: {
+        auto& hp = st.simManager->hydraulic();
+        const char* keys[] = {"density_kgm3", "density_kgm3", "density_kgm3", "density_kgm3",
+                              "bulk_modulus_bar", "viscosity_cst", "air_fraction"};
+        const std::string error = std::string("fluid.") + keys[I.fidelityCase] +
+            (I.fidelityCase == 6 ? " must be a finite number in [0, 0.2) or null." :
+                                  " must be a finite positive number or null.");
+        if (!siSeek(error.c_str(), p)) return;
+        if (!check("hydraulic_modeled_fluid_invalid_apply_atomic_with_error",
+                   hp.lastError() == error && hp.simulationDefinition() == I.before,
+                   {{"error", hp.lastError()}, {"native_setup", hp.simulationDefinition()},
+                    {"rendered_items", ui::audit::observedItems()}})) return;
+        if (siFocusDraft("##t", I.editorWindow.c_str())) siNext();
+        break;
+    }
+    case 205: {
+        nlohmann::json draft;
+        if (!siReadDraft(draft, "##t", I.editorWindow.c_str())) return;
+        if (!check("hydraulic_invalid_fluid_draft_preserved", draft == I.edited, draft)) return;
+        if (++I.fidelityCase < 7) siGo(201);
+        else {
+            st.simManager->handleCommand(st, "sim_hyd_hose");
+            siGo(210);
+        }
+        break;
+    }
+    case 210:
+    case 217: {
+        if (!siExpand("Hoses", I.step == 210 ? "Open the circuit's hose list" :
+                                               "Open hoses to restore physical geometry")) return;
+        const auto* list = shotItem("Hoses", false);
+        if (!list) return;
+        const auto& windowName = (*list)["window"].get_ref<const std::string&>();
+        const auto* window = ImGui::FindWindowByName(windowName.c_str());
+        if (!window) return;
+        // drawCircuitForm scopes each kit row by the actual hose ID, then "hose".
+        // Its drawn title is not the observed native label of the invisible hit item.
+        const ImGuiID hoseScope = ImHashStr(I.hose.c_str(), 0, window->ID);
+        const ImGuiID rowScope = ImHashStr("hose", 0, hoseScope);
+        const ImGuiID hitId = ImHashStr("##kit_rowhit", 0, rowScope);
+        const nlohmann::json* target = nullptr;
+        for (const auto& item : ui::audit::observedItems())
+            if (item.value("window", std::string()) == windowName &&
+                item.value("native_label", std::string()) == "##kit_rowhit" &&
+                item.value("id", ImGuiID(0)) == hitId && item.value("enabled", true)) {
+                target = &item; break;
+            }
+        if (!target || !target->value("visible", false)) {
+            shotScrollTo("##kit_rowhit", windowName.c_str(), true);
+            return;
+        }
+        I.report["actions"].push_back({{"action", "Locate exact drag-created hose list row"},
+                                       {"hose", I.report["hydraulic_drag_created_hose"]},
+                                       {"item", *target}});
+        p = shotPoint(*target);
+        siGesture(p, p, false, I.step == 210 ?
+            "Select the gesture-created hose for its native geometry editor" :
+            "Select the same hose to restore positive handoff geometry");
+        siNext(); break;
+    }
+    case 211: {
+        if (!siExpand("All hose parameters and ends (native JSON)", "Expand original gesture-created hose JSON")) return;
+        if (!siNativeEditor("Apply JSON")) return;
+        for (const auto& hose : st.simManager->hydraulic().circuit()["hoses"])
+            if (hose.value("id", std::string()) == I.hose) I.edited = hose;
+        I.edited["length_mm"] = 0.0;
+        siNext(); break;
+    }
+    case 212:
+        if (siWriteText(I.edited.dump(2), "##t", I.editorWindow.c_str())) siNext();
+        break;
+    case 213:
+        if (!siSeek("Apply JSON", p, I.editorWindow.c_str())) return;
+        siGesture(p, p, false, "Apply exact zero native hose length");
+        siNext(); break;
+    case 214: {
+        auto& hp = st.simManager->hydraulic();
+        nlohmann::json stored;
+        if (!siStudy(st, I.doc, hp.studyId(), stored)) return;
+        bool zero = false;
+        for (const auto& hose : hp.circuit()["hoses"])
+            zero |= hose.value("id", std::string()) == I.hose && hose.value("length_mm", -1.0) == 0.0;
+        if (!check("hydraulic_zero_hose_length_applied_and_persisted", zero &&
+                   stored.at("params").at("circuit") == hp.circuit(), stored)) return;
+        hp.openSimulationSetup();
+        siNext(); break;
+    }
+    case 215:
+        if (!siFooterAction("Run simulation", p)) return;
+        siGesture(p, p, false, "Run real native hydraulic simulation with zero-volume suction hose");
+        siNext(); break;
+    case 216: {
+        auto& hp = st.simManager->hydraulic();
+        const auto& result = hp.simulateResult();
+        if (!result.is_object() || result.empty()) {
+            if (!hp.lastError().empty()) siFail("hydraulic_zero_length_simulation", hp.lastError());
+            return;
+        }
+        const auto& samples = result.at("time_s");
+        const auto& series = result.at("components").at(I.pump).at("series");
+        const auto& flow = series.at("flow_lpm");
+        const auto& pressure = series.at("pressure_bar");
+        bool actualFlow = samples.size() >= 3 && flow.size() == samples.size() && pressure.size() == samples.size();
+        // Both pump ports return to the reservoir: zero differential pressure means zero leakage.
+        const double expectedFlow = 16.0 * 1450.0 / 1000.0;
+        for (size_t sample = 0; actualFlow && sample < flow.size(); ++sample)
+            actualFlow &= flow[sample].is_number() && pressure[sample].is_number() &&
+                          std::isfinite(flow[sample].get<double>()) &&
+                          std::abs(flow[sample].get<double>() - expectedFlow) < 1e-3 &&
+                          std::abs(pressure[sample].get<double>()) < 1e-6;
+        if (!check("hydraulic_zero_length_native_solver_flow_invariant", actualFlow, result)) return;
+        I.capture = I.dir + "/hydraulic_zero_length_native_result.png";
+        I.afterCapture = [](AppState& state) { state.simManager->handleCommand(state, "sim_hyd_hose"); };
+        siNext(); break;
+    }
+    case 218:
+        if (!siExpand("All hose parameters and ends (native JSON)", "Reopen exact hose JSON")) return;
+        if (!siNativeEditor("Apply JSON")) return;
+        I.edited["length_mm"] = 1000.0;
+        siNext(); break;
+    case 219:
+        if (siWriteText(I.edited.dump(2), "##t", I.editorWindow.c_str())) siNext();
+        break;
+    case 220:
+        if (!siSeek("Apply JSON", p, I.editorWindow.c_str())) return;
+        siGesture(p, p, false, "Apply positive-length handoff geometry without changing endpoints");
+        siNext(); break;
+    case 221:
+        st.simManager->handleCommand(st, "sim_hyd_piping");
+        I.edited = st.simManager->hydraulic().handoffDefinition();
+        I.edited["supply_pressure_bar"] = 160.0;
+        I.edited["flow_lpm"] = 20.0;
+        I.edited["load_pressure_bar"] = 0.0;
+        I.edited["tolerance_pct"] = 0.0;
+        I.edited["native_note"] = {{"authored", true}};
+        siNext(); break;
+    case 222:
+        if (!siExpand("All piping handoff inputs (native JSON)", "Expand exact native handoff parameters")) return;
+        if (!siNativeEditor("Apply JSON")) return;
+        siNext(); break;
+    case 223:
+        if (siWriteText(I.edited.dump(2), "##t", I.editorWindow.c_str())) siNext();
+        break;
+    case 224:
+        if (!siSeek("Apply JSON", p, I.editorWindow.c_str())) return;
+        siGesture(p, p, false, "Apply explicit zero load-pressure presence and zero verification tolerance");
+        siNext(); break;
+    case 225: {
+        auto& hp = st.simManager->hydraulic();
+        nlohmann::json stored;
+        if (!siStudy(st, I.doc, hp.studyId(), stored)) return;
+        if (!check("hydraulic_handoff_explicit_zeros_native_persistence", hp.handoffDefinition() == I.edited &&
+                   stored.value("params", nlohmann::json::object()).value("piping_handoff", nlohmann::json()) == I.edited,
+                   stored)) return;
+        if (!siSeek("Generate network", p)) return;
+        siGesture(p, p, false, "Run native hydraulic-to-piping handoff with explicit zero load and tolerance");
+        siNext(); break;
+    }
+    case 226: {
+        auto& hp = st.simManager->hydraulic();
+        const auto result = hp.handoffResult();
+        if (!result.is_object() || result.empty()) {
+            if (!hp.lastError().empty()) siFail("hydraulic_zero_handoff", hp.lastError());
+            return;
+        }
+        const auto margins = result.value("margin", nlohmann::json::object()).value("per_line", nlohmann::json::object());
+        bool exactZero = !margins.empty();
+        for (const auto& margin : margins) {
+            exactZero &= margin.value("load_pressure_bar", -1.0) == 0.0 &&
+                margin.contains("pump_margin_estimate_bar") && margin["pump_margin_estimate_bar"].is_number() &&
+                margin.contains("pump_margin_solved_bar") && margin["pump_margin_solved_bar"].is_number();
+            if (margin.contains("line_loss_solved_bar") && margin["line_loss_solved_bar"].is_number() &&
+                margin.contains("pump_margin_solved_bar") && margin["pump_margin_solved_bar"].is_number())
+                exactZero &= std::abs(margin["pump_margin_solved_bar"].get<double>() +
+                                      margin["line_loss_solved_bar"].get<double>() - 160.0) < 1e-3;
+        }
+        const auto checks = result.value("verify", nlohmann::json::object()).value("checks", nlohmann::json::array());
+        bool zeroTolerance = !checks.empty();
+        for (const auto& row : checks) zeroTolerance &= row.value("tolerance_pct", -1.0) == 0.0;
+        if (!check("hydraulic_handoff_zero_load_margin_and_exact_tolerance_executed",
+                   result.value("stage", std::string()) == "solved" && exactZero && zeroTolerance, result)) return;
+        I.capture = I.dir + "/hydraulic_zero_handoff_native_result.png";
+        siNext(); break;
+    }
+    case 227:
+        if (!siSeek("Open in Piping", p)) return;
+        siGesture(p, p, false, "Open actual generated solved piping network");
+        siNext(); break;
+    case 228:
+        if (st.simManager->piping().networkStudyId().empty()) return;
+        I.pipeBase = st.simManager->piping().setupDefinition(ui::PipingPanel::Form::Solve);
+        I.fidelityCase = 0;
+        st.ribbonTab = ui::kRibbonTabPiping;
+        siGo(250); break;
+    case 250:
+        st.simManager->handleCommand(st, "sim_piping_solve");
+        if (!siPipingEditor()) return;
+        I.before = st.simManager->piping().setupDefinition(ui::PipingPanel::Form::Solve);
+        I.edited = I.pipeBase;
+        I.edited["network_type"] = I.fidelityCase == 2 ? "gas" : "liquid";
+        I.edited["fluid"] = I.fidelityCase == 0 ? nlohmann::json{{"name", "water"}, {"T_C", 80.0}} :
+            I.fidelityCase == 1 ? nlohmann::json{{"name", "water"}, {"T", 293.15}, {"T_C", 80.0}} :
+                                 nlohmann::json{{"name", "ch4"}, {"T", 293.15}, {"T_C", 80.0}};
+        if (I.fidelityCase == 2) {
+            I.edited["boundary"] = nlohmann::json::array();
+            for (const auto& run : I.edited["piping"]["runs"]) {
+                const auto id = run.value("id", std::string());
+                I.edited["boundary"].push_back({{"run", id}, {"end", "start"}, {"pressure", 400.0}});
+                I.edited["boundary"].push_back({{"run", id}, {"end", "end"}, {"mass_demand", 1.0}});
+            }
+        }
+        siNext(); break;
+    case 251:
+        if (siWriteText(I.edited.dump(2), "##t", I.editorWindow.c_str())) siNext();
+        break;
+    case 252:
+        if (!siSeek("Apply parameters", p, I.editorWindow.c_str())) return;
+        siGesture(p, p, false, "Apply exact native piping fluid aliases and Celsius/Kelvin precedence");
+        siNext(); break;
+    case 253: {
+        auto& pp = st.simManager->piping();
+        nlohmann::json stored;
+        if (!siStudy(st, I.doc, pp.networkStudyId(), stored)) return;
+        if (!check("piping_native_fluid_definition_persisted_exactly",
+                   pp.setupDefinition(ui::PipingPanel::Form::Solve)["fluid"] == I.edited["fluid"] &&
+                   stored.value("params", nlohmann::json::object()).value("fluid", nlohmann::json()) == I.edited["fluid"],
+                   stored)) return;
+        if (!siSeek("Solve network", p)) return;
+        siGesture(p, p, false, "Run actual piping network solver with exact fluid temperature semantics");
+        siNext(); break;
+    }
+    case 254: {
+        auto& pp = st.simManager->piping();
+        const auto result = pp.solveResult();
+        if (!result.is_object() || result.empty()) {
+            if (!pp.lastError().empty()) siFail("piping_fluid_solver_refused", pp.lastError());
+            return;
+        }
+        const auto links = result.value("links", nlohmann::json::array());
+        const auto fluid = result.value("fluid", nlohmann::json::object());
+        bool native = result.value("converged", false) && !links.empty();
+        if (I.fidelityCase < 2) {
+            const double rho = I.fidelityCase == 0 ? 971.79 : 998.21;
+            const double mu = I.fidelityCase == 0 ? 0.0003540 : 0.0010016;
+            native &= std::abs(fluid.value("rho", 0.0) - rho) < 1e-5 &&
+                      std::abs(fluid.value("mu", 0.0) - mu) < 1e-9;
+            for (const auto& link : links) {
+                const double velocity = std::abs(link.value("velocity_ms", 0.0));
+                const double diameter = link.value("id_mm", 0.0) * 0.001;
+                const double re = link.value("reynolds", 0.0);
+                const double expected = rho * velocity * diameter / mu;
+                native &= std::isfinite(re) && expected > 0.0 && std::abs(re - expected) < expected * 0.01;
+            }
+            if (!check(I.fidelityCase == 0 ? "piping_water_celsius_native_properties_and_reynolds" :
+                                            "piping_kelvin_over_celsius_native_properties_and_reynolds", native, result)) return;
+            if (I.fidelityCase == 0) I.fidelityBase = result;
+            else {
+                bool changed = true;
+                for (const auto& link : links) {
+                    bool matched = false;
+                    for (const auto& hot : I.fidelityBase["links"])
+                        if (hot["id"] == link["id"]) {
+                            matched = true;
+                            const double ratio = hot.value("reynolds", 0.0) / link.value("reynolds", 1.0);
+                            const double expected = (971.79 / 0.0003540) / (998.21 / 0.0010016);
+                            changed &= std::abs(ratio - expected) < expected * 0.01;
+                        }
+                    changed &= matched;
+                }
+                if (!check("piping_temperature_alias_changes_actual_hydraulics",
+                           changed, {{"hot_native_result", I.fidelityBase}, {"kelvin_native_result", result}})) return;
+            }
+        } else {
+            native &= fluid.value("name", std::string()) == "methane" &&
+                      std::abs(fluid.value("T_K", 0.0) - 293.15) < 1e-6 &&
+                      fluid.value("rho_std_kgm3", 0.0) > 0.0 && fluid.value("mu", 0.0) > 0.0;
+            for (const auto& link : links)
+                native &= std::abs(std::abs(link.value("mass_flow_kgh", 0.0)) - 1.0) < 1e-4 &&
+                          link.value("reynolds", 0.0) > 0.0;
+            if (!check("piping_ch4_alias_native_gas_temperature_and_massflow", native, result)) return;
+        }
+        I.report["piping_fidelity_runs"].push_back({{"fluid_definition", I.edited["fluid"]}, {"native_result", result}});
+        I.capture = I.dir + "/piping_fluid_" + std::to_string(I.fidelityCase) + "_native_result.png";
+        if (++I.fidelityCase < 3) I.afterCapture = [](AppState&) { siGo(250); };
+        else I.afterCapture = [](AppState& state) {
+            state.simManager->handleCommand(state, "sim_piping_solve");
+            siGo(261);
+        };
+        break;
+    }
+    case 261:
+        if (!siSeek("Conditions", p)) return;
+        siGesture(p, p, false, "Expose actual piping boundary assignments and run-end sources");
+        siNext(); break;
+    case 262: {
+        std::string source;
+        for (const auto& item : ui::audit::observedItems()) {
+            const auto label = item.value("label", std::string());
+            if (label.find(" end###run_port") != std::string::npos) { source = label; break; }
+        }
+        if (source.empty()) { shotScrollTo("Drag a run end"); return; }
+        I.before = st.simManager->piping().setupDefinition(ui::PipingPanel::Form::Solve);
+        if (!siDragItems(source.c_str(), "Drop run end here", "Drag actual native pipe port across an agent setup refresh")) return;
+        siNext(); break;
+    }
+    case 263:
+        // Held-drag processing observes the immutable payload and performs the native same-ID
+        // external edit/refresh before delivery. It never constructs a test payload.
+        siNext(); break;
+    case 264: {
+        auto& pp = st.simManager->piping();
+        const auto current = pp.setupDefinition(ui::PipingPanel::Form::Solve);
+        if (!check("piping_stale_generation_real_drag_delivery_refused",
+                   !I.dragOrigin.empty() && current["boundary"] == I.before["boundary"] &&
+                   current["design"] != I.before["design"] &&
+                   !pp.acceptsSetupDrag(st, ui::PipingPanel::Form::Solve, I.dragOrigin) &&
+                   pp.acceptsSetupDrag(st, ui::PipingPanel::Form::Solve,
+                                       pp.setupDragOrigin(st, ui::PipingPanel::Form::Solve)),
+                   {{"actual_drag_origin", I.dragOrigin}, {"before_native_setup", I.before},
+                    {"after_native_refresh_and_delivery", current}})) return;
+        st.simManager->handleCommand(st, "sim_piping_flow");
+        I.fidelityCase = 0;
+        siGo(270); break;
+    }
+    case 270: {
+        if (!siPipingEditor()) return;
+        auto& pp = st.simManager->piping();
+        I.before = pp.setupDefinition(ui::PipingPanel::Form::Flow);
+        I.edited = I.before;
+        const auto& run = pp.network()["runs"][0];
+        I.edited["run_id"] = run["id"];
+        I.edited["inlet"] = {{"point", run["path"][0]}, {"normal", {-1.0, 0.0, 0.0}}};
+        I.edited["outlet"] = {{"point", run["path"].back()}, {"normal", {1.0, 0.0, 0.0}}};
+        I.edited["fluid"] = "water";
+        I.edited["mean_velocity_ms"] = I.fidelityCase == 0 ? nlohmann::json() : nlohmann::json(1.0);
+        I.edited["flow_m3s"] = nullptr;
+        I.edited.erase("density_kgm3");
+        I.edited.erase("viscosity_pas");
+        if (I.fidelityCase == 1) {
+            I.edited["density_kgm3"] = nullptr; I.edited["viscosity_pas"] = nullptr;
+        } else if (I.fidelityCase == 2) I.edited["density_kgm3"] = 997.0;
+        else if (I.fidelityCase == 3) {
+            I.edited["density_kgm3"] = 997.0; I.edited["viscosity_pas"] = 0.0008;
+        } else if (I.fidelityCase == 4) I.edited["density_kgm3"] = nullptr;
+        else if (I.fidelityCase == 5) {
+            I.edited["density_kgm3"] = nullptr; I.edited["viscosity_pas"] = 0.0008;
+        }
+        siNext(); break;
+    }
+    case 271:
+        if (siWriteText(I.edited.dump(2), "##t", I.editorWindow.c_str())) siNext();
+        break;
+    case 272:
+        if (!siSeek("Apply parameters", p, I.editorWindow.c_str())) return;
+        siGesture(p, p, false, "Apply real native CFD draft to exercise null rate and paired custom fluid semantics");
+        siNext(); break;
+    case 273: {
+        auto& pp = st.simManager->piping();
+        const bool accepted = I.fidelityCase == 3 || I.fidelityCase == 4;
+        const char* error = I.fidelityCase == 0 ? "CFD needs exactly one non-null finite positive velocity or flow." :
+                                                "Custom CFD density and viscosity must both be finite positive numbers.";
+        if (!accepted && !siSeek(error, p)) return;
+        const auto current = pp.setupDefinition(ui::PipingPanel::Form::Flow);
+        if (!check(accepted ? "piping_cfd_paired_custom_or_lone_null_applied" :
+                             "piping_cfd_null_rate_or_unpaired_custom_refused_atomically",
+                   accepted ? current == I.edited : current == I.before,
+                   {{"case", I.fidelityCase}, {"draft", I.edited}, {"native_setup", current},
+                    {"rendered_items", ui::audit::observedItems()}})) return;
+        if (accepted) {
+            nlohmann::json listed, persisted;
+            std::string error;
+            if (!st.worker.call("sim_study_list", {{"doc_id", I.doc}}, listed, error)) {
+                siFail("piping_cfd_native_store", error); return;
+            }
+            for (const auto& record : listed.value("studies", nlohmann::json::array())) {
+                const auto parameters = record.value("params", nlohmann::json::object());
+                if (record.value("type", std::string()) == "pipe_flow" &&
+                    parameters.value("network_id", std::string()) == pp.networkStudyId() &&
+                    parameters.value("run_id", std::string()) == I.edited.value("run_id", std::string()))
+                    persisted = parameters;
+            }
+            bool exact = !persisted.empty() && persisted.value("fluid", std::string()) == "water" &&
+                persisted.value("mean_velocity_ms", 0.0) == 1.0 &&
+                persisted.contains("flow_m3s") && persisted["flow_m3s"].is_null();
+            for (const char* key : {"density_kgm3", "viscosity_pas"}) {
+                exact &= persisted.contains(key) == I.edited.contains(key);
+                if (I.edited.contains(key) && persisted.contains(key)) exact &= persisted[key] == I.edited[key];
+            }
+            if (!check("piping_cfd_nullable_rate_and_custom_pair_native_persistence", exact, persisted)) return;
+        }
+        if (siFocusDraft("##t", I.editorWindow.c_str())) siNext();
+        break;
+    }
+    case 274: {
+        nlohmann::json draft;
+        if (!siReadDraft(draft, "##t", I.editorWindow.c_str())) return;
+        if (!check("piping_cfd_native_editor_retains_exact_draft", draft == I.edited, draft)) return;
+        if (++I.fidelityCase < 6) siGo(270);
+        else siGo(20);
+        break;
+    }
+    case 20:
+        st.simManager->handleCommand(st, "sim_piping_route");
+        st.ribbonTab = ui::kRibbonTabPiping;
+        siNext(); break;
+    case 21:
+        if (!siSeek("Start from face", q) || !siFacePoint(st)) return;
+        siGesture(I.facePoint, q, true, "Drag real CAD face to piping route start");
+        siNext(); break;
+    case 22: {
+        auto& pipe = st.simManager->piping();
+        const auto endpoints = pipe.routeEndpoints();
+        if (!check("piping_face_endpoint", endpoints["start"].value("face", nlohmann::json()).value("_pick", nlohmann::json()) ==
+                   nlohmann::json({{"body", I.face.body_id}, {"topo", I.face.topo_id}}), endpoints)) return;
+        nlohmann::json stored;
+        if (!siStudy(st, I.doc, pipe.networkStudyId(), stored)) return;
+        if (!check("piping_endpoint_native_store", stored["params"].value("route_inputs", nlohmann::json()) ==
+                   endpoints, stored)) return;
+        I.capture = I.dir + "/04_piping_face.png";
+        I.afterCapture = [](AppState& state) { state.simManager->handleCommand(state, "sim_piping_vessel"); };
+        siNext(); break;
+    }
+    case 23:
+        if (!siDragItems("Vertical receiver", "Apply preset here", "Copy vertical receiver preset to vessel setup")) return;
+        siNext(); break;
+    case 24: {
+        const auto parameters = st.simManager->piping().setupDefinition(ui::PipingPanel::Form::Vessel);
+        if (!check("vessel_preset_native_values", parameters.value("orientation", std::string()) == "vertical" &&
+                   parameters.value("inner_diameter_mm", 0.0) == 1000.0 &&
+                   parameters.value("tan_tan_length_mm", 0.0) == 2000.0 &&
+                   parameters.value("fill_fraction", -1.0) == 0.0, parameters)) return;
+        nlohmann::json studies, persisted;
+        std::string error;
+        if (!st.worker.call("sim_study_list", {{"doc_id", I.doc}}, studies, error, 15000) ||
+            !studies.is_object() || studies.contains("code")) { siFail("vessel_native_store", error.empty() ? studies.dump() : error); return; }
+        for (const auto& study : studies.value("studies", nlohmann::json::array()))
+            if (study.value("type", std::string()) == "vessel") persisted = study.value("params", nlohmann::json::object());
+        if (!check("vessel_preset_persisted", persisted == parameters, persisted)) return;
+        I.capture = I.dir + "/05_vessel_preset.png";
+        I.afterCapture = [&I](AppState& state) {
+            state.simManager->handleCommand(state, "sim_firmware_setup");
+            I.before = state.simManager->activeFirmwareScenario();
+        };
+        siNext(); break;
+    }
+    case 25:
+        if (!siDragItems("GPIO edges", "Drop stimulus here to add track", "Drop GPIO stimulus into native firmware scenario")) return;
+        siNext(); break;
+    case 26: {
+        const auto scenario = st.simManager->activeFirmwareScenario();
+        const size_t before = I.before.is_object() ? I.before.value("tracks", nlohmann::json::array()).size() : 0;
+        if (!check("firmware_track_drop", scenario.is_object() &&
+                   scenario.value("tracks", nlohmann::json::array()).size() == before + 1 &&
+                   scenario["tracks"].back().value("kind", std::string()) == "gpio_edges", scenario)) return;
+        I.capture = I.dir + "/06_firmware_stimulus.png";
+        I.report["not_run"].push_back({{"name", "firmware_emulator_execution"},
+            {"reason", "This isolated scenario authors setup tracks, not firmware source or an ELF; no emulator execution is claimed."}});
+        I.afterCapture = [&I](AppState& st) {
+        nlohmann::json schematic;
+        std::string err;
+        if (!st.worker.call("ecad_design", {{"request", "RC low-pass filter with 1000 Hz cutoff"},
+                    {"name", "Interactive RC circuit"}}, schematic, err) ||
+            schematic.contains("code") || !schematic.value("ok", false)) {
+            siFail("circuit_recipe", err.empty() ? schematic.dump() : err); return;
+        }
+        st.addEcadTab("sch", schematic.value("doc_id", std::string()), schematic.value("revision", 0),
+                      "Interactive RC circuit");
+        st.switchToTab(I.partTab);
+        };
+        siNext(); break;
+    }
+    case 27:
+        st.simManager->handleCommand(st, "sim_circuit_ac");
+        siNext(); break;
+    case 28:
+        if (!siDragItems("V(OUT)", "Copy-drop a native probe here", "Copy native RC output-voltage probe into circuit setup")) return;
+        siNext(); break;
+    case 29: {
+        const auto parameters = st.simManager->electronicsSetup();
+        const auto probes = parameters["study"].value("probes", nlohmann::json::array());
+        if (!check("circuit_probe_copy", std::count(probes.begin(), probes.end(), nlohmann::json("V(OUT)")) == 1,
+                   parameters)) return;
+        I.before = parameters;
+        if (!siDragItems("V(OUT)", "Copy-drop a native probe here", "Repeat circuit probe copy without duplicate")) return;
+        siNext(); break;
+    }
+    case 30:
+        if (!check("circuit_probe_duplicate_safe", st.simManager->electronicsSetup() == I.before,
+                   st.simManager->electronicsSetup())) return;
+        I.capture = I.dir + "/07_native_circuit_probe.png";
+        I.afterCapture = [&I](AppState& st) {
+        st.simManager->handleCommand(st, "sim_new_thermal_fea");
+        I.study = st.simManager->activeStudyId();
+        I.edited = st.simManager->activeStudyDefinition();
+        I.edited["material"] = {{"k_w_mk", 160.0}, {"cp_j_kgk", 900.0}, {"density_g_cm3", 2.7}};
+        I.edited["transient"] = {{"t_end_s", 0.2}, {"dt_s", 0.01}, {"t_init_c", 20.0},
+                                 {"frame_times_s", {0.0, 0.1, 0.2}}, {"capacitance", "lumped"}};
+        I.edited["fixtures"] = nlohmann::json::array();
+        I.edited["loads"] = nlohmann::json::array({{{"faces", nlohmann::json::array({I.faceSelector})},
+            {"type", "flux"}, {"magnitude", 10000.0}, {"schedule", {{"duty", 0.25}, {"period_s", 0.1}}}}});
+        I.edited["fineness"] = 0.2;
+        I.edited["mesh_order"] = 1;
+        st.simManager->handleCommand(st, "sim_parameters");
+        };
+        siNext(); break;
+    case 31:
+        if (siWriteText(I.edited.dump(2))) siNext();
+        break;
+    case 32:
+        if (!siSeek("Apply parameters", p)) return;
+        siGesture(p, p, false, "Apply pulsed thermal schedule and exact native frame times");
+        siNext(); break;
+    case 33: {
+        const auto definition = st.simManager->activeStudyDefinition();
+        if (!check("thermal_native_editor_applied", definition.value("transient", nlohmann::json()) ==
+                   I.edited["transient"] && definition["loads"][0].value("schedule", nlohmann::json()) ==
+                   I.edited["loads"][0]["schedule"], definition)) return;
+        if (!siSeek("Run Thermal FEA", p)) return;
+        siGesture(p, p, false, "Run real transient conduction using pulsed native schedule");
+        siNext(); break;
+    }
+    case 34:
+    case 35:
+        siNext(); break;  // native asynchronous export/preparation may still be launching
+    case 36: {
+        if (st.simManager->runUi().running) return;
+        const auto result = st.simManager->activeStudyResult();
+        if (!result.is_object() || !result.value("transient", false)) return;
+        bool middle = false, end = false, scheduled = false;
+        for (const auto& frame : result.value("frames", nlohmann::json::array())) {
+            const double t = frame.value("t_s", -1.0);
+            middle |= std::abs(t - 0.1) < 1e-6;
+            end |= std::abs(t - 0.2) < 1e-6;
+        }
+        for (const auto& flux : result.value("flux_summary", nlohmann::json::array()))
+            scheduled |= flux.value("scheduled", false) && flux.value("q_w_m2", 0.0) == 10000.0;
+        if (!check("thermal_native_schedule_and_frames_executed", middle && end && scheduled &&
+                   result.value("n_steps", 0) >= 20, result)) return;
+        I.pulsedFinalC = result["summary"].value("final_max_temp_c", 20.0);
+        I.edited = st.simManager->activeStudyDefinition();
+        I.edited["loads"][0]["schedule"]["duty"] = 1.0;
+        I.afterCapture = [](AppState& state) { state.simManager->handleCommand(state, "sim_parameters"); };
+        I.capture = I.dir + "/08_pulsed_thermal_result.png";
+        siNext(); break;
+    }
+    case 37:
+        if (siWriteText(I.edited.dump(2))) siNext();
+        break;
+    case 38:
+        if (!siSeek("Apply parameters", p)) return;
+        siGesture(p, p, false, "Change native thermal duty to continuous heating");
+        siNext(); break;
+    case 39:
+        if (!check("thermal_edit_invalidates_result", st.simManager->activeStudyResult().empty(),
+                   st.simManager->activeStudyResult())) return;
+        if (!siSeek("Run Thermal FEA", p)) return;
+        siGesture(p, p, false, "Run continuous heating with otherwise identical native inputs");
+        siNext(); break;
+    case 40: {
+        if (st.simManager->runUi().running) return;
+        const auto result = st.simManager->activeStudyResult();
+        if (!result.is_object() || !result.value("transient", false)) return;
+        const double continuous = result["summary"].value("final_max_temp_c", 20.0);
+        if (!check("thermal_duty_changes_solver_output", continuous > I.pulsedFinalC + 1e-4,
+                   {{"pulsed_final_max_temp_c", I.pulsedFinalC},
+                    {"continuous_final_max_temp_c", continuous}, {"native_result", result}})) return;
+        I.capture = I.dir + "/09_continuous_thermal_result.png";
+        I.afterCapture = [&I](AppState& st) {
+        st.simManager->handleCommand(st, "sim_new_flow");
+        st.simManager->configureActiveFlow(st, 0, 7.0f, 3.0f, 0);
+        st.simManager->handleCommand(st, "sim_flow_bc");
+        I.before = st.simManager->activeStudyDefinition();
+        };
+        siNext(); break;
+    }
+    case 41:
+        if (!siDragItems("-Y", "Drop direction preset", "Drop incoming-flow direction while retaining exact angles")) return;
+        siNext(); break;
+    case 42: {
+        const auto definition = st.simManager->activeStudyDefinition();
+        if (!check("flow_direction_native_store", definition["flow"].value("dir", -1) == 3 &&
+                   definition["flow"]["aoa"] == I.before["flow"]["aoa"] &&
+                   definition["flow"]["sideslip"] == I.before["flow"]["sideslip"], definition)) return;
+        I.capture = I.dir + "/10_flow_direction.png";
+        I.afterCapture = [](AppState& st) {
+        st.simManager->handleCommand(st, "sim_new_topology");
+        st.simManager->handleCommand(st, "sim_fixture");
+        };
+        siNext(); break;
+    }
+    case 43:
+        if (st.simManager->wantsViewportFacePick(st)) {
+            if (!siSeek("Picking\xe2\x80\xa6", p)) return;
+            siGesture(p, p, false, "Disarm topology click-picking before drag");
+            return;
+        }
+        if (!siSeek("Drop a face here", q) || !siFacePoint(st)) return;
+        siGesture(I.facePoint, q, true, "Drag real domain face to topology native fixture");
+        siNext(); break;
+    case 44: {
+        const auto definition = st.simManager->activeTopologyStudy();
+        const auto fixtures = definition.value("fixtures", nlohmann::json::array());
+        bool picked = false;
+        for (const auto& fixture : fixtures)
+            for (const auto& face : fixture.value("faces", nlohmann::json::array()))
+                picked |= face.value("_pick", nlohmann::json()) ==
+                          nlohmann::json({{"body", I.face.body_id}, {"topo", I.face.topo_id}});
+        if (!check("topology_face_native_fixture", picked, definition)) return;
+        I.capture = I.dir + "/11_topology_face.png";
+        I.afterCapture = [](AppState& st) {
+        st.simManager->handleCommand(st, "sim_em_sweep");
+        st.simManager->handleCommand(st, "sim_em_boundary");
+        };
+        siNext(); break;
+    }
+    case 45:
+        if (!siExpand("Standard waveguide palette", "Expand actual waveguide setup palette")) return;
+        siNext(); break;
+    case 46:
+        if (!siDragItems("WR-75", "Apply waveguide preset", "Copy WR-75 waveguide preset into EM setup")) return;
+        siNext(); break;
+    case 47: {
+        const auto parameters = st.simManager->activeEmParameters();
+        if (!check("em_waveguide_native_parameters", parameters.value("standard", std::string()) == "WR-75",
+                   parameters)) return;
+        I.capture = I.dir + "/12_em_waveguide.png";
+        I.afterCapture = [&I](AppState& st) {
+        SimAuditShot assembly;
+        assembly.dir = I.dir;
+        const std::string why = saBuildMotionAssembly(st, assembly);
+        if (!why.empty()) { siFail("motion_assembly", why); return; }
+        I.doc = assembly.asmDoc;
+        std::string ground;
+        for (const auto& component : st.docMirror.tree().value("components", nlohmann::json::array()))
+            if (component.value("name", std::string()) == "Ground") ground = component.value("id", std::string());
+        const auto mates = st.docMirror.tree().value("mates", nlohmann::json::array());
+        if (ground.empty() || mates.empty()) { siFail("motion_mates", st.docMirror.tree().dump()); return; }
+        I.mateA = mates[0].value("id", std::string());
+        const auto offset = nlohmann::json::array({1, 0, 0, 0, 0, 1, 0, 40, 0, 0, 1, 70, 0, 0, 0, 1});
+        auto inserted = st.docMirror.applyOps(st.worker, nlohmann::json::array({{
+            {"op", "asm_insert_component"}, {"source", {{"path", I.dir + "/simaudit_motion_arm.step+"}}},
+            {"name", "Second arm"}, {"fixed", false}, {"transform", offset}}}));
+        const auto arm = inserted.id_map.value("$0", std::string());
+        if (!inserted.ok || arm.empty()) { siFail("motion_second_arm", inserted.error_message); return; }
+        const auto refs = nlohmann::json::array({
+            {{"component", ground}, {"selector", {{"kind", "face"}, {"centroid", {0.0, 0.0, 5.0}}}}},
+            {{"component", arm}, {"selector", {{"kind", "face"}, {"centroid", {0.0, 0.0, 25.0}}}}}});
+        auto added = st.docMirror.applyOps(st.worker, nlohmann::json::array({{
+            {"op", "asm_add_mate"}, {"mate", {{"type", "distance"}, {"value", {{"value", 70.0}, {"expr", nullptr}}},
+                {"align", "aligned"}, {"suppressed", false}, {"refs", refs}}}}}));
+        I.mateB = added.id_map.value("$0", std::string());
+        if (!added.ok || I.mateB.empty()) { siFail("motion_second_mate", added.error_message); return; }
+        if (!added.aicm_path.empty()) { std::string err; st.loadDocMesh(added.aicm_path, err); }
+        };
+        siNext(); break;
+    }
+    case 48: {
+        st.simManager->handleCommand(st, "sim_new_motion");
+        I.study = st.simManager->activeStudyId();
+        auto definition = st.simManager->activeStudyDefinition();
+        definition["motion"]["drivers"] = nlohmann::json::array({
+            {{"mate_id", I.mateA}, {"start", 60.0}, {"stop", 100.0}},
+            {{"mate_id", I.mateB}, {"start", 70.0}, {"stop", 85.0}}});
+        std::string error;
+        if (!st.simManager->configureActiveStudy(st, definition, error)) { siFail("motion_setup", error); return; }
+        I.before = st.simManager->activeStudyDefinition();
+        st.simManager->handleCommand(st, "sim_motion_setup");
+        siNext(); break;
+    }
+    case 49:
+        if (!siDragItems("Move Driver 2", "Move Driver 1", "Reorder second real assembly driver before first")) return;
+        siNext(); break;
+    case 50: {
+        nlohmann::json persisted;
+        if (!siStudy(st, I.doc, I.study, persisted)) return;
+        const auto drivers = persisted["motion"].value("drivers", nlohmann::json::array());
+        const auto before = I.before["motion"]["drivers"];
+        if (!check("motion_reorder_preserves_native_ranges", drivers.size() == 2 &&
+                   drivers[0] == before[1] && drivers[1] == before[0], persisted)) return;
+        I.capture = I.dir + "/13_motion_driver_reorder.png";
+        I.report["ok"] = true;
+        I.report["seconds"] = pipingNow() - I.started;
+        I.done = true;
+        std::printf("siminteractive: PASS checks=%zu report=%s/report.json\n", I.report["checks"].size(), I.dir.c_str());
+        std::fflush(stdout);
+        break;
+    }
+    }
+}
+
+bool simInteractiveEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& done) {
+    auto& I = g_si;
+    if (!I.want) return false;
+    ++st.frame;
+    if (!I.capture.empty()) {
+        writeBackbufferPng(I.capture.c_str(), dw, dh, I.done ? screenshotPath : nullptr);
+        I.report["captures"].push_back(I.capture);
+        I.capture.clear();
+    }
+    std::ofstream out(I.dir + "/report.json", std::ios::trunc);
+    out << I.report.dump(2) << '\n';
+    out.close();
+    glfwSwapBuffers(st.win);
+    done = I.done;
+    if (done && I.failed) { std::fflush(nullptr); std::_Exit(EXIT_FAILURE); }
+    return true;
+}
+
+
+// Empty-document drawing regression: all geometric edits begin as real viewport
+// pointer/keyboard events; only the custom-K editor uses its canonical submitEdit API.
+struct PipeDrawShot {
+    bool init = false, want = false, done = false, failed = false;
+    bool qualityCombo = false;
+    int step = 0, settle = 0;
+    double started = 0, stepStart = 0, cfdStart = 0, applyStart = 0, cfdDoneAt = 0;
+    std::string dir, capture, queued, elbow;
+    nlohmann::json report;
+    SceneShotInput input;
+    int sweepFrames = 0;
+    float sweepZoom = 0, sweepRadius = 0;
+    bool sweepStable = true;
+    std::vector<std::string> planeRunIds;
+    std::size_t planeElbows = 0;
+};
+PipeDrawShot g_pd;
+
+void pipeDrawFail(const char* code, const std::string& detail) {
+    auto& P = g_pd;
+    P.done = P.failed = true; P.queued.clear(); P.report["ok"] = false;
+    P.report["failure"] = {{"code", code}, {"detail", detail}, {"step", P.step}};
+    P.report["items_at_failure"] = ui::audit::observedItems();
+    P.capture = P.dir + "/pipedraw_FAILED.png";
+    ImGui::GetIO().AddMouseButtonEvent(0, false);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
+    std::printf("pipedraw: FAILED [%s] %s\n", code, detail.c_str());
+    std::fflush(stdout);
+}
+
+void pipeDrawTick(AppState& st) {
+    auto& P = g_pd;
+    if (!P.init) {
+        P.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        P.want = st.shot && mode && std::strcmp(mode, "pipedraw") == 0;
+        if (P.want) {
+            const char* repo = std::getenv("CHUDWARE_REPO");
+            P.dir = std::string(repo ? repo : ".") + "/scratch/pipedraw_shots";
+            std::error_code ec; std::filesystem::create_directories(P.dir, ec);
+            P.started = P.stepStart = pipingNow();
+            P.report = {{"scenario", "pipedraw"}, {"ok", false},
+                {"checks", nlohmann::json::array()}, {"skipped", nlohmann::json::array()},
+                {"captures", nlohmann::json::array()}, {"input", nlohmann::json::array()}};
+        }
+    }
+    if (!P.want || P.done) return;
+    ui::audit::observedItems();
+    if (pipingNow() - P.started > 600 || pipingNow() - P.stepStart > (P.step == 27 ? 210 : 180)) {
+        pipeDrawFail("timeout", "scenario/action exceeded its wall-clock deadline"); return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !P.capture.empty()) return;
+    if (P.settle > 0) { --P.settle; return; }
+    if (!P.queued.empty()) { P.capture = P.queued; P.queued.clear(); return; }
+    auto next = [&](int step) { P.step = step; P.stepStart = pipingNow(); if (P.queued.empty()) P.settle = 3; };
+    auto shoot = [&](const char* name) { P.queued = P.dir + "/" + name; P.settle = 16; };
+    auto check = [&](const char* name, bool ok, const nlohmann::json& evidence) {
+        P.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+        if (!ok) pipeDrawFail(name, evidence.dump());
+        return ok;
+    };
+    auto click = [&](const std::array<float, 3>& world) {
+        ImVec2 p;
+        if (!sceneShotPoint(st, world.data(), p)) {
+            pipeDrawFail("projection", "chosen world point is outside the clear viewport"); return false;
+        }
+        if (!P.input.click(p)) return false;
+        P.report["input"].push_back({{"kind", "viewport_click"}, {"world", world}, {"screen", {p.x, p.y}}});
+        return true;
+    };
+    auto button = [&](const char* label) {
+        if (P.input.phase > 0) return P.input.click(P.input.point);
+        const auto* item = shotItem(label);
+        if (!item) { shotScrollTo(label); return false; }
+        return P.input.click(shotPoint(*item));
+    };
+    auto fieldButton = [&](const char* group, const char* field) {
+        if (P.input.phase > 0) return P.input.click(P.input.point);
+        const nlohmann::json* target = nullptr;
+        for (const auto& item : ui::audit::observedItems()) {
+            if (!item.value("enabled", true) || item.value("native_label", std::string()) != "##combo") continue;
+            const auto name = item.value("window", std::string());
+            if (name.find("SimulationManager") == std::string::npos) continue;
+            const auto* window = ImGui::FindWindowByName(name.c_str());
+            if (!window) continue;
+            // kit::FieldGroup -> beginField(id) -> comboCore("##combo").
+            // Match that exact scoped native ID, never another card's hidden combo.
+            const auto groupId = ImHashStr(group, 0, window->ID);
+            const auto fieldId = ImHashStr(field, 0, groupId);
+            if (item.value("id", ImGuiID(0)) == ImHashStr("##combo", 0, fieldId)) {
+                target = &item; break;
+            }
+        }
+        if (!target) {
+            const std::string seek = std::string("pipedraw_field_") + group + "_" + field;
+            shotScrollTo(seek.c_str());
+            return false;
+        }
+        if (!target->value("visible", false)) {
+            shotScrollTo("##combo", (*target)["window"].get_ref<const std::string&>().c_str(), true);
+            return false;
+        }
+        return P.input.click(shotPoint(*target));
+    };
+    auto* sm = st.simManager;
+    if (P.step > 1 && !sm) { pipeDrawFail("manager", "Simulation manager missing"); return; }
+    auto ready = [&]() {
+        return sm && !st.rpc.busy() && !sm->piping().busy() && !sm->piping().editPending();
+    };
+    auto fittings = [&](const char* type) {
+        auto out = nlohmann::json::array();
+        for (const auto& f : sm->piping().network().value("fittings", nlohmann::json::array()))
+            if (f.value("type", std::string()) == type) out.push_back(f);
+        return out;
+    };
+    const std::array<float, 3> a{-300,-150,0}, b{300,-150,0}, c{300,250,0},
+        d{300,250,300}, tee{0,-150,0}, end{0,-450,0};
+    switch (P.step) {
+    case 0: {
+        std::string err;
+        if (!st.docMirror.newPart(st.worker, err)) { pipeDrawFail("new_part", err); return; }
+        st.clearViewportForNewDoc();
+        st.addDocTab(false);
+        st.planesUserToggled = st.axesUserToggled = st.originUserToggled = true;
+        for (auto& p : st.showPlane) p = false;
+        for (const char* id : {"axis.x", "axis.y", "axis.z", "point.origin"}) st.hiddenFeatures.insert(id);
+        st.yaw = 35; st.pitch = 35; st.zoom = 0.05f;
+        st.pan[0] = 0; st.pan[1] = -50; st.pan[2] = 100;
+        st.renderer->setOrthographic(true);
+        next(1); return;
+    }
+    case 1:
+        if (!sm || st.rpc.busy()) return;
+        st.activeWorkspace = AppState::Workspace::Simulate;
+        st.leftPaneTab = AppState::LP_Simulation; st.showSimulationTools = st.showRibbon = true;
+        sm->handleCommand(st, "sim_piping_new");
+        next(2); return;
+    case 2:
+        if (!ready()) return;
+        if (!check("fresh_empty_document", !st.hasDocMesh &&
+            sm->piping().network().value("runs", nlohmann::json::array()).empty(), {{"has_doc_mesh", st.hasDocMesh}})) return;
+        sm->handleCommand(st, "sim_piping_draw");
+        sm->piping().drawSettings().plane = 0;
+        sm->piping().drawSettings().autoPlane = false;
+        sm->piping().drawSettings().gridMm = 50;
+        if (!check("draw_command_armed", sm->piping().tool() == ui::PipingPanel::Tool::DrawRun, {})) return;
+        shoot("pipedraw_00_empty.png"); next(3); return;
+    case 3: if (click(a)) next(50); return;
+    case 4: if (click(b)) next(5); return;
+    case 5: if (click(c)) next(6); return;
+    case 6: if (P.input.key(ImGuiKey_Enter)) next(7); return;
+    case 7: {
+        if (!ready()) return;
+        const auto elbows = fittings("elbow");
+        if (!check("l_run_and_elbow", sm->piping().network().value("runs", nlohmann::json::array()).size() == 1 &&
+            elbows.size() == 1, sm->piping().network())) return;
+        P.elbow = elbows[0].value("id", std::string());
+        sm->piping().setTool(st, ui::PipingPanel::Tool::None);
+        shoot("pipedraw_01_l_run.png"); next(8); return;
+    }
+    case 8:
+        sm->handleCommand(st, "sim_piping_draw");
+        // Finish returns to Auto; this existing one-Tab riser begins explicitly on XY.
+        sm->piping().drawSettings().plane = 0;
+        sm->piping().drawSettings().autoPlane = false;
+        if (click(c)) next(9); return;
+    case 9:
+        if (P.input.key(ImGuiKey_Tab)) next(10); return;
+    case 10:
+        if (!check("tab_switched_plane", sm->piping().drawSettings().plane == 1 &&
+            !sm->piping().drawSettings().autoPlane, {})) return;
+        if (click(d)) next(11); return;
+    case 11: if (P.input.key(ImGuiKey_Enter)) next(12); return;
+    case 12: {
+        if (!ready()) return;
+        const auto runs = sm->piping().network().value("runs", nlohmann::json::array());
+        bool vertical = false;
+        for (const auto& run : runs) {
+            const auto path = run.value("path", nlohmann::json::array());
+            if (path.size() != 2) continue;
+            vertical |= std::fabs(path[0][0].get<double>() - 300) < 0.1 &&
+                std::fabs(path[1][0].get<double>() - 300) < 0.1 &&
+                std::fabs(path[0][1].get<double>() - 250) < 0.1 &&
+                std::fabs(path[1][1].get<double>() - 250) < 0.1 &&
+                std::fabs(path[0][2].get<double>()) < 0.1 &&
+                std::fabs(path[1][2].get<double>() - 300) < 0.1;
+        }
+        if (!check("vertical_leg", runs.size() == 2 && vertical, sm->piping().network())) return;
+        sm->piping().setTool(st, ui::PipingPanel::Tool::None);
+        shoot("pipedraw_02_riser.png"); next(13); return;
+    }
+    case 13:
+        sm->handleCommand(st, "sim_piping_draw");
+        if (P.input.key(ImGuiKey_Tab)) next(14); return;
+    case 14: if (P.input.key(ImGuiKey_Tab)) next(15); return;
+    case 15:
+        // The new fourth Tab state is Auto, not XY. Choose XY for this branch explicitly.
+        sm->piping().drawSettings().plane = 0;
+        sm->piping().drawSettings().autoPlane = false;
+        if (click(tee)) next(16); return;
+    case 16: if (click(end)) next(17); return;
+    case 17: if (P.input.key(ImGuiKey_Enter)) next(18); return;
+    case 18:
+        if (!ready()) return;
+        if (!check("branch_tee_split", fittings("tee").size() == 1 &&
+            sm->piping().network().value("runs", nlohmann::json::array()).size() == 4, sm->piping().network())) return;
+        sm->piping().setTool(st, ui::PipingPanel::Tool::None);
+        shoot("pipedraw_03_branch.png"); next(19); return;
+    case 19:
+        sm->handleCommand(st, "sim_piping_fitting");
+        sm->piping().setTool(st, ui::PipingPanel::Tool::None);
+        sm->piping().drawSettings().insertType = "valve";
+        sm->piping().drawSettings().insertParams = {{"valve_type", "gate"}};
+        next(195); return;
+    case 195: {
+        ImVec2 p;
+        if (P.input.phase == 0 && !siFooterAction("Place fitting", p)) {
+            shotScrollTo("Place fitting"); return;
+        }
+        if (P.input.click(P.input.phase == 0 ? p : P.input.point)) next(196);
+        return;
+    }
+    case 196:
+        if (!check("place_fitting_footer_armed", sm->piping().tool() == ui::PipingPanel::Tool::InsertFitting, {})) return;
+        if (click({-150,-150,0})) next(20); return;
+    case 20: {
+        if (!ready()) return;
+        const auto valves = fittings("valve");
+        if (!check("gate_valve_attached", valves.size() == 1 && !valves[0].value("run_id", std::string()).empty() &&
+            valves[0].value("params", nlohmann::json::object()).value("valve_type", std::string()) == "gate", valves)) return;
+        sm->piping().setTool(st, ui::PipingPanel::Tool::None);
+        shoot("pipedraw_04_valve.png"); next(21); return;
+    }
+    case 21: {
+        if (!ready()) return;
+        nlohmann::json op = {{"op", "add_fitting"}, {"type", "custom"}, {"at", {150,-150,0}},
+            {"params", {{"label", "Demo constant loss"}, {"k_model", {{"kind", "constant"}, {"K", 2.5}}}}}};
+        if (!sm->piping().submitEdit(st, nlohmann::json::array({op}), "Custom fitting added")) {
+            pipeDrawFail("custom_submit", sm->piping().lastError()); return;
+        }
+        next(22); return;
+    }
+    case 22: {
+        if (!ready()) return;
+        const auto custom = fittings("custom");
+        if (!check("custom_constant_k", custom.size() == 1 &&
+            custom[0].value("params", nlohmann::json::object()).value("k_model", nlohmann::json::object()) ==
+                nlohmann::json{{"kind", "constant"}, {"K", 2.5}}, custom)) return;
+        shoot("pipedraw_05_custom.png"); next(290); return;
+    }
+    // A second connected polyline changes planes without Enter/finish between points.
+    // Keep it after the original run-count checks; its demand is at the new far endpoint.
+    case 290:
+        if (!ready()) return;
+        P.planeRunIds.clear();
+        for (const auto& run : sm->piping().network()["runs"])
+            P.planeRunIds.push_back(run.value("id", std::string()));
+        P.planeElbows = fittings("elbow").size();
+        sm->handleCommand(st, "sim_piping_draw");
+        sm->piping().drawSettings().plane = 0;
+        sm->piping().drawSettings().autoPlane = false;
+        sm->piping().drawSettings().planeOffsetMm = 300;
+        next(291); return;
+    case 291: if (click(d)) next(292); return;
+    case 292:
+        if (P.input.key(ImGuiKey_Tab)) {
+            if (sm->piping().drawSettings().plane == 1 && !sm->piping().drawSettings().autoPlane)
+                next(293);
+        }
+        return;
+    case 293: if (click({300,250,500})) next(294); return;
+    case 294:
+        sm->piping().drawSettings().plane = 0;
+        sm->piping().drawSettings().autoPlane = false;
+        next(295); return;
+    case 295: if (click({100,250,500})) next(296); return;
+    case 296: if (P.input.key(ImGuiKey_Enter)) next(297); return;
+    case 297: {
+        if (!ready()) return;
+        nlohmann::json committed = nlohmann::json::object();
+        for (const auto& run : sm->piping().network()["runs"])
+            if (std::find(P.planeRunIds.begin(), P.planeRunIds.end(), run.value("id", std::string())) == P.planeRunIds.end())
+                committed = run;
+        const auto path = committed.value("path", nlohmann::json::array());
+        bool changedPlane = path.size() == 3;
+        const double expected[3][3] = {{300,250,300}, {300,250,500}, {100,250,500}};
+        if (changedPlane) for (int i = 0; i < 3; ++i) for (int k = 0; k < 3; ++k)
+            changedPlane &= std::fabs(path[i][k].get<double>() - expected[i][k]) < 0.1;
+        const auto elbows = fittings("elbow").size();
+        if (!check("plane_switch_mid_run", changedPlane &&
+            sm->piping().network()["runs"].size() == P.planeRunIds.size() + 1 &&
+            elbows == P.planeElbows + 1,
+            {{"run", committed}, {"elbows_before", P.planeElbows}, {"elbows_after", elbows},
+             {"gesture", "XY start, Tab to XZ, vertical point, XY through last point, horizontal point, Enter"}})) return;
+        sm->piping().setTool(st, ui::PipingPanel::Tool::None);
+        sm->piping().drawSettings().planeOffsetMm = 0;
+        shoot("pipedraw_05b_plane_switch.png"); next(23); return;
+    }
+    case 23: {
+        if (!ready()) return;
+        nlohmann::json probe; std::string error;
+        const bool called = st.worker.call("piping_fitting_k_cfd_status", {{"job_id", "pipedraw-availability-probe"}}, probe, error, 15000);
+        if (!called || probe.value("reason", std::string()) != "unknown_job") {
+            P.report["skipped"].push_back({{"step", "Quick CFD-K"}, {"status", "SKIP"},
+                {"note", "Python CFD-K worker unavailable"}, {"response", probe}, {"error", error}});
+            next(30); return;
+        }
+        // The plane-switch run leaves the Draw form up; the K editor lives on Fittings.
+        sm->piping().setTool(st, ui::PipingPanel::Tool::None);
+        sm->handleCommand(st, "sim_piping_fitting");
+        sm->piping().selectFitting(st, P.elbow);
+        next(24); return;
+    }
+    case 24:
+        if (fieldButton("loss_fields", "source")) next(25); return;
+    case 25:
+        // A combo click that landed on a pre-reflow rect leaves no popup: reopen it.
+        if (P.input.phase == 0 && !shotItem("From CFD", false) && pipingNow() - P.stepStart > 2.0) {
+            next(24); return;
+        }
+        if (button("From CFD")) next(26); return;
+    case 26:
+        // fieldEnum uses segments when both quality options fit, otherwise ##combo.
+        if (P.input.phase == 0) P.qualityCombo = shotItem("Quick", false) == nullptr;
+        if (P.qualityCombo) {
+            if (fieldButton("fitting_cfd_fields", "quality")) next(260);
+        } else if (button("Quick")) next(261);
+        return;
+    case 260:
+        if (P.input.phase == 0 && !shotItem("Quick", false) && pipingNow() - P.stepStart > 2.0) {
+            next(26); return;
+        }
+        if (button("Quick")) next(261); return;
+    case 261:
+        if (button("Compute K from CFD###compute_k")) { P.cfdStart = pipingNow(); next(27); }
+        return;
+    case 27: {
+        if (pipingNow() - P.cfdStart > 180) {
+            pipeDrawFail("cfd_timeout", sm->piping().fittingCfdState().dump()); return;
+        }
+        const auto cfd = sm->piping().fittingCfdState();
+        const bool cfdDone = cfd.value("state", std::string()) == "done" && cfd.value("has_result", false);
+        if (cfdDone && P.cfdDoneAt <= 0.0) P.cfdDoneAt = pipingNow();
+        // The completion status line reflows the footer; let the layout settle before reading its rect.
+        if (P.input.phase > 0 || (cfdDone && pipingNow() - P.cfdDoneAt > 0.5)) {
+            ImVec2 p;
+            if (P.input.phase == 0 && !siFooterAction("Apply CFD K to fitting", p)) return;
+            if (P.input.click(P.input.phase == 0 ? p : P.input.point)) next(28);
+            return;
+        }
+        // Rendered status text is also captured by the test-engine hooks.
+        for (const auto& item : ui::audit::observedItems()) {
+            if (!item.value("text_only", false)) continue;
+            const auto label = item.value("label", std::string());
+            if (label.find("engine_unavailable") != std::string::npos ||
+                label.find("worker_unavailable") != std::string::npos ||
+                label.find("No module named") != std::string::npos) {
+                P.report["skipped"].push_back({{"step", "Quick CFD-K"}, {"status", "SKIP"}, {"note", label}});
+                next(30); return;
+            }
+        }
+        {
+            const std::string state = cfd.value("state", std::string());
+            if (state == "failed" || state == "refused") {
+                pipeDrawFail("cfd_failed", cfd.dump()); return;
+            }
+        }
+        return;
+    }
+    case 28: {
+        if (!ready()) return;
+        if (P.applyStart <= 0.0) P.applyStart = pipingNow();
+        nlohmann::json elbow = nlohmann::json::object();
+        for (const auto& f : fittings("elbow")) if (f.value("id", std::string()) == P.elbow) elbow = f;
+        const bool applied = elbow.value("params", nlohmann::json::object())
+            .value("k_model", nlohmann::json::object()).value("kind", std::string()) == "table";
+        // The footer click is consumed on the next UI frame; give the edit time to land.
+        if (!applied && pipingNow() - P.applyStart < 15.0) return;
+        if (!check("cfd_table_applied", applied, {{"elbow", elbow}, {"cfd", sm->piping().fittingCfdState()},
+                                                   {"error", sm->piping().lastError()}})) return;
+        shoot("pipedraw_06_cfd_k.png"); next(30); return;
+    }
+    case 30: {
+        if (!ready()) return;
+        sm->handleCommand(st, "sim_piping_solve");
+        auto setup = sm->piping().setupDefinition(ui::PipingPanel::Form::Solve);
+        setup["boundary"] = nlohmann::json::array({{{"at", a}, {"pressure", 300.0}},
+            {{"at", {100,250,500}}, {"demand_lps", 0.5}}, {{"at", end}, {"demand_lps", 0.3}}});
+        setup["network_type"] = "liquid"; setup["fluid"] = {{"name", "water"}, {"T_C", 20}};
+        std::string error;
+        if (!sm->piping().configureSetup(st, ui::PipingPanel::Form::Solve, setup, error)) {
+            pipeDrawFail("solve_setup", error); return;
+        }
+        next(31); return;
+    }
+    case 31:
+        if (!ready()) return;
+        if (!sm->piping().runSolve(st)) { pipeDrawFail("solve_start", sm->piping().lastError()); return; }
+        next(32); return;
+    case 32: {
+        if (!ready()) return;
+        const auto result = sm->piping().solveResult();
+        if (!result.is_object()) { pipeDrawFail("solve_result", sm->piping().lastError()); return; }
+        if (!check("solve_converged", result.value("converged", false), result)) return;
+        double maxResidual = 0, supply = 0, demand = 0;
+        for (const auto& node : result.value("nodes", nlohmann::json::array())) {
+            double net = 0;
+            const auto id = node.value("id", std::string());
+            for (const auto& link : result.value("links", nlohmann::json::array())) {
+                const double q = link.value("flow_m3h", 0.0);
+                if (link.value("from", std::string()) == id) net -= q;
+                if (link.value("to", std::string()) == id) net += q;
+            }
+            if (node.value("fixed", false)) supply -= net;
+            else {
+                const double sink = node.value("demand_m3h", 0.0);
+                demand += sink; maxResidual = std::max(maxResidual, std::fabs(net - sink));
+            }
+        }
+        if (!check("mass_balance", demand > 0 && maxResidual < 0.002 && std::fabs(supply-demand) < 0.002,
+            {{"supply_m3h", supply}, {"demand_m3h", demand}, {"max_node_residual_m3h", maxResidual}})) return;
+        next(33); return;
+    }
+    case 33: if (button("Pressure")) next(34); return;
+    case 34:
+        if (!check("pressure_colour", sm->piping().colorBy() == 1, {})) return;
+        shoot("pipedraw_07_pressure.png"); next(35); return;
+    case 35: {
+        if (!ready()) return;
+        nlohmann::json list, found = nlohmann::json::object(); std::string error;
+        if (!st.worker.call("sim_study_list", {{"doc_id", st.docMirror.docId()}}, list, error, 15000)) {
+            pipeDrawFail("study_list", error); return;
+        }
+        for (const auto& s : list.value("studies", nlohmann::json::array()))
+            if (s.value("id", std::string()) == sm->piping().networkStudyId()) found = s;
+        const auto persisted = found.value("params", nlohmann::json::object()).value("piping", nlohmann::json::object());
+        if (!check("network_fittings_persisted", found.value("type", std::string()) == "piping_network" &&
+            persisted.value("runs", nlohmann::json::array()) == sm->piping().network()["runs"] &&
+            persisted.value("fittings", nlohmann::json::array()) == sm->piping().network()["fittings"] &&
+            found.value("results", nlohmann::json::object()).contains("solve"), found)) return;
+        P.report["ok"] = true; P.report["seconds"] = pipingNow() - P.started;
+        P.done = true; P.capture = P.dir + "/pipedraw_08_final.png"; return;
+    }
+    // With exactly one draft point, exercise the full clear viewport rather than a
+    // small cursor jiggle. Only pointer-position events are sent during this sweep.
+    case 50:
+        P.sweepZoom = st.zoom;
+        P.sweepRadius = st.renderer->effectiveSceneRadius();
+        P.sweepFrames = 0; P.sweepStable = true;
+        P.report["zoom_sweep"] = nlohmann::json::array();
+        next(51); return;
+    case 51: {
+        ImVec2 lo, hi;
+        if (!ui::viewportClearRect(lo, hi)) { pipeDrawFail("zoom_sweep_viewport", "clear viewport unavailable"); return; }
+        const float zoom = st.zoom, radius = st.renderer->effectiveSceneRadius();
+        P.sweepStable &= std::fabs(zoom - P.sweepZoom) <= 1e-6f * std::max(std::fabs(P.sweepZoom), 1e-6f) &&
+            std::fabs(radius - P.sweepRadius) <= 1e-6f * std::max(std::fabs(P.sweepRadius), 1e-6f);
+        const float fractions[6][2] = {{0.1f,0.15f}, {0.9f,0.15f}, {0.1f,0.85f},
+                                      {0.9f,0.85f}, {0.5f,0.25f}, {0.5f,0.75f}};
+        const int position = P.sweepFrames / 2;
+        const ImVec2 p(lo.x + (hi.x-lo.x)*fractions[position][0],
+                       lo.y + (hi.y-lo.y)*fractions[position][1]);
+        ImGui::GetIO().AddMousePosEvent(p.x, p.y);
+        P.report["zoom_sweep"].push_back({{"frame", st.frame}, {"screen", {p.x,p.y}},
+            {"zoom", zoom}, {"scene_radius", radius}});
+        if (++P.sweepFrames == 12) next(52);
+        return;
+    }
+    case 52: {
+        const float zoom = st.zoom, radius = st.renderer->effectiveSceneRadius();
+        const bool stable = P.sweepStable &&
+            std::fabs(zoom - P.sweepZoom) <= 1e-6f * std::max(std::fabs(P.sweepZoom), 1e-6f) &&
+            std::fabs(radius - P.sweepRadius) <= 1e-6f * std::max(std::fabs(P.sweepRadius), 1e-6f);
+        if (!check("zoom_stable_while_drawing", stable && P.sweepFrames >= 12,
+            {{"pointer_positions", 6}, {"sweep_frames", P.sweepFrames}, {"relative_tolerance", 1e-6},
+             {"zoom_before", P.sweepZoom}, {"zoom_after", zoom},
+             {"scene_radius_before", P.sweepRadius}, {"scene_radius_after", radius}})) return;
+        shoot("pipedraw_00b_zoom_stable.png"); next(4); return;
+    }
+    default: return;
+    }
+}
+
+bool pipeDrawEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& done) {
+    auto& P = g_pd;
+    if (!P.want) return false;
+    ++st.frame;
+    if (!P.capture.empty()) {
+        if (!P.failed && P.capture.find("01_l_run") != std::string::npos) {
+            auto pixels = sceneShotPixels(st, {{-200,-150,0}, {100,-150,0}, {300,50,0}});
+            pixels["name"] = "pipe_visible_without_document_mesh";
+            pixels["has_doc_mesh"] = st.hasDocMesh;
+            pixels["ok"] = pixels.value("ok", false) && !st.hasDocMesh;
+            P.report["checks"].push_back(pixels);
+            if (!pixels.value("ok", false)) pipeDrawFail("pipe_invisible", pixels.dump());
+        }
+        writeBackbufferPng(P.capture.c_str(), dw, dh, P.done ? screenshotPath : nullptr);
+        P.report["captures"].push_back(P.capture); P.capture.clear();
+    }
+    std::ofstream out(P.dir + "/pipedraw_report.json", std::ios::trunc);
+    out << P.report.dump(2) << '\n'; out.close();
+    glfwSwapBuffers(st.win);
+    done = P.done;
+    if (!out || (done && (P.failed || !P.report.value("ok", false)))) {
+        std::fflush(nullptr); std::_Exit(EXIT_FAILURE);
+    }
+    return true;
+}
 }  // namespace
 
 namespace ui {
 
 void ScenarioRunner::tick(AppState& st) {
+    // CHUDWARE_IDAUDIT=1: whole-run ImGui ID-conflict detection under any CHUDWARE_SHOT scenario.
+    ui::audit::idAuditAutoStart();
+
     // ---------- manufacturing operator scenario (CHUDWARE_SHOT=manufacture) ----------
     // A hardware-free mirror fixture exercises the explicit Offline banner,
     // capability truth, stale/last-good telemetry, Stage-2 verdicts and a named
@@ -700,96 +5663,141 @@ void ScenarioRunner::tick(AppState& st) {
     }
 
     // ---------- C19 FEA scenario (CHUDWARE_SHOT=fea) ----------
-    // new part -> box 60x40x10 -> static study: fix the -X end face, 100 N -Z on the +X end,
-    // steel (index 0), density 0.4 -> wait for completion (cap ~90 s) -> von Mises colormap.
-    if (st.wantFea && st.workerStarted && !st.feaShotDone) {
-        auto* sim = st.simClient;
+    // new part -> box 60x40x10 -> static study: fix the -X end face, the default 100 N -Z force on
+    // the +X end, steel 1018, mesh density 0.2 -> run -> von Mises colormap. Same frame gate and
+    // idle waits as simaudit's static states (newStudy / run refuse while an engine RPC is in
+    // flight, which is how the old frame-0 sequence silently ended with no study). Prints
+    // "fea: PASS ..." or "fea: FAILED [code] ..." and exits non-zero on failure.
+    if (st.wantFea && st.workerStarted && !st.feaShotDone && st.frame >= 5) {
+        StudyShot& F = g_feaShot;
+        constexpr float kDensity = 0.2f;
+        constexpr double kReadyTimeoutS = 30.0, kRunTimeoutS = 30.0, kResultTimeoutS = 90.0;
         if (st.simManager) st.simManager->tick(st);  // pump so completion lands while we wait
         if (feaSettle > 0) { --feaSettle; }
         else switch (feaStep) {
             case 0: {  // New part + box
-                std::string err;
-                st.docMirror.newPart(st.worker, err);
-                nlohmann::json ops = nlohmann::json::array();
-                ops.push_back({{"op","add_feature"},{"feature",{
-                    {"type","box"},{"name","Box1"},{"params",{
-                        {"length",{{"value",60.0},{"expr",nullptr}}},
-                        {"width", {{"value",40.0},{"expr",nullptr}}},
-                        {"height",{{"value",10.0},{"expr",nullptr}}}},
-                    },{"centered",true}}}});
-                auto r = st.docMirror.applyOps(st.worker, ops);
-                if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
-                std::printf("fea: box ok=%d rev=%d\n", (int)r.ok, r.revision);
+                F.t0 = pipingNow();
+                int rev = 0;
+                const std::string why = studyShotBox(st, F, "Box1", 60.0, 40.0, 10.0, rev);
+                if (!why.empty()) { studyShotFail(F, "fea", "box", why); feaStep = 99; break; }
+                std::printf("fea: box 60x40x10 mm doc=%s rev=%d\n", F.docId.c_str(), rev);
                 std::fflush(stdout);
                 st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
+                F.stepStart = pipingNow();
                 feaSettle = 3; ++feaStep; break;
             }
             case 1: {  // Static study + resolved fixture/load faces (-X end / +X end)
+                if (!studyShotReady(st, F, "fea", kReadyTimeoutS)) {
+                    if (F.failed) feaStep = 99;
+                    break;
+                }
+                ui::SimManager& sm = *st.simManager;
                 st.activeWorkspace = AppState::Workspace::Simulate;
                 st.leftPaneTab = AppState::LP_Simulation;
                 st.showRibbon = true;
                 st.showSimulationTools = true;
-                st.ribbonTab = AppState::RT_Simulation;
-                if (st.simManager) {
-                    st.simManager->handleCommand(st, "sim_new_static");
-                    st.simManager->configureActive(st, 0.2f, "steel_1018");
+                st.ribbonTab = kSaTabStatic;
+                const int before = sm.studyCount();
+                sm.handleCommand(st, "sim_new_static");
+                if (sm.studyCount() != before + 1) {
+                    studyShotFail(F, "fea", "study_not_created",
+                                  "sim_new_static added no study (status: " + st.status + ")");
+                    feaStep = 99; break;
                 }
-                auto faceAtExtremeX = [&](bool wantMax) -> nlohmann::json {
-                    nlohmann::json best; double bestC = wantMax ? -1e30 : 1e30;
-                    for (int tid = 1; tid <= 12; ++tid) {
-                        std::string se;
-                        std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
-                        if (s.empty()) continue;
-                        try {
-                            auto o = nlohmann::json::parse(s);
-                            if (!o.contains("centroid")) continue;
-                            double cx = o["centroid"][0].get<double>();
-                            if ((wantMax && cx > bestC) || (!wantMax && cx < bestC)) { bestC = cx; best = o; }
-                        } catch (...) {}
-                    }
-                    return best;
+                sm.configureActive(st, kDensity, "steel_1018");
+                // -X / +X end faces by centroid, injected exactly as a viewport click resolves them.
+                struct Face { uint32_t tid = 0; nlohmann::json sel; double cx = 0.0; };
+                Face lo, hi;
+                lo.cx = 1e30; hi.cx = -1e30;
+                for (uint32_t tid = 1; tid <= 12; ++tid) {
+                    std::string se;
+                    const std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
+                    if (s.empty()) continue;
+                    nlohmann::json o = nlohmann::json::parse(s, nullptr, false);
+                    if (!o.is_object() || !o.contains("centroid") || !o["centroid"].is_array() ||
+                        o["centroid"].empty())
+                        continue;
+                    const double cx = o["centroid"][0].get<double>();
+                    if (cx < lo.cx) lo = {tid, o, cx};
+                    if (cx > hi.cx) hi = {tid, o, cx};
+                }
+                if (lo.tid == 0 || hi.tid == 0 || lo.tid == hi.tid) {
+                    studyShotFail(F, "fea", "faces", "the box end faces did not resolve");
+                    feaStep = 99; break;
+                }
+                auto pick = [&](const Face& f, const char* cmd) {
+                    st.selection.clear();
+                    core::SelItem it;
+                    it.hit.body_id = 1;
+                    it.hit.kind = render::PickKind::Face;
+                    it.hit.topo_id = f.tid;
+                    it.selector = f.sel.dump();
+                    it.pending_resolve = false;
+                    st.selection.mutableItems().push_back(it);
+                    sm.handleCommand(st, cmd);
+                    st.ribbonTab = kSaTabStatic;
                 };
-                nlohmann::json fixFace = faceAtExtremeX(false);
-                nlohmann::json loadFace = faceAtExtremeX(true);
-                // Inject the resolved selectors via the selection -> well capture path.
+                pick(lo, "sim_fixture");
+                pick(hi, "sim_load_force");
                 st.selection.clear();
-                { core::SelItem it; it.selector = fixFace.dump(); it.pending_resolve = false;
-                  st.selection.mutableItems().push_back(it); }
-                if (st.simManager) st.simManager->handleCommand(st, "sim_fixture");
-                st.selection.clear();
-                { core::SelItem it; it.selector = loadFace.dump(); it.pending_resolve = false;
-                  st.selection.mutableItems().push_back(it); }
-                if (st.simManager) st.simManager->handleCommand(st, "sim_load_force");
-                st.selection.clear();
-                std::printf("fea: faces fixCx=%.1f loadCx=%.1f\n",
-                            fixFace.contains("centroid") ? fixFace["centroid"][0].get<double>() : 0.0,
-                            loadFace.contains("centroid") ? loadFace["centroid"][0].get<double>() : 0.0);
+                std::printf("fea: static study, steel 1018, density %.1f, fixture x=%.1f, force x=%.1f\n",
+                            kDensity, lo.cx, hi.cx);
                 std::fflush(stdout);
+                F.stepStart = pipingNow();
+                F.lastTry = 0.0;
                 feaSettle = 2; ++feaStep; break;
             }
-            case 2: {  // Run
-                if (st.simManager) st.simManager->handleCommand(st, "sim_run");
-                std::printf("fea: study launched (density 0.4, steel, 100 N)\n");
+            case 2: {  // Run (retried while the engine finishes the setup saves)
+                if (st.docMirror.docId() != F.docId || !st.simManager) {
+                    studyShotFail(F, "fea", "doc_switched", "the scenario's part is no longer active");
+                    feaStep = 99; break;
+                }
+                ui::SimManager& sm = *st.simManager;
+                if (!studyShotRun(st, F, "fea", kRunTimeoutS,
+                                  [&] { return sm.runUi().running || st.colormapOn; })) {
+                    if (F.failed) feaStep = 99;
+                    break;
+                }
+                std::printf("fea: run started (%.1f s after start)\n", pipingNow() - F.t0);
                 std::fflush(stdout);
-                feaWaitFrames = 0; ++feaStep; break;
+                F.stepStart = pipingNow();
+                F.idleSince = 0.0;
+                ++feaStep; break;
             }
-            case 3: {  // Wait for completion (cap ~90 s)
-                ++feaWaitFrames;
-                if (st.colormapOn || feaWaitFrames > 5400) {
-                    std::printf("fea: result ready colormap=%d legend=%d (%d frames)\n",
-                                (int)st.colormapOn, (int)st.legendOn, feaWaitFrames);
+            case 3: {  // Wait for the von Mises colormap (the result lands on the Results node)
+                const double now = pipingNow();
+                if (st.colormapOn) {
+                    std::printf("fea: PASS colormap=1 legend=%d solve=%.1f s total=%.1f s\n",
+                                (int)st.legendOn, now - F.stepStart, now - F.t0);
                     std::fflush(stdout);
-                    ++feaStep;
+                    feaSettle = 8;  // let the legend + overlay settle before the capture
+                    feaStep = 99; break;
+                }
+                const bool running = st.simManager && st.simManager->runUi().running;
+                if (running) {
+                    F.idleSince = 0.0;
+                } else if (F.idleSince == 0.0) {
+                    F.idleSince = now;  // finished: open Results like "View results" does
+                    if (st.simManager) st.simManager->handleCommand(st, "sim_results");
+                } else if (now - F.idleSince > 10.0) {
+                    studyShotFail(F, "fea", "no_result",
+                                  "the run ended without a result colormap (status: " + st.status + ")");
+                    feaStep = 99; break;
+                }
+                if (now - F.stepStart > kResultTimeoutS) {
+                    studyShotFail(F, "fea", "timeout",
+                                  "no result colormap within " + std::to_string((int)kResultTimeoutS) +
+                                      " s (status: " + st.status + ")");
+                    feaStep = 99;
                 }
                 break;
             }
             default:
                 st.feaShotDone = true;
-                std::printf("fea: scenario complete\n");
+                std::printf("fea: scenario complete (%s)\n", F.failed ? "FAILED" : "PASS");
                 std::fflush(stdout);
                 break;
         }
-        (void)sim;
     }
 
     // ---------- T-FIN24 disclosure-matrix scenario (CHUDWARE_SHOT=simdisc_mech|simdisc_ecad) ----------
@@ -918,67 +5926,104 @@ void ScenarioRunner::tick(AppState& st) {
 
     // new part -> fuselage-ish bar 80x20x20 -> Flow study (water, 10 deg AoA, coarse) -> run ->
     // wait for the numeric result (and a contour if the selected solver provides one) -> capture.
-    if (st.wantFlow && st.workerStarted && !st.flowShotDone) {
+    // The old frame-0 sequence never got a study (newStudy / run refuse while an engine RPC is in
+    // flight), so it "timed out" without solving; the waits below mirror simaudit's. Solve cost:
+    // the coarse preset is 48 cells along the longest domain axis (core/sim/flow_run.cpp); this
+    // bar at 10 deg AoA spans ~412 x 198 x 185 mm, i.e. a 48 x 24 x 22 lattice (~25k cells) x 1500
+    // steps ~= 3.8e7 site updates, a few seconds of D3Q19 even single-threaded. The 120 s cap is
+    // headroom for export prep on a loaded machine, not solve time. Prints "flow: PASS ..." or
+    // "flow: FAILED [code] ..." and exits non-zero on failure.
+    if (st.wantFlow && st.workerStarted && !st.flowShotDone && st.frame >= 5) {
+        StudyShot& F = g_flowShot;
+        constexpr double kReadyTimeoutS = 30.0, kRunTimeoutS = 30.0, kResultTimeoutS = 120.0;
         if (st.simManager) st.simManager->tick(st);  // pump so completion lands while we wait
         if (flowSettle > 0) { --flowSettle; }
         else switch (flowStep) {
             case 0: {  // New part + a slender bar (stand-in fuselage/hull)
-                std::string err;
-                st.docMirror.newPart(st.worker, err);
-                nlohmann::json ops = nlohmann::json::array();
-                ops.push_back({{"op","add_feature"},{"feature",{
-                    {"type","box"},{"name","Hull"},{"params",{
-                        {"length",{{"value",80.0},{"expr",nullptr}}},
-                        {"width", {{"value",20.0},{"expr",nullptr}}},
-                        {"height",{{"value",20.0},{"expr",nullptr}}}},
-                    },{"centered",true}}}});
-                auto r = st.docMirror.applyOps(st.worker, ops);
-                if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
-                std::printf("flow: bar ok=%d rev=%d\n", (int)r.ok, r.revision);
+                F.t0 = pipingNow();
+                int rev = 0;
+                const std::string why = studyShotBox(st, F, "Hull", 80.0, 20.0, 20.0, rev);
+                if (!why.empty()) { studyShotFail(F, "flow", "bar", why); flowStep = 99; break; }
+                std::printf("flow: bar 80x20x20 mm doc=%s rev=%d\n", F.docId.c_str(), rev);
                 std::fflush(stdout);
                 st.yaw = 40; st.pitch = 22; st.zoom = 1.0f;
+                F.stepStart = pipingNow();
                 flowSettle = 3; ++flowStep; break;
             }
             case 1: {  // Flow study: water, 10 deg AoA, coarse preset
+                if (!studyShotReady(st, F, "flow", kReadyTimeoutS)) {
+                    if (F.failed) flowStep = 99;
+                    break;
+                }
+                ui::SimManager& sm = *st.simManager;
                 st.activeWorkspace = AppState::Workspace::Simulate;
                 st.leftPaneTab = AppState::LP_Simulation;
                 st.showRibbon = true;
                 st.showSimulationTools = true;
-                st.ribbonTab = AppState::RT_Simulation;
-                if (st.simManager) {
-                    st.simManager->handleCommand(st, "sim_new_flow");
-                    st.simManager->configureActiveFlow(st, /*fluid=water*/1, /*aoa*/10.0f,
-                                                       /*sideslip*/0.0f, /*preset=coarse*/0);
+                st.ribbonTab = kSaTabFlow;
+                const int before = sm.studyCount();
+                sm.handleCommand(st, "sim_new_flow");
+                st.ribbonTab = kSaTabFlow;
+                if (sm.studyCount() != before + 1) {
+                    studyShotFail(F, "flow", "study_not_created",
+                                  "sim_new_flow added no study (status: " + st.status + ")");
+                    flowStep = 99; break;
                 }
+                sm.configureActiveFlow(st, /*fluid=water*/1, /*aoa*/10.0f, /*sideslip*/0.0f,
+                                       /*preset=coarse*/0);
                 std::printf("flow: study configured (water, AoA 10, coarse)\n");
                 std::fflush(stdout);
+                F.stepStart = pipingNow();
+                F.lastTry = 0.0;
                 flowSettle = 2; ++flowStep; break;
             }
-            case 2: {  // Run
-                if (st.simManager) st.simManager->handleCommand(st, "sim_run");
-                std::printf("flow: study launched\n");
+            case 2: {  // Run (retried while the engine finishes the setup save)
+                if (st.docMirror.docId() != F.docId || !st.simManager) {
+                    studyShotFail(F, "flow", "doc_switched", "the scenario's part is no longer active");
+                    flowStep = 99; break;
+                }
+                ui::SimManager& sm = *st.simManager;
+                if (!studyShotRun(st, F, "flow", kRunTimeoutS,
+                                  [&] { return sm.runUi().running || sm.flowHasResult(); })) {
+                    if (F.failed) flowStep = 99;
+                    break;
+                }
+                std::printf("flow: run started (%.1f s after start)\n", pipingNow() - F.t0);
                 std::fflush(stdout);
-                flowWaitFrames = 0; ++flowStep; break;
+                F.stepStart = pipingNow();
+                F.idleSince = 0.0;
+                ++flowStep; break;
             }
-            case 3: {  // Wait for completion (cap ~180 s — coarse LBM)
-                ++flowWaitFrames;
-                const bool numericReady =
-                    st.simManager && st.simManager->flowHasResult();
-                if (numericReady) {
-                    std::printf("flow: result ready numeric=1 colormap=%d legend=%d (%d frames)\n",
-                                (int)st.colormapOn, (int)st.legendOn, flowWaitFrames);
+            case 3: {  // Wait for the numeric result (the LBM route may carry no contour overlay)
+                const double now = pipingNow();
+                ui::SimManager* sm = st.simManager;
+                if (sm && sm->flowHasResult()) {
+                    std::printf("flow: PASS numeric=1 colormap=%d legend=%d solve=%.1f s total=%.1f s\n",
+                                (int)st.colormapOn, (int)st.legendOn, now - F.stepStart, now - F.t0);
                     std::fflush(stdout);
-                    ++flowStep;
-                } else if (flowWaitFrames > 10800) {
-                    std::fprintf(stderr,
-                                 "flow: FAILED — numeric result did not arrive within 180 s\n");
-                    st.flowShotDone = true;
+                    flowSettle = 8;  // let the Results pane settle before the capture
+                    flowStep = 99; break;
+                }
+                if (sm && sm->runUi().running) {
+                    F.idleSince = 0.0;
+                } else if (F.idleSince == 0.0) {
+                    F.idleSince = now;
+                } else if (now - F.idleSince > 10.0) {
+                    studyShotFail(F, "flow", "no_result",
+                                  "the run ended without a result (status: " + st.status + ")");
+                    flowStep = 99; break;
+                }
+                if (now - F.stepStart > kResultTimeoutS) {
+                    studyShotFail(F, "flow", "timeout",
+                                  "numeric result did not arrive within " +
+                                      std::to_string((int)kResultTimeoutS) + " s (status: " + st.status + ")");
+                    flowStep = 99;
                 }
                 break;
             }
             default:
                 st.flowShotDone = true;
-                std::printf("flow: scenario complete\n");
+                std::printf("flow: scenario complete (%s)\n", F.failed ? "FAILED" : "PASS");
                 std::fflush(stdout);
                 break;
         }
@@ -1050,6 +6095,19 @@ void ScenarioRunner::tick(AppState& st) {
 
     // ---------- topology optimization scenario (CHUDWARE_SHOT=topology) ----------
     runTopology(st);
+
+    // ---------- piping / industrial scenario (CHUDWARE_SHOT=piping) ----------
+    pipingShotTick(st);
+    pipeDrawTick(st);
+
+    // ---------- hydraulic circuit scenario (CHUDWARE_SHOT=hydraulics) ----------
+    hydraulicsShotTick(st);
+
+    // ---------- simulation UI audit (CHUDWARE_SHOT=simaudit) ----------
+    simAuditTick(st);
+
+    // ---------- real interactive simulation setup (CHUDWARE_SHOT=siminteractive) ----------
+    simInteractiveTick(st);
 }
 
 // First-run onboarding visual proof. Each step is forced through the public scenario seam, so a
@@ -2178,6 +7236,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             std::printf("fea screenshot -> %s (%dx%d)\n",
                         screenshotPath ? screenshotPath : "(none)", dw, dh);
             std::fflush(stdout);
+            studyShotExit(g_feaShot);  // a failed scenario exits non-zero after its capture
             glfwSwapBuffers(st.win);
             return FrameAction::Break;
         }
@@ -2191,6 +7250,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             std::printf("flow screenshot -> %s (%dx%d)\n",
                         screenshotPath ? screenshotPath : "(none)", dw, dh);
             std::fflush(stdout);
+            studyShotExit(g_flowShot);
             glfwSwapBuffers(st.win);
             return FrameAction::Break;
         }
@@ -2351,6 +7411,29 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         }
         return FrameAction::Continue;
     }
+
+    // piping scenario: per-step captures; the final one is mirrored to --ui-screenshot.
+    bool pipeDrawBreak = false;
+    if (pipeDrawEndFrame(st, dw, dh, screenshotPath, pipeDrawBreak))
+        return pipeDrawBreak ? FrameAction::Break : FrameAction::Continue;
+
+    bool pipingBreak = false;
+    if (pipingShotEndFrame(st, dw, dh, screenshotPath, pipingBreak))
+        return pipingBreak ? FrameAction::Break : FrameAction::Continue;
+
+    // hydraulics scenario: same per-step capture + report contract.
+    bool hydBreak = false;
+    if (hydraulicsShotEndFrame(st, dw, dh, screenshotPath, hydBreak))
+        return hydBreak ? FrameAction::Break : FrameAction::Continue;
+
+    // simaudit: per-state captures + report; exits non-zero on any ID conflict.
+    bool saBreak = false;
+    if (simAuditEndFrame(st, dw, dh, screenshotPath, saBreak))
+        return saBreak ? FrameAction::Break : FrameAction::Continue;
+
+    bool interactiveBreak = false;
+    if (simInteractiveEndFrame(st, dw, dh, screenshotPath, interactiveBreak))
+        return interactiveBreak ? FrameAction::Break : FrameAction::Continue;
 
     return FrameAction::None;
 }

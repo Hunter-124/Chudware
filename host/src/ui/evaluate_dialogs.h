@@ -5,14 +5,15 @@
 // + legend on (reusing the C19 renderer scalar pass).
 //
 // Measure is live (re-evals on selection change). Mass Properties density DERIVES from the document
-// material key (doc.material.key via set_material) by default; the Material combo WRITES set_material
-// so changing it updates the part's active material. A manual density DragFloat is the only local
-// advanced override. Exposes COM / section I / polar J / axial k, and drives viewport markers + body
+// material key (doc.material.key via set_material) by default; the Material field WRITES set_material
+// so changing it updates the part's active material. A density field is the only local advanced
+// override. Exposes COM / section I / polar J / axial k, and drives viewport markers + body
 // translucency via the overlay accessors below. Interference view tints bodies + overlap meshes;
 // Measure color-codes refs with viewport highlights + callouts.
 // Wave 3: massMarkers_ carry COM + bending-I value chips (unit-aware); sectionPlanes_ expose three
 // draggable orthogonal cutting planes with live section-prop re-eval. All analysis controls use
-// resizable floating command windows with persistent geometry.
+// resizable floating command windows with persistent geometry, built from the ui::kit panel
+// scaffold (scroll body + pinned action footer), kit_form fields and kit result cards.
 #pragma once
 
 #include <array>
@@ -132,6 +133,7 @@ private:
     void tickLiveMeasure(AppState& st);
     void tickMassDesignSections(AppState& st);
     void tickSectionDrag(AppState& st);
+    void syncMassMaterial(AppState& st);
     void seedMassFromDoc(AppState& st);
     void initSectionSession(AppState& st);
     void fireSectionEval(AppState& st, int idx);   // one plane; -1 reserved
@@ -145,6 +147,13 @@ private:
     void drawMeasure(AppState& st);
     void runGeometryAnalysis(AppState& st);
     void drawGeometryAnalysis(AppState& st);
+    void drawCheck(AppState& st);
+    void drawInterference(AppState& st);
+    void drawSymmetry(AppState& st);
+    void drawZebra(AppState& st);
+    void drawFieldTool(AppState& st, const std::string& kind);   // draft / thickness / curvature
+    void runFieldTool(AppState& st, const std::string& kind);    // the footer's Update action
+    void drawExclusiveFooter(AppState& st, const std::string& kind);
 
     // Exclusive tools (measure/check/interference/draft/thickness/curvature/zebra/symmetry).
     // Mass and Section are independent so both can be open at once.
@@ -208,11 +217,16 @@ private:
     int sectionPendingCount_ = 0;
     nlohmann::json sectionResults_ = nlohmann::json::array({nullptr, nullptr, nullptr});
 
-    // Symmetry plane: 0 front, 1 top, 2 right.
-    // Zero in a control means use the engine's per-body, size-scaled default.
+    // Geometry analysis limits (model mm). Zero means use the engine's per-body, size-scaled
+    // default (the field shows "Auto").
     float geometryMinArea_ = 0.f, geometryMinEdge_ = 0.f;
     float geometrySliverRatio_ = 0.f, geometryGapTol_ = 0.f;
     bool geometryDiscontinuities_ = false;
+    bool geometryLimitsOpen_ = false;          // "Limits used" card (collapsed by default)
+    bool geometryKindOpen_[7] = {true, true, true, true, true, true, true};  // findings cards
+    bool measureHistoryOpen_ = false;          // "Recent readings" card
+    bool massTensorOpen_ = false;              // "Mass inertia tensor" card
+    // Symmetry plane: 0 front, 1 top, 2 right.
     int symmetryPlane_ = 0;
 
     // Field-analysis dock params (draft / thickness / curvature).

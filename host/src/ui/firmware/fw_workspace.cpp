@@ -1,7 +1,8 @@
 // Firmware workspace — unified Arduino-style embedded IDE view (T-FIN5 restructure).
 //
 // Layout (full central band, same host window pattern as PLM/RevEng):
-//   target bar : [Board/MCU chip][Toolchain][Port] .......... [Build][Flash][Debug][Monitor]
+//   target bar : Board/MCU, Toolchain and Port + Build/Flash/Debug/Monitor; rows wrap to the
+//                available central-band width and the bar grows to keep every action reachable.
 //   left  rail : project/board tree (fw_projects, ASYNC) + New Project + selected project's
 //                sources | Pinmap (pins observed in the last emulation trace) | Backend doctor
 //                (fw_status, T-FIN4) — honest gating: missing tools show a guidance banner
@@ -49,6 +50,7 @@
 #include "ui/icons.h"
 #include "ui/metrics.h"
 #include "ui/widgets/kit.h"   // ui::kit — the app-wide section header
+#include "ui/sim/sim_fw_scenario.h"
 #include "ui/panel_collapse.h"
 #include "ui_theme.h"
 
@@ -82,6 +84,7 @@ struct FwState {
     // ---- project rail (fw_projects) ----
     bool listPending = false, listedOnce = false;
     double lastListT = -1e9;
+    double interactiveSince = -1.0;
     std::vector<FwProject> projects;
     int selected = -1;
     std::string listErr;
@@ -106,8 +109,9 @@ struct FwState {
     int simBackend = 0;
     double runSeconds = 0.0, hostTimeoutSeconds = 0.0;
     std::vector<char> scenarioBuf = std::vector<char>(4096, '\0');
-    char scenarioPathBuf[2048] = "";
-    std::string scenarioErr, resultJson;
+    ui::sim::FwScenarioEditor scenarioEditor;
+    nlohmann::json scenario;
+    std::string resultJson;
     nlohmann::json simEvidence;
     std::vector<std::string> busEventRows;
     int selectedBusEvent = -1;
@@ -121,6 +125,7 @@ struct FwState {
     char portBuf[64] = "";           // serial device, e.g. /dev/ttyACM0 — shared by
                                       // fw_avr_flash and fw_serial_open
     bool focusDebugTabOnce = false;  // top-bar "Debug" jumps the center tab strip
+    bool focusEmulateTabOnce = false;
     bool focusMonitorDockOnce = false;  // top-bar "Monitor" jumps the bottom dock strip
 
     // ---- editor tab: read-only source preview (local disk, click-triggered) ----
@@ -152,6 +157,30 @@ static FwState& S() {
     static FwState s;
     return s;
 }
+
+static void invalidateEmulationResult(FwState& s) {
+    s.simDone = false;
+    s.simPassed = false;
+    s.uartLog.clear(); s.assertionLines.clear(); s.gpio.clear();
+    s.busEventRows.clear(); s.selectedBusEvent = -1;
+    s.simEvidence = nlohmann::json(); s.resultJson.clear();
+    s.tracePath.clear(); s.simErr.clear();
+}
+
+nlohmann::json firmwareScenarioDefinition() { return S().scenario; }
+std::string firmwareScenarioRawText() { return S().scenarioBuf.data(); }
+bool firmwareScenarioDraftValid() { return S().scenarioEditor.rawValid; }
+bool configureFirmwareScenario(const nlohmann::json& definition, std::string& error) {
+    if (!ui::sim::validateFwScenario(definition, error)) return false;
+    auto& s = S();
+    if (s.simPending) { error = "Wait for the active emulation."; return false; }
+    s.scenario = definition;
+    ui::sim::syncFwScenarioEditor(s.scenarioEditor, s.scenario, &s.scenarioBuf);
+    invalidateEmulationResult(s);
+    error.clear();
+    return true;
+}
+void openFirmwareEmulationSetup() { S().focusEmulateTabOnce = true; }
 
 static const char* kMcuFamilies[] = {"cortex-m4", "cortex-m0", "cortex-m3", "cortex-m7",
                                      "esp32", "avr"};
@@ -304,9 +333,11 @@ static bool fwProjectRow(const FwProject& p, bool selected) {
 
 // Small secondary action ("Refresh"/"Recheck") parked on the right edge of the header row
 // that the next fwSectionHeader() call draws. Call IMMEDIATELY before fwSectionHeader.
-static void fwHeaderAction(const char* label, float width, const std::function<void()>& onClick) {
+static void fwHeaderAction(const char* label, const std::function<void()>& onClick) {
     const ImVec2 cp = ImGui::GetCursorPos();
-    ImGui::SetCursorPosX(cp.x + ImGui::GetContentRegionAvail().x - width);
+    const float width = ImGui::CalcTextSize(label, nullptr, true).x +
+                        2.0f * ImGui::GetStyle().FramePadding.x;
+    ImGui::SetCursorPosX(cp.x + std::max(0.0f, ImGui::GetContentRegionAvail().x - width));
     if (ImGui::SmallButton(label)) onClick();
     ImGui::SetCursorPos(cp);
 }
@@ -385,6 +416,15 @@ static void loadProjects(AppState& st, bool force = false) {
 #endif
     if (!st.workerStarted || s.listPending) return;
     const double now = ImGui::GetTime();
+    if (!st.workerBootPending && st.startupPhase.empty()) {
+        if (s.interactiveSince < 0.0) s.interactiveSince = now;
+    } else {
+        s.interactiveSince = -1.0;
+    }
+    // The local sidecar probe below discloses the tab without waking the Python worker.
+    // Opening Firmware or explicitly refreshing still warms the rail immediately.
+    if (!force && st.activeWorkspace != AppState::Workspace::Firmware &&
+        (s.interactiveSince < 0.0 || now - s.interactiveSince < 1.5)) return;
     if (!force && s.listedOnce && now - s.lastListT < 4.0) return;
     s.listPending = true;
     s.lastListT = now;
@@ -392,6 +432,7 @@ static void loadProjects(AppState& st, bool force = false) {
         FwState& s2 = S();
         s2.listPending = false;
         s2.listedOnce = true;
+        s2.lastListT = ImGui::GetTime();
         if (!r.ok || !r.result.is_object()) {
             s2.listErr = r.err.empty() ? "firmware tools unavailable" : r.err;
             return;
@@ -662,7 +703,10 @@ static const char* kSimBackends[] = {"auto", "renode", "qemu", "simavr"};
 
 static void runEmulation(AppState& st) {
     FwState& s = S();
-    if (s.selected < 0 || s.selected >= (int)s.projects.size() || s.simPending) return;
+    if (s.selected < 0 || s.selected >= (int)s.projects.size() || s.simPending ||
+        !s.scenarioEditor.rawValid || (s.statusLoaded && !s.canEmulate) ||
+        !std::isfinite(s.runSeconds) || s.runSeconds < 0 ||
+        !std::isfinite(s.hostTimeoutSeconds) || s.hostTimeoutSeconds < 0) return;
     s.simPending = true;
     s.simDone = false;
     s.uartLog.clear(); s.assertionLines.clear(); s.gpio.clear();
@@ -808,72 +852,114 @@ static void drawTargetBar(AppState& st) {
 
     ui::pushGlassChildStyle(10.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * sc, 8 * sc));
-    ImGui::BeginChild("##fw_targetbar", ImVec2(0, ImGui::GetFrameHeight() + 16.0f * sc),
-                      ImGuiChildFlags_Border);
+    ImGui::BeginChild("##fw_targetbar", ImVec2(0, 0),
+                      ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
 
     const float rowStartX = ImGui::GetCursorPosX();
-    const float contentMaxX = rowStartX + ImGui::GetContentRegionAvail().x;
+    const float contentW = ImGui::GetContentRegionAvail().x;
+    const float contentMaxX = rowStartX + contentW;
+    const float contentRight = ImGui::GetCursorScreenPos().x + contentW;
+    const float inlineGap = ImGui::GetStyle().ItemSpacing.x;
+    const float fieldGap = 16.0f * sc;
+    bool rowHasItems = false;
+    auto flow = [&](float width, float gap) {
+        if (rowHasItems && ImGui::GetItemRectMax().x + gap + width <= contentRight)
+            ImGui::SameLine(0.0f, gap);
+        else
+            ImGui::SetCursorPosX(rowStartX);
+        rowHasItems = true;
+    };
 
+    const float boardLabelW = ImGui::CalcTextSize("Board/MCU").x;
+    const float chipW = std::min(150.0f * sc, std::max(sc, contentW - boardLabelW - inlineGap));
+    flow(boardLabelW + inlineGap + chipW, fieldGap);
+    ImGui::BeginGroup();
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("Board/MCU");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(150.0f * sc);
+    ImGui::SetNextItemWidth(chipW);
     ImGui::InputText("##fw_target_chip", s.chipBuf, sizeof(s.chipBuf));
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Target chip id used by Flash/Debug (probe-rs style, e.g. "
                           "STM32F407VGTx)");
 
-    ImGui::SameLine(0.0f, 16.0f * sc);
+    ImGui::EndGroup();
+
+    const char* toolchain = haveProject && !s.projects[s.selected].toolchain.empty()
+                            ? s.projects[s.selected].toolchain.c_str() : "-";
+    const float toolchainW = ImGui::CalcTextSize("Toolchain").x + inlineGap +
+                             ImGui::CalcTextSize(toolchain).x;
+    flow(std::min(toolchainW, contentW), fieldGap);
+    ImGui::BeginGroup();
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("Toolchain");
     ImGui::SameLine();
-    ImGui::TextUnformatted(haveProject && !s.projects[s.selected].toolchain.empty()
-                           ? s.projects[s.selected].toolchain.c_str() : "-");
+    ImGui::PushTextWrapPos(std::min(contentMaxX, ImGui::GetCursorPosX() +
+                                   ImGui::CalcTextSize(toolchain).x));
+    ImGui::TextUnformatted(toolchain);
+    ImGui::PopTextWrapPos();
+    ImGui::EndGroup();
+    if (toolchainW > contentW) rowHasItems = false;
 
-    ImGui::SameLine(0.0f, 16.0f * sc);
+    const float portLabelW = ImGui::CalcTextSize("Port").x;
+    const float portW = std::min(130.0f * sc, std::max(sc, contentW - portLabelW - inlineGap));
+    flow(portLabelW + inlineGap + portW, fieldGap);
+    ImGui::BeginGroup();
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("Port");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(130.0f * sc);
+    ImGui::SetNextItemWidth(portW);
     ImGui::InputTextWithHint("##fw_target_port", "/dev/ttyACM0", s.portBuf, sizeof(s.portBuf));
 
-    // Right-aligned action cluster: Build / Flash / Debug / Monitor.
-    const float bw = 84.0f * sc;
+    ImGui::EndGroup();
+
+    // Measure the same padding/icon geometry the buttons paint. Keep the action widths
+    // stable while busy, and move the cluster to its own row when the target fields fill it.
+    const float buildW = std::max(84.0f * sc, fwGlassButtonWidth("Building\xe2\x80\xa6", "eng_firm"));
+    const float flashW = std::max(84.0f * sc, fwGlassButtonWidth("Flash", "issue_bug"));
+    const float debugW = std::max(84.0f * sc, fwGlassButtonWidth("Debug", "run_study"));
+    const float monitorW = std::max(84.0f * sc, fwGlassButtonWidth("Monitor*", "activity"));
     const float gap = 8.0f * sc;
-    const float clusterW = bw * 4.0f + gap * 3.0f;
-    ImGui::SameLine(0.0f, 0.0f);
-    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), contentMaxX - clusterW));
+    const float clusterW = buildW + flashW + debugW + monitorW + gap * 3.0f;
+    if (clusterW <= contentW) {
+        flow(clusterW, fieldGap);
+        ImGui::SetCursorPosX(contentMaxX - clusterW);
+    } else {
+        rowHasItems = false;
+        flow(buildW, gap);
+    }
 
     const bool canBuildGo = haveProject && st.workerStarted && !s.buildPending &&
                             (!s.statusLoaded || s.canBuild);
     if (fwGlassButton("##fw_tb_build", s.buildPending ? "Building\xe2\x80\xa6" : "Build",
-                      "eng_firm", /*accent=*/true, bw, canBuildGo))
+                      "eng_firm", /*accent=*/true, buildW, canBuildGo))
         triggerBuild(st);
     if (!canBuildGo && s.statusLoaded && !s.canBuild && ImGui::IsItemHovered())
         ImGui::SetTooltip("Toolchain missing — see Backend panel for fw_status guidance");
-    ImGui::SameLine(0.0f, gap);
+    flow(flashW, gap);
 
     const bool canFlashGo = haveProject && st.workerStarted && !s.hwPending &&
                             !s.elfPath.empty() && (!s.statusLoaded || s.canFlash);
     if (fwGlassButton("##fw_tb_flash", s.hwPending ? "\xe2\x80\xa6" : "Flash", "issue_bug",
-                      /*accent=*/false, bw, canFlashGo))
+                      /*accent=*/false, flashW, canFlashGo))
         triggerFlash(st);
     if (!canFlashGo && ImGui::IsItemHovered()) {
         if (s.elfPath.empty()) ImGui::SetTooltip("Build first — the last successful ELF is flashed");
         else if (s.statusLoaded && !s.canFlash)
             ImGui::SetTooltip("Flashing unavailable — see Backend panel for fw_status guidance");
     }
-    ImGui::SameLine(0.0f, gap);
+    flow(debugW, gap);
 
-    if (fwGlassButton("##fw_tb_debug", "Debug", "run_study", /*accent=*/false, bw,
+    if (fwGlassButton("##fw_tb_debug", "Debug", "run_study", /*accent=*/false, debugW,
                       st.workerStarted)) {
         s.focusDebugTabOnce = true;
     }
-    ImGui::SameLine(0.0f, gap);
+    flow(monitorW, gap);
 
     if (fwGlassButton("##fw_tb_monitor", s.serialOpen ? "Monitor*" : "Monitor", "activity",
-                      /*accent=*/false, bw, st.workerStarted)) {
+                      /*accent=*/false, monitorW, st.workerStarted)) {
         s.focusMonitorDockOnce = true;
         s.dockCollapsed = false;
         if (!s.serialOpen && !s.serialPending && s.portBuf[0]) triggerSerialOpen(st);
@@ -895,8 +981,10 @@ static void drawProjectRail(AppState& st, float w) {
     ImGui::BeginChild("##fw_rail", ImVec2(w, 0), ImGuiChildFlags_Border);
     ImGui::PopStyleVar();
 
-    fwHeaderAction(s.listPending ? "..." : "Refresh", 64.0f * sc,
+    ImGui::PushID("projects_refresh");
+    fwHeaderAction(s.listPending ? "..." : "Refresh",
                    [&st]() { loadProjects(st, /*force=*/true); });
+    ImGui::PopID();
     fwSectionHeader("folder_new", "Projects");
 
     // New project (create only when the toolchain family can at least be selected —
@@ -1004,8 +1092,10 @@ static void drawProjectRail(AppState& st, float w) {
     // column hosts the AI Copilot pane. Flash/Debug actions themselves live in the target
     // bar + Debug tab; this stays the honest-gating status readout.
     ImGui::Spacing();
-    fwHeaderAction(s.statusPending ? "..." : "Recheck", 68.0f * sc,
+    ImGui::PushID("backend_refresh");
+    fwHeaderAction(s.statusPending ? "..." : "Recheck",
                    [&st]() { loadStatus(st, /*force=*/true); });
+    ImGui::PopID();
     fwSectionHeader("health_check", "Backend");
     if (!s.statusLoaded) {
         ImGui::TextDisabled("%s", s.statusErr.empty() ? "Checking fw_status\xe2\x80\xa6"
@@ -1222,45 +1312,6 @@ static void drawDebugTab(AppState& st) {
 
 // ---- center tab: Emulate — canonical scenario and native evidence ----------------------
 
-static int resizeScenarioInput(ImGuiInputTextCallbackData* data) {
-    auto& buf = *static_cast<std::vector<char>*>(data->UserData);
-    if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
-        buf.resize(static_cast<size_t>(data->BufSize));
-        data->Buf = buf.data();
-    }
-    return 0;
-}
-
-static void loadScenarioFile(FwState& s) {
-    s.scenarioErr.clear();
-    std::ifstream f(s.scenarioPathBuf, std::ios::binary);
-    if (!f) { s.scenarioErr = "Cannot open scenario file."; return; }
-    std::ostringstream text;
-    text << f.rdbuf();
-    if (f.bad()) { s.scenarioErr = "Cannot read scenario file."; return; }
-    const std::string content = text.str();
-    const auto parsed = nlohmann::json::parse(content, nullptr, false);
-    if (!parsed.is_object()) {
-        s.scenarioErr = "Scenario file must contain a JSON object. Existing editor preserved.";
-        return;
-    }
-    s.scenarioBuf.resize(std::max(size_t(4096), content.size() + 1));
-    std::memcpy(s.scenarioBuf.data(), content.c_str(), content.size() + 1);
-}
-
-static void saveScenarioFile(FwState& s) {
-    s.scenarioErr.clear();
-    const auto parsed = nlohmann::json::parse(s.scenarioBuf.data(), nullptr, false);
-    if (!parsed.is_object()) {
-        s.scenarioErr = "Save requires a JSON scenario object, not a fixture reference.";
-        return;
-    }
-    std::ofstream f(s.scenarioPathBuf, std::ios::binary);
-    if (!f) { s.scenarioErr = "Cannot open scenario file for saving."; return; }
-    f << s.scenarioBuf.data();
-    f.close();
-    if (!f) s.scenarioErr = "Cannot write scenario file.";
-}
 
 // Render only fields present in the native response; missing physics is never filled in here.
 static void drawEvidenceValue(const char* key, const nlohmann::json& value) {
@@ -1300,39 +1351,18 @@ static void drawEmulationSection(AppState& st, float h) {
                              ui::kit::Tone::Warn);
 
     // Full-width controls stay usable in a narrow centre pane, including at high DPI.
+    bool setupChanged = false;
     ImGui::BeginDisabled(s.simPending);
     ImGui::SetNextItemWidth(-1.0f);
-    ImGui::Combo("##fw_sim_backend", &s.simBackend, "Auto\0Renode\0QEMU\0simavr\0");
+    setupChanged |= ImGui::Combo("##fw_sim_backend", &s.simBackend, "Auto\0Renode\0QEMU\0simavr\0");
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Forced backends never silently fall back. Scenarios require Renode.");
-    if (ImGui::CollapsingHeader("Scenario JSON / file")) {
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputTextWithHint("##fw_scenario_path", "Saved scenario JSON path",
-                                 s.scenarioPathBuf, sizeof(s.scenarioPathBuf));
-        if (ui::kit::secondaryButton("Browse scenario", true, nullptr, ImVec2(-1.0f, 0))) {
-            const std::string path = ui::openFileDialog("Scenario JSON (*.json)\0*.json\0All files\0*.*\0");
-            if (!path.empty()) {
-                if (path.size() >= sizeof(s.scenarioPathBuf)) s.scenarioErr = "Scenario path is too long.";
-                else {
-                    std::memcpy(s.scenarioPathBuf, path.c_str(), path.size() + 1);
-                    loadScenarioFile(s);
-                }
-            }
-        }
-        if (ui::kit::secondaryButton("Load file", s.scenarioPathBuf[0], "Enter a path first",
-                                     ImVec2(-1.0f, 0))) loadScenarioFile(s);
-        if (ui::kit::secondaryButton("Save JSON to file", s.scenarioPathBuf[0], "Enter a path first",
-                                     ImVec2(-1.0f, 0))) saveScenarioFile(s);
-        if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
-        ImGui::InputTextMultiline("##fw_scenario_json", s.scenarioBuf.data(), s.scenarioBuf.size(),
-                                  ImVec2(-1.0f, ImGui::GetFrameHeightWithSpacing() * 6),
-                                  ImGuiInputTextFlags_CallbackResize,
-                                  resizeScenarioInput, &s.scenarioBuf);
-        if (st.fonts.mono) ImGui::PopFont();
-        ImGui::TextWrapped("Same aicad.fwscenario/1 JSON as fw_sim_run: tracks + optional bus_links "
-                           "and track link_id. Empty means no scenario; fixture: references also run.");
-        if (!s.scenarioErr.empty())
-            ui::kit::inlineStatus(s.scenarioErr.c_str(), ui::kit::Tone::Err);
+    if (ImGui::CollapsingHeader("Scenario JSON / file", ImGuiTreeNodeFlags_DefaultOpen)) {
+        setupChanged |= ui::sim::drawFwScenarioEditor(s.scenarioEditor, s.scenario,
+                                                     "firmware_scenario", &s.scenarioBuf);
+        ImGui::TextWrapped("Same aicad.fwscenario/1 as fw_sim_run. Empty means no scenario; "
+                           "fixture: references also run. Native timing and electrical fields "
+                           "are retained verbatim in the executable JSON.");
         if (ImGui::CollapsingHeader("Engineering units and model limits")) {
             ImGui::TextWrapped("Timed/electrical buses require a supported STM32F4 controller on "
                                "Renode. Check fw_status capabilities and native run evidence; "
@@ -1355,27 +1385,31 @@ static void drawEmulationSection(AppState& st, float h) {
     }
     if (ImGui::CollapsingHeader("Virtual duration / host timeout")) {
         ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputDouble("##fw_run_seconds", &s.runSeconds, 0, 0, "%.6g");
+        setupChanged |= ImGui::InputDouble("##fw_run_seconds", &s.runSeconds, 0, 0, "%.6g");
         ImGui::TextWrapped("Renode virtual run_s in seconds; 0 uses native default/scenario "
                            "horizon. An explicit horizon must include every stimulus. "
                            "simavr cannot guarantee virtual duration; QEMU has no virtual bus "
                            "stimulus. Their native limitations remain visible in Engineering.");
         ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputDouble("##fw_host_timeout", &s.hostTimeoutSeconds, 0, 0, "%.6g");
+        setupChanged |= ImGui::InputDouble("##fw_host_timeout", &s.hostTimeoutSeconds, 0, 0, "%.6g");
         ImGui::TextWrapped("Host timeout_s in seconds; 0 uses native default. "
                            "Wall time is not virtual bus latency.");
     }
     ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##fw_asserts", "Assertions: uart:hello; gpio:PA5=1",
-                             s.assertBuf, sizeof(s.assertBuf));
+    setupChanged |= ImGui::InputTextWithHint("##fw_asserts", "Assertions: uart:hello; gpio:PA5=1",
+                                            s.assertBuf, sizeof(s.assertBuf));
     ImGui::EndDisabled();
+    if (setupChanged) invalidateEmulationResult(s);
     const bool validTimes = std::isfinite(s.runSeconds) && s.runSeconds >= 0 &&
                             std::isfinite(s.hostTimeoutSeconds) && s.hostTimeoutSeconds >= 0;
-    const bool canGo = haveProject && st.workerStarted && !s.simPending && validTimes;
+    const bool canGo = haveProject && st.workerStarted && !s.simPending && validTimes &&
+                       s.scenarioEditor.rawValid && (!s.statusLoaded || s.canEmulate);
+    const char* blocker = !haveProject ? "Select a project first" : !validTimes
+        ? "Times must be finite and non-negative" : !s.scenarioEditor.rawValid
+        ? "Repair the scenario JSON before running" : s.statusLoaded && !s.canEmulate
+        ? "Emulator tooling unavailable. See Backend doctor." : "Worker unavailable or run active";
     if (ui::kit::primaryButton(s.simPending ? "Running..." : "Run emulation", canGo,
-                               !haveProject ? "Select a project first" : !validTimes
-                                   ? "Times must be finite and non-negative" : "Worker unavailable or run active",
-                               ImVec2(-1.0f, 0))) runEmulation(st);
+                               blocker, ImVec2(-1.0f, 0))) runEmulation(st);
     if (s.simDone) {
         char verdict[96];
         if (s.simEvidence.contains("ms") && s.simEvidence["ms"].is_number())
@@ -1585,6 +1619,10 @@ static void drawCenterTabs(AppState& st) {
         auto tf = [&](int idx) {
             if (s.focusDebugTabOnce && idx == 1) {
                 s.focusDebugTabOnce = false;
+                return ImGuiTabItemFlags_SetSelected;
+            }
+            if (s.focusEmulateTabOnce && idx == 2) {
+                s.focusEmulateTabOnce = false;
                 return ImGuiTabItemFlags_SetSelected;
             }
             return ImGuiTabItemFlags_None;
@@ -1827,6 +1865,19 @@ void seedFirmwareShotFixture() {
         "src/main.c:57:5: warning: implicit declaration of function 'delay_ms'",
     };
 
+    s.scenario = {
+        {"schema", "aicad.fwscenario/1"}, {"name", "Editable functional stimulus (canned)"},
+        {"tracks", nlohmann::json::array({
+            {{"kind", "gpio_edges"}, {"pin", "PA5"},
+             {"events", nlohmann::json::array({{{"t_ms", 0.0}, {"level", 1}}})}},
+            {{"kind", "uart_rx"}, {"uart", "usart1"},
+             {"events", nlohmann::json::array({{{"t_ms", 10.0}, {"text", "hello"}}})}}
+        })},
+        {"sources", nlohmann::json::array({"Canned UI fixture; not emulator evidence"})}
+    };
+    ui::sim::syncFwScenarioEditor(s.scenarioEditor, s.scenario, &s.scenarioBuf);
+    s.focusEmulateTabOnce = true;
+
     s.simDone = true; s.simPassed = true; s.simMs = 2210.0;
     s.uartLog = "boot: blinky v0.1\nhello from PA5 blink loop\nCHUDWARE_GPIO_EVT PA5=1 t=100ms\n"
                 "CHUDWARE_GPIO_EVT PA5=0 t=200ms\nloop tick 1\nloop tick 2\n";
@@ -1909,7 +1960,7 @@ bool firmwareTabVisible(AppState& st) {
     return false;
 #else
     firmware::FwState& s = firmware::S();
-    // Kick the throttled async listing so the rail is warm when the user enters.
+    // Warm the rail after startup settles; the disk probe keeps disclosure immediate.
     firmware::loadProjects(st);
     // Disclose on the worker listing OR the local disk probe — the disk probe covers
     // the boot window where the Python-worker-only fw_projects RPC can't answer yet.

@@ -18,13 +18,17 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "../render/aicm_loader.h"   // render::DocMesh for motion study body-transform cache
+#include "hydraulic_panel.h"         // hydraulic circuit design / sizing / simulation panel (Hydraulics tab)
+#include "piping_panel.h"            // piping / internal-flow / industrial sizing panel (Piping tab)
 #include "sim_topology.h"            // topology capabilities / settings + results views
 #include "sim_topology_bc.h"         // topology boundary-condition editor view
+#include "sim/sim_fw_scenario.h"
 
 struct AppState;
 
@@ -108,6 +112,8 @@ struct SimLoad {
     float fluxWm2 = 1000.0f;        // W/m^2 (thermalKind 0)
     float hWm2k = 10.0f;            // film coefficient W/(m^2 K) (thermalKind 1)
     float tAmbC = 25.0f;            // ambient temperature C (thermalKind 1)
+    // Keep native per-load metadata attached to this entry across removal/reordering.
+    nlohmann::json definition, typedBaseline;
 };
 
 struct MotionDriver {
@@ -121,6 +127,9 @@ struct Study {
     std::string id;                 // engine-assigned ("study-XXXXXXXX")
     StudyType type = StudyType::Static;
     std::string name;
+    // Exact native record plus the typed projection at ingestion. Serialization applies only
+    // changed typed fields, retaining unsupported/agent-authored keys without claiming execution.
+    nlohmann::json definition, typedBaseline;
 
     // FEA
     // materialKey mirrors the ACTIVE part material (doc.material.key via set_material). UI + run
@@ -195,6 +204,8 @@ struct Study {
     // Flow (external wind/water tunnel). The base axis + AoA/sideslip compose the incoming flow
     // direction; fluid + roughness set the physics; ref area normalises the coefficients.
     int flowDir = 0;                // base flow axis: 0..5 = +X,-X,+Y,-Y,+Z,-Z
+    bool flowUseFaceDirection = false; // arbitrary base direction from a picked inlet face
+    float flowFaceDirection[3] = {1.0f, 0.0f, 0.0f};
     float flowSpeed = 10.0f;        // free-stream speed, m/s
     int flowPreset = 0;             // grid resolution: 0 coarse,1 medium,2 fine,3 xfine
     int flowFluid = 0;              // 0 air, 1 water, 2 custom
@@ -309,6 +320,38 @@ struct Study {
 // Which sub-node of a study the tree has selected (drives the form + previews).
 enum class SimNode { Study, Material, Fixtures, Load, Mesh, Results, Boundaries, Regions };
 
+// Run state of the study pane's action footer (kit::actionFooter), refreshed from the SimClient
+// job / preparation / worker / motion state this manager owns. `running` is false while ANOTHER
+// document's job holds the solver (runBlocker() then says so).
+struct SimRunUi {
+    bool        running = false;
+    float       progress = -1.0f;      // [0,1]; -1 = unknown (marquee)
+    std::string stage;                 // "Preparing model", "Solving 42%", "Iteration 12 of 40"
+    double      elapsed = -1.0;        // seconds since the run started; < 0 = unknown
+    bool        cancellable = false;
+    std::string cancelBlocker;         // why Cancel is unavailable (when !cancellable)
+    bool        cancelRequested = false;
+    std::string studyId;               // study the in-flight run belongs to ("" = none)
+};
+
+// THE human label for an engine progress stage (footer, Run page, status bar — one map). `stage`
+// is a legacy key (voxelize|mesh|assemble|solve|stream|post) or a native phase id
+// ("mesh_background_probe", "topology.reanalyze"); `detail` is the worker's progress text
+// (SimClient::recentLog / SimProgress::text), read only for a meshing cell count.
+//   ("mesh_background_probe", "… (pin) 1921/1922 cells, 29376 elements") -> "Meshing · 1,921 of 1,922 cells"
+// Unknown ids are humanized ("foo_bar.baz" -> "Foo bar baz"); never returns a raw id.
+std::string simStageLabel(const std::string& stage, const std::string& detail = {});
+// Fraction [0,1] of a meshing stage carried by `detail` (cells done / total), else -1.
+float simStageFraction(const std::string& stage, const std::string& detail);
+
+// THE face-well control row (Simulation UI standard §4), shared by FEA fixtures/loads and the
+// topology wells: the label (with the pick count) on its own line, then [Pick faces] (secondary)
+// or [Picking…] (accent, armed) and [Clear] — kit buttons of one frame height, left-aligned; Clear
+// drops under the toggle only when the pane is too narrow for both. Ids "###arm"/"###clear" live
+// in the caller's ID scope. The caller draws the picked-face chips beneath.
+struct FaceWellClick { bool toggled = false; bool clear = false; };
+FaceWellClick faceWellControls(const char* label, int picked, bool armed, const char* tip);
+
 class SimManager {
 public:
     SimManager();
@@ -345,6 +388,18 @@ public:
     bool wantsViewportFacePick(AppState& st) const;
     // Route a resolved FACE pick into the armed well. Returns true if consumed.
     bool routeFacePick(AppState& st, const nlohmann::json& selector, uint32_t body, uint32_t topo);
+    bool routeSetupDrop(AppState& st, const std::string& tool,
+                        const nlohmann::json& selector, uint32_t body, uint32_t topo);
+    nlohmann::json activeStudyDefinition() const;
+    nlohmann::json activeStudyResult() const {
+        return sel_ >= 0 && sel_ < static_cast<int>(studies_.size()) ?
+               studies_[sel_].advResult : nlohmann::json();
+    }
+    bool configureActiveStudy(AppState& st, const nlohmann::json& definition, std::string& error);
+    nlohmann::json activeEmParameters() const;
+    bool configureEmParameters(const nlohmann::json& parameters, std::string& error);
+    nlohmann::json electronicsSetup() const;
+    nlohmann::json activeFirmwareScenario() const { return fwsim_.scenario; }
 
     // ---- pre-run previews (called from the viewport draw block) ----
     bool previewActive(AppState& st) const;      // Sim tab active + a study selected + no colormap
@@ -401,12 +456,12 @@ public:
     // True when the selected study is a Flow study and no result colormap is up (so the wind-tunnel
     // setup overlay reads without muddying a result). Drawn from the viewport block.
     bool flowSetupActive(AppState& st) const;
-    // Build the wind-tunnel setup overlay sized to the model: the incoming-flow arrows (oriented by
-    // the base axis + AoA + sideslip), the flow-domain box, and the inlet plane. Flat GL_LINES
-    // batches; `arrowTris` (optional) receives solid triangulated arrowhead cones for the flow
-    // arrows (Overlays::drawTriangles) — without it the legacy wireframe heads are emitted.
-    void collectFlowSetup(AppState& st, std::vector<float>& arrowSegs, std::vector<float>& domainSegs,
-                          std::vector<float>& inletSegs, std::vector<float>* arrowTris = nullptr) const;
+    // Build the flow setup overlay hugging the model: the incoming-flow arrows (base axis + AoA +
+    // sideslip) and the inlet / outlet plane markers. Flat GL_LINES batches; `arrowTris` (optional)
+    // receives solid arrowhead cones (Overlays::drawTriangles) — without it wireframe heads are
+    // emitted.
+    void collectFlowSetup(AppState& st, std::vector<float>& arrowSegs, std::vector<float>& inletSegs,
+                          std::vector<float>* arrowTris = nullptr) const;
 
     // ---- flow-result streamline / slice lines (drawn over the model while the Results node is up) ----
     // One speed-banded line batch: a pointer to the (manager-owned) flat GL_LINES xyz for that band +
@@ -418,16 +473,43 @@ public:
     // the show-streamlines / show-slices toggles. Rebuilt lazily from the cached overlay AICM.
     void collectFlowResultLines(AppState& st, std::vector<FlowLineBatch>& out);
 
-    // Number of studies the active document carries (mirror count after the last refresh). Used by
-    // the tab-switch hook to auto-reveal the Simulation workspace when a part has studies.
-    int  studyCount() const { return (int)studies_.size(); }
+    // Number of studies the active document carries (mirror count after the last refresh, the
+    // piping / vessel / duct / hydraulic-circuit records included). Used by the tab-switch hook
+    // to auto-reveal the Simulation workspace when a part has studies.
+    int  studyCount() const {
+        return (int)studies_.size() + piping_.studyCount() + hydraulic_.studyCount();
+    }
+
+    // The Piping tab's panel (sim_piping_* commands; persisted piping/vessel/duct/pipe-flow
+    // records). Scenarios drive it through the same entry points as its buttons.
+    PipingPanel& piping() { return piping_; }
+    // The Hydraulics tab's panel (sim_hyd_* commands; persisted hydraulic_circuit records).
+    HydraulicPanel& hydraulic() { return hydraulic_; }
+    // ---- central-view seam (viewport_panel.cpp drawViewportPanel) ----
+    // While the Hydraulics panel shows its Schematic or Plots view it owns the central Viewport
+    // window: drawCentralView paints it there in place of the 3D scene (the same branch shape as a
+    // Drawing tab's sheet). In its 3D view, drawViewportHud keeps the Schematic | Plots | 3D toggle
+    // over the model so the canvas stays one click away.
+    bool centralViewActive() const { return hydraulic_.ownsCentralView(); }
+    void drawCentralView(AppState& st) { hydraulic_.drawCentralView(st); }
+    void drawViewportHud(AppState& st) { hydraulic_.drawViewToggleHud(st); }
 
     // ---- scripted-shot helpers (CHUDWARE_SHOT=fea), preserved from the old SimPanel ----
     void configureActive(AppState& st, float density, const std::string& materialKey);
 
-    // Scripted-shot helper (CHUDWARE_SHOT=simdisclosure*): hold the "+ New Study" picker open
-    // so the headless disclosure-matrix shots capture the offered study kinds.
+    // Scripted-shot helper (CHUDWARE_SHOT=simdisclosure*/simaudit/topology): hold the grouped
+    // "New study" picker open so headless shots capture the offered study kinds.
     bool shotForcePicker = false;
+
+    // ---- study-pane action footer contract (kit::actionFooter) ----
+    // Live run state of this manager (see SimRunUi). Cheap; call every frame.
+    SimRunUi runUi() const;
+    // Why `s` cannot run right now ("" = ready): setup readiness, backend capability, and a
+    // solver busy with this or another document. The same gate run() enforces.
+    std::string runBlocker(const Study& s) const;
+    // Cancel the in-flight run when runUi().cancellable (cooperative solver cancel, topology
+    // preparation cancel, or discarding a pending Motion result).
+    void requestCancel(AppState& st);
 
     // ---- scripted-shot helpers (CHUDWARE_SHOT=motion) ----
     // True when the selected study is a Motion type with a successful result.
@@ -495,13 +577,40 @@ private:
     // tree + form
     void drawStudyRow(AppState& st, int i);
     void drawForm(AppState& st, Study& s);
-    void drawStudyChecklist(AppState& st, Study& s);  // stepwise setup overview (all structural nodes)
+    void drawParameterEditor(AppState& st, Study& s);
+    std::string parameterDocId_, parameterStudyId_, parameterDraft_, parameterBaseText_, parameterError_;
+    nlohmann::json parameterBase_;
+    uint64_t parameterSourceGeneration_ = 0, parameterSeenGeneration_ = 0;
+    long parameterSeenRevision_ = -1;
+    std::string parameterSeenMaterial_, parameterSeenSummary_;
+    bool parameterStale_ = false, parameterWasVisible_ = false;
+    // Clean drafts follow native setup; edited drafts retain their exact transactional baseline.
+    bool parameterDraftDirty_ = false;
+    int parameterInputGeneration_ = 0;
+    bool parameterEditorOpen_ = false;
+    // Study pane scaffold (sim_manager_forms.cpp): stepper Setup sub-chips from the readiness logic.
+    struct SetupStep {
+        const char* label = nullptr;   // short chip label that fits five to a row ("Temp", "Loads")
+        const char* title = nullptr;   // full name: tree row, chip tooltip ("Fixed temperature")
+        SimNode     node  = SimNode::Study;
+        int         status = 0;        // 0 ready, 1 optional / not set, 2 needs attention
+        std::string issue;             // first problem of that node ("" when ready)
+    };
+    std::vector<SetupStep> setupSteps(AppState& st, const Study& s);
+    void drawStudyOptions(AppState& st, Study& s);   // Study-node body per study type
+    void drawRunPage(AppState& st, Study& s);        // stepper "Run" page (live progress, traces, last run)
+    struct RunPageView { std::string studyId; SimNode node = SimNode::Study; bool sawRunning = false; };
+    RunPageView runPage_;                            // Run page shown while studyId/node match
     void drawFixturesForm(AppState& st, Study& s);
     void drawLoadsForm(AppState& st, Study& s);
     void drawMaterialCombo(AppState& st, Study& s);
     void drawMeshForm(AppState& st, Study& s);
     void drawFlowForm(AppState& st, Study& s);     // wind-tunnel setup: fluid, AoA, roughness, ref area
+    void syncFlowStudy(AppState& st, Study& s); // normalise flow/thermal-CFD setup outside draw (defined in sim_manager_flow.cpp)
     void drawResultControls(AppState& st, Study& s);
+    // Results step with no result: spinner while this study runs, else emptyState "Run <type>"
+    // (or blockedState + "Go to <step>") — sim_manager_results.cpp.
+    void drawResultsEmpty(AppState& st, Study& s);
     void drawWellRow(AppState& st, const char* label, SimWell& well, int armId, const char* tip);
     void drawCustomMaterialPopup(AppState& st, Study& s);
 
@@ -517,6 +626,7 @@ private:
     void persist(AppState& st, const std::string& docId, Study& s);
     void deleteStudy(AppState& st, int i);
     static nlohmann::json studyToJson(const Study& s);
+    static nlohmann::json typedStudyJson(const Study& s);
     static Study studyFromJson(const nlohmann::json& j);
 
     // fatigue form + result graphs (Goodman / Gerber / Soderberg diagram + S-N curve)
@@ -560,22 +670,75 @@ private:
     // pick capture: append every currently-selected face into `well`.
     void captureSelectionInto(AppState& st, SimWell& well);
 
+    // Piping / internal flow / vessel / duct panel. Its records live in doc["studies"] next to
+    // the FEA studies but are kept out of studies_ (refresh hands them over).
+    PipingPanel piping_;
+    // Hydraulic circuit panel; its hydraulic_circuit records are kept out of studies_ the same way.
+    HydraulicPanel hydraulic_;
     std::vector<Study> studies_;
     int sel_ = -1;                  // selected study index (-1 = none)
     SimNode node_ = SimNode::Study; // selected sub-node of sel_
     int loadIdx_ = -1;              // which load is selected when node_==Load
 
-    // sim-gui rework: tool-invoked setup panels. The setup editors are NOT stacked under the tree
-    // any more — a panel opens (PropertyManager-style, taking over the left pane body) ONLY when a
-    // ribbon tool is invoked or a tree node is double-clicked, and closes via its OK button / the
-    // header close glyph. While closed the pane shows just "+ New Study" + the study tree.
+    // Tool-invoked setup panel: a study editor takes over the pane (PropertyManager-style) when a
+    // ribbon tool is invoked, a picker kind is chosen or a row is double-clicked, and closes via
+    // the header's "Done". While closed the pane shows the study list.
     bool panelOpen_ = false;
+    // One-shot ribbon focus (UI standard decision 5): a setup command navigates node_ and names
+    // the card it targets; the form that draws that card calls takeFocus("<id>") right before
+    // its kit::cardBegin. The first matching call scrolls the pane body so the card sits at the
+    // top, clears the request and returns true (callers may flash/open the card). Unclaimed
+    // requests expire after a short grace period so a stale target never jumps the page later.
+    // Card ids: "material", "fixtures", "load" (the card of loadIdx_), "mesh", "modes" (Modal /
+    // Buckling), "strength" (Fatigue S-N data), "conduction", "excitation", "contact",
+    // "fluid", "flow" (flow boundaries), "heat" (Thermal CFD heat transfer), "resolution",
+    // "drivers" (Motion). Topology entries use topoBcView_.focusPointer instead.
+    void requestFocus(const char* cardId);
+    bool takeFocus(const char* cardId);
+    std::string focusCard_;
+    int focusFrame_ = -1;
+    // Per-frame pane context (tick): feeds the ribbon the selected study kind and scopes the
+    // status-bar line a run of this manager posted to that study — switching study, closing the
+    // editor or handing the pane to another panel clears it ("Static FEA complete" never lingers
+    // over a Modal / Flow / Hydraulics pane). Defined in sim_manager.cpp.
+    void syncPaneContext(AppState& st);
+    std::string simStatusText_;     // st.status text attributed to a run of this manager
+    std::string simStatusStudyId_;  // study that run belonged to
+    std::string lastStatusSeen_;    // st.status as of the previous tick
+    std::string lastRunStudyId_;    // study of the last active run
+    std::string scopeDocId_, scopeStudyId_; // pane scope at the previous tick: doc, study,
+    int scopeFlags_ = -1;                   // editor/takeover/workspace bits (-1 = unset)
+    bool statusRunActive_ = false;  // a run of this manager was active at the previous tick
     // Select a study of type t for a type-scoped ribbon tool (prefer the current selection when it
     // already matches, else the first study of that type). Returns false when none exists.
     bool selectStudyOfType(StudyType t);
-    // Draw the PM-style setup-panel header (icon + "<study> - <node>" + close). Returns false when
-    // the user closed the panel this frame.
+    // ONE header for every simulation pane (kit::panelHeader): study icon, elided name, dim type
+    // chip, status chip, a units popover and "Done". Draws nothing else (the body scaffold owns
+    // the hairline). Returns false on the frame "Done" is clicked.
     bool drawPanelHeader(AppState& st, Study& s);
+    // Grouped "New study" picker (kit::groupedPicker). openNewStudyPicker() closes any open
+    // panel and pops the picker on the next tree draw (pane button + ribbon sim_new_picker).
+    void openNewStudyPicker();
+    void drawNewStudyPicker(AppState& st);
+    bool newPickerRequested_ = false;
+    // Row-level delete waits for an inline confirmation (study id; "" = none pending).
+    std::string pendingDeleteStudyId_;
+    // Sync step (tick): keep studies' material keys in step with the part material and normalise
+    // setup the forms used to fix up mid-draw (modal studies carry no loads).
+    void syncStudies(AppState& st);
+    // Shared Run gate behind run() and runBlocker().
+    std::string runBlockerFor(AppState& st, const Study& s) const;
+    // AppState the manager last ticked/drew with (runUi()/runBlocker() read it; AppState
+    // outlives every DocSession-owned SimManager).
+    AppState* appSt_ = nullptr;
+    // Footer progress bookkeeping (tick/drain only).
+    double runStartTime_ = -1.0;       // ImGui::GetTime() when a run of this manager started
+    bool   runWasActive_ = false;
+    int    runPct_ = -1;               // last streamed percentage (<0 none)
+    std::string runStageText_;         // last streamed stage/text line
+    std::string advRunningStudyId_;    // study of the in-flight advRunning_ worker call
+    std::string advStage_;             // its stage line
+    std::string motionDiscardStudyId_; // Motion study whose pending result Cancel discarded
 
     // EM (electromagnetics) gating: 0 = not probed yet, 1 = em_* backend available, -1 = missing.
     // Probed ONCE asynchronously (st.rpc) when the Simulate workspace first becomes active; the
@@ -590,34 +753,41 @@ private:
     // EM is NOT a doc-persisted Study (the em_* backend is stateless one-shot analysis RPCs, no
     // sim_study_* persistence). It gets its own PropertyManager-style panel that takes over the left
     // pane — three forms (eigenmode / driven S-params / time domain), each run async via st.rpc with
-    // a dedicated in-flight guard and results parsed onto the manager (drawn with ImDrawList lines,
-    // the same plotting facility drawFatigueGraphs uses; there is no ImPlot in host/).
+    // a dedicated in-flight guard and results parsed onto the manager (plotted with kit::linePlot).
     enum class EmForm { Eigenmode, Driven, TimeDomain };
     struct EmState {
         // Shared waveguide selection. stdIdx: -1 = custom, else index into the WR-xx preset table.
         int   stdIdx = 7;          // default WR-90 (X band) — index into kEmStandards
         int   shape = 0;           // custom cross-section: 0 = rect, 1 = circular
-        float a_mm = 22.86f;       // rect broad wall (custom)
-        float b_mm = 10.16f;       // rect narrow wall (custom)
-        float radius_mm = 8.0f;    // circular radius (custom)
+        double a_mm = 22.86;       // rect broad wall (custom)
+        double b_mm = 10.16;       // rect narrow wall (custom)
+        double radius_mm = 8.0;    // circular radius (custom)
 
+        double epsR = 1.0;
+        std::string exactMode;
+        nlohmann::json nativeParameters[3] = {nlohmann::json::object(), nlohmann::json::object(), nlohmann::json::object()};
+        std::string parameterDraft[3], parameterError[3];
+        bool parameterEditorOpen = false;
+        nlohmann::json rawResults[3];
+        bool parameterDraftLoaded[3] = {false, false, false};
+        std::vector<std::string> backendNames[3];
         // Eigenmode inputs.
         int   nModes = 6;
         int   resolution = 64;
 
         // Driven / time-domain shared geometry length + mode.
-        float lengthMm = 50.0f;
+        double lengthMm = 50.0;
         int   modeIdx = 0;         // index into kEmModes (TE10 default)
 
         // Driven sweep.
-        float fStartGhz = 8.0f;
-        float fStopGhz = 12.0f;
+        double fStartGhz = 8.0;
+        double fStopGhz = 12.0;
         int   nFreq = 101;
         char  stlPath[256] = "";   // optional geometry STL (driven)
 
         // Time domain.
-        float f0Ghz = 10.0f;
-        float bwGhz = 4.0f;
+        double f0Ghz = 10.0;
+        double bwGhz = 4.0;
 
         // Per-form results (transient). ok<0 unrun, 0 error, 1 ok.
         int  eigResult = -1, drvResult = -1, tdResult = -1;
@@ -629,8 +799,6 @@ private:
     EmState em_;
     bool emPanelOpen_ = false;
     EmForm emForm_ = EmForm::Eigenmode;
-    bool emTabSync_ = false;               // force the in-panel tab bar to emForm_ for ONE frame
-                                           // (after a ribbon command); else the user's clicks win
     bool emRunning_ = false;               // an em_* run launched by this manager is in flight
     // Form validation is shared by dispatch and draw-time gating. The path cache keeps the
     // optional STL existence probe off the per-frame hot path until the input changes.
@@ -642,10 +810,9 @@ private:
     void drawEmForm(AppState& st);         // the active form's inputs
     void runEmForm(AppState& st);          // dispatch the active form's em_* RPC (async)
     nlohmann::json emWaveguideSpec() const; // {standard:...} or {waveguide:{...}} from em_
-    void drawEmLinePlot(const char* id, const std::vector<float>& x,
-                        const std::vector<float>* y1, const char* l1,
-                        const std::vector<float>* y2, const char* l2,
-                        const char* xlabel, const char* ylabel);
+    nlohmann::json buildEmRequest() const;
+    void invalidateEmResults();
+    void drawEmParameterEditor();
 
     // ---- T-FIN24: multiphysics capability doctor + panels ----------------------------------
     // sim_caps probe (worker multiphysics seam): CalculiX presence (contact), the
@@ -672,6 +839,16 @@ private:
         char  dcSource[64] = "V1";
         float dcStart = 0.0f, dcStop = 5.0f, dcStep = 0.1f;
         float acStartHz = 10.0f, acStopHz = 1e6f; int acPoints = 61;
+        std::string docId, paletteDocId, paletteError;
+        bool palettePending = false;
+        nlohmann::json circuit;
+        std::vector<std::string> setupProbes;
+        char manualProbe[128] = "";
+        double reltol = 1e-3, vntol = 1e-6, gmin = 1e-12, tempC = 27, tranStartMs = 0;
+        int maxiter = 100, acScale = 0;
+        bool tranUic = false;
+        char simParamsJson[32768] = "{}";
+        std::string simParamsError;
         // Result (transient). ok<0 unrun, 0 error, 1 ok. resultDocId/resultDocTitle
         // bind the payload to the schematic that launched it even if tabs are reordered or
         // the user selects another schematic before the async callback drains.
@@ -699,10 +876,18 @@ private:
         std::vector<std::string> projectIds, projectNames;
         int  projIdx = 0;
         char asserts[256] = "";
-        float durationMs = 1000.0f; // requested target run time; backend timeout adds 5 s grace
+        float durationMs = 1000.0f; // target virtual run horizon; host timeout is independent
+        sim::FwScenarioEditor scenarioEditor;
+        nlohmann::json scenario = nlohmann::json::object(), raw;
+        int backend = 0;
+        float timeoutS = 0;
+        std::string scenarioError;
+        char elfPath[2048] = "";
+        bool powerProfile = false;
         int  result = -1;             // <0 unrun, 0 error, 1 ok
         std::string error, headline;
         std::vector<std::string> uart; // UART console tail from the run
+        std::vector<std::pair<std::string, bool>> assertResults; // (assertion, passed) from the last fw_sim_run
     };
     FwSimState fwsim_;
     bool fwPanelOpen_ = false;
@@ -728,6 +913,13 @@ private:
         int heatsinkTargetKind = 0;   // 0 junction (Tj), 1 case (Tcase)
         float heatsinkTargetC = 0.0f;
         bool heatsinkContextReady = false;
+        bool customEnvironment = false, dryRun = false;
+        double ambientC = 25, filmWm2K = 10, meshFineness = 0.35;
+        char transientJson[8192] = "";
+        std::string transientError;
+        double timThicknessMm = 0.1, timConductivityWmK = 3;
+        bool heatsinkLibrary = true, heatsinkParametric = true;
+        int maxCandidates = 8;
         bool heatsinkRunning = false;
     };
     HandoffState ho_;
@@ -757,6 +949,7 @@ private:
 
     // Armed well for viewport picking: -1 none, 0 = fixtures, >=1 = loads[armId-1]. Tied to sel_.
     int armedWell_ = -1;
+    static constexpr int kArmFlowDirection = (1 << 20) + 1;
 
     bool running_ = false;          // a run launched by THIS manager is in flight
     int  runningStudy_ = -1;        // index of the study that launched the in-flight run
@@ -796,12 +989,14 @@ private:
     void drawTopologyForm(AppState& st, Study& s);
     void drawTopologyResults(AppState& st, Study& s);
     void drawTopologyRunArea(AppState& st, Study& s);
+    void drawTopologyLiveStatus(AppState& st, Study& s); // topology body top: status line + live convergence sparklines (defined in sim/sim_manager_topology.cpp)
     void finishTopologyRun(AppState& st, Study& s, const std::string& ownerDocId, bool uiActive);
     void processTopologyActions(AppState& st);
     void refreshTopologyRunsView(AppState& st, Study& s, bool force = false);
     bool showTopologyRun(AppState& st, Study& s, const std::string& runId);
     void exportTopologyArtifact(AppState& st, Study& s, const std::string& runId,
                                 const std::string& artifactKey);
+    void continueTopologyInCad(AppState& st, Study& s, const std::string& runId);
     topology::MaterialLookup topologyMaterialLookup() const;
     std::string topologyGeometryKey(AppState& st); // hash of the doc tree minus studies
     // Run gate shared by the panel button, ribbon sim_run and scenarios: capability matrix,

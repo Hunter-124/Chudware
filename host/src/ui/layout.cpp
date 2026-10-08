@@ -426,8 +426,28 @@ void drawLeftPane(AppState& st,
     // otherwise user-resized column; the doc-tab strip re-anchors to this edge each frame, so a wider
     // Electronics column just pushes its own tabs right — Model stays at its own persisted width.
     const bool ecadWs = (st.activeWorkspace == AppState::Workspace::Electronics);
+    // Simulate (when its Simulation Manager body draws — the early-return branch below) gets its
+    // OWN column window, so its width is remembered separately from the shared FeatureManager
+    // column: a wider default (metrics::simManagerPaneW, so sim forms stop wrapping at ~280 px of
+    // content) without forcing it (FirstUseEver), the user's resize persisted in the imgui ini under
+    // its own name, and the Model/Drawing/Manufacture/Electronics width untouched. Window slot 0 =
+    // shared FeatureManager column, 1 = Simulation Manager column. Position, collapse state and the
+    // published overlay edge/height are identical for both; only one is submitted per frame.
+    const bool simWs = (st.activeWorkspace == AppState::Workspace::Simulate && st.simManager);
+    const int widthSlot = simWs ? 1 : 0;
+    // "Reset layout" is a one-shot consumed by whichever column window draws this frame; latch it
+    // per window so the one NOT on screen also snaps back to its default the next time it draws.
+    static bool s_widthResetPending[2] = {false, false};
+    if (wantReset) s_widthResetPending[0] = s_widthResetPending[1] = true;
+    const bool resetWidth = s_widthResetPending[widthSlot];
+    s_widthResetPending[widthSlot] = false;
+    // Default capped at this fraction of the overlay band (still >= minW) so the Simulate column
+    // never eats the viewport on a narrow window; maxW below stays the hard drag limit.
+    constexpr float kSimPaneMaxBandFrac = 0.36f;
     const float defW = mobile ? std::min(availableW, 420.0f * panelSc)
-                             : (ecadWs ? 360.0f : mfgWs ? 380.0f : 320.0f) * panelSc;
+                     : simWs  ? std::max(minW, std::min(ui::metrics::simManagerPaneW(),
+                                                        (band.maxX - band.minX) * kSimPaneMaxBandFrac))
+                              : (ecadWs ? 360.0f : mfgWs ? 380.0f : 320.0f) * panelSc;
     const float maxW = mobile ? availableW
                              : std::max(minW + 40.0f * S,
                                         std::min(560.0f * panelSc, (band.maxX - band.minX) * 0.42f));
@@ -435,7 +455,7 @@ void drawLeftPane(AppState& st,
     const float winH = mobile ? std::min(animatedH, colH) : animatedH;
     ImGui::SetNextWindowPos(ImVec2(colX, colY), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(defW, winH),
-                             (mobile || wantReset || ecadWs) ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
+                             (mobile || resetWidth || ecadWs) ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(ImVec2(minW, winH), ImVec2(maxW, winH));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, bubbleDp * S);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
@@ -452,10 +472,15 @@ void drawLeftPane(AppState& st,
     // dialogs) and the whole pane stopped responding to the mouse. FM (left edge) and the floating
     // dialogs (top-right) don't overlap, so dropping the flag restores click routing without
     // re-introducing any layering issue.
+    // NoFocusOnAppearing: the two column windows (see widthSlot) swap on every Simulate <-> other
+    // workspace switch; a reappearing column must not steal keyboard focus or jump above open
+    // floating dialogs. Clicking inside still focuses it normally.
     const ImGuiWindowFlags lpFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoBackground |
-        ImGuiWindowFlags_NoScrollbar;
-    const bool lpOpen = ImGui::Begin("FeatureManager##LeftPane", nullptr, lpFlags);
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoFocusOnAppearing;
+    const bool lpOpen = ImGui::Begin(widthSlot == 1 ? "SimulationManager##LeftPane"
+                                                    : "FeatureManager##LeftPane",
+                                     nullptr, lpFlags);
     ImGui::PopStyleColor(5);
     ImGui::PopStyleVar(2);
     if (!lpOpen) { ImGui::End(); return; }

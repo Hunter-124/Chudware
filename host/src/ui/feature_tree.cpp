@@ -3310,7 +3310,12 @@ void drawFeatureTreeGlyph(ImDrawList* dl, ImVec2 mn, float sz, ImU32 ink) {
     }
 }
 
+static void tickOpenProgress(AppState& st);   // long-open progress readout (defined below)
+
 void fmPaneHeaderChip(AppState& st, const char* title, const char* titleIcon, float paneCenterX) {
+    // The pane header is drawn every frame on every left-pane tab, so a long open's elapsed
+    // readout keeps advancing even while the FeatureManager body itself is not the visible tab.
+    tickOpenProgress(st);
     const float S = ui::uiScale;
     const ui::AdaptiveSurface& surf = fmSurf();
     const float iconSz  = 16.0f * S;
@@ -3468,17 +3473,137 @@ static void doSaveDoc(AppState& st, bool forceDialog) {
                 }, 120000);
 }
 
+// ---- long-open progress -----------------------------------------------------------------------
+// doc_open and its optional mesh doc_activate run in hostd's long watchdog tier: a .step+ whose
+// saved build cache can't be used is recompiled from its features, which for a big part takes
+// minutes. While such a call is in flight the tree shows a spinner row and the status line an
+// elapsed-seconds readout, and the finished open says whether the saved cache served it — so a
+// slow open reads as "still building", never as a hang or an `Open failed`. Each open holds a
+// ticket; its completion callbacks end their own ticket (several opens may overlap).
+struct OpenProgress {
+    uint64_t ticket = 0;
+    std::string name;         // file basename
+    bool meshPhase = false;   // doc_open landed; the mesh doc_activate is still running
+    std::chrono::steady_clock::time_point started;
+};
+static std::vector<OpenProgress> s_openProgress;
+static uint64_t s_openTicketSeq = 0;
+// The st.status text this readout last wrote. The per-frame tick only rewrites st.status while it
+// still shows that text, so a sim / agent status posted mid-open is never clobbered.
+static std::string s_openStatusText;
+
+static double secondsSince(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+static std::string formatOpenSeconds(double s) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, s < 10.0 ? "%.1f s" : "%.0f s", s);
+    return buf;
+}
+
+// "Opening part.step+… 42 s" for the oldest in-flight open (+N more); empty when none.
+static std::string openProgressLabel() {
+    if (s_openProgress.empty()) return {};
+    const OpenProgress& o = s_openProgress.front();
+    char secs[32];
+    std::snprintf(secs, sizeof secs, "%.0f s", secondsSince(o.started));
+    std::string label = std::string(o.meshPhase ? "Loading mesh for " : "Opening ") + o.name +
+                        "\xe2\x80\xa6 " + secs;
+    if (s_openProgress.size() > 1)
+        label += "  (+" + std::to_string(s_openProgress.size() - 1) + " more)";
+    return label;
+}
+
+static void setOpenStatus(AppState& st, std::string text, int kind) {
+    st.status = text;
+    st.statusKind = kind;
+    s_openStatusText = std::move(text);
+}
+
+// Per frame (tree body + pane header): advance the elapsed readout in the status line.
+static void tickOpenProgress(AppState& st) {
+    if (s_openProgress.empty() || st.status != s_openStatusText) return;
+    std::string label = openProgressLabel();
+    if (label != s_openStatusText) setOpenStatus(st, std::move(label), 0);
+}
+
+static uint64_t beginOpenProgress(AppState& st, const std::string& path) {
+    OpenProgress o;
+    o.ticket = ++s_openTicketSeq;
+    o.name = pathBaseName(path);
+    o.started = std::chrono::steady_clock::now();
+    s_openProgress.push_back(std::move(o));
+    setOpenStatus(st, openProgressLabel(), 0);   // the user's own action claims the status line
+    return s_openTicketSeq;
+}
+
+static void setOpenMeshPhase(uint64_t ticket) {
+    for (OpenProgress& o : s_openProgress)
+        if (o.ticket == ticket) o.meshPhase = true;
+}
+
+// Drop the ticket; returns its elapsed seconds (-1 for ticket 0 / unknown, e.g. the sync path).
+static double endOpenProgress(uint64_t ticket) {
+    for (auto it = s_openProgress.begin(); it != s_openProgress.end(); ++it) {
+        if (it->ticket != ticket) continue;
+        const double secs = secondsSince(it->started);
+        s_openProgress.erase(it);
+        return secs;
+    }
+    return -1.0;
+}
+
+// How the engine served the doc_open just adopted: "loaded from saved build cache", or "rebuilt"
+// plus the engine's cache_miss_reason. Empty when the engine doesn't report cache use at all.
+static std::string openCacheNote(const core::DocMirror& m) {
+    if (!m.lastOpenedCacheReported()) return {};
+    if (m.lastOpenedCacheHit()) return "loaded from saved build cache";
+    std::string why = m.lastOpenedCacheMissReason();
+    if (why.empty()) return "rebuilt from features";
+    std::replace(why.begin(), why.end(), '_', ' ');
+    return "rebuilt from features \xe2\x80\x94 saved cache not used: " + why;
+}
+
+// The open finished (mesh on screen or nothing to load): end the ticket and say how long it took
+// and whether the saved cache served it. `quiet` (st.handoffQuietOpen captured when the open was
+// applied — a live MCP-handoff refresh would toast every build step) only logs.
+static void announceOpened(AppState& st, const std::string& base, const std::string& cacheNote,
+                           uint64_t ticket, bool quiet) {
+    const double secs = endOpenProgress(ticket);
+    std::string msg = "Opened " + base;
+    if (!cacheNote.empty()) msg += " \xe2\x80\x94 " + cacheNote;
+    if (secs >= 0.0) msg += " (" + formatOpenSeconds(secs) + ")";
+    st.addLog("[open] " + msg);
+    if (quiet) return;
+    st.toast(ui::ToastLevel::Info, msg);
+    setOpenStatus(st, msg, 0);
+}
+
+// A doc_open that failed (transport error or engine refusal): end the ticket, report with timing.
+static void reportOpenFailed(AppState& st, const std::string& path, const std::string& err,
+                             uint64_t ticket) {
+    const double secs = endOpenProgress(ticket);
+    std::string msg = "Open failed: " + pathBaseName(path) + " \xe2\x80\x94 " + err;
+    if (secs >= 0.0) msg += " (after " + formatOpenSeconds(secs) + ")";
+    st.addLog("[err] open: " + msg);
+    st.toast(ui::ToastLevel::Error, msg);
+    setOpenStatus(st, msg, 2);
+}
+
 // Apply a JUST-OPENED document (DocMirror::open already succeeded, so the mirror holds the new
 // doc id / revision / tree). Factored out so BOTH open paths (native dialog and the
 // CHUDWARE_NO_FILE_DIALOGS path-strip fallback) take the identical route.
 //
-// Geometry refresh: the worker's doc_open response DOES carry a tess block, but
-// DocMirror::open() discards it (doc_mirror.cpp parses only doc_id/revision/tree and is owned
-// elsewhere), so we fetch the mesh with a forced doc_rebuild — async via st.rpc to keep the GL
-// thread live. A forced rebuild does NOT bump the revision (engine/doc/session.py rebuild()),
-// so the mirror stays in step. The callback runs on the GL thread (AsyncRpc::drain), so
-// loadDocMesh / toast / resync are all safe there.
-static void applyOpenedDoc(AppState& st, const std::string& path) {
+// Geometry refresh: DocMirror::adoptOpenResponse keeps the doc_open response's own tess block,
+// so the common case loads that mesh directly. Only when the response carried no mesh AND the
+// engine did not report its session warm (older engines) do we fetch the mesh with doc_activate
+// — async via st.rpc to keep the GL thread live; it never bumps the revision, so the mirror stays
+// in step. A warm response with no mesh is a doc with nothing to display: no follow-up call, since
+// any activation would only repeat work the engine already did. The callback runs on the GL
+// thread (AsyncRpc::drain), so loadDocMesh / toast / resync are all safe there.
+// `ticket` (beginOpenProgress) is ended here or in the mesh callback; 0 = untracked sync open.
+static void applyOpenedDoc(AppState& st, const std::string& path, uint64_t ticket = 0) {
     st.clearViewportForNewDoc();   // resets viewport + tree transients (clears s_docPath too)
     // Re-derive default reference-plane/axis/origin visibility from the just-opened doc's tree.
     // docMirror.open() already ran applyDocDrivenVisibility once (via its notify() callback)
@@ -3512,8 +3637,6 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
     if (!st.handoffQuietOpen)
         st.fitViewOnNextMeshCommit = true;
     st.addLog("[doc] opened: " + path + "  rev=" + std::to_string(st.docMirror.revision()));
-    if (!st.handoffQuietOpen)   // silent on a live MCP-handoff refresh (would toast every build step)
-        st.toast(ui::ToastLevel::Info, "Opened " + pathBaseName(path));
     // W12+ — re-open any drawings the engine restored from this .step+ (their `source` already
     // re-pointed to the just-opened part). Each becomes a Drawing tab ALONGSIDE the part tab (the
     // part stays active). Tolerant: an empty/absent list is a no-op (a file with no drawings).
@@ -3529,7 +3652,9 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
                          "Restored " + std::to_string(drws.size()) + " drawing(s)");
         }
     }
-    std::string base = pathBaseName(path);
+    const std::string base = pathBaseName(path);
+    const std::string cacheNote = openCacheNote(st.docMirror);
+    const bool quiet = st.handoffQuietOpen;
     // FAST PATH: the doc_open response itself carried the mesh (DocMirror::open now keeps
     // tess.aicm_path + volume + feature_status/owner_map instead of discarding them). Load it
     // directly and skip the engine activation below — the forced-rebuild variant recompiled
@@ -3547,6 +3672,7 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
             st.yaw = 0.0f; st.pitch = 89.5f; st.zoom = 1.0f;
             st.addLog("[open] flat 2D import — hid datum planes + oriented Top");
         }
+        announceOpened(st, base, cacheNote, ticket, quiet);
         return;
 #else
         std::string lerr;
@@ -3559,27 +3685,38 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
                 st.yaw = 0.0f; st.pitch = 89.5f; st.zoom = 1.0f;
                 st.addLog("[open] flat 2D import — hid datum planes + oriented Top");
             }
+            announceOpened(st, base, cacheNote, ticket, quiet);
             return;
         }
         st.addLog("[err] loadDocMesh(open fast path): " + lerr + " — falling back to rebuild");
 #endif
+    } else if (st.docMirror.lastOpenedWarm()) {
+        // Warm engine session and no mesh in the response: the doc has nothing to display (empty
+        // part / sketch-only). An activation would hand back the same empty state.
+        announceOpened(st, base, cacheNote, ticket, quiet);
+        return;
     }
     // Multi-document: bind this open-refresh to the doc it targets so a tab switch before the async
     // result drains can't load THIS doc's mesh / tree into whatever doc is foreground by then.
     const std::string openDocId = st.docMirror.docId();
+    setOpenMeshPhase(ticket);
     ++st.rebuildsInFlight;
     st.rpc.call("doc_activate", {{"doc_id", openDocId}},
-        [&st, base, openDocId](const core::RpcResult& r) {
+        [&st, base, cacheNote, openDocId, ticket, quiet](const core::RpcResult& r) {
             --st.rebuildsInFlight;
             if (st.docMirror.docId() != openDocId) {
                 st.addLog("[open] mesh refresh for " + openDocId + " ignored — active doc changed");
+                announceOpened(st, base, cacheNote, ticket, quiet);
                 return;
             }
             if (!r.ok || r.result.contains("code")) {
                 std::string msg = !r.ok ? r.err : jfld(r.result, "message");
+                const double secs = endOpenProgress(ticket);
                 st.addLog("[err] open mesh refresh: " + msg);
-                st.toast(ui::ToastLevel::Warn,
-                         "Opened " + base + " — mesh refresh failed: " + msg);
+                std::string warn = "Opened " + base + " \xe2\x80\x94 mesh refresh failed: " + msg;
+                if (secs >= 0.0) warn += " (after " + formatOpenSeconds(secs) + ")";
+                st.toast(ui::ToastLevel::Warn, warn);
+                setOpenStatus(st, warn, 1);
                 return;
             }
             std::string aicm;
@@ -3610,7 +3747,34 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
             // clears them); doc_tree is a cheap no-rebuild pull that restores both (status
             // badges + feature->face highlights) and fires the listener so the tree repaints.
             st.docMirror.resync(st.worker);
-        }, 60000);
+            announceOpened(st, base, cacheNote, ticket, quiet);
+        }, core::kLongEngineCallTimeoutMs);
+}
+
+// User-facing open: doc_open on AsyncRpc so the GL thread stays live, with the long-tier deadline
+// (a cache-miss rebuild may take minutes — failure is reported only when the engine says so) and
+// an elapsed-time readout in the tree + status line until the mesh is on screen. Non-modal: tabs
+// already open keep switching from their local snapshots while the engine builds.
+static void startAsyncOpen(AppState& st, const std::string& path, bool asSolid) {
+    nlohmann::json params = {{"path", path}};
+    if (asSolid) params["as_solid"] = true;
+    st.toast(ui::ToastLevel::Info, "Opening " + pathBaseName(path) + "\xe2\x80\xa6");
+    const uint64_t ticket = beginOpenProgress(st, path);
+    ++st.rebuildsInFlight;
+    st.rpc.call("doc_open", std::move(params),
+                [&st, path, ticket](const core::RpcResult& r) {
+                    --st.rebuildsInFlight;
+                    if (!r.ok) {
+                        reportOpenFailed(st, path, r.err, ticket);
+                        return;
+                    }
+                    std::string err;
+                    if (!st.docMirror.adoptOpenResponse(r.result, err)) {
+                        reportOpenFailed(st, path, err, ticket);
+                        return;
+                    }
+                    applyOpenedDoc(st, path, ticket);
+                }, core::kLongEngineCallTimeoutMs);
 }
 
 // Native-dialog Open: pick a .step+ file, open it in the worker, apply it.
@@ -3640,26 +3804,7 @@ static void doOpenDoc(AppState& st) {
         st.toast(ui::ToastLevel::Error, "Open failed: worker not started");
         return;
     }
-    nlohmann::json params = {{"path", path}};
-    if (asSolid) params["as_solid"] = true;
-    st.toast(ui::ToastLevel::Info, "Opening " + pathBaseName(path) + "…");
-    ++st.rebuildsInFlight;
-    st.rpc.call("doc_open", std::move(params),
-                [&st, path](const core::RpcResult& r) {
-                    --st.rebuildsInFlight;
-                    if (!r.ok) {
-                        st.addLog("[err] open: " + r.err);
-                        st.toast(ui::ToastLevel::Error, "Open failed: " + r.err);
-                        return;
-                    }
-                    std::string err;
-                    if (!st.docMirror.adoptOpenResponse(r.result, err)) {
-                        st.addLog("[err] open: " + err);
-                        st.toast(ui::ToastLevel::Error, "Open failed: " + err);
-                        return;
-                    }
-                    applyOpenedDoc(st, path);
-                }, 120000);
+    startAsyncOpen(st, path, asSolid);
 }
 
 // Features section header — the SAME centred-label + twin-hairline + far-right chevron row as the
@@ -3960,6 +4105,16 @@ void drawFeatureTreeBody(AppState& st,
     // C24: SolidWorks-style top strip (tab row + compact doc toolbar), replacing the old wide
     // New Part / Undo / Redo text buttons that used to live at the panel bottom.
     drawFeatureManagerTopStrip(st);
+    // A doc_open / mesh activation still building (long cache-miss rebuild): spinner row with the
+    // elapsed time, above the tree of whatever doc is on screen meanwhile.
+    tickOpenProgress(st);
+    if (!s_openProgress.empty()) {
+        const std::string label = openProgressLabel();
+        ui::kit::spinner(label.c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The engine is building this file. Other open tabs stay usable;\n"
+                              "it opens in its own tab when the build finishes.");
+    }
 
     // ---- document title ----
     const nlohmann::json& tree = st.docMirror.tree();
@@ -5986,28 +6141,7 @@ bool featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid) {
         return false;
     }
 
-    nlohmann::json params = {{"path", path}};
-    if (asSolid) params["as_solid"] = true;
-    st.toast(ui::ToastLevel::Info, "Opening " + pathBaseName(path) + "\xe2\x80\xa6");
-    ++st.rebuildsInFlight;
-    st.rpc.call("doc_open", std::move(params),
-                [&st, path](const core::RpcResult& r) {
-                    --st.rebuildsInFlight;
-                    if (!r.ok) {
-                        st.addLog("[err] open: " + r.err);
-                        st.toast(ui::ToastLevel::Error,
-                                 "Open failed: " + pathBaseName(path) + " — " + r.err);
-                        return;
-                    }
-                    std::string err;
-                    if (!st.docMirror.adoptOpenResponse(r.result, err)) {
-                        st.addLog("[err] open: " + err);
-                        st.toast(ui::ToastLevel::Error,
-                                 "Open failed: " + pathBaseName(path) + " — " + err);
-                        return;
-                    }
-                    applyOpenedDoc(st, path);
-                }, 120000);
+    startAsyncOpen(st, path, asSolid);
     return true;  // open started (completion via applyOpenedDoc)
 }
 

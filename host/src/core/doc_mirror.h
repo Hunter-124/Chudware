@@ -132,6 +132,18 @@ public:
     const std::string& lastOpenedAicm() const { return lastOpenedAicm_; }
     double lastOpenedVolume() const { return lastOpenedVolume_; }
 
+    // How the most recent doc_open was served, from the engine's response (reset per open):
+    //   lastOpenedCacheReported — the engine sent `cache_hit` at all (older engines don't; the UI
+    //                             then says nothing about the cache rather than guessing).
+    //   lastOpenedCacheHit      — geometry/mesh came from the .step+'s saved build cache.
+    //   lastOpenedWarm          — the engine session's compiled state is hot, so a follow-up
+    //                             doc_activate/doc_rebuild would only repeat work already done.
+    //   lastOpenedCacheMissReason — why the saved cache was not used (snake_case; empty on a hit).
+    bool lastOpenedCacheReported() const { return lastOpenedCacheReported_; }
+    bool lastOpenedCacheHit() const { return lastOpenedCacheHit_; }
+    bool lastOpenedWarm() const { return lastOpenedWarm_; }
+    const std::string& lastOpenedCacheMissReason() const { return lastOpenedCacheMissReason_; }
+
     // ---- W1-B (item 6): owner-map lookups ----
     // The parsed feature->topology map from the latest response that carried one. TOLERANT of the
     // engine not (yet) sending "owner_map": the map is simply empty and the lookups return nothing.
@@ -343,6 +355,8 @@ public:
         featureStatus_ = {};
         refDatums_ = nlohmann::json::array();
         lastOpenedDrawings_ = nlohmann::json::array();
+        lastOpenedCacheReported_ = lastOpenedCacheHit_ = lastOpenedWarm_ = false;
+        lastOpenedCacheMissReason_.clear();
         ownerMap_.clear();
         faceOwner_.clear();
         edgeOwner_.clear();
@@ -371,6 +385,10 @@ private:
     nlohmann::json lastOpenedDrawings_ = nlohmann::json::array();  // W12+ doc_open "drawings"
     std::string    lastOpenedAicm_;                                // doc_open tess.aicm_path
     double         lastOpenedVolume_ = 1.0;                        // doc_open "volume" (flat-2D probe)
+    bool           lastOpenedCacheReported_ = false;               // doc_open carried "cache_hit"
+    bool           lastOpenedCacheHit_ = false;                    // doc_open "cache_hit"
+    bool           lastOpenedWarm_ = false;                        // doc_open "warm"
+    std::string    lastOpenedCacheMissReason_;                     // doc_open "cache_miss_reason"
     Listener       listener_;
     StaleCb        staleResyncCb_;  // W1-B: fired on stale_revision auto-resync
     uint64_t       mutationGen_ = 0;  // T-PERF1: latest-wins guard for applyOpsAsync

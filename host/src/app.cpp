@@ -108,6 +108,7 @@ inline void wasmBootReady() {
 #include "core/app_state.h"
 #include "core/engine_events.h" // Phase 4: per-frame hostd event drain (daemon mode)
 #include "core/fs_backend.h"
+#include "core/startup_trace.h"
 #include "engine_backend.h" // Phase 4: engine::daemonMode() (services/worker)
 #include "ipc_client.h"     // services/ipc EngineClient (orphan recovery RPCs)
 #include "ipc_discovery.h" // H2 shot: spawnDetached/resolveHostdBin for hostd bounce
@@ -2110,22 +2111,43 @@ static void drainWebFileDrop(AppState &st) {
 }
 #endif
 
-// Default to a fresh part on launch — on a non-shot run, once the worker is
-// ready and nothing is open, auto-create a disposable STARTER part
-// (DocTab::isStarter) so the app opens straight into a usable document instead
-// of an empty shell. If the user then opens an existing file, the untouched
-// starter is silently discarded (AppState::dropBlankStarterTabs, called from
-// the open path); if they edit it, it sticks. Fires at most once
-// (st.starterTried). No-op in shot/scenario mode (scenarios create their own
-// docs) and once a doc/design already exists. ITEM 15: wait one painted frame
-// after the worker becomes ready so the status bar can show "Ready" / clear the
-// warmup chip before the (still-sync) doc_new hitch, and so the first
-// interactive frames are not blocked by starter creation.
+#ifndef __EMSCRIPTEN__
+struct NativeStartup {
+  bool firstFramePresented = false;
+  bool daemonConnectedMarked = false;
+  bool daemonBootstrapMarked = false;
+  bool workerStartedMarked = false;
+  bool readinessPending = false;
+  bool engineReady = false;
+  std::chrono::steady_clock::time_point nextReadyPoll{};
+  bool starterOpenPending = false;
+  bool starterPresented = false;
+  bool interactiveMarked = false;
+};
+static NativeStartup s_nativeStartup;
+#endif
+
+// Offer a disposable starter only once, after the native engine is ready and
+// bootstrap has checked crash recovery. Readiness RPCs run on the async lane;
+// the GUI never waits for hostd's cold engine load. Web keeps its existing gate.
 static void ensureStarterDoc(AppState &st, bool shot) {
   if (shot || st.starterTried)
     return;
-  if (!st.workerStarted || st.docMirror.hasDoc() || !st.docTabs.empty() ||
-      st.designStarted)
+  if (st.docMirror.hasDoc() || !st.docTabs.empty() || st.designStarted) {
+#ifndef __EMSCRIPTEN__
+    // Seeing any document permanently cancels the offer, even if it is closed
+    // before the engine finishes starting.
+    st.starterTried = true;
+#endif
+    return;
+  }
+#ifndef __EMSCRIPTEN__
+  if (!st.requestOpenPath.empty() || st.rebuildsInFlight > 0) {
+    st.starterTried = true;
+    return;
+  }
+#endif
+  if (!st.workerStarted)
     return;
   // Never drop a blank starter next to parts the daemon is offering for crash
   // recovery.
@@ -2137,6 +2159,53 @@ static void ensureStarterDoc(AppState &st, bool shot) {
   // "worker not started" toast (the exact boot error users hit). Wait for the
   // first successful bootstrap.
   if (engine::daemonMode() && !st.daemonEverConnected)
+    return;
+#else
+  st.startupPhase = "Opening starter part\xe2\x80\xa6";
+  if (!s_nativeStartup.engineReady) {
+    if (!engine::daemonMode()) {
+      // A successfully started legacy worker / in-process fallback is ready.
+      s_nativeStartup.engineReady = true;
+      startup_trace::mark("engine ready");
+    } else {
+      // Do not mint a part before bootstrap has checked the recovery entries.
+      if (!st.daemonEverConnected)
+        return;
+      const auto now = std::chrono::steady_clock::now();
+      if (s_nativeStartup.readinessPending ||
+          now < s_nativeStartup.nextReadyPoll)
+        return;
+      s_nativeStartup.readinessPending = true;
+      st.rpc.call(
+          "daemon_status", nlohmann::json::object(),
+          [&st](const core::RpcResult &r) {
+            s_nativeStartup.readinessPending = false;
+            s_nativeStartup.nextReadyPoll =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(250);
+            if (!r.ok || !r.result.is_object() || r.result.contains("code"))
+              return;
+            const std::string state =
+                r.result.value("state", std::string());
+            if (state == "ready") {
+              s_nativeStartup.engineReady = true;
+              startup_trace::mark("engine ready");
+            } else if (state == "failed") {
+              st.starterTried = true;
+              st.startupPhase.clear();
+              st.status = "Engine failed to load";
+              st.statusKind = 2;
+              st.toast(ui::ToastLevel::Error, st.status);
+              st.addLog("[startup] engine failed to load in hostd");
+            }
+          },
+          5000);
+      return;
+    }
+  }
+  // A sync mint must not queue behind another call's WorkerClient mutex.
+  // Startup metadata pollers stay deferred while startupPhase is set.
+  if (st.rpc.busy())
     return;
 #endif
   static int s_readyFrame = -1;
@@ -2151,11 +2220,21 @@ static void ensureStarterDoc(AppState &st, bool shot) {
   ui::createNewDoc(
       st,
       0); // New Part — same path as the chooser (incl. per-doc session setup)
-  if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
+  if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
     st.docTabs[st.activeTab].isStarter = true;
+#ifndef __EMSCRIPTEN__
+    st.wantFocusViewport = 6;
+    s_nativeStartup.starterOpenPending = true;
+    st.addLog("[startup] opened default starter part");
+#endif
+  }
+#ifdef __EMSCRIPTEN__
   st.wantFocusViewport = 6;
+#endif
   st.startupPhase.clear();
+#ifdef __EMSCRIPTEN__
   st.addLog("[startup] opened default starter part");
+#endif
 }
 
 // Save every dirty tab for the exit flow ("Save All & Quit"), dispatching by
@@ -2287,8 +2366,9 @@ static void wasmDrainHudCommands(AppState &st) {
     break;
   case WasmHudCmd::ZoomIn: {
     st.zoom *= 1.15f;
-    if (st.zoom > 10.0f)
-      st.zoom = 10.0f;
+    const float maxZoom = st.renderer ? st.renderer->maxSceneZoom() : 10.0f;
+    if (st.zoom > maxZoom)
+      st.zoom = maxZoom;
     break;
   }
   case WasmHudCmd::ZoomOut: {
@@ -2433,6 +2513,10 @@ EMSCRIPTEN_KEEPALIVE void chudware_mobile_key(int key) {
 #endif
 
 int run_gui(const char *screenshotPath, const char *openPath) {
+  startup_trace::mark("run_gui entry");
+#ifndef __EMSCRIPTEN__
+  s_nativeStartup = {};
+#endif
   WASM_BOOT_LOG("[wasm-boot] run_gui enter\n");
   const bool shot = screenshotPath != nullptr;
 #ifdef __EMSCRIPTEN__
@@ -2521,6 +2605,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     glfwTerminate();
     return 1;
   }
+  startup_trace::mark("GLFW window created");
   if (winSized)
     glfwSetWindowPos(win, 0, 0);
   glfwMakeContextCurrent(win);
@@ -2592,6 +2677,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     ui::applyTheme(initTheme, scale);
   }
   ui::Fonts fonts = ui::loadFonts(assets, scale);
+  startup_trace::mark("fonts loaded");
   WASM_BOOT_LOG("[wasm-boot] loadFonts done\n");
   ImGui_ImplGlfw_InitForOpenGL(win, true);
 #ifdef __EMSCRIPTEN__
@@ -2615,6 +2701,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   std::string rerr;
   Renderer renderer;
   renderer.init(960, 720, rerr);
+  startup_trace::mark("renderer init");
   // Viewport visuals driven by palette roles so they switch with the theme.
   // These are cheap uniform/state sets re-pushed every frame in the main loop
   // (see below) so a runtime theme toggle takes effect immediately; this
@@ -2642,6 +2729,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
   // C14: load icon atlases (stb_image; must be after GL context is live).
   ui::loadIcons(assets);
+  startup_trace::mark("icons loaded");
   WASM_BOOT_LOG("[wasm-boot] loadIcons done\n");
 
   // W1-B: create the GLFW standard cursors once (consumed per-frame via
@@ -2855,6 +2943,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   st.ribbonDispatch = dispatchCmd;
 
   loadSettings(st.settings);
+  startup_trace::mark("settings loaded");
   st.orthographic =
       st.settings
           .orthographic; // live projection mode mirrors the persisted setting
@@ -4478,6 +4567,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
   while (!glfwWindowShouldClose(win)) {
 #ifdef __EMSCRIPTEN__
+    const bool engineTickAllowed = true;
+#else
+    // daemonMode() initializes and connects on first use. Even the legacy
+    // handoff check must wait until the native shell has actually been swapped.
+    const bool engineTickAllowed = shot || s_nativeStartup.firstFramePresented;
+#endif
+#ifdef __EMSCRIPTEN__
     static int s_wasmFrames = 0;
     ++s_wasmFrames;
     if (s_wasmFrames <= 3) {
@@ -4569,7 +4665,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       const bool wantFrames = ui::anim::consumeFrameRequest();
       const bool busy = wantFrames || st.animActive || st.rebuildsInFlight > 0 ||
                         st.rpc.busy() || (st.simClient && st.simClient->busy());
-      if (busy || shot) {
+      if (busy || shot || !engineTickAllowed) {
         glfwPollEvents();
       } else {
 #ifdef __EMSCRIPTEN__
@@ -4675,15 +4771,17 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       }
     }
 
-    // ITEM 15: deferred engine bootstrap. Interactive launches set
-    // workerBootPending so the first frames can paint chrome before
-    // tryStartWorker (libchudware/OCCT/daemon hello) blocks the UI thread. Wait ~2
-    // frames so at least one swap has presented. Daemon reconnect lifecycle is
-    // untouched (engineEventsTick / workerStarted gates).
+    // Start the native worker only after a real presentation, not a guessed
+    // frame count. Keep the browser's existing warmup-frame behavior.
     if (st.workerBootPending) {
+#ifdef __EMSCRIPTEN__
       static int s_bootDeferFrames = 0;
       ++s_bootDeferFrames;
-      if (s_bootDeferFrames >= 2) {
+      const bool bootReady = s_bootDeferFrames >= 2;
+#else
+      const bool bootReady = s_nativeStartup.firstFramePresented;
+#endif
+      if (bootReady) {
         st.workerBootPending = false;
         st.startupPhase = "Warming up kernel\xe2\x80\xa6";
         st.status = "Warming up kernel...";
@@ -4704,6 +4802,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         }
       }
     }
+#ifndef __EMSCRIPTEN__
+    if (st.workerStarted && !s_nativeStartup.workerStartedMarked) {
+      s_nativeStartup.workerStartedMarked = true;
+      startup_trace::mark("worker started");
+    }
+#endif
 
     // Clear the startup loading chip once the engine is ready and we are past
     // the starter-doc gate (starter created, skipped, or user already opened
@@ -4736,7 +4840,22 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // Phase 4 (shared engine daemon): drain hostd push events — foreign-edit
     // mirror refresh, mirror tabs from doc.opened, lease toasts. No-op in
     // legacy (in-process) mode.
-    core::engineEventsTick(st);
+    if (engineTickAllowed)
+      core::engineEventsTick(st);
+#ifndef __EMSCRIPTEN__
+    if (engineTickAllowed) {
+      if (!s_nativeStartup.daemonConnectedMarked) {
+        if (auto *c = engine::client(); c && c->connected()) {
+          s_nativeStartup.daemonConnectedMarked = true;
+          startup_trace::mark("daemon connected");
+        }
+      }
+      if (st.daemonEverConnected && !s_nativeStartup.daemonBootstrapMarked) {
+        s_nativeStartup.daemonBootstrapMarked = true;
+        startup_trace::mark("daemon bootstrap done");
+      }
+    }
+#endif
     // Multi-document: release closed-tab sessions whose async work (PM preview
     // / sketch / eval callbacks that captured `this`) has now fully drained —
     // safe to destroy once rpc is idle.
@@ -4749,7 +4868,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // doc.changed events with the mesh path (engineEventsTick above) — the
     // .step+ file handoff is legacy only, so skip the poller entirely (no
     // second source of truth).
-    if (!engine::daemonMode())
+    if (engineTickAllowed && !engine::daemonMode())
       ui::pollAiCadHandoff(st);
 
     // C48: click telemetry for interaction debugging — only when
@@ -6466,7 +6585,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // state machines that issue scripted ops through the REAL worker, drive the
     // panels, and request per-step screenshots; extracted to ui::ScenarioRunner
     // (ui/scenarios.cpp).
-    scenarios.tick(st);
+    const bool pointerShot =
+        st.shot && shotMode &&
+        (std::strcmp(shotMode, "siminteractive") == 0 ||
+         std::strcmp(shotMode, "simaudit") == 0 ||
+         std::strcmp(shotMode, "pipedraw") == 0 ||
+         std::strcmp(shotMode, "hydraulics3d") == 0);
+    if (!pointerShot)
+      scenarios.tick(st);
 
     // Keep theme state coherent across runtime toggles, screenshot scenarios,
     // and any accidental style leak. This runs before NewFrame so docked panes
@@ -6487,9 +6613,15 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // window opens under wherever the real cursor happens to sit, so a --ui-screenshot
     // frame can catch a ribbon/button tooltip parked over the very chrome the shot is
     // meant to show (the Manufacture captures kept eating the "Simulate" tooltip).
-    // Queue a final out-of-bounds mouse position so NewFrame resolves no hovered
-    // window at all. Shots never synthesize pointer input, so nothing else loses.
-    if (st.shot) ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+    // Pointer-driven simulation shots enqueue their input after the platform
+    // backend; other captures keep the cursor outside the window.
+    if (st.shot && !pointerShot)
+      ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+    if (pointerShot) {
+      scenarios.tick(st);
+      ensureFrameTheme();
+      busy = st.anyRunActive();
+    }
     ImGui::NewFrame();
 
     // Liquid glass v2.1: per-frame Settings -> resolved-glass push. Idempotent
@@ -6547,7 +6679,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
           st.docTabs[st.activeTab].docId == st.docMirror.docId() &&
           st.docMirror.hasDoc();
+      // The open Hydraulics panel (Simulate) owns Ctrl+Z/Ctrl+Y for its circuit history
+      // (HydraulicPanel::undo/redo, handled by its canvas and 3D scene); never also undo the
+      // CAD document underneath it.
+      const bool hydraulicsOwnsUndo =
+          st.activeWorkspace == AppState::Workspace::Simulate && st.simManager &&
+          st.simManager->hydraulic().isOpen();
       if (canDoc && !textFocus && !st.showWeb && !inSketchNow && !ecadFocused &&
+          !hydraulicsOwnsUndo &&
           !(st.propertyManager && st.propertyManager->active()) &&
           activeCad && (io.KeyCtrl || io.KeySuper)) {
         if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
@@ -8293,6 +8432,21 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       break;
     }
     glfwSwapBuffers(win);
+#ifndef __EMSCRIPTEN__
+    if (!s_nativeStartup.firstFramePresented) {
+      s_nativeStartup.firstFramePresented = true;
+      startup_trace::mark("first frame presented");
+    }
+    if (s_nativeStartup.starterOpenPending) {
+      s_nativeStartup.starterOpenPending = false;
+      s_nativeStartup.starterPresented = true;
+      startup_trace::mark("starter part open (doc visible)");
+    } else if (s_nativeStartup.starterPresented &&
+               !s_nativeStartup.interactiveMarked) {
+      s_nativeStartup.interactiveMarked = true;
+      startup_trace::mark("first interactive frame after starter");
+    }
+#endif
 #ifdef __EMSCRIPTEN__
     // ASYNCIFY: yield to the browser event loop so WebSocket/timer callbacks
     // run.

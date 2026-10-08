@@ -34,6 +34,7 @@ namespace {
 
 struct AiWsState {
     int view = -1;  // -1 = not yet restored from ai_prefs (agent.ui_ai_view) on first draw.
+    int compactPane = 0;  // Ephemeral: 0 = Chat, 1 = Workspace; never stored in ai_prefs.
     // Follow live runs: the last run id seen per session. A session is seeded silently on first
     // sight, so switching sessions (whose saved trace carries an old run id) never moves the
     // pane — only a NEW run in the same session does.
@@ -95,6 +96,20 @@ static bool navRow(int id, const char* label, bool active, int badge = 0) {
     return hit;
 }
 
+static void drawProjectChip(AppState& st) {
+    const std::string projectDir = convProjectDir(st);
+    const std::filesystem::path project(projectDir);
+    std::string projectName = project.filename().string();
+    if (projectName.empty() && !projectDir.empty())
+        projectName = project.parent_path().filename().string();
+    const std::string shortName = kit::elide(
+        projectName.empty() ? "No project selected" : projectName.c_str(),
+        ImGui::GetContentRegionAvail().x - kit::padX() * 2.0f);
+    kit::chip(shortName.c_str(),
+              projectName.empty() ? kit::Tone::Neutral : kit::Tone::Accent,
+              false, projectDir.empty() ? nullptr : projectDir.c_str());
+}
+
 static void drawNavColumn(AppState& st, float navW) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(ui::metrics::cpMenuGutter(), ui::metrics::px(8.0f)));
@@ -113,18 +128,8 @@ static void drawNavColumn(AppState& st, float navW) {
         adaptivePanel(panelId("ai_ws_nav_glass"), wRect, GlassGroup::Global);
     glassPanel(dl, wRect, GlassLevel::Thin, rowRoundDp(), surf);
 
-    const std::string projectDir = convProjectDir(st);
-    const std::filesystem::path project(projectDir);
-    std::string projectName = project.filename().string();
-    if (projectName.empty() && !projectDir.empty())
-        projectName = project.parent_path().filename().string();
-    const std::string shortName = kit::elide(
-        projectName.empty() ? "No project selected" : projectName.c_str(),
-        navW - ui::metrics::cpMenuGutter() * 3.0f);
     kit::sectionHeader("Active project", nullptr, nullptr, -1, true);
-    kit::chip(shortName.c_str(),
-              projectName.empty() ? kit::Tone::Neutral : kit::Tone::Accent,
-              false, projectDir.empty() ? nullptr : projectDir.c_str());
+    drawProjectChip(st);
     kit::gapSection();
 
     const int live = currentRunLiveCount();
@@ -179,10 +184,10 @@ static void drawSessionHeader(AppState& st) {
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuRowGap()));
 }
 
-static void drawChatCenter(AppState& st, bool busy, bool canRun) {
+static void drawChatCenter(AppState& st, bool busy, bool canRun, bool compact) {
     const float S = ui::uiScale;
 
-    // Main conversation stays visible while Current Run inspects one selected agent.
+    // Both layouts use the same session, transcript and draft state.
     drawSessionHeader(st);
 
     // Reserve the composer height measured last frame so the log fills the rest
@@ -192,7 +197,7 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
                                         : ImGui::GetFrameHeightWithSpacing() * 4.0f) +
                     14.0f * S;
     float logH = ImGui::GetContentRegionAvail().y - reserve;
-    if (logH < 120.0f * S) logH = 120.0f * S;
+    logH = std::max(compact ? 1.0f : 120.0f * S, logH);
 
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
@@ -327,20 +332,6 @@ static void drawViewPane(AppState& st, bool busy) {
         adaptivePanel(panelId("ai_ws_view_glass"), vRect, GlassGroup::Global);
     glassPanel(ImGui::GetWindowDrawList(), vRect, GlassLevel::Thin, rowRoundDp(), viewSurf);
 
-    // Follow live runs: only a NEW run in the session being viewed moves the pane. A session is
-    // seeded silently the first time it is seen, and a run id that changes while nothing is
-    // running (a saved trace restored on switch) just updates the record.
-    {
-        const std::string convId = st.activeConvId();
-        const std::string runId  = agentDagSummary(convId).runId;
-        auto [seen, firstSight] = s_ai.seenRunByConv.try_emplace(convId, runId);
-        if (!firstSight && seen->second != runId) {
-            seen->second = runId;
-            if (aiFollowActiveSession() && !runId.empty() && st.convRunning(convId))
-                setView(0);
-        }
-    }
-
     // The child's WindowPadding gutter (cpMenuGutter) IS the left margin now — one indent for
     // every nav view, shared with the docked Copilot menus. The old ad-hoc Indent(6dp) stacked
     // on top of it and is gone.
@@ -390,68 +381,108 @@ void drawAiWorkspace(AppState& st) {
     maybePersistChatHistoryDebounced(st, /*force=*/false);
     if (s_ai.view < 0) s_ai.view = aiWorkspaceView();   // restore the last nav selection
 
-    // v3 layout (Hunter's directive): MAIN CHAT on the left, everything else in the right
-    // utility panel — a vertical nav menu + the selected view. No sessions rail, no bottom
-    // options strip. A hairline marks the chat/utility boundary (layout.cpp grammar).
-    const float totalW = ImGui::GetContentRegionAvail().x;
-    const float gap    = 10.0f * S;
-    const float navW   = 168.0f * S;
+    // Follow runs even while the compact layout is showing only Chat. Seeding a session is
+    // silent, as before; only a new live run in that session changes the selected compartment.
+    {
+        const std::string convId = st.activeConvId();
+        const std::string runId  = agentDagSummary(convId).runId;
+        auto [seen, firstSight] = s_ai.seenRunByConv.try_emplace(convId, runId);
+        if (!firstSight && seen->second != runId) {
+            seen->second = runId;
+            if (aiFollowActiveSession() && !runId.empty() && st.convRunning(convId))
+                setView(0);
+        }
+    }
 
-    // Chat column: a generous main-chat slice — 44% with clean bounds so it never starves
-    // (min) or sprawls on ultrawide monitors (max). Full height: log + composer inside.
-    const float chatW = std::max(360.0f * S, std::min(totalW * 0.44f, 780.0f * S));
+    // Keep the three-column arrangement only when chat, nav and a useful compartment all
+    // fit. The breakpoint and bounds scale together; compact mode gives either pane the
+    // full width without changing the persisted compartment selection.
+    const float totalW  = ImGui::GetContentRegionAvail().x;
+    const float gap     = 10.0f * S;
+    const float navW    = 168.0f * S;
+    const float chatMin = 360.0f * S;
+    const float viewMin = 300.0f * S;
+    const bool compact = totalW < chatMin + navW + gap * 2.0f + viewMin;
+    const float chatW = compact ? totalW :
+        std::min(std::max(chatMin, std::min(totalW * 0.44f, 780.0f * S)),
+                 totalW - navW - gap * 2.0f - viewMin);
+
+    if (compact) {
+        const CozyDensity density;
+        static const char* const panes[] = {"Chat", "Workspace"};
+        kit::segmented("##ai_ws_compact_pane", panes, 2, &s_ai.compactPane);
+        // Keep context alongside the switch when useful space remains; otherwise wrap it.
+        const float remaining = totalW - ImGui::GetItemRectSize().x - gap;
+        if (remaining >= ui::metrics::px(120.0f)) ImGui::SameLine(0.0f, gap);
+        drawProjectChip(st);
+        kit::gapRow();
+    }
 
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     const float  bodyH  = ImGui::GetContentRegionAvail().y;
     const ImU32  hairline = ui::Palette::toU32(palette.glassBorder);
 
     // ---- left: main chat ----------------------------------------------------------
-    // Horizontal gutter is ASYMMETRIC: the pill scrollbar is clipped to this child, so the right
-    // side must reserve a full kChatScrollbarLane or the chat runs under the bar. ImGui's
-    // WindowPadding is symmetric, so push the WIDE (right) value and pull the LEFT edge back to
-    // the shared cpMenuGutter with a negative Indent below.
-    const float padL = ui::metrics::cpMenuGutter();
-    const float padR = std::max(padL, ui::metrics::px(ui::kChatScrollbarLane));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padR, ui::metrics::px(8.0f)));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##ai_ws_conv", ImVec2(chatW, 0),
-                      ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
-    if (padR > padL) ImGui::Indent(padL - padR);   // negative: pull the LEFT edge back to padL
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
-    // Liquid-glass slab behind the conversation (same recipe as the view pane); the same
-    // surface backs the pill scrollbar if the column ever overflows.
-    const ImVec2 cw0 = ImGui::GetWindowPos();
-    const ImRect cRect(cw0, ImVec2(cw0.x + ImGui::GetWindowSize().x,
-                                   cw0.y + ImGui::GetWindowSize().y));
-    const AdaptiveSurface& convSurf =
-        adaptivePanel(panelId("ai_ws_conv_glass"), cRect, GlassGroup::Global);
-    glassPanel(ImGui::GetWindowDrawList(), cRect, GlassLevel::Thin, rowRoundDp(), convSurf);
-    drawChatCenter(st, busy, canRun);   // log + composer (same state/send path as the dock)
-    if (padR > padL) ImGui::Unindent(padL - padR);  // undo before the scrollbar geometry read
-    drawWindowPillScrollbarV(convSurf, ui::kChatScrollbar);  // same 9px right-edge bar as the dock
-    ImGui::EndChild();
+    if (!compact || s_ai.compactPane == 0) {
+        // Horizontal gutter is ASYMMETRIC: the pill scrollbar is clipped to this child, so the right
+        // side must reserve a full kChatScrollbarLane or the chat runs under the bar. ImGui's
+        // WindowPadding is symmetric, so push the WIDE (right) value and pull the LEFT edge back to
+        // the shared cpMenuGutter with a negative Indent below.
+        const float padL = ui::metrics::cpMenuGutter();
+        const float padR = std::max(padL, ui::metrics::px(ui::kChatScrollbarLane));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padR, ui::metrics::px(8.0f)));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+        ImGui::BeginChild("##ai_ws_conv", ImVec2(chatW, 0),
+                          ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
+        if (padR > padL) ImGui::Indent(padL - padR);   // negative: pull the LEFT edge back to padL
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
+        // Liquid-glass slab behind the conversation (same recipe as the view pane); the same
+        // surface backs the pill scrollbar if the column ever overflows.
+        const ImVec2 cw0 = ImGui::GetWindowPos();
+        const ImRect cRect(cw0, ImVec2(cw0.x + ImGui::GetWindowSize().x,
+                                     cw0.y + ImGui::GetWindowSize().y));
+        const AdaptiveSurface& convSurf =
+            adaptivePanel(panelId("ai_ws_conv_glass"), cRect, GlassGroup::Global);
+        glassPanel(ImGui::GetWindowDrawList(), cRect, GlassLevel::Thin, rowRoundDp(), convSurf);
+        drawChatCenter(st, busy, canRun, compact);  // same state/send path as the dock
+        if (padR > padL) ImGui::Unindent(padL - padR);  // undo before the scrollbar geometry read
+        drawWindowPillScrollbarV(convSurf, ui::kChatScrollbar);  // same 9px right-edge bar as the dock
+        ImGui::EndChild();
+    }
 
-    ImGui::SameLine(0.0f, gap);
+    if (!compact) ImGui::SameLine(0.0f, gap);
 
     // ---- right: navigation + compartment -----------------------------------------
+    if (!compact || s_ai.compactPane == 1) {
+        // Pure layout wrapper: nav + view on wide surfaces, selector + view on compact ones.
+        // The view carries its own gutter + pill scrollbar; the wrapper must never scroll
+        // or grow a bar of its own — hence 0 padding and NoScrollbar|NoScrollWithMouse.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::BeginChild("##ai_ws_right", ImVec2(0, 0), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::PopStyleVar();
 
-    // Pure layout wrapper: it only hosts the nav column + the view pane side by side, both of
-    // which fill it exactly and carry their own gutter + pill scrollbar. It must never scroll
-    // or grow a bar of its own — hence 0 padding and NoScrollbar|NoScrollWithMouse.
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::BeginChild("##ai_ws_right", ImVec2(0, 0), ImGuiChildFlags_None,
-                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    ImGui::PopStyleVar();
+        if (compact) {
+            static const char* const compartments[] = {
+                "Current Run", "Plan", "Activity", "Sessions", "Insights", "Options"
+            };
+            int view = s_ai.view;
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::Combo("##ai_ws_compartment", &view, compartments, 6)) setView(view);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Choose a workspace compartment.");
+            kit::gapRow();
+        } else {
+            drawNavColumn(st, navW);
+            ImGui::SameLine(0.0f, gap);
+        }
+        drawViewPane(st, busy);
 
-    drawNavColumn(st, navW);
-    ImGui::SameLine(0.0f, gap);
-    drawViewPane(st, busy);
-
-    ImGui::EndChild();  // ##ai_ws_right
+        ImGui::EndChild();  // ##ai_ws_right
+    }
 
     // Vertical hairline along the chat/utility boundary (full height).
-    {
+    if (!compact) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const float x = origin.x + chatW + gap * 0.5f;
         dl->AddLine(ImVec2(x, origin.y), ImVec2(x, origin.y + bodyH), hairline,

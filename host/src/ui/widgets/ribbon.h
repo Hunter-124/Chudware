@@ -43,6 +43,15 @@ void setRibbonWorkspace(int workspace);
 // tools while the em_* electromagnetics solver backend is not installed. Sticky until changed.
 void setRibbonDisabledPrefix(const char* prefix, const char* reason);
 
+// Simulate study context: the SELECTED study's type key (SimManager's studyTypeKey: "static",
+// "modal", "buckling", "contact", "freq_response", "fatigue", "thermal", "thermal_fea", "flow",
+// "motion", "topology"), or "" when no study is selected. Call every frame (SimManager::tick);
+// the context expires when it is not refreshed (no CAD document active). The study tabs then
+// grey the commands that do not apply to that study (tooltip says why) and show the setup rows
+// of study types that share a tab (Buckling / Contact on Static, Vibration on Modal) only while
+// such a study is selected. See ribbonStudyGate (ribbon_def.h).
+void setRibbonStudyContext(const char* studyTypeKey);
+
 // --- Ribbon layout helpers --------------------------------------------------
 
 // Begin the ribbon bar: reserves a full-width child window of height ribbonH.

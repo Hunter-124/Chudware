@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -34,6 +35,42 @@ void main(){
     for (int i = 0; i < uClipCount; ++i)
         if (dot(vWorld, uClipN[i]) > uClipOff[i]) discard;
     frag = uColor;
+})";
+
+const char* kLitVert = R"(#version 330 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+layout(location=2) in vec3 aColor;
+uniform mat4 uMVP;
+out vec3 vWorld;
+out vec3 vNormal;
+out vec3 vColor;
+void main(){
+    vWorld = aPos;
+    vNormal = aNormal;
+    vColor = aColor;
+    gl_Position = uMVP * vec4(aPos, 1.0);
+})";
+
+const char* kLitFrag = R"(#version 330 core
+uniform vec4 uColor;
+uniform bool uHasColor;
+uniform vec3 uViewDir;
+uniform int uClipCount;
+uniform vec3 uClipN[3];
+uniform float uClipOff[3];
+in vec3 vWorld;
+in vec3 vNormal;
+in vec3 vColor;
+out vec4 frag;
+void main(){
+    for (int i = 0; i < uClipCount; ++i)
+        if (dot(vWorld, uClipN[i]) > uClipOff[i]) discard;
+    vec3 n = normalize(vNormal);
+    float lambert = abs(dot(n, uViewDir));
+    float specular = 0.12 * pow(lambert, 28.0);
+    vec3 color = uHasColor ? vColor : uColor.rgb;
+    frag = vec4(color * (0.28 + 0.72 * lambert) + color * specular, uColor.a);
 })";
 
 unsigned int compile(unsigned int type, const char* src) {
@@ -72,6 +109,7 @@ unsigned int linkProgram(const char* vs, const char* fs) {
 Overlays::~Overlays() {
     destroy();
     if (prog_) glDeleteProgram(prog_);
+    if (litProg_) glDeleteProgram(litProg_);
     if (vao_) glDeleteVertexArrays(1, &vao_);
     if (vbo_) glDeleteBuffers(1, &vbo_);
     if (segVao_) glDeleteVertexArrays(1, &segVao_);
@@ -124,7 +162,7 @@ void Overlays::setSectionClip(int count, const float normals[3][3], const float 
     }
 }
 
-bool Overlays::setDoc(const DocMesh& doc, std::string& err) {
+void Overlays::ensureCommonProgram() {
     if (!prog_) {
         prog_ = linkProgram(kVert, kFrag);
         // Cache uniform locations once — every draw path used to re-query them by string.
@@ -135,6 +173,10 @@ bool Overlays::setDoc(const DocMesh& doc, std::string& err) {
         uClipN_     = glGetUniformLocation(prog_, "uClipN");
         uClipOff_   = glGetUniformLocation(prog_, "uClipOff");
     }
+}
+
+bool Overlays::setDoc(const DocMesh& doc, std::string& err) {
+    ensureCommonProgram();
     int linked = 0;
     glGetProgramiv(prog_, GL_LINK_STATUS, &linked);
     if (!linked) { err = "overlays program link failed"; return false; }
@@ -361,6 +403,8 @@ void Overlays::drawSegments(const Renderer::CameraXform& cam, const std::vector<
 }
 
 void Overlays::beginSimulationFrame(uint64_t generation, uint64_t documentScope) {
+    // Simulation scenes are valid before setDoc has ever been called (empty new part).
+    ensureCommonProgram();
     if (generation != simulationGeneration_ || documentScope != simulationDocumentScope_) {
         clearSimulationBuffers();
         simulationGeneration_ = generation;
@@ -398,7 +442,7 @@ Overlays::SimulationBuf* Overlays::prepareSimulationBuffer(
 
     SimulationBuf& buf = simulationBufs_[batchKey];
     const int vertCount = (int)(xyz.size() / 3);
-    const bool needsUpload = !buf.vao || !buf.vbo || buf.primitive != primitive ||
+    const bool needsUpload = !buf.vao || !buf.vbo || buf.lit || buf.primitive != primitive ||
                              buf.vertCount != vertCount ||
                              buf.sourceRevision != sourceRevision;
     if (!buf.vao) glGenVertexArrays(1, &buf.vao);
@@ -413,6 +457,7 @@ Overlays::SimulationBuf* Overlays::prepareSimulationBuffer(
         buf.primitive = primitive;
         buf.vertCount = vertCount;
         buf.sourceRevision = sourceRevision;
+        buf.lit = false;
     }
     buf.lastFrame = simulationFrame_;
     return &buf;
@@ -461,6 +506,102 @@ void Overlays::drawSimulationTriangles(const Renderer::CameraXform& cam, uint64_
     glBindVertexArray(0);
 }
 
+void Overlays::drawSimulationLitTriangles(
+    const Renderer::CameraXform& cam, uint64_t batchKey, const std::vector<float>& xyz,
+    const std::vector<float>& nrm, const std::vector<float>* rgb, const float rgba[4],
+    uint64_t sourceRevision) {
+    if (!simulationFrameActive_ || xyz.size() < 9 || xyz.size() % 9 != 0 ||
+        nrm.size() != xyz.size() || (rgb && rgb->size() != xyz.size())) return;
+    if (!litProg_) {
+        litProg_ = linkProgram(kLitVert, kLitFrag);
+        uLitMVP_ = glGetUniformLocation(litProg_, "uMVP");
+        uLitColor_ = glGetUniformLocation(litProg_, "uColor");
+        uLitHasColor_ = glGetUniformLocation(litProg_, "uHasColor");
+        uLitViewDir_ = glGetUniformLocation(litProg_, "uViewDir");
+        uLitClipCount_ = glGetUniformLocation(litProg_, "uClipCount");
+        uLitClipN_ = glGetUniformLocation(litProg_, "uClipN");
+        uLitClipOff_ = glGetUniformLocation(litProg_, "uClipOff");
+    }
+    // Scene producers supply revisions. Keep the zero-revision convention safe for other
+    // callers by including every vertex attribute in the fallback fingerprint.
+    if (sourceRevision == 0) {
+        sourceRevision = 1469598103934665603ull;
+        auto fingerprint = [&](const std::vector<float>& values) {
+            for (float value : values) {
+                uint32_t bits = 0;
+                std::memcpy(&bits, &value, sizeof(bits));
+                sourceRevision ^= bits;
+                sourceRevision *= 1099511628211ull;
+            }
+            sourceRevision ^= (uint64_t)values.size();
+            sourceRevision *= 1099511628211ull;
+        };
+        fingerprint(xyz);
+        fingerprint(nrm);
+        if (rgb) fingerprint(*rgb);
+        if (sourceRevision == 0) sourceRevision = 1;
+    }
+    SimulationBuf& buf = simulationBufs_[batchKey];
+    const int vertCount = (int)(xyz.size() / 3);
+    const bool hasColor = rgb != nullptr;
+    const bool needsUpload = !buf.vao || !buf.vbo || !buf.nrmVbo || !buf.lit ||
+                             buf.vertCount != vertCount || buf.hasColor != hasColor ||
+                             buf.sourceRevision != sourceRevision;
+    if (!buf.vao) glGenVertexArrays(1, &buf.vao);
+    if (!buf.vbo) glGenBuffers(1, &buf.vbo);
+    if (!buf.nrmVbo) glGenBuffers(1, &buf.nrmVbo);
+    if (hasColor && !buf.rgbVbo) glGenBuffers(1, &buf.rgbVbo);
+    if (needsUpload) {
+        glBindVertexArray(buf.vao);
+        auto upload = [](unsigned int vbo, unsigned int attrib,
+                         const std::vector<float>& values) {
+            glBindBuffer(GL_ARRAY_BUFFER, vbo);
+            glBufferData(GL_ARRAY_BUFFER, values.size() * sizeof(float), values.data(),
+                         GL_STATIC_DRAW);
+            glEnableVertexAttribArray(attrib);
+            glVertexAttribPointer(attrib, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        };
+        upload(buf.vbo, 0, xyz);
+        upload(buf.nrmVbo, 1, nrm);
+        if (hasColor) upload(buf.rgbVbo, 2, *rgb);
+        else glDisableVertexAttribArray(2);
+        buf.primitive = GL_TRIANGLES;
+        buf.lit = true;
+        buf.hasColor = hasColor;
+        buf.vertCount = vertCount;
+        buf.sourceRevision = sourceRevision;
+    }
+    buf.lastFrame = simulationFrame_;
+    glUseProgram(litProg_);
+    glUniformMatrix4fv(uLitMVP_, 1, GL_FALSE, cam.mvp.m);
+    glUniform4fv(uLitColor_, 1, rgba);
+    glUniform1i(uLitHasColor_, hasColor ? 1 : 0);
+    glUniform3f(uLitViewDir_, cam.dir.x, cam.dir.y, cam.dir.z);
+    glUniform1i(uLitClipCount_, clipCount_);
+    if (clipCount_ > 0) {
+        glUniform3fv(uLitClipN_, clipCount_, clipNormals_[0]);
+        glUniform1fv(uLitClipOff_, clipCount_, clipOffsets_);
+    }
+    const bool culling = glIsEnabled(GL_CULL_FACE) == GL_TRUE;
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    if (rgba[3] >= 1.0f) {
+        glDisable(GL_BLEND);
+        glDepthMask(GL_TRUE);
+    } else {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+    }
+    glBindVertexArray(buf.vao);
+    glDrawArrays(GL_TRIANGLES, 0, buf.vertCount);
+    glBindVertexArray(0);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    if (culling) glEnable(GL_CULL_FACE);
+}
+
 void Overlays::endSimulationFrame() {
     if (!simulationFrameActive_) return;
     for (auto it = simulationBufs_.begin(); it != simulationBufs_.end();) {
@@ -470,6 +611,8 @@ void Overlays::endSimulationFrame() {
         }
         if (it->second.vao) glDeleteVertexArrays(1, &it->second.vao);
         if (it->second.vbo) glDeleteBuffers(1, &it->second.vbo);
+        if (it->second.nrmVbo) glDeleteBuffers(1, &it->second.nrmVbo);
+        if (it->second.rgbVbo) glDeleteBuffers(1, &it->second.rgbVbo);
         it = simulationBufs_.erase(it);
     }
     simulationFrameActive_ = false;
@@ -479,6 +622,8 @@ void Overlays::clearSimulationBuffers() {
     for (auto& kv : simulationBufs_) {
         if (kv.second.vao) glDeleteVertexArrays(1, &kv.second.vao);
         if (kv.second.vbo) glDeleteBuffers(1, &kv.second.vbo);
+        if (kv.second.nrmVbo) glDeleteBuffers(1, &kv.second.nrmVbo);
+        if (kv.second.rgbVbo) glDeleteBuffers(1, &kv.second.rgbVbo);
     }
     simulationBufs_.clear();
     simulationGeneration_ = 0;
@@ -683,6 +828,31 @@ void Overlays::draw(const Renderer::CameraXform& cam, const PickHit& hover,
     }
 
     glBindVertexArray(0);
+}
+
+void Overlays::beginScreenClip(const Renderer::CameraXform& cam, float u0, float v0, float u1,
+                               float v1) {
+    if (screenClipActive_ || cam.ssWidth <= 0 || cam.ssHeight <= 0) return;
+    u0 = std::clamp(u0, 0.0f, 1.0f); u1 = std::clamp(u1, u0, 1.0f);
+    v0 = std::clamp(v0, 0.0f, 1.0f); v1 = std::clamp(v1, v0, 1.0f);
+    screenClipPrevEnabled_ = glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE;
+    glGetIntegerv(GL_SCISSOR_BOX, screenClipPrevBox_);
+    // GL scissor origin is bottom-left; the image-space v runs down.
+    const int x0 = (int)std::floor(u0 * (float)cam.ssWidth);
+    const int x1 = (int)std::ceil(u1 * (float)cam.ssWidth);
+    const int y0 = (int)std::floor((1.0f - v1) * (float)cam.ssHeight);
+    const int y1 = (int)std::ceil((1.0f - v0) * (float)cam.ssHeight);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(x0, y0, std::max(0, x1 - x0), std::max(0, y1 - y0));
+    screenClipActive_ = true;
+}
+
+void Overlays::endScreenClip() {
+    if (!screenClipActive_) return;
+    glScissor(screenClipPrevBox_[0], screenClipPrevBox_[1], screenClipPrevBox_[2],
+              screenClipPrevBox_[3]);
+    if (!screenClipPrevEnabled_) glDisable(GL_SCISSOR_TEST);
+    screenClipActive_ = false;
 }
 
 }  // namespace render

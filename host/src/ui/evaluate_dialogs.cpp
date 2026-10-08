@@ -17,7 +17,6 @@
 #include "../core/app_state.h"
 #include "../renderer.h"
 #include "../ui_theme.h"
-#include "property_manager.h"   // pmFormatDim / Area / Volume / Mass / AreaMoment / MassMoment
 
 namespace ui {
 
@@ -29,8 +28,52 @@ static float gZebraFreq = 18.0f;
 // Shared with the viewport and MCP measurement emphasis contract.
 static const auto& kEvalPalette = ui::evalEmphasisPalette;
 
-// Format a linear value (canonical mm) for an evaluate readout in the active document units.
-static std::string evalLen(AppState& st, double mm) { return pmFormatDim(mm, st.ips()); }
+// Display-only readouts. The property-manager formatters ("%.4g" glued to the unit) double as
+// edit-buffer text, so the dialogs format through kit::fmtQuantity instead: significant digits,
+// thousands separators, a space before the unit, no e-notation noise. Values arrive canonical
+// (mm, mm², mm³, mm⁴, g, g·mm²) and read in the document's unit system. Anything below 1e-9 of
+// `ref` (the magnitude the value is read against: part size, the larger moment), and anything
+// below 1e-9 canonical units, is floating-point residue from a symmetric part ("-1.049e-17in")
+// and reads as 0.
+enum class EvalQty { Length, Area, Volume, Mass, AreaMoment, MassMoment };
+static std::string evalQty(bool ips, EvalQty q, double canonical, double ref = 0.0) {
+    struct Sys {
+        double      perUnit;   // canonical units per displayed unit
+        const char* unit;
+    };
+    static const Sys kMetric[] = {
+        {1.0, kit::unitText(kit::Unit::mm)},  {1.0, kit::unitText(kit::Unit::mm2)},
+        {1.0, kit::unitText(kit::Unit::mm3)}, {1.0, kit::unitText(kit::Unit::g)},
+        {1.0, "mm\xE2\x81\xB4"},              {1.0, "g\xC2\xB7mm\xC2\xB2"},
+    };
+    static const Sys kIps[] = {
+        {25.4, kit::unitText(kit::Unit::in)}, {645.16, kit::unitText(kit::Unit::in2)},
+        {16387.064, "in\xC2\xB3"},            {453.59237, kit::unitText(kit::Unit::lb)},
+        {416231.4256, "in\xE2\x81\xB4"},      {292639.66, "lb\xC2\xB7in\xC2\xB2"},
+    };
+    const Sys& s = (ips ? kIps : kMetric)[(int)q];
+    const double noise = std::max(1e-9, std::fabs(ref) * 1e-9);
+    if (std::isfinite(canonical) && std::fabs(canonical) <= noise) canonical = 0.0;
+    return kit::fmtQuantity(canonical / s.perUnit, s.unit);
+}
+
+// A linear value (canonical mm) in the active document units.
+static std::string evalLen(AppState& st, double mm, double ref = 0.0) {
+    return evalQty(st.ips(), EvalQty::Length, mm, ref);
+}
+
+// Small filled dot in a palette tint: pairs a card or row with its viewport highlight without
+// washing the whole card in a colour that reads as a status (a pink card looks like an error).
+// `tip` says what the colour refers to, so the dot is never an unexplained mark.
+static void evalSwatch(const float rgba[4], const char* tip = nullptr) {
+    const float  h = ImGui::GetTextLineHeight();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(h, h));
+    kit::itemTooltip(tip);
+    ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(p.x + h * 0.5f, p.y + h * 0.5f),
+                                                ui::metrics::U(1.25f),
+                                                ImGui::GetColorU32(ImVec4(rgba[0], rgba[1], rgba[2], 1.0f)));
+}
 
 struct MeasureSelection {
     nlohmann::json refs = nlohmann::json::array();
@@ -168,14 +211,12 @@ static MeasureRows measureRows(AppState& st, const nlohmann::json& result) {
     if (!result.contains("diameter"))
         number("radius", "Diameter", [&](double radius) { return length(2.0 * radius); });
     number("perimeter", "Perimeter", length);
-    number("area", "Area", [&](double value) { return pmFormatArea(value, st.ips()); });
-    number("volume", "Volume", [&](double value) { return pmFormatVolume(value, st.ips()); });
+    number("area", "Area", [&](double value) { return evalQty(st.ips(), EvalQty::Area, value); });
+    number("volume", "Volume", [&](double value) { return evalQty(st.ips(), EvalQty::Volume, value); });
     number("total_length", "Total length", length);
     number("total_distance", "Chain distance", length);
     number("angle", "Angle", [](double angle) {
-        char value[48];
-        std::snprintf(value, sizeof(value), "%.4f deg", angle);
-        return std::string(value);
+        return kit::fmtQuantity(angle, kit::unitText(kit::Unit::deg));
     });
     for (const char* key : {"segment_lengths", "distances"}) {
         const auto it = result.find(key);
@@ -203,21 +244,52 @@ static MeasureRows measureRows(AppState& st, const nlohmann::json& result) {
 static std::string measureReadingText(AppState& st, const nlohmann::json& result) {
     std::string text;
     for (const auto& row : measureRows(st, result)) {
-        if (!text.empty()) text += "; ";
+        if (!text.empty()) text += " \xc2\xb7 ";
         text += row.first + ": " + row.second;
     }
     return text;
 }
 
-static void drawColorChipRow(const char* text, const float rgba[4]) {
-    ImGui::PushID(text);
-    if (kit::cardBegin("##colored_reading", nullptr, nullptr, nullptr, rgba))
-        ImGui::TextWrapped("%s", text);
-    kit::cardEnd();
-    ImGui::PopID();
+static const char* kPlaneNames[] = {"plane.top", "plane.front", "plane.right"};
+
+// Field options for canonical-mm values shown in the document's unit system.
+static constexpr double kMmPerIn = 25.4;
+static kit::FieldOpts lengthOpts(bool ips) {
+    return kit::FieldOpts()
+        .withUnit(ips ? kit::Unit::in : kit::Unit::mm)
+        .withScale(ips ? 1.0 / kMmPerIn : 1.0);
+}
+static kit::FieldOpts areaOpts(bool ips) {
+    return kit::FieldOpts()
+        .withUnit(ips ? kit::Unit::in2 : kit::Unit::mm2)
+        .withScale(ips ? 1.0 / (kMmPerIn * kMmPerIn) : 1.0);
 }
 
-static const char* kPlaneNames[] = {"plane.top", "plane.front", "plane.right"};
+// Optional analysis limit: 0 (stored) means the engine's size-scaled default. The field shows the
+// "Auto" hint while unset; clearing it restores the default.
+static bool autoLimitField(const char* id, const char* label, float* v, kit::FieldOpts o) {
+    bool present = *v > 0.0f;
+    float shown = present ? *v : 0.0f;
+    const bool committed =
+        kit::fieldNumber(id, label, &shown, o.withPresent(&present).withHint("Auto").withMin(0.0));
+    if (committed) *v = present ? std::max(0.0f, shown) : 0.0f;
+    return committed;
+}
+
+// "measured vs limit" readout for one geometry-analysis finding (worker_rpc.md eval_geometry_analysis).
+static std::string findingMeta(AppState& st, const std::string& kind, double value, double limit) {
+    const bool ips = st.ips();
+    if (kind == "small_face")
+        return evalQty(ips, EvalQty::Area, value) + " < " + evalQty(ips, EvalQty::Area, limit);
+    if (kind == "short_edge" || kind == "gap") return evalLen(st, value) + " < " + evalLen(st, limit);
+    if (kind == "sliver_face") return kit::fmtValue(value, 3) + " < " + kit::fmtValue(limit, 3);
+    if (kind == "non_g1_edge") {
+        const char* deg = kit::unitText(kit::Unit::deg);
+        return kit::fmtQuantity(value, deg, 3) + " > " + kit::fmtQuantity(limit, deg, 3);
+    }
+    if (kind == "open_edge") return "Bounds one face";
+    return "Fails B-rep validation";
+}
 
 void EvaluateDialogs::clearOverlays() {
     // Shared exclusive-tool overlays only. Mass markers / section planes have independent
@@ -361,39 +433,33 @@ void EvaluateDialogs::runGeometryAnalysis(AppState& st) {
 }
 
 void EvaluateDialogs::drawGeometryAnalysis(AppState& st) {
-    kit::dimText("Zero uses a size-scaled default for each body. All dimensions are model mm.");
-    ImGui::InputFloat("Min face area (mm²)", &geometryMinArea_, 0, 0, "%.6g");
-    ImGui::InputFloat("Min edge length (mm)", &geometryMinEdge_, 0, 0, "%.6g");
-    ImGui::InputFloat("Sliver area / perimeter²", &geometrySliverRatio_, 0, 0, "%.6g");
-    ImGui::InputFloat("Gap tolerance (mm)", &geometryGapTol_, 0, 0, "%.6g");
-    ImGui::Checkbox("Inspect tangent discontinuities", &geometryDiscontinuities_);
-    if (kit::primaryButton("Run", !pending_)) {
-        geometryMinArea_ = std::max(0.f, geometryMinArea_);
-        geometryMinEdge_ = std::max(0.f, geometryMinEdge_);
-        geometrySliverRatio_ = std::max(0.f, geometrySliverRatio_);
-        geometryGapTol_ = std::max(0.f, geometryGapTol_);
-        runGeometryAnalysis(st);
+    const bool ips = st.ips();
+    {
+        kit::FieldGroup g("geo_limits", "Sliver area / perimeter²");
+        autoLimitField("min_area", "Min face area", &geometryMinArea_,
+                       areaOpts(ips).withTip("Faces with a smaller area are reported."));
+        autoLimitField("min_edge", "Min edge length", &geometryMinEdge_,
+                       lengthOpts(ips).withTip("Edges shorter than this are reported."));
+        autoLimitField("sliver", "Sliver area / perimeter²", &geometrySliverRatio_,
+                       kit::FieldOpts().withTip("Faces whose area / perimeter² ratio falls below "
+                                                "this are reported as slivers."));
+        autoLimitField("gap", "Gap tolerance", &geometryGapTol_,
+                       lengthOpts(ips).withTip("Open boundaries whose ends are closer than this "
+                                               "are reported as near gaps."));
+        kit::fieldCheckbox("g1", "Inspect tangent discontinuities", &geometryDiscontinuities_,
+                           kit::FieldOpts().withTip("Also report edges where the adjacent faces "
+                                                    "meet at more than 5° (G1 breaks)."));
     }
-    if (pending_) {
-        kit::spinner("Analyzing geometry...");
-        return;
-    }
+    kit::dimText("Empty limits use a size-scaled default for each body.");
+    if (pending_) return;   // the action footer shows progress
     if (!errorText_.empty()) {
         kit::blockedState("Geometry analysis unavailable", errorText_.c_str());
         return;
     }
-    if (!result_.contains("bodies") || !result_["bodies"].is_array()) return;
-    if (!result_.value("complete", false))
-        kit::blockedState("Incomplete source geometry",
-                          "Some source features or assembly components did not compile. Findings below cover surviving bodies only.");
-    for (const auto& body : result_["bodies"]) {
-        if (!body.contains("thresholds") || !body["thresholds"].is_object()) continue;
-        const auto& t = body["thresholds"];
-        ImGui::TextWrapped("Body %d limits: face %.4g mm², edge %.4g mm, "
-                           "sliver %.4g, gap %.4g mm",
-                           body.value("body_id", 0),
-                           t.value("min_face_area", 0.0), t.value("min_edge_length", 0.0),
-                           t.value("sliver_ratio", 0.0), t.value("gap_tol", 0.0));
+    if (!result_.contains("bodies") || !result_["bodies"].is_array()) {
+        kit::emptyState("geometry_analysis", "No analysis yet",
+                        "Set the limits above, then run the analysis.");
+        return;
     }
     static constexpr const char* kinds[] = {
         "brep_invalid", "small_face", "short_edge", "sliver_face",
@@ -403,53 +469,88 @@ void EvaluateDialogs::drawGeometryAnalysis(AppState& st) {
         "Invalid B-rep", "Small faces", "Short edges", "Sliver faces",
         "Open edges", "Near gaps", "Non-tangent edges"
     };
-    bool any = false;
+    const auto& bodies = result_["bodies"];
+    int counts[7] = {};
+    int total = 0;
+    bool gapScanSkipped = false;
+    for (const auto& body : bodies) {
+        if (!body.value("gap_scan_complete", true)) gapScanSkipped = true;
+        if (!body.contains("findings") || !body["findings"].is_array()) continue;
+        for (const auto& row : body["findings"]) {
+            const std::string kind = row.value("kind", std::string());
+            for (int k = 0; k < 7; ++k)
+                if (kind == kinds[k]) { ++counts[k]; ++total; }
+        }
+    }
+    const bool complete = result_.value("complete", false);
+
+    // Outcome first: one wrapping chip line, then the caveats inline.
+    kit::chipFlowBegin("geo_outcome");
+    if (total > 0) {
+        const std::string n = std::to_string(total) + (total == 1 ? " finding" : " findings");
+        kit::flowChip(n.c_str(), kit::Tone::Warn, true);
+    } else {
+        kit::flowChip("No findings", kit::Tone::Ok, true);
+    }
+    if (!complete) kit::flowChip("Incomplete source", kit::Tone::Warn, true);
+    kit::flowValueChip("Bodies", std::to_string(bodies.size()).c_str());
+    kit::chipFlowEnd();
+    if (!complete)
+        kit::inlineStatus("Some source features or assembly components did not compile. "
+                          "Findings cover surviving bodies only.", kit::Tone::Warn);
+    if (gapScanSkipped)
+        kit::inlineStatus("Gap scan skipped: too many open edge endpoints on a body.",
+                          kit::Tone::Warn);
+    if (total == 0) kit::dimText("The enabled checks found nothing to fix.");
+
+    // Limits the engine actually used (resolved per body), collapsed by default.
+    std::vector<kit::KeyValueItem> used;
+    for (const auto& body : bodies) {
+        if (!body.contains("thresholds") || !body["thresholds"].is_object()) continue;
+        const auto& t = body["thresholds"];
+        const std::string pre = bodies.size() > 1
+            ? "Body " + std::to_string(body.value("body_id", 0)) + " · " : std::string();
+        used.push_back({pre + "Min face area", evalQty(ips, EvalQty::Area, t.value("min_face_area", 0.0))});
+        used.push_back({pre + "Min edge length", evalLen(st, t.value("min_edge_length", 0.0))});
+        used.push_back({pre + "Sliver ratio", kit::fmtValue(t.value("sliver_ratio", 0.0))});
+        used.push_back({pre + "Gap tolerance", evalLen(st, t.value("gap_tol", 0.0))});
+    }
+    if (!used.empty()) kit::keyValueCard("geo_used", "Limits used", nullptr, used, &geometryLimitsOpen_);
+
+    if (total == 0) return;
+    kit::sectionHeader("Findings", nullptr, nullptr, total);
     for (int k = 0; k < 7; ++k) {
-        int count = 0;
-        for (const auto& body : result_["bodies"])
-            if (body.contains("findings") && body["findings"].is_array())
-                for (const auto& row : body["findings"])
-                    if (row.value("kind", std::string()) == kinds[k]) ++count;
-        if (!count) continue;
-        any = true;
-        kit::sectionHeader(labels[k], nullptr, nullptr, count, true);
-        if (!ImGui::BeginTable(kinds[k], 3, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg))
-            continue;
-        ImGui::TableSetupColumn("Entity");
-        ImGui::TableSetupColumn("Measured");
-        ImGui::TableSetupColumn("Limit");
-        ImGui::TableHeadersRow();
-        for (const auto& body : result_["bodies"]) {
-            if (!body.contains("findings") || !body["findings"].is_array()) continue;
-            for (const auto& row : body["findings"]) {
-                if (row.value("kind", std::string()) != kinds[k]) continue;
-                const int bid = row.value("body_id", 0);
-                const int fid = row.value("face_id", 0);
-                const int eid = row.value("edge_id", 0);
-                const std::string entity = "Body " + std::to_string(bid) +
-                    (fid ? " / Face " + std::to_string(fid) : "") +
-                    (eid ? " / Edge " + std::to_string(eid) : "");
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                ImGui::PushID(&row);
-                if (ImGui::Selectable(entity.c_str(), false, ImGuiSelectableFlags_SpanAllColumns) &&
-                    bid > 0 && (fid > 0 || eid > 0))
-                    st.selection.selectOne({static_cast<uint32_t>(bid),
-                                            fid ? render::PickKind::Face : render::PickKind::Edge,
-                                            static_cast<uint32_t>(fid ? fid : eid)});
-                ImGui::PopID();
-                ImGui::TableSetColumnIndex(1);
-                ImGui::Text("%.5g", row.value("value", 0.0));
-                ImGui::TableSetColumnIndex(2);
-                ImGui::Text("%.5g", row.value("threshold", 0.0));
+        if (!counts[k]) continue;
+        const std::string title = std::string(labels[k]) + " (" + std::to_string(counts[k]) + ")";
+        if (kit::cardBegin(kinds[k], title.c_str(), nullptr, &geometryKindOpen_[k])) {
+            int idx = 0;
+            for (const auto& body : bodies) {
+                if (!body.contains("findings") || !body["findings"].is_array()) continue;
+                for (const auto& row : body["findings"]) {
+                    if (row.value("kind", std::string()) != kinds[k]) continue;
+                    const int bid = row.value("body_id", 0);
+                    const int fid = row.value("face_id", 0);
+                    const int eid = row.value("edge_id", 0);
+                    const std::string entity = "Body " + std::to_string(bid) +
+                        (fid ? " · Face " + std::to_string(fid) : "") +
+                        (eid ? " · Edge " + std::to_string(eid) : "");
+                    const std::string meta = findingMeta(st, kinds[k], row.value("value", 0.0),
+                                                         row.value("threshold", 0.0));
+                    const bool selectable = bid > 0 && (fid > 0 || eid > 0);
+                    kit::RowStyle rs;
+                    rs.meta = meta.c_str();
+                    rs.tooltip = selectable ? "Select it in the viewport." : nullptr;
+                    ImGui::PushID(idx++);
+                    if (kit::row("finding", entity.c_str(), rs) && selectable)
+                        st.selection.selectOne({static_cast<uint32_t>(bid),
+                                                eid ? render::PickKind::Edge : render::PickKind::Face,
+                                                static_cast<uint32_t>(eid ? eid : fid)});
+                    ImGui::PopID();
+                }
             }
         }
-        ImGui::EndTable();
+        kit::cardEnd();
     }
-    if (!any) kit::dimText("No findings for the enabled checks.");
-    for (const auto& body : result_["bodies"])
-        if (!body.value("gap_scan_complete", true))
-            kit::dimText("Gap scan skipped: too many open edge endpoints on a body.");
 }
 
 // Dedicated mass eval slot so Mass Properties can stay open while exclusive tools use result_.
@@ -851,7 +952,7 @@ void EvaluateDialogs::rebuildMassOverlays(AppState& st) {
                 if (showI_) {
                     char labA[96];
                     std::snprintf(labA, sizeof(labA), "I%d %s", i + 1,
-                                  pmFormatAreaMoment(Imax, st.ips()).c_str());
+                                  evalQty(st.ips(), EvalQty::AreaMoment, Imax).c_str());
                     pushMarker(tipX, tipY, tipZ, labA,
                                "Bending (area) moment of inertia about this centroidal plane — "
                                "resists bending. Units: in⁴ (IPS) or mm⁴ (MMGS).",
@@ -879,7 +980,7 @@ void EvaluateDialogs::rebuildMassOverlays(AppState& st) {
                     }
                     char labJ[96];
                     std::snprintf(labJ, sizeof(labJ), "J%d %s", i + 1,
-                                  pmFormatAreaMoment(J, st.ips()).c_str());
+                                  evalQty(st.ips(), EvalQty::AreaMoment, J).c_str());
                     pushMarker(tipX + ox, tipY + oy, tipZ + oz, labJ,
                                "Polar (torsional) moment of inertia J = Ixx+Iyy about this axis — "
                                "resists torsion. Units: in⁴ (IPS) or mm⁴ (MMGS).",
@@ -1226,7 +1327,7 @@ void EvaluateDialogs::rebuildSectionPlaneViews(AppState& st) {
                 double Ixx = sec.value("Ixx", 0.0);
                 // Viewport label: plane index + bending I (clear per-plane moment callout).
                 std::snprintf(lab, sizeof(lab), "Sec %d  I=%s", i + 1,
-                              pmFormatAreaMoment(Ixx, st.ips()).c_str());
+                              evalQty(st.ips(), EvalQty::AreaMoment, Ixx).c_str());
             }
         } else {
             std::snprintf(lab, sizeof(lab), "Sec %d  %s", i + 1, kSectionNames[i]);
@@ -1531,79 +1632,137 @@ void EvaluateDialogs::syncDocument(AppState& st) {
 }
 
 void EvaluateDialogs::drawMeasure(AppState& st) {
-    kit::dimText("Pick a face, edge, or vertex to measure it. Ctrl-click adds or removes picks. "
-                 "Two picks measure distance; three to eight measure a chain.");
-    kit::sectionHeader("Selection", nullptr, nullptr, (int)st.selection.size(), true);
-    if (kit::secondaryButton("Clear selection", !st.selection.empty())) {
-        st.selection.clear();
-        tickLiveMeasure(st);
-    }
-    int remove = -1;
     const auto& items = st.selection.items();
-    for (size_t i = 0; i < items.size(); ++i) {
-        const auto& item = items[i];
-        ImGui::PushID((int)i);
-        if (kit::cardBegin("##pick", nullptr, nullptr, nullptr, kEvalPalette[i % 10])) {
-            const char* kind = item.hit.kind == render::PickKind::Face ? "Face" :
-                               item.hit.kind == render::PickKind::Edge ? "Edge" : "Vertex";
-            ImGui::TextWrapped("%zu. %s %u · Body %u", i + 1, kind,
-                               item.hit.topo_id, item.hit.body_id);
-            if (!item.resolution_error.empty()) {
-                ImGui::PushStyleColor(ImGuiCol_Text, kit::toneVec(kit::Tone::Err));
-                ImGui::TextWrapped("%s", item.resolution_error.c_str());
-                ImGui::PopStyleColor();
-            } else if (item.pending_resolve) kit::dimText("Resolving geometry...");
-            if (kit::secondaryButton("Remove")) remove = (int)i;
-        }
-        kit::cardEnd();
-        ImGui::PopID();
-    }
-    if (remove >= 0) {
-        const auto hit = items[(size_t)remove].hit;
-        st.selection.toggle(hit);
-        tickLiveMeasure(st);
-    }
-    kit::sectionHeader("Reading");
+    // Reading first (the result), then the picks that produced it.
     if (!errorText_.empty()) {
         kit::blockedState("Measurement unavailable", errorText_.c_str(),
                           "Remove an unresolved pick and select its geometry again.");
         if (!measureResolving_ && st.selection.size() <= 8 &&
-            measureSelection(st).error.empty() && kit::secondaryButton("Retry measurement")) {
+            measureSelection(st).error.empty() &&
+            kit::secondaryButton("Retry measurement###measure_retry")) {
             lastMeasureRefs_.clear();
             tickLiveMeasure(st);
         }
-    } else if (st.selection.empty()) {
-        kit::emptyState("measure", "Ready to measure", "Select geometry in the viewport to see its dimensions here.");
+    } else if (items.empty()) {
+        kit::emptyState("measure", "Ready to measure",
+                        "Pick a face, edge, or vertex in the viewport. Ctrl-click adds or removes "
+                        "picks: two measure a distance, three to eight measure a chain.");
     } else if (measureResolving_) {
-        kit::spinner("Resolving selection...");
+        kit::spinner("Resolving selection…");
         kit::dimText("Waiting for every selected item. No partial reading is shown.");
     } else if (pending_) {
-        kit::spinner("Computing measurement...");
+        kit::spinner("Computing measurement…");
     } else if (measureDirty_) {
-        kit::dimText("Ready — waiting for selection to settle.");
+        kit::spinner("Waiting for the selection to settle…");
     } else {
-        kit::chip("Ready", kit::Tone::Ok);
-        const auto rows = measureRows(st, result_);
-        for (const auto& row : rows)
-            kit::keyValueRow(row.first.c_str(), row.second.c_str(), kit::Tone::Neutral, true);
-        if (result_.contains("closed") && result_["closed"].is_boolean())
-            kit::keyValueRow("Closed profile", result_["closed"].get<bool>() ? "Yes" : "No");
-        if (kit::secondaryButton("Copy reading")) {
-            const auto text = measureReadingText(st, result_);
-            ImGui::SetClipboardText(text.c_str());
+        // One copy affordance per reading: the header copies every row at once.
+        if (kit::cardBegin("reading", "Reading", "measure")) {
+            kit::cardHeaderRight(ImGui::GetFrameHeight());
+            if (kit::iconButton("copy", "copy", "Copy this reading")) {
+                const auto text = measureReadingText(st, result_);
+                ImGui::SetClipboardText(text.c_str());
+            }
+            int r = 0;
+            for (const auto& row : measureRows(st, result_)) {
+                ImGui::PushID(r++);
+                kit::keyValueRowId("v", row.first.c_str(), row.second.c_str());
+                ImGui::PopID();
+            }
+            if (result_.contains("closed") && result_["closed"].is_boolean())
+                kit::keyValueRowId("closed", "Closed profile",
+                                   result_["closed"].get<bool>() ? "Yes" : "No");
         }
+        kit::cardEnd();
     }
-    if (!measureLog_.empty() && ImGui::CollapsingHeader("Recent readings (this document)")) {
-        kit::dimText("Previous readings are history, not the current selection.");
-        if (kit::secondaryButton("Clear history")) measureLog_.clear();
-        for (size_t i = measureLog_.size(); i-- > 0;) {
-            ImGui::PushID((int)i);
-            ImGui::TextWrapped("%s", measureLog_[i].c_str());
-            if (kit::secondaryButton("Copy")) ImGui::SetClipboardText(measureLog_[i].c_str());
-            kit::rule();
-            ImGui::PopID();
+
+    // Picks: one row each (dot = its viewport highlight colour, × removes it), not a card apiece.
+    int remove = -1;
+    bool clearAll = false;
+    if (!items.empty()) {
+        const std::string selTitle = "Selection (" + std::to_string(items.size()) + ")";
+        if (kit::cardBegin("picks", selTitle.c_str(), "point")) {
+            const float lineH = ImGui::GetTextLineHeight();
+            const float gap   = ImGui::GetStyle().ItemInnerSpacing.x;
+            for (size_t i = 0; i < items.size(); ++i) {
+                const auto& item = items[i];
+                const char* kind = item.hit.kind == render::PickKind::Face ? "Face" :
+                                   item.hit.kind == render::PickKind::Edge ? "Edge" : "Vertex";
+                char title[96];
+                std::snprintf(title, sizeof(title), "%zu. %s %u · Body %u", i + 1, kind,
+                              item.hit.topo_id, item.hit.body_id);
+                kit::RowStyle rs;
+                rs.secondary = item.resolution_error.empty() && item.pending_resolve
+                                   ? "Resolving geometry…" : nullptr;
+                // Dot + a text-height remove glyph, so the action reads at the row's own scale.
+                rs.actionsW = lineH + gap + lineH;
+                ImGui::PushID((int)i);
+                ImGui::SetNextItemAllowOverlap();
+                kit::row("pick", title, rs);
+                const ImVec2 rmin = ImGui::GetItemRectMin(), rmax = ImGui::GetItemRectMax();
+                const float  rowH = rmax.y - rmin.y;
+                const float  laneX = rmax.x - kit::padX() - rs.actionsW;
+                ImGui::SetCursorScreenPos(ImVec2(laneX, rmin.y + (rowH - lineH) * 0.5f));
+                evalSwatch(kEvalPalette[i % 10], "This pick's highlight colour in the viewport.");
+                ImGui::SetCursorScreenPos(ImVec2(laneX + lineH + gap, rmin.y + (rowH - lineH) * 0.5f));
+                if (kit::iconButton("remove", "cancel_x", "Remove this pick", true,
+                                    kit::Tone::Neutral, lineH))
+                    remove = (int)i;
+                ImGui::SetCursorScreenPos(ImVec2(rmin.x, rmax.y));
+                ImGui::Dummy(ImVec2(0.0f, 0.0f));
+                kit::inlineStatus(item.resolution_error.c_str(), kit::Tone::Err);
+                ImGui::PopID();
+            }
+            clearAll = kit::secondaryButton("Clear selection###measure_clear");
         }
+        kit::cardEnd();
     }
+    if (clearAll) {
+        st.selection.clear();
+        tickLiveMeasure(st);
+    } else if (remove >= 0) {
+        const auto hit = items[(size_t)remove].hit;
+        st.selection.toggle(hit);
+        tickLiveMeasure(st);
+    }
+
+    if (!measureLog_.empty()) {
+        // Newest first, one wrapped line each (never elided in a key/value column); the header
+        // copies the whole list, the same single copy affordance the Reading card uses.
+        const std::string title = "Recent readings (" + std::to_string(measureLog_.size()) + ")";
+        if (kit::cardBegin("history", title.c_str(), "history", &measureHistoryOpen_)) {
+            kit::cardHeaderRight(ImGui::GetFrameHeight());
+            if (kit::iconButton("copy", "copy", "Copy every recent reading")) {
+                std::string all;
+                for (size_t i = measureLog_.size(); i-- > 0;)
+                    all += std::to_string(i + 1) + ". " + measureLog_[i] + "\n";
+                ImGui::SetClipboardText(all.c_str());
+            }
+            for (size_t i = measureLog_.size(); i-- > 0;) {
+                const std::string line = std::to_string(i + 1) + ". " + measureLog_[i];
+                kit::dimText(line.c_str());
+            }
+            if (kit::secondaryButton("Clear history###measure_clear_log")) measureLog_.clear();
+        }
+        kit::cardEnd();
+    }
+}
+
+// Live re-seed from the doc while Mass Properties is open (FeatureManager / sim may have changed
+// the material). Runs before the window draws; a custom density override is never clobbered.
+void EvaluateDialogs::syncMassMaterial(AppState& st) {
+    if (!massOpen_) return;
+    std::string liveKey;
+    if (st.docMirror.hasDoc()) {
+        const auto& tree = st.docMirror.tree();
+        if (tree.is_object() && tree.contains("material") && tree["material"].is_object())
+            liveKey = tree["material"].value("key", std::string());
+    }
+    if (liveKey == massDocKey_) return;
+    massDocKey_ = liveKey;
+    massDocName_ = materialDisplayName(liveKey);
+    if (massCustomDensity_) return;
+    massDensity_ = liveKey.empty() ? 7.85f : materialDensityGcm3(liveKey);
+    if (!massPending_) runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
 }
 
 void EvaluateDialogs::drawMassWindow(AppState& st) {
@@ -1612,13 +1771,13 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
     ui::setNextCommandDialogPlacement("Mass Properties##eval_mass",
         ImVec2(ui::metrics::px(480), ui::metrics::px(620)),
         ImVec2(ui::metrics::px(340), ui::metrics::px(260)));
-    const auto& gpal = ui::palette;
     bool open = true;
     ImGui::SetNextWindowBgAlpha(1.0f);
     const bool vis = ImGui::Begin("Mass Properties##eval_mass", &open, ImGuiWindowFlags_NoScrollbar);
     if (vis) {
         const auto surf = ui::adaptiveSurface(-1.0f);
-        ImGui::PushTextWrapPos(0.0f);
+        kit::panelBegin("eval_mass", &surf);
+        kit::panelBodyBegin();
         // Material combo lists curated physical materials (same keys as FeatureManager Material).
         // Selecting one WRITES set_material (+ derived set_appearance) so mass, sim, and the tree
         // all share ONE active part material. Density follows that key unless the user has set an
@@ -1662,176 +1821,216 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
             runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
         };
 
-        // Live re-seed from doc while open (FeatureManager / sim may have changed the material).
-        // Skip when a custom density override is active so we don't clobber the user's override.
-        {
-            std::string liveKey;
-            if (st.docMirror.hasDoc()) {
-                const auto& tree = st.docMirror.tree();
-                if (tree.is_object() && tree.contains("material") && tree["material"].is_object())
-                    liveKey = tree["material"].value("key", std::string());
+        // Density is stored and sent in g/cm³ (the eval RPC's density_g_cm3), but Volume and Mass
+        // honour st.ips(); an IPS document edits and reads density in lb/in³ so one panel never
+        // mixes unit systems. The wire value stays metric.
+        constexpr double kLbPerIn3PerGcm3 = 0.0361272929;
+        const bool ips = st.ips();
+        const char* densityUnit = kit::unitText(ips ? kit::Unit::lb_in3 : kit::Unit::g_cm3);
+        // Material + density share one card so the inputs sit on the same surface as the results.
+        if (kit::cardBegin("mass_material", "Material", "material")) {
+            kit::FieldGroup g("mass_material", "Material");
+            static const std::vector<std::string> kNames = [] {
+                std::vector<std::string> v;
+                for (int i = 0; i < kPhysicalMaterialsCount; ++i) v.emplace_back(kPhysicalMaterials[i].name);
+                return v;
+            }();
+            int sel = -1;
+            for (int i = 0; i < kPhysicalMaterialsCount; ++i)
+                if (massDocKey_ == kPhysicalMaterials[i].key) sel = i;
+            kit::FieldOpts mo = kit::FieldOpts().withHint("Not set").withTip(
+                "The part material. Choosing one updates the part, so mass, simulation and the "
+                "feature tree all use it.");
+            if (sel < 0 && !massDocKey_.empty()) mo.withPreview(massDocName_.c_str());
+            if (kit::fieldCombo("material", "Material", &sel, kNames, mo) && sel >= 0 &&
+                sel < kPhysicalMaterialsCount)
+                applyMassMaterial(kPhysicalMaterials[sel].key);
+
+            double density = massDensity_;
+            if (kit::fieldNumber("density", "Density", &density,
+                                 kit::FieldOpts()
+                                     .withUnit(densityUnit)
+                                     .withScale(ips ? kLbPerIn3PerGcm3 : 1.0)
+                                     .withRange(0.0, 25.0)
+                                     .withTip("Overrides the density for this readout only. The "
+                                              "part material is unchanged."))) {
+                massDensity_ = (float)density;
+                massCustomDensity_ = true;
+                runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
             }
-            if (liveKey != massDocKey_) {
-                massDocKey_ = liveKey;
-                massDocName_ = materialDisplayName(liveKey);
-                if (!massCustomDensity_) {
-                    massDensity_ = liveKey.empty() ? 7.85f : materialDensityGcm3(liveKey);
-                    if (!massPending_)
-                        runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
+            if (massCustomDensity_) {
+                kit::inlineStatus("Custom density. The part material is unchanged.", kit::Tone::Info);
+                if (!massDocKey_.empty() &&
+                    kit::secondaryButton("Use material density###mass_reset_density")) {
+                    massCustomDensity_ = false;
+                    massDensity_ = materialDensityGcm3(massDocKey_);
+                    runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
                 }
             }
         }
-
-        kit::keyValueRow("Part material", massDocKey_.empty() ? "Not set" : massDocName_.c_str());
-
-        ImGui::TextUnformatted("Material");
-        ImGui::SetNextItemWidth(-1.0f);
-        const std::string comboLabel = massDocKey_.empty()
-            ? std::string("(select material)")
-            : massDocName_;
-        if (ImGui::BeginCombo("##Material", comboLabel.c_str())) {
-            for (int i = 0; i < kPhysicalMaterialsCount; ++i) {
-                const auto& pm = kPhysicalMaterials[i];
-                bool sel = (massDocKey_ == pm.key);
-                if (ImGui::Selectable(pm.name, sel)) applyMassMaterial(pm.key);
-                if (sel) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
-        // Density is stored and sent in g/cm3 (the eval RPC's density_g_cm3), but Volume and
-        // Mass above already honour st.ips() - so an IPS document read "Volume 4.322in^3,
-        // Mass 0.4216lb, Density 2.700 g/cm3", mixing unit systems inside one panel. Edit and
-        // display a converted proxy in IPS; the wire value stays metric.
-        constexpr double kLbPerIn3PerGcm3 = 0.0361272929;
-        const bool ips = st.ips();
-        ImGui::TextUnformatted("Density override");
-        ImGui::SetNextItemWidth(-1.0f);
-        float shown = ips ? (float)(massDensity_ * kLbPerIn3PerGcm3) : massDensity_;
-        const float shownMax = ips ? (float)(25.0 * kLbPerIn3PerGcm3) : 25.0f;
-        if (ImGui::DragFloat("##Density", &shown, ips ? 0.0005f : 0.01f, 0.0f, shownMax,
-                             ips ? "%.4f lb/in3" : "%.3f g/cm3", ImGuiSliderFlags_AlwaysClamp)) {
-            massDensity_ = ips ? (float)(shown / kLbPerIn3PerGcm3) : shown;
-            massCustomDensity_ = true;
-        }
-        if (ImGui::IsItemDeactivatedAfterEdit())
-            runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
-        if (massCustomDensity_ && !massDocKey_.empty()) {
-            if (ImGui::SmallButton("Reset##mass_dens")) {
-                massCustomDensity_ = false;
-                massDensity_ = materialDensityGcm3(massDocKey_);
-                runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Restore density from the part material");
-        }
+        kit::cardEnd();
 
         if (!massErrorText_.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
-                                                       gpal.statusErr[2], gpal.statusErr[3]));
-            ImGui::TextWrapped("%s", massErrorText_.c_str());
-            ImGui::PopStyleColor();
+            kit::blockedState("Mass properties unavailable", massErrorText_.c_str());
         } else if (massPending_) {
-            kit::spinner("Computing mass properties...");
+            kit::spinner("Computing mass properties…");
         } else {
-            ImGui::Separator();
-            kit::keyValueRow("Volume", pmFormatVolume(massResult_.value("volume_mm3", 0.0), st.ips()).c_str());
-            kit::keyValueRow("Mass", pmFormatMass(massResult_.value("mass_g", 0.0), st.ips()).c_str());
-            if (ips)
-                ImGui::Text("Density: %.4f lb/in3", massDensity_ * kLbPerIn3PerGcm3);
-            else
-                ImGui::Text("Density: %.3f g/cm3", massDensity_);
+            // Density is the editable field above; Totals carries only what was computed.
+            const double volume = massResult_.value("volume_mm3", 0.0);
+            kit::keyValueCard("mass_totals", "Totals", "mass_props", {
+                {"Volume", evalQty(ips, EvalQty::Volume, volume), kit::Tone::Neutral, true},
+                {"Mass", evalQty(ips, EvalQty::Mass, massResult_.value("mass_g", 0.0)),
+                 kit::Tone::Neutral, true},
+            });
             if (massResult_.contains("com") && massResult_["com"].is_array() &&
                 massResult_["com"].size() == 3) {
-                kit::sectionHeader("Center of gravity");
-                // A CG on a symmetry plane comes back as floating-point zero noise, and the panel
-                // printed it verbatim: "X: 4.449e-17in  Y: -1.062e-17in  Z: -6.856e-19in" for a
-                // centred box. Anything under a nanometre is zero at any display precision.
-                auto com = [&](int i) {
-                    double mm = massResult_["com"][i].get<double>();
-                    if (std::abs(mm) < 1e-6) mm = 0.0;
-                    return evalLen(st, mm);
-                };
-                kit::keyValueRow("X", com(0).c_str());
-                kit::keyValueRow("Y", com(1).c_str());
-                kit::keyValueRow("Z", com(2).c_str());
+                if (kit::cardBegin("mass_com", "Center of gravity", "origin")) {
+                    // A CG on a symmetry plane comes back as floating-point residue; read it
+                    // against the part's size so it shows as 0.
+                    const double partSize = std::cbrt(std::fabs(volume));
+                    static const char* const kAxes[] = {"X", "Y", "Z"};
+                    std::string vals[3];
+                    for (int i = 0; i < 3; ++i) {
+                        const auto& c = massResult_["com"][i];
+                        vals[i] = evalLen(st, c.is_number() ? c.get<double>() : 0.0, partSize);
+                    }
+                    // One copy affordance for the whole point (not one per axis row).
+                    kit::cardHeaderRight(ImGui::GetFrameHeight());
+                    if (kit::iconButton("copy", "copy", "Copy the center of gravity")) {
+                        const std::string text = "X: " + vals[0] + " \xc2\xb7 Y: " + vals[1] +
+                                                 " \xc2\xb7 Z: " + vals[2];
+                        ImGui::SetClipboardText(text.c_str());
+                    }
+                    for (int i = 0; i < 3; ++i) {
+                        ImGui::PushID(i);
+                        kit::keyValueRowId("c", kAxes[i], vals[i].c_str());
+                        ImGui::PopID();
+                    }
+                    if (kit::fieldCheckbox("show_com", "Show in viewport", &showCom_,
+                                           kit::FieldOpts().withTip(
+                                               "Mark the center of gravity in the viewport.")))
+                        rebuildMassOverlays(st);
+                }
+                kit::cardEnd();
             }
 
-            // ---- Moment of inertia (bending area I + polar J) — clear callout ----
-            kit::sectionHeader("Moment of inertia");
-            ImGui::TextWrapped(
-                "Area moments about centroidal planes through CG: I resists bending; "
-                "polar J = Imax+Imin resists torsion. Units follow document (in⁴ / mm⁴).");
-            bool cb = false;
-            cb |= ImGui::Checkbox("Show COM in viewport", &showCom_);
-            cb |= ImGui::Checkbox("Area moment I (bending)", &showI_);
-            cb |= ImGui::Checkbox("Polar moment J (torsion)", &showJ_);
-            cb |= ImGui::Checkbox("Axial stiffness k (EA/L est.)", &showK_);
-            if (cb) rebuildMassOverlays(st);
-
-            if (designSectionsPending_ > 0)
-                kit::spinner("Computing section I/J...");
-            if (designSections_.is_array()) {
-                for (int i = 0; i < 3; ++i) {
+            // Moment of inertia (bending area I + polar J) per principal axis: numbers first,
+            // then what to show.
+            if (kit::cardBegin("mass_moi", "Moment of inertia", "section_props")) {
+                if (designSectionsPending_ > 0) kit::spinner("Computing section I and J…");
+                bool firstAxis = true;
+                for (int i = 0; designSections_.is_array() && i < 3; ++i) {
                     if ((size_t)i >= designSections_.size() || !designSections_[i].is_object())
                         continue;
                     const auto& sec = designSections_[i];
+                    const std::string axis = "Principal axis " + std::to_string(i + 1);
+                    ImGui::PushID(i);
+                    if (!firstAxis) kit::rule();
+                    firstAxis = false;
                     if (sec.contains("error")) {
-                        ImGui::PushStyleColor(ImGuiCol_Text, kit::toneVec(kit::Tone::Err));
-                        ImGui::TextWrapped("Principal axis %d: %s", i + 1,
-                                           sec["error"].get<std::string>().c_str());
-                        ImGui::PopStyleColor();
+                        const std::string msg = axis + ": " +
+                            (sec["error"].is_string() ? sec["error"].get<std::string>()
+                                                      : sec["error"].dump());
+                        kit::inlineStatus(msg.c_str(), kit::Tone::Err);
+                        ImGui::PopID();
                         continue;
                     }
-                    ImGui::Separator();
-                    double Ixx = sec.value("Ixx", 0.0), Iyy = sec.value("Iyy", 0.0);
-                    double Imax = std::max(Ixx, Iyy), Imin = std::min(Ixx, Iyy);
-                    double J = sec.value("J", Ixx + Iyy);
-                    ImGui::Text("Principal axis %d", i + 1);
+                    const double Ixx = sec.value("Ixx", 0.0), Iyy = sec.value("Iyy", 0.0);
+                    const double J = sec.value("J", Ixx + Iyy);
+                    ImGui::TextUnformatted(axis.c_str());
                     if (showI_) {
-                        kit::keyValueRow("Imax", pmFormatAreaMoment(Imax, st.ips()).c_str());
-                        kit::keyValueRow("Imin", pmFormatAreaMoment(Imin, st.ips()).c_str());
+                        kit::keyValueRowId("imax", "Imax",
+                            evalQty(ips, EvalQty::AreaMoment, std::max(Ixx, Iyy)).c_str());
+                        kit::keyValueRowId("imin", "Imin",
+                            evalQty(ips, EvalQty::AreaMoment, std::min(Ixx, Iyy)).c_str());
                     }
                     if (showJ_)
-                        kit::keyValueRow("Polar J", pmFormatAreaMoment(J, st.ips()).c_str());
-                    if (showK_ && sec.contains("EA") && sec["EA"].is_number()) {
-                        ImGui::TextDisabled("  EA: %.4g N  (divide by length L for k)",
-                                            sec["EA"].get<double>());
-                    }
+                        kit::keyValueRowId("j", "Polar J",
+                                           evalQty(ips, EvalQty::AreaMoment, J).c_str());
+                    if (showK_ && sec.contains("EA") && sec["EA"].is_number())
+                        kit::keyValueRowId("ea", "EA (k = EA / L)",
+                                           kit::fmtQuantity(sec["EA"].get<double>(),
+                                                            kit::unitText(kit::Unit::N)).c_str());
                     if (sec.contains("area_mm2"))
-                        ImGui::Text("  Section area: %s",
-                                    pmFormatArea(sec.value("area_mm2", 0.0), st.ips()).c_str());
+                        kit::keyValueRowId("area", "Section area",
+                            evalQty(ips, EvalQty::Area, sec.value("area_mm2", 0.0)).c_str());
+                    ImGui::PopID();
                 }
+                kit::dimText("About centroidal planes through the center of gravity. I resists "
+                             "bending; polar J resists torsion.");
+                bool overlays = false;
+                kit::chipFlowBegin("mass_moi_show");
+                overlays |= kit::flowToggleChip("Bending I", &showI_, kit::Tone::Accent,
+                                                "Show Imax / Imin here and as viewport chips.");
+                overlays |= kit::flowToggleChip("Polar J", &showJ_, kit::Tone::Accent,
+                                                "Show polar J here and as viewport chips.");
+                overlays |= kit::flowToggleChip("Axial stiffness EA", &showK_, kit::Tone::Accent,
+                                                "Show EA (k = EA / L for a member of length L).");
+                kit::chipFlowEnd();
+                if (overlays) rebuildMassOverlays(st);
             }
+            kit::cardEnd();
 
-            if (ImGui::TreeNode("Advanced mass inertia")) {
-                const char* mmUnit = st.ips() ? "lb·in²" : "g·mm²";
+            if (kit::cardBegin("mass_tensor", "Mass inertia tensor", "csys", &massTensorOpen_)) {
+                // Rows first, so the header's one copy action carries the whole tensor.
+                std::vector<std::pair<std::string, std::string>> tensor, principal;
                 if (massResult_.contains("inertia") && massResult_["inertia"].is_array() &&
                     massResult_["inertia"].size() == 9) {
-                    ImGui::TextDisabled("Inertia tensor (%s, about origin)", mmUnit);
                     const auto& I = massResult_["inertia"];
-                    for (int r = 0; r < 3; ++r)
-                        ImGui::Text("%s  %s  %s",
-                                    pmFormatMassMoment(I[r * 3 + 0].get<double>(), st.ips())
-                                        .c_str(),
-                                    pmFormatMassMoment(I[r * 3 + 1].get<double>(), st.ips())
-                                        .c_str(),
-                                    pmFormatMassMoment(I[r * 3 + 2].get<double>(), st.ips())
-                                        .c_str());
+                    // Off-diagonal residue reads against the largest diagonal term.
+                    const double ref = std::max({std::fabs(I[0].get<double>()),
+                                                 std::fabs(I[4].get<double>()),
+                                                 std::fabs(I[8].get<double>())});
+                    static const char* const kKeys[] = {"Ixx", "Iyy", "Izz", "Ixy", "Ixz", "Iyz"};
+                    static const int kIdx[] = {0, 4, 8, 1, 2, 5};
+                    for (int r = 0; r < 6; ++r)
+                        tensor.emplace_back(kKeys[r], evalQty(ips, EvalQty::MassMoment,
+                                                              I[kIdx[r]].get<double>(), ref));
                 }
                 if (massResult_.contains("principal_moments") &&
                     massResult_["principal_moments"].is_array() &&
                     massResult_["principal_moments"].size() == 3) {
-                    ImGui::TextDisabled("Principal mass moments (%s)", mmUnit);
                     const auto& Pm = massResult_["principal_moments"];
                     for (int i = 0; i < 3; ++i)
-                        ImGui::Text("  P%d  %s", i + 1,
-                                    pmFormatMassMoment(Pm[i].get<double>(), st.ips()).c_str());
+                        principal.emplace_back("Principal P" + std::to_string(i + 1),
+                                               evalQty(ips, EvalQty::MassMoment,
+                                                       Pm[i].get<double>()));
                 }
-                ImGui::TreePop();
+                if (!tensor.empty() || !principal.empty()) {
+                    kit::cardHeaderRight(ImGui::GetFrameHeight());
+                    if (kit::iconButton("copy", "copy", "Copy the inertia tensor")) {
+                        std::string text;
+                        for (const auto* list : {&tensor, &principal})
+                            for (const auto& kv : *list) {
+                                if (!text.empty()) text += " \xc2\xb7 ";
+                                text += kv.first + ": " + kv.second;
+                            }
+                        ImGui::SetClipboardText(text.c_str());
+                    }
+                }
+                if (!tensor.empty()) {
+                    kit::dimText("About the origin.");
+                    for (int r = 0; r < (int)tensor.size(); ++r) {
+                        ImGui::PushID(r);
+                        kit::keyValueRowId("t", tensor[r].first.c_str(), tensor[r].second.c_str());
+                        ImGui::PopID();
+                    }
+                }
+                if (!principal.empty()) {
+                    if (!tensor.empty()) kit::rule();
+                    for (int i = 0; i < (int)principal.size(); ++i) {
+                        ImGui::PushID(i);
+                        kit::keyValueRowId("p", principal[i].first.c_str(),
+                                           principal[i].second.c_str());
+                        ImGui::PopID();
+                    }
+                }
+                if (tensor.empty() && principal.empty())
+                    kit::dimText("No inertia tensor was reported for this part.");
             }
+            kit::cardEnd();
         }
-        ImGui::PopTextWrapPos();
-        ui::drawWindowPillScrollbarV(surf);
+        kit::panelEnd();
     }
     ImGui::End();
 
@@ -1861,84 +2060,107 @@ void EvaluateDialogs::drawSectionWindow(AppState& st) {
     ui::setNextCommandDialogPlacement("Section Properties##eval_section",
         ImVec2(ui::metrics::px(480), ui::metrics::px(640)),
         ImVec2(ui::metrics::px(340), ui::metrics::px(280)));
-    const auto& gpal = ui::palette;
     bool open = true;
     ImGui::SetNextWindowBgAlpha(1.0f);
     const bool vis = ImGui::Begin("Section Properties##eval_section", &open, ImGuiWindowFlags_NoScrollbar);
     if (vis) {
         const auto surf = ui::adaptiveSurface(-1.0f);
-        ImGui::PushTextWrapPos(0.0f);
+        kit::panelBegin("eval_section", &surf);
+        kit::panelBodyBegin();
+        const bool ips = st.ips();
+        kit::inlineStatus(sectionErrorText_.c_str(), kit::Tone::Err);
+        kit::dimText("Drag a plane in the viewport or type an offset from the centroid. Each "
+                     "card's dot is its plane's colour in the viewport.");
 
-        if (!sectionErrorText_.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
-                                                       gpal.statusErr[2], gpal.statusErr[3]));
-            ImGui::TextWrapped("%s", sectionErrorText_.c_str());
-            ImGui::PopStyleColor();
-        }
-        if (sectionPendingCount_ > 0)
-            kit::spinner("Computing section properties...");
-        kit::dimText("Drag a plane in the viewport or use the offset sliders.");
-
-        // 3-card layout: one card per orthogonal section.
+        // One neutral card per orthogonal section; the header dot matches the viewport plane tint
+        // and the header's one copy action carries every row of the section.
         for (int i = 0; i < 3; ++i) {
-            const float* col = kEvalPalette[i % 10];
-            char header[64];
-            std::snprintf(header, sizeof(header), "Sec %d · %s", i + 1, kSectionNames[i]);
-            drawColorChipRow(header, col);
-
-            ImGui::PushID(i);
-            // Hidden label + explicit width so "Offset" text never clips the right edge.
-            ImGui::TextUnformatted("Offset");
-            const float avail = ImGui::GetContentRegionAvail().x;
-            ImGui::SetNextItemWidth(std::max(80.0f * ui::uiScale, avail - 4.0f * ui::uiScale));
-            const float unitScale = st.ips() ? 25.4f : 1.0f;
-            float off = sectionOffset_[i] / unitScale;
-            char sliderId[32];
-            std::snprintf(sliderId, sizeof(sliderId), "##sec%d", i);
-            if (ImGui::SliderFloat(sliderId, &off, -sectionHalfSize_ / unitScale,
-                                   sectionHalfSize_ / unitScale, st.ips() ? "%.3f in" : "%.2f mm")) {
-                applySectionOffset(st, i, off * unitScale, true);
-            }
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                sectionPendingIdx_ = i;
-                sectionDragLastT_ = ImGui::GetTime() - 1.0;
-            }
-
-            if (sectionResults_.is_array() && (size_t)i < sectionResults_.size() &&
-                sectionResults_[i].is_object()) {
-                const auto& sec = sectionResults_[i];
-                if (sec.contains("error") && sec["error"].is_string()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                                          ImVec4(gpal.statusErr[0], gpal.statusErr[1],
-                                                 gpal.statusErr[2], gpal.statusErr[3]));
-                    ImGui::TextWrapped("%s", sec["error"].get<std::string>().c_str());
-                    ImGui::PopStyleColor();
-                } else {
-                    kit::keyValueRow("Area", pmFormatArea(sec.value("area_mm2", 0.0), st.ips()).c_str());
-                    if (sec.contains("centroid") && sec["centroid"].is_array() &&
-                        sec["centroid"].size() == 3) {
-                        const char* labels[] = {"Centroid X", "Centroid Y", "Centroid Z"};
-                        for (int axis = 0; axis < 3; ++axis)
-                            kit::keyValueRow(labels[axis], evalLen(st, sec["centroid"][axis].get<double>()).c_str());
+            char title[64];
+            std::snprintf(title, sizeof(title), "Section %d · %s", i + 1, kSectionNames[i]);
+            const nlohmann::json* sec =
+                sectionResults_.is_array() && (size_t)i < sectionResults_.size() &&
+                        sectionResults_[i].is_object()
+                    ? &sectionResults_[i]
+                    : nullptr;
+            const bool secError = sec && sec->contains("error") && (*sec)["error"].is_string();
+            const std::string secErrorText = secError ? (*sec)["error"].get<std::string>() : "";
+            std::vector<std::pair<std::string, std::string>> rows;
+            if (sec && !secError) {
+                rows.emplace_back("Area", evalQty(ips, EvalQty::Area, sec->value("area_mm2", 0.0)));
+                if (sec->contains("centroid") && (*sec)["centroid"].is_array() &&
+                    (*sec)["centroid"].size() == 3) {
+                    static const char* const kLabels[] = {"Centroid X", "Centroid Y", "Centroid Z"};
+                    for (int axis = 0; axis < 3; ++axis) {
+                        const auto& c = (*sec)["centroid"][axis];
+                        // Read against the part size: residue on a symmetry plane is 0.
+                        rows.emplace_back(kLabels[axis],
+                                          evalLen(st, c.is_number() ? c.get<double>() : 0.0,
+                                                  sectionHalfSize_));
                     }
-                    double Ixx = sec.value("Ixx", 0.0);
-                    double Iyy = sec.value("Iyy", 0.0);
-                    double Ixy = sec.value("Ixy", 0.0);
-                    double J = sec.value("J", Ixx + Iyy);
-                    kit::keyValueRow("Ixx", pmFormatAreaMoment(Ixx, st.ips()).c_str());
-                    kit::keyValueRow("Iyy", pmFormatAreaMoment(Iyy, st.ips()).c_str());
-                    kit::keyValueRow("Ixy", pmFormatAreaMoment(Ixy, st.ips()).c_str());
-                    kit::keyValueRow("Polar J", pmFormatAreaMoment(J, st.ips()).c_str());
                 }
-            } else if (sectionPendingCount_ > 0) {
-                ImGui::TextDisabled("Waiting for section…");
-            } else {
-                ImGui::TextDisabled("No section data.");
+                const double Ixx = sec->value("Ixx", 0.0);
+                const double Iyy = sec->value("Iyy", 0.0);
+                const double Ixy = sec->value("Ixy", 0.0);
+                const double J = sec->value("J", Ixx + Iyy);
+                // The product moment of a symmetric section is residue against Ixx/Iyy.
+                const double ref = std::max(std::fabs(Ixx), std::fabs(Iyy));
+                rows.emplace_back("Ixx", evalQty(ips, EvalQty::AreaMoment, Ixx));
+                rows.emplace_back("Iyy", evalQty(ips, EvalQty::AreaMoment, Iyy));
+                rows.emplace_back("Ixy", evalQty(ips, EvalQty::AreaMoment, Ixy, ref));
+                rows.emplace_back("Polar J", evalQty(ips, EvalQty::AreaMoment, J));
             }
+            ImGui::PushID(i);
+            if (kit::cardBegin("section", title, "section_props")) {
+                const float lineH = ImGui::GetTextLineHeight();
+                const float gap   = ImGui::GetStyle().ItemInnerSpacing.x;
+                kit::cardHeaderRight(lineH + (rows.empty() ? 0.0f : gap + ImGui::GetFrameHeight()));
+                evalSwatch(kEvalPalette[i % 10], "This section plane's colour in the viewport.");
+                if (!rows.empty()) {
+                    ImGui::SameLine(0.0f, gap);
+                    if (kit::iconButton("copy", "copy", "Copy this section's properties")) {
+                        std::string text;
+                        for (const auto& kv : rows) {
+                            if (!text.empty()) text += " \xc2\xb7 ";
+                            text += kv.first + ": " + kv.second;
+                        }
+                        ImGui::SetClipboardText(text.c_str());
+                    }
+                }
+                {
+                    kit::FieldGroup g("plane", "Offset");
+                    float off = sectionOffset_[i];
+                    if (kit::fieldNumber("offset", "Offset", &off,
+                            lengthOpts(ips)
+                                .withRange(-sectionHalfSize_, sectionHalfSize_)
+                                .withTip("Distance of the cutting plane from the part centroid "
+                                         "along its normal."))) {
+                        applySectionOffset(st, i, off, true);
+                        sectionDragLastT_ = ImGui::GetTime() - 1.0;   // typed: evaluate now
+                    }
+                }
+                if (sectionOffset_[i] != 0.0f &&
+                    kit::secondaryButton("Reset to centroid###reset")) {
+                    applySectionOffset(st, i, 0.0f, true);
+                    sectionDragLastT_ = ImGui::GetTime() - 1.0;
+                }
+                if (secError) {
+                    kit::inlineStatus(secErrorText.c_str(), kit::Tone::Err);
+                } else if (!rows.empty()) {
+                    for (int r = 0; r < (int)rows.size(); ++r) {
+                        ImGui::PushID(r);
+                        kit::keyValueRowId("v", rows[r].first.c_str(), rows[r].second.c_str());
+                        ImGui::PopID();
+                    }
+                } else if (sectionPendingCount_ > 0 || sectionPendingIdx_ == i) {
+                    kit::spinner("Computing this section…");
+                } else {
+                    kit::dimText("No section data. Move the plane to evaluate it.");
+                }
+            }
+            kit::cardEnd();
             ImGui::PopID();
         }
-        ImGui::PopTextWrapPos();
-        ui::drawWindowPillScrollbarV(surf);
+        kit::panelEnd();
     }
     ImGui::End();
 
@@ -1958,295 +2180,379 @@ void EvaluateDialogs::drawSectionWindow(AppState& st) {
     }
 }
 
+void EvaluateDialogs::drawCheck(AppState&) {
+    if (pending_) {
+        kit::spinner("Checking geometry…");
+        return;
+    }
+    if (!errorText_.empty()) {
+        kit::blockedState("Geometry check unavailable", errorText_.c_str());
+        return;
+    }
+    if (!result_.contains("issues") || !result_["issues"].is_array()) {
+        kit::emptyState("check", "No check result", "Run Check from the Evaluate tab to inspect the part.");
+        return;
+    }
+    const auto& issues = result_["issues"];
+    auto toneOf = [](const std::string& sev) {
+        if (sev == "error") return kit::Tone::Err;
+        if (sev == "warning" || sev == "warn") return kit::Tone::Warn;
+        return kit::Tone::Info;
+    };
+    kit::Tone worst = kit::Tone::Info;
+    for (const auto& it : issues) {
+        const kit::Tone t = toneOf(it.value("severity", std::string("info")));
+        if (t == kit::Tone::Err || (t == kit::Tone::Warn && worst != kit::Tone::Err)) worst = t;
+    }
+    kit::chipFlowBegin("check_outcome");
+    if (issues.empty()) {
+        kit::flowChip("No geometry issues", kit::Tone::Ok, true);
+    } else {
+        const std::string n = std::to_string(issues.size()) + (issues.size() == 1 ? " issue" : " issues");
+        kit::flowChip(n.c_str(), worst, true);
+    }
+    kit::chipFlowEnd();
+    if (issues.empty()) {
+        kit::dimText("The part passed every geometry check.");
+        return;
+    }
+    for (const auto& it : issues)
+        kit::inlineStatus(it.value("text", std::string()).c_str(),
+                          toneOf(it.value("severity", std::string("info"))));
+}
+
+void EvaluateDialogs::drawInterference(AppState& st) {
+    const bool ips = st.ips();
+    if (!errorText_.empty()) kit::blockedState("Interference unavailable", errorText_.c_str());
+    if (!interferencePartNames_.empty()) {
+        const size_t n = std::min(interferencePartNames_.size(), interferencePartChecked_.size());
+        size_t included = 0;
+        for (size_t i = 0; i < n; ++i) included += interferencePartChecked_[i] ? 1 : 0;
+        const std::string title =
+            "Members (" + std::to_string(included) + " of " + std::to_string(n) + ")";
+        bool anyChange = false;
+        if (kit::cardBegin("members", title.c_str())) {
+            for (size_t i = 0; i < n; ++i) {
+                bool checked = interferencePartChecked_[i] != 0;
+                ImGui::PushID((int)i);
+                if (kit::checkbox("member", interferencePartNames_[i].c_str(), &checked)) {
+                    interferencePartChecked_[i] = checked ? 1 : 0;
+                    anyChange = true;
+                }
+                ImGui::PopID();
+            }
+        }
+        kit::cardEnd();
+        if (anyChange) {
+            nlohmann::json members = nlohmann::json::array();
+            for (size_t i = 0; i < n; ++i)
+                if (interferencePartChecked_[i]) members.push_back(interferencePartNames_[i]);
+            if (members.empty()) {
+                ++gen_;
+                pending_ = false;
+                result_ = nlohmann::json::object();
+                errorText_ = "Select at least one member to check interference.";
+                clearOverlays();
+            } else {
+                runEval(st, "eval_interference", {{"members", members}});
+            }
+        }
+    }
+    if (pending_) {
+        kit::spinner("Checking interference…");
+        return;
+    }
+    if (result_.empty()) {
+        if (errorText_.empty())
+            kit::emptyState("interference_eval", "Nothing to check",
+                            "Interference detection runs across assembly components or multi-body "
+                            "parts. Open an assembly or a multi-body part to check clashes.");
+        return;
+    }
+
+    const bool hasPairs = result_.contains("interferences") && result_["interferences"].is_array() &&
+                          !result_["interferences"].empty();
+    const bool hasClear = result_.contains("clearances") && result_["clearances"].is_array() &&
+                          !result_["clearances"].empty();
+    const bool complete = result_.value("complete", false);
+    const int pairsChecked = result_.value("pairs_checked", 0);
+
+    // Outcome first: one wrapping chip line, then the summary.
+    kit::chipFlowBegin("intf_outcome");
+    if (hasPairs) {
+        const size_t c = result_["interferences"].size();
+        const std::string clashes = std::to_string(c) + (c == 1 ? " clash" : " clashes");
+        kit::flowChip(clashes.c_str(), kit::Tone::Err, true);
+    } else if (complete && result_.value("ok", false) && pairsChecked > 0 && errorText_.empty()) {
+        kit::flowChip("No interference", kit::Tone::Ok, true);
+    }
+    if (!complete) kit::flowChip("Incomplete", kit::Tone::Warn, true);
+    if (pairsChecked > 0) kit::flowValueChip("Pairs checked", std::to_string(pairsChecked).c_str());
+    kit::chipFlowEnd();
+    if (result_.contains("summary")) kit::dimText(result_.value("summary", std::string()).c_str());
+
+    if (!complete) {
+        kit::inlineStatus("Some geometry or pair checks failed. Known clashes below remain valid; "
+                          "this report cannot establish clearance.", kit::Tone::Warn);
+        for (const char* key : {"geometry_failures", "pair_failures"}) {
+            if (!result_.contains(key) || !result_[key].is_array()) continue;
+            std::vector<kit::KeyValueItem> rows;
+            for (const auto& failure : result_[key]) {
+                if (!failure.is_object()) continue;
+                std::string subject = failure.value("name",
+                    failure.value("component", failure.value("feature", std::string())));
+                if (failure.contains("a") && failure.contains("b"))
+                    subject = failure["a"].is_string() ? failure["a"].get<std::string>() : failure["a"].dump();
+                if (failure.contains("b"))
+                    subject += " / " + (failure["b"].is_string() ? failure["b"].get<std::string>() : failure["b"].dump());
+                rows.push_back({subject.empty() ? "Geometry" : subject,
+                                failure.value("reason", std::string("Analysis failed")),
+                                kit::Tone::Err});
+            }
+            kit::keyValueCard(key, key[0] == 'g' ? "Geometry failures" : "Pair failures", nullptr, rows);
+        }
+    }
+    if (hasPairs) {
+        const auto& pairs = result_["interferences"];
+        kit::sectionHeader("Interferences", nullptr, nullptr, (int)pairs.size());
+        int pi = 0;
+        for (const auto& p : pairs) {
+            const std::string a = p.value("a", std::string("?"));
+            const std::string b = p.value("b", std::string("?"));
+            const double vol = p.value("overlap_volume_mm3",
+                                       p.value("volume", p.value("volume_mm3", 0.0)));
+            std::string bboxTxt;
+            if (p.contains("overlap_bbox") && p["overlap_bbox"].is_array() &&
+                p["overlap_bbox"].size() == 2 && p["overlap_bbox"][0].is_array() &&
+                p["overlap_bbox"][1].is_array() && p["overlap_bbox"][0].size() >= 3 &&
+                p["overlap_bbox"][1].size() >= 3) {
+                const auto& lo = p["overlap_bbox"][0];
+                const auto& hi = p["overlap_bbox"][1];
+                bboxTxt = evalLen(st, hi[0].get<double>() - lo[0].get<double>()) + " × " +
+                          evalLen(st, hi[1].get<double>() - lo[1].get<double>()) + " × " +
+                          evalLen(st, hi[2].get<double>() - lo[2].get<double>());
+            }
+            const std::string title = a + " × " + b;
+            // Index-scoped: patterned parts produce pairs with identical names and volumes.
+            ImGui::PushID(pi);
+            if (kit::cardBegin("pair", title.c_str())) {
+                // Header dots = the two bodies' viewport tints (the overlap itself is red).
+                kit::cardHeaderRight(ImGui::GetTextLineHeight() * 2.0f);
+                evalSwatch(kEvalPalette[(pi * 2) % 10], "First body's colour in the viewport.");
+                ImGui::SameLine(0.0f, 0.0f);
+                evalSwatch(kEvalPalette[(pi * 2 + 1) % 10], "Second body's colour in the viewport.");
+                kit::keyValueRowId("vol", "Overlap volume",
+                                   evalQty(ips, EvalQty::Volume, vol).c_str(),
+                                   kit::Tone::Err, true);
+                if (!bboxTxt.empty())
+                    kit::keyValueRowId("bbox", "Overlap extent", bboxTxt.c_str(), kit::Tone::Neutral, true);
+            }
+            kit::cardEnd();
+            ImGui::PopID();
+            ++pi;
+        }
+    }
+    if (hasClear) {
+        std::vector<kit::KeyValueItem> rows;
+        for (const auto& p : result_["clearances"]) {
+            std::string reading = "Exact gap not measured";
+            if (p.contains("distance_lower_bound_mm") && p["distance_lower_bound_mm"].is_number()) {
+                reading = ">= " + evalLen(st, p["distance_lower_bound_mm"].get<double>()) +
+                          " (lower bound)";
+            } else if (p.contains("distance") && p["distance"].is_number()) {
+                reading = evalLen(st, p["distance"].get<double>());
+                if (p.value("approx", false)) reading = ">= " + reading + " (lower bound)";
+            }
+            rows.push_back({p.value("a", std::string("?")) + " / " + p.value("b", std::string("?")),
+                            reading, kit::Tone::Neutral, true});
+        }
+        kit::keyValueCard("clearances", "Clearances", nullptr, rows);
+    }
+    if (!hasPairs && !hasClear && !result_.contains("summary") && pairsChecked == 0)
+        kit::emptyState("interference_eval", "Nothing to check",
+                        "Interference detection runs across assembly components or multi-body "
+                        "parts. Open an assembly or a multi-body part to check clashes.");
+}
+
+void EvaluateDialogs::drawSymmetry(AppState& st) {
+    {
+        kit::FieldGroup g("symmetry", "Mirror plane");
+        static const char* const kPlanes[] = {"Front", "Top", "Right"};
+        if (kit::fieldEnum("plane", "Mirror plane", &symmetryPlane_, kPlanes, 3,
+                           kit::FieldOpts().withTip("The datum plane the part is mirrored across."))) {
+            static const int map[] = {1, 0, 2};
+            const int pi = (symmetryPlane_ >= 0 && symmetryPlane_ < 3) ? map[symmetryPlane_] : 1;
+            runEval(st, "eval_symmetry", {{"plane", kPlaneNames[pi]}});
+        }
+    }
+    if (pending_) {
+        kit::spinner("Checking symmetry…");
+    } else if (!errorText_.empty()) {
+        kit::blockedState("Symmetry check unavailable", errorText_.c_str());
+    } else if (result_.contains("symmetric")) {
+        const bool sym = result_.value("symmetric", false);
+        kit::chipFlowBegin("sym_outcome");
+        kit::flowChip(sym ? "Symmetric" : "Not symmetric", sym ? kit::Tone::Ok : kit::Tone::Warn, true);
+        kit::chipFlowEnd();
+        kit::keyValueRowId("deviation", "Deviation volume",
+                           evalQty(st.ips(), EvalQty::Volume, result_.value("deviation_mm3", 0.0)).c_str(),
+                           kit::Tone::Neutral, true);
+    } else {
+        kit::emptyState("symmetry_check", "No result yet", "Choose a mirror plane to check the part.");
+    }
+}
+
+void EvaluateDialogs::drawZebra(AppState& st) {
+    kit::dimText("Even, smooth stripes mean a fair surface. A kink marks a G1 break; a jog marks "
+                 "a G2 break.");
+    kit::FieldGroup g("zebra", "Stripe density");
+    const float before = gZebraFreq;
+    kit::fieldSlider("density", "Stripe density", &gZebraFreq, 4.0f, 60.0f,
+                     kit::FieldOpts().withSigFigs(2).withTip(
+                         "Stripes across the reflection. Higher shows finer curvature changes."));
+    if (gZebraFreq != before && st.renderer) st.renderer->setZebra(true, gZebraFreq);
+}
+
+void EvaluateDialogs::drawFieldTool(AppState& st, const std::string& kind) {
+    kit::inlineStatus(errorText_.c_str(), kit::Tone::Err);
+    {
+        kit::FieldGroup g("field_params", "Pull direction");
+        if (kind == "draft") {
+            static const char* const kPulls[] = {"+X", "+Y", "+Z", "-Z"};
+            kit::fieldEnum("pull", "Pull direction", &draftPull_, kPulls, 4,
+                           kit::FieldOpts().withTip("Direction the part is pulled from the mold."));
+            kit::fieldNumber("angle", "Draft angle", &draftAngleDeg_,
+                             kit::FieldOpts()
+                                 .withUnit(kit::Unit::deg)
+                                 .withRange(0.0, 45.0)
+                                 .withTip("Faces with less draft than this against the pull "
+                                          "direction are highlighted."));
+        } else if (kind == "thickness") {
+            kit::fieldNumber("resolution", "Resolution", &thicknessRes_,
+                             lengthOpts(st.ips())
+                                 .withRange(0.05, 5.0)
+                                 .withTip("Sample spacing for the wall-thickness rays. Smaller is "
+                                          "finer and slower."));
+        } else {
+            static const char* const kKinds[] = {"Mean", "Gaussian", "Max", "Min"};
+            kit::fieldEnum("kind", "Curvature", &curvatureKind_, kKinds, 4,
+                           kit::FieldOpts().withTip("Which curvature the colormap shows."));
+        }
+    }
+    kit::dimText("Update recomputes the viewport colormap; the legend shows the value range.");
+}
+
+void EvaluateDialogs::runFieldTool(AppState& st, const std::string& kind) {
+    if (kind == "draft") {
+        static const double kPull[4][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {0, 0, -1}};
+        const int pi = (draftPull_ >= 0 && draftPull_ < 4) ? draftPull_ : 2;
+        runFieldEval(st, "eval_draft",
+                     {{"pull", {kPull[pi][0], kPull[pi][1], kPull[pi][2]}},
+                      {"angle_deg", (double)draftAngleDeg_}},
+                     "Draft angle", "deg");
+    } else if (kind == "thickness") {
+        nlohmann::json extra = nlohmann::json::object();
+        if (thicknessRes_ > 0.0f) extra["resolution"] = (double)thicknessRes_;
+        runFieldEval(st, "eval_thickness", extra, "Wall thickness", st.ips() ? "in" : "mm");
+    } else if (kind == "curvature") {
+        static const char* const kKinds[] = {"mean", "gaussian", "max", "min"};
+        static const char* const kTitles[] = {"Mean curvature", "Gaussian curvature",
+                                              "Max curvature", "Min curvature"};
+        const int ki = (curvatureKind_ >= 0 && curvatureKind_ < 4) ? curvatureKind_ : 0;
+        runFieldEval(st, "eval_curvature", {{"kind", kKinds[ki]}}, kTitles[ki], "1/mm");
+    }
+}
+
+// The tool window's single primary action (pinned footer). Run / Update are primary; Turn off is
+// secondary. Evaluations run to completion on the worker, so the running state explains why there
+// is no Cancel instead of offering a fake one.
+void EvaluateDialogs::drawExclusiveFooter(AppState& st, const std::string& kind) {
+    kit::ActionSpec a;
+    a.running = pending_;
+    a.cancellable = false;
+    a.cancelBlocker = "the analysis finishes on the worker. Close this window to discard its result.";
+    if (kind == "zebra") {
+        a.primaryLabel = "Turn off";
+        a.primaryAsSecondary = true;
+        a.running = false;
+        if (kit::actionFooter("zebra", a) == kit::FooterAction::Primary) {
+            if (st.renderer) st.renderer->setZebra(false, gZebraFreq);
+            openWindow_.clear();
+        }
+        return;
+    }
+    if (kind == "geometry") {
+        a.primaryLabel = "Run analysis";
+        a.primaryEnabled = !pending_;
+        a.stage = "Analyzing geometry";
+        if (kit::actionFooter("geometry", a) == kit::FooterAction::Primary) runGeometryAnalysis(st);
+        return;
+    }
+    a.primaryLabel = "Update";
+    a.primaryEnabled = !pending_;
+    a.stage = kind == "draft" ? "Computing draft" : kind == "thickness" ? "Computing thickness"
+                                                                        : "Computing curvature";
+    a.secondaryLabel = "Turn off";
+    switch (kit::actionFooter("field", a)) {
+        case kit::FooterAction::Primary:
+            runFieldTool(st, kind);
+            break;
+        case kit::FooterAction::Secondary:
+            clearFieldColormap(st);
+            openWindow_.clear();
+            break;
+        default:
+            break;
+    }
+}
+
 void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
     if (openWindow_.empty()) return;
 
-    const auto& gpal = ui::palette;
     bool open = true;
     char winTitle[128];
     std::snprintf(winTitle, sizeof(winTitle), "%s###eval_%s",
                   title_.empty() ? "Evaluate" : title_.c_str(), openWindow_.c_str());
     ui::setNextCommandDialogPlacement(winTitle,
+        // Measure's reading + picks fit ~420 px (a long chain scrolls); interference lists pairs.
         ImVec2(ui::metrics::px(480),
-               ui::metrics::px(openWindow_ == "measure" || openWindow_ == "interference" ? 580 : 380)),
+               ui::metrics::px(openWindow_ == "interference" ? 580
+                               : openWindow_ == "measure"    ? 420
+                                                             : 380)),
         ImVec2(ui::metrics::px(340), ui::metrics::px(240)));
     ImGui::SetNextWindowBgAlpha(1.0f);
     const bool evVis = ImGui::Begin(winTitle, &open, ImGuiWindowFlags_NoScrollbar);
     if (evVis) {
         const auto surf = ui::adaptiveSurface(-1.0f);
-        ImGui::PushTextWrapPos(0.0f);
-
-        const bool interactivePending =
-            openWindow_ == "measure" || openWindow_ == "draft" || openWindow_ == "thickness" ||
-            openWindow_ == "curvature" || openWindow_ == "zebra" || openWindow_ == "symmetry" ||
-            openWindow_ == "geometry";
-        if (pending_ && !interactivePending) {
-            kit::spinner("Computing analysis...");
-        } else if (!errorText_.empty() && openWindow_ != "measure" && openWindow_ != "draft" &&
-                   openWindow_ != "thickness" && openWindow_ != "curvature" &&
-                   openWindow_ != "field_err" && openWindow_ != "interference" &&
-                   openWindow_ != "geometry") {
-            ImGui::PushStyleColor(
-                ImGuiCol_Text,
-                ImVec4(gpal.statusErr[0], gpal.statusErr[1], gpal.statusErr[2], gpal.statusErr[3]));
-            ImGui::TextWrapped("%s", errorText_.c_str());
-            ImGui::PopStyleColor();
-        } else if (openWindow_ == "measure") {
+        // A footer action may close the tool mid-frame; the layout keys off the tool that opened it.
+        const std::string kind = openWindow_;
+        kit::panelBegin("eval_tool", &surf);
+        kit::panelBodyBegin(kind.c_str());
+        if (kind == "measure") {
             drawMeasure(st);
-        } else if (openWindow_ == "geometry") {
+        } else if (kind == "geometry") {
             drawGeometryAnalysis(st);
-        } else if (openWindow_ == "check") {
-            if (result_.contains("issues") && result_["issues"].is_array()) {
-                const auto& issues = result_["issues"];
-                if (issues.empty()) {
-                    ImGui::PushStyleColor(
-                        ImGuiCol_Text, ImVec4(gpal.statusOk[0], gpal.statusOk[1], gpal.statusOk[2],
-                                              gpal.statusOk[3]));
-                    ImGui::TextWrapped("No geometry issues found.");
-                    ImGui::PopStyleColor();
-                } else {
-                    ImGui::Text("%d issue(s):", (int)issues.size());
-                    for (const auto& it : issues) {
-                        std::string sev = it.value("severity", std::string("info"));
-                        std::string txt = it.value("text", std::string());
-                        ImGui::BulletText("[%s] %s", sev.c_str(), txt.c_str());
-                    }
-                }
-            }
-        } else if (openWindow_ == "interference") {
-            if (!errorText_.empty())
-                kit::blockedState("Interference unavailable", errorText_.c_str());
-            if (!interferencePartNames_.empty()) {
-                kit::sectionHeader("Members");
-                bool anyChange = false;
-                for (size_t i = 0; i < interferencePartNames_.size(); ++i) {
-                    if (i >= interferencePartChecked_.size()) break;
-                    bool checked = interferencePartChecked_[i] != 0;
-                    ImGui::PushID((int)i);
-                    if (ImGui::Checkbox("##member", &checked)) {
-                        interferencePartChecked_[i] = checked ? 1 : 0;
-                        anyChange = true;
-                    }
-                    ImGui::SameLine();
-                    ImGui::TextWrapped("%s", interferencePartNames_[i].c_str());
-                    ImGui::PopID();
-                }
-                if (anyChange) {
-                    nlohmann::json members = nlohmann::json::array();
-                    for (size_t i = 0; i < interferencePartNames_.size(); ++i) {
-                        if (i < interferencePartChecked_.size() && interferencePartChecked_[i])
-                            members.push_back(interferencePartNames_[i]);
-                    }
-                    nlohmann::json extra = nlohmann::json::object();
-                    if (members.empty()) {
-                        ++gen_;
-                        pending_ = false;
-                        result_ = nlohmann::json::object();
-                        errorText_ = "Select at least one member to check interference.";
-                        clearOverlays();
-                    } else {
-                        extra["members"] = members;
-                        runEval(st, "eval_interference", extra);
-                    }
-                }
-                ImGui::Separator();
-            }
-
-            bool hasPairs = result_.contains("interferences") &&
-                            result_["interferences"].is_array() &&
-                            !result_["interferences"].empty();
-            bool hasClear = result_.contains("clearances") && result_["clearances"].is_array() &&
-                            !result_["clearances"].empty();
-            if (result_.contains("summary"))
-                ImGui::TextWrapped("%s", result_.value("summary", std::string()).c_str());
-            const bool complete = result_.value("complete", false);
-            if (!result_.empty() && !complete) {
-                kit::blockedState("Incomplete interference check",
-                    "Some geometry or pair checks failed. Known clashes below remain valid; "
-                    "this report cannot establish clearance.");
-                for (const char* key : {"geometry_failures", "pair_failures"}) {
-                    if (!result_.contains(key) || !result_[key].is_array()) continue;
-                    kit::sectionHeader(key[0] == 'g' ? "Geometry failures" : "Pair failures");
-                    for (const auto& failure : result_[key]) {
-                        if (!failure.is_object()) continue;
-                        std::string subject = failure.value("name",
-                            failure.value("component", failure.value("feature", std::string())));
-                        if (failure.contains("a") && failure.contains("b"))
-                            subject = failure["a"].is_string() ? failure["a"].get<std::string>() : failure["a"].dump();
-                        if (failure.contains("b"))
-                            subject += " / " + (failure["b"].is_string() ? failure["b"].get<std::string>() : failure["b"].dump());
-                        ImGui::TextWrapped("%s: %s", subject.empty() ? "Geometry" : subject.c_str(),
-                                           failure.value("reason", std::string("Analysis failed")).c_str());
-                    }
-                }
-            }
-            if (hasPairs) {
-                kit::sectionHeader("Interferences");
-                int pi = 0;
-                for (const auto& p : result_["interferences"]) {
-                    std::string a = p.value("a", std::string("?"));
-                    std::string b = p.value("b", std::string("?"));
-                    double vol = p.value("overlap_volume_mm3",
-                                         p.value("volume", p.value("volume_mm3", 0.0)));
-                    std::string bboxTxt;
-                    if (p.contains("overlap_bbox") && p["overlap_bbox"].is_array() &&
-                        p["overlap_bbox"].size() == 2 && p["overlap_bbox"][0].is_array() &&
-                        p["overlap_bbox"][1].is_array() && p["overlap_bbox"][0].size() >= 3 &&
-                        p["overlap_bbox"][1].size() >= 3) {
-                        double dx =
-                            p["overlap_bbox"][1][0].get<double>() - p["overlap_bbox"][0][0].get<double>();
-                        double dy =
-                            p["overlap_bbox"][1][1].get<double>() - p["overlap_bbox"][0][1].get<double>();
-                        double dz =
-                            p["overlap_bbox"][1][2].get<double>() - p["overlap_bbox"][0][2].get<double>();
-                        bboxTxt = evalLen(st, dx) + " × " + evalLen(st, dy) + " × " + evalLen(st, dz);
-                    }
-                    const float* ca = kEvalPalette[(pi * 2) % 10];
-                    std::string line = a + " × " + b + ": overlap " + pmFormatVolume(vol, st.ips());
-                    if (!bboxTxt.empty()) line += ", bounding box " + bboxTxt;
-                    drawColorChipRow(line.c_str(), ca);
-                    ++pi;
-                }
-            }
-            if (hasClear) {
-                kit::sectionHeader("Clearances");
-                for (const auto& p : result_["clearances"]) {
-                    std::string a = p.value("a", std::string("?"));
-                    std::string b = p.value("b", std::string("?"));
-                    std::string reading = "exact gap not measured";
-                    if (p.contains("distance_lower_bound_mm") && p["distance_lower_bound_mm"].is_number())
-                        reading = ">= " + evalLen(st, p["distance_lower_bound_mm"].get<double>()) +
-                                  " (lower bound, not measured)";
-                    else if (p.contains("distance") && p["distance"].is_number()) {
-                        reading = evalLen(st, p["distance"].get<double>());
-                        if (p.value("approx", false)) reading += " (lower bound, not measured)";
-                    }
-                    ImGui::BulletText("%s <-> %s : %s", a.c_str(), b.c_str(), reading.c_str());
-                }
-            }
-            if (!hasPairs && !hasClear && !result_.contains("summary")) {
-                ImGui::TextWrapped(
-                    "Interference detection runs across assembly components or multi-body parts. "
-                    "Open an assembly or a multi-body part to check clashes.");
-            }
-            if (complete && result_.value("ok", false) && result_.value("pairs_checked", 0) > 0 &&
-                !hasPairs && errorText_.empty() && !pending_)
-                kit::chip("No interference", kit::Tone::Ok);
-        } else if (openWindow_ == "symmetry") {
-            ImGui::SetNextItemWidth(100 * ui::uiScale);
-            if (ImGui::Combo("Plane", &symmetryPlane_, "Front\0Top\0Right\0")) {
-                static const int map[] = {1, 0, 2};
-                int pi = (symmetryPlane_ >= 0 && symmetryPlane_ < 3) ? map[symmetryPlane_] : 1;
-                runEval(st, "eval_symmetry", {{"plane", kPlaneNames[pi]}});
-            }
-            if (pending_) {
-                kit::spinner("Computing symmetry...");
-            } else {
-                bool sym = result_.value("symmetric", false);
-                kit::keyValueRow("Symmetric", sym ? "Yes" : "No");
-                kit::keyValueRow("Deviation", pmFormatVolume(result_.value("deviation_mm3", 0.0), st.ips()).c_str());
-            }
-        } else if (openWindow_ == "zebra") {
-            ImGui::TextWrapped(
-                "Smooth even stripes = fair surface; kinks = G1 break; jogs = G2 break.");
-            ImGui::SetNextItemWidth(160 * ui::uiScale);
-            if (ImGui::SliderFloat("Density", &gZebraFreq, 4.0f, 60.0f, "%.0f")) {
-                if (st.renderer) st.renderer->setZebra(true, gZebraFreq);
-            }
-            if (kit::secondaryButton("Turn Off")) {
-                if (st.renderer) st.renderer->setZebra(false, gZebraFreq);
-                openWindow_.clear();
-            }
-        } else if (openWindow_ == "draft") {
-            if (!errorText_.empty()) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
-                                                           gpal.statusErr[2], gpal.statusErr[3]));
-                ImGui::TextWrapped("%s", errorText_.c_str());
-                ImGui::PopStyleColor();
-            }
-            if (pending_) {
-                kit::spinner("Computing draft...");
-            }
-            ImGui::SetNextItemWidth(90 * ui::uiScale);
-            ImGui::Combo("Pull", &draftPull_, "X\0Y\0Z\0-Z\0");
-            ImGui::SetNextItemWidth(80 * ui::uiScale);
-            ImGui::DragFloat("Angle", &draftAngleDeg_, 0.1f, 0.0f, 45.0f, "%.1f°",
-                             ImGuiSliderFlags_AlwaysClamp);
-            if (kit::primaryButton("Update", !pending_)) {
-                static const double kPull[4][3] = {
-                    {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {0, 0, -1}};
-                int pi = (draftPull_ >= 0 && draftPull_ < 4) ? draftPull_ : 2;
-                runFieldEval(st, "eval_draft",
-                             {{"pull", {kPull[pi][0], kPull[pi][1], kPull[pi][2]}},
-                              {"angle_deg", (double)draftAngleDeg_}},
-                             "Draft angle", "deg");
-            }
-            if (kit::secondaryButton("Turn Off")) {
-                clearFieldColormap(st);
-                openWindow_.clear();
-            }
-        } else if (openWindow_ == "thickness") {
-            if (!errorText_.empty()) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
-                                                           gpal.statusErr[2], gpal.statusErr[3]));
-                ImGui::TextWrapped("%s", errorText_.c_str());
-                ImGui::PopStyleColor();
-            }
-            if (pending_) {
-                kit::spinner("Computing thickness...");
-            }
-            ImGui::SetNextItemWidth(90 * ui::uiScale);
-            ImGui::DragFloat("Resolution", &thicknessRes_, 0.05f, 0.05f, 5.0f, "%.2f mm",
-                             ImGuiSliderFlags_AlwaysClamp);
-            if (kit::primaryButton("Update", !pending_)) {
-                nlohmann::json extra = nlohmann::json::object();
-                if (thicknessRes_ > 0.0f) extra["resolution"] = (double)thicknessRes_;
-                runFieldEval(st, "eval_thickness", extra, "Wall thickness",
-                             st.ips() ? "in" : "mm");
-            }
-            if (kit::secondaryButton("Turn Off")) {
-                clearFieldColormap(st);
-                openWindow_.clear();
-            }
-        } else if (openWindow_ == "curvature") {
-            if (!errorText_.empty()) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(gpal.statusErr[0], gpal.statusErr[1],
-                                                           gpal.statusErr[2], gpal.statusErr[3]));
-                ImGui::TextWrapped("%s", errorText_.c_str());
-                ImGui::PopStyleColor();
-            }
-            if (pending_) {
-                kit::spinner("Computing curvature...");
-            }
-            ImGui::SetNextItemWidth(110 * ui::uiScale);
-            ImGui::Combo("Kind", &curvatureKind_, "Mean\0Gaussian\0Max\0Min\0");
-            if (kit::primaryButton("Update", !pending_)) {
-                static const char* kKinds[] = {"mean", "gaussian", "max", "min"};
-                int ki = (curvatureKind_ >= 0 && curvatureKind_ < 4) ? curvatureKind_ : 0;
-                const char* kind = kKinds[ki];
-                char titleBuf[48];
-                std::snprintf(titleBuf, sizeof(titleBuf), "%s curvature",
-                              ki == 0   ? "Mean"
-                              : ki == 1 ? "Gaussian"
-                              : ki == 2 ? "Max"
-                                        : "Min");
-                runFieldEval(st, "eval_curvature", {{"kind", kind}}, titleBuf, "1/mm");
-            }
-            if (kit::secondaryButton("Turn Off")) {
-                clearFieldColormap(st);
-                openWindow_.clear();
-            }
-        } else if (openWindow_ == "field_wait") {
-            ImGui::TextDisabled("Computing field overlay…");
-        } else if (openWindow_ == "field_err") {
-            ImGui::PushStyleColor(
-                ImGuiCol_Text,
-                ImVec4(gpal.statusErr[0], gpal.statusErr[1], gpal.statusErr[2], gpal.statusErr[3]));
-            ImGui::TextWrapped("%s", errorText_.c_str());
-            ImGui::PopStyleColor();
+        } else if (kind == "check") {
+            drawCheck(st);
+        } else if (kind == "interference") {
+            drawInterference(st);
+        } else if (kind == "symmetry") {
+            drawSymmetry(st);
+        } else if (kind == "zebra") {
+            drawZebra(st);
+        } else if (kind == "draft" || kind == "thickness" || kind == "curvature") {
+            drawFieldTool(st, kind);
+        } else if (kind == "field_wait") {
+            kit::spinner("Computing field overlay…");
+        } else if (kind == "field_err") {
+            kit::blockedState("Field analysis unavailable", errorText_.c_str());
         }
-        ImGui::PopTextWrapPos();
-        ui::drawWindowPillScrollbarV(surf);
+        if (kind == "geometry" || kind == "zebra" || kind == "draft" || kind == "thickness" ||
+            kind == "curvature") {
+            kit::panelFooterBegin();
+            drawExclusiveFooter(st, kind);
+        }
+        kit::panelEnd();
     }
     ImGui::End();
     if (!open || openWindow_.empty()) {
@@ -2277,7 +2583,8 @@ void EvaluateDialogs::prepareFrame(AppState& st) {
 
 void EvaluateDialogs::draw(AppState& st) {
     prepareFrame(st);
-    // Mass design section chain and section plane drag debounce.
+    // Mass material re-seed, design section chain and section plane drag debounce.
+    syncMassMaterial(st);
     tickMassDesignSections(st);
     tickSectionDrag(st);
     if (massOpen_ && !massPending_) rebuildMassOverlays(st);

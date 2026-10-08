@@ -209,14 +209,22 @@ public:
     // id-buffer pick pass + overlays, which consume camera() — all stay pixel-exact in sync.
     void renderOrbit(float yawDeg, float pitchDeg, float zoom, const float pan[3]);
 
-    // W2-D: bounding radius of the loaded model (1 if none). The viewport input code uses it to
-    // convert a screen-space pan drag (px) into a world-space offset (matches drawCurrent framing).
+    // Bounding radius of the loaded model (0 when empty); auxiliary geometry never changes it.
     float modelRadius() const { return radius_; }
-    // Effective scene radius for camera math: the real bbox radius, or — when the part is empty
-    // (no bodies, radius_==0) — the same fallback the camera uses to frame an empty scene. Pan/zoom
-    // screen->world math MUST use this, not modelRadius(), or a drag on an empty part scales by 0
-    // (worldPerPx == 0) and the view never moves until the first body exists.
-    float effectiveSceneRadius() const { return radius_ > 0.0f ? radius_ : kEmptySceneRadius; }
+    // Additional world-space scene bounds enlarge framing and datum geometry without moving the
+    // model/origin frame center. The radius reaches the farthest auxiliary corner from that center.
+    void setAuxSceneBounds(const float lo[3], const float hi[3]);
+    void clearAuxSceneBounds() { hasAuxSceneBounds_ = false; auxSceneRadiusFloor_ = 0.0f; }
+    // Authoring may retain a padded framing radius while the exact bounds change/shrink.
+    // This floor never replaces the real bounds or changes the model's zoom-limit reference.
+    void setAuxSceneRadiusFloor(float radius) { auxSceneRadiusFloor_ = radius; }
+    // Camera and screen->world math use the model/empty radius enlarged by auxiliary bounds.
+    float effectiveSceneRadius() const;
+    // Preserve the model/empty scene's closest absolute view when auxiliary bounds grow; the
+    // minimum zoom remains 0.1 relative to effectiveSceneRadius() so large scenes can zoom out.
+    float maxSceneZoom() const {
+        return 10.0f * effectiveSceneRadius() / (radius_ > 0.0f ? radius_ : kEmptySceneRadius);
+    }
     Vec3 modelCenter() const { return center_; }
     // Perspective vertical FOV (degrees). Only used when orthographic() is false; kept so
     // external math that still needs the historical framing constant can share one source.
@@ -289,11 +297,18 @@ public:
     // this to the sketch's geometric center so the view orbits/centres there instead. Cleared (on
     // == false) outside sketch, where center_ (the model bbox centre) is already correct.
     void setOrbitCenterOverride(bool on, const Vec3& c) { orbitOverride_ = on; orbitCenter_ = c; }
-    // W2 full-bleed viewport: a horizontal lens shift (in NDC units) baked into the projection's
-    // unused m[8] slot by drawCurrent(), so the modeled part stays centered in the un-occluded
-    // region between the side panes WITHOUT moving pan_ — picking/overlays read cam_.mvp and so
-    // follow automatically. 0 = symmetric (no shift); set per frame from the viewport panel.
-    void setLensShiftX(float x) { lensShiftX_ = x; }
+    // W2 full-bleed viewport: the 3D band spans the whole window behind the glass panes, so the
+    // part is framed in the un-occluded CLEAR region (between the pinned columns, below the doc-tab
+    // band) instead of the full image. `shiftX/shiftY` are NDC lens shifts baked into the projection
+    // (perspective m[8]/m[9], ortho offset) by drawCurrent(); `scale` (>= 1) widens the zoom=1 view
+    // volume so the model's framing sphere fits the clear region's SHORTER side. Nothing moves pan_,
+    // and picking/overlays read cam_.mvp/halfHeight, so they follow automatically. Set per frame
+    // from the viewport panel; (0, 0, 1) = symmetric full-image framing.
+    void setFramingRegion(float shiftX, float shiftY, float scale) {
+        lensShiftX_ = shiftX;
+        lensShiftY_ = shiftY;
+        framingScale_ = scale < 1.0f ? 1.0f : scale;
+    }
 
     // ---- C28-C: SolidWorks-style Section View — up to 3 simultaneous clip planes ----
     // A fragment is visible only when it is inside ALL active half-spaces: dot(p,Ni) <= Oi.
@@ -479,13 +494,13 @@ private:
         int capExclude = -1;
     } uCap_;
     struct ResolveUniforms { int src = -1, ss = -1; } uResolve_;
-    struct DownsampleUniforms { int src = -1, invSrcSize = -1; } uDown_;
+    struct DownsampleUniforms { int src = -1, invDstSize = -1; } uDown_;
     struct KawaseUniforms { int src = -1, texel = -1, offset = -1; } uKawase_;
 
     // ---- F1 async luminance pipeline (ported from ui/viewport/renderer.cpp) ----
     void issueLumaReadback() const;   // one glReadPixels/frame -> PBO ring + fence, or fallback
     void issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const;  // handles resize
-    void pollLumaPbos() const;           // non-blocking glClientWaitSync poll of the ring
+    void pollLumaPbos(bool bootstrap = false) const;  // wait only to establish a new source's first grid
     void reduceLumaPbo(int slot) const;  // map -> Rec.709 reduce -> staging -> published swap
 
     // Desktop: 3x supersample + box-filter resolve for crisp edges.
@@ -517,7 +532,7 @@ private:
     mutable int blurW_ = 0, blurH_ = 0;
     mutable bool backdropDirty_ = true;
 
-    // ---- F1 async luminance pipeline: 3-slot PBO ring + fence, GPU-async, never blocks ----
+    // ---- F1 luminance pipeline: first-source contrast bootstrap, then 3-slot async PBO ring ----
     static constexpr int kLumaPboCount = 3;
     static constexpr int kLumaGridMaxW = 64, kLumaGridMaxH = 40;
     mutable unsigned int lumaPbo_[kLumaPboCount] = {0, 0, 0};
@@ -664,8 +679,15 @@ private:
     Vec3 center_;
     Vec3 pan_;  // W2-D: world-space orbit-target offset (set by renderOrbit; added to center_)
     float lensShiftX_ = 0.0f;  // W2: horizontal NDC lens shift (proj.m[8] / ortho offset)
+    float lensShiftY_ = 0.0f;  // W2: vertical NDC lens shift (proj.m[9] / ortho offset)
+    float framingScale_ = 1.0f; // W2: zoom=1 view-volume scale so the model fits the clear region
     bool orthographic_ = true; // default: orthographic projection (CAD parallel view)
     float radius_ = 1.0f;
+    bool hasAuxSceneBounds_ = false;
+    float auxSceneRadiusFloor_ = 0.0f;
+    Vec3 auxSceneLo_{0, 0, 0}, auxSceneHi_{0, 0, 0};
+    mutable Vec3 auxRadiusCenter_{0, 0, 0};
+    mutable float auxSceneRadius_ = -1.0f;  // cached until the bounds or model center change
     CameraXform cam_;  // updated each drawCurrent()
 
     // C19 colormap / deformation state.

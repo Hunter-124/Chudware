@@ -7,12 +7,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "ui/sim_topology.h"
+#include "ui/sim_topology_bc.h"
 
 namespace {
 
@@ -201,6 +203,181 @@ void testValidation() {
 
   CHECK(topo::hasBlocking(topo::validateTopology(ok, topo::Capabilities{})));
   CHECK(topo::hasBlocking(topo::validateTopology(json(), caps)));
+}
+
+// Resolved facesets are canonical native inputs, whether a fixture is bare or
+// an entry wraps selectors in `faces`. Editing other settings must not rewrite
+// their samples, tolerances, normals or analytic descriptors.
+json resolvedStudy(const json &faceset) {
+  return {
+      {"id", "topology-resolved"},
+      {"type", "topology"},
+      {"name", "Resolved study"},
+      {"material", {{"E_mpa", 70000.0}, {"nu", 0.3}}},
+      {"topology", {{"physics", "structural"}, {"method", "simp"},
+                    {"objective", "compliance"}}},
+      {"fixtures", json::array({
+                       faceset,
+                       {{"faces", json::array({faceset})}, {"dofs", {0, 1, 2}}}})},
+      {"load_cases", json::array({
+                         {{"name", "Service"},
+                          {"fixtures", json::array({
+                                           faceset,
+                                           {{"faces", json::array({faceset})}}})},
+                          {"loads", json::array({
+                                        {{"faces", json::array({faceset})},
+                                         {"type", "force"},
+                                         {"vec", {0, 0, -100}}}})}}})},
+      {"runs", json::array({{{"run_id", "retained"}}})}};
+}
+
+const std::vector<json::json_pointer> &resolvedLocations() {
+  static const std::vector<json::json_pointer> locations = {
+      json::json_pointer("/fixtures/0"),
+      json::json_pointer("/fixtures/1/faces/0"),
+      json::json_pointer("/load_cases/0/fixtures/0"),
+      json::json_pointer("/load_cases/0/fixtures/1/faces/0"),
+      json::json_pointer("/load_cases/0/loads/0/faces/0")};
+  return locations;
+}
+
+void testResolvedFacesetDefinitionEdits() {
+  const topo::Capabilities caps = topo::parseCapabilities(capsJson());
+  const json flat = {{"points", {0, 0, 0, 1, 0, 0, 0, 1, 0}}};
+  std::vector<json> accepted = {
+      flat,
+      {{"points", json::array({{0, 0, 0}, {1, 0, 0}, {0, 1, 0}})}},
+      {{"points", {0, 0, 0}}},
+      // Native validation counts a nested sample as three scalar components.
+      {{"points", json::array({json::array({0, 0, 0}), 1, 0, 0})}},
+      {{"points", json::array({{0, 0, 0, 7}})}},
+      {{"points", flat["points"]}, {"tol_mm", 1e-100},
+       {"perp_tol_mm", 1e100}, {"face_normal", {0, 0, 2, 7}}}};
+  const std::vector<json> surfaces = {
+      {{"type", "sphere"}, {"origin", {0, 0, 0, 7}}, {"radius", 2}},
+      {{"type", "cylinder"}, {"origin", {0, 0, 0}},
+       {"axis", {0, 0, 2, 7}}, {"radius", 2}},
+      {{"type", "cone"}, {"origin", {0, 0, 0}},
+       {"axis", {0, 0, 2}}, {"semi_angle_rad", 1.5707962}},
+      // Native accepts either radius ordering; it does not impose major > minor.
+      {{"type", "torus"}, {"origin", {0, 0, 0}},
+       {"axis", {0, 0, 2}}, {"major_radius", 1}, {"minor_radius", 2}}};
+  for (const json &surface : surfaces) {
+    json faceset = flat;
+    faceset["surface"] = surface;
+    accepted.push_back(std::move(faceset));
+  }
+  for (const json &faceset : accepted) {
+    json study = resolvedStudy(flat);
+    const json definition = resolvedStudy(faceset);
+    std::string error;
+    CHECK(topo::applyStudyDefinition(study, definition, caps, {}, error));
+    CHECK(error.empty());
+    CHECK(study == definition);
+
+    json edited = study;
+    edited["name"] = "Renamed resolved study";
+    edited["topology"]["max_iterations"] = 75;
+    CHECK(topo::applyStudyDefinition(study, edited, caps, {}, error));
+    CHECK(error.empty());
+    CHECK(study == edited);
+    for (const auto &location : resolvedLocations())
+      CHECK(study.at(location) == faceset);
+  }
+}
+
+void testInvalidResolvedFacesetDefinitionsAreTransactional() {
+  const topo::Capabilities caps = topo::parseCapabilities(capsJson());
+  const json flat = {{"points", {0, 0, 0, 1, 0, 0, 0, 1, 0}}};
+  const json original = resolvedStudy(flat);
+  const double inf = std::numeric_limits<double>::infinity();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  std::vector<json> rejected;
+  for (const json &points : std::vector<json>{
+           "invalid", nullptr, json::object(), json::array(),
+           json::array({0, 0}), json::array({0, 0, 0, 1}),
+           json::array({json::array({0, 0})}),
+           json::array({json::array({0, 0, "invalid"})}),
+           json::array({json::array({0, 0, 0}), 1}),
+           json::array({0, 0, inf}), json::array({0, 0, nan}),
+           json::array({json::array({0, inf, 0})}),
+           json::array({json::array({nan, 0, 0})})})
+    rejected.push_back(json{{"points", points}});
+  auto rejectField = [&](const char *key, const json &value) {
+    json faceset = flat;
+    faceset[key] = value;
+    rejected.push_back(std::move(faceset));
+  };
+  for (const char *key : {"tol_mm", "perp_tol_mm"})
+    for (const json &value : std::vector<json>{nullptr, "invalid", 0, -1, inf, nan})
+      rejectField(key, value);
+  for (const json &normal : std::vector<json>{
+           nullptr, "invalid", json::array({0, 0}), json::array({0, 0, 0}),
+           json::array({0, 0, "invalid"}), json::array({0, inf, 0}),
+           json::array({nan, 0, 0}), json::array({1e308, 0, 0}),
+           json::array({1e-300, 0, 0})})
+    rejectField("face_normal", normal);
+  for (const json &surface : std::vector<json>{
+           nullptr, "invalid", json::object(),
+           {{"type", 1}, {"origin", {0, 0, 0}}},
+           {{"type", "sphere"}, {"radius", 1}},
+           {{"type", "plane"}, {"origin", {0, 0, 0}}},
+           {{"type", "sphere"}, {"origin", {0, 0}}, {"radius", 1}},
+           {{"type", "sphere"}, {"origin", {0, inf, 0}}, {"radius", 1}}})
+    rejectField("surface", surface);
+  const std::vector<json> surfaces = {
+      {{"type", "sphere"}, {"origin", {0, 0, 0}}, {"radius", 1}},
+      {{"type", "cylinder"}, {"origin", {0, 0, 0}},
+       {"axis", {0, 0, 1}}, {"radius", 1}},
+      {{"type", "cone"}, {"origin", {0, 0, 0}},
+       {"axis", {0, 0, 1}}, {"semi_angle_rad", 0.5}},
+      {{"type", "torus"}, {"origin", {0, 0, 0}},
+       {"axis", {0, 0, 1}}, {"major_radius", 1}, {"minor_radius", 2}}};
+  for (const json &surface : surfaces) {
+    for (const char *key : {"radius", "semi_angle_rad", "major_radius",
+                            "minor_radius"}) {
+      if (!surface.contains(key))
+        continue;
+      for (const json &value : std::vector<json>{nullptr, "invalid", 0, -1, inf, nan}) {
+        json invalid = surface;
+        invalid[key] = value;
+        rejectField("surface", invalid);
+      }
+      json missing = surface;
+      missing.erase(key);
+      rejectField("surface", missing);
+    }
+    if (surface.contains("axis")) {
+      for (const json &axis : std::vector<json>{
+               nullptr, json::array({0, 0}), json::array({0, 0, 0}),
+               json::array({0, 0, inf}), json::array({nan, 0, 0}),
+               json::array({1e308, 0, 0}), json::array({1e-300, 0, 0})}) {
+        json invalid = surface;
+        invalid["axis"] = axis;
+        rejectField("surface", invalid);
+      }
+      json missing = surface;
+      missing.erase("axis");
+      rejectField("surface", missing);
+    }
+    if (surface["type"] == "cone") {
+      json invalid = surface;
+      invalid["semi_angle_rad"] = 1.5707963;
+      rejectField("surface", invalid);
+    }
+  }
+  for (const auto &location : resolvedLocations())
+    for (const json &faceset : rejected) {
+      json study = original;
+      json definition = original;
+      definition["name"] = "Invalid candidate";
+      definition["topology"]["max_iterations"] = 75;
+      definition[location] = faceset;
+      std::string error;
+      CHECK(!topo::applyStudyDefinition(study, definition, caps, {}, error));
+      CHECK(!error.empty());
+      CHECK(study == original);
+    }
 }
 
 void testApplyRunSettings() {
@@ -392,6 +569,8 @@ int main() {
   testCapabilityMatrix();
   testSwitchPreservesUnownedKeys();
   testValidation();
+  testResolvedFacesetDefinitionEdits();
+  testInvalidResolvedFacesetDefinitionsAreTransactional();
   testApplyRunSettings();
   testOutcomeHonesty();
   testManufacturingIsMeasuredNotRequested();

@@ -99,13 +99,27 @@ public:
     void drawSimulationTriangles(const Renderer::CameraXform& cam, uint64_t batchKey,
                                  const std::vector<float>& xyz, const float rgba[4],
                                  bool overSurface = true, uint64_t sourceRevision = 0);
+    // Shaded, two-sided simulation solids. Positions/normals and optional RGB are retained per
+    // batch/revision; opaque solids write depth, translucent previews blend without writing it.
+    void drawSimulationLitTriangles(const Renderer::CameraXform& cam, uint64_t batchKey,
+                                    const std::vector<float>& xyz, const std::vector<float>& nrm,
+                                    const std::vector<float>* rgb, const float rgba[4],
+                                    uint64_t sourceRevision);
     // Removes batches not submitted since beginSimulationFrame. clearSimulationBuffers is also
     // used when the simulation overlay is hidden or the active workspace/document changes.
     void endSimulationFrame();
     void clearSimulationBuffers();
 
+    // Restrict the following draws to a screen sub-rectangle of the target image, given as
+    // fractions of the image (u right, v DOWN; 0..1). Used to keep scene-scale setup overlays
+    // (flow tunnel planes/arrows) inside the viewport's clear region so they never streak behind
+    // the glass panes. Saves the caller's scissor state; endScreenClip() restores it. No nesting.
+    void beginScreenClip(const Renderer::CameraXform& cam, float u0, float v0, float u1, float v1);
+    void endScreenClip();
+
 private:
     void destroy();
+    void ensureCommonProgram();
     // Bind prog_ + upload the per-frame camera/clip uniforms shared by every draw path.
     void bindCommon(const Renderer::CameraXform& cam);
 
@@ -116,6 +130,8 @@ private:
 
     struct SimulationBuf {
         unsigned int vao = 0, vbo = 0, primitive = 0;
+        unsigned int nrmVbo = 0, rgbVbo = 0;
+        bool lit = false, hasColor = false;
         int vertCount = 0;
         uint64_t sourceRevision = 0;
         uint64_t lastFrame = 0;
@@ -132,6 +148,9 @@ private:
     void drawHit(const Renderer::CameraXform& cam, const PickHit& h, const float rgba[4]);
 
     unsigned int prog_ = 0;     // flat color (faces wash + edges)
+    unsigned int litProg_ = 0;
+    int uLitMVP_ = -1, uLitColor_ = -1, uLitHasColor_ = -1, uLitViewDir_ = -1;
+    int uLitClipCount_ = -1, uLitClipN_ = -1, uLitClipOff_ = -1;
     unsigned int vao_ = 0, vbo_ = 0;  // scratch buffer for single-vertex point draws
     unsigned int segVao_ = 0, segVbo_ = 0;  // dynamic buffer for line batches
     unsigned int triVao_ = 0, triVbo_ = 0;  // dynamic buffer for triangle batches
@@ -163,6 +182,10 @@ private:
     int clipCount_ = 0;
     float clipNormals_[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
     float clipOffsets_[3] = {0,0,0};
+    // beginScreenClip/endScreenClip saved scissor state.
+    bool screenClipActive_ = false;
+    bool screenClipPrevEnabled_ = false;
+    int screenClipPrevBox_[4] = {0, 0, 0, 0};
 };
 
 }  // namespace render

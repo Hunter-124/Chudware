@@ -90,6 +90,12 @@ static bool s_openChooser = false;
 // and reserve a dedicated "+N" glass chip after the last visible tab (and before the first when
 // scrolled) so the count never paints over a filename. Boundary tab titles get a clean alpha fade.
 static float s_scrollX = 0.0f;   // px of content hidden past the LEFT edge (0 = flush left)
+// Reveal only on selection/content/strip-size changes, not on every frame: browsing other tabs
+// with the wheel or overflow chips must be allowed to move away from the selected document.
+static CloseTabIdentity s_visibleActive;
+static float s_visibleActiveOffset = -1.0f;
+static float s_visibleActiveWidth = -1.0f;
+static float s_visibleStripW = -1.0f;
 // Overflow never changes the strip's height: there is no scrollbar lane. Scrolling is the wheel,
 // the "+N" chips, and click/hover-reveal of a clipped edge tab; position feedback is a hairline
 // thumb laid INSIDE the band's bottom edge while the strip is hovered (see drawDocTabs).
@@ -320,8 +326,9 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
         const bool aiSilent = t.aiHandoff && !t.userAdopted;
         if (t.dirty && !aiSilent) s_confirmClose = closeTabIdentity(t);   // ask first
         else                      s_closeIdx = idx;
-    } else if (switchClicked && !active) {
-        s_switchTo = idx;
+    } else if (switchClicked) {
+        s_hoverReveal = idx;  // also reveal a clipped tab that was already selected
+        if (!active) s_switchTo = idx;
     }
 
     ImGui::PopID();
@@ -682,14 +689,22 @@ float drawDocTabs(AppState& st, float availW) {
     if (band.valid) {
         const float margin = 12.0f * s;
         const float fmEdge = ui::overlayColumnEdge(0);
-        const float docX = (fmEdge >= 0.0f ? fmEdge : band.minX) + margin;
         const float docY = band.minY + 4.0f * s;   // hug the ribbon; matches the pinned columns' top
         // Hug content, clamped to the Copilot column's LEFT edge (never run tabs under it). The
         // viewport toolbar lives to the LEFT of that edge, so hugging content is what actually frees
         // it — clamping alone would not.
         float rightBound = ui::overlayColumnEdge(1);   // Copilot left edge
         if (rightBound < 0.0f) rightBound = band.maxX - margin;
-        const float winW = std::max(80.0f * s,
+        const float minimumStripW = nTabs > 0
+            ? std::max(80.0f * s, btnSlot + 24.0f * s +
+                       2.0f * (measureOverflowChipW(nTabs, s) + gap))
+            : 80.0f * s;
+        // Keep the minimum usable strip on the visible side of Copilot even if resized columns
+        // leave less than that width. Shift the strip left rather than extending its hit window
+        // under the right column or squeezing its controls.
+        const float docX = std::min((fmEdge >= 0.0f ? fmEdge : band.minX) + margin,
+                                    rightBound - minimumStripW);
+        const float winW = std::max(minimumStripW,
                                     std::min(contentW + 6.0f * s, rightBound - docX));
         // Height hugs the pill row + a hair of slack so the rounded pills are not clipped. Overflow
         // never grows the strip (no stacked scrollbar lane), so tabs sit at the same y either way.
@@ -754,9 +769,29 @@ float drawDocTabs(AppState& st, float availW) {
     // flush-left, no-chip layout. The tab row sits at the band top whether or not it overflows.
     const float y0 = origin.y;
 
-    // Two-pass layout: chip widths depend on hidden counts, and hidden counts depend on the
-    // (shrunk) tab clip width after chips are reserved. One refine pass is enough for digit-width
-    // stability (counts rarely change between passes).
+    // Deferred selection is applied AFTER drawing, so reveal it on the next frame, including
+    // selections made outside this strip. Keep the document identity rather than a stale index.
+    // A changed title/order or strip width can also move its close button out of the lane.
+    int reveal = s_hoverReveal;
+    if (st.activeTab >= 0 && st.activeTab < nTabs) {
+        const auto& active = st.docTabs[st.activeTab];
+        const bool changed = s_visibleActive.kind != active.kind ||
+            s_visibleActive.id != closeTabId(active);
+        if (changed || s_visibleActiveOffset != tabOff[st.activeTab] ||
+            s_visibleActiveWidth != tabWs[st.activeTab] || s_visibleStripW != availW)
+            reveal = st.activeTab;
+        if (changed) s_visibleActive = closeTabIdentity(active);
+        s_visibleActiveOffset = tabOff[st.activeTab];
+        s_visibleActiveWidth = tabWs[st.activeTab];
+    } else {
+        s_visibleActive = {};
+        s_visibleActiveOffset = s_visibleActiveWidth = -1.0f;
+    }
+    s_visibleStripW = availW;
+    s_hoverReveal = -1;
+
+    // Refine the chip counts against the lane AND the requested reveal position. The extra
+    // pass lets a revealed selection reserve the newly-hidden edge's chip before it is drawn.
     float leftChipW = 0.0f, rightChipW = 0.0f;
     float tabsL = outerL, tabsR = outerR, tabsW = outerW;
     float maxScroll = 0.0f;
@@ -765,7 +800,7 @@ float drawDocTabs(AppState& st, float availW) {
     leftTitles.reserve((size_t)nTabs);
     rightTitles.reserve((size_t)nTabs);
 
-    for (int pass = 0; pass < 2; ++pass) {
+    for (int pass = 0; pass < 3; ++pass) {
         tabsL = outerL + (leftChipW > 0.5f ? leftChipW + gap : 0.0f);
         tabsR = outerR - (rightChipW > 0.5f ? rightChipW + gap : 0.0f);
         tabsW = std::max(24.0f * s, tabsR - tabsL);
@@ -777,7 +812,21 @@ float drawDocTabs(AppState& st, float availW) {
         // this loop permanently ate the chip width off the reachable scroll range (the right end
         // could never be scrolled into view). The real clamp happens once, after the final
         // geometry is settled (below the loop).
-        const float viewScroll = overflow ? std::min(std::max(s_scrollX, 0.0f), maxScroll) : 0.0f;
+        float viewScroll = overflow ? std::min(std::max(s_scrollX, 0.0f), maxScroll) : 0.0f;
+        if (overflow && reveal >= 0 && reveal < nTabs) {
+            const float tL = tabOff[(size_t)reveal];
+            const float tR = tL + tabWs[(size_t)reveal];
+            // An oversized title cannot fit at once; reveal its trailing close control first.
+            if (tabWs[(size_t)reveal] > tabsW)
+                viewScroll = tR - tabsW;
+            else if (tL < viewScroll + 0.5f)
+                viewScroll = tL;
+            else if (tR > viewScroll + tabsW - 0.5f)
+                viewScroll = tR - tabsW;
+            // This is an explicit reveal, not a passive clamp: repeat it as chip slots settle.
+            viewScroll = std::min(std::max(viewScroll, 0.0f), maxScroll);
+            s_scrollX = viewScroll;
+        }
 
         nLeft = 0;
         nRight = 0;
@@ -822,28 +871,14 @@ float drawDocTabs(AppState& st, float availW) {
             s_scrollX = std::min(std::max(s_scrollX - wheel * 60.0f * s, 0.0f), maxScroll);
     }
 
-    // Clicking (or dwell-hovering) a partially-hidden tab scrolls it fully into view THIS frame (or
-    // the next for hover), so the active/hover border it is about to get is never left dissolved at
-    // a lane edge (and the user can always reach the first/last file by clicking its visible sliver).
-    {
-        const int reveal = s_switchTo >= 0 ? s_switchTo : s_hoverReveal;
-        s_hoverReveal = -1;
-        if (overflow && reveal >= 0 && reveal < nTabs) {
-            const float tL = tabOff[(size_t)reveal];
-            const float tR = tL + tabWs[(size_t)reveal];
-            if (tL < s_scrollX + 0.5f)
-                s_scrollX = tL;
-            else if (tR > s_scrollX + tabsW - 0.5f)
-                s_scrollX = tR - tabsW;
-            s_scrollX = std::min(std::max(s_scrollX, 0.0f), maxScroll);
-        }
-    }
-
     // Draw the tabs clipped to the reserved tab region (chips live outside this clip).
     // A partially-scrolled boundary tab stays drawn; the edge fade below dissolves it (title AND
     // pill edge treatment), so the truncation never reads as a hard slice through border/shadow.
     const float fadeW = 28.0f * s;
-    dl->PushClipRect(ImVec2(tabsL, y0), ImVec2(tabsR, y0 + barH), true);
+    // ImGui's clip updates BOTH renderer and window logical bounds. A draw-list-only clip
+    // hides pixels but leaves the invisible tab/close targets live over the chips and "+".
+    // The item audit captures this same logical lane at submission time.
+    ImGui::PushClipRect(ImVec2(tabsL, y0), ImVec2(tabsR, y0 + barH), true);
     for (int i = 0; i < nTabs; ++i) {
         const float x = tabsL + tabOff[i] - s_scrollX;
         const float xr = x + tabWs[i];
@@ -863,7 +898,7 @@ float drawDocTabs(AppState& st, float availW) {
     if (overflow && s_scrollX < maxScroll - 0.5f)
         drawTabEdgeFade(dl, tabsR, y0, y0 + barH, fadeW, /*fromRight=*/true, surf,
                         rightChipW > 0.5f ? 0.0f : bandRdp);
-    dl->PopClipRect();
+    ImGui::PopClipRect();
 
     // Reserved-slot overflow chips — never over a tab title.
     if (leftChipW > 0.5f && nLeft > 0) {
@@ -1030,6 +1065,11 @@ void createNewDoc(AppState& st, int kindOrd) {
                  "Read-only mode — sign in or manage your subscription to create a document");
         return;
     }
+#ifndef __EMSCRIPTEN__
+    // A deliberate New action supersedes the launch starter, even if this
+    // document is closed before the background engine-readiness probe settles.
+    if (!st.shot) st.starterTried = true;
+#endif
     const NewDocKind kind = (NewDocKind)kindOrd;
     if (kind == NewDocKind::Part || kind == NewDocKind::Assembly) {
         const bool asm_ = (kind == NewDocKind::Assembly);

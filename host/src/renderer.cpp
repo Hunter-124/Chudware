@@ -18,6 +18,7 @@
 #include <limits>
 #include <vector>
 
+#include "result_ramp.h"
 #include "vec_math.h"
 #include "ui_theme.h"
 #include "ui/viewport/glsl_compat.h"
@@ -231,10 +232,12 @@ void main(){
 
 const char* kDownsampleFrag = R"(#version 330 core
 uniform sampler2D uSrc;
-uniform vec2 uInvSrcSize;
+uniform vec2 uInvDstSize;
 out vec4 frag;
 void main(){
-    vec2 uv = (gl_FragCoord.xy + 0.5) * uInvSrcSize;
+    // Fragment coordinates already address destination pixel centers. Normalize by the
+    // destination size so a quarter-resolution backdrop covers the WHOLE source image.
+    vec2 uv = gl_FragCoord.xy * uInvDstSize;
     frag = texture(uSrc, uv);
 })";
 
@@ -244,7 +247,7 @@ uniform vec2 uTexel;
 uniform float uOffset;
 out vec4 frag;
 void main(){
-    vec2 uv = (gl_FragCoord.xy + 0.5) * uTexel;
+    vec2 uv = gl_FragCoord.xy * uTexel;
     vec2 d = uTexel * 0.5 * uOffset;
     vec4 c = texture(uSrc, uv);
     c += texture(uSrc, uv + vec2( d.x,  d.y));
@@ -438,34 +441,16 @@ Renderer::~Renderer() {
     deleteGpuTimer(lumaTimer_);
 }
 
-// SolidWorks-style "jet/rainbow" result ramp: blue -> cyan -> green -> yellow -> red. Built once
-// into a 256x1 RGB texture sampled by the shader's normalized scalar t in [0,1].
+// SolidWorks-style "jet/rainbow" result ramp from result_ramp.h (shared with the legend). Built
+// once into a 256x1 RGB texture sampled by the shader's normalized scalar t in [0,1].
 void Renderer::buildLut() {
     if (lutTex_) return;
     const int N = 256;
     std::vector<unsigned char> ramp(N * 3);
-    // Control stops (t, r, g, b) in sRGB 0..1.
-    struct Stop { float t, r, g, b; };
-    static const Stop stops[] = {
-        {0.00f, 0.00f, 0.10f, 0.55f},  // deep blue
-        {0.25f, 0.00f, 0.70f, 0.90f},  // cyan
-        {0.50f, 0.10f, 0.80f, 0.20f},  // green
-        {0.75f, 0.95f, 0.85f, 0.00f},  // yellow
-        {1.00f, 0.85f, 0.10f, 0.10f},  // red
-    };
-    const int NS = (int)(sizeof(stops) / sizeof(stops[0]));
     for (int i = 0; i < N; ++i) {
-        float t = (float)i / (float)(N - 1);
-        int k = 0;
-        while (k < NS - 2 && t > stops[k + 1].t) ++k;
-        float span = std::max(1e-6f, stops[k + 1].t - stops[k].t);
-        float f = (t - stops[k].t) / span;
-        float r = stops[k].r + (stops[k + 1].r - stops[k].r) * f;
-        float g = stops[k].g + (stops[k + 1].g - stops[k].g) * f;
-        float b = stops[k].b + (stops[k + 1].b - stops[k].b) * f;
-        ramp[i * 3 + 0] = (unsigned char)(r * 255.0f + 0.5f);
-        ramp[i * 3 + 1] = (unsigned char)(g * 255.0f + 0.5f);
-        ramp[i * 3 + 2] = (unsigned char)(b * 255.0f + 0.5f);
+        float rgb[3];
+        result_ramp::sample((float)i / (float)(N - 1), rgb);
+        for (int c = 0; c < 3; ++c) ramp[i * 3 + c] = (unsigned char)(rgb[c] * 255.0f + 0.5f);
     }
     glGenTextures(1, &lutTex_);
     glBindTexture(GL_TEXTURE_2D, lutTex_);
@@ -633,7 +618,7 @@ void Renderer::cacheUniformLocations() {
     uResolve_.ss      = glGetUniformLocation(resolveProg_, "uSS");
 
     uDown_.src        = glGetUniformLocation(downsampleProg_, "uSrc");
-    uDown_.invSrcSize = glGetUniformLocation(downsampleProg_, "uInvSrcSize");
+    uDown_.invDstSize = glGetUniformLocation(downsampleProg_, "uInvDstSize");
 
     uKawase_.src      = glGetUniformLocation(kawaseProg_, "uSrc");
     uKawase_.texel    = glGetUniformLocation(kawaseProg_, "uTexel");
@@ -1383,6 +1368,35 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
     ++meshesRevision_;
 }
 
+void Renderer::setAuxSceneBounds(const float lo[3], const float hi[3]) {
+    if (!hasAuxSceneBounds_ || auxSceneLo_.x != lo[0] || auxSceneLo_.y != lo[1] ||
+        auxSceneLo_.z != lo[2] || auxSceneHi_.x != hi[0] || auxSceneHi_.y != hi[1] ||
+        auxSceneHi_.z != hi[2]) {
+        auxSceneLo_ = Vec3(lo[0], lo[1], lo[2]);
+        auxSceneHi_ = Vec3(hi[0], hi[1], hi[2]);
+        auxSceneRadius_ = -1.0f;
+    }
+    hasAuxSceneBounds_ = true;
+}
+
+float Renderer::effectiveSceneRadius() const {
+    const float baseRadius = std::max(radius_ > 0.0f ? radius_ : kEmptySceneRadius,
+                                     auxSceneRadiusFloor_);
+    if (!hasAuxSceneBounds_) return baseRadius;
+    if (auxSceneRadius_ < 0.0f || auxRadiusCenter_.x != center_.x ||
+        auxRadiusCenter_.y != center_.y || auxRadiusCenter_.z != center_.z) {
+        const float dx = std::max(std::fabs(auxSceneLo_.x - center_.x),
+                                  std::fabs(auxSceneHi_.x - center_.x));
+        const float dy = std::max(std::fabs(auxSceneLo_.y - center_.y),
+                                  std::fabs(auxSceneHi_.y - center_.y));
+        const float dz = std::max(std::fabs(auxSceneLo_.z - center_.z),
+                                  std::fabs(auxSceneHi_.z - center_.z));
+        auxSceneRadius_ = std::sqrt(dx * dx + dy * dy + dz * dz);
+        auxRadiusCenter_ = center_;
+    }
+    return std::max(baseRadius, auxSceneRadius_);
+}
+
 // C25: world radius used when the document has no geometry yet (a fresh "new part") —
 // keeps the camera, datum planes, and label anchors at a sensible scale. ~35mm reads like
 // SolidWorks's default plane size. Single source of truth lives in renderer.h (camera math in
@@ -1411,7 +1425,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     // SolidWorks "new part" starting state) — only the geometry passes need meshes (their
     // loops over subs_ are natural no-ops). Previously this returned right here, leaving
     // cam_ stale: plane labels projected from garbage and the planes never drew.
-    const float sceneR = (radius_ > 0.0f) ? radius_ : kEmptySceneRadius;
+    const float sceneR = effectiveSceneRadius();
 
     const float deg = 3.14159265f / 180.0f;
     float yaw = yawDeg * deg, pitch = pitchDeg * deg;
@@ -1419,9 +1433,12 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     // Orbit distance is always the historical perspective framing distance so eye placement
     // (and therefore shading lights) stays identical across modes; only the PROJECTION changes.
     // Ortho half-height = sceneR*1.05/zoom matches the perspective silhouette at the target plane.
+    // framingScale_ (>= 1, set from the viewport's clear region) widens BOTH so zoom=1 fits the
+    // framing sphere inside the un-occluded region rather than the full-window image.
     const float fov = kFovDeg * deg;
     const float zc  = std::max(0.05f, zoom);
-    float dist = sceneR / std::sin(fov * 0.5f) * 1.05f / zc;
+    const float fitR = sceneR * framingScale_;
+    float dist = fitR / std::sin(fov * 0.5f) * 1.05f / zc;
     // W2-D: pan shifts the orbit target (and therefore the eye) in world space. While a sketch is
     // open, orbitOverride_ replaces the model-bbox centre with the sketch's geometric centre so the
     // view orbits/frames around the sketch (which is not part of the body bbox), not the origin.
@@ -1438,15 +1455,18 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
 
     const float aspect = (float)sw_ / (float)sh_;
     // World half-height of the view volume at the orbit target. Perspective uses dist*tan(fov/2)
-    // (classic frustum); orthographic uses sceneR*1.05/zoom so zoom=1 frames the same sphere.
-    // The two are equal under the historical dist = R/sin(fov/2)*1.05/zoom identity, so switching
-    // modes keeps framing continuous.
+    // (classic frustum); orthographic uses fitR*1.05/zoom so zoom=1 frames the same sphere.
+    // Both are proportional to sceneR/zoom: rescaling zoom with the framing radius preserves
+    // the eye, target-plane scale and lens shift in either projection.
     const float halfH = orthographic_
-        ? (sceneR * 1.05f / zc)
+        ? (fitR * 1.05f / zc)
         : (dist * std::tan(fov * 0.5f));
     const float halfW = halfH * aspect;
 
     Mat4 proj;
+    // Include the effective scene sphere even when radius growth was compensated by zoom
+    // (and dist stayed unchanged). Pan/orbit overrides can move the target off that sphere.
+    const float depthReach = 10.0f * sceneR + length(target - center_);
     if (orthographic_) {
         // Generous near/far in VIEW space (lookAt puts the eye at the origin looking -Z, so
         // the target sits at front-distance dist). The band must FOLLOW the eye: the orbit
@@ -1455,18 +1475,22 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
         // largest geometry, get sliced first (the "planes vanish / get cut off when zooming
         // out in ortho" bug). dist±10*sceneR brackets the model, pan, and datum quads at any
         // zoom; a negative near (zoomed in close) is harmless for an ortho volume.
-        // lensShiftX_ is NDC offset: convert to world offset = shift * halfW so the asymmetric
-        // ortho volume re-centers the part in the un-occluded region (same contract as proj.m[8]).
+        // lensShiftX_/Y_ are NDC offsets: convert to world offsets = shift * halfW/halfH so the
+        // asymmetric ortho volume re-centers the part in the clear region (same contract as
+        // the perspective proj.m[8]/m[9]).
         const float shiftW = lensShiftX_ * halfW;
+        const float shiftH = lensShiftY_ * halfH;
         proj = makeOrtho(-halfW + shiftW, halfW + shiftW,
-                         -halfH,           halfH,
-                         dist - 10.0f * sceneR, dist + 10.0f * sceneR);
+                         -halfH + shiftH, halfH + shiftH,
+                         dist - depthReach, dist + depthReach);
     } else {
-        proj = perspective(fov, aspect, dist * 0.01f, dist * 10.0f);
-        // W2 full-bleed viewport: bake the horizontal lens shift into the projection's unused m[8]
-        // slot BEFORE building mvp, so the asymmetric frustum re-centers the part in the un-occluded
+        const float nearPlane = std::max(0.001f, std::min(dist * 0.01f, sceneR * 0.001f));
+        proj = perspective(fov, aspect, nearPlane, dist + depthReach);
+        // W2 full-bleed viewport: bake the lens shift into the projection's unused m[8]/m[9]
+        // slots BEFORE building mvp, so the asymmetric frustum re-centers the part in the clear
         // region and the shift travels through cam_.mvp to the id-pass + overlays (pixel-exact).
         proj.m[8] = lensShiftX_;
+        proj.m[9] = lensShiftY_;
     }
     Mat4 view = lookAt(eye, target, up);
     Mat4 mvp = mul(proj, view);
@@ -2022,15 +2046,15 @@ void Renderer::planeCorners(int plane, float e, Vec3 out[4]) const {
 
 bool Renderer::planeQuad(int plane, Vec3 out[4]) const {
     if (plane < 0 || plane > 2) return false;
-    planeCorners(plane, ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f, out);
+    planeCorners(plane, effectiveSceneRadius() * 1.25f, out);
     return true;
 }
 
 // Rebuild the cached origin-plane quad geometry. The quads are CAMERA-INDEPENDENT — they depend
-// only on center_ and radius_ — so orbiting, zooming, emphasis changes and palette changes all
+// only on center_ and effectiveSceneRadius() — so orbiting, zooming, emphasis and palette changes all
 // reuse the same upload. Layout per plane: 6 fill verts (two triangles) then 4 border verts.
 void Renderer::refreshPlaneQuads() {
-    const float e = ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f;
+    const float e = effectiveSceneRadius() * 1.25f;
     if (planeQuadExtent_ == e && planeQuadCenter_.x == center_.x &&
         planeQuadCenter_.y == center_.y && planeQuadCenter_.z == center_.z)
         return;
@@ -2113,8 +2137,7 @@ void Renderer::drawReferencePlanes(const Mat4& mvp) {
 float Renderer::refAxisHalfLength(const std::string& id) const {
     // Match drawReferencePlanes / drawRefDatums: e = sceneRadius * 1.25. The rule itself lives with
     // the GL-free datum builder so draw and hit-test can never drift apart.
-    return render::refAxisHalfLength(id,
-                                     ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f);
+    return render::refAxisHalfLength(id, effectiveSceneRadius() * 1.25f);
 }
 
 // Rebuild + re-upload the batched datum geometry when any input changed. Inputs are the datum set
@@ -2122,7 +2145,7 @@ float Renderer::refAxisHalfLength(const std::string& id) const {
 // e, and the palette axis/accent roles — everything the build reads. The camera is NOT an input, so
 // orbiting, zooming, panning and section changes all reuse the upload.
 void Renderer::refreshDatumBatch() {
-    const float e = ((radius_ > 0.0f) ? radius_ : kEmptySceneRadius) * 1.25f;
+    const float e = effectiveSceneRadius() * 1.25f;
     render::RefDatumPalette pal;
     for (int i = 0; i < 4; ++i) {
         pal.axisX[i] = ui::palette.axisX[i];
@@ -2426,7 +2449,7 @@ void Renderer::updateBackdropBlur() const {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, resolvedTex_);
     glUniform1i(uDown_.src, 0);
-    glUniform2f(uDown_.invSrcSize, 1.0f / (float)rw_, 1.0f / (float)rh_);
+    glUniform2f(uDown_.invDstSize, 1.0f / (float)blurW_, 1.0f / (float)blurH_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     unsigned int srcTex = blurDownTex_;
@@ -2654,6 +2677,11 @@ void Renderer::issueLumaReadback() const {
     }
     pollLumaPbos();
     issueLumaPboRead(srcFbo, srcW, srcH);
+    // A replacement canvas invalidates contrast history. Do not publish a new pale native
+    // backdrop while its only contrast information is still "unknown" (palette-white ink).
+    // Establish its first grid from the actual rendered source; every subsequent read stays
+    // asynchronous. A resize/source transition needs the same one-time bootstrap.
+    if (!lumaEverRead_) pollLumaPbos(/*bootstrap=*/true);
 }
 
 // A11: issues one glReadPixels into the next PBO ring slot + a fence. Detects a source-size
@@ -2755,14 +2783,17 @@ void Renderer::issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
-// Non-blocking poll of every ring slot; a signaled slot is mapped, reduced, and freed.
-void Renderer::pollLumaPbos() const {
+// Poll every ring slot without blocking in steady state. A new source's first grid waits once
+// so resumed native geometry and its glass contrast are published as the same actual image.
+void Renderer::pollLumaPbos(bool bootstrap) const {
     // Oldest first: numeric slot order can publish an older frame after a newer one
     // when the ring wraps and several fences become ready together.
     for (int n = 0; n < kLumaPboCount; ++n) {
         const int i = (lumaPboNext_ + n) % kLumaPboCount;
         if (!lumaPboPending_[i] || !lumaFence_[i]) continue;
-        const GLenum res = glClientWaitSync(static_cast<GLsync>(lumaFence_[i]), 0, /*timeout=*/0);
+        const GLenum res = glClientWaitSync(static_cast<GLsync>(lumaFence_[i]),
+                                            bootstrap ? GL_SYNC_FLUSH_COMMANDS_BIT : 0,
+                                            bootstrap ? GL_TIMEOUT_IGNORED : 0);
         if (res == GL_ALREADY_SIGNALED || res == GL_CONDITION_SATISFIED) {
             glDeleteSync(static_cast<GLsync>(lumaFence_[i]));
             lumaFence_[i] = nullptr;

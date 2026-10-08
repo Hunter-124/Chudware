@@ -9,6 +9,42 @@
 // extraction — step order, settle counts, printf transcripts, and capture paths are
 // unchanged from the former inline blocks; the function-local statics became members
 // (run_gui constructs one runner per call, so init-once semantics hold).
+//
+// CHUDWARE_SHOT=siminteractive drives real ImGui pointer/keyboard events against observed
+// item hooks and a rendered face. It checks native schema refusal, pristine/dirty draft coherence,
+// library material changes, mesh aliases, fatigue token save/reopen and original family gestures.
+// Eight added real FEA solves compare prose/object/SID modal queries with a sampled reference,
+// prove static query/compound loads through reactions and displacement, and prove nondefault
+// convection ambient through resolved boundary evidence and a uniform-temperature invariant.
+// Malformed compound definitions must visibly disable Run. Hydraulic zero hose length executes
+// with native pump flow; zero load pressure/tolerance execute in solved handoff margins/checks.
+// Three actual piping solves prove Celsius/Kelvin precedence and methane aliases through native
+// properties, Reynolds numbers and mass flow. CFD null/pair semantics use actual JSON Apply
+// acceptance/refusal and retained drafts (not a 3D CFD solve). A real held port drag spans a native
+// same-ID agent edit/refresh and must retain its old origin and refuse stale delivery.
+// Both original transient thermal schedules remain. The bounded 1200 s isolated scenario is not
+// general solver certification.
+// Requires CHUDWARE_ENGINE_DAEMON=0 and isolated short XDG paths so user sessions remain untouched.
+// Writes scratch/siminteractive/report.json and captures; failures exit non-zero.
+// CHUDWARE_SHOT=simaudit covers expanded native editors and palettes.
+// Both navigate clipped setup items by hovering observed scrollable windows and sending real
+// wheel events. Drags stay held while exposing offscreen destinations; cards/popovers are checked
+// against annotated opened state, explicit native buttons against their actual opened label and
+// fully framed JSON field. Expansion reports retain the observed controls/editor, not a presumed
+// click result. Failure reports include target/clip/window/scroll evidence.
+// CHUDWARE_SHOT=pipedraw draws an L, a plane-switched riser and a split tee branch
+// on a fresh empty part using real projected viewport clicks and Enter/Tab events.
+// It places a gate valve, submits a custom constant-K fitting through the editor's
+// canonical path, solves pressure/demand boundaries and checks nodal mass balance,
+// Pressure colouring, actual foreground viewport pixels, and persisted fittings.
+// Quick CFD-K uses the human Source/Quality/Compute/Apply controls; missing worker
+// or engine is a reported SKIP, while an available job must apply a table within 180 s.
+// CHUDWARE_SHOT=hydraulics3d reuses the hydraulics circuit/sizing/simulation steps,
+// checks native viewport ownership and glyph pixels, then places a component with
+// real plane-click input and verifies params.layout3d in the persisted study.
+// Both write scratch/<scenario>_shots/<scenario>_report.json and staged captures,
+// exit non-zero on failure, and mirror the final capture to --ui-screenshot.
+// CHUDWARE_SHOT=piping also checks routed-pipe pixels away from its solid obstacle.
 #pragma once
 
 #include <memory>

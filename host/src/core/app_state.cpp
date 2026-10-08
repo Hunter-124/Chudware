@@ -1860,6 +1860,7 @@ struct MeshLoadJob {
     uint64_t gen = 0;
     std::string path;
     bool renderOnly = false;
+    bool cacheAsModel = true;
     bool cacheOnly = false;
     std::string docId;
     int revision = -1;
@@ -1935,12 +1936,14 @@ void AppState::stopMeshLoader() { stopMeshLoaderThread(); }
 static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::string& err,
                                     bool renderOnly, bool shadedAlreadyBound = false);
 
-bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly) {
+bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly,
+                          bool cacheAsModel) {
     if (!renderer || !idPass || !overlays) { err = "render objects not initialized"; return false; }
     render::DocMesh doc;
     if (!render::loadAicmFile(aicmPath, doc, err)) return false;
+    if (!cacheAsModel) renderer->parkActiveMeshes();
     if (!commitDocMeshFromParsed(*this, doc, err, renderOnly)) return false;
-    if (!renderOnly && docMirror.hasDoc()) {
+    if (!renderOnly && cacheAsModel && docMirror.hasDoc()) {
         renderer->setActiveMeshIdentity(docMirror.docId(), docMirror.revision());
         if (DocSession* s = activeSession()) {
             s->cachedAicmPath = aicmPath;
@@ -1952,7 +1955,7 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool r
     return true;
 }
 
-void AppState::loadDocMeshAsync(const std::string& aicmPath, bool renderOnly) {
+void AppState::loadDocMeshAsync(const std::string& aicmPath, bool renderOnly, bool cacheAsModel) {
     if (aicmPath.empty()) return;
     if (!renderer || !idPass || !overlays) return;
     ensureMeshLoader();
@@ -1968,6 +1971,7 @@ void AppState::loadDocMeshAsync(const std::string& aicmPath, bool renderOnly) {
         job.gen = gen;
         job.path = aicmPath;
         job.renderOnly = renderOnly;
+        job.cacheAsModel = cacheAsModel;
         job.queuedAt = std::chrono::steady_clock::now();
         g_meshQueue.push_back(std::move(job));
     }
@@ -2065,11 +2069,12 @@ void AppState::drainMeshLoads() {
         return;
     }
     std::string err;
+    if (!best->cacheAsModel) renderer->parkActiveMeshes();
     if (!commitDocMeshFromParsed(*this, best->doc, err, best->renderOnly)) {
         if (!err.empty()) addLog("[err] loadDocMeshAsync commit: " + err);
         return;
     }
-    if (!best->renderOnly && docMirror.hasDoc()) {
+    if (!best->renderOnly && best->cacheAsModel && docMirror.hasDoc()) {
         renderer->setActiveMeshIdentity(docMirror.docId(), docMirror.revision());
         if (DocSession* s = activeSession()) {
             s->cachedAicmPath = best->path;
@@ -2150,25 +2155,24 @@ static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::str
     // C19: attach any SCLR / DISP overlay arrays so the st.renderer can colormap + deform.
     std::vector<Renderer::PartMesh> pms;
     std::vector<uint32_t> newBodyIds;  // AICM body id per st.renderer slot (parallels pms)
+    st.docMeshHasScalar = false;
+    st.docMeshHasDisp = false;
     for (const auto& b : doc.bodies) {
         if (b.pos.empty()) continue;
         newBodyIds.push_back(b.body_id);
         Renderer::PartMesh pm;
-        pm.mesh = meshFromBody(b);
-        pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
-        pm.metallic = b.metallic; pm.roughness = b.roughness;  // C32-A RealView material
-        pm.appearance_regions = b.appearance_regions;
-        // Per-feature edit-preview isolation: carry the body id + per-face triangle runs so the
-        // st.renderer can draw a single feature's faces translucent. meshFromBody copies b.idx
-        // verbatim, so each FaceRange's first_tri/tri_count still index this body's EBO 1:1.
-        pm.body_id = b.body_id;
-        pm.faces.reserve(b.faces.size());
-        for (const auto& fr : b.faces)
-            pm.faces.push_back({fr.face_id, fr.first_tri, fr.tri_count});
-        // Scalar field for this body. Prefer the user-selected result field by name
-        // (st.activeScalarField — von Mises / principal / shear / disp component / FoS …) so switching
-        // result fields is a cheap renderOnly re-load of the same overlay with no re-solve; fall back
-        // to the first scalar present when the named field isn't in this overlay.
+        if (!shadedAlreadyBound) {
+            pm.mesh = meshFromBody(b);
+            pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
+            pm.metallic = b.metallic; pm.roughness = b.roughness;
+            pm.appearance_regions = b.appearance_regions;
+            // Face runs share the unmodified body index buffer for edit-preview isolation.
+            pm.body_id = b.body_id;
+            pm.faces.reserve(b.faces.size());
+            for (const auto& fr : b.faces)
+                pm.faces.push_back({fr.face_id, fr.first_tri, fr.tri_count});
+        }
+        // Prefer the selected result field; fall back to the first valid field for this body.
         const render::ScalarField* chosen = nullptr;
         for (const auto& sc : doc.scalars) {
             if (sc.body_id != b.body_id || sc.values.size() != b.n_verts) continue;
@@ -2176,32 +2180,34 @@ static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::str
             if (!chosen) chosen = &sc;
         }
         if (chosen) {
-            pm.scalar = chosen->values;
-            pm.scalarMin = chosen->vmin;
-            pm.scalarMax = chosen->vmax;
+            st.docMeshHasScalar |= !chosen->values.empty();
+            if (!shadedAlreadyBound) {
+                pm.scalar = chosen->values;
+                pm.scalarMin = chosen->vmin;
+                pm.scalarMax = chosen->vmax;
+            }
         }
         // First displacement field for this body (FEA deformed shape).
         for (const auto& df : doc.displacements) {
             if (df.body_id == b.body_id && df.vec.size() == (size_t)b.n_verts * 3) {
-                pm.disp = df.vec;
-                pm.dispScaleHint = df.scale_hint;
+                if (!df.vec.empty()) {
+                    st.docMeshHasDisp = true;
+                    st.dispScaleHint = df.scale_hint;
+                }
+                if (!shadedAlreadyBound) {
+                    pm.disp = df.vec;
+                    pm.dispScaleHint = df.scale_hint;
+                }
                 break;
             }
         }
-        pms.push_back(std::move(pm));
+        if (!shadedAlreadyBound) pms.push_back(std::move(pm));
     }
     // C48: unconditional — pms can be empty when every body has no triangles; keeping the
     // previous meshes would desync the viewport from the document (same stale-mesh bug as
     // the zero-bodies case above).
     if (!shadedAlreadyBound) st.renderer->setMeshes(pms);
 
-    // C19: surface overlay presence for the simulation panel's result controls.
-    st.docMeshHasScalar = false;
-    st.docMeshHasDisp = false;
-    for (const auto& pm : pms) {
-        if (!pm.scalar.empty()) st.docMeshHasScalar = true;
-        if (!pm.disp.empty()) { st.docMeshHasDisp = true; st.dispScaleHint = pm.dispScaleHint; }
-    }
 
     if (!st.idPass->setDoc(doc, err)) return false;
     if (!st.overlays->setDoc(doc, err)) return false;
@@ -2339,6 +2345,8 @@ bool AppState::bindCachedDocMesh(DocSession& s, std::string& err) {
         err = "no immutable document cache";
         return false;
     }
+    // A queued temporary overlay must not overwrite this restored model on a later drain.
+    ++meshGen_;
     if (!docMirror.restoreSnapshot(s.cachedMirror)) {
         err = "invalid document mirror cache";
         return false;

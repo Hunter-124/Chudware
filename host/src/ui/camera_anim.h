@@ -8,7 +8,9 @@
 // back-pointer set on the last requestCameraAnimation.
 //
 // Conventions: yaw/pitch in degrees (yaw takes the shortest signed arc, wrapping ±180); zoom in the
-// renderer's 0.1..10 range (1 = fit). pan is a world-space orbit-target offset (mm).
+// renderer's scene-relative zoom range (1 = fit, 0.1 = farthest; the near limit preserves the
+// model/empty scene's absolute scale when auxiliary bounds grow). pan is a world-space orbit-target
+// offset (mm).
 struct AppState;
 
 namespace ui {

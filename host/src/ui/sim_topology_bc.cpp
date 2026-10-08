@@ -7,11 +7,13 @@
 #include "sim_topology_bc.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <cmath>
-#include <cstdio>
+#include <cctype>
 #include <cstdlib>
+#include <cstring>
+#include <cstdio>
 #include <functional>
+#include <limits>
 #include <set>
 #include <utility>
 
@@ -58,6 +60,92 @@ bool vec3At(const json &j, const char *key, double out[3]) {
   return true;
 }
 
+// Mirror core/sim/fea_run.cpp::validate_faceset_input, not the stricter
+// three-component editor fields. Native vectors inspect their first three
+// components and native point sets count each nested vector as three scalars.
+// Validate without normalizing: canonical resolved data must survive edits.
+bool validateResolvedFaceset(const json &fs, const std::string &path,
+                             std::string &error) {
+  auto reject = [&](const std::string &message) {
+    error = path + ": " + message;
+    return false;
+  };
+  auto finiteNumber = [](const json &value) {
+    return value.is_number() && std::isfinite(value.get<double>());
+  };
+  auto finiteVector = [&](const json &value) {
+    return value.is_array() && value.size() >= 3 &&
+           finiteNumber(value[0]) && finiteNumber(value[1]) &&
+           finiteNumber(value[2]);
+  };
+  auto nonzeroVector = [&](const json &value) {
+    if (!finiteVector(value))
+      return false;
+    double norm2 = 0.0;
+    for (int i = 0; i < 3; ++i) {
+      const double component = value[i].get<double>();
+      norm2 += component * component;
+    }
+    return std::isfinite(norm2) && norm2 > 0.0;
+  };
+  const json &points = member(fs, "points");
+  if (!points.is_array() || points.empty())
+    return reject("faceset requires a non-empty points array.");
+  std::size_t flatCount = 0;
+  for (const json &point : points) {
+    if (point.is_array()) {
+      if (!finiteVector(point))
+        return reject("faceset points must contain finite 3-vectors.");
+      flatCount += 3;
+    } else if (finiteNumber(point)) {
+      ++flatCount;
+    } else {
+      return reject("faceset points must contain finite numbers.");
+    }
+  }
+  if (flatCount < 3 || flatCount % 3 != 0)
+    return reject("faceset points must contain complete 3-vectors.");
+  for (const char *key : {"tol_mm", "perp_tol_mm"}) {
+    double value = 0.0;
+    if (fs.contains(key) && !(finiteAt(fs, key, value) && value > 0.0))
+      return reject(std::string("faceset ") + key +
+                    " must be finite and positive.");
+  }
+  if (fs.contains("face_normal") && !nonzeroVector(fs["face_normal"]))
+    return reject("faceset face_normal must be a non-zero finite 3-vector.");
+  if (!fs.contains("surface"))
+    return true;
+  const json &surface = fs["surface"];
+  if (!surface.is_object() || !member(surface, "type").is_string())
+    return reject("faceset surface requires a string type.");
+  if (!finiteVector(member(surface, "origin")))
+    return reject("faceset surface requires a finite origin.");
+  auto positive = [&](const char *key) {
+    double value = 0.0;
+    return finiteAt(surface, key, value) && value > 0.0;
+  };
+  const std::string &type = surface["type"].get_ref<const std::string &>();
+  if (type == "sphere") {
+    if (!positive("radius"))
+      return reject("sphere faceset requires a positive finite radius.");
+  } else if (type == "cylinder") {
+    if (!positive("radius") || !nonzeroVector(member(surface, "axis")))
+      return reject("cylinder faceset requires positive radius and non-zero finite axis.");
+  } else if (type == "cone") {
+    if (!positive("semi_angle_rad") ||
+        surface["semi_angle_rad"].get<double>() >= 1.5707963 ||
+        !nonzeroVector(member(surface, "axis")))
+      return reject("cone faceset requires a valid semi-angle and non-zero finite axis.");
+  } else if (type == "torus") {
+    if (!positive("major_radius") || !positive("minor_radius") ||
+        !nonzeroVector(member(surface, "axis")))
+      return reject("torus faceset requires positive radii and non-zero finite axis.");
+  } else {
+    return reject("unsupported faceset surface type '" + type + "'.");
+  }
+  return true;
+}
+
 std::string idx(const char *base, std::size_t i) {
   return std::string(base) + "/" + std::to_string(i);
 }
@@ -72,13 +160,20 @@ bool pickOf(const json &sel, std::uint32_t &body, std::uint32_t &topo) {
   if (!p.is_object())
     return false;
   const json &b = member(p, "body"), &t = member(p, "topo");
-  if (!b.is_number_unsigned() && !b.is_number_integer())
-    return false;
-  if (!t.is_number_unsigned() && !t.is_number_integer())
+  auto validId = [](const json &value) {
+    if (!value.is_number_integer())
+      return false;
+    if (value.is_number_unsigned())
+      return value.get<std::uint64_t>() > 0 &&
+             value.get<std::uint64_t>() <= std::numeric_limits<std::uint32_t>::max();
+    return value.get<std::int64_t>() > 0 &&
+           value.get<std::int64_t>() <= std::numeric_limits<std::uint32_t>::max();
+  };
+  if (!validId(b) || !validId(t))
     return false;
   body = b.get<std::uint32_t>();
   topo = t.get<std::uint32_t>();
-  return body != 0 && topo != 0;
+  return true;
 }
 
 std::uint64_t faceKey(std::uint32_t body, std::uint32_t topo) {
@@ -183,6 +278,54 @@ std::string entryLabel(const json &entry, const std::string &fallback) {
   if (n.is_string() && !n.get<std::string>().empty())
     return n.get<std::string>();
   return fallback;
+}
+
+// The issue line under a field inside its entry's card: the card title
+// already names the entry, so the leading name is dropped ("Load 1 needs a
+// force vector." -> "Needs a force vector."). Empty when the message does not
+// open with the entry's name (then the full message is shown).
+std::string localIssueText(const json &study, const std::string &key,
+                           const std::string &msg) {
+  // The entry is the key up to its deepest array index ("/loads/0/vec").
+  long index = -1;
+  std::size_t entryEnd = std::string::npos;
+  for (std::size_t b = 0; b < key.size();) {
+    if (key[b] == '/')
+      ++b;
+    std::size_t e = key.find('/', b);
+    if (e == std::string::npos)
+      e = key.size();
+    if (e > b && std::all_of(key.begin() + (long)b, key.begin() + (long)e,
+                             [](char ch) { return ch >= '0' && ch <= '9'; })) {
+      index = std::strtol(key.c_str() + b, nullptr, 10);
+      entryEnd = e;
+    }
+    b = e;
+  }
+  if (index < 0)
+    return {};
+  std::string named;
+  try {
+    named = entryLabel(study.at(json::json_pointer(key.substr(0, entryEnd))), "");
+  } catch (...) {
+  }
+  std::string rest;
+  if (!named.empty() && msg.rfind(named + " ", 0) == 0) {
+    rest = msg.substr(named.size() + 1);
+  } else {
+    // Default names end in the 1-based number: "Fixed temperature 1 needs ...".
+    const std::string needle = " " + std::to_string(index + 1) + " ";
+    const std::size_t at = msg.find(needle);
+    if (at == std::string::npos || msg.find('.') < at)
+      return {};
+    rest = msg.substr(at + needle.size());
+  }
+  if (rest.empty())
+    return {};
+  if (rest == "has no faces.")
+    return "Pick at least one face.";
+  rest[0] = (char)std::toupper((unsigned char)rest[0]);
+  return rest;
 }
 
 bool facesNonEmpty(const json &entry) {
@@ -442,8 +585,9 @@ std::size_t appendFaces(json &study, const std::string &pointer,
     bool dup = false;
     for (const json &have : *faces) {
       std::uint32_t hb = 0, ht = 0;
-      if (identity ? (pickOf(have, hb, ht) && hb == b && ht == t)
-                   : selectorKey(have) == selectorKey(sel)) {
+      const bool haveIdentity = pickOf(have, hb, ht);
+      if (identity && haveIdentity ? (hb == b && ht == t)
+                                  : selectorKey(have) == selectorKey(sel)) {
         dup = true;
         break;
       }
@@ -539,6 +683,26 @@ std::string addEntry(json &study, EntryKind kind, int loadCase) {
 
 // ---- material
 // -------------------------------------------------------------------------------------
+// Plain name of a material constant key, for messages ("k_w_mk" ->
+// "thermal conductivity"); never the raw key.
+static std::string materialKeyLabel(const std::string &k) {
+  if (k == "E_mpa")
+    return "Young's modulus";
+  if (k == "nu")
+    return "Poisson's ratio";
+  if (k == "yield_mpa")
+    return "yield strength";
+  if (k == "density_g_cm3")
+    return "density";
+  if (k == "k_w_mk")
+    return "thermal conductivity";
+  if (k == "alpha_per_k")
+    return "thermal expansion coefficient";
+  if (k == "cp_j_kgk")
+    return "specific heat";
+  return "material constant";
+}
+
 std::vector<std::string> requiredMaterialKeys(const std::string &p) {
   if (p == "structural" || p == "buckling")
     return {"E_mpa", "nu"};
@@ -611,13 +775,20 @@ std::vector<Issue> validateBoundaries(const json &study,
   const json &order = member(study, "mesh_order");
   if (!order.is_null() && !(order.is_number_integer() && order.get<int>() == 1))
     issue(out, "/mesh_order", Severity::Blocking,
-          "Topology optimization meshes are linear tetrahedra; set mesh order "
-          "to 1 (tet4).");
+          "Set the element order to Linear: topology optimization meshes "
+          "linear tetrahedra.");
   double meshV = 0.0;
-  if (member(study, "mesh_target_mm").is_number() &&
-      !(finiteAt(study, "mesh_target_mm", meshV) && meshV >= 0.0))
-    issue(out, "/mesh_target_mm", Severity::Blocking,
-          "Mesh target size must be a finite length >= 0.");
+  for (const char *key : {"mesh_target_mm", "mesh_min_mm"}) {
+    const json &size = member(study, key);
+    if (!size.is_null() &&
+        !(finiteAt(study, key, meshV) && meshV > 0.0))
+      issue(out, std::string("/") + key, Severity::Blocking,
+            "Mesh sizes must be finite lengths > 0; clear the field for automatic sizing.");
+  }
+  if (!member(study, "mesh_fineness").is_null() &&
+      !(finiteAt(study, "mesh_fineness", meshV) && meshV >= 0.0 && meshV <= 1.0))
+    issue(out, "/mesh_fineness", Severity::Blocking,
+          "Mesh fineness must be within [0, 1].");
 
   // Material.
   json mat;
@@ -627,11 +798,14 @@ std::vector<Issue> validateBoundaries(const json &study,
       issue(out, "/material", Severity::Blocking, matErr);
   } else {
     for (const std::string &k : requiredMaterialKeys(physics))
-      if (!mat.contains(k))
-        issue(
-            out, "/material/" + k, Severity::Blocking,
-            pname + " needs the material's " + k +
-                " (not recorded by the library entry; enter it in Material).");
+      if (!mat.contains(k)) {
+        Issue i;
+        i.key = "/material/" + k;
+        i.message = "Enter the " + materialKeyLabel(k) +
+                    " in Material (the library entry has none).";
+        i.fieldMessage = "Required for " + pname + "; the library entry has none.";
+        out.push_back(std::move(i));
+      }
     double v = 0.0;
     if (finiteAt(mat, "E_mpa", v) && v <= 0.0)
       issue(out, "/material/E_mpa", Severity::Blocking,
@@ -645,6 +819,11 @@ std::vector<Issue> validateBoundaries(const json &study,
     if (finiteAt(mat, "density_g_cm3", v) && v <= 0.0)
       issue(out, "/material/density_g_cm3", Severity::Blocking,
             "Density must be > 0.");
+    for (const char *key : {"yield_mpa", "cp_j_kgk"})
+      if (finiteAt(mat, key, v) && v <= 0.0)
+        issue(out, std::string("/material/") + key, Severity::Blocking,
+              std::string(std::strcmp(key, "yield_mpa") == 0 ? "Yield strength" : "Specific heat") +
+                  " must be > 0.");
   }
 
   auto checkFixtures = [&](const json &arr, const std::string &base,
@@ -684,7 +863,11 @@ std::vector<Issue> validateBoundaries(const json &study,
     for (std::size_t i = 0; i < arr.size(); ++i) {
       const json &e = arr[i];
       const std::string ptr = idx(base.c_str(), i);
-      const std::string label = entryLabel(e, "Load " + std::to_string(i + 1));
+      // Same name as the load's card ("Force 1", "Pressure 2").
+      const bool pressureCard =
+          member(e, "type").is_string() && member(e, "type") == "pressure";
+      const std::string label = entryLabel(
+          e, (pressureCard ? "Pressure " : "Force ") + std::to_string(i + 1));
       if (!facesNonEmpty(e))
         issue(out, ptr + "/faces", Severity::Blocking,
               label + " has no faces.");
@@ -703,10 +886,11 @@ std::vector<Issue> validateBoundaries(const json &study,
                 label + " needs a force vector.");
         else if (v[0] == 0.0 && v[1] == 0.0 && v[2] == 0.0)
           issue(out, ptr + "/vec", Severity::Blocking,
-                label + " force vector is zero.");
+                label + " needs a non-zero force.");
       } else {
         issue(out, ptr + "/type", Severity::Blocking,
-              label + " type \"" + type + "\" is not force or pressure.");
+              label + " is neither a force nor a pressure; delete it and add "
+                      "the load again.");
       }
     }
   };
@@ -759,20 +943,20 @@ std::vector<Issue> validateBoundaries(const json &study,
       }
     } else if (!haveLoads && physics != "thermomechanical") {
       issue(out, "/loads", Severity::Blocking,
-            pname + " needs at least one force or pressure load.");
+            "Add at least one force or pressure load.");
     }
     if (!haveCases)
       checkLoads(loads, "/loads");
     if (fixtures == 0)
       issue(out, "/fixtures", Severity::Blocking,
-            pname + " needs fixtures that stop rigid-body motion.");
+            "Add a fixture that stops rigid-body motion.");
   }
 
   if (usesThermalBoundary(physics)) {
     const json &th = member(study, "thermal");
     if (!th.is_object()) {
       issue(out, "/thermal", Severity::Blocking,
-            pname + " needs thermal boundary conditions.");
+            "Add thermal boundary conditions.");
     } else {
       double ref = 0.0;
       if (!member(th, "reference_temperature_c").is_null() &&
@@ -782,7 +966,7 @@ std::vector<Issue> validateBoundaries(const json &study,
       if (physics == "thermomechanical" &&
           member(th, "reference_temperature_c").is_null())
         issue(out, "/thermal/reference_temperature_c", Severity::Blocking,
-              "Thermomechanical needs the strain-free reference temperature.");
+              "Set the strain-free reference temperature.");
       bool constrained = false, driven = false;
       const json &fx = member(th, "fixtures");
       if (fx.is_array())
@@ -807,8 +991,12 @@ std::vector<Issue> validateBoundaries(const json &study,
           const std::string type = member(e, "type").is_string()
                                        ? member(e, "type").get<std::string>()
                                        : "";
-          const std::string label =
-              entryLabel(e, "Heat load " + std::to_string(i + 1));
+          // Same name as the heat load's card ("Flux 1", "Convection 2").
+          const std::string label = entryLabel(
+              e, std::string(type == "power"        ? "Power "
+                             : type == "convection" ? "Convection "
+                                                    : "Flux ") +
+                     std::to_string(i + 1));
           if (!facesNonEmpty(e))
             issue(out, ptr + "/faces", Severity::Blocking,
                   label + " has no faces.");
@@ -834,13 +1022,13 @@ std::vector<Issue> validateBoundaries(const json &study,
                         " needs an ambient temperature above absolute zero.");
           } else {
             issue(out, ptr + "/type", Severity::Blocking,
-                  label + " must be flux, power or convection.");
+                  label + " has an unknown type; delete it and add it again "
+                          "as a flux, power or convection load.");
           }
         }
       if (!constrained && physics != "cht")
         issue(out, "/thermal/fixtures", Severity::Blocking,
-              "The temperature field needs a fixed temperature or a convection "
-              "boundary.");
+              "Add a fixed temperature or a convection boundary.");
       if (!driven && physics != "thermomechanical")
         issue(out, "/thermal/loads", Severity::Warning,
               "No flux or power input: only fixed-temperature differences "
@@ -852,7 +1040,7 @@ std::vector<Issue> validateBoundaries(const json &study,
     const json &fl = member(study, "flow");
     if (!fl.is_object()) {
       issue(out, "/flow", Severity::Blocking,
-            pname + " needs fluid properties, inlets and outlets.");
+            "Add the fluid properties, an inlet and an outlet.");
     } else {
       double v = 0.0;
       if (!(finiteAt(fl, "viscosity_pa_s", v) && v > 0.0))
@@ -872,10 +1060,10 @@ std::vector<Issue> validateBoundaries(const json &study,
       if (physics == "cht") {
         if (!(finiteAt(fl, "fluid_k_w_mk", v) && v > 0.0))
           issue(out, "/flow/fluid_k_w_mk", Severity::Blocking,
-                "Conjugate heat transfer needs the fluid conductivity.");
+                "Enter the fluid's thermal conductivity.");
         if (!(finiteAt(fl, "fluid_cp_j_kgk", v) && v > 0.0))
           issue(out, "/flow/fluid_cp_j_kgk", Severity::Blocking,
-                "Conjugate heat transfer needs the fluid specific heat.");
+                "Enter the fluid's specific heat.");
       }
       const json &in = member(fl, "inlets");
       if (!in.is_array() || in.empty())
@@ -937,8 +1125,9 @@ std::vector<Issue> validateBoundaries(const json &study,
     for (std::size_t i = 0; i < arr.size(); ++i) {
       const json &e = arr[i];
       const std::string ptr = idx((std::string("/") + which).c_str(), i);
-      const std::string label =
-          entryLabel(e, title + " " + std::to_string(i + 1));
+      // Same name as the region's card ("Exclude band 1", "Preserve box 2").
+      const std::string label = entryLabel(
+          e, title + (e.contains("faces") ? " band " : " box ") + std::to_string(i + 1));
       if (e.contains("faces")) {
         if (!facesNonEmpty(e))
           issue(out, ptr + "/faces", Severity::Blocking,
@@ -984,8 +1173,248 @@ std::vector<Issue> validateBoundaries(const json &study,
             "conditions stay solid.");
       break;
     }
+  // The issue line under a field sits inside its entry's card, whose title
+  // already names the entry: give it the short form.
+  for (Issue &i : out)
+    if (i.fieldMessage.empty())
+      i.fieldMessage = localIssueText(study, i.key, i.message);
   return out;
 }
+bool applyStudyDefinition(json &study, const json &definition,
+                          const Capabilities &caps,
+                          const MaterialLookup &lookup, std::string &error) {
+  error.clear();
+  if (!definition.is_object()) {
+    error = "Study definition must be a JSON object.";
+    return false;
+  }
+  json candidate = definition;
+  for (const char *key : {"id", "type", "runs", "last_job", "results", "result"}) {
+    if (candidate.contains(key) &&
+        (!study.contains(key) || candidate[key] != study[key])) {
+      error = std::string("/") + key + " is managed by the study, not editable.";
+      return false;
+    }
+    if (study.contains(key))
+      candidate[key] = study[key];
+  }
+
+  // Only native setup fields are replaceable by omission. Future/agent fields
+  // survive an editor that does not know them, including inside retained entries.
+  std::set<std::string> native = {
+      "name", "material", "mesh_order", "mesh_target_mm", "mesh_fineness",
+      "mesh_min_mm", "fixtures", "loads", "load_cases", "preserve", "exclude",
+      "thermal", "flow", "topology", "method", "physics", "objective",
+      "key", "E_mpa", "nu", "yield_mpa", "density_g_cm3", "k_w_mk",
+      "alpha_per_k", "cp_j_kgk", "faces", "dofs", "label", "type", "vec",
+      "vector", "magnitude", "weight", "box_min_mm", "box_max_mm",
+      "thickness_mm", "reference_temperature_c", "temperature_c",
+      "magnitude_w_m2", "power_w", "h_w_m2k", "ambient_c", "inlets",
+      "outlets", "walls", "velocity_m_s", "pressure_pa", "viscosity_pa_s",
+      "density_kg_m3", "fluid_k_w_mk", "fluid_cp_j_kgk", "brinkman_max",
+      "reference_length_mm"};
+  for (const auto &key : scalarKeys())
+    native.insert(key);
+  std::function<void(const json &, json &, bool)> keepUnknown =
+      [&](const json &old, json &next, bool extension) {
+        if (old.is_object() && next.is_object()) {
+          for (auto it = old.begin(); it != old.end(); ++it) {
+            if (!next.contains(it.key())) {
+              if (extension || !native.count(it.key()))
+                next[it.key()] = it.value();
+            } else if (it.key() != "faces") {
+              keepUnknown(it.value(), next[it.key()],
+                          extension || !native.count(it.key()));
+            }
+          }
+        } else if (old.is_array() && next.is_array()) {
+          // Preserve extension fields only on entries whose native fields still
+          // identify the same entry; never attach old metadata after a reorder.
+          for (auto &entry : next) {
+            if (!entry.is_object())
+              continue;
+            for (const auto &previous : old) {
+              if (!previous.is_object())
+                continue;
+              bool same = true, identified = false;
+              for (const char *key : {"name", "label", "faces", "type",
+                                      "box_min_mm", "box_max_mm"}) {
+                if (previous.contains(key) || entry.contains(key)) {
+                  identified = true;
+                  if (member(previous, key) != member(entry, key)) {
+                    same = false;
+                    break;
+                  }
+                }
+              }
+              if (same && identified) {
+                keepUnknown(previous, entry, extension);
+                break;
+              }
+            }
+          }
+        }
+      };
+  keepUnknown(study, candidate, false);
+  const std::string physics = studyPhysics(candidate);
+  auto keepInactive = [&](const char *key, bool active) {
+    if (!active && study.contains(key)) {
+      if (!candidate.contains(key))
+        candidate[key] = study[key];
+      else
+        keepUnknown(study[key], candidate[key], true);
+    }
+  };
+  keepInactive("fixtures", usesStructuralBoundary(physics));
+  keepInactive("loads", usesStructuralLoads(physics));
+  keepInactive("load_cases", usesStructuralLoads(physics));
+  keepInactive("thermal", usesThermalBoundary(physics));
+  keepInactive("flow", usesFlowBoundary(physics));
+
+  auto type = [&](const json &object, const char *key, const std::string &path,
+                  const auto &valid,
+                  const char *expected) {
+    if (!object.contains(key) || valid(object[key]))
+      return true;
+    error = path + "/" + key + " must be " + expected + ".";
+    return false;
+  };
+  auto object = [](const json &v) { return v.is_object(); };
+  auto array = [](const json &v) { return v.is_array(); };
+  auto text = [](const json &v) { return v.is_string(); };
+  auto number = [](const json &v) {
+    return v.is_number() && std::isfinite(v.get<double>());
+  };
+  auto vector = [&](const json &v) {
+    return v.is_array() && v.size() == 3 &&
+           number(v[0]) && number(v[1]) && number(v[2]);
+  };
+  if (!type(candidate, "name", "", text, "text") ||
+      !type(candidate, "topology", "", object, "an object"))
+    return false;
+  for (const char *key : {"thermal", "flow"})
+    if (!type(candidate, key, "", object, "an object"))
+      return false;
+  for (const char *key : {"fixtures", "loads", "load_cases", "preserve", "exclude"})
+    if (!type(candidate, key, "", array, "an array"))
+      return false;
+  for (const char *key : {"mesh_order", "mesh_target_mm", "mesh_min_mm",
+                          "mesh_fineness"})
+    if (!type(candidate, key, "", number, "a finite number"))
+      return false;
+  if (candidate.contains("material") &&
+      !candidate["material"].is_string() && !candidate["material"].is_object()) {
+    error = "/material must be a library key or a physical-property object.";
+    return false;
+  }
+  if (member(candidate, "material").is_object()) {
+    const json &m = candidate["material"];
+    for (const char *key : kMaterialKeys)
+      if (!type(m, key, "/material", number, "a finite number"))
+        return false;
+    for (const char *key : {"name", "key"})
+      if (!type(m, key, "/material", text, "text"))
+        return false;
+  }
+  // Typed canonical boundary objects prevent malformed inactive sections from
+  // being silently retained as if they were usable native configuration.
+  std::function<bool(const json &, const std::string &)> boundaryTypes =
+      [&](const json &value, const std::string &path) {
+        if (value.is_array()) {
+          for (std::size_t i = 0; i < value.size(); ++i) {
+            if (!value[i].is_object()) {
+              error = path + "/" + std::to_string(i) + " must be an object.";
+              return false;
+            }
+            if (!boundaryTypes(value[i], path + "/" + std::to_string(i)))
+              return false;
+          }
+          return true;
+        }
+        if (!value.is_object())
+          return true;
+        for (const char *key : {
+                 "weight", "magnitude", "thickness_mm", "reference_temperature_c",
+                 "temperature_c", "magnitude_w_m2", "power_w", "h_w_m2k",
+                 "ambient_c", "pressure_pa", "viscosity_pa_s", "density_kg_m3",
+                 "fluid_k_w_mk", "fluid_cp_j_kgk", "brinkman_max",
+                 "reference_length_mm"})
+          if (!type(value, key, path, number, "a finite number"))
+            return false;
+        for (const char *key : {"vec", "vector", "box_min_mm", "box_max_mm",
+                                "velocity_m_s"})
+          if (!type(value, key, path, vector, "three finite numbers"))
+            return false;
+        for (const char *key : {"type", "name", "label"})
+          if (!type(value, key, path, text, "text"))
+            return false;
+        if (isBareSelector(value) && value.contains("points") &&
+            !validateResolvedFaceset(value, path, error))
+          return false;
+        if (value.contains("faces")) {
+          if (!type(value, "faces", path, array, "a selector array"))
+            return false;
+          for (const auto &selector : value["faces"]) {
+            if (!((selector.is_object() && !selector.empty()) ||
+                  (selector.is_string() &&
+                   !selector.get_ref<const std::string &>().empty()))) {
+              error = path + "/faces needs native selectors or resolved point sets.";
+              return false;
+            }
+            if (selector.is_object() && selector.contains("_pick")) {
+              std::uint32_t body = 0, topo = 0;
+              if (!pickOf(selector, body, topo)) {
+                error = path + "/faces/_pick needs valid positive body and face identities.";
+                return false;
+              }
+            }
+            if (selector.is_object() && selector.contains("points") &&
+                !validateResolvedFaceset(selector, path + "/faces", error))
+              return false;
+          }
+        }
+        if (value.contains("dofs")) {
+          if (!value["dofs"].is_array() || value["dofs"].empty()) {
+            error = path + "/dofs must be a nonempty array of axes 0, 1 or 2.";
+            return false;
+          }
+          std::set<int> seen;
+          for (const auto &dof : value["dofs"]) {
+            if (!dof.is_number_integer() || dof < 0 || dof > 2 ||
+                !seen.insert(dof.get<int>()).second) {
+              error = path + "/dofs needs distinct axes 0, 1 or 2.";
+              return false;
+            }
+          }
+        }
+        for (const char *key : {"fixtures", "loads", "inlets", "outlets", "walls"})
+          if (!type(value, key, path, array, "an array") ||
+              (value.contains(key) &&
+               !boundaryTypes(value[key], path + "/" + key)))
+            return false;
+        return true;
+      };
+  for (const char *key : {"fixtures", "loads", "load_cases", "preserve",
+                          "exclude", "thermal", "flow"})
+    if (candidate.contains(key) &&
+        !boundaryTypes(candidate[key], std::string("/") + key))
+      return false;
+
+  auto issues = validateTopology(member(candidate, "topology"), caps);
+  for (auto &issue : issues)
+    if (!issue.key.empty())
+      issue.key = "/topology/" + issue.key;
+  const auto boundaries = validateBoundaries(candidate, lookup);
+  issues.insert(issues.end(), boundaries.begin(), boundaries.end());
+  for (const auto &issue : issues)
+    if (issue.severity == Severity::Blocking) {
+      error = issue.key.empty() ? issue.message : issue.key + ": " + issue.message;
+      return false;
+    }
+  study = std::move(candidate);
+  return true;
+}
+
 
 // ---- envelope
 // --------------------------------------------------------------------------------------
@@ -1326,16 +1755,19 @@ json compactResult(const json &result) {
 
 #ifndef CHUDWARE_SIM_TOPOLOGY_MODEL_ONLY
 // ==================================================================================================
-// Editors (GUI thread)
+// Editors (GUI thread) — Simulation UI standard: removable cards per entry,
+// kit_form fields bound by JSON pointer (unit slot, required marker, issue
+// line), one face-well layout, "+ Add" buttons once per section.
 // ==================================================================================================
-#include <cfloat>
-#include <cstring>
-
 #include "imgui.h"
+#include "imgui_internal.h" // ImGuiWindow: scroll the editor's body to a focused card
 
 #include "../core/app_state.h"
+#include "metrics.h"
 #include "sim_manager.h" // SimManager::unitSys — the Simulate workspace's display units
+#include "viewport_panel.h" // claimViewportHoverFace — face-chip hover highlight
 #include "widgets/kit.h"
+#include "sim/sim_interaction.h"
 
 namespace ui {
 namespace topology {
@@ -1351,480 +1783,485 @@ struct EditCtx {
   bool locked = false;
   BcResult result;
   SimManager::UnitSys units;
+  ImGuiWindow *body = nullptr; // the scrolling window the editor draws into
+  bool focusHandled = false;   // the view's focus was revealed this frame
 };
 
-void tip(const char *t) {
-  if (t && *t && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-    ImGui::SetTooltip("%s", t);
-}
-
-std::string fmtNum(double v) {
-  char b[48];
-  std::snprintf(b, sizeof(b), "%.6g", v);
-  return b;
-}
-
-bool parseNumber(const std::string &raw, double &out) {
-  std::string s = raw;
-  s.erase(0, s.find_first_not_of(" \t"));
-  s.erase(s.find_last_not_of(" \t") + 1);
-  if (s.empty())
+// ---- one-shot scroll focus (BcView::focusPointer) ----------------------------
+// True while the pending focus addresses `pointer` itself or a value inside it.
+bool focusWithin(const EditCtx &c, const std::string &pointer) {
+  const std::string &f = c.view.focusPointer;
+  if (f.empty() || c.focusHandled || pointer.empty())
     return false;
-  errno = 0;
-  char *end = nullptr;
-  out = std::strtod(s.c_str(), &end);
-  return errno == 0 && end && *end == '\0' && std::isfinite(out);
+  return f == pointer || (f.size() > pointer.size() &&
+                          f.compare(0, pointer.size(), pointer) == 0 &&
+                          f[pointer.size()] == '/');
 }
 
-bool isBlank(const char *s) {
-  for (; s && *s; ++s)
-    if (*s != ' ' && *s != '\t')
-      return false;
-  return true;
+// Scrolls the editor's body so the screen-space span [top, bottom] shows (its
+// top a row gap under the view's top edge); nothing moves when it already
+// shows. Marks the focus handled, so an enclosing card ending later (load case
+// around its loads) does not override the deeper target.
+void revealSpan(EditCtx &c, float top, float bottom) {
+  c.focusHandled = true;
+  ImGuiWindow *w = c.body;
+  if (!w)
+    return;
+  if (top >= w->InnerRect.Min.y && bottom <= w->InnerRect.Max.y)
+    return;
+  ImGui::SetScrollFromPosY(w, top - w->Pos.y - kit::rowGap(), 0.0f);
 }
 
-// Issues whose key is `pointer` or nested under it.
-void issuesFor(const EditCtx &c, const std::string &pointer) {
+// A list-level focus ("/fixtures") lands on the list's section header: call
+// right before drawing it.
+void focusAnchor(EditCtx &c, const std::string &listPointer) {
+  if (c.focusHandled || c.view.focusPointer != listPointer)
+    return;
+  const float y = ImGui::GetCursorScreenPos().y;
+  revealSpan(c, y, y + ImGui::GetFrameHeight() * 3.0f);
+}
+
+// After a card that owns `pointers` ended (the card is the last item): reveal
+// it when the focus addresses one of them.
+void focusCard(EditCtx &c, float top, std::initializer_list<const char *> pointers) {
+  for (const char *p : pointers)
+    if (focusWithin(c, p)) {
+      revealSpan(c, top, ImGui::GetItemRectMax().y);
+      return;
+    }
+}
+
+kit::Tone toneOf(const Issue &i) {
+  return i.severity == Severity::Blocking ? kit::Tone::Err : kit::Tone::Warn;
+}
+
+// The issue keyed exactly at `pointer` (a field's own issue line), or null.
+const Issue *issueAt(const EditCtx &c, const std::string &pointer) {
+  if (pointer.empty())
+    return nullptr;
   for (const Issue &i : c.issues)
-    if (!pointer.empty() && i.key == pointer)
-      kit::inlineStatus(i.message.c_str(), i.severity == Severity::Blocking
-                                               ? kit::Tone::Err
-                                               : kit::Tone::Warn);
+    if (i.key == pointer)
+      return &i;
+  return nullptr;
 }
 
-// One numeric text field bound to obj[key] (SI value scaled by `factor` for
-// display). Empty input erases the key. `required` only changes the
-// placeholder.
-void numberField(EditCtx &c, const std::string &id, const char *label,
-                 json &obj, const char *key, double factor, const char *unit,
-                 const char *help, const char *placeholder = nullptr) {
-  ImGui::PushID(id.c_str());
-  ImGui::TextUnformatted(label);
-  tip(help);
-  std::string shown;
-  const json &cur = member(obj, key);
-  if (c.view.editingId == id)
-    shown = c.view.editText;
-  else if (cur.is_number())
-    shown = fmtNum(cur.get<double>() * factor);
-  char buf[64];
-  std::snprintf(buf, sizeof(buf), "%s", shown.c_str());
-  const float unitW =
-      unit && *unit ? ImGui::CalcTextSize(unit).x + 8.0f * ui::uiScale : 0.0f;
-  ImGui::SetNextItemWidth(-FLT_MIN - unitW);
-  ImGui::InputTextWithHint("##v", placeholder ? placeholder : "required", buf,
-                           sizeof(buf), ImGuiInputTextFlags_CharsScientific);
-  const bool active = ImGui::IsItemActive();
-  const bool done = ImGui::IsItemDeactivatedAfterEdit();
-  if (active) {
-    c.view.editingId = id;
-    c.view.editText = buf;
-  }
-  if (unit && *unit) {
-    ImGui::SameLine();
-    ImGui::TextUnformatted(unit);
-  }
-  if (done) {
-    c.view.editingId.clear();
-    c.view.fieldErrors.erase(id);
-    double v = 0.0;
-    if (isBlank(buf)) {
-      if (obj.is_object() && obj.contains(key)) {
-        obj.erase(key);
-        c.result.committed = true;
-      }
-    } else if (parseNumber(buf, v)) {
-      obj[key] = v / factor;
-      c.result.committed = true;
-    } else {
-      c.view.fieldErrors[id] = std::string("\"") + buf + "\" is not a number.";
-    }
-  } else if (!active && c.view.editingId == id) {
-    c.view.editingId.clear();
-  }
-  const auto err = c.view.fieldErrors.find(id);
-  if (err != c.view.fieldErrors.end())
-    kit::inlineStatus(err->second.c_str(), kit::Tone::Err);
-  ImGui::PopID();
+// `o` plus the pointer's issue (Err when blocking, Warn otherwise).
+kit::FieldOpts withIssueAt(const EditCtx &c, const std::string &pointer,
+                           kit::FieldOpts o) {
+  if (const Issue *i = issueAt(c, pointer))
+    o.withIssue(i->fieldMessage.empty() ? i->message.c_str() : i->fieldMessage.c_str(),
+                toneOf(*i));
+  return o;
 }
 
-// Three-component vector bound to obj[key]; a component committed on an absent
-// vector creates the full vector with the other components shown as 0.
-void vectorField(EditCtx &c, const std::string &id, const char *label,
-                 json &obj, const char *key, double factor, const char *unit,
-                 const char *help, const char *altKey = nullptr) {
-  ImGui::PushID(id.c_str());
-  ImGui::TextUnformatted(label);
-  tip(help);
-  if (unit && *unit) {
-    ImGui::SameLine();
-    kit::dimText(unit);
-  }
-  const char *srcKey = key;
-  if (altKey && !(obj.is_object() && obj.contains(key)) && obj.is_object() &&
-      obj.contains(altKey))
-    srcKey = altKey;
-  const json &cur = member(obj, srcKey);
-  const bool have = cur.is_array() && cur.size() == 3;
-  static const char *const kAxis[3] = {"X", "Y", "Z"};
-  const float w = (ImGui::GetContentRegionAvail().x -
-                   2.0f * ImGui::GetStyle().ItemSpacing.x) /
-                  3.0f;
-  for (int k = 0; k < 3; ++k) {
-    if (k)
-      ImGui::SameLine();
-    const std::string cid = id + "/" + std::to_string(k);
-    ImGui::PushID(k);
-    std::string shown;
-    if (c.view.editingId == cid)
-      shown = c.view.editText;
-    else if (have && cur[k].is_number())
-      shown = fmtNum(cur[k].get<double>() * factor);
-    char buf[48];
-    std::snprintf(buf, sizeof(buf), "%s", shown.c_str());
-    ImGui::SetNextItemWidth(w);
-    ImGui::InputTextWithHint("##c", kAxis[k], buf, sizeof(buf),
-                             ImGuiInputTextFlags_CharsScientific);
-    const bool active = ImGui::IsItemActive();
-    if (active) {
-      c.view.editingId = cid;
-      c.view.editText = buf;
-    }
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-      c.view.editingId.clear();
-      c.view.fieldErrors.erase(id);
-      double v = 0.0;
-      if (parseNumber(buf, v) || isBlank(buf)) {
-        json vec = have ? cur : json::array({0.0, 0.0, 0.0});
-        vec[k] = isBlank(buf) ? 0.0 : v / factor;
-        if (altKey && srcKey == altKey)
-          obj.erase(altKey); // persist the shared dialect key
-        obj[key] = vec;
-        c.result.committed = true;
-      } else {
-        c.view.fieldErrors[id] =
-            std::string("\"") + buf + "\" is not a number.";
-      }
-    } else if (!active && c.view.editingId == cid) {
-      c.view.editingId.clear();
-    }
-    tip(kAxis[k]);
-    ImGui::PopID();
-  }
-  const auto err = c.view.fieldErrors.find(id);
-  if (err != c.view.fieldErrors.end())
-    kit::inlineStatus(err->second.c_str(), kit::Tone::Err);
-  ImGui::PopID();
+// Every issue keyed at `pointer` as inline lines (list-level keys).
+void issuesFor(const EditCtx &c, const std::string &pointer) {
+  if (pointer.empty())
+    return;
+  for (const Issue &i : c.issues)
+    if (i.key == pointer)
+      kit::inlineStatus(i.fieldMessage.empty() ? i.message.c_str() : i.fieldMessage.c_str(),
+                        toneOf(i));
 }
 
-void textField(EditCtx &c, const std::string &id, const char *label, json &obj,
-               const char *key, const char *help) {
-  ImGui::PushID(id.c_str());
-  ImGui::TextUnformatted(label);
-  tip(help);
-  std::string shown =
-      c.view.editingId == id
-          ? c.view.editText
-          : (member(obj, key).is_string() ? obj[key].get<std::string>()
-                                          : std::string());
-  char buf[96];
-  std::snprintf(buf, sizeof(buf), "%s", shown.c_str());
-  ImGui::SetNextItemWidth(-FLT_MIN);
-  ImGui::InputText("##t", buf, sizeof(buf));
-  const bool active = ImGui::IsItemActive();
-  if (active) {
-    c.view.editingId = id;
-    c.view.editText = buf;
+// ---- JSON pointer binding ----------------------------------------------------
+// Fields read through these and write only on commit, so drawing never inserts
+// keys into an authored study.
+const json *jsonAt(const json &root, const std::string &pointer) {
+  try {
+    const json::json_pointer p(pointer);
+    if (root.contains(p))
+      return &root.at(p);
+  } catch (...) {
   }
-  if (ImGui::IsItemDeactivatedAfterEdit()) {
-    c.view.editingId.clear();
-    if (isBlank(buf))
-      obj.erase(key);
-    else
-      obj[key] = std::string(buf);
+  return nullptr;
+}
+
+json *arrayAt(json &root, const std::string &pointer) {
+  try {
+    const json::json_pointer p(pointer);
+    if (root.contains(p) && root.at(p).is_array())
+      return &root.at(p);
+  } catch (...) {
+  }
+  return nullptr;
+}
+
+int countAt(const json &root, const std::string &pointer) {
+  const json *a = jsonAt(root, pointer);
+  return a && a->is_array() ? static_cast<int>(a->size()) : 0;
+}
+
+void setAt(EditCtx &c, const std::string &pointer, json value) {
+  try {
+    c.study[json::json_pointer(pointer)] = std::move(value);
     c.result.committed = true;
-  } else if (!active && c.view.editingId == id) {
-    c.view.editingId.clear();
+  } catch (...) {
   }
-  ImGui::PopID();
 }
 
-// The face well: arm toggle + face chips (right-click removes) + Clear.
-void wellRow(EditCtx &c, const std::string &pointer, const char *help) {
+void eraseAt(EditCtx &c, const std::string &pointer) {
+  try {
+    const json::json_pointer p(pointer);
+    const json::json_pointer pp = p.parent_pointer();
+    json &parent = pp.empty() ? c.study : c.study.at(pp);
+    if (parent.is_object() && parent.erase(p.back()) > 0)
+      c.result.committed = true;
+  } catch (...) {
+  }
+}
+
+// ---- fields ------------------------------------------------------------------
+// Number at `pointer` (stored SI, shown through o's scale). An empty commit
+// erases the key; nothing is silently defaulted.
+void numberField(EditCtx &c, const char *id, const std::string &pointer,
+                 const char *label, kit::FieldOpts o) {
+  const json *cur = jsonAt(c.study, pointer);
+  bool present = cur && cur->is_number();
+  double v = present ? cur->get<double>() : 0.0;
+  o.withPresent(&present);
+  if (kit::fieldNumber(id, label, &v, withIssueAt(c, pointer, o))) {
+    if (present)
+      setAt(c, pointer, v);
+    else
+      eraseAt(c, pointer);
+  }
+}
+
+// X/Y/Z triple at `pointer`; a first committed cell creates the whole vector
+// (other cells 0). `altPointer` is the dialect alias read when `pointer` is
+// absent (force "vector"); a commit persists `pointer` and drops the alias.
+void vectorField(EditCtx &c, const char *id, const std::string &pointer,
+                 const char *label, kit::FieldOpts o,
+                 const std::string &altPointer = std::string()) {
+  const json *cur = jsonAt(c.study, pointer);
+  bool fromAlt = false;
+  if (!cur && !altPointer.empty()) {
+    cur = jsonAt(c.study, altPointer);
+    fromAlt = cur != nullptr;
+  }
+  bool present = cur && cur->is_array() && cur->size() == 3;
+  double v[3] = {0.0, 0.0, 0.0};
+  if (present)
+    for (int k = 0; k < 3; ++k)
+      v[k] = (*cur)[k].is_number() ? (*cur)[k].get<double>() : 0.0;
+  o.withPresent(&present);
+  if (kit::fieldVec3(id, label, v, withIssueAt(c, pointer, o))) {
+    if (fromAlt)
+      eraseAt(c, altPointer);
+    setAt(c, pointer, json::array({v[0], v[1], v[2]}));
+  }
+}
+
+// Text at `pointer`; a blank commit erases the key.
+void textField(EditCtx &c, const char *id, const std::string &pointer,
+               const char *label, const kit::FieldOpts &o) {
+  const json *cur = jsonAt(c.study, pointer);
+  std::string v = cur && cur->is_string() ? cur->get<std::string>() : std::string();
+  if (kit::fieldText(id, label, &v, withIssueAt(c, pointer, o))) {
+    if (v.find_first_not_of(" \t") == std::string::npos)
+      eraseAt(c, pointer);
+    else
+      setAt(c, pointer, v);
+  }
+}
+
+// The face well (standard §4): the SAME controls as the FEA wells
+// (faceWellControls: label line with the count, then "Pick faces" /
+// "Picking…" and Clear at one frame height, Clear dropping under only when
+// the row is too narrow), the picks as removable chips in a wrapping flow
+// (hover lights the face in the viewport, × removes it), one dim hint line
+// while armed, and the field's issue line.
+void wellField(EditCtx &c, const std::string &pointer, const char *help) {
   json *faces = facesAt(c.study, pointer);
   if (!faces)
     return;
-  ImGui::PushID(pointer.c_str());
   const bool armed = c.view.armedPointer == pointer;
-  const std::string label =
-      armed ? "Selecting faces\xe2\x80\xa6 (click viewport)"
-            : (faces->empty()
-                   ? std::string("Pick faces")
-                   : "Pick faces (" + std::to_string(faces->size()) + ")");
-  if (armed)
-    ImGui::PushStyleColor(ImGuiCol_Button,
-                          kit::toneVec(kit::Tone::Accent, 0.85f));
-  if (ImGui::Button(label.c_str(), ImVec2(-FLT_MIN, 0))) {
+  std::size_t n = faces->size();
+  ImGui::PushID("faces");
+  const FaceWellClick click = faceWellControls("Faces", (int)n, armed, help);
+  ImGui::PopID();
+  // A real well target, independent of Pick/Clear: delivery copies the face
+  // and never toggles an already-present selector off.
+  ImGui::PushID("face_drop");
+  kit::secondaryButton("Drop a face here", !c.locked && !c.view.docId.empty(),
+                       c.locked ? "Setup is locked while running."
+                                : "Drag a model face or another face chip here.",
+                       ImVec2(ImGui::GetContentRegionAvail().x, 0));
+  ui::sim::FaceDrop dropped;
+  if (!c.locked && !c.view.docId.empty() &&
+      ui::sim::acceptFaceDrop(c.view.docId, dropped)) {
+    dropped.selector["_pick"] = {{"body", dropped.body}, {"topo", dropped.topo}};
+    if (appendFaces(c.study, pointer, {dropped.selector}))
+      c.result.committed = true;
+  }
+  n = faces->size();
+  ImGui::PopID();
+  const bool toggle = click.toggled;
+  const bool clear = click.clear;
+  if (toggle) {
     c.view.armedPointer = armed ? std::string() : pointer;
     c.result.armChanged = true;
   }
-  if (armed)
-    ImGui::PopStyleColor();
-  tip(armed ? "Click model faces to add them (click a picked face again to "
-              "remove it). "
-              "Click here to stop."
-            : help);
+
   int removeAt = -1;
-  for (int k = 0; k < static_cast<int>(faces->size()); ++k) {
-    ImGui::PushID(k);
-    const json &sel = (*faces)[k];
-    const bool resolvedSet = sel.is_object() && sel.contains("points");
-    std::uint32_t b = 0, t = 0;
-    const bool picked = pickOf(sel, b, t);
-    const std::string chip = resolvedSet
-                                 ? "Resolved set " + std::to_string(k + 1)
-                                 : "Face " + std::to_string(k + 1);
-    ImGui::SmallButton(chip.c_str());
-    if (ImGui::IsItemClicked(ImGuiMouseButton_Right))
-      removeAt = k;
-    tip(resolvedSet
-            ? "Pre-resolved point set (agent-authored). Right-click to remove."
-        : picked
-            ? "Right-click to remove this face."
-            : "Face selector without a viewport identity (agent-authored); it "
-              "resolves at run time but is not highlighted. Right-click to "
-              "remove.");
-    if (k % 4 != 3 && k + 1 < static_cast<int>(faces->size()))
-      ImGui::SameLine();
-    ImGui::PopID();
+  if (n) {
+    kit::chipFlowBegin("chips");
+    for (std::size_t k = 0; k < n; ++k) {
+      ImGui::PushID(static_cast<int>(k));
+      const json &sel = (*faces)[k];
+      const bool pointSet = sel.is_object() && sel.contains("points");
+      std::uint32_t body = 0, topo = 0;
+      const bool picked = pickOf(sel, body, topo);
+      const std::string text =
+          (pointSet ? "Point set " : "Face ") + std::to_string(k + 1);
+      bool hovered = false;
+      if (kit::removableChip("face", text.c_str(),
+                             pointSet ? "Remove this point set."
+                                      : "Remove this face.",
+                             kit::Tone::Neutral, &hovered))
+        removeAt = static_cast<int>(k);
+      if (!c.locked && picked && !c.view.docId.empty())
+        ui::sim::faceDragSource(c.view.docId, sel, body, topo, text.c_str());
+      ImGui::PopID();
+      if (!hovered)
+        continue;
+      if (picked)
+        ui::claimViewportHoverFace(body, topo);
+      else
+        kit::tooltip(pointSet
+                         ? "Pre-resolved point set (agent-authored)."
+                         : "Face selector without a viewport identity "
+                           "(agent-authored); it resolves at run time but "
+                           "cannot be highlighted.");
+    }
+    kit::chipFlowEnd();
   }
-  if (!faces->empty()) {
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Clear"))
-      removeAt = -2;
-    tip("Remove every face from this selection.");
-  }
+  if (armed)
+    kit::dimText("Click model faces to add or remove them.");
+  if (const Issue *i = issueAt(c, pointer))
+    kit::inlineStatus(i->fieldMessage.empty() ? i->message.c_str()
+                                              : i->fieldMessage.c_str(),
+                      toneOf(*i));
   if (removeAt >= 0) {
     faces->erase(static_cast<std::size_t>(removeAt));
     c.result.committed = true;
-  } else if (removeAt == -2) {
+  } else if (clear) {
     faces->clear();
     c.result.committed = true;
   }
-  issuesFor(c, pointer);
-  ImGui::PopID();
 }
 
-// Remove-entry button. Returns true when clicked.
-bool removeButton(const char *what) {
-  const bool hit = kit::secondaryButton("Remove");
-  tip(what);
+// "+ X" creation buttons of one section, wrapping as a flow. Returns the
+// clicked index or -1.
+int addButtons(const char *id, const char *const *labels,
+               const char *const *tips, int n) {
+  const ImGuiStyle &style = ImGui::GetStyle();
+  int hit = -1;
+  kit::chipFlowBegin(id);
+  for (int k = 0; k < n; ++k) {
+    kit::chipFlowItem(ImGui::CalcTextSize(labels[k]).x +
+                      style.FramePadding.x * 2.0f);
+    if (kit::secondaryButton(labels[k]))
+      hit = k;
+    kit::itemTooltip(tips ? tips[k] : nullptr);
+  }
+  kit::chipFlowEnd();
   return hit;
 }
 
-json &ensureObject(json &parent, const char *key) {
-  if (!parent.contains(key) || !parent[key].is_object())
-    parent[key] = json::object();
-  return parent[key];
-}
-
+// A well created in the editor ("+ Fixture") arms and is scrolled into view
+// once its card is drawn (the next frame).
 void armNew(EditCtx &c, const std::string &pointer) {
   if (!pointer.empty()) {
     c.view.armedPointer = pointer;
+    c.view.focusPointer = pointer;
+    c.view.focusFrames = 0;
     c.result.armChanged = true;
   }
   c.result.committed = true;
 }
 
+// One removable card per element of the array at `listPointer` (PushID index
+// scopes each card). Removal is applied after the loop and disarms the well,
+// whose pointer would otherwise shift onto a sibling.
+struct CardHead {
+  std::string title;
+  const char *icon = nullptr;
+  const char *removeTip = nullptr;
+  bool removable = true;
+};
+void entryCards(
+    EditCtx &c, const std::string &listPointer,
+    const std::function<CardHead(const json &, std::size_t)> &head,
+    const std::function<void(json &, const std::string &, std::size_t)> &body) {
+  json *arr = arrayAt(c.study, listPointer);
+  if (!arr)
+    return;
+  int removeAt = -1;
+  for (std::size_t i = 0; i < arr->size(); ++i) {
+    json &e = (*arr)[i];
+    const CardHead h = head(e, i);
+    const std::string ptr = idx(listPointer.c_str(), i);
+    const float top = ImGui::GetCursorScreenPos().y;
+    ImGui::PushID(static_cast<int>(i));
+    bool removed = false;
+    const bool open =
+        h.removable ? kit::removableCard("card", h.title.c_str(), h.icon,
+                                         nullptr, h.removeTip, &removed)
+                    : kit::cardBegin("card", h.title.c_str(), h.icon);
+    if (open)
+      body(e, ptr, i);
+    kit::cardEnd();
+    ImGui::PopID();
+    // Nested lists (a load case's loads) end first, so the deepest card wins.
+    if (focusWithin(c, ptr))
+      revealSpan(c, top, ImGui::GetItemRectMax().y);
+    if (removed)
+      removeAt = static_cast<int>(i);
+  }
+  if (removeAt >= 0) {
+    arr->erase(static_cast<std::size_t>(removeAt));
+    c.view.armedPointer.clear();
+    c.result.armChanged = true;
+    c.result.committed = true;
+  }
+}
+
 // ---- structural
 // -----------------------------------------------------------------------------------
-void fixtureList(EditCtx &c, const std::string &listPointer, int loadCase) {
-  json *arr = nullptr;
-  try {
-    const json::json_pointer p(listPointer);
-    if (c.study.contains(p) && c.study[p].is_array())
-      arr = &c.study[p];
-  } catch (...) {
+// X/Y/Z fixed directions as checkboxes (the same control as the symmetry
+// axes); all three on erases "dofs" (fully clamped, the shared default).
+void dofField(EditCtx &c, json &e, const std::string &ptr) {
+  bool on[3] = {true, true, true};
+  const json &d = member(e, "dofs");
+  if (d.is_array()) {
+    on[0] = on[1] = on[2] = false;
+    for (const json &k : d)
+      if (k.is_number_integer() && k.get<int>() >= 0 && k.get<int>() <= 2)
+        on[k.get<int>()] = true;
   }
-  int removeAt = -1;
-  if (arr)
-    for (std::size_t i = 0; i < arr->size(); ++i) {
-      json &e = (*arr)[i];
-      const std::string ptr = listPointer + "/" + std::to_string(i);
-      ImGui::PushID(ptr.c_str());
-      const std::string title =
-          entryLabel(e, "Fixture " + std::to_string(i + 1));
-      if (kit::cardBegin("fixture", title.c_str(), "fixture")) {
+  static const char *const kTips[3] = {"Hold the faces in X.",
+                                       "Hold the faces in Y.",
+                                       "Hold the faces in Z."};
+  kit::fieldBegin("dofs", "Fixed directions",
+                  withIssueAt(c, ptr + "/dofs",
+                              kit::FieldOpts().withTip(
+                                  "Checked directions are held; the others "
+                                  "stay free (roller / slider supports). All "
+                                  "three = fully clamped.")));
+  const bool changed = axisToggles(on, kTips);
+  kit::fieldEnd();
+  if (!changed)
+    return;
+  if (on[0] && on[1] && on[2]) {
+    e.erase("dofs");
+  } else {
+    json dofs = json::array();
+    for (int k = 0; k < 3; ++k)
+      if (on[k])
+        dofs.push_back(k);
+    e["dofs"] = dofs; // an empty set is reported as a blocking issue
+  }
+  c.result.committed = true;
+}
+
+void fixtureList(EditCtx &c, const std::string &listPointer, int loadCase) {
+  ImGui::PushID(listPointer.c_str());
+  entryCards(
+      c, listPointer,
+      [](const json &e, std::size_t i) {
+        return CardHead{entryLabel(e, "Fixture " + std::to_string(i + 1)),
+                        "fixture", "Delete this fixture.", true};
+      },
+      [&](json &e, const std::string &ptr, std::size_t) {
         if (isBareSelector(e)) {
-          kit::dimText(
-              "One face selector authored outside the editor (all three "
-              "directions fixed).");
+          kit::dimText("One face selector authored outside the editor (all "
+                       "three directions fixed).");
           if (kit::secondaryButton("Make editable")) {
             json sel = e;
             e = json{{"faces", json::array({sel})}};
             c.result.committed = true;
           }
-          tip("Wrap the selector in an editable fixture (faces + fixed "
-              "directions); the "
-              "constraint is unchanged.");
-        } else {
-          wellRow(c, ptr + "/faces",
-                  "Arm, then click the faces this fixture holds.");
-          ImGui::TextUnformatted("Fixed directions");
-          tip("Unchecked directions stay free (roller / slider supports). All "
-              "three = "
-              "fully clamped.");
-          bool on[3] = {true, true, true};
-          const json &d = member(e, "dofs");
-          if (d.is_array()) {
-            on[0] = on[1] = on[2] = false;
-            for (const json &k : d)
-              if (k.is_number_integer() && k.get<int>() >= 0 &&
-                  k.get<int>() <= 2)
-                on[k.get<int>()] = true;
-          }
-          static const char *const kDof[3] = {"X", "Y", "Z"};
-          bool changed = false;
-          for (int k = 0; k < 3; ++k) {
-            if (k)
-              ImGui::SameLine();
-            changed |= ImGui::Checkbox(kDof[k], &on[k]);
-          }
-          if (changed) {
-            if (on[0] && on[1] && on[2]) {
-              e.erase("dofs");
-            } else {
-              json dofs = json::array();
-              for (int k = 0; k < 3; ++k)
-                if (on[k])
-                  dofs.push_back(k);
-              e["dofs"] = dofs; // an empty set is reported as a blocking issue
-            }
-            c.result.committed = true;
-          }
-          issuesFor(c, ptr + "/dofs");
+          kit::itemTooltip("Wrap the selector in an editable fixture (faces + "
+                           "fixed directions); the constraint is unchanged.");
+          return;
         }
-        if (removeButton("Delete this fixture."))
-          removeAt = static_cast<int>(i);
-      }
-      kit::cardEnd();
-      ImGui::PopID();
-    }
-  if (removeAt >= 0) {
-    arr->erase(static_cast<std::size_t>(removeAt));
-    c.result.committed = true;
-    c.view.armedPointer.clear();
-    c.result.armChanged = true;
-  }
-  if (kit::secondaryButton(loadCase >= 0 ? "+ Case fixture" : "+ Fixture"))
+        kit::FieldGroup g("f", "Fixed directions");
+        wellField(c, ptr + "/faces", "The faces this fixture holds.");
+        dofField(c, e, ptr);
+      });
+  static const char *const kAdd[1] = {"+ Fixture"};
+  static const char *const kShared[1] = {"A support shared by every load case."};
+  static const char *const kCase[1] = {
+      "A support active only in this load case (added to the shared ones)."};
+  if (addButtons("add", kAdd, loadCase >= 0 ? kCase : kShared, 1) == 0) {
+    if (loadCase >= 0)
+      c.view.loadCase = loadCase;
     armNew(c, addEntry(c.study, EntryKind::Fixture, loadCase));
-  tip(loadCase >= 0 ? "A support active only in this load case (added to the "
-                      "shared ones)."
-                    : "A support shared by every load case.");
+  }
+  ImGui::PopID();
 }
 
 void loadList(EditCtx &c, const std::string &listPointer, int loadCase) {
-  json *arr = nullptr;
-  try {
-    const json::json_pointer p(listPointer);
-    if (c.study.contains(p) && c.study[p].is_array())
-      arr = &c.study[p];
-  } catch (...) {
+  // The load type is chosen at creation (+ Force / + Pressure) and fixed, as
+  // in FEA studies: the card title and icon carry it, no type switch.
+  static const char *const kKindTips[2] = {
+      "A total force vector, split over the faces by area.",
+      "A uniform pressure normal to the faces; positive pushes into them."};
+  ImGui::PushID(listPointer.c_str());
+  entryCards(
+      c, listPointer,
+      [](const json &e, std::size_t i) {
+        const bool pressure =
+            member(e, "type").is_string() && e["type"] == "pressure";
+        return CardHead{
+            entryLabel(e, std::string(pressure ? "Pressure " : "Force ") +
+                              std::to_string(i + 1)),
+            pressure ? "load_pressure" : "load_force", "Delete this load.",
+            true};
+      },
+      [&](json &e, const std::string &ptr, std::size_t) {
+        kit::FieldGroup g("f", "Pressure");
+        const bool pressure =
+            member(e, "type").is_string() && e["type"] == "pressure";
+        issuesFor(c, ptr + "/type"); // agent-authored type not force/pressure
+        wellField(c, ptr + "/faces", "The faces this load acts on.");
+        if (!pressure)
+          vectorField(c, "vec", ptr + "/vec", "Force",
+                      kit::FieldOpts()
+                          .withUnit(kit::unitText(c.units.force))
+                          .withScale(c.units.forceFromN)
+                          .withRequired()
+                          .withTip("Total force over the selected faces "
+                                   "(split by area)."),
+                      ptr + "/vector");
+        else
+          numberField(c, "magnitude", ptr + "/magnitude", "Pressure",
+                      kit::FieldOpts()
+                          .withUnit(kit::unitText(c.units.press))
+                          .withScale(c.units.pressFromMpa)
+                          .withRequired()
+                          .withTip("Uniform pressure; positive pushes INTO "
+                                   "the faces."));
+      });
+  static const char *const kAdd[2] = {"+ Force", "+ Pressure"};
+  const int hit = addButtons("add", kAdd, kKindTips, 2);
+  if (hit >= 0) {
+    if (loadCase >= 0)
+      c.view.loadCase = loadCase;
+    armNew(c, addEntry(c.study,
+                       hit == 0 ? EntryKind::ForceLoad : EntryKind::PressureLoad,
+                       loadCase));
   }
-  int removeAt = -1;
-  if (arr)
-    for (std::size_t i = 0; i < arr->size(); ++i) {
-      json &e = (*arr)[i];
-      const std::string ptr = listPointer + "/" + std::to_string(i);
-      ImGui::PushID(ptr.c_str());
-      const bool pressure =
-          member(e, "type").is_string() && e["type"] == "pressure";
-      const std::string title = entryLabel(
-          e, (pressure ? "Pressure " : "Force ") + std::to_string(i + 1));
-      if (kit::cardBegin("load", title.c_str(),
-                         pressure ? "load_pressure" : "load_force")) {
-        wellRow(c, ptr + "/faces",
-                "Arm, then click the faces this load acts on.");
-        int kind = pressure ? 1 : 0;
-        static const char *const kKinds[2] = {"Force", "Pressure"};
-        if (kit::segmented("kind", kKinds, 2, &kind)) {
-          e["type"] = kind == 1 ? "pressure" : "force";
-          c.result.committed = true;
-        }
-        if (kind == 0) {
-          vectorField(c, ptr + "/vec", "Force vector", e, "vec",
-                      c.units.forceFromN, c.units.force,
-                      "Total force over the selected faces (split by area).",
-                      "vector");
-          issuesFor(c, ptr + "/vec");
-        } else {
-          numberField(c, ptr + "/magnitude", "Pressure", e, "magnitude",
-                      c.units.pressFromMpa, c.units.press,
-                      "Uniform pressure; positive pushes INTO the faces.");
-          issuesFor(c, ptr + "/magnitude");
-        }
-        issuesFor(c, ptr + "/type");
-        if (removeButton("Delete this load."))
-          removeAt = static_cast<int>(i);
-      }
-      kit::cardEnd();
-      ImGui::PopID();
-    }
-  if (removeAt >= 0) {
-    arr->erase(static_cast<std::size_t>(removeAt));
-    c.result.committed = true;
-    c.view.armedPointer.clear();
-    c.result.armChanged = true;
-  }
-  if (kit::secondaryButton(loadCase >= 0 ? "+ Force##case" : "+ Force"))
-    armNew(c, addEntry(c.study, EntryKind::ForceLoad, loadCase));
-  ImGui::SameLine();
-  if (kit::secondaryButton(loadCase >= 0 ? "+ Pressure##case" : "+ Pressure"))
-    armNew(c, addEntry(c.study, EntryKind::PressureLoad, loadCase));
+  ImGui::PopID();
 }
 
-void structuralSection(EditCtx &c, const std::string &physics) {
-  kit::sectionHeader("Supports", "fixture");
-  fixtureList(c, "/fixtures", -1);
-  issuesFor(c, "/fixtures");
-  if (physics == "modal") {
-    kit::dimText("Modal topology uses supports only; loads do not apply.");
-    return;
-  }
+void loadCases(EditCtx &c) {
   json &study = c.study;
-  const bool haveCases = study.contains("load_cases") &&
-                         study["load_cases"].is_array() &&
-                         !study["load_cases"].empty();
-  kit::sectionHeader("Loads", "load_force");
-  if (!haveCases) {
-    loadList(c, "/loads", -1);
-    issuesFor(c, "/loads");
-    kit::gapRow();
-    if (kit::secondaryButton("Use multiple load cases")) {
-      json cases = json::array();
-      json first = json::object();
-      first["name"] = "Case 1";
-      first["weight"] = 1.0;
-      first["loads"] = study.contains("loads") && study["loads"].is_array()
-                           ? study["loads"]
-                           : json::array();
-      cases.push_back(std::move(first));
-      study["load_cases"] = std::move(cases);
-      study.erase("loads");
-      c.view.loadCase = 0;
-      c.view.armedPointer.clear();
-      c.result.armChanged = true;
-      c.result.committed = true;
-    }
-    tip("Optimize for several independent load cases with weights. The current "
-        "loads "
-        "become Case 1 (weight 1, identical to today's single case).");
-    return;
-  }
   // Shared loads left over next to cases are ambiguous: offer the explicit
   // move.
-  if (study.contains("loads") && study["loads"].is_array() &&
-      !study["loads"].empty()) {
+  if (countAt(study, "/loads") > 0) {
     issuesFor(c, "/loads");
     if (kit::secondaryButton("Move shared loads into Case 1")) {
       json &cl = study["load_cases"][0]["loads"];
@@ -1836,52 +2273,52 @@ void structuralSection(EditCtx &c, const std::string &physics) {
       c.result.committed = true;
     }
   }
+  const std::size_t caseCount = study["load_cases"].size();
+  ImGui::PushID("cases");
+  entryCards(
+      c, "/load_cases",
+      [caseCount](const json &cs, std::size_t i) {
+        return CardHead{entryLabel(cs, "Case " + std::to_string(i + 1)),
+                        "load_force", "Delete this load case.",
+                        caseCount > 1};
+      },
+      [&](json &, const std::string &base, std::size_t ci) {
+        {
+          kit::FieldGroup g("f", "Weight");
+          textField(c, "name", base + "/name", "Name",
+                    kit::FieldOpts().withRequired().withTip(
+                        "Unique load-case name."));
+          numberField(c, "weight", base + "/weight", "Weight",
+                      kit::FieldOpts().withHint("1 (default)").withTip(
+                          "Positive weight of this case in the weighted "
+                          "objective."));
+        }
+        focusAnchor(c, base + "/fixtures");
+        kit::sectionHeader("Supports in this case", "fixture", "optional",
+                           countAt(c.study, base + "/fixtures"));
+        fixtureList(c, base + "/fixtures", static_cast<int>(ci));
+        focusAnchor(c, base + "/loads");
+        kit::sectionHeader("Loads in this case", "load_force", nullptr,
+                           countAt(c.study, base + "/loads"));
+        loadList(c, base + "/loads", static_cast<int>(ci));
+        issuesFor(c, base + "/loads");
+      });
+  static const char *const kAdd[2] = {"+ Load case", "Back to a single case"};
+  static const char *const kTips[2] = {
+      "A new case needs its own loads; weight is optional (solver default 1).",
+      "Return to one shared set of loads (this case's supports join the "
+      "shared ones)."};
   json &cases = study["load_cases"];
-  int removeCase = -1;
-  for (std::size_t ci = 0; ci < cases.size(); ++ci) {
-    json &cs = cases[ci];
-    const std::string base = "/load_cases/" + std::to_string(ci);
-    ImGui::PushID(base.c_str());
-    const std::string title = entryLabel(cs, "Case " + std::to_string(ci + 1));
-    if (kit::cardBegin("case", title.c_str(), "load_force")) {
-      textField(c, base + "/name", "Name", cs, "name",
-                "Unique load-case name.");
-      issuesFor(c, base + "/name");
-      numberField(c, base + "/weight", "Weight", cs, "weight", 1.0, "",
-                  "Positive weight of this case in the weighted objective.",
-                  "solver default 1");
-      issuesFor(c, base + "/weight");
-      ImGui::TextUnformatted("Case supports (optional)");
-      fixtureList(c, base + "/fixtures", static_cast<int>(ci));
-      ImGui::TextUnformatted("Case loads");
-      loadList(c, base + "/loads", static_cast<int>(ci));
-      issuesFor(c, base + "/loads");
-      if (cases.size() > 1 && removeButton("Delete this load case."))
-        removeCase = static_cast<int>(ci);
-    }
-    kit::cardEnd();
-    ImGui::PopID();
-  }
-  if (removeCase >= 0) {
-    cases.erase(static_cast<std::size_t>(removeCase));
-    c.view.armedPointer.clear();
-    c.result.armChanged = true;
-    c.result.committed = true;
-  }
-  if (kit::secondaryButton("+ Load case")) {
+  const int hit = addButtons("add", kAdd, kTips, cases.size() == 1 ? 2 : 1);
+  if (hit == 0) {
     json cs = json::object();
     cs["name"] = "Case " + std::to_string(cases.size() + 1);
     cs["loads"] = json::array();
     cases.push_back(std::move(cs));
     c.result.committed = true;
-  }
-  tip("A new case needs its own loads; weight is optional (solver default 1).");
-  if (cases.size() == 1 && kit::secondaryButton("Back to a single case")) {
+  } else if (hit == 1) {
     json loads = cases[0].contains("loads") ? cases[0]["loads"] : json::array();
-    const bool hasCaseFixtures = cases[0].contains("fixtures") &&
-                                 cases[0]["fixtures"].is_array() &&
-                                 !cases[0]["fixtures"].empty();
-    if (hasCaseFixtures) {
+    if (countAt(cases[0], "/fixtures") > 0) {
       json &fx = study["fixtures"];
       if (!fx.is_array())
         fx = json::array();
@@ -1890,405 +2327,539 @@ void structuralSection(EditCtx &c, const std::string &physics) {
     }
     study["loads"] = std::move(loads);
     study.erase("load_cases");
+    c.view.loadCase = -1;
     c.view.armedPointer.clear();
     c.result.armChanged = true;
     c.result.committed = true;
   }
+  ImGui::PopID();
+}
+
+void structuralSection(EditCtx &c, const std::string &physics) {
+  focusAnchor(c, "/fixtures");
+  kit::sectionHeader("Supports", "fixture", nullptr,
+                     countAt(c.study, "/fixtures"), true);
+  fixtureList(c, "/fixtures", -1);
+  issuesFor(c, "/fixtures");
+  if (physics == "modal") {
+    kit::inlineStatus("Modal topology uses supports only; loads do not apply.",
+                      kit::Tone::Info);
+    return;
+  }
+  json &study = c.study;
+  if (countAt(study, "/load_cases") > 0) {
+    focusAnchor(c, "/load_cases");
+    kit::sectionHeader("Load cases", "load_force", nullptr,
+                       countAt(study, "/load_cases"));
+    loadCases(c);
+    return;
+  }
+  focusAnchor(c, "/loads");
+  kit::sectionHeader("Loads", "load_force", nullptr, countAt(study, "/loads"));
+  loadList(c, "/loads", -1);
+  issuesFor(c, "/loads");
+  ImGui::PushID("cases");
+  static const char *const kMulti[1] = {"Use multiple load cases"};
+  static const char *const kMultiTip[1] = {
+      "Optimize for several independent load cases with weights. The current "
+      "loads become Case 1 (weight 1, identical to today's single case)."};
+  if (addButtons("multi", kMulti, kMultiTip, 1) == 0) {
+    json first = json::object();
+    first["name"] = "Case 1";
+    first["weight"] = 1.0;
+    first["loads"] = countAt(study, "/loads") > 0 ? study["loads"] : json::array();
+    study["load_cases"] = json::array({std::move(first)});
+    study.erase("loads");
+    c.view.loadCase = 0;
+    c.view.armedPointer.clear();
+    c.result.armChanged = true;
+    c.result.committed = true;
+  }
+  ImGui::PopID();
 }
 
 // ---- thermal
 // ----------------------------------------------------------------------------------------
 void thermalSection(EditCtx &c, const std::string &physics) {
-  json &th = ensureObject(c.study, "thermal");
-  kit::sectionHeader("Thermal", "study_thermal");
-  numberField(c, "/thermal/reference_temperature_c",
-              physics == "thermomechanical"
-                  ? "Reference (strain-free) temperature"
-                  : "Reference temperature",
-              th, "reference_temperature_c", 1.0, "degC",
-              "Temperature of zero thermal strain and of unconstrained nodes.",
-              physics == "thermomechanical" ? "required" : "optional");
-  issuesFor(c, "/thermal/reference_temperature_c");
+  const bool tm = physics == "thermomechanical";
+  if (tm)
+    kit::gapSection(); // below the structural supports and loads
+  const float cardTop = ImGui::GetCursorScreenPos().y;
+  if (kit::cardBegin("thermal_ref", "Thermal", "load_heat")) {
+    kit::FieldGroup g("ref", "Reference temperature");
+    kit::FieldOpts o = kit::FieldOpts()
+                           .withUnit(kit::Unit::DegC)
+                           .withRequired(tm)
+                           .withTip(tm ? "Temperature of zero thermal strain "
+                                         "and of unconstrained nodes."
+                                       : "Temperature of unconstrained nodes.");
+    if (!tm)
+      o.withHint("optional");
+    numberField(c, "ref_t", "/thermal/reference_temperature_c",
+                tm ? "Strain-free temperature" : "Reference temperature", o);
+  }
+  issuesFor(c, "/thermal");
+  kit::cardEnd();
+  focusCard(c, cardTop,
+            {c.view.focusPointer == "/thermal"
+                 ? "/thermal"
+                 : "/thermal/reference_temperature_c"});
 
-  kit::sectionHeader("Fixed temperatures", "fixture");
-  json &fx = th["fixtures"];
-  if (!fx.is_array())
-    fx = json::array();
-  int removeAt = -1;
-  for (std::size_t i = 0; i < fx.size(); ++i) {
-    const std::string ptr = "/thermal/fixtures/" + std::to_string(i);
-    ImGui::PushID(ptr.c_str());
-    const std::string title =
-        entryLabel(fx[i], "Fixed temperature " + std::to_string(i + 1));
-    if (kit::cardBegin("tfix", title.c_str(), "fixture")) {
-      wellRow(c, ptr + "/faces", "Faces held at a fixed temperature.");
-      numberField(c, ptr + "/temperature_c", "Temperature", fx[i],
-                  "temperature_c", 1.0, "degC",
-                  "Prescribed surface temperature.");
-      issuesFor(c, ptr + "/temperature_c");
-      if (removeButton("Delete this fixed temperature."))
-        removeAt = static_cast<int>(i);
-    }
-    kit::cardEnd();
-    ImGui::PopID();
-  }
-  if (removeAt >= 0) {
-    fx.erase(static_cast<std::size_t>(removeAt));
-    c.view.armedPointer.clear();
-    c.result.armChanged = true;
-    c.result.committed = true;
-  }
-  if (kit::secondaryButton("+ Fixed temperature"))
+  focusAnchor(c, "/thermal/fixtures");
+  kit::sectionHeader("Fixed temperatures", "fixture", nullptr,
+                     countAt(c.study, "/thermal/fixtures"));
+  ImGui::PushID("tfix");
+  entryCards(
+      c, "/thermal/fixtures",
+      [](const json &e, std::size_t i) {
+        return CardHead{
+            entryLabel(e, "Fixed temperature " + std::to_string(i + 1)),
+            "fixture", "Delete this fixed temperature.", true};
+      },
+      [&](json &, const std::string &ptr, std::size_t) {
+        kit::FieldGroup g("f", "Temperature");
+        wellField(c, ptr + "/faces", "Faces held at a fixed temperature.");
+        numberField(c, "t", ptr + "/temperature_c", "Temperature",
+                    kit::FieldOpts()
+                        .withUnit(kit::Unit::DegC)
+                        .withRequired()
+                        .withTip("Prescribed surface temperature."));
+      });
+  static const char *const kAddFix[1] = {"+ Fixed temperature"};
+  static const char *const kAddFixTip[1] = {
+      "Faces held at a prescribed temperature."};
+  if (addButtons("add", kAddFix, kAddFixTip, 1) == 0)
     armNew(c, addEntry(c.study, EntryKind::ThermalFixture));
   issuesFor(c, "/thermal/fixtures");
+  ImGui::PopID();
 
-  kit::sectionHeader("Heat loads", "study_thermal");
-  json &th2 =
-      c.study["thermal"]; // addEntry may have rebuilt nothing, but re-read
-  json &ld = th2["loads"];
-  if (!ld.is_array())
-    ld = json::array();
-  removeAt = -1;
+  // The heat-load type is chosen at creation (+ Flux / + Power / + Convection)
+  // and fixed: the card title carries it, no type switch.
   static const char *const kKinds[3] = {"Flux", "Power", "Convection"};
-  for (std::size_t i = 0; i < ld.size(); ++i) {
-    json &e = ld[i];
-    const std::string ptr = "/thermal/loads/" + std::to_string(i);
-    ImGui::PushID(ptr.c_str());
-    const std::string type =
-        member(e, "type").is_string() ? e["type"].get<std::string>() : "";
-    int kind = type == "power" ? 1 : type == "convection" ? 2 : 0;
-    const std::string title =
-        entryLabel(e, std::string(kKinds[kind]) + " " + std::to_string(i + 1));
-    if (kit::cardBegin("tload", title.c_str(), "study_thermal")) {
-      wellRow(c, ptr + "/faces", "Faces this heat boundary acts on.");
-      if (kit::segmented("kind", kKinds, 3, &kind)) {
-        e["type"] = kind == 1 ? "power" : kind == 2 ? "convection" : "flux";
-        c.result.committed = true;
-      }
-      if (kind == 0) {
-        numberField(c, ptr + "/magnitude_w_m2", "Heat flux", e,
-                    "magnitude_w_m2", 1.0, "W/m2",
-                    "Heat flux into the faces (negative = out).");
-        issuesFor(c, ptr + "/magnitude_w_m2");
-      } else if (kind == 1) {
-        numberField(c, ptr + "/power_w", "Power", e, "power_w", 1.0, "W",
-                    "Total heat power over the faces, spread by area.");
-        issuesFor(c, ptr + "/power_w");
-      } else {
-        numberField(c, ptr + "/h_w_m2k", "Film coefficient", e, "h_w_m2k", 1.0,
-                    "W/m2K", "Convective heat-transfer coefficient h.");
-        issuesFor(c, ptr + "/h_w_m2k");
-        numberField(c, ptr + "/ambient_c", "Ambient temperature", e,
-                    "ambient_c", 1.0, "degC",
-                    "Temperature of the surrounding fluid.");
-        issuesFor(c, ptr + "/ambient_c");
-      }
-      issuesFor(c, ptr + "/type");
-      if (removeButton("Delete this heat load."))
-        removeAt = static_cast<int>(i);
-    }
-    kit::cardEnd();
-    ImGui::PopID();
-  }
-  if (removeAt >= 0) {
-    ld.erase(static_cast<std::size_t>(removeAt));
-    c.view.armedPointer.clear();
-    c.result.armChanged = true;
-    c.result.committed = true;
-  }
-  if (kit::secondaryButton("+ Flux"))
-    armNew(c, addEntry(c.study, EntryKind::ThermalFlux));
-  ImGui::SameLine();
-  if (kit::secondaryButton("+ Power"))
-    armNew(c, addEntry(c.study, EntryKind::ThermalPower));
-  ImGui::SameLine();
-  if (kit::secondaryButton("+ Convection"))
-    armNew(c, addEntry(c.study, EntryKind::ThermalConvection));
+  static const char *const kKindTips[3] = {
+      "Heat flux per unit area into the faces (negative = out).",
+      "Total heat power over the faces, spread by area.",
+      "Convection to a surrounding fluid: film coefficient and ambient "
+      "temperature."};
+  auto kindOf = [](const json &e) {
+    const json &t = member(e, "type");
+    const std::string type = t.is_string() ? t.get<std::string>() : "";
+    return type == "power" ? 1 : type == "convection" ? 2 : 0;
+  };
+  focusAnchor(c, "/thermal/loads");
+  kit::sectionHeader("Heat loads", "load_heat", nullptr,
+                     countAt(c.study, "/thermal/loads"));
+  ImGui::PushID("tload");
+  entryCards(
+      c, "/thermal/loads",
+      [&](const json &e, std::size_t i) {
+        return CardHead{entryLabel(e, std::string(kKinds[kindOf(e)]) + " " +
+                                          std::to_string(i + 1)),
+                        "load_heat", "Delete this heat load.", true};
+      },
+      [&](json &e, const std::string &ptr, std::size_t) {
+        kit::FieldGroup g("f", "Ambient temperature");
+        const int kind = kindOf(e);
+        issuesFor(c, ptr + "/type"); // agent-authored type not flux/power/convection
+        wellField(c, ptr + "/faces", "Faces this heat boundary acts on.");
+        if (kind == 0) {
+          numberField(c, "flux", ptr + "/magnitude_w_m2", "Heat flux",
+                      kit::FieldOpts()
+                          .withUnit(kit::Unit::W_m2)
+                          .withRequired()
+                          .withTip("Heat flux into the faces (negative = out)."));
+        } else if (kind == 1) {
+          numberField(c, "power", ptr + "/power_w", "Power",
+                      kit::FieldOpts()
+                          .withUnit(kit::Unit::W)
+                          .withRequired()
+                          .withTip("Total heat power over the faces, spread "
+                                   "by area."));
+        } else {
+          numberField(c, "h", ptr + "/h_w_m2k", "Film coefficient",
+                      kit::FieldOpts()
+                          .withUnit(kit::Unit::W_m2K)
+                          .withRequired()
+                          .withTip("Convective heat-transfer coefficient h."));
+          numberField(c, "ambient", ptr + "/ambient_c", "Ambient temperature",
+                      kit::FieldOpts()
+                          .withUnit(kit::Unit::DegC)
+                          .withRequired()
+                          .withTip("Temperature of the surrounding fluid."));
+        }
+      });
+  static const char *const kAdd[3] = {"+ Flux", "+ Power", "+ Convection"};
+  const int hit = addButtons("add", kAdd, kKindTips, 3);
+  if (hit >= 0)
+    armNew(c, addEntry(c.study, hit == 0   ? EntryKind::ThermalFlux
+                                : hit == 1 ? EntryKind::ThermalPower
+                                           : EntryKind::ThermalConvection));
   issuesFor(c, "/thermal/loads");
-  issuesFor(c, "/thermal");
+  ImGui::PopID();
 }
 
 // ---- flow
 // -------------------------------------------------------------------------------------------
 void portList(EditCtx &c, const char *key, const char *title, EntryKind kind,
               const std::string &physics) {
-  json &fl = ensureObject(c.study, "flow");
-  json &arr = fl[key];
-  if (!arr.is_array())
-    arr = json::array();
-  int removeAt = -1;
-  for (std::size_t i = 0; i < arr.size(); ++i) {
-    json &e = arr[i];
-    const std::string ptr =
-        std::string("/flow/") + key + "/" + std::to_string(i);
-    ImGui::PushID(ptr.c_str());
-    const std::string t =
-        entryLabel(e, std::string(title) + " " + std::to_string(i + 1));
-    if (kit::cardBegin("port", t.c_str(), "study_flow")) {
-      wellRow(c, ptr + "/faces", "Faces of this boundary.");
-      if (kind == EntryKind::FlowInlet) {
-        vectorField(c, ptr + "/velocity_m_s", "Inflow velocity", e,
-                    "velocity_m_s", 1.0, "m/s",
-                    "Velocity imposed on the inlet faces (must point into the "
-                    "domain).");
-        issuesFor(c, ptr + "/velocity_m_s");
-        if (physics == "cht") {
-          numberField(c, ptr + "/temperature_c", "Inlet temperature", e,
-                      "temperature_c", 1.0, "degC",
-                      "Fluid temperature entering through this inlet.");
-          issuesFor(c, ptr + "/temperature_c");
+  const std::string list = std::string("/flow/") + key;
+  ImGui::PushID(key);
+  entryCards(
+      c, list,
+      [title](const json &e, std::size_t i) {
+        return CardHead{
+            entryLabel(e, std::string(title) + " " + std::to_string(i + 1)),
+            "flow_bc", "Delete this boundary.", true};
+      },
+      [&](json &, const std::string &ptr, std::size_t) {
+        kit::FieldGroup g("f", "Inlet temperature");
+        wellField(c, ptr + "/faces", "Faces of this boundary.");
+        if (kind == EntryKind::FlowInlet) {
+          vectorField(c, "u", ptr + "/velocity_m_s", "Velocity",
+                      kit::FieldOpts()
+                          .withUnit(kit::Unit::m_s)
+                          .withRequired()
+                          .withTip("Velocity imposed on the inlet faces (must "
+                                   "point into the domain)."));
+          if (physics == "cht")
+            numberField(c, "t", ptr + "/temperature_c", "Inlet temperature",
+                        kit::FieldOpts()
+                            .withUnit(kit::Unit::DegC)
+                            .withRequired()
+                            .withTip("Fluid temperature entering through "
+                                     "this inlet."));
+        } else if (kind == EntryKind::FlowOutlet) {
+          numberField(c, "p", ptr + "/pressure_pa", "Pressure",
+                      kit::FieldOpts()
+                          .withUnit(kit::Unit::Pa)
+                          .withRequired()
+                          .withTip("Static (gauge) pressure on the outlet "
+                                   "faces."));
         }
-      } else if (kind == EntryKind::FlowOutlet) {
-        numberField(c, ptr + "/pressure_pa", "Outlet pressure", e,
-                    "pressure_pa", 1.0, "Pa",
-                    "Static (gauge) pressure on the outlet faces.");
-        issuesFor(c, ptr + "/pressure_pa");
-      }
-      if (removeButton("Delete this boundary."))
-        removeAt = static_cast<int>(i);
-    }
-    kit::cardEnd();
-    ImGui::PopID();
-  }
-  if (removeAt >= 0) {
-    arr.erase(static_cast<std::size_t>(removeAt));
-    c.view.armedPointer.clear();
-    c.result.armChanged = true;
-    c.result.committed = true;
-  }
+      });
   const std::string add = std::string("+ ") + title;
-  if (kit::secondaryButton(add.c_str()))
+  const char *labels[1] = {add.c_str()};
+  const char *tips[1] = {kind == EntryKind::FlowInlet
+                             ? "A velocity inlet."
+                         : kind == EntryKind::FlowOutlet
+                             ? "A pressure outlet."
+                             : "Every exterior face that is not an inlet or "
+                               "outlet is already a no-slip wall; a named wall "
+                               "only labels a subset."};
+  if (addButtons("add", labels, tips, 1) == 0)
     armNew(c, addEntry(c.study, kind));
-  issuesFor(c, std::string("/flow/") + key);
+  issuesFor(c, list);
+  ImGui::PopID();
 }
 
 void flowSection(EditCtx &c, const std::string &physics) {
-  json &fl = ensureObject(c.study, "flow");
-  kit::sectionHeader("Fluid", "study_flow");
-  numberField(c, "/flow/viscosity_pa_s", "Dynamic viscosity", fl,
-              "viscosity_pa_s", 1.0, "Pa s",
-              "Fluid dynamic viscosity mu (water ~1.0e-3, air ~1.8e-5).");
-  issuesFor(c, "/flow/viscosity_pa_s");
-  numberField(c, "/flow/density_kg_m3", "Density", fl, "density_kg_m3", 1.0,
-              "kg/m3", "Fluid density.");
-  issuesFor(c, "/flow/density_kg_m3");
-  if (physics == "cht") {
-    numberField(c, "/flow/fluid_k_w_mk", "Fluid conductivity", fl,
-                "fluid_k_w_mk", 1.0, "W/mK",
-                "Thermal conductivity of the fluid.");
-    issuesFor(c, "/flow/fluid_k_w_mk");
-    numberField(c, "/flow/fluid_cp_j_kgk", "Fluid specific heat", fl,
-                "fluid_cp_j_kgk", 1.0, "J/kgK",
-                "Specific heat capacity of the fluid.");
-    issuesFor(c, "/flow/fluid_cp_j_kgk");
+  const bool cht = physics == "cht";
+  if (cht)
+    kit::gapSection(); // below the thermal boundaries
+  const float cardTop = ImGui::GetCursorScreenPos().y;
+  if (kit::cardBegin("fluid", "Fluid", "fluid")) {
+    {
+      kit::FieldGroup g("fluid", "Fluid conductivity");
+      numberField(c, "mu", "/flow/viscosity_pa_s", "Dynamic viscosity",
+                  kit::FieldOpts()
+                      .withUnit(kit::Unit::Pa_s)
+                      .withRequired()
+                      .withTip("Fluid dynamic viscosity (water ~1.0e-3, air "
+                               "~1.8e-5)."));
+      numberField(c, "rho", "/flow/density_kg_m3", "Density",
+                  kit::FieldOpts()
+                      .withUnit(kit::Unit::kg_m3)
+                      .withRequired()
+                      .withTip("Fluid density."));
+      if (cht) {
+        numberField(c, "k", "/flow/fluid_k_w_mk", "Fluid conductivity",
+                    kit::FieldOpts()
+                        .withUnit(kit::Unit::W_mK)
+                        .withRequired()
+                        .withTip("Thermal conductivity of the fluid."));
+        numberField(c, "cp", "/flow/fluid_cp_j_kgk", "Fluid specific heat",
+                    kit::FieldOpts()
+                        .withUnit(kit::Unit::J_kgK)
+                        .withRequired()
+                        .withTip("Specific heat capacity of the fluid."));
+      }
+      numberField(c, "brinkman", "/flow/brinkman_max", "Brinkman maximum",
+                  kit::FieldOpts()
+                      .withHint("solver default")
+                      .withTip("Dimensionless solid impermeability (alpha_max "
+                               "= value * mu / L^2)."));
+      numberField(c, "lref", "/flow/reference_length_mm", "Reference length",
+                  kit::FieldOpts()
+                      .withUnit(kit::unitText(c.units.len))
+                      .withScale(c.units.lenFromMm)
+                      .withHint("solver default")
+                      .withTip("Length L for the Brinkman scale and the "
+                               "reported Reynolds number."));
+    }
+    kit::dimText("Laminar (Stokes / Navier-Stokes Brinkman) flow; the "
+                 "reported Reynolds number is regime evidence, not a "
+                 "turbulence model.");
+    issuesFor(c, "/flow");
   }
-  numberField(
-      c, "/flow/brinkman_max", "Brinkman maximum", fl, "brinkman_max", 1.0, "",
-      "Dimensionless solid impermeability (alpha_max = value * mu / L^2).",
-      "solver default");
-  issuesFor(c, "/flow/brinkman_max");
-  numberField(
-      c, "/flow/reference_length_mm", "Reference length", fl,
-      "reference_length_mm", c.units.lenFromMm, c.units.len,
-      "Length L for the Brinkman scale and the reported Reynolds number.",
-      "solver default");
-  issuesFor(c, "/flow/reference_length_mm");
-  kit::dimText("Laminar (Stokes/Navier-Stokes Brinkman) flow; the reported "
-               "Reynolds number "
-               "is regime evidence, not a turbulence model.");
-  issuesFor(c, "/flow");
+  kit::cardEnd();
+  if (c.view.focusPointer == "/flow")
+    focusCard(c, cardTop, {"/flow"});
+  else
+    focusCard(c, cardTop,
+              {"/flow/viscosity_pa_s", "/flow/density_kg_m3",
+               "/flow/fluid_k_w_mk", "/flow/fluid_cp_j_kgk",
+               "/flow/brinkman_max", "/flow/reference_length_mm"});
 
-  kit::sectionHeader("Inlets", "study_flow");
+  focusAnchor(c, "/flow/inlets");
+  kit::sectionHeader("Inlets", "flow_bc", nullptr,
+                     countAt(c.study, "/flow/inlets"));
   portList(c, "inlets", "Inlet", EntryKind::FlowInlet, physics);
-  kit::sectionHeader("Outlets", "study_flow");
+  focusAnchor(c, "/flow/outlets");
+  kit::sectionHeader("Outlets", "flow_bc", nullptr,
+                     countAt(c.study, "/flow/outlets"));
   portList(c, "outlets", "Outlet", EntryKind::FlowOutlet, physics);
-  kit::sectionHeader("Walls (optional labels)", "study_flow");
-  kit::dimText("Every exterior face that is not an inlet or outlet is a "
-               "no-slip wall. Named "
-               "walls only label a subset.");
+  focusAnchor(c, "/flow/walls");
+  kit::sectionHeader("Walls", "flow_bc", "optional",
+                     countAt(c.study, "/flow/walls"));
   portList(c, "walls", "Wall", EntryKind::FlowWall, physics);
 }
 
 // ---- regions
 // ----------------------------------------------------------------------------------------
 void regionList(EditCtx &c, const char *key, bool preserve) {
-  json &arr = c.study[key];
-  if (!arr.is_array())
-    arr = json::array();
+  const std::string list = std::string("/") + key;
   const char *title = preserve ? "Preserve" : "Exclude";
-  int removeAt = -1;
-  for (std::size_t i = 0; i < arr.size(); ++i) {
-    json &e = arr[i];
-    const std::string ptr = std::string("/") + key + "/" + std::to_string(i);
-    ImGui::PushID(ptr.c_str());
-    const bool band = e.contains("faces");
-    const std::string t =
-        entryLabel(e, std::string(title) + (band ? " band " : " box ") +
-                          std::to_string(i + 1));
-    if (kit::cardBegin("region", t.c_str(), nullptr)) {
-      if (band) {
-        wellRow(c, ptr + "/faces",
-                preserve ? "Faces whose adjacent material always stays solid."
-                         : "Faces whose adjacent material is always removed "
-                           "(keep-out).");
-        numberField(
-            c, ptr + "/thickness_mm", "Band depth", e, "thickness_mm",
-            c.units.lenFromMm, c.units.len,
-            "Depth below the faces held fixed. Empty uses the study's default "
-            "region depth (Manufacturing settings).",
-            "study default");
-        issuesFor(c, ptr + "/thickness_mm");
-      } else {
-        vectorField(c, ptr + "/box_min_mm", "Box minimum corner", e,
-                    "box_min_mm", c.units.lenFromMm, c.units.len,
-                    "Elements whose centroid lies inside the box are fixed.");
-        vectorField(c, ptr + "/box_max_mm", "Box maximum corner", e,
-                    "box_max_mm", c.units.lenFromMm, c.units.len,
-                    "Opposite corner of the box.");
-        issuesFor(c, ptr);
-      }
-      if (removeButton("Delete this region."))
-        removeAt = static_cast<int>(i);
-    }
-    kit::cardEnd();
-    ImGui::PopID();
-  }
-  if (removeAt >= 0) {
-    arr.erase(static_cast<std::size_t>(removeAt));
-    c.view.armedPointer.clear();
-    c.result.armChanged = true;
-    c.result.committed = true;
-  }
-  const std::string addBand = std::string("+ Face band##") + key;
-  const std::string addBox = std::string("+ Box##") + key;
-  if (kit::secondaryButton(addBand.c_str()))
+  ImGui::PushID(key);
+  entryCards(
+      c, list,
+      [title, preserve](const json &e, std::size_t i) {
+        const bool band = e.is_object() && e.contains("faces");
+        return CardHead{entryLabel(e, std::string(title) +
+                                          (band ? " band " : " box ") +
+                                          std::to_string(i + 1)),
+                        preserve ? "combine" : "subtract", "Delete this region.",
+                        true};
+      },
+      [&](json &e, const std::string &ptr, std::size_t) {
+        kit::FieldGroup g("f", "Minimum corner");
+        const kit::FieldOpts len = kit::FieldOpts()
+                                       .withUnit(kit::unitText(c.units.len))
+                                       .withScale(c.units.lenFromMm);
+        if (e.is_object() && e.contains("faces")) {
+          wellField(c, ptr + "/faces",
+                    preserve ? "Faces whose adjacent material always stays "
+                               "solid."
+                             : "Faces whose adjacent material is always "
+                               "removed (keep-out).");
+          numberField(c, "depth", ptr + "/thickness_mm", "Band depth",
+                      kit::FieldOpts(len)
+                          .withHint("Auto")
+                          .withTip("Depth below the faces held fixed. Empty "
+                                   "uses the study's default region depth "
+                                   "(Manufacturing settings)."));
+        } else {
+          vectorField(c, "min", ptr + "/box_min_mm", "Minimum corner",
+                      kit::FieldOpts(len).withRequired().withTip(
+                          "Elements whose centroid lies inside the box are "
+                          "fixed."));
+          vectorField(c, "max", ptr + "/box_max_mm", "Maximum corner",
+                      kit::FieldOpts(len).withRequired().withTip(
+                          "Opposite corner of the box."));
+          issuesFor(c, ptr);
+        }
+      });
+  static const char *const kAdd[2] = {"+ Face band", "+ Box"};
+  static const char *const kPreserveTips[2] = {
+      "Keep a layer of material under picked faces. Fixture, load and "
+      "flow-port faces are already kept (solid, or fluid for ports).",
+      "Keep every element inside an axis-aligned box."};
+  static const char *const kExcludeTips[2] = {
+      "Remove a layer of material under picked faces.",
+      "Remove every element inside an axis-aligned box."};
+  const int hit =
+      addButtons("add", kAdd, preserve ? kPreserveTips : kExcludeTips, 2);
+  if (hit == 0) {
     armNew(c, addEntry(c.study, preserve ? EntryKind::PreserveFaces
                                          : EntryKind::ExcludeFaces));
-  ImGui::SameLine();
-  if (kit::secondaryButton(addBox.c_str())) {
-    addEntry(c.study,
-             preserve ? EntryKind::PreserveBox : EntryKind::ExcludeBox);
+  } else if (hit == 1) {
+    addEntry(c.study, preserve ? EntryKind::PreserveBox : EntryKind::ExcludeBox);
+    // The new box has no well to arm; still bring its card into view.
+    const int n = countAt(c.study, list);
+    if (n > 0) {
+      c.view.focusPointer = idx(list.c_str(), static_cast<std::size_t>(n - 1));
+      c.view.focusFrames = 0;
+    }
     c.result.committed = true;
   }
-  issuesFor(c, std::string("/") + key);
+  issuesFor(c, list);
+  ImGui::PopID();
 }
 
 void regionsSection(EditCtx &c) {
-  kit::sectionHeader("Preserve (always solid)", nullptr, nullptr, -1, true);
-  kit::dimText(
-      "Fixture, load and flow-port faces stay solid (or fluid for ports) "
-      "automatically; add bands or boxes for other keep-in regions.");
+  // The step's readiness dot names a region problem: say it on the page too
+  // (the offending card may be below the fold) — unless it is the run's first
+  // blocker, which the footer already shows.
+  const Issue *first = nullptr;
+  for (const Issue &i : c.issues)
+    if (i.severity == Severity::Blocking && !first)
+      first = &i;
+  for (const Issue &i : c.issues)
+    if (i.severity == Severity::Blocking &&
+        (i.key.rfind("/preserve", 0) == 0 || i.key.rfind("/exclude", 0) == 0)) {
+      if (&i != first)
+        kit::inlineStatus(i.message.c_str(), kit::Tone::Warn);
+      break;
+    }
+  focusAnchor(c, "/preserve");
+  kit::sectionHeader("Preserve", "combine", "Always solid",
+                     countAt(c.study, "/preserve"), true);
   regionList(c, "preserve", true);
-  kit::sectionHeader("Exclude (keep-out)");
+  focusAnchor(c, "/exclude");
+  kit::sectionHeader("Exclude", "subtract", "Keep-out",
+                     countAt(c.study, "/exclude"));
   regionList(c, "exclude", false);
 }
 
 // ---- material
 // ---------------------------------------------------------------------------------------
 struct MatKeyInfo {
-  const char *key, *label, *unit, *help;
+  const char *key, *label;
+  kit::Unit unit;
+  bool stress; // shown in the study's stress unit (MPa or psi)
+  const char *help;
 };
 const MatKeyInfo kMatInfo[] = {
-    {"E_mpa", "Young's modulus", "MPa", "Elastic modulus of the solid phase."},
-    {"nu", "Poisson's ratio", "", "Lateral contraction ratio (-1 < nu < 0.5)."},
-    {"yield_mpa", "Yield strength", "MPa",
+    {"E_mpa", "Young's modulus", kit::Unit::MPa, true,
+     "Elastic modulus of the solid phase."},
+    {"nu", "Poisson's ratio", kit::Unit::None, false,
+     "Lateral contraction ratio (-1 < nu < 0.5)."},
+    {"yield_mpa", "Yield strength", kit::Unit::MPa, true,
      "Used for stress reporting / limits."},
-    {"density_g_cm3", "Density", "g/cm3",
+    {"density_g_cm3", "Density", kit::Unit::g_cm3, false,
      "Mass density (mass and modal physics)."},
-    {"k_w_mk", "Thermal conductivity", "W/mK",
+    {"k_w_mk", "Thermal conductivity", kit::Unit::W_mK, false,
      "Solid conductivity (thermal physics)."},
-    {"alpha_per_k", "Thermal expansion", "1/K",
+    {"alpha_per_k", "Thermal expansion", kit::Unit::perK, false,
      "Linear expansion coefficient (thermomechanical)."},
-    {"cp_j_kgk", "Specific heat", "J/kgK", "Solid specific heat capacity."},
+    {"cp_j_kgk", "Specific heat", kit::Unit::J_kgK, false,
+     "Solid specific heat capacity."},
 };
+
+std::string materialKey(const json &m) {
+  if (m.is_string())
+    return m.get<std::string>();
+  const json &k = member(m, "key");
+  return k.is_string() ? k.get<std::string>() : std::string();
+}
 
 void materialSection(
     EditCtx &c, const MaterialLookup &lookup,
     const std::vector<std::pair<std::string, std::string>> &library,
     const std::string &physics) {
   // Work on a copy so drawing never inserts a null `material` into an authored
-  // record.
-  json m = c.study.contains("material") ? c.study["material"] : json();
-  const bool committedBefore = c.result.committed;
-  c.result.committed = false;
-  std::string key;
-  if (m.is_string())
-    key = m.get<std::string>();
-  else if (member(m, "key").is_string())
-    key = m["key"].get<std::string>();
-  std::string preview = "Custom (no library entry)";
-  for (const auto &kv : library)
-    if (kv.first == key)
-      preview = kv.second;
+  // record; it is written back only on a commit.
+  const json *cur = jsonAt(c.study, "/material");
+  json m = cur ? *cur : json();
+  std::string key = materialKey(m);
+  const std::vector<std::string> required = requiredMaterialKeys(physics);
+
+  std::vector<std::string> names;
+  names.reserve(library.size() + 1);
+  int sel = -1;
+  for (std::size_t i = 0; i < library.size(); ++i) {
+    names.push_back(library[i].second);
+    if (!key.empty() && library[i].first == key)
+      sel = static_cast<int>(i);
+  }
+  const int customIdx = static_cast<int>(names.size());
+  names.emplace_back("Custom (no library entry)");
+  if (sel < 0 && m.is_object() && key.empty())
+    sel = customIdx;
+  std::string preview;
   if (m.is_null())
     preview = "Choose a material";
-  kit::sectionHeader("Material", "material", nullptr, -1, true);
-  ImGui::SetNextItemWidth(-FLT_MIN);
-  if (ImGui::BeginCombo("##topo_mat", preview.c_str())) {
-    for (const auto &kv : library) {
-      if (ImGui::Selectable(kv.second.c_str(), kv.first == key) &&
-          kv.first != key) {
-        m = kv.first; // library reference; overrides below convert it to an
-                      // object
-        c.result.committed = true;
-      }
-    }
-    if (ImGui::Selectable("Custom (no library entry)",
-                          m.is_object() && key.empty())) {
-      json custom = json::object();
-      if (m.is_object())
-        for (const MatKeyInfo &mi : kMatInfo)
-          copyNumber(m, custom, mi.key);
-      m = std::move(custom);
-      c.result.committed = true;
-    }
-    ImGui::EndCombo();
-  }
-  tip("The study's own material. Library entries supply the constants they "
-      "record; "
-      "anything the library lacks must be entered below.");
-  issuesFor(c, "/material");
+  else if (sel < 0)
+    preview = key + " (not in the library)";
 
-  json lib = json::object();
-  if (!key.empty() && lookup)
-    lookup(key, lib);
-  const std::vector<std::string> required = requiredMaterialKeys(physics);
-  for (const MatKeyInfo &mi : kMatInfo) {
-    const bool req =
-        std::find(required.begin(), required.end(), mi.key) != required.end();
-    // Editing promotes a key-string material to an object that keeps the
-    // reference.
-    json view = m.is_object() ? m : json::object();
-    const std::string libText =
-        lib.contains(mi.key) && lib[mi.key].is_number()
-            ? "library " + fmtNum(lib[mi.key].get<double>())
-            : (req ? std::string("required") : std::string("not set"));
-    const std::string label = std::string(mi.label) + (req ? " *" : "");
-    const bool before = c.result.committed;
-    c.result.committed = false;
-    numberField(c, std::string("/material/") + mi.key, label.c_str(), view,
-                mi.key, 1.0, mi.unit, mi.help, libText.c_str());
-    if (c.result.committed) {
-      if (!m.is_object()) {
-        json obj = json::object();
-        if (!key.empty())
-          obj["key"] = key;
-        m = std::move(obj);
+  bool changed = false;
+  const float cardTop = ImGui::GetCursorScreenPos().y;
+  if (kit::cardBegin("material", "Material", "material")) {
+    kit::FieldGroup g("mat", "Thermal conductivity");
+    kit::FieldOpts o =
+        withIssueAt(c, "/material",
+                    kit::FieldOpts()
+                        .withRequired(!required.empty())
+                        .withTip("The study's own material. Library entries "
+                                 "supply the constants they record; anything "
+                                 "the library lacks must be entered below."));
+    if (!preview.empty())
+      o.withPreview(preview.c_str());
+    int pick = sel;
+    if (kit::fieldCombo("lib", "Material", &pick, names, o) && pick != sel &&
+        pick >= 0) {
+      if (pick == customIdx) {
+        json custom = json::object();
+        if (m.is_object())
+          for (const MatKeyInfo &mi : kMatInfo)
+            copyNumber(m, custom, mi.key);
+        m = std::move(custom);
+      } else {
+        // Library reference; a typed override below promotes it to an object.
+        m = library[static_cast<std::size_t>(pick)].first;
       }
-      if (view.contains(mi.key))
-        m[mi.key] = view[mi.key];
-      else
-        m.erase(mi.key);
+      key = materialKey(m);
+      changed = true;
     }
-    c.result.committed = c.result.committed || before;
-    issuesFor(c, std::string("/material/") + mi.key);
+
+    json lib = json::object();
+    if (!key.empty() && lookup)
+      lookup(key, lib);
+    for (const MatKeyInfo &mi : kMatInfo) {
+      const bool req =
+          std::find(required.begin(), required.end(), mi.key) != required.end();
+      const double scale = mi.stress ? c.units.stressFromMpa : 1.0;
+      const json &v = member(m, mi.key);
+      bool present = v.is_number();
+      double val = present ? v.get<double>() : 0.0;
+      const json &lv = member(lib, mi.key);
+      const std::string hint =
+          lv.is_number() ? kit::fmtValue(lv.get<double>() * scale) + " (library)"
+          : req          ? std::string()
+                         : std::string("optional");
+      kit::FieldOpts fo =
+          withIssueAt(c, std::string("/material/") + mi.key,
+                      kit::FieldOpts()
+                          .withUnit(mi.stress ? kit::unitText(c.units.stress)
+                                              : kit::unitText(mi.unit))
+                          .withScale(scale)
+                          .withRequired(req)
+                          .withPresent(&present)
+                          .withTip(mi.help));
+      if (!hint.empty())
+        fo.withHint(hint.c_str());
+      if (kit::fieldNumber(mi.key, mi.label, &val, fo)) {
+        if (!m.is_object()) {
+          json obj = json::object();
+          if (!key.empty())
+            obj["key"] = key;
+          m = std::move(obj);
+        }
+        if (present)
+          m[mi.key] = val;
+        else
+          m.erase(mi.key);
+        changed = true;
+      }
+    }
+    kit::dimText("A typed value overrides the library entry for this study "
+                 "only.");
   }
-  kit::dimText(
-      "* required by the selected physics. A typed value overrides the library "
-      "entry for this study only.");
-  if (c.result.committed)
+  kit::cardEnd();
+  focusCard(c, cardTop, {"/material"});
+  if (changed) {
     c.study["material"] = m;
-  c.result.committed = c.result.committed || committedBefore;
+    c.result.committed = true;
+  }
 }
 
 } // namespace
@@ -2302,6 +2873,17 @@ BcResult drawBoundaryEditor(
   EditCtx c{st, study, view, issues};
   c.locked = lockedReason != nullptr;
   c.units = SimManager::unitSys(st);
+  c.body = ImGui::GetCurrentWindow();
+  // A well armed from outside the editor (ribbon command, run-gate jump) is
+  // brought into view like an explicit focus.
+  if (view.armedPointer != view.seenArmed) {
+    if (!view.armedPointer.empty() && view.focusPointer.empty()) {
+      view.focusPointer = view.armedPointer;
+      view.focusFrames = 0;
+    }
+    view.seenArmed = view.armedPointer;
+  }
+  const std::string focusAtStart = view.focusPointer;
   ImGui::PushID("topology_bc");
   if (lockedReason)
     kit::inlineStatus(lockedReason, kit::Tone::Warn);
@@ -2315,10 +2897,8 @@ BcResult drawBoundaryEditor(
     kit::blockedState(
         "Choose a physics first",
         "Boundary conditions depend on the physics being optimized.",
-        "Open the topology setup and pick the physics.");
+        "Pick the physics on the Settings step.");
   } else {
-    kit::dimText(
-        ("Boundary conditions for " + physicsLabel(physics) + ".").c_str());
     if (usesStructuralBoundary(physics))
       structuralSection(c, physics);
     if (usesThermalBoundary(physics))
@@ -2326,17 +2906,17 @@ BcResult drawBoundaryEditor(
     if (usesFlowBoundary(physics))
       flowSection(c, physics);
     // Sections authored for another physics are kept verbatim but not sent.
+    auto nonEmpty = [&](const char *pointer) {
+      const json *v = jsonAt(study, pointer);
+      return v && (v->is_array() || v->is_object()) && !v->empty();
+    };
     std::string kept;
     if (!usesStructuralBoundary(physics) &&
-        ((study.contains("fixtures") && !study["fixtures"].empty()) ||
-         (study.contains("loads") && !study["loads"].empty()) ||
-         (study.contains("load_cases") && !study["load_cases"].empty())))
+        (nonEmpty("/fixtures") || nonEmpty("/loads") || nonEmpty("/load_cases")))
       kept += " supports/loads";
-    if (!usesThermalBoundary(physics) && study.contains("thermal") &&
-        study["thermal"].is_object() && !study["thermal"].empty())
+    if (!usesThermalBoundary(physics) && nonEmpty("/thermal"))
       kept += " thermal";
-    if (!usesFlowBoundary(physics) && study.contains("flow") &&
-        study["flow"].is_object() && !study["flow"].empty())
+    if (!usesFlowBoundary(physics) && nonEmpty("/flow"))
       kept += " flow";
     if (!kept.empty())
       kit::inlineStatus(("Saved" + kept +
@@ -2348,15 +2928,26 @@ BcResult drawBoundaryEditor(
   // Whole-setup issues.
   for (const Issue &i : issues)
     if (i.key.empty())
-      kit::inlineStatus(i.message.c_str(), i.severity == Severity::Blocking
-                                               ? kit::Tone::Err
-                                               : kit::Tone::Warn);
+      kit::inlineStatus(i.message.c_str(), toneOf(i));
   ImGui::EndDisabled();
   ImGui::PopID();
   // A removed well cannot stay armed.
   if (!view.armedPointer.empty() && !wellExists(study, view.armedPointer)) {
     view.armedPointer.clear();
     c.result.armChanged = true;
+  }
+  // Wells armed by the editor itself are already in view: no refocus.
+  view.seenArmed = view.armedPointer;
+  // Focus bookkeeping: a revealed target is held one more frame (a new card's
+  // first-frame height is provisional); a focus set during this draw (a new
+  // entry drawn next frame) waits; anything else unmatched is dropped.
+  if (!view.focusPointer.empty()) {
+    if (view.focusPointer != focusAtStart) {
+      view.focusFrames = 0;
+    } else if (!c.focusHandled || ++view.focusFrames >= 2) {
+      view.focusPointer.clear();
+      view.focusFrames = 0;
+    }
   }
   return c.result;
 }

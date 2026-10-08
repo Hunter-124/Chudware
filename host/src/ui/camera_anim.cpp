@@ -1,11 +1,13 @@
 // Chudware camera animation (W2-D). See camera_anim.h.
 #include "camera_anim.h"
 
+#include <algorithm>
 #include <cmath>
 
 #include "imgui.h"
 
 #include "../core/app_state.h"
+#include "../renderer.h"
 
 namespace ui {
 
@@ -37,9 +39,8 @@ void requestCameraAnimation(AppState& st, float yawDeg, float pitchDeg,
     if (p >  89.5f) p =  89.5f;
     if (p < -89.5f) p = -89.5f;
     st.animPitch1 = p;
-    st.animZoom1  = (zoom < 0.0f) ? st.animZoom0 : zoom;
-    if (st.animZoom1 < 0.1f) st.animZoom1 = 0.1f;
-    if (st.animZoom1 > 10.0f) st.animZoom1 = 10.0f;
+    const float maxZoom = st.renderer ? st.renderer->maxSceneZoom() : 10.0f;
+    st.animZoom1 = std::clamp(zoom < 0.0f ? st.animZoom0 : zoom, 0.1f, maxZoom);
     if (pan) { st.animPan1[0] = pan[0]; st.animPan1[1] = pan[1]; st.animPan1[2] = pan[2]; }
     else     { st.animPan1[0] = st.animPan0[0]; st.animPan1[1] = st.animPan0[1];
                st.animPan1[2] = st.animPan0[2]; }

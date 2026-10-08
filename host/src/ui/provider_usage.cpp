@@ -30,8 +30,11 @@ struct UsageState {
     std::map<std::string, UsageLoginProgress> login;
     double lastAccountsPoll = -1e9;
     double lastUsagePoll    = -1e9;
+    double lastStatusPoll   = -1e9;
+    double interactiveSince = -1.0;
     bool   accountsInFlight = false;
     bool   usageInFlight    = false;
+    bool   statusInFlight   = false;
     bool   rpcMissing       = false;   // unknown_method → stop polling, degrade quietly
     std::map<std::string, BridgeUsage> bridge;   // Chudcode service windows, by provider id
     bool   bridgeRpcMissing = false;   // chudcode_auth_state absent → stop asking the service
@@ -41,6 +44,16 @@ UsageState g;
 
 // 5-minute usage refresh per contracts/providers.md §4.5.
 constexpr double kUsageTtlSec = 5.0 * 60.0;
+
+bool startupPollReady(const AppState& st) {
+    const double now = ImGui::GetTime();
+    if (!st.workerStarted || st.workerBootPending || !st.startupPhase.empty()) {
+        g.interactiveSince = -1.0;
+        return false;
+    }
+    if (g.interactiveSince < 0.0) g.interactiveSince = now;
+    return now - g.interactiveSince >= 1.5;
+}
 
 std::string jstr(const nlohmann::json& obj, const char* key) {
     auto it = obj.find(key);
@@ -183,6 +196,7 @@ void parseBridgeWindows(const nlohmann::json& wins, std::vector<UsageWindow>& ou
 // their "unavailable" path on an empty model.
 void providerUsagePollUsage(AppState& st, bool force) {
     if (g.rpcMissing || webBuild()) return;
+    if (!force && !startupPollReady(st)) return;
     const double now = ImGui::GetTime();
     if (!force && (now - g.lastUsagePoll) < kUsageTtlSec) return;
     if (g.usageInFlight) return;
@@ -190,6 +204,7 @@ void providerUsagePollUsage(AppState& st, bool force) {
     g.usageInFlight = true;
     st.rpc.call("subscription_usage", nlohmann::json::object(), [](const core::RpcResult& r) {
         g.usageInFlight = false;
+        g.lastUsagePoll = ImGui::GetTime();
         if (!r.ok) {
             // unknown_method / worker down — keep the last usage; latch missing once so we stop
             // hammering and consumers stay on their "unavailable" path.
@@ -209,6 +224,7 @@ void providerUsagePollUsage(AppState& st, bool force) {
 
 void providerUsagePollBridge(AppState& st, const char* bridgeProviderId, bool force) {
     if (g.bridgeRpcMissing || !bridgeProviderId || !*bridgeProviderId) return;
+    if (!force && !startupPollReady(st)) return;
     const std::string id = bridgeProviderId;
     BridgeUsage& slot = g.bridge[id];
     const double now = ImGui::GetTime();
@@ -220,6 +236,7 @@ void providerUsagePollBridge(AppState& st, const char* bridgeProviderId, bool fo
                 [id](const core::RpcResult& r) {
         BridgeUsage& s = g.bridge[id];   // std::map: the slot taken above is still this one
         s.inFlight = false;
+        s.lastPoll = ImGui::GetTime();
         if (!r.ok) {
             // Same latch as subscription_usage: an absent method stops the polling for good,
             // a transport blip just keeps the windows we already have.
@@ -242,6 +259,8 @@ void providerUsagePollBridge(AppState& st, const char* bridgeProviderId, bool fo
 
 void providerUsagePollAccounts(AppState& st, double ttlSec, bool force) {
     if (webBuild()) return;  // operator-owned; refused for non-admins over the web bridge
+    if (!force && !startupPollReady(st)) return;
+    providerUsagePollStatus(st, ttlSec, force);
     const double now = ImGui::GetTime();
     if (!force && (now - g.lastAccountsPoll) < ttlSec) return;
     if (g.accountsInFlight) return;
@@ -249,6 +268,7 @@ void providerUsagePollAccounts(AppState& st, double ttlSec, bool force) {
     g.accountsInFlight = true;
     st.rpc.call("subscription_accounts", nlohmann::json::object(), [](const core::RpcResult& r) {
         g.accountsInFlight = false;
+        g.lastAccountsPoll = ImGui::GetTime();
         // hostd's worker_lane_busy (an agent turn holds the agent worker lane) is transient
         // and internal: keep the rings as they are and say nothing — the next poll after the
         // turn succeeds.
@@ -297,8 +317,18 @@ void providerUsagePollAccounts(AppState& st, double ttlSec, bool force) {
             g.rows.push_back(std::move(row));
         }
     });
-    // Status carries live login progress (device code, verification URL, stage).
+}
+
+void providerUsagePollStatus(AppState& st, double ttlSec, bool force) {
+    if (webBuild()) return;
+    if (!force && !startupPollReady(st)) return;
+    const double now = ImGui::GetTime();
+    if (g.statusInFlight || (!force && now - g.lastStatusPoll < ttlSec)) return;
+    g.lastStatusPoll = now;
+    g.statusInFlight = true;
     st.rpc.call("subscription_status", nlohmann::json::object(), [](const core::RpcResult& r) {
+        g.statusInFlight = false;
+        g.lastStatusPoll = ImGui::GetTime();
         if (!r.ok || !r.result.is_object()) return;
         nlohmann::json providers = jobj(r.result, "providers");
         if (!providers.is_object()) return;
@@ -306,6 +336,8 @@ void providerUsagePollAccounts(AppState& st, double ttlSec, bool force) {
             if (!it.value().is_object()) continue;
             UsageLoginProgress& p = g.login[it.key()];
             const auto& x = it.value();
+            p.connected     = jbool(x, "connected", false);
+            p.email         = jstr(x, "email");
             const bool wasInProgress = p.inProgress;
             p.inProgress    = jbool(x, "login_in_progress", false);
             p.browserOpened = jbool(x, "browser_opened", false);
@@ -332,6 +364,7 @@ void providerUsagePollAccounts(AppState& st, double ttlSec, bool force) {
 void providerUsageInvalidate() {
     g.lastAccountsPoll = -1e9;
     g.lastUsagePoll    = -1e9;
+    g.lastStatusPoll   = -1e9;
     for (auto& kv : g.bridge) kv.second.lastPoll = -1e9;
 }
 

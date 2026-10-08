@@ -35,6 +35,7 @@
 #include "api/chudware_version.h"  // CHUDWARE_VERSION_LINE (generated, <build>/generated)
 #include "bootstrap.h"
 #include "core/app_state.h"  // appstateInitPersist (WASM IDBFS)
+#include "core/startup_trace.h"
 #include "ipc_discovery.h"   // chudware_ipc::SingleInstance/instanceKey/guiLockPath (services/ipc)
 #include "mesh.h"
 #include "renderer.h"
@@ -506,6 +507,7 @@ std::string guiTakeActivationDoc() {
 #endif  // !__EMSCRIPTEN__
 
 int main(int argc, char** argv) {
+    startup_trace::mark("main entry");
 #ifdef __EMSCRIPTEN__
     // Web client: skip desktop CLI modes entirely. Report progress via Module.setStatus
     // (shell.html) which is reliable from the browser main thread.

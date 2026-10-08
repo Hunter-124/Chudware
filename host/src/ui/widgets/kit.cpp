@@ -67,6 +67,8 @@ constexpr float kDisabledA      = 0.55f;
 constexpr float kMatteA         = 0.85f;   // plate behind a row thumbnail
 constexpr float kTrackA         = 0.85f;   // progress / segmented-control track
 constexpr float kPrimaryFillA   = 0.90f;
+constexpr float kBtnDisabledA   = 0.85f;   // disabled button: neutral frame fill (any button kind)
+constexpr float kRuleInkA       = 0.18f;   // rule() hairline: current ink at this alpha
 constexpr float kDangerFillA    = 0.85f;
 constexpr float kDangerActA     = 0.70f;
 constexpr float kSegSelA        = 0.85f;
@@ -74,11 +76,11 @@ constexpr float kSegHoverA      = 0.16f;
 constexpr float kBtnGhostHoverA = 0.10f;   // icon-button hover wash, over the current ink
 constexpr float kEmptyIconA     = 0.60f;
 constexpr float kWrapInsetFrac  = 0.08f;   // empty-state paragraph inset when a line must wrap
-constexpr float kTooltipWrapEm  = 26.0f;
 constexpr float kEmptyIconScale = 2.0f;    // empty/blocked glyph = 2x the header icon tier
 constexpr float kMarqueeFrac    = 0.28f;   // indeterminate bar segment, fraction of the track
 constexpr float kGlyphRadiusFrac= 0.30f;   // status-mark radius as a fraction of its glyph cell
-constexpr float kIconInsetFrac  = 0.62f;   // glyph size inside a square icon button
+constexpr float kIconFillFrac   = 0.78f;   // icon-button glyph, at least this fraction of the button
+constexpr float kKeyColMaxFrac  = 0.55f;   // a key/value row's key column never exceeds this of the row
 constexpr float kSettled        = 0.004f;  // below this a tween is visually done
 
 // ---- palette plumbing ----------------------------------------------------------------------------
@@ -127,12 +129,7 @@ AdaptiveSurface inkSurface() {
 // Wrapped hover tooltip; a no-op on an empty string so callers can pass an optional reason
 // straight through. ImGuiCol_PopupBg is already the glass role (applyTheme), so no extra push.
 void kitTooltip(const char* text) {
-    if (!text || !text[0]) return;
-    if (!ImGui::BeginTooltip()) return;
-    ImGui::PushTextWrapPos(ImGui::GetFontSize() * kTooltipWrapEm);
-    ImGui::TextUnformatted(text);
-    ImGui::PopTextWrapPos();
-    ImGui::EndTooltip();
+    tooltip(text);  // one tooltip painter: kit_form.cpp kit::tooltip
 }
 
 // Draw a caller-named atlas icon centred at `center`. Unknown names draw NOTHING and report it,
@@ -200,60 +197,95 @@ ChipGeom chipGeom(const char* label, bool withDot) {
     g.padY     = ui::metrics::U(0.5f);
     g.gap      = ui::metrics::U(1.0f);
     g.dotR     = withDot ? ui::metrics::U(0.75f) : 0.0f;
-    g.textSize = ImGui::CalcTextSize(label ? label : "");
+    g.textSize = ImGui::CalcTextSize(label ? label : "", nullptr, true);   // "##id" suffix hidden
     g.h        = g.textSize.y + g.padY * 2.0f;
     g.w        = g.padX * 2.0f + g.textSize.x + (withDot ? (g.dotR * 2.0f + g.gap) : 0.0f);
     return g;
 }
 
 // ---- buttons --------------------------------------------------------------------------------
-// Shared body for primary/secondary/danger. A disabled button still RENDERS (greyed) and still
-// answers "why can't I click this?" on hover — the kit never hides an action the user is hunting.
+// Shared body for primary/secondary/danger. A disabled button still RENDERS and still answers
+// "why can't I click this?" on hover — the kit never hides an action the user is hunting. It
+// gets ONE explicit disabled look for every kind: a neutral frame fill, a hairline border and dim
+// (still legible) text. No BeginDisabled alpha: that scaled the accent fill to a washed-out pale
+// orange with near-white text that read as neither enabled nor disabled.
 bool kitButton(const char* label, bool enabled, const char* disabledReason, const ImVec2& size,
                const ImVec4& base, const ImVec4& hovered, const ImVec4& active,
                const ImVec4& text) {
     ImVec2 sz = size;
     if (sz.y <= 0.0f) sz.y = ImGui::GetFrameHeight();
 
-    ImGui::PushStyleColor(ImGuiCol_Button,        base);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hovered);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  active);
-    ImGui::PushStyleColor(ImGuiCol_Text,          text);
+    int vars = 1, cols = 4;
+    if (enabled) {
+        ImGui::PushStyleColor(ImGuiCol_Button,        base);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hovered);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  active);
+        ImGui::PushStyleColor(ImGuiCol_Text,          text);
+    } else {
+        const ImVec4 fill = roleVec(palette.frameBg, kBtnDisabledA);
+        ImGui::PushStyleColor(ImGuiCol_Button,        fill);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, fill);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  fill);
+        ImGui::PushStyleColor(ImGuiCol_Text,          roleVec(palette.textDim));
+        ImGui::PushStyleColor(ImGuiCol_Border,        roleVec(palette.border));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, ui::metrics::stroke(1.0f));
+        ++cols;
+        ++vars;
+    }
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, chipRound());
 
-    if (!enabled) ImGui::BeginDisabled();
+    // The disabled ITEM flag (not BeginDisabled) blocks presses without the global alpha.
+    if (!enabled) ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
     bool pressed = ImGui::Button(label ? label : "", sz);
     if (!enabled) {
-        ImGui::EndDisabled();
+        ImGui::PopItemFlag();
         pressed = false;
         // Disabled items do not report hover normally; AllowWhenDisabled is what makes the
         // explanation reachable at all.
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) kitTooltip(disabledReason);
     }
 
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(vars);
+    ImGui::PopStyleColor(cols);
     return pressed;
 }
 
 // ---- centred text (empty / blocked states) ------------------------------------------------------
-// A line that FITS is centred. A line that does not must WRAP: centring unconditionally makes
-// (avail - textW) * 0.5 negative once the text is wider than the pane, which pushes it off the
-// left edge and clips it at BOTH ends. Lifted from plmEmptyState, which is where that was fixed.
+// Every line is centred under the (centred) title. A line that does not fit WRAPS at word
+// boundaries inside a small inset and each wrapped line is centred on its own, so a paragraph
+// never reads as a ragged left-aligned block under a centred heading — and never centres to a
+// negative offset that clips it at both ends. Explicit '\n' starts a new line.
 void centeredOrWrapped(const char* text, const ImVec4& col) {
     if (!text || !text[0]) return;
-    const float avail = ImGui::GetContentRegionAvail().x;
-    const float tw    = ImGui::CalcTextSize(text).x;
+    const float avail  = ImGui::GetContentRegionAvail().x;
+    const float startX = ImGui::GetCursorPosX();
+    const float inset  = ImGui::CalcTextSize(text).x <= avail ? 0.0f : avail * kWrapInsetFrac;
+    const float wrapW  = ImMax(avail - inset * 2.0f, ImGui::GetFontSize());
+    ImFont*     font   = ImGui::GetFont();
+    const float scale  = ImGui::GetFontSize() / ImMax(font->FontSize, 1.0f);
+    const char* end    = text + std::strlen(text);
+
     ImGui::PushStyleColor(ImGuiCol_Text, col);
-    if (tw <= avail) {
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - tw) * 0.5f);
-        ImGui::TextUnformatted(text);
-    } else {
-        const float inset = avail * kWrapInsetFrac;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + inset);
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + avail - inset * 2.0f);
-        ImGui::TextUnformatted(text);
-        ImGui::PopTextWrapPos();
+    for (const char* para = text; para <= end;) {
+        const char* nl = static_cast<const char*>(std::memchr(para, '\n', (size_t)(end - para)));
+        const char* pe = nl ? nl : end;
+        const char* s  = para;
+        do {
+            const char* e = s < pe ? font->CalcWordWrapPositionA(scale, s, pe, wrapW) : pe;
+            if (e <= s && s < pe) {   // narrower than one glyph: take one UTF-8 character
+                unsigned int c = 0;
+                e = s + ImMax(1, ImTextCharFromUtf8(&c, s, pe));
+            }
+            const char* le = e;
+            while (le > s && (le[-1] == ' ' || le[-1] == '\t')) --le;
+            const float lw = ImGui::CalcTextSize(s, le).x;
+            ImGui::SetCursorPosX(startX + ImMax(0.0f, (avail - lw) * 0.5f));
+            ImGui::TextUnformatted(s, le);
+            s = e;
+            while (s < pe && (*s == ' ' || *s == '\t')) ++s;
+        } while (s < pe);
+        if (!nl) break;
+        para = nl + 1;
     }
     ImGui::PopStyleColor();
 }
@@ -429,6 +461,7 @@ float gutter() {
 // ==================================================================================================
 bool cardBegin(const char* id, const char* title, const char* icon, bool* open,
                const float tint[3]) {
+    ImGuiContext& g = *GImGui;
     ImGui::PushID(id && id[0] ? id : "kit_card");
 
     const bool canCollapse = (open != nullptr);
@@ -467,6 +500,17 @@ bool cardBegin(const char* id, const char* title, const char* icon, bool* open,
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(padX(), pY));
     ImGui::BeginChild("kit_card_body", ImVec2(0.0f, childH), cf,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    // A brand-new auto-sized card has never measured its content, so on its first frame the child
+    // is only its padding tall: border + wash would paint an EMPTY rounded shell with the title
+    // clipped away. Lay it out (sizes measure) but do not render it that one frame, and pump the
+    // next frame so it appears at its real height at once. Never hides a card seen before.
+    if (cf & ImGuiChildFlags_AutoResizeY) {
+        ImGuiWindow* cw = ImGui::GetCurrentWindow();
+        if (cw->Appearing && cw->ContentSize.y <= 0.0f) {
+            cw->Hidden = true;
+            anim::requestFrames();
+        }
+    }
     // Content draws on channel 1; cardEnd paints the wash behind it on channel 0 once the height
     // is final. Split + merge are unconditional and paired.
     ImGui::GetWindowDrawList()->ChannelsSplit(2);
@@ -503,6 +547,11 @@ bool cardBegin(const char* id, const char* title, const char* icon, bool* open,
     bool toggled = false;
     if (canCollapse) toggled = ImGui::InvisibleButton("kit_card_head", ImVec2(rowW, rowH + gapH));
     else             ImGui::Dummy(ImVec2(rowW, rowH + gapH));
+    if (canCollapse)
+        IMGUI_TEST_ENGINE_ITEM_INFO(
+            ImGui::GetItemID(), title ? title : "",
+            GImGui->LastItemData.StatusFlags | ImGuiItemStatusFlags_Openable |
+                (isOpen ? ImGuiItemStatusFlags_Opened : 0));
     const float hv = anim::toward(ImGui::GetID("##kit_card_hv"),
                                   ImGui::IsItemHovered() ? 1.0f : 0.0f, anim::kFast);
     g_cards.back().hover = hv;
@@ -751,7 +800,7 @@ void chip(const char* label, Tone t, bool dot, const char* tooltip) {
     if (dot) dl->AddCircleFilled(ImVec2(p0.x + g.padX + g.dotR, p0.y + g.h * 0.5f), g.dotR,
                                  roleU32(role));
     dl->AddText(ImVec2(p0.x + g.padX + (dot ? g.dotR * 2.0f + g.gap : 0.0f), p0.y + g.padY),
-                roleU32(role), lab);
+                roleU32(role), lab, ImGui::FindRenderedTextEnd(lab));
     if (hovered) kitTooltip(tooltip);
 }
 
@@ -790,6 +839,12 @@ bool toggleChip(const char* label, bool* on, Tone t, const char* tooltip) {
     const bool clicked = ImGui::InvisibleButton("##kit_toggle", ImVec2(g.w, g.h));
     const bool hovered = ImGui::IsItemHovered();
     if (clicked && on) *on = !*on;
+    {
+        ImGuiContext& g = *GImGui;
+        IMGUI_TEST_ENGINE_ITEM_INFO(
+            ImGui::GetItemID(), lab, g.LastItemData.StatusFlags |
+            ImGuiItemStatusFlags_Checkable | (on && *on ? ImGuiItemStatusFlags_Checked : 0));
+    }
 
     const bool  isOn = on && *on;
     const float fill = anim::toward(ImGui::GetID("##fill"), isOn ? 1.0f : 0.0f, anim::kFast);
@@ -808,7 +863,8 @@ bool toggleChip(const char* label, bool* on, Tone t, const char* tooltip) {
                                   (1.0f - kChipOffBorderA) * ImMax(fill, hv * 0.5f)),
                 rnd, 0, ui::metrics::stroke(1.0f));
     dl->AddText(ImVec2(p0.x + g.padX, p0.y + g.padY),
-                u32(lerpVec4(roleVec(palette.textDim), roleVec(role), fill)), lab);
+                u32(lerpVec4(roleVec(palette.textDim), roleVec(role), fill)), lab,
+                ImGui::FindRenderedTextEnd(lab));
     if (hovered) kitTooltip(tooltip);
 
     ImGui::PopID();
@@ -861,7 +917,10 @@ bool iconButton(const char* id, const char* icon, const char* tooltip, bool enab
     if (hv > kSettled) {
         dl->AddRectFilled(p0, p1, roleU32(palette.text, kBtnGhostHoverA * hv), chipRound());
     }
-    drawIconAt(dl, icon, ImVec2(p0.x + s * 0.5f, p0.y + s * 0.5f), s * kIconInsetFrac,
+    // Glyph per icon tier: at least kIconFillFrac of the button (a frame-height button lands on
+    // the header tier, ~iconHeader), and a text-height button still shows a full font-size glyph.
+    const float glyph = ImMax(s * kIconFillFrac, ImMin(s, ImGui::GetFontSize()));
+    drawIconAt(dl, icon, ImVec2(p0.x + s * 0.5f, p0.y + s * 0.5f), glyph,
                enabled ? toneU32(t) : roleU32(palette.textDisabled));
 
     // An unlabelled glyph with no tooltip is not a discoverable control, so this is unconditional.
@@ -874,6 +933,7 @@ bool iconButton(const char* id, const char* icon, const char* tooltip, bool enab
 bool segmented(const char* id, const char* const* labels, int count, int* selected, float width,
                const char* const* tooltips) {
     if (!labels || count <= 0 || !selected) return false;
+    [[maybe_unused]] ImGuiContext& g = *GImGui;
 
     ImGui::PushID(id && id[0] ? id : "kit_seg");
 
@@ -924,6 +984,8 @@ bool segmented(const char* id, const char* const* labels, int count, int* select
             *selected = i;
             changed   = true;
         }
+        IMGUI_TEST_ENGINE_ITEM_INFO(
+            ImGui::GetItemID(), labels[i] ? labels[i] : "", GImGui->LastItemData.StatusFlags);
         const bool  hovered = ImGui::IsItemHovered();
         const float hv      = anim::toward(ImGui::GetID("##hv"), hovered ? 1.0f : 0.0f,
                                            anim::kFast);
@@ -964,6 +1026,7 @@ bool segmented(const char* id, const char* const* labels, int count, int* select
 }
 
 bool popoverBegin(const char* id, const char* label, const char* icon, int activeCount) {
+    ImGuiContext& g = *GImGui;
     ImGui::PushID(id && id[0] ? id : "kit_popover");
 
     const char*  lab    = label ? label : "";
@@ -983,6 +1046,10 @@ bool popoverBegin(const char* id, const char* label, const char* icon, int activ
 
     const ImVec2 p0      = ImGui::GetCursorScreenPos();
     const bool   pressed = ImGui::InvisibleButton("##kit_poptrigger", ImVec2(w, h));
+    IMGUI_TEST_ENGINE_ITEM_INFO(
+        ImGui::GetItemID(), lab,
+        GImGui->LastItemData.StatusFlags | ImGuiItemStatusFlags_Openable |
+            (ImGui::IsPopupOpen("##kit_popover_body") ? ImGuiItemStatusFlags_Opened : 0));
     const bool   hovered = ImGui::IsItemHovered();
     const float  hv      = anim::toward(ImGui::GetID("##hv"), hovered ? 1.0f : 0.0f, anim::kFast);
 
@@ -1022,6 +1089,14 @@ bool popoverBegin(const char* id, const char* label, const char* icon, int activ
     ui::pushGlassWindowStyle();
     ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, rowRound());
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padX(), padY()));
+    // Wrapped text and full-width fields cannot establish an auto-fit width from zero.
+    // Keep the default popover readable without overriding caller-supplied constraints.
+    if (ImGui::IsPopupOpen("##kit_popover_body") &&
+        !(g.NextWindowData.Flags & ImGuiNextWindowDataFlags_HasSizeConstraint)) {
+        const float minW = ImMin(ImMax(w, ImGui::GetFontSize() * 18.0f + padX() * 2.0f),
+                                 ImGui::GetMainViewport()->WorkSize.x);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(minW, 0.0f), ImVec2(FLT_MAX, FLT_MAX));
+    }
     const bool open = ImGui::BeginPopup("##kit_popover_body");
     if (!open) {
         ImGui::PopStyleVar(2);
@@ -1123,6 +1198,7 @@ void statusGlyphInline(Status s) {
 
 void inlineStatus(const char* msg, Tone t) {
     if (!msg || !msg[0]) return;   // sticky-error callers pass an empty string unconditionally
+    ImGuiContext& g = *GImGui;
 
     ImDrawList*  dl   = ImGui::GetWindowDrawList();
     const float  dotR = ui::metrics::U(0.75f);
@@ -1134,6 +1210,7 @@ void inlineStatus(const char* msg, Tone t) {
 
     ImGui::PushStyleColor(ImGuiCol_Text, toneVec(t));
     ImGui::TextWrapped("%s", msg);
+    IMGUI_TEST_ENGINE_ITEM_INFO(0, msg, g.LastItemData.StatusFlags);
     ImGui::PopStyleColor();
 }
 
@@ -1219,9 +1296,10 @@ bool emptyState(const char* icon, const char* title, const char* body, const cha
         centeredOrWrapped(body, roleVec(palette.textDim));
     }
 
+    // The action sits directly beneath the text it resolves (a heading gap, not a section gap).
     bool clicked = false;
     if (actionLabel && actionLabel[0]) {
-        ImGui::Dummy(ImVec2(0.0f, sectionGap()));
+        ImGui::Dummy(ImVec2(0.0f, headGap()));
         clicked = centeredAction(actionLabel, actionEnabled);
     }
 
@@ -1280,30 +1358,95 @@ void dimText(const char* text) {
     ImGui::PopStyleColor();
 }
 
-void keyValueRow(const char* key, const char* value, Tone valueTone, bool copyable) {
+namespace detail {
+// Word-wrap `text` (newlines/tabs folded to spaces) into at most `maxLines` lines of `maxW` px.
+// The last allowed line carries the remainder, elided; *cut reports that elision. Shared by the
+// key/value row (kit.cpp) and the footer status / grouped picker (kit_panel.cpp) so wrapped
+// kit text breaks identically everywhere.
+std::vector<std::string> wrapLines(const char* text, float maxW, int maxLines, bool* cut) {
+    std::vector<std::string> out;
+    if (cut) *cut = false;
+    if (!text || !text[0] || maxW <= 0.0f || maxLines <= 0) return out;
+    std::string flat(text);
+    for (char& c : flat)
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    ImFont*     font  = ImGui::GetFont();
+    const float scale = ImGui::GetFontSize() / ImMax(font->FontSize, 1.0f);
+    const char* s     = flat.c_str();
+    const char* end   = s + flat.size();
+    while (end > s && end[-1] == ' ') --end;
+    while (s < end && *s == ' ') ++s;
+    while (s < end) {
+        if ((int)out.size() + 1 == maxLines) {
+            const std::string rest(s, end);
+            std::string       shown = elide(rest.c_str(), maxW);
+            if (cut && shown != rest) *cut = true;
+            out.push_back(std::move(shown));
+            break;
+        }
+        const char* e = font->CalcWordWrapPositionA(scale, s, end, maxW);
+        if (e <= s) {   // narrower than one glyph: take one UTF-8 character
+            unsigned int c = 0;
+            e = s + ImMax(1, ImTextCharFromUtf8(&c, s, end));
+        }
+        const char* le = e;
+        while (le > s && le[-1] == ' ') --le;
+        out.emplace_back(s, le);
+        s = e;
+        while (s < end && *s == ' ') ++s;
+    }
+    return out;
+}
+
+// keyValueRow with an explicit key column (kit_plot.cpp keyValueCard aligns all of a card's rows
+// on its widest key). labelW > 0: the value starts exactly labelW into the row. labelW <= 0: the
+// standard pmLabelCol, which a longer key may widen for its own row. Either way the column is
+// capped at kKeyColMaxFrac of the row, and a key longer than the column WRAPS onto a second line
+// (eliding only past two lines, full key on hover) — "Max von Mises at fixtures" stays readable.
+//
+// The value sits on the key's first line. The optional copy button is a text-height icon button
+// pinned to the row's right edge on that line, so a copyable row has the same rhythm as a plain
+// one and the copy glyphs of a card line up in one column instead of trailing each value.
+void keyValueRowCol(const char* key, const char* value, Tone valueTone, bool copyable, float labelW) {
     const char* k = key ? key : "";
     const char* v = value ? value : "";
     ImGui::PushID(k);
 
-    const float rowLeft = ImGui::GetCursorScreenPos().x;
-    const float rowW    = ImMax(ImGui::GetContentRegionAvail().x, ui::metrics::stroke(1.0f));
+    const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+    const float  minW   = ui::metrics::stroke(1.0f);
+    const float  rowW   = ImMax(ImGui::GetContentRegionAvail().x, minW);
+    const float  lineH  = ImGui::GetTextLineHeight();
+    const float  gap    = ImGui::GetStyle().ItemSpacing.x;
 
+    // Default column = the pane-wide field value column (kit_form), so readouts line up with the
+    // fields of the same pane; pmLabelCol when the pane column is unusable here.
+    const float paneCol = fieldValueColumnX() - rowPos.x;
+    float       col     = labelW > 0.0f ? labelW
+                                        : (paneCol > gap ? paneCol : ui::metrics::pmLabelCol());
+    if (labelW <= 0.0f) col = ImMax(col, ImGui::CalcTextSize(k).x + gap);
+    col = ImMin(col, rowW * kKeyColMaxFrac);
+
+    const float keyMax = ImMax(col - gap, minW);
+    bool        keyCut = false;
+    std::string keyShown;
+    if (ImGui::CalcTextSize(k).x <= keyMax) {
+        keyShown = k;
+    } else {
+        const std::vector<std::string> lines = wrapLines(k, keyMax, 2, &keyCut);
+        for (size_t i = 0; i < lines.size(); ++i) keyShown += (i ? "\n" : "") + lines[i];
+    }
     ImGui::PushStyleColor(ImGuiCol_Text, roleVec(palette.textDim));
-    ImGui::TextUnformatted(k);
+    ImGui::TextUnformatted(keyShown.c_str());
     ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered() && keyCut) kitTooltip(k);
 
-    float       x    = rowLeft + ui::metrics::pmLabelCol();
-    const float minX = ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x;
-    if (x < minX) x = minX;
+    const float btnS = copyable ? lineH : 0.0f;
+    const float btnG = copyable ? ui::metrics::U(1.0f) : 0.0f;
     ImGui::SameLine(0.0f, 0.0f);
-    ImGui::SetCursorScreenPos(ImVec2(x, ImGui::GetCursorScreenPos().y));
-
-    const float btnW  = copyable ? ImGui::GetFrameHeight() + ui::metrics::U(1.0f) : 0.0f;
-    const float valW  = ImMax(rowLeft + rowW - x - btnW, ui::metrics::stroke(1.0f));
-
+    ImGui::SetCursorScreenPos(ImVec2(rowPos.x + col, rowPos.y));
     // The whole point of this row: an id or an absolute path has no whitespace, so TextWrapped
     // breaks it mid-token inside a stretch column. Elide + tooltip instead, always.
-    const std::string shown = elide(v, valW);
+    const std::string shown = elide(v, ImMax(rowW - col - btnS - btnG, minW));
     // Neutral reads as PRIMARY text here: the key is already dim, so dimming the value too makes
     // a perfectly good readout look disabled.
     ImGui::PushStyleColor(ImGuiCol_Text,
@@ -1313,12 +1456,17 @@ void keyValueRow(const char* key, const char* value, Tone valueTone, bool copyab
     if (ImGui::IsItemHovered() && shown != v) kitTooltip(v);
 
     if (copyable) {
-        ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
-        if (iconButton("copy", "copy", "Copy to clipboard", v[0] != '\0')) {
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::SetCursorScreenPos(ImVec2(rowPos.x + rowW - btnS, rowPos.y));
+        if (iconButton("copy", "copy", "Copy to clipboard", v[0] != '\0', Tone::Neutral, btnS))
             ImGui::SetClipboardText(v);
-        }
     }
     ImGui::PopID();
+}
+}  // namespace detail
+
+void keyValueRow(const char* key, const char* value, Tone valueTone, bool copyable) {
+    detail::keyValueRowCol(key, value, valueTone, copyable, 0.0f);
 }
 
 std::string elide(const char* text, float maxW) {
@@ -1355,8 +1503,13 @@ void rule() {
     const ImVec2 p  = ImGui::GetCursorScreenPos();
     const float  w  = ImMax(ImGui::GetContentRegionAvail().x, ui::metrics::stroke(1.0f));
     const float  t  = ui::metrics::stroke(1.0f);
+    // The CURRENT ink at low alpha, not palette.border: a fixed mid-grey vanishes wherever a glass
+    // pane's backdrop darkens to that grey (the footer rule "stopped" part-way across), while an
+    // ink wash always shifts the surface toward the text colour, whatever is behind the glass.
+    ImVec4 ink = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    ink.w *= kRuleInkA;
     dl->AddLine(ImVec2(p.x, p.y + pY + t * 0.5f), ImVec2(p.x + w, p.y + pY + t * 0.5f),
-                roleU32(palette.border), t);
+                ImGui::ColorConvertFloat4ToU32(ink), t);
     ImGui::Dummy(ImVec2(w, t + pY * 2.0f));
 }
 

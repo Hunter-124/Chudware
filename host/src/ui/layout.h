@@ -55,6 +55,9 @@ const OverlayBand& overlayBand();
 // pinned columns' default width/collapse state, or the menu item breaks its promise. app.cpp calls
 // resetOverlayColumns() in the rebuild branch; each column consumes its one-shot flag on its next
 // draw. Slots: 0 = FeatureManager column (drawLeftPane), 1 = Copilot column (ui/copilot/).
+// Slot 0 restores BOTH left-column widths: the shared FeatureManager column and the Simulate
+// workspace's own Simulation Manager column (default metrics::simManagerPaneW), even if the
+// latter is not on screen when Reset is chosen.
 void resetOverlayColumns();
 bool takeOverlayColumnReset(int slot);
 
@@ -92,7 +95,9 @@ float docTabBandBottom();
 // rolls UP to its top tab row + collapse chevron instead of shrinking to a small pill; see
 // ui::PanelCollapseAnim in panel_collapse.h — shared with the Copilot column), and the invisible
 // right-edge resize. editCallback is forwarded to the FeatureManager body (a tree "Edit" reopens a
-// PM form). Call every frame in place of the old drawFeatureTree/PM block.
+// PM form). Call every frame in place of the old drawFeatureTree/PM block. In Simulate the column
+// is a separate window ("SimulationManager##LeftPane") with its own remembered width and the wider
+// metrics::simManagerPaneW default; every other workspace shares "FeatureManager##LeftPane".
 void drawLeftPane(AppState& st,
                   const std::function<void(const std::string& featureId)>& editCallback = {});
 

@@ -251,10 +251,30 @@ set(CHUDWARE_CORE_SOURCES
   # --- end Cut List ---
   # --- C19: simulation + flow + evaluate UI ---
   src/core/sim_client.cpp
-  src/ui/sim_manager.cpp
+  src/ui/sim_manager.cpp           # core: state/JSON, refresh/persist, CRUD, command routing
+  src/ui/sim/sim_manager_tree.cpp
+  src/ui/sim/sim_manager_forms.cpp
+  src/ui/sim/sim_manager_run.cpp
+  src/ui/sim/sim_manager_results.cpp
+  src/ui/sim/sim_manager_viewport.cpp
+  src/ui/sim/sim_manager_flow.cpp
+  src/ui/sim/sim_manager_motion.cpp
+  src/ui/sim/sim_manager_em.cpp
+  src/ui/sim/sim_manager_topology.cpp
+  src/ui/sim/sim_manager_electronics.cpp
+  src/ui/piping_panel.cpp
+  src/ui/hydraulic_panel.cpp
+  src/ui/sim/hydraulic_canvas.cpp
+  src/ui/sim/hydraulic_forms.cpp
+  src/ui/sim/sim_scene.cpp         # viewport <-> sim-panel 3D scene seam (dispatcher)
+  src/ui/sim/pipe_scene.cpp        # Piping producer: shaded network, picking, draw/insert tools
+  src/ui/sim/pipe_sketch.cpp       # 3D pipe line tool: working plane, snapping, rubber band
+  src/ui/sim/pipe_mesh.cpp         # pipe/fitting tube tessellation (cached per network revision)
+  src/ui/sim/hydraulic_scene.cpp   # Hydraulics producer: 3D components + hoses, placement tool
   src/ui/sim_topology.cpp
   src/ui/sim_topology_bc.cpp
   src/ui/legend.cpp
+  src/ui/ui_audit.cpp
   src/ui/evaluate_dialogs.cpp
   # --- end C19 ---
   # --- C20b: assembly UI panels ---
@@ -301,6 +321,11 @@ set(CHUDWARE_CORE_SOURCES
   # easing curves and the continuous-redraw frame request the idle throttle in app.cpp consumes.
   src/ui/anim.cpp
   src/ui/widgets/kit.cpp
+  src/ui/widgets/kit_form.cpp
+  src/ui/widgets/kit_plot.cpp
+  src/ui/widgets/kit_panel.cpp
+  src/ui/sim/sim_common.cpp
+  src/ui/sim/sim_pump_drive.cpp
   src/ui/tesseract.cpp  # brand mark: live 4D tesseract projection (copilot logo + Appearance preview)
   src/win_chrome.cpp
   src/stb_impl.cpp
@@ -363,6 +388,25 @@ set(CHUDWARE_CORE_SOURCES
   ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
 )
+# Dear ImGui test-engine item hooks for the UI audit (CHUDWARE_SHOT=simaudit, CHUDWARE_IDAUDIT=1):
+# with IMGUI_ENABLE_TEST_ENGINE ImGui reports every submitted item to the hooks src/ui/ui_audit.cpp
+# defines. ImGui and the custom item annotation sites get the define (enum values and hook call
+# sites, no struct fields). They belong to Chudware, which also compiles ui_audit.cpp.
+# Each hook site is one branch on ImGuiContext::TestEngineHookItems, false outside an active audit.
+set_property(SOURCE
+  ${imgui_SOURCE_DIR}/imgui.cpp
+  ${imgui_SOURCE_DIR}/imgui_draw.cpp
+  ${imgui_SOURCE_DIR}/imgui_tables.cpp
+  ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+  src/ui/widgets/kit.cpp
+  src/ui/widgets/kit_panel.cpp
+  src/ui/widgets/kit_form.cpp
+  src/ui/sim/sim_manager_forms.cpp
+  src/ui/sim/sim_manager_flow.cpp
+  src/ui/sim/sim_manager_motion.cpp
+  src/ui/sim/sim_manager_electronics.cpp
+  src/ui/ui_audit.cpp
+  APPEND PROPERTY COMPILE_DEFINITIONS IMGUI_ENABLE_TEST_ENGINE)
 
 if(EMSCRIPTEN)
   # Full app under EMSCRIPTEN: same core list, swap IPC transport, stub bootstrap/
@@ -1149,6 +1193,7 @@ add_test(NAME test_cam_mirror
 
 add_executable(test_sim_topology
   src/ui/sim_topology.cpp
+  src/ui/sim_topology_bc.cpp
   tests/test_sim_topology.cpp)
 target_compile_definitions(test_sim_topology PRIVATE CHUDWARE_SIM_TOPOLOGY_MODEL_ONLY=1)
 target_include_directories(test_sim_topology PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

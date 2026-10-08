@@ -265,6 +265,17 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
 
 namespace ui {
 
+static bool startupComposerMetadataReady(const AppState& st) {
+    static double interactiveSince = -1.0;
+    if (!st.workerStarted || st.workerBootPending || !st.startupPhase.empty()) {
+        interactiveSince = -1.0;
+        return false;
+    }
+    const double now = ImGui::GetTime();
+    if (interactiveSince < 0.0) interactiveSince = now;
+    return now - interactiveSince >= 1.5;
+}
+
 // ---- O1: model picker → RPC payload threading --------------------------------------------------
 // Canonical provider name sent to the long-lived worker from the GUI enum. PROV_LOCAL uses the
 // OpenAI-compatible wire family — base_url (persisted before every send) discriminates local from
@@ -1038,7 +1049,7 @@ struct ComposerSkillsCache {
     bool   loaded = false;
     bool   inFlight = false;
     bool   rpcMissing = false;
-    double lastList = 0.0;
+    double lastList = -1e9;
 };
 static ComposerSkillsCache s_composerSkills;
 
@@ -1083,15 +1094,16 @@ static bool slashSkillsAbsent(const core::RpcResult& r) {
 
 static void pollComposerSkills(AppState& st, bool force) {
     if (s_composerSkills.rpcMissing) return;
-    if (!st.workerStarted && !force) return;
+    if (!force && !startupComposerMetadataReady(st)) return;
     const double now = ImGui::GetTime();
-    if (!force && s_composerSkills.loaded && (now - s_composerSkills.lastList) < 8.0) return;
+    if (!force && (now - s_composerSkills.lastList) < 8.0) return;
     if (s_composerSkills.inFlight) return;
     s_composerSkills.lastList = now;
     s_composerSkills.inFlight = true;
     st.rpc.call("skills_list", nlohmann::json::object(),
                 [](const core::RpcResult& r) {
         s_composerSkills.inFlight = false;
+        s_composerSkills.lastList = ImGui::GetTime();
         if (slashSkillsAbsent(r)) {
             s_composerSkills.rpcMissing = true;
             s_composerSkills.loaded = true;
@@ -1331,7 +1343,7 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
         s_slash.dismissed = false;  // query changed — re-arm the menu
     }
 
-    pollComposerSkills(st, /*force=*/false);
+    pollComposerSkills(st, /*force=*/!s_composerSkills.loaded);
     if (!s_slash.open || filter != s_slash.filter) {
         s_slash.filter = filter;
         s_slash.selected = 0;
@@ -2160,6 +2172,7 @@ static constexpr double kPromptBaselineTtlS   = 60.0;
 static constexpr double kPromptBaselineRetryS = 15.0;
 
 static void refreshPromptBaseline(AppState& st) {
+    if (!startupComposerMetadataReady(st)) return;
     const double now = ImGui::GetTime();
     if (g_promptBaseline.inflight) return;
     if (g_promptBaseline.loaded && now < g_promptBaseline.staleAt) return;
@@ -2958,7 +2971,8 @@ static void voiceBindSession(AppState& st) {
 static void voiceProbe(AppState& st) {
     voiceBindSession(st);
     VoiceInputUi& v = voiceUi();
-    if (v.rpcBusy) return;
+    if (v.rpcBusy || v.pollQueued || v.state == VoiceUiState::Listening ||
+        v.state == VoiceUiState::Processing) return;
 #ifdef __EMSCRIPTEN__
     if (v.probed) return;
     v.probed = true;
@@ -2966,6 +2980,7 @@ static void voiceProbe(AppState& st) {
     v.reason = "Voice input is not available in the web build.";
     return;
 #else
+    if (!startupComposerMetadataReady(st)) return;
     if (v.probed && ImGui::GetTime() - v.lastProbeSec < 5.0) return;
     v.lastProbeSec = ImGui::GetTime();
     if (v.sessionId.empty()) {
@@ -2982,6 +2997,7 @@ static void voiceProbe(AppState& st) {
                     VoiceInputUi& vv = voiceUi();
                     if (vv.sessionId != sessionId || vv.requestGeneration != generation) return;
                     vv.rpcBusy = false;
+                    vv.lastProbeSec = ImGui::GetTime();
                     if (core::workerLaneBusy(r)) {
                         // A run holds the speech service: keep the last-known mic state and
                         // re-probe on the normal cadence. Before any answer, say when it opens.
@@ -3003,7 +3019,7 @@ static void voiceProbe(AppState& st) {
 static void voicePoll(AppState& st) {
     VoiceInputUi& v = voiceUi();
     if (v.state != VoiceUiState::Listening && v.state != VoiceUiState::Processing) return;
-    if (v.pollQueued) return;
+    if (v.pollQueued || v.rpcBusy) return;
     const double now = ImGui::GetTime();
     if (now - v.lastPollSec < 0.20) return;
     v.lastPollSec = now;
@@ -3015,6 +3031,7 @@ static void voicePoll(AppState& st) {
                     VoiceInputUi& vv = voiceUi();
                     if (vv.sessionId != sessionId) return;
                     vv.pollQueued = false;
+                    vv.lastPollSec = ImGui::GetTime();
                     if (vv.requestGeneration != generation) return;
                     if (r.ok) voiceApplyStatus(st, r.result);
                 },
@@ -4322,7 +4339,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         ImGui::SetKeyboardFocusHere();
         s_refocusComposer = false;
     }
-    // Prime slash-menu skill catalog once the worker is up (cheap TTL'd RPC).
+    // Prime the slash-menu catalog after the initial interactive frame has had time to settle.
     if (st.workerStarted) pollComposerSkills(st, /*force=*/false);
 
     // Slash query opens before the InputText so Up/Down history callbacks fire this frame.

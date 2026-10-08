@@ -1298,9 +1298,11 @@ void drawWindowPillScrollbarV(const AdaptiveSurface& surf, const PillScrollbarSt
     const float scrollMax = ImGui::GetScrollMaxY();
     // Ignore sub-padding phantom overflow: a child with AlwaysUseWindowPadding + a fixed height can
     // report a few px of ScrollMaxY even when the content visually fits (e.g. collapsed tree
-    // sections), which showed a spurious bar. Only show it for a real overflow bigger than the
-    // window's own bottom padding.
-    const float phantom = ImGui::GetStyle().WindowPadding.y + 4.0f * ui::uiScale;
+    // sections), which showed a spurious bar. Only show it for a real overflow bigger than THIS
+    // window's own bottom padding (not the global style's: a zero-padding scroll body such as
+    // kit::panelBodyBegin would otherwise hide a real overflow of up to ~13 px with no bar). Hosts
+    // that key anything off "the bar shows" must use the same test (kit_panel's scroll cues do).
+    const float phantom = ImGui::GetCurrentWindow()->WindowPadding.y + 4.0f * ui::uiScale;
     if (scrollMax <= phantom) return;   // fits — no bar (hidden entirely, not just faded)
     const float s = ui::uiScale;
     const ImVec2 wpos = ImGui::GetWindowPos();

@@ -2064,7 +2064,10 @@ struct AppState {
     // pick caches untouched. Used by the blend (fillet/chamfer) live preview to DISPLAY the rounded
     // result while picking + highlighting still resolve against the un-rounded base body that the
     // session holds (suppressed). So the user sees the round form but every edge pick is exact.
-    bool loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly = false);
+    // cacheAsModel=false: a temporary full simulation overlay keeps scalar/displacement fields
+    // without replacing the session's editable model cache; its GPU identity is not the part.
+    bool loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly = false,
+                     bool cacheAsModel = true);
     // Restore a session's immutable mirror + parsed tessellation and bind its cached renderer
     // buffers. Rebuilds only the independent pick/overlay buffers; no worker or disk round-trip.
     bool bindCachedDocMesh(DocSession& session, std::string& err);
@@ -2074,7 +2077,8 @@ struct AppState {
     // meshGen drops stale completions when a newer load is queued. Keep-last-good is free: the
     // previous mesh stays on screen until a current completion commits. Safe to call from GL
     // thread; no-ops empty paths.
-    void loadDocMeshAsync(const std::string& aicmPath, bool renderOnly = false);
+    void loadDocMeshAsync(const std::string& aicmPath, bool renderOnly = false,
+                          bool cacheAsModel = true);
     // Parse and upload an inactive document's pushed tessellation into its per-tab CPU/GPU cache
     // without disturbing the visible document. Newer revisions supersede queued older ones.
     void cacheBackgroundDocMeshAsync(const std::string& docId, int revision,

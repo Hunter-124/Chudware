@@ -59,21 +59,28 @@ static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulatio
                                     "Schematic",
                                     // Topology optimization study tab (index 21, Simulate workspace
                                     // only — see ribbon_tabVisible). Appended to keep every index stable.
-                                    "Topology"};
-static constexpr int kRibbonTabCount = 22;  // + W17 contextual "View Layout"/"Annotation" (drawings)
+                                    "Topology",
+                                    // Piping networks + internal-flow CFD + vessel/duct sizing (index 22,
+                                    // Simulate workspace only). Appended to keep every index stable.
+                                    "Piping",
+                                    // Hydraulic (fluid-power) circuits: components, sizing, transient
+                                    // simulation, BOM, piping handoff (index 23, Simulate only).
+                                    "Hydraulics"};
+static constexpr int kRibbonTabCount = 24;  // + W17 contextual "View Layout"/"Annotation" (drawings)
                                             //   + "Appearance" (index 11) + "Manufacture" (CAM, 12)
                                             //   + sim-gui per-type tabs (13..19, Simulate only)
                                             //   + "Topology" (21, Simulate only)
+                                            //   + "Piping" (22, Simulate only)
+                                            //   + "Hydraulics" (23, Simulate only)
 
 // W-overhaul: per-workspace tab icon, parallel to kRibbonTabs[]. The eight true workspace tabs use
-// the dedicated ws_* atlas glyphs from the icon contract; the four tabs that have no ws_* glyph
-// (Simulation, PCB, and the two contextual drawing tabs) reuse the closest existing atlas icon as a
-// placeholder until dedicated glyphs ship.
+// the dedicated ws_* atlas glyphs from the icon contract; PCB and the two contextual drawing tabs
+// reuse the closest existing atlas icon as a placeholder until dedicated glyphs ship.
 static const char* kTabIcons[] = {
     "ws_features",    // Features
     "ws_sketch",      // Sketch
     "ws_evaluate",    // Evaluate
-    "study_static",   // Simulation (placeholder — no ws_simulation glyph in the contract)
+    "ws_simulate",    // Simulation (legacy all-in-one sim tab)
     "ws_assembly",    // Assembly
     "ws_sheetmetal",  // Sheet Metal
     "ws_weldments",   // Weldments
@@ -83,21 +90,34 @@ static const char* kTabIcons[] = {
     "smart_dim",      // Annotation (drawing — placeholder)
     "ws_appearance",  // Appearance
     "hole_wizard",    // Manufacture (CAM — placeholder, machining glyph)
-    // sim-gui per-type tabs (13..19). study_* glyphs exist in the atlas for the five FEA/CFD
-    // kinds; Motion reuses the assembly "mate" glyph (a motion study drives a mate), EM reuses
-    // "relations" as a wave-ish placeholder until a dedicated em glyph ships.
-    "study_static",   // Static
-    "study_modal",    // Modal
-    "study_flow",     // Flow
-    "study_thermal",  // Thermal
-    "study_fatigue",  // Fatigue
-    "mate",           // Motion
-    "relations",      // EM (placeholder)
-    "sketch",         // Schematic (index 20 — reuse sketch glyph; no ws_schematic glyph yet)
-    "study_static",   // Topology (index 21 — structural study glyph until a study_topology ships)
+    // Simulate tabs: each wears its own study glyph — the same one its "New Study" button shows.
+    // Motion keeps the assembly "mate" glyph (a motion study drives a mate).
+    "study_static",      // Static
+    "study_modal",       // Modal
+    "study_flow",        // Flow
+    "study_thermal_fea", // Thermal (thermal FEA)
+    "study_fatigue",     // Fatigue
+    "mate",              // Motion
+    "study_em",          // EM
+    "sketch",            // Schematic (index 20 — reuse sketch glyph; no ws_schematic glyph yet)
+    "study_topology",    // Topology (index 21)
+    "study_piping",      // Piping (index 22)
+    "study_hydraulics",  // Hydraulics (index 23)
 };
 static_assert(sizeof(kTabIcons) / sizeof(kTabIcons[0]) == kRibbonTabCount,
               "kTabIcons must stay parallel to kRibbonTabs");
+
+// Left-to-right DISPLAY order of the tab strip. Tab indices are append-only (AppState::ribbonTab
+// and the scenarios address tabs by index), so the strip order is declared here instead: the
+// Simulate tabs read structural (Static, Modal, Fatigue) -> thermal / fluids -> motion -> EM ->
+// optimization -> industrial (Piping, Hydraulics). Must list every index exactly once.
+static constexpr int kTabDisplayOrder[] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+    13 /*Static*/, 14 /*Modal*/, 17 /*Fatigue*/, 16 /*Thermal*/, 15 /*Flow*/, 18 /*Motion*/,
+    19 /*EM*/, 20 /*Schematic*/, 21 /*Topology*/, 22 /*Piping*/, 23 /*Hydraulics*/,
+};
+static_assert(sizeof(kTabDisplayOrder) / sizeof(kTabDisplayOrder[0]) == kRibbonTabCount,
+              "kTabDisplayOrder must list every ribbon tab");
 
 // Forward-declared here; defined after drawRibbon's local state block (~line 330).
 // Default Model (0) — app.cpp sets the live value each frame via setRibbonWorkspace().
@@ -111,17 +131,31 @@ static int s_workspace = 0;
 // ui/web_capabilities.cpp — no per-command state here).
 static std::string s_disabledPrefix;
 static std::string s_disabledReason;
+
+// Simulate study context (setRibbonStudyContext): the selected study's type key, refreshed every
+// frame by SimManager::tick. It expires one frame after the last refresh, so a stale study never
+// gates the ribbon once no CAD document (and so no SimManager) is active.
+static std::string s_studyCtx;
+static int s_studyCtxFrame = -100;
+static const char* ribbon_studyCtx() {
+    return ImGui::GetFrameCount() - s_studyCtxFrame <= 1 ? s_studyCtx.c_str() : nullptr;
+}
+
 static const char* ribbon_dynDisabledReason(const char* cmd_id) {
     if (!cmd_id) return nullptr;
     if (!s_disabledPrefix.empty() &&
         std::strncmp(cmd_id, s_disabledPrefix.c_str(), s_disabledPrefix.size()) == 0)
         return s_disabledReason.c_str();
+    // Simulate: commands that do not apply to the selected study (ribbon_def.cpp ribbonStudyGate).
+    const char* why = nullptr;
+    if (ui::ribbonStudyGate(cmd_id, ribbon_studyCtx(), &why) == ui::RibbonStudyGate::Disabled)
+        return why;
     // T-RF12: web-build capability gaps (ui/web_capabilities.cpp; folds to nullptr on
     // native, so desktop rendering/tooltips are unchanged).
     return ui::webGapReason(cmd_id);
 }
 // Effective enabled state for a row: the static schema-reserved flag (stretch) AND the dynamic
-// prefix gate above. Every button/flyout/overflow row goes through this.
+// gates above. Every button/flyout/overflow row goes through this.
 static bool ribbon_cmdEnabled(const ui::RibbonCmd* c) {
     return !c->stretch && !ribbon_dynDisabledReason(c->cmd_id);
 }
@@ -131,7 +165,8 @@ static bool ribbon_cmdEnabled(const ui::RibbonCmd* c) {
 // Tab index → name map (matches kRibbonTabs):
 //   0=Features, 1=Sketch, 2=Evaluate, 3=Simulation, 4=Assembly, 5=Sheet Metal,
 //   6=Weldments, 7=PCB, 8=Surfaces, 9=View Layout, 10=Annotation, 11=Appearance, 12=Manufacture,
-//   13..19=Static/Modal/Flow/Thermal/Fatigue/Motion/EM, 20=Schematic, 21=Topology
+//   13..19=Static/Modal/Flow/Thermal/Fatigue/Motion/EM, 20=Schematic, 21=Topology, 22=Piping,
+//   23=Hydraulics
 //
 // Workspace enum (AppState::Workspace): Model=0, Drawing=1, Simulate=2, Electronics=3,
 //   Manufacture=4, PLM=5, PartsLibrary=6, AI=7
@@ -152,11 +187,11 @@ static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbToo
     }
 
     // Simulate workspace (sim-gui rework): the per-simulation-type tabs ONLY (Static / Modal /
-    // Flow / Thermal / Fatigue / Motion / EM, indices 13..19, plus Topology at 21). Each carries
-    // only the tools for its study type + the shared Reference group. The legacy all-in-one
-    // Simulation tab (3) is retired from this workspace (its rows stay in ribbon_def for
+    // Flow / Thermal / Fatigue / Motion / EM, indices 13..19, plus Topology at 21, Piping at 22 and
+    // Hydraulics at 23). Each carries only the tools for its study type + the shared Reference group. The legacy
+    // all-in-one Simulation tab (3) is retired from this workspace (its rows stay in ribbon_def for
     // append-only compat).
-    if (s_workspace == 2 /*Simulate*/) return (tab >= 13 && tab <= 19) || tab == 21;
+    if (s_workspace == 2 /*Simulate*/) return (tab >= 13 && tab <= 19) || tab == 21 || tab == 22 || tab == 23;
 
     // Electronics workspace: both ECAD tabs — PCB Design (7) and Schematic (20).
     if (s_workspace == 3 /*Electronics*/) return tab == 7 || tab == 20;
@@ -172,7 +207,7 @@ static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbToo
     if (tab == 7) return showPcbTools;         // PCB Design: legacy bool
     if (tab == 20) return showPcbTools;        // Schematic: same legacy ECAD bool as PCB Design
     if (tab == 12) return false;               // Manufacture: only in Manufacture workspace
-    if (tab >= 13) return false;               // sim-gui per-type tabs + Topology: Simulate only
+    if (tab >= 13) return false;               // sim-gui per-type tabs + Topology + Piping + Hydraulics: Simulate only
     return true;
 }
 
@@ -202,6 +237,18 @@ static const ParentDefault* ribbon_parentDefault(const char* parentId) {
     for (const auto& pd : kParentDefaults)
         if (std::strcmp(pd.parentId, parentId) == 0) return &pd;
     return nullptr;
+}
+
+// Launcher split buttons: the face is ONE fixed command — a plain click always fires the parent
+// (Simulate "New Study" always opens the grouped study picker) — and the arrow lists direct
+// shortcuts. Picking a shortcut fires it without becoming the face (no last-used swap), the flyout
+// does not repeat the parent, and the button is sized to its own label only.
+static const char* const kLauncherParents[] = {"sim_new_picker"};
+
+static bool ribbon_isLauncher(const char* cmdId) {
+    for (const char* id : kLauncherParents)
+        if (std::strcmp(id, cmdId) == 0) return true;
+    return false;
 }
 
 // C25c FIX (defect 3): seed last-used so a plain click on a default-mapped split button immediately
@@ -266,6 +313,19 @@ static float ribbon_wrapLabel(const char* label, std::string& l1, std::string& l
     return w1 > w2 ? w1 : w2;
 }
 
+// Launcher split buttons ("New Study") keep their caption on ONE line: their arrow strip sits right
+// under the caption, and a two-line caption under the 36 px icon left the second line touching the
+// caret (and the button too narrow for its group caption). One line still fits kBigBtnMaxW.
+static float ribbon_wrapLabelFor(const char* cmd_id, const char* label, std::string& l1,
+                                 std::string& l2) {
+    if (cmd_id && ribbon_isLauncher(cmd_id)) {
+        l1 = label;
+        l2.clear();
+        return ImGui::CalcTextSize(label).x;
+    }
+    return ribbon_wrapLabel(label, l1, l2);
+}
+
 // C25: snap to nearest integer pixel for crisp atlas rendering.
 // Declared early so measure helpers (ribbon_bigBtnW / ribbon_smBtnW) and all button
 // draw paths share the same pixel-grid math.
@@ -279,7 +339,7 @@ static float ribbon_bigBtnW(const char* cmd_id, const char* label, bool hasDrop)
     float s = ui::uiScale;
     std::string l1, l2;
     const char* visibleLabel = ribbon_displayLabel(cmd_id, label);
-    float lblWScreen = ribbon_wrapLabel(visibleLabel, l1, l2) + kBigLblPad * 2.0f * s;
+    float lblWScreen = ribbon_wrapLabelFor(cmd_id, visibleLabel, l1, l2) + kBigLblPad * 2.0f * s;
     float base = (visibleLabel[0] == '\0' ? 46.0f : kBigBtnW) * s;
     if (lblWScreen > base) base = lblWScreen;
     if (base > kBigBtnMaxW * s) base = kBigBtnMaxW * s;
@@ -547,10 +607,35 @@ struct TabGroupOrder {
 static const char* const kManufactureGroupOrder[] = {
     "Job", "2.5D", "Holes", "3D", "Turning", "Cutting", "Output", "Reference",
 };
-static const TabGroupOrder kTabGroupOrder[] = {
-    {"Manufacture", kManufactureGroupOrder,
-     (int)(sizeof(kManufactureGroupOrder) / sizeof(kManufactureGroupOrder[0]))},
+// Simulate study tabs (standard §7): Study -> Setup -> Boundaries -> Mesh -> Run -> Results ->
+// Reference. A tab simply has no group where one does not apply (Modal: no loads, Motion: no mesh).
+static const char* const kSimStudyGroupOrder[] = {
+    "Study", "Setup", "Boundaries", "Mesh", "Run", "Results", "Reference",
 };
+// Piping / Hydraulics are design tools, not studies: the network or circuit, its design (sizing),
+// analysis, results, then Reference.
+static const char* const kPipingGroupOrder[] = {
+    "Network", "Design", "Analysis", "Results", "Reference",
+};
+static const char* const kHydraulicsGroupOrder[] = {
+    "Circuit", "Design", "Analysis", "Results", "Reference",
+};
+#define RIBBON_GROUP_ORDER(TAB, ARR) {TAB, ARR, (int)(sizeof(ARR) / sizeof(ARR[0]))}
+static const TabGroupOrder kTabGroupOrder[] = {
+    RIBBON_GROUP_ORDER("Manufacture", kManufactureGroupOrder),
+    RIBBON_GROUP_ORDER("Simulation",  kSimStudyGroupOrder),
+    RIBBON_GROUP_ORDER("Static",      kSimStudyGroupOrder),
+    RIBBON_GROUP_ORDER("Modal",       kSimStudyGroupOrder),
+    RIBBON_GROUP_ORDER("Flow",        kSimStudyGroupOrder),
+    RIBBON_GROUP_ORDER("Thermal",     kSimStudyGroupOrder),
+    RIBBON_GROUP_ORDER("Fatigue",     kSimStudyGroupOrder),
+    RIBBON_GROUP_ORDER("Motion",      kSimStudyGroupOrder),
+    RIBBON_GROUP_ORDER("EM",          kSimStudyGroupOrder),
+    RIBBON_GROUP_ORDER("Topology",    kSimStudyGroupOrder),
+    RIBBON_GROUP_ORDER("Piping",      kPipingGroupOrder),
+    RIBBON_GROUP_ORDER("Hydraulics",  kHydraulicsGroupOrder),
+};
+#undef RIBBON_GROUP_ORDER
 
 // Reorder `groups` for `tabName` per kTabGroupOrder. Stable, so unlisted groups keep table order.
 static void ribbon_orderGroups(std::vector<RibbonGroup>& groups, const char* tabName) {
@@ -609,7 +694,7 @@ static bool ribbon_hasSubs(const RibbonGroup& grp, const ui::RibbonCmd* cmd) {
 // own width unchanged.
 static float ribbon_bigBtnWMax(const RibbonGroup& grp, const ui::RibbonCmd* cmd, bool drop) {
     float w = ribbon_bigBtnW(cmd->cmd_id, cmd->label, drop);
-    if (!drop) return w;
+    if (!drop || ribbon_isLauncher(cmd->cmd_id)) return w;   // launcher face never changes
     // Injected parent-default flyout row (e.g. sk_ellipse_big -> "Ellipse") is also a possible face.
     if (const ParentDefault* pd = ribbon_parentDefault(cmd->cmd_id))
         w = ImMax(w, ribbon_bigBtnW(pd->defaultCmd, pd->defaultLabel, drop));
@@ -626,11 +711,13 @@ static float ribbon_bigBtnAsSmallWMax(const RibbonGroup& grp, const ui::RibbonCm
     float s = ui::uiScale;
     float w = ribbon_smBtnW(cmd->label);
     if (drop) {
-        if (const ParentDefault* pd = ribbon_parentDefault(cmd->cmd_id))
-            w = ImMax(w, ribbon_smBtnW(pd->defaultLabel));
-        for (const auto* sc : grp.subCmds)
-            if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0)
-                w = ImMax(w, ribbon_smBtnW(sc->label));
+        if (!ribbon_isLauncher(cmd->cmd_id)) {   // launcher face never changes
+            if (const ParentDefault* pd = ribbon_parentDefault(cmd->cmd_id))
+                w = ImMax(w, ribbon_smBtnW(pd->defaultLabel));
+            for (const auto* sc : grp.subCmds)
+                if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0)
+                    w = ImMax(w, ribbon_smBtnW(sc->label));
+        }
         // Snap the trailing arrow slot so mainW + dropW == totalW on the pixel grid.
         w += snap(kDropArrowW * s);
     }
@@ -704,7 +791,19 @@ static float ribbon_groupNaturalW(const RibbonGroup& grp, CollapseLevel level) {
     return content;
 }
 
+// The tab drawRibbon is rendering (set per frame) — a command whose label differs per tab gets the
+// matching description from kTabTips.
+static const char* s_tipTab = "";
+
 static const char* ribbon_tipFor(const char* cmd_id) {
+    // Per-tab descriptions, checked first: the same command reads differently on some tabs
+    // (Thermal "Fixed Temp" is sim_fixture holding faces at a temperature).
+    struct TabTip { const char* tab; const char* id; const char* tip; };
+    static const TabTip kTabTips[] = {
+        {"Thermal", "sim_fixture", "Hold the selected faces at a fixed temperature."},
+    };
+    for (const auto& t : kTabTips)
+        if (std::strcmp(t.tab, s_tipTab) == 0 && std::strcmp(t.id, cmd_id) == 0) return t.tip;
     struct T { const char* id; const char* tip; };
     static const T tips[] = {
         {"sketch_new",        "Start a 2D sketch on a plane or planar face."},
@@ -785,16 +884,67 @@ static const char* ribbon_tipFor(const char* cmd_id) {
         {"eval_check",        "Check geometry for errors and bad faces."},
         {"eval_geometry",     "Find small faces, short edges, slivers, gaps and tangency breaks."},
         {"eval_interference", "Detect interference between bodies."},
-        {"sim_new_static",    "Create a linear static stress study."},
-        {"sim_new_modal",     "Create a frequency / modal study."},
-        {"sim_new_flow",      "Create a flow simulation study."},
-        {"sim_material",      "Assign a material to the study."},
-        {"sim_fixture",       "Add a fixture / restraint."},
-        {"sim_load_force",    "Apply a force load."},
-        {"sim_load_pressure", "Apply a pressure load."},
-        {"sim_mesh",          "Generate the simulation mesh."},
-        {"sim_run",           "Run the study."},
-        {"sim_results",       "View result plots."},
+        // --- Simulate: Study group (New Study launcher + every study type in its flyout) ---
+        {"sim_new_picker",    "Create a study: choose its type from the grouped list (structural, "
+                              "thermal, fluids, motion, electromagnetics, optimization). The arrow "
+                              "creates a study of one type directly."},
+        {"sim_new_static",    "Linear static study: stress, displacement and factor of safety under "
+                              "fixtures and loads."},
+        {"sim_new_modal",     "Modal study: natural frequencies and mode shapes."},
+        {"sim_new_buckling",  "Linear buckling study: critical load factors and buckled mode shapes."},
+        {"sim_new_fatigue",   "Fatigue study: cycles to failure from a static stress state, an S-N "
+                              "curve and Marin factors."},
+        {"sim_new_contact",   "Contact study: two blocks pressed together, on a proxy sized to the "
+                              "part (CalculiX) — contact pressure and reaction balance."},
+        {"sim_new_freqresp",  "Vibration study: steady response to base excitation across a frequency "
+                              "band, with modal damping."},
+        {"sim_new_thermal_fea", "Thermal FEA study: steady or transient conduction in the solid — "
+                                "fixed temperatures, heat flux and convection."},
+        {"sim_new_flow",      "Flow study: external flow around the part in a virtual wind or water "
+                              "tunnel — drag, lift and surface pressure."},
+        {"sim_new_motion",    "Motion study: drive an assembly mate over time and play the motion back "
+                              "with interference checks."},
+        // --- Simulate: Setup / Boundaries / Mesh / Run / Results (shared by the study tabs) ---
+        {"sim_material",      "Assign the study's material: stiffness, strength, density and thermal "
+                              "properties."},
+        {"sim_fixture",       "Restrain the selected faces (zero displacement)."},
+        {"sim_load_force",    "Apply a force to the selected faces."},
+        {"sim_load_pressure", "Apply a pressure normal to the selected faces."},
+        {"sim_load_heat",     "Apply a heat load to the selected faces of a thermal FEA study: heat "
+                              "flux or convection to ambient."},
+        {"sim_mesh",          "Set the mesh size and generate the study's mesh."},
+        {"sim_run",           "Solve the active study. Progress and Cancel show at the foot of the "
+                              "study pane."},
+        {"sim_results",       "Open the active study's results: key values, plots and the viewport "
+                              "field (a motion study plays back here)."},
+        {"sim_modal_options", "Set how many natural frequencies and mode shapes to solve."},
+        {"sim_buckling_options", "Set how many buckling modes (critical load factors) to solve."},
+        {"sim_contact_options", "Set the contact pressure on the proxy blocks."},
+        {"sim_freqresp_options", "Set the base-excitation axis and amplitude, the modal damping and "
+                                 "the modes in the superposition."},
+        {"sim_thermal_fea_options", "Set the solid's conductivity and initial temperature, and the "
+                                    "transient time settings."},
+        {"sim_fluid",         "Choose the fluid and its density and viscosity."},
+        {"sim_flow_bc",       "Set the flow boundaries: flow direction, speed and angle of attack."},
+        {"sim_flow_res",      "Set the flow grid resolution and the solver settings."},
+        {"sim_fatigue_setup", "Set the cyclic loading, the S-N curve and the Marin surface, size and "
+                              "reliability factors."},
+        {"sim_motion_setup",  "Set the drivers (which joints move, from where to where), the "
+                              "sampling and the interference check."},
+        // --- Simulate: EM tab (waveguide electromagnetics, gated on the em_* backend) ---
+        {"sim_em_eigen",      "Eigenmode analysis: cutoff frequencies and field patterns of a "
+                              "waveguide cross-section's modes."},
+        {"sim_em_sweep",      "Frequency sweep: S-parameters of a waveguide section across a "
+                              "frequency band."},
+        {"sim_em_time",       "Time-domain analysis: a pulse travelling through the waveguide "
+                              "section."},
+        {"sim_em_range",      "Set the sweep's start and stop frequency and its point count."},
+        {"sim_em_ports",      "Excitation ports: matched modal ports on the guide cross-section — set "
+                              "the waveguide, length and mode."},
+        {"sim_em_boundary",   "Boundaries: the conducting guide walls and port terminations of the "
+                              "waveguide section."},
+        {"sim_em_run",        "Solve the open electromagnetics analysis."},
+        {"sim_em_results",    "Open the electromagnetics results: modes, S-parameters and fields."},
         {"asm_insert",        "Insert a component into the assembly."},
         {"asm_move",          "Move or rotate a component."},
         {"asm_pattern",       "Pattern a component."},
@@ -815,10 +965,7 @@ static const char* ribbon_tipFor(const char* cmd_id) {
         {"sk_poly_hex",  "Draw a regular hexagon."},
         {"sk_poly_oct",  "Draw a regular octagon."},
         {"sk_poly_star", "Draw a star polygon with alternating outer and inner radii."},
-        // --- Simulation: extended study types ---
-        {"sim_new_thermal",   "Create a steady-state or transient thermal study."},
-        {"sim_new_fatigue",   "Estimate fatigue life from a static stress result."},
-        // --- Simulation: topology optimization (Topology tab) ---
+        // --- Simulate: topology optimization (Topology tab) ---
         {"sim_new_topology",  "Create a topology optimization study: find the best material layout "
                               "inside the part for a volume budget."},
         {"sim_topology_setup", "Choose the physics, optimization method, objective, volume budget "
@@ -833,6 +980,36 @@ static const char* ribbon_tipFor(const char* cmd_id) {
                                        "enclosed-void rules for the optimized shape."},
         {"sim_topology_compare", "Compare retained optimization runs: objective, volume, "
                                  "constraints and convergence against a baseline run."},
+        // --- Simulation: piping, internal flow, vessels, ducts (Piping tab) ---
+        {"sim_piping_new",    "Start a new pipe network saved in this document."},
+        {"sim_piping_route",  "Route a pipe between two points; the router steers around the model's "
+                              "bodies with the clearance you set and places elbows at every bend."},
+        {"sim_piping_solve",  "Solve the network's flows and pressures from supply pressures and demands."},
+        {"sim_piping_spec",   "Check every run and flange against ASME B31.3 at the design pressure "
+                              "and temperature: wall, MAWP, flange rating, support span."},
+        {"sim_piping_bom",    "Line list, material take-off with masses, and shop spools."},
+        {"sim_piping_flow",   "3D internal-flow CFD through a fluid volume: pressure drop against the "
+                              "Darcy estimate, Reynolds number and regime."},
+        {"sim_piping_vessel", "Size a pressure vessel's shell and heads to ASME VIII-1, with "
+                              "hydrotest pressure, volume and masses."},
+        {"sim_piping_duct",   "Size a duct tree by equal friction and find the fan static pressure."},
+        // --- Simulation: hydraulic (fluid-power) circuits (Hydraulics tab) ---
+        {"sim_hyd_new",       "Start a new hydraulic circuit saved in this document."},
+        {"sim_hyd_add",       "Add an ISO 1219 component: pump, motor, cylinder, directional / relief / "
+                              "check / flow-control valve, accumulator, reservoir, filter, cooler."},
+        {"sim_hyd_hose",      "Connect component ports with a hose (two ends, or more for a tee) and set "
+                              "its length, bore and pressure rating."},
+        {"sim_hyd_size_cyl",  "Size a cylinder: forces, areas, flows and stroke time; bore from a force."},
+        {"sim_hyd_size_pump", "Size a pump: displacement, hydraulic and shaft power, torque."},
+        {"sim_hyd_size_motor","Size a hydraulic motor for a torque and speed, with the catalog displacement."},
+        {"sim_hyd_drive",     "Size the electric motor driving a pump: rating, poles, frame and current."},
+        {"sim_hyd_simulate",  "Simulate the circuit over time with a valve schedule and actuator loads: "
+                              "pressures, strokes, speeds, energy and heat."},
+        {"sim_hyd_bom",       "Bill of materials with sourcing for every component and hose."},
+        {"sim_hyd_piping",    "Turn the hoses into a solved pipe network and open it in the Piping tab."},
+        {"sim_hyd_view_schematic", "Show the circuit's ISO 1219 schematic in the central view."},
+        {"sim_hyd_view_plots",     "Show the simulation plots in the central view: pressures, "
+                                   "strokes and speeds over time."},
         // --- Assembly ---
         {"asm_parts_library", "Insert a standard hardware part from the library."},
         // --- Evaluate: drawing entry point + profiler ---
@@ -971,17 +1148,6 @@ static const char* ribbon_tipFor(const char* cmd_id) {
     return nullptr;
 }
 
-// Look up the atlas icon name registered for a cmd_id (mirrors the ribbon_def table) so the tooltip
-// can render the very glyph the button shows. Returns nullptr for an unknown command.
-static const char* ribbon_iconFor(const char* cmd_id) {
-    if (!cmd_id) return nullptr;
-    int n = 0;
-    const ui::RibbonCmd* cmds = ui::getRibbonCmds(n);
-    for (int i = 0; i < n; ++i)
-        if (std::strcmp(cmds[i].cmd_id, cmd_id) == 0) return cmds[i].icon;
-    return nullptr;
-}
-
 static bool ribbon_tooltipsEnabled() {
 #ifdef __EMSCRIPTEN__
     return ImGui::GetIO().DisplaySize.x > 900.0f;
@@ -990,7 +1156,9 @@ static bool ribbon_tooltipsEnabled() {
 #endif
 }
 
-static void ribbon_tooltip(const char* title, const char* cmd_id, bool enabled) {
+// `iconName` is the glyph the hovered control actually draws (rows of one cmd_id can differ per tab).
+static void ribbon_tooltip(const char* title, const char* cmd_id, const char* iconName,
+                           bool enabled) {
     auto col = [](const float f[4]) { return ImVec4(f[0], f[1], f[2], f[3]); };
     ui::pushGlassTooltipStyle();
     if (ImGui::BeginTooltip()) {
@@ -999,7 +1167,6 @@ static void ribbon_tooltip(const char* title, const char* cmd_id, bool enabled) 
         ui::glassBackground(ImGui::GetWindowDrawList(), wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
         // Icon mini-preview: the same glyph the button shows, so the tooltip previews what the tool
         // does. Tinted like the button — white when enabled, grey when disabled / "Coming soon".
-        const char* iconName = ribbon_iconFor(cmd_id);
         const bool  hasIcon  = iconName && *iconName;
         if (hasIcon) {
             float isz = 36.0f * ui::uiScale;
@@ -1268,7 +1435,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         const float* matRgb = ribbon_matSwatchColor(cmd_id);
 
         std::string l1, l2;
-        ribbon_wrapLabel(visibleLabel, l1, l2);
+        ribbon_wrapLabelFor(cmd_id, visibleLabel, l1, l2);
         float lineH   = ImGui::GetTextLineHeight();
         int   nLines  = (visibleLabel[0] == '\0') ? 0 : (l2.empty() ? 1 : 2);
         float swatchH = matRgb ? 5.0f * s : 0.0f;  // 4px bar + 1px gap
@@ -1319,7 +1486,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         dl->PopClipRect();
     }
 
-    if (mainHovTip && ribbon_tooltipsEnabled()) ribbon_tooltip(label, cmd_id, enabled);
+    if (mainHovTip && ribbon_tooltipsEnabled()) ribbon_tooltip(label, cmd_id, iconName, enabled);
 
     // C25: plain-click on split button fires last-used variant; if none chosen yet and the
     // parent itself has no functional action (hasDrop=true), open the flyout instead.
@@ -1452,7 +1619,7 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
         dl->PopClipRect();
     }
 
-    if (mainHovTip && ribbon_tooltipsEnabled()) ribbon_tooltip(label, cmd_id, enabled);
+    if (mainHovTip && ribbon_tooltipsEnabled()) ribbon_tooltip(label, cmd_id, iconName, enabled);
 
     if (clicked && enabled) {
         if (hasDrop) {
@@ -1514,8 +1681,9 @@ static const char* ribbon_flyoutPopup(const char* parentId,
         // FIRST row (unless a kParentDefaults row already stands in for the parent's action, or the
         // parent is a pure flyout host with no engine action). Selecting it sets s_LastUsed[parent]=
         // parent; resolveFace then finds no matching sub and falls back to the parent's own face.
+        // A launcher's parent is the button face itself, so its flyout lists only the shortcuts.
         const ui::RibbonCmd* parentCmd = nullptr;
-        if (!pd) {
+        if (!pd && !ribbon_isLauncher(parentId)) {
             int n = 0;
             const ui::RibbonCmd* all = ui::getRibbonCmds(n);
             for (int i = 0; i < n; ++i)
@@ -1573,20 +1741,10 @@ static const char* ribbon_flyoutPopup(const char* parentId,
                 dl->AddText(nullptr, 0.0f, ImVec2(tx, ty), tCol, sc->label);
             }
 
-            if (rowHov && !scEnabled) {
-                ImGui::BeginTooltip();
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                    ImVec4(ui::palette.text[0], ui::palette.text[1],
-                           ui::palette.text[2], ui::palette.text[3]));
-                ImGui::TextUnformatted(sc->label);
-                ImGui::PopStyleColor();
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                    ImVec4(ui::palette.textDisabled[0], ui::palette.textDisabled[1],
-                           ui::palette.textDisabled[2], ui::palette.textDisabled[3]));
-                ImGui::TextUnformatted("Coming soon");
-                ImGui::PopStyleColor();
-                ImGui::EndTooltip();
-            }
+            // Same glass tooltip as the buttons: description, and the real disabled reason (e.g. a
+            // web-build gap) instead of a blanket "Coming soon".
+            if (rowHov && ribbon_tooltipsEnabled())
+                ribbon_tooltip(sc->label, sc->cmd_id, sc->icon, scEnabled);
 
             if (rowClicked && scEnabled) {
                 selected = sc->cmd_id;
@@ -1777,7 +1935,7 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
         dl->AddText(nullptr, 0.0f, ImVec2(tx, ty), tCol, label);
     }
 
-    if (hovTip && ribbon_tooltipsEnabled()) ribbon_tooltip(label, cmd_id, enabled);
+    if (hovTip && ribbon_tooltipsEnabled()) ribbon_tooltip(label, cmd_id, iconName, enabled);
 
     if (clicked && enabled) ribbon_fire(cmd_id);
     ImGui::PopID();
@@ -1847,6 +2005,11 @@ void setRibbonDisabledPrefix(const char* prefix, const char* reason) {
     s_disabledReason = (reason && *reason) ? reason : "Unavailable";
 }
 
+void setRibbonStudyContext(const char* studyTypeKey) {
+    s_studyCtx = studyTypeKey ? studyTypeKey : "";
+    s_studyCtxFrame = ImGui::GetFrameCount();
+}
+
 float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool showPcbTools,
                  float titleBarH, bool showDrawingTools) {
     if (!visible) return 0.0f;
@@ -1858,8 +2021,9 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         // Land on the first visible tab — in drawing mode tab 0 is hidden, so pick the
         // first drawing tab; on a 3D doc fall back to Features.
         activeTab = 0;
-        for (int i = 0; i < kRibbonTabCount; ++i)
-            if (ribbon_tabVisible(i, showSimulationTools, showPcbTools, showDrawingTools)) {
+        for (int k = 0; k < kRibbonTabCount; ++k)
+            if (const int i = kTabDisplayOrder[k];
+                ribbon_tabVisible(i, showSimulationTools, showPcbTools, showDrawingTools)) {
                 activeTab = i;
                 break;
             }
@@ -1935,7 +2099,8 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                             ImVec2(ui::metrics::px(10.0f),
                                    (tabH - ImGui::GetFontSize()) * 0.5f));
         if (ImGui::BeginCombo("##ribbon_tabs", kRibbonTabs[activeTab])) {
-            for (int i = 0; i < kRibbonTabCount; ++i) {
+            for (int k = 0; k < kRibbonTabCount; ++k) {
+                const int i = kTabDisplayOrder[k];
                 if (!ribbon_tabVisible(i, showSimulationTools, showPcbTools, showDrawingTools)) continue;
                 if (ImGui::Selectable(kRibbonTabs[i], activeTab == i)) activeTab = i;
             }
@@ -1943,7 +2108,8 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         }
         ImGui::PopStyleVar();
     } else {
-    for (int i = 0; i < kRibbonTabCount; ++i) {
+    for (int k = 0; k < kRibbonTabCount; ++k) {
+        const int i = kTabDisplayOrder[k];
         if (!ribbon_tabVisible(i, showSimulationTools, showPcbTools, showDrawingTools)) continue;
         const char* tabLabel = kRibbonTabs[i];
         ImVec2 tsize  = ImGui::CalcTextSize(tabLabel);
@@ -2009,6 +2175,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     int cmdCount = 0;
     const RibbonCmd* cmds = getRibbonCmds(cmdCount);
     const char* actTabName = kRibbonTabs[activeTab];
+    s_tipTab = actTabName;   // per-tab tooltip overrides (ribbon_tipFor)
 
     std::vector<RibbonGroup> groups;
     groups.reserve(16);
@@ -2038,6 +2205,12 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     for (int i = 0; i < cmdCount; ++i) {
         const RibbonCmd& c = cmds[i];
         if (std::strcmp(c.tab, srcTabName) != 0) continue;
+        // Superseded (a later row for this tab + cmd_id replaces it) or retired rows never render.
+        if (!ribbonRowActive(i)) continue;
+        // Simulate: a study type's own setup row on a shared tab (Buckling "Modes" on Static, …)
+        // shows only while a study of that type is selected.
+        if (ribbonStudyGate(c.cmd_id, ribbon_studyCtx(), nullptr) == RibbonStudyGate::Hidden)
+            continue;
         // Sketch tab, no sketch being edited: present "New Sketch" in the "Exit Sketch" slot so the
         // user can start a sketch from this tab (matches the Features-tab entry point). Once a sketch
         // is open, s_sketchActive is true and the real "Exit Sketch" button shows.
@@ -2255,7 +2428,11 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             for (const auto* sc : grp.subCmds)
                 if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0) mySubs.push_back(sc);
             const char* chosen = ribbon_flyoutPopup(cmd->cmd_id, mySubs);
-            if (chosen) { s_LastUsed[cmd->cmd_id] = chosen; ribbon_fire(chosen); }
+            // A launcher's shortcut fires once; the face stays the launcher (no last-used swap).
+            if (chosen) {
+                if (!ribbon_isLauncher(cmd->cmd_id)) s_LastUsed[cmd->cmd_id] = chosen;
+                ribbon_fire(chosen);
+            }
         };
 
         if (!isSmall) {

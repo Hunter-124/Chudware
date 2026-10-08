@@ -54,6 +54,8 @@ struct UsageAccount {
 
 // Live device-code / browser login progress for one provider.
 struct UsageLoginProgress {
+    bool        connected = false;
+    std::string email;
     bool        inProgress = false;
     bool        browserOpened = false;
     std::string userCode;
@@ -66,6 +68,8 @@ struct UsageLoginProgress {
 // Accounts + status. `ttlSec` lets a visible management UI refresh briskly (1.5s) while a
 // background consumer such as the composer asks for a lazy refresh (60s). `force` ignores the TTL.
 void providerUsagePollAccounts(AppState& st, double ttlSec, bool force);
+// Shared connected flags + login progress; independent in-flight guard and caller-selected TTL.
+void providerUsagePollStatus(AppState& st, double ttlSec, bool force);
 // Usage windows. TTL is fixed at 5 min per contracts/providers.md §4.5; `force` bypasses it.
 // No-op once the worker has reported the method as unknown.
 void providerUsagePollUsage(AppState& st, bool force);

@@ -211,7 +211,8 @@ bool blockedState(const char* title, const char* reason, const char* hint = null
 // ---- text ------------------------------------------------------------------------------------------
 // Dim/secondary body text with wrapping. `label`/`value` is the canonical read-only property row —
 // the value ELIDES with an ellipsis and gains a tooltip rather than wrapping mid-token, which is
-// what unbroken ids and paths do inside a stretch column.
+// what unbroken ids and paths do inside a stretch column. A key longer than its column (capped at
+// ~55% of the row) wraps onto a second line instead of eliding; the value stays on the first.
 void dimText(const char* text);
 void keyValueRow(const char* key, const char* value, Tone valueTone = Tone::Neutral,
                  bool copyable = false);
@@ -234,3 +235,9 @@ std::string fmtDuration(double seconds);
 
 }  // namespace kit
 }  // namespace ui
+
+// Extended kit vocabulary (same ui::kit namespace): form fields, plots/tables/result cards, and
+// the panel scaffold (header, form tabs, stepper, action footer). One implementation each.
+#include "kit_form.h"
+#include "kit_plot.h"
+#include "kit_panel.h"

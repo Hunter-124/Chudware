@@ -56,6 +56,13 @@ inline bool workerLaneBusy(const RpcResult& r) {
     return it != r.result.end() && it->is_string() && *it == "worker_lane_busy";
 }
 
+// Client deadline for engine calls hostd runs in its long-running watchdog tier (doc_open,
+// doc_activate, doc_save, …: core/hostd/engine_watchdog.h; default 60 min, env
+// CHUDWARE_HOSTD_ENGINE_WATCHDOG_LONG_S). A shorter client deadline reports `Open failed`
+// while the engine is still legitimately compiling under the doc lock; hostd's watchdog is
+// what bounds a genuinely stuck call.
+inline constexpr int kLongEngineCallTimeoutMs = 60 * 60 * 1000;
+
 class AsyncRpc {
 public:
     using Done = std::function<void(const RpcResult&)>;
@@ -79,6 +86,9 @@ public:
 
     // True while any call is queued, executing, or finished-but-undrained.
     bool busy() const { return pending_.load() > 0; }
+    // Global capability/account/catalog polling must not disable a setup gesture.
+    // All other calls (including document reads and unknown methods) remain blocking.
+    bool interactionBusy() const { return interactionPending_.load() > 0; }
 
     // Stop the dispatch thread: drop queued + undrained work, abort the in-flight call,
     // join. Idempotent; also run by the destructor.
@@ -92,6 +102,7 @@ private:
         Done done;
         Event onEvent;
         RpcResult res;
+        bool blocksInteraction = true;
     };
 
     void threadMain();
@@ -109,6 +120,7 @@ private:
     std::vector<std::pair<Event, nlohmann::json>> eventQ_;
     bool quit_ = false;
     std::atomic<int> pending_{0};                   // queued + executing + undrained
+    std::atomic<int> interactionPending_{0};
 };
 
 }  // namespace core

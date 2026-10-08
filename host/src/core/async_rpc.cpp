@@ -2,8 +2,26 @@
 #include "async_rpc.h"
 
 #include <cstdio>
+#include <string_view>
 
 #include "../worker_client.h"
+
+namespace {
+bool blocksInteraction(std::string_view method) {
+    // Exact global discovery/status methods only. Never infer safety from a
+    // "get"/"list" prefix: document reads and every unknown method stay blocking.
+    static constexpr std::string_view metadata[] = {
+        "fw_projects", "agent_list_models", "subscription_accounts",
+        "subscription_status", "subscription_usage", "chudcode_auth_state",
+        "chudcode_models_list", "ai_prompt_baseline", "skills_list",
+        "chudcode_stt_status", "em_status", "sim_caps", "fw_status",
+        "topology_capabilities"
+    };
+    for (const auto name : metadata)
+        if (method == name) return false;
+    return true;
+}
+}  // namespace
 
 namespace core {
 
@@ -13,7 +31,9 @@ void AsyncRpc::call(std::string method, nlohmann::json params, Done done, int ti
 
 void AsyncRpc::call(std::string method, nlohmann::json params, Done done, Event onEvent,
                     int timeoutMs) {
+    const bool blocking = blocksInteraction(method);
     auto p = std::make_unique<Pending>();
+    p->blocksInteraction = blocking;
     p->method = std::move(method);
     // `rpc.call("m", {}, cb)` looks like "no arguments" but nlohmann parses a bare `{}` as
     // NULL, not an empty object — and a null lands on the wire as `"params": null`. hostd's
@@ -32,6 +52,7 @@ void AsyncRpc::call(std::string method, nlohmann::json params, Done done, Event 
         if (quit_) return;  // shutting down — drop silently (callbacks must not run after)
         queue_.push_back(std::move(p));
         pending_.fetch_add(1);
+        if (blocking) interactionPending_.fetch_add(1);
         // GL-thread-only by contract, so the lazy start can't race another call().
         if (!threadStarted_) {
             threadStarted_ = true;
@@ -107,6 +128,7 @@ void AsyncRpc::drain() {
                          p->method.c_str());
         }
         pending_.fetch_sub(1);
+        if (p->blocksInteraction) interactionPending_.fetch_sub(1);
     }
 }
 
@@ -123,6 +145,7 @@ void AsyncRpc::shutdown() {
     worker_.abortPending();
     if (thread_.joinable()) thread_.join();
     pending_.store(0);
+    interactionPending_.store(0);
 }
 
 }  // namespace core

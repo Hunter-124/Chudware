@@ -4,12 +4,39 @@
 // stretch=true = schema-reserved, rendered disabled in v1.
 //
 // APPEND-ONLY: later cards add rows here; never reorder or delete existing rows.
+// To CHANGE a row (group / label / icon / size / position in its group), append a replacement row
+// with the same tab + cmd_id: the LATER row wins and the earlier one is skipped by every renderer
+// (ribbonRowActive). To drop a row from view with no replacement, list it in kRetiredRows below.
+// Group order within a tab is declared in widgets/ribbon.cpp kTabGroupOrder, never by row order.
 #include "ribbon_def.h"
 #include <cstring>
+#include <initializer_list>
+#include <string>
+#include <vector>
 
 namespace ui {
 
 // clang-format off
+
+// Simulate standard (2026-10): the Study group every simulation study tab carries. "New Study" is a
+// launcher split button — a plain click always opens the grouped New Study picker (sim_new_picker,
+// SimManager); its arrow lists the study types directly, so Buckling / Contact / Vibration /
+// Thermal FEA are one click away on every tab. Thermal CFD (sim_new_thermal) needs the OpenFOAM
+// backend, so it is offered only by the picker, which shows why it is unavailable. ICON is the
+// tab's own study glyph.
+#define SIM_NEW_STUDY_ROWS(TAB, ICON) \
+    { "sim_new_picker",      "New Study",   ICON,                TAB, "Study", true,  nullptr,          false }, \
+    { "sim_new_static",      "Static",      "study_static",      TAB, "Study", false, "sim_new_picker", false }, \
+    { "sim_new_modal",       "Modal",       "study_modal",       TAB, "Study", false, "sim_new_picker", false }, \
+    { "sim_new_buckling",    "Buckling",    "study_buckling",    TAB, "Study", false, "sim_new_picker", false }, \
+    { "sim_new_fatigue",     "Fatigue",     "study_fatigue",     TAB, "Study", false, "sim_new_picker", false }, \
+    { "sim_new_contact",     "Contact",     "study_contact",     TAB, "Study", false, "sim_new_picker", false }, \
+    { "sim_new_freqresp",    "Vibration",   "study_vibration",   TAB, "Study", false, "sim_new_picker", false }, \
+    { "sim_new_thermal_fea", "Thermal FEA", "study_thermal_fea", TAB, "Study", false, "sim_new_picker", false }, \
+    { "sim_new_flow",        "Flow",        "study_flow",        TAB, "Study", false, "sim_new_picker", false }, \
+    { "sim_new_motion",      "Motion",      "mate",              TAB, "Study", false, "sim_new_picker", false }, \
+    { "sim_new_topology",    "Topology",    "study_topology",    TAB, "Study", false, "sim_new_picker", false }
+
 static const RibbonCmd kCmds[] = {
 
     // =========================================================================
@@ -732,12 +759,255 @@ static const RibbonCmd kCmds[] = {
     { "ref_axis",                   "Ref. Axis",   "ref_axis",      "Topology", "Reference",     false, nullptr, false },
     { "ref_point",                  "Ref. Point",  "ref_point",     "Topology", "Reference",     false, nullptr, false },
     { "ref_csys",                   "Coord. Sys.", "ref_csys",      "Topology", "Reference",     false, nullptr, false },
+
+    // --- Tab: Piping (piping networks, internal-flow CFD, vessel + duct sizing — Simulate workspace
+    // only, tab index 22). Every row routes through SimManager::handleCommand (sim_ prefix) to the
+    // PipingPanel, which calls the same native RPCs the agent's piping/industrial tools call and
+    // saves each result in the document as a study.
+    { "sim_piping_new",             "New Network", "new_doc",       "Piping",   "Network",       true,  nullptr, false },
+    { "sim_piping_route",           "Route Pipe",  "sweep",         "Piping",   "Network",       true,  nullptr, false },
+    { "sim_piping_solve",           "Solve",       "run_study",     "Piping",   "Analysis",      true,  nullptr, false },
+    { "sim_piping_spec",            "Spec Check",  "check",         "Piping",   "Analysis",      true,  nullptr, false },
+    { "sim_piping_bom",             "BOM",         "bom",           "Piping",   "Analysis",      true,  nullptr, false },
+    { "sim_piping_flow",            "Internal CFD","study_flow",    "Piping",   "Flow",          true,  nullptr, false },
+    { "sim_piping_vessel",          "Vessel",      "revolve_boss",  "Piping",   "Equipment",     true,  nullptr, false },
+    { "sim_piping_duct",            "Duct Sizing", "flow_arrow",    "Piping",   "Equipment",     true,  nullptr, false },
+
+    // --- Tab: Hydraulics (fluid-power circuits: pumps, valves, cylinders, motors — Simulate
+    // workspace only, tab index 23). Every row routes through SimManager::handleCommand (sim_
+    // prefix) to the HydraulicPanel, which calls the same native RPCs the agent's hydraulic tools
+    // call and saves the circuit and its results in the document as a hydraulic_circuit study.
+    { "sim_hyd_new",                "New Circuit", "new_doc",          "Hydraulics", "Circuit",   true,  nullptr, false },
+    { "sim_hyd_add",                "Add Component","insert_component","Hydraulics", "Circuit",   true,  nullptr, false },
+    { "sim_hyd_hose",               "Connect",     "sch_wire",         "Hydraulics", "Circuit",   true,  nullptr, false },
+    { "sim_hyd_size_cyl",           "Size Cylinder","cylinder_feature","Hydraulics", "Sizing",    true,  nullptr, false },
+    { "sim_hyd_size_pump",          "Size Pump",   "cat_hydraulics",   "Hydraulics", "Sizing",    true,  nullptr, false },
+    { "sim_hyd_size_motor",         "Size Motor",  "cat_drivetrain",   "Hydraulics", "Sizing",    true,  nullptr, false },
+    { "sim_hyd_drive",              "Pump Drive",  "performance",      "Hydraulics", "Sizing",    true,  nullptr, false },
+    { "sim_hyd_simulate",           "Simulate",    "run_study",        "Hydraulics", "Analysis",  true,  nullptr, false },
+    { "sim_hyd_bom",                "BOM",         "bom",              "Hydraulics", "Analysis",  true,  nullptr, false },
+    { "sim_hyd_piping",             "To Piping",   "sweep",            "Hydraulics", "Analysis",  true,  nullptr, false },
+
+    // =========================================================================
+    // Simulate standard (2026-10) — every simulation tab, re-laid out as replacement rows (the
+    // later row for a tab + cmd_id wins, see the header). Study tabs follow
+    //   Study · Setup · Boundaries · Mesh · Run · Results · Reference
+    // (a group is omitted only when it does not apply: Modal has no loads, Motion no mesh), and a
+    // command has the same group / label / icon / size on every tab: Fixture, Force and Pressure
+    // are big buttons in Boundaries everywhere. Piping / Hydraulics are not studies:
+    //   Network | Circuit · Design · Analysis · Results · Reference.
+    // Group order is enforced by widgets/ribbon.cpp kTabGroupOrder; the Reference rows above stay.
+    // =========================================================================
+
+    // --- Tab: Simulation (legacy all-in-one tab, Model workspace once a sim tool was used) ---
+    SIM_NEW_STUDY_ROWS("Simulation", "ws_simulate"),
+    { "sim_motion_study",  "Motion Study", "mate",           "Simulation", "Study",      true,  nullptr, false },
+    { "sim_material",      "Material",     "material",       "Simulation", "Setup",      true,  nullptr, false },
+    { "sim_fixture",       "Fixture",      "fixture",        "Simulation", "Boundaries", true,  nullptr, false },
+    { "sim_load_force",    "Force",        "load_force",     "Simulation", "Boundaries", true,  nullptr, false },
+    { "sim_load_pressure", "Pressure",     "load_pressure",  "Simulation", "Boundaries", true,  nullptr, false },
+    { "sim_mesh",          "Mesh",         "mesh",           "Simulation", "Mesh",       true,  nullptr, false },
+    { "sim_run",           "Run",          "run_study",      "Simulation", "Run",        true,  nullptr, false },
+    { "sim_results",       "Results",      "results",        "Simulation", "Results",    true,  nullptr, false },
+    { "ref_plane",         "Ref. Plane",   "ref_plane",      "Simulation", "Reference",  false, nullptr, false },
+    { "ref_axis",          "Ref. Axis",    "ref_axis",       "Simulation", "Reference",  false, nullptr, false },
+    { "ref_point",         "Ref. Point",   "ref_point",      "Simulation", "Reference",  false, nullptr, false },
+    { "ref_csys",          "Coord. Sys.",  "ref_csys",       "Simulation", "Reference",  false, nullptr, false },
+
+    // --- Tab: Static ---
+    SIM_NEW_STUDY_ROWS("Static", "study_static"),
+    { "sim_material",      "Material",     "material",       "Static",     "Setup",      true,  nullptr, false },
+    { "sim_fixture",       "Fixture",      "fixture",        "Static",     "Boundaries", true,  nullptr, false },
+    { "sim_load_force",    "Force",        "load_force",     "Static",     "Boundaries", true,  nullptr, false },
+    { "sim_load_pressure", "Pressure",     "load_pressure",  "Static",     "Boundaries", true,  nullptr, false },
+    { "sim_mesh",          "Mesh",         "mesh",           "Static",     "Mesh",       true,  nullptr, false },
+    { "sim_run",           "Run",          "run_study",      "Static",     "Run",        true,  nullptr, false },
+    { "sim_results",       "Results",      "results",        "Static",     "Results",    true,  nullptr, false },
+
+    // --- Tab: Modal (loads do not apply; fixtures constrain rigid-body modes) ---
+    SIM_NEW_STUDY_ROWS("Modal", "study_modal"),
+    { "sim_material",      "Material",     "material",       "Modal",      "Setup",      true,  nullptr, false },
+    { "sim_modal_options", "Frequencies",  "freq_range",     "Modal",      "Setup",      true,  nullptr, false },
+    { "sim_fixture",       "Fixture",      "fixture",        "Modal",      "Boundaries", true,  nullptr, false },
+    { "sim_mesh",          "Mesh",         "mesh",           "Modal",      "Mesh",       true,  nullptr, false },
+    { "sim_run",           "Run",          "run_study",      "Modal",      "Run",        true,  nullptr, false },
+    { "sim_results",       "Results",      "results",        "Modal",      "Results",    true,  nullptr, false },
+
+    // --- Tab: Flow (external CFD; the solver grid is the flow study's mesh) ---
+    SIM_NEW_STUDY_ROWS("Flow", "study_flow"),
+    { "sim_fluid",         "Fluid",        "fluid",          "Flow",       "Setup",      true,  nullptr, false },
+    { "sim_flow_bc",       "Flow BCs",     "flow_bc",        "Flow",       "Boundaries", true,  nullptr, false },
+    { "sim_flow_res",      "Resolution",   "mesh",           "Flow",       "Mesh",       true,  nullptr, false },
+    { "sim_run",           "Run",          "run_study",      "Flow",       "Run",        true,  nullptr, false },
+    { "sim_results",       "Results",      "results",        "Flow",       "Results",    true,  nullptr, false },
+
+    // --- Tab: Thermal (thermal FEA: conduction in the solid — fixed-temperature faces are the
+    //     study's fixtures, heat loads are flux / convection). Thermal CFD needs the OpenFOAM
+    //     backend and stays reachable only through New Study, where the picker gives the reason. ---
+    SIM_NEW_STUDY_ROWS("Thermal", "study_thermal_fea"),
+    { "sim_material",      "Material",     "material",       "Thermal",    "Setup",      true,  nullptr, false },
+    { "sim_fixture",       "Fixture",      "fixture",        "Thermal",    "Boundaries", true,  nullptr, false },
+    { "sim_load_heat",     "Heat Load",    "load_heat",      "Thermal",    "Boundaries", true,  nullptr, false },
+    { "sim_mesh",          "Mesh",         "mesh",           "Thermal",    "Mesh",       true,  nullptr, false },
+    { "sim_run",           "Run",          "run_study",      "Thermal",    "Run",        true,  nullptr, false },
+    { "sim_results",       "Results",      "results",        "Thermal",    "Results",    true,  nullptr, false },
+
+    // --- Tab: Fatigue (cyclic life over a static stress state: fixtures + loads + S-N) ---
+    SIM_NEW_STUDY_ROWS("Fatigue", "study_fatigue"),
+    { "sim_material",      "Material",     "material",       "Fatigue",    "Setup",      true,  nullptr, false },
+    { "sim_fatigue_setup", "Loading / S-N","plots_view",     "Fatigue",    "Setup",      true,  nullptr, false },
+    { "sim_fixture",       "Fixture",      "fixture",        "Fatigue",    "Boundaries", true,  nullptr, false },
+    { "sim_load_force",    "Force",        "load_force",     "Fatigue",    "Boundaries", true,  nullptr, false },
+    { "sim_load_pressure", "Pressure",     "load_pressure",  "Fatigue",    "Boundaries", true,  nullptr, false },
+    { "sim_mesh",          "Mesh",         "mesh",           "Fatigue",    "Mesh",       true,  nullptr, false },
+    { "sim_run",           "Run",          "run_study",      "Fatigue",    "Run",        true,  nullptr, false },
+    { "sim_results",       "Results",      "results",        "Fatigue",    "Results",    true,  nullptr, false },
+
+    // --- Tab: Motion (kinematics: no mesh, no loads; Results is the playback node) ---
+    SIM_NEW_STUDY_ROWS("Motion", "mate"),
+    { "sim_motion_setup",  "Driver / Time","move_component", "Motion",     "Setup",      true,  nullptr, false },
+    { "sim_run",           "Run",          "run_study",      "Motion",     "Run",        true,  nullptr, false },
+    { "sim_results",       "Results",      "results",        "Motion",     "Results",    true,  nullptr, false },
+
+    // --- Tab: EM (sim_em_* stay gated on the em_status probe via setRibbonDisabledPrefix). The
+    //     three analysis kinds sit beside New Study as small buttons; each opens its EM form. ---
+    SIM_NEW_STUDY_ROWS("EM", "study_em"),
+    { "sim_em_eigen",      "Eigenmode",    "study_modal",    "EM",         "Study",      false, nullptr, false },
+    { "sim_em_sweep",      "Freq Sweep",   "plots_view",     "EM",         "Study",      false, nullptr, false },
+    { "sim_em_time",       "Time Domain",  "activity",       "EM",         "Study",      false, nullptr, false },
+    { "sim_em_range",      "Freq Range",   "freq_range",     "EM",         "Setup",      true,  nullptr, false },
+    { "sim_em_ports",      "Ports",        "em_port",        "EM",         "Boundaries", true,  nullptr, false },
+    { "sim_em_boundary",   "EM BCs",       "em_boundary",    "EM",         "Boundaries", true,  nullptr, false },
+    { "sim_em_run",        "Run",          "run_study",      "EM",         "Run",        true,  nullptr, false },
+    { "sim_em_results",    "Results",      "results",        "EM",         "Results",    true,  nullptr, false },
+
+    // --- Tab: Topology (regions and manufacturing rules are setup; heat / flow BCs sit with the
+    //     structural boundaries) ---
+    SIM_NEW_STUDY_ROWS("Topology", "study_topology"),
+    { "sim_topology_setup",         "Method",      "settings",      "Topology", "Setup",      true,  nullptr, false },
+    { "sim_material",               "Material",    "material",      "Topology", "Setup",      true,  nullptr, false },
+    { "sim_topology_preserve",      "Preserve",    "combine",       "Topology", "Setup",      false, nullptr, false },
+    { "sim_topology_exclude",       "Exclude",     "subtract",      "Topology", "Setup",      false, nullptr, false },
+    { "sim_topology_manufacturing", "Mfg. Rules",  "draft",         "Topology", "Setup",      false, nullptr, false },
+    { "sim_fixture",                "Fixture",     "fixture",       "Topology", "Boundaries", true,  nullptr, false },
+    { "sim_load_force",             "Force",       "load_force",    "Topology", "Boundaries", true,  nullptr, false },
+    { "sim_load_pressure",          "Pressure",    "load_pressure", "Topology", "Boundaries", true,  nullptr, false },
+    { "sim_topology_boundaries",    "Heat / Flow", "load_heat",     "Topology", "Boundaries", true,  nullptr, false },
+    { "sim_mesh",                   "Mesh",        "mesh",          "Topology", "Mesh",       true,  nullptr, false },
+    { "sim_run",                    "Run",         "run_study",     "Topology", "Run",        true,  nullptr, false },
+    { "sim_results",                "Results",     "results",       "Topology", "Results",    true,  nullptr, false },
+    { "sim_topology_compare",       "Compare",     "plots_view",    "Topology", "Results",    true,  nullptr, false },
+
+    // --- Tab: Piping ---
+    { "sim_piping_new",    "New Network",  "new_network",    "Piping",     "Network",    true,  nullptr, false },
+    { "sim_piping_route",  "Route Pipe",   "route_pipe",     "Piping",     "Network",    true,  nullptr, false },
+    { "sim_piping_draw",   "Draw Pipe",    "line",           "Piping",     "Network",    true,  nullptr, false },
+    { "sim_piping_fitting","Fittings",     "insert_component","Piping",    "Network",    true,  nullptr, false },
+    { "sim_piping_vessel", "Vessel",       "vessel",         "Piping",     "Design",     true,  nullptr, false },
+    { "sim_piping_duct",   "Duct Sizing",  "duct",           "Piping",     "Design",     true,  nullptr, false },
+    { "sim_piping_solve",  "Solve",        "run_study",      "Piping",     "Analysis",   true,  nullptr, false },
+    { "sim_piping_spec",   "Spec Check",   "spec_check",     "Piping",     "Analysis",   true,  nullptr, false },
+    { "sim_piping_flow",   "Internal CFD", "study_flow",     "Piping",     "Analysis",   true,  nullptr, false },
+    { "sim_piping_bom",    "BOM",          "bom",            "Piping",     "Results",    true,  nullptr, false },
+    { "ref_plane",         "Ref. Plane",   "ref_plane",      "Piping",     "Reference",  false, nullptr, false },
+    { "ref_axis",          "Ref. Axis",    "ref_axis",       "Piping",     "Reference",  false, nullptr, false },
+    { "ref_point",         "Ref. Point",   "ref_point",      "Piping",     "Reference",  false, nullptr, false },
+    { "ref_csys",          "Coord. Sys.",  "ref_csys",       "Piping",     "Reference",  false, nullptr, false },
+
+    // --- Tab: Hydraulics ---
+    { "sim_hyd_new",       "New Circuit",  "new_circuit",    "Hydraulics", "Circuit",    true,  nullptr, false },
+    { "sim_hyd_add",       "Add Component","insert_component","Hydraulics","Circuit",    true,  nullptr, false },
+    { "sim_hyd_hose",      "Connect",      "sch_wire",       "Hydraulics", "Circuit",    true,  nullptr, false },
+    { "sim_hyd_size_cyl",  "Size Cylinder","size_actuator",  "Hydraulics", "Design",     true,  nullptr, false },
+    { "sim_hyd_size_pump", "Size Pump",    "size_pump",      "Hydraulics", "Design",     true,  nullptr, false },
+    { "sim_hyd_size_motor","Size Motor",   "size_motor",     "Hydraulics", "Design",     true,  nullptr, false },
+    { "sim_hyd_drive",     "Pump Drive",   "pump_drive",     "Hydraulics", "Design",     true,  nullptr, false },
+    { "sim_hyd_simulate",  "Simulate",     "run_study",      "Hydraulics", "Analysis",   true,  nullptr, false },
+    { "sim_hyd_view_schematic","Schematic","schematic",      "Hydraulics", "Results",    true,  nullptr, false },
+    { "sim_hyd_view_plots","Plots",        "plots_view",     "Hydraulics", "Results",    true,  nullptr, false },
+    { "sim_hyd_view_3d",   "3D Layout",    "depth_3d",       "Hydraulics", "Results",    true,  nullptr, false },
+    { "sim_hyd_bom",       "BOM",          "bom",            "Hydraulics", "Results",    true,  nullptr, false },
+    { "sim_hyd_piping",    "To Piping",    "study_piping",   "Hydraulics", "Results",    true,  nullptr, false },
+    { "ref_plane",         "Ref. Plane",   "ref_plane",      "Hydraulics", "Reference",  false, nullptr, false },
+    { "ref_axis",          "Ref. Axis",    "ref_axis",       "Hydraulics", "Reference",  false, nullptr, false },
+    { "ref_point",         "Ref. Point",   "ref_point",      "Hydraulics", "Reference",  false, nullptr, false },
+    { "ref_csys",          "Coord. Sys.",  "ref_csys",       "Hydraulics", "Reference",  false, nullptr, false },
+
+    // =========================================================================
+    // Simulate corrective wave 2 — ribbon labels match the study pane's setup sub-chips and form
+    // tabs (Modes, Excitation, Contact, Conduction, Loading, Drivers, Settings, Fixed Temp,
+    // Boundaries), and every study type sharing a tab gets its own setup command. Rows re-appended
+    // only to keep the chip order inside their group (a later row wins, see the header).
+    // sim_buckling_options / sim_contact_options / sim_freqresp_options are study-scoped
+    // (ribbonStudyGate): shown only while a study of that type is selected.
+    // =========================================================================
+    // --- Static tab: Buckling and Contact studies are created from it and set up here ---
+    { "sim_buckling_options",    "Modes",       "study_buckling",    "Static",   "Setup",      true,  nullptr, false },
+    { "sim_contact_options",     "Contact",     "study_contact",     "Static",   "Setup",      true,  nullptr, false },
+    { "sim_material",            "Material",    "material",          "Static",   "Setup",      true,  nullptr, false },
+    // --- Modal tab: Modal (natural frequencies) and Vibration studies ---
+    { "sim_modal_options",       "Modes",       "freq_range",        "Modal",    "Setup",      true,  nullptr, false },
+    { "sim_freqresp_options",    "Excitation",  "study_vibration",   "Modal",    "Setup",      true,  nullptr, false },
+    { "sim_material",            "Material",    "material",          "Modal",    "Setup",      true,  nullptr, false },
+    // --- Flow tab: the boundaries step is "Boundaries" in the study pane ---
+    { "sim_flow_bc",             "Boundaries",  "flow_bc",           "Flow",     "Boundaries", true,  nullptr, false },
+    // --- Thermal tab (Thermal FEA): Conduction options; fixtures are fixed-temperature faces ---
+    { "sim_thermal_fea_options", "Conduction",  "study_thermal_fea", "Thermal",  "Setup",      true,  nullptr, false },
+    { "sim_material",            "Material",    "material",          "Thermal",  "Setup",      true,  nullptr, false },
+    { "sim_fixture",             "Fixed Temp",  "fixture",           "Thermal",  "Boundaries", true,  nullptr, false },
+    { "sim_load_heat",           "Heat Load",   "load_heat",         "Thermal",  "Boundaries", true,  nullptr, false },
+    // --- Fatigue tab ---
+    { "sim_fatigue_setup",       "Loading",     "plots_view",        "Fatigue",  "Setup",      true,  nullptr, false },
+    { "sim_material",            "Material",    "material",          "Fatigue",  "Setup",      true,  nullptr, false },
+    // --- Motion tab ---
+    { "sim_motion_setup",        "Drivers",     "move_component",    "Motion",   "Setup",      true,  nullptr, false },
+    // --- Topology tab ---
+    { "sim_topology_setup",      "Settings",    "settings",          "Topology", "Setup",      true,  nullptr, false },
+    { "sim_material",            "Material",    "material",          "Topology", "Setup",      true,  nullptr, false },
 };
 // clang-format on
+#undef SIM_NEW_STUDY_ROWS
+
+// Rows removed from view with no replacement (append-only: hidden, never deleted).
+struct RetiredRow { const char* tab; const char* cmd_id; };
+static const RetiredRow kRetiredRows[] = {
+    // Static "Torque": the engine has no torque/moment load op and SimManager::handleCommand has
+    // no sim_load_torque handler — a permanently disabled control, so it is not shown at all.
+    { "Static", "sim_load_torque" },
+    // Thermal "Heat Loads" (sim_thermal_bc) edits a thermal CFD study; the Thermal tab is a
+    // Thermal FEA tab now (its heat loads are sim_load_heat), so the CFD-only row is not shown.
+    { "Thermal", "sim_thermal_bc" },
+    // Thermal CFD needs the OpenFOAM backend the desktop flow solver never runs, so its "New Study"
+    // rows (Thermal tab, legacy Simulation tab) are not shown; the New Study picker offers it with
+    // the reason it is unavailable.
+    { "Thermal",    "sim_new_thermal" },
+    { "Simulation", "sim_new_thermal" },
+};
 
 const RibbonCmd* getRibbonCmds(int& count) {
     count = (int)(sizeof(kCmds) / sizeof(kCmds[0]));
     return kCmds;
+}
+
+bool ribbonRowActive(int index) {
+    constexpr int n = (int)(sizeof(kCmds) / sizeof(kCmds[0]));
+    // The table is static, so resolve every row once: retired, or superseded by a later row with
+    // the same tab + cmd_id.
+    static const std::vector<char> active = [] {
+        std::vector<char> a((size_t)n, 1);
+        for (int i = 0; i < n; ++i) {
+            for (const RetiredRow& r : kRetiredRows)
+                if (std::strcmp(r.tab, kCmds[i].tab) == 0 &&
+                    std::strcmp(r.cmd_id, kCmds[i].cmd_id) == 0)
+                    a[(size_t)i] = 0;
+            for (int j = i + 1; j < n && a[(size_t)i]; ++j)
+                if (std::strcmp(kCmds[j].tab, kCmds[i].tab) == 0 &&
+                    std::strcmp(kCmds[j].cmd_id, kCmds[i].cmd_id) == 0)
+                    a[(size_t)i] = 0;
+        }
+        return a;
+    }();
+    return index >= 0 && index < n && active[(size_t)index];
 }
 
 CommandCapability ribbonCommandCapability(const char* cmdId) {
@@ -745,6 +1015,75 @@ CommandCapability ribbonCommandCapability(const char* cmdId) {
     for (const RibbonCmd& command : kCmds)
         if (std::strcmp(command.cmd_id, cmdId) == 0) return command.capability;
     return CommandCapability::Mutate;
+}
+
+// Rows that configure ONE study type (its Study-node options) on a tab shared with other types:
+// Buckling and Contact studies use the Static tab, Vibration uses the Modal tab.
+struct StudyScopedRow { const char* cmd_id; const char* typeKey; };
+static const StudyScopedRow kStudyScopedRows[] = {
+    { "sim_buckling_options", "buckling" },
+    { "sim_contact_options",  "contact" },
+    { "sim_freqresp_options", "freq_response" },
+};
+
+// Study commands that act on the SELECTED study (the per-type setup commands, sim_load_heat and the
+// sim_topology_* tools pick a study of their own type instead, so they are never gated here).
+static const char* const kSelectedStudyCmds[] = {
+    "sim_material", "sim_fixture", "sim_load_force", "sim_load_pressure",
+    "sim_mesh",     "sim_run",     "sim_results",
+};
+
+static bool cmdIs(const char* cmdId, std::initializer_list<const char*> ids) {
+    for (const char* id : ids)
+        if (std::strcmp(cmdId, id) == 0) return true;
+    return false;
+}
+
+RibbonStudyGate ribbonStudyGate(const char* cmdId, const char* studyTypeKey, const char** reason) {
+    if (reason) *reason = nullptr;
+    if (!cmdId) return RibbonStudyGate::Enabled;
+    for (const StudyScopedRow& r : kStudyScopedRows)
+        if (std::strcmp(r.cmd_id, cmdId) == 0)
+            return studyTypeKey && std::strcmp(studyTypeKey, r.typeKey) == 0
+                       ? RibbonStudyGate::Enabled
+                       : RibbonStudyGate::Hidden;
+    if (!studyTypeKey) return RibbonStudyGate::Enabled;
+    bool selectedStudyCmd = false;
+    for (const char* id : kSelectedStudyCmds)
+        selectedStudyCmd = selectedStudyCmd || std::strcmp(id, cmdId) == 0;
+    if (!selectedStudyCmd) return RibbonStudyGate::Enabled;
+
+    const std::string key = studyTypeKey;
+    const char* why = nullptr;
+    const bool loads = cmdIs(cmdId, {"sim_load_force", "sim_load_pressure"});
+    if (key.empty()) {
+        why = "Create or select a study first: New Study.";
+    } else if (key == "contact") {
+        if (loads || cmdIs(cmdId, {"sim_fixture", "sim_mesh"}))
+            why = "Contact runs on a two-block proxy sized to the part: it takes no fixtures, "
+                  "loads or mesh settings.";
+    } else if (key == "modal") {
+        if (loads) why = "Modal studies take no loads: they solve the part's natural frequencies.";
+    } else if (key == "freq_response") {
+        if (loads) why = "Vibration studies are driven by base excitation (Excitation), not by face "
+                         "loads.";
+    } else if (key == "thermal_fea") {
+        if (loads) why = "Thermal FEA studies take heat loads (Heat Load), not forces or pressures.";
+    } else if (key == "flow" || key == "thermal") {
+        if (cmdIs(cmdId, {"sim_material"}))
+            why = "Flow studies use a fluid, not a solid material: set it under Fluid.";
+        else if (loads || cmdIs(cmdId, {"sim_fixture"}))
+            why = "Flow studies have no structural fixtures or loads: set the flow under Boundaries.";
+        else if (cmdIs(cmdId, {"sim_mesh"}))
+            why = "The flow grid is set under Resolution.";
+    } else if (key == "motion") {
+        if (!cmdIs(cmdId, {"sim_run", "sim_results"}))
+            why = "Motion studies drive assembly mates: they take no material, fixtures, loads or "
+                  "mesh.";
+    }
+    if (!why) return RibbonStudyGate::Enabled;
+    if (reason) *reason = why;
+    return RibbonStudyGate::Disabled;
 }
 
 }  // namespace ui

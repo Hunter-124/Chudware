@@ -9,6 +9,7 @@
 #include "../web_capabilities.h"    // ui::webGapReason — subscription sign-in is not a web path
 #include "../web_provider_keys.h"   // per-account BYOK on web (/api/providers/keys)
 #include "../chudcode_descriptors.h" // ui::parseChudcode* — Chudcode worker payload parsing
+#include "../provider_usage.h"     // shared subscription status cache and single-flight poller
 
 namespace ui {
 
@@ -26,13 +27,27 @@ namespace {
 //     connect-fails back to back. The per-provider cooldowns make the probes alternate rather
 //     than stack: whichever is off cooldown when the slot frees up goes next.
 struct ProbeTiming {
-    double last = -1e9;     // ImGui::GetTime() when this provider's probe was DISPATCHED
+    double last = -1e9;     // latest dispatch/completion; cooldown includes a cold slow response
     bool failed = false;    // last completed probe failed -> 60s backoff
     bool inFlight = false;  // this provider's probe is outstanding
+    const char* wire = nullptr;
+    std::string baseUrl;
+    std::string apiKey;
 };
 // GL-thread only: written from refreshModelAvailability and from the AsyncRpc completion, which
 // core::AsyncRpc runs on the GL thread inside drain().
 std::unordered_map<int, ProbeTiming> s_probeTiming;
+
+bool startupCatalogFollowupReady(const AppState& st) {
+    static double interactiveSince = -1.0;
+    if (!st.workerStarted || st.workerBootPending || !st.startupPhase.empty()) {
+        interactiveSince = -1.0;
+        return false;
+    }
+    const double now = ImGui::GetTime();
+    if (interactiveSince < 0.0) interactiveSince = now;
+    return now - interactiveSince >= 1.5;
+}
 
 bool anyProbeInFlight() {
     for (const auto& kv : s_probeTiming)
@@ -70,6 +85,8 @@ static void parseProbeRows(int provider, const nlohmann::json& result, ProviderM
 static char* providerKeyBuf(Settings& s, int provider);
 
 void refreshModelAvailability(AppState& st, bool force) {
+    if (!force && (!st.workerStarted || st.workerBootPending || !st.startupPhase.empty()))
+        return;
     // One async agent_list_models round-trip. `slots` are the providerModels entries its answer
     // fills (the local endpoint feeds PROV_LOCAL and PROV_LLAMACPP — one endpoint family).
     // Borrowed pointers, not strings: this runs EVERY frame from three call sites, so nothing is
@@ -89,7 +106,31 @@ void refreshModelAvailability(AppState& st, bool force) {
         }
         const double now = ImGui::GetTime();
         if (!force && (now - t.last) < (t.failed ? 60.0 : 5.0)) return false;
+        // Two UI provider slots can resolve to the same OpenAI-compatible endpoint.
+        // Reuse that answer rather than issuing the identical request under another slot.
+        if (!force) {
+            for (const auto& [otherProvider, other] : s_probeTiming) {
+                if (otherProvider == provider || !other.wire || other.inFlight ||
+                    std::strcmp(other.wire, wire) != 0 ||
+                    other.baseUrl != (baseUrl ? baseUrl : "") ||
+                    other.apiKey != (apiKey ? apiKey : "") ||
+                    now - other.last >= (other.failed ? 60.0 : 5.0)) continue;
+                if (t.last != other.last) {
+                    for (const int slot : slots)
+                        st.providerModels[slot] = st.providerModels[otherProvider];
+                    t.last = other.last;
+                    t.failed = other.failed;
+                    t.wire = wire;
+                    t.baseUrl = baseUrl ? baseUrl : "";
+                    t.apiKey = apiKey ? apiKey : "";
+                }
+                return false;
+            }
+        }
         t.last = now;
+        t.wire = wire;
+        t.baseUrl = baseUrl ? baseUrl : "";
+        t.apiKey = apiKey ? apiKey : "";
         t.inFlight = true;
         st.modelProbeInFlight.store(true);
         nlohmann::json p = {{"provider", wire},
@@ -97,6 +138,7 @@ void refreshModelAvailability(AppState& st, bool force) {
                             {"api_key", apiKey ? apiKey : ""}};
         st.rpc.call("agent_list_models", std::move(p),
                     [&st, provider, slots = std::vector<int>(slots)](const core::RpcResult& r) {
+            s_probeTiming[provider].last = ImGui::GetTime();
             if (core::workerLaneBusy(r)) {
                 // A running agent turn holds the lane. Transient, not a provider failure: keep
                 // the last model list and backoff state, and retry on the normal 5 s cadence.
@@ -777,38 +819,26 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         static double s_xaiLastPoll = -1e9;
 
         auto pollXaiStatus = [&](bool force) {
-            double now = ImGui::GetTime();
-            if (!force && (now - s_xaiLastPoll) < 1.5) return;
-            s_xaiLastPoll = now;
-            st.rpc.call("subscription_status", nlohmann::json::object(),
-                        [](const core::RpcResult& r) {
-                if (!r.ok || !r.result.is_object()) return;
-                auto providers = jsonOptObj(r.result, "providers");
-                auto x = jsonOptObj(providers, "xai");
-                s_xaiConnected = jsonOptBool(x, "connected", false);
-                s_xaiEmail = jsonOptStr(x, "email");
-                s_xaiLoginBusy = jsonOptBool(x, "login_in_progress", false);
-                s_xaiBrowserOpened = jsonOptBool(x, "browser_opened", false);
-                s_xaiUserCode = jsonOptStr(x, "user_code");
-                s_xaiVerifyUrl = jsonOptStr(x, "verification_url");
-                if (s_xaiVerifyUrl.empty())
-                    s_xaiVerifyUrl = jsonOptStr(x, "verification_uri");
-                if (!s_xaiUserCode.empty() &&
-                    (s_xaiVerifyUrl.empty() ||
-                     s_xaiVerifyUrl.find("user_code=") == std::string::npos)) {
-                    const std::string base = s_xaiVerifyUrl.empty()
-                        ? "https://accounts.x.ai/oauth2/device"
-                        : s_xaiVerifyUrl;
-                    const char sep =
-                        (base.find('?') == std::string::npos) ? '?' : '&';
-                    s_xaiVerifyUrl = base + sep + "user_code=" + s_xaiUserCode;
-                }
-                s_xaiStage = jsonOptStr(x, "login_stage");
-                if (auto err = jsonOptStr(x, "last_error"); !err.empty())
-                    s_xaiError = err;
-                else if (s_xaiConnected)
-                    s_xaiError.clear();
-            });
+            const double now = ImGui::GetTime();
+            if (force || now - s_xaiLastPoll >= 1.5) {
+                s_xaiLastPoll = now;
+                ui::providerUsagePollStatus(st, 1.5, force);
+            }
+            const auto& login = ui::providerUsageLogin();
+            const auto it = login.find("xai");
+            if (it == login.end()) return;
+            const auto& x = it->second;
+            s_xaiConnected = x.connected;
+            s_xaiEmail = x.email;
+            s_xaiLoginBusy = x.inProgress;
+            s_xaiBrowserOpened = x.browserOpened;
+            s_xaiUserCode = x.userCode;
+            s_xaiVerifyUrl = x.verifyUrl;
+            s_xaiStage = x.stage;
+            if (!x.lastError.empty())
+                s_xaiError = x.lastError;
+            else if (s_xaiConnected)
+                s_xaiError.clear();
         };
         pollXaiStatus(false);
 
@@ -852,7 +882,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
 #endif
                 }
             }
-            pollXaiStatus(true);
+            pollXaiStatus(false);
         } else if (s_xaiConnected) {
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusOk));
             if (!s_xaiEmail.empty())
@@ -871,6 +901,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                 s_xaiStage.clear();
                 s_xaiBrowserOpened = false;
                 s_xaiLastPoll = -1e9;
+                ui::providerUsageInvalidate();
             }
         } else {
             if (ImGui::Button("Sign in with xAI", ImVec2(-1, 0))) {
@@ -894,6 +925,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                         if (!hint.empty()) s_xaiError += " — " + hint;
                     }
                     s_xaiLastPoll = -1e9;
+                    ui::providerUsageInvalidate();
                 });
             }
             if (ImGui::IsItemHovered())
@@ -1391,8 +1423,6 @@ struct SubConnectedCache {
     bool hostMoonshot = false;
     bool hostXaiKey = false;    // xAI API key (distinct from xai-sub OAuth)
     bool hostFetched = false;   // web: /api/providers completed at least once
-    double lastPoll = -1e9;
-    bool inFlight = false;
 };
 static SubConnectedCache s_subConn;
 #ifdef __EMSCRIPTEN__
@@ -1464,7 +1494,6 @@ static void wasmKickHostProvidersFetch() {
 #endif
 
 static void pollSubConnected(AppState& st) {
-    const double now = ImGui::GetTime();
 #ifdef __EMSCRIPTEN__
     wasmKickHostProvidersFetch();
 #endif
@@ -1472,25 +1501,17 @@ static void pollSubConnected(AppState& st) {
     // operator identity. The raw RPC is now refused for non-admin accounts (engine_bridge.py), so
     // polling it every two seconds would only log a refusal per tick and learn nothing.
     if (ui::webBuild()) return;
-    if (s_subConn.inFlight || (now - s_subConn.lastPoll) < 2.0) return;
-    s_subConn.lastPoll = now;
-    s_subConn.inFlight = true;
-    st.rpc.call("subscription_status", nlohmann::json::object(),
-                [](const core::RpcResult& r) {
-        s_subConn.inFlight = false;
-        if (!r.ok || !r.result.is_object()) return;
-        auto providers = jsonOptObj(r.result, "providers");
-        auto connected = [](const nlohmann::json& providers, const char* key) {
-            auto p = jsonOptObj(providers, key);
-            return jsonOptBool(p, "connected", false);
-        };
-        // OR with host-fetched bits so a slow/failed RPC doesn't clear web presence.
-        s_subConn.xai    = connected(providers, "xai")    || s_subConn.xai;
-        s_subConn.claude = connected(providers, "claude") || s_subConn.claude;
-        s_subConn.cursor = connected(providers, "cursor") || s_subConn.cursor;
-        s_subConn.codex  = connected(providers, "codex")  || s_subConn.codex;
-        s_subConn.kimi   = connected(providers, "kimi")   || s_subConn.kimi;
-    });
+    ui::providerUsagePollStatus(st, 2.0, false);
+    const auto& login = ui::providerUsageLogin();
+    auto connected = [&login](const char* key) {
+        const auto it = login.find(key);
+        return it != login.end() && it->second.connected;
+    };
+    s_subConn.xai    = connected("xai")    || s_subConn.xai;
+    s_subConn.claude = connected("claude") || s_subConn.claude;
+    s_subConn.cursor = connected("cursor") || s_subConn.cursor;
+    s_subConn.codex  = connected("codex")  || s_subConn.codex;
+    s_subConn.kimi   = connected("kimi")   || s_subConn.kimi;
 }
 }  // namespace
 
@@ -1695,6 +1716,10 @@ bool isDeprecatedModelId(const std::string& id) {
 void refreshBridgeModelCatalog(AppState& st, bool force) {
     if (!s_bridgeCatalogAvailable || s_bridgeCatalogInFlight) return;
     const double now = ImGui::GetTime();
+    const bool followupReady = startupCatalogFollowupReady(st);
+    if (!force && (!st.workerStarted || st.workerBootPending || !st.startupPhase.empty()))
+        return;
+    if (!force && s_bridgeCatalogLastFetch > -1e9 && !followupReady) return;
     // During Chudcode's background discovery, follow up promptly rather than waiting
     // five minutes after showing the old list. Steady-state polling stays at five minutes.
     if (!force && (now - s_bridgeCatalogLastFetch) < (s_bridgeCatalogRefreshing ? 5.0 : 300.0))
@@ -1704,6 +1729,7 @@ void refreshBridgeModelCatalog(AppState& st, bool force) {
     st.rpc.call("chudcode_models_list", nlohmann::json::object(),
                 [](const core::RpcResult& r) {
         s_bridgeCatalogInFlight = false;
+        s_bridgeCatalogLastFetch = ImGui::GetTime();
         if (r.ok && r.result.is_object() && r.result.value("ok", true))
             s_bridgeCatalogRefreshing = r.result.value("refreshing", false);
         if (bridgeRpcAbsent(r)) {
@@ -2383,9 +2409,11 @@ void drawModelDropdown(AppState& st, bool busy) {
             }
         }
     }
+    const bool modelsLoading = s_bridgeCatalogInFlight || st.modelProbeInFlight.load() ||
+        (s_bridgeCatalogAvailable && s_bridgeCatalogLastFetch < 0.0);
     if (shown == 0) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDisabled));
-        ImGui::TextWrapped(q.empty()
+        ImGui::TextWrapped(modelsLoading ? "Loading models\xe2\x80\xa6" : q.empty()
             ? "No models available — sign in to a subscription (ZenMux / xAI / Claude / Cursor), "
               "add an API key, or start a local model server (gear below)."
             : "No models match your search.");
@@ -2394,7 +2422,7 @@ void drawModelDropdown(AppState& st, bool busy) {
     ImGui::EndChild();
 
     // No providers signed in yet -> nothing routable; point the user at Settings to add models.
-    if (st.signedInBridgeProviders.empty()) {
+    if (st.signedInBridgeProviders.empty() && !modelsLoading) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
         ImGui::TextUnformatted("Sign in to a provider in Settings -> Providers to add models.");
         ImGui::PopStyleColor();

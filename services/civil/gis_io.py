@@ -15,7 +15,6 @@ from pathlib import Path
 import sqlite3
 import struct
 
-from pyproj import CRS
 from . import crs as crs_ops, schema
 from .errors import CivilError
 
@@ -352,6 +351,7 @@ def _decode_geometry(blob, expected_srs):
 
 def export_geopackage(model: dict, path, *, spacing_m=10.0) -> dict:
     """Write OGC 1.3 feature tables in the projected EPSG CRS (no local grid)."""
+    from pyproj import CRS  # call-time: tool registration imports this module without PROJ
     record = crs_ops.normalize(model.get("crs"))
     if record["horizontal"] is None:
         raise CivilError("crs_unknown")
@@ -399,6 +399,7 @@ CREATE TABLE civil_site (model_json TEXT NOT NULL);
 
 def import_geopackage(path, model: dict | None = None, *, field_mapping=None) -> dict:
     """Read 2D feature tables using their declared EPSG CRS; apply explicit mapping."""
+    from pyproj import CRS  # call-time: tool registration imports this module without PROJ
     def quote(identifier):
         return '"' + identifier.replace('"', '""') + '"'
     try:

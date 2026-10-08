@@ -3,13 +3,14 @@
 Local grid equations: contracts/civil_schema.md §3. Scale factors: PROJ
 proj_factors; combined factor k R/(R+h), using the ellipsoid Gaussian radius
 sqrt(M*N) at the point. No vertical datum transformation is implied.
+
+pyproj is imported where it is used, not at module import: the MCP server registers the
+civil tools by importing this module, and tool registration must not require PROJ.
 """
 from __future__ import annotations
 
 import math
 from copy import deepcopy
-import pyproj
-from pyproj import CRS, Proj, Transformer
 from .errors import CivilError
 
 REFERENCE = "PROJ coordinate operations / proj_factors; contracts/civil_schema.md §3"
@@ -20,8 +21,9 @@ def _finite(value):
 
 
 def _parse(code, projected=False):
+    import pyproj
     try:
-        parsed = CRS.from_user_input(code)
+        parsed = pyproj.CRS.from_user_input(code)
     except (pyproj.exceptions.CRSError, TypeError, ValueError) as exc:
         raise CivilError("invalid_crs", str(exc)) from exc
     if projected and not parsed.is_projected:
@@ -112,13 +114,14 @@ def transform(xy, src, dst) -> dict:
     source transformation and inverted after destination transformation. Vertical
     CRS is recorded only: inputs/outputs are strictly two-dimensional.
     """
+    import pyproj
     source, source_record = _operation_crs(src)
     destination, destination_record = _operation_crs(dst)
     x, y = _xy(xy)
     if source_record:
         x, y = local_to_projected(source_record, [x, y])
     try:
-        transformer = Transformer.from_crs(source, destination, always_xy=True)
+        transformer = pyproj.Transformer.from_crs(source, destination, always_xy=True)
         x, y = transformer.transform(x, y, errcheck=True)
         if not all(math.isfinite(v) for v in (x, y)):
             raise CivilError("crs_transform_failed")
@@ -153,6 +156,7 @@ def from_wgs84(model_crs, xy) -> dict:
 
 def scale_factors(crs, x, y, elevation_m=0.0) -> dict:
     """Grid/elevation/combined factors; h is ellipsoidal height, not orthometric."""
+    import pyproj
     record = normalize(crs)
     if record["horizontal"] is None:
         raise CivilError("crs_unknown")
@@ -161,8 +165,8 @@ def scale_factors(crs, x, y, elevation_m=0.0) -> dict:
     projected = _parse(record["horizontal"], projected=True)
     X, Y = local_to_projected(record, [x, y])
     try:
-        lon, lat = Transformer.from_crs(projected, projected.geodetic_crs, always_xy=True).transform(X, Y, errcheck=True)
-        factors = Proj(projected).get_factors(lon, lat, errcheck=True)
+        lon, lat = pyproj.Transformer.from_crs(projected, projected.geodetic_crs, always_xy=True).transform(X, Y, errcheck=True)
+        factors = pyproj.Proj(projected).get_factors(lon, lat, errcheck=True)
     except pyproj.exceptions.ProjError as exc:
         raise CivilError("crs_transform_failed", str(exc)) from exc
     a = projected.ellipsoid.semi_major_metre

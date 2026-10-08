@@ -34,7 +34,9 @@ pipeline be split into *setup* (parent, needs the live doc) -> *solve* (child, p
 * ``core_rpc`` — one engine solve RPC from :data:`CORE_RPC_METHODS`. A doc-shaped method
   (``sim_run_flow`` tessellates a document) additionally names ``open_step``: the parent
   exported the solid, and the child re-opens that ONE file, because it shares no document
-  table with the server that started it. ``sim_run_topology`` carries a self-contained
+  table with the server that started it. ``sim_run_pipe_flow`` (internal-flow LBM over a
+  voxelized fluid volume) takes either ``params.stl_path`` or that same ``open_step``
+  prelude. ``sim_run_topology`` carries a self-contained
   topology envelope (exported STEP or inline tet4 mesh + resolved facesets) and is
   validated by :func:`services.sim.topology.validate_run_envelope`, never as a static
   or modal study.
@@ -222,7 +224,8 @@ def _resolve_tokens(value: Any, progress_path: str) -> Any:
 #: The engine solve entry points a ``core_rpc`` payload may name. A payload names a
 #: METHOD from this closed list — never an import path, a module or a callable.
 CORE_RPC_METHODS = ("sim_run_static", "sim_run_modal", "sim_run_adaptive",
-                    "sim_run_fatigue", "sim_run_flow", "sim_run_topology")
+                    "sim_run_fatigue", "sim_run_flow", "sim_run_topology",
+                    "sim_run_pipe_flow")
 
 #: Methods whose params carry a self-contained ``study`` (an exported STEP path + JSON),
 #: i.e. everything the child needs is already on disk.
@@ -237,6 +240,18 @@ _DOC_SHAPED_METHODS = ("sim_run_flow",)
 
 #: Methods whose params carry their own self-contained envelope with its own schema.
 _TOPOLOGY_METHODS = ("sim_run_topology",)
+
+#: Internal-flow methods: the fluid volume arrives as ``params.stl_path`` OR as a document
+#: the child re-opens from ``open_step`` (never both).
+_PIPE_FLOW_METHODS = ("sim_run_pipe_flow",)
+
+#: The only params an internal pipe-flow payload may carry (``doc_id`` is filled by the
+#: ``open_step`` prelude, never by the payload).
+_PIPE_FLOW_PARAMS = frozenset({
+    "stl_path", "body", "inlet", "outlet", "fluid", "temp_c", "pressure_kpa",
+    "density_kgm3", "viscosity_pas", "mean_velocity_ms", "flow_m3s", "voxel_mm",
+    "cells_across", "max_fluid_cells", "max_steps", "tolerance", "inlet_profile",
+    "roughness_mm", "progress_path", "piping", "run_id"})
 
 #: The only params key a geometry prelude is allowed to fill.
 _DOC_PARAM = "doc_id"
@@ -617,6 +632,82 @@ def _validate_flow_params(params: dict) -> None:
             raise ValueError(f"sim_run_flow {key} must be an integer >= {floor}")
 
 
+def _vec3(value: Any, label: str) -> list:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{label} must be a 3-vector [x, y, z]")
+    return [_finite(v, label) for v in value]
+
+
+def _validate_pipe_flow_payload(payload: dict, params: dict) -> None:
+    """``sim_run_pipe_flow``: one geometry source, two boundary planes, one flow rate."""
+    extra = sorted(set(params) - _PIPE_FLOW_PARAMS)
+    if extra:
+        raise ValueError(f"sim_run_pipe_flow params do not accept {extra}")
+    step = payload.get("open_step")
+    stl = params.get("stl_path")
+    if (step is None) == (stl is None):
+        raise ValueError(
+            "sim_run_pipe_flow needs exactly one geometry source: params.stl_path (a fluid-"
+            "volume STL) or open_step=<exported STEP path> (a document the child re-opens)")
+    if step is not None:
+        _require_geometry_file(step, "sim_run_pipe_flow exported document geometry")
+    else:
+        _require_geometry_file(stl, "sim_run_pipe_flow STL geometry")
+    if params.get("body") is not None and not isinstance(params.get("body"), str):
+        raise ValueError("sim_run_pipe_flow body must be a body name")
+    for side in ("inlet", "outlet"):
+        plane = params.get(side)
+        if not isinstance(plane, dict):
+            raise ValueError(f"sim_run_pipe_flow {side} must be {{point, normal}}")
+        _vec3(plane.get("point"), f"sim_run_pipe_flow {side}.point")
+        normal = _vec3(plane.get("normal"), f"sim_run_pipe_flow {side}.normal")
+        if math.sqrt(sum(c * c for c in normal)) <= 1e-12:
+            raise ValueError(f"sim_run_pipe_flow {side}.normal must be non-zero")
+    rates = [k for k in ("mean_velocity_ms", "flow_m3s") if params.get(k) is not None]
+    if len(rates) != 1:
+        raise ValueError("sim_run_pipe_flow needs exactly one of mean_velocity_ms or flow_m3s")
+    if _finite(params[rates[0]], f"sim_run_pipe_flow {rates[0]}") <= 0.0:
+        raise ValueError(f"sim_run_pipe_flow {rates[0]} must be > 0")
+    explicit = [k for k in ("density_kgm3", "viscosity_pas") if params.get(k) is not None]
+    if explicit:
+        if len(explicit) != 2:
+            raise ValueError("sim_run_pipe_flow density_kgm3 and viscosity_pas go together")
+        for key in explicit:
+            if _finite(params[key], f"sim_run_pipe_flow {key}") <= 0.0:
+                raise ValueError(f"sim_run_pipe_flow {key} must be > 0")
+    else:
+        fluid = params.get("fluid")
+        if not isinstance(fluid, str) or not fluid.strip():
+            raise ValueError("sim_run_pipe_flow needs a fluid name or density_kgm3 + "
+                             "viscosity_pas")
+    for key in ("temp_c", "pressure_kpa"):
+        if params.get(key) is not None:
+            _finite(params[key], f"sim_run_pipe_flow {key}")
+    for key in ("voxel_mm", "roughness_mm"):
+        if params.get(key) is not None:
+            value = _finite(params[key], f"sim_run_pipe_flow {key}")
+            if value < 0.0 or (key == "voxel_mm" and value == 0.0):
+                raise ValueError(f"sim_run_pipe_flow {key} must be > 0")
+    steps = params.get("max_steps")
+    if steps is not None and (isinstance(steps, bool) or not isinstance(steps, int)
+                              or steps < 1):
+        raise ValueError("sim_run_pipe_flow max_steps must be an integer >= 1")
+    cells = params.get("cells_across")
+    if cells is not None and (isinstance(cells, bool) or not isinstance(cells, int)
+                              or not 4 <= cells <= 128):
+        raise ValueError("sim_run_pipe_flow cells_across must be an integer in [4, 128]")
+    if params.get("progress_path") is not None and not isinstance(params["progress_path"], str):
+        raise ValueError("sim_run_pipe_flow progress_path must be a path")
+    piping = params.get("piping")
+    if piping is not None and not isinstance(piping, dict):
+        raise ValueError("sim_run_pipe_flow piping must be an aicad.piping/1 object")
+    run = params.get("run_id")
+    if run is not None and (not isinstance(run, str) or not run):
+        raise ValueError("sim_run_pipe_flow run_id must be a run id string")
+    if run is not None and piping is None:
+        raise ValueError("sim_run_pipe_flow run_id needs the piping document it names")
+
+
 #: Substrings that mean "this build has no such solver", as opposed to "the solver is here
 #: and rejected an empty payload" — which is the answer a WORKING solver gives the probe.
 _MISSING_SOLVER_TOKENS = ("unknown method", "solver unavailable", "not compiled")
@@ -667,6 +758,10 @@ def _validate_core_rpc_payload(payload: dict) -> None:
         from services.sim.topology import validate_run_envelope  # noqa: PLC0415
 
         validate_run_envelope(params.get("study"))
+        _probe_backend(method)
+        return
+    if method in _PIPE_FLOW_METHODS:
+        _validate_pipe_flow_payload(payload, params)
         _probe_backend(method)
         return
     step = payload.get("open_step")

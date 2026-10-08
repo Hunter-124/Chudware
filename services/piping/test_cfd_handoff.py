@@ -154,6 +154,26 @@ def test_internal_volume_unknown_run_id():
     assert "run_id" in res.get("reason", "").lower() or "not found" in res.get("reason", "")
 
 
+@_needs_kernel
+def test_end_elbow_keeps_full_lr_radius():
+    """A routed run ends one LR take-out past its last corner (piping_route's nozzle stub):
+    that elbow — and every other — is swept at the full bend radius, in both the bore wire
+    (CFD fluid volume) and the pipe wire (3-D model). An end segment may be consumed whole;
+    a segment shared by two bends is split half each."""
+    from services.piping import threed
+    R = 76.2  # NPS 2 LR take-out = bend radius for a 90° elbow
+    pts = [[0, 0, 0], [300, 0, 0], [300, 0, -180], [600, 0, -180], [600, 0, 0],
+           [600 + R, 0, 0]]
+    for build in (ch._bore_wire, threed._path_wire):
+        wire = build(pts, R)
+        arcs = [e for e in wire.edges() if str(e.geom_type).upper().endswith("CIRCLE")]
+        assert len(arcs) == 4, f"{build.__name__}: expected 4 bends, got {len(arcs)}"
+        for e in arcs:
+            assert abs(e.radius - R) < 1e-6, f"{build.__name__}: bend radius {e.radius} != {R}"
+        end = wire.edges()[-1] @ 1
+        assert abs(end.X - (600 + R)) < 1e-6 and abs(end.Z) < 1e-6, (build.__name__, end)
+
+
 def test_internal_volume_no_kernel_raises_piping_cfd_error():
     """When the kernel is absent, internal_volume raises PipingCFDError (not bare exception).
 
@@ -411,7 +431,8 @@ def main():
         test_internal_volume_produces_step()
         test_internal_volume_single_run_filter()
         test_internal_volume_unknown_run_id()
-        print("  group 1 (internal_volume kernel): 3/3 OK")
+        test_end_elbow_keeps_full_lr_radius()
+        print("  group 1 (internal_volume kernel): 4/4 OK")
     else:
         test_internal_volume_no_kernel_raises_piping_cfd_error()
         print("  group 1 (internal_volume kernel): SKIPPED (build123d absent); "

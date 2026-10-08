@@ -107,14 +107,19 @@ def _bore_wire(pts, bend_r: float):
             delta = math.acos(d)
             if delta < 1e-6:
                 continue
+            # An end segment may be used whole, a segment shared with another bend half each
+            # (a route ends one LR take-out past its last corner — that elbow keeps its radius).
             t = bend_r * math.tan(delta / 2.0)
-            t = min(t, 0.49 * _norm(_sub(b, a)), 0.49 * _norm(_sub(c, b)))
+            t = min(t, (1.0 if i == 1 else 0.5) * _norm(_sub(b, a)),
+                    (1.0 if i == len(P) - 2 else 0.5) * _norm(_sub(c, b)))
             arc_start = _sub(b, _scale(u, t))
             arc_end = _add(b, _scale(w, t))
-            Line(Vector(*cur), Vector(*arc_start))
+            if _norm(_sub(arc_start, cur)) > 1e-9:
+                Line(Vector(*cur), Vector(*arc_start))
             TangentArc(Vector(*arc_start), Vector(*arc_end), tangent=Vector(*u))
             cur = arc_end
-        Line(Vector(*cur), Vector(*P[-1]))
+        if _norm(_sub(P[-1], cur)) > 1e-9:
+            Line(Vector(*cur), Vector(*P[-1]))
     return bl.wire()
 
 

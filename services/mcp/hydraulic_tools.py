@@ -8,16 +8,27 @@ must do the bookkeeping and return rich, actionable context"). Each tool returns
 parsing and its tiny session state so tools can reuse the last active circuit document.
 
 Tools:
-  hydraulic_new             create a new aicad.hydraulic/1 circuit document
+  hydraulic_new             create a blank or native-template aicad.hydraulic/1 circuit
+  hydraulic_templates       list native starter circuits and their component/hose counts
   hydraulic_add_component   add an ISO 1219 component to the active circuit
   hydraulic_add_hose        add a hose/line net connecting two or more component ports
   hydraulic_size_cylinder   size a hydraulic cylinder (force, flow, cycle time)
   hydraulic_size_pump       size a hydraulic pump (displacement, power, torque)
+  hydraulic_size_motor      size a hydraulic motor (displacement, catalog step, flow, power)
+  pump_drive_size           electric motor for a hydraulic or centrifugal pump (IEC / NEMA)
+  hydraulic_simulate        lumped-parameter transient of the circuit under a valve schedule
   hydraulic_bom             extract a sourcing BOM from the active circuit
+  hydraulic_layout_3d       place circuit components in the shared shaded 3D layout (mm)
+  hydraulic_load            restore a circuit persisted in a document's studies
   hydraulic_piping_handoff  hose/tube runs -> piping 1D solver (real per-line pressure drops)
   hydraulic_verify_piping   cross-check per-hose estimates vs piping solve + pump margin
   hydraulic_fea_handoff     cylinder mount loads at max pressure -> static FEA load cases
   hydraulic_verify_fea      cross-check envelope mount forces vs independent recompute
+
+With ``doc_id`` the circuit and every analysis on it (sizing, bom, simulate) persist into the
+document's ``hydraulic_circuit`` study (one per circuit name), so the work round-trips through
+the ``.step+`` and ``hydraulic_load`` brings it back. Editing the circuit drops the stored
+simulate / bom results (they described the old circuit); hand-calc sizing is kept.
 
 Registration is deferred behind :func:`register_hydraulic_tools` so ``server.py`` wires us in
 with a tiny fenced block — mirrors :func:`register_piping_tools`.
@@ -34,9 +45,11 @@ from __future__ import annotations
 import json
 import math
 import os
+import tempfile
 from typing import Any, Optional, Union
 
 from . import core_bridge as cb
+from .cad_common import _doc, _persist_study, _project_dir
 from services.mcp import simhandoff as sh
 from services.mcp._envelopes import plain_dumps as _dumps, reason_err as _err
 
@@ -154,6 +167,355 @@ def _as_obj(x: Union[str, list, dict, None]) -> Any:
 
 def _active_doc() -> Optional[dict]:
     return _HYD.get("doc")
+
+
+# ------------------------------------------------------- circuit studies (persistence)
+#: Study type/engine a circuit and every analysis on it persist under (doc ``studies[]``).
+_CIRCUIT_STUDY = "hydraulic_circuit"
+_CIRCUIT_ENGINE = "cpp-hydraulic"
+_DEFAULT_CIRCUIT = "Hydraulic Circuit"
+#: Results that describe inputs rather than the circuit (hand-calc sizing) survive a circuit
+#: edit; simulate / bom / piping_handoff describe THIS circuit and are dropped with it.
+_KEEP_ON_CIRCUIT_CHANGE = ("sizing",)
+_SIZING_KINDS = ("cylinders", "pumps", "motors", "drives")
+#: Envelope keys that describe the call rather than the result — never stored in a study.
+_ENVELOPE_KEYS = ("ok", "hint", "next_actions")
+#: Points kept per returned time series; the full-resolution run goes to ``series_path``.
+_SERIES_MAX_POINTS = 400
+
+
+def _body(res: dict) -> dict:
+    """A result minus its call envelope — what a study stores."""
+    return {k: v for k, v in res.items() if k not in _ENVELOPE_KEYS}
+
+
+def _drop_none(d: dict) -> dict:
+    return {k: v for k, v in d.items() if v is not None}
+
+
+def _rpc(method: str, params: dict) -> dict:
+    """One native RPC as a contract-shaped dict; an engine failure is a refusal, never a raise."""
+    try:
+        res = cb.call(method, params)
+    except Exception as exc:  # noqa: BLE001 — contract-shaped soft-fail
+        return _err("engine_unavailable",
+                    hint=f"{method} could not run in the core engine: {exc}")
+    if not isinstance(res, dict):
+        return _err("engine_bad_reply", hint=f"{method} returned {res!r}")
+    return res
+
+
+def _target_doc(doc_id: Optional[str]) -> "tuple[Optional[str], Optional[dict]]":
+    """Resolve an OPTIONAL persistence target; no doc_id means nothing is persisted."""
+    if not doc_id:
+        return None, None
+    try:
+        return _doc(doc_id), None
+    except Exception as exc:  # noqa: BLE001 — DocRefError names the open documents
+        return None, _err("unknown_doc", hint=str(exc))
+
+
+def _circuit_studies(doc_id: str) -> list:
+    try:
+        res = cb.call("sim_study_list", {"doc_id": doc_id})
+    except Exception:  # noqa: BLE001 — an unreadable study list reads as empty
+        return []
+    return [s for s in (res.get("studies") or [])
+            if isinstance(s, dict) and s.get("type") == _CIRCUIT_STUDY]
+
+
+def _find_circuit_study(doc_id: str, name: str) -> Optional[dict]:
+    for s in _circuit_studies(doc_id):
+        if s.get("name") == name:
+            return s
+    return None
+
+
+def _saved(doc_id: str, sid: Optional[str]) -> dict:
+    out: dict = {"doc_id": doc_id, "saved_to_study": bool(sid)}
+    if sid:
+        out["study_id"] = sid
+    else:
+        out["study_not_saved_reason"] = (
+            f"the result could not be written into document {doc_id}'s studies; the "
+            "numbers above are unaffected")
+    return out
+
+
+def _circuit_name(circuit: Optional[dict]) -> str:
+    name = circuit.get("name") if isinstance(circuit, dict) else None
+    return str(name) if name else _DEFAULT_CIRCUIT
+
+
+def _merge_results(old: dict, new: dict) -> dict:
+    """``old`` + ``new``; ``sizing`` merges per kind and per key, everything else replaces."""
+    out = dict(old)
+    for k, v in new.items():
+        if k == "sizing" and isinstance(v, dict) and isinstance(out.get("sizing"), dict):
+            merged = dict(out["sizing"])
+            for kind, rows in v.items():
+                prior = merged.get(kind) if isinstance(merged.get(kind), dict) else {}
+                merged[kind] = {**prior, **(rows or {})}
+            out["sizing"] = merged
+        else:
+            out[k] = v
+    return out
+
+
+def _persist_circuit(doc_id: str, name: str, circuit: Optional[dict] = None, *,
+                     params: Optional[dict] = None, results: Optional[dict] = None) -> dict:
+    """Merge into ``doc_id``'s ``hydraulic_circuit`` study ``name`` (one study per circuit).
+
+    ``circuit=None`` keeps the stored circuit (sizing recorded before or beside it). A
+    changed circuit invalidates every analysis of the old one: only ``sizing`` (hand calcs
+    on their own inputs) is kept, exactly like ``piping_tools._persist_network`` keeps
+    routed-run records.
+    """
+    existing = _find_circuit_study(doc_id, name) or {}
+    old_params = existing.get("params") if isinstance(existing.get("params"), dict) else {}
+    old_results = existing.get("results") if isinstance(existing.get("results"), dict) else {}
+    stored = old_params.get("circuit")
+    if circuit is None:
+        circuit = stored
+    elif stored != circuit:
+        old_results = {k: v for k, v in old_results.items() if k in _KEEP_ON_CIRCUIT_CHANGE}
+    rec: dict = {"type": _CIRCUIT_STUDY, "name": name, "engine": _CIRCUIT_ENGINE,
+                 "params": {**old_params, **(params or {}), "circuit": circuit},
+                 "results": _merge_results(old_results, results or {})}
+    if existing.get("id"):
+        rec["id"] = existing["id"]
+    return _saved(doc_id, _persist_study(doc_id, rec))
+
+
+def _restore_circuit(study: dict) -> dict:
+    """Make a persisted circuit the active session circuit; returns the circuit."""
+    circuit = (study.get("params") or {})["circuit"]
+    _HYD["doc"] = circuit
+    return circuit
+
+
+def _layout_3d(circuit: dict, authored: Optional[dict] = None) -> dict:
+    """Shared physical millimetre layout; authored positions override schematic XY defaults."""
+    merged = {}
+    for component in circuit.get("components") or []:
+        xy = component.get("position") or [0, 0]
+        merged[component["id"]] = [2.0 * float(xy[0]), 2.0 * float(xy[1]), 0.0]
+    merged.update({cid: xyz for cid, xyz in (authored or {}).items() if cid in merged})
+    return merged
+
+
+def _saved_circuit(target: str, name: Optional[str] = None) -> "tuple[Optional[dict], list]":
+    """The circuit study to restore from ``target``: by name, else the doc's only circuit."""
+    nets = [s for s in _circuit_studies(target)
+            if isinstance((s.get("params") or {}).get("circuit"), dict)]
+    names = [s.get("name") for s in nets]
+    if name is not None:
+        return next((s for s in nets if s.get("name") == name), None), names
+    return (nets[0] if len(nets) == 1 else None), names
+
+
+def _circuit_input(doc: Union[str, dict, None],
+                   target: Optional[str]) -> "tuple[Optional[dict], Optional[dict]]":
+    """``(circuit, refusal)``: the inline ``doc``, else the session circuit, else (with a
+    persistence target) the circuit saved in that document — the save/reopen path."""
+    if doc is not None:
+        try:
+            d = _load_doc(doc)
+        except (ValueError, TypeError, OSError) as exc:
+            return None, _err("bad_circuit", hint=f"could not parse doc: {exc}")
+        if isinstance(d, dict) and d.get("schema") is None and isinstance(d.get("circuit"), dict):
+            d = d["circuit"]  # a whole hydraulic_load result
+        if not isinstance(d, dict):
+            return None, _err("bad_circuit", hint="doc must be an aicad.hydraulic/1 object")
+        return d, None
+    active = _active_doc()
+    if isinstance(active, dict):
+        return active, None
+    if target is not None:
+        st, _names = _saved_circuit(target)
+        if st is not None:
+            return _restore_circuit(st), None
+    return None, _err(
+        "no_circuit",
+        hint=("no active hydraulic circuit: hydraulic_new(name) starts one, "
+              "hydraulic_load(doc_id) restores one saved in a document, or pass doc=<circuit>"))
+
+
+def _sizing_study_name(target: str) -> str:
+    """Which circuit study a hand-calc sizing belongs to: the active circuit, else the
+    document's only saved circuit, else the default circuit name."""
+    active = _active_doc()
+    if isinstance(active, dict):
+        return _circuit_name(active)
+    studies = _circuit_studies(target)
+    if len(studies) == 1 and studies[0].get("name"):
+        return str(studies[0]["name"])
+    return _DEFAULT_CIRCUIT
+
+
+def _persist_sizing(doc_id: Optional[str], kind: str, key: str, res: dict) -> dict:
+    """Record one sizing result under ``results.sizing.<kind>.<key>`` (nothing w/o doc_id)."""
+    target, refusal = _target_doc(doc_id)
+    if refusal:
+        return {"study_not_saved_reason": refusal["hint"], "saved_to_study": False}
+    if target is None:
+        return {}
+    name = _sizing_study_name(target)
+    active = _active_doc()
+    circuit = active if isinstance(active, dict) and _circuit_name(active) == name else None
+    out = _persist_circuit(target, name, circuit,
+                           results={"sizing": {kind: {key: _body(res)}}})
+    out["circuit_study"] = name
+    out["sizing_key"] = key
+    return out
+
+
+def _num_label(v: Any) -> str:
+    try:
+        return f"{float(v):g}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+# ------------------------------------------------------- transient simulation payload
+def _sample_indices(n: int, max_points: int) -> list:
+    """Evenly spaced sample indices over ``n`` points, always keeping the first and last."""
+    if n <= max_points:
+        return list(range(n))
+    m = max(2, max_points)
+    return sorted({round(i * (n - 1) / (m - 1)) for i in range(m)})
+
+
+def _sample(series: Any, n: int, idx: list) -> Any:
+    if isinstance(series, list) and len(series) == n:
+        return [series[i] for i in idx]
+    return series
+
+
+def compact_simulation(res: dict, max_points: int = _SERIES_MAX_POINTS) -> dict:
+    """A ``hydraulic_simulate`` result with every time series cut to ≤ ``max_points``
+    samples on ONE shared index set (so ``time_s`` still aligns with every series).
+
+    Summary, solver and warnings are untouched; ``downsampled`` records the reduction.
+    """
+    out = dict(res)
+    time_s = res.get("time_s")
+    n = len(time_s) if isinstance(time_s, list) else 0
+    cap = max(2, min(int(max_points), _SERIES_MAX_POINTS))
+    idx = _sample_indices(n, cap)
+    out["time_s"] = _sample(time_s, n, idx)
+    nodes = res.get("nodes")
+    if isinstance(nodes, dict):
+        out["nodes"] = {nid: ({k: _sample(v, n, idx) for k, v in nd.items()}
+                              if isinstance(nd, dict) else nd)
+                        for nid, nd in nodes.items()}
+    comps = res.get("components")
+    if isinstance(comps, dict):
+        new_comps = {}
+        for cid, c in comps.items():
+            if isinstance(c, dict) and isinstance(c.get("series"), dict):
+                c = {**c, "series": {k: _sample(v, n, idx) for k, v in c["series"].items()}}
+            new_comps[cid] = c
+        out["components"] = new_comps
+    out["downsampled"] = {"points": len(idx), "of": n, "full_resolution": n <= cap}
+    return out
+
+
+def _series_dir() -> str:
+    """``<project>/.chudware/hydraulic`` when a project is bound, else the temp dir."""
+    root = os.environ.get("CHUDWARE_PROJECT_SAVE_DIR", "").strip() or _project_dir()
+    base = (os.path.join(root, ".chudware", "hydraulic") if root
+            else os.path.join(tempfile.gettempdir(), "chudware-hydraulic"))
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def write_series(res: dict, name: str) -> "tuple[Optional[str], Optional[str]]":
+    """Write the full-resolution run to a JSON file; ``(path, None)`` or ``(None, reason)``."""
+    stem = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name.strip()) or "circuit"
+    payload = {k: res.get(k) for k in ("time_s", "nodes", "components", "summary", "solver",
+                                       "warnings")}
+    try:
+        fd, path = tempfile.mkstemp(prefix=f"{stem}-", suffix=".json", dir=_series_dir())
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+    except OSError as exc:
+        return None, f"could not write the full-resolution series: {exc}"
+    return path, None
+
+
+#: Pressure-rating keys read from a component's params or a hose (object or its params).
+_RATING_KEYS = ("max_pressure_bar", "pressure_rating_bar", "working_pressure_bar",
+                "rated_pressure_bar")
+
+
+def _rating(obj: Any) -> Optional[float]:
+    if not isinstance(obj, dict):
+        return None
+    for src in (obj, obj.get("params")):
+        if isinstance(src, dict):
+            for k in _RATING_KEYS:
+                try:
+                    v = float(src[k])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if v > 0:
+                    return v
+    return None
+
+
+def rating_check(circuit: dict, res: dict) -> dict:
+    """Peak simulated pressure at every rated component / hose vs its pressure rating.
+
+    A node's peak is the max of its full-resolution ``pressure_bar`` series; a component's
+    peak is the max over the nodes its ports sit on (node ``members`` are
+    ``"<component_id>.<port>"``), a hose's the node its connections join.
+    """
+    peak_by_member: dict = {}
+    for node in (res.get("nodes") or {}).values():
+        if not isinstance(node, dict):
+            continue
+        series = [v for v in (node.get("pressure_bar") or []) if isinstance(v, (int, float))]
+        if not series:
+            continue
+        peak = max(series)
+        for m in node.get("members") or []:
+            key = str(m).lower()
+            peak_by_member[key] = max(peak, peak_by_member.get(key, peak))
+
+    def _peak_of(cid: str, ports: Optional[list] = None) -> Optional[float]:
+        cid = str(cid).lower()
+        vals = [v for k, v in peak_by_member.items()
+                if k.split(".", 1)[0] == cid
+                and (ports is None or k.split(".", 1)[-1] in ports)]
+        return max(vals) if vals else None
+
+    checked: list = []
+    for comp in circuit.get("components") or []:
+        rating = _rating(comp)
+        peak = _peak_of(comp.get("id", "")) if rating else None
+        if rating and peak is not None:
+            checked.append({"item": f"{comp.get('id')} ({comp.get('type')})",
+                            "rating_bar": rating, "peak_bar": round(peak, 3)})
+    for hose in circuit.get("hoses") or []:
+        rating = _rating(hose)
+        if not rating:
+            continue
+        peaks = [p for p in (_peak_of(c.get("component_id", ""),
+                                      [str(c.get("port", "")).lower()])
+                             for c in hose.get("connections") or [] if isinstance(c, dict))
+                 if p is not None]
+        if peaks:
+            checked.append({"item": f"{hose.get('id')} ({hose.get('net_name')})",
+                            "rating_bar": rating, "peak_bar": round(max(peaks), 3)})
+    for row in checked:
+        row["utilization"] = round(row["peak_bar"] / row["rating_bar"], 4)
+        row["pass"] = row["peak_bar"] <= row["rating_bar"]
+    out = {"checked": checked, "exceeded": [r for r in checked if not r["pass"]]}
+    if not checked:
+        out["note"] = ("no component or hose carries a pressure rating (params "
+                       "max_pressure_bar / pressure_rating_bar) — nothing to check against")
+    return out
 
 
 # ── hydraulic → piping / FEA handoff helpers (module-level: engine-less testable) ──
@@ -522,23 +884,60 @@ def register_hydraulic_tools(mcp) -> None:
     :func:`register_piping_tools`.
     """
 
+    def _persist_edit(r: dict, target: Optional[str], params: Optional[dict] = None) -> dict:
+        """After a successful circuit edit, merge the new circuit into its study."""
+        if target and r.get("ok") and isinstance(r.get("doc"), dict):
+            r.update(_persist_circuit(target, _circuit_name(r["doc"]), r["doc"], params=params))
+            r["circuit_study"] = _circuit_name(r["doc"])
+        return r
+
     @mcp.tool()
-    def hydraulic_new(name: str = "Hydraulic Circuit") -> str:
+    def hydraulic_new(name: str = "Hydraulic Circuit", doc_id: Optional[str] = None,
+                      template: str = "blank") -> str:
         """Create a new ``aicad.hydraulic/1`` hydraulic circuit document.
 
-        Initialises an empty circuit with ISO 1219 unit defaults (bar / L/min / kN / mm).
-        The new document becomes the active session document for subsequent
-        ``hydraulic_add_component``, ``hydraulic_add_hose``, and ``hydraulic_bom`` calls.
+        ``template`` selects a native starting circuit: ``blank`` (default, empty),
+        ``power_unit`` (tank, gear pump, relief and return filter), ``cylinder_circuit``
+        (power unit + 4/3 valve + double-acting cylinder), or ``motor_circuit``
+        (power unit + 4/3 valve + bidirectional motor). Unknown ids return reason + hint.
+        All templates use ISO 1219 units (bar / L/min / kN / mm); their definitions and
+        suggested ``simulation`` setups come only from the native engine.
+        The new document becomes the active session circuit for subsequent hydraulic tools.
 
-        Returns the initial document envelope with schema, id, and empty component/hose lists.
+        With ``doc_id`` the circuit AND its suggested simulation setup are saved into that
+        CAD document's ``hydraulic_circuit`` study named ``name`` (saved into the ``.step+``
+        by save_part); later edits and analyses passing the same ``doc_id`` merge into it
+        and ``hydraulic_load`` restores it.
+        A saved circuit of the same name is replaced (its sizing results are kept).
+
+        Returns the document envelope, ``template`` echo and ``simulation`` setup. Adapt
+        the example loads to the real duty, then pass ``**simulation`` to hydraulic_simulate.
         """
-        try:
-            r = cb.call("hydraulic_new", {"name": name})
-        except Exception as exc:  # noqa: BLE001 — contract-shaped soft-fail, never raise
-            return _dumps(_err(f"core engine unavailable: {exc}"))
+        target, refusal = _target_doc(doc_id)
+        if refusal:
+            return _dumps(refusal)
+        r = _rpc("hydraulic_new", {"name": name, "template": template})
         if r.get("ok") and isinstance(r.get("doc"), dict):
             _HYD["doc"] = r["doc"]
-        return _dumps(r)
+            if target:
+                prior = _find_circuit_study(target, _circuit_name(r["doc"]))
+                old = ((prior or {}).get("params") or {}).get("circuit")
+                if isinstance(old, dict) and (old.get("components") or old.get("hoses")):
+                    r.setdefault("warnings", []).append(
+                        f"replaced the circuit saved as {_circuit_name(r['doc'])!r} in "
+                        f"{target} ({len(old.get('components') or [])} components); use "
+                        "hydraulic_load to continue a saved circuit instead")
+        return _dumps(_persist_edit(r, target, params=r.get("simulation")))
+
+    @mcp.tool()
+    def hydraulic_templates() -> str:
+        """List native circuit templates: id, name, description, component count, hose count.
+
+        Pass an entry's ``id`` as ``hydraulic_new(template=..., doc_id=...)`` to create
+        its circuit and suggested simulation setup. The catalog comes from the same native
+        definitions used by the desktop Hydraulics workspace.
+        """
+        return _dumps(_rpc("hydraulic_templates", {}))
 
     @mcp.tool()
     def hydraulic_add_component(
@@ -549,6 +948,7 @@ def register_hydraulic_tools(mcp) -> None:
         params: Union[str, dict, None] = None,
         sourcing: Union[str, dict, None] = None,
         doc: Union[str, dict, None] = None,
+        doc_id: Optional[str] = None,
     ) -> str:
         """Add an ISO 1219 hydraulic component to the active circuit document.
 
@@ -569,7 +969,15 @@ def register_hydraulic_tools(mcp) -> None:
         description/quantity/unit/category for BOM roll-up.
 
         ``doc`` overrides the session document (optional — if omitted, uses the last
-        ``hydraulic_new`` document).
+        ``hydraulic_new`` document; with ``doc_id`` and no session circuit, the circuit saved
+        in that document). With ``doc_id`` the edited circuit is saved into its
+        ``hydraulic_circuit`` study (stored simulate/bom results are dropped — they described
+        the old circuit).
+
+        For ``hydraulic_simulate`` a component needs its required params (pump
+        displacement_cc_rev + speed_rpm, cylinder_linear bore_mm + stroke_mm (+ rod_mm),
+        motor_hydraulic displacement_cc_rev, valve_relief set_pressure_bar, accumulator
+        volume_l + pre_charge_bar, valve_flow_control set_flow_lpm | Kv | Cv).
 
         Returns the updated document with the new component appended.
         """
@@ -579,12 +987,17 @@ def register_hydraulic_tools(mcp) -> None:
             return _dumps(_err(str(exc),
                                hint="pick the specific ISO 1219 member — see the type list "
                                     "in contracts/hydraulic_schema.md"))
+        target, refusal = _target_doc(doc_id)
+        if refusal:
+            return _dumps(refusal)
         try:
             d = _load_doc(doc) if doc is not None else _active_doc()
             p = _as_obj(params) or {}
             s = _as_obj(sourcing) or {}
         except (ValueError, TypeError, OSError) as exc:
             return _dumps(_err(f"could not parse inputs: {exc}"))
+        if d is None and target:
+            d, _miss = _circuit_input(None, target)
 
         try:
             r = cb.call("hydraulic_add_component", {
@@ -596,31 +1009,43 @@ def register_hydraulic_tools(mcp) -> None:
             _HYD["doc"] = r["doc"]  # additive "doc" key: the updated active circuit
         if r.get("ok") and type_note:
             r["interpreted"] = [type_note]
-        return _dumps(r)
+        return _dumps(_persist_edit(r, target))
 
     @mcp.tool()
     def hydraulic_add_hose(
         net_name: str,
         connections: Union[str, list],
         doc: Union[str, dict, None] = None,
+        doc_id: Optional[str] = None,
     ) -> str:
         """Add a hose/line net connecting two or more hydraulic component ports.
 
         ``net_name`` is a label for the net (e.g. ``"PRESSURE_LINE"``, ``"RETURN_LINE"``).
-        ``connections`` is a JSON list of ``{"component_id": "c1", "port": "p1"}`` objects
+        ``connections`` is a JSON list of ``{"component_id": "c1", "port": "P"}`` objects
         identifying which port on which component each end of the hose connects to.
 
-        Port types: pressure, tank, work_a, work_b, drain, generic.
+        Port names ``hydraulic_simulate`` resolves (case-insensitive): pump P (outlet) /
+        T (suction) / L; cylinder_linear A (cap) / B (rod); motor_hydraulic and
+        cylinder_rotary A / B / L; valve_directional P / T / A / B; valve_relief P / T;
+        valve_check, valve_flow_control, filter, heat_exchanger IN / OUT; reservoir and
+        accumulator any name. Other names must be declared in the component's ``ports``
+        with a port_type (pressure, tank, work_a, work_b, drain, generic).
 
-        ``doc`` overrides the session document (optional).
+        ``doc`` overrides the session document (optional). With ``doc_id`` the edited
+        circuit is saved into its ``hydraulic_circuit`` study.
 
         Returns the updated document with the new hose appended.
         """
+        target, refusal = _target_doc(doc_id)
+        if refusal:
+            return _dumps(refusal)
         try:
             d = _load_doc(doc) if doc is not None else _active_doc()
             conns = _as_obj(connections)
         except (ValueError, TypeError, OSError) as exc:
             return _dumps(_err(f"could not parse inputs: {exc}"))
+        if d is None and target:
+            d, _miss = _circuit_input(None, target)
 
         try:
             r = cb.call("hydraulic_add_hose", {
@@ -629,7 +1054,7 @@ def register_hydraulic_tools(mcp) -> None:
             return _dumps(_err(f"core engine unavailable: {exc}"))
         if r.get("ok") and isinstance(r.get("doc"), dict):
             _HYD["doc"] = r["doc"]  # additive "doc" key: the updated active circuit
-        return _dumps(r)
+        return _dumps(_persist_edit(r, target))
 
     @mcp.tool()
     def hydraulic_size_cylinder(
@@ -639,6 +1064,8 @@ def register_hydraulic_tools(mcp) -> None:
         rod_mm: float = 0.0,
         velocity_mm_s: float = 50.0,
         efficiency: float = 0.95,
+        component_id: Optional[str] = None,
+        doc_id: Optional[str] = None,
     ) -> str:
         """Size a hydraulic cylinder: extend/retract force, flow, and cycle time.
 
@@ -651,7 +1078,9 @@ def register_hydraulic_tools(mcp) -> None:
         Hand-calc check: 50 mm bore, 200 bar, efficiency=1 → ≈ 39.27 kN extend force.
 
         All inputs in the circuit's native units (mm, bar). Returns a contract-shaped dict
-        with all sizing results plus recommended pump flow.
+        with all sizing results plus recommended pump flow. With ``doc_id`` the result is
+        saved under the active circuit's study ``results.sizing.cylinders.<component_id>``
+        (a bore/pressure label when ``component_id`` is omitted).
         """
         try:
             r = cb.call("hydraulic_size_cylinder", {
@@ -660,6 +1089,9 @@ def register_hydraulic_tools(mcp) -> None:
                 "efficiency": efficiency})
         except Exception as exc:  # noqa: BLE001
             return _dumps(_err(f"core engine unavailable: {exc}"))
+        if r.get("ok"):
+            key = component_id or f"bore{_num_label(bore_mm)}mm@{_num_label(pressure_bar)}bar"
+            r.update(_persist_sizing(doc_id, "cylinders", key, r))
         return _dumps(r)
 
     @mcp.tool()
@@ -668,6 +1100,8 @@ def register_hydraulic_tools(mcp) -> None:
         pressure_bar: float,
         efficiency: float = 0.85,
         speed_rpm: float = 1500.0,
+        component_id: Optional[str] = None,
+        doc_id: Optional[str] = None,
     ) -> str:
         """Size a hydraulic pump: displacement, hydraulic power, shaft power, torque.
 
@@ -680,7 +1114,8 @@ def register_hydraulic_tools(mcp) -> None:
         Hand-calc check: 10 L/min, 200 bar, η=0.85 → shaft ≈ 3.92 kW.
 
         Returns displacement, power, and torque in a contract-shaped dict ready to pass to
-        component selection.
+        component selection; size its electric motor next with ``pump_drive_size``. With
+        ``doc_id`` the result is saved under ``results.sizing.pumps.<component_id>``.
         """
         try:
             r = cb.call("hydraulic_size_pump", {
@@ -688,10 +1123,190 @@ def register_hydraulic_tools(mcp) -> None:
                 "efficiency": efficiency, "speed_rpm": speed_rpm})
         except Exception as exc:  # noqa: BLE001
             return _dumps(_err(f"core engine unavailable: {exc}"))
+        if r.get("ok"):
+            key = component_id or f"{_num_label(flow_lpm)}lpm@{_num_label(pressure_bar)}bar"
+            r.update(_persist_sizing(doc_id, "pumps", key, r))
         return _dumps(r)
 
     @mcp.tool()
-    def hydraulic_bom(doc: Union[str, dict, None] = None) -> str:
+    def hydraulic_size_motor(
+        torque_nm: float,
+        speed_rpm: float,
+        pressure_bar: float,
+        mech_efficiency: float = 0.9,
+        vol_efficiency: float = 0.95,
+        type: Optional[str] = None,
+        component_id: Optional[str] = None,
+        doc_id: Optional[str] = None,
+    ) -> str:
+        """Size a hydraulic motor: displacement (exact + catalog step), flow, output/input power.
+
+        ``torque_nm`` is the load torque at the shaft, ``speed_rpm`` the required speed and
+        ``pressure_bar`` the DIFFERENTIAL pressure available across the motor (supply minus
+        return/back pressure). Physics: D = 2π·T / (Δp·η_m) → ``displacement_cc_rev``;
+        ``standard_displacement_cc_rev`` is the next catalog step up for ``type``
+        (gear | vane | piston | orbital); Q = D·n / η_v → ``flow_lpm``; output P = T·ω,
+        input hydraulic P = Δp·Q.
+
+        Hand-calc check: 100 N·m at 100 bar, η_m = 1 → D = 62.83 cc/rev.
+
+        Feed ``flow_lpm`` + the supply pressure to ``hydraulic_size_pump`` and put the chosen
+        displacement on the circuit's motor_hydraulic (``displacement_cc_rev``). With
+        ``doc_id`` the result is saved under ``results.sizing.motors.<component_id>``.
+        """
+        res = _rpc("hydraulic_size_motor", _drop_none({
+            "torque_nm": torque_nm, "speed_rpm": speed_rpm, "pressure_bar": pressure_bar,
+            "mech_efficiency": mech_efficiency, "vol_efficiency": vol_efficiency,
+            "type": type}))
+        if res.get("ok"):
+            key = component_id or (f"{_num_label(torque_nm)}Nm@{_num_label(speed_rpm)}rpm"
+                                   f"@{_num_label(pressure_bar)}bar")
+            res.update(_persist_sizing(doc_id, "motors", key, res))
+        return _dumps(res)
+
+    @mcp.tool()
+    def pump_drive_size(
+        kind: str = "hydraulic",
+        flow_lpm: Optional[float] = None,
+        flow_m3h: Optional[float] = None,
+        pressure_bar: Optional[float] = None,
+        head_m: Optional[float] = None,
+        fluid_density_kgm3: Optional[float] = None,
+        pump_efficiency: Optional[float] = None,
+        speed_rpm: Optional[float] = None,
+        standard: str = "IEC",
+        service_factor: float = 1.15,
+        voltage_v: float = 400.0,
+        phases: int = 3,
+        frequency_hz: float = 50.0,
+        efficiency_class: str = "IE3",
+        component_id: Optional[str] = None,
+        doc_id: Optional[str] = None,
+    ) -> str:
+        """Size the electric motor driving a pump (hydraulic or centrifugal): kW/hp, poles, frame, current.
+
+        ``kind`` = ``"hydraulic"`` (positive displacement: give ``flow_lpm`` + ``pressure_bar``)
+        or ``"centrifugal"`` (give ``flow_m3h`` + ``head_m``, or flow + pressure). Hydraulic
+        power = Q·Δp (or ρ·g·Q·H); shaft power = hydraulic / ``pump_efficiency`` (default 0.88
+        hydraulic overall, 0.7 centrifugal); required motor = shaft × ``service_factor``,
+        rounded UP the ``standard`` ladder (IEC 60072 kW or NEMA MG-1 hp). ``speed_rpm``
+        (default 1500) picks the pole count at ``frequency_hz``; ``efficiency_class`` (IE2 |
+        IE3 | IE4) gives the IEC 60034-30-1 motor efficiency, hence input power and
+        full-load current at ``voltage_v`` / ``phases``. ``fluid_density_kgm3`` defaults to
+        870 (oil) / 998 (water).
+
+        Returns hydraulic_power_kw, shaft_power_kw, required_motor_kw, motor_rating_kw or
+        motor_rating_hp, poles, sync_speed_rpm, motor_efficiency, input_power_kw,
+        full_load_current_a and iec_frame / nema_frame. With ``doc_id`` a hydraulic drive
+        is saved under the circuit study's ``results.sizing.drives.<component_id>``; for a
+        piping network's pump use ``piping_pump_drive`` (it reads the solved duty point and
+        saves into the ``piping_network`` study).
+        """
+        res = _rpc("pump_drive_size", _drop_none({
+            "kind": kind, "flow_lpm": flow_lpm, "flow_m3h": flow_m3h,
+            "pressure_bar": pressure_bar, "head_m": head_m,
+            "fluid_density_kgm3": fluid_density_kgm3, "pump_efficiency": pump_efficiency,
+            "speed_rpm": speed_rpm, "standard": standard, "service_factor": service_factor,
+            "voltage_v": voltage_v, "phases": phases, "frequency_hz": frequency_hz,
+            "efficiency_class": efficiency_class}))
+        if res.get("ok") and doc_id:
+            if str(kind).lower() == "hydraulic":
+                flow = flow_lpm if flow_lpm is not None else flow_m3h
+                key = component_id or (f"drive{_num_label(flow)}"
+                                       f"{'lpm' if flow_lpm is not None else 'm3h'}"
+                                       f"@{_num_label(pressure_bar)}bar")
+                res.update(_persist_sizing(doc_id, "drives", key, res))
+            else:
+                res["saved_to_study"] = False
+                res["study_not_saved_reason"] = (
+                    "a centrifugal pump drive is saved with its piping network — call "
+                    "piping_pump_drive(network=..., doc_id=...) to size and save it from the "
+                    "solved duty point")
+        return _dumps(res)
+
+    @mcp.tool()
+    def hydraulic_simulate(
+        duration_s: float = 5.0,
+        valve_schedule: Union[str, list, None] = None,
+        loads: Union[str, dict, None] = None,
+        fluid: Union[str, dict, None] = None,
+        initial: Union[str, dict, None] = None,
+        output_dt_s: float = 0.01,
+        max_step_s: Optional[float] = None,
+        max_points: int = _SERIES_MAX_POINTS,
+        doc: Union[str, dict, None] = None,
+        doc_id: Optional[str] = None,
+    ) -> str:
+        """Transient simulation of the hydraulic circuit: pressures, cylinder/motor motion, flows, energy.
+
+        Lumped-parameter model of the active circuit (or inline ``doc``; with ``doc_id`` and
+        no session circuit, the one saved in that document): every hose net is a node with
+        hydraulic capacitance V/β; pumps are flow sources (displacement × speed × η_v),
+        relief valves crack at set_pressure_bar with linear override, directional valves
+        meter Q = Cd·A·√(2Δp/ρ) per spool position, cylinders/motors integrate load, mass,
+        inertia and friction with hard end stops, accumulators follow the polytropic gas law.
+        Stiff adaptive integrator with energy bookkeeping.
+
+        ``valve_schedule`` = ``[{"t_s":0,"component_id":"c3","position":"a"|"b"|"center"|0..1}]``
+        (0..1 = proportional spool). ``loads`` = ``{"c4":{"force_n":..,"mass_kg":..,
+        "friction_n":..}}`` for cylinders, ``{"c5":{"torque_nm":..,"inertia_kgm2":..}}`` for
+        motors. ``fluid`` = ``{"density_kgm3":870,"bulk_modulus_bar":15000,
+        "viscosity_cst":32}``. ``initial`` = ``{"c4":{"position_mm":0}}`` /
+        ``{"<accumulator>":{"pressure_bar":..}}``. Units: bar, L/min, mm, N, N·m, rpm, kW, s.
+
+        Returns ``summary`` (peak_pressure_bar, pump_energy_kj, useful_work_kj, heat_kj,
+        efficiency, relief_open_time_s, per-cylinder stroke_time_s / max_velocity_mms /
+        end_reached, per-motor steady speed/torque, per-pump mean pressure/power),
+        ``ratings`` (peak node pressure vs every component/hose max_pressure_bar),
+        ``time_s`` + ``nodes`` + ``components`` series cut to ≤ ``max_points`` (≤ 400)
+        samples and ``series_path``, a JSON file with the full-resolution run. Unconnected
+        ports, unknown schedule ids and missing params refuse by name. With ``doc_id`` the
+        run (inputs + results) is saved into the circuit's ``hydraulic_circuit`` study.
+        """
+        target, refusal = _target_doc(doc_id)
+        if refusal:
+            return _dumps(refusal)
+        circuit, refusal = _circuit_input(doc, target)
+        if refusal:
+            return _dumps(refusal)
+        try:
+            vs = _as_obj(valve_schedule)
+            ld = _as_obj(loads)
+            fl = _as_obj(fluid)
+            ini = _as_obj(initial)
+        except (ValueError, TypeError) as exc:
+            return _dumps(_err("bad_input", hint=f"could not parse inputs: {exc}"))
+        setup = _drop_none({"duration_s": duration_s, "max_step_s": max_step_s,
+                            "output_dt_s": output_dt_s, "valve_schedule": vs, "loads": ld,
+                            "fluid": fl, "initial": ini})
+        res = _rpc("hydraulic_simulate", {"doc": circuit, **setup})
+        if not res.get("ok"):
+            return _dumps(res)
+        name = _circuit_name(circuit)
+        ratings = rating_check(circuit, res)
+        path, why = write_series(res, name)
+        out = compact_simulation(res, max_points)
+        out["ratings"] = ratings
+        out["warnings"] = list(out.get("warnings") or []) + [
+            f"{e['item']}: peak {e['peak_bar']} bar exceeds its {e['rating_bar']} bar rating"
+            for e in ratings["exceeded"]]
+        if path:
+            out["series_path"] = path
+        else:
+            out["warnings"].append(why)
+        out["circuit_study"] = name
+        out["next_actions"] = list(out.get("next_actions") or []) + [
+            "compare summary.peak_pressure_bar with the relief set pressure and ratings.exceeded",
+            "hydraulic_piping_handoff(supply_pressure_bar=..., flow_lpm=...) for rigid lines",
+            "hydraulic_bom() once every component is sourced",
+        ]
+        if target:
+            out.update(_persist_circuit(target, name, circuit, params=setup,
+                                        results={"simulate": _body(out)}))
+        return _dumps(out)
+
+    @mcp.tool()
+    def hydraulic_bom(doc: Union[str, dict, None] = None, doc_id: Optional[str] = None) -> str:
         """Extract a sourcing bill of materials from the active hydraulic circuit.
 
         Emits VendorPart-compatible sourcing lines for every component in the circuit:
@@ -701,20 +1316,147 @@ def register_hydraulic_tools(mcp) -> None:
         counts components by type and lists those missing MPNs.
 
         ``doc`` overrides the session document (optional — uses the last ``hydraulic_new``
-        document if omitted).
+        document if omitted). With ``doc_id`` the BOM is saved into the circuit's
+        ``hydraulic_circuit`` study.
 
         Returns a list of BOM lines and a sourcing summary.
         """
+        target, refusal = _target_doc(doc_id)
+        if refusal:
+            return _dumps(refusal)
         try:
             d = _load_doc(doc) if doc is not None else _active_doc()
         except (ValueError, TypeError, OSError) as exc:
             return _dumps(_err(f"could not parse inputs: {exc}"))
+        if d is None and target:
+            d, _miss = _circuit_input(None, target)
 
         try:
             r = cb.call("hydraulic_bom", {"doc": d})
         except Exception as exc:  # noqa: BLE001
             return _dumps(_err(f"core engine unavailable: {exc}"))
+        if target and r.get("ok") and isinstance(d, dict):
+            r.update(_persist_circuit(target, _circuit_name(d), d,
+                                      results={"bom": _body(r)}))
+            r["circuit_study"] = _circuit_name(d)
         return _dumps(r)
+
+    @mcp.tool()
+    def hydraulic_layout_3d(
+        positions: Union[str, dict],
+        circuit: Union[str, dict, None] = None,
+        doc_id: Optional[str] = None,
+    ) -> str:
+        """Merge component positions (mm) into the document's hydraulic 3D layout.
+
+        ``positions`` = ``{component_id: [x_mm, y_mm, z_mm]}``. ``circuit`` is an inline
+        aicad.hydraulic/1 circuit, its saved name, or omitted for the document's only saved
+        circuit / active session circuit. Layout lives in the hydraulic_circuit study's
+        params.layout3d, shared with Hydraulics > 3D Layout. Unplaced components default
+        to twice their schematic XY position on Z=0. Moving components preserves simulation
+        results and schematic positions. Returns the merged layout and persistence receipt.
+        """
+        try:
+            target = _doc(doc_id)
+        except Exception as exc:  # noqa: BLE001 — same document resolution as hydraulic_load
+            return _dumps(_err("unknown_doc", hint=str(exc)))
+        study = None
+        if isinstance(circuit, str) and not circuit.lstrip().startswith("{") and not os.path.isfile(circuit):
+            study, names = _saved_circuit(target, circuit)
+            if study is None:
+                return _dumps(_err("circuit_not_found", hint="Pass a saved circuit name or an inline circuit.",
+                                   circuits=names))
+            definition = (study.get("params") or {})["circuit"]
+        elif circuit is None:
+            study, names = _saved_circuit(target)
+            if study is not None:
+                definition = (study.get("params") or {})["circuit"]
+            elif len(names) > 1:
+                return _dumps(_err("circuit_ambiguous", hint="Pass circuit=<saved circuit name>.", circuits=names))
+            else:
+                definition, refusal = _circuit_input(None, target)
+                if refusal:
+                    return _dumps(refusal)
+        else:
+            definition, refusal = _circuit_input(circuit, target)
+            if refusal:
+                return _dumps(refusal)
+        name = _circuit_name(definition)
+        study = study or _find_circuit_study(target, name) or {}
+        params = study.get("params") or {}
+        merged = _layout_3d(definition, params.get("layout3d"))
+        ids = set(merged)
+        try:
+            updates = _as_obj(positions)
+            if not isinstance(updates, dict):
+                raise ValueError("positions must map component IDs to three coordinates")
+            for cid, xyz in updates.items():
+                if cid not in ids:
+                    return _dumps(_err("unknown_component", hint=f"No component {cid!r} in circuit {name!r}."))
+                if (not isinstance(xyz, (list, tuple)) or len(xyz) != 3 or
+                        any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in xyz)):
+                    raise ValueError(f"{cid}: position must contain three finite numbers in mm")
+                merged[cid] = [float(v) for v in xyz]
+        except (ValueError, TypeError) as exc:
+            return _dumps(_err("bad_layout", hint=str(exc)))
+        receipt = _persist_circuit(target, name, definition, params={"layout3d": merged})
+        if not receipt.get("saved_to_study"):
+            return _dumps(_err("study_not_saved", hint=receipt.get("study_not_saved_reason", "Could not save 3D layout."),
+                               **receipt))
+        _HYD["doc"] = definition
+        return _dumps({"ok": True, "name": name, "layout3d": merged, **receipt})
+
+    @mcp.tool()
+    def hydraulic_load(doc_id: Optional[str] = None, name: Optional[str] = None) -> str:
+        """Restore a hydraulic circuit saved in a document (with its sizing, BOM and simulation).
+
+        Reads the document's ``hydraulic_circuit`` studies (written by hydraulic_new /
+        add_component / add_hose / size_* / pump_drive_size / bom / simulate with ``doc_id``,
+        or by the Hydraulics panel). ``name`` picks one by circuit name; omitted, the
+        document's only circuit is loaded (several → refused with their names). The circuit
+        becomes the active session circuit, so every hydraulic tool works on it without
+        ``doc``; the saved valve_schedule / loads / fluid come back for a re-run.
+        """
+        try:
+            target = _doc(doc_id)
+        except Exception as exc:  # noqa: BLE001 — DocRefError names the open documents
+            return _dumps(_err("unknown_doc", hint=str(exc)))
+        st, names = _saved_circuit(target, name)
+        if st is None:
+            if not names:
+                sizing_only = [s.get("name") for s in _circuit_studies(target)]
+                return _dumps(_err(
+                    "no_hydraulic_circuit",
+                    hint=(f"document {target} has no saved hydraulic circuit; build one with "
+                          "hydraulic_new(name, doc_id=...)"),
+                    sizing_only_studies=sizing_only))
+            return _dumps(_err(
+                "circuit_not_found" if name else "circuit_ambiguous",
+                hint=f"document {target} saves these circuits: {names}; pass name=<circuit>",
+                circuits=names))
+        circuit = _restore_circuit(st)
+        params = st.get("params") or {}
+        results = st.get("results") or {}
+        cname = st.get("name") or _circuit_name(circuit)
+        setup = {k: params.get(k) for k in ("valve_schedule", "loads", "fluid", "initial",
+                                            "duration_s", "output_dt_s", "max_step_s")
+                 if params.get(k) is not None}
+        return _dumps({
+            "ok": True, "doc_id": target, "name": cname, "study_id": st.get("id"),
+            "circuit": circuit,
+            "layout3d": _layout_3d(circuit, params.get("layout3d")),
+            "components": len(circuit.get("components") or []),
+            "hoses": len(circuit.get("hoses") or []),
+            "simulation_setup": setup,
+            "restored_results": sorted(k for k, v in results.items() if v is not None),
+            "results": results, "warnings": [],
+            "hint": f'circuit "{cname}" is the active session circuit',
+            "next_actions": [
+                f'hydraulic_simulate(doc_id="{target}", ...) — re-run with the saved setup',
+                f'hydraulic_add_component(type=..., doc_id="{target}") to keep editing',
+                f'hydraulic_bom(doc_id="{target}")',
+            ],
+        })
 
     @mcp.tool()
     def hydraulic_piping_handoff(supply_pressure_bar: float,

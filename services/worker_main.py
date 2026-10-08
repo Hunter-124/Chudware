@@ -82,11 +82,22 @@ def _worker_control_info(_params: dict, _emit_event: EmitFn) -> dict:
     return server.info()
 
 
+def _normalize_face_query(params: dict, _emit_event: EmitFn) -> dict:
+    """Pure shared grammar normalization; document resolution stays in the caller's engine."""
+    from services.mcp.cad_common import _SID_RE, _as_face_query, _parse_inspect_target
+
+    query = params["query"]
+    if isinstance(query, str) and _SID_RE.fullmatch(query.strip()):
+        return {"query": {"of": "face"}, "sid": _parse_inspect_target(query)["sid"]}
+    return {"query": _as_face_query(query)}
+
+
 _METHODS = {
     "ping": _ping,
     "run_model": _run_model,
     "list_editable_prompts": _list_editable_prompts,
     "worker_control_info": _worker_control_info,
+    "worker_normalize_face_query": _normalize_face_query,
 }
 
 _STRUCTURED_ERROR_METHODS: set[str] = set()
@@ -149,6 +160,7 @@ _register("em", "services.sim.em.worker_rpc", "WORKER_METHODS")
 
 # ---- Multi-physics seam ----
 _register("multiphysics", "services.sim.multiphysics_rpc", "WORKER_METHODS")
+_register("piping_fitting_cfd", "services.piping.worker_rpc", "WORKER_METHODS")
 
 # ---- Manufacturing printer adapters (Moonraker / OctoPrint / PrusaLink) ----
 # HTTP+WebSocket clients live in Python; the hostd manufacturing lane stays the sole

@@ -95,6 +95,9 @@ public:
     // Rows under the Simulation tree's "Piping, hydraulics & industrial" group (header drawn by
     // SimManager).
     void drawStudyRows(AppState& st);
+    // Open the saved circuit named `name` exactly as a click on its row does. False when no
+    // record has that name or a circuit RPC is in flight (CHUDWARE_SHOT=demoreview).
+    bool openStudyNamed(AppState& st, const std::string& name);
 
     // ---- commands + panel ----------------------------------------------------------------------
     // sim_hyd_new / _add / _hose / _size_cyl / _size_pump / _size_motor / _drive / _simulate /
@@ -230,6 +233,8 @@ private:
     };
     using Done = void (HydraulicPanel::*)(AppState&, bool, const nlohmann::json&, const std::string&);
 
+    // A study row click: adopt the record (a copy: adoption may refresh the mirror) and show it.
+    void openRecord(AppState& st, nlohmann::json rec);
     // ---- drawing ----
     void syncForDraw();                     // normalise draw-time state before any widget
     void setForm(Form f);

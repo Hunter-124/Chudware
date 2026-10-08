@@ -74,6 +74,9 @@ public:
     // Rows of the Simulation tree's "Piping, hydraulics & industrial" group (header drawn by
     // SimManager, which also lists the Hydraulics panel's circuits there).
     void drawStudyRows(AppState& st);
+    // Open the saved record named `name` exactly as a click on its row does (its own form; a
+    // result on its Results page). False when no record has that name (CHUDWARE_SHOT=demoreview).
+    bool openStudyNamed(AppState& st, const std::string& name);
     // Open a generated network (the Hydraulics panel's hose-to-piping handoff) as a NEW network
     // study: its boundary rows, its resolved fluid ({name, rho, mu}, e.g. hydraulic oil) and the
     // handoff's live solve. Opens the panel on the Solve form.
@@ -126,6 +129,11 @@ public:
     // the network study as results.pump_drive[<run id>].
     bool runPumpDrive(AppState& st);
     const nlohmann::json& pumpDrives() const { return pumpDrive_; }
+    // What a click on the current form's page switch / the "Colour pipes by" control does
+    // (scripted review, CHUDWARE_SHOT=demoreview). Pages: Solve 0 Conditions, 1 Results, 2 Pump
+    // drive; Spec 0 Design basis, 1 Results. colorBy: 0 none, 1 pressure, 2 velocity.
+    void setPage(Form f, int page);
+    void setColorBy(int c) { colorBy_ = c < 0 ? 0 : c > 2 ? 2 : c; }
     bool busy() const { return store_.inflight() > 0 || flowRunning_ || flowPreparing_ ||
                                endpointResolving_[0] || endpointResolving_[1]; }
     const nlohmann::json& network() const { return network_; }
@@ -178,8 +186,9 @@ public:
     const std::string& selectedFittingId() const { return selectedFitting_; }
     void selectRun(AppState& st, const std::string& runId);
     void selectFitting(AppState& st, const std::string& fittingId);
-    // Viewport colouring of runs from the last solve: 0 none, 1 pressure, 2 velocity.
-    int colorBy() const { return colorBy_; }
+    // Viewport colouring of runs from the last solve: 0 none, 1 pressure, 2 velocity. Vessel and
+    // duct forms show no pipe legend, so their pipes draw uncoloured rather than unexplained.
+    int colorBy() const { return form_ == Form::Vessel || form_ == Form::Duct ? 0 : colorBy_; }
 
 private:
     using Slot = sim::StudyRecordStore::Slot;
@@ -280,6 +289,8 @@ private:
     void adoptVessel(const nlohmann::json& record);
     void adoptDuct(const nlohmann::json& record);
     void adoptFlow(AppState& st, const nlohmann::json& record);
+    // A study row click: adopt the record (a copy: adoption re-reads the mirror) and show it.
+    void openRecord(AppState& st, nlohmann::json rec);
 
     void onRoute(AppState& st, bool ok, const nlohmann::json& r, const std::string& why);
     void onSolve(AppState& st, bool ok, const nlohmann::json& r, const std::string& why);

@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -30,6 +31,7 @@
 #include "../render/splat_renderer.h"  // RE-28: 3DGS splat renderer
 #include "cam/cam_panel.h"  // camLoadJob (CAM copilot fast-path scenario)
 #include "asm_panels.h"
+#include "camera_anim.h"
 #include "evaluate_dialogs.h"
 #include "manufacture/manufacture_panel.h"
 #include "property_manager.h"
@@ -1182,6 +1184,436 @@ nlohmann::json shotNavigationEvidence() {
     return {{"target", g_simNavigation.target}, {"wheel_events", g_simNavigation.wheels},
             {"scrolls", g_simNavigation.evidence}, {"windows", ui::audit::observedWindows()},
             {"items", ui::audit::observedItems()}};
+}
+
+// ---------- saved-demo review scenario (CHUDWARE_SHOT=demoreview) ----------
+// Proves a saved part shows every study it carries. $CHUDWARE_SHOT_DOC is copied to
+// scratch/demoreview_shots/demo_copy.step+ and the COPY opens through the File > Open request pump
+// (st.requestOpenPath). The part is captured fitted in iso; then every hydraulic_circuit record is
+// opened as its Simulation-tree row click does (HydraulicPanel::openStudyNamed) and captured on its
+// Results/Outcome page with the Schematic, Plots and 3D Layout central views; the piping_network
+// record opens the same way (PipingPanel::openStudyNamed) and is captured on Solve > Results
+// coloured by Pressure, then Pump drive, Spec > Results and BOM; the vessel and duct records are
+// captured on their Results pages; the Simulation tree's study rows, then the Model workspace,
+// close the run. Stored numbers are checked
+// on the adopted panel state. Every capture is preceded by a ui::audit pass (left pane, viewport,
+// floating) whose ID conflicts, clipped items and rendered status lines are reported per capture.
+// Nothing is saved. Captures + demoreview_report.json land in scratch/demoreview_shots; a failure
+// exits non-zero.
+struct DemoReviewShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, settle = 0, captureWait = 0, shotNo = 0, auditStage = 0;
+    size_t circuit = 0;
+    double started = 0.0, stepStart = 0.0;
+    std::string dir, copy, capture, shotName;
+    nlohmann::json report, studies;
+    std::vector<std::string> circuits;  // hydraulic_circuit record names, in document order
+    std::string network, vessel, duct;  // piping_network / vessel / duct_system record names
+};
+DemoReviewShot g_demo;
+
+void demoFail(const std::string& code, const std::string& detail) {
+    auto& D = g_demo;
+    std::printf("demoreview: FAILED [%s] %s\n", code.c_str(), detail.c_str());
+    std::fflush(stdout);
+    D.report["ok"] = false;
+    D.report["failure"] = {{"code", code}, {"detail", detail}, {"step", D.step}};
+    D.failed = D.done = true;
+    D.capture = D.dir + "/demoreview_FAILED.png";
+}
+
+bool demoCheck(const std::string& name, bool ok, const nlohmann::json& evidence) {
+    g_demo.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    if (!ok) demoFail(name, evidence.dump());
+    return ok;
+}
+
+std::string demoSlug(const std::string& name) {
+    std::string s;
+    for (char c : name) {
+        if (std::isalnum((unsigned char)c)) s += (char)std::tolower((unsigned char)c);
+        else if (!s.empty() && s.back() != '_') s += '_';
+    }
+    while (!s.empty() && s.back() == '_') s.pop_back();
+    return s;
+}
+
+// The audit that precedes every capture: ID conflicts, clipped items and the status lines the pane
+// rendered (kit::inlineStatus is observable text; cards and chips are not).
+void demoAuditDone() {
+    auto& D = g_demo;
+    const nlohmann::json& res = ui::audit::lastResult();
+    nlohmann::json overflows = nlohmann::json::array(), conflicts = nlohmann::json::array(),
+                   status = nlohmann::json::array();
+    for (const auto& o : res.value("overflows", nlohmann::json::array()))
+        overflows.push_back({{"label", o.value("item_label", o.value("label", std::string()))},
+                             {"window", o.value("window", std::string())},
+                             {"overflow_px", o.value("overflow_px", 0.0)}});
+    for (const auto& c : res.value("conflicts", nlohmann::json::array()))
+        conflicts.push_back({{"label", c.value("item_label", c.value("label", std::string()))},
+                             {"window", c.value("window", std::string())}, {"count", c.value("count", 0)}});
+    for (const auto& item : ui::audit::observedItems())
+        if (item.value("text_only", false) && item.value("visible", false) &&
+            item["window"].get_ref<const std::string&>().find("LeftPane") != std::string::npos)
+            status.push_back(item["label"]);
+    const std::string file = std::filesystem::path(D.shotName).filename().string();
+    std::printf("demoreview: %s conflicts=%zu overflows=%zu items_seen=%d\n", file.c_str(), conflicts.size(),
+                overflows.size(), res.value("items_seen", 0));
+    std::fflush(stdout);
+    D.report["audits"].push_back({{"capture", D.shotName}, {"conflicts", conflicts}, {"overflows", overflows},
+                                  {"pane_status", status}, {"items_seen", res.value("items_seen", 0)}});
+}
+
+constexpr int kDemoFinalStep = 43;
+
+void demoReviewTick(AppState& st) {
+    auto& D = g_demo;
+    if (!D.init) {
+        D.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        D.want = st.shot && mode && std::strcmp(mode, "demoreview") == 0;
+        if (!D.want) return;
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        D.dir = std::string(repo ? repo : ".") + "/scratch/demoreview_shots";
+        D.copy = D.dir + "/demo_copy.step+";
+        std::error_code ec;
+        std::filesystem::create_directories(D.dir, ec);
+        D.started = D.stepStart = pipingNow();
+        D.report = {{"scenario", "demoreview"}, {"ok", false}, {"checks", nlohmann::json::array()},
+                    {"audits", nlohmann::json::array()}, {"captures", nlohmann::json::array()}};
+    }
+    if (!D.want || D.done) return;
+    ui::audit::observedItems();  // keeps item observation on while an audit records
+    if (pipingNow() - D.started > 900 || pipingNow() - D.stepStart > 240) {
+        demoFail("timeout", "scenario/step exceeded its wall-clock deadline"); return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !D.capture.empty()) return;
+    if (D.settle > 0) { --D.settle; return; }
+    if (D.auditStage == 1) {
+        ui::audit::AuditOptions o;
+        o.regions = ui::audit::RegionLeftPane | ui::audit::RegionViewport | ui::audit::RegionFloating;
+        if (!ui::audit::begin(std::filesystem::path(D.shotName).stem().string(), o)) {
+            demoFail("audit", "ui::audit::begin refused"); return;
+        }
+        D.auditStage = 2;
+        return;
+    }
+    if (D.auditStage == 2) {
+        if (ui::audit::active()) return;  // the audit is recording; keep the state still
+        D.auditStage = 0;
+        demoAuditDone();
+        if (D.failed) return;
+        if (D.step == kDemoFinalStep) {  // the last capture ends the run (mirrored to --ui-screenshot)
+            D.report["ok"] = true;
+            D.done = true;
+        }
+        D.capture = D.shotName;
+        return;
+    }
+
+    auto next = [&](int step) { D.step = step; D.stepStart = pipingNow(); };
+    auto shoot = [&](const std::string& name) {
+        char prefix[24];
+        std::snprintf(prefix, sizeof prefix, "demoreview_%02d_", ++D.shotNo);
+        D.shotName = D.dir + "/" + prefix + name + ".png";
+        D.settle = 20;
+        D.auditStage = 1;
+    };
+    auto check = demoCheck;
+    // Iso orientation, scene fitted (zoom 1 = fit, pan reset), eased like the HUD presets.
+    auto fitIso = [&] {
+        static const float kZeroPan[3] = {0, 0, 0};
+        ui::requestCameraAnimation(st, 35.0f, 30.0f, 1.0f, kZeroPan);
+    };
+    ui::SimManager* sm = st.simManager;
+    auto idle = [&] {
+        return sm && !st.rpc.busy() && !sm->hydraulic().busy() && !sm->piping().busy() &&
+               !ui::cameraAnimating();
+    };
+
+    switch (D.step) {
+    case 0: {  // copy the saved demo; open the COPY through the File > Open pump
+        const char* doc = std::getenv("CHUDWARE_SHOT_DOC");
+        if (!doc || !*doc) { demoFail("no_doc", "CHUDWARE_SHOT_DOC is not set"); return; }
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(doc, ec)) {
+            demoFail("doc_missing", std::string("CHUDWARE_SHOT_DOC does not exist: ") + doc); return;
+        }
+        std::filesystem::copy_file(doc, D.copy, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) { demoFail("copy", ec.message()); return; }
+        D.report["source_doc"] = doc;
+        D.report["opened_copy"] = D.copy;
+        st.requestOpenPath = D.copy;
+        std::printf("demoreview: opening copy %s\n", D.copy.c_str());
+        std::fflush(stdout);
+        next(1);
+        return;
+    }
+    case 1: {  // the copy is the active, meshed document
+        const bool tabOk = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+            std::filesystem::path(st.docTabs[st.activeTab].path).filename() == "demo_copy.step+";
+        if (!tabOk || !st.docMirror.hasDoc() || !st.hasDocMesh || !sm || st.rpc.busy()) return;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.leftPaneTab = AppState::LP_FeatureManager;
+        fitIso();
+        nlohmann::json list;
+        std::string err;
+        if (!st.worker.call("sim_study_list", {{"doc_id", st.docMirror.docId()}}, list, err, 15000) ||
+            !list.is_object()) {
+            demoFail("study_list", err); return;
+        }
+        nlohmann::json found = nlohmann::json::array();
+        for (const auto& s : list.value("studies", nlohmann::json::array())) {
+            if (!s.is_object()) continue;
+            const std::string type = s.value("type", std::string()), name = s.value("name", std::string());
+            const nlohmann::json results = s.value("results", nlohmann::json::object());
+            nlohmann::json keys = nlohmann::json::array();
+            for (const auto& kv : results.items()) keys.push_back(kv.key());
+            found.push_back({{"id", s.value("id", std::string())}, {"type", type}, {"name", name},
+                             {"results", keys}});
+            if (type == "hydraulic_circuit") D.circuits.push_back(name);
+            else if (type == "piping_network" && D.network.empty()) D.network = name;
+            else if (type == "vessel" && D.vessel.empty()) D.vessel = name;
+            else if (type == "duct_system" && D.duct.empty()) D.duct = name;
+            D.studies[name] = s;
+        }
+        D.report["studies_found"] = found;
+        std::printf("demoreview: %zu studies (%zu hydraulic circuits)\n", found.size(), D.circuits.size());
+        std::fflush(stdout);
+        if (!check("studies_found", D.circuits.size() == 2 && !D.network.empty() && !D.vessel.empty() &&
+                       !D.duct.empty(), found)) return;
+        // The Simulation manager mirror sees them too (the tree rows the user clicks).
+        sm->refresh(st);
+        const int pipingRecords = (int)found.size() - (int)D.circuits.size();
+        if (!check("simulation_tree_refreshed",
+                   sm->hydraulic().studyCount() == (int)D.circuits.size() &&
+                       sm->piping().studyCount() == pipingRecords,
+                   {{"hydraulic_rows", sm->hydraulic().studyCount()}, {"piping_rows", sm->piping().studyCount()}}))
+            return;
+        next(2);
+        return;
+    }
+    case 2:
+        if (!idle()) return;
+        shoot("model_iso");
+        D.circuit = 0;
+        next(10);
+        return;
+
+    // ---- Simulate > Hydraulics: every saved circuit -------------------------------------------
+    case 10: {
+        if (D.circuit >= D.circuits.size()) { next(20); return; }
+        if (!idle()) return;
+        const std::string& name = D.circuits[D.circuit];
+        auto& hp = sm->hydraulic();
+        if (!check("hyd_adopt_" + demoSlug(name), hp.openStudyNamed(st, name), {{"name", name}})) return;
+        const std::string wantId = D.studies[name].value("id", std::string());
+        if (!check("hyd_adopted_id_" + demoSlug(name), hp.studyId() == wantId,
+                   {{"want", wantId}, {"got", hp.studyId()}})) return;
+        hp.openResults(ui::HydraulicPanel::ResultPage::Outcome);
+        hp.setCentralView(ui::HydraulicPanel::CentralView::Schematic);
+        next(11);
+        return;
+    }
+    case 11: {  // results present, numbers match the record, no error; schematic owns the view
+        if (!idle()) return;
+        auto& hp = sm->hydraulic();
+        const std::string& name = D.circuits[D.circuit];
+        const std::string slug = demoSlug(name);
+        const auto& r = hp.simulateResult();
+        const auto summary = r.is_object() ? r.value("summary", nlohmann::json::object()) : nlohmann::json::object();
+        const size_t samples = r.is_object() ? r.value("time_s", nlohmann::json::array()).size() : 0;
+        if (!check("hyd_results_" + slug, !summary.empty() && samples >= 2 && summary.contains("peak_pressure_bar"),
+                   {{"samples", samples}, {"summary", summary}})) return;
+        if (!check("hyd_no_error_" + slug, hp.lastError().empty(), {{"last_error", hp.lastError()}})) return;
+        if (!check("hyd_schematic_" + slug, sm->centralViewActive(), {})) return;
+        nlohmann::json numbers = {{"efficiency", summary.value("efficiency", 0.0)},
+                                  {"peak_pressure_bar", summary.value("peak_pressure_bar", 0.0)}};
+        if (name == "Test Stand Clamp Cylinder") {
+            const double eff = summary.value("efficiency", 0.0);
+            if (!check("hyd_metric_" + slug, std::fabs(eff - 0.199) < 0.001, numbers)) return;
+        } else if (name == "Rotary Actuator Drive") {
+            double rpm = 0.0;
+            for (const auto& m : summary.value("motors", nlohmann::json::object()))
+                rpm = m.value("steady_speed_rpm", 0.0);
+            numbers["motor_steady_speed_rpm"] = rpm;
+            if (!check("hyd_metric_" + slug, std::fabs(rpm - 261.7) < 0.1, numbers)) return;
+        }
+        D.report["hydraulic_numbers"][name] = numbers;
+        shoot("hyd_" + slug + "_schematic");
+        next(12);
+        return;
+    }
+    case 12: {
+        const std::string slug = demoSlug(D.circuits[D.circuit]);
+        sm->hydraulic().setCentralView(ui::HydraulicPanel::CentralView::Plots);
+        if (!check("hyd_plots_" + slug, sm->centralViewActive(), {})) return;
+        shoot("hyd_" + slug + "_plots");
+        next(13);
+        return;
+    }
+    case 13: {  // 3D Layout: native viewport, hoses coloured by pressure from the stored run
+        const std::string slug = demoSlug(D.circuits[D.circuit]);
+        sm->handleCommand(st, "sim_hyd_view_3d");
+        sm->hydraulic().openResults(ui::HydraulicPanel::ResultPage::Outcome);
+        if (!check("hyd_3d_" + slug, !sm->centralViewActive() &&
+                       sm->hydraulic().centralView() == ui::HydraulicPanel::CentralView::View3D, {})) return;
+        next(14);
+        return;
+    }
+    case 14: {
+        if (!idle()) return;
+        const std::string slug = demoSlug(D.circuits[D.circuit]);
+        shoot("hyd_" + slug + "_3d");
+        ++D.circuit;
+        next(10);
+        return;
+    }
+
+    // ---- Simulate > Piping: the network, then the vessel and the duct records -------------------
+    case 20: {
+        if (!idle()) return;
+        sm->hydraulic().setCentralView(ui::HydraulicPanel::CentralView::View3D);
+        sm->hydraulic().close();
+        auto& pp = sm->piping();
+        if (!check("pipe_adopt_network", pp.openStudyNamed(st, D.network), {{"name", D.network}})) return;
+        if (!check("pipe_adopted_id", pp.networkStudyId() == D.studies[D.network].value("id", std::string()),
+                   {{"got", pp.networkStudyId()}})) return;
+        sm->handleCommand(st, "sim_piping_solve");
+        pp.setPage(ui::PipingPanel::Form::Solve, 1);  // Results
+        pp.setColorBy(1);                              // Colour pipes by: Pressure
+        fitIso();
+        next(21);
+        return;
+    }
+    case 21: {
+        if (!idle()) return;
+        auto& pp = sm->piping();
+        const auto& s = pp.solveResult();
+        const auto links = s.is_object() ? s.value("links", nlohmann::json::array()) : nlohmann::json::array();
+        if (!check("pipe_solve_results", s.is_object() && s.value("converged", false) && !links.empty(),
+                   {{"converged", s.is_object() && s.value("converged", false)}, {"links", links.size()}})) return;
+        if (!check("pipe_colour_pressure", pp.colorBy() == 1, {{"color_by", pp.colorBy()}})) return;
+        if (!check("pipe_no_error", pp.lastError().empty(), {{"last_error", pp.lastError()}})) return;
+        D.report["piping_numbers"]["solve_links"] = links.size();
+        D.report["piping_numbers"]["solve_iterations"] = s.value("iterations", nlohmann::json());
+        shoot("pipe_solve_pressure");
+        next(22);
+        return;
+    }
+    case 22: {
+        auto& pp = sm->piping();
+        if (!check("pipe_pump_drive", pp.pumpDrives().is_object() && !pp.pumpDrives().empty(),
+                   {{"pump_drive", pp.pumpDrives()}})) return;
+        pp.setPage(ui::PipingPanel::Form::Solve, 2);  // Pump drive
+        shoot("pipe_pump_drive");
+        next(23);
+        return;
+    }
+    case 23: {
+        auto& pp = sm->piping();
+        sm->handleCommand(st, "sim_piping_spec");
+        pp.setPage(ui::PipingPanel::Form::Spec, 1);  // Results
+        const auto& s = pp.specResult();
+        const auto runs = s.is_object() ? s.value("runs", nlohmann::json::array()) : nlohmann::json::array();
+        if (!check("pipe_spec_results", !runs.empty(), {{"runs", runs.size()},
+                   {"all_pass", s.is_object() ? s.value("all_pass", nlohmann::json()) : nlohmann::json()}})) return;
+        D.report["piping_numbers"]["spec_runs"] = runs.size();
+        D.report["piping_numbers"]["spec_all_pass"] = s.value("all_pass", nlohmann::json());
+        shoot("pipe_spec");
+        next(24);
+        return;
+    }
+    case 24: {
+        sm->handleCommand(st, "sim_piping_bom");
+        const auto& b = sm->piping().bomResult();
+        const auto items = b.is_object() ? b.value("items", nlohmann::json::array()) : nlohmann::json::array();
+        if (!check("pipe_bom_results", !items.empty(), {{"items", items.size()}})) return;
+        D.report["piping_numbers"]["bom_items"] = items.size();
+        shoot("pipe_bom");
+        next(32);
+        return;
+    }
+    case 32:
+        if (!idle()) return;
+        if (!check("vessel_adopt", sm->piping().openStudyNamed(st, D.vessel), {{"name", D.vessel}})) return;
+        next(33);
+        return;
+    case 33:
+        if (!idle()) return;
+        if (!check("vessel_no_error", sm->piping().lastError().empty(), {{"last_error", sm->piping().lastError()}})) return;
+        shoot("vessel_" + demoSlug(D.vessel));
+        next(34);
+        return;
+    case 34:
+        if (!idle()) return;
+        if (!check("duct_adopt", sm->piping().openStudyNamed(st, D.duct), {{"name", D.duct}})) return;
+        next(35);
+        return;
+    case 35:
+        if (!idle()) return;
+        if (!check("duct_no_error", sm->piping().lastError().empty(), {{"last_error", sm->piping().lastError()}})) return;
+        shoot("duct_" + demoSlug(D.duct));
+        next(40);
+        return;
+
+    // ---- the Simulation tree lists every saved study; then the Model workspace ------------------
+    case 40:
+        if (!idle()) return;
+        sm->piping().close();  // "Done": the pane returns to the study rows
+        shoot("simulation_studies");
+        next(41);
+        return;
+    case 41:
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.shotWorkspacePin = -1;  // the shot pin restores the last non-Model workspace otherwise
+        st.leftPaneTab = AppState::LP_FeatureManager;
+        fitIso();
+        next(42);
+        return;
+    case 42:
+        if (!idle()) return;
+        if (!check("model_workspace", st.activeWorkspace == AppState::Workspace::Model,
+                   {{"workspace", (int)st.activeWorkspace}})) return;
+        shoot("model_final");
+        next(kDemoFinalStep);  // the audit branch above finishes the run with this capture
+        return;
+    default:
+        return;
+    }
+}
+
+bool demoReviewEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    auto& D = g_demo;
+    if (!D.want) return false;
+    ++st.frame;
+    if (!D.capture.empty() && (!st.rpc.busy() || ++D.captureWait > 600)) {
+        std::error_code ec;
+        std::filesystem::create_directories(D.dir, ec);
+        writeBackbufferPng(D.capture.c_str(), dw, dh, D.done ? screenshotPath : nullptr);
+        std::printf("demoreview: screenshot -> %s (%dx%d)\n", D.capture.c_str(), dw, dh);
+        std::fflush(stdout);
+        D.report["captures"].push_back(D.capture);
+        D.capture.clear();
+        D.captureWait = 0;
+    }
+    glfwSwapBuffers(st.win);
+    breakLoop = false;
+    if (D.done && D.capture.empty()) {
+        const std::string path = D.dir + "/demoreview_report.json";
+        D.report["seconds"] = pipingNow() - D.started;
+        std::ofstream out(path, std::ios::trunc);
+        out << D.report.dump(2) << '\n';
+        out.close();
+        std::printf("demoreview: report -> %s ok=%d\n", path.c_str(), (int)D.report.value("ok", false));
+        std::fflush(stdout);
+        if (D.failed || !out) {
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+        breakLoop = true;
+    }
+    return true;
 }
 
 struct SimAuditShot {
@@ -6103,6 +6535,9 @@ void ScenarioRunner::tick(AppState& st) {
     // ---------- hydraulic circuit scenario (CHUDWARE_SHOT=hydraulics) ----------
     hydraulicsShotTick(st);
 
+    // ---------- saved-demo review (CHUDWARE_SHOT=demoreview) ----------
+    demoReviewTick(st);
+
     // ---------- simulation UI audit (CHUDWARE_SHOT=simaudit) ----------
     simAuditTick(st);
 
@@ -7425,6 +7860,11 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
     bool hydBreak = false;
     if (hydraulicsShotEndFrame(st, dw, dh, screenshotPath, hydBreak))
         return hydBreak ? FrameAction::Break : FrameAction::Continue;
+
+    // demoreview: saved-study captures + report; exits non-zero on failure.
+    bool demoBreak = false;
+    if (demoReviewEndFrame(st, dw, dh, screenshotPath, demoBreak))
+        return demoBreak ? FrameAction::Break : FrameAction::Continue;
 
     // simaudit: per-state captures + report; exits non-zero on any ID conflict.
     bool saBreak = false;

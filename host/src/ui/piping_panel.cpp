@@ -2397,7 +2397,24 @@ void PipingPanel::drawStudyRows(AppState& st) {
         ImGui::PopID();
     }
     if (picked < 0) return;
-    const json rec = recs[picked];
+    openRecord(st, recs[picked]);
+}
+
+bool PipingPanel::openStudyNamed(AppState& st, const std::string& name) {
+    for (const json& rec : store_.records())
+        if (jstr(rec, "name") == name) {
+            openRecord(st, rec);
+            return true;
+        }
+    return false;
+}
+
+void PipingPanel::setPage(Form f, int page) {
+    const int count = pagesOf(f).count;
+    page_[(int)f] = page < 0 ? 0 : page >= count ? count - 1 : page;
+}
+
+void PipingPanel::openRecord(AppState& st, json rec) {
     const std::string type = jstr(rec, "type");
     // A saved record opens on its own form; a result opens on its Results page.
     if (type == "piping_network") {
@@ -2429,7 +2446,14 @@ std::string PipingPanel::headerTitle() const {
     };
     if (form_ == Form::Vessel) return recordName(vesselSlot_, "New vessel");
     if (form_ == Form::Duct) return recordName(ductSlot_, "New duct system");
-    return network_.is_object() ? jstr(network_, "name", "Pipe network") : std::string("Piping");
+    // The saved record's name is what the study list shows; the network JSON's own name can
+    // still be a generic default ("Piping") when an agent or import created it.
+    if (network_.is_object()) {
+        const std::string own = jstr(network_, "name", "Pipe network");
+        const json* rec = store_.find(netSlot_.id);
+        return rec ? jstr(*rec, "name", own) : own;
+    }
+    return std::string("Piping");
 }
 
 bool PipingPanel::onResultsPage() const {
@@ -3871,10 +3895,11 @@ void PipingPanel::drawDuctForm(AppState& st) {
                            {"Critical path", path.empty() ? std::string(kEmDash) : path}});
         const json& segs = jarr(duct_, "segments");
         kit::sectionHeader("Segments", "duct", nullptr, (int)segs.size());
-        if (kit::tableBegin("duct_segments", {{"Segment"},
-                                              {"Size (mm)", kit::TableAlign::Right},
-                                              {"v (m/s)", kit::TableAlign::Right},
-                                              {"dp (Pa)", kit::TableAlign::Right}})) {
+        // Sizes read "550 × 300" for rectangular ducts, so the size column gets the extra width.
+        if (kit::tableBegin("duct_segments", {{"Segment", kit::TableAlign::Left, 1.1f},
+                                              {"Size (mm)", kit::TableAlign::Right, 1.5f},
+                                              {"v (m/s)", kit::TableAlign::Right, 0.8f},
+                                              {"dp (Pa)", kit::TableAlign::Right, 0.8f}})) {
             for (const auto& s : segs) {
                 const std::string size = jhas(s, "width_mm")
                                              ? val(s, "width_mm") + " \xc3\x97 " + val(s, "height_mm")

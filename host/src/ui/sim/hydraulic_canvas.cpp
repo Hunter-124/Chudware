@@ -1233,7 +1233,7 @@ void HydraulicPanel::drawSchematic(AppState& st, float width, float height) {
     };
     // Component names: below, above, beside, then the corners; one is always placed.
     for (int i = 0; i < (int)comps.size(); ++i) {
-        const std::string text = kit::elide(jstr(comps[i], "name", jstr(comps[i], "id")).c_str(), 7.0f * h);
+        const std::string text = kit::elide(jstr(comps[i], "name", jstr(comps[i], "id")).c_str(), 10.0f * h);
         const ImVec2 ts = ImGui::CalcTextSize(text.c_str());
         const Box& b = boxes[i];
         const float below = b.y1 + gap + plate, above = b.y0 - gap - plate - ts.y;

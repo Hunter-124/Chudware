@@ -45,6 +45,9 @@
 // Both write scratch/<scenario>_shots/<scenario>_report.json and staged captures,
 // exit non-zero on failure, and mirror the final capture to --ui-screenshot.
 // CHUDWARE_SHOT=piping also checks routed-pipe pixels away from its solid obstacle.
+// CHUDWARE_SHOT=demoreview opens a COPY of $CHUDWARE_SHOT_DOC (File > Open pump) and captures
+// every saved hydraulic / piping / vessel / duct study the way its Simulation-tree row opens it,
+// auditing each capture; report + captures in scratch/demoreview_shots.
 #pragma once
 
 #include <memory>

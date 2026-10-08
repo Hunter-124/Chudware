@@ -386,6 +386,10 @@ and `hint`, never a bare "failed".
   `pipedraw` and `hydraulics3d` are real-input self-checking scenarios registered in
   `app.cpp`'s `pointerShot` and `ui_audit.cpp`'s observed-item path. The `piping` shot
   also pixel-checks routed geometry visibility; do not replace it with a route JSON check.
+  `CHUDWARE_SHOT=demoreview CHUDWARE_SHOT_DOC=<file.step+>` opens a COPY of a saved part,
+  adopts every saved circuit/network/vessel/duct by name (`openStudyNamed`, the row-click
+  path) and captures Schematic/Plots/3D and Solve/Spec/BOM/vessel/duct results into
+  `scratch/demoreview_shots`; use it to prove a saved file reopens with all its studies.
 
 ### Simulation: Topology tab
 

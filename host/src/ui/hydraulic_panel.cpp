@@ -1663,10 +1663,23 @@ void HydraulicPanel::drawStudyRows(AppState& st) {
         ImGui::PopID();
     }
     if (picked < 0 || busy()) return;
-    const json rec = recs[picked];
+    openRecord(st, recs[picked]);
+}
+
+void HydraulicPanel::openRecord(AppState& st, json rec) {
     adopt(rec);
     handleCommand(st, "sim_hyd_add");
     setCircuitPage(CircuitPage::Components);
+}
+
+bool HydraulicPanel::openStudyNamed(AppState& st, const std::string& name) {
+    if (busy()) return false;
+    for (const json& rec : store_.records())
+        if (jstr(rec, "name") == name) {
+            openRecord(st, rec);
+            return true;
+        }
+    return false;
 }
 
 void HydraulicPanel::setForm(Form f) {

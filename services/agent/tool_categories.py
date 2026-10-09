@@ -458,6 +458,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "add_balloon",
         "drawing_bom",
         "add_drawing_sheet",
+        "arrange_drawing",
         "list_drawing_sheets",
         "set_active_drawing_sheet",
         "add_drawing_table",

@@ -140,6 +140,13 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "the implicit session doc for all later hydraulic_* calls."
         ),
     },
+    "hydraulic_templates": {
+        "prompt_note": (
+            "Read-only catalog of native circuit templates; pass an entry's id as "
+            "hydraulic_new(template=..., doc_id=...) to start from a complete circuit and "
+            "suggested simulation setup instead of adding every component by hand."
+        ),
+    },
     "hydraulic_piping_handoff": {
         "prompt_note": (
             "Runs the real piping solve inline and returns the simhandoff "

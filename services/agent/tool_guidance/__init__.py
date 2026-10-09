@@ -24,11 +24,11 @@ import logging
 from typing import Any
 
 # Guidance family modules. Normally one per live tool_registry family; "firmware"
-# is an authoring split — the fw_* tools are registry-tagged "ecad" (they share the
-# board seam) but their guidance is its own module, and no fw_* key exists in
-# ecad.py, so each tool still has exactly one owner.
+# and "civil" are authoring splits — the fw_* tools are registry-tagged "ecad" and
+# the civil_* tools "sim", but their guidance lives in its own module and no fw_* /
+# civil_* key exists in ecad.py / sim.py, so each tool still has exactly one owner.
 _FAMILIES = (
-    "advisor", "cad", "cam", "ecad", "em", "files", "firmware", "gsl",
+    "advisor", "cad", "cam", "civil", "ecad", "em", "files", "firmware", "gsl",
     "intake", "ledger", "manufacturing", "mission", "office", "org", "parts",
     "plm", "recon", "research", "reveng", "shell", "sim", "tasklist", "workspace",
 )

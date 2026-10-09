@@ -231,6 +231,12 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "set_active_drawing_sheet before adding its views/tables/annotations."
         ),
     },
+    "arrange_drawing": {
+        "prompt_note": (
+            "Re-lay the sheet (projection third|first, standard scale, paper size) instead "
+            "of hand-moving views; dimensions and section cuts follow the views."
+        ),
+    },
     "add_drawing_table": {
         "prompt_note": (
             "Place kind=bom|revision|holes|notes|cutlist on the active sheet; use "

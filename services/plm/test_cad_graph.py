@@ -1011,3 +1011,80 @@ def test_invalidate_keeps_prev_baseline(project: Path):
     g2 = cad_graph.get_graph(project, force=True)
     d = cad_graph.graph_diff(old, g2)
     assert "file:delta.md" in {n["id"] for n in d["nodes_added"]}
+
+
+def _source_mtimes_reference(root: Path, *, skip_names, source_states=None):
+    """The pre-optimisation pathlib scan, kept verbatim as the equality oracle."""
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_names]
+        for fn in filenames:
+            lower = fn.lower()
+            if not lower.endswith((".step+", ".ecad+")):
+                ext = lower.rsplit(".", 1)[-1] if "." in lower else ""
+                if not ext or f".{ext}" not in cad_graph._FILE_EXTS:
+                    continue
+            fp = Path(dirpath) / fn
+            try:
+                rel = str(fp.relative_to(root)).replace("\\", "/")
+                st = fp.stat()
+            except OSError:
+                continue
+            out[f"file:{rel}"] = st.st_mtime
+            if source_states is not None:
+                source_states[f"file:{rel}"] = cad_graph._source_state(st)
+    om = cad_graph._overlay_mtime(root, source_states)
+    if om > 0:
+        out["overlay:graph_links"] = om
+    return out
+
+
+@pytest.mark.parametrize("relative_root", [False, True])
+def test_source_mtimes_fast_matches_pathlib_scan(tmp_path, monkeypatch, relative_root):
+    for rel in ("a.txt", "Top.step+", "sub/b.md", "sub/deep/er/c.txt",
+                "sub/deep/Board.ecad+", "sp ace/d.txt", "noext", "sub/skip.bin",
+                "node_modules/x.txt", "sub/.git/y.txt", "_archive/old.txt"):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(rel)
+    (tmp_path / ".plm").mkdir(exist_ok=True)
+    (tmp_path / ".plm" / "keywords.json").write_text("{}")
+    if relative_root:
+        monkeypatch.chdir(tmp_path)
+        root = Path(".")
+    else:
+        root = tmp_path
+    for include_archive in (False, True):
+        skip = cad_graph._skip_dir_names(include_archive=include_archive)
+        want_states, got_states = {}, {}
+        want = _source_mtimes_reference(root, skip_names=skip, source_states=want_states)
+        got = cad_graph._source_mtimes_fast(root, skip_names=skip, source_states=got_states)
+        assert got == want
+        assert got_states == want_states
+        assert "file:sub/deep/er/c.txt" in got and "file:node_modules/x.txt" not in got
+
+
+def test_get_graph_fingerprint_reuses_single_scan(tmp_path, monkeypatch):
+    for rel in ("a.txt", "sub/b.md", "sub/c.txt"):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(rel)
+    real = cad_graph._source_mtimes_fast
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cad_graph, "_source_mtimes_fast", counting)
+    for _ in ("cold build", "warm cache"):
+        calls.clear()
+        out = cad_graph.get_graph(tmp_path)
+        assert len(calls) == 1
+        fresh = real(tmp_path, skip_names=cad_graph._skip_dir_names())
+        assert out["sources_mtime_max"] == max(fresh.values())
+        assert out["sources_count"] == sum(
+            1 for k in fresh if not k.startswith("overlay:"))
+    probe = cad_graph.get_graph(tmp_path, if_mtimes_max=out["sources_mtime_max"],
+                                if_sources_count=out["sources_count"])
+    assert probe.get("unchanged") is True

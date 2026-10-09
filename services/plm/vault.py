@@ -98,14 +98,21 @@ def _local_config_lock(path: Path) -> Iterator[None]:
 # keyed by the resolved project root and reused across short-lived Vaults in
 # the same process (hostd / web worker bridge).
 #
-# Fast path: reuse a verdict only against the same HEAD and unchanged working
-# stat fingerprint (mtime, ctime, size, inode). Same-size rewrites preserving
-# mtime therefore invalidate immediately on platforms with change-time ctime.
+# Fast path: reuse a verdict only against an unchanged per-item HEAD key (the item's
+# committed content blob ids, excluding the entry metadata every commit rewrites, plus its
+# manifest record) and unchanged working stat fingerprint (mtime, ctime, size, inode).
+# Verdicts survive HEAD moves, so a checkpoint re-examines only the items whose committed
+# content or record it changed — never every container in the project. Same-size
+# rewrites preserving mtime invalidate immediately on platforms with change-time ctime.
 # Windows ctime is creation time: recheck each item's content after a bounded
 # age measured AFTER its last comparison (never an expiring whole-scan TTL).
-# Explicit mutations always drop the cache for this root.
-# root -> {"head": str|None, "items": {item_id: {"stamp": tuple, "dirty": bool}}}
+# root -> {"head": str|None, "item_oids": {item_id: subtree id at head},
+#          "content_keys": {subtree id: content key},
+#          "items": {item_id: {"stamp": tuple, "head_key": tuple, "dirty": bool}}}
 _dirty_scan_cache: dict[str, dict[str, Any]] = {}
+# Files under items/<id>/ that every commit rewrites for every item (entry metadata), so
+# they say nothing about the item's content.
+_PER_COMMIT_ITEM_FILES = frozenset({"meta.json", "summary.txt"})
 _STAT_RECHECK_S: float | None = 30.0 if os.name == "nt" else None
 
 
@@ -118,8 +125,16 @@ def _vault_cache_key(project_dir: str | os.PathLike) -> str:
     return str(Path(project_dir).resolve())
 
 
+def _item_record_key(it: dict[str, Any]) -> str:
+    """Canonical manifest record of an item: any field change revalidates its verdict."""
+    return json.dumps(it, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def _invalidate_dirty_cache(project_dir: str | os.PathLike) -> None:
-    """Drop cached dirty verdicts for *project_dir* (any in-process mutation)."""
+    """Drop every cached dirty verdict for *project_dir* (forces a full rescan).
+
+    Commits do not need this: verdicts are keyed by each item's HEAD subtree id.
+    """
     _dirty_scan_cache.pop(_vault_cache_key(project_dir), None)
 
 
@@ -499,7 +514,6 @@ class Vault:
                 commit = self._bind.commit_tree(files, emeta)
             except gitbind.ConcurrentUpdate:
                 continue  # HEAD advanced under us — rebuild against the new snapshot and retry
-            _invalidate_dirty_cache(self.project_dir)
             try:  # optional Box cloud mirror — spool-only, never blocks or fails a save
                 from services.plm import box_mirror
                 box_mirror.on_vault_saved(str(self.project_dir))
@@ -723,7 +737,6 @@ class Vault:
             kind=hist.KIND_AUTO, message="",
             author_name=author["display"], author_email=f'{author["id"]}@aicad.local')
         self._bind.commit_tree(files, emeta)
-        _invalidate_dirty_cache(self.project_dir)
         if checkout_path:
             self.set_local_config({"link_checkouts": {iid: str(checkout_path)}})
         m = self.manifest()
@@ -880,7 +893,6 @@ class Vault:
             author_name=author["display"], author_email=f'{author["id"]}@aicad.local',
         )
         commit = self._bind.commit_tree(files, emeta)
-        _invalidate_dirty_cache(self.project_dir)
         return commit
 
     # -- deterministic message drafting (T-R3) ------------------------------
@@ -1052,7 +1064,6 @@ class Vault:
             author_name=author["display"], author_email=f'{author["id"]}@aicad.local',
         )
         pinned_commit = self._bind.commit_tree(files, pin_meta)
-        _invalidate_dirty_cache(self.project_dir)
 
         return {"commit": pinned_commit, "release_commit": commit, "rev": new_rev,
                 "entry": self._entry_view(pinned_commit, self._bind.read_tree(pinned_commit), item_id),
@@ -1491,14 +1502,39 @@ class Vault:
                     changes[it["item_id"]] = "A"
             return [it["item_id"] for it in m["items"]]
 
+        # Per-item verdicts survive HEAD moves: each is keyed by the item's committed CONTENT
+        # (its HEAD blob ids minus the per-commit entry metadata every commit rewrites) and
+        # its manifest record, so a checkpoint revalidates only the items whose content it
+        # changed instead of re-exploding every container in the project.
         root_key = _vault_cache_key(self.project_dir)
         cached = _dirty_scan_cache.get(root_key)
-        if cached is None or cached.get("head") != head:
-            item_cache: dict[str, dict[str, Any]] = {}
-            cached = {"head": head, "items": item_cache}
+        if cached is None:
+            cached = {"head": None, "items": {}, "content_keys": {}}
             _dirty_scan_cache[root_key] = cached
-        else:
-            item_cache = cached["items"]
+        if cached.get("head") != head or "item_oids" not in cached:
+            cached["head"] = head
+            cached["item_oids"] = self._bind.child_ids(head, "items")
+            live_oids = set(cached["item_oids"].values())
+            cached["content_keys"] = {oid: key for oid, key in cached.get("content_keys", {}).items()
+                                      if oid in live_oids}
+        item_cache: dict[str, dict[str, Any]] = cached["items"]
+        item_oids: dict[str, bytes] = cached["item_oids"]
+        content_keys: dict[bytes, tuple] = cached["content_keys"]
+
+        def head_content_key(iid: str) -> tuple:
+            oid = item_oids.get(iid)
+            if oid is None:
+                return ()
+            key = content_keys.get(oid)
+            if key is None:
+                try:
+                    blobs = self._bind.tree_blob_ids(oid)
+                except TypeError:  # not a directory: its own id is the content
+                    blobs = {"": oid}
+                key = tuple(sorted((path, blob) for path, blob in blobs.items()
+                                   if path not in _PER_COMMIT_ITEM_FILES))
+                content_keys[oid] = key
+            return key
 
         dirty: list[str] = []
         live_ids: set[str] = set()
@@ -1507,6 +1543,7 @@ class Vault:
             iid = it["item_id"]
             live_ids.add(iid)
             stamp = self._working_stamp(it)
+            head_key = (head_content_key(iid), _item_record_key(it))
             dt = it.get("doc_type")
             store = doctypes.storage_form(dt) if dt in doctypes.GENERIC_DOC_TYPES else None
             head_has_content = False
@@ -1560,6 +1597,7 @@ class Vault:
 
             prev = item_cache.get(iid)
             if (prev is not None and prev.get("stamp") == stamp
+                    and prev.get("head_key") == head_key
                     and not _stat_cache_expired(prev)
                     and self._stamp_is_stable(stamp, prev.get("recorded_ns", 0))
                     and (changes is None or "content_changed" in prev or store == "link")):
@@ -1620,7 +1658,7 @@ class Vault:
                 else:
                     content_changed = is_dirty
 
-            entry = {"stamp": stamp, "dirty": is_dirty,
+            entry = {"stamp": stamp, "head_key": head_key, "dirty": is_dirty,
                      "recorded_ns": time.time_ns(), "recorded_at": time.monotonic()}
             if changes is not None:
                 entry["content_changed"] = content_changed

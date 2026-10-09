@@ -231,6 +231,11 @@ class GitBinding:
         entry = self.entry_at(commit_hex, prefix)
         if entry is None or entry[0] != 0o040000:
             return {}
+        base = prefix.rstrip("/") + "/"
+        return {base + path: oid for path, oid in self.tree_blob_ids(entry[1]).items()}
+
+    def tree_blob_ids(self, tree_oid: bytes) -> dict[str, bytes]:
+        """Map blob paths (relative to a tree object) to ids, without decoding blobs."""
         out: dict[str, bytes] = {}
 
         def walk(oid: bytes, base: str) -> None:
@@ -241,8 +246,16 @@ class GitBinding:
                 else:
                     out[path] = child.sha
 
-        walk(entry[1], prefix.rstrip("/") + "/")
+        walk(tree_oid, "")
         return out
+
+    def child_ids(self, commit_hex: str, prefix: str) -> dict[str, bytes]:
+        """Map the immediate children of a directory to their object ids (one tree read)."""
+        entry = self.entry_at(commit_hex, prefix)
+        if entry is None or entry[0] != 0o040000:
+            return {}
+        return {child.path.decode("utf-8"): child.sha
+                for child in self._read_object(entry[1]).items()}
 
     def read_subtree(self, commit_hex: str, prefix: str) -> dict[str, bytes]:
         """Read only one item's blobs, reusing a warm whole-tree snapshot."""

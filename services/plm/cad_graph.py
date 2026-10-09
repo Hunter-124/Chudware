@@ -995,6 +995,9 @@ def get_graph(
         project_dir, open_docs=open_docs, force=force,
         include_archive=include_archive, exclude_dirs=exclude_dirs,
     )
+    # build_graph's fast scan (fresh, or the cache's mtimes after it validated
+    # them against an identical scan). Captured before the linked merge.
+    primary_mtimes = g.get("mtimes")
     linked_dirs: list[str] = []
     if linked and project_dir is not None:
         g, linked_dirs = _merge_with_linked(Path(project_dir), g)
@@ -1041,12 +1044,18 @@ def get_graph(
     # Change-probe fingerprint: newest source mtime via the SAME code path
     # the probe uses (_source_mtimes_fast — every .step+/.ecad+ under the
     # request's skip policy, plus the overlay), so equality can actually
-    # hold. g["mtimes"] only covers sources that parsed, which can disagree.
+    # hold. With the default skip policy build_graph already ran exactly that
+    # scan (its "mtimes" minus open: keys), so reuse it instead of walking the
+    # tree a second time.
     sources_mtime_max = 0.0
     sources_count = 0
     if project_dir is not None:
-        skip = _skip_dir_names(include_archive=include_archive)
-        fast = _source_mtimes_fast(Path(project_dir), skip_names=skip)
+        if exclude_dirs is None and isinstance(primary_mtimes, dict):
+            fast = {k: v for k, v in primary_mtimes.items()
+                    if not str(k).startswith("open:")}
+        else:
+            skip = _skip_dir_names(include_archive=include_archive)
+            fast = _source_mtimes_fast(Path(project_dir), skip_names=skip)
         sources_mtime_max = max(fast.values()) if fast else 0.0
         sources_count = sum(1 for k in fast
                             if not str(k).startswith("overlay:")
@@ -2030,6 +2039,9 @@ def _overlay_mtime(root: Path, source_states: dict[str, list[int]] | None = None
     return newest
 
 
+_PATH_SEPS = tuple(s for s in (os.sep, os.altsep) if s)
+
+
 def _source_mtimes_fast(
     root: Path,
     *,
@@ -2049,8 +2061,15 @@ def _source_mtimes_fast(
     out: dict[str, float] = {}
     if not root.is_dir():
         return out
+    # Relative keys come from string slicing once per directory: pathlib's
+    # relative_to walks every ancestor per call, which made this scan cost
+    # ~5 s on a 145k-file tree (twice per cad_graph_get).
+    prefix = os.fspath(root)
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in skip_names]
+        reldir = dirpath[len(prefix):]
+        if reldir[:1] in _PATH_SEPS:
+            reldir = reldir[1:]
         for fn in filenames:
             lower = fn.lower()
             if lower.endswith((".step+", ".ecad+")):
@@ -2059,16 +2078,15 @@ def _source_mtimes_fast(
                 ext = lower.rsplit(".", 1)[-1] if "." in lower else ""
                 if not ext or f".{ext}" not in _FILE_EXTS:
                     continue
-            fp = Path(dirpath) / fn
             try:
-                rel = str(fp.relative_to(root)).replace("\\", "/")
-                st = fp.stat()
-                key = f"file:{rel}"
-                out[key] = st.st_mtime
-                if source_states is not None:
-                    source_states[key] = _source_state(st)
+                st = os.stat(os.path.join(dirpath, fn))
             except OSError:
                 continue
+            rel = (f"{reldir}{os.sep}{fn}" if reldir else fn).replace("\\", "/")
+            key = f"file:{rel}"
+            out[key] = st.st_mtime
+            if source_states is not None:
+                source_states[key] = _source_state(st)
     # overlays participate in invalidation (mutations also invalidate_cache)
     om = _overlay_mtime(root, source_states)
     if om > 0:

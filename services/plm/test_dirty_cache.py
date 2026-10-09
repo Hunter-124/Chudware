@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import time
 import zipfile
 
 import pytest
@@ -331,5 +332,113 @@ def test_generic_file_deletion_remains_visible_when_checkpoint_carries_content(t
         v.checkpoint("Other project changes")
         after = worker_rpc._plm_item_list(project, None)["items"]
         assert next(row for row in after if row["item_id"] == item["item_id"])["change"] == "D"
+    finally:
+        v.close()
+
+
+# ---- verdicts survive HEAD moves (per-item HEAD key) ----------------------------------------
+
+def _two_parts(project_dir) -> None:
+    _write(project_dir, "A.step+", _part(3.0))
+    other = _part(4.0)
+    other["id"], other["name"] = "uuid-part-2", "Other"
+    _write(project_dir, "B.step+", other)
+
+
+def _ids_by_path(v: Vault) -> dict[str, str]:
+    return {it["path"]: it["item_id"] for it in v.manifest()["items"]}
+
+
+def _item_entry(project_dir, iid: str) -> dict:
+    return vault_mod._dirty_scan_cache[vault_mod._vault_cache_key(project_dir)]["items"][iid]
+
+
+def test_unchanged_item_verdict_survives_unrelated_checkpoint(tmp_path, monkeypatch):
+    _two_parts(tmp_path)
+    vault_mod._invalidate_dirty_cache(tmp_path)
+    v = Vault.open(tmp_path)
+    try:
+        ids = _ids_by_path(v)
+        assert v._dirty_items(v.manifest(), changes={}) == []
+        _write(tmp_path, "A.step+", _part(8.0))
+        v.checkpoint("Edit A")
+
+        compared = []
+        real_get = vault_mod._explode_cache_get
+
+        def spy(key, stamp):
+            compared.append(key.rsplit("\x00", 1)[-1])
+            return real_get(key, stamp)
+
+        monkeypatch.setattr(vault_mod, "_explode_cache_get", spy)
+        changes: dict[str, str] = {}
+        assert v._dirty_items(v.manifest(), changes=changes) == []
+        assert changes == {ids["A.step+"]: "", ids["B.step+"]: ""}
+        # Only the item the checkpoint touched is compared again; B keeps its verdict.
+        assert "B.step+" not in compared
+    finally:
+        v.close()
+
+
+def test_item_revalidated_when_its_head_content_changes(tmp_path):
+    _write(tmp_path, "A.step+", _part(3.0))
+    vault_mod._invalidate_dirty_cache(tmp_path)
+    v = Vault.open(tmp_path)
+    try:
+        iid = _ids_by_path(v)["A.step+"]
+        assert v._dirty_items(v.manifest()) == []
+        head1_key = _item_entry(tmp_path, iid)["head_key"]
+        original = (tmp_path / "A.step+").read_bytes()
+        _write(tmp_path, "A.step+", _part(8.0))
+        v.checkpoint("A to 8")  # HEAD now holds the 8.0 recipe
+        (tmp_path / "A.step+").write_bytes(original)
+        # Plant the clean verdict the 3.0 file earned against the OLD head, under the file's
+        # current stamp: only the HEAD key can tell that this verdict no longer applies.
+        stamp = v._working_stamp(v.manifest()["items"][0])
+        vault_mod._dirty_scan_cache[vault_mod._vault_cache_key(tmp_path)]["items"][iid] = {
+            "stamp": stamp, "head_key": head1_key, "dirty": False,
+            "recorded_ns": time.time_ns() + 1, "recorded_at": time.monotonic()}
+        assert v._dirty_items(v.manifest()) == [iid]
+        assert _item_entry(tmp_path, iid)["head_key"] != head1_key
+    finally:
+        v.close()
+
+
+def test_working_edit_detected_after_head_move(tmp_path):
+    _two_parts(tmp_path)
+    vault_mod._invalidate_dirty_cache(tmp_path)
+    v = Vault.open(tmp_path)
+    try:
+        ids = _ids_by_path(v)
+        assert v._dirty_items(v.manifest()) == []
+        other = _part(6.0)
+        other["id"], other["name"] = "uuid-part-2", "Other"
+        _write(tmp_path, "B.step+", other)
+        v.checkpoint("Edit B")
+        assert v._dirty_items(v.manifest()) == []
+        _write(tmp_path, "A.step+", _part(9.0))
+        assert v._dirty_items(v.manifest()) == [ids["A.step+"]]
+    finally:
+        v.close()
+
+
+def test_missing_file_semantics_unchanged_with_warm_cache(tmp_path):
+    _two_parts(tmp_path)
+    vault_mod._invalidate_dirty_cache(tmp_path)
+    v = Vault.open(tmp_path)
+    try:
+        ids = _ids_by_path(v)
+        assert v._dirty_items(v.manifest(), changes={}) == []
+        (tmp_path / "A.step+").unlink()
+        changes: dict[str, str] = {}
+        # A missing container is not dirty; the change view reports the deletion.
+        assert v._dirty_items(v.manifest(), changes=changes) == []
+        assert changes[ids["A.step+"]] == "D"
+        assert changes[ids["B.step+"]] == ""
+        v.checkpoint("Remove A")
+        changes = {}
+        assert v._dirty_items(v.manifest(), changes=changes) == []
+        assert changes[ids["A.step+"]] == ""
+        assert not (tmp_path / "A.step+").exists()
     finally:
         v.close()

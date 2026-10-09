@@ -286,8 +286,9 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     ImGui::PopStyleVar();   // ##umsg WindowPadding -- pushed before BeginChild, pops after
     float tint[3];
     modeAccentRgb(m.copilotMode, tint);
+    // A soft pill: the tint carries "you", so the same-hue edge stays a whisper, not an outline.
     const ImRect bubble = endTintBubble(gb, tint, surf.darkText ? 0.16f : 0.24f,
-                                        surf.darkText ? 0.22f : 0.26f);
+                                        surf.darkText ? 0.16f : 0.18f);
     const std::string sel = chatInputSelection(textId);
     chatCopyContext(bubble, "##umsg_copy", userBody, userBody, sel);
 
@@ -342,7 +343,7 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                 dl->AddRectFilled(bmn, bmx,
                     ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
                                                           surf.textPrimary.z, pending ? 0.18f : 0.10f)),
-                    ui::metrics::rounding(4.0f));
+                    btnSz * 0.5f);   // round hover pad, like every other icon affordance
             // Inset to match the pencil icon's 0.18 pad -- the raw glyph otherwise reads
             // noticeably bigger/bolder than the pencil.
             const float rp = btnSz * 0.18f;
@@ -373,7 +374,7 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                 dl->AddRectFilled(bmn, bmx,
                     ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
                                                           surf.textPrimary.z, 0.10f)),
-                    ui::metrics::rounding(4.0f));
+                    btnSz * 0.5f);
             const ImU32 inkU = ImGui::ColorConvertFloat4ToU32(ink);
             IconUV editIcon = ui::getIcon("msg_edit", 20);
             if (editIcon.valid) {
@@ -435,7 +436,6 @@ static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
     bool& open = calls.front()->expanded;
     if (turnFailed) open = true;
 
-    const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
     const auto& pal = ui::palette;
 
@@ -443,26 +443,16 @@ static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
     {
         char hdr[64];
         std::snprintf(hdr, sizeof(hdr), "Provider log (%d)", (int)calls.size());
-        // Vector-drawn chevron — the ▼/▶ text glyphs are missing from the UI font and rendered
-        // as a literal "?". Same hand-drawn-triangle recipe as the FM section dividers.
+        // Vector chevron — the ▼/▶ text glyphs are missing from the UI font and render as a
+        // literal "?". The SAME disclosure the timeline rows use, rotating as it opens.
         const float box = ImGui::GetTextLineHeight();
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
         ImGui::Dummy(ImVec2(box * 0.8f, box));
-        {
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            const ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textTertiary);
-            const float cx = p0.x + box * 0.4f, cy = p0.y + box * 0.5f;
-            const float aa = box * 0.20f;
-            if (open)
-                dl->AddTriangleFilled(ImVec2(cx - aa, cy - aa * 0.6f),
-                                      ImVec2(cx + aa, cy - aa * 0.6f),
-                                      ImVec2(cx, cy + aa * 0.7f), ink);
-            else
-                dl->AddTriangleFilled(ImVec2(cx - aa * 0.6f, cy - aa),
-                                      ImVec2(cx - aa * 0.6f, cy + aa),
-                                      ImVec2(cx + aa * 0.7f, cy), ink);
-        }
-        ImGui::SameLine(0, 2.0f * sc);
+        const float openT = ui::anim::toward(ImGui::GetID("##provlog_chev"), open ? 1.0f : 0.0f,
+                                             ui::anim::kFast);
+        chatPaintDisclosure(ImGui::GetWindowDrawList(), ImVec2(p0.x + box * 0.4f, p0.y + box * 0.5f),
+                            box * 0.38f, openT, ImGui::ColorConvertFloat4ToU32(surf.textTertiary));
+        ImGui::SameLine(0, ui::metrics::U(0.5f));
         ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
         ImGui::PushFont(fonts.medium ? fonts.medium : fonts.body);
         ImGui::TextUnformatted(hdr);

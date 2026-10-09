@@ -3,9 +3,9 @@
 // Overlay redesign: buildDefaultLayout() keeps one uninterrupted central Viewport / ECAD node so
 // the 3D surface spans the full dockspace. Manufacture previews render natively in that viewport,
 // while drawLeftPane() hosts Explorer, Job Manager, NC Output, Devices, Run and Attention as
-// integrated views in the pinned full-height glass column over its left edge. The invisible
-// right-edge resize and collapse-to-pill affordance remain; command dialogs float above the
-// central node.
+// integrated views in the pinned full-height glass column over its left edge. The right-edge resize
+// boundary (columnResizeEdge, shared with the Copilot column) and collapse affordance remain;
+// command dialogs float above the central node.
 #include "layout.h"
 
 #include "imgui.h"
@@ -26,6 +26,7 @@
 #include "ecad/ecad_panel.h"    // drawEcadManagerBody (the Electronics workspace's left tree)
 #include "doc_tabs.h"           // docTabStripHeight (the column never overlaps the doc-tab band)
 #include "icons.h"              // getIcon / IconUV
+#include "anim.h"               // ui::anim::toward — resize-boundary hover fade
 #include "metrics.h"            // logical dp scaling
 #include "panel_collapse.h"     // ui::PanelCollapseAnim — shared vertical-collapse animation (T-G21)
 #include "widgets/kit.h"         // ui::kit::elide
@@ -42,7 +43,8 @@
 // Overlay layout: the dockspace hosts ONLY the central document windows, tabbed in one node, so
 // the viewport runs edge to edge between the ribbon and the status bar. The FeatureManager and
 // Copilot are pinned floating glass columns drawn OVER the viewport (drawLeftPane below /
-// drawAIPanel in ui/copilot/panel.cpp) — no left/right dock splits, no splitter bars anywhere.
+// drawAIPanel in ui/copilot/panel.cpp) — no left/right dock splits; each column's inner edge
+// carries the shared columnResizeEdge boundary instead of a splitter bar.
 // "Reset layout" rebuilds exactly this (plus resetOverlayColumns for the columns' geometry).
 void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     ImGui::DockBuilderRemoveNode(root);
@@ -207,6 +209,129 @@ bool takeOverlayColumnReset(int slot) {
     if (slot < 0 || slot > 1 || !g_overlayColReset[slot]) return false;
     g_overlayColReset[slot] = false;
     return true;
+}
+
+// ---- pinned-column resize boundary (see layout.h) ----------------------------------------------
+// Palette role `a` (alpha * alphaA) blended toward role `b` (alpha * alphaB) by t, as a draw color.
+static ImU32 mixRoles(const float a[4], float alphaA, const float b[4], float alphaB, float t) {
+    float c[4];
+    for (int i = 0; i < 3; ++i) c[i] = a[i] + (b[i] - a[i]) * t;
+    c[3] = a[3] * alphaA + (b[3] * alphaB - a[3] * alphaA) * t;
+    return ui::Palette::toU32(c);
+}
+
+ColumnResizeResult columnResizeEdge(const char* strId, bool rightEdge, float currentWidth,
+                                    bool interactive) {
+    ColumnResizeResult r;
+    r.width = currentWidth;
+    if (!interactive) return r;
+
+    ImGuiContext& g = *ImGui::GetCurrentContext();
+    ImGuiWindow* win = ImGui::GetCurrentWindow();
+    const ImRect winR = win->Rect();
+    const ImGuiID id = win->GetID(strId);
+    const float edgeX = rightEdge ? winR.Max.x : winR.Min.x;
+    // Two grid units inside the edge: the strip lives in the window-padding gutter, so it is
+    // comfortably grabbable without reaching into the column's rows.
+    const float hitW = metrics::U(2.0f);
+    const ImRect hit(rightEdge ? edgeX - hitW : edgeX, winR.Min.y,
+                     rightEdge ? edgeX : edgeX + hitW, winR.Max.y);
+
+    // Same mechanism as ImGui's own window resize borders: KeepAliveID + ButtonBehavior, no
+    // ItemAdd — the strip is edge chrome, so it neither grows the window's content extent nor
+    // registers as overflowing content. AllowOverlap lets any widget submitted later over the
+    // strip win hover (child windows win by being separate windows). The window's inner clip stops
+    // half a padding short of the edge, so hit-test under the full window rect.
+    ImGui::KeepAliveID(id);
+    ImGui::PushClipRect(winR.Min, winR.Max, false);
+    bool hovered = false, held = false;
+    ImGui::ButtonBehavior(hit, id, &hovered, &held,
+                          ImGuiButtonFlags_AllowOverlap | ImGuiButtonFlags_NoNavFocus);
+    ImGui::PopClipRect();
+
+    // Absolute drag (start width + distance from the press point), so clamping or the column
+    // re-anchoring under the cursor can never accumulate drift. One drag at a time app-wide.
+    static ImGuiID s_dragId = 0;
+    static float s_dragStartW = 0.f;
+    if (held && s_dragId != id) { s_dragId = id; s_dragStartW = currentWidth; }
+    if (!held && s_dragId == id) s_dragId = 0;
+    if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        r.resetRequested = true;
+        // The second press re-armed a drag; end it so its start width can't override the reset.
+        if (held) ImGui::ClearActiveID();
+        held = false;
+        s_dragId = 0;
+    }
+    if (held) {
+        const float dx = g.IO.MousePos.x - g.IO.MouseClickedPos[ImGuiMouseButton_Left].x;
+        r.width = s_dragStartW + (rightEdge ? dx : -dx);
+        r.active = true;
+    }
+    if (hovered || held) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    if (hovered && !held && g.HoveredIdTimer >= ImGui::GetStyle().HoverDelayNormal)
+        kit::tooltip("Drag to resize · Double-click to reset width");
+
+    // ---- paint: faint hairline + grip at rest; brighter accent line + soft glow on hover/drag ----
+    const float t = anim::toward(id, (hovered || held) ? 1.0f : 0.0f, anim::kFast);
+    const auto& pal = ui::palette;
+    ImDrawList* dl = win->DrawList;
+    const float glowW = metrics::U(2.0f);
+    dl->PushClipRect(ImVec2(winR.Min.x - glowW, winR.Min.y), ImVec2(winR.Max.x + glowW, winR.Max.y),
+                     false);
+
+    // The line runs between the bubble's corner arcs so it never overshoots the rounded column.
+    float y0 = winR.Min.y + win->WindowRounding;
+    float y1 = winR.Max.y - win->WindowRounding;
+    if (y1 - y0 < metrics::U(4.0f)) {               // collapsed header strip: use the whole edge
+        y0 = winR.Min.y + metrics::U(1.0f);
+        y1 = winR.Max.y - metrics::U(1.0f);
+    }
+    const float midY = (winR.Min.y + winR.Max.y) * 0.5f;
+
+    if (t > 0.001f && y1 > y0) {
+        // Glow: accent at low alpha peaking at the edge's middle, fading to nothing toward the
+        // top/bottom and away from the edge on both sides (bilinear quads).
+        float glowC[4];
+        ui::Palette::withAlpha(pal.accentSoft, glowC, t);
+        const ImU32 peak = ui::Palette::toU32(glowC);
+        const ImU32 none = peak & ~IM_COL32_A_MASK;
+        const float gm = (y0 + y1) * 0.5f;
+        dl->AddRectFilledMultiColor(ImVec2(edgeX - glowW, y0), ImVec2(edgeX, gm), none, none, peak, none);
+        dl->AddRectFilledMultiColor(ImVec2(edgeX - glowW, gm), ImVec2(edgeX, y1), none, peak, none, none);
+        dl->AddRectFilledMultiColor(ImVec2(edgeX, y0), ImVec2(edgeX + glowW, gm), none, none, none, peak);
+        dl->AddRectFilledMultiColor(ImVec2(edgeX, gm), ImVec2(edgeX + glowW, y1), peak, none, none, none);
+    }
+
+    if (y1 > y0) {
+        // Boundary hairline with short fades at both ends.
+        const float lw = metrics::stroke(1.0f + t);
+        const float lx0 = edgeX - lw * 0.5f, lx1 = edgeX + lw * 0.5f;
+        const ImU32 lineCol = mixRoles(pal.textDim, 0.16f, pal.accent, 0.85f, t);
+        const ImU32 lineNone = lineCol & ~IM_COL32_A_MASK;
+        const float fadeH = std::min(metrics::U(6.0f), (y1 - y0) * 0.25f);
+        dl->AddRectFilledMultiColor(ImVec2(lx0, y0), ImVec2(lx1, y0 + fadeH),
+                                    lineNone, lineNone, lineCol, lineCol);
+        dl->AddRectFilled(ImVec2(lx0, y0 + fadeH), ImVec2(lx1, y1 - fadeH), lineCol);
+        dl->AddRectFilledMultiColor(ImVec2(lx0, y1 - fadeH), ImVec2(lx1, y1),
+                                    lineCol, lineCol, lineNone, lineNone);
+    }
+
+    // Grip: a short rounded pill centred on the edge, always faintly visible, on a surface-colored
+    // halo so it reads over any viewport content; grows a touch and takes the accent on hover.
+    {
+        const float gw = metrics::px(4.0f);
+        const float gh = std::min(metrics::U(7.0f), winR.GetHeight() * 0.5f) * (1.0f + 0.15f * t);
+        const ImVec2 g0(edgeX - gw * 0.5f, midY - gh * 0.5f);
+        const ImVec2 g1(edgeX + gw * 0.5f, midY + gh * 0.5f);
+        const float halo = metrics::stroke(1.0f);
+        float haloC[4];
+        ui::Palette::withAlpha(pal.glassBg, haloC, 0.55f + 0.35f * t);
+        dl->AddRectFilled(ImVec2(g0.x - halo, g0.y - halo), ImVec2(g1.x + halo, g1.y + halo),
+                          ui::Palette::toU32(haloC), gw * 0.5f + halo);
+        dl->AddRectFilled(g0, g1, mixRoles(pal.textDim, 0.55f, pal.accent, 1.0f, t), gw * 0.5f);
+    }
+    dl->PopClipRect();
+    return r;
 }
 
 static ImVec4 roleColor(const float role[4]) {
@@ -404,12 +529,12 @@ void drawLeftPane(AppState& st,
     }
 
     // ---- pinned full-height-or-collapsed glass column -------------------------------------------
-    // Position is pinned every frame; WIDTH is resized via ImGui's invisible edge hit-zone
-    // (ConfigWindowsResizeFromEdges, EW mouse-cursor feedback, no drawn bars) and persisted in the
-    // imgui ini like any floating window. HEIGHT animates between the full column height and the
-    // header-strip height (T-G21: vertical collapse — rolls UP to the tab row + chevron instead of
-    // shrinking to a pill; see ui::PanelCollapseAnim). Default/min widths reuse the HiDPI-damped
-    // targets of the old dock split.
+    // Position is pinned every frame; WIDTH is resized via the shared visible resize boundary on
+    // the right edge (columnResizeEdge: hairline + grip + hover glow, EW cursor, double-click resets
+    // to defW) and persisted in the imgui ini like any floating window. HEIGHT animates between the
+    // full column height and the header-strip height (T-G21: vertical collapse — rolls UP to the tab
+    // row + chevron instead of shrinking to a pill; see ui::PanelCollapseAnim). Default/min widths
+    // reuse the HiDPI-damped targets of the old dock split.
     const float panelSc = 1.0f + (S - 1.0f) * 0.55f;
     // Manufacture hosts a SIX-tab icon rail (Explorer / Job Manager / NC Output / Devices / Run /
     // Attention) across the column top — 6 * 30dp + 5 * 6dp = 210dp of rail before the header chip.
@@ -459,14 +584,8 @@ void drawLeftPane(AppState& st,
     ImGui::SetNextWindowSizeConstraints(ImVec2(minW, winH), ImVec2(maxW, winH));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, bubbleDp * S);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    // Kill every drawn resize affordance (corner grips + the edge hover/active flash) — the
-    // cursor change is the only feedback. Popped right after Begin (decorations render inside it);
-    // in-window Separator() uses ImGuiCol_Separator, which stays untouched.
-    ImGui::PushStyleColor(ImGuiCol_ResizeGrip, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_ResizeGripHovered, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_ResizeGripActive, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_SeparatorActive, ImVec4(0, 0, 0, 0));
+    // ImGui's own edge/corner resize is off (NoResize below): columnResizeEdge right after Begin
+    // owns the width so this column and the Copilot column share one visible boundary treatment.
     // Input-regression fix: this column previously carried only NoBackground and was reliably
     // clickable; commit 043e752 added NoBringToFrontOnFocus (to keep it below transient command
     // dialogs) and the whole pane stopped responding to the mouse. FM (left edge) and the floating
@@ -477,13 +596,26 @@ void drawLeftPane(AppState& st,
     // floating dialogs. Clicking inside still focuses it normally.
     const ImGuiWindowFlags lpFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoBackground |
-        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoFocusOnAppearing;
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoResize;
     const bool lpOpen = ImGui::Begin(widthSlot == 1 ? "SimulationManager##LeftPane"
                                                     : "FeatureManager##LeftPane",
                                      nullptr, lpFlags);
-    ImGui::PopStyleColor(5);
     ImGui::PopStyleVar(2);
     if (!lpOpen) { ImGui::End(); return; }
+
+    // Right-edge resize boundary, submitted before any content so the column body (submitted later,
+    // overlap-permissive strip) keeps every click. Electronics forces its width and mobile pins the
+    // column, so neither offers the affordance. The new width lands next frame (SetWindowSize ->
+    // SizeFull, clamped by the constraints above; ini marked dirty so it persists).
+    {
+        const float curW = ImGui::GetWindowWidth();
+        const ColumnResizeResult rz = columnResizeEdge("##lp_resize", /*rightEdge=*/true, curW,
+                                                       !mobile && !ecadWs);
+        if (rz.resetRequested)
+            ImGui::SetWindowSize(ImVec2(defW, ImGui::GetWindowHeight()));
+        else if (rz.active)
+            ImGui::SetWindowSize(ImVec2(std::clamp(rz.width, minW, maxW), ImGui::GetWindowHeight()));
+    }
 
     // Liquid glass v2 (host contract §H4): the WHOLE-column glass slab is intentionally NOT painted
     // anymore — the column bounding box is hidden (fully transparent) so the 3D viewport shows

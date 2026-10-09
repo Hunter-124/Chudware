@@ -299,6 +299,22 @@ Mode→role: agent→default, plan→planning, swarm→default(+corporate), edit
   is open. It is editor CONTEXT (rendered into the user message as ACTIVE DOCUMENT), not an
   edit-targeting restriction.
 
+## Inter-agent messages (2026-10-08, additive)
+- `agent.message` (new kind): display-only mirror of agent-to-agent traffic so the main chat
+  shows it inline. Fields: `node_id`, `id`, `channel` (`irc` | `pool` | `board`), `from`, `to`
+  (`Main` for a message delivered to the main agent; `board` for a board post), `text` (the
+  message body, <=4096; never the prompt wrapper Chudcode renders around it), optional
+  `message_id`, `reply_to`, `mode` (workpool card mode), `run_id`, `actor`.
+- Producers: `services/agent/chudcode_events.py` maps Chudcode `irc_message` frames
+  (`irc:incoming` / `irc:relay` / `irc:workpool` records) — previously a `sub_run`
+  "Message from <agent>" row whose body never rendered; `services/agent/coordination.py`
+  `CoordinationBoard.post_progress` forwards each board post (`channel=board`) to the board's
+  `on_event` sink (`get_board(run_id, on_event=...)`), else the turn's ambient live sink.
+  Forwarding never affects delivery or the post.
+- GUI: `copilot/feed.cpp` folds each into one compact transcript line (rowKind 7, stage
+  `msg:<channel>:<message_id|id>`, deduped by that key); `ai/agent_dag.cpp` records a Note step
+  on the sender when the trace knows it, else on the event's owner.
+
 ## Current producer ownership
 
 The online producer is the Chudcode session host and `services/agent/worker_rpc.py`.

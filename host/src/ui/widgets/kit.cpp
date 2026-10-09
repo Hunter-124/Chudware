@@ -74,6 +74,11 @@ constexpr float kDangerActA     = 0.70f;
 constexpr float kSegSelA        = 0.85f;
 constexpr float kSegHoverA      = 0.16f;
 constexpr float kBtnGhostHoverA = 0.10f;   // icon-button hover wash, over the current ink
+constexpr float kGhostPressMul  = 1.8f;    // icon-button wash while held, x the hover wash
+constexpr float kPressSink      = 0.65f;   // a held button loses this much of its lift (sinks in)
+constexpr float kPrimaryEdgeA   = 0.80f;   // primary/segment pill edge: accentDim at this alpha
+constexpr float kDangerEdgeA    = 0.55f;   // danger edge: glassShadow at this alpha (darker rim)
+constexpr float kEdgeHoverLift  = 0.45f;   // soft control edge alpha gained at full hover
 constexpr float kEmptyIconA     = 0.60f;
 constexpr float kWrapInsetFrac  = 0.08f;   // empty-state paragraph inset when a line must wrap
 constexpr float kEmptyIconScale = 2.0f;    // empty/blocked glyph = 2x the header icon tier
@@ -206,37 +211,46 @@ ChipGeom chipGeom(const char* label, bool withDot) {
 // ---- buttons --------------------------------------------------------------------------------
 // Shared body for primary/secondary/danger. A disabled button still RENDERS and still answers
 // "why can't I click this?" on hover — the kit never hides an action the user is hunting. It
-// gets ONE explicit disabled look for every kind: a neutral frame fill, a hairline border and dim
-// (still legible) text. No BeginDisabled alpha: that scaled the accent fill to a washed-out pale
-// orange with near-white text that read as neither enabled nor disabled.
+// gets ONE explicit disabled look for every kind: a flat neutral frame fill, a hairline border and
+// dim (still legible) text. No BeginDisabled alpha: that scaled the accent fill to a washed-out
+// pale orange with near-white text that read as neither enabled nor disabled.
+//
+// The face is ui::controlFace (soft lip, lighter-top tint, sheen, 1-px edge), painted BEHIND
+// ImGui's own label once the item rect and its hover/press state are known: ImGui draws the label
+// on channel 1 of a kit-owned splitter, the face goes on channel 0. One reused splitter (buttons
+// never nest), distinct from any card's, so it is legal inside a split card body.
+ImDrawListSplitter& buttonSplitter() {
+    static ImDrawListSplitter s;
+    return s;
+}
+
 bool kitButton(const char* label, bool enabled, const char* disabledReason, const ImVec2& size,
                const ImVec4& base, const ImVec4& hovered, const ImVec4& active,
-               const ImVec4& text) {
+               const ImVec4& text, const ImVec4& edge) {
     ImVec2 sz = size;
     if (sz.y <= 0.0f) sz.y = ImGui::GetFrameHeight();
 
-    int vars = 1, cols = 4;
-    if (enabled) {
-        ImGui::PushStyleColor(ImGuiCol_Button,        base);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hovered);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  active);
-        ImGui::PushStyleColor(ImGuiCol_Text,          text);
-    } else {
-        const ImVec4 fill = roleVec(palette.frameBg, kBtnDisabledA);
-        ImGui::PushStyleColor(ImGuiCol_Button,        fill);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, fill);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  fill);
-        ImGui::PushStyleColor(ImGuiCol_Text,          roleVec(palette.textDim));
-        ImGui::PushStyleColor(ImGuiCol_Border,        roleVec(palette.border));
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, ui::metrics::stroke(1.0f));
-        ++cols;
-        ++vars;
-    }
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, chipRound());
+    ImDrawList*         dl    = ImGui::GetWindowDrawList();
+    ImDrawListSplitter& split = buttonSplitter();
+    split.Split(dl, 2);
+    split.SetCurrentChannel(dl, 1);
+
+    const ImVec4 clear = roleVec(palette.button, 0.0f);   // ImGui's own fill off: we paint it
+    ImGui::PushStyleColor(ImGuiCol_Button,        clear);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, clear);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  clear);
+    ImGui::PushStyleColor(ImGuiCol_Text,          enabled ? text : roleVec(palette.textDim));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding,   chipRound());
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
 
     // The disabled ITEM flag (not BeginDisabled) blocks presses without the global alpha.
     if (!enabled) ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
-    bool pressed = ImGui::Button(label ? label : "", sz);
+    bool       pressed = ImGui::Button(label ? label : "", sz);
+    const bool hov     = enabled && ImGui::IsItemHovered();
+    const bool held    = enabled && ImGui::IsItemActive();
+    const ImGuiID iid  = ImGui::GetItemID();
+    const ImVec2  a    = ImGui::GetItemRectMin();
+    const ImVec2  b    = ImGui::GetItemRectMax();
     if (!enabled) {
         ImGui::PopItemFlag();
         pressed = false;
@@ -244,9 +258,23 @@ bool kitButton(const char* label, bool enabled, const char* disabledReason, cons
         // explanation reachable at all.
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) kitTooltip(disabledReason);
     }
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(4);
 
-    ImGui::PopStyleVar(vars);
-    ImGui::PopStyleColor(cols);
+    const float hv = anim::toward(ImHashStr("##kit_btn_hv", 0, iid), hov ? 1.0f : 0.0f, anim::kFast);
+    const float pr = anim::toward(ImHashStr("##kit_btn_pr", 0, iid), held ? 1.0f : 0.0f,
+                                  anim::kInstant);
+    ImVec4 fill = roleVec(palette.frameBg, kBtnDisabledA);
+    ImVec4 rim  = roleVec(palette.border);
+    float  lift = 0.0f;   // disabled: flat
+    if (enabled) {
+        fill = lerpVec4(lerpVec4(base, hovered, hv), active, pr);
+        rim  = edge;
+        lift = 1.0f - kPressSink * pr;
+    }
+    split.SetCurrentChannel(dl, 0);
+    ui::controlFace(dl, a, b, ImGui::GetColorU32(fill), ImGui::GetColorU32(rim), chipRound(), lift);
+    split.Merge(dl);
     return pressed;
 }
 
@@ -510,6 +538,12 @@ bool cardBegin(const char* id, const char* title, const char* icon, bool* open,
             cw->Hidden = true;
             anim::requestFrames();
         }
+        // A content-sized card has no height of its own to hand out. Left alone, ImGui derives
+        // the card's vertical content region from LAST frame's card height, so a "fill the rest"
+        // child, spacer or centred block inside the card feeds its own height back into the next
+        // frame (the growing box). Pin the region to the content origin: avail.y is 0 here, and
+        // the card is exactly as tall as what it actually draws.
+        cw->ContentRegionRect.Max.y = cw->DC.CursorPos.y;
     }
     // Content draws on channel 1; cardEnd paints the wash behind it on channel 0 once the height
     // is final. Split + merge are unconditional and paired.
@@ -878,21 +912,23 @@ bool primaryButton(const char* label, bool enabled, const char* disabledReason,
                    const ImVec2& size) {
     const ImVec4 base = roleVec(palette.accent, kPrimaryFillA);
     return kitButton(label, enabled, disabledReason, size, base, roleVec(palette.accent),
-                     roleVec(palette.accentDim), ui::maxContrastTextOn(base));
+                     roleVec(palette.accentDim), ui::maxContrastTextOn(base),
+                     roleVec(palette.accentDim, kPrimaryEdgeA));
 }
 
 bool secondaryButton(const char* label, bool enabled, const char* disabledReason,
                      const ImVec2& size) {
     return kitButton(label, enabled, disabledReason, size, roleVec(palette.button),
                      roleVec(palette.buttonHovered), roleVec(palette.buttonActive),
-                     roleVec(palette.text));
+                     roleVec(palette.text), roleVec(palette.controlBorder));
 }
 
 bool dangerButton(const char* label, bool enabled, const char* disabledReason,
                   const ImVec2& size) {
     const ImVec4 base = roleVec(palette.statusErr, kDangerFillA);
     return kitButton(label, enabled, disabledReason, size, base, roleVec(palette.statusErr),
-                     roleVec(palette.statusErr, kDangerActA), ui::maxContrastTextOn(base));
+                     roleVec(palette.statusErr, kDangerActA), ui::maxContrastTextOn(base),
+                     roleVec(palette.glassShadow, kDangerEdgeA));
 }
 
 bool iconButton(const char* id, const char* icon, const char* tooltip, bool enabled, Tone t,
@@ -909,13 +945,17 @@ bool iconButton(const char* id, const char* icon, const char* tooltip, bool enab
         clicked = false;
     }
     const bool hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
+    const bool held    = enabled && ImGui::IsItemActive();
 
     const float hv = anim::toward(ImGui::GetID("##hv"), (hovered && enabled) ? 1.0f : 0.0f,
                                   anim::kFast);
+    const float pr = anim::toward(ImGui::GetID("##pr"), held ? 1.0f : 0.0f, anim::kInstant);
     ImDrawList*  dl = ImGui::GetWindowDrawList();
     const ImVec2 p1(p0.x + s, p0.y + s);
     if (hv > kSettled) {
-        dl->AddRectFilled(p0, p1, roleU32(palette.text, kBtnGhostHoverA * hv), chipRound());
+        // Ghost variant: no face at rest, an ink wash on hover that deepens while held.
+        const float washA = kBtnGhostHoverA * hv * (1.0f + (kGhostPressMul - 1.0f) * pr);
+        dl->AddRectFilled(p0, p1, roleU32(palette.text, washA), chipRound());
     }
     // Glyph per icon tier: at least kIconFillFrac of the button (a frame-height button lands on
     // the header tier, ~iconHeader), and a text-height button still shows a full font-size glyph.
@@ -961,16 +1001,18 @@ bool segmented(const char* id, const char* const* labels, int count, int* select
 
     ImDrawList* dl  = ImGui::GetWindowDrawList();
     const float rnd = chipRound();
-    dl->AddRectFilled(p0, p1, roleU32(palette.frameBg, kTrackA), rnd);
-    dl->AddRect(p0, p1, roleU32(palette.border), rnd, 0, ui::metrics::stroke(1.0f));
+    // Track: a flat inset well with the soft control edge; the selection is a raised pill on it.
+    ui::controlFace(dl, p0, p1, roleU32(palette.frameBg, kTrackA), ui::controlBorderU32(), rnd,
+                    0.0f);
 
     // The selection SLIDES between segments rather than teleporting, so the eye keeps track of
     // which one it left.
     const float selT  = anim::toward(ImGui::GetID("##sel"), (float)sel, anim::kBase);
     const float inset = ui::metrics::stroke(2.0f);
-    dl->AddRectFilled(ImVec2(p0.x + segW * selT + inset, p0.y + inset),
-                      ImVec2(p0.x + segW * (selT + 1.0f) - inset, p1.y - inset),
-                      roleU32(palette.accent, kSegSelA), rnd);
+    ui::controlFace(dl, ImVec2(p0.x + segW * selT + inset, p0.y + inset),
+                    ImVec2(p0.x + segW * (selT + 1.0f) - inset, p1.y - inset),
+                    roleU32(palette.accent, kSegSelA), roleU32(palette.accentDim, kPrimaryEdgeA),
+                    ImMax(rnd - inset, 0.0f));
 
     const ImVec4 selInk = ui::maxContrastTextOn(roleVec(palette.accent, kSegSelA));
     bool         changed = false;
@@ -1051,16 +1093,22 @@ bool popoverBegin(const char* id, const char* label, const char* icon, int activ
         GImGui->LastItemData.StatusFlags | ImGuiItemStatusFlags_Openable |
             (ImGui::IsPopupOpen("##kit_popover_body") ? ImGuiItemStatusFlags_Opened : 0));
     const bool   hovered = ImGui::IsItemHovered();
-    const float  hv      = anim::toward(ImGui::GetID("##hv"), hovered ? 1.0f : 0.0f, anim::kFast);
+    const bool   isOpen  = ImGui::IsPopupOpen("##kit_popover_body");
+    const float  hv      = anim::toward(ImGui::GetID("##hv"), (hovered || isOpen) ? 1.0f : 0.0f,
+                                        anim::kFast);
 
     ImDrawList*  dl = ImGui::GetWindowDrawList();
     const ImVec2 p1(p0.x + w, p0.y + h);
     const float  rnd = chipRound();
-    dl->AddRectFilled(p0, p1, u32(lerpVec4(roleVec(palette.button), roleVec(palette.buttonHovered),
-                                           hv)), rnd);
-    dl->AddRect(p0, p1, roleU32(activeCount > 0 ? palette.accent : palette.border,
-                                kChipBorderA + (1.0f - kChipBorderA) * hv),
-                rnd, 0, ui::metrics::stroke(1.0f));
+    // Same raised face as a secondary button; an active filter set keeps the accent edge, and an
+    // open popover sits pressed-in so the trigger reads as the popup's anchor.
+    const ImU32 edge = activeCount > 0
+                           ? roleU32(palette.accent, kChipBorderA + (1.0f - kChipBorderA) * hv)
+                           : ui::controlBorderU32(1.0f + kEdgeHoverLift * hv);
+    ui::controlFace(dl, p0, p1,
+                    ImGui::GetColorU32(lerpVec4(roleVec(palette.button),
+                                                roleVec(palette.buttonHovered), hv)),
+                    edge, rnd, isOpen ? 1.0f - kPressSink : 1.0f);
 
     float x = p0.x + pX;
     if (glyph > 0.0f &&

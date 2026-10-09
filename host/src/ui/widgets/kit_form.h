@@ -323,6 +323,17 @@ bool fieldEnum(const char* id, const char* label, int* sel, const char* const* i
 //   kit::fieldCombo("comp", "Component", &idx, names, kit::FieldOpts().withPreview(shortName));
 bool fieldCombo(const char* id, const char* label, int* sel, const std::vector<std::string>& items,
                 const FieldOpts& o = FieldOpts());
+// Popup geometry for the NEXT ImGui::BeginCombo whose frame starts at screen x `frameX` and is
+// `frameW` wide: at least frame-wide, never wider than the room from the frame's LEFT edge to the
+// viewport work area's right edge, at most `maxItems` rows tall. With the width bounded that way
+// ImGui's combo placement always hangs the popup from the frame's left edge instead of flipping it
+// to "below, toward left" across the neighbouring pane. Kit combos (fieldEnum/fieldCombo) already
+// call it; a raw BeginCombo calls it immediately before BeginCombo. Popup content must size from
+// the popup itself (Selectable with zero width, GetContentRegionAvail) — never from
+// GetWindowWidth(), which feeds back into the auto-sized popup and widens it every frame.
+//   kit::constrainNextComboPopup(ImGui::GetCursorScreenPos().x, w);
+//   if (ImGui::BeginCombo("##mode", preview)) { ... ImGui::EndCombo(); }
+void constrainNextComboPopup(float frameX, float frameW, int maxItems = 20);
 
 // X/Y/Z cells sharing one unit; each cell shows its axis letter (axis-tinted) inside the frame,
 // so cellHints are only placeholders for empty cells. Each cell keeps room for "-0,000.0"; when

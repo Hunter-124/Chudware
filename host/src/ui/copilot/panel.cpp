@@ -1,7 +1,7 @@
 // Chudware Copilot pane (T-RF6 split of legacy_chat.cpp — this file is the pane host).
 //
 // A PINNED, full-height, rounded liquid-glass column overlaid on the viewport's right edge with
-// ~12dp margins (geometry from ui::viewportBackdrop(); invisible left-edge drag zone to resize;
+// ~12dp margins (geometry from ui::viewportBackdrop(); visible left-edge resize boundary + grip;
 // the docked task-pane layout is gone — this is the only layout). Top-down: ONE slim header row
 // (the live animated tesseract brand mark, tinted by run status — its animation style comes from
 // Settings -> Appearance -> Brand mark — then the Chat / Tasks / Artifacts / Sessions pills and a
@@ -21,6 +21,7 @@
 // that let the full-page AI workspace embed the SAME chat state + send path.
 
 #include "copilot_internal.h"
+#include "agent_overview.h"         // ui::drawAgentOverview — live sub-agents + persistent todos
 #include "ui/tesseract.h"  // ui::drawTesseract — the animated 4-cube brand mark in the header
 #include "core/engine_events.h"  // core::mirrorRecoveredDocs — Reopen a dismissed live agent doc
 #include "ui/ai/ai_prefs.h"      // ui::chatShowRenders — Artifacts render-thumbnail display pref
@@ -2238,17 +2239,15 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // Collapse chip floats just left of the column (see drawCopilotHeader) so header
     // content can start flush without a chevron reserve.
 
-    // Invisible left-edge resize hit-zone (design rule: no visible splitter bars). Dragging the
-    // strip left widens the column; clamped at the top of the next frame.
-    if (overlay && !mobile) {
-        const ImVec2 keep = ImGui::GetCursorPos();
-        ImGui::SetCursorScreenPos(ImGui::GetWindowPos());
-        ImGui::InvisibleButton("##copilot_resize",
-                               ImVec2(ui::metrics::px(6.0f), ImGui::GetWindowSize().y));
-        if (ImGui::IsItemHovered() || ImGui::IsItemActive())
-            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-        if (ImGui::IsItemActive()) s_paneW -= ImGui::GetIO().MouseDelta.x;
-        ImGui::SetCursorPos(keep);
+    // Left-edge resize boundary — the same visible hairline + grip + hover glow as the
+    // FeatureManager column (ui::columnResizeEdge, layout.h). Dragging left widens the column;
+    // s_paneW is clamped at the top of the next frame; double-click restores the default width.
+    // Submitted before the header so the collapse chip (later, overlapping) keeps its clicks.
+    if (overlay) {
+        const ui::ColumnResizeResult rz = ui::columnResizeEdge(
+            "##copilot_resize", /*rightEdge=*/false, ImGui::GetWindowWidth(), !mobile);
+        if (rz.resetRequested) s_paneW = ui::metrics::dockRightTarget();
+        else if (rz.active)    s_paneW = rz.width;
     }
 
     // focusSettingsTab opens the Settings modal AI tab (full form + leaderboard).
@@ -2429,6 +2428,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
             ImGui::BeginGroup();
             // Keep runtime actions scrollable with the composer on a keyboard-shortened screen.
             if (mobile) drawRuntimeBanner(st);
+            ui::drawAgentOverview(st, ImGui::GetContentRegionAvail().x);
             drawComposer(st, busy, canRun);
             ImGui::EndGroup();
             s_composerH = ImGui::GetItemRectSize().y + ui::metrics::U(1);

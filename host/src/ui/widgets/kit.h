@@ -91,6 +91,9 @@ float gutter();      // pane content inset
 //                 neutral glass. This is how a card carries meaning without a colored border.
 //
 // Returns false when the card is collapsed — skip the body, still call cardEnd().
+// An open card is CONTENT-sized: GetContentRegionAvail().y is 0 inside it (a card has no height of
+// its own to hand out, and last frame's height must never feed the next frame's layout). Give a
+// list or canvas inside a card an explicit height.
 bool cardBegin(const char* id, const char* title = nullptr, const char* icon = nullptr,
                bool* open = nullptr, const float tint[3] = nullptr);
 void cardEnd();
@@ -146,8 +149,12 @@ bool toggleChip(const char* label, bool* on, Tone t = Tone::Accent,
                 const char* tooltip = nullptr);
 
 // ---- buttons -----------------------------------------------------------------------------------
-// `enabled == false` renders a DISABLED button plus `disabledReason` as its tooltip. Never hide an
-// action the user is looking for — tell them why it is unavailable.
+// Every variant shares one shape (chipRound corner, frame height) and one raised face
+// (ui::controlFace: soft lip, lighter-top tint, top sheen, 1-px edge); hover eases the fill, a
+// press sinks the face flat, disabled is flat and neutral. iconButton is the ghost variant (no
+// face at rest, ink wash on hover/press). `enabled == false` renders a DISABLED button plus
+// `disabledReason` as its tooltip. Never hide an action the user is looking for — tell them why
+// it is unavailable.
 bool primaryButton(const char* label, bool enabled = true, const char* disabledReason = nullptr,
                    const ImVec2& size = ImVec2(0, 0));
 bool secondaryButton(const char* label, bool enabled = true, const char* disabledReason = nullptr,

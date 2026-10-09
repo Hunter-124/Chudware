@@ -42,7 +42,10 @@ constexpr float kUnitInkA        = 0.62f;  // unit suffix / disabled caption = d
 constexpr float kDisabledA       = 0.55f;
 constexpr float kDisabledFrameA  = 0.35f;  // disabled value frame: hollow (bg mostly gone)
 constexpr float kSettled         = 0.004f;
-constexpr float kCheckRound      = 3.0f;   // logical px, through metrics::rounding
+constexpr float kCheckRound      = 4.0f;   // logical px, through metrics::rounding
+constexpr float kThumbEdgeA      = 0.80f;  // slider thumb rim: accentDim at this alpha
+constexpr float kCheckHoverEdge  = 0.50f;  // unchecked box edge eases this far to accent on hover
+constexpr float kPressedLift     = 0.35f;  // controlFace lift of an open combo / dragged thumb
 constexpr float kCheckInsetFrac  = 0.22f;  // check mark inset inside the box
 constexpr float kChevronFrac     = 0.16f;  // combo chevron half-width as a fraction of frame h
 constexpr float kThumbFrac       = 0.28f;  // slider thumb radius as a fraction of frame h
@@ -494,6 +497,18 @@ std::string groupedNumber(double v, bool integer, int sig) {
     return s;
 }
 
+// Focus ring: while a value frame is being edited its soft edge eases to the accent — the one
+// "you are typing here" cue (ImGui's own frame only nudges its fill). Call right after the input.
+void focusRing() {
+    const float t = anim::toward(ImHashStr("##kit_focus", 0, ImGui::GetItemID()),
+                                 ImGui::IsItemActive() ? 1.0f : 0.0f, anim::kFast);
+    if (t <= kSettled) return;
+    ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                                        roleU32(palette.accent, t * ImGui::GetStyle().Alpha),
+                                        ImGui::GetStyle().FrameRounding, 0,
+                                        ui::metrics::stroke(1.0f));
+}
+
 // One InputText bound to a display value. Not active: reseeded from the value every frame and
 // painted RIGHT-aligned (grouped) against the unit; active: left-aligned plain draft that
 // persists in the store. Deactivated with changed text: parsed and reported. `prefix` (vec3 axis
@@ -524,6 +539,7 @@ Cell numberCell(const char* cid, const char* hint, double disp, bool has, bool i
     inputString(cid, hint, &s.text, flags);
     if (paint) ImGui::PopStyleColor();
     if (preW > 0.0f) ImGui::PopStyleVar();
+    focusRing();
 
     const ImVec2 a  = ImGui::GetItemRectMin();
     const ImVec2 b  = ImGui::GetItemRectMax();
@@ -579,6 +595,7 @@ bool textCell(const char* cid, const char* cur, float width, const FieldOpts& o,
         ImGui::SetNextItemWidth(width);
         inputString(cid, o.hint, &s.text, 0);
     }
+    focusRing();
     valueTip(o);
     if (!ImGui::IsItemDeactivated()) return false;
     if (std::strcmp(s.text.c_str(), cur ? cur : "") == 0) return false;
@@ -610,14 +627,25 @@ void paintChevronDown(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
     dl->AddPolyline(pts, 3, col, ImDrawFlags_None, ui::metrics::stroke(1.5f));
 }
 
-// Kit combo: own preview (elided, placeholder dim) + vector chevron, PushID(i) per item, disabled
-// items greyed with their reason on hover. Returns true when *sel changed.
+// Reused splitter for the combo popup's item rows: rounded highlight pills go on channel 0 under
+// the Selectable labels on channel 1. Combos never nest their popups, so one instance suffices.
+ImDrawListSplitter& comboSplitter() {
+    static ImDrawListSplitter s;
+    return s;
+}
+
+// Kit combo: own preview (elided, placeholder dim) + vector chevron on a raised control face,
+// PushID(i) per item, disabled items greyed with their reason on hover. The popup hangs from the
+// frame's LEFT edge at least frame-wide (constrainNextComboPopup), with rounded highlight pills.
+// Returns true when *sel changed.
 bool comboCore(const char* cid, int* sel, int n, ItemGetter get, const void* ctx, float w,
                const FieldOpts& o) {
+    ImGuiContext&     g  = *GImGui;
     ImDrawList*       dl = ImGui::GetWindowDrawList();
     const ImGuiStyle& st = ImGui::GetStyle();
     const ImVec2      p0 = ImGui::GetCursorScreenPos();
     const float       h  = ImGui::GetFrameHeight();
+    const ImVec2      p1(p0.x + w, p0.y + h);
 
     const bool  valid = *sel >= 0 && *sel < n;
     const char* shown = (o.preview && o.preview[0]) ? o.preview : (valid ? get(ctx, *sel) : nullptr);
@@ -626,8 +654,43 @@ bool comboCore(const char* cid, int* sel, int n, ItemGetter get, const void* ctx
 
     bool changed = false;
     if (n == 0) ImGui::BeginDisabled();
+    // The face is the kit's, so read the live frame roles (a caller or the field may have pushed
+    // them: issue border, disabled hollow frame, glass-tinted fills) before clearing ImGui's own.
+    const ImVec4 fillRest = ImGui::ColorConvertU32ToFloat4(ImGui::GetColorU32(ImGuiCol_FrameBg));
+    const ImVec4 fillHov  = ImGui::ColorConvertU32ToFloat4(ImGui::GetColorU32(ImGuiCol_FrameBgHovered));
+    const ImVec4 fillAct  = ImGui::ColorConvertU32ToFloat4(ImGui::GetColorU32(ImGuiCol_FrameBgActive));
+    const ImU32  edge     = st.FrameBorderSize > 0.0f ? ImGui::GetColorU32(ImGuiCol_Border)
+                                                      : ui::controlBorderU32();
+    const ImVec4 clear    = roleVec(palette.frameBg, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,        clear);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, clear);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,  clear);
+    ImGui::PushStyleColor(ImGuiCol_PopupBg,        roleVec(palette.popupBg));
+    ImGui::PushStyleColor(ImGuiCol_Border,         roleVec(palette.glassBorder));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding,   rowRound());
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, ui::metrics::stroke(1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(st.FramePadding.x, ui::metrics::U(1.0f)));
+    constrainNextComboPopup(p0.x, w);
+    // Resolve the frame id while the PARENT window is current: once BeginCombo opens the popup,
+    // GetID() and LastItemData both belong to the popup window.
+    const ImGuiID fid = ImGui::GetID(cid);
     ImGui::SetNextItemWidth(w);
-    if (ImGui::BeginCombo(cid, "", ImGuiComboFlags_NoArrowButton | ImGuiComboFlags_HeightLarge)) {
+    const bool open = ImGui::BeginCombo(cid, "", ImGuiComboFlags_NoArrowButton | ImGuiComboFlags_HeightLarge);
+    ImGui::PopStyleVar(4);
+    ImGui::PopStyleColor(5);
+    const bool hovered = g.HoveredId == fid;
+    if (open) {
+        ImDrawList*         pdl   = ImGui::GetWindowDrawList();
+        ImDrawListSplitter& split = comboSplitter();
+        split.Split(pdl, 2);
+        split.SetCurrentChannel(pdl, 1);
+        const ImVec4 none = roleVec(palette.accent, 0.0f);   // Selectable's square fill off
+        ImGui::PushStyleColor(ImGuiCol_Header,        none);
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, none);
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive,  none);
+        const float rr    = chipRound();
+        const float inset = ui::metrics::stroke(1.0f);
         for (int i = 0; i < n; ++i) {
             ImGui::PushID(i);
             const bool dis = o.itemDisabled && o.itemDisabled[i];
@@ -637,22 +700,43 @@ bool comboCore(const char* cid, int* sel, int n, ItemGetter get, const void* ctx
                 *sel    = i;
                 changed = true;
             }
+            const bool  itemHov = ImGui::IsItemHovered();
+            const float hv = anim::toward(ImHashStr("##kit_combo_hv", 0, ImGui::GetItemID()),
+                                          itemHov ? 1.0f : 0.0f, anim::kFast);
+            const bool  isSel = i == *sel;
+            if (isSel || hv > kSettled) {
+                // Selectable's rect is padded by half the item spacing on every side so rows
+                // touch; inset it back so each highlight is its own rounded pill.
+                const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+                const ImVec4 rest = isSel ? roleVec(palette.accentSoft) : none;
+                split.SetCurrentChannel(pdl, 0);
+                pdl->AddRectFilled(ImVec2(a.x, a.y + inset), ImVec2(b.x, b.y - inset),
+                                   ImGui::GetColorU32(lerpVec4(rest, roleVec(palette.accentMid), hv)),
+                                   rr);
+                split.SetCurrentChannel(pdl, 1);
+            }
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
                 if (dis) tooltip(o.itemReasons ? o.itemReasons[i] : nullptr);
                 else     tooltip(o.itemTips ? o.itemTips[i] : nullptr);
             }
-            if (i == *sel) ImGui::SetItemDefaultFocus();
+            if (isSel) ImGui::SetItemDefaultFocus();
             ImGui::PopID();
         }
+        ImGui::PopStyleColor(3);
+        split.Merge(pdl);
         ImGui::EndCombo();
     }
     // Name the combo record for the shot/audit item snapshot (no-op outside test-engine builds).
-    {
-        [[maybe_unused]] ImGuiContext& g = *GImGui;
-        IMGUI_TEST_ENGINE_ITEM_INFO(ImGui::GetID(cid), cid, 0);
-    }
+    IMGUI_TEST_ENGINE_ITEM_INFO(fid, cid, 0);
 
-    // Preview + chevron on the parent draw list (captured before BeginCombo opened its popup).
+    // Face + preview + chevron on the parent draw list (captured before BeginCombo opened its
+    // popup). Open = pressed-in; hover eases the fill toward the hovered frame role.
+    const float  hv    = anim::toward(ImHashStr("##kit_combo_face", 0, fid),
+                                      (hovered || open) ? 1.0f : 0.0f, anim::kFast);
+    const ImVec4 fill  = open ? fillAct : lerpVec4(fillRest, fillHov, hv);
+    const bool   inert = n == 0 || o.disabled;
+    ui::controlFace(dl, p0, p1, ImGui::ColorConvertFloat4ToU32(fill), edge, st.FrameRounding,
+                    inert ? 0.0f : (open ? kPressedLift : 1.0f));
     const float       chevR = h * kChevronFrac;
     const float       textW = ImMax(w - st.FramePadding.x - h, ui::metrics::stroke(1.0f));
     const std::string txt   = elide(shown, textW);
@@ -663,7 +747,7 @@ bool comboCore(const char* cid, int* sel, int n, ItemGetter get, const void* ctx
     if (n == 0) ImGui::EndDisabled();
 
     if (!o.disabled && ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
-        ImGui::IsMouseHoveringRect(p0, ImVec2(p0.x + w, p0.y + h)) &&
+        ImGui::IsMouseHoveringRect(p0, p1) &&
         !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) {
         if (txt != shown && o.tip && o.tip[0]) {
             const std::string both = std::string(shown) + "\n\n" + o.tip;
@@ -700,6 +784,23 @@ void tooltip(const char* text) {
 
 void itemTooltip(const char* text) {
     if (text && text[0] && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) tooltip(text);
+}
+
+// ==================================================================================================
+// combo popup geometry
+// ==================================================================================================
+void constrainNextComboPopup(float frameX, float frameW, int maxItems) {
+    const ImGuiStyle&    st    = ImGui::GetStyle();
+    const ImGuiViewport* vp    = ImGui::GetWindowViewport();
+    const float          right = vp->WorkPos.x + vp->WorkSize.x - st.DisplaySafeAreaPadding.x;
+    const float          minW  = ImMax(frameW, ui::metrics::stroke(1.0f));
+    const float          maxW  = ImMax(minW, right - frameX);
+    // ImGui's own row-count height (CalcMaxPopupHeightFromItemCount), with the padding the popup
+    // will actually use: a caller-supplied constraint replaces ImGui's height logic entirely.
+    const int   rows = ImMax(maxItems, 1);
+    const float maxH = (ImGui::GetFontSize() + st.ItemSpacing.y) * (float)rows - st.ItemSpacing.y +
+                       st.WindowPadding.y * 2.0f;
+    ImGui::SetNextWindowSizeConstraints(ImVec2(minW, 0.0f), ImVec2(maxW, maxH));
 }
 
 // ==================================================================================================
@@ -988,22 +1089,24 @@ float beginField(const char* id, const char* label, const FieldOpts& o, const Fi
     f.slotX  = f.valueX + f.valueW + sp;
 
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, chipRound());
-    ++f.vars;
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, ui::metrics::stroke(1.0f));
+    f.vars += 2;
     const bool ownIssue = o.issue && o.issue[0];
     if (ownIssue || !fs.error.empty()) {
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, ui::metrics::stroke(1.0f));
-        ++f.vars;
         ImGui::PushStyleColor(ImGuiCol_Border, toneVec(ownIssue ? o.issueTone : fs.errTone));
         ++f.cols;
     } else if (o.disabled) {
         // Clearly disabled: a hollow outlined frame (on top of the disabled alpha), not a filled
         // box that only looks a little faint.
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, ui::metrics::stroke(1.0f));
-        ++f.vars;
         ImGui::PushStyleColor(ImGuiCol_Border, roleVec(palette.border));
         ImGui::PushStyleColor(ImGuiCol_FrameBg, roleVec(palette.frameBg, kDisabledFrameA));
         ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, roleVec(palette.frameBg, kDisabledFrameA));
         f.cols += 3;
+    } else {
+        // Every value frame carries the soft 1-px control edge in BOTH themes (dark used to be
+        // borderless and light used the hard window outline), matching kit buttons and combos.
+        ImGui::PushStyleColor(ImGuiCol_Border, roleVec(palette.controlBorder));
+        ++f.cols;
     }
     ImGui::SetNextItemWidth(f.valueW);
     g_fields.push_back(f);
@@ -1414,8 +1517,9 @@ bool fieldSlider(const char* id, const char* label, double* v, double lo, double
     };
     const float xt = xOf(d);
     const float xa = xOf(dlo < 0.0 && dhi > 0.0 ? 0.0 : dlo);   // fill grows from zero when inside
+    // Rounded track: the soft control edge tone for the rail, accent for the filled run.
     dl->AddRectFilled(ImVec2(x0, cy - th * 0.5f), ImVec2(x1, cy + th * 0.5f),
-                      roleU32(palette.border, alpha), th * 0.5f);
+                      roleU32(palette.controlBorder, alpha), th * 0.5f);
     if (xt != xa) {
         dl->AddRectFilled(ImVec2(ImMin(xa, xt), cy - th * 0.5f), ImVec2(ImMax(xa, xt), cy + th * 0.5f),
                           roleU32(palette.accent, alpha), th * 0.5f);
@@ -1426,7 +1530,10 @@ bool fieldSlider(const char* id, const char* label, double* v, double lo, double
         dl->AddCircleFilled(ImVec2(xt, cy), r * (1.0f + (kThumbHaloMul - 1.0f) * hv),
                             roleU32(palette.accentSoft, alpha * hv));
     }
-    dl->AddCircleFilled(ImVec2(xt, cy), r, roleU32(active ? palette.accentDim : palette.accent, alpha));
+    // Thumb: the raised control face as a disc (rounding = radius) — soft lip, lighter top, rim.
+    ui::controlFace(dl, ImVec2(xt - r, cy - r), ImVec2(xt + r, cy + r),
+                    roleU32(active ? palette.accentDim : palette.accent, alpha),
+                    roleU32(palette.accentDim, kThumbEdgeA * alpha), r, active ? kPressedLift : 1.0f);
 
     // ---- readout cell ----
     ImGui::SameLine(0.0f, gap);
@@ -1566,14 +1673,18 @@ bool checkbox(const char* id, const char* label, bool* v, const char* tip, bool 
     const ImVec2 bMax(bMin.x + box, bMin.y + box);
     const float  rnd = ui::metrics::rounding(kCheckRound);
 
-    ImVec4 base = held ? roleVec(palette.frameBgActive)
-                       : lerpVec4(roleVec(palette.frameBg), roleVec(palette.frameBgHovered), hv);
-    base.w *= alpha;
-    dl->AddRectFilled(bMin, bMax, ImGui::ColorConvertFloat4ToU32(base), rnd);
-    if (fill > kSettled) dl->AddRectFilled(bMin, bMax, roleU32(palette.accent, fill * alpha), rnd);
-    ImVec4 edge = lerpVec4(roleVec(palette.border), roleVec(palette.accent), ImMax(fill, hv * 0.5f));
+    // One raised face whose fill eases frame -> accent as it checks; the soft control edge leans
+    // toward the accent on hover and settles on the accent rim once checked.
+    const ImVec4 base = held ? roleVec(palette.frameBgActive)
+                             : lerpVec4(roleVec(palette.frameBg), roleVec(palette.frameBgHovered), hv);
+    ImVec4 face = lerpVec4(base, roleVec(palette.accent), fill);
+    face.w *= alpha;
+    ImVec4 edge = lerpVec4(lerpVec4(roleVec(palette.controlBorder), roleVec(palette.accent),
+                                    hv * kCheckHoverEdge),
+                           roleVec(palette.accentDim, kThumbEdgeA), fill);
     edge.w *= alpha;
-    dl->AddRect(bMin, bMax, ImGui::ColorConvertFloat4ToU32(edge), rnd, 0, ui::metrics::stroke(1.0f));
+    ui::controlFace(dl, bMin, bMax, ImGui::ColorConvertFloat4ToU32(face),
+                    ImGui::ColorConvertFloat4ToU32(edge), rnd, (held || !enabled) ? 0.0f : 1.0f);
     if (fill > kSettled) {
         ImVec4 ck = ui::maxContrastTextOn(roleVec(palette.accent));
         ck.w *= fill * alpha;

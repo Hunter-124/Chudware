@@ -434,7 +434,9 @@ static bool settingsPopupRowSelectable(
     const float windowWidth = ImGui::GetWindowWidth();
     const float border = style.WindowBorderSize;
     const ImVec2 rowPos = ImGui::GetCursorScreenPos();
-    const float rowWidth = ImMax(0.0f, windowPos.x + windowWidth - border - rowPos.x);
+    // Content region, never window width: a row sized from the window edge feeds the popup's
+    // own auto-fit and the popup grows a little every frame until ImGui flips it left.
+    const float rowWidth = ImMax(0.0f, ImGui::GetContentRegionAvail().x);
 
     ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
@@ -556,16 +558,19 @@ static void settingsSectionHeader(const char* title, bool first = false) {
     ui::kit::popDensity();
 }
 
-// Frosted glass card around a group of related fields. Auto-height; id must be unique per tab.
-// Keeps label+widget pairs inside one child so scrolling cannot detach a caption from its field.
-// width=0 fills the row (the default); an explicit width lets two sections sit side by side
-// (Settings → Providers packs Sign-in and Usage into two columns on wide panes).
-static void settingsGlassSectionBegin(const char* id, const char* title, float width = 0.0f) {
-    const float sc = ui::uiScale;
-    settingsSectionHeader(title);
+// Rounded frosted glass card around a group of related fields, under a small accent section
+// header. Auto-height; id must be unique per page. Keeps label+widget pairs inside one child so
+// scrolling cannot detach a caption from its field. width=0 fills the row (the default); an
+// explicit width lets two sections sit side by side (Settings → Providers packs Sign-in and
+// Usage into two columns on wide panes). `first` drops the header's leading gap at a page top.
+static void settingsGlassSectionBegin(const char* id, const char* title, float width = 0.0f,
+                                      bool first = false) {
+    settingsSectionHeader(title, first);
     ui::pushGlassChildStyle(10.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * sc, 7.0f * sc));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * sc, 5.0f * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::px(12.0f), ui::metrics::px(8.0f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ui::metrics::px(8.0f), ui::metrics::px(5.0f)));
     ImGui::BeginChild(id, ImVec2(width, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
 }
@@ -3460,8 +3465,7 @@ static void drawBenchRunner(AppState& st, float sc, ui::leaderboard::Board& lb,
     }
 
     const bool canRun = !s_bench.running && st.workerStarted;
-    if (!canRun) ImGui::BeginDisabled();
-    if (ImGui::Button("Run benchmark", ImVec2(160.0f * sc, 0))) {
+    if (ui::kit::primaryButton("Run benchmark", canRun, nullptr, ImVec2(160.0f * sc, 0))) {
         const std::string tier = benchTierForSource(st.settings, s_bench.source);
         const char* mode = (s_bench.mode == 0) ? "diag" : "smoke";
         nlohmann::json p;
@@ -3485,7 +3489,6 @@ static void drawBenchRunner(AppState& st, float sc, ui::leaderboard::Board& lb,
             s_bench.lastPoll = -1e9;
         });
     }
-    if (!canRun) ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
         if (s_bench.running)
             ImGui::SetTooltip("A benchmark is already running.");
@@ -5404,7 +5407,7 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
         ImGui::TextUnformatted(catalogMeta.c_str());
         ImGui::PopStyleColor();
         ImGui::Dummy(ImVec2(0, 2.0f * S));
-        if (ImGui::Button("New skill", ImVec2(-1, 0))) {
+        if (ui::kit::secondaryButton("New skill", true, nullptr, ImVec2(-1, 0))) {
             s_ovSkills.creating = true;
             s_ovSkills.selected.clear();
             std::fill(s_ovSkills.body.begin(), s_ovSkills.body.end(), 0);
@@ -5522,9 +5525,8 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
             }
 
             const bool busySave = s_ovSkills.saveInFlight;
-            if (busySave) ImGui::BeginDisabled();
-            if (ImGui::Button(s_ovSkills.creating ? "Create##set_sksave" : "Save##set_sksave",
-                              ImVec2(-1, 0))) {
+            if (ui::kit::primaryButton(s_ovSkills.creating ? "Create##set_sksave" : "Save##set_sksave",
+                                       !busySave, "Saving\xe2\x80\xa6", ImVec2(-1, 0))) {
                 if (s_ovSkills.creating) {
                     // Normalize name from field; rewrite frontmatter name if needed.
                     std::string name = s_ovSkills.newName;
@@ -5539,7 +5541,6 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
                     ovSaveSkill(st);
                 }
             }
-            if (busySave) ImGui::EndDisabled();
 
             // Delete only for user skills.
             if (!s_ovSkills.creating && !s_ovSkills.selected.empty()) {
@@ -5549,12 +5550,8 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
                         isUser = true; break;
                     }
                 if (isUser) {
-                    ImGui::PushStyleColor(ImGuiCol_Button,
-                        ImVec4(ui::palette.statusErr[0], ui::palette.statusErr[1],
-                               ui::palette.statusErr[2], 0.55f));
-                    if (ImGui::Button("Delete user skill", ImVec2(-1, 0)))
+                    if (ui::kit::dangerButton("Delete user skill", true, nullptr, ImVec2(-1, 0)))
                         ovDeleteSkill(st, s_ovSkills.selected);
-                    ImGui::PopStyleColor();
                 }
             }
         }
@@ -5668,7 +5665,7 @@ static void drawSettingsContextTab(AppState& st, float S) {
         const float gap = 6.0f * S;
         const float halfW = ImMax(60.0f * S,
                                   (ImGui::GetContentRegionAvail().x - gap) * 0.5f);
-        if (ImGui::Button("New rule", ImVec2(halfW, 0))) {
+        if (ui::kit::secondaryButton("New rule", true, nullptr, ImVec2(halfW, 0))) {
             s_ovTrig.creating = true;
             s_ovTrig.selected.clear();
             s_ovTrig.enabled = true;
@@ -5705,7 +5702,7 @@ static void drawSettingsContextTab(AppState& st, float S) {
             ImGui::SetTooltip(
                 "Blank rule + pack, edited on the right (saved under context_injection/).");
         ImGui::SameLine(0, gap);
-        if (ImGui::Button("New\xe2\x80\xa6", ImVec2(-1, 0)))
+        if (ui::kit::secondaryButton("New\xe2\x80\xa6", true, nullptr, ImVec2(-1, 0)))
             s_rulesAuthorOpen = true;
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Guided authoring for rules, skills and context injections.");
@@ -5883,9 +5880,8 @@ static void drawSettingsContextTab(AppState& st, float S) {
             }
 
             const bool busySave = s_ovTrig.saveInFlight;
-            if (busySave) ImGui::BeginDisabled();
-            if (ImGui::Button(s_ovTrig.creating ? "Create##set_trsave" : "Save##set_trsave",
-                              ImVec2(-1, 0))) {
+            if (ui::kit::primaryButton(s_ovTrig.creating ? "Create##set_trsave" : "Save##set_trsave",
+                                       !busySave, "Saving\xe2\x80\xa6", ImVec2(-1, 0))) {
                 if (s_ovTrig.creating) {
                     std::string name = s_ovTrig.newId;
                     name.erase(std::remove_if(name.begin(), name.end(),
@@ -5900,7 +5896,6 @@ static void drawSettingsContextTab(AppState& st, float S) {
                     ovSaveTrigger(st);
                 }
             }
-            if (busySave) ImGui::EndDisabled();
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(
                     "Writes a user override (shipped triggers.yaml is never rewritten).");
@@ -5916,15 +5911,10 @@ static void drawSettingsContextTab(AppState& st, float S) {
                     }
                 }
                 if (isOverrideOrUser) {
-                    ImGui::PushStyleColor(ImGuiCol_Button,
-                        ImVec4(ui::palette.statusErr[0], ui::palette.statusErr[1],
-                               ui::palette.statusErr[2], 0.55f));
-                    if (ImGui::Button(
-                            isUserOnly ? "Delete user trigger"
-                                       : "Reset to shipped",
-                            ImVec2(-1, 0)))
+                    if (ui::kit::dangerButton(isUserOnly ? "Delete user trigger"
+                                                         : "Reset to shipped",
+                                              true, nullptr, ImVec2(-1, 0)))
                         ovDeleteTriggerOverride(st, s_ovTrig.selected);
-                    ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip(
                             isUserOnly
@@ -6124,7 +6114,7 @@ static void drawRuntimeMaintenanceSection(AppState& st, float sc) {
     dimText("Repair the local CAD engine runtime.");
     const bool canSetup = !st.setupRunning.load() && !st.anyRunActive();
     if (!canSetup) ImGui::BeginDisabled();
-    if (ImGui::Button("Repair / install runtime", ImVec2(220.0f * sc, 0)))
+    if (ui::kit::secondaryButton("Repair / install runtime", true, nullptr, ImVec2(220.0f * sc, 0)))
         st.startSetup(true);
     if (!canSetup) ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -6267,20 +6257,25 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed,
             ImVec4(ui::palette.headerBg[0], ui::palette.headerBg[1],
                    ui::palette.headerBg[2], 1.0f));
-        // Borderless: WindowBorderSize kills the outer frame, and FrameBorderSize kills the
-        // title bar's OWN frame border — RenderFrame strokes the title rect with ImGuiCol_Border
-        // independently of the window border, which is the hairline that survived the first pass.
-        // WindowPadding is horizontally zero so each tab body reaches the modal's right edge and
-        // its pill scrollbar rides that edge; the tab row re-indents itself below.
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        // Rounded, softly elevated dialog: a large corner radius (the title strip follows it via
+        // RoundCornersTop) and ONE low-alpha glass hairline as the outer edge. FrameBorderSize
+        // stays zero — RenderFrame strokes the title rect with ImGuiCol_Border independently of
+        // the window border, and that inner hairline under the title read as a hard seam.
+        // WindowPadding is horizontally zero so each page body reaches the modal's right edge and
+        // its pill scrollbar rides that edge; the nav rail insets itself below.
+        ImGui::PushStyleColor(ImGuiCol_Border,
+            ImVec4(ui::palette.glassBorder[0], ui::palette.glassBorder[1],
+                   ui::palette.glassBorder[2], ui::palette.glassBorder[3]));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui::metrics::rounding(12.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, ui::metrics::stroke(1.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 8.0f * sc));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, ui::metrics::px(8.0f)));
         bool settingsBegun = ImGui::Begin("Settings", &s_settingsOpen,
                          ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking);
-        // Decorations render inside Begin, so the two border vars pop immediately after it —
+        // Decorations render inside Begin, so the chrome vars pop immediately after it —
         // widgets inside keep their normal frame borders.
-        ImGui::PopStyleVar(2);    // FrameBorderSize, WindowBorderSize
-        ImGui::PopStyleColor(3);  // TitleBg / TitleBgActive / TitleBgCollapsed
+        ImGui::PopStyleVar(3);    // FrameBorderSize, WindowBorderSize, WindowRounding
+        ImGui::PopStyleColor(4);  // Border / TitleBg / TitleBgActive / TitleBgCollapsed
         // All placement is resolved above, before Begin paints the window decorations.
         if (settingsBegun) {
         // C22b: if a pending prompt role was requested, load prompts and jump to the Prompts tab.
@@ -6346,40 +6341,162 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (jumpToTab < 0) jumpToTab = 2;
         }
 
-        // Sticky tab bar: fixed header region (tabs) + scrolling body per tab.
-        // Outer child is non-scrolling so the tab row never leaves the top; each
-        // tab wraps its content in settingsTabBodyBegin/End so only the body scrolls.
-        // The container is TRANSPARENT — a glass frame around the whole tab region read
-        // as a nested border box; the section cards carry their own glass.
+        // Pages: 0=Appearance 1=General 2=AI 3=Providers (indices are the openSettingsTab /
+        // CHUDWARE_SHOT_SETTINGS_TAB contract — never reorder). The selection persists across
+        // opens; a resolved jump drives it directly so it lands the same frame.
+        static int s_settingsPage = 0;
+        if (jumpToTab >= 0 && jumpToTab <= 3) s_settingsPage = jumpToTab;
+
+        // AI sub-section visibility, resolved BEFORE the nav rail: on wide dialogs the AI
+        // sections are listed in the rail under "AI" (one navigation column, not a rail
+        // inside a rail), and the AI page body below dispatches on the same stable indices.
+        static const char* kAiSubLabels[8] = {
+            "Harness", "Roles", "Prompts", "Skills",
+            "Rules", "Benchmarks", "Tools", "Dev Preview"};
+        // Basic mode paints only the everyday sections (kAiSubAdvanced, file scope). visIdx
+        // maps a rail/combo row back to its REAL section index.
+        const char* visLabels[8];
+        int visIdx[8];
+        int visN = 0;
+        for (int i = 0; i < 8; ++i) {
+            if (!st.settings.showAdvanced && kAiSubAdvanced[i]) continue;
+            visLabels[visN] = kAiSubLabels[i];
+            visIdx[visN] = i;
+            ++visN;
+        }
+        // Turning Advanced off while parked on an advanced section would otherwise render a
+        // body with no corresponding nav row. Fall back to Harness.
+        if (!st.settings.showAdvanced && s_aiSubSel >= 0 && s_aiSubSel < 8 &&
+            kAiSubAdvanced[s_aiSubSel])
+            s_aiSubSel = 0;
+        // With one visible section there is nothing to navigate (the Basic-mode shape).
+        const bool aiNav = visN > 1;
+
+        // Fixed navigation + scrolling page body. The outer container is non-scrolling and
+        // TRANSPARENT — a glass frame around the whole region read as a nested border box; the
+        // section cards carry their own glass. Each page wraps its content in
+        // settingsTabBodyBegin/End so only the body scrolls.
         ImGui::BeginChild("##settabsarea", ImVec2(0, 0),
                           ImGuiChildFlags_None,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        // Keep every destination identifiable on a phone instead of letting ImGui
-        // squeeze four full labels to "Ap..." / "Ge..." / "Pr...". ### preserves
-        // tab IDs while the viewport crosses the compact-width threshold.
+        // Phone-width dialogs cannot afford a sidebar: the pages become one segmented row with
+        // short labels instead, and the AI page keeps its own section picker.
         const bool compactTabs = ImGui::GetContentRegionAvail().x < 520.0f * sc;
-        // Tab row inset: the window has zero horizontal padding (so tab bodies can reach the
-        // right edge), so the row indents itself instead.
-        ImGui::Indent(10.0f * sc);
+        const bool navRail = !compactTabs;
+        static const char* kPageLabel[4] = {"Appearance", "General", "AI", "Providers"};
+        static const char* kPageShort[4] = {"Look", "General", "AI", "Keys"};
+        static const char* kPageIcon[4]  = {"ws_appearance", "settings", "ai_panel", "eng_firm"};
+        static const char* kPageId[4]    = {"nav_appearance", "nav_general", "nav_ai",
+                                            "nav_providers"};
+        const char* kAdvancedTip =
+            "Advanced settings\n"
+            "Off: only the controls most users need.\n"
+            "On: every tuning, authoring and diagnostic control.\n\n"
+            "Nothing is disabled while this is off — hidden controls keep their current "
+            "values, config.json stays authoritative, and searching for a hidden setting "
+            "turns this on for you.";
+        // Basic / Advanced disclosure. Lives in the navigation (visible from every page) so it
+        // reads as a property of the whole dialog rather than of one page. Why it exists: ~130
+        // indexed entries plus an 8-section AI hub with no triage — Basic hides power controls
+        // and disables nothing.
+        auto advancedToggle = [&]() {
+            bool adv = st.settings.showAdvanced;
+            if (ui::kit::checkbox("set_advanced", "Advanced", &adv, kAdvancedTip)) {
+                st.settings.showAdvanced = adv;
+                saveSettings(st.settings);
+            }
+        };
+        if (navRail) {
+            const ImVec2 railMn = ImGui::GetCursorScreenPos();
+            const float railAvailH = ImGui::GetContentRegionAvail().y;
+            const float railW = ui::metrics::px(176.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                                ImVec2(ui::metrics::px(8.0f), ui::metrics::px(4.0f)));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                                ImVec2(ui::metrics::px(6.0f), ui::metrics::px(2.0f)));
+            ImGui::BeginChild("##settings_nav", ImVec2(railW, 0),
+                              ImGuiChildFlags_AlwaysUseWindowPadding,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            // Rounded kit rows: frosted selection pill, animated hover wash, icon in accent
+            // while selected — the same row every selected list in the app uses.
+            ui::kit::pushDensity(ui::kit::Density::Compact);
+            for (int i = 0; i < 4; ++i) {
+                ui::kit::RowStyle rs;
+                rs.icon     = kPageIcon[i];
+                rs.iconTone = (s_settingsPage == i) ? ui::kit::Tone::Accent
+                                                    : ui::kit::Tone::Neutral;
+                rs.selected = (s_settingsPage == i);
+                if (i == 3 && s_omp.oauth.active) {
+                    rs.meta    = "sign-in";
+                    rs.tooltip = "A provider sign-in is in progress";
+                }
+                if (ui::kit::row(kPageId[i], kPageLabel[i], rs)) s_settingsPage = i;
+                // AI sections nest under their page while it is open.
+                if (i == 2 && s_settingsPage == 2 && aiNav) {
+                    ImGui::Indent(ui::metrics::px(22.0f));
+                    for (int k = 0; k < visN; ++k) {
+                        ImGui::PushID(visIdx[k]);
+                        ui::kit::RowStyle sr;
+                        sr.selected = (visIdx[k] == s_aiSubSel);
+                        if (ui::kit::row("nav_ai_sub", visLabels[k], sr)) s_aiSubSel = visIdx[k];
+                        ImGui::PopID();
+                    }
+                    ImGui::Unindent(ui::metrics::px(22.0f));
+                }
+            }
+            ui::kit::popDensity();
+            // Advanced switch pinned to the rail's foot (or right after the rows when the rail
+            // is short), with the "more exists" cue above it so hidden sections are never a
+            // surprise.
+            const float lineH = ImGui::GetTextLineHeightWithSpacing();
+            const float footH = ImGui::GetFrameHeight() +
+                                (!st.settings.showAdvanced ? lineH : 0.0f);
+            const float footY = ImGui::GetWindowHeight() - ImGui::GetStyle().WindowPadding.y -
+                                footH;
+            if (footY > ImGui::GetCursorPosY()) ImGui::SetCursorPosY(footY);
+            if (!st.settings.showAdvanced && visN < 8) {
+                char more[32];
+                std::snprintf(more, sizeof(more), "+%d in Advanced", 8 - visN);
+                dimText(more);
+            }
+            advancedToggle();
+            ImGui::EndChild();
+            ImGui::PopStyleVar(2);  // ItemSpacing, WindowPadding
+            {
+                float edge[4];
+                ui::Palette::withAlpha(ui::palette.glassBorder, edge, 0.6f);
+                const float dx = railMn.x + railW + ui::metrics::px(3.5f);
+                ImGui::GetWindowDrawList()->AddLine(
+                    ImVec2(dx, railMn.y), ImVec2(dx, railMn.y + railAvailH),
+                    ui::Palette::toU32(edge), ui::metrics::stroke(1.0f));
+            }
+            ImGui::SameLine(0, ui::metrics::px(8.0f));
+        } else {
+            ImGui::Indent(ui::metrics::px(10.0f));
+            ui::kit::segmented("##set_pages", kPageShort, 4, &s_settingsPage,
+                               ImGui::GetContentRegionAvail().x - ui::metrics::px(10.0f),
+                               kPageLabel);
+            advancedToggle();
+            ImGui::Unindent(ui::metrics::px(10.0f));
+        }
         bool providerTabDrawn = false;
-        if (ImGui::BeginTabBar("##settabs")) {
-            // ---- Appearance tab (FIRST): theme + colored liquid glass (v2.1) ----
+        {
+            // ---- Appearance page (FIRST): theme + colored liquid glass (v2.1) ----
             // The canonical theme control lives here (moved from General; the View-menu item
             // stays a synced shortcut). The glass knobs edit Settings::glassCfg per group and
             // live-apply via ui::setGlassConfig + persist via saveSettings on every change —
             // so the persisted "appearance.glass" block is no longer a dead round-trip.
-            if (ImGui::BeginTabItem(compactTabs ? "Look###Appearance" : "Appearance", nullptr,
-                                    (jumpToTab == 0) ? ImGuiTabItemFlags_SetSelected
-                                                     : ImGuiTabItemFlags_None)) {
+            if (s_settingsPage == 0) {
                 settingsTabBodyBegin("##tab_appearance");
-                settingsSectionHeader("Theme", /*first=*/true);
+                settingsGlassSectionBegin("##app_theme", "Theme", 0.0f, /*first=*/true);
                 bool isLight = (ui::activeTheme == ui::Theme::Light);
-                if (ImGui::Checkbox("Light theme (SolidWorks-style)", &isLight))
+                if (ui::kit::checkbox("app_light", "Light theme (SolidWorks-style)", &isLight))
                     applyThemeNow(st, isLight);
                 dimText("Switches the whole UI between the dark and light palettes. "
                         "Saved immediately.");
+                settingsGlassSectionEnd();
 
-                settingsSectionHeader("Accent colors");
+                settingsGlassSectionBegin("##app_accent", "Accent colors");
                 dimText("Primary is the color a modelling operation's RESULT is drawn in \xe2\x80\x94 "
                         "the same role the 3D ribbon icons bake their new geometry with. Secondary "
                         "is the direction cue: arrows, axes, annotation. The ribbon retints as you "
@@ -6410,8 +6527,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                     // "##accent" only disambiguates the ImGui id: the Liquid Glass section below
                     // has a button with the identical visible label, and two same-label buttons in
                     // one window share an id (the second one becomes unclickable).
-                    if (ImGui::Button("Reset to defaults##accent",
-                                      ImVec2(150.0f * sc, 28.0f * sc))) {
+                    if (ui::kit::secondaryButton("Reset to defaults##accent", true, nullptr, ImVec2(150.0f * sc, 28.0f * sc))) {
                         std::memcpy(settings.accentPrimary, ui::kDefaultAccentPrimary,
                                     sizeof(settings.accentPrimary));
                         std::memcpy(settings.accentSecondary, ui::kDefaultAccentSecondary,
@@ -6428,8 +6544,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                         saveSettings(settings);
                     }
                 }
+                settingsGlassSectionEnd();
 
-                settingsSectionHeader("Brand mark");
+                settingsGlassSectionBegin("##app_brand", "Brand mark");
                 dimText("The copilot logo is a live 3D projection of a rotating tesseract "
                         "(a 4-cube) — this picks how it turns. Saved immediately.");
                 ImGui::Dummy(ImVec2(0, 4 * sc));
@@ -6487,9 +6604,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                                      nm);
                     }
                 }
-                ImGui::Dummy(ImVec2(0, 4 * sc));
+                settingsGlassSectionEnd();
 
-                settingsSectionHeader("Liquid Glass");
+                settingsGlassSectionBegin("##app_glass", "Liquid Glass");
                 dimText("Per-surface styling for the glass panels floating over the viewport. "
                         "Dynamic color auto-tints each panel for max contrast against the live "
                         "model; pin a tint below to override it. Saved immediately.");
@@ -6500,14 +6617,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                 static int s_glassGroup = 0;
                 static const char* kGroupLabel[(size_t)ui::GlassGroup::Count] = {
                     "Global", "Feature Manager", "Copilot", "Viewport HUD"};
-                for (int i = 0; i < (int)ui::GlassGroup::Count; ++i) {
-                    if (i) ImGui::SameLine(0.0f, 6.0f * sc);
-                    bool selGrp = (s_glassGroup == i);
-                    const float* bc = selGrp ? ui::palette.accentSoft : ui::palette.button;
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(bc[0], bc[1], bc[2], bc[3]));
-                    if (ImGui::Button(kGroupLabel[i])) s_glassGroup = i;
-                    ImGui::PopStyleColor();
-                }
+                ui::kit::segmented("##glass_group", kGroupLabel, (int)ui::GlassGroup::Count,
+                                   &s_glassGroup);
 
                 const ui::GlassGroup grp = (ui::GlassGroup)s_glassGroup;
                 ui::GlassStyle& g = settings.glassCfg.group[(size_t)grp];
@@ -6608,8 +6719,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 bool dyn = res.dynamicColor;
-                if (ImGui::Checkbox("Dynamic color \xe2\x80\x94 auto max-contrast vs model",
-                                    &dyn)) {
+                if (ui::kit::checkbox("glass_dynamic",
+                                      "Dynamic color \xe2\x80\x94 auto max-contrast vs model", &dyn)) {
                     g.dynamicColor = dyn ? 1 : 0;
                     glassChanged = true;
                 }
@@ -6617,7 +6728,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         "for legibility. Off: the pinned tint above is used as-is.");
 
                 ImGui::Dummy(ImVec2(0, 4 * sc));
-                if (ImGui::Button("Reset to defaults", ImVec2(150.0f * sc, 28.0f * sc))) {
+                if (ui::kit::secondaryButton("Reset to defaults", true, nullptr, ImVec2(150.0f * sc, 28.0f * sc))) {
                     g = ui::GlassStyle();  // all sentinels -> inherit Global / built-in defaults
                     glassChanged = true;
                 }
@@ -6628,12 +6739,13 @@ void drawSettingsModal(AppState& st, bool busy) {
                     ui::setGlassConfig(settings.glassCfg);  // live-apply (idempotent)
                     saveSettings(settings);                 // glass knobs persist immediately
                 }
+                settingsGlassSectionEnd();
 
                 // Live preview through the ACTUAL glass pipeline (adaptivePanel + glassPanel):
                 // over the viewport it frosts the real backdrop with this group's resolved style;
                 // over chrome it falls back to the layered glass. One stable id per group (the
                 // adaptive cache requires the same group every frame for a given id).
-                settingsSectionHeader("Preview");
+                settingsGlassSectionBegin("##app_preview", "Preview");
                 {
                     static const char* kPreviewId[(size_t)ui::GlassGroup::Count] = {
                         "settings_glass_preview_global", "settings_glass_preview_fm",
@@ -6656,57 +6768,59 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 "Adaptive text over this group's glass");
                     ImGui::Dummy(ImVec2(pw, ph));
                 }
+                settingsGlassSectionEnd();
                 settingsTabBodyEnd();
-                ImGui::EndTabItem();
             }
 
-            // ---- General tab: Document (units) + System (engine readout, profiler) ----
-            if (ImGui::BeginTabItem("General", nullptr,
-                                    (jumpToTab == 1) ? ImGuiTabItemFlags_SetSelected
-                                                     : ImGuiTabItemFlags_None)) {
+            // ---- General page: Document (units) + System (engine readout, profiler) ----
+            if (s_settingsPage == 1) {
                 settingsTabBodyBegin("##tab_general");
 #ifndef __EMSCRIPTEN__
                 settingsSectionHeader("Chudware account", /*first=*/true);
                 ui::drawAccountSettings(st);
 #endif
-                settingsSectionHeader("Document", /*first=*/true);
-                ImGui::TextUnformatted("Units");
-                helpMarker("The unit system for dimension display and input. The model is always "
-                           "stored in canonical millimeters; this only changes how lengths are "
-                           "shown and how a bare typed number is read. Angles stay in degrees in "
-                           "both systems. You can also click the MMGS/IPS badge in the status bar "
-                           "to switch.");
+                settingsGlassSectionBegin("##gen_document", "Document");
+                static const char* kUnitHelp =
+                    "The unit system for dimension display and input. The model is always "
+                    "stored in canonical millimeters; this only changes how lengths are "
+                    "shown and how a bare typed number is read. Angles stay in degrees in "
+                    "both systems. You can also click the MMGS/IPS badge in the status bar "
+                    "to switch.";
+                static const char* kDisplayQualityHelp =
+                    "How finely curved geometry is tessellated for DISPLAY. Fine (default) "
+                    "keeps tubes, wheels and fillets smooth on large imported parts; Draft "
+                    "trades smoothness for triangles on very heavy models. Geometry, mass "
+                    "properties and exports are unaffected. Saved immediately and applied "
+                    "to every open document.";
+                const float docLabelW =
+                    ImMax(settingsLabelLeadWidth("Units", true),
+                          settingsLabelLeadWidth("Display quality", true));
+                settingsLabelLead("Units", kUnitHelp, docLabelW);
+                static const char* kUnitLabels[] = {"MMGS", "IPS"};
+                static const char* kUnitTips[] = {"Millimeter, gram, second",
+                                                  "Inch, pound, second"};
                 int unitSel = st.ips() ? 1 : 0;
-                bool unitsChanged = false;
-                unitsChanged |= ImGui::RadioButton("MMGS (millimeter, gram, second)", &unitSel, 0);
-                unitsChanged |= ImGui::RadioButton("IPS (inch, pound, second)", &unitSel, 1);
-                if (unitsChanged) {
+                if (ui::kit::segmented("##units", kUnitLabels, 2, &unitSel, 0.0f, kUnitTips)) {
                     settings.units = (unitSel == 1) ? Units::IPS : Units::MMGS;
                     // Saved immediately so the choice survives a Cancel (it is a display/document
                     // preference, like theme — and the status-bar toggle persists the same way).
                     saveSettings(settings);
                     st.addLog(std::string("[units] set to ") + (st.ips() ? "IPS" : "MMGS"));
                 }
-                dimText("Changes how lengths display/parse everywhere (saved immediately).");
+                ImGui::SameLine();
+                ImGui::AlignTextToFramePadding();
+                dimText(st.ips() ? "inch, pound, second" : "millimeter, gram, second");
 
                 // Display tessellation quality (contracts/doc_ops.md §7). Saved immediately like
                 // Units above, then pushed to every open part/assembly doc so the viewport
                 // re-meshes at the new deflections without a reopen.
-                ImGui::Dummy(ImVec2(0, 6 * sc));
-                ImGui::TextUnformatted("Display quality");
-                helpMarker("How finely curved geometry is tessellated for DISPLAY. Fine (default) "
-                           "keeps tubes, wheels and fillets smooth on large imported parts; Draft "
-                           "trades smoothness for triangles on very heavy models. Geometry, mass "
-                           "properties and exports are unaffected. Saved immediately and applied "
-                           "to every open document.");
+                settingsLabelLead("Display quality", kDisplayQualityHelp, docLabelW);
                 static const char* kDisplayQualityLabels[] = {"Draft", "Standard", "Fine"};
                 static const char* kDisplayQualityValues[] = {"draft", "standard", "fine"};
                 int dqSel = 2;
                 for (int i = 0; i < 3; ++i)
                     if (settings.displayQuality == kDisplayQualityValues[i]) dqSel = i;
-                ImGui::SetNextItemWidth(220.0f * sc);
-                if (settingsPopupRowCombo("##display_quality", &dqSel,
-                                          kDisplayQualityLabels, 3)) {
+                if (ui::kit::segmented("##display_quality", kDisplayQualityLabels, 3, &dqSel)) {
                     settings.displayQuality = kDisplayQualityValues[dqSel];
                     saveSettings(settings);
                     if (st.workerStarted) {
@@ -6745,7 +6859,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                     }
                     st.addLog(std::string("[display] quality set to ") + settings.displayQuality);
                 }
-                dimText("Display-only mesh smoothness (saved immediately).");
+                dimText("Display-only mesh smoothness; lengths display/parse in the chosen units "
+                        "everywhere. Both save immediately.");
+                settingsGlassSectionEnd();
 
                 // Configurations moved here from the left-pane strip (Graph took that slot).
                 settingsSectionHeader("Configurations");
@@ -6757,7 +6873,8 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                 // Workspace folder (audit P1): workspace_dir was persisted but had NO UI —
                 // users had to hand-edit config.json to re-root the File Explorer.
-                settingsSectionHeader("Workspace");
+                settingsGlassSectionBegin("##gen_workspace", "Workspace");
+                ImGui::AlignTextToFramePadding();
                 ImGui::TextUnformatted("Workspace folder");
 #ifdef __EMSCRIPTEN__
                 // Web: default is the server workspace abs root (fsBackend), not the
@@ -6781,7 +6898,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                     ImGui::InputTextWithHint("##wsdir", s_wsHintWeb.c_str(),
                                              s_wsBuf.data(), s_wsBuf.size());
                     ImGui::SameLine();
-                    if (ImGui::Button("Browse\xe2\x80\xa6", ImVec2(90.0f * sc, 0))) {
+                    if (ui::kit::secondaryButton("Browse\xe2\x80\xa6", true, nullptr, ImVec2(90.0f * sc, 0))) {
                         std::string chosen = openFolderDialog();
                         if (!chosen.empty() && chosen != "/workspace") {
                             std::fill(s_wsBuf.begin(), s_wsBuf.end(), 0);
@@ -6789,7 +6906,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         }
                     }
                     ImGui::SameLine();
-                    if (ImGui::Button("Apply", ImVec2(100.0f * sc, 0))) {
+                    if (ui::kit::primaryButton("Apply", true, nullptr, ImVec2(100.0f * sc, 0))) {
                         std::string chosen = s_wsBuf.data();
                         // Never persist the literal '/workspace' stub — resolve real root.
                         if (chosen.empty() || chosen == "/workspace") {
@@ -6822,7 +6939,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::InputTextWithHint("##wsdir", s_wsHint.c_str(),
                                          s_wsBuf.data(), s_wsBuf.size());
                 ImGui::SameLine();
-                if (ImGui::Button("Apply", ImVec2(100.0f * sc, 0))) {
+                if (ui::kit::primaryButton("Apply", true, nullptr, ImVec2(100.0f * sc, 0))) {
                     settings.workspaceDir = s_wsBuf.data();
                     saveSettings(settings);
                     // Re-resolve the live root: empty falls back to Documents/Chudware inside
@@ -6834,44 +6951,47 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
                 dimText("Root of the File Explorer and default save location (saved on Apply).");
 #endif
-                settingsSectionHeader("Box.com mirror");
-                if (ImGui::Checkbox("Mirror saved projects to Box", &settings.boxEnabled)) {
+                settingsGlassSectionEnd();
+
+                settingsGlassSectionBegin("##gen_box", "Box.com mirror");
+                if (ui::kit::checkbox("box_enabled", "Mirror saved projects to Box",
+                                      &settings.boxEnabled)) {
                     saveSettings(settings);
                     requestBoxStatus(st);
                 }
                 dimText("Saved project files are queued in the background; saves never wait for Box.");
 
-                ImGui::TextUnformatted("Folder ID");
+                const float boxLabelW = ImMax(settingsLabelLeadWidth("Developer token", false),
+                                              settingsLabelLeadWidth("Client secret", false));
+                settingsLabelLead("Folder ID", nullptr, boxLabelW);
                 ImGui::SetNextItemWidth(-1.0f);
                 ImGui::InputTextWithHint("##box_folder_id", "Box folder id (0 = All Files)",
                                          s_boxFolderBuf.data(), s_boxFolderBuf.size());
 
-                ImGui::TextUnformatted("Auth method");
-                ImGui::SetNextItemWidth(-1.0f);
-                static const char* kBoxAuthMethods[] = {"developer_token", "oauth"};
-                ImGui::Combo("##box_auth_method", &s_boxAuthMethod, kBoxAuthMethods,
-                             (int)(sizeof(kBoxAuthMethods) / sizeof(kBoxAuthMethods[0])));
+                settingsLabelLead("Auth method", nullptr, boxLabelW);
+                static const char* kBoxAuthLabels[] = {"Developer token", "OAuth"};
+                ui::kit::segmented("##box_auth_method", kBoxAuthLabels, 2, &s_boxAuthMethod);
 
-                ImGui::TextUnformatted("Developer token");
+                settingsLabelLead("Developer token", nullptr, boxLabelW);
                 ImGui::SetNextItemWidth(-1.0f);
                 ImGui::InputTextWithHint("##box_developer_token", "Box developer token",
                                          s_boxDeveloperTokenBuf.data(),
                                          s_boxDeveloperTokenBuf.size(),
                                          ImGuiInputTextFlags_Password);
 
-                ImGui::TextUnformatted("Client ID");
+                settingsLabelLead("Client ID", nullptr, boxLabelW);
                 ImGui::SetNextItemWidth(-1.0f);
                 ImGui::InputTextWithHint("##box_client_id", "Box OAuth client ID",
                                          s_boxClientIdBuf.data(), s_boxClientIdBuf.size());
 
-                ImGui::TextUnformatted("Client secret");
+                settingsLabelLead("Client secret", nullptr, boxLabelW);
                 ImGui::SetNextItemWidth(-1.0f);
                 ImGui::InputTextWithHint("##box_client_secret", "Box OAuth client secret",
                                          s_boxClientSecretBuf.data(),
                                          s_boxClientSecretBuf.size(),
                                          ImGuiInputTextFlags_Password);
 
-                if (ImGui::Button("Apply##box", ImVec2(100.0f * sc, 0))) {
+                if (ui::kit::primaryButton("Apply##box", true, nullptr, ImVec2(100.0f * sc, 0))) {
                     settings.boxFolderId =
                         s_boxFolderBuf[0] ? std::string(s_boxFolderBuf.data()) : std::string("0");
                     settings.boxAuthMethod =
@@ -6888,7 +7008,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                     settings.boxAuthMethod != "oauth" ||
                     s_boxMirrorUi.connectInFlight || !st.workerStarted;
                 ImGui::BeginDisabled(oauthLoginDisabled);
-                if (ImGui::Button(s_boxMirrorUi.connectInFlight
+                if (ui::kit::secondaryButton(s_boxMirrorUi.connectInFlight
                                       ? "Connecting Box account\xe2\x80\xa6"
                                       : "Connect Box account\xe2\x80\xa6"))
                     beginBoxOAuthLogin(st);
@@ -6901,7 +7021,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 const bool syncDisabled =
                     s_boxMirrorUi.syncInFlight || !st.workerStarted || !settings.boxEnabled;
                 ImGui::BeginDisabled(syncDisabled);
-                if (ImGui::Button(s_boxMirrorUi.syncInFlight ? "Syncing\xe2\x80\xa6" : "Sync now")) {
+                if (ui::kit::secondaryButton(s_boxMirrorUi.syncInFlight ? "Syncing\xe2\x80\xa6" : "Sync now")) {
                     const std::string projectRoot = st.plmProjectPath();
                     if (projectRoot.empty())
                         s_boxMirrorUi.actionStatus =
@@ -6916,11 +7036,11 @@ void drawSettingsModal(AppState& st, bool busy) {
                 if (!s_boxMirrorUi.actionStatus.empty())
                     boxStatusLine = s_boxMirrorUi.actionStatus + "  |  " + boxStatusLine;
                 dimText(boxStatusLine.c_str());
+                settingsGlassSectionEnd();
 
-
-                // Theme moved to the Appearance tab (the canonical control); engine routing +
+                // Theme moved to the Appearance page (the canonical control); engine routing +
                 // profiler are status/launchers, folded under one System section (audit P2).
-                settingsSectionHeader("System");
+                settingsGlassSectionBegin("##gen_system", "System");
                 // R5a (T-RF21): routing is unconditional — the C++ core IS the engine
                 // (the CHUDWARE_CPP_* escape hatches were removed with the Python oracle).
                 if (core::cpp_core().available()) {
@@ -6968,107 +7088,34 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::Dummy(ImVec2(0, 8 * sc));
                 dimText("Sampling profiler \xe2\x80\x94 see where modeling time goes (extrude / "
                         "fillet / boolean, into the kernel) as a live flame graph.");
-                if (ImGui::Button("Open Profiler", ImVec2(160.0f * sc, 30.0f * sc)))
+                if (ui::kit::secondaryButton("Open Profiler", true, nullptr, ImVec2(160.0f * sc, 30.0f * sc)))
                     st.showProfilerWindow = true;
+                settingsGlassSectionEnd();
                 ImGui::Dummy(ImVec2(0, 6 * sc));
                 dimText(("All settings here are stored in " + configPath() + ".").c_str());
                 settingsTabBodyEnd();
-                ImGui::EndTabItem();
             }
-            // ---- AI tab: unified hub (absorbed Benchmarks / Prompts / Agent / Experimental) ----
-            // Tab indices: 0=Appearance 1=General 2=AI 3=Providers. s_aiSubJump is resolved
-            // above, before the tab bar, so a jump lands on the right sub-tab the same frame.
-            if (ImGui::BeginTabItem("AI", nullptr,
-                                    (jumpToTab == 2) ? ImGuiTabItemFlags_SetSelected
-                                                     : ImGuiTabItemFlags_None)) {
+            // ---- AI page: unified hub (absorbed Benchmarks / Prompts / Agent / Experimental) ----
+            // s_aiSubJump is resolved above, before the navigation, so a jump lands on the right
+            // section the same frame.
+            if (s_settingsPage == 2) {
                 settingsTabBodyBegin("##tab_ai", /*scroll=*/false,
                                      /*padX=*/0.0f, /*padY=*/0.0f);
 
-                // AI sub-navigation: left vertical rail + content pane, mirroring
-                // drawOmpProviderManager's split. Under 640*sc the rail collapses to a combo
-                // (design §3.1). Only the SELECTED section's body runs each frame —
-                // Benchmarks' status polling relies on that.
-                static const char* kAiSubLabels[8] = {
-                    "Harness", "Roles", "Prompts", "Skills",
-                    "Rules", "Benchmarks", "Tools", "Dev Preview"};
-                // Basic mode paints only the everyday sections (kAiSubAdvanced, file scope).
-                // visIdx maps a rail/combo row back to its REAL section index, so the body
-                // dispatch below keeps switching on the stable index and needs no edits —
-                // that is what keeps this filter from touching eight section bodies.
-                const char* visLabels[8];
-                int visIdx[8];
-                int visN = 0;
-                for (int i = 0; i < 8; ++i) {
-                    if (!st.settings.showAdvanced && kAiSubAdvanced[i]) continue;
-                    visLabels[visN] = kAiSubLabels[i];
-                    visIdx[visN] = i;
-                    ++visN;
-                }
-                // Turning Advanced off while parked on an advanced section would otherwise
-                // render a body with no corresponding rail row. Fall back to Harness.
-                if (!st.settings.showAdvanced && s_aiSubSel >= 0 && s_aiSubSel < 8 &&
-                    kAiSubAdvanced[s_aiSubSel])
-                    s_aiSubSel = 0;
-                int visSel = 0;
-                for (int k = 0; k < visN; ++k)
-                    if (visIdx[k] == s_aiSubSel) {
-                        visSel = k;
-                        break;
-                    }
-                // With one visible section there is nothing to navigate: a rail (or combo)
-                // offering a single choice is pure noise, and skipping it hands the whole
-                // pane width to the content. This is the Basic-mode shape.
-                const bool aiNav = visN > 1;
-                const bool aiNarrow = ImGui::GetContentRegionAvail().x < 640.0f * sc;
-                if (!aiNav) {
-                    // No navigation chrome at all.
-                } else if (aiNarrow) {
+                // AI sub-navigation: wide dialogs list the sections in the settings rail under
+                // "AI" (above); phone-width dialogs have no rail, so a section picker leads the
+                // page. Only the SELECTED section's body runs each frame — Benchmarks' status
+                // polling relies on that.
+                if (aiNav && !navRail) {
+                    int visSel = 0;
+                    for (int k = 0; k < visN; ++k)
+                        if (visIdx[k] == s_aiSubSel) {
+                            visSel = k;
+                            break;
+                        }
                     ImGui::SetNextItemWidth(-1);
                     if (settingsPopupRowCombo("##ai_sub_pick", &visSel, visLabels, visN))
                         s_aiSubSel = visIdx[visSel];
-                } else {
-                    // Borderless nav rail. Rows are the kit's rounded glass rows, inset by
-                    // this child's padding so the selection pill never touches the pane edge.
-                    const ImVec2 railMn = ImGui::GetCursorScreenPos();
-                    const float railAvailH = ImGui::GetContentRegionAvail().y;
-                    const float railW = 148.0f * sc;
-                    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                                        ImVec2(6.0f * sc, 6.0f * sc));
-                    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                                        ImVec2(6.0f * sc, 2.0f * sc));
-                    ImGui::BeginChild("##ai_rail", ImVec2(railW, 0),
-                                      ImGuiChildFlags_AlwaysUseWindowPadding,
-                                      ImGuiWindowFlags_NoScrollbar |
-                                          ImGuiWindowFlags_NoScrollWithMouse);
-                    for (int k = 0; k < visN; ++k) {
-                        const int i = visIdx[k];
-                        ImGui::PushID(i);
-                        const bool selRow = (i == s_aiSubSel);
-                        if (settingsChildRowSelectable(kAiSubLabels[i], selRow))
-                            s_aiSubSel = i;
-                        if (selRow) ImGui::SetItemDefaultFocus();
-                        ImGui::PopID();
-                    }
-                    // Discoverability: say that more sections exist rather than leaving the
-                    // hidden ones to be found by accident. Without this the rail silently
-                    // shrinks from 8 rows to 3 and looks like the app lost features.
-                    if (!st.settings.showAdvanced && visN < 8) {
-                        ImGui::Dummy(ImVec2(0, 4.0f * sc));
-                        char more[32];
-                        std::snprintf(more, sizeof(more), "+%d in Advanced", 8 - visN);
-                        dimText(more);
-                    }
-                    ImGui::EndChild();
-                    ImGui::PopStyleVar(2);  // ItemSpacing, WindowPadding
-                    {
-                        float edge[4];
-                        ui::Palette::withAlpha(ui::palette.glassBorder, edge, 0.6f);
-                        const float dx = railMn.x + railW + 3.5f * sc;
-                        ImGui::GetWindowDrawList()->AddLine(
-                            ImVec2(dx, railMn.y), ImVec2(dx, railMn.y + railAvailH),
-                            ui::Palette::toU32(edge));
-                    }
-                    ImGui::SameLine(0, 8.0f * sc);
                 }
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                                     ImVec2(10.0f * sc, 6.0f * sc));
@@ -7088,7 +7135,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                     // seven pages. Names them explicitly rather than just counting.
                     if (!aiNav && !st.settings.showAdvanced) {
                         dimText("Roles, Prompts, Skills, Rules, Benchmarks, Tools and Dev "
-                                "Preview are in Advanced (switch at the top right).");
+                                "Preview appear when Advanced is turned on.");
                         ImGui::Dummy(ImVec2(0, 6.0f * sc));
                     }
 
@@ -7266,7 +7313,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                             }
                             ImGui::PopFont();
                             flushSystemPromptOverride(st, /*force=*/false);
-                            if (ImGui::Button("Clear (use built-in)")) {
+                            if (ui::kit::secondaryButton("Clear (use built-in)")) {
                                 std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
                                 commitSystemPromptOverride(st);  // empty = built-in, persist now
                             }
@@ -7297,19 +7344,18 @@ void drawSettingsModal(AppState& st, bool busy) {
                             ImGui::InputTextMultiline("##prompted", pr.buf.data(), pr.buf.size(),
                                                       ImVec2(-1, edH));
                             ImGui::PopFont();
-                            if (!canFetch) ImGui::BeginDisabled();
-                            if (primaryButton("Save", ImVec2(80.0f * sc, 28.0f * sc))) {
+                            const char* noFetch = "Prompts are unavailable until the engine is connected.";
+                            if (ui::kit::primaryButton("Save", canFetch, noFetch,
+                                                       ImVec2(80.0f * sc, 28.0f * sc))) {
                                 savePromptOverride(pr);
                                 st.addLog("[ok] prompt saved: " + pr.role);
                             }
-                            if (!canFetch) ImGui::EndDisabled();
                             ImGui::SameLine();
-                            if (!canFetch) ImGui::BeginDisabled();
-                            if (ImGui::Button("Reset to built-in", ImVec2(140.0f * sc, 28.0f * sc))) {
+                            if (ui::kit::secondaryButton("Reset to built-in", canFetch, noFetch,
+                                                         ImVec2(140.0f * sc, 28.0f * sc))) {
                                 resetPromptOverride(pr, st);
                                 st.addLog("[ok] prompt reset: " + pr.role);
                             }
-                            if (!canFetch) ImGui::EndDisabled();
                             if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("Delete override and restore shipped prompt");
                         } else {
@@ -7463,7 +7509,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                             ImGui::Dummy(ImVec2(0, 4.0f * sc));
                             if (!s_globalErr.empty())
                                 ImGui::TextColored(settingsErrInk(), "%s", s_globalErr.c_str());
-                            if (ImGui::Button("Save global limits", ImVec2(180.0f * sc, 0))) {
+                            if (ui::kit::primaryButton("Save global limits", true, nullptr,
+                                                       ImVec2(180.0f * sc, 0))) {
                                 if (updateConfigJson([&](nlohmann::json& j) {
                                         if (!j.contains("agent") || !j["agent"].is_object())
                                             j["agent"] = nlohmann::json::object();
@@ -8349,8 +8396,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                             if (!s_toolOptErr.empty()) {
                                 ImGui::TextColored(settingsErrInk(), "%s", s_toolOptErr.c_str());
                             }
-                            if (ImGui::Button("Save role tools & options",
-                                              ImVec2(240.0f * sc, 0))) {
+                            if (ui::kit::primaryButton("Save role tools & options", true, nullptr,
+                                                       ImVec2(240.0f * sc, 0))) {
                                 nlohmann::json rt = nlohmann::json::object();
                                 for (const auto& kv : s_roleTools) {
                                     nlohmann::json arr = nlohmann::json::array();
@@ -8419,12 +8466,12 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 }
                             }
                             ImGui::SameLine();
-                            if (ImGui::Button("Reset role defaults", ImVec2(160.0f * sc, 0))) {
+                            if (ui::kit::secondaryButton("Reset role defaults", true, nullptr, ImVec2(160.0f * sc, 0))) {
                                 seedDefaultRoleTools();
                                 s_roleToolsDirty = true;
                             }
                             ImGui::SameLine();
-                            if (ImGui::Button("Reset tool options", ImVec2(150.0f * sc, 0))) {
+                            if (ui::kit::secondaryButton("Reset tool options", true, nullptr, ImVec2(150.0f * sc, 0))) {
                                 s_toolEnabled.clear();
                                 s_toolTimeout.clear();
                                 s_toolMaxCalls.clear();
@@ -8537,7 +8584,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         if (s_devFetching) ImGui::EndDisabled();
                         ImGui::SameLine();
                         if (!canDev || s_devFetching) ImGui::BeginDisabled();
-                        if (ImGui::Button("Refresh##dev_preview", ImVec2(100.0f * sc, 0)))
+                        if (ui::kit::secondaryButton("Refresh##dev_preview", true, nullptr, ImVec2(100.0f * sc, 0)))
                             fetchDevPreview();
                         if (!canDev || s_devFetching) ImGui::EndDisabled();
                         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -8600,17 +8647,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::PopStyleVar();  // WindowPadding (content pane)
                 s_aiSubJump = -1;
                 settingsTabBodyEnd();
-                ImGui::EndTabItem();
             }
 
-// ---- Providers tab: Chudcode two-pane provider manager -----------------------------
-            const char* providersTabLabel = compactTabs
-                ? (s_omp.oauth.active ? "Keys!###Providers" : "Keys###Providers")
-                : (s_omp.oauth.active ? "Providers (sign-in active)###Providers"
-                                      : "Providers###Providers");
-            if (ImGui::BeginTabItem(providersTabLabel, nullptr,
-                                    (jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
-                                                     : ImGuiTabItemFlags_None)) {
+            // ---- Providers page: two-pane provider manager ----
+            if (s_settingsPage == 3) {
                 providerTabDrawn = true;
                 settingsTabBodyBegin("##tab_providers");
                 dimText(ui::webProviderKeysAvailable()
@@ -8662,45 +8702,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
 
                 settingsTabBodyEnd();
-                ImGui::EndTabItem();
             }
-
-            // ---- Basic / Advanced disclosure switch ----
-            // Right-aligned in the tab strip itself (Trailing), so it is visible from every
-            // tab and reads as a property of the whole modal rather than of one page.
-            //
-            // Why this exists: the settings surface had grown to ~130 indexed entries across
-            // 4 tabs plus an 8-section AI hub with NO triage whatsoever — a tool-call budget
-            // slider carried exactly the same visual weight as "should the assistant plan
-            // before building". Reading all of it end to end is the hour the owner reported.
-            // Basic mode is the fix; it hides power controls and disables nothing.
-            //
-            // Plain ASCII label: the tab strip is drawn with the UI font, and a glyph the
-            // atlas has no cell for renders as '?' (scripts/gui_lint.py --rule glyph).
-            {
-                const char* advLabel = compactTabs
-                    ? (st.settings.showAdvanced ? "Adv: On" : "Adv: Off")
-                    : (st.settings.showAdvanced ? "Advanced: On" : "Advanced: Off");
-                if (ImGui::TabItemButton(advLabel, ImGuiTabItemFlags_Trailing |
-                                                       ImGuiTabItemFlags_NoTooltip)) {
-                    st.settings.showAdvanced = !st.settings.showAdvanced;
-                    saveSettings(st.settings);
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip(
-                        "Advanced settings\n"
-                        "Off: only the controls most users need.\n"
-                        "On: every tuning, authoring and diagnostic control.\n\n"
-                        "Nothing is disabled while this is off — hidden controls keep "
-                        "their current values, config.json stays authoritative, and\n"
-                        "searching for a hidden setting turns this on for you.");
-                }
-            }
-            // --- end C22b marked block ---
-            ImGui::EndTabBar();
         }
         if (!providerTabDrawn) leaveOmpProviderView();
-        ImGui::Unindent(10.0f * sc);
         ImGui::EndChild();
         // Nested modal: must be submitted every frame inside the Settings window scope or
         // ImGui's modal stack makes it non-interactive. It clears the flag itself on close.

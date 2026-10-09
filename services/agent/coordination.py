@@ -21,7 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 COORDINATION_SCHEMA = "aicad.coordination/1"
 DEFAULT_PROGRESS_LIMIT = 50
@@ -126,12 +126,16 @@ class CoordinationBoard:
         runs_dir: Path | None = None,
         persist: bool = True,
         progress_limit: int = DEFAULT_PROGRESS_LIMIT,
+        on_event: Callable[..., None] | None = None,
     ) -> None:
         self.run_id = run_id or f"r_{uuid.uuid4().hex[:8]}"
         self._runs_dir = runs_dir
         self._persist = persist
         self._progress_limit = max(1, int(progress_limit))
         self._lock = threading.RLock()
+        # Live GUI event sink for board posts (agent_events ``live`` shape). When
+        # unset, posts follow the ambient per-turn sink instead (_live_sink).
+        self.on_event = on_event
         # resource -> Claim
         self._claims: dict[str, Claim] = {}
         self._progress: list[ProgressNote] = []
@@ -297,13 +301,58 @@ class CoordinationBoard:
             if len(self._progress) > self._progress_limit:
                 self._progress = self._progress[-self._progress_limit:]
             self._flush_sidecar()
-            return {
-                "ok": True,
-                "status": "posted",
-                "agent_id": agent,
-                "note": text,
-                "ts": entry.ts,
-            }
+        self._forward_post(agent, text)
+        return {
+            "ok": True,
+            "status": "posted",
+            "agent_id": agent,
+            "note": text,
+            "ts": entry.ts,
+        }
+
+    # -- live forwarding --------------------------------------------------------
+
+    def _live_sink(self) -> Callable[..., None] | None:
+        """The board's own sink, else the turn's ambient live sink.
+
+        ``agent_turn.run_turn`` installs its ordered event sink on
+        ``task_list``'s contextvar for every turn; a board post made by a tool
+        dispatched inside that turn reaches the same stream through it.
+        """
+        if self.on_event is not None:
+            return self.on_event
+        try:
+            from services.agent import task_list  # noqa: PLC0415 — optional
+            return task_list._SINK.get()
+        except Exception:  # noqa: BLE001 — forwarding is display-only
+            return None
+
+    def _forward_post(self, agent: str, text: str) -> None:
+        """Mirror one board post to the GUI as an ``agent.message`` (channel=board).
+
+        Display-only: a missing or raising sink never affects the post.
+        """
+        sink = self._live_sink()
+        if sink is None:
+            return
+        try:
+            from services.agent import agent_events  # noqa: PLC0415
+            agent_events.emit_event(
+                "agent.message",
+                {
+                    "node_id": agent,
+                    "id": agent_events.new_span_id(),
+                    "run_id": self.run_id,
+                    "actor": agent,
+                    "channel": "board",
+                    "from": agent,
+                    "to": "board",
+                    "text": text,
+                },
+                live=sink,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def board_snapshot(self) -> dict[str, Any]:
         """Return active claims + recent progress notes."""
@@ -464,19 +513,24 @@ def get_board(
     runs_dir: Path | None = None,
     persist: bool = True,
     create: bool = True,
+    on_event: Callable[..., None] | None = None,
 ) -> CoordinationBoard | None:
-    """Return the shared CoordinationBoard for *run_id* (create on demand)."""
+    """Return the shared CoordinationBoard for *run_id* (create on demand).
+
+    *on_event* binds the board's live GUI sink when it has none yet.
+    """
     rid = str(run_id or "").strip()
     if not rid:
         return None
     with _BOARDS_LOCK:
         board = _BOARDS.get(rid)
-        if board is not None:
-            return board
-        if not create:
-            return None
-        board = CoordinationBoard(rid, runs_dir=runs_dir, persist=persist)
-        _BOARDS[rid] = board
+        if board is None:
+            if not create:
+                return None
+            board = CoordinationBoard(rid, runs_dir=runs_dir, persist=persist)
+            _BOARDS[rid] = board
+        if on_event is not None and board.on_event is None:
+            board.on_event = on_event
         return board
 
 

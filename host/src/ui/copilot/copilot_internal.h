@@ -218,6 +218,9 @@ std::string stripMdMarks(const std::string& in, std::vector<size_t>* srcOf = nul
 // The one truncation primitive for chat chrome — call it inside the PushFont whose metrics
 // the label will be drawn with. Returns the input unchanged when it already fits.
 std::string chatEllipsize(const std::string& s, float maxW);
+// The transcript's one disclosure chevron (activity_timeline.cpp): a stroked right-pointing
+// chevron rotating to point down as `openT` goes 0 -> 1. Shared with chat_log.cpp.
+void chatPaintDisclosure(ImDrawList* dl, ImVec2 c, float r, float openT, ImU32 col);
 // Fence-aware assistant prose: ``` spans render via drawCodeBox, everything else through
 // stripMdMarks + chatDrawSelectableText. Returns the last prose segment's InputText id.
 ImGuiID     drawMdProse(const char* id, const std::string& in, const ImVec4& col, ImFont* mono);

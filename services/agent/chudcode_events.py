@@ -1133,6 +1133,61 @@ def _subagent_frame(
 
 
 
+# Chudcode IRC record customTypes -> agent.message channel. `irc:incoming` is a
+# message delivered to the session whose stream carries it (the top-level stream
+# is the main agent's); `irc:relay` mirrors sub-agent <-> sub-agent traffic onto
+# the main session; `irc:workpool` is a workpool dispatch card.
+_IRC_CHANNELS = {"irc:incoming": "irc", "irc:relay": "irc", "irc:workpool": "pool"}
+_IRC_MAIN_AGENT = "Main"   # Chudcode MAIN_AGENT_ID
+_IRC_HEADER = re.compile(r"^\[(?:IRC|pool)[^\]\n]{0,300}\]\s*", re.IGNORECASE)
+
+
+def _irc_message(
+    data: Mapping[str, Any], link: Mapping[str, Any]
+) -> list[tuple[str, dict[str, Any]]]:
+    """One ``irc_message`` frame as an ``agent.message`` transcript row.
+
+    Display-only forwarding of inter-agent traffic: sender, recipient and the
+    message body (never the rendered prompt wrapper around it).
+    """
+    message = data.get("message")
+    if not isinstance(message, Mapping):
+        return []
+    raw_details = message.get("details")
+    details: Mapping[str, Any] = raw_details if isinstance(raw_details, Mapping) else {}
+    custom = _str(message, "customType", limit=64)
+    content = _str(message, "content", limit=_MAX_DETAIL)
+    sender = _str(details, "from", limit=120)
+    if not sender:
+        found = re.search(r"from agent `([^`]{1,120})`", content)
+        sender = found.group(1) if found else ""
+    recipient = _str(details, "to", limit=120)
+    if not recipient and custom == "irc:incoming":
+        recipient = _IRC_MAIN_AGENT
+    text = _str(details, "message", "body", limit=_MAX_DETAIL)
+    if not text:
+        text = _IRC_HEADER.sub("", content, count=1).strip()
+    if not text:
+        return []
+    payload = _linked(
+        link,
+        channel=_IRC_CHANNELS.get(custom, "irc"),
+        to=recipient,
+        text=text,
+    )
+    payload["from"] = sender or "agent"
+    message_id = _str(details, "id", limit=160)
+    if message_id:
+        payload["message_id"] = message_id
+    reply_to = _str(details, "replyTo", "reply_to", limit=160)
+    if reply_to:
+        payload["reply_to"] = reply_to
+    mode = _str(details, "mode", limit=32)
+    if mode:
+        payload["mode"] = mode
+    return [("agent.message", payload)]
+
+
 def map_rpc_frame(
     frame: Mapping[str, Any],
     context: Mapping[str, Any] | None = None,
@@ -1204,17 +1259,7 @@ def map_rpc_frame(
             return []
         return [_status(link, "notice" if event == "notice" else "progress_nudge", text)]
     if event == "irc_message":
-        message = data.get("message")
-        body = _str(message, "content", limit=_MAX_DETAIL) if isinstance(message, Mapping) else ""
-        sender = re.search(r"from agent `([^`]{1,120})`", body)
-        row = _linked(
-            link,
-            purpose="Message from " + sender.group(1) if sender else "Agent message",
-            status="done",
-        )
-        if body:
-            row["detail"] = body
-        return [("sub_run", row)]
+        return _irc_message(data, link)
     if event == "agent_question":
         questions = [
             _question_payload(q)

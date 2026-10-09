@@ -162,6 +162,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/activity_timeline.cpp  # per-turn typed-block activity timeline
   src/ui/copilot/cards.cpp              # plan/clarify/corporate/swarm cards + AI-VC
   src/ui/copilot/feed.cpp               # feedTurnActivity stream-event folding
+  src/ui/copilot/agent_overview.cpp     # live sub-agent roster + todo checklist above the composer
   src/ui/copilot/conversations.cpp      # conversation tabs + chat-history persistence
   src/ui/copilot/conv_ids.cpp           # session-id allocation (GL-free; unit-tested)
   src/ui/copilot/agent_text.cpp         # doc-id + atlas-glyph text sanitizers (GL-free; unit-tested)

@@ -47,6 +47,7 @@
 
     {"kind": "ai_artifact", "required_fields": ["artifact_id", "insertion_point", "model", "prompt_hash", "input_ref", "output_ref", "base_revision", "verifier_scores", "latency_ms", "consent"], "optional": false, "emitter_note": "cpp (telemetry.md vocabulary)"},
     {"kind": "ai_artifact_action", "required_fields": ["artifact_id", "action", "revision", "edit_ops_ref", "undo_within_ops", "dwell_ms", "note", "consent"], "optional": false, "emitter_note": "cpp (telemetry.md vocabulary)"},
-    {"kind": "doc_semantic_diff", "required_fields": ["artifact_id", "from_revision", "to_revision", "diff_ref", "consent"], "optional": false, "emitter_note": "cpp (telemetry.md vocabulary)"}
+    {"kind": "doc_semantic_diff", "required_fields": ["artifact_id", "from_revision", "to_revision", "diff_ref", "consent"], "optional": false, "emitter_note": "cpp (telemetry.md vocabulary)"},
+    {"kind": "agent.message", "required_fields": ["node_id", "channel", "from", "to", "text"], "optional": true, "emitter_note": "services/agent/chudcode_events.py (Chudcode irc_message) + services/agent/coordination.py (board post_progress); outside scanned emitters, display-only (2026-10-08 additive)"}
   ]
 }

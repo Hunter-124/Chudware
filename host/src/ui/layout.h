@@ -88,16 +88,34 @@ float overlayColumnHeight(int slot);
 void publishDocTabBandBottom(float y);
 float docTabBandBottom();
 
+// ---- pinned-column resize boundary ---------------------------------------------------------------
+// ONE resize affordance for both pinned columns (FeatureManager's RIGHT edge, Copilot's LEFT edge):
+// a hairline boundary that brightens on hover, an always-faint grip pill at its vertical middle, a
+// soft accent glow along the edge on hover/drag (fading out top and bottom), the EW resize cursor,
+// and double-click to reset. Call inside the column window right after Begin(). The hit strip
+// covers the window-padding gutter along that edge and is an overlap-permissive item, so any widget
+// later submitted over it (and any child window) keeps its hover and clicks.
+// `currentWidth` is the column's width this frame; `interactive` false (fixed-width columns) paints
+// nothing and never hit-tests.
+struct ColumnResizeResult {
+    float width = 0.f;             // currentWidth, or drag-start width +/- drag distance (UNclamped)
+    bool  active = false;          // a drag is in progress
+    bool  resetRequested = false;  // double-clicked: caller restores its default width
+};
+ColumnResizeResult columnResizeEdge(const char* strId, bool rightEdge, float currentWidth,
+                                    bool interactive = true);
+
 // Draw the tabbed SolidWorks-style left manager as a pinned full-height rounded glass column over
 // the viewport's left edge (~12dp margins, below the doc-tab band). Owns the horizontal icon-tab
 // row + the active tab's body, the PM auto-switch (open-edge -> PropertyManager tab, close-edge
 // -> FeatureManager tab), the vertical collapse-to-header-strip affordance (T-G21: the column
 // rolls UP to its top tab row + collapse chevron instead of shrinking to a small pill; see
-// ui::PanelCollapseAnim in panel_collapse.h — shared with the Copilot column), and the invisible
-// right-edge resize. editCallback is forwarded to the FeatureManager body (a tree "Edit" reopens a
-// PM form). Call every frame in place of the old drawFeatureTree/PM block. In Simulate the column
-// is a separate window ("SimulationManager##LeftPane") with its own remembered width and the wider
-// metrics::simManagerPaneW default; every other workspace shares "FeatureManager##LeftPane".
+// ui::PanelCollapseAnim in panel_collapse.h — shared with the Copilot column), and the right-edge
+// resize boundary (columnResizeEdge). editCallback is forwarded to the FeatureManager body (a tree
+// "Edit" reopens a PM form). Call every frame in place of the old drawFeatureTree/PM block. In
+// Simulate the column is a separate window ("SimulationManager##LeftPane") with its own remembered
+// width and the wider metrics::simManagerPaneW default; every other workspace shares
+// "FeatureManager##LeftPane".
 void drawLeftPane(AppState& st,
                   const std::function<void(const std::string& featureId)>& editCallback = {});
 

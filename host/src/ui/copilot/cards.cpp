@@ -496,7 +496,7 @@ static void planDrawSubagents(const PlanState& plan,
                 r.status = a.status.empty() ? "pending" : a.status;
                 r.brief = a.reason.empty() ? a.detail : a.reason;
                 rows.push_back(std::move(r));
-            } else if (a.rowKind >= 4 && a.rowKind <= 8) {
+            } else if (a.rowKind >= 4 && a.rowKind <= 8 && a.stage.rfind("msg:", 0) != 0) {
                 AgRow r;
                 r.name = a.title.empty() ? "agent" : a.title;
                 r.status = a.status.empty() ? "done" : a.status;
@@ -1814,8 +1814,116 @@ void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts) {
     }
 }
 
-// Muted single-line activity (route rejection / wind-down summary).
+// Inter-agent message (rowKind 7, stage "msg:<channel>:<id>"; title = from, reason = to,
+// detail = body): ONE compact line — reply hook, channel tag, "from > to", the body's first
+// line — that expands to the whole body on click. Vector marks only: the font has no arrows.
+static void paintMsgArrow(ImDrawList* dl, float x0, float x1, float cy, ImU32 col) {
+    const float th   = ui::metrics::stroke(1.2f);
+    const float head = (x1 - x0) * 0.42f;
+    dl->AddLine(ImVec2(x0, cy), ImVec2(x1 - head * 0.5f, cy), col, th);
+    dl->AddTriangleFilled(ImVec2(x1, cy), ImVec2(x1 - head, cy - head * 0.62f),
+                          ImVec2(x1 - head, cy + head * 0.62f), col);
+}
+static void paintMsgHook(ImDrawList* dl, ImVec2 p, float s, ImU32 col) {
+    const float th = ui::metrics::stroke(1.2f);
+    const ImVec2 top(p.x + s * 0.22f, p.y + s * 0.20f);
+    const ImVec2 knee(p.x + s * 0.22f, p.y + s * 0.62f);
+    dl->AddLine(top, knee, col, th);
+    paintMsgArrow(dl, knee.x, p.x + s * 0.92f, knee.y, col);
+}
+
+static void drawAgentMessageLine(const ActivityItem& a, const ui::Fonts& fonts) {
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const size_t chEnd = a.stage.find(':', 4);
+    const std::string channel = chEnd == std::string::npos ? std::string("irc")
+                                                           : a.stage.substr(4, chEnd - 4);
+    const bool board = channel == "board";
+    const ui::kit::Tone tone = channel == "pool" ? ui::kit::Tone::Info
+                             : board             ? ui::kit::Tone::Neutral
+                                                 : ui::kit::Tone::Accent;
+    const char* tag = channel == "pool" ? "Pool" : board ? "Board" : "IRC";
+    const std::string& from = a.title;
+    const std::string& to   = a.reason;
+    const std::string& body = a.detail;
+    const size_t nl = body.find('\n');
+    const std::string first = nl == std::string::npos ? body : body.substr(0, nl);
+
+    ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
+    ImGuiStorage* store = ImGui::GetStateStorage();
+    const ImGuiID openKey = ImGui::GetID(("##msg_open" + a.stage).c_str());
+    bool open = store->GetBool(openKey, false);
+
+    ImGui::PushFont(fonts.body);
+    const float lineH = ImGui::GetTextLineHeight();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float w = std::max(ImGui::GetContentRegionAvail().x, ui::metrics::stroke(1.0f));
+    const float h = lineH + ui::kit::padY() * 2.0f;
+    const bool clicked = ui::kit::rowBegin(a.stage.c_str(), h, open);
+    const bool hovered = ImGui::IsItemHovered();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 toneCol = ImGui::ColorConvertFloat4ToU32(ui::kit::toneOn(tone, surf));
+    const ImU32 nameCol = ImGui::ColorConvertFloat4ToU32(surf.textSecondary);
+    const ImU32 bodyCol = ImGui::ColorConvertFloat4ToU32(surf.textTertiary);
+    const float gap = ui::metrics::U(1.5f);
+    const float cy = p0.y + h * 0.5f;
+    const float right = p0.x + w - ui::kit::padX();
+    float x = p0.x + ui::kit::padX();
+
+    paintMsgHook(dl, ImVec2(x, cy - lineH * 0.5f), lineH, toneCol);
+    x += lineH + gap * 0.5f;
+    ImGui::PushFont(fonts.medium);
+    dl->AddText(ImVec2(x, cy - ImGui::GetTextLineHeight() * 0.5f), toneCol, tag);
+    x += ImGui::CalcTextSize(tag).x + gap;
+    // Names share at most half the line so the body always shows.
+    const float nameMax = std::max((right - x) * 0.5f, ui::metrics::U(6));
+    const std::string fromS = ui::kit::elide(from.c_str(), board ? nameMax : nameMax * 0.5f);
+    dl->AddText(ImVec2(x, cy - ImGui::GetTextLineHeight() * 0.5f), nameCol, fromS.c_str());
+    x += ImGui::CalcTextSize(fromS.c_str()).x;
+    if (!board && !to.empty()) {
+        const float aw = lineH * 0.7f;
+        paintMsgArrow(dl, x + gap * 0.6f, x + gap * 0.6f + aw, cy, nameCol);
+        x += aw + gap * 1.2f;
+        const std::string toS = ui::kit::elide(to.c_str(), nameMax * 0.5f);
+        dl->AddText(ImVec2(x, cy - ImGui::GetTextLineHeight() * 0.5f), nameCol, toS.c_str());
+        x += ImGui::CalcTextSize(toS.c_str()).x;
+    }
+    ImGui::PopFont();
+    x += gap;
+    std::string firstS;
+    if (!open && x < right) {
+        firstS = ui::kit::elide(first.c_str(), right - x);
+        dl->AddText(ImVec2(x, cy - lineH * 0.5f), bodyCol, firstS.c_str());
+    }
+    ui::kit::rowEnd();
+    ImGui::PopFont();
+
+    if (clicked) store->SetBool(openKey, open = !open);
+    if (hovered && !open && (firstS != first || nl != std::string::npos))
+        ui::kit::tooltip(body.c_str());
+    const std::string copy = from + (board || to.empty() ? std::string() : " -> " + to) + ": " + body;
+    chatCopyContext(ImRect(p0, ImVec2(p0.x + w, p0.y + h)), "##agent_msg_copy", copy);
+    if (open) {
+        ImGui::PushFont(fonts.body);
+        ImGui::Indent(lineH + gap * 0.5f + ui::kit::padX());
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(body.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+        ImGui::Unindent(lineH + gap * 0.5f + ui::kit::padX());
+        ImGui::PopFont();
+        const ImRect r(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        chatCopyContext(r, "##agent_msg_body_copy", body);
+    }
+}
+
+// Muted single-line activity (route rejection / wind-down summary), or an inter-agent message.
 void drawCorpMutedLine(const ActivityItem& a, const ui::Fonts& fonts) {
+    if (a.rowKind == 7 && a.stage.rfind("msg:", 0) == 0) {
+        drawAgentMessageLine(a, fonts);
+        return;
+    }
     const ui::AdaptiveSurface& surf = chatSurf();
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     const std::string& line = !a.reason.empty() ? a.reason

@@ -1183,7 +1183,6 @@ void saveSubagentToolCallBudget(int budget) {
 
 void drawAISettingsBody(AppState& st, bool busy) {
     Settings& s = st.settings;
-    const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
     bool changed = false;
     (void)busy;
@@ -1201,155 +1200,134 @@ void drawAISettingsBody(AppState& st, bool busy) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui::metrics::U(1.0f), ui::metrics::U(0.85f)));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ui::metrics::U(1.5f), ui::metrics::U(0.75f)));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    // The menu views run at the docked-pane rhythm whatever the host pushed around us.
+    ui::kit::pushDensity(ui::kit::Density::Cozy);
 
     cpMenuHeader(st.fonts, "Quick settings",
                  "Session knobs. Full providers, roles and prompts live in Settings.");
 
-    // Fields sit on adaptive GLASS, not on ImGui's opaque dark FrameBg: with the default frame the
-    // combo/slider VALUES rendered near-invisible (dark ink on a dark frame over a bright
-    // viewport). Derive the frame from the surface ink, exactly like the composer toolbar chips.
-    const ImVec4 fieldBg (surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.08f);
-    const ImVec4 fieldHov(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.14f);
-    const ImVec4 fieldAct(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.18f);
-    // A combo POPUP is an opaque themed window, not glass — its ink must contrast with popupBg,
-    // not with the viewport backdrop (the glass tone can land dark-on-dark in there).
-    const ImVec4 popBg(pal.popupBg[0], pal.popupBg[1], pal.popupBg[2], pal.popupBg[3]);
-    auto pushField = [&]() {
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, fieldBg);
-        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, fieldHov);
-        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, fieldAct);
-        ImGui::PushStyleColor(ImGuiCol_Button, fieldBg);        // combo caret well == frame
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, fieldHov);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, fieldAct);
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
-        ImGui::PushStyleVar(ImGuiStyleVar_GrabRounding, ui::metrics::cpMenuChipRound());
-    };
-    auto popField = []() { ImGui::PopStyleVar(2); ImGui::PopStyleColor(7); };
-    // The ONE vertical gap this body owns: control -> next label. No ad-hoc Dummy() stacks, so the
-    // groups here share the rhythm of the Sessions / Tasks / Artifacts menus.
-    auto ctlGap = []() { ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap())); };
-
-    cpMenuSection("Autonomy");
-    static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
-    auto prefCombo = [&](const char* label, const char* id, int* pref) {
-        const int v = (*pref < 0 || *pref > 3) ? 0 : *pref;
-        cpMenuLabel(label);
-        ImGui::SetNextItemWidth(-1);
-        pushField();
-        // Selectable's own header fill is intentionally transparent: popup auto-sizing makes
-        // content-region widths unstable on the measuring frame, so each row is sized from its
-        // label until the popup has a real width and its blue fill is drawn manually edge to edge.
-        if (ImGui::BeginCombo(id, kPrefLabels[v])) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::maxContrastTextOn(popBg));
-            const ImGuiStyle& optionStyle = ImGui::GetStyle();
-            const float border = optionStyle.WindowBorderSize;
-            const float windowWidth = ImGui::GetWindowWidth();
-            const ImVec2 windowPos = ImGui::GetWindowPos();
-            const float labelInset = ui::metrics::U(2.0f);
-            for (int i = 0; i < 4; ++i) {
-                const bool selected = (i == v);
-                const float labelWidth =
-                    ImGui::CalcTextSize(kPrefLabels[i]).x + 2.0f * optionStyle.FramePadding.x;
-                const float rowWidth =
-                    ImMax(windowWidth - 2.0f * border, labelWidth) - labelInset;
-                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + labelInset);
-                const ImVec2 rowPos = ImGui::GetCursorScreenPos();
-                ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
-                ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
-                ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
-                const bool clicked =
-                    ImGui::Selectable(kPrefLabels[i], selected, ImGuiSelectableFlags_None,
-                                      ImVec2(rowWidth, 0.0f));
-                const bool hovered = ImGui::IsItemHovered();
-                ImGui::PopStyleColor(3);
-                if (selected || hovered) {
-                    const float rowHeight = ImGui::GetItemRectSize().y;
-                    ImGui::GetWindowDrawList()->AddRectFilled(
-                        ImVec2(windowPos.x + border, rowPos.y),
-                        ImVec2(windowPos.x + windowWidth - border, rowPos.y + rowHeight),
-                        ImGui::GetColorU32(
-                            ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.30f)));
-                }
-                if (clicked) {
-                    *pref = i;
-                    if (pref == &s.planPreference) s.planMode = (i != 0);
-                    changed = true;
-                }
-                if (selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::PopStyleColor();
-            ImGui::EndCombo();
+    // Two-column rows: caption left in ONE shared column (sized from the widest caption, capped
+    // so the control keeps most of the row), control right. Small enumerations are kit segmented
+    // controls; when the remainder cannot hold every segment unelided the control drops under its
+    // caption at full width — decided per row from the measured need, so a narrow pane never
+    // shows a clipped "Enc...". No combo popups here at all: the old hand-sized combo rows were
+    // the source of the dropdown that grew wider than its frame and flipped left.
+    static const char* kRowLabels[] = {"Plan", "Task list", "Subagents", "Advisor",
+                                       "Max nesting", "Project memory"};
+    float labelCol = 0.0f;
+    for (const char* l : kRowLabels) labelCol = std::max(labelCol, ImGui::CalcTextSize(l).x);
+    auto segRow = [&](const char* id, const char* label, const char* tip,
+                      const char* const* items, int n, int* sel) -> bool {
+        const float x0    = ImGui::GetCursorScreenPos().x;
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float gap   = ui::kit::padX();
+        const float col   = std::min(labelCol, avail * 0.45f);
+        float widest = 0.0f;
+        for (int i = 0; i < n; ++i) widest = std::max(widest, ImGui::CalcTextSize(items[i]).x);
+        const float need = (widest + ui::kit::padX() * 2.0f) * (float)n;
+        const bool  fits = avail - col - gap >= need;
+        ImGui::AlignTextToFramePadding();
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted(label);
+        ImGui::PopStyleColor();
+        if (tip && ImGui::IsItemHovered()) ui::kit::tooltip(tip);
+        float w = avail;
+        if (fits) {
+            ImGui::SameLine(0.0f, 0.0f);
+            ImGui::SetCursorScreenPos(ImVec2(x0 + col + gap, ImGui::GetCursorScreenPos().y));
+            w = avail - col - gap;
         }
-        popField();
-        ctlGap();
+        return ui::kit::segmented(id, items, n, sel, w);
     };
-    prefCombo("Plan preference", "##q_plan_pref", &s.planPreference);
-    prefCombo("Task list preference", "##q_tasklist_pref", &s.taskListPreference);
-    prefCombo("Subagent preference", "##q_sub_pref", &s.subagentPreference);
-    prefCombo("Advisor preference", "##q_adv_pref", &s.advisorPreference);
-    pushField();
-    if (ImGui::Checkbox("Proactive advisor", &s.proactiveAdvisor)) changed = true;
-    popField();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(
-            "Opt-in mid-run guidance on failures. Cheap notes by default; "
-            "rare short advisor call only on severe streaks.");
+    // Checkboxes flow two-up when the card is wide enough and wrap otherwise, so three booleans
+    // cost one or two lines instead of three.
+    auto checkFlow = [&](bool first, const char* id, const char* label, bool* v,
+                         const char* tip) -> bool {
+        if (!first) {
+            const float labelW = ImGui::GetTextLineHeight() + ui::metrics::U(2.0f) +
+                                 ImGui::CalcTextSize(label).x;
+            const float lastR  = ImGui::GetItemRectMax().x;
+            const float sp     = ui::kit::padX() * 2.0f;
+            const float right  = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+            if (lastR + sp + labelW <= right) ImGui::SameLine(0.0f, sp);
+        }
+        return ui::kit::checkbox(id, label, v, tip);
+    };
 
-    cpMenuSection("Session");
-    pushField();
-    if (ImGui::Checkbox("Vision (send screenshots)", &s.vision)) changed = true;
-    if (ImGui::Checkbox("Offline mode (local only)", &s.offlineMode)) changed = true;
-    ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
-    popField();
-
-    cpMenuSection("Limits");
-
-    static int s_maxDepth = -1;
-    if (s_maxDepth < 0) s_maxDepth = loadMaxSubagentDepth();
-    cpMenuLabel("Max subagent nesting");
-    ImGui::SetNextItemWidth(-1);
-    pushField();
-    int depth = s_maxDepth;
-    if (ImGui::SliderInt("##q_depth", &depth, 0, 4, "%d levels")) {
-        if (depth < 0) depth = 0;
-        if (depth > 4) depth = 4;
-        s_maxDepth = depth;
-        saveMaxSubagentDepth(depth);
+    // ---- Autonomy ----
+    if (ui::kit::cardBegin("q_card_autonomy", "Autonomy", "ai_panel")) {
+        static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
+        auto prefRow = [&](const char* label, const char* id, const char* tip, int* pref) {
+            int v = (*pref < 0 || *pref > 3) ? 0 : *pref;
+            if (segRow(id, label, tip, kPrefLabels, 4, &v)) {
+                *pref = v;
+                if (pref == &s.planPreference) s.planMode = (v != 0);
+                changed = true;
+            }
+        };
+        prefRow("Plan", "##q_plan_pref", "Plan preference", &s.planPreference);
+        prefRow("Task list", "##q_tasklist_pref", "Task list preference",
+                &s.taskListPreference);
+        prefRow("Subagents", "##q_sub_pref", "Subagent preference", &s.subagentPreference);
+        prefRow("Advisor", "##q_adv_pref", "Advisor preference", &s.advisorPreference);
+        if (ui::kit::checkbox("q_proactive", "Proactive advisor", &s.proactiveAdvisor,
+                              "Opt-in mid-run guidance on failures. Cheap notes by default; "
+                              "rare short advisor call only on severe streaks."))
+            changed = true;
     }
-    popField();
+    ui::kit::cardEnd();
+    ui::kit::gapRow();
 
-    cpMenuSection("Memory");
-    {
+    // ---- Session ----
+    if (ui::kit::cardBegin("q_card_session", "Session", "activity")) {
+        if (checkFlow(true, "q_vision", "Vision", &s.vision,
+                      "Send viewport screenshots so the model can see the part."))
+            changed = true;
+        if (checkFlow(false, "q_offline", "Offline (local only)", &s.offlineMode,
+                      "Refuse any cloud provider; only a local endpoint is used."))
+            changed = true;
+        checkFlow(false, "q_thoughts", "Show thoughts", &gShowThinking,
+                  "Show the assistant's reasoning inline (this session only).");
+    }
+    ui::kit::cardEnd();
+    ui::kit::gapRow();
+
+    // ---- Limits + memory ----
+    if (ui::kit::cardBegin("q_card_limits", "Limits & memory", "settings")) {
+        static int s_maxDepth = -1;
+        if (s_maxDepth < 0) s_maxDepth = loadMaxSubagentDepth();
+        static const char* kDepthLabels[] = {"0", "1", "2", "3", "4"};
+        int depth = std::max(0, std::min(4, s_maxDepth));
+        if (segRow("##q_depth", "Max nesting",
+                   "Max subagent nesting: how many levels deep a subagent may spawn its own "
+                   "subagents (0 = no subagents).",
+                   kDepthLabels, 5, &depth)) {
+            s_maxDepth = depth;
+            saveMaxSubagentDepth(depth);
+        }
+
         static const char* kMemoryBackends[] = {"off", "sharpshooter", "mnemo"};
         static const char* kMemoryLabels[] = {"Off", "Decisions", "Full recall"};
         int cur = 1;
         for (int i = 0; i < 3; ++i)
             if (s.memoryBackend == kMemoryBackends[i]) cur = i;
-        cpMenuLabel("Project memory (per folder)");
-        ImGui::SetNextItemWidth(-1);
-        pushField();
-        if (ImGui::Combo("##q_memory", &cur, kMemoryLabels, 3)) {
+        if (segRow("##q_memory", "Project memory", "Project memory, kept per folder.",
+                   kMemoryLabels, 3, &cur)) {
             s.memoryBackend = kMemoryBackends[cur];
             s.memoryEnabled = cur != 0;
             changed = true;
         }
-        popField();
     }
+    ui::kit::cardEnd();
 
     cpMenuSection("Full settings");
     {
-        // One row of three equal chips instead of three stacked full-width buttons — the stack
-        // read as another form field group rather than as navigation out of the pane.
+        // One row of three equal buttons — navigation out of the pane, not another field group.
         const float gap = ui::metrics::cpMenuRowGap();
         const float chipW = std::max(ui::metrics::px(48.0f),
                                      (ImGui::GetContentRegionAvail().x - 2.0f * gap) / 3.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
-        ImGui::PushStyleColor(ImGuiCol_Button, fieldBg);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, fieldHov);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, fieldAct);
         auto deepLink = [&](const char* label, int tab) {
-            if (ImGui::Button(label, ImVec2(chipW, 0.0f))) {
+            if (ui::kit::secondaryButton(label, true, nullptr, ImVec2(chipW, 0.0f))) {
                 st.openSettings = true;
                 st.openSettingsTab = tab;
                 st.showAISettingsOverlay = false;
@@ -1360,14 +1338,13 @@ void drawAISettingsBody(AppState& st, bool busy) {
         deepLink("Providers##q_open_prov", 3);
         ImGui::SameLine(0.0f, gap);
         deepLink("Prompts##q_open_prompts", 2);   // AI tab (Prompts absorbed)
-        ImGui::PopStyleColor(3);
-        ImGui::PopStyleVar();
     }
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
     cpMenuHint("Opens the full Settings window.");
 
     if (changed) saveSettings(s);
 
+    ui::kit::popDensity();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
 }

@@ -32,7 +32,8 @@ static std::string friendlyStageTitle(const std::string& stage) {
 // rowKind 4 = org chart (stage "corp:org", detail = JSON snapshot)
 // rowKind 5 = meeting digest (stage "corp:meet:<n>", detail = JSON digest)
 // rowKind 6 = steering note (stage "corp:steer:<n>", reason = text)
-// rowKind 7 = route rejected (stage "corp:rej:<n>", reason = muted line)
+// rowKind 7 = route rejected (stage "corp:rej:<n>", reason = muted line); also inter-agent
+//             messages (stage "msg:<channel>:<id>", title = from, reason = to, detail = body)
 // rowKind 8 = wind-down summary (stage "corp:wind", reason = final line)
 
 static const nlohmann::json& corpPayloadObj(const nlohmann::json& data) {
@@ -2256,6 +2257,32 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             if (norm == "running" && !purpose.empty()) m.liveStatus = purpose;
             else if (!closedLive.empty() && m.liveStatus == closedLive) m.liveStatus = "Working";
         }
+    } else if (kind == "agent.message") {
+        // Inter-agent traffic (IRC between agents, workpool dispatch cards, coordination-board
+        // posts): ONE compact transcript line per message, drawn by drawCorpMutedLine's
+        // agent-message branch (stage "msg:<channel>:<id>"). title = sender, reason =
+        // recipient, detail = body. Replayed frames carry the same id and are dropped.
+        std::string text = jstr(data, "text");
+        if (text.find_first_not_of(" \t\r\n") == std::string::npos) return;
+        std::string channel = jstr(data, "channel");
+        if (channel != "pool" && channel != "board") channel = "irc";
+        std::string id = jstr(data, "message_id");
+        if (id.empty()) id = jstr(data, "id");
+        if (id.empty()) id = std::to_string(m.activity.size());
+        const std::string key = "msg:" + channel + ":" + id;
+        for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
+            if (it->rowKind == 7 && it->stage == key) return;
+        // A message is an interjection: the reasoning burst it lands in is over.
+        finalizeLiveStreamBoxes(m);
+        ActivityItem ni;
+        ni.rowKind = 7;
+        ni.stage = key;
+        ni.title = ui::foldToAtlasGlyphs(jstr(data, "from"));
+        if (ni.title.empty()) ni.title = "agent";
+        ni.reason = ui::foldToAtlasGlyphs(jstr(data, "to"));
+        ni.detail = ui::foldToAtlasGlyphs(text);
+        ni.status = "done";
+        m.activity.push_back(std::move(ni));
     } else if (kind == "agent.context") {
         separateLiveStreamThoughtParagraph(m);
         // Per-completion usage telemetry (Python general lane). app.cpp feeds the
@@ -2276,7 +2303,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
     if (m.running || kind == "run_finished" || kind == "mission_finished" ||
         kind == "agent.thought" || kind == "agent.thought.delta" || kind == "assistant_delta" ||
         kind == "agent.tool_call" || kind == "agent.role" ||
-        kind == "agent.spawn" || kind == "plan_state" || kind == "plan") {
+        kind == "agent.spawn" || kind == "plan_state" || kind == "plan" ||
+        kind == "agent.message") {
         markChatHistoryDirty();
         if (kind == "run_finished" || kind == "mission_finished")
             s_chatHistoryLastPersist = -1e9;  // force next draw flush

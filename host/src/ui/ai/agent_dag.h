@@ -55,10 +55,15 @@ struct AgentTraceAgent {
     int toolCount = 0, failCount = 0;
     std::string lastStep;         // "Tool call · add_features" — the newest step, one line
     double lastStepTs = 0.0;
+    int depth = 1;                // tree depth: 1 = spawned by the main agent
 };
 // Tree order (parents before children). Empty when the conversation has no trace.
 void agentTraceSubagents(AppState& st, const std::string& convId,
                          std::vector<AgentTraceAgent>& out);
 // Show `agentId`'s steps in the trace tree/timeline. False when the trace has no such agent.
 bool agentTraceSelectAgent(AppState& st, const std::string& convId, const std::string& agentId);
+// The newest `maxSteps` steps of `agentId` (oldest first), copied out for compact inline views.
+// Empty when the trace has no such agent.
+void agentTraceRecentSteps(AppState& st, const std::string& convId, const std::string& agentId,
+                           size_t maxSteps, std::vector<AgentTraceStep>& out);
 }  // namespace ui

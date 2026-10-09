@@ -583,6 +583,20 @@ void feedAgentDagEvent(const std::string& convId, const std::string& kind,
         s.title = "Advisor \xC2\xB7 " + foldToAtlasGlyphs(jstr(data, "advisor_kind"));
         s.detail = jstr(data, "verdict_summary");
         s.target = foldToAtlasGlyphs(s.detail);
+    } else if (kind == "agent.message") {
+        // Inter-agent traffic: a Note on the SENDER when the trace knows it (Chudcode sub-agent
+        // ids are their names), else on the event's owner.
+        const std::string from = jstr(data, "from");
+        int ai = findAgent(t, from);
+        if (ai < 0) ai = eventOwner(t, data, now);
+        const std::string to = jstr(data, "to");
+        const std::string channel = jstr(data, "channel");
+        Step& s = pushStep(t, ai, StepKind::Note, now);
+        s.title = foldToAtlasGlyphs(channel == "board" ? "Board post"
+                                  : to.empty()         ? "Message"
+                                                       : "Message to " + to);
+        s.detail = capText(jstr(data, "text"), kMaxStepText);
+        s.target = foldToAtlasGlyphs(capText(s.detail.substr(0, s.detail.find('\n')), 160));
     }
 }
 
@@ -1364,6 +1378,7 @@ void agentTraceSubagents(AppState& st, const std::string& convId,
         v.endTs = a.endTs;
         v.toolCount = a.toolCount;
         v.failCount = a.failCount;
+        v.depth = std::max(1, entry.second);
         if (!a.steps.empty()) {
             const Step& s = a.steps.back();
             std::string title = s.title;
@@ -1383,6 +1398,21 @@ bool agentTraceSelectAgent(AppState& st, const std::string& convId, const std::s
     if (t->selAgent != agentId) chatLogJumpToBottom(kTimelineRegion);
     t->selAgent = agentId;
     return true;
+}
+
+void agentTraceRecentSteps(AppState& st, const std::string& convId, const std::string& agentId,
+                           size_t maxSteps, std::vector<AgentTraceStep>& out) {
+    out.clear();
+    bool fromTranscript = false;
+    TraceStore* t = activeTrace(st, convId, &fromTranscript);
+    if (!t || maxSteps == 0) return;
+    const int ai = findAgent(*t, agentId);
+    if (ai < 0) return;
+    const Agent& a = t->agents[(size_t)ai];
+    const size_t n = std::min(maxSteps, a.steps.size());
+    out.reserve(n);
+    for (size_t i = a.steps.size() - n; i < a.steps.size(); ++i)
+        out.push_back(stepView(convId, a, a.steps[i]));
 }
 
 }  // namespace ui

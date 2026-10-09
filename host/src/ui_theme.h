@@ -237,6 +237,11 @@ struct Palette {
     // blockActionBg: action-card background — near-opaque so structured content reads clearly.
     float blockActionBg[4]  = {0.094f, 0.110f, 0.141f, 0.96f};
 
+    // ---- controls (buttons, input/combo frames, checkboxes, segmented tracks) ----
+    // controlBorder: the soft 1-px edge of every kit control — quieter than the window/popup
+    // outline (ImGuiCol_Border), firmer than a separator (border). Paired with controlFace().
+    float controlBorder[4]  = {0.290f, 0.330f, 0.420f, 0.60f};
+
     // Helper: convert float[4] to ImU32 (for draw-list calls).
     // Usage: palette.toU32(palette.accent)
     static inline uint32_t toU32(const float f[4]) {
@@ -284,6 +289,18 @@ void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 8.0f
 // Alpha-scaled variant for animated widgets (e.g. toasts): `alpha` (0..1) multiplies every glass
 // role's alpha before drawing, so a fading card dims all five layers coherently.
 void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, float alpha);
+
+// Soft-elevated control face shared by every kit control (buttons, combo frames, segmented pills,
+// popover triggers, checkbox boxes). Back to front: a 1-px bottom lip in glassShadow (raised
+// only), the rounded fill with a gentle vertical tint (lighter top, slightly deeper bottom), a top
+// inner highlight hairline, then the 1-px `border` (alpha 0 = none). `fill`/`border` arrive
+// already resolved for hover/press/disabled by the caller. `lift` 1 = resting raised control,
+// 0 = flat (disabled, inset track); values between blend (a press sinks toward flat).
+// `roundingPx` is PIXELS (metrics/kit tokens), NOT logical dp — unlike glassBackground.
+void controlFace(ImDrawList* dl, ImVec2 mn, ImVec2 mx, ImU32 fill, ImU32 border,
+                 float roundingPx, float lift = 1.0f);
+// The theme's soft control edge (palette.controlBorder) at `alphaMul`, honouring style.Alpha.
+ImU32 controlBorderU32(float alphaMul = 1.0f);
 
 // Push/pop ImGuiStyle overrides for the BeginTooltip() + glassBackground() pattern.
 // pushGlassTooltipStyle() sets PopupBg=transparent so ImGui's native rect fill does not

@@ -252,6 +252,7 @@ static void fillDark(Palette& p) {
     set4(p.treeSection,    0.620f, 0.660f, 0.720f, 1.0f);   // muted section-header label
     // copilot blocks (chat action cards)
     set4(p.blockActionBg,  0.094f, 0.110f, 0.141f, 0.96f);  // near-opaque action card
+    set4(p.controlBorder,  0.290f, 0.330f, 0.420f, 0.60f);  // soft cool control edge
 }
 
 // =========================================================================
@@ -382,6 +383,7 @@ static void fillLight(Palette& p) {
     set4(p.treeSection,    0.357f, 0.384f, 0.439f, 1.0f);   // darker grey section-header label
     // copilot blocks (chat action cards)
     set4(p.blockActionBg,  0.930f, 0.940f, 0.960f, 0.96f);  // near-opaque action card
+    set4(p.controlBorder,  0.560f, 0.590f, 0.660f, 0.55f);  // soft grey-blue control edge
 }
 
 // =========================================================================
@@ -407,22 +409,27 @@ void applyTheme(Theme t, float scale) {
     else
         ImGui::StyleColorsDark(&s);
 
-    // --- shape: rounded + roomy (same for both themes) ---
-    s.WindowRounding    = 9.0f;
-    s.ChildRounding     = 9.0f;
-    s.FrameRounding     = 7.0f;
+    // --- shape: rounded, compact-but-airy (same for both themes) ---
+    // One control radius: FrameRounding == the kit's chip/button radius (6 dp), so a native
+    // ImGui::Button and a kit::secondaryButton side by side share a corner. Grabs are pills
+    // (rounding = half the grab), windows/popups a step rounder than the controls inside them.
+    s.WindowRounding    = 10.0f;
+    s.ChildRounding     = 8.0f;
+    s.FrameRounding     = 6.0f;
     s.PopupRounding     = 8.0f;
     s.ScrollbarRounding = 10.0f;
     s.GrabRounding      = 7.0f;
-    s.TabRounding       = 8.0f;
+    s.TabRounding       = 6.0f;
 
-    s.WindowPadding     = ImVec2(15, 13);
-    s.FramePadding      = ImVec2(12, 7);
-    s.ItemSpacing       = ImVec2(10, 9);
-    s.ItemInnerSpacing  = ImVec2(8, 6);
-    s.CellPadding       = ImVec2(8, 6);
-    s.ScrollbarSize     = 12.0f;
-    s.GrabMinSize       = 11.0f;
+    // Compact density: one frame is ~2 dp shorter and rows sit 2 dp closer than before, while
+    // FramePadding.x stays 12 (metrics::partsPadX() aligns pane gutters to it).
+    s.WindowPadding     = ImVec2(12, 10);
+    s.FramePadding      = ImVec2(12, 6);
+    s.ItemSpacing       = ImVec2(9, 7);
+    s.ItemInnerSpacing  = ImVec2(6, 5);  // gui-lint: allow (base style; ScaleAllSizes below)
+    s.CellPadding       = ImVec2(8, 5);  // gui-lint: allow (base style; ScaleAllSizes below)
+    s.ScrollbarSize     = 10.0f;
+    s.GrabMinSize       = 14.0f;
 
     s.WindowBorderSize  = 1.0f;
     s.ChildBorderSize   = 1.0f;
@@ -921,6 +928,76 @@ bool sameGlassStyle(const GlassStyle& a, const GlassStyle& b) {
 float clampF(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 float wrapHue(float h) { h = std::fmod(h, 360.f); return h < 0.f ? h + 360.f : h; }
 }  // namespace
+
+// =========================================================================
+// Control faces (kit buttons, combo frames, segmented pills, checkboxes)
+// =========================================================================
+namespace {
+constexpr float kFaceTopLift    = 0.09f;  // top edge RGB pulled this far toward glassHighlight
+constexpr float kFaceBottomSink = 0.07f;  // bottom edge RGB pulled this far toward glassShadow
+constexpr float kFaceLipDark    = 0.50f;  // bottom lip = glassShadow alpha x this (dark theme)
+constexpr float kFaceLipLight   = 0.80f;  // ... (light theme: its glassShadow is already softer)
+constexpr float kFaceSheenDark  = 0.10f;  // top inner hairline alpha (glassHighlight RGB)
+constexpr float kFaceSheenLight = 0.45f;
+
+// `c` with its RGB pulled `t` of the way toward `role`'s RGB; c's alpha kept.
+ImU32 mixRgb(ImU32 c, const float role[4], float t) {
+    ImVec4 v = ImGui::ColorConvertU32ToFloat4(c);
+    v.x += (role[0] - v.x) * t;
+    v.y += (role[1] - v.y) * t;
+    v.z += (role[2] - v.z) * t;
+    return ImGui::ColorConvertFloat4ToU32(v);
+}
+}  // namespace
+
+void controlFace(ImDrawList* dl, ImVec2 mn, ImVec2 mx, ImU32 fill, ImU32 border,
+                 float roundingPx, float lift) {
+    if (!dl || !(mx.x > mn.x) || !(mx.y > mn.y)) return;
+    const Palette& p      = palette;
+    const bool     dark   = activeTheme != Theme::Light;
+    const float    hair   = std::max(1.0f, uiScale);
+    const float    k      = clampF(lift, 0.f, 1.f);
+    const float    r      = std::max(0.f, roundingPx);
+    const float    fillA  = (float)((fill >> IM_COL32_A_SHIFT) & 0xFF) / 255.f;
+    const float    styleA = ImGui::GetStyle().Alpha;
+
+    if (fillA > 0.f) {
+        // 1. Elevation: a 1-px lip peeking out under the bottom edge. Scaled by fill alpha
+        //    squared so a faint glass-tinted field never darkens through its own translucency.
+        if (k > 0.f) {
+            const float lipA = p.glassShadow[3] * (dark ? kFaceLipDark : kFaceLipLight) * k *
+                               fillA * fillA * styleA;
+            dl->AddRectFilled(ImVec2(mn.x, mn.y + hair), ImVec2(mx.x, mx.y + hair),
+                              roleAlphaU32(p.glassShadow, lipA), r);
+        }
+        // 2. Fill with a gentle vertical tint (lighter top, deeper bottom); vertex alpha kept so
+        //    the anti-aliased fringe stays soft.
+        const int v0 = dl->VtxBuffer.Size;
+        dl->AddRectFilled(mn, mx, fill, r);
+        if (k > 0.f) {
+            ImGui::ShadeVertsLinearColorGradientKeepAlpha(
+                dl, v0, dl->VtxBuffer.Size, mn, ImVec2(mn.x, mx.y),
+                mixRgb(fill, p.glassHighlight, kFaceTopLift * k),
+                mixRgb(fill, p.glassShadow, kFaceBottomSink * k));
+            // 3. Top inner sheen, kept clear of the corner arcs.
+            const float inset = std::max(r, hair * 2.0f);
+            if (mx.x - mn.x > inset * 2.0f) {
+                const float y = mn.y + hair;
+                dl->AddLine(ImVec2(mn.x + inset, y), ImVec2(mx.x - inset, y),
+                            roleAlphaU32(p.glassHighlight, (dark ? kFaceSheenDark : kFaceSheenLight) *
+                                                               k * fillA * styleA),
+                            hair);
+            }
+        }
+    }
+    // 4. Soft 1-px edge.
+    if ((border >> IM_COL32_A_SHIFT) & 0xFF) dl->AddRect(mn, mx, border, r, 0, hair);
+}
+
+ImU32 controlBorderU32(float alphaMul) {
+    return roleAlphaU32(palette.controlBorder,
+                        palette.controlBorder[3] * alphaMul * ImGui::GetStyle().Alpha);
+}
 
 void setViewportBackdrop(const ViewportBackdropInfo& b) { gViewportBackdrop = b; }
 const ViewportBackdropInfo& viewportBackdrop() { return gViewportBackdrop; }

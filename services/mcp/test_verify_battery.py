@@ -276,6 +276,31 @@ def test_extract_score_dfm_uses_dfm_pass_and_failed_checks():
     }]
 
 
+def test_verify_skips_solid_checks_on_a_study_only_doc(monkeypatch):
+    """2026-10-08 clamp-HPU run: a saved hydraulic circuit (no geometry) scored 0.0 on
+    eval_check / is_manifold / measure_part and the agent reported "geometry failures"
+    to the user. A study-only document has no solid to check: honest SKIP."""
+    import services.verify.battery as bat
+    from services.mcp import core_bridge
+
+    monkeypatch.setattr(bat, "_doc_features", lambda doc_id: [])
+    monkeypatch.setattr(core_bridge, "call", lambda method, params=None: {
+        "studies": [{"id": "s1", "type": "hydraulic_circuit"}]}
+        if method == "sim_study_list" else {})
+    ran = []
+    monkeypatch.setitem(bat.GAP_FNS, "is_manifold",
+                        lambda **_: ran.append(1) or json.dumps({"ok": False}))
+    result = bat.verify(doc_id="d1", checks=["is_manifold"])
+    assert ran == [] and result["scores"] == {}
+    assert result["skipped"] == ["is_manifold"]
+    assert "hydraulic_circuit" in result["findings"][0]["detail"]
+
+    # A truly empty document (no studies either) still fails the solid checks.
+    monkeypatch.setattr(core_bridge, "call", lambda method, params=None: {"studies": []})
+    result = bat.verify(doc_id="d1", checks=["is_manifold"])
+    assert ran == [1] and result["scores"] == {"is_manifold": 0.0}
+
+
 def test_verify_findings_deterministic(monkeypatch):
     """Findings list (not just scores) is identical across repeated runs."""
     import services.verify.battery as bat

@@ -796,6 +796,27 @@ class HostToolDispatchTests(unittest.TestCase):
         self.assertEqual(enabled_calls, [["measure"]])
         self.assertIn("measure_part", result["added"])
 
+    def test_cad_skill_mounts_the_tools_its_pack_teaches(self):
+        """2026-10-08 cooling-water run: piping-design loaded, then six calls hit
+        "No such tool: xd://piping_solve" because nothing mounted the pack's tools."""
+        enabled_calls = []
+        skill = self._binding(
+            "cad_skill",
+            handler=lambda name, path=None: f"[SKILL: {name} (builtin)]\n# body",
+            enable_categories=lambda tools: enabled_calls.append(tools) or {
+                "ok": True, "added": ["piping_solve", "duct_size"]},
+        )
+        result = dispatch_host_tool(skill, {"name": "piping-design"}, None, None)
+        self.assertEqual(len(enabled_calls), 1)
+        self.assertIn("piping_solve", enabled_calls[0])
+        self.assertIn("vessel_size", enabled_calls[0])
+        self.assertTrue(result.startswith("[SKILL: piping-design"))
+        self.assertIn("now loaded: duct_size, piping_solve", result)
+
+        # A file inside the pack is reference reading, not a load: nothing mounts.
+        dispatch_host_tool(skill, {"name": "piping-design", "path": "x.md"}, None, None)
+        self.assertEqual(len(enabled_calls), 1)
+
 
 class _SubagentCall:
     """The chudcode_rpc HostToolContext fields dispatch reads."""

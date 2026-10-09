@@ -8737,7 +8737,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         Save every deliverable BEFORE your session ends: the user is never warned about your
         unsaved docs, so anything you don't save (and don't close_part(discard=True)) is only
         recoverable from a fallback crash-recovery tier — not a delivery mechanism.
-        Empty documents are refused without writing; allow_empty=True explicitly saves one.
+        Empty documents (no bodies AND no studies) are refused without writing;
+        allow_empty=True explicitly saves one. A document whose only content is
+        engineering studies (hydraulic_circuit, piping_network, vessel, duct_system, …)
+        is not empty: it saves without allow_empty.
         A file the user has open in a tab is refused too (`path_open_in_user_tab`, naming the
         open doc_id): edit that document in place so the user sees the change live, then save
         it — never rebuild it in a second document and save that over its file.
@@ -8745,9 +8748,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         try:
             d = _doc(doc_id)
             if not allow_empty and not cb.call(
-                    "asm_world_bodies", {"doc_id": d, "explode": False}).get("bodies"):
+                    "asm_world_bodies", {"doc_id": d, "explode": False}).get("bodies") \
+                    and not (cb.call("sim_study_list", {"doc_id": d}) or {}).get("studies"):
                 return _dumps({"ok": False, "reason": "no_bodies_empty_document",
-                               "doc_id": d, "content": "Save refused: document has 0 bodies."})
+                               "doc_id": d,
+                               "content": "Save refused: document has 0 bodies and no studies."})
             # K3: canonicalise the caller-supplied path so any '..' traversal sequences are
             # fully resolved before we pass them to the engine.  This means the caller sees
             # exactly where the file will be written (no hidden navigation).

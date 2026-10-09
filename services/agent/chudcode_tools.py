@@ -1329,6 +1329,39 @@ def _dispatch_meta(binding: HostToolBinding, args: dict[str, Any]) -> Any:
     }
 
 
+def _mount_skill_tools(binding: HostToolBinding, args: Mapping[str, Any], result: Any) -> Any:
+    """After ``cad_skill(name)`` loads a pack, mount the tools that pack teaches.
+
+    A skill body names its tools (frontmatter ``triggers.tools``) and the model calls
+    them next; when they were not loaded yet every such call was Chudcode's
+    "No such tool: xd://piping_solve" (six in one cooling-water run, 2026-10-08).
+    Mounting goes through the same ``enable_categories`` path as ``enable_tools``, so
+    the mode policy still narrows it. Returns *result* with a one-line note appended
+    when something new was mounted.
+    """
+    callback = _ctx(binding.context, "enable_categories", None)
+    name = args.get("name")
+    if not callable(callback) or not isinstance(name, str) or args.get("path"):
+        return result
+    if not isinstance(result, str) or not result.startswith("[SKILL:"):
+        return result
+    try:
+        from services.agent.skills import get_skill
+
+        skill = get_skill(name, project_root=_ctx(binding.context, "workspace_dir", None))
+    except Exception as exc:  # noqa: BLE001 - a missing pack leaves the body as is
+        _debug_fallback(f"skill tools for {name}", exc)
+        return result
+    tools = list(getattr(getattr(skill, "triggers", None), "tools", ()) or ())
+    if not tools:
+        return result
+    enabled = callback(tools)
+    added = sorted((enabled or {}).get("added") or ()) if isinstance(enabled, Mapping) else []
+    if not added:
+        return result
+    return f"{result}\n\n[This skill's tools are now loaded: {', '.join(added)}]"
+
+
 def _guardrail_block(binding: HostToolBinding, args: dict[str, Any]) -> str | None:
     context = binding.context
     ledger = _ctx(context, "ledger", None)
@@ -1552,6 +1585,8 @@ def dispatch_host_tool(
             _inner=inner,
             _loop_guard=_ctx(binding.context, "tool_loop_guard", None),
         )
+    if binding.name == "cad_skill":
+        result = _mount_skill_tools(binding, supplied, result)
     safe_result = _json_safe(result)
     records = _ctx(binding.context, "tool_calls", _ctx(binding.context, "calls", None))
     if records is None:

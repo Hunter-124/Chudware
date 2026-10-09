@@ -386,6 +386,24 @@ def _saved(doc_id: str, sid: Optional[str]) -> dict:
     return out
 
 
+def _not_saved(res: dict, stype: str) -> dict:
+    """A sizing run without ``doc_id``: say it was NOT saved and how to save it.
+
+    The engine's own next_actions tell the caller to persist with ``sim_study_add`` —
+    true for the raw RPC, wrong for this wrapper, which persists itself when given a
+    ``doc_id``. Models followed neither and delivered numbers nobody could reopen.
+    """
+    res["saved_to_study"] = False
+    res["study_not_saved_reason"] = (
+        f"no doc_id — this {stype} sizing is not saved anywhere the user can open it. "
+        "Re-run with doc_id=<the part> (no document yet: new_part(name=<system name>) "
+        f"first); the result is then a {stype} study, and save_part writes it into the "
+        ".step+.")
+    res["next_actions"] = [a for a in res.get("next_actions") or []
+                           if "sim_study_add" not in str(a)]
+    return res
+
+
 def _restore_network(name: str, study: dict) -> dict:
     """Load a persisted ``piping_network`` study into the session as network ``name``."""
     params = study.get("params") or {}
@@ -1544,6 +1562,8 @@ def register_piping_tools(mcp) -> None:
             res.update(_persist_record(
                 target, "vessel", name or f"Vessel ID {inner_diameter_mm:g} mm",
                 "cpp-industrial", params, _body(res)))
+        elif res.get("ok"):
+            _not_saved(res, "vessel")
         return _dumps(res)
 
     @mcp.tool()
@@ -1563,8 +1583,11 @@ def register_piping_tools(mcp) -> None:
         (or rect W×H at ``aspect_ratio``, Huebscher equivalent diameter) meeting
         ``friction_pa_per_m`` and ``max_velocity_ms``; Colebrook friction with
         ``roughness_mm`` and air at ``air_temp_c``. Path losses sum through the tree; the
-        worst is the ``critical_path`` and sets ``fan_static_pa``. With ``doc_id`` the design
-        is saved as a ``duct_system`` study (``name``).
+        worst is the ``critical_path`` and sets ``fan_static_pa``. ``length_m`` and
+        ``k_fittings`` are the real developed length and fitting losses; when the user gave
+        none, assume a representative layout and state it — 1 m stubs with no fittings make
+        ``fan_static_pa`` meaningless (a warning says so). With ``doc_id`` the design is
+        saved as a ``duct_system`` study (``name``).
         """
         try:
             segs = _as_obj(segments)
@@ -1577,9 +1600,18 @@ def register_piping_tools(mcp) -> None:
                   "max_velocity_ms": max_velocity_ms, "air_temp_c": air_temp_c,
                   "roughness_mm": roughness_mm}
         res = _rpc("duct_size", params)
+        if res.get("ok") and isinstance(segs, list) and segs and all(
+                isinstance(s, dict) and float(s.get("length_m") or 0) <= 1.0
+                and not float(s.get("k_fittings") or 0) for s in segs):
+            res.setdefault("warnings", []).append(
+                "every segment is <= 1 m long with no fitting losses, so fan_static_pa "
+                "is only a per-metre figure: re-run with real (or stated representative) "
+                "length_m and k_fittings before quoting a fan static pressure")
         if res.get("ok") and target:
             res.update(_persist_record(target, "duct_system", name or "Duct system",
                                        "cpp-industrial", params, _body(res)))
+        elif res.get("ok"):
+            _not_saved(res, "duct_system")
         return _dumps(res)
 
     # ----------------------------------------------------------- internal flow (3-D)

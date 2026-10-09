@@ -120,12 +120,17 @@ How to run it:
 
 ## 6. Vessels and ducts
 
+- **No CAD document yet** (a vessel or duct sizing on its own): `new_part(name=<system
+  name>)` first and pass its `doc_id`, so the sizing is a study the user can open, then
+  `save_part` (a study-only document saves without geometry).
 - **Vessel:** run `vessel_size(...)` (ASME VIII-1 UG-27/UG-32). Use the returned
   `t_nominal_mm` for shell and heads, `mawp_kpa`, `hydrotest_kpa`, and masses. Then model
   it with a revolve at those thicknesses, add nozzles, and route to the nozzle faces.
 - **Ducts:** run `duct_size(segments=[...parent tree...])` with equal friction. Size the
-  fan from `fan_static_pa` and the `critical_path`. A velocity warning means a lower
-  friction rate (bigger duct) or a split branch.
+  fan from `fan_static_pa` and the `critical_path`. No lengths given: assume a
+  representative layout (segment lengths, K for elbows/take-offs), state it, and quote
+  the resulting `fan_static_pa` — never a formula in place of the number. A velocity
+  warning means a lower friction rate (bigger duct) or a split branch.
 - **Skid, rack, or supports:** build the frame with `weld_member` (cad_skill
   `weldment-frame`) and check it with `struct_check`. Space supports at or inside the
   spec check's `support_span_m`.

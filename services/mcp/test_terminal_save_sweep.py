@@ -45,8 +45,9 @@ class _FakeEngine:
     real bridge instead of being recorded as a save the sweep made.
     """
 
-    def __init__(self, docs, passthrough=None):
+    def __init__(self, docs, passthrough=None, studies=None):
         self.docs = [dict(d) for d in docs]
+        self.studies = dict(studies or {})
         self.saves: list = []
         self._owner = threading.current_thread()
         self._passthrough = passthrough
@@ -63,6 +64,8 @@ class _FakeEngine:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text("ISO-10303-21;\n")  # a real file, so the size check passes
             return {"ok": True, "path": str(dest)}
+        if method == "sim_study_list":
+            return {"studies": [dict(s) for s in self.studies.get(p.get("doc_id"), [])]}
         return {}
 
 
@@ -75,8 +78,8 @@ def sweep(monkeypatch, tmp_path):
     C.quiesce_publishes(10.0)
     real_call = C.cb.call
 
-    def _install(docs, *, touched=(), project_dir=save_dir):
-        fake = _FakeEngine(docs, passthrough=real_call)
+    def _install(docs, *, touched=(), project_dir=save_dir, studies=None):
+        fake = _FakeEngine(docs, passthrough=real_call, studies=studies)
         monkeypatch.setattr(C.cb, "call", fake.call)
         monkeypatch.setattr(C, "_TOUCHED_DOCS", list(touched))
         if project_dir is None:
@@ -210,6 +213,32 @@ def test_an_empty_doc_never_becomes_a_file(sweep):
 
     assert fake.saves == []
     assert out["saved"] == []
+
+
+def test_a_study_only_doc_is_saved(sweep, tmp_path):
+    """A hydraulic circuit / piping network / vessel / duct sizing lives in a document
+    with no geometry. The engine flags it `empty`, but it carries the whole design: the
+    2026-10-08 clamp-HPU run lost its simulated circuit when the sweep skipped it."""
+    fake = sweep(
+        [
+            {
+                "doc_id": "d1",
+                "name": "clamp_hpu",
+                "kind": "part",
+                "feature_count": 0,
+                "empty": True,
+                "dirty": False,
+                "path": "",
+                "origin_kind": "mcp",
+            }
+        ],
+        touched=["d1"],
+        studies={"d1": [{"id": "study-1", "type": "hydraulic_circuit", "name": "clamp"}]},
+    )
+    out = C.save_touched_docs()
+
+    assert [s[0] for s in fake.saves] == ["d1"]
+    assert Path(out["saved"][0]["path"]).name == "clamp_hpu.step+"
 
 
 def test_a_crash_autosave_path_does_not_count_as_saved(sweep, tmp_path):

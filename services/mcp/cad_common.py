@@ -2048,12 +2048,21 @@ def _needs_project_save(entry: dict) -> bool:
     """True when this doc holds content that is NOT yet in a real user file.
 
     Mirrors hostd's own retire test (`gcCloseDoc`): no path, unsaved edits, or a path
-    that is only a crash-recovery autosave. An `empty` doc is skipped — hostd purges
-    those instead of retiring them, so saving one would create a file for nothing.
+    that is only a crash-recovery autosave. A doc with no features, components or
+    studies is skipped — hostd purges those instead of retiring them, so saving one
+    would create a file for nothing. The engine's `empty` flag counts geometry only,
+    so a study-only document (a hydraulic circuit, piping network, vessel or duct
+    sizing) reads `empty` yet carries the user's whole design: it is saved.
     """
-    if entry.get("empty"):
-        return False
     if not ((entry.get("feature_count") or 0) or (entry.get("component_count") or 0)):
+        try:
+            studies = (cb.call("sim_study_list", {"doc_id": entry.get("doc_id")})
+                       or {}).get("studies")
+        except Exception:  # noqa: BLE001 — an unreadable study list reads as none
+            studies = None
+        if not studies:
+            return False
+    elif entry.get("empty"):
         return False
     path = entry.get("path") or ""
     if not isinstance(path, str) or not path.strip():

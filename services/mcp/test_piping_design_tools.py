@@ -556,6 +556,34 @@ def test_duct_size_envelope_equal_friction_tree():
     assert bad["ok"] is False and bad["reason"] == "missing_segments" and bad["hint"]
 
 
+def test_sizing_without_doc_id_says_it_was_not_saved_and_how(monkeypatch):
+    """2026-10-08 demo runs: both models sized the vessel and the ducts with no doc_id and
+    delivered numbers nobody could reopen; the engine's next_actions pointed at the raw
+    sim_study_add RPC this wrapper already performs when given a doc_id."""
+    from services.mcp import piping_tools as pt
+
+    def fake_rpc(method, params):
+        return {"ok": True, "warnings": [], "fan_static_pa": 1.66, "next_actions": [
+            f"persist the sizing with sim_study_add {{type:'{method}'}}", "keep this"]}
+
+    monkeypatch.setattr(pt, "_rpc", fake_rpc)
+    tools = _tools()
+    vessel = _j(tools["vessel_size"](inner_diameter_mm=1000.0, design_pressure_kpa=1400.0,
+                                     volume_m3=2.0))
+    assert vessel["saved_to_study"] is False
+    assert "new_part" in vessel["study_not_saved_reason"]
+    assert vessel["next_actions"] == ["keep this"]
+
+    stubs = [{"id": "main", "airflow_m3s": 3.0, "length_m": 1.0},
+             {"id": "b1", "parent": "main", "airflow_m3s": 1.2, "length_m": 1.0}]
+    duct = _j(tools["duct_size"](segments=stubs))
+    assert duct["saved_to_study"] is False
+    assert any("fan_static_pa" in w for w in duct["warnings"])
+    real = [{**s, "length_m": 15.0, "k_fittings": 1.5} for s in stubs]
+    assert not _j(tools["duct_size"](segments=real))["warnings"]
+
+
+
 def _write_cylinder_stl(path: str, d_mm: float, l_mm: float, n: int = 96) -> None:
     """Closed, outward-oriented round duct along +X from x=0 to x=l_mm (ASCII STL)."""
     r = d_mm / 2.0

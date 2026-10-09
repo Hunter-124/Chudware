@@ -66,6 +66,26 @@ def _doc_features(doc_id: Optional[str]) -> list[dict]:
         return []
 
 
+# Checks that need a solid body. On a study-only document (a hydraulic circuit, piping
+# network, vessel or duct sizing saved with no geometry) they have nothing to check, and
+# scoring them 0.0 turned a finished engineering study into a "failed" battery the agent
+# then reported to the user as geometry failures (2026-10-08, clamp HPU run).
+_SOLID_CHECKS = frozenset({"eval_check", "is_manifold", "measure_part"})
+
+
+def _study_only_kinds(doc_id: Optional[str]) -> list[str]:
+    """Study types of a document that has studies but no features; else ``[]``."""
+    if _doc_features(doc_id):
+        return []
+    try:
+        from services.mcp import core_bridge as cb  # noqa: PLC0415
+        studies = (cb.call("sim_study_list", {"doc_id": doc_id or _cur_doc()}) or {}).get(
+            "studies") or []
+    except Exception:  # noqa: BLE001 — unreadable: score the checks as before
+        return []
+    return sorted({str(s.get("type") or "study") for s in studies if isinstance(s, dict)})
+
+
 _VALID_SIDE_WORDS = frozenset({
     "top", "bottom", "left", "right", "front", "back",
     "+x", "-x", "+y", "-y", "+z", "-z",
@@ -1374,6 +1394,7 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
     scores: dict[str, float] = {}
     findings: list[dict] = []
     skipped: list[str] = []
+    study_only = _study_only_kinds(doc_id) if _SOLID_CHECKS.intersection(checks) else []
 
     for name in sorted(checks):  # deterministic order
 
@@ -1381,6 +1402,17 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
 
         if platform_req == "posix" and not is_posix:
             skipped.append(name)
+            continue
+
+        if study_only and name in _SOLID_CHECKS:
+            skipped.append(name)
+            findings.append({
+                "check": name,
+                "ok": True,
+                "skipped": True,
+                "detail": "study-only document (" + ", ".join(study_only) + "): no solid "
+                          "geometry to check — the studies' own results are the evidence",
+            })
             continue
 
         try:

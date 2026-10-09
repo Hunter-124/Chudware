@@ -6330,3 +6330,24 @@ Runtime captures covered pipe drawing after a large-document transition, the dem
 workspaces, Parts, PLM and multi-document state. The simulation audit covered 117
 states with zero ID conflicts or overflow findings; its declared solver/torque
 skips are not claimed as verified capabilities.
+
+## 2026-10-09 — Working-directory authority and saved demo studies
+
+`AppState::workspaceDir` is now the sole top-left, PLM and chat project authority;
+opening or selecting outside-directory documents cannot override it.
+`copilot/conversations.cpp` reconciles history startup/reload against the selected
+root and validates remembered-session ownership, while parking running chats on
+root switches. `layout.cpp` keeps Simulate, Manufacture and Electronics rails
+independent of Model's saved roll-up state; Simulation Manager reports list-load
+errors with an explicit retry instead of a blank pane or repeated frame retries.
+The `projectchat` runtime scenario passed startup, root-switch, remembered-map and
+real external-file checks. `demoreview` reopened a copy of the pristine facilities
+part with Model collapsed, found five studies through the normal tree path and
+captured sixteen saved-result views. The original and backup stayed byte-identical.
+Linux CI now refreshes the service runtime, obtains the private typed SDK from the
+source archive pinned by the canonical runtime release, installs its DVC gate
+dependency and uses that interpreter for manual generation; configure failures
+retain full logs. A clean isolated wheel install proved the archived SDK's 0.3.0 pin.
+Focused service suites passed 1,758 tests; host CTest passed 31/31 and all nine
+source gates passed. Full remote Linux gate and production promotion remain pending
+at this handoff; no successful OpenFOAM execution or live provider turn is claimed.

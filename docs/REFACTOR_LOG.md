@@ -6363,3 +6363,8 @@ provisions real ngspice rather than weakening backend assertions. Seven focused
 tests passed, and direct runtime smoke connected the default-key private daemon
 and computed a 6.6667 V divider through ngspice. Full remote requalification remains
 pending; the workspace/demo repair itself is already promoted and locally verified.
+
+The WSL builder has no unattended sudo. Ngspice provisioning therefore extracts
+the real distro package and its dependency closure into job-local storage, scopes
+library lookup to its launcher and relocates the shipped code-model initialization.
+The exact CI step ran as an unprivileged Ubuntu user and solved the 6.6667 V divider.

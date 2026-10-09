@@ -115,24 +115,48 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v ngspice >/dev/null 2>&1; then
-            # Keep the live backend tests intact; install their real executable
-            # on the dedicated builder, never on the production gateway.
-            if ! sudo -n true >/dev/null 2>&1; then
-              echo "::error::ngspice is missing and unattended package installation needs passwordless sudo"
-              exit 1
-            fi
-            if command -v dnf >/dev/null 2>&1; then
-              sudo -n dnf install -y ngspice
-            elif command -v apt-get >/dev/null 2>&1; then
-              sudo -n apt-get update
-              sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y ngspice
+          ngspice_bin="$(command -v ngspice || true)"
+          if [ -z "${ngspice_bin}" ]; then
+            # Download the builder's real distro package without granting the
+            # CI service account root or weakening the live backend assertions.
+            if command -v apt-get >/dev/null 2>&1 && command -v dpkg-deb >/dev/null 2>&1; then
+              package_dir="$(mktemp -d "${RUNNER_TEMP}/gate-ngspice.XXXXXX")"
+              pushd "${package_dir}"
+              mkdir -p cache debs/partial
+              apt-get -o Debug::NoLocking=1 -o Dir::Cache="${package_dir}/cache" \
+                -o Dir::Cache::archives="${package_dir}/debs" \
+                --assume-yes --download-only install ngspice
+              for package in debs/*.deb; do
+                dpkg-deb --extract "${package}" root
+              done
+              popd
+              # Debian's spinit contains absolute code-model paths. Relocate the
+              # real models with the extracted package, not a substitute solver.
+              python3 - "${package_dir}/root" <<'PY'
+          import sys
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          init = root / "usr/share/ngspice/scripts/spinit"
+          models = root / "usr/lib/x86_64-linux-gnu/ngspice"
+          init.write_text(init.read_text().replace("/usr/lib/x86_64-linux-gnu/ngspice/", f"{models}/"))
+          PY
+              ngspice_bin="${package_dir}/ngspice"
+              cat > "${ngspice_bin}" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="${here}/root/usr/lib/x86_64-linux-gnu:${here}/root/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          export SPICE_SCRIPTS="${here}/root/usr/share/ngspice/scripts"
+          exec "${here}/root/usr/bin/ngspice" "$@"
+          SH
+              chmod +x "${ngspice_bin}"
+              echo "CHUDWARE_NGSPICE=${ngspice_bin}" >> "$GITHUB_ENV"
             else
-              echo "::error::install ngspice on this builder; neither dnf nor apt-get is available"
+              echo "::error::provision ngspice on this builder; rootless Debian package extraction is unavailable"
               exit 1
             fi
           fi
-          ngspice --version
+          "${ngspice_bin}" --version
 
       # Eight check.py audits use only the standard library; advertised_tool_audit
       # imports the live MCP registry and needs exactly these six packages (langgraph

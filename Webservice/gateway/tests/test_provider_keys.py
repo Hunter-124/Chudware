@@ -41,11 +41,12 @@ class _FakeOnlineHost:
 
 
 def _isolate_online_persistence(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(
-        sys.modules, "services.mcp.cad_common",
-        SimpleNamespace(save_touched_docs=lambda: {
+    from services.mcp import cad_common
+
+    monkeypatch.setattr(
+        cad_common, "save_touched_docs", lambda: {
             "saved": [], "errors": [], "persistence_failure": None,
-        }),
+        },
     )
 
 
@@ -101,8 +102,8 @@ def accept_validation(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    fake = FakeDaemon(tmp_path / "webd.sock")
+def daemon(unix_socket_path: Path, monkeypatch: pytest.MonkeyPatch):
+    fake = FakeDaemon(unix_socket_path)
     fake.start()
     monkeypatch.setattr(settings, "webd_socket", fake.sock_path)
     monkeypatch.setattr(settings, "dev_mode", True)

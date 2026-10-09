@@ -6368,3 +6368,17 @@ The WSL builder has no unattended sudo. Ngspice provisioning therefore extracts
 the real distro package and its dependency closure into job-local storage, scopes
 library lookup to its launcher and relocates the shipped code-model initialization.
 The exact CI step ran as an unprivileged Ubuntu user and solved the 6.6667 V divider.
+
+### Gateway CI qualification follow-up
+
+Remote run 37975808162 passed the strict core/service gate and host GUI CTest;
+its remaining failure was the gateway suite. Both fake-daemon fixtures now use
+a shared, private short AF_UNIX path rather than pytest's deeply nested paths.
+The gateway test venv installs the existing six-package MCP import surface from
+the canonical manifest. Billing/BYOK contracts patch only `save_touched_docs`,
+not the entire `cad_common` module, preserving live registry imports.
+The complete gateway suite passed locally with real PostgreSQL under a deep
+CI-style TMPDIR: 849 passed, 29 skipped. Workflow policy reported zero errors.
+Remote requalification remains pending; these changes do not alter the desktop
+demo binary. Its fallback now contains sixteen verified metric views and a
+64-second still-view walkthrough, with the source model and backup unchanged.

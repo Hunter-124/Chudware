@@ -173,8 +173,8 @@ class FakeDaemon:
 
 
 @pytest.fixture()
-def daemon(tmp_path, monkeypatch):
-    sock = tmp_path / "webd.sock"
+def daemon(unix_socket_path, monkeypatch):
+    sock = unix_socket_path
     fake = FakeDaemon(sock)
     fake.start()
     monkeypatch.setattr(settings, "webd_socket", sock)

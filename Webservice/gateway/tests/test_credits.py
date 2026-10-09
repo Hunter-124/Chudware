@@ -242,11 +242,12 @@ def test_ample_pooled_turn_records_reported_actuals(monkeypatch):
             emit(terminal)
             return {"ok": True, "result": "done", "terminal": terminal}
 
-    monkeypatch.setitem(
-        sys.modules, "services.mcp.cad_common",
-        SimpleNamespace(save_touched_docs=lambda: {
+    from services.mcp import cad_common
+
+    monkeypatch.setattr(
+        cad_common, "save_touched_docs", lambda: {
             "saved": [], "errors": [], "persistence_failure": None,
-        }),
+        },
     )
 
     host = UsageHost()

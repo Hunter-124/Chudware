@@ -30,6 +30,13 @@ if str(GATEWAY_DIR.parent) not in sys.path:
     sys.path.insert(0, str(GATEWAY_DIR.parent))
 
 
+@pytest.fixture
+def unix_socket_path() -> Iterator[Path]:
+    """Keep AF_UNIX addresses short even when CI's TMPDIR is deeply nested."""
+    with tempfile.TemporaryDirectory(prefix="cw-webd-", dir="/tmp") as root:
+        yield Path(root) / "webd.sock"
+
+
 @pytest.fixture(scope="session", autouse=True)
 def entitlement_signing_key(tmp_path_factory) -> Iterator[Path]:
     """A throwaway Ed25519 entitlement key, and the matching embedded public key.

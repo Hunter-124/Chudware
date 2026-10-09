@@ -291,6 +291,9 @@ jobs:
           fi
           "${venv_py}" -m pip install --quiet --upgrade pip
           "${venv_py}" -m pip install --quiet -r Webservice/gateway/requirements.txt
+          # Worker security/billing contracts build the live MCP tool registry.
+          # These are test prerequisites, not gateway deployment dependencies.
+          "${venv_py}" -m pip install --quiet -r "${RUNNER_TEMP}/check-requirements.txt"
           if ! "${venv_py}" -c 'import pytest' 2>/dev/null; then
             # pytest is a test-only dep and is deliberately absent from the
             # pinned runtime requirements, which the deployment venv installs.

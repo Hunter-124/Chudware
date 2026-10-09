@@ -121,6 +121,7 @@ struct ExplorerPlmState {
     std::vector<ExplorerPlmItem> items, untracked;
     std::unordered_map<std::string, const ExplorerPlmItem*> byPath;
     int hubGeneration = -1;
+    unsigned long long itemsRevision = UINT64_MAX;
     unsigned serial = 0;
     bool loading = false, ready = false, checkpointing = false;
     // The branch answer is independent of the (much slower) item scan: its own in-flight flag,
@@ -175,6 +176,7 @@ static void pollExplorerPlm(AppState& st, const std::string& project, bool force
         P.checkpointing = false;
         P.fetchedAt = -1.0e9;
         P.hubGeneration = -1;
+        P.itemsRevision = UINT64_MAX;
         const auto known = s_branchByProject.find(project);
         P.branchKnown = known != s_branchByProject.end();
         P.branch = P.branchKnown ? known->second : std::string();
@@ -190,69 +192,62 @@ static void pollExplorerPlm(AppState& st, const std::string& project, bool force
         P.fetchedAt = -1.0e9;
         return;
     }
-    if (project.empty() || P.loading || P.branchLoading || P.checkpointing) return;
+    if (project.empty() || P.checkpointing) return;
+    auto& H = g_plmHub;
     const double now = ImGui::GetTime();
-    if (!force && P.hubGeneration == g_plmHub.generation &&
-        now - P.fetchedAt < kPlmRefreshSeconds) return;
-    P.loading = true;
-    P.branchLoading = true;
-    P.error.clear();
-    P.hubGeneration = g_plmHub.generation;
-    P.fetchedAt = now;
-    const unsigned serial = ++P.serial;
-    // Branch first: it is a single ref read, while the item list scans every tracked file
-    // for changes. The RPCs run in order, so this keeps the header from waiting on the scan.
-    st.rpc.call("plm_branch_list", {{"path", project}}, [project, serial, &st](const core::RpcResult& r) {
-        auto& state = s_plm;
-        if (state.serial != serial || state.project != project ||
-            st.plmProjectPath() != project) return;
-        state.branchLoading = false;
-        state.branchKnown = true;
-        std::string err;
-        state.branch = plmOk(r, err) ? plmField(r.result, "active") : std::string();
-        if (!state.branch.empty()) s_branchByProject[project] = state.branch;
-    });
-    st.rpc.call("plm_item_list", {{"path", project}}, [project, serial, &st](const core::RpcResult& r) {
-        auto& state = s_plm;
-        if (state.serial != serial || state.project != project ||
-            st.plmProjectPath() != project) return;
-        state.loading = false;
-        if (!plmOk(r, state.error)) {
-            state.ready = false;
-            return;
+    const bool refresh = force || P.hubGeneration != H.generation ||
+        now - P.fetchedAt >= kPlmRefreshSeconds;
+    if (refresh) {
+        // Explorer and PLM consume one coalesced scan, not two copies on the shared FIFO.
+        // Adopt a warm/in-flight scan on first entry instead of invalidating its first answer.
+        if (!H.itemsLoading && (force ||
+            (P.fetchedAt > -1.0e8 && now - P.fetchedAt >= kPlmRefreshSeconds)))
+            H.itemsGen = -1;
+        P.hubGeneration = H.generation;
+        P.fetchedAt = now;
+    }
+    if (!P.branchLoading && (refresh || !P.branchKnown)) {
+        P.branchLoading = true;
+        const unsigned serial = ++P.serial;
+        // The cheap branch read precedes the shared working-file scan.
+        st.rpc.call("plm_branch_list", {{"path", project}}, [project, serial, &st](const core::RpcResult& r) {
+            auto& state = s_plm;
+            if (state.serial != serial || state.project != project) return;
+            state.branchLoading = false;
+            if (st.plmProjectPath() != project) return;
+            state.branchKnown = true;
+            std::string err;
+            state.branch = plmOk(r, err) ? plmField(r.result, "active") : std::string();
+            if (!state.branch.empty()) s_branchByProject[project] = state.branch;
+        });
+    }
+    plmEnsureItems(st);
+    P.loading = H.itemsLoading;
+    if (H.itemsProjectDir == project) {
+        P.error = H.itemsErr;
+        if (H.itemsErr.empty() && P.itemsRevision != H.itemsRevision) {
+            P.itemsRevision = H.itemsRevision;
+            P.ready = true;
+            P.byPath.clear();
+            P.items.clear();
+            P.untracked.clear();
+            auto copy = [](const PlmItemRow& row) {
+                return ExplorerPlmItem{row.path, row.itemId, row.rev, row.lifecycle,
+                                       row.workingRev, row.change};
+            };
+            for (const auto& row : H.items) P.items.push_back(copy(row));
+            for (const auto& row : H.untracked) P.untracked.push_back(copy(row));
+            auto index = [&P](const std::vector<ExplorerPlmItem>& rows) {
+                for (const auto& item : rows) {
+                    std::string key = item.path;
+                    for (char& c : key) if (c == '\\') c = '/';
+                    P.byPath.emplace(std::move(key), &item);
+                }
+            };
+            index(P.items);
+            index(P.untracked);
         }
-        state.error.clear();
-        state.ready = true;
-        state.byPath.clear();
-        state.items.clear();
-        state.untracked.clear();
-        auto parse = [](const nlohmann::json& row) {
-            ExplorerPlmItem item;
-            item.path = plmField(row, "path");
-            item.itemId = plmField(row, "item_id");
-            item.rev = plmField(row, "rev");
-            item.lifecycle = plmField(row, "lifecycle");
-            item.workingRev = plmField(row, "working_rev");
-            item.change = plmField(row, "change");
-            return item;
-        };
-        if (auto it = r.result.find("items"); it != r.result.end() && it->is_array())
-            for (const auto& row : *it)
-                if (row.is_object()) state.items.push_back(parse(row));
-        if (auto it = r.result.find("untracked"); it != r.result.end() && it->is_array())
-            for (const auto& row : *it)
-                if (row.is_object()) state.untracked.push_back(parse(row));
-        state.byPath.reserve(state.items.size() + state.untracked.size());
-        auto index = [&state](const std::vector<ExplorerPlmItem>& rows) {
-            for (const auto& item : rows) {
-                std::string key = item.path;
-                for (char& c : key) if (c == '\\') c = '/';
-                state.byPath.emplace(std::move(key), &item);
-            }
-        };
-        index(state.items);
-        index(state.untracked);
-    });
+    }
 }
 
 static const ExplorerPlmItem* statusForPath(const std::string& path) {
@@ -547,6 +542,7 @@ static void drawChanges(AppState& st, const std::string& project) {
         }
         ImGui::SameLine();
         kit::dimText("Project-wide checkpoint");
+        if (P.loading && P.ready) kit::spinner("Refreshing project changes");
         if (!st.workerStarted)
             kit::blockedState("Vault offline", "The Chudware service is unavailable.",
                               "Files can still be browsed; reconnect to see changes.");
@@ -1085,8 +1081,8 @@ void drawFileExplorerBody(AppState& st) {
     struct DensityPop { ~DensityPop() { kit::popDensity(); } } densityPop;
     const std::string project = st.plmProjectPath();
     pollExplorerPlm(st, project);
-    const std::string projectTitle = project.empty() ? "No working project" : plmProjectName(st);
-    kit::sectionHeader(projectTitle.c_str(), "body_folder", nullptr, -1, true);
+    // Files already names the root in its tree row; avoid repeating it in the header too.
+    kit::sectionHeader("Working project", "body_folder", nullptr, -1, true);
     if (!project.empty()) {
         // Last known branch while a refresh is pending; no chip at all until the first answer
         // for this project arrives (a single ref read, issued ahead of the item scan).
@@ -1168,17 +1164,10 @@ void drawFileExplorerBody(AppState& st) {
         ImGui::Spacing();
     }
 
-    // Breadcrumb: the current folder, in an FM row pill (secondary ink, frame-padded centering).
-    {
-        std::string folderName = pathFilename(current);
-        if (folderName.empty()) folderName = current;
-        ui::FmRowRect bc = ui::fmRowPill(false);
-        ImGui::SetCursorScreenPos(ImVec2(bc.mn.x + 6.0f * ui::uiScale, bc.mn.y));
-        ImGui::AlignTextToFramePadding();
-        ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
-        ImGui::TextUnformatted(folderName.c_str());
-        ImGui::PopStyleColor();
-        ui::fmRowPillEnd(bc, false);
+    // A breadcrumb is useful only below the root; the root tree row already names the project.
+    if (current != root) {
+        const std::string folderName = pathFilename(current);
+        kit::dimText(folderName.c_str());
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", current.c_str());
     }
 

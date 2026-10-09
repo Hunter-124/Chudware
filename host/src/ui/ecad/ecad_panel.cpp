@@ -101,6 +101,9 @@ struct EcadEditorState {
     std::string catalogQuery;
     std::vector<nlohmann::json> symbolCatalog;
     std::vector<std::string> footprintCatalog;
+    // Reused pointer list for data-derived kit pickers; strings remain mirror/catalog owned.
+    std::vector<const char*> comboItems;
+    bool starterCanvasChosen = false;
     std::string catalogError;
     // Sheet controls.
     char newSheetName[96] = "Sheet";
@@ -585,16 +588,19 @@ bool drawPropInspector(AppState& st, EcadEditorState& es, float sc) {
 
     if (!sch) return true;
     ui::kit::sectionHeader("Assembly", nullptr, nullptr, -1);
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::BeginCombo("##ecadFootprintLibrary",
-                          es.editFootprint[0] ? es.editFootprint : "No footprint")) {
-        if (ImGui::Selectable("No footprint", es.editFootprint[0] == '\0'))
-            es.editFootprint[0] = '\0';
-        for (const std::string& fp : es.footprintCatalog)
-            if (ImGui::Selectable(fp.c_str(), std::string(es.editFootprint) == fp))
-                std::snprintf(es.editFootprint, sizeof(es.editFootprint), "%s", fp.c_str());
-        ImGui::EndCombo();
+    es.comboItems.clear();
+    es.comboItems.push_back("No footprint");
+    int footprintChoice = 0;
+    for (const std::string& fp : es.footprintCatalog) {
+        if (fp == es.editFootprint) footprintChoice = static_cast<int>(es.comboItems.size());
+        es.comboItems.push_back(fp.c_str());
     }
+    if (ui::kit::fieldEnum("##ecadFootprintLibrary", "Footprint", &footprintChoice,
+                           es.comboItems.data(), static_cast<int>(es.comboItems.size()),
+                           ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo)
+                               .withPreview(es.editFootprint[0] ? es.editFootprint : "No footprint")))
+        std::snprintf(es.editFootprint, sizeof(es.editFootprint), "%s",
+                      footprintChoice == 0 ? "" : es.comboItems[footprintChoice]);
     ImGui::SetNextItemWidth(-1.0f);
     bool fpCommit = ImGui::InputTextWithHint("##ecadFootprint",
         "Footprint id (blank clears)", es.editFootprint, sizeof(es.editFootprint),
@@ -1486,34 +1492,32 @@ void drawPcbEditingContext(EcadEditorState& es) {
     EcadMirror& m = es.mirror;
     ensurePcbContext(es);
     ui::kit::sectionHeader("Routing context", "ecad_route", nullptr, -1, true);
-    ui::kit::dimText("Active copper layer");
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::BeginCombo("##activeCopper", es.activeLayer.c_str())) {
-        for (const auto& layer : m.layers()) {
-            if (ImGui::Selectable(layer.id.c_str(), es.activeLayer == layer.id)) {
-                es.activeLayer = layer.id;
-                es.mgrSel = "layer:" + layer.id;
-            }
-        }
-        ImGui::EndCombo();
+    es.comboItems.clear();
+    int layerChoice = -1;
+    for (const auto& layer : m.layers()) {
+        if (es.activeLayer == layer.id) layerChoice = static_cast<int>(es.comboItems.size());
+        es.comboItems.push_back(layer.id.c_str());
     }
-    ui::kit::dimText("Active net");
-    ImGui::SetNextItemWidth(-1.0f);
-    const char* netPreview = es.activeNet.empty() ? "No net" : es.activeNet.c_str();
-    if (ImGui::BeginCombo("##activeNet", netPreview)) {
-        if (ImGui::Selectable("No net", es.activeNet.empty())) {
-            es.activeNet.clear();
-            if (es.mgrSel.rfind("net:", 0) == 0) es.mgrSel.clear();
-            es.canvas.setHighlightedNet(std::string());
-        }
-        for (const auto& net : m.nets()) {
-            if (ImGui::Selectable(net.name.c_str(), es.activeNet == net.name)) {
-                es.activeNet = net.name;
-                es.mgrSel = "net:" + net.name;
-                es.canvas.setHighlightedNet(net.name);
-            }
-        }
-        ImGui::EndCombo();
+    if (ui::kit::fieldEnum("##activeCopper", "Copper layer", &layerChoice,
+                           es.comboItems.data(), static_cast<int>(es.comboItems.size()),
+                           ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo))) {
+        es.activeLayer = m.layers()[layerChoice].id;
+        es.mgrSel = "layer:" + es.activeLayer;
+    }
+    es.comboItems.clear();
+    es.comboItems.push_back("No net");
+    int netChoice = 0;
+    for (const auto& net : m.nets()) {
+        if (es.activeNet == net.name) netChoice = static_cast<int>(es.comboItems.size());
+        es.comboItems.push_back(net.name.c_str());
+    }
+    if (ui::kit::fieldEnum("##activeNet", "Active net", &netChoice,
+                           es.comboItems.data(), static_cast<int>(es.comboItems.size()),
+                           ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo))) {
+        es.activeNet = netChoice == 0 ? std::string() : m.nets()[netChoice - 1].name;
+        if (!es.activeNet.empty()) es.mgrSel = "net:" + es.activeNet;
+        else if (es.mgrSel.rfind("net:", 0) == 0) es.mgrSel.clear();
+        es.canvas.setHighlightedNet(es.activeNet);
     }
     ui::kit::dimText("Route width (mm)");
     ImGui::SetNextItemWidth(-1.0f);
@@ -1566,21 +1570,20 @@ void drawCanvasToolContext(AppState& st, EcadEditorState& es) {
     }
 
     if (!pcb) {
-        ui::kit::dimText("Schematic grid");
-        const float grids[] = {0.254f, 0.5f, 1.0f, 1.27f, 2.54f, 5.08f};
+        static const float grids[] = {0.254f, 0.5f, 1.0f, 1.27f, 2.54f, 5.08f};
+        static const char* gridLabels[] = {
+            "0.254 mm", "0.5 mm", "1 mm", "1.27 mm", "2.54 mm", "5.08 mm"};
+        int gridChoice = -1;
+        for (int i = 0; i < 6; ++i)
+            if (std::fabs(es.mirror.grid() - grids[i]) < 1e-5f) gridChoice = i;
         char gridLabel[32];
         std::snprintf(gridLabel, sizeof(gridLabel), "%.3g mm", es.mirror.grid());
-        ImGui::SetNextItemWidth(-1.0f);
-        if (ImGui::BeginCombo("##schGrid", gridLabel)) {
-            for (float g : grids) {
-                char label[32]; std::snprintf(label, sizeof(label), "%.3g mm", g);
-                if (ImGui::Selectable(label, std::fabs(es.mirror.grid() - g) < 1e-5f)) {
-                    st.ecadPendingOps = nlohmann::json::array(
-                        {{{"op", "sch_set_grid"}, {"grid", g}}});
-                    st.ecadOpsGo = true;
-                }
-            }
-            ImGui::EndCombo();
+        if (ui::kit::fieldEnum("##schGrid", "Schematic grid", &gridChoice, gridLabels, 6,
+                               ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo)
+                                   .withPreview(gridLabel))) {
+            st.ecadPendingOps = nlohmann::json::array(
+                {{{"op", "sch_set_grid"}, {"grid", grids[gridChoice]}}});
+            st.ecadOpsGo = true;
         }
     }
 
@@ -1589,13 +1592,13 @@ void drawCanvasToolContext(AppState& st, EcadEditorState& es) {
         ui::kit::segmented("##pcbPlaceKind", placeLabels, 2, &es.pcbPlaceKind,
                            ImGui::GetContentRegionAvail().x);
         if (es.pcbPlaceKind == 0) {
-            ui::kit::dimText("Footprint library");
-            ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::BeginCombo("##placeFootprint", es.placeFp.c_str())) {
-                for (const std::string& fp : es.footprintCatalog)
-                    if (ImGui::Selectable(fp.c_str(), es.placeFp == fp)) es.placeFp = fp;
-                ImGui::EndCombo();
-            }
+            int footprintChoice = -1;
+            for (size_t i = 0; i < es.footprintCatalog.size(); ++i)
+                if (es.footprintCatalog[i] == es.placeFp) footprintChoice = static_cast<int>(i);
+            if (ui::kit::fieldCombo("##placeFootprint", "Footprint library", &footprintChoice,
+                                    es.footprintCatalog,
+                                    ui::kit::FieldOpts().withPreview(es.placeFp.c_str())))
+                es.placeFp = es.footprintCatalog[footprintChoice];
             if (es.footprintCatalog.empty())
                 ui::kit::dimText("No catalog footprint matches the current symbol search.");
         } else {
@@ -1613,8 +1616,8 @@ void drawCanvasToolContext(AppState& st, EcadEditorState& es) {
     } else if (st.ecadTool == 1 && !pcb) {
         static const char* kinds[] = {
             "Symbol", "Net label", "Power", "Junction", "No-connect", "Text"};
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::Combo("##schPlaceKind", &es.schPlaceKind, kinds, 6);
+        ui::kit::fieldEnum("##schPlaceKind", "Entity", &es.schPlaceKind, kinds, 6,
+                           ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo));
         if (es.schPlaceKind == 0) {
             ui::kit::dimText("Search symbol library");
             ImGui::SetNextItemWidth(-1.0f);
@@ -1650,17 +1653,19 @@ void drawCanvasToolContext(AppState& st, EcadEditorState& es) {
             ImGui::SetNextItemWidth(-1.0f);
             ImGui::InputText("##placeLabel", es.placeLabel, sizeof(es.placeLabel));
             static const char* scopes[] = {"Local", "Global", "Hierarchical"};
-            ImGui::SetNextItemWidth(-1.0f);
-            ImGui::Combo("##labelScope", &es.placeLabelScope, scopes, 3);
+            ui::kit::fieldEnum("##labelScope", "Scope", &es.placeLabelScope, scopes, 3,
+                               ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo));
         } else if (es.schPlaceKind == 2) {
             ImGui::SetNextItemWidth(-1.0f);
             ImGui::InputText("##powerNet", es.placePowerNet, sizeof(es.placePowerNet));
-            if (ImGui::BeginCombo("##powerSymbol", es.placePowerSymbol.c_str())) {
-                for (const char* power : {"GND", "VCC", "+5V", "+3V3"})
-                    if (ImGui::Selectable(power, es.placePowerSymbol == power))
-                        es.placePowerSymbol = power;
-                ImGui::EndCombo();
-            }
+            static const char* powers[] = {"GND", "VCC", "+5V", "+3V3"};
+            int powerChoice = -1;
+            for (int i = 0; i < 4; ++i)
+                if (es.placePowerSymbol == powers[i]) powerChoice = i;
+            if (ui::kit::fieldEnum("##powerSymbol", "Power symbol", &powerChoice, powers, 4,
+                                   ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo)
+                                       .withPreview(es.placePowerSymbol.c_str())))
+                es.placePowerSymbol = powers[powerChoice];
         } else if (es.schPlaceKind == 5) {
             ImGui::SetNextItemWidth(-1.0f);
             ImGui::InputTextMultiline("##placeText", es.placeText, sizeof(es.placeText),
@@ -1694,9 +1699,9 @@ void drawHierarchy(AppState& st, EcadEditorState& es) {
     static const char* kSchKinds[] = {"All", "Nets", "Symbols"};
     const int kindCount = pcb ? 4 : 3;
     if (es.hierarchyKind >= kindCount) es.hierarchyKind = 0;
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::Combo("##ecadHierarchyKind", &es.hierarchyKind,
-                 pcb ? kPcbKinds : kSchKinds, kindCount);
+    ui::kit::fieldEnum("##ecadHierarchyKind", "Show", &es.hierarchyKind,
+                       pcb ? kPcbKinds : kSchKinds, kindCount,
+                       ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo));
 
     int shown = 0;
     ui::fmRowStripeReset();
@@ -1781,15 +1786,18 @@ void drawSheetControls(AppState& st, EcadEditorState& es) {
     ui::kit::sectionHeader("Sheets", nullptr, nullptr, static_cast<int>(m.sheets().size()));
     const EcadSheet* active = nullptr;
     for (const auto& sheet : m.sheets()) if (sheet.id == m.activeSheet()) { active = &sheet; break; }
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::BeginCombo("##activeSheet", active ? active->name.c_str() : "Root")) {
-        for (const auto& sheet : m.sheets())
-            if (ImGui::Selectable(sheet.name.c_str(), sheet.id == m.activeSheet())) {
-                m.setActiveSheet(sheet.id);
-                es.selected.clear();
-                es.canvas.requestFit();
-            }
-        ImGui::EndCombo();
+    es.comboItems.clear();
+    int sheetChoice = -1;
+    for (const auto& sheet : m.sheets()) {
+        if (sheet.id == m.activeSheet()) sheetChoice = static_cast<int>(es.comboItems.size());
+        es.comboItems.push_back(sheet.name.c_str());
+    }
+    if (ui::kit::fieldEnum("##activeSheet", "Active sheet", &sheetChoice, es.comboItems.data(),
+                           static_cast<int>(es.comboItems.size()),
+                           ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo))) {
+        m.setActiveSheet(m.sheets()[sheetChoice].id);
+        es.selected.clear();
+        es.canvas.requestFit();
     }
     if (es.renameLoadedFor != m.activeSheet()) {
         std::snprintf(es.renameSheetName, sizeof(es.renameSheetName), "%s",
@@ -1879,8 +1887,8 @@ void drawDesignView(AppState& st, EcadEditorState& es) {
     if (es.mirror.isSch()) {
         ui::kit::sectionHeader("Simulation", "sch_simulate");
         static const char* kAnalyses[] = {"Transient", "AC"};
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::Combo("##ecadAnalysis", &st.ecadSimAnalysis, kAnalyses, 2);
+        ui::kit::fieldEnum("##ecadAnalysis", "Analysis", &st.ecadSimAnalysis, kAnalyses, 2,
+                           ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo));
         if (ui::kit::primaryButton("Simulate", true, nullptr, ImVec2(-1.0f, 0.0f)))
             st.ecadSimGo = true;
     }
@@ -2094,12 +2102,17 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
             bodyH -= ecadBottomStripHeight(st, m);
     }
     bodyH = std::max(ui::metrics::cpMenuRowGap(), bodyH);
-    ImGui::BeginChild("##ecadManagerScroll", ImVec2(0.0f, bodyH), ImGuiChildFlags_None,
-                      ImGuiWindowFlags_NoScrollbar);
+    const float laneW = ui::metrics::px(ui::kChatScrollbarLane);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(laneW, 0.0f));
+    ImGui::BeginChild("##ecadManagerScroll", ImVec2(0.0f, bodyH),
+                      ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
+    ImGui::PopStyleVar();
+    ImGui::Indent(-laneW);
     if (es.managerView == 0) drawDesignView(st, es);
     else if (es.managerView == 1) drawInspectView(st, es);
     else if (!pcb && es.managerView == 2) drawBomView(st, es);
     else drawChecksView(st, es);
+    ImGui::Indent(laneW);
     ui::drawWindowPillScrollbarV(surf);
     ImGui::EndChild();
 }
@@ -2436,26 +2449,48 @@ ClearSpan ecadClearSpan() {
     return span;
 }
 
-// No-document launchpad: describe a circuit -> the AI designs a verified schematic (AI Board goes
-// on to a populated, outlined, autorouted PCB). The buttons hand the request to the app loop via
-// st.ecadAiRequest + ecadAiGo / ecadAiBoardGo. Centred in the clear span below the floating
-// doc-tab strip, so neither pinned column covers any of it.
-void drawEcadLaunchpad(AppState& st) {
+// Welcome surface for no document or an untouched automatic PCB starter. Existing
+// designs bypass it; actions use the same app hooks as the ribbon and AI launchpad.
+void drawEcadLaunchpad(AppState& st, bool starterBoard = false) {
     const ClearSpan span = ecadClearSpan();
     const float pad = ui::metrics::U(6.0f);
     const float spanW = std::max(span.x1 - span.x0 - pad * 2.0f, ui::metrics::U(1.0f));
     const float colW = std::min(spanW, ui::metrics::px(560.0f));
     const float top = ImGui::GetCursorScreenPos().y + ui::docTabStripHeight(st) + pad;
     ImGui::SetCursorScreenPos(ImVec2(span.x0 + pad + (spanW - colW) * 0.5f, top));
-    ImGui::BeginChild("##ecadLaunchpad", ImVec2(colW, 0.0f), ImGuiChildFlags_None,
+    const float laneW = ui::metrics::px(ui::kChatScrollbarLane);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(laneW, 0.0f));
+    ImGui::BeginChild("##ecadLaunchpad", ImVec2(colW, 0.0f),
+                      ImGuiChildFlags_AlwaysUseWindowPadding,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
+    ImGui::PopStyleVar();
+    ImGui::Indent(-laneW);
     const auto surf = ui::adaptiveSurface(-1.0f);
     ui::kit::pushDensity(ui::kit::Density::Roomy);
+    if (ui::kit::cardBegin("ecad_start", starterBoard ? "Start your PCB" : "Start an electronics design",
+                           "ecad_pcb")) {
+        ui::kit::dimText(starterBoard
+            ? "Your blank board is ready. Edit it on the grid, start with a schematic, "
+              "or describe a circuit for the AI team."
+            : "Open a design or start a new board or schematic.");
+        if (ui::kit::primaryButton(starterBoard ? "Edit this board" : "New PCB",
+                                   true, nullptr, ImVec2(-1.0f, 0.0f))) {
+            if (starterBoard) {
+                state().starterCanvasChosen = true;
+                st.docTabs[st.activeTab].isStarter = false;
+                state().canvas.requestFit();
+            } else st.ecadPanelCmd = "ecad_new_pcb";
+        }
+        if (ui::kit::secondaryButton("New Schematic", true, nullptr, ImVec2(-1.0f, 0.0f)))
+            st.ecadPanelCmd = "ecad_new_sch";
+        if (ui::kit::secondaryButton("Open design", true, nullptr, ImVec2(-1.0f, 0.0f)))
+            st.ecadPanelCmd = "ecad_open";
+    }
+    ui::kit::cardEnd();
+    ui::kit::gapSection();
     if (ui::kit::cardBegin("ecad_launchpad", "Design a circuit with AI", "ai_panel")) {
-        ui::kit::dimText("Describe a circuit and the AI designs a verified schematic. AI Board "
-                         "continues to a populated, outlined and autorouted PCB, ready for "
-                         "Board to 3D. For a blank document use PCB Layout or New Schematic on "
-                         "the ribbon.");
+        ui::kit::dimText("Describe a circuit for a verified schematic. AI Board continues "
+                         "to a populated, outlined and autorouted PCB for Board to 3D.");
         static char aibuf[512] = "5V divider with 2.5V output";
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
         ImGui::InputTextWithHint("##ecad_ai", "Describe a circuit...", aibuf, sizeof(aibuf));
@@ -2501,6 +2536,7 @@ void drawEcadLaunchpad(AppState& st) {
     }
     ui::kit::cardEnd();
     ui::kit::popDensity();
+    ImGui::Indent(laneW);
     ui::drawWindowPillScrollbarV(surf);
     ImGui::EndChild();
 }
@@ -2635,8 +2671,17 @@ void drawEcadEditor(AppState& st) {
     if (!ecadOpen) { ImGui::End(); return; }
     ecadDockStripDraw(st);   // hide the redundant dock tab; app.cpp owns the filename strip
 
-    if (!es.mirror.hasDoc()) {
-        drawEcadLaunchpad(st);
+    bool emptyStarter = false;
+    if (st.activeTab >= 0 && st.activeTab < static_cast<int>(st.docTabs.size())) {
+        const auto& tab = st.docTabs[st.activeTab];
+        emptyStarter = tab.kind == AppState::DocTab::TabKind::PCB && tab.isStarter &&
+                       !tab.dirty && tab.path.empty() && es.mirror.isPcb() &&
+                       tab.ecadDocId == es.mirror.docId() && !es.mirror.hasBoardContent();
+    }
+    // Manager/ribbon placement is also an explicit choice to work on the canvas.
+    if (emptyStarter && st.ecadTool != 0) es.starterCanvasChosen = true;
+    if (!es.mirror.hasDoc() || (emptyStarter && !es.starterCanvasChosen)) {
+        drawEcadLaunchpad(st, emptyStarter);
         ImGui::End();
         return;
     }

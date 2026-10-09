@@ -29,6 +29,7 @@ enum class PlmPage {
 
 struct PlmItemRow {
     std::string itemId, path, kind, docType, partNumber, rev, lifecycle, workingRev;
+    std::string change;                  // authoritative working-tree M/A/D/U status
     bool dirty = false;
 };
 
@@ -208,6 +209,7 @@ struct PlmHubState {
     int         itemsGen = -1; bool itemsLoading = false; std::string itemsErr;
     std::string itemsProjectDir;         // also consumed by the quickbar outside PLM
     std::vector<PlmItemRow> items;
+    std::vector<PlmItemRow> untracked;    // shared discovery result for Explorer
     unsigned long long itemsRevision = 0; // changes only when the row vector is replaced
     unsigned long long filesViewRevision = 0;
     int filesViewFilter = -1, filesViewSort = -1;
@@ -223,6 +225,7 @@ struct PlmHubState {
     std::string histAuthorFilter;         // author display name ("" = anyone) — client-side
     int         histActor = 0;            // 0 all | 1 people | 2 AI — client-side
     std::vector<PlmEntryRow> history;
+    unsigned long long historyRevision = 0;
     std::string selectedEntry;
 
     // where-used explorer (Files page) — cached consumers of one item
@@ -243,11 +246,12 @@ struct PlmHubState {
     int         setGen = -1; bool setLoading = false; std::string setErr;
     std::string partPrefix, aiMode;
     bool        autoCommit = true;        // record saves to history automatically
-    // Fired once per projectDir when the hub first loads it (setActiveProjectDir
-    // also fires plm_record_outside; this covers "open PLM tab on already-set dir").
+    // One-shot outside-change recording is scheduled after the first dashboard answer.
 
     PlmVersionsState versionsGraph;
     std::string outsideRecordedFor;
+    bool outsideLoading = false;
+    std::string outsideErr;
 
     // git (Git page) — real git / GitHub client
     int         gitGen = -1; bool gitLoading = false; std::string gitErr;

@@ -1,5 +1,6 @@
 // SimManager motion study: drivers, run/cache/trace, playback, collisions, form/timeline/results.
 #include "sim_manager_internal.h"
+#include "sim_common.h"
 
 #include <cfloat>
 #include <climits>
@@ -1165,7 +1166,7 @@ void SimManager::drawMotionForm(AppState &st, Study &s) {
       const auto &joint = joints[j];
       const bool driven = std::any_of(s.motionDrivers.begin(), s.motionDrivers.end(),
                                       [&](const MotionDriver &d) { return d.mateId == joint.id; });
-      const std::string current = kit::fmtQuantity(joint.value, kit::unitText(joint.unit.c_str()));
+      const std::string current = sim::fmtU(joint.value, joint.unit.c_str(), unitSys(st).us);
       kit::RowStyle style;
       style.icon = joint.type == "angle" ? "rotate_component" : "move_component";
       style.secondary = driven ? "Already in this study" : "Click or drag to add";
@@ -1248,13 +1249,13 @@ void SimManager::drawMotionForm(AppState &st, Study &s) {
           driver = {joint.id, joint.value, joint.value + (joint.type == "angle" ? 360.0 : 10.0)};
           changed = save = true;
         }
-        const char *unit = sel >= 0 ? kit::unitText(joints[sel].unit.c_str()) : nullptr;
+        const char *unit = sel >= 0 ? joints[sel].unit.c_str() : nullptr;
         if (kit::fieldNumber("start", "Start", &driver.start,
-                             kit::FieldOpts().withUnit(unit).withTip(
+                             sim::fieldU(unit, unitSys(st).us).withTip(
                                  "Exact joint value at the first sample.")))
           changed = save = true;
         if (kit::fieldNumber("stop", "Stop", &driver.stop,
-                             kit::FieldOpts().withUnit(unit).withTip(
+                             sim::fieldU(unit, unitSys(st).us).withTip(
                                  "Exact joint value at the last sample. Equal to Start holds this "
                                  "joint while the other drivers move.")))
           changed = save = true;
@@ -1286,8 +1287,8 @@ void SimManager::drawMotionForm(AppState &st, Study &s) {
         kit::dimText("Adjust either endpoint interactively; use Start and Stop for exact values.");
         if (std::isfinite(bounds[0]) && std::isfinite(bounds[1]) && bounds[0] < bounds[1]) {
           kit::FieldGroup group("range_fields", "Start");
-          const auto options = kit::FieldOpts().withUnit(
-              sel >= 0 ? kit::unitText(joints[sel].unit.c_str()) : nullptr);
+          const auto options = sim::fieldU(
+              sel >= 0 ? joints[sel].unit.c_str() : nullptr, unitSys(st).us);
           const double beforeStart = driver.start, beforeStop = driver.stop;
           const bool startReleased =
               kit::fieldSlider("adjust_start", "Start", &driver.start, bounds[0], bounds[1], options);
@@ -1368,17 +1369,16 @@ void SimManager::drawMotionForm(AppState &st, Study &s) {
                                "clearance violations.")))
       changed = save = true;
     if (kit::fieldNumber("clearance", "Minimum clearance", &s.motionMinClearance,
-                         kit::FieldOpts()
-                             .withUnit(kit::Unit::mm)
+                         sim::fieldU("mm", unitSys(st).us)
                              .withMin(0.0)
                              .withTip("Also report separations below this value. Zero checks "
                                       "intersections only.")
                              .withDisabled(!s.motionCheckInterference,
                                            "Turn on Check interference to set a clearance.")))
       changed = save = true;
-    kit::dimText("For inverse dynamics, define motion.dynamics in Exact native parameters. "
-                 "Its native object supports duration_s, gravity, default_density_g_cm3, "
-                 "densities, masses, loads and damping; omit it for a kinematic-only sweep.");
+    kit::dimText("To calculate joint forces and moments, add inverse dynamics in Advanced "
+                 "parameters. Set the sweep duration, gravity, component masses, applied loads "
+                 "and damping there. Without inverse dynamics, this study checks motion only.");
   }
   kit::cardEnd();
   kit::gapRow();
@@ -1486,16 +1486,16 @@ void SimManager::drawMotionTimeline(AppState &st, Study &s) {
       const char *key = !known                   ? "Value"
                         : joint->type == "angle" ? "Angle"
                                                  : "Distance";
-      const std::string text = kit::fmtQuantity(
-          value->get<double>(), kit::unitText(driver.value("unit", std::string()).c_str()));
+      const std::string text = sim::fmtU(
+          value->get<double>(), driver.value("unit", std::string()).c_str(), unitSys(st).us);
       ImGui::PushID(static_cast<int>(i));
       kit::dimText(caption.c_str());
       kit::keyValueRowId("driver", key, text.c_str());
       ImGui::PopID();
     }
   } else if (pose.contains("value") && pose["value"].is_number()) {
-    const std::string text = kit::fmtQuantity(pose["value"].get<double>(),
-                                              kit::unitText(s.motionDriverUnit.c_str()));
+    const std::string text = sim::fmtU(pose["value"].get<double>(),
+                                      s.motionDriverUnit.c_str(), unitSys(st).us);
     kit::keyValueRowId("driver", "Driver", text.c_str());
   }
 }
@@ -1593,12 +1593,12 @@ void SimManager::drawMotionResults(AppState &st, Study &s) {
       if (worstForce != s.advResult.end() &&
           finiteNumber(*worstForce, "force_mag_n", value))
         kit::keyValueRowId("worst_force", "Peak joint reaction",
-                          kit::fmtQuantity(value, kit::unitText(kit::Unit::N)).c_str());
+                          sim::fmtU(value, "N", unitSys(st).us).c_str());
       const auto worstMoment = s.advResult.find("worst_moment_case");
       if (worstMoment != s.advResult.end() &&
           finiteNumber(*worstMoment, "moment_mag_nm", value))
         kit::keyValueRowId("worst_moment", "Peak joint moment",
-                          kit::fmtQuantity(value, kit::unitText(kit::Unit::N_m)).c_str());
+                          sim::fmtU(value, "N m", unitSys(st).us).c_str());
       const auto warnings = s.advResult.find("warnings");
       if (warnings != s.advResult.end() && warnings->is_array())
         for (const auto &warning : *warnings)
@@ -1744,12 +1744,12 @@ void SimManager::drawMotionResults(AppState &st, Study &s) {
                                   simJsonText(pair, "b", "component_b", "Unknown component");
         std::string secondary;
         if (pair.contains("volume") && pair["volume"].is_number())
-          secondary = "Overlap " + kit::fmtQuantity(pair["volume"].get<double>(),
-                                                    kit::unitText(kit::Unit::mm3));
+          secondary = "Overlap " + kit::fmtQuantity(
+              pair["volume"].get<double>() / (unitSys(st).us ? 25.4 * 25.4 * 25.4 : 1.0),
+              unitSys(st).us ? "in\xc2\xb3" : kit::unitText(kit::Unit::mm3));
         if (pair.contains("distance") && pair["distance"].is_number())
           secondary += (secondary.empty() ? "" : " \xC2\xB7 ") + std::string("Clearance ") +
-                       kit::fmtQuantity(pair["distance"].get<double>(),
-                                        kit::unitText(kit::Unit::mm));
+                       sim::fmtU(pair["distance"].get<double>(), "mm", unitSys(st).us);
         const std::string warning = simJsonText(pair, "warning", "reason", "");
         const std::string tip =
             "Highlight this pair in the viewport." + (warning.empty() ? "" : "\n" + warning);
@@ -1812,6 +1812,7 @@ void SimManager::drawMotionResults(AppState &st, Study &s) {
     std::vector<double> xs, trace;
     xs.reserve(nFrames);
     trace.reserve(nFrames);
+    const sim::Disp positionUnits = sim::disp("mm", unitSys(st).us);
     for (int fi = 0; fi < nFrames; ++fi) {
       const auto &frameJ = s.motionTrajectory[fi];
       double magnitude = std::numeric_limits<double>::quiet_NaN();
@@ -1829,7 +1830,7 @@ void SimManager::drawMotionResults(AppState &st, Study &s) {
           break;
         }
       xs.push_back(fi + 1);
-      trace.push_back(magnitude);
+      trace.push_back(sim::toDisplay(magnitude, positionUnits));
     }
     kit::PlotSpec plot;
     plot.x = xs;
@@ -1841,7 +1842,7 @@ void SimManager::drawMotionResults(AppState &st, Study &s) {
     plot.xAxis.integer = true;
     plot.xAxis.zero = false;
     plot.yAxis.title = "Position |p|";
-    plot.yAxis.unit = kit::unitText(kit::Unit::mm);
+    plot.yAxis.unit = positionUnits.unit;
     plot.yAxis.zero = false;
     plot.refs.push_back(kit::PlotRef::v(std::clamp(s.motionFrame, 0, nFrames - 1) + 1.0, nullptr,
                                         kit::Tone::Accent, false));

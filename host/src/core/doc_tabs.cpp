@@ -7,10 +7,12 @@
 //
 // Per-document PropertyManager, sketch, evaluate, selection, visibility, and camera state are parked
 // and restored with the same switch so an in-progress edit resumes in the correct document.
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "app_state.h"
 
@@ -32,6 +34,56 @@
 // Closing a daemon mirror is a GL-thread round trip, never an unbounded wait.
 // A timeout leaves the server-side outcome unknown; do not record a confirmed detach.
 static constexpr int kMirrorCloseTimeoutMs = 10000;
+
+// ---- most-recently-active tab history ---------------------------------------------------------
+// Closing the ACTIVE tab returns to the tab the user was on before it (e.g. leaving Electronics
+// discards the auto-created PCB1 starter and must land back on the part the user came from, not
+// on whichever tab happens to sit next to PCB1 in the strip). Keys are stable per-document ids so
+// they survive index shifts from erases; stale keys are skipped and pruned when looked up.
+static std::vector<std::string>& tabMru() {
+    static std::vector<std::string> mru;
+    return mru;
+}
+static std::string tabMruKey(const AppState::DocTab& t) {
+    if (!t.docId.empty()) return t.docId;
+    if (!t.ecadDocId.empty()) return "ecad:" + t.ecadDocId;
+    if (!t.drawingDocId.empty()) return "drawing:" + t.drawingDocId;
+    return {};
+}
+static bool tabMatchesMruKey(const AppState::DocTab& t, const std::string& key) {
+    if (!t.docId.empty()) return key == t.docId;
+    if (!t.ecadDocId.empty())
+        return key.size() == 5 + t.ecadDocId.size() && key.compare(0, 5, "ecad:") == 0 &&
+               key.compare(5, std::string::npos, t.ecadDocId) == 0;
+    if (!t.drawingDocId.empty())
+        return key.size() == 8 + t.drawingDocId.size() && key.compare(0, 8, "drawing:") == 0 &&
+               key.compare(8, std::string::npos, t.drawingDocId) == 0;
+    return false;
+}
+// Record the CURRENTLY active tab as most recent; call before any path makes a different tab active.
+static void noteLeavingTab(const AppState& st) {
+    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return;
+    std::string key = tabMruKey(st.docTabs[st.activeTab]);
+    if (key.empty()) return;
+    auto& mru = tabMru();
+    mru.erase(std::remove(mru.begin(), mru.end(), key), mru.end());
+    mru.insert(mru.begin(), std::move(key));
+    if (mru.size() > 64) mru.resize(64);
+}
+// Index of the most recently active remaining tab other than `excludeKey`, or -1.
+static int mostRecentTab(const AppState& st, const std::string& excludeKey) {
+    auto& mru = tabMru();
+    for (auto it = mru.begin(); it != mru.end();) {
+        int found = -1;
+        if (*it != excludeKey)
+            for (int i = 0; i < (int)st.docTabs.size(); ++i)
+                if (tabMatchesMruKey(st.docTabs[i], *it)) { found = i; break; }
+        if (found >= 0) return found;
+        if (*it == excludeKey) ++it;
+        else it = mru.erase(it);   // prune closed docs
+    }
+    return -1;
+}
 // ---- DocSession (multi-document per-tab editing/display state) -------------------------------
 // Defined here (not in app_state.h) so the unique_ptr members see the COMPLETE PropertyManager /
 // SketchMode / EvaluateDialogs types pulled in above — app_state.h only forward-declares them.
@@ -169,6 +221,7 @@ void AppState::addDocTab(bool isAssembly) {
     // The worker mirror already points at the new document, but the renderer still owns the leaving
     // tab's immutable buffers. Park them before the first upload for the new tab can replace them.
     if (renderer) renderer->parkActiveMeshes();
+    noteLeavingTab(*this);
     if (DocSession* prev = activeSession()) {
         DocTab& cur = docTabs[activeTab];
         cur.yaw = yaw; cur.pitch = pitch; cur.zoom = zoom;
@@ -208,6 +261,7 @@ static void parkActiveCadSession(AppState& st) {
 void AppState::addEcadTab(const std::string& kind, const std::string& ecadDocId_,
                           int ecadRevision_, const std::string& title) {
     if (ecadDocId_.empty()) return;
+    noteLeavingTab(*this);
     parkActiveCadSession(*this);
     // Save the leaving 3D tab's camera (mirrors switchToTab step 2; skipped for drawing/ECAD tabs).
     if (activeTab >= 0 && activeTab < (int)docTabs.size() &&
@@ -274,6 +328,7 @@ void AppState::switchToTab(int idx) {
         if (docMirror.docId() == docTabs[idx].docId) return;
     }
 
+    noteLeavingTab(*this);
     if (asmPanels) asmPanels->closeAllToolForms(*this);
     // 1) Park the LEAVING CAD tab's per-doc value state into its session (its PM form / sketch /
     //    measure live on the session and are preserved — switching no longer cancels them).
@@ -822,11 +877,14 @@ void AppState::closeDocTab(int idx, bool detachOnly) {
     }
 
     if (closingActive) {
-        // Activate a neighbor (prefer the tab now at the same index, i.e. the one that followed;
-        // otherwise the new last tab). switchToTab does the full re-point + viewport refresh.
-        int neighbor = idx < (int)docTabs.size() ? idx : (int)docTabs.size() - 1;
+        // Return to the tab the user was on before this one (leaving Electronics discards the PCB1
+        // starter and must land back on the part the user came from). With no usable history,
+        // fall back to a neighbor: the tab now at the same index, else the new last tab.
+        // switchToTab does the full re-point + viewport refresh.
+        int next = mostRecentTab(*this, tabMruKey(closing));
+        if (next < 0) next = idx < (int)docTabs.size() ? idx : (int)docTabs.size() - 1;
         activeTab = -1;            // force switchToTab to do a real switch (don't early-out)
-        switchToTab(neighbor);
+        switchToTab(next);
     } else {
         // A background tab closed: the active doc is unchanged; just fix up the active index. The
         // active session lives on the heap (shared_ptr), so erasing a different tab from the vector
@@ -943,6 +1001,7 @@ void AppState::ensureActiveTab() {
         // may have re-pointed the mirror without going through switchToTab) and keep its title in
         // step with the live tree (renames, agent-built names). Ensure the tab has a session and the
         // active-subsystem borrows resolve to it (idempotent when the active tab didn't change).
+        if (idx != activeTab) noteLeavingTab(*this);
         activeTab = idx;
         ensureTabSession(docTabs[idx]);
         reseatActiveSubsystems(docTabs[idx].session.get());
@@ -989,15 +1048,16 @@ void AppState::makeDrawing() {
     for (char& c : titleUpper)
         if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
 
-    // ONE engine call builds the complete professional sheet: A3 frame + ISO 7200 title block,
-    // third-angle front/top/right + iso laid out at a standard scale, auto-dimensions and hole
-    // callouts. The response carries the full drawing_get, so no follow-up fetch is needed.
+    // ONE engine call builds the complete professional sheet: frame + title block (ANSI B in an
+    // inch session, ISO A3 otherwise), third-angle front/top/right + iso laid out at a standard
+    // scale, auto-dimensions and hole callouts. The response carries the full drawing_get, so no
+    // follow-up fetch is needed.
     nlohmann::json res;
     std::string err;
     const nlohmann::json params = {
         {"source_doc_id", sourceId},
         {"spec", {{"name", sourceName + " - Drawing"},
-                  {"sheet", "A3"},
+                  {"sheet", ips() ? "B" : "A3"},
                   {"views", nlohmann::json::array({"front", "top", "right", "iso"})},
                   {"model_items", true},
                   {"hole_callouts", true},
@@ -1017,6 +1077,25 @@ void AppState::makeDrawing() {
         return;
     }
     nlohmann::json drawingDoc = std::move(res["drawing"]);
+    // An IPS session gets an inch drawing: the engine seeds the drawing's units from the source
+    // doc's stored system, which can still read MMGS while the user works in inches. Re-unit it
+    // (dimension text + the frame's unit note) before the sheet is first shown.
+    if (ips()) {
+        std::string sys;
+        if (drawingDoc.contains("tree") && drawingDoc["tree"].is_object() &&
+            drawingDoc["tree"].contains("units") && drawingDoc["tree"]["units"].is_object())
+            sys = jstr(drawingDoc["tree"]["units"], "system");
+        if (sys != "IPS") {
+            nlohmann::json ures;
+            std::string uerr;
+            if (worker.call("drawing_set_units", {{"doc_id", drawingId}, {"system", "IPS"}}, ures,
+                            uerr) &&
+                ures.is_object() && ures.contains("drawing") && ures["drawing"].is_object())
+                drawingDoc = std::move(ures["drawing"]);
+            else
+                addLog("[draw] drawing_set_units IPS failed: " + uerr);
+        }
+    }
     std::string drawingName;
     if (drawingDoc.contains("tree") && drawingDoc["tree"].is_object())
         drawingName = jstr(drawingDoc["tree"], "name");
@@ -1042,6 +1121,7 @@ void AppState::makeDrawing() {
     t.drawNeedFit = true;
     // Park the source part's edit/display state before the drawing tab takes focus (it stays loaded
     // behind the sheet), then push the drawing tab and fall the CAD subsystems back to the singletons.
+    noteLeavingTab(*this);
     parkActiveCadSession(*this);
     // The source now feeds a drawing: it is no longer an "untouched starter" that leaving the
     // Model workspace may discard (that would close the drawing's source part).

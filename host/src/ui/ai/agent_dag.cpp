@@ -67,6 +67,8 @@ struct TraceStore {
     unsigned long long uidCtr = 1;
     int thoughtCount = 0, ctxCount = 0;
     double userSyncTs = 0.0;
+    double lastEventTs = 0.0;   // persists the last delta too, not just the start of its text block
+    bool settled = false;      // ended traces are normalized once, never on every display frame
     bool userSeeded = false;
     std::string selAgent = "main";
 
@@ -76,6 +78,7 @@ struct TraceStore {
         agents.clear(); agentIdx.clear(); spanAgent.clear();
         thoughtCount = ctxCount = 0;
         userSyncTs = 0.0; userSeeded = false;
+        lastEventTs = 0.0; settled = false;
         selAgent = "main";
         Agent m;
         m.id = "main"; m.name = "Main agent"; m.status = "idle";
@@ -115,6 +118,17 @@ static void appendCapped(std::string& dst, const std::string& src) {
 static bool blankText(const std::string& s) {
     return s.find_first_not_of(" \t\r\n") == std::string::npos;
 }
+static bool stoppedReason(const std::string& reason) {
+    return reason == "confirmed" || reason == "cancelled" ||
+           reason == "stopped" || reason == "interrupted";
+}
+
+static bool turnWasStopped(const ChatMsg& m) {
+    return m.resultPartial ||
+        std::any_of(m.activity.begin(), m.activity.end(), [](const ActivityItem& a) {
+            return a.stage == "__stop_meta__" && stoppedReason(a.title);
+        });
+}
 static bool terminalStatus(const std::string& s) {
     return s == "done" || s == "failed" || s == "cancelled" || s == "stopped";
 }
@@ -126,6 +140,7 @@ static std::string agentStatusFrom(const std::string& raw) {
     if (raw == "fail" || raw == "failed" || raw == "error") return "failed";
     if (raw == "cancel" || raw == "cancelled" || raw == "canceled" || raw == "aborted")
         return "cancelled";
+    if (raw == "stopped" || raw == "interrupted") return "stopped";
     if (raw == "pending" || raw == "waiting") return "pending";
     return "running";
 }
@@ -137,6 +152,7 @@ static std::string stepStatusFrom(const std::string& raw) {
     if (raw == "skipped") return "skipped";
     if (raw == "retry") return "retry";
     if (raw == "cancelled" || raw == "canceled") return "cancelled";
+    if (raw == "stopped" || raw == "interrupted") return "stopped";
     if (raw == "running" || raw == "started" || raw == "pending") return "running";
     return raw.empty() ? std::string() : std::string("ok");
 }
@@ -194,6 +210,7 @@ static void closeOpen(Agent& a) {
 
 static Step& pushStep(TraceStore& t, int ai, StepKind k, double ts) {
     Agent& a = t.agents[(size_t)ai];
+    t.lastEventTs = std::max(t.lastEventTs, ts);
     closeOpen(a);
     if (a.steps.size() >= kMaxStepsPerAgent) { a.steps.pop_front(); ++a.dropped; }
     Step s;
@@ -236,6 +253,7 @@ static int eventOwner(TraceStore& t, const nlohmann::json& d, double now) {
 
 // Coalesce a streamed thinking/prose delta into the agent's open block of the same kind.
 static void appendStream(TraceStore& t, int ai, StepKind k, const std::string& txt, double now) {
+    t.lastEventTs = std::max(t.lastEventTs, now);
     Agent& a = t.agents[(size_t)ai];
     if (!a.steps.empty() && a.steps.back().open && a.steps.back().kind == k) {
         appendCapped(a.steps.back().detail, txt);
@@ -284,7 +302,7 @@ static void subagentLifecycle(TraceStore& t, const nlohmann::json& d, const std:
             if (a.startTs <= 0.0) a.startTs = now;
             return;
         }
-        if (terminalStatus(a.status)) return;   // repeated terminal frame
+        if (terminalStatus(a.status) && a.status != "stopped") return;   // repeated terminal frame
         a.status = st;
         a.endTs = now;
         if (a.startTs <= 0.0) a.startTs = now;
@@ -319,6 +337,40 @@ static void subagentLifecycle(TraceStore& t, const nlohmann::json& d, const std:
     if (st == "failed") s.error = detail;
 }
 
+// Close the whole tree, not only the main agent. A stream can disappear without run_finished
+// (Stop, transport loss, crash recovery). Its last recorded event is the cutoff, never wall now.
+static void settleTrace(TraceStore& t) {
+    if (t.settled) return;
+    double end = t.lastEventTs;
+    for (const Agent& a : t.agents) {
+        end = std::max(end, a.endTs);
+        for (const Step& s : a.steps) {
+            const bool timed = s.kind == StepKind::Tool || s.kind == StepKind::Spawn ||
+                               s.kind == StepKind::Compaction || s.kind == StepKind::Retry;
+            end = std::max(end, s.ts + (timed && s.durationMs > 0 ? s.durationMs / 1000.0 : 0.0));
+        }
+    }
+    for (Agent& a : t.agents) {
+        if (!terminalStatus(a.status) && (a.status != "idle" || !a.steps.empty())) {
+            a.status = "stopped";
+            a.endTs = std::max(end, a.startTs);
+        }
+        for (Step& s : a.steps) {
+            if (s.status != "running" && !s.open) continue;
+            s.open = false;
+            s.status = "stopped";
+            if (s.durationMs < 0 && s.ts > 0.0 &&
+                (s.kind == StepKind::Tool || s.kind == StepKind::Spawn ||
+                 s.kind == StepKind::Compaction || s.kind == StepKind::Retry))
+                s.durationMs = (int)std::max(0.0, (end - s.ts) * 1000.0);
+            ++s.rev;
+        }
+    }
+    if (!t.agents.empty()) t.agents[0].endTs = std::max(t.agents[0].endTs, end);
+    t.lastEventTs = end;
+    t.settled = true;
+}
+
 static const char* kindName(StepKind k) {
     static const char* names[] = {"thinking", "reply", "tool", "user", "steer", "spawn",
                                   "subagent_end", "context", "compaction", "retry", "plan",
@@ -349,6 +401,8 @@ void feedAgentDagEvent(const std::string& convId, const std::string& kind,
     if (!data.is_object()) return;
     TraceStore& t = s_traces[convId];
     const double now = chatNowEpoch();
+    t.settled = false;
+    t.lastEventTs = std::max(t.lastEventTs, now);
     const std::string sub = jstr(data, "subagent_id");
 
     if (kind == "run_started") {
@@ -515,19 +569,18 @@ void feedAgentDagEvent(const std::string& convId, const std::string& kind,
     } else if (kind == "run_finished") {
         const std::string raw = jstr(data, "status");
         if (!sub.empty()) { subagentLifecycle(t, data, raw.empty() ? "done" : raw, now); return; }
-        const std::string st = agentStatusFrom(raw.empty() ? std::string("done") : raw);
-        for (Agent& a : t.agents) closeOpen(a);
+        const std::string reason = jstr(data, "stop_reason");
+        const std::string st = stoppedReason(reason) ? "stopped"
+                                  : agentStatusFrom(raw.empty() ? std::string("done") : raw);
         Agent& m = t.agents[0];
         m.status = st == "running" || st == "pending" ? std::string("done") : st;
         m.endTs = now;
         if (m.startTs <= 0.0) m.startTs = now;
-        for (Step& s : m.steps)
-            if (s.status == "running") { s.status = "stopped"; ++s.rev; }
         const std::string model = jstr(data, "model");
         if (!model.empty()) m.model = model;
         Step& s = pushStep(t, 0, StepKind::RunEnd, now);
         s.title = m.status == "done" ? "Run finished" : m.status == "failed" ? "Run failed"
-                                                                          : "Run cancelled";
+                       : m.status == "stopped" ? "Run stopped" : "Run cancelled";
         s.status = m.status == "done" ? "ok" : m.status;
         s.target = jstr(data, "stop_reason");
         std::string err = jstr(data, "error_human");
@@ -535,6 +588,7 @@ void feedAgentDagEvent(const std::string& convId, const std::string& kind,
         if (!ed.empty()) err += (err.empty() ? "" : "\n\n") + ed;
         s.error = err;
         s.durationMs = (int)std::max(0.0, (m.endTs - m.startTs) * 1000.0);
+        settleTrace(t);
     } else if (kind == "plan_state") {
         const int ai = eventOwner(t, data, now);
         int total = 0, done = 0;
@@ -614,6 +668,7 @@ nlohmann::json agentDagToJson(const std::string& convId) {
     j["uidCtr"] = t.uidCtr;
     j["userSyncTs"] = t.userSyncTs;
     j["userSeeded"] = t.userSeeded;
+    j["lastEventTs"] = t.lastEventTs;
     j["thoughtCount"] = t.thoughtCount;
     j["ctxCount"] = t.ctxCount;
     nlohmann::json agents = nlohmann::json::array(), nodes = nlohmann::json::array();
@@ -698,6 +753,7 @@ void agentDagFromJson(const std::string& convId, const nlohmann::json& j) {
         }
     t.uidCtr = std::max(j.value("uidCtr", (unsigned long long)1), maxUid + 1);
     t.userSyncTs = j.value("userSyncTs", 0.0);
+    t.lastEventTs = j.value("lastEventTs", 0.0);
     t.userSeeded = j.value("userSeeded", false);
     t.thoughtCount = j.value("thoughtCount", 0);
     t.ctxCount = j.value("ctxCount", 0);
@@ -883,21 +939,25 @@ static void buildFallback(const std::vector<ChatMsg>& msgs, TraceStore& t) {
                     Agent& c = t.agents[(size_t)ci];
                     c.name = jstr(dlg, "role");
                     c.brief = jstr(dlg, "brief");
-                    c.status = m.running ? "running" : "done";
+                    // Dispatch is not proof of completion. Only a terminal lifecycle event can
+                    // say "done"; an ended transcript without one is an interrupted delegate.
+                    c.status = m.running ? "running" : "stopped";
                     Step& s = pushStep(t, 0, StepKind::Spawn, m.ts);
                     s.spanId = id;
                     s.title = "Spawned " + (c.name.empty() ? std::string("sub-agent") : c.name);
                     s.target = c.brief;
-                    s.status = m.running ? "running" : "ok";
+                    s.status = m.running ? "running" : "stopped";
                 }
                 break;
             }
             default:
                 if (a.stage == "__stop_meta__" && (!a.detail.empty() || !a.title.empty())) {
-                    Step& s = pushStep(t, 0, StepKind::Error, m.ts);
+                    const bool stopped = stoppedReason(a.title);
+                    Step& s = pushStep(t, 0, stopped ? StepKind::RunEnd : StepKind::Error, m.ts);
                     s.title = a.title.empty() ? std::string("Stopped") : "Stopped: " + a.title;
-                    s.error = a.detail;
-                    s.status = "failed";
+                    if (stopped) s.detail = a.detail;
+                    else s.error = a.detail;
+                    s.status = stopped ? "stopped" : "failed";
                 }
                 break;
             }
@@ -907,6 +967,8 @@ static void buildFallback(const std::vector<ChatMsg>& msgs, TraceStore& t) {
             s.detail = capText(m.text, kMaxStepText);
         }
         failed = m.errKind != ERR_NONE && m.errKind != ERR_PARTIAL;
+        const bool stopped = turnWasStopped(m);
+        if (stopped) failed = false;
         if (failed) {
             Step& s = pushStep(t, 0, StepKind::Error, m.ts);
             s.title = m.errorHuman.empty() ? std::string("Run failed") : m.errorHuman;
@@ -916,9 +978,15 @@ static void buildFallback(const std::vector<ChatMsg>& msgs, TraceStore& t) {
     }
     for (Agent& a : t.agents) if (!running) closeOpen(a);
     Agent& main = t.agents[0];
-    main.status = running ? "running" : failed ? "failed" : main.steps.empty() ? "idle" : "done";
+    const ChatMsg* latest = nullptr;
+    for (auto it = msgs.rbegin(); it != msgs.rend(); ++it)
+        if (!it->fromUser) { latest = &*it; break; }
+    const bool stopped = latest && turnWasStopped(*latest);
+    main.status = running ? "running" : stopped ? "stopped" : failed ? "failed"
+                                                    : main.steps.empty() ? "idle" : "done";
     main.startTs = first;
     main.endTs = running ? 0.0 : last;
+    if (!running) settleTrace(t);
     t.selAgent = findAgent(t, keepSel) >= 0 ? keepSel : std::string("main");
 }
 
@@ -934,7 +1002,10 @@ static size_t transcriptSig(const std::vector<ChatMsg>& msgs) {
 static TraceStore* activeTrace(AppState& st, const std::string& convId, bool* fromTranscript) {
     *fromTranscript = false;
     auto it = s_traces.find(convId);
-    if (it != s_traces.end() && it->second.hasContent()) return &it->second;
+    if (it != s_traces.end() && it->second.hasContent()) {
+        if (!st.convRunning(convId)) settleTrace(it->second);
+        return &it->second;
+    }
     const std::vector<ChatMsg>* msgs = conversationMsgs(st, convId);
     if (!msgs || msgs->empty()) return nullptr;
     FallbackTrace& fb = s_fallback[convId];
@@ -948,6 +1019,7 @@ static TraceStore* activeTrace(AppState& st, const std::string& convId, bool* fr
         fb.built = true;
     }
     if (!fb.store.hasContent()) return nullptr;
+    if (!st.convRunning(convId)) settleTrace(fb.store);
     *fromTranscript = true;
     return &fb.store;
 }
@@ -1011,22 +1083,12 @@ static kit::Status agentGlyph(const std::string& status) {
     return kit::Status::Skipped;   // cancelled / stopped
 }
 
-// "42s" / "12m" / "1h 05m" — the tree's compact elapsed readout.
-static std::string compactElapsed(double seconds) {
-    const long s = (long)std::max(0.0, seconds);
-    char buf[32];
-    if (s < 60)        std::snprintf(buf, sizeof(buf), "%lds", s);
-    else if (s < 3600) std::snprintf(buf, sizeof(buf), "%ldm", s / 60);
-    else               std::snprintf(buf, sizeof(buf), "%ldh %02ldm", s / 3600, (s % 3600) / 60);
-    return buf;
-}
 
 static std::string stepDuration(const Step& s, double now) {
     if (s.status == "running" && s.ts > 0.0 &&
         (s.kind == StepKind::Tool || s.kind == StepKind::Spawn || s.kind == StepKind::Compaction))
         return kit::fmtDuration(now - s.ts);
     if (s.durationMs < 0) return std::string();
-    if (s.durationMs < 1000) return std::to_string(s.durationMs) + " ms";
     return kit::fmtDuration(s.durationMs / 1000.0);
 }
 
@@ -1052,7 +1114,8 @@ static std::string agentLabel(const Agent& a) {
 // Display status: any agent still marked running after its run ended was interrupted (no event
 // can arrive for it once the run's stream is gone).
 static std::string agentDisplayStatus(const Agent& a, bool convRunning, bool fromTranscript) {
-    if (!fromTranscript && a.status == "running" && !convRunning) return "stopped";
+    (void)fromTranscript;
+    if (!convRunning && (a.status == "running" || a.status == "pending")) return "stopped";
     if (a.status == "idle" && !a.steps.empty()) return "done";
     return a.status.empty() ? std::string("idle") : a.status;
 }
@@ -1193,7 +1256,7 @@ static void drawAgentRow(AppState& st, TraceStore& t, int ai, int depth, bool co
     const double end = agentEndTs(a, status);
     std::string meta;
     if (a.startTs > 0.0 && end >= a.startTs)
-        meta += "  \xE2\x80\xA2  " + compactElapsed(end - a.startTs);
+        meta += "  \xE2\x80\xA2  " + kit::fmtDuration(end - a.startTs);
     meta += "  \xE2\x80\xA2  " + std::to_string(a.toolCount) +
             (a.toolCount == 1 ? " tool" : " tools");
     std::string failTxt;
@@ -1342,8 +1405,15 @@ void drawAgentTrace(AppState& st, const std::string& convId, AgentTraceSelectAge
     const float spacingY = ImGui::GetStyle().ItemSpacing.y;
     const float agentRowH = ImGui::GetTextLineHeight() + kit::padY() * 2.0f;
     const float avail = ImGui::GetContentRegionAvail().y;
-    const float treeContent = order.size() * (agentRowH + spacingY) + ImGui::GetStyle().WindowPadding.y * 2.0f;
-    const float treeH = std::min(treeContent, std::max(avail * 0.34f, (agentRowH + spacingY) * 2.0f));
+    const float pitch = agentRowH + spacingY;
+    const float padding = ImGui::GetStyle().WindowPadding.y * 2.0f;
+    const float treeContent = order.size() * pitch - spacingY + padding;
+    // Small trees should fit in full. Larger trees scroll in whole-row viewports, not through
+    // a percentage-height cut across a name. Leave at least two step rows below the tree.
+    const float treeBudget = order.size() <= 5 ? treeContent
+        : std::max(pitch * 2.0f + padding, std::min(avail * 0.5f, treeContent));
+    const int visibleRows = std::max(2, (int)std::floor((treeBudget - padding + spacingY) / pitch));
+    const float treeH = std::min(treeContent, visibleRows * pitch - spacingY + padding);
     ImGui::BeginChild("##trace_tree", ImVec2(0, treeH), ImGuiChildFlags_AlwaysUseWindowPadding,
                       ImGuiWindowFlags_NoScrollbar);
     {

@@ -1172,8 +1172,8 @@ namespace {
 namespace kit = ui::kit;
 
 struct DisplayUnits {
-  double len = 1.0, stress = 1.0, pressPa = 1.0;
-  std::string lenL = "mm", stressL = "MPa", pressL = "Pa";
+  double len = 1.0, stress = 1.0, pressPa = 1.0, mass = 1.0;
+  std::string lenL = "mm", stressL = "MPa", pressL = "Pa", massL = "g";
 };
 
 DisplayUnits displayUnits(const AppState &st) {
@@ -1187,6 +1187,8 @@ DisplayUnits displayUnits(const AppState &st) {
               // sim's psi
     d.pressPa = u.pressFromMpa * 1e-6;
     d.pressL = u.press;
+    d.mass = 1.0 / 453.59237;
+    d.massL = "lb";
   }
   return d;
 }
@@ -1773,8 +1775,16 @@ bool problemSection(json &topo, const Capabilities &caps, SettingsView &view,
           sel = items.count();
         items.add(objectiveLabel(o, p2));
       }
+    // Keep the selected value compact enough for the pane's value column; the complete
+    // objective is wrapped below the group rather than ellipsized inside the combo.
     const std::string preview =
-        sel < 0 && !obj.empty() ? objectiveLabel(obj, p2) : "";
+        obj == "compliance" ? "Stiffness" :
+        obj == "mass" ? "Mass" :
+        obj == "thermal_compliance" ? "Thermal" :
+        obj == "frequency" ? "Frequency" :
+        obj == "buckling_factor" ? "Buckling" :
+        obj == "pressure_drop" ? "Pressure drop" :
+        (!obj.empty() ? objectiveLabel(obj, p2) : "");
     const FieldIssue fi = keyIssue(issues, "objective");
     kit::FieldOpts o;
     o.withHint("Choose objective")
@@ -1794,6 +1804,8 @@ bool problemSection(json &topo, const Capabilities &caps, SettingsView &view,
     }
   }
   } // FieldGroup "problem"
+  if (!str(topo, "objective").empty())
+    kit::dimText(objectiveLabel(str(topo, "objective"), str(topo, "physics")).c_str());
   if (!view.switchNote.empty())
     kit::inlineStatus(view.switchNote.c_str(), kit::Tone::Info);
   kit::cardEnd();
@@ -2177,7 +2189,7 @@ void outcomeCard(const json &result, const OutcomeSummary &o) {
 // Key metrics: baseline vs final of the objective, the volume budget and the
 // mass (metricTable folds each unit into its metric label). Iterations and
 // run time are outcome chips; the rest of the evidence is in Run details.
-void metricsSection(const json &result) {
+void metricsSection(const json &result, const DisplayUnits &du) {
   const json &s = member(result, "summary");
   const std::string physics = str(result, "physics");
   const std::string objective = str(s, "objective");
@@ -2209,7 +2221,8 @@ void metricsSection(const json &result) {
       num(s, "volume_fraction_final"), "", 0,
       std::isfinite(target) ? "Target " + kit::fmtValue(target) + "."
                             : std::string());
-  add("Mass", num(s, "mass_baseline_g"), num(s, "mass_final_g"), "g", -1);
+  add("Mass", num(s, "mass_baseline_g") * du.mass,
+      num(s, "mass_final_g") * du.mass, du.massL, -1);
   if (rows.empty())
     kit::dimText("This run reported no baseline or final values.");
   else
@@ -2552,9 +2565,10 @@ void compareView(const json &runs, size_t sel, const DisplayUnits &du,
       dir = -1;
     kit::MetricRow r;
     r.metric = d.label;
-    r.unit = kit::unitText(d.units.c_str());
-    r.values = {{kit::fmtValue(d.baseline)},
-                {kit::fmtValue(d.selected)},
+    const bool mass = d.key == "mass_final_g";
+    r.unit = mass ? du.massL.c_str() : kit::unitText(d.units.c_str());
+    r.values = {{kit::fmtValue(d.baseline * (mass ? du.mass : 1.0))},
+                {kit::fmtValue(d.selected * (mass ? du.mass : 1.0))},
                 d.comparable ? changeCell(d.baseline, d.selected, dir)
                              : kit::MetricCell{"n/a", kit::Tone::Neutral}};
     r.tooltip = d.note.empty() ? nullptr : d.note.c_str();
@@ -2796,7 +2810,7 @@ ResultsAction drawTopologyResults(AppState &st, const json &runs,
   const OutcomeSummary o = classifyResult(result);
   outcomeCard(result, o);
   if (result.is_object())
-    metricsSection(result);
+    metricsSection(result, displayUnits(st));
   if (displayControls) {
     kit::gapRow();
     displayControls();

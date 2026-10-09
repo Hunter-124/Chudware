@@ -507,7 +507,7 @@ void plmStartGuidedTour() {
 // gate visible content count — this is the headless capture's "settled" signal.
 bool plmBusy() {
     const PlmHubState& H = g_plmHub;
-    if (H.itemsLoading || H.histLoading || H.versionsGraph.loading) return true;
+    if (H.itemsLoading || H.histLoading || H.versionsGraph.loading || H.outsideLoading) return true;
     switch (H.page) {
         case PlmPage::Overview: return H.ovLoading || H.gitLoading || H.planLoading;
         case PlmPage::Planning:
@@ -534,6 +534,8 @@ void drawPlmWorkspace(AppState& st) {
     std::string proj = st.plmProjectPath();
     if (proj != g_plmHub.projectDir) {
         g_plmHub.projectDir = proj;
+        g_plmHub.outsideLoading = false;
+        g_plmHub.outsideErr.clear();
         plmInvalidate();
         plmGraphOnProjectChanged();
         plmVersionsOnProjectChanged();
@@ -571,6 +573,9 @@ void drawPlmWorkspace(AppState& st) {
     // the same right margin the page body keeps (-M below) so it never runs past it.
     drawTopNav(st, ImGui::GetContentRegionAvail().x - M);
     ImGui::Dummy(ImVec2(0, 2 * S));  // tighter gap between nav and page body
+    if (g_plmHub.outsideLoading)
+        kit::spinner("Recording outside changes");
+    kit::inlineStatus(g_plmHub.outsideErr.c_str(), kit::Tone::Warn);
 
     // One generous, uniform content margin for every page body — so the Overview,
     // Planning band, Team & Sync and the board all share the same left edge instead

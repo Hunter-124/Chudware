@@ -4981,6 +4981,7 @@ void pipeDrawTick(AppState& st) {
             P.dir = std::string(repo ? repo : ".") + "/scratch/pipedraw_shots";
             std::error_code ec; std::filesystem::create_directories(P.dir, ec);
             P.started = P.stepStart = pipingNow();
+            P.step = -2;  // exercise large-document -> empty-document framing in one GUI session
             P.report = {{"scenario", "pipedraw"}, {"ok", false},
                 {"checks", nlohmann::json::array()}, {"skipped", nlohmann::json::array()},
                 {"captures", nlohmann::json::array()}, {"input", nlohmann::json::array()}};
@@ -5058,6 +5059,31 @@ void pipeDrawTick(AppState& st) {
     const std::array<float, 3> a{-300,-150,0}, b{300,-150,0}, c{300,250,0},
         d{300,250,300}, tee{0,-150,0}, end{0,-450,0};
     switch (P.step) {
+    case -2: {
+        std::string err;
+        if (!st.docMirror.newPart(st.worker, err)) { pipeDrawFail("large_part", err); return; }
+        st.clearViewportForNewDoc();
+        st.addDocTab(false);
+        auto dim = [](double v) { return nlohmann::json{{"value", v}, {"expr", nullptr}}; };
+        auto result = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {
+                {"type", "box"}, {"name", "Large framing regression fixture"},
+                {"params", {{"length", dim(4000)}, {"width", dim(1650)}, {"height", dim(3063)}}},
+                {"centered", true}}}}
+        }));
+        if (!result.ok || result.aicm_path.empty() || !st.loadDocMesh(result.aicm_path, err)) {
+            pipeDrawFail("large_part_mesh", result.error_message.empty() ? err : result.error_message);
+            return;
+        }
+        next(-1);
+        P.settle = 12;
+        break;
+    }
+    case -1:
+        if (!check("large_document_framed", st.renderer->effectiveSceneRadius() > 1000,
+                   {{"radius_mm", st.renderer->effectiveSceneRadius()}})) return;
+        next(0);
+        break;
     case 0: {
         std::string err;
         if (!st.docMirror.newPart(st.worker, err)) { pipeDrawFail("new_part", err); return; }
@@ -5081,6 +5107,8 @@ void pipeDrawTick(AppState& st) {
         if (!ready()) return;
         if (!check("fresh_empty_document", !st.hasDocMesh &&
             sm->piping().network().value("runs", nlohmann::json::array()).empty(), {{"has_doc_mesh", st.hasDocMesh}})) return;
+        if (!check("empty_document_drops_large_radius", st.renderer->effectiveSceneRadius() < 100,
+                   {{"radius_mm", st.renderer->effectiveSceneRadius()}})) return;
         sm->handleCommand(st, "sim_piping_draw");
         sm->piping().drawSettings().plane = 0;
         sm->piping().drawSettings().autoPlane = false;

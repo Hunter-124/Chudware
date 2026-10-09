@@ -1,6 +1,7 @@
 #include "versions_tab.h"
 
 #include "plm_hub.h"
+#include "graph_thumbs.h"
 
 #include <algorithm>
 #include <cctype>
@@ -50,6 +51,12 @@ struct VersionsView {
     struct TimelineRow { std::string authoredAt, authoredBy, summary; };
     std::vector<TimelineRow> timeline;
     bool showChanges = true, showAi = true;
+    bool thumbsLoading = false;
+    bool thumbAttempted = false;
+    std::string thumbsProject, thumbsError, thumbCommit;
+    std::unordered_map<std::string, std::string> thumbFiles;
+    unsigned int thumbTexture = 0;
+    int thumbWidth = 0, thumbHeight = 0;
     char tagName[64] = {};
     char checkpointMessage[192] = {};
     char branchName[96] = {};
@@ -281,8 +288,9 @@ const PlmVersionNodeRow* selectedNode() {
 void drawToolbar(AppState& st) {
     auto& G = g_plmHub.versionsGraph;
     auto& V = view();
-    ImGui::SetNextItemWidth(px(220.0f));
-    ImGui::InputTextWithHint("##versions_search", "Search messages, authors, refs", G.search, sizeof(G.search));
+    ImGui::SetNextItemWidth(std::min(ImGui::GetContentRegionAvail().x,
+        ImGui::CalcTextSize("Search versions").x + ImGui::GetStyle().FramePadding.x * 2.0f));
+    ImGui::InputTextWithHint("##versions_search", "Search versions", G.search, sizeof(G.search));
     ImGui::SameLine(0.0f, px(8.0f));
     const char* scopes[] = {"Design", "Planning", "All"};
     int scope = G.scope;
@@ -292,7 +300,17 @@ void drawToolbar(AppState& st) {
     ImGui::SameLine(0.0f, px(8.0f));
     if (kit::iconButton("##versions_fit", "mesh", "Fit all commits")) V.fit = true;
     ImGui::SameLine(0.0f, px(6.0f));
-    if (kit::iconButton("##versions_refresh", "history", "Refresh versions")) G.gen = -1;
+    if (kit::iconButton("##versions_refresh", "history", "Refresh versions")) {
+        G.gen = -1;
+        if (!V.thumbsLoading) {
+            for (auto it = V.thumbFiles.begin(); it != V.thumbFiles.end();) {
+                if (it->second.empty()) it = V.thumbFiles.erase(it);
+                else ++it;
+            }
+            V.thumbsError.clear();
+            V.thumbAttempted = false;
+        }
+    }
     ImGui::SameLine(0.0f, px(8.0f));
     const bool two = !G.selected.empty() && !G.compareSecond.empty();
     if (kit::secondaryButton(two ? "Compare these two" : "Compare", two,
@@ -521,7 +539,53 @@ void drawInspector(AppState& st, const PlmVersionNodeRow& n) {
         kit::valueChip("AI model", n.ai.model.c_str(), kit::Tone::Accent);
         if (!n.ai.provider.empty()) { ImGui::SameLine(); kit::chip(n.ai.provider.c_str()); }
     }
-    if (!n.thumbnailRef.empty()) kit::inlineStatus("Geometry thumbnail is available for this commit.", kit::Tone::Neutral);
+    if (!n.thumbnailRef.empty()) {
+        const std::string project = st.plmProjectPath();
+        if (!V.thumbsLoading && !V.thumbFiles.count(n.commit)) {
+            const std::string requestKey = project + ":" + n.commit;
+            V.thumbsLoading = true;
+            V.thumbsProject = requestKey;
+            V.thumbsError.clear();
+            V.thumbFiles.emplace(n.commit, std::string());
+            nlohmann::json p{{"path", project}, {"scope", "all"}, {"commit", n.commit},
+                             {"thumb_dir", project + "/.plm/version-thumbs"}};
+            st.rpc.call("plm_history", p, [project, requestKey, &st](const core::RpcResult& r) {
+                auto& V = view();
+                if (V.thumbsProject != requestKey) return;
+                V.thumbsLoading = false;
+                if (project != st.plmProjectPath() || !plmOk(r, V.thumbsError)) return;
+                if (auto entries = r.result.find("entries");
+                    entries != r.result.end() && entries->is_array()) {
+                    for (const auto& entry : *entries) {
+                        auto file = entry.find("thumbnail_file");
+                        auto commit = entry.find("commit");
+                        if (file != entry.end() && file->is_string() &&
+                            commit != entry.end() && commit->is_string())
+                            V.thumbFiles[commit->get<std::string>()] = file->get<std::string>();
+                    }
+                }
+            });
+        }
+        if (V.thumbCommit != n.commit) {
+            plmFreePngTexture(V.thumbTexture);
+            V.thumbCommit = n.commit;
+            V.thumbAttempted = false;
+        }
+        const auto file = V.thumbFiles.find(n.commit);
+        if (!V.thumbAttempted && file != V.thumbFiles.end() && !file->second.empty()) {
+            V.thumbAttempted = true;
+            plmLoadPngTexture(file->second, V.thumbTexture, V.thumbWidth, V.thumbHeight);
+        }
+        if (V.thumbTexture) {
+            const float width = ImGui::GetContentRegionAvail().x;
+            const float scale = std::min(width / std::max(V.thumbWidth, 1),
+                metrics::px(180.0f) / std::max(V.thumbHeight, 1));
+            ImGui::Image((ImTextureID)(intptr_t)V.thumbTexture,
+                         ImVec2(V.thumbWidth * scale, V.thumbHeight * scale));
+        } else if (V.thumbsLoading) kit::spinner("Loading preview");
+        else kit::inlineStatus(V.thumbsError.empty() ? "This version's preview could not be loaded."
+                                                    : V.thumbsError.c_str(), kit::Tone::Warn);
+    }
     ImGui::Separator();
     if (kit::secondaryButton("Tag this version", !g_plmHub.busy)) ImGui::OpenPopup("##tag_version");
     ImGui::SameLine();
@@ -550,7 +614,7 @@ void drawInspector(AppState& st, const PlmVersionNodeRow& n) {
             callMutation(st, "plm_branch_merge", {{"name", branch.name}}, "Branch merged");
     }
     ImGui::Separator();
-    if (ImGui::CollapsingHeader("Show changes", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (kit::cardBegin("##version_changes", "Show changes", "history", &V.showChanges)) {
         // An explicit "Compare these two" pair wins while both commits stay picked; otherwise
         // the version is compared against its first parent.
         const bool pair = V.pairCompare && !G.compareSecond.empty();
@@ -584,7 +648,8 @@ void drawInspector(AppState& st, const PlmVersionNodeRow& n) {
                 kit::dimText("No differences found.");
         }
     }
-    if (ImGui::CollapsingHeader("AI activity", ImGuiTreeNodeFlags_DefaultOpen)) {
+    kit::cardEnd();
+    if (kit::cardBegin("##version_ai", "AI activity", "history", &V.showAi)) {
         fetchTimeline(st, n);
         if (V.timelineLoading) kit::spinner("Loading agent micro-history");
         else if (!V.timelineError.empty()) kit::inlineStatus(V.timelineError.c_str(), kit::Tone::Warn);
@@ -596,6 +661,7 @@ void drawInspector(AppState& st, const PlmVersionNodeRow& n) {
             kit::cardEnd();
         }
     }
+    kit::cardEnd();
 }
 
 }  // namespace
@@ -607,6 +673,7 @@ void plmVersionsOnProjectChanged() {
     const bool available = G.available;
     G = PlmVersionsState{};
     G.available = available;
+    plmFreePngTexture(view().thumbTexture);
     view() = VersionsView{};
 }
 

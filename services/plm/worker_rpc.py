@@ -124,7 +124,8 @@ def _plm_history(params: dict, _emit: Callable) -> dict:
         item_id = (params or {}).get("item_id") or None
         limit = int((params or {}).get("limit") or 0) or None
         scope = str((params or {}).get("scope", "design") or "design")
-        entries = v.history(item_id, limit, scope=scope)
+        commit = str((params or {}).get("commit") or "")
+        entries = [v._entry_view_light(commit, item_id=item_id)] if commit else v.history(item_id, limit, scope=scope)
         thumb_dir = str((params or {}).get("thumb_dir", "") or "")
         if thumb_dir:
             td = Path(thumb_dir)

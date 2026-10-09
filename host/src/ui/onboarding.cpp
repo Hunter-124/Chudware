@@ -79,29 +79,24 @@ constexpr OAuthProvider kOAuthProviders[] = {
 struct WorkspaceChoice {
     const char* label;
     const char* detail;
-    const char* icon;
     const char* configName;
     AppState::Workspace workspace;
 };
 
 constexpr WorkspaceChoice kWorkspaces[] = {
-    {"Model", "Parametric parts & assemblies", "ws_model", "model", AppState::Workspace::Model},
-    {"Drawing", "Production drawings & sheets", "ws_drawing", "drawing",
-     AppState::Workspace::Drawing},
-    {"Simulate", "Structural, thermal, flow, piping, hydraulics, topology", "ws_simulate",
+    {"Model", "Parametric parts & assemblies", "model", AppState::Workspace::Model},
+    {"Drawing", "Production drawings & sheets", "drawing", AppState::Workspace::Drawing},
+    {"Simulate", "Structural, thermal, flow, piping, hydraulics, topology",
      "simulate", AppState::Workspace::Simulate},
-    {"Electronics", "Schematics & PCB layout", "ws_electronics", "electronics",
-     AppState::Workspace::Electronics},
-    {"Manufacture", "CAM setup, toolpaths & shop", "ws_manufacture", "manufacture",
-     AppState::Workspace::Manufacture},
-    {"PLM", "Projects, BOMs & revisions", "history", "plm", AppState::Workspace::PLM},
-    {"Parts Library", "Reusable components & suppliers", "ws_parts", "parts_library",
+    {"Electronics", "Schematics & PCB layout", "electronics", AppState::Workspace::Electronics},
+    {"Manufacture", "CAM setup, toolpaths & shop", "manufacture", AppState::Workspace::Manufacture},
+    {"PLM", "Projects, BOMs & revisions", "plm", AppState::Workspace::PLM},
+    {"Parts Library", "Reusable components & suppliers", "parts_library",
      AppState::Workspace::PartsLibrary},
-    {"AI", "Copilot command center", "ai_panel", "ai", AppState::Workspace::AI},
-    {"Reverse Engineering", "Scans, meshes & reconstruction", "file_mesh",
+    {"AI", "Copilot command center", "ai", AppState::Workspace::AI},
+    {"Reverse Engineering", "Scans, meshes & reconstruction",
      "reverse_engineering", AppState::Workspace::ReverseEng},
-    {"Firmware", "Build, emulate & inspect firmware", "file_code", "firmware",
-     AppState::Workspace::Firmware},
+    {"Firmware", "Build, emulate & inspect firmware", "firmware", AppState::Workspace::Firmware},
 };
 
 std::string jsonString(const nlohmann::json& value, const char* key) {
@@ -157,18 +152,13 @@ void dimWrapped(const char* text) {
     ImGui::PopStyleColor();
 }
 
-bool beginCard(const char* id, float height) {
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(14.0f * uiScale, 12.0f * uiScale));
-    const bool visible = ImGui::BeginChild(
-        id, ImVec2(-1.0f, height * uiScale),
-        ImGuiChildFlags_Border | ImGuiChildFlags_AlwaysUseWindowPadding,
-        ImGuiWindowFlags_NoScrollbar);
-    ImGui::PopStyleVar();
-    return visible;
+bool beginCard(const char* id) {
+    // Content-sized cards share the kit's padding and grow with wrapped copy and asynchronous
+    // account/provider messages. The wizard body owns scrolling; no nested fixed-height clip.
+    return kit::cardBegin(id);
 }
 
-void endCard() { ImGui::EndChild(); }
+void endCard() { kit::cardEnd(); }
 
 void showAccountSummary() {
     if (!s_wizard.account.signedIn) {
@@ -207,7 +197,7 @@ void drawAccountStep(AppState& st) {
     ImGui::TextUnformatted("Sign in to Chudware");
     dimWrapped("Connect this desktop to your Chudware account. Authorization happens in your system browser, never inside the app.");
     ImGui::Dummy(ImVec2(0, 8.0f * uiScale));
-    if (beginCard("##onboarding_account", 290.0f)) {
+    if (beginCard("##onboarding_account")) {
         showAccountSummary();
         ImGui::Dummy(ImVec2(0, 8.0f * uiScale));
         if (!s_accountLogin) {
@@ -281,7 +271,7 @@ void drawPowerStep(AppState& st) {
     dimWrapped("Bring your own AI: sign in to a subscription you already pay for, or paste a provider API key.");
     ImGui::Dummy(ImVec2(0, 6.0f * uiScale));
 
-    if (beginCard("##onboarding_oauth", 142.0f)) {
+    if (beginCard("##onboarding_oauth")) {
         ImGui::TextUnformatted("Sign in to an AI account you already pay for");
         dimWrapped("One click opens the provider in your system browser.");
         ImGui::Dummy(ImVec2(0, 4.0f * uiScale));
@@ -326,7 +316,7 @@ void drawPowerStep(AppState& st) {
     endCard();
     ImGui::Dummy(ImVec2(0, 6.0f * uiScale));
 
-    if (beginCard("##onboarding_apikey", 176.0f)) {
+    if (beginCard("##onboarding_apikey")) {
         ImGui::TextUnformatted("Paste an API key");
         static const char* const kKeyProviderLabels[] = {
             kKeyProviders[0].label, kKeyProviders[1].label, kKeyProviders[2].label,
@@ -393,11 +383,11 @@ void beginRealTest(AppState& st) {
 
 void drawTestStep(AppState& st, bool appBusy) {
     ImGui::TextUnformatted("Test it");
-    dimWrapped("Send one tiny real completion through the provider you configured. The reply below comes from the provider; it is never simulated.");
+    dimWrapped("Check your AI connection with a short message. Your provider's reply appears below.");
     ImGui::Dummy(ImVec2(0, 10.0f * uiScale));
     const bool testBlocked = appBusy || s_wizard.testBusy;
     if (kit::primaryButton(s_wizard.testBusy ? "Waiting for the provider\xe2\x80\xa6###run_test"
-                                             : "Run real copilot test###run_test",
+                                             : "Test copilot connection###run_test",
                            !testBlocked,
                            s_wizard.testBusy ? "A test request is already in flight."
                                              : "Chudware is busy; try again in a moment.",
@@ -406,7 +396,7 @@ void drawTestStep(AppState& st, bool appBusy) {
         beginRealTest(st);
     ImGui::Dummy(ImVec2(0, 10.0f * uiScale));
     if (!s_wizard.testReply.empty()) {
-        if (beginCard("##onboarding_test_reply", 170.0f)) {
+        if (beginCard("##onboarding_test_reply")) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                                   Palette::toU32(s_wizard.testError ? palette.statusErr : palette.statusOk));
             ImGui::TextUnformatted(s_wizard.testError ? "Provider error" : "Copilot replied");
@@ -434,17 +424,14 @@ void drawWorkspaceStep() {
 
     // Keep two balanced columns while both lines can remain intact. On narrower windows the
     // cards become one scrollable column rather than clipping a capability label or destination.
-    // Selection reads from the row's selected glow and accent icon, so no trailing meta text
-    // competes with the capability line for width.
+    // Selection reads from the row's selected glow, so no trailing meta text competes with the
+    // capability line for width.
     float widestText = 0.0f;
     for (const WorkspaceChoice& choice : kWorkspaces) {
         widestText = std::max(widestText, ImGui::CalcTextSize(choice.label).x);
         widestText = std::max(widestText, ImGui::CalcTextSize(choice.detail).x);
     }
-    const float twoLineH =
-        ImGui::GetTextLineHeight() * 2.0f + metrics::U(0.5f);
-    const float minimumCardW =
-        kit::padX() * 2.0f + twoLineH + metrics::U(1.5f) + widestText;
+    const float minimumCardW = kit::padX() * 2.0f + widestText;
     const float availableW = ImGui::GetContentRegionAvail().x;
     const int columns =
         availableW >= minimumCardW * 2.0f + kit::rowGap() ? 2 : 1;
@@ -459,8 +446,8 @@ void drawWorkspaceStep() {
             ImGui::TableNextColumn();
             const bool selected = s_wizard.chosenWorkspace == i;
             kit::RowStyle style;
-            style.icon = kWorkspaces[i].icon;
-            style.iconTone = selected ? kit::Tone::Accent : kit::Tone::Neutral;
+            // Text-first destination rows avoid mixing rendered part thumbnails with outline
+            // file/workspace glyphs; the label and capability line carry the choice consistently.
             style.secondary = kWorkspaces[i].detail;
             style.tooltip = kWorkspaces[i].detail;
             style.selected = selected;
@@ -505,7 +492,9 @@ void drawFooter(AppState& st) {
     ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
                                   ImGui::GetWindowContentRegionMax().x - continueWidth));
     const char* next = s_wizard.step == 3 ? "Start here" : "Continue";
-    if (kit::primaryButton(next, true, nullptr, ImVec2(continueWidth, 0))) {
+    const bool canContinue = s_wizard.step != 3 || s_wizard.chosenWorkspace >= 0;
+    if (kit::primaryButton(next, canContinue, "Choose a workspace, or select Skip and finish.",
+                           ImVec2(continueWidth, 0))) {
         if (s_wizard.step < 3) ++s_wizard.step;
         else finishWizard(st);
     }

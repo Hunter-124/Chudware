@@ -15,6 +15,7 @@
 #include "appearance_common.h"
 #include "layout.h"
 #include "metrics.h"
+#include "viewport_panel.h"
 #include "widgets/kit.h"
 #include "../core/app_state.h"
 #include "../renderer.h"
@@ -85,68 +86,77 @@ static std::string evalExclusiveWindowName(const std::string& title, const std::
     return (title.empty() ? std::string("Evaluate") : title) + "###eval_" + kind;
 }
 
-// Every Evaluate dialog asks setNextCommandDialogPlacement for the same anchor (right of the
-// viewport, top of the overlay band), so two tools opened together landed exactly on top of each
-// other — and over the floating doc-tab strip. On the frame a dialog APPEARS, keep it below the
-// doc-tab band and cascade it down-left past any other Evaluate dialog already on screen at the
-// same spot. Only the appearing frame is touched: drags/resizes stick for the rest of the session.
-// Call right after setNextCommandDialogPlacement (this SetNextWindowPos takes precedence).
+// Recover Evaluate windows inside the clear viewport, below the doc tabs. The shared placement
+// helper constrains to the full overlay band, which is taller than the clear viewport: a 620dp
+// Mass Properties window otherwise gets pushed upward over the tabs by ImGui's viewport clamp.
+// Only new/reopened windows cascade; active windows keep user placement unless outside the rect.
 static void evalPlaceAppearing(const char* windowName, ImVec2 preferredSizePx,
                                std::initializer_list<const char*> others) {
     ImGuiWindow* self = ImGui::FindWindowByName(windowName);
-    if (self && self->WasActive) return;   // already on screen: never move it
-
+    const bool appearing = !self || !self->WasActive;
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    float loX = vp->WorkPos.x, loY = vp->WorkPos.y;
-    float hiX = loX + vp->WorkSize.x, hiY = loY + vp->WorkSize.y;
+    ImVec2 lo = vp->WorkPos, hi(lo.x + vp->WorkSize.x, lo.y + vp->WorkSize.y);
     const OverlayBand& band = overlayBand();
     if (band.valid) {
-        loX = std::max(loX, band.minX); loY = std::max(loY, band.minY);
-        hiX = std::min(hiX, band.maxX); hiY = std::min(hiY, band.maxY);
+        lo.x = std::max(lo.x, band.minX); lo.y = std::max(lo.y, band.minY);
+        hi.x = std::min(hi.x, band.maxX); hi.y = std::min(hi.y, band.maxY);
     }
-    if (hiX <= loX || hiY <= loY) return;
+    ImVec2 clearLo, clearHi;
+    if (ui::viewportClearRect(clearLo, clearHi)) {
+        lo.x = std::max(lo.x, clearLo.x); lo.y = std::max(lo.y, clearLo.y);
+        hi.x = std::min(hi.x, clearHi.x); hi.y = std::min(hi.y, clearHi.y);
+    }
+    lo.y = std::max(lo.y, docTabBandBottom());
+    if (hi.x <= lo.x || hi.y <= lo.y) return;
     const float margin = metrics::px(12);
-
-    // Where it would open: the live/remembered rect, else the shared command-dialog anchor.
+    lo.x += std::min(margin, (hi.x - lo.x) * 0.05f);
+    lo.y += std::min(margin, (hi.y - lo.y) * 0.05f);
+    hi.x -= std::min(margin, (hi.x - lo.x) * 0.05f);
+    hi.y -= std::min(margin, (hi.y - lo.y) * 0.05f);
+    const ImVec2 maximum(hi.x - lo.x, hi.y - lo.y);
+    const ImVec2 sharedMinimum = ImGui::GetCurrentContext()->NextWindowData.SizeConstraintRect.Min;
+    const ImVec2 minimum(std::min(sharedMinimum.x, maximum.x),
+                         std::min(sharedMinimum.y, maximum.y));
     ImVec2 size = preferredSizePx, pos;
     if (self) {
         pos = self->Pos; size = self->SizeFull;
     } else if (const ImGuiWindowSettings* s = ImGui::FindWindowSettingsByID(ImHashStr(windowName))) {
         const ImVec2 vpPos = s->ViewportId ? ImVec2((float)s->ViewportPos.x, (float)s->ViewportPos.y)
                                            : vp->Pos;
-        pos  = ImVec2(s->Pos.x + vpPos.x, s->Pos.y + vpPos.y);
+        pos = ImVec2(s->Pos.x + vpPos.x, s->Pos.y + vpPos.y);
         size = ImVec2((float)s->Size.x, (float)s->Size.y);
     } else {
-        const float cpEdge = overlayColumnEdge(1);
-        const float right  = cpEdge >= loX ? std::min(hiX, cpEdge) : hiX;
-        pos = ImVec2(right - margin - size.x, loY + margin);
+        // Leave part of the evaluated model visible beside the initial readout.
+        size.x = std::min(size.x, std::max(minimum.x, maximum.x * 0.6f));
+        pos = ImVec2(hi.x - size.x, lo.y);
     }
-
-    // Never open under the floating doc-tab strip.
-    float topY = loY + margin;
-    const float tabBottom = docTabBandBottom();
-    if (tabBottom > 0.0f) topY = std::max(topY, tabBottom + margin);
-    pos.y = std::max(pos.y, topY);
-
-    // Cascade down-left while another visible Evaluate dialog sits at (nearly) the same spot.
-    const float step = metrics::px(32);
-    for (int k = 0; k < 8; ++k) {
-        bool clash = false;
-        for (const char* name : others) {
-            const ImGuiWindow* w = name ? ImGui::FindWindowByName(name) : nullptr;
-            if (!w || w == self || !w->WasActive) continue;
-            if (std::fabs(w->Pos.x - pos.x) < step * 0.75f &&
-                std::fabs(w->Pos.y - pos.y) < step * 0.75f) { clash = true; break; }
+    size.x = std::clamp(size.x, minimum.x, maximum.x);
+    size.y = std::clamp(size.y, minimum.y, maximum.y);
+    pos.x = std::clamp(pos.x, lo.x, hi.x - size.x);
+    pos.y = std::clamp(pos.y, lo.y, hi.y - size.y);
+    if (appearing) {
+        // A full-height dialog has no room for a vertical cascade. Reserve room for the new
+        // window's exposed title bar before positioning it, rather than clamping it back onto
+        // the other dialog after a nominal 32dp shift.
+        const float step = metrics::px(32);
+        for (int k = 0; k < 8; ++k) {
+            const ImGuiWindow* clash = nullptr;
+            for (const char* name : others) {
+                const ImGuiWindow* w = name ? ImGui::FindWindowByName(name) : nullptr;
+                if (!w || w == self || !w->WasActive) continue;
+                if (std::fabs(w->Pos.x - pos.x) < step &&
+                    std::fabs(w->Pos.y - pos.y) < step) { clash = w; break; }
+            }
+            if (!clash) break;
+            const float nextTop = clash->Pos.y + step;
+            if (hi.y - nextTop < minimum.y) break;
+            pos.x = std::max(lo.x, clash->Pos.x - step);
+            pos.y = nextTop;
+            size.y = std::min(size.y, hi.y - pos.y);
         }
-        if (!clash) break;
-        pos.x -= step;
-        pos.y += step;
     }
-
-    if (hiX - margin - size.x > loX + margin)
-        pos.x = std::clamp(pos.x, loX + margin, hiX - margin - size.x);
-    if (hiY - margin - size.y > topY)
-        pos.y = std::clamp(pos.y, topY, hiY - margin - size.y);
+    ImGui::SetNextWindowSizeConstraints(minimum, maximum);
+    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
     ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
 }
 

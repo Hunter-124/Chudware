@@ -158,6 +158,19 @@ def test_history_exports_thumbnails(project, tmp_path_factory):
             _assert_no_git_vocab(str(e.get(field) or ""))
 
 
+def test_history_selects_immutable_commit(project, tmp_path):
+    initial = _call("plm_history", path=str(project))["head"]
+    _write(project, "Bracket.step+", _part(4.0))
+    assert _call("plm_save", path=str(project))["ok"]
+    latest = _call("plm_history", path=str(project))["head"]
+    assert initial != latest
+    output = _call("plm_history", path=str(project), commit=initial, thumb_dir=str(tmp_path))
+    assert output["ok"]
+    assert output["head"] == latest
+    assert [entry["commit"] for entry in output["entries"]] == [initial]
+    assert (tmp_path / f"{initial}.png").exists()
+    assert not (tmp_path / f"{latest}.png").exists()
+
 def test_history_and_outside_scan_do_not_query_remote_locks(project, monkeypatch):
     from services.plm import remote
     from services.plm.vault import Vault

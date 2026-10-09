@@ -6293,3 +6293,40 @@ Handoff (2026-10-08 — Hydraulics workflow and native templates): `host/src/ui/
 ## 2026-10-08 — Professional 2D engineering drawings (ISO 128/129/5457/7200, ASME Y14)
 
 Before: drawings had a bare 10 mm border, an unframed key/value title-block list (PNG drew a separate screen-space panel), outline-only arrowheads, blue Helvetica text, no centre lines/marks, a uniform grid layout that left views unaligned and duplicated the same overall dimension in every view, iso views full of hidden lines, landscape-only paper, and stacked diameter leaders. Now `core/doc/annot_draw.cpp` compiles a v2 primitive contract (thin/thick/dashed/chain classes, filled arrows, Helvetica-metric text, stroked ⌀⌴⌵↧) plus `compile_sheet_frame` (ISO 5457 frame, zones, centring marks, ISO 7200 title block with the ISO 5456-2 projection symbol, cell-fitted values) and `compile_view_decorations` (ISO 128-40 cutting planes, detail circles, SECTION/DETAIL captions); `drawing_get` emits `sheet.frame` + `view.draw`. `core/doc/drawing_session.cpp` adds the `drawing_arrange` layout engine (first/third-angle lattice, one ISO 5455 scale fitted to the area free of title block/tables, shared projection lines, derived views beside their parent), sheet-level non-redundant auto-dimensioning (each extent once, round outlines by ⌀, centre marks, side-view axis centre lines from the B-rep cylinders, bolt circles), portrait sizes (`A4P`), assembly BOM-on-title-block + balloons, general-arrangement mode for >4 bodies (no hidden lines, envelope dims), and a source-revision-keyed shape + HLR projection cache (skid drawing_make no longer re-runs HLR per step). `export2d/pdfvec/svgvec/dxf` + `drawing_render_png` share one pool (`core/doc/sheet_ink.h`): true ISO line weights, WinAnsi PDF text, DXF R12 layers VISIBLE/HIDDEN/CENTER/DIMENSIONS/HATCH/BORDER/TABLES with SOLID arrows, anti-aliased 5 px/mm PNG with a stroke font. Host `drawing_panel.cpp` renders the same contract, clips to the viewport clear rect, and gains a Sheet Properties popup (size/portrait/projection/scale/units/arrange/title block/export); `makeDrawing()` is one `drawing_make`. MCP: `make_drawing(projection=, orientation="portrait")`, `arrange_drawing`, extended title-block vocabulary; manual `guide-drawings.md`. Pins: `test_drawing_gdt` (layout per projection, non-redundant dims/centre lines/bolt circle, frame fit, ISO 129 geometry, section/detail identification), `services/mcp/test_cad_drawing_tools.py`, `CHUDWARE_SHOT=drawing` (self-checking PASS/CHECK). Deferred: agent-side registration of `arrange_drawing` (services/agent tool_categories/tool_guidance + panel snapshot), feature-level dimensioning beyond envelope/diameters.
+
+## 2026-10-09 — Facilities demo qualification and GUI runtime closeout
+
+`benchmarks/artifact_validity` now uses the ordinary single-turn mission executor and
+grades one declared saved artifact with fixed mandatory checks, independent facilities
+oracles and isolated workspaces. Live GPT facilities trials exposed and repaired
+study-only save, vessel/duct persistence and skill-tool loading failures. These are
+product QA trials, not training-data collection.
+
+Copilot now shows persistent tasks, a bounded scrolling agent roster and inline
+coordination messages. Transcript/control styling, settings navigation and pane grips
+share the kit/theme vocabulary. Ended and restored runs settle unfinished agent/task
+states and freeze elapsed time at the last event. Scripted screenshots use private
+session/draft stores and skip legacy history import; explicit session overrides remain
+available. Simulation units share one SI/US conversion implementation. The viewport's
+auxiliary radius is document-scoped so a large facility cannot leave a new empty part
+unusable; `pipedraw` exercises that transition before real port/plane input.
+
+Drawing verification covers projected sheets and PDF/DXF/SVG export, but automatic
+dimensioning is not a substitute for engineering detailing. Pressure-vessel sizing is
+preliminary internal-pressure sizing, not code certification. Thermal CFD requires an
+installed OpenFOAM backend. The demo script names these limits and separates quick live
+vessel/duct prompts from the longer HPU/piping prompts.
+
+Final workspace closeout restores the most recently active surviving document when
+closing tabs, sizes collapsed columns against the current workspace band, and makes
+empty ECAD boards actionable. PLM/Explorer share project discovery and fence stale
+graph responses; Versions previews export the selected immutable commit rather than
+HEAD. Parts performs real initial searches and coalesces filter changes. Onboarding,
+Manufacture, EM frequency controls, Motion playback and topology summaries use the
+existing kit layout and document units. Native and WASM builds passed; source audits
+passed all nine gates, host CTest passed 31/31, and PLM worker tests passed 28/28.
+Runtime captures covered pipe drawing after a large-document transition, the demo's
+15 views, chat, modeling/edit/save/reopen, sketch3D, Evaluate, drawing exports,
+workspaces, Parts, PLM and multi-document state. The simulation audit covered 117
+states with zero ID conflicts or overflow findings; its declared solver/torque
+skips are not claimed as verified capabilities.

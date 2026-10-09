@@ -108,6 +108,19 @@ static const AgentTraceAgent* traceFor(const std::string& id) {
     return nullptr;
 }
 
+// A matched trace's terminal outcome outlives registry polls. The registry can retain its
+// last "running" snapshot after a stream stops; never revive that run in the live roster.
+// Unmatched registry sessions are independent project work and keep their own controls/state.
+static bool registryDisplayLive(const SubagentSession& s) {
+    const AgentTraceAgent* tr = traceFor(s.id);
+    return isLive(s) && (!tr || traceLive(*tr));
+}
+static std::string registryDisplayStatus(const SubagentSession& s) {
+    const AgentTraceAgent* tr = traceFor(s.id);
+    if (isLive(s) && tr && !traceLive(*tr)) return tr->status;
+    return s.paused && isLive(s) ? std::string("paused") : s.status;
+}
+
 // One meaning→tone map for registry and trace statuses alike.
 static kit::Tone toneFor(const std::string& status, bool live) {
     if (status == "abandoned" || status == "stopped" || status == "cancelled")
@@ -411,7 +424,6 @@ static kit::Tone stepTone(const std::string& status) {
 
 static std::string stepDurationText(int ms) {
     if (ms < 0) return std::string();
-    if (ms < 1000) return std::to_string(ms) + " ms";
     return kit::fmtDuration(ms / 1000.0);
 }
 
@@ -475,21 +487,21 @@ static void rosterEntries(std::vector<RosterEntry>& out) {
         RosterEntry e;
         e.tr = &a;
         e.reg = registryFor(a.id);
-        // The registry's status is authoritative (pause holds); the trace covers the rest.
-        e.live = e.reg ? isLive(*e.reg) : traceLive(a);
+        // Pause is a live session control, but a stale registry poll cannot reopen a stopped run.
+        e.live = e.reg ? registryDisplayLive(*e.reg) : traceLive(a);
         out.push_back(e);
     }
     for (const auto& s : s_sub.sessions) {
         if (traceFor(s.id)) continue;
         RosterEntry e;
         e.reg = &s;
-        e.live = isLive(s);
+        e.live = registryDisplayLive(s);
         out.push_back(e);
     }
 }
 
 static std::string entryStatus(const RosterEntry& e) {
-    if (e.reg) return e.reg->paused && e.live ? std::string("paused") : e.reg->status;
+    if (e.reg) return registryDisplayStatus(*e.reg);
     return e.tr->status;
 }
 
@@ -674,9 +686,10 @@ static void drawInspector(AppState& st) {
                        cs.cur.effortOverride == "max" ? 5 : 0;
         cs.runtimeSeeded = true;
     }
-    kit::chip(cs.cur.status.empty() ? "unknown" : cs.cur.status.c_str(),
-              toneFor(cs.cur.status, isLive(cs.cur)), isLive(cs.cur));
-    if (cs.cur.paused && cs.cur.status != "paused") {
+    const bool live = registryDisplayLive(cs.cur);
+    const std::string status = registryDisplayStatus(cs.cur);
+    kit::chip(status.empty() ? "unknown" : status.c_str(), toneFor(status, live), live);
+    if (cs.cur.paused && status != "paused" && live) {
         ImGui::SameLine();
         kit::chip("paused", kit::Tone::Warn);
     }
@@ -690,7 +703,7 @@ static void drawInspector(AppState& st) {
     kit::keyValueRow("Budget", budget.c_str());
     const std::string started = fmtAge(cs.cur.createdTs);
     kit::keyValueRow("Started", started.empty() ? "unknown" : started.c_str());
-    if (tr) drawTraceFacts(*tr, isLive(cs.cur));
+    if (tr) drawTraceFacts(*tr, live);
     if (!cs.cur.statusNote.empty()) kit::dimText(cs.cur.statusNote.c_str());
     if (!cs.cur.brief.empty()) {
         kit::sectionHeader("Prompt");

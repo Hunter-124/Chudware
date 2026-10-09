@@ -138,6 +138,8 @@ struct LabelCand {
 struct GraphTabState {
   bool available = true; // false after permanent unknown_method
   bool loading = false;
+  bool fetchInFlight = false;
+  unsigned fetchSerial = 0;
   bool blastLoading = false;
   bool layoutDirty = true;
   bool centerPending = false;
@@ -2425,7 +2427,7 @@ void requestGraph(AppState &st, bool force) {
   auto &G = S();
   if (!G.available)
     return;
-  if (G.loading)
+  if (G.fetchInFlight)
     return;
   const std::string proj = st.plmProjectPath();
   if (proj.empty())
@@ -2445,6 +2447,8 @@ void requestGraph(AppState &st, bool force) {
   // Background change-probes stay invisible: no spinner, no button flicker.
   const bool silent = !force && G.mtimesMax > 0.0 && !G.nodes.empty();
   G.loading = !silent;
+  G.fetchInFlight = true;
+  const unsigned serial = ++G.fetchSerial;
   if (G.loading)
     G.loadStartedAt = now;
 
@@ -2467,8 +2471,12 @@ void requestGraph(AppState &st, bool force) {
     p["if_sources_count"] = G.sourcesCount;
   }
 
-  st.rpc.call("cad_graph_get", p, [](const core::RpcResult &r) {
+  st.rpc.call("cad_graph_get", p, [proj, serial, &st](const core::RpcResult &r) {
     auto &G = S();
+    if (serial != G.fetchSerial || proj != G.projectDir) return;
+    G.fetchInFlight = false;
+    G.loading = false;
+    if (proj != st.plmProjectPath()) return;
     // The poll interval runs from when the answer landed, not from when it
     // was queued, so a slow response is never immediately re-requested.
     G.lastFetch = ImGui::GetTime();
@@ -6209,6 +6217,8 @@ void plmGraphOnProjectChanged() {
   G.generatedAt.clear();
   G.layoutDirty = true;
   G.loading = false;
+  G.fetchInFlight = false;
+  ++G.fetchSerial;
   G.blastLoading = false;
   G.projectDir.clear();
   G.lastFetch = -1e9;
@@ -6572,7 +6582,6 @@ void plmDrawGraphPage(AppState &st) {
       G.userNavigated = false;
     }
     // Relation scope: the link web, everything, or assembly structure.
-    ImGui::SameLine();
     // One word per segment. "Links only" was eliding to "Links o..." in the segment's own
     // measured width, and three parallel one-word choices read better anyway; the tooltip
     // below carries the full meaning.
@@ -6587,7 +6596,9 @@ void plmDrawGraphPage(AppState &st) {
         G.hiddenKinds.size() == 1 && G.hiddenKinds.count("CONTAINS") > 0;
     int scope = G.asmView ? 2 : (linksOnly ? 0 : 1);
     const int wasScope = scope;
-    if (ui::kit::segmented("##graph_scope", kScopeLabels, 3, &scope, 0.0f,
+    const float scopeW = 3.0f * (ImGui::CalcTextSize("Assembly").x +
+                                 2.0f * ui::kit::padX());
+    if (ui::kit::segmented("##graph_scope", kScopeLabels, 3, &scope, scopeW,
                            kScopeTips) &&
         scope != wasScope) {
       if ((scope == 2) != G.asmView)
@@ -6608,20 +6619,12 @@ void plmDrawGraphPage(AppState &st) {
   }
   // Layout seeding is a force-layout concern: graph view only (as before).
   if (!G.listView && !G.gridView) {
-  ImGui::SameLine(0, 12 * S);
   {
-    ImGui::AlignTextToFramePadding();
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                                 palette.textDisabled[2], 1.0f));
-    ImGui::TextUnformatted("Layout:");
-    ImGui::PopStyleColor();
-    ImGui::SameLine(0, 4 * S);
     static const char *kClusterModes[] = {"Default", "By project", "By keyword",
                                           "By folder"};
-    ImGui::SetNextItemWidth(ui::metrics::asmInputW());
-    if (ImGui::Combo("##cluster_mode", &G.clusterMode, kClusterModes,
-                     (int)IM_ARRAYSIZE(kClusterModes))) {
+    if (ui::kit::fieldEnum("##cluster_mode", "Layout", &G.clusterMode, kClusterModes,
+                          (int)IM_ARRAYSIZE(kClusterModes),
+                          ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo))) {
       for (auto &n : G.nodes)
         n.lx = n.ly = n.lz = 0.0f;
       G.projPosStash.clear();
@@ -6909,10 +6912,9 @@ void plmDrawGraphPage(AppState &st) {
   }
   if (ImGui::BeginPopup("Add link##graph_link")) {
     ImGui::TextUnformatted("New link");
-    ImGui::SetNextItemWidth(180 * S);
-    ImGui::Combo("kind##lk", &G.linkKindIdx, kEdgeKinds,
-                 IM_ARRAYSIZE(kEdgeKinds));
-    ImGui::SetNextItemWidth(220 * S);
+    ui::kit::fieldEnum("kind##lk", "Kind", &G.linkKindIdx, kEdgeKinds,
+                      IM_ARRAYSIZE(kEdgeKinds),
+                      ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo));
     if (ImGui::Button("Create")) {
       int ki = std::clamp(G.linkKindIdx, 0, (int)IM_ARRAYSIZE(kEdgeKinds) - 1);
       requestLinkAdd(st, G.linkArmSrc, G.linkPopupDst, kEdgeKinds[ki],

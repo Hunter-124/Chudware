@@ -22,6 +22,9 @@ struct AdaptiveSurface;  // fwd (defined in ui_theme.h)
 
 // Draw the ECAD editor dock window. Call every frame from the app draw loop, after the other panels
 // (see ECAD_UI_INTEGRATION.md §(c)). Self-contained: opens/closes its own ImGui window.
+// No document and an untouched automatic PCB starter show the actionable welcome/AI
+// launchpad. Edit this board keeps the same document and exposes its editable grid;
+// authored board content, saved/dirty tabs and intentional New PCB tabs go straight to canvas.
 void drawEcadEditor(AppState& st);
 
 // Draw the "PCB Manager" / "Schematic Manager" body — the ECAD analogue of the Feature Manager tree,

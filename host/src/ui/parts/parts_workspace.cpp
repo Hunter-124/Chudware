@@ -396,6 +396,7 @@ static void collectNotices(const nlohmann::json& res) {
 // fan-out resolves, so two queries in quick succession overlap and the loser must drop its
 // payload instead of hijacking the winner's list.
 static unsigned g_searchGen = 0;
+static bool g_searchPending = false;
 
 // The one search-parameter serializer, shared by the fast local `parts_search` and the slow
 // `parts_search_live_start` fan-out: query + category + global filters + facets. Single code
@@ -442,7 +443,15 @@ static void fillSearchParams(nlohmann::json& p) {
 }
 
 void doSearch(AppState& st) {
-    if (S().searching) return;
+    // Category/search clicks can arrive before the previous local query lands.
+    // Coalesce them, then run the latest visible selection instead of dropping it.
+    if (S().searching) {
+        g_searchPending = true;
+        S().liveSearching = false;
+        S().liveToken.clear();
+        return;
+    }
+    g_searchPending = false;
     S().searching  = true;
     S().searchDone = false;
     S().searchErr.clear();
@@ -460,6 +469,10 @@ void doSearch(AppState& st) {
         S().searching  = false;
         // Superseded by a newer query while this one was in flight — drop its rows.
         if (gen != g_searchGen) return;
+        if (g_searchPending) {
+            doSearch(st);
+            return;
+        }
         S().searchDone = true;
         if (!r.ok) { S().searchErr = r.err; return; }
         if (!r.result.is_object()) return;
@@ -708,7 +721,7 @@ void startLiveSearch(AppState& st) {
     // loser drop its token instead of hijacking the newer search.
     const unsigned gen = g_searchGen;
     st.rpc.call("parts_search_live_start", p, [gen, &st](const core::RpcResult& r) {
-        if (gen != g_searchGen) return;   // superseded by a newer query
+        if (gen != g_searchGen || g_searchPending) return;   // superseded query
         if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) return;
         collectNotices(r.result);
         std::string token = r.result.value("token", "");
@@ -1137,7 +1150,10 @@ bool partsLibrarySettled(const AppState& st) {
         (S().taxonomyIsTree || !S().categories.empty() ||
          S().taxonomyAttempts >= kTaxonomyMaxAttempts);
     const bool vendorsSettled = S().vendorsLoaded && !S().vendorsLoading;
-    return catsSettled && vendorsSettled;
+    const bool resultsSettled = S().searchDone && !S().searching && !g_searchPending &&
+                                !g_indexBuilding && !g_indexPolling &&
+                                !S().liveSearching && !S().livePolling;
+    return catsSettled && vendorsSettled && resultsSettled;
 }
 
 void drawPartsLibraryWorkspace(AppState& st) {
@@ -1157,33 +1173,18 @@ void drawPartsLibraryWorkspace(AppState& st) {
             loadVendors(st);
             pollQueue(st);
         }
-        // RE-32 / CHUDWARE_SHOT=parts: seed a synthetic no-model result so the
-        // "Generate 3D model" button is visible in the headless screenshot without
-        // needing the worker to be running. The item has placeable=false so all
-        // action buttons (including "Generate 3D model") render on hover.
-        if (st.wantPartsShot) {
-            st.wantPartsShot = false;
-            PartsItem demo;
-            demo.id          = "catalog:mcmaster::https://www.mcmaster.com/91251A542/";
-            demo.name        = "Socket Head Cap Screw M8×30 (demo)";
-            demo.vendor      = "McMaster-Carr";
-            demo.partNumber  = "91251A542";
-            demo.description = "Class 12.9 alloy steel, black-oxide finish";
-            demo.material    = "Alloy Steel";
-            demo.domain      = "fastener";
-            demo.source      = "live";
-            demo.priceUsd    = 0.18;
-            demo.unit        = "ea";
-            demo.downloaded  = false;
-            demo.placeable   = false;   // no 3D model → "Generate 3D model" button shows
-            S().results.push_back(std::move(demo));
-            S().searchDone  = true;
-        }
+        // The parts screenshot uses the same catalog browse as the real workspace.
+        // Never inject a vendor sample into All Parts in place of its available catalog.
+        st.wantPartsShot = false;
     }
     // Re-try if worker came up after first frame.
     if (st.workerStarted) {
         if (!S().taxonomyLoaded && !S().taxonomyLoading) loadTaxonomy(st);
         if (!S().vendorsLoaded  && !S().vendorsLoading)  loadVendors(st);
+        if (!S().searching && !S().searchDone &&
+            (S().taxonomyIsTree || !S().categories.empty() ||
+             S().taxonomyAttempts >= kTaxonomyMaxAttempts))
+            doSearch(st);   // initial All Parts browse, including a late worker startup
     }
     // Cold-start recovery for the category tree. The parts worker is a Python sidecar that
     // may still be booting when this workspace opens; parts_taxonomy AND its
@@ -1454,30 +1455,24 @@ void drawPartsLibraryWorkspace(AppState& st) {
                         Palette::toU32(palette.text), "Search");
         }
         ImGui::SameLine();
-        // Full width (widest label) or arrow-only — never an elided preview. At the arrow-only
-        // floor the combo drops its preview and names the active sort in its tooltip instead.
+        // A one-cell table bounds the kit field to the measured toolbar slot;
+        // fieldEnum takes its width from the content region, not SetNextItemWidth.
         const char* sortLabel = kSortItems[std::clamp(S().sortMode, 0,
                                                       (int)IM_ARRAYSIZE(kSortItems) - 1)];
-        ImGui::SetNextItemWidth(sortW);
-        parts::glassFieldBegin();
-        const bool sortOpen = ImGui::BeginCombo(
-            "##sort", sortLabel,
-            sortArrowOnly ? ImGuiComboFlags_NoPreview : ImGuiComboFlags_None);
-        parts::glassFieldEnd(barTint);
-        if (sortArrowOnly && !sortOpen && ImGui::IsItemHovered())
-            ImGui::SetTooltip("Sort: %s", sortLabel);
         bool sortChanged = false;
-        if (sortOpen) {
-            for (int i = 0; i < (int)IM_ARRAYSIZE(kSortItems); ++i) {
-                const bool sel = S().sortMode == i;
-                if (ImGui::Selectable(kSortItems[i], sel) && !sel) {
-                    S().sortMode = i;
-                    sortChanged  = true;
-                }
-                if (sel) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
+        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0, 0));
+        if (ImGui::BeginTable("##sort_layout", 1,
+                             ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoPadOuterX |
+                             ImGuiTableFlags_NoPadInnerX, ImVec2(sortW, 0))) {
+            ImGui::TableSetupColumn("Sort", ImGuiTableColumnFlags_WidthFixed, sortW);
+            ImGui::TableNextColumn();
+            sortChanged = ui::kit::fieldEnum(
+                "##sort", "", &S().sortMode, kSortItems, IM_ARRAYSIZE(kSortItems),
+                ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo)
+                    .withPreview(sortArrowOnly ? " " : sortLabel).withTip(sortLabel));
+            ImGui::EndTable();
         }
+        ImGui::PopStyleVar();
         if (sortChanged) {
             st.settings.partsSortMode = S().sortMode;
             saveSettings(st.settings);
@@ -1552,7 +1547,7 @@ void drawPartsLibraryWorkspace(AppState& st) {
         }
         ImGui::PopStyleVar(2);
 
-        if ((hit || go) && !S().searching)
+        if (hit || go)
             doSearch(st);
 
         ImGui::Spacing();

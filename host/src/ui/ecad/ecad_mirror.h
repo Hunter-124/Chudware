@@ -346,6 +346,9 @@ public:
     const std::vector<EcadVia>&       vias()        const { return vias_; }
     const std::vector<EcadZone>&      zones()       const { return zones_; }
     const std::vector<EcadOutlineSeg>& outline()    const { return outline_; }
+    // Authored board content, including graphics that are not yet drawn by the canvas.
+    // Stackup/rule defaults alone do not make the automatic starter a design.
+    bool hasBoardContent() const { return isPcb() && hasBoardContent_; }
     const std::vector<EcadLayer>&     layers()       const { return layers_; }
 
     // Tracks filtered to one copper layer (the canvas draws layer-by-layer back-to-front so the top
@@ -420,6 +423,7 @@ private:
     std::vector<EcadVia>        vias_;
     std::vector<EcadZone>       zones_;
     std::vector<EcadOutlineSeg> outline_;
+    bool hasBoardContent_ = false;
     std::vector<EcadLayer>      layers_;
     std::unordered_map<std::string, bool> layerVis_;  // id -> visible (panel-owned)
     std::unordered_map<std::string, bool> netVis_;    // net name -> visible (panel-owned)

@@ -433,6 +433,9 @@ void EcadMirror::parseSch(const nlohmann::json& tree, const nlohmann::json& comp
 
 void EcadMirror::parsePcb(const nlohmann::json& tree, const nlohmann::json& compile) {
     (void)compile;
+    hasBoardContent_ = !jarr(jobj(tree, "outline"), "shapes").empty();
+    for (const char* key : {"footprints", "tracks", "vias", "zones", "graphics", "nets"})
+        hasBoardContent_ = hasBoardContent_ || !jarr(tree, key).empty();
 
     // Stackup -> ordered copper layer list (F.Cu … B.Cu). Mirrors schema.py::copper_layer_ids.
     const nlohmann::json& stackup = jobj(tree, "stackup");
@@ -517,10 +520,16 @@ void EcadMirror::parsePcb(const nlohmann::json& tree, const nlohmann::json& comp
                 ep.hasDrill = true;
                 ep.drillDia = (float)jnum(*drillIt, "diameter");
             }
-            growBox(ep.pos);
+            const float angle = ep.angle * kPi / 180.0f;
+            const float ex = std::fabs(std::cos(angle)) * ep.w * 0.5f +
+                             std::fabs(std::sin(angle)) * ep.h * 0.5f;
+            const float ey = std::fabs(std::sin(angle)) * ep.w * 0.5f +
+                             std::fabs(std::cos(angle)) * ep.h * 0.5f;
+            growBox({ep.pos.x - ex, ep.pos.y - ey});
+            growBox({ep.pos.x + ex, ep.pos.y + ey});
             efp.pads.push_back(std::move(ep));
         }
-        // Courtyard: pad bbox grown by a small margin (no per-graphic courtyard parse in v1 scaffold).
+        // Courtyard fallback encloses whole rotated pads, not just their centers.
         if (haveBox) {
             const float m = 0.25f;  // mm margin
             efp.courtyardMin = {bmin.x - m, bmin.y - m};

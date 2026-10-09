@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <cctype>
 
@@ -279,17 +280,21 @@ bool emAcceptStandard(int &index) {
 double gEmRunStart = 0.0;
 int gEmRunForm = -1; // EmForm (as int) of the in-flight call
 
-// Standard picker rows: "WR-90  22.86 × 10.16 mm", then "Custom cross-section".
-const std::vector<std::string> &emStandardItems() {
-  static const std::vector<std::string> items = [] {
-    std::vector<std::string> v;
-    for (const auto &s : kEmStandards)
-      v.push_back(std::string(s.name) + "  " + kit::fmtValue(s.a_mm) +
-                  " \xc3\x97 " + kit::fmtValue(s.b_mm) + " mm");
-    v.push_back("Custom cross-section");
-    return v;
+// Standard picker rows use the document's display units, without allocating a new list per frame.
+const std::vector<std::string> &emStandardItems(bool us) {
+  static const std::array<std::vector<std::string>, 2> items = [] {
+    std::array<std::vector<std::string>, 2> lists;
+    for (int u = 0; u < 2; ++u) {
+      auto &v = lists[u];
+      v.reserve(kNEmStandards + 1);
+      for (const auto &s : kEmStandards)
+        v.push_back(std::string(s.name) + "  " + sim::fmtU(s.a_mm, "mm", u != 0) +
+                    " \xc3\x97 " + sim::fmtU(s.b_mm, "mm", u != 0));
+      v.push_back("Custom cross-section");
+    }
+    return lists;
   }();
-  return items;
+  return items[us ? 1 : 0];
 }
 
 // Short waveguide name for card titles and the Run recap: "WR-90",
@@ -300,16 +305,15 @@ std::string emWaveguideName(int stdIdx, int shape) {
   return shape == 1 ? "Custom circular" : "Custom rectangular";
 }
 
-// Inner cross-section, e.g. "22.86 × 10.16 mm" or "r 5 mm".
-std::string emWaveguideDims(int stdIdx, int shape, double a, double b, double r) {
-  const char *mmU = kit::unitText(kit::Unit::mm);
+// Inner cross-section, in the document's display units.
+std::string emWaveguideDims(int stdIdx, int shape, double a, double b, double r, bool us) {
   if (stdIdx >= 0 && stdIdx < kNEmStandards) {
     a = kEmStandards[stdIdx].a_mm;
     b = kEmStandards[stdIdx].b_mm;
   } else if (shape == 1) {
-    return "r " + kit::fmtQuantity(r, mmU);
+    return "r " + sim::fmtU(r, "mm", us);
   }
-  return kit::fmtValue(a) + " \xc3\x97 " + kit::fmtQuantity(b, mmU);
+  return sim::fmtU(a, "mm", us) + " \xc3\x97 " + sim::fmtU(b, "mm", us);
 }
 
 // Frequency drag aid on a LOG scale: EM ranges span 0.01-300 GHz, so a linear
@@ -321,10 +325,16 @@ bool emLogSlider(const char *id, const char *label, double *v, double lo,
   lo = std::max(lo, 1e-6);
   hi = std::max(hi, lo * 1.0001);
   const float width = kit::fieldBegin(id, label, options);
-  ImGui::SetNextItemWidth(width);
+  const ImVec2 valueOrigin = ImGui::GetCursorScreenPos();
   const double before = *v;
   double value = std::clamp(*v, lo, hi);
-  ImGui::SliderScalar("##log", ImGuiDataType_Double, &value, &lo, &hi, "%.4g",
+  // Keep the frequency in a readout above the track. A logarithmic slider thumb can cross
+  // every digit in a narrow value column; no text is ever painted beneath it.
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted(kit::fmtValue(value, options.sigFigs).c_str());
+  ImGui::SetCursorScreenPos(ImVec2(valueOrigin.x, ImGui::GetCursorScreenPos().y));
+  ImGui::SetNextItemWidth(width);
+  ImGui::SliderScalar("##log", ImGuiDataType_Double, &value, &lo, &hi, "",
                       ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp |
                           ImGuiSliderFlags_NoInput);
   ImGuiContext &g = *GImGui;  // IMGUI_TEST_ENGINE_ITEM_INFO expands against a local `g`
@@ -875,8 +885,8 @@ void SimManager::drawEmForm(AppState &st) {
     // Standards select a separate spec; never overwrite retained Custom dimensions.
     gEmWgOpen = true;
   };
-  kit::FieldOpts mm;
-  mm.withUnit(kit::Unit::mm).withMin(0);
+  const bool us = unitSys(st).us;
+  const auto mm = sim::fieldU("mm", us).withMin(0);
   kit::FieldOpts ghz;
   ghz.withUnit(kit::Unit::GHz).withMin(0);
 
@@ -1014,7 +1024,7 @@ void SimManager::drawEmForm(AppState &st) {
         applyStandard(i);
       if (!emRunning_ && ImGui::BeginDragDropSource()) {
         ImGui::SetDragDropPayload(kEmStandardDragPayload, &i, sizeof(i));
-        kit::dimText(emStandardItems()[i].c_str());
+        kit::dimText(emStandardItems(us)[i].c_str());
         ImGui::EndDragDropSource();
       }
       ImGui::PopID();
@@ -1034,7 +1044,7 @@ void SimManager::drawEmForm(AppState &st) {
                      tint(kEmFocusWaveguide, kEmFocusWaveguide))) {
     kit::dimText("Matched modal ports at both ends; conducting walls.");
     kit::FieldGroup g("wg", "Narrow wall b");
-    const std::vector<std::string> &items = emStandardItems();
+    const std::vector<std::string> &items = emStandardItems(us);
     int sel = isStd ? em_.stdIdx : kNEmStandards;
     if (kit::fieldCombo(
             "std", "Standard", &sel, items,
@@ -1057,15 +1067,14 @@ void SimManager::drawEmForm(AppState &st) {
       applyStandard(dropped);
     if (em_.stdIdx >= 0 && em_.stdIdx < kNEmStandards) {
       // One value per row so neither dimension is ever elided.
-      const char *mmU = kit::unitText(kit::Unit::mm);
       kit::fieldReadout(
           "dim_a", "Broad wall a",
-          kit::fmtQuantity(kEmStandards[em_.stdIdx].a_mm, mmU).c_str(),
+          sim::fmtU(kEmStandards[em_.stdIdx].a_mm, "mm", us).c_str(),
           kit::FieldOpts().withTip("Inner broad-wall width of the standard "
                                    "guide; sets the TE10 cutoff."));
       kit::fieldReadout(
           "dim_b", "Narrow wall b",
-          kit::fmtQuantity(kEmStandards[em_.stdIdx].b_mm, mmU).c_str(),
+          sim::fmtU(kEmStandards[em_.stdIdx].b_mm, "mm", us).c_str(),
           kit::FieldOpts().withTip("Inner narrow-wall height of the standard "
                                    "guide."));
     } else {
@@ -1354,7 +1363,6 @@ void SimManager::drawEmPanel(AppState &st) {
   } else if (page == kEmRun) {
     // The settings this run solves (the footer carries the stage, the
     // progress bar and the elapsed time, the stepper the run state).
-    const char *mmU = kit::unitText(kit::Unit::mm);
     const char *ghzU = kit::unitText(kit::Unit::GHz);
     const int mi =
         (em_.modeIdx >= 0 && em_.modeIdx < kNEmModes) ? em_.modeIdx : 0;
@@ -1362,12 +1370,12 @@ void SimManager::drawEmPanel(AppState &st) {
     rows.push_back({"Waveguide", emWaveguideName(em_.stdIdx, em_.shape)});
     rows.push_back({"Inner size",
                     emWaveguideDims(em_.stdIdx, em_.shape, em_.a_mm, em_.b_mm,
-                                    em_.radius_mm)});
+                                    em_.radius_mm, unitSys(st).us)});
     if (emForm_ == EmForm::Eigenmode) {
       rows.push_back({"Modes", std::to_string(em_.nModes)});
       rows.push_back({"Grid resolution", std::to_string(em_.resolution)});
     } else {
-      rows.push_back({"Guide length", kit::fmtQuantity(em_.lengthMm, mmU)});
+      rows.push_back({"Guide length", sim::fmtU(em_.lengthMm, "mm", unitSys(st).us)});
       rows.push_back({"Port 1 mode", kEmModes[mi]});
       if (emForm_ == EmForm::Driven) {
         rows.push_back({"Frequency", kit::fmtValue(em_.fStartGhz) +

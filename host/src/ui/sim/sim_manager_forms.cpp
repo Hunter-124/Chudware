@@ -1824,6 +1824,10 @@ void SimManager::drawRunPage(AppState &st, Study &s) {
   }
   if (mine)
     return;
+  if (s.type == StudyType::Motion && hasResults) {
+    drawMotionTimeline(st, s);
+    kit::gapRow();
+  }
 
   // ---- last run (human summary) or what the next run needs ----
   // A topology error is already the status banner above: say it once.

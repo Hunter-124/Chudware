@@ -80,8 +80,10 @@ private:
     std::string snapTargetLabel_;
     bool showErcMarkers_ = true;
     bool showDrcMarkers_ = true;
-    // Screen positions of DRC glyphs already painted this frame (declutter dedupe).
-    // Member so the steady state reuses its capacity instead of allocating per frame.
+    // Reused screen-space scratch keeps labels and violation badges clear of pads.
+    struct OverlayRect { ImVec2 min, max; };
+    std::vector<OverlayRect> pcbOverlayKeepouts_;
+    std::vector<ImVec2> drcAnchorPts_;
     std::vector<ImVec2> drcMarkerPts_;
     bool showSheetFrame_ = false;
 

@@ -9,6 +9,9 @@
 #include "../renderer.h"
 #include "../ui_theme.h"
 #include "toast.h"
+#include "viewport_panel.h"
+#include "metrics.h"
+#include "layout.h"
 
 namespace ui {
 
@@ -1167,8 +1170,16 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
     // genuinely viewport-local: the DOF/status readout, and the selection-contextual constraint
     // buttons + dimension popup, which need to sit right next to the current selection/cursor.
     {
-        ImGui::SetNextWindowPos(ImVec2((imgMin.x + imgMax.x) * 0.5f, imgMin.y + 12.0f * ui::uiScale),
-                                ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+        ImVec2 clearMin = imgMin, clearMax = imgMax;
+        ui::viewportClearRect(clearMin, clearMax);
+        const float margin = ui::metrics::U(12.0f);
+        clearMin.y = std::max(clearMin.y, ui::docTabBandBottom());
+        ImGui::SetNextWindowPos(
+            ImVec2((clearMin.x + clearMax.x) * 0.5f, clearMin.y + margin),
+            ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0),
+            ImVec2(std::max(1.0f, clearMax.x - clearMin.x - margin * 2),
+                   std::max(1.0f, clearMax.y - clearMin.y - margin * 2)));
         ImGui::SetNextWindowBgAlpha(0.85f);
         if (ImGui::Begin("##sk3status", nullptr,
                          ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |

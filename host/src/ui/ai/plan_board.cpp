@@ -178,6 +178,7 @@ const char* pbStatusLabel(const std::string& s) {
     if (s == "running" || s == "active") return "Active";
     if (s == "done" || s == "pass") return "Done";
     if (pbIsFailed(s)) return "Failed";
+    if (s == "stopped" || s == "interrupted" || s == "cancelled") return "Stopped";
     if (s == "abandoned" || s == "dropped") return "Dropped";
     return "Pending";
 }
@@ -187,7 +188,8 @@ const char* pbStatusLabel(const std::string& s) {
 std::string pbStatusNext(const std::string& s) {
     if (s == "running" || s == "active") return "done";
     if (s == "done" || s == "pass") return "abandoned";
-    if (pbIsFailed(s) || s == "abandoned" || s == "dropped") return "pending";
+    if (pbIsFailed(s) || s == "abandoned" || s == "dropped" ||
+        s == "stopped" || s == "interrupted" || s == "cancelled") return "pending";
     return "running";
 }
 
@@ -199,6 +201,7 @@ ImVec4 pbStatusColor(const std::string& s, const AdaptiveSurface& surf) {
     if (s == "running" || s == "active") return ui::kit::toneOn(ui::kit::Tone::Accent, surf);
     if (s == "done" || s == "pass")      return ui::kit::toneOn(ui::kit::Tone::Ok, surf);
     if (pbIsFailed(s))                   return ui::kit::toneOn(ui::kit::Tone::Err, surf);
+    if (s == "stopped" || s == "interrupted" || s == "cancelled") return surf.textSecondary;
     if (s == "abandoned" || s == "dropped") return surf.textTertiary;
     return surf.textSecondary;
 }

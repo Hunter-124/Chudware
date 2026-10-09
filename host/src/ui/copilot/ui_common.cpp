@@ -334,7 +334,8 @@ ui::kit::Status chatRowStatus(const std::string& status) {
     if (status == "fail" || status == "error")  return ui::kit::Status::Failed;
     // "skipped" = the step deliberately did NOT run (harness intervention, e.g. the tool-loop
     // guard refusing a repeated call). Informational, never alarming.
-    if (status == "skipped")                    return ui::kit::Status::Skipped;
+    if (status == "skipped" || status == "stopped" || status == "interrupted" ||
+        status == "cancelled" || status == "abandoned") return ui::kit::Status::Skipped;
     return ui::kit::Status::Pending;
 }
 

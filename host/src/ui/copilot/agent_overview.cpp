@@ -9,10 +9,10 @@
 namespace ui {
 namespace {
 
-constexpr int    kAgentRows   = 5;      // sub-agent rows shown before "… N more — expand"
-constexpr int    kTodoRows    = 6;      // todo rows shown before "… N more — expand"
-constexpr size_t kInlineSteps = 6;      // recent steps shown under a clicked sub-agent
-constexpr float  kMaxHeightFrac = 0.35f;   // block cap: share of the host column's height
+constexpr int    kAgentRows   = 3;      // compact overview; expand for the full roster
+constexpr int    kTodoRows    = 3;
+constexpr size_t kInlineSteps = 6;
+constexpr float  kMaxHeightFrac = 0.30f;
 
 struct ConvUi {
     int  openOverride = -1;    // -1 follow the run (open while it runs), 0 closed, 1 open
@@ -31,6 +31,7 @@ struct Todo {
     int  done          = 0;
     int  active        = -1;     // the running item, else the next open one
     bool activeRunning = false;
+    bool running = false;
 };
 Todo s_todo;
 
@@ -46,23 +47,25 @@ void findTodo(const AppState& st, Todo& t) {
     t.done = 0;
     t.active = -1;
     t.activeRunning = false;
+    t.running = false;
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
         if (it->fromUser || !it->planState.present) continue;
         for (const PlanItem& p : it->planState.items)
             if (p.kind != "subagent" && !p.title.empty()) t.items.push_back(&p);
         if (t.items.empty()) continue;
         t.plan = &it->planState;
+        t.running = it->running;
         break;
     }
     for (int i = 0; i < (int)t.items.size(); ++i) {
         const std::string& s = t.items[(size_t)i]->status;
         if (itemClosed(s)) ++t.done;
-        if (s == "running" && !t.activeRunning) {
+        if (t.running && s == "running" && !t.activeRunning) {
             t.active = i;
             t.activeRunning = true;
         }
     }
-    if (t.active < 0)
+    if (t.running && t.active < 0)
         for (int i = 0; i < (int)t.items.size(); ++i)
             if (!itemClosed(t.items[(size_t)i]->status)) { t.active = i; break; }
 }
@@ -133,8 +136,9 @@ void drawTodoRow(const PlanItem& it, int idx, bool active, const ui::Fonts& font
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float cy = p0.y + h * 0.5f;
     float x = p0.x + kit::padX();
-    kit::statusGlyph(dl, ImVec2(x + lineH * 0.5f, cy), glyphR(lineH), chatRowStatus(it.status),
-                     surf);
+    const kit::Status status = it.status == "running" && !s_todo.running
+                                  ? kit::Status::Skipped : chatRowStatus(it.status);
+    kit::statusGlyph(dl, ImVec2(x + lineH * 0.5f, cy), glyphR(lineH), status, surf);
     x += lineH + ui::metrics::U(1.5f);
     const float right = p0.x + w - kit::padX();
     if (active) ImGui::PushFont(fonts.medium);
@@ -157,14 +161,9 @@ void drawTodoRow(const PlanItem& it, int idx, bool active, const ui::Fonts& font
 void drawTodos(ConvUi& cu, const ui::Fonts& fonts, bool first) {
     const Todo& t = s_todo;
     const int total = (int)t.items.size();
-    std::string phase;
-    if (t.active >= 0) phase = t.items[(size_t)t.active]->phase;
-    if (phase.empty() && t.plan) phase = t.plan->title;
-    if (phase.empty()) phase = "Tasks";
-    char trailing[96];
-    std::snprintf(trailing, sizeof(trailing), "%s \xC2\xB7 %d/%d",
-                  kit::elide(phase.c_str(), ui::metrics::px(150.0f)).c_str(), t.done, total);
-    kit::sectionHeader("Todo", nullptr, trailing, -1, first);
+    char trailing[32];
+    std::snprintf(trailing, sizeof(trailing), "%d/%d", t.done, total);
+    kit::sectionHeader("Tasks", nullptr, trailing, -1, first);
 
     // Collapsed: a window that starts one row above the active item, so the done/next boundary
     // is always in view.
@@ -257,8 +256,8 @@ void drawAgentRow(AppState& st, const std::string& convId, ConvUi& cu,
     float right = p0.x + w - kit::padX();
     const float gap = ui::metrics::U(1.5f);
     const double secs = agentElapsed(a, now);
-    if (secs >= 0.0) {
-        const std::string el = elapsedText(secs);
+    if (secs >= 0.0 || a.status == "stopped") {
+        const std::string el = a.status == "stopped" ? "Stopped" : elapsedText(secs);
         const float ew = ImGui::CalcTextSize(el.c_str()).x;
         dl->AddText(ImVec2(right - ew, top), ink(live ? surf.textSecondary : surf.textTertiary),
                     el.c_str());
@@ -303,6 +302,7 @@ void drawAgentRow(AppState& st, const std::string& convId, ConvUi& cu,
     if (hovered) {
         std::string tip = a.name;
         if (!a.brief.empty()) tip += "\n" + a.brief;
+        tip += "\nStatus: " + a.status;
         if (a.toolCount > 0) {
             tip += "\n" + std::to_string(a.toolCount) + (a.toolCount == 1 ? " tool call" : " tool calls");
             if (a.failCount > 0) tip += " (" + std::to_string(a.failCount) + " failed)";
@@ -381,16 +381,17 @@ void drawAgentOverview(AppState& st, float width) {
         std::snprintf(buf, sizeof(buf), "%d agent%s", (int)s_agents.size(),
                       s_agents.size() == 1 ? "" : "s");
         title = buf;
-        if (nRun > 0)  { std::snprintf(buf, sizeof(buf), " \xC2\xB7 %d running", nRun); title += buf; }
-        if (nFail > 0) { std::snprintf(buf, sizeof(buf), " \xC2\xB7 %d failed", nFail);  title += buf; }
-        if (nRun == 0 && nFail == 0 && nDone > 0) title += " \xC2\xB7 done";
+        if (nRun > 0 && !todoOpen) {
+            std::snprintf(buf, sizeof(buf), " \xC2\xB7 %d running", nRun);
+            title += buf;
+        }
+        if (nRun == 0 && nFail == 0 && nDone == (int)s_agents.size()) title += " \xC2\xB7 done";
     }
     if (todoOpen) {
         std::snprintf(buf, sizeof(buf), "%s%d/%d tasks", title.empty() ? "" : " \xC2\xB7 ",
                       s_todo.done, (int)s_todo.items.size());
         title += buf;
-        if (!open && s_todo.active >= 0)
-            title += " \xC2\xB7 " + s_todo.items[(size_t)s_todo.active]->title;
+        // The active task belongs in the body, not in a title that became one long ellipsis.
     }
 
     // Header right: the run's ticking elapsed while live, else how long ago the agents finished.
@@ -411,7 +412,8 @@ void drawAgentOverview(AppState& st, float width) {
     const float hostH = ImGui::GetWindowHeight();
     ImGui::PushID("agent_overview");
     kit::pushDensity(kit::Density::Compact);
-    ImGui::BeginChild("##agent_overview_host", ImVec2(width, 0.0f), ImGuiChildFlags_AutoResizeY,
+    ImGui::BeginChild("##agent_overview_host", ImVec2(width, 0.0f),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
                           ImGuiWindowFlags_NoBackground);
     ImGui::PushFont(fonts.body);
@@ -442,18 +444,23 @@ void drawAgentOverview(AppState& st, float width) {
         const float headerBlock = lineH + kit::headGap() + kit::padY() * 2.0f + ui::metrics::U(1);
         const float bodyMax = std::max(hostH * kMaxHeightFrac - headerBlock, lineH * 3.0f);
         ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(FLT_MAX, bodyMax));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(kit::padX() + ui::metrics::U(2), kit::padY()));
         if (ImGui::BeginChild("##agent_overview_body", ImVec2(0.0f, 0.0f),
-                              ImGuiChildFlags_AutoResizeY,
+                              ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize |
+                                  ImGuiChildFlags_AlwaysUseWindowPadding,
                               ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground)) {
+            // The roster is the point of this overview: never bury it below a long checklist.
             bool first = true;
-            if (todoOpen) {
-                drawTodos(cu, fonts, first);
+            if (!s_agents.empty()) {
+                drawAgents(st, convId, cu, fonts, nRun, first);
                 first = false;
             }
-            if (!s_agents.empty()) drawAgents(st, convId, cu, fonts, nRun, first);
+            if (todoOpen) drawTodos(cu, fonts, first);
             drawWindowPillScrollbarV(chatSurf());
         }
         ImGui::EndChild();
+        ImGui::PopStyleVar();
     }
     kit::cardEnd();
     ImGui::PopFont();

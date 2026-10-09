@@ -1478,7 +1478,8 @@ static bool sheetPlaceholder(const ImRect& r, const char* id, const char* title,
     const float w = std::min(ui::metrics::px(440.0f), r.GetWidth());
     ImGui::SetCursorScreenPos(ImVec2(r.Min.x + (r.GetWidth() - w) * 0.5f,
                                      r.Min.y + std::max(0.0f, (r.GetHeight() - blockH) * 0.5f)));
-    if (ImGui::BeginChild("##placeholder", ImVec2(w, 0.0f), ImGuiChildFlags_AutoResizeY,
+    if (ImGui::BeginChild("##placeholder", ImVec2(w, 0.0f),
+                          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize,
                           ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
                               ImGuiWindowFlags_NoScrollWithMouse)) {
         clicked = ui::kit::emptyState("ws_drawing", title, body, action, actionEnabled);

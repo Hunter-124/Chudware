@@ -98,6 +98,26 @@ float labelBudget(float rowW, const char* icon) {
     return rowW - textX - kChevronGutterDp * sc;
 }
 
+// Taxonomy data may name glyphs that are not in the shipped icon contract.
+// Resolve those semantic categories here, before getIcon/glassRow can log an
+// unknown atlas name. All replacements belong to contracts/icons.md.
+const char* taxonomyIcon(const TaxNode& node) {
+    struct IconAlias { const char* requested; const char* shipped; };
+    static const IconAlias aliases[] = {
+        {"warning",          "warning_badge"},
+        {"cat_motor",        "cat_drivetrain"},
+        {"cat_motion",       "cat_bearings"},
+        {"cat_power",        "cat_electronics"},
+        {"cat_battery",      "cat_electronics"},
+        {"cat_seal",         "cat_hardware"},
+        {"cat_electromech",  "cat_electronics"},
+        {"cat_custom_fab",   "part"},
+    };
+    for (const auto& alias : aliases)
+        if (node.icon == alias.requested) return alias.shipped;
+    return node.icon.empty() ? partIcon(node.id) : node.icon.c_str();
+}
+
 // Right-aligned expand chevron over the row rect (drawlist triangle; rotates when expanded).
 // Expanded is tinted accent so an open branch is readable from the chevron alone — a uniformly
 // disabled-grey chevron made the pane's open/closed state depend entirely on the rotation.
@@ -136,7 +156,7 @@ void drawNode(AppState& st, const TaxNode& node, int depth, bool first) {
 
     ImGui::PushID(node.id.c_str());
     if (root && S().fonts && S().fonts->medium) ImGui::PushFont(S().fonts->medium);
-    const char* icon = !node.icon.empty() ? node.icon.c_str() : partIcon(node.id);
+    const char* icon = taxonomyIcon(node);
     // Only a row that actually gets a chevron needs the gutter reserved; a leaf keeps the
     // full width (and glassRow's own padX clip) so nothing is ellipsized for free.
     std::string  fitted;
@@ -225,7 +245,18 @@ void drawTaxonomyPane(AppState& st, float paneW) {
         std::snprintf(catCount, sizeof(catCount), "%d", rootCount);
         catTrailing = catCount;
     }
-    sectionHeader("Categories", /*firstInPane=*/true, "parts_all", catTrailing);
+    // Header and rows share the same right edge; the trailing count must not
+    // occupy the pill scrollbar's reserved lane.
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0, 0));
+    if (ImGui::BeginTable("##categories_header", 1,
+                         ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoPadOuterX |
+                         ImGuiTableFlags_NoPadInnerX,
+                         ImVec2(ImGui::GetContentRegionAvail().x - laneW, 0))) {
+        ImGui::TableNextColumn();
+        sectionHeader("Categories", /*firstInPane=*/true, "parts_all", catTrailing);
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar();
     ImGui::Dummy(ImVec2(0, 2.0f * sc));   // first row is not welded to the header rule
 
     // "All Parts" is not a taxonomy node, so it has no category hue — it wears the app accent,

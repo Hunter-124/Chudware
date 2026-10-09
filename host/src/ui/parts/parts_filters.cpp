@@ -344,11 +344,20 @@ void drawFiltersBlock(AppState& st, float paneW) {
     ImGui::Dummy(ImVec2(0, gapField));
     fieldLabel("Source");
     ImGui::Dummy(ImVec2(0, gapLabel));
-    glassFieldBegin();
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - laneW);
-    const bool srcChanged =
-        ImGui::Combo("##fsrc", &S().sourceFilter, "All\0Local library\0Live vendors\0");
-    glassFieldEnd(tint);
+    static const char* const sources[] = {"All", "Local library", "Live vendors"};
+    bool srcChanged = false;
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0, 0));
+    if (ImGui::BeginTable("##source_layout", 1,
+                         ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoPadOuterX |
+                         ImGuiTableFlags_NoPadInnerX,
+                         ImVec2(ImGui::GetContentRegionAvail().x - laneW, 0))) {
+        ImGui::TableNextColumn();
+        srcChanged = ui::kit::fieldEnum(
+            "##fsrc", "", &S().sourceFilter, sources, IM_ARRAYSIZE(sources),
+            ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo));
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar();
     if (srcChanged) markDirty();
 
     ImGui::Dummy(ImVec2(0, gapField));

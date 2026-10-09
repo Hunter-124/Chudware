@@ -1197,6 +1197,9 @@ void HydraulicPanel::setDriveFromPump(const std::string& pumpComponentId) {
 
 bool HydraulicPanel::runPumpDrive(AppState& st) {
     if (busy()) return false;
+    // Match the display form's supply before deriving poles/frame/speed. Pump-linked runs and
+    // ribbon actions can size without drawing the form, so this belongs at the sizing boundary.
+    sim::defaultSupplyForUnits(drive_, SimManager::unitSys(st).us);
     const std::string why = driveBlocker();
     if (!why.empty()) {
         setStatus(why, 3);

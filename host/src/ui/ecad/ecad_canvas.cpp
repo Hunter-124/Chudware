@@ -342,8 +342,8 @@ void EcadCanvas::drawGrid(const EcadMirror& doc, const ImVec2& avail) {
     if (gridMaxX <= gridMinX) return;
 
     dl_->PushClipRect(ImVec2(gridMinX, imgMin_.y), ImVec2(gridMaxX, imgMax.y), true);
-    const float minorRadius = ui::metrics::px(0.65f);
-    const float majorRadius = ui::metrics::px(1.05f);
+    const float minorRadius = ui::metrics::px(0.9f);
+    const float majorRadius = ui::metrics::px(1.3f);
     const float stepPx = stepMm * pxPerMm_;
     const float fadeSpan = std::max(stepPx * 2.0f, ui::metrics::U(2.0f));
     const ImVec2 first = toScreen(
@@ -353,8 +353,8 @@ void EcadCanvas::drawGrid(const EcadMirror& doc, const ImVec2& avail) {
         if (sx <= gridMinX || sx >= gridMaxX) continue;
         const float edgeDistance = std::min(sx - gridMinX, gridMaxX - sx);
         const float edgeFade = std::clamp(edgeDistance / fadeSpan, 0.0f, 1.0f);
-        const ImU32 minorCol = col(p.sketchGrid, 0.55f * edgeFade);
-        const ImU32 majorCol = col(p.sketchGrid, edgeFade);
+        const ImU32 minorCol = col(p.sketchGrid, 1.6f * edgeFade);
+        const ImU32 majorCol = col(p.sketchGrid, 2.4f * edgeFade);
         const long long baseIx = static_cast<long long>(ix) * skip;
         for (int iy = iy0; iy <= iy1; ++iy) {
             const long long baseIy = static_cast<long long>(iy) * skip;
@@ -950,9 +950,9 @@ void EcadCanvas::drawSch(const EcadMirror& doc) {
 void EcadCanvas::drawPcb(const EcadMirror& doc) {
     const ui::Palette& p = ui::palette;
     const ImU32 outlineCol = col(p.statusWarn);
-    const ImU32 courtCol   = col(p.textDim, 0.70f);
+    const ImU32 courtCol   = col(p.sketchDimLine, 0.70f);
     const ImU32 drillCol   = col(p.windowBg);
-    const ImU32 refCol     = col(p.text, 0.85f);
+    const ImU32 refCol     = col(p.sketchInk);
 
 
     auto trackStroke = [this](const EcadTrack& track, float extra) {
@@ -989,6 +989,14 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
         if (selected("fp", fp.id)) return EcadPt{dragDx_, dragDy_};
         return EcadPt{0.0f, 0.0f};
     };
+    pcbOverlayKeepouts_.clear();
+    for (const auto& fp : doc.footprints()) {
+        if (!fp.hasCourtyard) continue;
+        const EcadPt offset = footprintOffset(fp);
+        pcbOverlayKeepouts_.push_back({
+            toScreen({fp.courtyardMin.x + offset.x, fp.courtyardMax.y + offset.y}),
+            toScreen({fp.courtyardMax.x + offset.x, fp.courtyardMin.y + offset.y})});
+    }
 
     auto drawCourtyard = [this](const EcadFootprint& fp, const EcadPt& offset, ImU32 color) {
         const EcadPt mn{fp.courtyardMin.x + offset.x, fp.courtyardMin.y + offset.y};
@@ -1180,14 +1188,6 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
                 dl_->AddCircle(drill, radius, edge, 24, ui::metrics::stroke(1.0f));
             }
         }
-
-        if (!fp.ref.empty()) {
-            const ImVec2 origin =
-                toScreen({fp.pos.x + offset.x, fp.pos.y + offset.y});
-            dl_->AddText(ImVec2(origin.x + ui::metrics::U(1.0f),
-                                origin.y - ui::metrics::U(4.0f)),
-                         refCol, fp.ref.c_str());
-        }
     }
 
     for (const auto& via : doc.vias()) {
@@ -1277,6 +1277,38 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
         dl_->AddRect(a, b, selectionOuter, 0.0f, 0, ui::metrics::stroke(4.0f));
         dl_->AddRect(a, b, selectionInner, 0.0f, 0, ui::metrics::stroke(1.5f));
     }
+    // Reference designators live outside the complete rotated pad envelope, and paint
+    // after all copper. Reserve their measured rectangles for subsequent labels/DRC.
+    const float labelGap = ui::metrics::px(4.0f);
+    const float labelPad = ui::metrics::px(2.0f);
+    for (const auto& fp : doc.footprints()) {
+        if (fp.ref.empty()) continue;
+        const EcadPt offset = footprintOffset(fp);
+        const ImVec2 origin = toScreen({fp.pos.x + offset.x, fp.pos.y + offset.y});
+        const ImVec2 size = ImGui::CalcTextSize(fp.ref.c_str());
+        const float top = fp.hasCourtyard
+            ? toScreen({fp.pos.x + offset.x, fp.courtyardMax.y + offset.y}).y
+            : origin.y;
+        ImVec2 pos(origin.x - size.x * 0.5f, top - labelGap - size.y);
+        for (size_t attempt = 0; attempt <= pcbOverlayKeepouts_.size(); ++attempt) {
+            bool blocked = false;
+            for (const auto& rect : pcbOverlayKeepouts_) {
+                if (pos.x - labelPad < rect.max.x && pos.x + size.x + labelPad > rect.min.x &&
+                    pos.y - labelPad < rect.max.y && pos.y + size.y + labelPad > rect.min.y) {
+                    pos.y = rect.min.y - labelGap - size.y - labelPad;
+                    blocked = true;
+                    break;
+                }
+            }
+            if (!blocked) break;
+        }
+        const OverlayRect label{{pos.x - labelPad, pos.y - labelPad},
+                                {pos.x + size.x + labelPad, pos.y + size.y + labelPad}};
+        dl_->AddRectFilled(label.min, label.max, col(p.viewportBottom),
+                           ui::metrics::px(2.0f));
+        dl_->AddText(pos, refCol, fp.ref.c_str());
+        pcbOverlayKeepouts_.push_back(label);
+    }
 }
 
 void EcadCanvas::drawOverlays(const EcadMirror& doc) {
@@ -1293,23 +1325,11 @@ void EcadCanvas::drawOverlays(const EcadMirror& doc) {
     }
 
     if (showDrcMarkers_ && doc.isPcb()) {
-        // Persistent DRC markers — the board-side twin of the schematic ERC markers above:
-        // same severity glyphs, same palette roles, same constant screen-space size, drawn
-        // at the same overlay z (above copper, below the focus flash). Violations on a
-        // hidden copper layer hide with it, exactly like the tracks they flag.
-        //
-        // A pair violation (clearance is BETWEEN two shapes) reports one location per
-        // offender: a glyph marks EVERY location and a thin hairline joins the first two.
-        // Marking only the midpoint would often land on bare substrate and point at
-        // neither offending shape.
-        //
-        // Density: a real board can carry hundreds of violations. Errors paint first, and
-        // a glyph landing within one glyph-radius of one already painted this frame is
-        // skipped — stacked identical glyphs add overdraw, not information, and errors
-        // must never be buried under warnings. The dedupe scratch is a reused member, so
-        // the steady state allocates nothing; the quadratic scan only walks glyphs that
-        // actually painted, which the dedupe itself keeps small when zoomed out.
+        // Locate every offender precisely, but place its badge outside the footprint
+        // and refdes envelopes. A hairline and tiny anchor dot retain the true location.
+        // Errors paint first; nearby anchors deduplicate rather than stacking badges.
         drcMarkerPts_.clear();
+        drcAnchorPts_.clear();
         const float r = ui::metrics::U(2.2f);
         const float minSepSq = r * r;
         const float cullMinX = imgMin_.x - r, cullMinY = imgMin_.y - r;
@@ -1339,13 +1359,43 @@ void EcadCanvas::drawOverlays(const EcadMirror& doc) {
                         q.y < cullMinY || q.y > cullMaxY)
                         continue;
                     bool crowded = false;
-                    for (const ImVec2& drawn : drcMarkerPts_) {
+                    for (const ImVec2& drawn : drcAnchorPts_) {
                         const float dx = q.x - drawn.x, dy = q.y - drawn.y;
                         if (dx * dx + dy * dy < minSepSq) { crowded = true; break; }
                     }
                     if (crowded) continue;
-                    drcMarkerPts_.push_back(q);
-                    drawViolationGlyph(dl_, q, isError, c, r);
+                    drcAnchorPts_.push_back(q);
+                    ImVec2 badge = q;
+                    const float gap = ui::metrics::px(3.0f);
+                    const float separation = r * 2.0f + gap;
+                    const size_t maxMoves = pcbOverlayKeepouts_.size() + drcMarkerPts_.size() + 1;
+                    for (size_t attempt = 0; attempt < maxMoves; ++attempt) {
+                        bool blocked = false;
+                        for (const auto& rect : pcbOverlayKeepouts_) {
+                            if (badge.x + r + gap > rect.min.x && badge.x - r - gap < rect.max.x &&
+                                badge.y + r + gap > rect.min.y && badge.y - r - gap < rect.max.y) {
+                                badge.y = rect.min.y - r - gap;
+                                blocked = true;
+                                break;
+                            }
+                        }
+                        if (blocked) continue;
+                        for (const ImVec2& drawn : drcMarkerPts_) {
+                            const float dx = badge.x - drawn.x, dy = badge.y - drawn.y;
+                            if (dx * dx + dy * dy < separation * separation) {
+                                badge.y = drawn.y - separation;
+                                blocked = true;
+                                break;
+                            }
+                        }
+                        if (!blocked) break;
+                    }
+                    drcMarkerPts_.push_back(badge);
+                    if (badge.x != q.x || badge.y != q.y) {
+                        dl_->AddLine(q, badge, col(role, 0.55f), ui::metrics::stroke(1.0f));
+                        dl_->AddCircleFilled(q, ui::metrics::px(1.25f), c, 8);
+                    }
+                    drawViolationGlyph(dl_, badge, isError, c, r);
                 }
             }
         }

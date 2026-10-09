@@ -194,13 +194,19 @@ void drawManufactureModeBar(AppState& st, float x, float y, float w, float h) {
     ImGui::PopStyleColor();
 
     // Chrome material: the app's frosted glass, square-cornered because the strip is full-bleed
-    // between the ribbon and the dockspace. Only LIVE MACHINE tints it.
+    // between the ribbon and the dockspace. The viewport columns/tabs start one grid unit below
+    // that band. Carry the strip's material through that chrome gutter rather than exposing a
+    // bright sliver of the studio canvas between two dark surfaces. This is paint only: the
+    // reserved mode-row height and the controls' hit rectangles remain unchanged.
+    // Only LIVE MACHINE tints it.
     ImDrawList*             dl   = ImGui::GetWindowDrawList();
-    const ImRect            rect(ImVec2(x, y), ImVec2(x + w, y + h));
+    const ImRect            rect(ImVec2(x, y), ImVec2(x + w, y + h + metrics::U()));
     const AdaptiveSurface&  surf = adaptivePanel(panelId("mfg_mode_bar"), rect);
+    dl->PushClipRect(rect.Min, rect.Max, false);
     glassPanel(dl, rect, GlassLevel::Thin, 0.0f, surf);
     if (!offline)
         glassCardWash(dl, rect.Min, rect.Max, 0.0f, palette.statusErr, kLiveWashTopAlpha);
+    dl->PopClipRect();
 
     const float      gap    = metrics::camBtnGap();
     const float      rowTop = ImGui::GetCursorPosY();

@@ -52,6 +52,7 @@ PlmItemRow parseItem(const nlohmann::json& it) {
     r.rev        = getStr(it, "rev");
     r.lifecycle  = getStr(it, "lifecycle");
     r.workingRev = getStr(it, "working_rev");
+    r.change     = getStr(it, "change");
     r.dirty      = it.value("dirty", false);
     return r;
 }
@@ -374,19 +375,26 @@ void plmEnsureOverview(AppState& st) {
     // Every hub page enters here before dispatch. Capture on-disk changes once
     // when binding a project, including explicit folder picks and restored paths.
     // No-op when the working tree matches history.
-    {
-        std::string proj = st.plmProjectPath();
-        if (!proj.empty() && proj != H.outsideRecordedFor && st.workerStarted) {
-            H.outsideRecordedFor = proj;
-            nlohmann::json p;
-            p["path"] = proj;
-            st.rpc.call("plm_record_outside", p, [](const core::RpcResult&) {});
-        }
+    // Record outside changes only after the first overview has landed. A cold discovery/save
+    // must not sit ahead of all visible page reads on the shared FIFO.
+    const std::string proj = st.plmProjectPath();
+    if (!proj.empty() && H.ovProject == proj && proj != H.outsideRecordedFor &&
+        st.workerStarted) {
+        H.outsideRecordedFor = proj;
+        H.outsideLoading = true;
+        H.outsideErr.clear();
+        st.rpc.call("plm_record_outside", pathParam(st), [proj, &st](const core::RpcResult& r) {
+            if (g_plmHub.outsideRecordedFor != proj) return;
+            g_plmHub.outsideLoading = false;
+            if (proj != st.plmProjectPath()) return;
+            if (!plmOk(r, g_plmHub.outsideErr)) return;
+            if (r.result.value("committed", false)) plmInvalidate();
+        });
     }
     if (H.ovLoading || H.ovGen == H.generation) return;
     H.ovLoading = true;
     const int gen = H.generation;
-    const std::string proj = st.plmProjectPath();
+    if (proj.empty() || !st.workerStarted) { H.ovLoading = false; return; }
     st.rpc.call("plm_overview", pathParam(st), [gen, proj, &st](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.ovLoading = false;
@@ -440,9 +448,12 @@ void plmEnsureItems(AppState& st) {
         if (!plmOk(r, H.itemsErr)) return;
         H.itemsErr.clear();
         H.items.clear();
+        H.untracked.clear();
         ++H.itemsRevision;
         if (auto it = r.result.find("items"); it != r.result.end() && it->is_array())
             for (const auto& row : *it) H.items.push_back(parseItem(row));
+        if (auto it = r.result.find("untracked"); it != r.result.end() && it->is_array())
+            for (const auto& row : *it) H.untracked.push_back(parseItem(row));
     });
 }
 
@@ -467,6 +478,7 @@ void plmEnsureHistory(AppState& st) {
         if (!plmOk(r, H.histErr)) return;
         H.histErr.clear();
         H.history.clear();
+        ++H.historyRevision;
         if (auto e = r.result.find("entries"); e != r.result.end() && e->is_array())
             for (const auto& en : *e) H.history.push_back(parseEntry(en));
     });

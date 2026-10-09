@@ -277,6 +277,21 @@ void collect(AppState& st,simscene::Scene& out) {
         for(const auto* g:{&cache.bodies,&cache.hoses}) for(std::size_t i=0;i<g->xyz.size();i+=3) for(int k=0;k<3;++k) {
             st.zoomToBBoxMin[k]=std::min(st.zoomToBBoxMin[k],g->xyz[i+k]-30);st.zoomToBBoxMax[k]=std::max(st.zoomToBBoxMax[k],g->xyz[i+k]+30);
         }
+        // Fit the entire document + circuit into the viewport's clear rect (frameBBox owns the
+        // lens-shift/clear-region scale). Fitting only the circuit zooms the surrounding skid
+        // and vessels under the glass columns and doc-tab band.
+        if(st.hasDocMesh&&st.renderer&&st.renderer->modelRadius()>0.0f) {
+            if(!st.bodyBBoxCache.empty()) {
+                for(const auto& entry:st.bodyBBoxCache) for(int k=0;k<3;++k) {
+                    st.zoomToBBoxMin[k]=std::min(st.zoomToBBoxMin[k],entry.second[k]);
+                    st.zoomToBBoxMax[k]=std::max(st.zoomToBBoxMax[k],entry.second[k+3]);
+                }
+            } else {
+                const Vec3 c=st.renderer->modelCenter();const float r=st.renderer->modelRadius();
+                const float mc[3]={c.x,c.y,c.z};
+                for(int k=0;k<3;++k){st.zoomToBBoxMin[k]=std::min(st.zoomToBBoxMin[k],mc[k]-r);st.zoomToBBoxMax[k]=std::max(st.zoomToBBoxMax[k],mc[k]+r);}
+            }
+        }
         st.zoomToBBoxRequested=true;
     }
 }

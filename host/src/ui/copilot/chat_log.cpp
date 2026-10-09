@@ -262,7 +262,8 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                                       ui::metrics::cpChatBubbleRadius());
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padX, padY));
     ImGui::BeginChild("##umsg", ImVec2(bw, 0),
-                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize |
+                          ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
     // Same selectable read-only InputText treatment as assistant prose (soft-wrap +
     // click-drag + Ctrl+C toast + right-click Copy), plus the keywords' static gradient.
@@ -480,7 +481,8 @@ static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
     ImGui::BeginChild("##provlog", ImVec2(0, 0),
-                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize |
+                          ImGuiChildFlags_AlwaysUseWindowPadding);
     if (fonts.mono) ImGui::PushFont(fonts.mono);
     for (size_t i = 0; i < calls.size(); ++i) {
         const ActivityItem* a = calls[i];
@@ -549,7 +551,12 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
     // turn like every other activity-led turn. The trailing card survives only for a reply
     // the timeline never saw (a non-streaming provider, a restored transcript, an RPC answer).
     const bool proseInline = ui::timelineHasInlineProse(m);
-    const bool proseCard = !proseInline && !m.text.empty() && m.errKind == ERR_NONE;
+    // A partial outcome (mission mixed results, or a run interrupted mid-reply) shows its reply
+    // INSIDE the amber "Partially complete" card below; drawing the open prose too printed the
+    // same text twice.
+    const bool partialCard = m.errKind == ERR_PARTIAL || m.resultPartial;
+    const bool proseCard = !proseInline && !m.text.empty() && m.errKind == ERR_NONE &&
+                           !partialCard;
     // Geometry-mutating turns keep the checkpoint-backed Before/After restore; EVERY
     // other finished turn still offers a chat-only rewind (msg:<idx>) so a revert is
     // reachable at any point in the chat. turnNum > 0 already implies chatMsgMutatedDoc
@@ -568,7 +575,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
         restoreDrawn = true;
     };
     const bool metaInCard = !vcMutated &&
-        (proseCard || m.errKind != ERR_NONE || m.resultPartial);
+        (proseCard || m.errKind != ERR_NONE || partialCard);
     bool metaDrawn = false;
     const char* mid = nullptr;
     if (!m.model.empty()) mid = m.model.c_str();
@@ -656,13 +663,15 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
     // (stage cards, thoughts, tool lines) is a rail or a bare line, so the answer still reads as
     // the deliverable without being boxed. Selectable for click-drag + Ctrl+C; right-click
     // copies selection or full text.
-    if (proseCard || (proseInline && !bodyText.empty() && m.errKind == ERR_NONE)) {
+    if (proseCard ||
+        (proseInline && !bodyText.empty() && m.errKind == ERR_NONE && !partialCard)) {
         const std::string prose = stripMdMarks(bodyText);
         GlassBubble gb = beginOpenBubble(ImGui::GetContentRegionAvail().x);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                             ImVec2(chatProseInsetX(), ui::metrics::cpChatCardPadY()));
         ImGui::BeginChild("##prose", ImVec2(0, 0),
-                          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+                          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize |
+                              ImGuiChildFlags_AlwaysUseWindowPadding);
         // Author meta row INSIDE the card top (model left, age right) when it
         // wasn't drawn above the turn (VC-restore turns keep the top row).
         if (metaInCard && !metaDrawn) {
@@ -763,16 +772,19 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
     // (8) Result / error block.
     // ERR_PARTIAL: warning-accent "Partially complete" card (mission mixed outcomes) —
     // geometry is kept; NOT a hard error. ERR_CAD/ERR_SYSTEM: red-bordered error card.
-    if (m.errKind == ERR_PARTIAL || m.resultPartial) {
-        std::string body = stripMdMarks(bodyText);
-        if (body.empty()) body = "Partially complete";
+    if (partialCard) {
+        // An empty tail (the timeline already drew the reply inline) leaves just the headline:
+        // a "Partially complete" body under a "Partially complete" title read as a stutter.
+        const std::string body = stripMdMarks(bodyText);
+        const std::string copyText = body.empty() ? std::string("Partially complete") : body;
         ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
                                           ui::metrics::cpChatBubbleRadius() * 0.7f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                             ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
         ImGui::BeginChild("##partialcard", ImVec2(0, 0),
-                          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+                          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize |
+                              ImGuiChildFlags_AlwaysUseWindowPadding);
         const ImVec4 warnCol = semanticOnGlass(pal.statusWarn, chatSurf());
         if (metaInCard && !metaDrawn) {
             drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
@@ -785,13 +797,15 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
         ImGui::TextColored(warnCol, "Partially complete");
         ImGui::PopFont();
         // Body is the selectable detail (counts + first failure / verdict).
-        const ImGuiID textId = chatDrawSelectableText("##partial_sel", body, chatSurf().textPrimary);
+        ImGuiID textId = 0;
+        if (!body.empty())
+            textId = chatDrawSelectableText("##partial_sel", body, chatSurf().textPrimary);
         // Submitted before EndChild — see the comment on the user-bubble copy glyph in
         // drawUserBlock() for why an after-EndChild button silently eats no clicks here.
         {
             const ImVec2 wp = ImGui::GetWindowPos();
             const ImVec2 ws = ImGui::GetWindowSize();
-            chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), body);
+            chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), copyText);
         }
         restoreBar();
         ImGui::EndChild();
@@ -800,7 +814,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
         // heavy border: it informs, it does not alarm.
         ImRect cardRect = endTintBubble(gb, pal.statusWarn, 0.08f, 0.40f);
         const std::string sel = chatInputSelection(textId);
-        chatCopyContext(cardRect, "##partial_copy", body, body, sel);
+        chatCopyContext(cardRect, "##partial_copy", copyText, copyText, sel);
     } else if (m.errKind != ERR_NONE) {
         std::string stopReason, errorDetail;
         for (const auto& a : m.activity) {
@@ -904,7 +918,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                                 ImVec2(ui::metrics::cpChatCardPadX(), ui::metrics::cpChatCardPadY()));
             ImGui::BeginChild("##errcard", ImVec2(0, 0),
-                              ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+                              ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize |
+                                  ImGuiChildFlags_AlwaysUseWindowPadding);
             // Error tone retuned for the frost so the reason stays readable over any model.
             const float* ec = (m.errKind == ERR_SYSTEM) ? pal.errSystem : pal.errCad;
             const ImVec4 errCol = semanticOnGlass(ec, chatSurf());
@@ -1032,6 +1047,10 @@ void drawChatLogWindowed(AppState& st) {
         ImGui::PushID((int)mi);
         const float y = ImGui::GetCursorPosY();
         const bool cacheValid = m.uiCachedH > 0.0f && std::fabs(m.uiCachedW - logW) < 0.5f;
+        // Auto-height bubbles must continue measuring even when their previous height clips the
+        // selectable text. Otherwise a newly hosted/restored row caches only padding and remains
+        // an empty bar. The bubble children use AlwaysAutoResize; the outer log still windows
+        // genuinely off-screen, already-measured turns here.
         const bool interactive = m.running || m.clarify.active || m.clarify.awaiting ||
                                  std::any_of(m.asks.begin(), m.asks.end(),
                                              [](const AskBatch& b) { return askStatusOpen(b.status); }) ||

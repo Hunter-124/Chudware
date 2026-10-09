@@ -1057,6 +1057,24 @@ static std::vector<DimCandidate> dimCandidates(AppState& st, const std::string& 
         c.rangeMin = fd.dimMin;
         c.rangeMax = fd.dimMax;
         c.dirW = dimWorldDir(fd.key);
+        // Dress-up dimensions belong on the affected surface, not at the whole body's centre
+        // plus an arbitrary fraction of its size (which placed the fillet radius on a shell's
+        // floor). Use a real face created by the feature, with no bbox-based displacement.
+        bool surfaceAnchored = false;
+        if (type == "fillet" || type == "chamfer") {
+            const auto owner = st.docMirror.ownerMap().find(fid);
+            if (owner != st.docMirror.ownerMap().end()) {
+                for (const auto& bf : owner->second.faces) {
+                    const uint64_t key = ((uint64_t)bf.first << 32) | bf.second;
+                    const auto face = st.faceNormalCache.find(key);
+                    if (face == st.faceNormalCache.end()) continue;
+                    const auto& geometry = face->second;
+                    for (int k = 0; k < 3; ++k) c.anchor[k] = geometry[k + 3];
+                    surfaceAnchored = true;
+                    break;
+                }
+            }
+        }
         // TASK A: the primary extrude/planar depth handle is constrained to the extruded surface and
         // oriented along the real extrusion axis (recovered from cached cap geometry), honouring the
         // "Reverse direction" flag. This replaces the hardcoded dimWorldDir()+AABB-centre placement
@@ -1082,7 +1100,7 @@ static std::vector<DimCandidate> dimCandidates(AppState& st, const std::string& 
                 extrudeAnchored = true;
             }
         }
-        if (!extrudeAnchored && hasAnchor) {
+        if (!extrudeAnchored && !surfaceAnchored && hasAnchor) {
             // Spread the handles around the anchor so chips/arrows don't stack: nudge each one a
             // little further out along its own measured axis (or +Z for angles).
             Vec3 d = isAngle ? Vec3(0, 0, 1) : c.dirW;
@@ -1149,10 +1167,11 @@ static uint64_t simulationDocumentScope(const AppState& st) {
 
 // Bounds share the producers' immutable batch revisions, just like their retained GL buffers.
 // Unchanged frames merge small AABBs, never walk the triangle/line payloads again.
-static void updateSimulationSceneBounds(AppState& st, const simscene::Scene& scene,
+// Returns false when the document scope changed this frame: the retained framing radius belonged
+// to the previous document, so the caller must not rescale the restored camera by it.
+static bool updateSimulationSceneBounds(AppState& st, const simscene::Scene& scene,
                                         uint64_t documentScope, bool toolArmed) {
     Renderer& renderer = *st.renderer;
-    const float previousRadius = renderer.effectiveSceneRadius();
     struct BatchBounds {
         uint64_t key = 0, revision = 0;
         float lo[3]{}, hi[3]{};
@@ -1161,8 +1180,14 @@ static void updateSimulationSceneBounds(AppState& st, const simscene::Scene& sce
     static std::vector<BatchBounds> batches;
     static uint64_t previousScope = 0;
     static const Renderer* previousRenderer = nullptr;
-    if (previousScope != documentScope || previousRenderer != &renderer) {
+    // Padded framing radius held for auxiliary (simulation) geometry in THIS scope; 0 = none.
+    // It only ever exceeds the document's own model/empty radius: a large previous document or a
+    // model-radius change must never pin a small or new document's framing (B1 speck regression).
+    static float retainedRadius = 0.0f;
+    const bool sameScope = previousScope == documentScope && previousRenderer == &renderer;
+    if (!sameScope) {
         batches.clear();
+        retainedRadius = 0.0f;
         previousScope = documentScope;
         previousRenderer = &renderer;
     }
@@ -1218,26 +1243,31 @@ static void updateSimulationSceneBounds(AppState& st, const simscene::Scene& sce
     // Read the exact cached bounds radius without the retained authoring floor.
     renderer.setAuxSceneRadiusFloor(0.0f);
     const float requiredRadius = renderer.effectiveSceneRadius();
-    float framingRadius = previousRadius;
-    if (requiredRadius > previousRadius ||
-        (!toolArmed && requiredRadius < previousRadius * 0.7f)) {
-        const float baseRadius = renderer.modelRadius() > 0.0f
-            ? renderer.modelRadius() : Renderer::kEmptySceneRadius;
-        // Geometric 25% bands leave headroom for small edits without repeatedly resizing
-        // the datums. Compute bands only at a grow/shrink threshold, never for mouse motion.
+    const float baseRadius = renderer.modelRadius() > 0.0f
+        ? renderer.modelRadius() : Renderer::kEmptySceneRadius;
+    float framingRadius = std::max(requiredRadius, retainedRadius);
+    if (requiredRadius > baseRadius && requiredRadius > retainedRadius) {
+        // Auxiliary geometry outgrew the held frame. Geometric 25% bands leave headroom for small
+        // edits without repeatedly resizing the datums; bands are computed only at a threshold.
         const float band = std::ceil(std::log(requiredRadius / baseRadius) / std::log(1.25f));
-        const float nextRadius = std::max(requiredRadius, baseRadius * std::pow(1.25f, band));
+        framingRadius = std::max(requiredRadius, baseRadius * std::pow(1.25f, band));
+    } else if (retainedRadius > requiredRadius && !toolArmed &&
+               requiredRadius < retainedRadius * 0.7f) {
+        float nextRadius = requiredRadius;
+        if (requiredRadius > baseRadius) {
+            const float band = std::ceil(std::log(requiredRadius / baseRadius) / std::log(1.25f));
+            nextRadius = std::max(requiredRadius, baseRadius * std::pow(1.25f, band));
+        }
         float minimumZoom = st.zoom;
         if (st.animActive)
             minimumZoom = std::min(minimumZoom, std::min(st.animZoom0, st.animZoom1));
         // Clamping after radius compensation would visibly jump at the 0.1 zoom limit.
         // Retain the old radius until both the live view and animation can shrink exactly.
-        if (nextRadius > previousRadius ||
-            (nextRadius < previousRadius * 0.7f &&
-             minimumZoom * (nextRadius / previousRadius) >= 0.1f))
-            framingRadius = nextRadius;
+        if (minimumZoom * (nextRadius / retainedRadius) >= 0.1f) framingRadius = nextRadius;
     }
-    renderer.setAuxSceneRadiusFloor(framingRadius);
+    retainedRadius = framingRadius > baseRadius ? framingRadius : 0.0f;
+    renderer.setAuxSceneRadiusFloor(retainedRadius);
+    return sameScope;
 }
 
 // C37-C: shared AABB-framing helper — pan to bbox center, zoom to fit bbox radius (animated).
@@ -2166,10 +2196,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     if (sceneActive) ui::simscene::collect(st, simulationScene);
     // Collect before bbox requests and camera ticking: a producer may request framing while it
     // publishes new geometry. Changing only R/zoom leaves the view and orbit center untouched.
+    // A document switch restores that document's own camera, so a radius change caused by
+    // dropping the previous document's auxiliary bounds/floor must not rescale it.
     const float previousSceneRadius = renderer.effectiveSceneRadius();
-    updateSimulationSceneBounds(st, simulationScene, sceneDocumentScope, sceneToolArmed);
+    const bool sameSceneScope =
+        updateSimulationSceneBounds(st, simulationScene, sceneDocumentScope, sceneToolArmed);
     const float sceneRadius = renderer.effectiveSceneRadius();
-    if (sceneRadius != previousSceneRadius) {
+    if (sameSceneScope && sceneRadius != previousSceneRadius) {
         const float ratio = sceneRadius / previousSceneRadius;
         // Both projection scales and the orbit distance depend only on R/zoom. The bounds
         // helper already deferred unsafe shrinking; maxSceneZoom scales by the same ratio.
@@ -5544,92 +5577,20 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Hover: accentSoft circle behind the label. Tooltip: view name.
         if (st.showTriad) {
             const float ts = ui::uiScale;
-            // Half-extent of everything the triad paints AND clicks: arm (30) + label-chip offset
-            // (12) + the invisible axis button's half size (8). Every obstacle test below measures
-            // against this, so the hit targets — not just the ink — stay clear.
-            const float reach  = 50.0f * ts;
-            const float clearM = 12.0f * ts;   // clearance, same 12dp rhythm as the chip offset
-            // Anchor RIGHT of the pinned FeatureManager column — the old cr0-relative anchor put
-            // the triad underneath the floating glass column (visual-review fix).
-            const float e = ui::overlayColumnEdge(0);
-            const bool colDodgeable = (e > cr0.x && e < cr1.x - 140.0f * ts);
-            // Does the pinned column's content reach down to a triad whose box top sits at topAbs?
-            // overlayColumnHeight(0) is the column's occupied bottom as an absolute screen Y —
-            // republished per frame for whichever tab (Explorer / Feature Manager / Configurations)
-            // is showing, so expanding or collapsing a tab re-targets the triad.
-            auto colReaches = [&](float topAbs) {
-                const float colBottomAbs = ui::overlayColumnHeight(0);
-                return (colBottomAbs > 0.0f) && (colBottomAbs >= topAbs);
-            };
-            float targetLeft = cr0.x;
-            // Only push the triad right of the FM column when the column's CONTENT actually reaches
-            // down to the triad's row (they would overlap). Otherwise there's room underneath the
-            // column (below the tab's bottom-most element), so the triad tucks to the far-left
-            // anchor (cr0.x).
-            if (colDodgeable && colReaches(cr1.y - 90.0f * ts))   // triad box top at the base row
-                targetLeft = e;
-
-            // ---- obstacle 2: a bottom-anchored viewport HUD ------------------------------------
-            // The Manufacture playback card pins bottom-CENTRE, i.e. straight across the triad's
-            // row, and the column dodge knew nothing about it: on Manufacture's 360dp column the
-            // dodge parked the axis chips on the card's Play button. Resolution order is
-            // horizontal-first — slide LEFT until the triad's right edge clears the card's left
-            // edge, bounded by the leftmost legal anchor (`targetLeft`: the viewport edge, or the
-            // column's edge when its content reaches this row, and never left of the current
-            // target). That bound is why the slide can only rescue the EASED position — clamped
-            // below, beside the column guard. When the target itself lands on the card no legal x
-            // fits, so LIFT the triad above the card instead, keeping the horizontal dodge.
+            const float reach = ui::metrics::U(50.0f);
+            const float clearM = ui::metrics::U(12.0f);
+            // Always anchor in the clear rect, even when the manager has little content. Its
+            // transparent column still occupies the full width, and content-driven easing made
+            // the triad move sideways on every sketch step and show through dark panes.
+            const float hudLeft = clr0.x;
+            const float cx = hudLeft + ui::metrics::U(52.0f);
+            float cy = clr1.y - ui::metrics::U(52.0f);
             const ui::ViewportHudRect hud = ui::viewportHudRect();
-            auto hudHitX = [&](float left) {
-                const float bcx = left + 52.0f * ts;   // triad hub x for that left anchor
-                return hud.valid && bcx + reach + clearM > hud.minX &&
-                                    bcx - reach - clearM < hud.maxX;
-            };
-            auto hudHitY = [&](float row) {
-                return hud.valid && row + reach + clearM > hud.minY &&
-                                    row - reach - clearM < hud.maxY;
-            };
-            const float hudClearLeft = hud.minX - clearM - reach - 52.0f * ts;
-            float targetCy = cr1.y - 52.0f * ts;
-            if (hudHitY(targetCy) && hudHitX(targetLeft)) {
-                // Lift the box's bottom clear of the card's top, staying inside the viewport rect.
-                targetCy = std::max(hud.minY - clearM - reach, cr0.y + reach + clearM);
-                // The lifted box sits higher up, where a column that stopped short of the base row
-                // may now reach it — re-run the same test against the row we actually landed on.
-                if (colDodgeable && targetLeft < e && colReaches(targetCy - reach)) targetLeft = e;
-            }
-
-            // Ease the triad horizontally toward its target so opening/collapsing a manager tab (or
-            // the column growing past the triad's row) SLIDES it aside and back instead of snapping
-            // after a pause. Frame-rate-independent exponential smoothing; snap the last sub-pixel.
-            static float s_triadLeft = -1.0f;
-            static float s_triadRow  = -1.0f;
-            if (s_triadLeft < 0.0f) s_triadLeft = targetLeft;   // first frame: place, don't slide in
-            if (s_triadRow  < 0.0f) s_triadRow  = targetCy;
-            {
-                const float dt = ImGui::GetIO().DeltaTime;
-                const float k  = 1.0f - std::exp(-12.0f * (dt > 0.0f ? dt : 1.0f / 60.0f));
-                s_triadLeft += (targetLeft - s_triadLeft) * k;
-                if (std::fabs(targetLeft - s_triadLeft) < 0.5f) s_triadLeft = targetLeft;
-                s_triadRow += (targetCy - s_triadRow) * k;
-                if (std::fabs(targetCy - s_triadRow) < 0.5f) s_triadRow = targetCy;
-            }
-            // The ease is a nicety on the way BACK; on the way out it is a bug. While the smoothing
-            // runs (~200 ms) the triad sits inside the manager column it is supposed to dodge, which
-            // is exactly what a CHUDWARE_SHOT=fea capture caught: the Z/Y axis chips drawn on top of
-            // the Simulation Manager's "Deformation scale" row. Never render left of the current
-            // target: dodge right immediately, slide left only as the column shrinks. Same rule
-            // vertically — a lift is a dodge, so take it instantly and only settle back down eased.
-            float hudLeft = std::max(s_triadLeft, targetLeft);
-            const float cy = std::min(s_triadRow, targetCy);
-            // …and the eased horizontal position must not park the triad ON the card either, so pull
-            // it back to the card's clearance line, never past the target.
-            if (hudHitY(cy) && hudHitX(hudLeft))
-                hudLeft = std::max(targetLeft, std::min(hudLeft, hudClearLeft));
-            // Keep the readout below at its documented distance above the resolved triad row (at the
-            // base row this is exactly the cr1.y - 112 * uiScale it used to hard-code).
-            triadInfoBottom = cy - 60.0f * ts;
-            float cx = hudLeft + 52.0f * ts;
+            if (hud.valid && cx + reach + clearM > hud.minX &&
+                cx - reach - clearM < hud.maxX &&
+                cy + reach + clearM > hud.minY && cy - reach - clearM < hud.maxY)
+                cy = std::max(hud.minY - clearM - reach, clr0.y + reach + clearM);
+            triadInfoBottom = cy - ui::metrics::U(60.0f);
             float L = 30.0f * ts;
             float yawR = st.yaw * 3.14159265f / 180.0f, pitR = st.pitch * 3.14159265f / 180.0f;
             float cyaw = std::cos(yawR), syaw = std::sin(yawR);
@@ -5804,6 +5765,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const ImU32 planeChipBord = ui::Palette::toU32(vpal.planeOutline);
             for (int p = 0; p < 3; ++p) {
                 if (!effPlane[p]) continue;
+                // Edge-on planes are lines, not readable surfaces. Do not clamp their labels to
+                // an unrelated viewport edge when a sketch/Normal To view faces another plane.
+                const Vec3 viewDir = renderer.camera().dir;
+                const float facing = p == 0 ? viewDir.y : p == 1 ? viewDir.z : viewDir.x;
+                if (std::fabs(facing) < 0.03f) continue;
                 // Anchor the chip to the quad corner that currently sits farthest from the
                 // viewport centre among the corners IN FRONT of the camera. A fixed world
                 // corner swings behind the eye while orbiting (wc <= 0 -> chip popped out of
@@ -5902,16 +5868,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     const ImU32 leaderCol = ImGui::ColorConvertFloat4ToU32(
                         ImVec4(vpal.accent[0], vpal.accent[1], vpal.accent[2], 0.8f));
                     const ImU32 chipBord = ui::Palette::toU32(vpal.accent);
-                    // Dodge the pinned Copilot column the same way the HUD pick-status readout
-                    // (above) and viewport toolbar do — the viewport rect spans full width under
-                    // the pinned glass columns, so clamping to cr1.x alone lets these chips render
-                    // behind the Copilot pane (T-BL31 NEW-1: reproduced with a real extrude PM —
-                    // "Depth"/"Draft angle" chips bled behind the Copilot header).
-                    float rightBound = cr1.x;
-                    {
-                        const float e = ui::overlayColumnEdge(1);
-                        if (e > cr0.x + 80.0f * sc && e < cr1.x) rightBound = e;
-                    }
+                    // Keep callouts inside the clear viewport, beneath the view-toolbar and
+                    // pick-status rows; the full-bleed image also spans the glass columns/tabs.
+                    const float margin = ui::metrics::U(8.0f);
+                    const float calloutTop = clr0.y + ui::metrics::U(60.0f);
+                    const float rightBound = clr1.x - margin;
                     // Limit to ~3 chips; stagger vertically so anchored chips don't overlap.
                     int shown = 0, anchoredRow = 0, dockRow = 0;
                     for (const auto& ci : items) {
@@ -5932,17 +5893,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             drawLeader = true;
                             ++anchoredRow;
                         } else {
-                            // No geometry: dock top-right (below the HUD pick readout), inset from
-                            // the Copilot column edge rather than the raw viewport edge.
-                            chipTL = ImVec2(rightBound - cw - 12.0f * sc,
-                                            cr0.y + 44.0f * sc + dockRow * (ch + 6.0f * sc));
+                            // No geometry: dock below the toolbar and pick-status rows.
+                            chipTL = ImVec2(rightBound - cw,
+                                            calloutTop + dockRow * (ch + ui::metrics::U(6.0f)));
                             ++dockRow;
                         }
-                        // Clamp the chip inside the viewport rect, dodging the Copilot column.
-                        if (chipTL.x + cw > rightBound - 4) chipTL.x = rightBound - cw - 4;
-                        if (chipTL.x < cr0.x + 4)       chipTL.x = cr0.x + 4;
-                        if (chipTL.y + ch > cr1.y - 4) chipTL.y = cr1.y - ch - 4;
-                        if (chipTL.y < cr0.y + 4)       chipTL.y = cr0.y + 4;
+                        const float maxLeft = std::max(clr0.x + margin, rightBound - cw);
+                        const float maxTop = std::max(calloutTop, clr1.y - margin - ch);
+                        chipTL.x = std::clamp(chipTL.x, clr0.x + margin, maxLeft);
+                        chipTL.y = std::clamp(chipTL.y, calloutTop, maxTop);
                         ImVec2 chipBR(chipTL.x + cw, chipTL.y + ch);
 
                         if (drawLeader) {

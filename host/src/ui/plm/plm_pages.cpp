@@ -919,10 +919,8 @@ void drawFilesTab(AppState& st) {
     static const char* kSort[] = {
         "Name (A-Z)", "Type", "Revision", "Status", "Unsaved first",
     };
-    const float sortW = 130 * S;
-    ImGui::SameLine(ImGui::GetContentRegionMax().x - sortW);
-    ImGui::SetNextItemWidth(sortW);
-    ImGui::Combo("##sort", &H.sortMode, kSort, IM_ARRAYSIZE(kSort));
+    ui::kit::fieldEnum("##sort", "Sort", &H.sortMode, kSort, IM_ARRAYSIZE(kSort),
+                      ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo));
     ImGui::Separator();
     ImGui::Spacing();
 
@@ -1114,66 +1112,42 @@ void plmDrawHistoryPage(AppState& st) {
 
     // scope toggle
     static const char* kScope[] = {"Design", "Planning", "All"};
-    for (int i = 0; i < 3; ++i) {
-        if (i) ImGui::SameLine();
-        bool sel = (H.histScope == i);
-        ImGui::PushStyleColor(ImGuiCol_Button, sel
-            ? ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.30f)
-            : ImVec4(palette.button[0], palette.button[1], palette.button[2], 0.5f));
-        if (ImGui::SmallButton(kScope[i]) && H.histScope != i) {
-            H.histScope = i;
-            H.histGen = -1;  // force refetch for the new scope
-        }
-        ImGui::PopStyleColor();
-    }
+    if (ui::kit::segmented("##hist_scope", kScope, 3, &H.histScope))
+        H.histGen = -1;
     // Live filters: item narrows the fetch itself (plm_history filters by item_id
     // server-side); person and AI-vs-human apply to the cached rows. Every choice
     // is derived from cached rows — nothing invented.
     {
-        const float itemW = 170 * S, authW = 120 * S;
-        std::string itemLabel = "All items";
-        for (const auto& it : H.items)
-            if (it.itemId == H.histItemFilter) { itemLabel = it.path; break; }
-        ImGui::SetNextItemWidth(itemW);
-        if (ImGui::BeginCombo("##hist_item", itemLabel.c_str())) {
-            if (ImGui::Selectable("All items", H.histItemFilter.empty()) &&
-                !H.histItemFilter.empty()) {
-                H.histItemFilter.clear();
-                H.histGen = -1;              // refetch without the item narrow
-            }
-            for (const auto& it : H.items) {
-                ImGui::PushID(it.itemId.c_str());
-                if (ImGui::Selectable(it.path.c_str(),
-                                      H.histItemFilter == it.itemId) &&
-                    H.histItemFilter != it.itemId) {
-                    H.histItemFilter = it.itemId;
-                    H.histGen = -1;          // refetch narrowed to this item
-                }
-                ImGui::PopID();
-            }
-            ImGui::EndCombo();
+        static unsigned long long itemRevision = ~0ULL, authorRevision = ~0ULL;
+        static std::vector<std::string> itemNames, authorNames;
+        if (itemRevision != H.itemsRevision) {
+            itemRevision = H.itemsRevision;
+            itemNames.assign(1, "All items");
+            itemNames.reserve(H.items.size() + 1);
+            for (const auto& item : H.items) itemNames.push_back(item.path);
         }
-        // Derive choices only while the picker is open.
-        ImGui::SameLine();
-        if (ImGui::GetContentRegionAvail().x < authW + 8 * S) ImGui::NewLine();
-        ImGui::SetNextItemWidth(authW);
-        if (ImGui::BeginCombo("##hist_author",
-                H.histAuthorFilter.empty() ? "Anyone"
-                                           : H.histAuthorFilter.c_str())) {
+        int selectedItem = 0;
+        for (size_t i = 0; i < H.items.size(); ++i)
+            if (H.items[i].itemId == H.histItemFilter) { selectedItem = (int)i + 1; break; }
+        if (ui::kit::fieldCombo("##hist_item", "Item", &selectedItem, itemNames)) {
+            H.histItemFilter = selectedItem > 0 ? H.items[(size_t)selectedItem - 1].itemId : "";
+            H.histGen = -1;
+        }
+        if (authorRevision != H.historyRevision) {
+            authorRevision = H.historyRevision;
             std::set<std::string> authors;
-            for (const auto& e : H.history)
-                if (!e.author.empty()) authors.insert(e.author);
-            if (ImGui::Selectable("Anyone", H.histAuthorFilter.empty()))
-                H.histAuthorFilter.clear();
-            for (const auto& a : authors)
-                if (ImGui::Selectable(a.c_str(), H.histAuthorFilter == a))
-                    H.histAuthorFilter = a;
-            ImGui::EndCombo();
+            for (const auto& entry : H.history)
+                if (!entry.author.empty()) authors.insert(entry.author);
+            authorNames.assign(1, "Anyone");
+            authorNames.insert(authorNames.end(), authors.begin(), authors.end());
         }
+        const auto author = std::find(authorNames.begin() + 1, authorNames.end(), H.histAuthorFilter);
+        int selectedAuthor = author == authorNames.end() ? 0 : (int)(author - authorNames.begin());
+        if (ui::kit::fieldCombo("##hist_author", "Author", &selectedAuthor, authorNames))
+            H.histAuthorFilter = selectedAuthor > 0 ? authorNames[(size_t)selectedAuthor] : "";
         static const char* kActor[] = {"All", "People", "AI"};
-        ImGui::SameLine();
-        if (ImGui::GetContentRegionAvail().x < 120 * S) ImGui::NewLine();
-        (void)ui::kit::segmented("##hist_actor", kActor, 3, &H.histActor);
+        const float actorW = 3.0f * (ImGui::CalcTextSize("People").x + 2.0f * ui::kit::padX());
+        (void)ui::kit::segmented("##hist_actor", kActor, 3, &H.histActor, actorW);
     }
     ImGui::Separator();
     ImGui::Spacing();
@@ -1204,8 +1178,39 @@ void plmDrawHistoryPage(AppState& st) {
         return true;
     };
     size_t matched = 0;
-    for (const auto& e : H.history) {
+    static std::set<std::string> expandedNoChangeRuns;
+    auto noChange = [](const PlmEntryRow& entry) {
+        return entry.scope != "planning" && entry.kind != "release" &&
+            entry.summary == "No design changes." &&
+            (entry.message.empty() || entry.message == entry.summary);
+    };
+    size_t expandedUntil = 0;
+    for (size_t index = 0; index < H.history.size(); ++index) {
+        const auto& e = H.history[index];
         if (!passes(e)) continue;
+        if (index >= expandedUntil && noChange(e)) {
+            size_t end = index + 1;
+            while (end < H.history.size() && noChange(H.history[end]) &&
+                   passes(H.history[end])) ++end;
+            if (end - index > 1) {
+                const std::string key = st.plmProjectPath() + ":" + e.commit;
+                const bool open = expandedNoChangeRuns.count(key) != 0;
+                ImGui::PushID(e.commit.c_str());
+                const std::string label = (open ? "Hide " : "Show ") +
+                    std::to_string(end - index) + " checkpoints · No design changes";
+                if (ui::kit::secondaryButton(label.c_str())) {
+                    if (open) expandedNoChangeRuns.erase(key);
+                    else expandedNoChangeRuns.insert(key);
+                }
+                ImGui::PopID();
+                if (!open) {
+                    matched += end - index;
+                    index = end - 1;
+                    continue;
+                }
+                expandedUntil = end;
+            }
+        }
         ++matched;
         ImGui::PushID(e.commit.c_str());
         bool sel = (H.selectedEntry == e.commit);
@@ -1358,11 +1363,11 @@ void plmDrawReleasesPage(AppState& st) {
         plmDocTypeTag(it.docType, it.kind);
         ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
-        ImGui::TextWrapped("%s", it.path.c_str());
+        plmItemTitle(it.path, nullptr, /*alignFrame=*/true);
         plmLifecycleBadge(it.lifecycle, !it.rev.empty() ? it.rev : it.workingRev);
         if (lane == 0) {
             ImGui::SameLine(0, 12 * S);
-            if (ImGui::SmallButton(open ? "Cancel" : "Release\xe2\x80\xa6")) {
+            if (ui::kit::secondaryButton(open ? "Cancel" : "Release…")) {
                 s_releaseItem = open ? "" : it.itemId;
                 s_releaseNote[0] = '\0';
                 H.actionErr.clear();
@@ -2352,9 +2357,8 @@ void plmDrawPlanningPage(AppState& st) {
     // Issues — log a problem with a severity, so you can plan fixes while you see
     // what's wrong. "Make plan" (on each row) turns one into a linked task.
     plmPanelBegin("##pl_issues", "Issues", "issue_bug", halfW);
-    ImGui::SetNextItemWidth(90 * S);
-    ImGui::Combo("##newissuesev", &H.newIssueSev, kSev, IM_ARRAYSIZE(kSev));
-    ImGui::SameLine();
+    ui::kit::fieldEnum("##newissuesev", "Severity", &H.newIssueSev, kSev, IM_ARRAYSIZE(kSev),
+                      ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo));
     ImGui::SetNextItemWidth(-96 * S);
     bool ienter = ImGui::InputTextWithHint("##newissue", "describe an issue\xe2\x80\xa6",
         H.newIssueTitle, sizeof(H.newIssueTitle), ImGuiInputTextFlags_EnterReturnsTrue);
@@ -2454,9 +2458,8 @@ void plmDrawPlanningPage(AppState& st) {
     static int s_newTaskPri = 1;                        // default med
     static const char* kPriWord[] = {"low", "med", "high", "critical"};
     static const char* kPriCode[] = {"p3", "p2", "p1", "p0"};
-    ImGui::SetNextItemWidth(86 * S);
-    ImGui::Combo("##ntpri", &s_newTaskPri, kPriWord, IM_ARRAYSIZE(kPriWord));
-    ImGui::SameLine();
+    ui::kit::fieldEnum("##ntpri", "Priority", &s_newTaskPri, kPriWord, IM_ARRAYSIZE(kPriWord),
+                      ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo));
     ImGui::SetNextItemWidth(300 * S);
     bool enter = ImGui::InputTextWithHint("##newtask", "new task title\xe2\x80\xa6",
         H.newTaskTitle, sizeof(H.newTaskTitle), ImGuiInputTextFlags_EnterReturnsTrue);

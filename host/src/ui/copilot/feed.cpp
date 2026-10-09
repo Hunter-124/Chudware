@@ -2299,6 +2299,13 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             ++m.cacheReadCalls;
         }
     }
+    if (kind == "mission_finished" || (kind == "run_finished" && m.curMissionTask < 0)) {
+        for (auto& item : m.planState.items)
+            if (item.status == "running" ||
+                (item.kind == "subagent" && (item.status.empty() || item.status == "pending")))
+                item.status = "stopped";
+        m.uiCachedH = -1.0f;
+    }
     // Resume-safe: mark history dirty on activity/text/plan changes; force on terminal events.
     if (m.running || kind == "run_finished" || kind == "mission_finished" ||
         kind == "agent.thought" || kind == "agent.thought.delta" || kind == "assistant_delta" ||

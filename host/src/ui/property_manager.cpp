@@ -18,6 +18,7 @@
 
 #include "property_manager.h"
 #include "icons.h"
+#include "widgets/kit_form.h"  // display-only dimension formatting for viewport callouts
 #include "sketch_mode.h"   // C38 (P1f): SketchMode::active() — sketch owns Esc while editing
 #include "../ui_theme.h"   // liquid glass v2: adaptivePanel / glassRowBackground / AdaptiveSurface
 
@@ -1153,8 +1154,11 @@ std::vector<PMCalloutItem> PropertyManager::calloutItems(AppState& st) const {
         if (!fieldEnabled(*f.def, fields_)) continue;   // skip greyed / coming-soon dims
         PMCalloutItem it;
         it.label = f.def->label;
-        it.value = f.dimExpr.empty() ? pmFieldValueText(f.def, f.dimValue, ips_)
-                                     : ("=" + f.dimExpr);
+        it.value = f.dimExpr.empty()
+            ? (pmFieldUnitless(f.def) ? ui::kit::fmtValue(f.dimValue)
+               : pmFieldIsAngle(f.def) ? ui::kit::fmtQuantity(f.dimValue, "deg")
+               : ui::kit::fmtQuantity(ips_ ? f.dimValue / 25.4 : f.dimValue, ips_ ? "in" : "mm"))
+            : ("=" + f.dimExpr);
         it.hasAnchor = hasAnchor;
         if (hasAnchor) { it.anchor[0] = anchor[0]; it.anchor[1] = anchor[1]; it.anchor[2] = anchor[2]; }
         out.push_back(std::move(it));

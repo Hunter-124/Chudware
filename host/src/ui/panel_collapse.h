@@ -7,6 +7,9 @@
 #pragma once
 
 #include "imgui.h"
+#include "anim.h"
+
+#include <algorithm>
 
 #include <cmath>
 
@@ -16,18 +19,33 @@ struct PanelCollapseAnim {
     // Header-strip height, captured via measureHeader() right after the header content is drawn
     // each frame (one-frame lag — same trick the Copilot composer already uses for s_composerH).
     float headerH = 0.0f;
-    // Current animated window height (px); negative = not yet initialized (snaps to target).
+    // Current window height (px) returned by the last tick(); negative = not yet ticked.
     float h = -1.0f;
+    // Animated collapse fraction: 0 = fully expanded, 1 = rolled up to the header; negative = not
+    // yet initialized (snaps to the requested state).
+    float t = -1.0f;
+    // snap(collapsed) ran before the header was ever measured: hold a 1 px sliver (not fullH) until
+    // measureHeader() supplies the real header height.
+    bool tinyUntilMeasured = false;
 
     // Call BEFORE SetNextWindowSize/Begin: returns the window height to use this frame.
+    // Only the collapse/expand TRANSITION animates. The expanded height is the live `fullH` every
+    // frame, so a ribbon/status-bar height change re-pins the column's bottom edge to the status
+    // bar immediately instead of easing past it (overrunning) or stopping short for several frames.
     float tick(bool collapsed, float fullH) {
-        const float target = collapsed ? (headerH > 0.0f ? headerH : fullH) : fullH;
-        const float dt = ImGui::GetIO().DeltaTime;
-        if (h < 0.0f) { h = target; return h; }
-        const float tau = 0.12f;  // exponential approach, ~120ms feel (matches ui_theme's approach())
-        const float a = 1.0f - std::exp(-dt / tau);
-        h += (target - h) * a;
-        if (std::fabs(h - target) < 0.5f) h = target;
+        const float goal = collapsed ? 1.0f : 0.0f;
+        if (t < 0.0f) {
+            t = goal;
+        } else if (t != goal) {
+            const float a = 1.0f - std::exp(-anim::dt() / anim::kFast);
+            t += (goal - t) * a;
+            if (std::fabs(t - goal) < 0.002f) t = goal;
+            else anim::requestFrames();
+        }
+        if (headerH > 0.0f) tinyUntilMeasured = false;
+        const float rolledH = std::min(fullH,
+            headerH > 0.0f ? headerH : (tinyUntilMeasured ? 1.0f : fullH));
+        h = fullH + (rolledH - fullH) * t;
         return h;
     }
 
@@ -38,9 +56,11 @@ struct PanelCollapseAnim {
     // returns false immediately) — tick() will hold near headerH once it's measured the next frame.
     // For expanded: sets h directly to fullH.
     void snap(bool collapsed, float fullH) {
-        if (!collapsed) { h = fullH; return; }
+        t = collapsed ? 1.0f : 0.0f;
+        if (!collapsed) { h = fullH; tinyUntilMeasured = false; return; }
         // If headerH is known, snap exactly; otherwise use 1px so bodyVisible() is already false
         // and tick() will snap to headerH as soon as it's measured (one-frame lag, same as init).
+        tinyUntilMeasured = headerH <= 0.0f;
         h = headerH > 0.0f ? headerH : 1.0f;
     }
 

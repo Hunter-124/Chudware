@@ -12,10 +12,10 @@ namespace ui {
 // empty-state when the parts services are not running.
 void drawPartsLibraryWorkspace(AppState& st);
 
-// True once the workspace's startup fetches have resolved: the category tree (or its flat
-// fallback) landed or the loader gave up, and vendor status landed. Also true when the worker
-// is not running (nothing will ever load). Headless captures (CHUDWARE_SHOT=parts, the
-// workspaces sweep) wait on this instead of photographing the first-frame spinners.
+// True once startup categories (or their fallback/final failure), vendor status, and the
+// real initial catalog browse have resolved, including index build and live results.
+// Also true without a worker. CHUDWARE_SHOT=parts and the workspaces sweep wait here
+// instead of photographing an empty or synthetic result set.
 bool partsLibrarySettled(const AppState& st);
 
 }  // namespace ui

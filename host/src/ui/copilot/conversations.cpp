@@ -1378,6 +1378,25 @@ void maybePersistChatHistoryDebounced(AppState& st, bool force) {
     persistChatHistory(st);
 }
 
+// A transcript restored from disk or forked into a new session owns no live stream. Keep
+// terminal outcomes, but close unfinished work so every consumer sees the same truthful state.
+static void closeDetachedTurn(ChatMsg& m) {
+    m.running = false;
+    m.liveStatus.clear();
+    for (auto& item : m.planState.items) {
+        const bool terminal = item.status == "done" || item.status == "pass" ||
+            item.status == "fail" || item.status == "failed" || item.status == "error" ||
+            item.status == "abandoned" || item.status == "skipped" || item.status == "cancelled";
+        if (item.status == "running" || (item.kind == "subagent" && !terminal))
+            item.status = "stopped";
+    }
+    for (auto& a : m.activity) {
+        if (a.status == "running") a.status = "stopped";
+        a.streaming = false;
+    }
+    m.uiCachedH = -1.0f;
+}
+
 // Parse ONE persisted session object into the resident set (APPEND). docLink is the
 // session's optional document reference: the v2 loader passes its "doc" field; the v1
 // migration stamps the bucket key the session was folded out of. Returns false when the
@@ -1492,7 +1511,7 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
             if (m.contains("asks") && m["asks"].is_array())
                 for (const auto& jb : m["asks"])
                     if (jb.is_object()) cm.asks.push_back(askBatchFromJson(jb));
-            cm.running = false;
+            closeDetachedTurn(cm);
             // Placeholder for a turn that produced no visible output (persisted as
             // "empty" so message ORDINALS survive the round trip — AI-VC msg_idx
             // anchors depend on positions never shifting across a restart).
@@ -2467,8 +2486,7 @@ int forkConversation(AppState& st, int idx) {
     fork.archived = false;
     fork.msgs = idx == st.activeConv ? st.chat : source.msgs;
     for (auto& msg : fork.msgs) {
-        msg.running = false;
-        msg.liveStatus.clear();
+        closeDetachedTurn(msg);
     }
     seedChatRawSnapshots(fork.id, fork.msgs);
 

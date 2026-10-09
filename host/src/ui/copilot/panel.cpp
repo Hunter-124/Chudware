@@ -25,6 +25,7 @@
 #include "ui/tesseract.h"  // ui::drawTesseract — the animated 4-cube brand mark in the header
 #include "core/engine_events.h"  // core::mirrorRecoveredDocs — Reopen a dismissed live agent doc
 #include "ui/ai/ai_prefs.h"      // ui::chatShowRenders — Artifacts render-thumbnail display pref
+#include "ui/ai/agent_dag.h"      // one terminal-state source for every sub-agent surface
 #include "gl_compat.h"           // glDeleteTextures — LRU eviction of render thumbnails
 #include "ui/chudcode_session_actions.h"  // Chudcode session recovery (export/branch/repair/close)
 #include <string_view>
@@ -1076,7 +1077,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
         // for a frame (and the old row still lit).
         active = (i == st.activeConv);
         float wash = active ? 0.55f : (rowHot ? 0.44f : 0.34f);
-        ui::glassRowBackground(dl, rowMin, rowMax, rowRndDp, (i % 2) == 1, active, wash);
+        ui::glassRowBackground(dl, rowMin, rowMax, rowRndDp, false, active, wash);
 
         // Titles and snippets are user text of arbitrary length and are painted straight onto
         // the draw list, which does NOT clip to the row — a long snippet used to run out past
@@ -1330,8 +1331,9 @@ void drawSessionsPanel(AppState& st, bool busy) {
 static ui::kit::Status planItemStatus(const std::string& s) {
     if (s == "done" || s == "pass") return ui::kit::Status::Done;
     if (s == "running")             return ui::kit::Status::Running;
-    if (s == "fail")                return ui::kit::Status::Failed;
-    if (s == "abandoned")           return ui::kit::Status::Skipped;
+    if (s == "fail" || s == "failed" || s == "error") return ui::kit::Status::Failed;
+    if (s == "abandoned" || s == "stopped" || s == "interrupted" || s == "cancelled")
+        return ui::kit::Status::Skipped;
     return ui::kit::Status::Pending;
 }
 
@@ -1353,8 +1355,9 @@ static int planDepth(const PlanState& ps, const PlanItem& item) {
 // One plan item. `parent_id` (indent) and `desc` (second line) were both parsed and persisted and
 // neither reached this panel before, so a one-word subtask sat at the same level as its parent
 // with no elaboration anywhere in the surface.
-static void planTaskRow(const PlanState& ps, const PlanItem& pi, int index) {
-    const ui::kit::Status s = planItemStatus(pi.status);
+static void planTaskRow(const PlanState& ps, const PlanItem& pi, int index, bool running) {
+    const ui::kit::Status s = pi.status == "running" && !running
+                                  ? ui::kit::Status::Skipped : planItemStatus(pi.status);
     const float ind = (float)planDepth(ps, pi) * ui::metrics::U(3.0f);
     if (ind > 0.0f) ImGui::Indent(ind);
 
@@ -1397,24 +1400,34 @@ static void planTaskRow(const PlanState& ps, const PlanItem& pi, int index) {
 static void drawTaskListPanel(AppState& st, bool busy) {
     (void)busy;
     const PlanState* ps = nullptr;
+    bool planRunning = false;
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
         if (!it->fromUser && planIsReal(it->planState)) {
-            ps = &it->planState; break;
+            ps = &it->planState;
+            planRunning = it->running;
+            break;
         }
 
-    // Subagents are run telemetry, not session artifacts. Keep the exact two sources the
-    // Artifacts panel historically used: plan-state subagent rows and agent activity rows.
+    // The trace knows lifecycle outcomes; spawn-only plan rows never receive them. Use the
+    // SAME source as the overview and AI roster, so "done/failed/stopped" cannot disagree.
+    static std::vector<AgentTraceAgent> agents;
+    agentTraceSubagents(st, st.activeConvId(), agents);
     std::vector<std::string> subs;
-    for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
-        if (it->fromUser) continue;
-        if (it->planState.present)
-            for (const auto& pi : it->planState.items)
-                if (pi.kind == "subagent")
-                    subs.push_back(pi.title +
-                                   (pi.status.empty() ? "" : (" \xc2\xb7 " + pi.status)));
-        for (const auto& a : it->activity)
-            if (a.stage.rfind("agent:", 0) == 0 || a.title.rfind("Subagent", 0) == 0)
-                subs.push_back(a.title.empty() ? a.stage : a.title);
+    subs.reserve(agents.size());
+    for (const auto& a : agents) subs.push_back(a.name + " \xc2\xb7 " + a.status);
+    if (agents.empty()) {
+        for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it) {
+            if (it->fromUser) continue;
+            for (const auto& pi : it->planState.items) {
+                if (pi.kind != "subagent") continue;
+                const bool terminal = pi.status == "done" || pi.status == "pass" ||
+                    pi.status == "fail" || pi.status == "failed" || pi.status == "error" ||
+                    pi.status == "cancelled" || pi.status == "abandoned";
+                const std::string status = !it->running && !terminal ? "stopped" : pi.status;
+                subs.push_back(pi.title + (status.empty() ? "" : (" \xc2\xb7 " + status)));
+            }
+            if (!subs.empty()) break;
+        }
     }
 
     int done = 0, total = 0;
@@ -1472,16 +1485,15 @@ static void drawTaskListPanel(AppState& st, bool busy) {
             for (const auto& pi : ps->items) {
                 if (pi.kind == "subagent") continue;
                 if (anyPhase && pi.phase != ph) continue;
-                planTaskRow(*ps, pi, index++);
+                planTaskRow(*ps, pi, index++, planRunning);
             }
         }
     }
 
     ui::kit::sectionHeader("Subagents", "ai_panel", nullptr, (int)subs.size());
     if (subs.empty()) {
-        ui::kit::emptyState(nullptr, "No subagents running",
-                            "Spawned helpers and their current status appear here while a run "
-                            "is working.");
+        ui::kit::emptyState(nullptr, "No subagents recorded",
+                            "Spawned helpers and their run outcomes appear here.");
         return;
     }
 
@@ -1545,11 +1557,15 @@ static ArtiClass artiClassify(const std::string& path, const std::string& label)
     static const struct {
         const char* ext; const char* icon; const char* what; bool image; ArtiBucket bucket;
     } kMap[] = {
+        {"step+",  "file_step",    "CAD document",       false, ArtiModels},
+        {"aicm",   "file_step",    "CAD model",          false, ArtiModels},
+        {"draw+",  "file_doc",     "Drawing document",   false, ArtiDrawings},
+        {"ecad+",  "file_data",    "Electronics document", false, ArtiModels},
         {"step",   "file_step",    "STEP export",        false, ArtiModels},
         {"stp",    "file_step",    "STEP export",        false, ArtiModels},
         {"iges",   "file_step",    "IGES export",        false, ArtiModels},
         {"igs",    "file_step",    "IGES export",        false, ArtiModels},
-        {"sldprt", "file_step",    "SolidWorks part",    false, ArtiModels},
+        {"sldprt", "file_step",    "CAD part",           false, ArtiModels},
         {"x_t",    "file_step",    "Parasolid export",   false, ArtiModels},
         {"stl",    "file_mesh",    "STL mesh",           false, ArtiModels},
         {"obj",    "file_mesh",    "OBJ mesh",           false, ArtiModels},

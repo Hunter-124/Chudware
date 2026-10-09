@@ -10,6 +10,7 @@
 
 #include "../../core/app_state.h"
 #include "../metrics.h"
+#include "../sim_manager.h"   // SimManager::unitSys — the Simulation pane's display units
 
 namespace ui {
 using namespace hydint;
@@ -27,9 +28,10 @@ const char* const kEffClasses[] = {"IE2", "IE3", "IE4"};
 
 // One-line verdict on a simulation: the peak against the relief setting. The peak value itself is
 // the Outcome card's chip, so the verdict states only the comparison.
-std::string simVerdict(const json& summary, double relief, kit::Tone& tone) {
+// `relief` is in bar; every quantity is formatted in the pane's display units (`us`).
+std::string simVerdict(const json& summary, double relief, bool us, kit::Tone& tone) {
     const double peak = jnum(summary, "peak_pressure_bar");
-    const std::string rs = kit::fmtQuantity(relief, kit::unitText(kit::Unit::bar), 3);
+    const std::string rs = fmtU(relief, "bar", us, 3);
     tone = kit::Tone::Ok;
     if (!(relief > 0.0)) {
         tone = kit::Tone::Neutral;
@@ -128,7 +130,7 @@ void HydraulicPanel::drawStart(AppState& st) {
 
 void HydraulicPanel::drawCircuitForm(AppState& st) {
     ImGuiContext& g = *GImGui;
-    if (central_ == CentralView::View3D) drawLayout3d();
+    if (central_ == CentralView::View3D) drawLayout3d(st);
     if (!circuit_.is_object() || (jarr(circuit_, "components").empty() && startVisible_)) {
         drawStart(st);
         return;
@@ -212,7 +214,8 @@ void HydraulicPanel::drawCircuitForm(AppState& st) {
     kit::cardEnd();
 }
 
-void HydraulicPanel::drawLayout3d() {
+void HydraulicPanel::drawLayout3d(AppState& st) {
+    const bool us = SimManager::unitSys(st).us;
     if (!circuit_.is_object()) return;
     if (kit::cardBegin("hyd_layout3d", "3D layout", "study_hydraulics")) {
         if (kit::secondaryButton(placing3d_ ? "Stop placing###place3d" : "Place in 3D###place3d",
@@ -228,8 +231,8 @@ void HydraulicPanel::drawLayout3d() {
         int plane = (int)placementPlane;
         if (kit::fieldEnum("plane", "Working plane", &plane, planes, 3))
             placementPlane = (simscene::Plane)plane;
-        kit::fieldNumber("offset", "Plane offset", &placementOffsetMm, kit::FieldOpts().withUnit(kit::Unit::mm));
-        kit::fieldNumber("grid", "Grid spacing", &placementGridMm, kit::FieldOpts().withUnit(kit::Unit::mm));
+        kit::fieldNumber("offset", "Plane offset", &placementOffsetMm, fieldU("mm", us));
+        kit::fieldNumber("grid", "Grid spacing", &placementGridMm, fieldU("mm", us));
         kit::fieldCheckbox("snap", "Snap to grid", &placementSnap);
         kit::dimText("Select a component, then click its position on the plane. Tab switches plane; Esc or Enter finishes.");
     }
@@ -238,6 +241,7 @@ void HydraulicPanel::drawLayout3d() {
 }
 
 void HydraulicPanel::drawComponentEditor(AppState& st) {
+    const bool us = SimManager::unitSys(st).us;
     json& comp = circuit_["components"][selected_];
     const std::string id = jstr(comp, "id");
     const std::string type = jstr(comp, "type");
@@ -283,7 +287,7 @@ void HydraulicPanel::drawComponentEditor(AppState& st) {
                 pos[1] = pj[1].get<double>();
             }
             const kit::FieldOpts po =
-                kit::FieldOpts().withUnit(kit::Unit::mm).withTip("Schematic placement; drag the symbol to move it.");
+                fieldU("mm", us).withTip("Schematic placement; drag the symbol to move it.");
             const bool mx = kit::fieldNumber("pos_x", "Position X", &pos[0], po);
             const bool my = kit::fieldNumber("pos_y", "Position Y", &pos[1], po);
             if (mx || my) {
@@ -296,7 +300,7 @@ void HydraulicPanel::drawComponentEditor(AppState& st) {
             kit::FieldGroup g("layout3d", "3D position X");
             float xyz[3]; componentPosition3d(comp, xyz);
             double p3[3] = {xyz[0], xyz[1], xyz[2]};
-            const auto opts = kit::FieldOpts().withUnit(kit::Unit::mm);
+            const auto opts = fieldU("mm", us);
             bool moved = kit::fieldNumber("x", "3D position X", &p3[0], opts);
             moved |= kit::fieldNumber("y", "3D position Y", &p3[1], opts);
             moved |= kit::fieldNumber("z", "3D position Z", &p3[2], opts);
@@ -334,7 +338,12 @@ void HydraulicPanel::drawComponentEditor(AppState& st) {
                 }
                 double v = jnum(params, pd.key, pd.optional ? 0.0 : pd.def);
                 bool present = !pd.optional || jhas(params, pd.key);
-                if (pd.unit) o.unit = kit::unitText(pd.unit);
+                if (pd.unit) {
+                    const Disp d = paramDisp(pd, us);
+                    o.unit = d.unit;
+                    o.scale = d.scale;
+                    o.offset = d.offset;
+                }
                 if (pd.ratio) {
                     o.unit = kit::unitText(kit::Unit::Percent);
                     o.scale = 100.0;
@@ -474,8 +483,9 @@ void HydraulicPanel::drawAddComponent(AppState& st) {
         const std::string hint = std::string(labels[addType_]) + " (default)";
         kit::fieldText("name", "Name", &addName_,
                        kit::FieldOpts().withHint(hint.c_str()).withTip("Optional; defaults to the type."));
-        kit::fieldNumber("x", "Position X", &addX_, kit::FieldOpts().withUnit(kit::Unit::mm));
-        kit::fieldNumber("y", "Position Y", &addY_, kit::FieldOpts().withUnit(kit::Unit::mm));
+        const bool us = SimManager::unitSys(st).us;
+        kit::fieldNumber("x", "Position X", &addX_, fieldU("mm", us));
+        kit::fieldNumber("y", "Position Y", &addY_, fieldU("mm", us));
         if (addParamsType_ != addType_) {
             addParams_ = defaultParams(typeDefs()[addType_]);
             addParamsType_ = addType_;
@@ -494,6 +504,7 @@ void HydraulicPanel::drawAddComponent(AppState& st) {
 
 void HydraulicPanel::drawHoses(AppState& st, int onlyIndex) {
     json& hoses = circuit_["hoses"];  // an array (syncForDraw)
+    const bool us = SimManager::unitSys(st).us;
     if (hoses.empty()) {
         kit::emptyState("sch_wire", "No hoses yet",
                         "Click two ports on the schematic, or use Connect manually.");
@@ -526,13 +537,15 @@ void HydraulicPanel::drawHoses(AppState& st, int onlyIndex) {
                 kit::FieldGroup g("geom", "Inside diameter");
                 double len = jnum(h, "length_mm", 1000.0);
                 if (kit::fieldNumber("len", "Length", &len,
-                                     kit::FieldOpts().withUnit(kit::Unit::mm).withMin(0.0).withTip(kVolumeTip))) {
+                                     fieldU("mm", us).withMin(0.0).withTip(kVolumeTip))) {
                     h["length_mm"] = len;
                     geomEdited = true;
                 }
                 double bore = jnum(h, "id_mm", 12.7);
                 if (kit::fieldNumber("bore", "Inside diameter", &bore,
-                                     kit::FieldOpts().withUnit(kit::Unit::mm).withMin(0.1).withTip(
+                                     fieldU("mm", us).withMin(0.1).withTip(us ?
+                                         "Hose inside diameter (a -8 hose is 1/2 in, a -12 is 3/4 in). It sets the "
+                                         "line's oil volume in the simulation and its pressure drop in the piping handoff." :
                                          "Hose inside diameter (1/2\" = 12.7 mm, 3/4\" = 19.0 mm). It sets the line's "
                                          "oil volume in the simulation and its pressure drop in the piping handoff."))) {
                     h["id_mm"] = bore;
@@ -541,7 +554,7 @@ void HydraulicPanel::drawHoses(AppState& st, int onlyIndex) {
                 bool rated = jhas(h, "rating_bar");
                 double rating = jnum(h, "rating_bar", 0.0);
                 if (kit::fieldNumber("rating", "Rating", &rating,
-                                     kit::FieldOpts().withUnit(kit::Unit::bar).withMin(0.0).withPresent(&rated).withHint(
+                                     fieldU("bar", us).withMin(0.0).withPresent(&rated).withHint(
                                          "not rated").withTip("Working-pressure rating of the hose."))) {
                     if (rated && rating > 0.0)
                         h["rating_bar"] = rating;
@@ -575,6 +588,7 @@ void HydraulicPanel::drawHoses(AppState& st, int onlyIndex) {
 
 void HydraulicPanel::drawConnect(AppState& st) {
     seedConnectDefaults();
+    const bool us = SimManager::unitSys(st).us;
     const json& comps = jarr(circuit_, "components");
     if (!endpointComponent_.empty()) {
         const std::string context = componentName(endpointComponent_) + " · " + endpointPort_ +
@@ -631,14 +645,16 @@ void HydraulicPanel::drawConnect(AppState& st) {
                        kit::FieldOpts().withHint("From its ends").withTip(
                            "Optional label shown on the schematic and the plots, e.g. \"Pressure line\"."));
         kit::fieldNumber("len", "Length", &hoseLengthMm_,
-                         kit::FieldOpts().withUnit(kit::Unit::mm).withMin(0.0).withTip(
+                         fieldU("mm", us).withMin(0.0).withTip(
                              "Sets the line's oil volume in the simulation and its pressure drop in the piping handoff."));
         kit::fieldNumber("bore", "Inside diameter", &hoseIdMm_,
-                         kit::FieldOpts().withUnit(kit::Unit::mm).withMin(0.1).withTip(
+                         fieldU("mm", us).withMin(0.1).withTip(us ?
+                             "Hose inside diameter: a -8 hose is 1/2 in, a -12 is 3/4 in." :
                              "Hose inside diameter: 1/2\" = 12.7 mm, 3/4\" = 19.0 mm."));
         kit::fieldNumber("rating", "Rating", &hoseRatingBar_,
-                         kit::FieldOpts().withUnit(kit::Unit::bar).withMin(0.0).withTip(
-                             "Hose working-pressure rating (SAE 100R2AT 1/2\" = 275 bar)."));
+                         fieldU("bar", us).withMin(0.0).withTip(
+                             us ? "Hose working-pressure rating (SAE 100R2AT 1/2\" = 4,000 psi)."
+                                : "Hose working-pressure rating (SAE 100R2AT 1/2\" = 275 bar)."));
     }
     kit::cardEnd();
     const std::string blocker = connectBlocker();
@@ -707,6 +723,7 @@ kit::FieldOpts ratioOpts(const char* tip) {
 
 void HydraulicPanel::drawCylinderSizing(AppState& st) {
     const char* kWidest = "Working pressure";
+    const bool us = SimManager::unitSys(st).us;
     if (kit::cardBegin("cyl_in", "Cylinder", "size_actuator")) {
         if (targetField("target", "Component", circuit_, "cylinder_linear", cylTarget_)) {
             boreNote_.clear();
@@ -721,7 +738,7 @@ void HydraulicPanel::drawCylinderSizing(AppState& st) {
         {
             kit::FieldGroup g("cyl_force", kWidest);
             kit::fieldNumber("force", "Required force", &cylForceKn_,
-                             kit::FieldOpts().withUnit(kit::Unit::kN).withMin(0.0).withTip(
+                             fieldU("kN", us).withMin(0.0).withTip(
                                  "Force the cylinder must push at the working pressure."));
         }
         // Belongs to the force above: full width, its outcome inline under it.
@@ -740,23 +757,22 @@ void HydraulicPanel::drawCylinderSizing(AppState& st) {
             for (double r : kIsoRods)
                 if (r <= 0.6 * pick) rod = r;
             cylRod_ = rod;
-            const char* mm = kit::unitText(kit::Unit::mm);
-            boreNote_ = "ISO 3320 bore " + kit::fmtQuantity(pick, mm) + " (needs " + kit::fmtQuantity(bore, mm, 3) +
-                        "), rod " + kit::fmtQuantity(rod, mm) + ". Size it to confirm.";
+            boreNote_ = "ISO 3320 bore " + fmtU(pick, "mm", us) + " (needs " + fmtU(bore, "mm", us, 3) +
+                        "), rod " + fmtU(rod, "mm", us) + ". Size it to confirm.";
         }
         kit::itemTooltip("Pick the smallest ISO 3320 bore that reaches the force at this pressure and efficiency.");
         kit::inlineStatus(boreNote_.c_str(), kit::Tone::Info);
         {
             kit::FieldGroup g("cyl_geom", kWidest);
-            const kit::FieldOpts mm = kit::FieldOpts().withUnit(kit::Unit::mm).withMin(0.0);
+            const kit::FieldOpts mm = fieldU("mm", us).withMin(0.0);
             if (kit::fieldNumber("bore", "Bore", &cylBore_, mm)) boreNote_.clear();
             if (kit::fieldNumber("rod", "Rod", &cylRod_, kit::FieldOpts(mm).withTip("0 for single-acting / rodless.")))
                 boreNote_.clear();
             kit::fieldNumber("pressure", "Working pressure", &cylPressure_,
-                             kit::FieldOpts().withUnit(kit::Unit::bar).withMin(0.0));
+                             fieldU("bar", us).withMin(0.0));
             kit::fieldNumber("stroke", "Stroke", &cylStroke_, mm);
             kit::fieldNumber("speed", "Extend speed", &cylVelocity_,
-                             kit::FieldOpts().withUnit(kit::Unit::mm_s).withMin(0.0));
+                             fieldU("mm/s", us).withMin(0.0));
             kit::fieldNumber("eff", "Efficiency", &cylEff_, ratioOpts("Force efficiency (seal friction), typically 90-95 %."));
         }
     }
@@ -769,13 +785,13 @@ void HydraulicPanel::drawCylinderSizing(AppState& st) {
         const kit::Tone forceTone =
             jnum(cylRes_, "extend_force_kn") + 1e-9 >= cylForceKn_ ? kit::Tone::Ok : kit::Tone::Warn;
         kit::keyValueCard("cyl_res", "Cylinder sizing", "results",
-                          {{"Extend force", qty(cylRes_, "extend_force_kn", "kN"), forceTone},
-                           {"Retract force", qty(cylRes_, "retract_force_kn", "kN")},
-                           {"Extend flow", qty(cylRes_, "flow_extend_lpm", "L/min")},
-                           {"Retract flow", qty(cylRes_, "flow_retract_lpm", "L/min")},
+                          {{"Extend force", qtyU(cylRes_, "extend_force_kn", "kN", us), forceTone},
+                           {"Retract force", qtyU(cylRes_, "retract_force_kn", "kN", us)},
+                           {"Extend flow", qtyU(cylRes_, "flow_extend_lpm", "L/min", us)},
+                           {"Retract flow", qtyU(cylRes_, "flow_retract_lpm", "L/min", us)},
                            {"Stroke time", qty(cylRes_, "cycle_time_s", "s")},
-                           {"Bore area", qty(cylRes_, "area_bore_cm2", "cm2")},
-                           {"Annulus area", qty(cylRes_, "area_annulus_cm2", "cm2")}});
+                           {"Bore area", qtyU(cylRes_, "area_bore_cm2", "cm2", us)},
+                           {"Annulus area", qtyU(cylRes_, "area_annulus_cm2", "cm2", us)}});
         warningsList(cylRes_);
         const bool busy = store_.inflight() > 0;
         if (kit::secondaryButton("Apply to component###cyl_apply", componentIndex(cylTarget_) >= 0 && !busy,
@@ -792,14 +808,15 @@ void HydraulicPanel::drawCylinderSizing(AppState& st) {
 }
 
 void HydraulicPanel::drawPumpSizing(AppState& st) {
+    const bool us = SimManager::unitSys(st).us;
     if (kit::cardBegin("pump_in", "Pump", "size_pump")) {
         if (targetField("target", "Component", circuit_, "pump", pumpTarget_)) {
             const int i = componentIndex(pumpTarget_);
             if (i >= 0) pumpSpeed_ = jnum(jobj(jarr(circuit_, "components")[i], "params"), "speed_rpm", pumpSpeed_);
         }
         kit::FieldGroup g("pump", "Efficiency");
-        kit::fieldNumber("flow", "Flow", &pumpFlow_, kit::FieldOpts().withUnit(kit::Unit::L_min).withMin(0.0));
-        kit::fieldNumber("pressure", "Pressure", &pumpPressure_, kit::FieldOpts().withUnit(kit::Unit::bar).withMin(0.0));
+        kit::fieldNumber("flow", "Flow", &pumpFlow_, fieldU("L/min", us).withMin(0.0));
+        kit::fieldNumber("pressure", "Pressure", &pumpPressure_, fieldU("bar", us).withMin(0.0));
         kit::fieldNumber("eff", "Efficiency", &pumpEff_, ratioOpts("Overall pump efficiency at the duty point."));
         kit::fieldNumber("speed", "Speed", &pumpSpeed_, kit::FieldOpts().withUnit(kit::Unit::rpm).withMin(0.0));
     }
@@ -809,9 +826,9 @@ void HydraulicPanel::drawPumpSizing(AppState& st) {
         revealHere(Reveal::Pump);
         kit::keyValueCard("pump_res", "Pump sizing", "results",
                           {{"Displacement", qty(pumpRes_, "displacement_cc_rev", "cc/rev")},
-                           {"Shaft power", qty(pumpRes_, "shaft_power_kw", "kW")},
-                           {"Hydraulic power", qty(pumpRes_, "hydraulic_power_kw", "kW")},
-                           {"Shaft torque", qty(pumpRes_, "torque_nm", "N m")}});
+                           {"Shaft power", powerQty(pumpRes_, "shaft_power_kw", us)},
+                           {"Hydraulic power", powerQty(pumpRes_, "hydraulic_power_kw", us)},
+                           {"Shaft torque", qtyU(pumpRes_, "torque_nm", "N m", us)}});
         warningsList(pumpRes_);
         const bool busy = store_.inflight() > 0;
         const int i = componentIndex(pumpTarget_);
@@ -841,13 +858,14 @@ void HydraulicPanel::drawPumpSizing(AppState& st) {
 void HydraulicPanel::drawMotorSizing(AppState& st) {
     // Labels short enough for the inline layout the Cylinder and Pump cards use (the card never
     // flips to stacked fields between tabs); the tips carry the full terms.
+    const bool us = SimManager::unitSys(st).us;
     if (kit::cardBegin("motor_in", "Hydraulic motor", "size_motor")) {
         targetField("target", "Component", circuit_, "motor_hydraulic", motorTarget_);
         kit::FieldGroup g("motor", "Torque efficiency");
-        kit::fieldNumber("torque", "Output torque", &motTorque_, kit::FieldOpts().withUnit(kit::Unit::N_m).withMin(0.0));
+        kit::fieldNumber("torque", "Output torque", &motTorque_, fieldU("N m", us).withMin(0.0));
         kit::fieldNumber("speed", "Output speed", &motSpeed_, kit::FieldOpts().withUnit(kit::Unit::rpm).withMin(0.0));
         kit::fieldNumber("pressure", "Pressure drop", &motPressure_,
-                         kit::FieldOpts().withUnit(kit::Unit::bar).withMin(0.0).withTip(
+                         fieldU("bar", us).withMin(0.0).withTip(
                              "Differential pressure available across the motor ports."));
         kit::fieldNumber("mech", "Torque efficiency", &motMech_, ratioOpts("Mechanical (torque) efficiency of the motor."));
         kit::fieldNumber("vol", "Flow efficiency", &motVol_, ratioOpts("Volumetric (leakage) efficiency of the motor."));
@@ -861,9 +879,9 @@ void HydraulicPanel::drawMotorSizing(AppState& st) {
         kit::keyValueCard("motor_res", "Motor sizing", "results",
                           {{"Catalog displacement", qty(motorRes_, "standard_displacement_cc_rev", "cc/rev"), kit::Tone::Ok},
                            {"Displacement", qty(motorRes_, "displacement_cc_rev", "cc/rev")},
-                           {"Flow", qty(motorRes_, "flow_lpm", "L/min")},
-                           {"Output power", qty(motorRes_, "output_power_kw", "kW")},
-                           {"Hydraulic input", qty(motorRes_, "input_hydraulic_power_kw", "kW")}});
+                           {"Flow", qtyU(motorRes_, "flow_lpm", "L/min", us)},
+                           {"Output power", powerQty(motorRes_, "output_power_kw", us)},
+                           {"Hydraulic input", powerQty(motorRes_, "input_hydraulic_power_kw", us)}});
         warningsList(motorRes_);
         const bool busy = store_.inflight() > 0;
         const int i = componentIndex(motorTarget_);
@@ -891,13 +909,14 @@ void HydraulicPanel::drawDriveSizing(AppState& st) {
         kit::cardEnd();
         kit::gapRow();
     }
-    // Mains supply follows the document's region until the user picks one.
-    sim::defaultSupplyForUnits(drive_, st.ips());
-    sim::drawPumpDriveInputs("drive", drive_, true);
+    // Mains supply follows the pane's units until the user picks one.
+    const bool us = SimManager::unitSys(st).us;
+    sim::defaultSupplyForUnits(drive_, us);
+    sim::drawPumpDriveInputs("drive", drive_, true, us);
     if (driveRes_.is_object() && !driveRes_.empty()) {
         kit::gapRow();
         revealHere(Reveal::Drive);
-        sim::drawPumpDriveResult("drive_res", driveRes_, "Drive sizing");
+        sim::drawPumpDriveResult("drive_res", driveRes_, "Drive sizing", us);
         const bool busy = store_.inflight() > 0;
         const int i = componentIndex(driveTarget_);
         if (drive_.kind == 0 &&
@@ -919,6 +938,7 @@ void HydraulicPanel::drawDriveSizing(AppState& st) {
 // ---- simulate ----------------------------------------------------------------------------------
 
 void HydraulicPanel::drawSimulateForm(AppState& st) {
+    const bool us = SimManager::unitSys(st).us;
     const json& comps = jarr(circuit_, "components");
     const std::string blocker = simulateBlocker();
     if (focusSimulationBlocker_) {
@@ -1029,7 +1049,7 @@ void HydraulicPanel::drawSimulateForm(AppState& st) {
             const json& L = jobj(loads_, id.c_str());
             auto loadField = [&](const char* key, const char* label, kit::Unit unit, const char* tip) {
                 double v = jnum(L, key, 0.0);
-                if (!kit::fieldNumber(key, label, &v, kit::FieldOpts().withUnit(unit).withTip(tip))) return;
+                if (!kit::fieldNumber(key, label, &v, fieldU(kit::unitText(unit), us).withTip(tip))) return;
                 setupChanged = true;
                 json& dst = loads_[id];
                 if (!dst.is_object()) dst = json::object();
@@ -1044,7 +1064,7 @@ void HydraulicPanel::drawSimulateForm(AppState& st) {
                 loadField("friction_n", "Load friction", kit::Unit::N, "Coulomb friction of the driven load.");
                 double x0 = jnum(jobj(initial_, id.c_str()), "position_mm", 0.0);
                 if (kit::fieldNumber("x0", "Start position", &x0,
-                                     kit::FieldOpts().withUnit(kit::Unit::mm).withMin(0.0).withTip("Rod extension at t = 0."))) {
+                                     fieldU("mm", us).withMin(0.0).withTip("Rod extension at t = 0."))) {
                     json& row = initial_[id];
                     if (!row.is_object()) row = json::object();
                     if (x0 == 0.0) row.erase("position_mm");
@@ -1065,13 +1085,14 @@ void HydraulicPanel::drawSimulateForm(AppState& st) {
     if (kit::cardBegin("fluid", "Fluid", "fluid")) {
         kit::FieldGroup g("fluid", "Bulk modulus");
         if (kit::fieldNumber("rho", "Density", &fluidRho_,
-                         kit::FieldOpts().withUnit(kit::Unit::kg_m3).withMin(1.0).withTip(
+                         fieldU("kg/m3", us).withMin(1.0).withTip(us ?
+                             "ISO VG32 mineral oil is about 54.3 lb/ft\xc2\xb3." :
                              "ISO VG32 mineral oil is about 870 kg/m\xc2\xb3."))) {
             fluid_["density_kgm3"] = fluidRho_;
             setupChanged = true;
         }
         if (kit::fieldNumber("beta", "Bulk modulus", &fluidBeta_,
-                         kit::FieldOpts().withUnit(kit::Unit::bar).withMin(1.0).withTip(
+                         fieldU("bar", us).withMin(1.0).withTip(
                              "Effective bulk modulus (entrained air lowers it)."))) {
             fluid_["bulk_modulus_bar"] = fluidBeta_;
             setupChanged = true;
@@ -1112,7 +1133,7 @@ void HydraulicPanel::drawResultsForm(AppState& st) {
 }
 
 void HydraulicPanel::drawSimResults(AppState& st) {
-    (void)st;
+    const bool us = SimManager::unitSys(st).us;
     if (!sim_.is_object() || sim_.empty()) {
         kit::emptyState("results", "No simulation results yet",
                         "Run the simulation to see pressures, actuator motion and energy");
@@ -1136,19 +1157,19 @@ void HydraulicPanel::drawSimResults(AppState& st) {
         }
         kit::chipFlowEnd();
         kit::Tone tone = kit::Tone::Ok;
-        const std::string verdict = simVerdict(s, relief, tone);
+        const std::string verdict = simVerdict(s, relief, us, tone);
         kit::inlineStatus(verdict.c_str(), tone);
     }
     kit::cardEnd();
     kit::gapRow();
     kit::keyValueCard("key_metrics", "Key metrics", "performance",
-                      {{"Peak pressure", qty(s, "peak_pressure_bar", "bar", 1.0, 3),
+                      {{"Peak pressure", qtyU(s, "peak_pressure_bar", "bar", us, 1.0, 3),
                         overPeak ? kit::Tone::Warn : kit::Tone::Neutral},
                        {"Efficiency", pct(s, "efficiency", 3)},
                        {"Pump energy", qty(s, "pump_energy_kj", "kJ", 1.0, 3)}});
     kit::gapRow();
     // Key metrics: one key/value card per actuator and pump, index-scoped.
-    auto resultCards = [&](const char* group, const char* icon, std::vector<kit::KeyValueItem> (*rows)(const json&)) {
+    auto resultCards = [&](const char* group, const char* icon, auto&& rows) {
         const json& g = jobj(s, group);
         int i = 0;
         for (auto it = g.begin(); it != g.end(); ++it, ++i) {
@@ -1160,20 +1181,20 @@ void HydraulicPanel::drawSimResults(AppState& st) {
             kit::gapRow();
         }
     };
-    resultCards("cylinders", "cylinder_feature", [](const json& r) {
+    resultCards("cylinders", "cylinder_feature", [us](const json& r) {
         return std::vector<kit::KeyValueItem>{
             {"Stroke time", qty(r, "stroke_time_s", "s", 1.0, 3)},
-            {"Max speed", qty(r, "max_velocity_mms", "mm/s", 1.0, 3)},
+            {"Max speed", qtyU(r, "max_velocity_mms", "mm/s", us, 1.0, 3)},
             {"End reached", jbool(r, "end_reached", false) ? "Yes" : "No",
              jbool(r, "end_reached", false) ? kit::Tone::Ok : kit::Tone::Warn}};
     });
-    resultCards("motors", "rotate_component", [](const json& r) {
+    resultCards("motors", "rotate_component", [us](const json& r) {
         return std::vector<kit::KeyValueItem>{{"Steady speed", qty(r, "steady_speed_rpm", "rpm", 1.0, 3)},
-                                              {"Steady torque", qty(r, "steady_torque_nm", "N m", 1.0, 3)}};
+                                              {"Steady torque", qtyU(r, "steady_torque_nm", "N m", us, 1.0, 3)}};
     });
-    resultCards("pumps", "size_pump", [](const json& r) {
-        return std::vector<kit::KeyValueItem>{{"Mean pressure", qty(r, "mean_pressure_bar", "bar", 1.0, 3)},
-                                              {"Mean power", qty(r, "mean_power_kw", "kW", 1.0, 3)}};
+    resultCards("pumps", "size_pump", [us](const json& r) {
+        return std::vector<kit::KeyValueItem>{{"Mean pressure", qtyU(r, "mean_pressure_bar", "bar", us, 1.0, 3)},
+                                              {"Mean power", powerQty(r, "mean_power_kw", us, 3)}};
     });
     warningsList(sim_);
     if (kit::secondaryButton("Show plots###show_plots", true, nullptr, ImVec2(-FLT_MIN, 0)))
@@ -1202,6 +1223,7 @@ void HydraulicPanel::drawBomForm(AppState& st) {
             handleCommand(st, "sim_hyd_add");
         return;
     }
+    const bool us = SimManager::unitSys(st).us;
     json& comps = circuit_["components"];  // an array (syncForDraw)
     // The bill of materials first once it is built; the sourcing it came from below.
     if (bom_.is_object() && !bom_.empty()) {
@@ -1246,8 +1268,8 @@ void HydraulicPanel::drawBomForm(AppState& st) {
                 const json& h = hoses[i];
                 const std::string net = jstr(h, "net_name");
                 const std::string title = net.empty() ? "Hose " + std::to_string(i + 1) : net;
-                const std::string second = qty(h, "length_mm", "mm") + " \xc2\xb7 ID " + qty(h, "id_mm", "mm") +
-                                           " \xc2\xb7 " + qty(h, "rating_bar", "bar");
+                const std::string second = qtyU(h, "length_mm", "mm", us) + " \xc2\xb7 ID " +
+                                           qtyU(h, "id_mm", "mm", us) + " \xc2\xb7 " + qtyU(h, "rating_bar", "bar", us);
                 kit::RowStyle rs;
                 rs.icon = "sch_wire";
                 rs.secondary = second.c_str();
@@ -1302,6 +1324,7 @@ void HydraulicPanel::drawBomForm(AppState& st) {
 // ---- piping handoff ----------------------------------------------------------------------------
 
 void HydraulicPanel::drawPipingForm(AppState& st) {
+    const bool us = SimManager::unitSys(st).us;
     const json& hoses = jarr(circuit_, "hoses");
     if (hoses.empty()) {
         if (kit::emptyState("route_pipe", "No hoses to hand off",
@@ -1313,20 +1336,20 @@ void HydraulicPanel::drawPipingForm(AppState& st) {
     if (kit::cardBegin("handoff", "Hose lines to piping", "route_pipe")) {
         kit::FieldGroup g("handoff", "Verify tolerance");
         if (kit::fieldNumber("supply", "Supply pressure", &hoSupplyBar_,
-                         kit::FieldOpts().withUnit(kit::Unit::bar).withMin(0.0).withTip(
+                         fieldU("bar", us).withMin(0.0).withTip(
                              "Pump outlet / relief setting. Each hose becomes a pipe run sized from its inside "
                              "diameter and length, solved as an independent supply-to-demand case with hydraulic oil."))) {
             handoffParams_["supply_pressure_bar"] = hoSupplyBar_;
             edited = true;
         }
         if (kit::fieldNumber("flow", "Flow", &hoFlowLpm_,
-                         kit::FieldOpts().withUnit(kit::Unit::L_min).withMin(0.0).withTip(
+                         fieldU("L/min", us).withMin(0.0).withTip(
                              "Flow each line carries (the pump flow by default)."))) {
             handoffParams_["flow_lpm"] = hoFlowLpm_;
             edited = true;
         }
         if (kit::fieldNumber("load", "Load pressure", &hoLoadBar_,
-                             kit::FieldOpts().withUnit(kit::Unit::bar).withMin(0.0).withPresent(&hoLoadPresent_).withHint(
+                             fieldU("bar", us).withMin(0.0).withPresent(&hoLoadPresent_).withHint(
                                  "optional").withTip("Optional: actuator load pressure for the pump margin."))) {
             if (hoLoadPresent_) handoffParams_["load_pressure_bar"] = hoLoadBar_;
             else handoffParams_.erase("load_pressure_bar");
@@ -1390,20 +1413,21 @@ void HydraulicPanel::drawPipingForm(AppState& st) {
                     if (name.empty()) name = "Hose " + std::to_string(k + 1);
                 }
             if (name.empty()) name = hid;
-            const std::string title = name + " \xc2\xb7 " + qty(l, "id_mm", "mm", 1.0, 3) + " \xc3\x97 " +
-                                      qty(l, "length_mm", "mm");
+            const std::string title = name + " \xc2\xb7 " + qtyU(l, "id_mm", "mm", us, 1.0, 3) + " \xc3\x97 " +
+                                      qtyU(l, "length_mm", "mm", us);
             const json& est = jobj(estimates, rid.c_str());
             const json& margin = jobj(margins, rid.c_str());
             const bool shortMargin = jhas(margin, "pump_margin_solved_bar") && jnum(margin, "pump_margin_solved_bar") < 0.0;
-            std::string solvedDp = kDash;
-            if (jhas(perLine, rid.c_str()))
-                solvedDp = kit::fmtQuantity(std::fabs(jnum(perLine, rid.c_str())) / 100.0, kit::unitText(kit::Unit::bar), 3);
+            // Drops arrive in kPa; shown like every hydraulic pressure (bar, or psi in US units).
+            const std::string estDp = qtyU(est, "dp_kpa", "bar", us, 0.01, 3);
+            const std::string solvedDp = jhas(perLine, rid.c_str())
+                ? fmtU(std::fabs(jnum(perLine, rid.c_str())) * 0.01, "bar", us, 3) : std::string(kDash);
             ImGui::PushID(i);
             kit::keyValueCard("line", title.c_str(), "route_pipe",
-                              {{"Velocity", qty(est, "velocity_ms", "m/s", 1.0, 3)},
-                               {"Drop, estimated", qty(est, "dp_kpa", "bar", 0.01, 3)},
+                              {{"Velocity", qtyU(est, "velocity_ms", "m/s", us, 1.0, 3)},
+                               {"Drop, estimated", estDp},
                                {"Drop, solved", solvedDp},
-                               {"Pump margin", qty(margin, "pump_margin_solved_bar", "bar", 1.0, 3),
+                               {"Pump margin", qtyU(margin, "pump_margin_solved_bar", "bar", us, 1.0, 3),
                                 shortMargin ? kit::Tone::Warn : kit::Tone::Neutral}});
             ImGui::PopID();
             kit::gapRow();

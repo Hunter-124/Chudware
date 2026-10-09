@@ -301,40 +301,6 @@ std::vector<float> floats(const json& arr) {
     return out;
 }
 
-// Display unit of a hydraulic SI unit (any kit::unitText spelling): unchanged in SI; in US
-// customary (the Simulation pane's units, SimManager::unitSys) bar -> psi, L/min -> gpm,
-// mm -> in, mm/s -> in/s, L -> gal, N -> lbf, N·m -> lbf·ft, kW -> hp, by exact factors.
-// Units without a US counterpart here (rpm, cc/rev, kJ, °, %) pass through.
-struct HydDisp {
-    const char* unit;
-    double scale;
-};
-HydDisp hydDisp(const char* unit, bool us) {
-    using kit::Unit;
-    const char* u = kit::unitText(unit ? unit : "");
-    if (!us || !u[0]) return {u, 1.0};
-    static const struct { Unit si; const char* us; double scale; } kMap[] = {
-        {Unit::bar, "psi", 1.0e5 / 6894.757293168},
-        {Unit::L_min, "gpm", 1.0 / 3.785411784},
-        {Unit::mm, "in", 1.0 / 25.4},
-        {Unit::mm_s, "in/s", 1.0 / 25.4},
-        {Unit::L, "gal", 1.0 / 3.785411784},
-        {Unit::N, "lbf", 1.0 / 4.4482216152605},
-        {Unit::N_m, "lbf\xc2\xb7" "ft", 1.0 / 1.3558179483314004},
-        {Unit::kW, "hp", 1.0 / 0.745699871582270},
-    };
-    for (const auto& e : kMap)
-        if (std::strcmp(u, kit::unitText(e.si)) == 0) return {e.us, e.scale};
-    return {u, 1.0};
-}
-// Numeric member `k` (in SI `unit`) as display text, or an em dash when absent.
-std::string hydQty(const json& o, const char* k, const char* unit, bool us, int sig = 4) {
-    if (!jhas(o, k)) return kDash;
-    const HydDisp d = hydDisp(unit, us);
-    return kit::fmtQuantity(jnum(o, k) * d.scale, d.unit, sig);
-}
-
-
 }  // namespace
 
 std::pair<float, float> HydraulicPanel::schematicScreenPosition(double x, double y) const {
@@ -477,8 +443,8 @@ std::string componentTip(const json& component, bool us) {
             if (field.ratio) {
                 value = kit::fmtQuantity(number * 100.0, kit::unitText(kit::Unit::Percent));
             } else {
-                const HydDisp d = hydDisp(field.unit, us);
-                value = kit::fmtQuantity(number * d.scale, d.unit[0] ? d.unit : nullptr);
+                const Disp d = paramDisp(field, us);
+                value = kit::fmtQuantity(toDisplay(number, d), d.unit[0] ? d.unit : nullptr);
             }
         }
         text += "\n" + std::string(field.label) + ": " + value;
@@ -1096,14 +1062,12 @@ void HydraulicPanel::drawSchematic(AppState& st, float width, float height) {
     } else if (hoverHose >= 0 && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         const auto& hose = hoses[hoverHose];
         std::string tip = jstr(hose, "net_name", "Hose") +
-            "\nLength: " + hydQty(hose, "length_mm", "mm", us) +
-            "\nInner diameter: " + hydQty(hose, "id_mm", "mm", us) +
-            "\nRated pressure: " + hydQty(hose, "rating_bar", "bar", us);
+            "\nLength: " + qtyU(hose, "length_mm", "mm", us) +
+            "\nInner diameter: " + qtyU(hose, "id_mm", "mm", us) +
+            "\nRated pressure: " + qtyU(hose, "rating_bar", "bar", us);
         const auto peak = schematicPressurePeaks_.find(jstr(hose, "id"));
-        if (peak != schematicPressurePeaks_.end()) {
-            const HydDisp bar = hydDisp("bar", us);
-            tip += "\nPeak pressure: " + kit::fmtQuantity(peak->second * bar.scale, bar.unit);
-        }
+        if (peak != schematicPressurePeaks_.end())
+            tip += "\nPeak pressure: " + fmtU(peak->second, "bar", us);
         tip += "\nHose ID: " + jstr(hose, "id");
         kit::tooltip(tip.c_str());
     }
@@ -1312,8 +1276,7 @@ void HydraulicPanel::drawSchematic(AppState& st, float width, float height) {
             variants[0] = name;
             // An unloaded net (return / drain lines at ~0 bar) carries just its name.
             if (peak >= 0.05f) {
-                const HydDisp bar = hydDisp("bar", us);
-                const std::string pk = kit::fmtQuantity(peak * bar.scale, bar.unit, 3);
+                const std::string pk = fmtU(peak, "bar", us, 3);
                 variants[0] = name + " \xc2\xb7 peak " + pk;
                 variants[1] = name + " \xc2\xb7 " + pk;
                 variants[2] = name;
@@ -1529,7 +1492,7 @@ void HydraulicPanel::drawPlots(AppState& st, float width, float height) {
     // Plots only: the outcome numbers and verdict live once, in the side pane's Outcome card.
     const bool us = SimManager::unitSys(st).us;   // plots follow the Simulation pane's units
     // Relief setting in the pressure plot's display unit (stored in bar).
-    const double relief = reliefPressureBar() * hydDisp("bar", us).scale;
+    const double relief = toDisplay(reliefPressureBar(), disp("bar", us));
 
     if (plotResultRevision_ != resultGeneration_ || plotCircuitRevision_ != circuitGeneration_ ||
         plotPick_ != seriesPick_ || plotUs_ != us) {
@@ -1607,11 +1570,11 @@ void HydraulicPanel::drawPlots(AppState& st, float width, float height) {
     // Series arrive in SI (bar, L/min, mm, ...): convert once here, in the cache, to the display
     // unit, and keep that unit's spelling on the cell for the axis.
     for (Cell& c : cells) {
-        const HydDisp d = hydDisp(c.unit.c_str(), us);
+        const Disp d = disp(c.unit.c_str(), us);
         c.unit = d.unit;
-        if (d.scale != 1.0)
+        if (d.scale != 1.0 || d.offset != 0.0)
             for (auto& y : c.ys)
-                for (float& v : y) v = (float)(v * d.scale);
+                for (float& v : y) v = (float)toDisplay(v, d);
     }
     plotResultRevision_ = resultGeneration_;
     plotCircuitRevision_ = circuitGeneration_;

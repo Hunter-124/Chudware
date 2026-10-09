@@ -1768,8 +1768,9 @@ void loadChatHistory(AppState& st) {
             }
         }
     }
-    if (st.conversations.empty()) {
-        // First run on the new store: import the legacy single-file history.
+    if (st.conversations.empty() && shotChatStoreDir().empty()) {
+        // First run on the new store: import the legacy single-file history (never into a
+        // scripted shot's private store, which must start empty).
         nlohmann::json root = nlohmann::json::object();
         {
             std::ifstream in(chatHistoryPath());

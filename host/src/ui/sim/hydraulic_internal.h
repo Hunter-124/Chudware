@@ -33,6 +33,18 @@ inline std::string qty(const json& o, const char* k, const char* unit, double sc
     return kit::fmtQuantity(jnum(o, k) * scale, kit::unitText(unit), sigFigs);
 }
 
+// Display units: the shared ui::sim converter (sim_common.h). The circuit, its results and every
+// stored member stay SI (bar, L/min, mm, ...); the pane, canvas and plots show and take input in
+// the Simulation pane's unit system (SimManager::unitSys(st).us).
+using sim::Disp;
+using sim::disp;
+using sim::fieldU;
+using sim::fmtPower;
+using sim::fmtU;
+using sim::powerQty;
+using sim::qtyU;
+using sim::toDisplay;
+
 struct ParamDef {
     const char* key;
     const char* label;
@@ -44,6 +56,13 @@ struct ParamDef {
     bool ratio;                        // 0..1, shown as a percentage
     const char* tip;
 };
+
+// Display conversion of a component parameter. Kv is a valve flow COEFFICIENT (m³/h at a 1 bar
+// drop), not a flow: its US counterpart Cv is a different coefficient, so it is never converted.
+inline Disp paramDisp(const ParamDef& pd, bool us) {
+    if (pd.unit && std::string(pd.key) == "Kv") return {kit::unitText(pd.unit), 1.0, 0.0};
+    return disp(pd.unit, us);
+}
 struct TypeDef {
     const char* type;
     const char* label;

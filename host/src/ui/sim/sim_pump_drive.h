@@ -3,10 +3,14 @@
 // pump_drive_size tool; this file owns its inputs, the request params and the result card so the
 // two surfaces cannot drift apart.
 //
-//   ui::sim::PumpDriveInputs in;                        // panel member (defaults below)
-//   ui::sim::drawPumpDriveInputs("drive", in, true);   // kind + duty + pump + motor cards
+//   ui::sim::PumpDriveInputs in;                            // panel member (defaults below)
+//   ui::sim::drawPumpDriveInputs("drive", in, true, us);   // kind + duty + pump + motor cards
 //   st.rpc.call("pump_drive_size", ui::sim::pumpDriveParams(in), ...);
-//   ui::sim::drawPumpDriveResult("drive_res", result);
+//   ui::sim::drawPumpDriveResult("drive_res", result, "Drive sizing", us);
+//
+// `us` is the Simulation pane's unit system (SimManager::unitSys(st).us): US customary shows and
+// takes the duty in gpm / psi / ft / lb/ft³ and adds hp beside every kW; inputs and the request
+// stay SI.
 //
 // GL/GUI thread only (the draw functions).
 #pragma once
@@ -27,7 +31,7 @@ struct PumpDriveInputs {
     double speedRpm = 1500.0;     // required pump speed (picks the motor pole count)
     double serviceFactor = 1.15;
     // Mains supply. These are only a starting point: defaultSupplyForUnits() picks the regional
-    // supply that matches the document's units the first time the form is shown, and the
+    // supply that matches the Simulation pane's units the first time the form is shown, and the
     // Motor card leads with an explicit "Mains supply" choice.
     double voltageV = 400.0;
     double frequencyHz = 50.0;
@@ -38,8 +42,8 @@ struct PumpDriveInputs {
     bool customSupply = false;    // the user chose "Custom" supply (shows the individual fields)
 };
 
-// Region default for a form whose supply nobody has chosen yet: US customary documents get the
-// North American 460 V / 60 Hz NEMA supply, metric documents 400 V / 50 Hz IEC. A supply the
+// Region default for a form whose supply nobody has chosen yet: US customary units get the
+// North American 460 V / 60 Hz NEMA supply, SI units 400 V / 50 Hz IEC. A supply the
 // user already picked is left alone.
 void defaultSupplyForUnits(PumpDriveInputs& in, bool usCustomary);
 
@@ -51,14 +55,14 @@ nlohmann::json pumpDriveParams(const PumpDriveInputs& in);
 // the duty point (flow/pressure or flow/head + density) in the "Pump duty" card; without it the
 // card holds only the pump efficiency and speed (the caller supplies the duty point, e.g. a
 // solved network). Always draws the "Motor" card. Returns true when any field committed.
-bool drawPumpDriveInputs(const char* id, PumpDriveInputs& in, bool showKindAndDuty);
+bool drawPumpDriveInputs(const char* id, PumpDriveInputs& in, bool showKindAndDuty, bool us);
 
 // Result card of one pump_drive_size answer (scoped under `id`), titled `title` (null = "Pump
 // drive"; callers name the pump's run/component in human words, never a raw id): duty flow and
 // head (when the result carries `operating_point`), powers, motor rating, poles, synchronous
 // speed, efficiency, current and frame, then its warnings. Nothing when `result` is not a
 // non-empty object.
-void drawPumpDriveResult(const char* id, const nlohmann::json& result, const char* title = nullptr);
+void drawPumpDriveResult(const char* id, const nlohmann::json& result, const char* title, bool us);
 
 }  // namespace sim
 }  // namespace ui

@@ -242,5 +242,119 @@ private:
     std::string lastError_;
 };
 
+// ---- display units ------------------------------------------------------------------------------
+// THE one SI -> display converter of the simulation panels (Piping, Hydraulics, pump drive).
+// Engine values and every stored member stay SI; DISPLAY and typed INPUT follow the Simulation
+// pane's unit system (SimManager::unitSys(st).us). In SI the stored unit shows unchanged; in US
+// customary each SI unit converts, by exact factors, to its usual US unit (mm -> in, m -> ft,
+// bar/kPa/Pa -> psi, L/min and m³/h -> gpm, m³/s -> cfm, °C -> °F, kg -> lb, N -> lbf, ...), or
+// to an explicit `usUnit` of the same quantity (e.g. Pa -> "in. w.g." for ducts, m/s -> "fpm").
+// Units it does not know (rpm, cc/rev, kW, kJ, s, %, °, cSt) pass through unchanged.
+struct Disp {
+    const char* unit;   // display spelling
+    double scale;       // display = stored * scale + offset
+    double offset;
+};
+namespace unit_detail {
+struct UnitDef {
+    std::string name;   // kit::unitText canonical spelling, or the US spelling
+    int dim;            // quantity: units convert only within one dim
+    double toBase;      // base = value * toBase + offset (base: SI coherent unit, K)
+    double offset;
+    const char* usDefault;  // US unit for an SI unit (nullptr: a US unit, or no US counterpart)
+};
+inline const std::vector<UnitDef>& unitDefs() {
+    using kit::Unit;
+    static const std::vector<UnitDef> defs = [] {
+        constexpr double kIn = 0.0254, kFt = 0.3048, kLb = 0.45359237, kLbf = 4.4482216152605;
+        constexpr double kGal = 3.785411784e-3, kPsi = 6894.757293168, kInWg = 249.08891;
+        auto t = [](Unit u) { return std::string(kit::unitText(u)); };
+        enum { Len, Press, Flow, Vel, Temp, Mass, Force, Torque, Dens, Area, Vol, MassFlow, Visc,
+               Inertia, LinMass, Damping, PressGrad };
+        return std::vector<UnitDef>{
+            {t(Unit::mm), Len, 1e-3, 0, "in"},      {t(Unit::m), Len, 1, 0, "ft"},
+            {t(Unit::in), Len, kIn, 0, nullptr},    {t(Unit::ft), Len, kFt, 0, nullptr},
+            {t(Unit::Pa), Press, 1, 0, "psi"},      {t(Unit::kPa), Press, 1e3, 0, "psi"},
+            {t(Unit::bar), Press, 1e5, 0, "psi"},   {t(Unit::psi), Press, kPsi, 0, nullptr},
+            {"in. w.g.", Press, kInWg, 0, nullptr},
+            {t(Unit::L_min), Flow, 1e-3 / 60.0, 0, "gpm"}, {t(Unit::m3_h), Flow, 1.0 / 3600.0, 0, "gpm"},
+            {t(Unit::m3_s), Flow, 1, 0, "cfm"},     {t(Unit::gpm), Flow, kGal / 60.0, 0, nullptr},
+            {"cfm", Flow, kFt * kFt * kFt / 60.0, 0, nullptr},
+            {t(Unit::m_s), Vel, 1, 0, "ft/s"},      {t(Unit::mm_s), Vel, 1e-3, 0, "in/s"},
+            {"ft/s", Vel, kFt, 0, nullptr},         {"in/s", Vel, kIn, 0, nullptr},
+            {"fpm", Vel, kFt / 60.0, 0, nullptr},
+            {t(Unit::DegC), Temp, 1, 273.15, "\xc2\xb0" "F"},
+            {t(Unit::DegF), Temp, 5.0 / 9.0, 459.67 * 5.0 / 9.0, nullptr},
+            {t(Unit::kg), Mass, 1, 0, "lb"},        {t(Unit::lb), Mass, kLb, 0, nullptr},
+            {t(Unit::N), Force, 1, 0, "lbf"},       {t(Unit::kN), Force, 1e3, 0, "lbf"},
+            {t(Unit::lbf), Force, kLbf, 0, nullptr},
+            {t(Unit::N_m), Torque, 1, 0, "lbf\xc2\xb7" "ft"}, {"lbf\xc2\xb7" "ft", Torque, kLbf * kFt, 0, nullptr},
+            {t(Unit::kg_m3), Dens, 1, 0, "lb/ft\xc2\xb3"}, {"lb/ft\xc2\xb3", Dens, kLb / (kFt * kFt * kFt), 0, nullptr},
+            {t(Unit::mm2), Area, 1e-6, 0, "in\xc2\xb2"}, {t(Unit::cm2), Area, 1e-4, 0, "in\xc2\xb2"},
+            {t(Unit::in2), Area, kIn * kIn, 0, nullptr},
+            {t(Unit::L), Vol, 1e-3, 0, "gal"},      {t(Unit::m3), Vol, 1, 0, "gal"},
+            {"gal", Vol, kGal, 0, nullptr},
+            {"kg/h", MassFlow, 1.0 / 3600.0, 0, "lb/h"}, {"lb/h", MassFlow, kLb / 3600.0, 0, nullptr},
+            {t(Unit::Pa_s), Visc, 1, 0, "cP"},      {"cP", Visc, 1e-3, 0, nullptr},
+            {t(Unit::kg_m2), Inertia, 1, 0, "lb\xc2\xb7" "ft\xc2\xb2"},
+            {"lb\xc2\xb7" "ft\xc2\xb2", Inertia, kLb * kFt * kFt, 0, nullptr},
+            {"kg/m", LinMass, 1, 0, "lb/ft"},       {"lb/ft", LinMass, kLb / kFt, 0, nullptr},
+            {"N\xc2\xb7s/m", Damping, 1, 0, "lbf\xc2\xb7s/in"},
+            {"lbf\xc2\xb7s/in", Damping, kLbf / kIn, 0, nullptr},
+            {"Pa/m", PressGrad, 1, 0, "in. w.g./100 ft"},
+            {"in. w.g./100 ft", PressGrad, kInWg / (100.0 * kFt), 0, nullptr},
+        };
+    }();
+    return defs;
+}
+// The unit named `name`: exact spelling first ("cP" is its own US unit even though kit::unitText
+// folds it into mPa·s), then its kit::unitText canonical spelling.
+inline const UnitDef* unitDef(const char* name) {
+    const char* raw = name ? name : "";
+    const char* canon = kit::unitText(raw);
+    for (const auto& d : unitDefs())
+        if (d.name == raw) return &d;
+    for (const auto& d : unitDefs())
+        if (d.name == canon) return &d;
+    return nullptr;
+}
+}  // namespace unit_detail
+
+// Display unit and conversion of a stored value in `siUnit` (any kit::unitText spelling).
+inline Disp disp(const char* siUnit, bool us, const char* usUnit = nullptr) {
+    const char* canon = kit::unitText(siUnit ? siUnit : "");
+    const unit_detail::UnitDef* from = unit_detail::unitDef(canon);
+    if (!us || !from || !from->usDefault) return {canon, 1.0, 0.0};
+    const unit_detail::UnitDef* to = unit_detail::unitDef(usUnit ? usUnit : from->usDefault);
+    if (!to || to->dim != from->dim) return {canon, 1.0, 0.0};
+    // display = (stored * from.toBase + from.offset - to.offset) / to.toBase
+    return {to->name.c_str(), from->toBase / to->toBase, (from->offset - to->offset) / to->toBase};
+}
+inline double toDisplay(double stored, const Disp& d) { return stored * d.scale + d.offset; }
+// A stored value in `siUnit` as display text ("2,436 psi" / "168 bar").
+inline std::string fmtU(double v, const char* siUnit, bool us, int sigFigs = 4, const char* usUnit = nullptr) {
+    const Disp d = disp(siUnit, us, usUnit);
+    return kit::fmtQuantity(toDisplay(v, d), d.unit[0] ? d.unit : nullptr, sigFigs);
+}
+// Numeric member `k` (times `scale`, giving `siUnit`) as display text, or an em dash when absent.
+inline std::string qtyU(const nlohmann::json& o, const char* k, const char* siUnit, bool us,
+                        double scale = 1.0, int sigFigs = 4) {
+    return jhas(o, k) ? fmtU(jnum(o, k) * scale, siUnit, us, sigFigs) : std::string("\xe2\x80\x94");
+}
+// Field options that show and take a stored `siUnit` value in the display unit.
+inline kit::FieldOpts fieldU(const char* siUnit, bool us, const char* usUnit = nullptr) {
+    const Disp d = disp(siUnit, us, usUnit);
+    return kit::FieldOpts().withUnit(d.unit).withScale(d.scale, d.offset);
+}
+// Power stays in kW (the motor catalogs' unit); US customary adds hp: "12.3 kW (16.5 hp)".
+inline std::string fmtPower(double kw, bool us, int sigFigs = 4) {
+    std::string s = kit::fmtQuantity(kw, kit::unitText(kit::Unit::kW), sigFigs);
+    if (us) s += " (" + kit::fmtQuantity(kw / 0.745699871582270, kit::unitText(kit::Unit::hp), sigFigs) + ")";
+    return s;
+}
+inline std::string powerQty(const nlohmann::json& o, const char* k, bool us, int sigFigs = 4) {
+    return jhas(o, k) ? fmtPower(jnum(o, k), us, sigFigs) : std::string("\xe2\x80\x94");
+}
+
 }  // namespace sim
 }  // namespace ui

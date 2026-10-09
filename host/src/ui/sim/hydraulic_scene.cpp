@@ -293,15 +293,15 @@ bool handleViewport(AppState& st,const simscene::ViewportCtx& vp,ImDrawList* dl)
         // bar). The legend shows it in the Simulation pane's units (psi when US customary; the
         // conversion is linear, so the ramp is unchanged). The shared legend owns tick
         // formatting and framing reservation.
-        const bool us = SimManager::unitSys(st).us;
+        const sim::Disp bar = sim::disp("bar", SimManager::unitSys(st).us);
         const bool previousOn = st.legendOn;
         const auto previousMin = st.legendMin, previousMax = st.legendMax;
-        std::string title = "Peak pressure", units = us ? "psi" : "bar";
+        std::string title = "Peak pressure", units = bar.unit;
         title.swap(st.legendTitle);
         units.swap(st.legendUnits);
         st.legendOn = true;
-        st.legendMin = 0;
-        st.legendMax = us ? (float)(cache.peak * (1.0e5 / 6894.757293168)) : cache.peak;
+        st.legendMin = (float)sim::toDisplay(0.0, bar);
+        st.legendMax = (float)sim::toDisplay(cache.peak, bar);
         dl->PushClipRect(vp.imgMin, vp.imgMax, true);
         ui::drawLegend(st, dl, vp.imgMin, vp.imgMax);
         dl->PopClipRect();

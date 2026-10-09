@@ -136,51 +136,44 @@ std::string qty(const json& o, const char* k, const char* unit, int sig = 4) {
 }
 const char* U(kit::Unit u) { return kit::unitText(u); }
 
-// One display quantity: its SI (stored) unit and its US customary unit with the exact factor
-// (display = stored * scale + offset). Lengths/coordinates mm -> in; spans and heads m -> ft;
-// pressures kPa -> psi; small pipe pressure drops Pa -> psi; duct pressures Pa -> in. w.g.
-// (conventional inch of water, 249.08891 Pa); flows m³/h -> US gpm; airflow m³/s -> cfm.
+// One display quantity of this panel: its stored SI unit and, where the default US unit of that
+// SI unit is not the trade's usual one, the US unit to show instead (ducts quote pressures in
+// in. w.g. and velocities in fpm). The conversion itself is the shared sim::disp.
 enum class Q {
     Len, Span, Head, Press, PressPa, DuctPa, Friction, Temp, Flow, Airflow, Vel, DuctVel,
     Dens, Visc, Mass, MassFlow, Vol, Area, LineMass
 };
-struct Disp { const char* unit; double scale; double offset; };
-Disp disp(Q q, bool us) {
-    using kit::Unit;
-    constexpr double kPsiKpa = 6.894757293168;          // kPa per psi
-    constexpr double kFt = 0.3048;                      // m per ft
-    constexpr double kLb = 0.45359237;                  // kg per lb
-    constexpr double kGal = 3.785411784e-3;             // m³ per US gal
-    constexpr double kInWg = 249.08891;                 // Pa per inch of water
+struct QUnit { const char* si; const char* us; };
+QUnit unitsOf(Q q) {
     switch (q) {
-        case Q::Len: return us ? Disp{U(Unit::in), 1.0 / 25.4, 0} : Disp{U(Unit::mm), 1, 0};
+        case Q::Len: return {"mm", nullptr};
         case Q::Span:
-        case Q::Head: return us ? Disp{U(Unit::ft), 1.0 / kFt, 0} : Disp{U(Unit::m), 1, 0};
-        case Q::Press: return us ? Disp{U(Unit::psi), 1.0 / kPsiKpa, 0} : Disp{U(Unit::kPa), 1, 0};
-        case Q::PressPa: return us ? Disp{U(Unit::psi), 1.0 / (kPsiKpa * 1000.0), 0} : Disp{U(Unit::Pa), 1, 0};
-        case Q::DuctPa: return us ? Disp{"in. w.g.", 1.0 / kInWg, 0} : Disp{U(Unit::Pa), 1, 0};
-        case Q::Friction: return us ? Disp{"in. w.g./100 ft", 100.0 * kFt / kInWg, 0} : Disp{"Pa/m", 1, 0};
-        case Q::Temp: return us ? Disp{U(Unit::DegF), 1.8, 32.0} : Disp{U(Unit::DegC), 1, 0};
-        case Q::Flow: return us ? Disp{U(Unit::gpm), 1.0 / (3600.0 * kGal / 60.0), 0} : Disp{U(Unit::m3_h), 1, 0};
-        case Q::Airflow: return us ? Disp{"cfm", 60.0 / (kFt * kFt * kFt), 0} : Disp{U(Unit::m3_s), 1, 0};
-        case Q::Vel: return us ? Disp{"ft/s", 1.0 / kFt, 0} : Disp{U(Unit::m_s), 1, 0};
-        case Q::DuctVel: return us ? Disp{"fpm", 60.0 / kFt, 0} : Disp{U(Unit::m_s), 1, 0};
-        case Q::Dens: return us ? Disp{"lb/ft\xc2\xb3", kFt * kFt * kFt / kLb, 0} : Disp{U(Unit::kg_m3), 1, 0};
-        // US practice quotes dynamic viscosity in centipoise (1 cP = 1 mPa·s).
-        case Q::Visc: return us ? Disp{"cP", 1000.0, 0} : Disp{U(Unit::Pa_s), 1, 0};
-        case Q::Mass: return us ? Disp{U(Unit::lb), 1.0 / kLb, 0} : Disp{U(Unit::kg), 1, 0};
-        case Q::MassFlow: return us ? Disp{"lb/h", 1.0 / kLb, 0} : Disp{"kg/h", 1, 0};
-        case Q::Vol: return us ? Disp{"gal", 1.0 / kGal, 0} : Disp{U(Unit::m3), 1, 0};
-        case Q::Area: return us ? Disp{U(Unit::in2), 1.0 / 645.16, 0} : Disp{U(Unit::mm2), 1, 0};
-        case Q::LineMass: return us ? Disp{"lb/ft", kFt / kLb, 0} : Disp{"kg/m", 1, 0};
+        case Q::Head: return {"m", nullptr};
+        case Q::Press: return {"kPa", nullptr};
+        case Q::PressPa: return {"Pa", nullptr};
+        case Q::DuctPa: return {"Pa", "in. w.g."};
+        case Q::Friction: return {"Pa/m", nullptr};
+        case Q::Temp: return {"degC", nullptr};
+        case Q::Flow: return {"m3/h", nullptr};
+        case Q::Airflow: return {"m3/s", nullptr};
+        case Q::Vel: return {"m/s", nullptr};
+        case Q::DuctVel: return {"m/s", "fpm"};
+        case Q::Dens: return {"kg/m3", nullptr};
+        case Q::Visc: return {"Pa s", nullptr};
+        case Q::Mass: return {"kg", nullptr};
+        case Q::MassFlow: return {"kg/h", nullptr};
+        case Q::Vol: return {"m3", nullptr};
+        case Q::Area: return {"mm2", nullptr};
+        case Q::LineMass: return {"kg/m", nullptr};
     }
-    return {"", 1, 0};
+    return {"", nullptr};
 }
-double toDisp(double si, Q q, bool us) {
-    const Disp d = disp(q, us);
-    return si * d.scale + d.offset;
+sim::Disp dispQ(Q q, bool us) {
+    const QUnit u = unitsOf(q);
+    return sim::disp(u.si, us, u.us);
 }
-const char* unitOf(Q q, bool us) { return disp(q, us).unit; }
+double toDisp(double si, Q q, bool us) { return sim::toDisplay(si, dispQ(q, us)); }
+const char* unitOf(Q q, bool us) { return dispQ(q, us).unit; }
 // A stored SI value as display text with its unit.
 std::string fmtQ(double si, Q q, bool us, int sig = 4) { return kit::fmtQuantity(toDisp(si, q, us), unitOf(q, us), sig); }
 // Numeric member `k` (stored SI) as display text with its unit (em dash when absent).
@@ -195,8 +188,8 @@ std::string valQ(const json& o, const char* k, Q q, bool us, int sig = 4) {
 std::string colQ(const char* title, Q q, bool us) { return std::string(title) + " (" + unitOf(q, us) + ")"; }
 // Field options that edit a stored SI value in the display unit.
 kit::FieldOpts fieldQ(Q q, bool us) {
-    const Disp d = disp(q, us);
-    return kit::FieldOpts().withUnit(d.unit).withScale(d.scale, d.offset);
+    const QUnit u = unitsOf(q);
+    return sim::fieldU(u.si, us, u.us);
 }
 // Placeholder text of an SI default, in the display unit.
 std::string hintQ(double si, Q q, bool us) { return kit::fmtValue(toDisp(si, q, us), 3); }
@@ -3444,7 +3437,7 @@ void PipingPanel::drawPumpDrive(AppState& st) {
         for (auto it = pumpDrive_.begin(); it != pumpDrive_.end(); ++it, ++i) {
             ImGui::PushID(i);
             const std::string title = "Pump drive \xc2\xb7 " + driveRunName(it.key());
-            sim::drawPumpDriveResult("drive_result", *it, title.c_str());
+            sim::drawPumpDriveResult("drive_result", *it, title.c_str(), us_);
             ImGui::PopID();
         }
         if (!pumpDrive_.empty()) kit::sectionHeader("Inputs", "size_pump");
@@ -3486,7 +3479,7 @@ void PipingPanel::drawPumpDrive(AppState& st) {
         }
     }
     kit::cardEnd();
-    sim::drawPumpDriveInputs("drive", driveIn_, false);
+    sim::drawPumpDriveInputs("drive", driveIn_, false, us_);
 }
 
 void PipingPanel::drawSpecForm(AppState& st) {

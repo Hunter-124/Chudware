@@ -90,7 +90,7 @@ nlohmann::json pumpDriveParams(const PumpDriveInputs& in) {
     return p;
 }
 
-bool drawPumpDriveInputs(const char* id, PumpDriveInputs& in, bool showKindAndDuty) {
+bool drawPumpDriveInputs(const char* id, PumpDriveInputs& in, bool showKindAndDuty, bool us) {
     ImGui::PushID(id && id[0] ? id : "pump_drive");
     bool committed = false;
 
@@ -105,23 +105,19 @@ bool drawPumpDriveInputs(const char* id, PumpDriveInputs& in, bool showKindAndDu
             }
             if (in.kind == 0) {
                 committed |= kit::fieldNumber("flow_lpm", "Flow", &in.flowLpm,
-                                              kit::FieldOpts().withUnit(kit::Unit::L_min).withMin(0.0)
-                                                  .withRequired());
+                                              fieldU("L/min", us).withMin(0.0).withRequired());
                 committed |= kit::fieldNumber("pressure_bar", "Pressure", &in.pressureBar,
-                                              kit::FieldOpts().withUnit(kit::Unit::bar).withMin(0.0)
-                                                  .withRequired()
+                                              fieldU("bar", us).withMin(0.0).withRequired()
                                                   .withTip("Highest working pressure (the relief setting)."));
             } else {
                 committed |= kit::fieldNumber("flow_m3h", "Flow", &in.flowM3h,
-                                              kit::FieldOpts().withUnit(kit::Unit::m3_h).withMin(0.0)
-                                                  .withRequired());
+                                              fieldU("m3/h", us).withMin(0.0).withRequired());
                 committed |= kit::fieldNumber("head_m", "Head", &in.headM,
-                                              kit::FieldOpts().withUnit(kit::Unit::m).withMin(0.0)
-                                                  .withRequired());
+                                              fieldU("m", us).withMin(0.0).withRequired());
             }
+            const std::string densityHint = kit::fmtValue(toDisplay(998.0, disp("kg/m3", us)), 3);
             committed |= kit::fieldNumber("density", "Fluid density", &in.densityKgm3,
-                                          kit::FieldOpts().withUnit(kit::Unit::kg_m3).withMin(1.0)
-                                              .withHint("998"));
+                                          fieldU("kg/m3", us).withMin(1.0).withHint(densityHint.c_str()));
         }
         committed |= kit::fieldNumber("eff", "Pump efficiency", &in.pumpEff,
                                       kit::FieldOpts().withScale(100.0).withUnit(kit::Unit::Percent)
@@ -192,29 +188,34 @@ bool drawPumpDriveInputs(const char* id, PumpDriveInputs& in, bool showKindAndDu
     return committed;
 }
 
-void drawPumpDriveResult(const char* id, const nlohmann::json& r, const char* title) {
+void drawPumpDriveResult(const char* id, const nlohmann::json& r, const char* title, bool us) {
     if (!r.is_object() || r.empty()) return;
     ImGui::PushID(id && id[0] ? id : "pump_drive_result");
     std::vector<kit::KeyValueItem> rows;
     const json& op = jobj(r, "operating_point");
     // One fact per row: the duty point's flow and head, then powers, the motor and its speed.
-    if (jhas(op, "flow_m3h")) rows.push_back({"Duty flow", qty(op, "flow_m3h", kit::Unit::m3_h)});
-    if (jhas(op, "head_m")) rows.push_back({"Duty head", qty(op, "head_m", kit::Unit::m)});
+    // Powers stay in kW (the IEC catalogs' unit) with hp beside them in US units.
+    if (jhas(op, "flow_m3h")) rows.push_back({"Duty flow", qtyU(op, "flow_m3h", "m3/h", us)});
+    if (jhas(op, "head_m")) rows.push_back({"Duty head", qtyU(op, "head_m", "m", us)});
     if (jhas(r, "hydraulic_power_kw"))
-        rows.push_back({"Hydraulic power", qty(r, "hydraulic_power_kw", kit::Unit::kW)});
-    rows.push_back({"Shaft power", qty(r, "shaft_power_kw", kit::Unit::kW)});
+        rows.push_back({"Hydraulic power", powerQty(r, "hydraulic_power_kw", us)});
+    rows.push_back({"Shaft power", powerQty(r, "shaft_power_kw", us)});
     if (jhas(r, "required_motor_kw"))
-        rows.push_back({"Required (with SF)", qty(r, "required_motor_kw", kit::Unit::kW)});
+        rows.push_back({"Required (with SF)", powerQty(r, "required_motor_kw", us)});
     // The rating is the answer, not a warning: primary ink (warnings are their own lines below).
-    if (jhas(r, "motor_rating_kw")) rows.push_back({"Motor rating", qty(r, "motor_rating_kw", kit::Unit::kW)});
-    if (jhas(r, "motor_rating_hp")) rows.push_back({"Motor rating", qty(r, "motor_rating_hp", kit::Unit::hp)});
+    // A NEMA answer carries its own hp rating, so the kW row does not repeat hp beside it.
+    const bool nemaHp = jhas(r, "motor_rating_hp");
+    if (jhas(r, "motor_rating_kw"))
+        rows.push_back({"Motor rating", nemaHp ? qty(r, "motor_rating_kw", kit::Unit::kW)
+                                               : powerQty(r, "motor_rating_kw", us)});
+    if (nemaHp) rows.push_back({"Motor rating", qty(r, "motor_rating_hp", kit::Unit::hp)});
     rows.push_back({"Poles", fmtText(r, "poles")});
     rows.push_back({"Synchronous speed", qty(r, "sync_speed_rpm", kit::Unit::rpm)});
     if (jhas(r, "motor_efficiency"))
         rows.push_back({"Motor efficiency",
                         kit::fmtQuantity(jnum(r, "motor_efficiency") * 100.0,
                                          kit::unitText(kit::Unit::Percent), 3)});
-    if (jhas(r, "input_power_kw")) rows.push_back({"Input power", qty(r, "input_power_kw", kit::Unit::kW)});
+    if (jhas(r, "input_power_kw")) rows.push_back({"Input power", powerQty(r, "input_power_kw", us)});
     rows.push_back({"Full-load current", qty(r, "full_load_current_a", kit::Unit::A)});
     if (r.contains("iec_frame")) rows.push_back({"IEC frame", fmtText(r, "iec_frame")});
     if (r.contains("nema_frame")) rows.push_back({"NEMA frame", fmtText(r, "nema_frame")});

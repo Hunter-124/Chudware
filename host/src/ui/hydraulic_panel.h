@@ -246,7 +246,7 @@ private:
     void drawFooter(AppState& st);
     void drawCircuitForm(AppState& st);
     void drawStart(AppState& st);
-    void drawLayout3d();
+    void drawLayout3d(AppState& st);
     void drawSchematic(AppState& st, float width, float height);
     void drawPlots(AppState& st, float width, float height);
     void selectFromCanvas(int component, int hose);

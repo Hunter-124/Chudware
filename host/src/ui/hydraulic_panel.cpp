@@ -13,6 +13,7 @@
 #include "imgui.h"
 
 #include "../core/app_state.h"
+#include "sim_manager.h"  // SimManager::unitSys — the Simulation pane's display units
 
 namespace ui {
 using namespace hydint;
@@ -260,7 +261,7 @@ void downsampleResult(json& r, int maxN) {
 
 const char* recordIcon() { return "study_hydraulics"; }
 
-std::string recordSummary(const json& rec) {
+std::string recordSummary(const json& rec, bool us) {
     const json& circuit = jobj(jobj(rec, "params"), "circuit");
     const json& results = jobj(rec, "results");
     const std::size_t nc = jarr(circuit, "components").size();
@@ -268,7 +269,7 @@ std::string recordSummary(const json& rec) {
     std::string s = std::to_string(nc) + (nc == 1 ? " component" : " components") + " \xc2\xb7 " +
                     std::to_string(nh) + (nh == 1 ? " hose" : " hoses");
     const json& sim = jobj(results, "simulate");
-    if (!sim.empty()) s += " \xc2\xb7 peak " + qty(jobj(sim, "summary"), "peak_pressure_bar", "bar");
+    if (!sim.empty()) s += " \xc2\xb7 peak " + sim::qtyU(jobj(sim, "summary"), "peak_pressure_bar", "bar", us);
     if (results.contains("bom")) s += " \xc2\xb7 BOM";
     if (results.contains("piping_handoff")) s += " \xc2\xb7 piping";
     return s;
@@ -1652,7 +1653,7 @@ void HydraulicPanel::drawStudyRows(AppState& st) {
     for (int i = 0; i < (int)recs.size(); ++i) {
         const json& rec = recs[i];
         const std::string title = jstr(rec, "name", "Hydraulic circuit");
-        const std::string summary = recordSummary(rec);
+        const std::string summary = recordSummary(rec, SimManager::unitSys(st).us);
         kit::RowStyle rs;
         rs.icon = recordIcon();
         rs.secondary = summary.c_str();

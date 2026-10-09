@@ -806,11 +806,10 @@ struct Conversation {
     std::string docLink;           // OPTIONAL document reference ("file:<path>" | "doc:<id>") —
                                    // metadata only (Sessions row badge); the session exists
                                    // independently of the document.
-    // The project/workspace folder this session was CREATED under — the same value the
-    // composer sends Chudcode as workspace_dir (st.workspaceDir when set, else
-    // plmProjectPath()). Persisted as "project"; the Sessions list filters on it instead of
-    // guessing from produced artifacts. Empty = unscoped (legacy session with nothing to
-    // recover a folder from) and therefore always listed.
+    // Workspace folder this session last ran under (initially its creation folder).
+    // The composer sends the same top-left working directory as workspace_dir.
+    // Persisted as "project"; Sessions filters this stored key, never document paths.
+    // Empty = a legacy session shown only in Unassigned or All projects.
     std::string projectDir;
     std::vector<ChatMsg> msgs;      // populated only while INACTIVE (active lives in AppState::chat)
     int lastContextTokens = 0;     // per-session context meter (input tokens from last model call)
@@ -1928,33 +1927,9 @@ struct AppState {
     // workspaceDir is the Explorer root. It defaults to Documents/Chudware,
     // is created on first use, and persists as "workspace_dir".
     std::string workspaceDir;
-    // plmProjectDir: the folder the PLM Project Hub (Workspace::PLM) treats as the current project
-    // (a project = a folder + its hidden vault, contract plm.md §1). "" = derive it: the parent
-    // folder of the active saved document, else workspaceDir. Set explicitly by "Open project
-    // folder…" in the hub, and implicitly followed as documents are opened/saved. Read via
-    // plmProjectPath() — every plm_* RPC passes {"path": st.plmProjectPath()}.
-    std::string plmProjectDir;
+    // The top-left working-directory selector is the project authority for PLM,
+    // Explorer and chat. An open document's source folder never changes it.
     std::string plmProjectPath() const {
-        if (!plmProjectDir.empty()) return plmProjectDir;
-        // Prefer the active tab, but never the read-only MCP handoff mirror
-        // (its folder is %APPDATA%\...\handoff — not a user project). Fall back
-        // to the first real saved doc, then the workspace folder.
-        auto folderOf = [](const std::string& p) -> std::string {
-            size_t s = p.find_last_of("/\\");
-            return s == std::string::npos ? std::string() : p.substr(0, s);
-        };
-        if (activeTab >= 0 && activeTab < (int)docTabs.size()) {
-            const auto& t = docTabs[activeTab];
-            if (!t.aiHandoff && !t.path.empty()) {
-                std::string f = folderOf(t.path);
-                if (!f.empty()) return f;
-            }
-        }
-        for (const auto& t : docTabs) {
-            if (t.aiHandoff || t.path.empty()) continue;
-            std::string f = folderOf(t.path);
-            if (!f.empty()) return f;
-        }
         return workspaceDir;
     }
     // Recent files and project folders are persisted independently. Both are

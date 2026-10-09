@@ -141,6 +141,20 @@ jobs:
           fi
           echo "CHECK_PYTHON=${check_python}" >> "$GITHUB_ENV"
 
+      - name: Refresh the service runtime and gate dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # A persistent runner's venv is not a dependency lock. Refresh it from
+          # the product manifest before sweeping every service (including civil).
+          venv="$HOME/.local/share/Chudware/mcp-venv"
+          VENV_DIR="${venv}" CHUDCODE_RPC_SRC="" bash scripts/provision_venv.sh
+          # DVC is a subprocess-only training-data tool, not a shipped runtime import.
+          "${venv}/bin/python" -m pip install --quiet --disable-pip-version-check pytest dvc==3.67.1
+          "${venv}/bin/python" -c 'import pyproj, dvc, pytest; print("gate runtime imports OK")'
+          echo "CHUDWARE_GATE_PYTHON=${venv}/bin/python" >> "$GITHUB_ENV"
+
       - name: Run scripts/gate.sh (CHUDWARE_GATE_STRICT=1)
         shell: bash
         run: |

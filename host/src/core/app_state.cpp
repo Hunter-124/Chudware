@@ -3155,7 +3155,6 @@ bool AppState::verifyEntitlementForAi() {
 
 void setActiveProjectDir(AppState& st, const std::string& absDir) {
     if (absDir.empty()) return;  // cancelled dialog → no-op
-    st.plmProjectDir = absDir;
     st.workspaceDir = absDir;
     st.settings.workspaceDir = absDir;
     st.pushRecentProject(absDir);

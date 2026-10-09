@@ -518,15 +518,28 @@ void drawLeftPane(AppState& st,
         st.settings.fmCollapsed = false;
         saveSettings(st.settings);
     }
+    // Workspace-rail columns (Simulate's Simulation Manager, Manufacture, Electronics) draw no
+    // collapse chevron: their tree IS the workspace's primary surface. They therefore never inherit
+    // the Model FeatureManager's persisted roll-up — a collapsed fm_collapsed used to pin the
+    // Simulation Manager column to its 69px header strip, so the whole study list was clipped to a
+    // blank rail with no control to expand it. s_collapsed (the Model choice) is kept untouched.
+    const bool railWs = (st.activeWorkspace == AppState::Workspace::Simulate && st.simManager) ||
+                        st.activeWorkspace == AppState::Workspace::Manufacture ||
+                        st.activeWorkspace == AppState::Workspace::Electronics;
     // T-G21 screenshot hook: --ui-screenshot always resets the overlay columns for determinism
     // (io.IniFilename is nulled in shot mode, so DockBuilderGetNode is always null and the reset
     // branch above always fires) — the persisted collapse setting can't survive that on its own.
     // CHUDWARE_FM_COLLAPSED forces the collapsed capture the same way CHUDWARE_COPILOT_NARROW forces
     // a pane width; no effect outside a screenshot run.
-    if (std::getenv("CHUDWARE_FM_COLLAPSED")) {
-        s_collapsed = true;
-        s_anim.snap(true, colH);  // snap immediately — headless captures must not depend on frame count
-    }
+    const bool forceCollapsed = std::getenv("CHUDWARE_FM_COLLAPSED") != nullptr;
+    if (forceCollapsed) s_collapsed = true;
+    const bool collapsedHere = s_collapsed && !railWs;
+    // Snap (no roll animation) when the effective state flips because the workspace changed, and
+    // every frame under the screenshot hook — headless captures must not depend on frame count.
+    static int s_lastRailWs = -1;
+    if (forceCollapsed || (s_lastRailWs >= 0 && s_lastRailWs != (int)railWs))
+        s_anim.snap(collapsedHere, colH);
+    s_lastRailWs = (int)railWs;
 
     // ---- pinned full-height-or-collapsed glass column -------------------------------------------
     // Position is pinned every frame; WIDTH is resized via the shared visible resize boundary on
@@ -576,7 +589,7 @@ void drawLeftPane(AppState& st,
     const float maxW = mobile ? availableW
                              : std::max(minW + 40.0f * S,
                                         std::min(560.0f * panelSc, (band.maxX - band.minX) * 0.42f));
-    const float animatedH = s_anim.tick(s_collapsed, colH);
+    const float animatedH = s_anim.tick(collapsedHere, colH);
     const float winH = mobile ? std::min(animatedH, colH) : animatedH;
     ImGui::SetNextWindowPos(ImVec2(colX, colY), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(defW, winH),

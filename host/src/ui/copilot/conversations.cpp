@@ -365,11 +365,11 @@ std::string convProjectKey(std::string_view rawDir) {
     return comparablePath(lexicalPath(rawDir));
 }
 
-// The project folder a newly created session belongs to. A turn launch can restamp this
-// when its actual workspace differs; until then the current workspace (or PLM path if
-// none is set) scopes an empty/draft conversation.
+// The project folder chat belongs to: the selected working directory (Explorer root), and
+// nothing else. An open document — even one saved outside that folder — never changes it.
+// A turn launch restamps a session to the workspace it actually ran in.
 std::string convProjectDir(AppState& st) {
-    return st.workspaceDir.empty() ? st.plmProjectPath() : st.workspaceDir;
+    return st.workspaceDir;
 }
 
 // Legacy fallback #1: the Chudcode session JSONL records the run's cwd on its session line
@@ -484,8 +484,26 @@ static bool hasProjectArtifact(const std::vector<ChatMsg>& msgs,
 
 // Remembered active session PER PROJECT (index.json v3 "active_by_project"): opening the app
 // under project X must land on the chat that was last active THERE, not on whatever was last
-// active anywhere. Keyed by convProjectKey.
+// active anywhere. Keyed by convProjectKey. Invariant: an entry only ever names a session whose
+// OWN stored project has that key — the session on screen may be another project's (the user
+// opened it explicitly), and it must never claim the current root's slot.
 static std::map<std::string, std::string> s_activeByProject;
+
+// The root key the active session was last reconciled against. loadChatHistory clears
+// s_followReconciled so a (re)load — startup or the WASM shared-store merge — is reconciled
+// like a root switch: the restored selection is whatever was on screen last time, possibly
+// under another root.
+static bool        s_followReconciled = false;
+static std::string s_followKey;
+
+// True when session `id` is resident and its OWN stored project has `key` — the only kind of
+// session s_activeByProject may remember for that key.
+static bool sessionOwnedByProject(const AppState& st, const std::string& id,
+                                  const std::string& key) {
+    for (const Conversation& c : st.conversations)
+        if (c.id == id) return convProjectKey(c.projectDir) == key;
+    return false;
+}
 
 // A run binds the session to the workspace actually sent to the worker. A session
 // resumed under another project must also stop being the old project's remembered tab.
@@ -1299,13 +1317,18 @@ void persistChatHistory(AppState& st) {
         if (atomicWriteFileDurable(chatSessionFilePath(st.conversations[i].id), convObj.dump(1)))
             s_pruneableSessionStems.insert(chatSessionFileStem(st.conversations[i].id));
     }
-    // Index v3: `order` + the global `active` (fallback when no project is resolvable) +
-    // `active_by_project`, so relaunching under a project lands on THAT project's last chat.
-    const std::string projectKey = convProjectKey(convProjectDir(st));
-    if (!projectKey.empty() && !activeId.empty()) s_activeByProject[projectKey] = activeId;
+    // Index v3: `order` + the global `active` (fallback when no root is resolvable) +
+    // `active_by_project`, so relaunching under a root lands on THAT root's last chat. The
+    // active session is remembered under its OWN stored project, never the current root's:
+    // it may be another project's session the user opened explicitly.
+    if (!activeId.empty()) {
+        const std::string ownKey = convProjectKey(st.conversations[st.activeConv].projectDir);
+        if (!ownKey.empty()) s_activeByProject[ownKey] = activeId;
+    }
     nlohmann::json activeByProject = nlohmann::json::object();
     for (const auto& [key, id] : s_activeByProject)
-        if (!key.empty() && !id.empty()) activeByProject[key] = id;
+        if (!key.empty() && writtenIds.count(id) && sessionOwnedByProject(st, id, key))
+            activeByProject[key] = id;
     nlohmann::json index = {{"version", 3},
                             {"active", activeId},
                             {"active_by_project", std::move(activeByProject)},
@@ -1722,8 +1745,9 @@ void loadChatHistory(AppState& st) {
             if (in) { try { in >> index; } catch (...) {} }
         }
         if (index.is_object() && index.contains("order") && index["order"].is_array()) {
-            // v3: per-project active pointer wins for the project we are opening under; the
-            // top-level `active` remains the fallback (and is all a v2 index carries).
+            // v3: per-project active pointer wins for the project we are opening under (resolved
+            // once every session is loaded, below); the top-level `active` remains the fallback
+            // (and is all a v2 index carries).
             activeId = index.value("active", std::string());
             if (index.contains("session_seq") && index["session_seq"].is_number_integer())
                 s_sessionSeq = std::max(s_sessionSeq, index["session_seq"].get<int>());
@@ -1733,10 +1757,6 @@ void loadChatHistory(AppState& st) {
                     if (!it.value().is_string() || it.key().empty()) continue;
                     s_activeByProject[it.key()] = it.value().get<std::string>();
                 }
-                auto mine = s_activeByProject.find(projectKey);
-                if (!projectKey.empty() && mine != s_activeByProject.end() &&
-                    !mine->second.empty())
-                    activeId = mine->second;
             }
             bool droppedDup = false;
             for (const auto& jid : index["order"]) {
@@ -1849,6 +1869,17 @@ void loadChatHistory(AppState& st) {
             }
         }
     }
+    // A remembered pointer is valid only for a session stored under that same project. Older
+    // builds keyed whatever session was on screen under the current root, so another project's
+    // chat could claim it; drop such entries (the next persist rewrites a clean index).
+    for (auto it = s_activeByProject.begin(); it != s_activeByProject.end();) {
+        if (sessionOwnedByProject(st, it->second, it->first)) { ++it; continue; }
+        it = s_activeByProject.erase(it);
+        markChatHistoryDirty();
+    }
+    if (const auto mine = s_activeByProject.find(projectKey);
+        !projectKey.empty() && mine != s_activeByProject.end())
+        activeId = mine->second;
     if (st.conversations.empty()) {
         ensureConversations(st);  // seeds a numbered session linked to the current document
     } else {
@@ -1858,6 +1889,10 @@ void loadChatHistory(AppState& st) {
                 if (st.conversations[i].id == activeId) { st.activeConv = i; break; }
         restoreActiveConversation(st);
     }
+    // The restored selection was on screen under whatever root was current LAST time; the next
+    // followProjectActiveConversation reconciles it against the root selected now (and again
+    // whenever an asynchronously restored root arrives).
+    s_followReconciled = false;
     restorePromptDraft(st);
     // Sessions saved under a placeholder ("Chat 3") show their first prompt straight away.
     for (int i = 0; i < (int)st.conversations.size(); ++i) autoTitleConversation(st, i);
@@ -2140,46 +2175,62 @@ static void pollChudcodeSessionHealth(AppState& st) {
 }
 
 
-// On a project switch, remember the last active session in the project being left and
-// reselect the last active one in the project being entered. An empty/draft session has
-// not run anywhere yet: move its scope instead of stranding a ghost in the old project.
-// Sessions are tied to their workspace, so when the entered project has no session to
-// resume, a session from another project never stays in view: a new one opens there.
+// Newest non-archived session stored under `key`, never index `skip`; -1 when there is none.
+// st.conversations is creation order (newConversation appends), so the tail is the newest.
+static int latestProjectConversation(const AppState& st, const std::string& key, int skip) {
+    for (int i = (int)st.conversations.size() - 1; i >= 0; --i) {
+        const Conversation& c = st.conversations[i];
+        if (i != skip && !c.archived && convProjectKey(c.projectDir) == key) return i;
+    }
+    return -1;
+}
+
+// The selected root is the sole chat authority. Whenever it changes — and once after every
+// (re)load, because the restored selection was on screen under LAST run's root — the active
+// session is reconciled to it: kept when it is stored under that root; otherwise the root's
+// remembered session, else its newest one, opens (switchConversation parks the outgoing
+// session; a run keeps streaming into it in the background). The session being left stays
+// its OWN project's remembered chat. An empty draft has run nowhere: with nothing to restore
+// it moves to the entered root; otherwise a new session opens there. Peeking at another
+// project in Sessions, or opening one of its sessions explicitly, is not a root change.
 static void followProjectActiveConversation(AppState& st) {
-    static bool s_seeded = false;
-    static std::string s_lastKey;
-    const std::string key = convProjectKey(convProjectDir(st));
-    if (!s_seeded) {  // first observation is the load's own selection, never a switch
-        s_seeded = true;
-        s_lastKey = key;
-        return;
+    const std::string dir = convProjectDir(st);
+    const std::string key = convProjectKey(dir);
+    if (s_followReconciled && key == s_followKey) return;
+    const bool switched = s_followReconciled;   // false: first observation after a (re)load
+    s_followReconciled = true;
+    s_followKey = key;
+    if (key.empty()) return;   // no root resolved yet: nothing to reconcile against
+    const bool haveActive = st.activeConv >= 0 && st.activeConv < (int)st.conversations.size();
+    bool draft = false;
+    if (haveActive) {
+        const Conversation& active = st.conversations[st.activeConv];
+        const std::string activeKey = convProjectKey(active.projectDir);
+        if (activeKey == key) return;   // already this root's session
+        draft = st.chat.empty() && active.msgs.empty() && st.queuedPrompts.empty() &&
+                !st.convRunning(active.id);
+        if (switched && !draft && !activeKey.empty()) s_activeByProject[activeKey] = active.id;
     }
-    if (key == s_lastKey) return;
-    if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size()) {
-        Conversation& active = st.conversations[st.activeConv];
-        const bool hasNotRun = st.chat.empty() && active.msgs.empty() &&
-                               st.queuedPrompts.empty() && !st.convRunning(active.id);
-        if (hasNotRun && !key.empty()) {
-            // A draft belongs to its session id, not its project: leave the draft intact.
-            bindActiveConversationProject(st, convProjectDir(st));
-        } else if (!s_lastKey.empty()) {
-            s_activeByProject[s_lastKey] = active.id;
-        }
-    }
-    s_lastKey = key;
-    if (key.empty()) return;
-    const auto it = s_activeByProject.find(key);
-    if (it != s_activeByProject.end() && !it->second.empty()) {
+    int target = -1;
+    if (const auto it = s_activeByProject.find(key); it != s_activeByProject.end()) {
         for (int i = 0; i < (int)st.conversations.size(); ++i) {
-            if (st.conversations[i].id != it->second) continue;
-            if (i != st.activeConv) switchConversation(st, i);  // parks the outgoing session
-            return;
+            const Conversation& c = st.conversations[i];
+            if (c.id != it->second) continue;
+            if (!c.archived && convProjectKey(c.projectDir) == key) target = i;
+            break;
         }
+        if (target < 0) s_activeByProject.erase(it);   // stale or foreign: never restored
     }
-    if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size() &&
-        convProjectKey(st.conversations[st.activeConv].projectDir) == key)
+    if (target < 0) target = latestProjectConversation(st, key, st.activeConv);
+    if (target >= 0) {
+        switchConversation(st, target);
         return;
-    newConversation(st);  // parks the outgoing session; scope = the entered project
+    }
+    if (draft) {
+        bindActiveConversationProject(st, dir);   // the draft keeps its session id and text
+        return;
+    }
+    newConversation(st);   // parks the outgoing session; scope = the entered root
 }
 
 // Per-frame chat/doc sync (called each frame). Sessions are document-independent now: a

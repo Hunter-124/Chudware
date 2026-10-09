@@ -521,7 +521,7 @@ std::string newConvId(AppState& st);
 std::filesystem::path lexicalPath(std::string_view raw);
 std::string comparablePath(const std::filesystem::path& path);
 std::string convProjectKey(std::string_view rawDir);   // comparable key for a project folder
-std::string convProjectDir(AppState& st);              // project folder for a NEW session
+std::string convProjectDir(AppState& st);              // the selected root (st.workspaceDir) only
 void        bindActiveConversationProject(AppState& st, const std::string& workspace);
 void        ensureConversations(AppState& st);
 void        maybePersistChatHistoryDebounced(AppState& st, bool force);
@@ -538,6 +538,13 @@ int         forkConversation(AppState& st, int idx);   // -> new conversation in
 // unknown-method response proves the worker slice absent; the Sessions panel and the
 // post-turn health capture both honor (and may flip) it.
 bool&       chudcodeSessionServiceAvailable();
+// Sessions list scope as last drawn (scenario probe): the project key it shows (empty for
+// Unassigned/All) and the root key it last snapped to. `drawn` = the list has drawn at least once.
+struct SessionsScopeProbe {
+    std::string viewedKey, followedKey;
+    bool        drawn = false;
+};
+SessionsScopeProbe sessionsScopeProbe();
 
 // ---- AI settings (settings) ----
 // Compact AI-settings popover body (provider + model + effort + run toggles + "All settings...");

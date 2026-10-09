@@ -196,10 +196,17 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   `doc.changed` only while `userMidEdit`; a revision without an `aicm_path` key keeps the mesh
   (only an empty `aicm_path` means empty) and the active view catches up via
   `core/tess_catchup.h` (`test_tess_catchup`). A part the agent is editing stays selected.
+- **One working-directory authority.** `AppState::workspaceDir` drives the top-left
+  chip, `plmProjectPath()` and `convProjectDir()`. Opening or switching to an external
+  document never changes it; only an explicit working-directory selection does.
 - **Chat sessions follow the workspace of their latest turn.** `bindActiveConversationProject`
   restamps `Conversation.projectDir`; `index.json` v3 keeps `active_by_project`; Sessions
-  filters the stored key (never a draw-time scan). On a workspace switch
-  (`followProjectActiveConversation`) a session from another project never stays in view.
+  filters the stored key (never a document-directory inference). Startup and shared-store
+  reload reconcile the restored chat to the selected root, validating remembered
+  sessions against their own stored project key. A root switch restores its last chat
+  or creates an empty one, parking active runs rather than stopping them. Explicit
+  cross-project history viewing does not rewrite another root's remembered session.
+  `CHUDWARE_SHOT=projectchat` exercises these transitions and real outside-file opening.
 - **Steers split the running bubble** (`composer.cpp::appendSteerToTranscript`, persisted
   `steerSplit`/`"split"`): append-only, so AI-VC `msg_idx` anchors never shift.
 - The model picker has no default-hiding pass: `hidden_models` is only the user's own choice;

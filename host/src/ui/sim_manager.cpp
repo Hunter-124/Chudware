@@ -1343,12 +1343,17 @@ void SimManager::refresh(AppState &st) {
                       err, 15000) ||
       !res.is_object() || res.contains("code") ||
       !res.value("ok", true)) {
-    st.addLog("[sim] sim_study_list failed: " +
-              (res.is_object()
-                   ? res.value("message", res.value("error", err))
-                   : (err.empty() ? "invalid response" : err)));
+    const std::string detail =
+        res.is_object() ? res.value("message", res.value("error", err))
+                        : (err.empty() ? "invalid response" : err);
+    st.addLog("[sim] sim_study_list failed: " + detail);
+    listErrorDocId_ = st.docMirror.docId();
+    listErrorRevision_ = (long)st.docMirror.revision();
+    listError_ = detail;
     return;
   }
+  listErrorDocId_.clear();
+  listError_.clear();
   // Preserve the transient (non-persisted) result fields across a refresh by
   // id.
   std::vector<Study> prev = std::move(studies_);

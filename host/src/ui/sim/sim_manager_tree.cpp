@@ -105,9 +105,13 @@ void SimManager::openNewStudyPicker() {
 void SimManager::drawTreeBody(AppState &st) {
   appSt_ = &st;
   // Keep the mirror in step with the active document (cheap: re-pull only on a
-  // doc/revision change).
-  if (!st.rpc.busy() && st.docMirror.hasDoc() && (lastDocId_ != st.docMirror.docId() ||
-                                lastRevision_ != (long)st.docMirror.revision()))
+  // doc/revision change). A failed pull for this exact doc/revision is not re-issued every frame
+  // (each attempt is a blocking worker round-trip); the list below shows it with Retry instead.
+  const bool listFailedHere = !listErrorDocId_.empty() && st.docMirror.hasDoc() &&
+                              listErrorDocId_ == st.docMirror.docId() &&
+                              listErrorRevision_ == (long)st.docMirror.revision();
+  if (!st.rpc.busy() && st.docMirror.hasDoc() && !listFailedHere &&
+      (lastDocId_ != st.docMirror.docId() || lastRevision_ != (long)st.docMirror.revision()))
     refresh(st);
 
   // The Simulation body is embedded in the FeatureManager column, whose glass surface layout.cpp
@@ -201,6 +205,27 @@ void SimManager::drawTreeBody(AppState &st) {
                         "firmware projects unlock circuit simulation and firmware emulation.",
                         "+ New study"))
       newPickerRequested_ = true;
+    return;
+  }
+  // The study list is answered per document: until this document's sim_study_list lands, the
+  // rail says so (loading, or the failure with Retry) — never "No studies yet" for a document that
+  // may carry saved studies, and never a blank body.
+  if (listFailedHere) {
+    const bool listedBefore = lastDocId_ == st.docMirror.docId();
+    if (!listedBefore) {
+      if (kit::blockedState("Saved studies couldn't be loaded",
+                            "The engine didn't return this document's study list.",
+                            "Retry. If it keeps failing, see the Console for the engine message.",
+                            "Retry"))
+        listErrorDocId_.clear();
+      return;
+    }
+    kit::inlineStatus("Showing the last loaded studies; the latest list couldn't be loaded.",
+                      kit::Tone::Warn);
+    if (kit::secondaryButton("Retry###sim_list_retry"))
+      listErrorDocId_.clear();
+  } else if (lastDocId_ != st.docMirror.docId()) {
+    kit::spinner("Loading saved studies\xe2\x80\xa6");
     return;
   }
   const int industrial = piping_.studyCount() + hydraulic_.studyCount();

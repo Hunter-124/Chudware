@@ -4058,12 +4058,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // CHUDWARE_PLM_PROJECT points the capture at a specific project folder.
     // Without it the shot falls back to the cwd, which is fine for the pages
     // that need no vault but useless for Compare (it needs real versions).
-    if (const char *pd = std::getenv("CHUDWARE_PLM_PROJECT"); pd && *pd)
-      st.plmProjectDir = pd;
-    if (st.plmProjectDir.empty()) {
+    if (const char *pd = std::getenv("CHUDWARE_PLM_PROJECT"); pd && *pd) {
+      st.workspaceDir = pd;
+    } else {
       std::error_code ec;
       auto cwd = std::filesystem::current_path(ec);
-      st.plmProjectDir = ec ? std::string(".") : cwd.string();
+      st.workspaceDir = ec ? std::string(".") : cwd.string();
     }
   }
   // Seed the pin from the scenario's own selection (see AppState::shotWorkspacePin). Model is

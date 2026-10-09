@@ -168,11 +168,13 @@ stage_check() {
 # `python -m tools.manual_gen`", not a build break.
 stage_manual_gen() {
     echo "=== manual regen clean (advisory) ==="
-    if ! command -v python3 >/dev/null 2>&1; then
-        skip_stage env "manual regen clean" "python3 not on PATH" "python3 not installed"
+    local manual_py
+    manual_py="$(gate_python_or_system)"
+    if [ -z "$manual_py" ]; then
+        skip_stage env "manual regen clean" "no usable Python interpreter" "python3 not installed"
         return 0
     fi
-    if python3 -m tools.manual_gen --check > ${GATE_TMP}/manual.out 2>&1; then
+    if "$manual_py" -m tools.manual_gen --check > ${GATE_TMP}/manual.out 2>&1; then
         record "manual regen clean  PASS    docs/manual/*.md matches a fresh regen"
         echo "  PASS"
     else
@@ -220,7 +222,10 @@ stage_core_build() {
     # ~16x slower (sim ctests 34s -> 2s once Release was set). See docs/REFACTOR_LOG.md.
     if ! CCACHE_DISABLE=1 cmake -S core -B "$build_dir" -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_WITH_OCCT=ON -G Ninja > ${GATE_TMP}/cfg.out 2>&1; then
         record "core build          FAIL    cmake configure failed (see ${GATE_TMP}/cfg.out)"
-        echo "  FAIL: configure"; tail -n 15 ${GATE_TMP}/cfg.out | sed 's/^/    /'
+        echo "  FAIL: configure"
+        # FetchContent's actual download/clone error precedes CMake's final
+        # stack trace. Keep the complete configure log in CI's job log.
+        cat "${GATE_TMP}/cfg.out"
         fail_fatal=1
         return 0
     fi

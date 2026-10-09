@@ -42,6 +42,8 @@
 #include "sketch3d_mode.h"
 #include "ui_audit.h"  // simaudit + CHUDWARE_IDAUDIT: test-engine-hook ID-conflict / clipping audit
 #include "viewport_panel.h"
+#include "layout.h"  // overlayBand: demoreview Simulation-column clip check
+#include "copilot/copilot_internal.h"  // projectchat: session store, root reconciliation, Sessions probe
 #include "sim/sim_scene.h"
 #include "../ui_theme.h"
 #include <array>
@@ -1189,7 +1191,11 @@ nlohmann::json shotNavigationEvidence() {
 // ---------- saved-demo review scenario (CHUDWARE_SHOT=demoreview) ----------
 // Proves a saved part shows every study it carries. $CHUDWARE_SHOT_DOC is copied to
 // scratch/demoreview_shots/demo_copy.step+ and the COPY opens through the File > Open request pump
-// (st.requestOpenPath). The part is captured fitted in iso; then every hydraulic_circuit record is
+// (st.requestOpenPath) with the FeatureManager roll-up persisted (CHUDWARE_FM_COLLAPSED). The selected
+// root is the source demo's folder (in memory only); opening the copy from outside it must leave the
+// root and plmProjectPath() unchanged. Simulate > Piping then opens normally: the Simulation tree must
+// list every saved study from its own refresh and its rail column must not be clipped (captured
+// before any direct adoption). The part is captured fitted in iso; then every hydraulic_circuit record is
 // opened as its Simulation-tree row click does (HydraulicPanel::openStudyNamed) and captured on its
 // Results/Outcome page with the Schematic, Plots and 3D Layout central views; the piping_network
 // record opens the same way (PipingPanel::openStudyNamed) and is captured on Solve > Results
@@ -1204,8 +1210,10 @@ struct DemoReviewShot {
     bool init = false, want = false, done = false, failed = false;
     int step = 0, settle = 0, captureWait = 0, shotNo = 0, auditStage = 0;
     size_t circuit = 0;
+    int pipingRecords = 0;  // saved non-hydraulic study records (piping/vessel/duct rows)
     double started = 0.0, stepStart = 0.0;
     std::string dir, copy, capture, shotName;
+    std::string root;  // selected working folder: the source demo's own folder
     nlohmann::json report, studies;
     std::vector<std::string> circuits;  // hydraulic_circuit record names, in document order
     std::string network, vessel, duct;  // piping_network / vessel / duct_system record names
@@ -1343,6 +1351,19 @@ void demoReviewTick(AppState& st) {
         if (ec) { demoFail("copy", ec.message()); return; }
         D.report["source_doc"] = doc;
         D.report["opened_copy"] = D.copy;
+        // The selected root is the SOURCE demo's folder; the copy lives outside it (scratch), so
+        // opening it must not move the root. Assigned in memory only — the shot never saves
+        // settings, so the owner's persisted working folder is untouched.
+        D.root = std::filesystem::path(doc).parent_path().string();
+        st.workspaceDir = D.root;
+        D.report["workspace_root"] = D.root;
+        // Reproduce a persisted FeatureManager roll-up (config fm_collapsed:true): shot mode resets
+        // the columns otherwise, and the rail workspaces must not inherit that collapse.
+#ifdef _WIN32
+        _putenv_s("CHUDWARE_FM_COLLAPSED", "1");
+#else
+        setenv("CHUDWARE_FM_COLLAPSED", "1", 1);
+#endif
         st.requestOpenPath = D.copy;
         std::printf("demoreview: opening copy %s\n", D.copy.c_str());
         std::fflush(stdout);
@@ -1353,6 +1374,12 @@ void demoReviewTick(AppState& st) {
         const bool tabOk = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
             std::filesystem::path(st.docTabs[st.activeTab].path).filename() == "demo_copy.step+";
         if (!tabOk || !st.docMirror.hasDoc() || !st.hasDocMesh || !sm || st.rpc.busy()) return;
+        if (!check("root_unchanged_by_outside_open",
+                   st.workspaceDir == D.root && st.plmProjectPath() == D.root,
+                   {{"root", D.root}, {"workspace_dir", st.workspaceDir},
+                    {"plm_project_path", st.plmProjectPath()},
+                    {"opened", st.docTabs[st.activeTab].path}}))
+            return;
         st.activeWorkspace = AppState::Workspace::Model;
         st.leftPaneTab = AppState::LP_FeatureManager;
         fitIso();
@@ -1382,17 +1409,40 @@ void demoReviewTick(AppState& st) {
         std::fflush(stdout);
         if (!check("studies_found", D.circuits.size() == 2 && !D.network.empty() && !D.vessel.empty() &&
                        !D.duct.empty(), found)) return;
-        // The Simulation manager mirror sees them too (the tree rows the user clicks).
-        sm->refresh(st);
-        const int pipingRecords = (int)found.size() - (int)D.circuits.size();
-        if (!check("simulation_tree_refreshed",
-                   sm->hydraulic().studyCount() == (int)D.circuits.size() &&
-                       sm->piping().studyCount() == pipingRecords,
-                   {{"hydraulic_rows", sm->hydraulic().studyCount()}, {"piping_rows", sm->piping().studyCount()}}))
-            return;
-        next(2);
+        // The Simulation tree is NOT refreshed here: the rows must come from the normal open path
+        // (SimManager::drawTreeBody's own refresh), proven in step 3.
+        D.pipingRecords = (int)found.size() - (int)D.circuits.size();
+        st.activeWorkspace = AppState::Workspace::Simulate;
+        st.revealSimManager = true;
+        st.ribbonTab = ui::kRibbonTabPiping;
+        next(3);
         return;
     }
+    case 3: {  // Simulate > Piping opened normally: the tree lists every saved study, unclipped
+        if (!idle()) return;
+        if (!check("simulation_tree_normal_open",
+                   sm->hydraulic().studyCount() == (int)D.circuits.size() &&
+                       sm->piping().studyCount() == D.pipingRecords,
+                   {{"hydraulic_rows", sm->hydraulic().studyCount()},
+                    {"piping_rows", sm->piping().studyCount()},
+                    {"want_hydraulic", (int)D.circuits.size()}, {"want_piping", D.pipingRecords}}))
+            return;
+        const ImGuiWindow* w = ImGui::FindWindowByName("SimulationManager##LeftPane");
+        const ui::OverlayBand& band = ui::overlayBand();
+        const float bandH = band.maxY - band.minY;
+        if (!check("simulation_column_not_clipped", w && w->Size.y > 0.5f * bandH,
+                   {{"window_found", w != nullptr}, {"window_h", w ? w->Size.y : 0.0f},
+                    {"band_h", bandH}}))
+            return;
+        shoot("simulate_tree_normal_open");
+        next(4);
+        return;
+    }
+    case 4:  // back to Model for the iso capture (its FeatureManager stays rolled up, as persisted)
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.leftPaneTab = AppState::LP_FeatureManager;
+        next(2);
+        return;
     case 2:
         if (!idle()) return;
         shoot("model_iso");
@@ -1608,6 +1658,398 @@ bool demoReviewEndFrame(AppState& st, int dw, int dh, const char* screenshotPath
         std::printf("demoreview: report -> %s ok=%d\n", path.c_str(), (int)D.report.value("ok", false));
         std::fflush(stdout);
         if (D.failed || !out) {
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+        breakLoop = true;
+    }
+    return true;
+}
+
+// ---------- project-scoped chat scenario (CHUDWARE_SHOT=projectchat) ----------
+// The selected root (st.workspaceDir) is the sole chat authority. Seeds the shot's PRIVATE session
+// store with an ME-490 session and a Demo-SpaceX session plus an index whose global `active` and
+// polluted `active_by_project` (old builds keyed the on-screen session under the current root)
+// both name the ME-490 one, then reloads that store under Demo-SpaceX the way startup does.
+// Checks, each driven through the real frame loop (Copilot column + Sessions list):
+//   startup: the active session reconciles to Demo-SpaceX's own; the rewritten index carries no
+//     cross-project entry; Sessions shows Demo-SpaceX.
+//   root A/B/C: with a (simulated) run live in Demo-SpaceX's session, selecting ME-490 restores
+//     ME-490's session and parks the run untouched; an empty root opens a new session there;
+//     returning restores the still-running Demo-SpaceX session; Sessions follows each root.
+//   outside document: a part saved outside the root opens through File > Open and tab
+//     switches between it and an in-root part never move the root, plmProjectPath() or the chat.
+//   explicit pick: opening the ME-490 session from Sessions keeps it open under Demo-SpaceX
+//     without claiming Demo-SpaceX's remembered slot; Sessions still shows the root.
+// Root switches assign st.workspaceDir in memory only (no settings save). Refuses to run against
+// a named CHUDWARE_SESSIONS_DIR. Captures + projectchat_report.json land in
+// scratch/projectchat_shots; a failure exits non-zero.
+struct ProjectChatShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, settle = 0, captureWait = 0, outsideTab = -1, insideTab = -1;
+    size_t runMsgs = 0;
+    double started = 0.0, stepStart = 0.0;
+    std::string dir, rootA, rootB, rootC, outsidePath, keyA, keyB, keyC, capture, queued;
+    nlohmann::json report;
+};
+ProjectChatShot g_pchat;
+
+constexpr const char* kPcSessA = "pc_me490";
+constexpr const char* kPcSessB = "pc_demo_spacex";
+
+void pchatFail(const std::string& code, const nlohmann::json& evidence) {
+    auto& P = g_pchat;
+    std::printf("projectchat: FAILED [%s] %s\n", code.c_str(), evidence.dump().c_str());
+    std::fflush(stdout);
+    P.report["ok"] = false;
+    P.report["failure"] = {{"code", code}, {"evidence", evidence}, {"step", P.step}};
+    P.failed = P.done = true;
+    P.queued.clear();
+    P.capture = P.dir + "/projectchat_FAILED.png";
+}
+
+bool pchatCheck(const std::string& name, bool ok, const nlohmann::json& evidence) {
+    g_pchat.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("projectchat: %s %s\n", ok ? "PASS" : "FAIL", name.c_str());
+    std::fflush(stdout);
+    if (!ok) pchatFail(name, evidence);
+    return ok;
+}
+
+int pchatConvIndex(const AppState& st, const std::string& id) {
+    for (int i = 0; i < (int)st.conversations.size(); ++i)
+        if (st.conversations[i].id == id) return i;
+    return -1;
+}
+
+std::string pchatActiveKey(const AppState& st) {
+    if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return std::string();
+    return ui::convProjectKey(st.conversations[st.activeConv].projectDir);
+}
+
+// The index the store holds right now (forces a persist first).
+nlohmann::json pchatActiveByProject(AppState& st) {
+    ui::persistChatHistory(st);
+    nlohmann::json index = nlohmann::json::object();
+    std::ifstream in(ui::chatSessionsDir() + "/index.json");
+    if (in) { try { in >> index; } catch (...) {} }
+    return index.is_object() ? index.value("active_by_project", nlohmann::json::object())
+                             : nlohmann::json::object();
+}
+
+void pchatShowSessions(AppState& st) {
+    st.showTaskList = st.showArtifacts = st.showAISettingsOverlay = false;
+    st.showSessionsPicker = true;
+}
+
+// Root + document + chat state, recorded with every root/document check.
+nlohmann::json pchatState(AppState& st) {
+    return {{"workspace_dir", st.workspaceDir}, {"plm_project_path", st.plmProjectPath()},
+            {"conv_project_dir", ui::convProjectDir(st)}, {"active_session", st.activeConvId()},
+            {"active_session_project_key", pchatActiveKey(st)},
+            {"active_tab_path", (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
+                                    ? st.docTabs[st.activeTab].path : std::string()}};
+}
+
+void projectChatTick(AppState& st) {
+    auto& P = g_pchat;
+    if (!P.init) {
+        P.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        P.want = st.shot && mode && std::strcmp(mode, "projectchat") == 0;
+        if (!P.want) return;
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        std::error_code ec;
+        P.dir = std::filesystem::absolute(std::string(repo ? repo : ".") + "/scratch/projectchat_shots", ec)
+                    .lexically_normal().string();
+        std::filesystem::remove_all(P.dir, ec);
+        std::filesystem::create_directories(P.dir, ec);
+        P.started = P.stepStart = pipingNow();
+        P.report = {{"scenario", "projectchat"}, {"ok", false}, {"checks", nlohmann::json::array()},
+                    {"captures", nlohmann::json::array()}};
+    }
+    if (!P.want || P.done) return;
+    if (pipingNow() - P.started > 600 || pipingNow() - P.stepStart > 180) {
+        pchatFail("timeout", {{"step", P.step}}); return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !P.capture.empty()) return;
+    if (P.settle > 0) { --P.settle; return; }
+    if (!P.queued.empty()) { P.capture = P.queued; P.queued.clear(); return; }
+
+    enum { kSettle = 8 };
+    auto next = [&](int step, int settle = kSettle) {
+        P.step = step; P.settle = settle; P.stepStart = pipingNow();
+    };
+    auto shoot = [&](const char* name) {
+        P.queued = P.dir + "/projectchat_" + name + ".png";
+        P.settle = kSettle;
+    };
+    auto sessionsShow = [&](const std::string& key, const char* name) {
+        const ui::SessionsScopeProbe probe = ui::sessionsScopeProbe();
+        return pchatCheck(name, probe.drawn && probe.followedKey == key && probe.viewedKey == key,
+                          {{"want_key", key}, {"drawn", probe.drawn},
+                           {"followed_key", probe.followedKey}, {"viewed_key", probe.viewedKey}});
+    };
+    auto rootHolds = [&](const char* name) {
+        return pchatCheck(name,
+                          st.workspaceDir == P.rootB && st.plmProjectPath() == P.rootB &&
+                              ui::convProjectDir(st) == P.rootB && st.activeConvId() == kPcSessB,
+                          pchatState(st));
+    };
+    const int idxA = pchatConvIndex(st, kPcSessA), idxB = pchatConvIndex(st, kPcSessB);
+
+    switch (P.step) {
+    case 0: {  // seed the private store, then load it under Demo-SpaceX as startup does
+        if (std::getenv("CHUDWARE_SESSIONS_DIR")) {
+            pchatFail("named_session_store",
+                      {{"reason", "projectchat rewrites its session store; unset CHUDWARE_SESSIONS_DIR"}});
+            return;
+        }
+        P.rootA = P.dir + "/ME-490";
+        P.rootB = P.dir + "/Demo-SpaceX";
+        P.rootC = P.dir + "/Fresh-Project";
+        P.outsidePath = P.dir + "/Outside/outside_bracket.step+";
+        std::error_code ec;
+        for (const auto& d : {P.rootA, P.rootB, P.rootC, P.dir + "/Outside"})
+            std::filesystem::create_directories(d, ec);
+        P.keyA = ui::convProjectKey(P.rootA);
+        P.keyB = ui::convProjectKey(P.rootB);
+        P.keyC = ui::convProjectKey(P.rootC);
+        const std::string store = ui::chatSessionsDir();
+        auto session = [&](const char* id, const char* title, const std::string& project,
+                           const char* prompt, const char* reply) {
+            const nlohmann::json js = {
+                {"id", id}, {"title", title}, {"project", project},
+                {"msgs", nlohmann::json::array({{{"u", true}, {"t", prompt}, {"ts", 1.7e9}},
+                                                {{"u", false}, {"t", reply}, {"ts", 1.7e9 + 5}}})}};
+            std::ofstream(store + "/" + id + ".json", std::ios::trunc) << js.dump(1);
+        };
+        session(kPcSessA, "ME-490 bracket revision", P.rootA, "Thicken the ME-490 bracket web",
+                "The web is now 6 mm.");
+        session(kPcSessB, "Demo-SpaceX HPU cooling", P.rootB, "Size the HPU cooling loop",
+                "The loop needs 38 L/min.");
+        const nlohmann::json index = {
+            {"version", 3}, {"active", kPcSessA},
+            {"active_by_project", {{P.keyA, kPcSessA}, {P.keyB, kPcSessA}}},
+            {"order", nlohmann::json::array({kPcSessB, kPcSessA})}, {"session_seq", 2}};
+        std::ofstream(store + "/index.json", std::ios::trunc) << index.dump(1);
+        P.report["store"] = store;
+        P.report["seeded_index"] = index;
+        st.workspaceDir = P.rootB;   // the selected root (in memory only; settings are not saved)
+        ui::loadChatHistory(st);
+        P.report["loaded_active"] = st.activeConvId();
+        std::printf("projectchat: store %s loaded under %s (restored %s)\n", store.c_str(),
+                    P.rootB.c_str(), st.activeConvId().c_str());
+        std::fflush(stdout);
+        next(1);
+        return;
+    }
+    case 1: {  // startup reconciled to the root; the index no longer lets ME-490 claim it
+        if (!pchatCheck("startup_active_is_root_session",
+                        idxA >= 0 && idxB >= 0 && st.activeConvId() == kPcSessB &&
+                            pchatActiveKey(st) == P.keyB,
+                        pchatState(st)))
+            return;
+        const nlohmann::json abp = pchatActiveByProject(st);
+        if (!pchatCheck("index_active_by_project_clean",
+                        abp.size() == 2 && abp.value(P.keyA, std::string()) == kPcSessA &&
+                            abp.value(P.keyB, std::string()) == kPcSessB,
+                        abp))
+            return;
+        pchatShowSessions(st);
+        next(2);
+        return;
+    }
+    case 2:
+        if (!sessionsShow(P.keyB, "sessions_startup_shows_root")) return;
+        shoot("01_startup_sessions");
+        next(3, 0);
+        return;
+    case 3: {  // a live turn in Demo-SpaceX's session, then select ME-490 as the root
+        ChatMsg user;
+        user.fromUser = true;
+        user.text = "Check the HPU return line velocity";
+        ChatMsg reply;
+        reply.fromUser = false;
+        reply.running = true;
+        reply.text = "Checking the return line\xe2\x80\xa6";
+        st.chat.push_back(std::move(user));
+        st.chat.push_back(std::move(reply));
+        st.runFor(kPcSessB)->running.store(true);
+        P.runMsgs = st.chat.size();
+        st.workspaceDir = P.rootA;
+        next(4);
+        return;
+    }
+    case 4: {
+        if (!pchatCheck("root_a_restores_its_session",
+                        st.activeConvId() == kPcSessA && pchatActiveKey(st) == P.keyA, pchatState(st)))
+            return;
+        const bool parked = idxB >= 0 && st.convRunning(kPcSessB) &&
+                            st.conversations[idxB].msgs.size() == P.runMsgs &&
+                            st.conversations[idxB].msgs.back().running;
+        if (!pchatCheck("run_parked_not_stopped", parked,
+                        {{"running", st.convRunning(kPcSessB)},
+                         {"parked_msgs", idxB >= 0 ? st.conversations[idxB].msgs.size() : 0},
+                         {"want_msgs", P.runMsgs}}))
+            return;
+        pchatShowSessions(st);
+        next(5);
+        return;
+    }
+    case 5:
+        if (!sessionsShow(P.keyA, "sessions_follow_root_a")) return;
+        shoot("02_root_me490");
+        st.workspaceDir = P.rootC;
+        next(6);
+        return;
+    case 6: {  // a root with no sessions opens a new one there
+        const bool fresh = st.activeConvId() != kPcSessA && st.activeConvId() != kPcSessB &&
+                           pchatActiveKey(st) == P.keyC && st.chat.empty();
+        if (!pchatCheck("empty_root_opens_new_session", fresh, pchatState(st))) return;
+        st.workspaceDir = P.rootB;
+        next(7);
+        return;
+    }
+    case 7: {
+        if (!pchatCheck("root_b_restores_running_session",
+                        st.activeConvId() == kPcSessB && st.convRunning(kPcSessB) &&
+                            st.chat.size() == P.runMsgs && st.chat.back().running,
+                        pchatState(st)))
+            return;
+        const nlohmann::json abp = pchatActiveByProject(st);
+        if (!pchatCheck("index_each_root_remembers_its_own",
+                        abp.value(P.keyA, std::string()) == kPcSessA &&
+                            abp.value(P.keyB, std::string()) == kPcSessB && !abp.contains(P.keyC),
+                        abp))
+            return;
+        pchatShowSessions(st);
+        next(8);
+        return;
+    }
+    case 8:
+        if (!sessionsShow(P.keyB, "sessions_follow_root_b")) return;
+        shoot("03_root_demo_running");
+        next(9, 0);
+        return;
+    case 9: {  // an in-root part, then a part saved OUTSIDE the root opened through File > Open
+        // File > Open queues until every run is idle. The synthetic run above
+        // has already proved parking/restoration; complete it before exercising
+        // the normal file pump rather than bypassing that production guard.
+        st.runFor(kPcSessB)->running.store(false);
+        if (!st.chat.empty()) st.chat.back().running = false;
+        auto dim = [](double v) { return nlohmann::json{{"value", v}, {"expr", nullptr}}; };
+        nlohmann::json res, ap, sv, cl;
+        std::string err;
+        if (!st.worker.call("doc_new", {{"kind", "part"}, {"name", "Outside bracket"}}, res, err)) {
+            pchatFail("outside_doc_new", {{"error", err}}); return;
+        }
+        const std::string did = res.value("doc_id", std::string());
+        nlohmann::json ops = nlohmann::json::array();
+        ops.push_back({{"op", "add_feature"}, {"feature", {
+            {"type", "box"}, {"name", "Bracket"}, {"suppressed", false},
+            {"params", {{"length", dim(40)}, {"width", dim(30)}, {"height", dim(8)}, {"centered", true}}},
+            {"refs", nlohmann::json::object()}}}});
+        if (!st.worker.call("doc_apply_ops", {{"doc_id", did}, {"base_revision", res.value("revision", 0)},
+                                              {"ops", ops}}, ap, err) ||
+            !st.worker.call("doc_save", {{"doc_id", did}, {"path", P.outsidePath}}, sv, err)) {
+            pchatFail("outside_doc_save", {{"error", err}}); return;
+        }
+        st.worker.call("doc_close", {{"doc_id", did}}, cl, err);
+        if (!st.docMirror.newPart(st.worker, err)) { pchatFail("inside_new_part", {{"error", err}}); return; }
+        st.clearViewportForNewDoc();
+        st.addDocTab(false);
+        P.insideTab = st.activeTab;
+        st.requestOpenPath = P.outsidePath;
+        next(10, 0);
+        return;
+    }
+    case 10: {  // the outside part is the active document; nothing about the root moved
+        const bool open = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+                          std::filesystem::path(st.docTabs[st.activeTab].path).filename() ==
+                              "outside_bracket.step+";
+        if (!open || !st.docMirror.hasDoc() || st.rpc.busy()) return;
+        P.outsideTab = st.activeTab;
+        if (!rootHolds("outside_open_keeps_root")) return;
+        st.switchToTab(P.insideTab);
+        next(11);
+        return;
+    }
+    case 11:
+        if (st.rpc.busy()) return;
+        if (!rootHolds("inside_tab_select_keeps_root")) return;
+        st.switchToTab(P.outsideTab);
+        next(12);
+        return;
+    case 12:
+        if (st.rpc.busy()) return;
+        if (!rootHolds("outside_tab_select_keeps_root")) return;
+        pchatShowSessions(st);
+        next(13);
+        return;
+    case 13:
+        if (!sessionsShow(P.keyB, "sessions_hold_root_with_outside_doc")) return;
+        shoot("04_outside_document");
+        next(14, 0);
+        return;
+    case 14:  // the user explicitly opens ME-490's session from the Sessions list
+        if (idxA < 0) { pchatFail("me490_session_missing", pchatState(st)); return; }
+        ui::switchConversation(st, idxA);
+        next(15);
+        return;
+    case 15: {
+        if (!pchatCheck("explicit_pick_stays_open",
+                        st.activeConvId() == kPcSessA && st.workspaceDir == P.rootB, pchatState(st)))
+            return;
+        const nlohmann::json abp = pchatActiveByProject(st);
+        if (!pchatCheck("explicit_pick_no_cross_project_claim",
+                        abp.value(P.keyB, std::string()) == kPcSessB &&
+                            abp.value(P.keyA, std::string()) == kPcSessA,
+                        abp))
+            return;
+        pchatShowSessions(st);
+        next(16);
+        return;
+    }
+    case 16:
+        if (!sessionsShow(P.keyB, "sessions_label_root_not_picked_project")) return;
+        shoot("05_explicit_pick");
+        next(17, 0);
+        return;
+    case 17:  // return to the root's session
+        if (idxB >= 0) ui::switchConversation(st, idxB);
+        P.report["ok"] = true;
+        P.done = true;
+        P.capture = P.dir + "/projectchat_06_final.png";
+        return;
+    default:
+        return;
+    }
+}
+
+bool projectChatEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    auto& P = g_pchat;
+    if (!P.want) return false;
+    ++st.frame;
+    if (!P.capture.empty() && (!st.rpc.busy() || ++P.captureWait > 600)) {
+        writeBackbufferPng(P.capture.c_str(), dw, dh, P.done ? screenshotPath : nullptr);
+        std::printf("projectchat: screenshot -> %s (%dx%d)\n", P.capture.c_str(), dw, dh);
+        std::fflush(stdout);
+        P.report["captures"].push_back(P.capture);
+        P.capture.clear();
+        P.captureWait = 0;
+    }
+    glfwSwapBuffers(st.win);
+    breakLoop = false;
+    if (P.done && P.capture.empty()) {
+        const std::string path = P.dir + "/projectchat_report.json";
+        P.report["seconds"] = pipingNow() - P.started;
+        std::ofstream out(path, std::ios::trunc);
+        out << P.report.dump(2) << '\n';
+        out.close();
+        std::printf("projectchat: report -> %s ok=%d\n", path.c_str(), (int)P.report.value("ok", false));
+        std::fflush(stdout);
+        if (P.failed || !out) {
             std::fflush(nullptr);
             std::_Exit(EXIT_FAILURE);
         }
@@ -6570,6 +7012,9 @@ void ScenarioRunner::tick(AppState& st) {
     // ---------- saved-demo review (CHUDWARE_SHOT=demoreview) ----------
     demoReviewTick(st);
 
+    // ---------- root-scoped chat sessions (CHUDWARE_SHOT=projectchat) ----------
+    projectChatTick(st);
+
     // ---------- simulation UI audit (CHUDWARE_SHOT=simaudit) ----------
     simAuditTick(st);
 
@@ -7928,6 +8373,11 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
     bool demoBreak = false;
     if (demoReviewEndFrame(st, dw, dh, screenshotPath, demoBreak))
         return demoBreak ? FrameAction::Break : FrameAction::Continue;
+
+    // projectchat: root/session reconciliation checks + report; exits non-zero on failure.
+    bool projectChatBreak = false;
+    if (projectChatEndFrame(st, dw, dh, screenshotPath, projectChatBreak))
+        return projectChatBreak ? FrameAction::Break : FrameAction::Continue;
 
     // simaudit: per-state captures + report; exits non-zero on any ID conflict.
     bool saBreak = false;

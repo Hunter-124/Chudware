@@ -94,6 +94,10 @@ ReverseEng and Firmware have their own shots.
   a time via the header switcher (active project by default; empty key = "Unassigned" only).
   Titles come from `autoTitleConversation` (first prompt) unless renamed (`title_user`);
   numbering uses the index's monotonic `session_seq`.
+  The default scope comes directly from `AppState::workspaceDir`, the top-left chip's
+  sole authority, not the active document's folder. History load/reload validates
+  `active_by_project` ownership before restoring the selected root's chat. The
+  `projectchat` shot checks startup, root switches, parked runs and external documents.
 - During a run every agent-lane worker call returns `worker_lane_busy`; UI detects it with
   `core::workerLaneBusy` and phrases refusals via `ui::userFacingRpcError` /
   `ui::kAvailableAfterRun`. Never show raw worker/lane/RPC text.
@@ -390,6 +394,12 @@ and `hint`, never a bare "failed".
   adopts every saved circuit/network/vessel/duct by name (`openStudyNamed`, the row-click
   path) and captures Schematic/Plots/3D and Solve/Spec/BOM/vessel/duct results into
   `scratch/demoreview_shots`; use it to prove a saved file reopens with all its studies.
+  The scenario selects the source file's working directory, opens its scratch copy
+  outside that directory and verifies the root stays unchanged. It enters Simulate
+  with the Model column collapsed and waits for the normal tree draw to list studies
+  (no direct refresh injection). Simulate, Manufacture and Electronics rails ignore
+  Model's saved roll-up state; their bodies have no Model collapse control.
+
 
 ### Simulation: Topology tab
 

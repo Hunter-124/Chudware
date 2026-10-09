@@ -866,6 +866,14 @@ void drawSessionsProjectSwitcher(const std::vector<SessProjectEntry>& projects, 
 }
 }  // namespace
 
+SessionsScopeProbe sessionsScopeProbe() {
+    SessionsScopeProbe p;
+    p.drawn       = s_sessScope.seeded;
+    p.followedKey = s_sessScope.followedKey;
+    if (s_sessScope.scope == SessScope::Project) p.viewedKey = s_sessScope.key;
+    return p;
+}
+
 
 // Sessions list — replaces the chat log while open so users can jump between sessions easily.
 void drawSessionsPanel(AppState& st, bool busy) {

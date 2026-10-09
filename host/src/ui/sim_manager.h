@@ -372,7 +372,7 @@ public:
     void refresh(AppState& st);
     // Another client (an agent's run_fea_* / simulate_motion) added or edited a study: re-pull
     // the list on the next tree draw. Driven by hostd's doc.studies_changed event.
-    void markStudiesStale() { lastRevision_ = -1; }
+    void markStudiesStale() { lastRevision_ = -1; listErrorDocId_.clear(); }
     // Drop the local result overlay state (called when leaving the tab / deleting a study).
     void clearResultOverlay(AppState& st);
     // Reconcile the viewport with the current view: the result overlay (FEA mesh, colormap, deformed)
@@ -1028,6 +1028,12 @@ private:
 
     std::string lastDocId_;         // doc id the mirror was last refreshed for (re-pull on change)
     long lastRevision_ = -1;        // engine revision at last refresh
+    // Last failed sim_study_list, fenced by (doc, revision): the tree draw does not re-issue the
+    // (synchronous) list every frame after a failure — it shows the error with Retry and re-pulls
+    // on a new revision, a studies_changed event (markStudiesStale) or the Retry click.
+    std::string listErrorDocId_;
+    long listErrorRevision_ = -1;
+    std::string listError_;
 
     // Result-view state: whether the FEA result overlay is currently loaded into the viewport, and
     // for which study, so syncResultView only reloads the overlay / restores the model mesh on an

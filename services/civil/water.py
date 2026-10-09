@@ -22,7 +22,6 @@ import warnings as _warnings
 import numpy as np
 from scipy.sparse import bmat, coo_matrix, diags
 from scipy.sparse.linalg import MatrixRankWarning, spsolve
-from fluids.friction import friction_factor
 
 from .errors import CivilError
 
@@ -113,6 +112,7 @@ def _darcy_factor(reynolds, relative_roughness):
         # in f. Rescale the helper argument to evaluate EPANET's exact term,
         # keeping the headloss and its analytic derivative consistent.
         helper_re = reynolds * (6.97 / 5.74 ** (1 / 0.9))
+        from fluids.friction import friction_factor  # call-time: registration needs no fluids
         f = friction_factor(Re=helper_re, eD=e, Method="Swamee_Jain_1976")
         y = e/3.7+5.74/reynolds**0.9
         derivative = 2.0*0.25*0.9*5.74/(reynolds**1.9*math.log(10)*y*math.log10(y)**3)

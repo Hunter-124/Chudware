@@ -14,9 +14,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-from lxml import etree
-
 from .errors import CivilError
+
+
+class _LazyEtree:
+    """lxml.etree resolved on first use: the MCP server registers civil tools by importing
+    this module, and tool registration must not require lxml."""
+
+    def __getattr__(self, name):
+        from lxml import etree as _etree
+        return getattr(_etree, name)
+
+
+etree = _LazyEtree()
 
 NS = "http://www.landxml.org/schema/LandXML-1.2"
 _PREFIX = "{" + NS + "}"

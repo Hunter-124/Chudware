@@ -1273,25 +1273,23 @@ def _offset_block() -> str:
     return doc
 
 
-def test_rescaling_keeps_each_view_where_the_layout_put_it():
-    """Geometry is laid at model*scale + position (drawing_session.cpp:1917-1920), so applying a
-    scale without recomputing the position slides the view across the sheet by
-    centre_model*(new-old). Built off-origin precisely so that drift is non-zero: same part, two
-    scales, same sheet centres."""
+def test_an_explicit_scale_keeps_the_projection_alignment():
+    """An explicit scale is laid out by the engine BEFORE dimensioning: at 1:1 and 2:1 the top
+    view stays on the front view's vertical projection line and every view stays on the sheet.
+    Built off-origin so a missing reposition would show as drift."""
     doc = _offset_block()
-    centers = {}
     for scale in (1.0, 2.0):
         mk = _call("make_drawing", {"doc_id": doc, "views": ["front", "top"],
                                     "model_items": False, "hole_callouts": False,
                                     "scale": scale})
         assert mk["ok"], (scale, mk)
         assert not mk.get("warnings"), (scale, mk)
-        centers[scale] = {v["orientation"]: [(v["bbox"][0] + v["bbox"][2]) / 2.0,
-                                             (v["bbox"][1] + v["bbox"][3]) / 2.0]
-                          for v in _views(mk["drawing_doc_id"])}
-    for orientation, c1 in centers[1.0].items():
-        c2 = centers[2.0][orientation]
-        assert abs(c1[0] - c2[0]) < 0.5 and abs(c1[1] - c2[1]) < 0.5, (orientation, c1, c2)
+        by = {v["orientation"]: v["bbox"] for v in _views(mk["drawing_doc_id"])}
+        fx = (by["front"][0] + by["front"][2]) / 2.0
+        tx = (by["top"][0] + by["top"][2]) / 2.0
+        assert abs(fx - tx) < 1e-3, (scale, by)
+        assert abs((by["front"][2] - by["front"][0]) - 40.0 * scale) < 1e-3, (scale, by)
+        assert by["top"][1] > by["front"][3], (scale, by)   # third angle: top above front
 
 
 def test_a_scale_contradicting_the_printed_scale_cell_is_refused():
@@ -1332,21 +1330,53 @@ def test_a_scale_that_overflows_the_sheet_says_so():
     assert any("past the" in w for w in mk.get("warnings", [])), mk
 
 
-def test_landscape_orientation_is_refused_and_names_the_real_sheet_argument():
-    """The verbatim live call. Every paper size in the engine is landscape (A3 = 420x297) and a
-    sheet carries only a SIZE, so accepting this would report a rotation that never happened."""
+def test_landscape_orientation_keeps_the_landscape_sheet():
+    """orientation="landscape" is the SHEET's orientation and the default one."""
     mk = _call("make_drawing", {"doc_id": _cube(40.0), "views": ["front"],
                                 "model_items": False, "orientation": "landscape"})
-    assert mk["ok"] is False, mk
-    assert "sheet=" in mk["error"] and "landscape" in mk["error"], mk
-    assert mk["valid_sheet"][0] == "A4", mk
-    assert "drawing_doc_id" not in mk, mk
+    assert mk["ok"], mk
+    assert _sheet_size(mk["drawing_doc_id"]) == "A3", mk
+    assert any("sheet" in n for n in mk["interpreted"]), mk
 
 
-def test_portrait_is_refused_too_rather_than_rotating_nothing():
-    mk = _call("make_drawing", {"doc_id": _cube(40.0), "views": ["front"],
+def test_portrait_orientation_rotates_the_paper():
+    mk = _call("make_drawing", {"doc_id": _cube(40.0), "views": ["front"], "sheet": "A4",
                                 "model_items": False, "orientation": "portrait"})
-    assert mk["ok"] is False and "no orientation to set" in mk["error"], mk
+    assert mk["ok"], mk
+    assert _sheet_size(mk["drawing_doc_id"]) == "A4P", mk
+    full = cb.call("drawing_get", {"doc_id": mk["drawing_doc_id"]})
+    assert full["sheets"][0]["size_mm"] == [210.0, 297.0], full["sheets"][0]["size_mm"]
+
+
+def test_first_angle_projection_and_arrange_drawing():
+    """projection="first" mirrors the lattice; arrange_drawing re-lays it third-angle at an
+    explicit standard scale, and the title block echoes scale + projection."""
+    mk = _call("make_drawing", {"doc_id": _cube(40.0), "views": ["front", "top", "right"],
+                                "model_items": False, "projection": "first"})
+    assert mk["ok"], mk
+    by = {v["orientation"]: v["bbox"] for v in _views(mk["drawing_doc_id"])}
+    assert by["top"][3] < by["front"][1] and by["right"][2] < by["front"][0], by
+    assert _title_block(mk["drawing_doc_id"])["projection"] == "first"
+    ar = _call("arrange_drawing", {"doc_id": mk["drawing_doc_id"], "projection": "third",
+                                   "scale": "1:2"})
+    assert ar["ok"] and ar["scale"] == 0.5 and ar["projection"] == "third", ar
+    by = {v["orientation"]: v["bbox"] for v in _views(mk["drawing_doc_id"])}
+    assert by["top"][1] > by["front"][3] and by["right"][0] > by["front"][2], by
+    assert abs((by["front"][2] - by["front"][0]) - 20.0) < 1e-3, by
+    tb = _title_block(mk["drawing_doc_id"])
+    assert tb["scale"] == "1:2" and tb["projection"] == "third", tb
+
+
+def test_extended_title_block_fields_are_accepted():
+    mk = _call("make_drawing", {"doc_id": _cube(40.0), "views": ["front"], "model_items": False,
+                                "title": {"title": "CUBE", "checked": "QA",
+                                          "general_tolerance": "ISO 2768-m", "mass": "0.17 kg"}})
+    assert mk["ok"], mk
+    tb = _title_block(mk["drawing_doc_id"])
+    assert tb["checked_by"] == "QA" and tb["general_tolerance"] == "ISO 2768-m", tb
+    frame_text = {t["text"] for t in cb.call("drawing_get", {"doc_id": mk["drawing_doc_id"]})
+                  ["sheets"][0]["frame"]["texts"]}
+    assert {"QA", "0.17 kg", "CUBE"} <= frame_text, frame_text
 
 
 def test_orientation_naming_views_is_read_as_views():
@@ -1454,8 +1484,8 @@ def test_both_dispatch_paths_accept_a_model_target_and_the_new_parameters():
     assert abs(r["value"] - HOLE_D_MM) < 1e-6, r
     assert _the_annotation(dwg, top, r["annotation"])["kind"] == "diameter_dim", r
     orient = _agent_call("make_drawing", {"doc_id": doc, "views": ["front"],
-                                          "model_items": False, "orientation": "landscape"})
-    assert orient["ok"] is False and "no orientation to set" in orient["error"], orient
+                                          "model_items": False, "orientation": "portrait"})
+    assert orient["ok"] and orient["sheet"] == "A3P", orient
 
 
 # ------------------------------- Problem 6: the sheet is a place, and things can miss it

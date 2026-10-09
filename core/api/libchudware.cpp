@@ -3949,6 +3949,13 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("sheet_id", std::string()),
                                 params.value("size", std::string("A3"))),
                             out_json, 0);
+            if (m == "drawing_arrange")
+                return emit(chudware::doc::drawing_arrange(
+                                params.value("doc_id", std::string()),
+                                params.value("sheet_id", std::string()),
+                                params.value("projection", std::string()),
+                                params.contains("scale") ? params["scale"] : json(nullptr)),
+                            out_json, 0);
             if (m == "drawing_add_table") {
                 json table_spec =
                     params.contains("spec") && params["spec"].is_object()
@@ -3973,7 +3980,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 ? params["spec"]
                                 : json::object();
                 for (const char* k : {"name", "sheet", "views", "model_items", "hole_callouts",
-                                      "title"})
+                                      "title", "projection", "sections", "scale"})
                     if (params.contains(k)) spec[k] = params[k];
                 return emit(chudware::doc::drawing_make(src, spec), out_json, 0);
             }

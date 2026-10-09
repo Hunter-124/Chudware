@@ -1,53 +1,31 @@
-// Minimal vector PDF writer — C++ port of engine/doc/pdfvec.py (W14).
+// Vector PDF writer for drawing sheets.
 //
-// Hand-writes a spec-valid PDF 1.4 file (Catalog, Pages, Page, content stream, xref
-// + trailer) with line-drawing operators at 1:1 mm scale. The PDF origin is
-// bottom-left with +y up, matching the engine's sheet convention (no Y flip).
-//
-// The byte layout (objects, content-stream operators, %.3f float formatting, xref
-// offsets) is identical to pdfvec.py::write_pdf for the same input, so the parity
-// harness can gate page count + path count + bbox + (here) exact byte equality.
+// Hand-writes a spec-valid PDF 1.4 file (Catalog, Pages, one Page + content stream per
+// sheet, a shared Helvetica/WinAnsiEncoding font, xref + trailer). Each page renders an
+// InkSheet in sheet millimetres (a `cm` maps mm → pt; origin bottom-left, +y up) with
+// ISO 128 line classes: thin 0.25 mm, thick 0.5 mm, dashed [3 1.5], long-dash-dot
+// [6 1 0.5 1], round caps/joins, filled arrowheads, and black Helvetica text aligned
+// from the real AFM advance widths. Text stays as literal `(...)` strings.
 #pragma once
 
-#include <array>
 #include <string>
 #include <vector>
 
+#include "doc/sheet_ink.h"
+
 namespace chudware::doc {
 
-// One drawn polyline + its dashed flag (hidden lines are dashed). polyline is a
-// list of [x,y] mm points; polylines with <2 points are skipped.
-struct PdfLine {
-    std::vector<std::array<double, 2>> pts;
-    bool dashed = false;
-};
+// Build the full PDF bytes, one page per sheet. A sheet with fixed_page uses its
+// page_w/page_h; otherwise the page is the ink bbox + a 10 mm margin. Throws
+// std::runtime_error when there are no pages or a page has no ink.
+std::string build_pdf(const std::vector<const InkSheet*>& pages);
 
-// One TEXT label at an insertion point (mm), `height` mm tall. Used for drawing
-// annotations on PDF export (Bug N-7). When the texts list is empty the output is
-// byte-identical to the geometry-only writer (no Font object is emitted).
-struct PdfText {
-    std::array<double, 2> pos;
-    double height = 3.0;
-    std::string text;
-};
+// Write the PDF at `path` (parent dirs created). Returns the absolute path.
+std::string write_pdf(const std::string& path, const std::vector<const InkSheet*>& pages);
+std::string write_pdf(const std::string& path, const InkSheet& sheet);
 
-// Build the full PDF bytes for `lines`. `page_w_mm`/`page_h_mm` set the page size;
-// when `auto_page` is true the page is sized to the drawing bbox + a 10mm margin
-// (and `page_w_mm`/`page_h_mm` are ignored). `path_count` (out) gets the number of
-// stroked polylines. Throws std::runtime_error when there is no geometry.
-std::string build_pdf(const std::vector<PdfLine>& lines, bool auto_page,
-                      double page_w_mm, double page_h_mm, int* path_count);
-std::string build_pdf(const std::vector<PdfLine>& lines, const std::vector<PdfText>& texts,
-                      bool auto_page, double page_w_mm, double page_h_mm, int* path_count);
-
-// Write `lines` to a single-page vector PDF at `path` (parent dirs created). When
-// `auto_page` is false the caller-fixed page size is used. Throws std::runtime_error
-// on no geometry / a write failure. Returns the resolved absolute path.
-std::string write_pdf(const std::string& path, const std::vector<PdfLine>& lines,
-                      bool auto_page = true, double page_w_mm = 0.0,
-                      double page_h_mm = 0.0);
-std::string write_pdf(const std::string& path, const std::vector<PdfLine>& lines,
-                      const std::vector<PdfText>& texts, bool auto_page = true,
-                      double page_w_mm = 0.0, double page_h_mm = 0.0);
+// Helvetica advance width (mm) of UTF-8 `text` set at cap height `cap_h` mm, using the
+// same WinAnsi mapping the writer applies.
+double pdf_text_width(const std::string& text, double cap_h);
 
 }  // namespace chudware::doc

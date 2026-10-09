@@ -168,7 +168,8 @@ size_t draw_count(const json& ann) {
     const json& d = ann["draw"];
     return d.value("segments", json::array()).size() + d.value("arcs", json::array()).size() +
            d.value("tris", json::array()).size() + d.value("texts", json::array()).size() +
-           d.value("dashed", json::array()).size();
+           d.value("dashed", json::array()).size() + d.value("thick", json::array()).size() +
+           d.value("chain", json::array()).size() + d.value("chain_thick", json::array()).size();
 }
 }  // namespace
 
@@ -1102,17 +1103,22 @@ TEST_CASE("Multi-sheet drawing tables and extended title data survive and export
     for (const json& view : full["sheets"][1]["views"])
         if (view.value("type", std::string()) == "table_overlay") {
             saw_table_overlay = true;
-            CHECK(view["annotations"].size() >= 3);  // BOM + holes + title extension
-            bool saw_projection_symbol = false;
-            for (const json& annotation : view["annotations"])
-                if (annotation.value("type", std::string()) == "title_extension") {
-                    saw_projection_symbol =
-                        annotation["draw"].value("arcs", json::array()).size() == 1 &&
-                        annotation["draw"].value("segments", json::array()).size() > 0;
-                }
-            CHECK(saw_projection_symbol);
+            CHECK(view["annotations"].size() >= 2);  // BOM + holes
         }
     CHECK(saw_table_overlay);
+    // The extended title data lives in the compiled ISO 7200 sheet frame, with the
+    // first-angle projection symbol (two concentric circles + the cone outline).
+    const json& frame = full["sheets"][1]["frame"];
+    REQUIRE(frame.is_object());
+    CHECK(frame.value("arcs", json::array()).size() >= 2);
+    CHECK(frame.value("thick", json::array()).size() >= 2);
+    std::set<std::string> frame_text;
+    for (const json& t : frame.value("texts", json::array()))
+        frame_text.insert(t.value("text", std::string()));
+    for (const char* want : {"QA", "CHIEF", "FIRST ANGLE PROJECTION", "2.5 kg", "TP-001",
+                             "GENERAL TOLERANCES: ISO 2768-m", "ISO 128 / ASME Y14.5",
+                             "TAPPED PLATE", "2 OF 2", "A4"})
+        CHECK_MESSAGE(frame_text.count(want) == 1, want);
 
     json restored = doc::register_restored_drawing(full["tree"], src);
     json restored_sheets = doc::drawing_list_sheets(restored.at("doc_id").get<std::string>());
@@ -1135,11 +1141,11 @@ TEST_CASE("Multi-sheet drawing tables and extended title data survive and export
     CHECK(pages == 2);
     CHECK(bytes.find("(BOM-PART-ALPHA)") != std::string::npos);
     CHECK(bytes.find("(M6 TAPPED)") != std::string::npos);
-    CHECK(bytes.find("(CHECKED BY: QA)") != std::string::npos);
-    CHECK(bytes.find("(STANDARD: ISO 128 / ASME Y14.5)") != std::string::npos);
-    CHECK(bytes.find("(PROJECTION: FIRST ANGLE)") != std::string::npos);
-    CHECK(bytes.find("(GENERAL TOL: ISO 2768-m)") != std::string::npos);
-    CHECK(bytes.find("(MASS: 2.5 kg)") != std::string::npos);
+    CHECK(bytes.find("(QA)") != std::string::npos);
+    CHECK(bytes.find("(ISO 128 / ASME Y14.5)") != std::string::npos);
+    CHECK(bytes.find("(FIRST ANGLE PROJECTION)") != std::string::npos);
+    CHECK(bytes.find("(GENERAL TOLERANCES: ISO 2768-m)") != std::string::npos);
+    CHECK(bytes.find("(2.5 kg)") != std::string::npos);
 
     auto svg_path = std::filesystem::temp_directory_path() / "chudware_multisheet_test.svg";
     json svg_exported = doc::export_drawing(did, svg_path.string(), "svg");
@@ -1603,4 +1609,282 @@ TEST_CASE("Auto Balloon attaches each assembly BOM item to its visible component
     doc::doc_close(part);
     doc::drawing_close(did);
     doc::doc_close(asm_id);
+}
+
+namespace {
+std::array<double, 4> bb_of(const json& v) {
+    const json& b = v.value("bbox", json(nullptr));
+    REQUIRE(b.is_array());
+    return {b[0].get<double>(), b[1].get<double>(), b[2].get<double>(), b[3].get<double>()};
+}
+const json* view_by_orient(const json& sheet, const std::string& orient) {
+    if (!sheet.contains("views")) return nullptr;
+    for (const json& v : sheet["views"])
+        if (v.value("orientation", std::string()) == orient) return &v;
+    return nullptr;
+}
+bool has_text(const json& draw, const std::string& want) {
+    for (const json& t : draw.value("texts", json::array()))
+        if (t.value("text", std::string()) == want) return true;
+    return false;
+}
+// 80 x 80 x 12 flange plate: 4 x Ø8 holes on a Ø50 bolt circle (positions on the top face).
+std::string make_bolt_circle_plate() {
+    json nr = doc::doc_new("part", "BoltPlate");
+    const std::string id = nr.at("doc_id").get<std::string>();
+    json ops = json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Plate"},
+             {"params", {{"length", dimv(80)}, {"width", dimv(80)}, {"height", dimv(12)}}}}}},
+        json{{"op", "add_feature"}, {"feature", {{"type", "hole"}, {"name", "Bolts"},
+             {"params", {{"style", "simple"}, {"standard", "custom"}, {"diameter", dimv(8)},
+                         {"end", "through_all"},
+                         {"positions", json::array({json::array({25.0, 0.0}),
+                                                    json::array({0.0, 25.0}),
+                                                    json::array({-25.0, 0.0}),
+                                                    json::array({0.0, -25.0})})}}},
+             {"refs", {{"face", json{{"of", "face"}, {"side", "top"}}}}}}}},
+    });
+    doc::doc_apply_ops(id, -1, ops, false);
+    return id;
+}
+}  // namespace
+
+// ISO 5456-2: third-angle puts the top view ABOVE the front and the right view to its RIGHT;
+// first-angle mirrors both. Views share their projection lines (same x for front/top, same y
+// for front/right), stay inside the frame, and never cover the title block.
+TEST_CASE("Auto layout aligns standard views per projection method and clears the title block") {
+    const std::string src = make_block();
+    for (const char* proj : {"third", "first"}) {
+        const json made = doc::drawing_make(
+            src, json{{"views", json::array({"front", "top", "right", "iso"})},
+                      {"projection", proj}, {"model_items", false}});
+        const json& sheet = made["drawing"]["sheets"][0];
+        const json* front = view_by_orient(sheet, "front");
+        const json* top = view_by_orient(sheet, "top");
+        const json* right = view_by_orient(sheet, "right");
+        REQUIRE(front);
+        REQUIRE(top);
+        REQUIRE(right);
+        const auto f = bb_of(*front), t = bb_of(*top), r = bb_of(*right);
+        CHECK((f[0] + f[2]) * 0.5 == doctest::Approx((t[0] + t[2]) * 0.5).epsilon(1e-6));
+        CHECK((f[1] + f[3]) * 0.5 == doctest::Approx((r[1] + r[3]) * 0.5).epsilon(1e-6));
+        if (std::string(proj) == "third") {
+            CHECK(t[1] > f[3]);  // top above front
+            CHECK(r[0] > f[2]);  // right to the right
+        } else {
+            CHECK(t[3] < f[1]);  // top below front
+            CHECK(r[2] < f[0]);  // right to the left
+        }
+        const auto inner = doc::sheet_frame_inner(420.0, 297.0);
+        const auto tbr = doc::sheet_title_block_rect(420.0, 297.0);
+        for (const json& v : sheet["views"]) {
+            if (v.value("type", std::string()) == "table_overlay") continue;
+            const auto b = bb_of(v);
+            CHECK(b[0] > inner[0]);
+            CHECK(b[2] < inner[2]);
+            CHECK(b[1] > inner[1]);
+            CHECK(b[3] < inner[3]);
+            const bool clear_of_tb = b[2] < tbr[0] || b[1] > tbr[3];
+            CHECK(clear_of_tb);
+        }
+        // One standard scale for every orthographic view, echoed in the title block with the
+        // projection; a pictorial at its own scale must say so under the view.
+        const double sc = (*front)["scale"].get<double>();
+        for (const json& v : sheet["views"]) {
+            if (!v.contains("scale")) continue;
+            if (v.value("type", std::string()) == "iso") {
+                if (std::fabs(v["scale"].get<double>() - sc) > 1e-12)
+                    CHECK(v["draw"].value("texts", json::array()).size() == 1);
+                continue;
+            }
+            CHECK(v["scale"].get<double>() == doctest::Approx(sc));
+        }
+        const json& tb = sheet["title_block"];
+        CHECK(tb.value("projection", std::string()) == proj);
+        CHECK_FALSE(tb.value("scale", std::string()).empty());
+        CHECK(has_text(sheet["frame"], std::string(proj) == "third" ? "THIRD ANGLE PROJECTION"
+                                                                      : "FIRST ANGLE PROJECTION"));
+        doc::drawing_close(made["doc_id"].get<std::string>());
+    }
+    doc::doc_close(src);
+}
+
+// drawing_arrange re-lays an existing sheet; an explicit scale is honoured exactly.
+TEST_CASE("drawing_arrange switches projection and honours an explicit scale") {
+    const std::string src = make_block();
+    const json made = doc::drawing_make(
+        src, json{{"views", json::array({"front", "top", "right"})}, {"model_items", true}});
+    const std::string did = made["doc_id"].get<std::string>();
+    const json r = doc::drawing_arrange(did, "s1", "first", json(2.0));
+    CHECK(r["scale"].get<double>() == doctest::Approx(2.0));
+    CHECK(r["projection"] == "first");
+    const json& sheet = r["drawing"]["sheets"][0];
+    const auto f = bb_of(*view_by_orient(sheet, "front"));
+    const auto t = bb_of(*view_by_orient(sheet, "top"));
+    CHECK(t[3] < f[1]);
+    CHECK((f[2] - f[0]) == doctest::Approx(80.0).epsilon(1e-3));  // 40 mm block at 2:1
+    CHECK(sheet["title_block"]["scale"] == "2:1");
+    doc::drawing_close(did);
+    doc::doc_close(src);
+}
+
+// Auto-dimensioning a whole sheet states each model extent ONCE (no redundant dimensions),
+// marks every hole centre, draws hole axes as centre lines in the side views, and turns an
+// equally spaced hole pattern into a chain pitch circle with its diameter.
+TEST_CASE("Sheet auto-dimension is non-redundant with centre marks, centre lines and bolt circle") {
+    const std::string src = make_bolt_circle_plate();
+    const json made = doc::drawing_make(
+        src, json{{"views", json::array({"front", "top", "right", "iso"})},
+                  {"hole_callouts", true}});
+    const json& sheet = made["drawing"]["sheets"][0];
+    std::map<double, int> linear_by_value;
+    int center_marks = 0, center_lines = 0, pitch = 0, pcd = 0, holes = 0;
+    for (const json& v : sheet["views"])
+        for (const json& an : v.value("annotations", json::array())) {
+            const std::string kind = an.value("kind", an.value("type", std::string()));
+            if (kind == "linear_dim") ++linear_by_value[std::round(an["value"].get<double>())];
+            if (kind == "center_mark") ++center_marks;
+            if (kind == "center_line") {
+                ++center_lines;
+                CHECK(an["draw"].value("chain", json::array()).size() == 1);
+            }
+            if (kind == "pitch_circle") ++pitch;
+            if (kind == "diameter_dim" && std::fabs(an.value("value", 0.0) - 50.0) < 1e-3) ++pcd;
+            if (kind == "diameter_dim" && an.value("count", 0) == 4 &&
+                std::fabs(an.value("value", 0.0) - 8.0) < 1e-3)
+                ++holes;
+            if (kind == "hole_callout") FAIL("hole callout duplicated a model-items diameter");
+        }
+    CHECK(linear_by_value[80] == 2);  // X and Y extents (equal values, different axes)
+    CHECK(linear_by_value[12] == 1);  // the thickness once, not in front AND right views
+    CHECK(center_marks >= 4);
+    CHECK(center_lines >= 2);  // the hole axes seen side-on in front + right
+    CHECK(pitch == 1);
+    CHECK(pcd == 1);
+    CHECK(holes == 1);
+    // Arrowheads are FILLED triangles and dimension text is never empty.
+    for (const json& v : sheet["views"])
+        for (const json& an : v.value("annotations", json::array()))
+            if (an.value("type", std::string()) == "linear_dim") {
+                CHECK(an["draw"]["tris"].size() == 2);
+                CHECK(an["draw"]["texts"].size() >= 1);
+            }
+    doc::drawing_close(made["doc_id"].get<std::string>());
+    doc::doc_close(src);
+}
+
+// The compiled sheet frame: thick drawing border, zone references, a filled-in title block
+// whose values never overflow their cells, and portrait paper.
+TEST_CASE("Sheet frame carries border, zones and a fitted title block; portrait sizes") {
+    const std::string src = make_cube(30.0);
+    const json made = doc::drawing_make(
+        src, json{{"sheet", "A4 portrait"}, {"views", json::array({"front", "top"})},
+                  {"title", {{"title", "A VERY LONG PART TITLE THAT MUST NEVER LEAVE ITS CELL"},
+                             {"part_number", "CW-0001"}, {"rev", "B"}}}});
+    const json& sheet = made["drawing"]["sheets"][0];
+    CHECK(sheet["size"] == "A4P");
+    CHECK(sheet["size_mm"][0].get<double>() == doctest::Approx(210.0));
+    CHECK(sheet["size_mm"][1].get<double>() == doctest::Approx(297.0));
+    const json& frame = sheet["frame"];
+    CHECK(frame["thick"].size() >= 2);  // drawing frame + title block border
+    CHECK(has_text(frame, "A"));
+    CHECK(has_text(frame, "1"));
+    CHECK(has_text(frame, "CW-0001"));
+    CHECK(has_text(frame, "1 OF 1"));
+    CHECK(has_text(frame, "A4"));
+    const auto tbr = doc::sheet_title_block_rect(210.0, 297.0);
+    for (const json& t : frame["texts"]) {
+        const double x = t["pos"][0].get<double>(), y = t["pos"][1].get<double>();
+        if (y > tbr[3] || y < tbr[1] || x < tbr[0] || x > tbr[2]) continue;  // zone labels
+        const double w = doc::annot_text_width(t["text"].get<std::string>(), t["h"].get<double>());
+        const std::string align = t.value("align", std::string("left"));
+        const double x0 = align == "center" ? x - w * 0.5 : x;
+        CHECK(x0 >= tbr[0] - 1e-6);
+        CHECK(x0 + w <= tbr[2] + 1e-6);
+    }
+    CHECK_THROWS(doc::drawing_set_sheet(made["doc_id"].get<std::string>(), "s1", "A7"));
+    doc::drawing_close(made["doc_id"].get<std::string>());
+    doc::doc_close(src);
+}
+
+// ISO 129-1 dimension geometry: extension lines start off the feature, the dimension line
+// carries filled arrows inside (outside on a tight span), the value sits above it; a diameter
+// leader's arrow touches the circle.
+TEST_CASE("Dimension and leader geometry follow ISO 129-1") {
+    const json lin = doc::compile_annotation(
+        json{{"type", "linear_dim"}, {"a", {100.0, 100.0}}, {"b", {160.0, 100.0}},
+             {"pos", {130.0, 90.0}}, {"text", "60"}},
+        "MMGS");
+    REQUIRE(lin["tris"].size() == 2);
+    REQUIRE(lin["texts"].size() == 1);
+    CHECK(lin["texts"][0]["align"] == "center");
+    CHECK(lin["texts"][0]["pos"][1].get<double>() > 90.0);  // above the dimension line
+    for (const json& seg : lin["segments"]) {
+        // No extension line touches the measured feature (the ISO gap).
+        for (const json& p : seg)
+            CHECK(std::hypot(p[0].get<double>() - 100.0, p[1].get<double>() - 100.0) > 0.5);
+    }
+    const json tight = doc::compile_annotation(
+        json{{"type", "linear_dim"}, {"a", {100.0, 100.0}}, {"b", {103.0, 100.0}},
+             {"pos", {101.5, 90.0}}, {"text", "3"}},
+        "MMGS");
+    REQUIRE(tight["tris"].size() == 2);
+    // Outside arrows: the left arrowhead's body lies left of its tip.
+    const json& tri = tight["tris"][0];
+    CHECK(tri[1][0].get<double>() < tri[0][0].get<double>());
+
+    const json dia = doc::compile_annotation(
+        json{{"type", "note"}, {"kind", "diameter_dim"}, {"center", {50.0, 50.0}},
+             {"radius", 10.0}, {"pos", {70.0, 70.0}}, {"text", "\xE2\x8C\x80" "20"}},
+        "MMGS");
+    REQUIRE(dia["tris"].size() == 1);
+    const json& tip = dia["tris"][0][0];
+    CHECK(std::hypot(tip[0].get<double>() - 50.0, tip[1].get<double>() - 50.0) ==
+          doctest::Approx(10.0).epsilon(1e-6));
+    // The ⌀ sign is stroked (a circle + slash), the number stays text.
+    CHECK(dia["arcs"].size() == 1);
+    CHECK(has_text(dia, "20"));
+}
+
+// Section views: a chain cutting plane with thick ends, filled viewing arrows and letters on
+// the parent; a "SECTION A-A" caption under the section; detail circles + "DETAIL" caption.
+TEST_CASE("Section and detail views carry ISO 128-40 identification") {
+    const std::string src = make_block();
+    const json made = doc::drawing_make(
+        src, json{{"views", json::array({"front", "top"})}, {"model_items", false},
+                  {"sections", json::array({json{{"parent", "top"}, {"axis", "horizontal"},
+                                                 {"label", "A"}}})}});
+    const std::string did = made["doc_id"].get<std::string>();
+    const json* top = view_by_orient(made["drawing"]["sheets"][0], "top");
+    REQUIRE(top);
+    const json& deco = (*top)["draw"];
+    CHECK(deco["chain"].size() == 1);
+    CHECK(deco["thick"].size() == 2);
+    CHECK(deco["tris"].size() == 2);
+    CHECK(has_text(deco, "A"));
+    bool caption = false;
+    for (const json& v : made["drawing"]["sheets"][0]["views"])
+        if (v.value("type", std::string()) == "section") {
+            caption = has_text(v["draw"], "SECTION A-A");
+            CHECK(v.value("hatch", json::array()).size() > 0);
+        }
+    CHECK(caption);
+    const auto tb = bb_of(*top);
+    const json det = doc::drawing_add_detail(
+        did, (*top)["view_id"].get<std::string>(),
+        json::array({tb[0] + 2.0, tb[3] - 2.0}), 8.0, json(nullptr),
+        json("B"), json(nullptr), "s1", json(nullptr));
+    const json full = doc::drawing_get(did);
+    bool detail_caption = false, detail_circle = false;
+    for (const json& v : full["sheets"][0]["views"]) {
+        if (v.value("type", std::string()) == "detail")
+            for (const json& t : v["draw"]["texts"])
+                detail_caption |= t["text"].get<std::string>().rfind("DETAIL B", 0) == 0;
+        if (v.value("orientation", std::string()) == "top")
+            detail_circle = v["draw"]["arcs"].size() == 1 && has_text(v["draw"], "B");
+    }
+    CHECK(detail_caption);
+    CHECK(detail_circle);
+    doc::drawing_close(did);
+    doc::doc_close(src);
 }

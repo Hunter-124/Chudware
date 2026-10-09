@@ -913,6 +913,51 @@ Address geometry the same plain-English way as modeling — extract regions/hole
 part, don't hand-type coordinates unless you must.
 """
 
+_DRAWINGS_GUIDE = """\
+2D ENGINEERING DRAWINGS — professional sheets from the live part or assembly
+
+WHAT A NEW DRAWING CONTAINS (Make Drawing in the app, make_drawing for agents)
+  - Paper: ISO A4-A0 or ANSI A-E, landscape by default; "A4 portrait" / "A4P" for portrait.
+  - ISO 5457 frame: 20 mm filing margin, 10 mm elsewhere, zone letters/numbers in the margin,
+    centring marks.
+  - ISO 7200 title block (180 mm wide, lower right): TITLE, DRAWING / PART NO., REV, SHEET
+    (auto "n OF m"), MATERIAL (from the part), FINISH, MASS, SCALE, SIZE, DRAWN, DATE (today),
+    CHECKED, APPROVED, COMPANY, the ISO 5456-2 projection symbol, UNITS (the drawing's unit
+    system — change with drawing units, never by typing), GENERAL TOLERANCES and the standard.
+    Values shrink to fit their cell and never overflow it.
+  - Views: front / top / right + an isometric, on the projection lattice — third angle (ASME,
+    default: top above front, right view to its right) or first angle (ISO E: mirrored). Views
+    share projection lines, are drawn at ONE standard ISO 5455 scale chosen to fit the free
+    area (frame minus title block and tables), and never cover the title block.
+  - Line types per ISO 128: visible outlines 0.5 mm continuous, hidden edges 0.25 mm dashed,
+    centre lines 0.25 mm long-dash-dot, dimensions/hatching 0.25 mm. The isometric carries no
+    hidden lines.
+  - Auto-dimensions per ISO 129-1: each overall extent stated once on the sheet (no redundant
+    dims), round outlines by their diameter, one "N× ⌀d" callout per distinct hole size, centre
+    marks on every hole, centre lines on hole/boss axes seen side-on, and a chain pitch circle
+    with its diameter for equally spaced hole patterns. Filled 3 mm arrowheads, 3.5 mm text,
+    extension lines with a 1 mm gap and 2 mm overshoot, arrows flip outside on tight spans.
+  - Assemblies: overall envelope, a parts list (BOM) sitting on the title block, and one balloon
+    per BOM item.
+
+EDITING
+  - Sections: chain cutting plane with thick ends, viewing arrows and letters on the parent,
+    hatched cut faces, "SECTION A-A" caption. Details: boundary circle + letter on the parent,
+    "DETAIL B  SCALE 2:1" caption.
+  - arrange_drawing(doc_id, projection?, scale?, size?) re-lays a sheet (switch first/third
+    angle, force a standard scale, change paper) and moves dimensions and cuts with their views.
+  - Dimensions, tolerances (symmetric / deviation / limit / basic), GD&T frames, datums, surface
+    finish, weld symbols, notes, balloons, tables: see the agent cheatsheet below.
+
+DELIVERABLES (export_drawing)
+  - PDF: vector, true paper size, ISO line weights, filled arrows, searchable Helvetica text.
+  - DXF R12: layers VISIBLE, HIDDEN (DASHED), CENTER, DIMENSIONS, HATCH, BORDER, TABLES; opens in
+    any CAD package.
+  - SVG: editable paths and real text. PNG review raster via review_drawing.
+  - Drawings save inside the part's .step+ and reopen associatively; a standalone .draw+ embeds
+    its source.
+"""
+
 
 def cad_guide_text(topic: str = "overview") -> str:
     topic = (topic or "overview").strip().lower()
@@ -2074,6 +2119,11 @@ def cad_guide_text(topic: str = "overview") -> str:
             "(mass props), inspect_feature (emphasis close-up + dims), verify_battery.\n"
         )
 
+    if topic in ("drawings", "drawing_standards", "2d", "engineering_drawing",
+                 "engineering_drawings"):
+        sheet = _read_prompt("shared/cheatsheets/drawing.md")
+        return _DRAWINGS_GUIDE + ("\n" + sheet if sheet else "")
+
     # Otherwise treat the topic as a per-feature cheatsheet name (hole, fillet, revolve, ...).
     sheet = _read_prompt(f"shared/cheatsheets/{topic}.md")
     if sheet:
@@ -2083,6 +2133,7 @@ def cad_guide_text(topic: str = "overview") -> str:
     return (f"No guide for {topic!r}. Topics: overview, simulation, motion, review, intake, gsl, "
             f"cam, narration, parts, reverse, reveng, deliverables, requirements, dag, verify, "
             f"interaction, sourcing, cost, spec, piping, industrial, hydraulic, firmware, structural, "
+            f"drawings, "
             f"mechanical, "
             f"regen, code_compliance, serving, design_review, doc_diff, plm, tolerance_stackup, "
             f"evaluate, measure, sketch3d; or a feature cheatsheet: {avail}")

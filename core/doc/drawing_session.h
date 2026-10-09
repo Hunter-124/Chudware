@@ -195,10 +195,19 @@ nlohmann::json drawing_model_items(const std::string& doc_id, const std::string&
 nlohmann::json drawing_set_titleblock(const std::string& doc_id, const std::string& sheet_id,
                                       const nlohmann::json& fields);
 
-// drawing_set_sheet: change a sheet's paper size (one of the ISO/ANSI keys A4..A0 / A..E).
-// Returns {size, drawing}.
+// drawing_set_sheet: change a sheet's paper size: ISO A4..A0 / ANSI A..E, landscape by default;
+// a trailing "P" (or "portrait") selects portrait ("A4P", "A3 portrait"). Returns {size, drawing}.
 nlohmann::json drawing_set_sheet(const std::string& doc_id, const std::string& sheet_id,
                                  const std::string& size);
+
+// drawing_arrange: professional auto layout of one sheet. Picks ONE standard scale (ISO 5455)
+// that fits the free drawing area (frame minus title block and tables) unless `scale` is a
+// number, places the standard views on the first- or third-angle lattice ("first"|"third";
+// empty keeps the title block's projection, default third) with shared alignment, derived views
+// beside their parent row, and records SCALE + projection in the title block. Annotations and
+// derived cuts move with their views. Returns {doc_id, scale, scale_text, projection, drawing}.
+nlohmann::json drawing_arrange(const std::string& doc_id, const std::string& sheet_id,
+                               const std::string& projection, const nlohmann::json& scale);
 // drawing_add_table: append a first-class structured on-sheet table.
 // kind = bom|revision|holes|notes|cutlist. `spec` may carry anchor:[x,y],
 // columns:[{key,title,width}], rows:[...], title, and table-specific options.

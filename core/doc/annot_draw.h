@@ -23,6 +23,7 @@
 // so annotations scale with the sheet exactly like a real CAD drawing.
 #pragma once
 
+#include <array>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -31,18 +32,45 @@ namespace chudware::doc {
 
 // Compile one annotation into draw primitives. `units` is the drawing's unit system
 // ("MMGS"|"IPS"), used only to format a fallback display string when the annotation has
-// no composed `text`. Returns:
+// no composed `text`. Returns the v2 draw block:
 //   {
-//     "segments": [ [[x,y],[x,y],...], ... ],  // stroked thin SOLID polylines (sheet mm)
-//     "dashed":   [ [[x,y],[x,y],...], ... ],  // stroked thin DASHED polylines (centerlines)
-//     "arcs":     [ {"center":[x,y],"radius":r,"a0":rad,"a1":rad}, ... ],
-//     "tris":     [ [[x,y],[x,y],[x,y]], ... ], // FILLED triangles (arrowheads)
-//     "texts":    [ {"pos":[x,y],"h":mm,"text":"...","align":"left|center|right",
-//                    "valign":"base|mid|top"}, ... ],
-//     "pick":     [x,y]                          // primary label/leader anchor (hit-test)
+//     "segments":    [ [[x,y],...], ... ],  // THIN continuous polylines (0.25 mm)
+//     "thick":       [ [[x,y],...], ... ],  // THICK continuous polylines (0.5 mm)
+//     "dashed":      [ [[x,y],...], ... ],  // THIN dashed polylines (hidden-line pattern)
+//     "chain":       [ [[x,y],...], ... ],  // THIN long-dash-dot polylines (centre lines)
+//     "chain_thick": [ [[x,y],...], ... ],  // THICK long-dash-dot polylines
+//     "arcs":        [ {"center":[x,y],"radius":r,"a0":rad,"a1":rad}, ... ],  // THIN arcs
+//     "tris":        [ [[x,y],[x,y],[x,y]], ... ], // FILLED triangles (arrowheads)
+//     "texts":       [ {"pos":[x,y],"h":mm,"text":"...","align":"left|center|right",
+//                       "valign":"base|mid|top"}, ... ],   // h = cap height (ISO 3098)
+//     "pick":        [x,y]                          // primary label/leader anchor (hit-test)
 //   }
-// Never throws; an unrecognized / malformed annotation yields empty primitive arrays.
+// Dimension values stroke the ⌀ / ⌴ / ⌵ / ↧ symbols as vector glyphs, so their text runs
+// never depend on a font carrying them. Never throws; a malformed annotation yields empty
+// primitive arrays.
 nlohmann::json compile_annotation(const nlohmann::json& ann, const std::string& units);
+
+// Compile a sheet's complete frame (ISO 5457 border, zone grid + centring marks, and the
+// ISO 7200-style title block with its projection symbol) into one draw block. `sheet` is a
+// drawing_get sheet ({size_mm, title_block}); `units` the drawing unit system; sheet_index
+// is 1-based. Empty block for a sheet without a paper size.
+nlohmann::json compile_sheet_frame(const nlohmann::json& sheet, const std::string& units,
+                                   int sheet_index, int sheet_count);
+
+// Per-view decorations compiled from a projected view: section cutting-plane lines with
+// viewing arrows + letters and detail boundary circles + letters (from the view's
+// section_lines / detail_circles markers), plus the "SECTION A-A" / "DETAIL B  SCALE 2:1"
+// caption under a derived view. Empty block when the view has none.
+nlohmann::json compile_view_decorations(const nlohmann::json& view);
+
+// Paper-space advance width (mm) of `text` set at cap height `h` (Helvetica metrics, with the
+// stroked dimension symbols at their glyph widths) — the same estimate the compiler lays out by.
+double annot_text_width(const std::string& text, double h);
+
+// Paper rectangles [x0,y0,x1,y1] (sheet mm) of a w x h sheet: the area inside the drawing
+// frame, and the title block the frame draws in its lower-right corner.
+std::array<double, 4> sheet_frame_inner(double w, double h);
+std::array<double, 4> sheet_title_block_rect(double w, double h);
 
 // Compile section hatch for a closed polygon (already sheet mm). The style overload accepts
 // `pattern` ("single" default, "cross", or "double"), `spacing_mm`, and `angle_deg`; unknown

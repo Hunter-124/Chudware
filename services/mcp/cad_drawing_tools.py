@@ -249,7 +249,8 @@ def _fold_alias_param(canon_name: str, canon: Any, alias_name: str,
     }
 
 
-#: The engine's real paper sizes — core/doc/drawing_session.cpp:40-45 (ISO A0..A4 + ANSI A..E).
+#: The engine's real paper sizes — sheet_dims in core/doc/drawing_session.cpp (ISO A0..A4 +
+#: ANSI A..E). Landscape by default; a trailing "P" is the same paper portrait ("A4P").
 _SHEET_SIZES = ("A4", "A3", "A2", "A1", "A0", "A", "B", "C", "D", "E")
 #: Words a model decorates a size with ("ISO A3", "A4 landscape", "A3 sheet size").
 _SHEET_NOISE = frozenset({"iso", "ansi", "din", "jis", "landscape", "portrait",
@@ -257,27 +258,31 @@ _SHEET_NOISE = frozenset({"iso", "ansi", "din", "jis", "landscape", "portrait",
 
 
 def _canon_sheet_size(value: Any) -> tuple[Optional[str], Optional[dict]]:
-    """('A3', None) or (None, an error dict naming the real sizes).
+    """('A3' | 'A4P', None) or (None, an error dict naming the real sizes).
 
     SILENT-WRONG-OUTPUT guard: drawing_make wraps the sheet write in
-    `try { drawing_set_sheet(...) } catch (const OpError&) { /* bad size -> keep default A3 */ }`
-    (core/doc/drawing_session.cpp:1796-1797), so an unrecognised size produced an A3 sheet that
-    looks completely normal — the caller asked for A1 and shipped A3. Validate the spelling
-    before the drawing is created instead.
+    `try { drawing_set_sheet(...) } catch (const OpError&) { /* bad size -> keep default A3 */ }`,
+    so an unrecognised size produced an A3 sheet that looks completely normal — the caller
+    asked for A1 and shipped A3. Validate the spelling before the drawing is created instead.
+    "portrait" (or a trailing P, "A4P") selects the portrait orientation of the same paper.
     """
     raw = str(value if value is not None else "").strip()
     words = [w for w in _re.split(r"[\s\-_]+", raw.lower()) if w]
+    portrait = "portrait" in words
     kept = [w for w in words if w not in _SHEET_NOISE] or words
     s = "".join(kept).upper()
+    if len(s) >= 2 and s.endswith("P") and s[:-1] in _SHEET_SIZES:
+        s, portrait = s[:-1], True
     if s in _SHEET_SIZES:
-        return s, None
+        return (s + "P" if portrait else s), None
     return None, {
         "ok": False,
         "code": "invalid_op",
         "error": f"sheet {raw!r} is not a paper size; the drawing engine knows "
                  + ", ".join(_SHEET_SIZES)
-                 + " (ISO A0-A4 and ANSI A-E). An unknown size used to fall back to A3 "
-                   "silently, so this call was refused instead of drawn on the wrong sheet.",
+                 + " (ISO A0-A4 and ANSI A-E, landscape; add 'portrait' or a P suffix, e.g. "
+                   "'A4P', for portrait). An unknown size used to fall back to A3 silently, so "
+                   "this call was refused instead of drawn on the wrong sheet.",
         "valid_sheet": list(_SHEET_SIZES),
     }
 
@@ -801,53 +806,31 @@ def _canon_view_scale(value: Any) -> tuple[Optional[float], Optional[dict]]:
     return num, None
 
 
-def _apply_view_scale(doc_id: str, want: float, notes: list) -> tuple[list, list]:
-    """Set every view's geometric scale to *want*, keeping each view centred where it is.
+def _scale_readback(doc_id: str, want: float, notes: list) -> tuple[list, list]:
+    """Read back every view's applied scale after make_drawing laid the sheet out at *want*.
 
-    Returns (per-view {view_id, orientation, scale} read back off the drawing, warnings).
+    Returns (per-view {view_id, orientation, scale}, warnings) — a view that kept another
+    scale, or that the requested scale pushed past the paper, is reported, never silent.
     """
-    before = cb.call("drawing_get", {"doc_id": doc_id})
-    keep: dict = {}
-    for v in _views_of(before):
-        vid = v.get("view_id") or v.get("id")
-        bbox = v.get("bbox")
-        pos = v.get("position")
-        old = v.get("scale") or 1.0
-        if not vid:
-            continue
-        params: dict = {"doc_id": doc_id, "view_id": vid, "scale": want}
-        if (isinstance(bbox, list) and len(bbox) == 4
-                and all(isinstance(x, (int, float)) for x in bbox)
-                and isinstance(pos, list) and len(pos) == 2 and old):
-            cx, cy = (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0
-            keep[vid] = (cx, cy)
-            # geometry = model*scale + position (drawing_session.cpp:1917-1920), so hold the
-            # view's bbox centre still while the scale changes.
-            params["position"] = [cx - (cx - pos[0]) / old * want,
-                                  cy - (cy - pos[1]) / old * want]
-        cb.call("drawing_set_view", params)
     after = cb.call("drawing_get", {"doc_id": doc_id})
     sheets = after.get("sheets") or []
     size_mm = (sheets[0].get("size_mm") if sheets else None) or [0.0, 0.0]
     applied: list = []
     warnings: list = []
     for v in _views_of(after):
+        if v.get("type") == "table_overlay":
+            continue
         vid = v.get("view_id") or v.get("id")
         got = v.get("scale")
         applied.append({"view_id": vid, "orientation": v.get("orientation") or v.get("type"),
                         "scale": got})
-        if isinstance(got, (int, float)) and abs(float(got) - want) > 1e-9:
+        if (isinstance(got, (int, float)) and v.get("type") not in ("detail",)
+                and abs(float(got) - want) > 1e-9):
             warnings.append(f"view {vid} kept scale {got} instead of {want}")
         bbox = v.get("bbox")
         if not (isinstance(bbox, list) and len(bbox) == 4
                 and all(isinstance(x, (int, float)) for x in bbox)):
             continue
-        if vid in keep:
-            cx, cy = (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0
-            drift = max(abs(cx - keep[vid][0]), abs(cy - keep[vid][1]))
-            if drift > 0.5:
-                warnings.append(f"view {vid} moved {round(drift, 3)} mm on the sheet while "
-                                f"rescaling")
         if size_mm[0] > 0.0 and (bbox[0] < 0.0 or bbox[1] < 0.0
                                  or bbox[2] > size_mm[0] or bbox[3] > size_mm[1]):
             warnings.append(f"view {vid} now extends past the {size_mm[0]}x{size_mm[1]} mm "
@@ -888,8 +871,7 @@ def _bbox_of(view: Any) -> Optional[list]:
 
 
 def _sheet_size(full: dict) -> Optional[list]:
-    """The sheet's [width, height] in mm — core/doc/drawing_session.cpp:39-48 stores every
-    paper size landscape, so this is always (w >= h)."""
+    """The sheet's [width, height] in mm (landscape w >= h; portrait "…P" sizes w < h)."""
     for sh in (full.get("sheets") or []):
         size = sh.get("size_mm")
         if (isinstance(size, list) and len(size) == 2
@@ -1195,7 +1177,9 @@ def _view_handles(full: dict, *, derived: bool = True) -> str:
 #: Not a synonym of `fields` (there is no single unambiguous target) — it is the same
 #: flattened-dict dialect query_geometry already accepts for its query keys.
 _TITLEBLOCK_FIELDS = ("title", "drawn_by", "date", "material", "finish",
-                      "scale", "rev", "sheet", "part_number", "company")
+                      "scale", "rev", "sheet", "part_number", "company",
+                      "checked_by", "approved_by", "projection", "general_tolerance",
+                      "mass", "drawing_standard")
 
 #: _norm_arg spelling -> the canonical field ("drawnby" -> "drawn_by"), so a caller who writes
 #: drawnBy / DRAWN_BY hits the same cell the docstring names.
@@ -1206,7 +1190,11 @@ _TITLEBLOCK_BY_NORM = {_norm_arg(f): f for f in _TITLEBLOCK_FIELDS}
 #: {"part_number","part_no"}, {"drawn_by","drawn"}. Folding them onto the canonical name is
 #: therefore not a guess about intent; it is what the drawing does with them anyway.
 #: Keys normalised through _norm_arg.
-_TITLEBLOCK_ALIASES = {"revision": "rev", "partno": "part_number", "drawn": "drawn_by"}
+_TITLEBLOCK_ALIASES = {"revision": "rev", "partno": "part_number", "drawn": "drawn_by",
+                       "checked": "checked_by", "approved": "approved_by",
+                       "tolerance": "general_tolerance", "generaltolerances": "general_tolerance",
+                       "standard": "drawing_standard", "weight": "mass",
+                       "projectionmethod": "projection", "drawingnumber": "part_number"}
 
 #: Spellings of "the part's NAME". A title block's TITLE cell is what carries a part's name
 #: ("40mm Cube"); PART NO carries its identifier. So a name maps to `title` — and NEVER to
@@ -1229,8 +1217,8 @@ _TITLEBLOCK_EXPORT_MIRROR = {"rev": "revision"}
 def _titleblock_units_refusal(name: str, value: Any) -> str:
     """Why `units` has no home here — verified against the engine, not assumed."""
     return (
-        f"set_titleblock() has no {name!r} field. The ten cells this drawing actually "
-        f"renders are {', '.join(_TITLEBLOCK_FIELDS)} (core/doc/session.cpp:7106-7117) — "
+        f"set_titleblock() has no {name!r} field. The title-block cells this drawing actually "
+        f"renders are {', '.join(_TITLEBLOCK_FIELDS)} (the sheet frame, core/doc/annot_draw.cpp) — "
         f"units is not one of them, and passing it as a field would store a key nothing "
         f"draws. Units are a property of the DOCUMENT, not of the title block: the "
         f"drawing's own units.system field is 'MMGS' (millimetres) by default and 'IPS' "
@@ -1263,7 +1251,7 @@ def _canon_titleblock_fields(fields: dict, where: str) -> tuple[dict, list, Opti
                     "error": f"{where} got {key}={value!r} alongside an explicit title. A "
                              f"title block has no separate part-NAME cell: TITLE carries the "
                              f"part's name and PART NO carries its identifier "
-                             f"(core/doc/session.cpp:7106-7117). {key} is NOT part_number — a "
+                             f"(core/doc/annot_draw.cpp). {key} is NOT part_number — a "
                              f"name in the box a shop floor orders from is a wrong drawing "
                              f"that looks right. Pass the name as title=, or the identifier "
                              f"as part_number=. Nothing was written."}
@@ -1273,7 +1261,7 @@ def _canon_titleblock_fields(fields: dict, where: str) -> tuple[dict, list, Opti
                 "ok": False,
                 "error": f"{where} got the unknown title-block field {key!r}. The cells this "
                          f"drawing renders are {', '.join(_TITLEBLOCK_FIELDS)} "
-                         f"(core/doc/session.cpp:7106-7117); anything else is stored as a key "
+                         f"(the sheet frame, core/doc/annot_draw.cpp); anything else is stored as a key "
                          f"nothing draws, so the value would silently never appear on the "
                          f"sheet. Nothing was written."}
         if target in out:
@@ -1297,19 +1285,13 @@ def _titleblock_payload(fields: dict) -> dict:
 
 # ---------------------------------------------------------------- sheet orientation
 #
-# LIVE-DIALECT gap (2026-07-29): make_drawing(orientation="landscape") died as
-# unknown_argument. There is NO sheet-orientation concept in the engine to wire it to: every
-# paper size in sheet_dims (core/doc/drawing_session.cpp:39-48) is stored LANDSCAPE — the table
-# is literally commented "Landscape (w >= h)" and A3 is {420, 297} — and drawing_set_sheet
-# (:1771-1782) takes a size string and nothing else. So orientation is REFUSED, because
-# accepting it would tell the caller a sheet was rotated when it was not.
-#
-# One value of `orientation` IS real here though, and it is not the sheet's: "front"/"top"/"iso"
-# is a VIEW orientation, which is what `views` takes (and what add_drawing_view calls the
-# argument). That spelling is folded onto `views` with a note instead of being refused.
-_SHEET_ORIENTATIONS = frozenset({"landscape", "portrait", "horizontal", "vertical"})
+# `orientation` has two real meanings and both are honoured. "portrait"/"landscape" is the
+# SHEET's orientation — the engine keys portrait paper with a P suffix ("A4P" = 210 x 297,
+# sheet_dims in core/doc/drawing_session.cpp), so make_drawing folds it onto `sheet`.
+# "front"/"top"/"iso" is a VIEW orientation, which is what `views` takes (and what
+# add_drawing_view calls the argument); that spelling is folded onto `views` with a note.
 
-#: orient_frame's real view directions — core/doc/drawing_session.cpp:342-355 (+ "iso").
+#: orient_frame's real view directions (core/doc/drawing_session.cpp) + "iso".
 _VIEW_ORIENTATIONS = ("front", "back", "top", "bottom", "left", "right", "iso")
 
 
@@ -1319,27 +1301,11 @@ def _orientation_verdict(value: Any) -> tuple[Optional[list], Optional[dict]]:
     words = [_canon_word(v) for v in items if str(v).strip()]
     if words and all(w in _VIEW_ORIENTATIONS for w in words):
         return list(words), None
-    bad = next((w for w in words if w in _SHEET_ORIENTATIONS), None)
-    if bad:
-        return None, {
-            "ok": False,
-            "error": f"make_drawing: orientation={value!r} — a Chudware sheet has no "
-                     f"orientation to set. Every paper size is stored LANDSCAPE "
-                     f"(A4 297x210, A3 420x297, … core/doc/drawing_session.cpp:39-48) and the "
-                     f"only sheet property there is its SIZE, so accepting "
-                     f"orientation={bad!r} would report a rotation that never happened. Choose "
-                     f"the paper with sheet=\"A4\"…\"A0\"/\"A\"…\"E\"; for a taller drawing use "
-                     f"the next size up. (orientation= IS accepted when it names VIEW "
-                     f"orientations — orientation=\"front\" or [\"front\",\"top\"] — which is "
-                     f"what views= takes.) Nothing was created.",
-            "valid_sheet": list(_SHEET_SIZES),
-        }
     return None, {
         "ok": False,
         "error": f"make_drawing: orientation={value!r} is neither a VIEW orientation "
-                 f"({', '.join(_VIEW_ORIENTATIONS)} — a synonym of views=) nor anything a "
-                 f"sheet has: sheets are landscape-only and carry just a SIZE "
-                 f"(sheet=\"A4\"…\"A0\"/\"A\"…\"E\"). Nothing was created.",
+                 f"({', '.join(_VIEW_ORIENTATIONS)} — a synonym of views=) nor a sheet "
+                 f"orientation (portrait | landscape). Nothing was created.",
         "valid_views": list(_VIEW_ORIENTATIONS),
     }
 
@@ -2014,20 +1980,26 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                      source_doc: Optional[str] = None,
                      source_doc_id: Optional[str] = None,
                      scale: Optional[Any] = None, orientation: Optional[Any] = None,
-                     name: Optional[str] = None) -> str:
+                     name: Optional[str] = None, projection: Optional[str] = None) -> str:
         """Create a 2D engineering drawing of the current part in ONE shot, then refine it.
 
-        Builds projected views (hidden-line removed), auto-dimensions the ortho views, calls out
-        holes, and fills the title block. Returns the new drawing_doc_id.
+        Builds a professional sheet: ISO 5457 frame with zones, ISO 7200 title block, standard
+        views laid out on the projection lattice at ONE standard scale, hidden lines in the
+        orthographic views, centre marks / centre lines / bolt circles, non-redundant overall
+        dimensions and hole callouts. Returns the new drawing_doc_id.
 
         views   : list of orientations, e.g. ["front","top","right","iso"] (default this set).
         sections: list of auto-section requests, each a dict
                   {"parent":"front","axis":"vertical"|"horizontal","mode":"full"|"half",
                    "reverse":false,"label":"A"} — cuts the parent view through its centre, no
                   sheet-mm math needed.
-        sheet   : paper size "A4".."A0" (ISO) or "A".."E" (ANSI) — default A3. Also accepted as
+        sheet   : paper size "A4".."A0" (ISO) or "A".."E" (ANSI) — default A3, landscape; add
+                  " portrait" (or a P suffix, "A4P") for portrait paper. Also accepted as
                   sheet_size= / paper_size= / template= when the value IS a size; a template
                   FILE has no meaning here (there is no border/titleblock template concept).
+        projection: "third" (ASME, default: top view above front, right view to its right) or
+                  "first" (ISO E: top below, right view to the left). Printed in the title block
+                  with its ISO 5456-2 symbol. Re-lay later with arrange_drawing().
         model_items: true (default) runs the engine's auto-dimension pass on the ortho views —
                   overall width/height plus one "N× ⌀d" per distinct hole diameter. A switch
                   only: individual dimensions are placed with add_dimension.
@@ -2039,9 +2011,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                   title={"scale":"1:1"}); setting scale= rewrites that text to match.
         name    : a name for the DRAWING DOCUMENT ("40mm_cube_drawing"). Defaults to
                   "<part> - Drawing". The title BLOCK's printed title is `title`, not this.
-        orientation: only as a synonym of views= (a VIEW orientation, "front"/["front","top"]).
-                  Sheets have no orientation — every paper size is landscape — so
-                  orientation="landscape" is refused rather than silently ignored.
+        orientation: "portrait"/"landscape" sets the SHEET orientation; a VIEW orientation
+                  ("front" / ["front","top"]) is read as a synonym of views=.
 
         source_doc: a synonym of doc_id (the 3D model to draw) — source_doc_id / model_doc /
                   from_doc / part_doc are understood too.
@@ -2088,9 +2059,17 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 sheet, bad = _canon_sheet_size(sheet)
                 if bad:
                     return _dumps(bad)
-            # LIVE-DIALECT gap: orientation="landscape" died as unknown_argument. A sheet has no
-            # orientation to set (see the sheet-orientation block above), but a VIEW orientation
-            # is real and is what views= takes, so that reading is folded on instead of refused.
+            # orientation="portrait"/"landscape" is the SHEET's orientation (a size suffix in the
+            # engine: "A4P" is A4 portrait); "front"/["front","top"] is a VIEW orientation, which
+            # is what views= takes, so that reading is folded onto views instead.
+            if orientation is not None:
+                word = _canon_word(orientation) if not isinstance(orientation, (list, tuple)) else ""
+                if word in ("portrait", "landscape", "horizontal", "vertical"):
+                    cur = sheet or "A3"
+                    base = cur[:-1] if cur.endswith("P") and cur[:-1] in _SHEET_SIZES else cur
+                    sheet = base + "P" if word in ("portrait", "vertical") else base
+                    notes.append(f"orientation={orientation!r} applied to the sheet: {sheet}")
+                    orientation = None
             if orientation is not None:
                 as_views, bad = _orientation_verdict(orientation)
                 if bad:
@@ -2108,7 +2087,7 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 else:
                     views = as_views
                     notes.append(f"orientation={orientation!r} read as views={as_views!r} (a "
-                                 f"VIEW orientation; sheets have no orientation)")
+                                 f"VIEW orientation)")
             # LIVE-DIALECT gap: scale=1.0 died as unknown_argument (twice). A real geometric view
             # scale exists — see the drawing/view-scale block above.
             want_scale = None
@@ -2183,6 +2162,20 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 spec["sections"] = sections
             if sheet:
                 spec["sheet"] = sheet
+            if projection is not None:
+                proj = _canon_word(projection).replace("_angle", "").replace("angle", "")
+                if proj in ("1st", "iso_e", "e", "european"):
+                    proj = "first"
+                if proj in ("3rd", "asme", "american"):
+                    proj = "third"
+                if proj not in ("first", "third"):
+                    return _dumps({"ok": False,
+                                   "error": f"make_drawing: projection={projection!r} must be "
+                                            f"'third' (ASME) or 'first' (ISO E). Nothing was "
+                                            f"created."})
+                spec["projection"] = proj
+            if want_scale is not None:
+                spec["scale"] = want_scale
             # LIVE-DIALECT gap: name="40mm_cube_drawing" died as unknown_argument although
             # drawing_make already reads spec["name"] and hands it to drawing_new as the drawing
             # DOCUMENT's name (core/doc/drawing_session.cpp:1788 -> :813); with none it composes
@@ -2224,13 +2217,12 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 spec["title"] = _titleblock_payload(tb)
             r = cb.call("drawing_make", {"source_doc_id": d, "spec": spec})
             drawing_doc_id = r.get("doc_id")
-            # drawing_make always auto-scales to fit the sheet (drawing_session.cpp:1841-1946)
-            # and its spec has no scale key, so an explicit scale is applied to the finished
-            # views — repositioning each so it stays where the layout put it.
+            # The engine lays every view out at the explicit scale before dimensioning, so
+            # offsets and alignment are right at that scale; read back what was really drawn.
             scale_warnings: list = []
             view_scales: list = []
             if want_scale is not None and drawing_doc_id:
-                view_scales, scale_warnings = _apply_view_scale(drawing_doc_id, want_scale, notes)
+                view_scales, scale_warnings = _scale_readback(drawing_doc_id, want_scale, notes)
                 if want_scale not in _STANDARD_SCALES:
                     notes.append(f"scale={want_scale} is not one of the ISO 5455 / ASME Y14.1 "
                                  f"preferred scales (…2:1, 1:1, 1:2, 1:5…) — applied as asked")
@@ -2256,6 +2248,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                         for v in sh.get("views", []):
                             vid = v.get("view_id") or v.get("id")
                             ori = v.get("orientation") or v.get("type", "")
+                            if v.get("type") == "table_overlay":
+                                continue
                             if not vid:
                                 continue
                             view_map[vid] = ori
@@ -3551,6 +3545,69 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
+
+    @mcp.tool()
+    def arrange_drawing(doc_id: Optional[str] = None, projection: Optional[str] = None,
+                        scale: Optional[Any] = None, sheet_id: Optional[str] = None,
+                        size: Optional[str] = None) -> str:
+        """Re-lay a drawing sheet professionally in one call (no sheet-mm math).
+
+        Picks ONE ISO 5455 standard scale that fits the views in the free drawing area (frame
+        minus title block and tables) unless `scale` is given (1.0, 0.5, "1:2", "2:1"), puts the
+        standard views on the projection lattice — projection "third" (ASME; top above front,
+        right to its right) or "first" (ISO E; mirrored) — with shared alignment, places
+        sections/details beside their parent row, and updates the title block SCALE and
+        projection symbol. Dimensions and section cuts move with their views. `size` optionally
+        changes the paper first ("A3", "A4 portrait", "A2"). doc_id = drawing_doc_id.
+        """
+        try:
+            d = _doc(doc_id)
+            params: dict = {"doc_id": d, "sheet_id": sheet_id or ""}
+            notes: list = []
+            if size is not None:
+                paper, bad = _canon_sheet_size(size)
+                if bad:
+                    return _dumps(bad)
+                cb.call("drawing_set_sheet", {"doc_id": d, "sheet_id": sheet_id or "",
+                                              "size": paper})
+                notes.append(f"sheet set to {paper}")
+            if projection is not None:
+                proj = _canon_word(projection).replace("_angle", "").replace("angle", "")
+                proj = {"1st": "first", "3rd": "third"}.get(proj, proj)
+                if proj not in ("first", "third"):
+                    return _dumps({"ok": False, "error": "arrange_drawing: projection must be "
+                                   "'third' (ASME) or 'first' (ISO E)."})
+                params["projection"] = proj
+            if scale is not None:
+                want, bad = _canon_view_scale(scale)
+                if bad:
+                    return _dumps(bad)
+                params["scale"] = want
+            result, unsupported = _drawing_rpc("arrange_drawing", "drawing_arrange", params)
+            if unsupported:
+                return _dumps(unsupported)
+            result = result or {}
+            out = {"ok": True, "doc_id": d, "scale": result.get("scale"),
+                   "scale_text": result.get("scale_text"),
+                   "projection": result.get("projection")}
+            full = result.get("drawing") or {}
+            sheets = full.get("sheets") or []
+            size_mm = _sheet_size(full)
+            warnings = []
+            for v in _views_of(full):
+                bb = _bbox_of(v)
+                if bb and size_mm and _off_sheet_by(bb, size_mm):
+                    warnings.append(f"view {v.get('view_id')} extends past the sheet — use a "
+                                    f"bigger size= or a smaller scale")
+            if sheets:
+                out["sheet"] = sheets[0].get("size")
+            if warnings:
+                out["warnings"] = warnings
+            if notes:
+                out["interpreted"] = notes
+            return _dumps(out)
+        except Exception as exc:  # noqa: BLE001
+            return _err(exc)
 
     @mcp.tool()
     def add_drawing_sheet(doc_id: Optional[str] = None, size: str = "A3",

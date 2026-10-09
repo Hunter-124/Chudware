@@ -976,22 +976,6 @@ void AppState::syncActiveTabTitle() {
 // DRAWINGS module
 // ---------------------------------------------------------------------------------------------
 
-// The standard four-view layout placed on the blank A3 sheet (positions in sheet mm; the engine
-// scales + translates each projected polyline to these anchors). Matches the wave brief.
-namespace {
-struct DrawingViewSpec {
-    const char* type;         // "base" | "projected" | "iso"
-    const char* orientation;  // "front" | "top" | "right" | "iso"
-    double x, y;              // sheet-mm anchor
-};
-const DrawingViewSpec kStdViews[] = {
-    {"base",      "front", 105.0, 180.0},
-    {"projected", "top",   105.0,  80.0},
-    {"projected", "right", 230.0, 180.0},
-    {"iso",       "iso",   300.0,  80.0},
-};
-}  // namespace
-
 void AppState::makeDrawing() {
     // Guard: need an active PART/ASM tab to project from.
     if (activeTab < 0 || activeTab >= (int)docTabs.size() ||
@@ -1001,60 +985,53 @@ void AppState::makeDrawing() {
     }
     const std::string sourceId = docMirror.docId();
     const std::string sourceName = docTabs[activeTab].title;
+    std::string titleUpper = sourceName;
+    for (char& c : titleUpper)
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
 
-    // 1) Create a blank drawing sheet from the source part. drawing_new returns a DRAWING id in a
-    //    separate registry (NOT a doc_* id) plus the initial (view-less) drawing object.
-    std::string drawingId, drawingName;
-    {
-        nlohmann::json res;
-        std::string err;
-        nlohmann::json params = {{"source_doc_id", sourceId},
-                                 {"name", sourceName + " - Drawing"}};
-        if (!worker.call("drawing_new", params, res, err) || !res.is_object()) {
-            addLog("[draw] drawing_new failed: " + err);
-            toast(ui::ToastLevel::Error, "Make Drawing failed: " + (err.empty() ? "engine error" : err));
-            return;
-        }
-        drawingId = jstr(res, "doc_id");
-        if (res.contains("drawing") && res["drawing"].is_object())
-            drawingName = jstr(res["drawing"], "name");
-        if (drawingId.empty()) {
-            addLog("[draw] drawing_new returned no doc_id");
-            toast(ui::ToastLevel::Error, "Make Drawing failed: no drawing id");
-            return;
-        }
+    // ONE engine call builds the complete professional sheet: A3 frame + ISO 7200 title block,
+    // third-angle front/top/right + iso laid out at a standard scale, auto-dimensions and hole
+    // callouts. The response carries the full drawing_get, so no follow-up fetch is needed.
+    nlohmann::json res;
+    std::string err;
+    const nlohmann::json params = {
+        {"source_doc_id", sourceId},
+        {"spec", {{"name", sourceName + " - Drawing"},
+                  {"sheet", "A3"},
+                  {"views", nlohmann::json::array({"front", "top", "right", "iso"})},
+                  {"model_items", true},
+                  {"hole_callouts", true},
+                  {"projection", "third"},
+                  {"title", {{"title", titleUpper}}}}},
+    };
+    if (!worker.call("drawing_make", params, res, err) || !res.is_object() || res.contains("code")) {
+        const std::string msg = res.is_object() && res.contains("message") ? jstr(res, "message") : err;
+        addLog("[draw] drawing_make failed: " + msg);
+        toast(ui::ToastLevel::Error, "Make Drawing failed: " + (msg.empty() ? "engine error" : msg));
+        return;
     }
+    const std::string drawingId = jstr(res, "doc_id");
+    if (drawingId.empty() || !res.contains("drawing") || !res["drawing"].is_object()) {
+        addLog("[draw] drawing_make returned no drawing");
+        toast(ui::ToastLevel::Error, "Make Drawing failed: no drawing returned");
+        return;
+    }
+    nlohmann::json drawingDoc = std::move(res["drawing"]);
+    std::string drawingName;
+    if (drawingDoc.contains("tree") && drawingDoc["tree"].is_object())
+        drawingName = jstr(drawingDoc["tree"], "name");
     if (drawingName.empty()) drawingName = sourceName + " - Drawing";
 
-    // 2) Add the four standard views. Each is best-effort: a view that fails to project still leaves
-    //    a usable drawing (the panel renders a "view failed" note for it). We keep going on errors.
-    int added = 0;
-    for (const auto& v : kStdViews) {
-        nlohmann::json res;
-        std::string err;
-        nlohmann::json params = {
-            {"doc_id", drawingId},
-            {"type", v.type},
-            {"orientation", v.orientation},
-            {"position", nlohmann::json::array({v.x, v.y})},
-            {"scale", 1.0},
-        };
-        if (worker.call("drawing_add_view", params, res, err))
-            ++added;
-        else
-            addLog(std::string("[draw] add_view ") + v.orientation + " failed: " + err);
-    }
-
-    // 3) Fetch the assembled drawing (sheets + view geometry) and open a Drawing tab for it.
-    nlohmann::json drawingDoc;
-    {
-        nlohmann::json res;
-        std::string err;
-        if (worker.call("drawing_get", {{"doc_id", drawingId}}, res, err) && res.is_object())
-            drawingDoc = res;
-        else
-            addLog("[draw] drawing_get failed: " + err);
-    }
+    int nViews = 0, nDims = 0;
+    if (drawingDoc.contains("sheets") && drawingDoc["sheets"].is_array())
+        for (const auto& sh : drawingDoc["sheets"])
+            if (sh.is_object() && sh.contains("views") && sh["views"].is_array())
+                for (const auto& v : sh["views"]) {
+                    if (!v.is_object() || jstr(v, "type") == "table_overlay") continue;
+                    ++nViews;
+                    if (v.contains("annotations") && v["annotations"].is_array())
+                        nDims += (int)v["annotations"].size();
+                }
 
     DocTab t;
     t.kind = DocTab::TabKind::Drawing;
@@ -1066,13 +1043,23 @@ void AppState::makeDrawing() {
     // Park the source part's edit/display state before the drawing tab takes focus (it stays loaded
     // behind the sheet), then push the drawing tab and fall the CAD subsystems back to the singletons.
     parkActiveCadSession(*this);
+    // The source now feeds a drawing: it is no longer an "untouched starter" that leaving the
+    // Model workspace may discard (that would close the drawing's source part).
+    docTabs[activeTab].isStarter = false;
     docTabs.push_back(std::move(t));
     activeTab = (int)docTabs.size() - 1;
     reseatActiveSubsystems(nullptr);
-    if (ribbonTab == RT_Assembly) ribbonTab = RT_Features;
+    // Same landing as switchToTab() for a drawing tab: the sheet lives in the Drawing workspace,
+    // with the contextual View Layout ribbon forward (never a stale Sketch/Assembly tab).
+    activeWorkspace = Workspace::Drawing;
+    animActive = false;
+    ribbonTab = RT_ViewLayout;
     addLog("[draw] created drawing '" + drawingName + "' (" + drawingId + ", " +
-           std::to_string(added) + " views) from " + sourceId);
-    toast(ui::ToastLevel::Info, "Drawing created with " + std::to_string(added) + " views");
+           std::to_string(nViews) + " views, " + std::to_string(nDims) + " annotations) from " +
+           sourceId);
+    toast(ui::ToastLevel::Info,
+          "Drawing created \xE2\x80\x94 " + std::to_string(nViews) + " view" +
+              (nViews == 1 ? "" : "s") + (nDims > 0 ? ", auto-dimensioned" : ""));
 }
 
 void AppState::refreshDrawingTab(int idx) {

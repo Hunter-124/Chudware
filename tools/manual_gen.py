@@ -62,7 +62,7 @@ OVERVIEW_TOPIC = "overview"
 # of dict/set iteration. A curated subset of the topics cad_guide_text serves.
 GUIDE_TOPICS = [
     "review", "simulation", "intake", "gsl", "cam", "narration", "deliverables", "reverse",
-    "piping", "industrial", "civil",
+    "piping", "industrial", "civil", "drawings",
 ]
 
 # Known output names, including the retired duplicate overview. A guide- prefix alone

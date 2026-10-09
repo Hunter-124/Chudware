@@ -1,6 +1,6 @@
 # Commands Reference
 
-Every ribbon command (512 total), grouped by tab and ribbon group.
+Every ribbon command (514 total), grouped by tab and ribbon group.
 
 ## Annotation
 
@@ -2326,11 +2326,19 @@ _Available from the View Layout ▸ Section ribbon group._
 
 ### Sheet
 
+#### Auto Arrange
+
+_Available from the View Layout ▸ Sheet ribbon group._
+
 #### Export DXF
 
 _Available from the View Layout ▸ Sheet ribbon group._
 
 #### Export PDF
+
+_Available from the View Layout ▸ Sheet ribbon group._
+
+#### Export SVG
 
 _Available from the View Layout ▸ Sheet ribbon group._
 

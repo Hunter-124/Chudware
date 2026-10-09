@@ -18,5 +18,6 @@ in-app modeling guide, and the frozen contract set — see `tools/manual_gen.py`
 - [Guide: Piping](guide-piping.md)
 - [Guide: Industrial](guide-industrial.md)
 - [Guide: Civil](guide-civil.md)
+- [Guide: Drawings](guide-drawings.md)
 - [Contracts Summary](contracts.md)
 

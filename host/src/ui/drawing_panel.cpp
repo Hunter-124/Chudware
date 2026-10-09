@@ -1,16 +1,19 @@
 // Chudware Drawing panel — 2D sheet renderer. See drawing_panel.h.
 //
-// The drawing engine hands us, per sheet: size_mm:[w,h] (the paper) and a list of ViewGeometry, each
-// with `visible` (solid) and `hidden` (dashed) polylines already scaled + translated to sheet-mm at
-// the view's `position`. So all this panel does is paper -> screen: a single affine (uniform scale
-// pxPerMm + screen pan), then stroke the polylines with ImDrawList. We add a paper border, a faint
-// drop shadow, per-view bounding boxes + labels, and a small "Rebuild" / fit affordance.
+// The drawing engine hands us, per sheet, everything already compiled to sheet millimetres
+// (contract: draw-primitive v2): the sheet frame (border, ISO 5457 zones, ISO 7200 title block,
+// projection symbol) in sheet["frame"], each view's visible/hidden/hatch polylines, per-view
+// decorations (cutting planes, detail circles, captions) in view["draw"], and every annotation's
+// compiled draw block. This panel maps sheet-mm -> screen with one affine (pxPerMm zoom + pan) and
+// strokes them with ISO 128 paper-space weights (SheetPen), so the canvas matches the PDF/SVG/DXF
+// deliverables. It adds only UI: the paper shadow, hover/selection accents, tool previews, HUD.
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <map>
 #include <string>
@@ -23,9 +26,9 @@
 #include "../core/app_state.h"
 #include "../ui_theme.h"
 #include "file_dialog.h"
-#include "property_manager.h"   // pmFormatDim — dimension text follows MMGS/IPS like the rest of the UI
-#include "layout.h"             // ui::overlayColumnEdge — the sheet hint dodges the doc-tab strip
+#include "layout.h"             // ui::overlayColumnEdge / docTabBandBottom — the sheet's clear rect
 #include "metrics.h"            // ui::metrics::U — 4 px grid
+#include "widgets/kit.h"        // ui::kit — HUD chips, empty states, sheet-properties form
 
 namespace ui {
 
@@ -37,7 +40,7 @@ static inline ImU32 sheetCol(const float role[4], float a = 1.0f) {
     return Palette::toU32(c);
 }
 
-// --- 2D export (DXF / PDF) for the active Drawing tab -----------------------------------------
+// --- 2D export (PDF / SVG / DXF) for the active Drawing tab -----------------------------------
 // Path choice: a native Save-As dialog when available (remembers the Documents folder); when file
 // dialogs are disabled (headless / CHUDWARE_NO_FILE_DIALOGS) we fall back to writing next to nothing
 // in the cwd as "<title>_drawing.<ext>" and toast the path. A future nicety: per-sheet export +
@@ -65,7 +68,8 @@ static void exportActiveDrawing(AppState& st, const char* fmt) {
         return;
     }
     const bool isDxf = std::strcmp(fmt, "dxf") == 0;
-    const std::string ext = isDxf ? "dxf" : "pdf";
+    const bool isSvg = std::strcmp(fmt, "svg") == 0;
+    const std::string ext = isDxf ? "dxf" : isSvg ? "svg" : "pdf";
     const std::string base = s_sanitize(tab.title.empty() ? "drawing" : tab.title) + "_drawing";
 
     std::string path;
@@ -75,13 +79,15 @@ static void exportActiveDrawing(AppState& st, const char* fmt) {
     } else {
         const char* filterDxf = "DXF (*.dxf)\0*.dxf\0All files (*.*)\0*.*\0";
         const char* filterPdf = "PDF (*.pdf)\0*.pdf\0All files (*.*)\0*.*\0";
+        const char* filterSvg = "SVG (*.svg)\0*.svg\0All files (*.*)\0*.*\0";
         std::string suggest = base + "." + ext;
-        path = ui::saveFileDialog(isDxf ? filterDxf : filterPdf, ext.c_str(), suggest.c_str());
+        path = ui::saveFileDialog(isDxf ? filterDxf : isSvg ? filterSvg : filterPdf, ext.c_str(),
+                                  suggest.c_str());
         if (path.empty()) return;  // canceled
     }
 
     std::string err;
-    std::string written = st.docMirror.exportDrawing(st.worker, tab.drawingDocId, path, fmt, err);
+    std::string written = st.docMirror.exportDrawing(st.worker, tab.drawingDocId, path, ext, err);
     if (!written.empty()) {
         st.addLog("[draw] exported " + ext + ": " + written);
         st.toast(ui::ToastLevel::Info, "Exported " + written);
@@ -320,49 +326,6 @@ static void commitDetail(AppState& st, AppState::DocTab& tab, const std::string&
     }
 }
 
-// W15: hatch a closed section-face polygon with 45° lines (sheet-mm spacing), clipped to the
-// polygon by even-odd scanline crossings. `toScreen` maps sheet-mm -> screen px. We sweep a family
-// of lines x + y = c (i.e. 45°) across the polygon's mm bbox; for each we collect the polygon-edge
-// crossings, sort along the line, and stroke inside/outside pairs.
-static void hatchPolygon(ImDrawList* dl, const std::vector<std::array<float, 2>>& poly,
-                         const std::function<ImVec2(double, double)>& toScreen, ImU32 col,
-                         float thick, float spacingMm) {
-    if (poly.size() < 3) return;
-    float minx = poly[0][0], maxx = poly[0][0], miny = poly[0][1], maxy = poly[0][1];
-    for (const auto& p : poly) {
-        minx = std::min(minx, p[0]); maxx = std::max(maxx, p[0]);
-        miny = std::min(miny, p[1]); maxy = std::max(maxy, p[1]);
-    }
-    // 45° hatch direction d=(1,1)/sqrt2; the family is parameterized by c = (y - x). For each line
-    // y = x + c we intersect each polygon edge and pair up the crossings (even-odd fill).
-    const float cMin = (miny - maxx), cMax = (maxy - minx);
-    const float step = std::max(spacingMm, 0.5f) * 1.41421356f;  // perpendicular spacing -> c-step
-    for (float c = cMin; c <= cMax; c += step) {
-        // crossings: solve edge (p0->p1) against y = x + c.  param t where (p0.y + t*dy) = (p0.x + t*dx) + c
-        std::vector<float> xs;  // x-coordinate of each crossing
-        for (size_t i = 0; i < poly.size(); ++i) {
-            const auto& p0 = poly[i];
-            const auto& p1 = poly[(i + 1) % poly.size()];
-            float dx = p1[0] - p0[0], dy = p1[1] - p0[1];
-            float denom = dy - dx;                       // d/dt of (y - x)
-            float num = c - (p0[1] - p0[0]);             // target (y-x)=c minus current at t=0
-            if (std::fabs(denom) < 1e-6f) continue;      // edge parallel to the hatch line
-            float t = num / denom;
-            if (t < 0.0f || t > 1.0f) continue;
-            xs.push_back(p0[0] + t * dx);
-        }
-        if (xs.size() < 2) continue;
-        std::sort(xs.begin(), xs.end());
-        for (size_t k = 0; k + 1 < xs.size(); k += 2) {
-            float x0 = xs[k], x1 = xs[k + 1];
-            // points on the line: y = x + c
-            ImVec2 a = toScreen(x0, x0 + c);
-            ImVec2 b = toScreen(x1, x1 + c);
-            dl->AddLine(a, b, col, thick);
-        }
-    }
-}
-
 // Fetch the BOM for the active drawing (drawing_bom) into the tab cache.
 static void fetchBom(AppState& st, AppState::DocTab& tab) {
     nlohmann::json res;
@@ -406,23 +369,25 @@ static bool drawCall(AppState& st, const char* method, const nlohmann::json& par
     return false;
 }
 
-// T-PERF4: async drawing RPC for HLR-heavy ops (add/scale view). Keeps UI live; absorbs on drain.
-static void drawCallAsync(AppState& st, const char* method, nlohmann::json params,
-                          const char* label, bool needFit = false) {
+// T-PERF4: async drawing RPC for HLR-heavy ops (add/scale view, arrange, sheet size, title block).
+// Keeps the UI live; absorbs the returned drawing on drain. `then` runs after a successful absorb
+// (e.g. drawing_set_sheet -> drawing_arrange so the views refit the new paper).
+using DrawThen = std::function<void(AppState&, int tabIdx)>;
+static void drawCallAsyncOn(AppState& st, int tabIdx, const char* method, nlohmann::json params,
+                            const char* label, bool needFit = false, DrawThen then = {}) {
     if (!st.workerStarted) {
         st.toast(ui::ToastLevel::Error, std::string(label) + " failed: worker not started");
         return;
     }
+    if (tabIdx < 0 || tabIdx >= (int)st.docTabs.size()) return;
     const std::string methodS = method;
     const std::string labelS = label;
-    const int tabIdx = st.activeTab;
-    const std::string drawingId =
-        (tabIdx >= 0 && tabIdx < (int)st.docTabs.size()) ? st.docTabs[tabIdx].drawingDocId
-                                                         : std::string();
-    st.toast(ui::ToastLevel::Info, labelS + "…");
+    const std::string drawingId = st.docTabs[tabIdx].drawingDocId;
+    st.toast(ui::ToastLevel::Info, labelS + "\xE2\x80\xA6");
     ++st.rebuildsInFlight;
     st.rpc.call(methodS, std::move(params),
-                [&st, methodS, labelS, tabIdx, drawingId, needFit](const core::RpcResult& r) {
+                [&st, methodS, labelS, tabIdx, drawingId, needFit,
+                 then = std::move(then)](const core::RpcResult& r) {
                     --st.rebuildsInFlight;
                     if (tabIdx < 0 || tabIdx >= (int)st.docTabs.size() ||
                         st.docTabs[tabIdx].drawingDocId != drawingId) {
@@ -455,8 +420,13 @@ static void drawCallAsync(AppState& st, const char* method, nlohmann::json param
                         return;
                     }
                     st.addLog("[draw] " + methodS + " ok");
+                    if (then) then(st, tabIdx);
                 },
                 120000);
+}
+static void drawCallAsync(AppState& st, const char* method, nlohmann::json params,
+                          const char* label, bool needFit = false) {
+    drawCallAsyncOn(st, st.activeTab, method, std::move(params), label, needFit);
 }
 
 // Clear every modal drawing tool + its in-progress stage (called when arming a new tool).
@@ -614,6 +584,17 @@ bool drawingHandleCommand(AppState& st, const std::string& cmd) {
     if (cmd == "dwg_fit")         { tab.drawNeedFit = true; return true; }
     if (cmd == "dwg_export_dxf")  { exportActiveDrawing(st, "dxf"); return true; }
     if (cmd == "dwg_export_pdf")  { exportActiveDrawing(st, "pdf"); return true; }
+    if (cmd == "dwg_export_svg")  { exportActiveDrawing(st, "svg"); return true; }
+    if (cmd == "dwg_arrange") {
+        // Re-run the engine's professional layout (projection + scale kept from the title block).
+        disarmDrawTools(tab);
+        nlohmann::json p = {{"doc_id", tab.drawingDocId}};
+        if (tab.drawingDoc.contains("sheets") && tab.drawingDoc["sheets"].is_array() &&
+            !tab.drawingDoc["sheets"].empty() && tab.drawingDoc["sheets"][0].is_object())
+            p["sheet_id"] = djstr(tab.drawingDoc["sheets"][0], "id");
+        drawCallAsync(st, "drawing_arrange", std::move(p), "Arrange views", /*needFit=*/true);
+        return true;
+    }
     if (cmd == "dwg_view_model")  { disarmDrawTools(tab); addStdView(st, tab, "base", "front", 150, 180); return true; }
     if (cmd == "dwg_view_proj")   { disarmDrawTools(tab); addStdView(st, tab, "projected", "top", 150, 80); return true; }
     if (cmd == "dwg_view_std3") {
@@ -685,269 +666,249 @@ bool drawingHandleCommand(AppState& st, const std::string& cmd) {
     return false;
 }
 
-// Render one stored dimension annotation: extension lines from a & b, a dimension line through the
-// text position, simple arrowheads, and the value text. `toScreen` maps sheet-mm to screen px.
-static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
-                            const std::function<ImVec2(double, double)>& toScreen, float z,
-                            float s, bool selected) {
-    auto rdvec = [&](const char* k, double& x, double& y) -> bool {
-        auto it = ann.find(k);
-        if (it == ann.end() || !it->is_array() || it->size() != 2 ||
-            !(*it)[0].is_number() || !(*it)[1].is_number()) return false;
-        x = (*it)[0].get<double>(); y = (*it)[1].get<double>(); return true;
-    };
-    const std::string atype = djstr(ann, "type");
-    const std::string kind = djstr(ann, "kind");
-    const bool critical = ann.is_object() && ann.value("critical", false);
-    double ax, ay, bx, by, px, py;
-    bool haveA = rdvec("a", ax, ay), haveB = rdvec("b", bx, by), haveP = rdvec("pos", px, py);
+// ---- sheet ink: the v2 draw-primitive contract ----------------------------------------------------
+// Every line on the sheet — frame, title block, view geometry, core view decorations (cutting
+// planes, detail circles, captions) and every annotation — arrives as compiled primitives in
+// sheet millimetres. This painter maps them to screen with ISO 128 PAPER-SPACE weights and dash
+// patterns scaled by the live zoom, so the canvas matches the PDF / SVG / DXF deliverables.
+static constexpr float kThinMm = 0.25f;    // ISO 128 type 01.1 (dims, hatch, hidden, centre)
+static constexpr float kThickMm = 0.50f;   // outlines, frame, title-block border, cutting-plane ends
+static constexpr float kHiddenPat[] = {3.0f, 1.5f};             // dash, gap (mm)
+static constexpr float kChainPat[] = {6.0f, 1.0f, 0.5f, 1.0f};  // long dash, gap, dot, gap (mm)
 
-    // Critical dims pop red + heavier; selected = amber; otherwise the SolidWorks dimension blue.
-    const ImU32 dimCol = critical ? sheetCol(palette.statusErr)
-                       : selected  ? sheetCol(palette.statusWarn)
-                                   : sheetCol(palette.sketchUnder);
-    const float thick = std::max(1.0f, (critical ? 1.6f : 1.0f) * s);
-
-    const float fontPx = std::max(ImGui::GetFontSize(), 3.5f * z);
-    ImFont* font = ImGui::GetFont();
-    std::string txt = djstr(ann, "text");
-    auto drawLabel = [&](ImVec2 tp, const std::string& t) {
-        if (t.empty()) return;
-        ImVec2 ts = font->CalcTextSizeA(fontPx, FLT_MAX, 0.0f, t.c_str());
-        dl->AddRectFilled(ImVec2(tp.x - 2 * s, tp.y - s),
-                          ImVec2(tp.x + ts.x + 2 * s, tp.y + ts.y + s),
-                          sheetCol(palette.viewportTop, 0.86f), 2.0f * s);
-        dl->AddText(font, fontPx, tp, dimCol, t.c_str());
-    };
-    auto criticalFlag = [&](ImVec2 at) {
-        if (critical)
-            dl->AddText(ImVec2(at.x - 10 * s, at.y - 1), sheetCol(palette.statusErr), "!");
-    };
-
-    // --- center mark: a small cross at the circle center ---
-    if (kind == "center_mark") {
-        double cx = ax, cy = ay, t1, t2;
-        if (rdvec("center", t1, t2)) { cx = t1; cy = t2; }
-        ImVec2 c = toScreen(cx, cy);
-        float r = 6.0f * s;
-        dl->AddLine(ImVec2(c.x - r, c.y), ImVec2(c.x + r, c.y), dimCol, thick);
-        dl->AddLine(ImVec2(c.x, c.y - r), ImVec2(c.x, c.y + r), dimCol, thick);
-        return;
-    }
-    // --- center line: dashed construction line a->b (with a small overrun each end) ---
-    if (kind == "center_line") {
-        if (haveA && haveB) {
-            ImVec2 A = toScreen(ax, ay), B = toScreen(bx, by);
-            ImVec2 d(B.x - A.x, B.y - A.y);
-            float l = std::sqrt(d.x * d.x + d.y * d.y);
-            if (l > 1e-3f) {
-                d.x /= l; d.y /= l;
-                float e = 6.0f * s;
-                A = ImVec2(A.x - d.x * e, A.y - d.y * e);
-                B = ImVec2(B.x + d.x * e, B.y + d.y * e);
-            }
-            addDashedPolyline(dl, {A, B}, dimCol, thick, 9.0f * s, 4.0f * s);
+// Stroke an open polyline with an on/off pattern in screen px (even entries draw). The phase runs
+// continuously across vertices, so dashes turn corners instead of restarting per segment.
+static void strokePatternPx(ImDrawList* dl, const ImVec2* pts, int n, ImU32 col, float w,
+                            const float* pat, int np) {
+    if (n < 2 || np < 2) return;
+    int idx = 0;
+    float left = pat[0];
+    for (int i = 1; i < n; ++i) {
+        const ImVec2 a = pts[i - 1], b = pts[i];
+        const float len = std::sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y));
+        if (len < 1e-4f) continue;
+        const float ux = (b.x - a.x) / len, uy = (b.y - a.y) / len;
+        float d = 0.0f;
+        while (d < len) {
+            const float step = std::min(left, len - d);
+            if ((idx & 1) == 0)
+                dl->AddLine(ImVec2(a.x + ux * d, a.y + uy * d),
+                            ImVec2(a.x + ux * (d + step), a.y + uy * (d + step)), col, w);
+            d += step;
+            left -= step;
+            if (left <= 1e-4f) { idx = (idx + 1) % np; left = pat[idx]; }
         }
-        return;
     }
-    // --- balloon: leader from anchor a to a numbered bubble at pos ---
-    if (kind == "balloon") {
-        if (haveP) {
-            ImVec2 P = toScreen(px, py);
-            float r = 11.0f * s;
-            if (haveA) {
-                ImVec2 A = toScreen(ax, ay);
-                dl->AddLine(A, P, dimCol, thick);
-                dl->AddCircleFilled(A, 2.0f * s, dimCol);
-            }
-            dl->AddCircleFilled(P, r, sheetCol(palette.viewportTop, 0.92f));
-            dl->AddCircle(P, r, dimCol, 24, thick);
-            if (txt.empty()) {
-                int it = (int)djnum(ann, "item", 0);
-                if (it > 0) txt = std::to_string(it);
-            }
-            if (!txt.empty()) {
-                ImVec2 ts = font->CalcTextSizeA(fontPx, FLT_MAX, 0.0f, txt.c_str());
-                dl->AddText(font, fontPx,
-                            ImVec2(P.x - ts.x * 0.5f, P.y - ts.y * 0.5f), dimCol, txt.c_str());
-            }
-        }
-        return;
-    }
-    // --- hole callout / radial / diameter: leader from the circle center to text at pos ---
-    if (kind == "hole_callout" || kind == "radial_dim" || kind == "diameter_dim") {
-        if (txt.empty()) {
-            double val = djnum(ann, "value", 0.0);
-            txt = pmFormatDim(val, ips);
-            if (kind == "diameter_dim" || kind == "hole_callout") txt = "\xE2\x8C\x80" + txt;
-            else if (kind == "radial_dim") txt = "R" + txt;
-        }
-        double cx = ax, cy = ay, t1, t2;
-        if (rdvec("center", t1, t2)) { cx = t1; cy = t2; }
-        ImVec2 C = toScreen(cx, cy);
-        ImVec2 P = haveP ? toScreen(px, py) : ImVec2(C.x + 22 * s, C.y - 22 * s);
-        dl->AddLine(C, P, dimCol, thick);
-        dl->AddCircleFilled(C, 2.0f * s, dimCol);
-        drawLabel(ImVec2(P.x + 3 * s, P.y - ImGui::GetTextLineHeight() * 0.5f), txt);
-        criticalFlag(P);
-        return;
-    }
-    // --- angular dim: value text at pos (witness geometry omitted for the MVP) ---
-    if (kind == "angular_dim") {
-        if (haveP) drawLabel(toScreen(px, py), txt.empty() ? "?" : txt);
-        return;
-    }
-
-    // Note: just text at pos.
-    if (atype == "note" || !haveA || !haveB) {
-        if (haveP) {
-            if (txt.empty()) txt = "note";
-            drawLabel(toScreen(px, py), txt);
-        }
-        return;
-    }
-    if (!haveP) { px = (ax + bx) * 0.5; py = (ay + by) * 0.5; }
-
-    ImVec2 A = toScreen(ax, ay), B = toScreen(bx, by), P = toScreen(px, py);
-
-    // The dimension line is parallel to A->B, passing through P. We project A and B onto that line so
-    // the dimension line spans the measured extent at the text offset; extension lines connect the
-    // real points to the dimension line ends.
-    ImVec2 dir(B.x - A.x, B.y - A.y);
-    float len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
-    if (len < 1e-3f) return;
-    ImVec2 u(dir.x / len, dir.y / len);          // unit along A->B
-    // Offset = component of (P - A) perpendicular to u, applied to both ends.
-    ImVec2 pa(P.x - A.x, P.y - A.y);
-    float along = pa.x * u.x + pa.y * u.y;
-    ImVec2 perp(pa.x - along * u.x, pa.y - along * u.y);   // perpendicular vector A->dimline
-    ImVec2 A2(A.x + perp.x, A.y + perp.y);
-    ImVec2 B2(B.x + perp.x, B.y + perp.y);
-
-    // Extension lines (with a small gap off the geometry).
-    auto gapStart = [&](const ImVec2& from, const ImVec2& to) {
-        ImVec2 d(to.x - from.x, to.y - from.y);
-        float l = std::sqrt(d.x * d.x + d.y * d.y);
-        if (l < 1e-3f) return from;
-        float g = std::min(4.0f * s, l * 0.25f);
-        return ImVec2(from.x + d.x / l * g, from.y + d.y / l * g);
-    };
-    dl->AddLine(gapStart(A, A2), A2, dimCol, thick);
-    dl->AddLine(gapStart(B, B2), B2, dimCol, thick);
-    // Dimension line.
-    dl->AddLine(A2, B2, dimCol, thick);
-
-    // Arrowheads at A2 and B2 pointing inward.
-    auto arrow = [&](const ImVec2& tip, const ImVec2& other) {
-        ImVec2 d(other.x - tip.x, other.y - tip.y);
-        float l = std::sqrt(d.x * d.x + d.y * d.y);
-        if (l < 1e-3f) return;
-        d.x /= l; d.y /= l;
-        ImVec2 n(-d.y, d.x);
-        float ah = 7.0f * s, aw = 2.6f * s;
-        ImVec2 base(tip.x + d.x * ah, tip.y + d.y * ah);
-        dl->AddTriangleFilled(tip, ImVec2(base.x + n.x * aw, base.y + n.y * aw),
-                              ImVec2(base.x - n.x * aw, base.y - n.y * aw), dimCol);
-    };
-    arrow(A2, B2);
-    arrow(B2, A2);
-
-    // Value text at the dimension line midpoint. Paper-space dimensions scale with sheet zoom,
-    // but never fall below the UI font size at fit-to-window zoom.
-    if (txt.empty()) {
-        double val = djnum(ann, "value", 0.0);
-        txt = pmFormatDim(val, ips);   // engine value is canonical mm; pmFormatDim handles IPS
-    }
-    ImVec2 ts = font->CalcTextSizeA(fontPx, FLT_MAX, 0.0f, txt.c_str());
-    ImVec2 mid((A2.x + B2.x) * 0.5f, (A2.y + B2.y) * 0.5f);
-    ImVec2 tp(mid.x - ts.x * 0.5f, mid.y - ts.y - 2 * s);
-    dl->AddRectFilled(ImVec2(tp.x - 2 * s, tp.y - s),
-                      ImVec2(tp.x + ts.x + 2 * s, tp.y + ts.y + s),
-                      sheetCol(palette.viewportTop, 0.86f), 2.0f * s);
-    dl->AddText(font, fontPx, tp, dimCol, txt.c_str());
-    criticalFlag(ImVec2(tp.x, tp.y));
 }
 
-// Render an annotation from the engine-compiled `draw` primitive block (segments / dashed /
-// arcs / tris / texts in sheet mm). This is the ONE rendering path for dimensions, callouts,
-// AND every GD&T element — the same primitives the DXF/PDF export and PNG raster consume, so
-// the on-screen sheet matches the deliverables exactly. `z` is px-per-mm (paper space).
-static void renderDrawPrimitives(ImDrawList* dl, const nlohmann::json& ann,
-                                 const std::function<ImVec2(double, double)>& toScreen, float z,
-                                 float s, bool selected) {
-    auto it = ann.find("draw");
-    if (it == ann.end() || !it->is_object()) return;
-    const nlohmann::json& d = *it;
-    const bool critical = ann.value("critical", false);
-    const ImU32 col = critical ? sheetCol(palette.statusErr)
-                    : selected  ? sheetCol(palette.statusWarn)
-                                : sheetCol(palette.sketchUnder);
-    const float thick = std::max(1.0f, (critical ? 1.6f : 1.0f) * s);
+// The atlas has no cell for the counterbore / countersink / depth symbols; spell them as the
+// ASCII words the PDF and DXF exports use (the diameter sign is in the atlas and stays).
+static void mapCadGlyphs(std::string& s) {
+    static const char* const kSym[] = {"\xE2\x8C\xB4", "\xE2\x8C\xB5", "\xE2\x86\xA7"};
+    static const char* const kWord[] = {"CBORE", "CSK", "DEPTH"};
+    for (int k = 0; k < 3; ++k) {
+        size_t at;
+        while ((at = s.find(kSym[k])) != std::string::npos) {
+            std::string rep = kWord[k];
+            if (at + 3 < s.size() && s[at + 3] != ' ') rep += ' ';
+            s.replace(at, 3, rep);
+        }
+    }
+}
 
-    auto strokePoly = [&](const nlohmann::json& pl, bool dashed) {
-        if (!pl.is_array() || pl.size() < 2) return;
-        std::vector<ImVec2> pts;
-        pts.reserve(pl.size());
+struct SheetPen {
+    ImDrawList* dl;
+    ImVec2 origin;              // screen position of sheet (0,0)
+    float z;                    // px per sheet mm
+    float thin = 1.0f, thick = 2.0f;
+    ImFont* font = nullptr;
+    float capRatio = 0.7f;      // cap height / font size   (measured from the 'H' glyph)
+    float baseRatio = 0.8f;     // baseline below the line top / font size
+    std::vector<ImVec2> buf;    // reused per polyline (no per-line allocation)
+    std::string textBuf;
+
+    SheetPen(ImDrawList* d, ImVec2 o, float zoom) : dl(d), origin(o), z(zoom) {
+        // Paper-space weights, floored at a hairline; thick always reads heavier than thin.
+        thin = std::max(ui::metrics::stroke(1.0f), kThinMm * z);
+        thick = std::max(kThickMm * z, thin * 1.8f);
+        font = ImGui::GetFont();
+        const ImFontGlyph* g = font->FindGlyph((ImWchar)'H');
+        if (g && font->FontSize > 0.0f && g->Y1 > g->Y0) {
+            capRatio = (g->Y1 - g->Y0) / font->FontSize;
+            baseRatio = g->Y1 / font->FontSize;
+        }
+    }
+    ImVec2 at(double x, double y) const {
+        return ImVec2(origin.x + (float)x * z, origin.y - (float)y * z);
+    }
+    static bool num2(const nlohmann::json& p) {
+        return p.is_array() && p.size() == 2 && p[0].is_number() && p[1].is_number();
+    }
+    bool load(const nlohmann::json& pl) {
+        buf.clear();
+        if (!pl.is_array()) return false;
         for (const auto& p : pl)
-            if (p.is_array() && p.size() == 2 && p[0].is_number() && p[1].is_number())
-                pts.push_back(toScreen(p[0].get<double>(), p[1].get<double>()));
-        if (pts.size() < 2) return;
-        if (dashed) addDashedPolyline(dl, pts, col, thick, 6.0f * s, 3.0f * s);
-        else dl->AddPolyline(pts.data(), (int)pts.size(), col, 0, thick);
-    };
-    if (d.contains("segments") && d["segments"].is_array())
-        for (const auto& pl : d["segments"]) strokePoly(pl, false);
-    if (d.contains("dashed") && d["dashed"].is_array())
-        for (const auto& pl : d["dashed"]) strokePoly(pl, true);
-    // Arcs — sample to screen points (toScreen flips Y, so sampling is orientation-safe).
-    if (d.contains("arcs") && d["arcs"].is_array())
-        for (const auto& a : d["arcs"]) {
-            if (!a.is_object() || !a.contains("center")) continue;
-            double cx = a["center"][0].get<double>(), cy = a["center"][1].get<double>();
-            double r = djnum(a, "radius", 0.0);
-            double a0 = djnum(a, "a0", 0.0), a1 = djnum(a, "a1", 6.28318530718);
-            if (r <= 0.0) continue;
-            int n = std::max(10, (int)(std::fabs(a1 - a0) / 0.3));
-            std::vector<ImVec2> pts;
-            pts.reserve(n + 1);
-            for (int i = 0; i <= n; ++i) {
-                double t = a0 + (a1 - a0) * (double)i / (double)n;
-                pts.push_back(toScreen(cx + r * std::cos(t), cy + r * std::sin(t)));
+            if (num2(p)) buf.push_back(at(p[0].get<double>(), p[1].get<double>()));
+        return buf.size() >= 2;
+    }
+    void solid(const nlohmann::json& list, ImU32 col, float w) {
+        if (!list.is_array()) return;
+        for (const auto& pl : list) {
+            if (!load(pl)) continue;
+            ImDrawFlags flags = 0;
+            const ImVec2 f = buf.front(), l = buf.back();
+            if (buf.size() >= 4 && std::fabs(f.x - l.x) < 0.01f && std::fabs(f.y - l.y) < 0.01f) {
+                buf.pop_back();   // closed loop: a mitred joint instead of a seam
+                flags = ImDrawFlags_Closed;
             }
-            dl->AddPolyline(pts.data(), (int)pts.size(), col, 0, thick);
+            dl->AddPolyline(buf.data(), (int)buf.size(), col, flags, w);
         }
-    // Filled triangles (arrowheads / datum triangles).
-    if (d.contains("tris") && d["tris"].is_array())
-        for (const auto& t : d["tris"]) {
-            if (!t.is_array() || t.size() != 3) continue;
-            dl->AddTriangleFilled(toScreen(t[0][0].get<double>(), t[0][1].get<double>()),
-                                  toScreen(t[1][0].get<double>(), t[1][1].get<double>()),
-                                  toScreen(t[2][0].get<double>(), t[2][1].get<double>()), col);
+    }
+    void patterned(const nlohmann::json& list, ImU32 col, float w, const float* patMm, int n) {
+        if (!list.is_array()) return;
+        // Never fewer than one logical px per pattern mm, so a zoomed-out sheet keeps legible dashes.
+        const float mmPx = std::max(z, ui::metrics::px(1.0f));
+        float pat[4];
+        for (int i = 0; i < n && i < 4; ++i) pat[i] = patMm[i] * mmPx;
+        for (const auto& pl : list)
+            if (load(pl)) strokePatternPx(dl, buf.data(), (int)buf.size(), col, w, pat, std::min(n, 4));
+    }
+    void arcs(const nlohmann::json& list, ImU32 col, float w) {
+        if (!list.is_array()) return;
+        constexpr double kTwoPi = 6.283185307179586;
+        for (const auto& a : list) {
+            if (!a.is_object() || !a.contains("center") || !num2(a["center"])) continue;
+            const double r = djnum(a, "radius", 0.0);
+            if (!(r > 0.0)) continue;
+            const double cx = a["center"][0].get<double>(), cy = a["center"][1].get<double>();
+            const double a0 = djnum(a, "a0", 0.0);
+            double da = djnum(a, "a1", kTwoPi) - a0;
+            const bool full = std::fabs(da) >= kTwoPi - 1e-9;
+            if (full) da = kTwoPi;
+            const int segs = std::clamp((int)(std::fabs(da) * r * z / 3.0), 8, 512);
+            buf.clear();
+            const int count = full ? segs : segs + 1;
+            for (int i = 0; i < count; ++i) {
+                const double t = a0 + da * (double)i / (double)segs;
+                buf.push_back(at(cx + r * std::cos(t), cy + r * std::sin(t)));
+            }
+            dl->AddPolyline(buf.data(), (int)buf.size(), col, full ? ImDrawFlags_Closed : 0, w);
         }
-    // Text runs — paper-space height (mm) scaled to px by the live zoom.
-    if (d.contains("texts") && d["texts"].is_array()) {
-        ImFont* font = ImGui::GetFont();
-        const float baseSz = ImGui::GetFontSize();
-        for (const auto& t : d["texts"]) {
-            if (!t.is_object() || !t.contains("pos")) continue;
-            std::string txt = djstr(t, "text");
-            if (txt.empty()) continue;
-            double h = djnum(t, "h", 3.5);
-            float fpx = std::max(ImGui::GetFontSize(), (float)h * z);
-            ImVec2 anchor = toScreen(t["pos"][0].get<double>(), t["pos"][1].get<double>());
-            ImVec2 ts = ImGui::CalcTextSize(txt.c_str());
-            float scaleF = fpx / baseSz;
-            float w = ts.x * scaleF;
-            std::string align = djstr(t, "align"), valign = djstr(t, "valign");
-            float tx = anchor.x, ty = anchor.y;
-            if (align == "center") tx -= w * 0.5f;
-            else if (align == "right") tx -= w;
-            if (valign == "base") ty -= fpx;
-            else if (valign == "mid") ty -= fpx * 0.5f;
-            // a faint white pad behind the glyphs for legibility over geometry
-            dl->AddRectFilled(ImVec2(tx - 1, ty), ImVec2(tx + w + 1, ty + fpx),
-                              sheetCol(palette.viewportTop, 0.78f), 1.0f);
-            dl->AddText(font, fpx, ImVec2(tx, ty), col, txt.c_str());
+    }
+    void tris(const nlohmann::json& list, ImU32 col) {
+        if (!list.is_array()) return;
+        for (const auto& t : list) {
+            if (!t.is_array() || t.size() != 3 || !num2(t[0]) || !num2(t[1]) || !num2(t[2]))
+                continue;
+            dl->AddTriangleFilled(at(t[0][0].get<double>(), t[0][1].get<double>()),
+                                  at(t[1][0].get<double>(), t[1][1].get<double>()),
+                                  at(t[2][0].get<double>(), t[2][1].get<double>()), col);
+        }
+    }
+    // `h` is the cap height in mm (ISO 3098); align/valign per the contract, measured with the
+    // real rendered width.
+    void texts(const nlohmann::json& list, ImU32 col) {
+        if (!list.is_array()) return;
+        for (const auto& t : list) {
+            if (!t.is_object() || !t.contains("pos") || !num2(t["pos"])) continue;
+            auto it = t.find("text");
+            if (it == t.end() || !it->is_string()) continue;
+            const std::string* raw = it->get_ptr<const std::string*>();
+            if (raw->empty()) continue;
+            const std::string* txt = raw;
+            if (raw->find('\xE2') != std::string::npos) {
+                textBuf = *raw;
+                mapCadGlyphs(textBuf);
+                txt = &textBuf;
+            }
+            const float capPx = (float)djnum(t, "h", 3.5) * z;
+            const float fpx = capPx / capRatio;
+            if (fpx < 1.0f) continue;
+            const char* b = txt->c_str();
+            const char* e = b + txt->size();
+            const ImVec2 a = at(t["pos"][0].get<double>(), t["pos"][1].get<double>());
+            const std::string align = djstr(t, "align"), valign = djstr(t, "valign");
+            float x = a.x;
+            if (align == "center" || align == "right") {
+                const float w = font->CalcTextSizeA(fpx, FLT_MAX, 0.0f, b, e).x;
+                x -= align == "center" ? w * 0.5f : w;
+            }
+            float baseY = a.y;                          // "base": pos is the baseline
+            if (valign == "mid") baseY += capPx * 0.5f; // pos is mid cap-height
+            else if (valign == "top") baseY += capPx;   // pos is the top of capitals
+            dl->AddText(font, fpx, ImVec2(x, baseY - baseRatio * fpx), col, b, e);
+        }
+    }
+    // One draw block. Missing keys are empty; unknown keys are ignored.
+    void block(const nlohmann::json& d, ImU32 col) {
+        if (!d.is_object()) return;
+        auto arr = [&](const char* k) -> const nlohmann::json* {
+            auto it = d.find(k);
+            return (it != d.end() && it->is_array() && !it->empty()) ? &*it : nullptr;
+        };
+        if (const auto* a = arr("segments")) solid(*a, col, thin);
+        if (const auto* a = arr("thick")) solid(*a, col, thick);
+        if (const auto* a = arr("dashed")) patterned(*a, col, thin, kHiddenPat, 2);
+        if (const auto* a = arr("chain")) patterned(*a, col, thin, kChainPat, 4);
+        if (const auto* a = arr("chain_thick")) patterned(*a, col, thick, kChainPat, 4);
+        if (const auto* a = arr("arcs")) arcs(*a, col, thin);
+        if (const auto* a = arr("tris")) tris(*a, col);
+        if (const auto* a = arr("texts")) texts(*a, col);
+    }
+};
+
+static std::string viewIdOf(const nlohmann::json& v) {
+    std::string id = djstr(v, "view_id");
+    return id.empty() ? djstr(v, "id") : id;
+}
+
+// A view's sheet-mm bbox (false for table overlays / views without geometry).
+static bool viewBox(const nlohmann::json& v, double& x0, double& y0, double& x1, double& y1) {
+    auto it = v.find("bbox");
+    if (it == v.end() || !it->is_array() || it->size() != 4) return false;
+    const auto& b = *it;
+    if (!(b[0].is_number() && b[1].is_number() && b[2].is_number() && b[3].is_number()))
+        return false;
+    x0 = b[0].get<double>(); y0 = b[1].get<double>();
+    x1 = b[2].get<double>(); y1 = b[3].get<double>();
+    return true;
+}
+
+// The point an annotation is grabbed by: its compiled draw block's pick, else its stored pos.
+static bool annAnchor(const nlohmann::json& ann, double& x, double& y) {
+    auto dr = ann.find("draw");
+    if (dr != ann.end() && dr->is_object()) {
+        auto pk = dr->find("pick");
+        if (pk != dr->end() && SheetPen::num2(*pk)) {
+            x = (*pk)[0].get<double>(); y = (*pk)[1].get<double>();
+            return true;
+        }
+    }
+    auto it = ann.find("pos");
+    if (it != ann.end() && SheetPen::num2(*it)) {
+        x = (*it)[0].get<double>(); y = (*it)[1].get<double>();
+        return true;
+    }
+    return false;
+}
+
+// Nearest editable annotation anchor within `radiusMm` (table overlays are not annotations the
+// dimension editor can patch, so they never pick).
+static void pickAnnotation(const nlohmann::json& sheet, double qx, double qy, double radiusMm,
+                           std::string& hv, std::string& ha, double& hx, double& hy) {
+    double best = radiusMm * radiusMm;
+    if (!(sheet.contains("views") && sheet["views"].is_array())) return;
+    for (const auto& v : sheet["views"]) {
+        if (!v.is_object() || djstr(v, "type") == "table_overlay" || !v.contains("annotations") ||
+            !v["annotations"].is_array())
+            continue;
+        for (const auto& ann : v["annotations"]) {
+            double px, py;
+            if (!ann.is_object() || !annAnchor(ann, px, py)) continue;
+            const double d2 = (px - qx) * (px - qx) + (py - qy) * (py - qy);
+            if (d2 < best) {
+                best = d2; hv = viewIdOf(v); ha = djstr(ann, "id"); hx = px; hy = py;
+            }
         }
     }
 }
@@ -969,75 +930,6 @@ static const nlohmann::json* findSelAnn(const nlohmann::json& sheet, const std::
             if (a.is_object() && djstr(a, "id") == annId) return &a;
     }
     return nullptr;
-}
-
-// Draw a standard SolidWorks-style title block in the bottom-right of the sheet (always drawn so
-// the sheet reads as a real drawing; fields come from sheet["title_block"], else sensible blanks).
-static void renderTitleBlock(ImDrawList* dl, const nlohmann::json& sheet,
-                             const std::function<ImVec2(double, double)>& toScreen,
-                             double paperW, double /*paperH*/, float s) {
-    const nlohmann::json* tb =
-        (sheet.contains("title_block") && sheet["title_block"].is_object()) ? &sheet["title_block"]
-                                                                            : nullptr;
-    auto field = [&](const char* key, const std::string& fb) -> std::string {
-        if (tb) {
-            auto it = tb->find(key);
-            if (it != tb->end()) {
-                if (it->is_string()) return it->get<std::string>();
-                if (it->is_number()) { char b[32]; std::snprintf(b, sizeof(b), "%g",
-                                       it->get<double>()); return b; }
-            }
-        }
-        return fb;
-    };
-    const double margin = 8.0, bw = 176.0, bh = 56.0;
-    const double rx = paperW - margin, by = margin;     // bottom-right corner, inside the trim
-    const double lx = rx - bw, ty = by + bh;
-    ImVec2 tl = toScreen(lx, ty), br = toScreen(rx, by);
-    const ImU32 ink = sheetCol(palette.sketchInk), line = sheetCol(palette.sketchDimLine);
-    // The title owns one row; metadata owns two equal-height rows. Row height is in SHEET units
-    // (it scales with the sheet zoom) while the text is drawn at a fixed font size, so the rows
-    // must be at LEAST tall enough for a label plus a value or the two collapse onto each other.
-    // This was a std::min, which is the opposite: at 149% sheet zoom (a 1280x800 window) the
-    // rows shrank under the text and the block read "DRAWN" over "Chudware" and "MATL" over
-    // "AL 6061" again. Take the max, and grow the block UPWARD when the fixed text needs more
-    // room than the scaled box has, so it stays anchored in the bottom-right corner.
-    float h = br.y - tl.y, w = br.x - tl.x;
-    const float fontH = ImGui::GetTextLineHeight();
-    const float pad = 2.0f * s;
-    const float metadataRowH = std::max(h * 0.34f, 2.0f * fontH + 3.0f * pad);
-    const float titleRowH = std::max(h * 0.32f, fontH + 2.0f * pad);
-    const float needed = 2.0f * metadataRowH + titleRowH;
-    if (needed > h) {
-        tl.y = br.y - needed;
-        h = needed;
-    }
-    dl->AddRectFilled(tl, br, sheetCol(palette.viewportTop, 0.92f));
-    dl->AddRect(tl, br, line, 0.0f, 0, 1.4f * s);
-    const float r2 = br.y - metadataRowH;
-    const float r1 = r2 - metadataRowH;
-    dl->AddLine(ImVec2(tl.x, r1), ImVec2(br.x, r1), line, 1.0f * s);
-    dl->AddLine(ImVec2(tl.x, r2), ImVec2(br.x, r2), line, 1.0f * s);
-    auto label = [&](float x, float y, float cellW, const char* k, const std::string& val) {
-        const float cellH = metadataRowH;
-        const float labelY = y + pad;
-        const float valueY = std::min(y + cellH - fontH - pad, labelY + fontH + pad);
-        dl->PushClipRect(ImVec2(x + pad, y), ImVec2(x + cellW - pad, y + cellH), true);
-        dl->AddText(ImVec2(x + pad, labelY), sheetCol(palette.sketchInk, 0.55f), k);
-        dl->AddText(ImVec2(x + pad, valueY), ink, val.c_str());
-        dl->PopClipRect();
-    };
-    std::string title = field("title", "TITLE");
-    ImVec2 tts = ImGui::CalcTextSize(title.c_str());
-    dl->AddText(ImVec2(tl.x + (w - tts.x) * 0.5f, tl.y + (r1 - tl.y - tts.y) * 0.5f), ink,
-                title.c_str());
-    label(tl.x, r1, w * 0.5f, "DRAWN", field("drawn_by", ""));
-    std::string date = field("date", "");
-    if (!date.empty()) label(tl.x + w * 0.5f, r1, w * 0.5f, "DATE", date);
-    label(tl.x, r2, w * 0.34f, "MATL", field("material", ""));
-    label(tl.x + w * 0.34f, r2, w * 0.28f, "SCALE", field("scale", "1:1"));
-    label(tl.x + w * 0.62f, r2, w * 0.18f, "REV", field("rev", "A"));
-    label(tl.x + w * 0.80f, r2, w * 0.20f, "SHEET", field("sheet", "1/1"));
 }
 
 // The dimension/annotation editor popup: double-click a dim to open it. Edits tolerance, prefix/
@@ -1307,126 +1199,399 @@ static void renderGdtEditorPopup(AppState& st, AppState::DocTab& tab) {
     ImGui::EndPopup();
 }
 
+// ---- Sheet / title-block properties ----------------------------------------------------------------
+// Opened by dwg_sheet_props / dwg_title_block. Sheet controls (paper, orientation, projection,
+// scale, units) apply immediately through the engine's professional layout pass; the title-block
+// fields are edited together and applied with one drawing_set_titleblock.
+static const char* const kSheetSizeKeys[] = {"A4", "A3", "A2", "A1", "A0", "A", "B", "C", "D", "E"};
+static const char* const kSheetSizeLabels[] = {
+    "ISO A4   297 \xC3\x97 210 mm",   "ISO A3   420 \xC3\x97 297 mm",
+    "ISO A2   594 \xC3\x97 420 mm",   "ISO A1   841 \xC3\x97 594 mm",
+    "ISO A0   1189 \xC3\x97 841 mm",  "ANSI A   11 \xC3\x97 8.5 in",
+    "ANSI B   17 \xC3\x97 11 in",     "ANSI C   22 \xC3\x97 17 in",
+    "ANSI D   34 \xC3\x97 22 in",     "ANSI E   44 \xC3\x97 34 in"};
+static const char* const kProjLabels[] = {"Third angle", "First angle"};
+static const char* const kProjTips[] = {"ASME Y14.3 / North America: top view above the front.",
+                                        "ISO 128 / Europe: top view below the front."};
+static const char* const kScaleLabels[] = {"Auto", "10:1", "5:1", "2:1", "1:1", "1:2",
+                                           "1:5",  "1:10", "1:20", "1:50", "1:100"};
+static const double kScaleValues[] = {0.0, 10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01};
+static const char* const kUnitLabels[] = {"Millimetres", "Inches"};
+
+struct TitleField {
+    const char* key;
+    const char* label;
+    const char* hint;
+    const char* legacy;   // older alias still read by the engine (nullptr = none)
+};
+static const TitleField kTitleFields[] = {
+    {"title", "Title", "PART NAME", nullptr},
+    {"part_number", "Part number", "CW-0001", "part_no"},
+    {"rev", "Revision", "A", "revision"},
+    {"drawing_standard", "Standard", "ISO 128", nullptr},
+    {"material", "Material", "AISI 304", nullptr},
+    {"finish", "Finish", "As machined", nullptr},
+    {"general_tolerance", "General tolerance", "ISO 2768-m", nullptr},
+    {"mass", "Mass", "0.25 kg", nullptr},
+    {"drawn_by", "Drawn by", "Initials", "drawn"},
+    {"date", "Date", "YYYY-MM-DD", nullptr},
+    {"checked_by", "Checked by", "", nullptr},
+    {"approved_by", "Approved by", "", nullptr},
+    {"company", "Company", "", nullptr},
+};
+static constexpr int kTitleFieldCount = (int)(sizeof(kTitleFields) / sizeof(kTitleFields[0]));
+
+// drawing_arrange on the sheet; projection "" keeps the title block's, scale <= 0 = auto-fit.
+static void arrangeSheet(AppState& st, int tabIdx, const std::string& sheetId,
+                         const std::string& projection, double scale) {
+    if (tabIdx < 0 || tabIdx >= (int)st.docTabs.size()) return;
+    nlohmann::json params = {{"doc_id", st.docTabs[tabIdx].drawingDocId}, {"sheet_id", sheetId}};
+    if (!projection.empty()) params["projection"] = projection;
+    if (scale > 0.0) params["scale"] = scale;
+    drawCallAsyncOn(st, tabIdx, "drawing_arrange", std::move(params), "Arrange views",
+                    /*needFit=*/true);
+}
+
+// Paper size (e.g. "A4P") then a re-arrange so the views refit the new paper.
+static void applySheetSize(AppState& st, int tabIdx, const std::string& sheetId,
+                           const std::string& size, const std::string& projection, double scale) {
+    if (tabIdx < 0 || tabIdx >= (int)st.docTabs.size()) return;
+    drawCallAsyncOn(st, tabIdx, "drawing_set_sheet",
+                    {{"doc_id", st.docTabs[tabIdx].drawingDocId}, {"sheet_id", sheetId},
+                     {"size", size}},
+                    "Sheet size", /*needFit=*/true,
+                    [sheetId, projection, scale](AppState& s2, int idx) {
+                        arrangeSheet(s2, idx, sheetId, projection, scale);
+                    });
+}
+
 static void renderTitleBlockPopup(AppState& st, AppState::DocTab& tab, const nlohmann::json& sheet) {
-    static char tbTitle[96] = {0}, tbDrawn[48] = {0}, tbDate[32] = {0}, tbMatl[48] = {0},
-                tbFinish[48] = {0}, tbRev[16] = {0}, tbScale[16] = {0}, tbSheetNo[16] = {0},
-                tbCompany[64] = {0};
-    static int tbSizeIdx = 1;          // A3 default
-    static int tbUnitsIdx = 0;
-    static bool tbLoaded = false;
-    static const char* kSizes[] = {"A4", "A3", "A2", "A1", "A0", "A", "B", "C", "D", "E"};
-    static const char* kUnits[] = {"MMGS", "IPS"};
+    static int sizeIdx = 1, scaleIdx = 0, projIdx = 0, unitsIdx = 0;
+    static bool portrait = false;
+    static bool loaded = false;
+    static double loadedRev = -1.0;
+    static char fieldBuf[kTitleFieldCount][96] = {};
+
+    const double rev = djnum(tab.drawingDoc, "revision", 0.0);
+    const nlohmann::json* tb = (sheet.contains("title_block") && sheet["title_block"].is_object())
+                                   ? &sheet["title_block"] : nullptr;
+    // Sheet controls mirror the engine's state; reloaded on open and whenever a finished RPC
+    // changed the drawing (never mid-flight, so a pending change does not snap back).
+    auto loadSheetState = [&]() {
+        std::string sz = djstr(sheet, "size");
+        portrait = sz.size() > 1 && sz.back() == 'P';
+        if (portrait) sz.pop_back();
+        sizeIdx = 1;
+        for (int i = 0; i < IM_ARRAYSIZE(kSheetSizeKeys); ++i)
+            if (sz == kSheetSizeKeys[i]) { sizeIdx = i; break; }
+        projIdx = (tb && djstr(*tb, "projection") == "first") ? 1 : 0;
+        const std::string sc = tb ? djstr(*tb, "scale") : std::string();
+        scaleIdx = 0;
+        for (int i = 1; i < IM_ARRAYSIZE(kScaleLabels); ++i)
+            if (sc == kScaleLabels[i]) { scaleIdx = i; break; }
+        const nlohmann::json& tree = tab.drawingDoc.value("tree", nlohmann::json::object());
+        unitsIdx = tree.contains("units") && tree["units"].is_object() &&
+                           djstr(tree["units"], "system") == "IPS" ? 1 : 0;
+        loadedRev = rev;
+    };
 
     if (tab.titleBlockOpen) {
         ImGui::OpenPopup("Sheet Properties##sheetprops");
         tab.titleBlockOpen = false;
-        tbLoaded = false;
+        loaded = false;
     }
-    if (!tbLoaded) {
-        const nlohmann::json* tb =
-            (sheet.contains("title_block") && sheet["title_block"].is_object())
-                ? &sheet["title_block"] : nullptr;
-        auto load = [&](const char* k, char* buf, size_t n, const char* fb) {
-            std::string v = tb ? djstr(*tb, k) : std::string();
-            std::snprintf(buf, n, "%s", v.empty() ? fb : v.c_str());
-        };
-        load("title", tbTitle, sizeof(tbTitle), "");
-        load("drawn_by", tbDrawn, sizeof(tbDrawn), "");
-        load("date", tbDate, sizeof(tbDate), "");
-        load("material", tbMatl, sizeof(tbMatl), "");
-        load("finish", tbFinish, sizeof(tbFinish), "");
-        load("rev", tbRev, sizeof(tbRev), "A");
-        load("scale", tbScale, sizeof(tbScale), "1:1");
-        load("sheet", tbSheetNo, sizeof(tbSheetNo), "1/1");
-        load("company", tbCompany, sizeof(tbCompany), "");
-        std::string sz = djstr(sheet, "size");
-        tbSizeIdx = 1;
-        for (int i = 0; i < IM_ARRAYSIZE(kSizes); ++i)
-            if (sz == kSizes[i]) { tbSizeIdx = i; break; }
-        const nlohmann::json& tree = tab.drawingDoc.value("tree", nlohmann::json::object());
-        tbUnitsIdx = tree.contains("units") && tree["units"].is_object() &&
-                             djstr(tree["units"], "system") == "IPS" ? 1 : 0;
-        tbLoaded = true;
+    if (!loaded) {
+        loadSheetState();
+        for (int i = 0; i < kTitleFieldCount; ++i) {
+            const TitleField& f = kTitleFields[i];
+            std::string v;
+            if (tb) {
+                for (const char* k : {f.key, f.legacy}) {
+                    if (!k || !v.empty()) continue;
+                    auto it = tb->find(k);
+                    if (it == tb->end()) continue;
+                    if (it->is_string()) v = it->get<std::string>();
+                    else if (it->is_number()) {
+                        char b[32];
+                        std::snprintf(b, sizeof(b), "%g", it->get<double>());
+                        v = b;
+                    }
+                }
+            }
+            if (v.empty() && std::strcmp(f.key, "date") == 0) {   // default: today (ISO 8601)
+                const std::time_t now = std::time(nullptr);
+                char b[16] = {0};
+                if (const std::tm* lt = std::localtime(&now)) std::strftime(b, sizeof(b), "%Y-%m-%d", lt);
+                v = b;
+            }
+            std::snprintf(fieldBuf[i], sizeof(fieldBuf[i]), "%s", v.c_str());
+        }
+        loaded = true;
+    } else if (rev != loadedRev && st.rebuildsInFlight == 0) {
+        loadSheetState();
     }
 
-    ImGui::SetNextWindowSize(ImVec2(360 * ui::uiScale, 0), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(440.0f), 0), ImGuiCond_Appearing);
     ImGui::SetNextWindowBgAlpha(0.0f);
-    if (ImGui::BeginPopup("Sheet Properties##sheetprops")) {
-        GlassPopupScope glass = beginGlassPopup("drw_sheetprops_popup");
-        ImGui::SetNextItemWidth(120 * ui::uiScale);
-        ImGui::Combo("Sheet size", &tbSizeIdx, kSizes, IM_ARRAYSIZE(kSizes));
-        ImGui::SetNextItemWidth(120 * ui::uiScale);
-        ImGui::Combo("Units", &tbUnitsIdx, kUnits, IM_ARRAYSIZE(kUnits));
-        ImGui::Separator();
-        // Short fields share rows (kills the dead vertical space of nine full-width inputs in a
-        // 360px popup); Title/Company stay full width.
-        const float tbHalfW = 110.0f * ui::uiScale;
-        const float tbThirdW = 60.0f * ui::uiScale;
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        ImGui::InputTextWithHint("##tb_title", "Title", tbTitle, sizeof(tbTitle));
-        const float tbCol2X = 190.0f * ui::uiScale;   // fixed 2nd column so rows align vertically
-        ImGui::SetNextItemWidth(tbHalfW);
-        ImGui::InputText("Drawn by", tbDrawn, sizeof(tbDrawn));
-        ImGui::SameLine(tbCol2X);
-        ImGui::SetNextItemWidth(tbHalfW);
-        ImGui::InputText("Date", tbDate, sizeof(tbDate));
-        ImGui::SetNextItemWidth(tbHalfW);
-        ImGui::InputText("Material", tbMatl, sizeof(tbMatl));
-        ImGui::SameLine(tbCol2X);
-        ImGui::SetNextItemWidth(tbHalfW);
-        ImGui::InputText("Finish", tbFinish, sizeof(tbFinish));
-        ImGui::SetNextItemWidth(tbThirdW);
-        ImGui::InputText("Scale", tbScale, sizeof(tbScale));
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(tbThirdW);
-        ImGui::InputText("Rev", tbRev, sizeof(tbRev));
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(tbThirdW);
-        ImGui::InputText("Sheet", tbSheetNo, sizeof(tbSheetNo));
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        ImGui::InputTextWithHint("##tb_company", "Company", tbCompany, sizeof(tbCompany));
-        ImGui::Separator();
-        if (ImGui::Button("Apply", ImVec2(120 * ui::uiScale, 0))) {
-            std::string sheetId = djstr(sheet, "id");
-            // Sheet size (only if it changed) then the title-block fields.
-            std::string curSize = djstr(sheet, "size");
-            if (curSize != kSizes[tbSizeIdx]) {
-                nlohmann::json res;
-                drawCall(st, "drawing_set_sheet",
-                         {{"doc_id", tab.drawingDocId}, {"sheet_id", sheetId},
-                          {"size", kSizes[tbSizeIdx]}}, res, "Sheet size");
-                absorbDrawingResult(st, tab, res);
-                tab.drawNeedFit = true;
-            }
-            const nlohmann::json& tree = tab.drawingDoc.value("tree", nlohmann::json::object());
-            const std::string curUnits = tree.contains("units") && tree["units"].is_object()
-                                              ? djstr(tree["units"], "system") : "MMGS";
-            if (curUnits != kUnits[tbUnitsIdx]) {
-                nlohmann::json res;
-                if (drawCall(st, "drawing_set_units",
-                             {{"doc_id", tab.drawingDocId}, {"system", kUnits[tbUnitsIdx]}},
-                             res, "Drawing units"))
-                    absorbDrawingResult(st, tab, res);
-            }
-            nlohmann::json fields = {
-                {"title", tbTitle}, {"drawn_by", tbDrawn}, {"date", tbDate}, {"material", tbMatl},
-                {"finish", tbFinish}, {"scale", tbScale}, {"rev", tbRev}, {"sheet", tbSheetNo},
-                {"company", tbCompany}};
-            nlohmann::json res;
-            if (drawCall(st, "drawing_set_titleblock",
-                         {{"doc_id", tab.drawingDocId}, {"sheet_id", sheetId}, {"fields", fields}},
-                         res, "Title block")) {
-                absorbDrawingResult(st, tab, res);
-            }
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(90 * ui::uiScale, 0))) ImGui::CloseCurrentPopup();
-        glass.finish();
-        ImGui::EndPopup();
-    } else {
-        tbLoaded = false;
+    if (!ImGui::BeginPopup("Sheet Properties##sheetprops")) {
+        loaded = false;
+        return;
     }
+    GlassPopupScope glass = beginGlassPopup("drw_sheetprops_popup");
+    const std::string sheetId = djstr(sheet, "id");
+    const int tabIdx = st.activeTab;
+    // Every re-layout below auto-fits the scale unless the user picked one; an empty projection
+    // keeps the title block's.
+
+    ui::kit::sectionHeader("Sheet", nullptr, nullptr, -1, /*first=*/true);
+    {
+        ui::kit::FieldGroup g("drw_sheet", "Projection");
+        bool sizeChanged = false;
+        if (ui::kit::fieldEnum("size", "Paper", &sizeIdx, kSheetSizeLabels,
+                               IM_ARRAYSIZE(kSheetSizeLabels),
+                               ui::kit::FieldOpts().withTip(
+                                   "ISO 5457 / ASME Y14.1 sheet. Views re-arrange to fit.")))
+            sizeChanged = true;
+        if (ui::kit::fieldCheckbox("portrait", "Portrait orientation", &portrait,
+                                   ui::kit::FieldOpts().withTip(
+                                       "Portrait paper (A4 portrait suits a single small part).")))
+            sizeChanged = true;
+        if (sizeChanged)
+            applySheetSize(st, tabIdx, sheetId,
+                           std::string(kSheetSizeKeys[sizeIdx]) + (portrait ? "P" : ""), "", 0.0);
+        if (ui::kit::fieldEnum("proj", "Projection", &projIdx, kProjLabels, 2,
+                               ui::kit::FieldOpts().withItemTips(kProjTips)))
+            arrangeSheet(st, tabIdx, sheetId, projIdx == 1 ? "first" : "third", 0.0);
+        if (ui::kit::fieldEnum("scale", "Scale", &scaleIdx, kScaleLabels,
+                               IM_ARRAYSIZE(kScaleLabels),
+                               ui::kit::FieldOpts().withTip(
+                                   "ISO 5455 standard scale for every primary view. Auto picks the "
+                                   "largest scale that fits the drawing area.")))
+            arrangeSheet(st, tabIdx, sheetId, "", kScaleValues[scaleIdx]);
+        if (ui::kit::fieldEnum("units", "Units", &unitsIdx, kUnitLabels, 2,
+                               ui::kit::FieldOpts().withTip(
+                                   "Drawing unit system: dimension values and the frame's unit note.")))
+            drawCallAsyncOn(st, tabIdx, "drawing_set_units",
+                            {{"doc_id", tab.drawingDocId}, {"system", unitsIdx == 1 ? "IPS" : "MMGS"}},
+                            "Drawing units");
+    }
+    ui::kit::gapRow();
+    if (ui::kit::secondaryButton("Auto-arrange views##drw_arrange", true, nullptr,
+                                 ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)))
+        arrangeSheet(st, tabIdx, sheetId, "", 0.0);
+    ui::kit::itemTooltip("Re-run the professional layout: standard views on the projection grid, "
+                         "aligned, centred in the free drawing area.");
+
+    auto fieldsRange = [&](int from, int to) {
+        for (int i = from; i < to; ++i) {
+            const TitleField& f = kTitleFields[i];
+            ui::kit::fieldText(f.key, f.label, fieldBuf[i], sizeof(fieldBuf[i]),
+                               ui::kit::FieldOpts().withHint(f.hint));
+        }
+    };
+    ui::kit::sectionHeader("Title block");
+    { ui::kit::FieldGroup g("drw_tb_id", "General tolerance"); fieldsRange(0, 4); }
+    ui::kit::sectionHeader("Manufacturing");
+    { ui::kit::FieldGroup g("drw_tb_mfg", "General tolerance"); fieldsRange(4, 8); }
+    ui::kit::sectionHeader("Approvals");
+    { ui::kit::FieldGroup g("drw_tb_appr", "General tolerance"); fieldsRange(8, kTitleFieldCount); }
+
+    ui::kit::gapSection();
+    if (st.rebuildsInFlight > 0) {
+        ui::kit::spinner("Updating sheet\xE2\x80\xA6");
+        ui::kit::gapRow();
+    }
+    const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+    if (ui::kit::primaryButton("Apply title block##drw_tb_apply", true, nullptr, ImVec2(half, 0.0f))) {
+        nlohmann::json fields = nlohmann::json::object();
+        for (int i = 0; i < kTitleFieldCount; ++i) fields[kTitleFields[i].key] = std::string(fieldBuf[i]);
+        drawCallAsyncOn(st, tabIdx, "drawing_set_titleblock",
+                        {{"doc_id", tab.drawingDocId}, {"sheet_id", sheetId}, {"fields", fields}},
+                        "Title block");
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ui::kit::secondaryButton("Close##drw_tb_close", true, nullptr, ImVec2(half, 0.0f)))
+        ImGui::CloseCurrentPopup();
+
+    ui::kit::sectionHeader("Export");
+    const char* exportFmt = nullptr;
+    const float third = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.0f) / 3.0f;
+    if (ui::kit::secondaryButton("PDF##drw_exp_pdf", true, nullptr, ImVec2(third, 0.0f))) exportFmt = "pdf";
+    ui::kit::itemTooltip("Vector PDF at true paper size");
+    ImGui::SameLine();
+    if (ui::kit::secondaryButton("SVG##drw_exp_svg", true, nullptr, ImVec2(third, 0.0f))) exportFmt = "svg";
+    ui::kit::itemTooltip("Scalable vector SVG at true paper size");
+    ImGui::SameLine();
+    if (ui::kit::secondaryButton("DXF##drw_exp_dxf", true, nullptr, ImVec2(third, 0.0f))) exportFmt = "dxf";
+    ui::kit::itemTooltip("AutoCAD R12 DXF, millimetre units");
+    if (exportFmt) ImGui::CloseCurrentPopup();
+
+    glass.finish();
+    ImGui::EndPopup();
+    if (exportFmt) exportActiveDrawing(st, exportFmt);
+}
+
+// ---- canvas chrome --------------------------------------------------------------------------------
+
+// The part of the canvas no pinned glass column covers: FeatureManager (left), Copilot (right)
+// and the doc-tab band (top). The sheet is fitted into and clipped to this rect so no paper ink
+// shows through the translucent columns, and every HUD element stays inside it.
+static ImRect drawingClearRect(const ImVec2& mn, const ImVec2& mx) {
+    ImRect r(mn, mx);
+    const float gap = ui::metrics::U(2.0f);
+    // A column rolled up to its header strip (published height under half the canvas) leaves the
+    // sheet the full width; only a full-height column occludes a side.
+    auto occludes = [&](int slot) {
+        const float h = ui::overlayColumnHeight(slot);
+        return !(h > 0.0f && h < (mx.y - mn.y) * 0.5f);
+    };
+    const float left = ui::overlayColumnEdge(0);
+    if (left > r.Min.x && left < r.Max.x && occludes(0)) r.Min.x = left + gap;
+    const float right = ui::overlayColumnEdge(1);
+    if (right > r.Min.x && right < r.Max.x && occludes(1)) r.Max.x = right - gap;
+    const float top = ui::docTabBandBottom();
+    if (top > r.Min.y && top < r.Max.y) r.Min.y = top + gap;
+    // Columns wider than the window (tiny window): fall back to the full canvas on that axis.
+    if (r.GetWidth() < ui::metrics::U(24.0f)) { r.Min.x = mn.x; r.Max.x = mx.x; }
+    if (r.GetHeight() < ui::metrics::U(24.0f)) { r.Min.y = mn.y; r.Max.y = mx.y; }
+    return r;
+}
+
+// Canvas backdrop behind the paper: a soft theme gradient so the white sheet reads as paper.
+static void paintCanvasBackdrop(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx) {
+    const ImU32 top = ui::Palette::toU32(ui::palette.panelBg);
+    const ImU32 bot = ui::Palette::toU32(ui::palette.windowBg);
+    dl->AddRectFilledMultiColor(mn, mx, top, top, bot, bot);
+}
+
+// A kit empty state centred in `r` at a readable measure (vertically centred on last frame's
+// measured height). `extra` draws optional rows beneath the action. Returns true on the action.
+static bool sheetPlaceholder(const ImRect& r, const char* id, const char* title, const char* body,
+                             const char* action, bool actionEnabled,
+                             const std::function<void()>& extra = {}) {
+    bool clicked = false;
+    ImGui::PushID(id);
+    ImGuiStorage* store = ImGui::GetStateStorage();
+    const ImGuiID hKey = ImGui::GetID("##placeholder_h");
+    const float blockH = store->GetFloat(hKey, 0.0f);
+    const float w = std::min(ui::metrics::px(440.0f), r.GetWidth());
+    ImGui::SetCursorScreenPos(ImVec2(r.Min.x + (r.GetWidth() - w) * 0.5f,
+                                     r.Min.y + std::max(0.0f, (r.GetHeight() - blockH) * 0.5f)));
+    if (ImGui::BeginChild("##placeholder", ImVec2(w, 0.0f), ImGuiChildFlags_AutoResizeY,
+                          ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+                              ImGuiWindowFlags_NoScrollWithMouse)) {
+        clicked = ui::kit::emptyState("ws_drawing", title, body, action, actionEnabled);
+        if (extra) extra();
+        store->SetFloat(hKey, ImGui::GetCursorPosY());
+    }
+    ImGui::EndChild();
+    ImGui::PopID();
+    return clicked;
+}
+
+// One frosted HUD row whose top-left is `origin`. `body` lays its widgets out left to right,
+// advancing `x` past each (hudNext); the glass is painted behind their union afterwards.
+static float hudChipH() { return ImGui::GetFontSize() + ui::metrics::U(1.0f); }  // kit chip height
+static void hudNext(float& x) { x = ImGui::GetItemRectMax().x + ui::metrics::U(1.0f); }
+static ImRect hudRow(const ImVec2& origin,
+                     const std::function<void(float& x, float y, float rowH)>& body) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float pad = ui::metrics::U(1.5f);
+    const float rowH = ImGui::GetFrameHeight();
+    dl->ChannelsSplit(2);
+    dl->ChannelsSetCurrent(1);
+    float x = origin.x + pad;
+    const float y = origin.y + pad;
+    body(x, y, rowH);
+    dl->ChannelsSetCurrent(0);
+    const float right = std::max(origin.x + pad, x - ui::metrics::U(1.0f)) + pad;
+    const ImRect r(origin, ImVec2(right, y + rowH + pad));
+    ui::glassBackground(dl, r.Min, r.Max);
+    dl->ChannelsMerge();
+    return r;
+}
+static float hudRowHeight() { return ImGui::GetFrameHeight() + ui::metrics::U(3.0f); }
+
+// "1:2" / "2:1" from a numeric view scale.
+static std::string fmtScaleRatio(double sc) {
+    char b[32];
+    if (!(sc > 0.0)) return "1:1";
+    if (sc >= 1.0) std::snprintf(b, sizeof(b), "%g:1", std::round(sc * 100.0) / 100.0);
+    else std::snprintf(b, sizeof(b), "1:%g", std::round(100.0 / sc) / 100.0);
+    return b;
+}
+
+// UI caption for a view (hover/selection chip only — never sheet ink).
+static std::string viewCaption(const nlohmann::json& v) {
+    const std::string type = djstr(v, "type"), label = djstr(v, "label");
+    std::string cap;
+    if (type == "section" && !label.empty()) cap = "Section " + label + "-" + label;
+    else if (type == "detail" && !label.empty()) cap = "Detail " + label;
+    else {
+        cap = djstr(v, "orientation");
+        if (cap.empty()) cap = "view";
+        if (cap[0] >= 'a' && cap[0] <= 'z') cap[0] = (char)(cap[0] - 'a' + 'A');
+        cap += " view";
+    }
+    return cap + "  \xC2\xB7  " + fmtScaleRatio(djnum(v, "scale", 1.0));
+}
+
+// Sheet summary for the HUD: "A3 · 1:2 · Third angle" (title-block scale/projection).
+static std::string sheetSummary(const nlohmann::json& sheet) {
+    std::string size = djstr(sheet, "size");
+    bool portrait = false;
+    if (size.size() > 1 && size.back() == 'P') { size.pop_back(); portrait = true; }
+    if (size.empty()) size = "Sheet";
+    if (portrait) size += " portrait";
+    std::string scale, proj = "third";
+    if (sheet.contains("title_block") && sheet["title_block"].is_object()) {
+        scale = djstr(sheet["title_block"], "scale");
+        const std::string p = djstr(sheet["title_block"], "projection");
+        if (!p.empty()) proj = p;
+    }
+    std::string out = size;
+    if (!scale.empty()) out += "  \xC2\xB7  " + scale;
+    out += proj == "first" ? "  \xC2\xB7  First angle" : "  \xC2\xB7  Third angle";
+    return out;
+}
+
+void drawDrawingEmptyState(AppState& st) {  // gui-lint: allow (forwards to kit::emptyState via sheetPlaceholder)
+    const ImVec2 mn = ImGui::GetCursorScreenPos();
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    avail.x = std::max(avail.x, ui::metrics::U(8.0f));
+    avail.y = std::max(avail.y, ui::metrics::U(8.0f));
+    const ImVec2 mx(mn.x + avail.x, mn.y + avail.y);
+    paintCanvasBackdrop(ImGui::GetWindowDrawList(), mn, mx);
+    const ImRect clear = drawingClearRect(mn, mx);
+    const bool canMake = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+                         st.docTabs[st.activeTab].kind != AppState::DocTab::TabKind::Drawing &&
+                         st.docMirror.hasDoc();
+    std::vector<int> drawings;
+    for (int i = 0; i < (int)st.docTabs.size(); ++i)
+        if (st.docTabs[i].kind == AppState::DocTab::TabKind::Drawing) drawings.push_back(i);
+    int openIdx = -1;
+    const std::string body =
+        canMake ? "Make Drawing projects " + st.docTabs[st.activeTab].title +
+                      " onto an A3 sheet: third-angle views, auto-dimensions, hole callouts "
+                      "and a complete title block."
+                : std::string("Open or create a part in the Model workspace, then make its "
+                              "drawing here.");
+    const bool make = sheetPlaceholder(
+        clear, "drw_empty", "No drawing open", body.c_str(), "Make Drawing", canMake, [&]() {
+            if (drawings.empty()) return;
+            ui::kit::sectionHeader("Open drawings", nullptr, nullptr, (int)drawings.size());
+            for (int i : drawings) {
+                ImGui::PushID(i);
+                ui::kit::RowStyle rs;
+                rs.icon = "ws_drawing";
+                rs.secondary = "Switch to this drawing";
+                if (ui::kit::row("drw_open", st.docTabs[i].displayTitle().c_str(), rs)) openIdx = i;
+                ImGui::PopID();
+            }
+        });
+    if (make) st.makeDrawing();
+    else if (openIdx >= 0) st.switchToTab(openIdx);
 }
 
 void drawDrawingSheet(AppState& st) {
@@ -1436,106 +1601,34 @@ void drawDrawingSheet(AppState& st) {
     if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return;
     AppState::DocTab& tab = st.docTabs[st.activeTab];
 
-    // ---- compact status strip (the tools now live on the View Layout / Annotation ribbon tabs) ----
-    // SolidWorks-style contextual ribbon owns Rebuild/Fit/Export/Views/Dimensions/Callouts; this
-    // strip just echoes the active tool's current click-stage + the canvas hotkeys.
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
-    ImGui::TextUnformatted("Drawing");
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
-    {
-        const char* stageMsg = nullptr;
-        if (tab.dimToolActive)
-            stageMsg = tab.dimStage == 0 ? "Smart Dimension: click vertex A"
-                     : tab.dimStage == 1 ? "Smart Dimension: click vertex B"
-                                         : "Smart Dimension: click to place text";
-        else if (tab.sectionToolActive)
-            stageMsg = tab.sectionStage == 0 ? "Section: click the cutting-line start across a view"
-                                             : "Section: click the cutting-line end";
-        else if (tab.detailToolActive)
-            stageMsg = tab.detailStage == 0 ? "Detail: click the circle center on a view"
-                                            : "Detail: move to set the radius, click to finish";
-        else if (tab.modelItemsActive)  stageMsg = "Model Items: click a view to auto-dimension it";
-        else if (tab.holeCalloutActive) stageMsg = "Hole Callout: click a circle";
-        else if (tab.centerMarkActive)  stageMsg = "Center Mark: click a circle";
-        else if (tab.centerLineActive)
-            stageMsg = tab.centerLineStage == 0 ? "Center Line: click the first point"
-                                                : "Center Line: click the second point";
-        else if (tab.noteActive)        stageMsg = "Note: click to place a note";
-        else if (tab.balloonActive)     stageMsg = "Balloon: click to drop an item bubble";
-
-        if (stageMsg) {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(pal.statusWarn[0], pal.statusWarn[1],
-                                         pal.statusWarn[2], pal.statusWarn[3]));
-            ImGui::TextUnformatted(stageMsg);
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Done")) disarmDrawTools(tab);
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
-            const char* hint = "double-click dim to edit | drag to reposition | wheel zoom | "
-                               "MMB / Space+drag pan | Del removes";
-            // The hint shares its ROW with the floating doc-tab strip, which is drawn later and
-            // over it. Ellipsising to the full content width therefore clipped nothing useful:
-            // the strip covered the middle and the tail ("Del removes") reappeared on the far
-            // side, so the line read as two fragments. The strip starts at the FeatureManager
-            // column's right edge plus its margin (doc_tabs.cpp), so that is the real budget.
-            const ImVec2 hp = ImGui::GetCursorScreenPos();
-            float hintW = ImGui::GetContentRegionAvail().x;
-            const float stripLeft = ui::overlayColumnEdge(0);
-            if (stripLeft > hp.x) hintW = std::min(hintW, stripLeft - hp.x - ui::metrics::U(3.0f));
-            if (hintW > ui::metrics::U(12.0f)) {
-                ImGui::RenderTextEllipsis(ImGui::GetWindowDrawList(), hp,
-                                          ImVec2(hp.x + hintW, hp.y + ImGui::GetTextLineHeight()),
-                                          hp.x + hintW, hp.x, hint, nullptr, nullptr);
-            }
-            ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetTextLineHeight()));
-            ImGui::PopStyleColor();
-        }
-    }
-
-    if (tab.drawingDoc.is_object() &&
-        tab.drawingDoc.value("views_stale", false)) {
-        const std::string warning = djstr(tab.drawingDoc, "warning");
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              ImVec4(pal.statusWarn[0], pal.statusWarn[1],
-                                     pal.statusWarn[2], pal.statusWarn[3]));
-        ImGui::TextUnformatted(warning.empty() ? "Source unavailable — views are stale"
-                                               : warning.c_str());
-        ImGui::PopStyleColor();
-    }
-
-    // ---- canvas child ----
-    ImVec2 canvasMin = ImGui::GetCursorScreenPos();
+    // ---- canvas: the whole window body is one hit item; the sheet lives in the clear rect ----
+    const ImVec2 canvasMin = ImGui::GetCursorScreenPos();
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    if (avail.x < 32) avail.x = 32;
-    if (avail.y < 32) avail.y = 32;
+    avail.x = std::max(avail.x, ui::metrics::U(8.0f));
+    avail.y = std::max(avail.y, ui::metrics::U(8.0f));
+    ImGui::SetNextItemAllowOverlap();   // HUD widgets drawn over the canvas take hover + clicks
     ImGui::InvisibleButton("##drawcanvas", avail,
                            ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle);
-    bool canvasHovered = ImGui::IsItemHovered();
-    ImVec2 canvasMax(canvasMin.x + avail.x, canvasMin.y + avail.y);
+    const bool canvasHovered = ImGui::IsItemHovered();
+    const bool canvasActive = ImGui::IsItemActive();
+    const ImVec2 canvasMax(canvasMin.x + avail.x, canvasMin.y + avail.y);
+    const ImRect clear = drawingClearRect(canvasMin, canvasMax);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->PushClipRect(canvasMin, canvasMax, true);
-    // Canvas backdrop (a touch darker than the panel so the white paper reads as paper).
-    dl->AddRectFilled(canvasMin, canvasMax, ui::Palette::toU32(pal.headerBg));
+    paintCanvasBackdrop(dl, canvasMin, canvasMax);
 
-    // The active sheet: first sheet of the cached drawing_get (the engine makes one A3 sheet "s1").
+    // The active sheet: first sheet of the cached drawing_get.
     const nlohmann::json* sheet = nullptr;
     if (tab.drawingDoc.is_object() && tab.drawingDoc.contains("sheets") &&
         tab.drawingDoc["sheets"].is_array() && !tab.drawingDoc["sheets"].empty() &&
         tab.drawingDoc["sheets"][0].is_object())
         sheet = &tab.drawingDoc["sheets"][0];
-
     if (!sheet) {
-        const char* msg = "No sheet to display - try Rebuild.";
-        ImVec2 ts = ImGui::CalcTextSize(msg);
-        dl->AddText(ImVec2((canvasMin.x + canvasMax.x) * 0.5f - ts.x * 0.5f,
-                           (canvasMin.y + canvasMax.y) * 0.5f - ts.y * 0.5f),
-                    ui::Palette::toU32(pal.textDim), msg);
-        dl->PopClipRect();
+        if (sheetPlaceholder(clear, "drw_nosheet", "This drawing has no sheet",
+                             "The engine returned no sheet for this drawing. Rebuild re-fetches it "
+                             "from the source part.",
+                             "Rebuild", st.workerStarted))
+            st.refreshDrawingTab(st.activeTab);
         return;
     }
 
@@ -1547,41 +1640,38 @@ void drawDrawingSheet(AppState& st) {
     }
     if (paperW <= 0 || paperH <= 0) { paperW = 420.0; paperH = 297.0; }  // A3 fallback
 
-    // ---- one-shot fit: frame the combined bounds with a margin ----
+    // ---- one-shot fit: frame the sheet in the clear rect, above the bottom HUD row ----
     if (tab.drawNeedFit || tab.drawZoom <= 0.0f) {
         float bx0, by0, bx1, by1;
         if (!sheetBounds(*sheet, bx0, by0, bx1, by1)) {
             bx0 = 0; by0 = 0; bx1 = (float)paperW; by1 = (float)paperH;
         }
-        float bw = std::max(1.0f, bx1 - bx0), bh = std::max(1.0f, by1 - by0);
+        const ImRect fitR(clear.Min, ImVec2(clear.Max.x, clear.Max.y - hudRowHeight()));
+        const float bw = std::max(1.0f, bx1 - bx0), bh = std::max(1.0f, by1 - by0);
         const float margin = 0.92f;  // leave a little air around the paper
-        float zx = (avail.x * margin) / bw;
-        float zy = (avail.y * margin) / bh;
-        tab.drawZoom = std::min(zx, zy);
+        tab.drawZoom = std::min(fitR.GetWidth() * margin / bw,
+                                std::max(1.0f, fitR.GetHeight()) * margin / bh);
         if (tab.drawZoom <= 0.0f || !std::isfinite(tab.drawZoom)) tab.drawZoom = 1.0f;
-        // Center the bounds in the canvas. screen = canvasMin + pan + mm*zoom*(x, -y inverted).
-        // We flip Y so the engine's +Y-up sheet maps to screen +Y-down.
-        float cxMm = (bx0 + bx1) * 0.5f, cyMm = (by0 + by1) * 0.5f;
-        tab.drawPanX = avail.x * 0.5f - cxMm * tab.drawZoom;
-        tab.drawPanY = avail.y * 0.5f + cyMm * tab.drawZoom;  // +cy because of the Y flip
+        // screen = canvasMin + pan + (x, -y) * zoom   (engine +Y up, screen +Y down)
+        const ImVec2 c = fitR.GetCenter();
+        const float cxMm = (bx0 + bx1) * 0.5f, cyMm = (by0 + by1) * 0.5f;
+        tab.drawPanX = (c.x - canvasMin.x) - cxMm * tab.drawZoom;
+        tab.drawPanY = (c.y - canvasMin.y) + cyMm * tab.drawZoom;
         tab.drawNeedFit = false;
     }
 
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const bool overSheet = canvasHovered && clear.Contains(mouse);
+
     // ---- wheel zoom to cursor ----
-    if (canvasHovered) {
-        float wheel = ImGui::GetIO().MouseWheel;
+    if (overSheet) {
+        const float wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.0f) {
-            float old = tab.drawZoom;
-            float factor = std::pow(1.15f, wheel);
-            float nz = old * factor;
-            nz = std::clamp(nz, 0.02f, 200.0f);
-            // Keep the sheet-mm point under the cursor fixed: solve pan so that mapping is stable.
-            ImVec2 mouse = ImGui::GetIO().MousePos;
-            float lx = mouse.x - canvasMin.x;   // cursor in canvas-local px
-            float ly = mouse.y - canvasMin.y;
-            // mm under cursor (inverse of the forward map below).
-            float mmx = (lx - tab.drawPanX) / old;
-            float mmy = -(ly - tab.drawPanY) / old;
+            const float old = tab.drawZoom;
+            const float nz = std::clamp(old * std::pow(1.15f, wheel), 0.02f, 200.0f);
+            const float lx = mouse.x - canvasMin.x, ly = mouse.y - canvasMin.y;
+            const float mmx = (lx - tab.drawPanX) / old;
+            const float mmy = -(ly - tab.drawPanY) / old;
             tab.drawZoom = nz;
             tab.drawPanX = lx - mmx * nz;
             tab.drawPanY = ly + mmy * nz;
@@ -1589,274 +1679,145 @@ void drawDrawingSheet(AppState& st) {
     }
 
     // ---- pan: MMB drag, or Space + LMB drag ----
-    bool spaceDown = ImGui::IsKeyDown(ImGuiKey_Space);
-    bool panning = ImGui::IsMouseDragging(ImGuiMouseButton_Middle) ||
-                   (spaceDown && ImGui::IsMouseDragging(ImGuiMouseButton_Left));
-    if (panning && (canvasHovered || ImGui::IsItemActive())) {
-        ImVec2 d = ImGui::GetIO().MouseDelta;
+    const bool spaceDown = ImGui::IsKeyDown(ImGuiKey_Space) && !ImGui::GetIO().WantTextInput;
+    const bool panning = ImGui::IsMouseDragging(ImGuiMouseButton_Middle) ||
+                         (spaceDown && ImGui::IsMouseDragging(ImGuiMouseButton_Left));
+    if (panning && (overSheet || canvasActive)) {
+        const ImVec2 d = ImGui::GetIO().MouseDelta;
         tab.drawPanX += d.x;
         tab.drawPanY += d.y;
     }
 
     const float z = tab.drawZoom;
-    const float panX = tab.drawPanX, panY = tab.drawPanY;
+    const ImVec2 origin(canvasMin.x + tab.drawPanX, canvasMin.y + tab.drawPanY);
     // Forward map: sheet-mm (x,y) -> screen px. Y flipped (engine +Y up, screen +Y down).
     auto toScreen = [&](double mx, double my) -> ImVec2 {
-        return ImVec2(canvasMin.x + panX + (float)mx * z,
-                      canvasMin.y + panY - (float)my * z);
+        return ImVec2(origin.x + (float)mx * z, origin.y - (float)my * z);
     };
+    const double curMx = (mouse.x - origin.x) / z;
+    const double curMy = -(mouse.y - origin.y) / z;
+    const double snapRadiusMm = ui::metrics::px(9.0f) / std::max(z, 1e-4f);
+    const double pickRadiusMm = ui::metrics::px(14.0f) / std::max(z, 1e-4f);
+    const bool hasViews = sheet->contains("views") && (*sheet)["views"].is_array();
 
-    // ---- paper: drop shadow + white fill + border ----
-    {
-        ImVec2 p0 = toScreen(0, paperH);          // top-left of paper in screen (maxY -> top)
-        ImVec2 p1 = toScreen(paperW, 0);          // bottom-right
-        ImVec2 sh0(p0.x + 4 * s, p0.y + 4 * s), sh1(p1.x + 4 * s, p1.y + 4 * s);
-        dl->AddRectFilled(sh0, sh1, sheetCol(pal.glassShadow, 0.59f), 0.0f);
-        dl->AddRectFilled(p0, p1, sheetCol(pal.viewportTop), 0.0f);  // paper: light in both themes
-        dl->AddRect(p0, p1, sheetCol(pal.sketchDimLine), 0.0f, 0, 1.4f * s);
-        // Inner trim border (a faint margin line, SolidWorks-style).
-        float m = 8.0f * z;  // 8mm margin scaled
-        if (m > 4)
-            dl->AddRect(ImVec2(p0.x + m, p0.y + m), ImVec2(p1.x - m, p1.y - m),
-                        sheetCol(pal.sketchInk, 0.35f), 0.0f, 0, 1.0f * s);
+    // ---- hover (no tool armed): the annotation under the cursor, else the view ----
+    std::string hovAnnView, hovAnnId, hovViewId;
+    if (!anyDrawToolActive(tab) && overSheet && !tab.viewDragActive && !s_annDragActive &&
+        !panning) {
+        double hx = 0, hy = 0;
+        pickAnnotation(*sheet, curMx, curMy, pickRadiusMm, hovAnnView, hovAnnId, hx, hy);
+        if (hovAnnId.empty()) hovViewId = viewAtPoint(*sheet, curMx, curMy, 2.0);
     }
 
-    // Line colors: drawings are ink-on-paper and the paper is light in BOTH themes, so the strokes
-    // are the on-canvas sketch ink. Hidden lines are the same ink at reduced alpha + dashed.
-    const ImU32 inkVisible = sheetCol(pal.sketchInk);
-    const ImU32 inkHidden  = sheetCol(pal.sketchInk, 0.52f);
-    const float visThick = std::max(1.0f, 1.1f * s);
-    const float hidThick = std::max(1.0f, 1.0f * s);
+    dl->PushClipRect(clear.Min, clear.Max, true);
 
-    // ---- views ----
-    const ImVec2 titleBlockTL = toScreen(paperW - 8.0 - 176.0, 8.0 + 56.0);
-    const ImVec2 titleBlockBR = toScreen(paperW - 8.0, 8.0);
-    const float labelBandH = ImGui::GetTextLineHeight() + 8.0f * s;
-    int viewIdx = 0;
-    if (sheet->contains("views") && (*sheet)["views"].is_array()) {
+    // ---- paper: soft drop shadow + paper fill (the frame block draws every sheet line) ----
+    const ImVec2 paper0 = toScreen(0, paperH);   // top-left (maxY -> top)
+    const ImVec2 paper1 = toScreen(paperW, 0);   // bottom-right
+    for (int i = 4; i >= 1; --i) {
+        const float grow = ui::metrics::px(1.5f * (float)i);
+        const float drop = ui::metrics::px(2.0f);
+        dl->AddRectFilled(ImVec2(paper0.x - grow, paper0.y - grow + drop),
+                          ImVec2(paper1.x + grow, paper1.y + grow + drop),
+                          sheetCol(pal.glassShadow, 0.22f), grow);
+    }
+    dl->AddRectFilled(paper0, paper1, sheetCol(pal.viewportTop));
+    dl->AddRect(paper0, paper1, sheetCol(pal.sketchInk, 0.14f), 0.0f, 0, ui::metrics::stroke(1.0f));
+
+    // One sheet ink for every line class; selection/hover stays the theme accent.
+    const ImU32 ink = sheetCol(pal.sketchInk);
+    const ImU32 accent = ui::Palette::toU32(pal.accent);
+    SheetPen pen(dl, origin, z);
+    if (sheet->contains("frame")) pen.block((*sheet)["frame"], ink);
+
+    // ---- views: hatch (thin), hidden (thin dashed), visible (thick), core decorations ----
+    if (hasViews) {
         for (const auto& v : (*sheet)["views"]) {
-            ++viewIdx;
-            if (!v.is_object()) continue;
-
-            std::string err = djstr(v, "error");
-            std::string orient = djstr(v, "orientation");
-            double scale = djnum(v, "scale", 1.0);
-
-            // bbox (sheet-mm) for the label + failure note + view frame.
-            bool haveBox = v.contains("bbox") && v["bbox"].is_array() && v["bbox"].size() == 4 &&
-                           v["bbox"][0].is_number();
-            ImVec2 boxTL, boxBR;  // screen
-            double bMinX = 0, bMinY = 0, bMaxX = 0, bMaxY = 0;
-            if (haveBox) {
-                bMinX = v["bbox"][0].get<double>(); bMinY = v["bbox"][1].get<double>();
-                bMaxX = v["bbox"][2].get<double>(); bMaxY = v["bbox"][3].get<double>();
-                boxTL = toScreen(bMinX, bMaxY);  // maxY -> top
-                boxBR = toScreen(bMaxX, bMinY);
-            }
-
-            // A failed / empty view: render nothing but a small note anchored at its position/bbox.
-            auto visEmpty = [&]() {
-                if (!v.contains("visible") || !v["visible"].is_array()) return true;
+            if (!v.is_object() || djstr(v, "type") == "table_overlay") continue;
+            const std::string err = djstr(v, "error");
+            bool visEmpty = true;
+            if (v.contains("visible") && v["visible"].is_array())
                 for (const auto& pl : v["visible"])
-                    if (pl.is_array() && pl.size() >= 2) return false;
-                return true;
-            };
-            if (!err.empty() || visEmpty()) {
-                ImVec2 anchor;
-                if (haveBox) anchor = ImVec2((boxTL.x + boxBR.x) * 0.5f, (boxTL.y + boxBR.y) * 0.5f);
+                    if (pl.is_array() && pl.size() >= 2) { visEmpty = false; break; }
+            if (!err.empty() || visEmpty) {
+                // A failed / empty view: a small note at its bbox / position instead of geometry.
+                ImVec2 anchor((clear.Min.x + clear.Max.x) * 0.5f, (clear.Min.y + clear.Max.y) * 0.5f);
+                double bx0, by0, bx1, by1;
+                if (viewBox(v, bx0, by0, bx1, by1))
+                    anchor = toScreen((bx0 + bx1) * 0.5, (by0 + by1) * 0.5);
                 else if (v.contains("position") && v["position"].is_array() &&
-                         v["position"].size() == 2 && v["position"][0].is_number())
-                    anchor = toScreen(v["position"][0].get<double>(),
-                                      v["position"][1].get<double>());
-                else
-                    anchor = ImVec2((canvasMin.x + canvasMax.x) * 0.5f,
-                                    (canvasMin.y + canvasMax.y) * 0.5f);
-                std::string note = (orient.empty() ? std::string("view") : orient) +
-                                   (err.empty() ? ": (empty)" : ": view failed");
-                ImVec2 ts = ImGui::CalcTextSize(note.c_str());
-                ImVec2 t0(anchor.x - ts.x * 0.5f - 6, anchor.y - ts.y * 0.5f - 3);
-                ImVec2 t1(t0.x + ts.x + 12, t0.y + ts.y + 6);
-                dl->AddRectFilled(t0, t1, sheetCol(pal.viewportTop, 0.92f), 3.0f);
-                dl->AddRect(t0, t1, sheetCol(pal.statusErr, 0.85f), 3.0f);
-                dl->AddText(ImVec2(t0.x + 6, t0.y + 3), sheetCol(pal.statusErr), note.c_str());
+                         v["position"].size() == 2 && v["position"][0].is_number() &&
+                         v["position"][1].is_number())
+                    anchor = toScreen(v["position"][0].get<double>(), v["position"][1].get<double>());
+                const std::string orient = djstr(v, "orientation");
+                const std::string note = (orient.empty() ? std::string("view") : orient) +
+                                         (err.empty() ? ": (empty)" : ": view failed");
+                const ImVec2 ts = ImGui::CalcTextSize(note.c_str());
+                const float px = ui::metrics::U(1.5f), py = ui::metrics::U(0.75f);
+                const ImVec2 t0(anchor.x - ts.x * 0.5f - px, anchor.y - ts.y * 0.5f - py);
+                const ImVec2 t1(t0.x + ts.x + px * 2.0f, t0.y + ts.y + py * 2.0f);
+                dl->AddRectFilled(t0, t1, sheetCol(pal.viewportTop, 0.92f), ui::metrics::rounding(3.0f));
+                dl->AddRect(t0, t1, sheetCol(pal.statusErr, 0.85f), ui::metrics::rounding(3.0f), 0,
+                            ui::metrics::stroke(1.0f));
+                dl->AddText(ImVec2(t0.x + px, t0.y + py), sheetCol(pal.statusErr), note.c_str());
                 continue;
             }
-
-            // W15: section hatching — fill each section_face polygon with 45° lines (under the
-            // edges, so the cut outline draws crisply on top). The bore shows as a gap because the
-            // engine returns the cut face split into pieces around the hole.
-            if (v.contains("section_faces") && v["section_faces"].is_array()) {
-                const ImU32 hatchCol = sheetCol(pal.sketchDimLine, 0.70f);
-                for (const auto& poly : v["section_faces"]) {
-                    if (!poly.is_array() || poly.size() < 3) continue;
-                    std::vector<std::array<float, 2>> mm;
-                    mm.reserve(poly.size());
-                    for (const auto& pt : poly)
-                        if (pt.is_array() && pt.size() == 2 && pt[0].is_number() && pt[1].is_number())
-                            mm.push_back({(float)pt[0].get<double>(), (float)pt[1].get<double>()});
-                    if (mm.size() < 3) continue;
-                    // 45° hatch at ~3 mm spacing (sheet mm); thin lines.
-                    hatchPolygon(dl, mm, toScreen, hatchCol, std::max(1.0f, 0.8f * s), 3.0f);
-                    // Outline the cut face boundary so the hatched region reads as a solid cut.
-                    std::vector<ImVec2> bnd;
-                    bnd.reserve(mm.size());
-                    for (const auto& p : mm) bnd.push_back(toScreen(p[0], p[1]));
-                    dl->AddPolyline(bnd.data(), (int)bnd.size(), inkVisible,
-                                    ImDrawFlags_Closed, visThick);
-                }
-            }
-
-            // Stroke hidden polylines first (under the solid lines).
-            if (v.contains("hidden") && v["hidden"].is_array()) {
-                for (const auto& pl : v["hidden"]) {
-                    if (!pl.is_array() || pl.size() < 2) continue;
-                    std::vector<ImVec2> pts;
-                    pts.reserve(pl.size());
-                    for (const auto& pt : pl)
-                        if (pt.is_array() && pt.size() == 2 && pt[0].is_number() && pt[1].is_number())
-                            pts.push_back(toScreen(pt[0].get<double>(), pt[1].get<double>()));
-                    addDashedPolyline(dl, pts, inkHidden, hidThick, 5.0f * s, 4.0f * s);
-                }
-            }
-            // Then the solid visible polylines.
-            if (v.contains("visible") && v["visible"].is_array()) {
-                for (const auto& pl : v["visible"]) {
-                    if (!pl.is_array() || pl.size() < 2) continue;
-                    std::vector<ImVec2> pts;
-                    pts.reserve(pl.size());
-                    for (const auto& pt : pl)
-                        if (pt.is_array() && pt.size() == 2 && pt[0].is_number() && pt[1].is_number())
-                            pts.push_back(toScreen(pt[0].get<double>(), pt[1].get<double>()));
-                    if (pts.size() >= 2)
-                        dl->AddPolyline(pts.data(), (int)pts.size(), inkVisible, 0, visThick);
-                }
-            }
-
-            // W15: parent-view markers — the cutting line(s) and detail circle(s) the engine
-            // attaches to a parent view in drawing_get, drawn over the geometry.
-            const ImU32 markCol = sheetCol(pal.statusErr, 0.92f);
-            const float markThick = std::max(1.2f, 1.3f * s);
-            if (v.contains("section_lines") && v["section_lines"].is_array()) {
-                for (const auto& sl : v["section_lines"]) {
-                    if (!sl.is_object() || !sl.contains("line") || !sl["line"].is_array() ||
-                        sl["line"].size() != 2) continue;
-                    const auto& L = sl["line"];
-                    if (!(L[0].is_array() && L[1].is_array())) continue;
-                    ImVec2 a = toScreen(L[0][0].get<double>(), L[0][1].get<double>());
-                    ImVec2 b = toScreen(L[1][0].get<double>(), L[1][1].get<double>());
-                    addDashedPolyline(dl, {a, b}, markCol, markThick, 10.0f * s, 4.0f * s);
-                    // End arrows + the section letter at both ends ("A").
-                    std::string lab = djstr(sl, "label");
-                    ImVec2 dir(b.x - a.x, b.y - a.y);
-                    float len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
-                    if (len > 1e-3f) {
-                        ImVec2 n(-dir.y / len, dir.x / len);   // perpendicular (arrow body)
-                        auto endArrow = [&](const ImVec2& tip, float sgn) {
-                            ImVec2 bdir(n.x * sgn, n.y * sgn);  // arrow points along the look dir
-                            float ah = 10.0f * s, aw = 4.0f * s;
-                            ImVec2 base(tip.x + bdir.x * ah, tip.y + bdir.y * ah);
-                            ImVec2 u(dir.x / len, dir.y / len);
-                            dl->AddTriangleFilled(tip,
-                                ImVec2(base.x + u.x * aw, base.y + u.y * aw),
-                                ImVec2(base.x - u.x * aw, base.y - u.y * aw), markCol);
-                        };
-                        endArrow(a, 1.0f);
-                        endArrow(b, 1.0f);
-                        if (!lab.empty()) {
-                            dl->AddText(ImVec2(a.x - 6 * s, a.y - 16 * s), markCol, lab.c_str());
-                            dl->AddText(ImVec2(b.x - 6 * s, b.y + 6 * s), markCol, lab.c_str());
-                        }
-                    }
-                }
-            }
-            if (v.contains("detail_circles") && v["detail_circles"].is_array()) {
-                for (const auto& dc : v["detail_circles"]) {
-                    if (!dc.is_object() || !dc.contains("center") || !dc["center"].is_array() ||
-                        dc["center"].size() != 2) continue;
-                    double ccx = dc["center"][0].get<double>(), ccy = dc["center"][1].get<double>();
-                    double rad = djnum(dc, "radius", 0.0);
-                    ImVec2 c = toScreen(ccx, ccy);
-                    float rpx = (float)rad * z;
-                    dl->AddCircle(c, rpx, markCol, 48, markThick);
-                    std::string lab = djstr(dc, "label");
-                    if (!lab.empty()) {
-                        ImVec2 lp(c.x + rpx * 0.7f, c.y - rpx * 0.7f - 14 * s);
-                        dl->AddText(lp, markCol, lab.c_str());
-                    }
-                }
-            }
-
-            // Per-view label: reserve a dedicated band below the view frame. If that band intersects
-            // the title block, place it immediately above the frame instead; labels therefore never
-            // sit under title-block ink, and annotations remain visually separate from the label band.
-            if (haveBox) {
-                char lbl[80];
-                std::string vtype = djstr(v, "type");
-                std::string vlabel = djstr(v, "label");
-                if (vtype == "section" && !vlabel.empty())
-                    std::snprintf(lbl, sizeof(lbl), "SECTION %s-%s  (%.2g:1)",
-                                  vlabel.c_str(), vlabel.c_str(), scale);
-                else if (vtype == "detail" && !vlabel.empty())
-                    std::snprintf(lbl, sizeof(lbl), "DETAIL %s  (%.2g:1)", vlabel.c_str(), scale);
-                else
-                    std::snprintf(lbl, sizeof(lbl), "%s  (%.2g:1)",
-                                  orient.empty() ? "view" : orient.c_str(), scale);
-                ImVec2 ts = ImGui::CalcTextSize(lbl);
-                // Dimensions are painted AFTER the labels (below), in the same band under the
-                // view, so a view that carries annotations had its label overprinted by a dim
-                // string - "top (1:1)" sitting under "80.00 +/-0.10" at 149% sheet zoom. Drop
-                // the label clear of that band when the view actually has annotations.
-                const bool hasDims = v.contains("annotations") && v["annotations"].is_array() &&
-                                     !v["annotations"].empty();
-                const float dimBand = hasDims ? ImGui::GetTextLineHeight() + 6.0f * s : 0.0f;
-                ImVec2 lp(boxTL.x, boxBR.y + 4 * s + dimBand);
-                ImVec2 labelBR(lp.x + ts.x + 4 * s, lp.y + labelBandH);
-                const bool hitsTitle = lp.x < titleBlockBR.x && labelBR.x > titleBlockTL.x &&
-                                       lp.y < titleBlockBR.y && labelBR.y > titleBlockTL.y;
-                if (hitsTitle) lp.y = boxTL.y - labelBandH;
-                dl->AddRectFilled(ImVec2(lp.x - 2 * s, lp.y - s),
-                                  ImVec2(lp.x + ts.x + 4 * s, lp.y + ts.y + 2 * s),
-                                  sheetCol(pal.viewportTop, 0.92f), 2.0f * s);
-                dl->AddText(lp, sheetCol(pal.sketchInk, 0.80f), lbl);
-            }
+            if (v.contains("hatch")) pen.solid(v["hatch"], ink, pen.thin);
+            if (v.contains("hidden")) pen.patterned(v["hidden"], ink, pen.thin, kHiddenPat, 2);
+            if (v.contains("visible")) pen.solid(v["visible"], ink, pen.thick);
+            if (v.contains("draw")) pen.block(v["draw"], ink);
         }
     }
 
-    // ---- W17: standard title block in the sheet's bottom-right corner ----
-    renderTitleBlock(dl, *sheet, toScreen, paperW, paperH, s);
-
-    // ---- W13: render stored dimensions/notes (over the geometry) ----
-    if (sheet->contains("views") && (*sheet)["views"].is_array()) {
+    // ---- annotations (dims, callouts, GD&T, notes, centre marks, tables): compiled draw blocks ----
+    if (hasViews) {
         for (const auto& v : (*sheet)["views"]) {
             if (!v.is_object() || !v.contains("annotations") || !v["annotations"].is_array())
                 continue;
-            const std::string vid = djstr(v, "view_id").empty() ? djstr(v, "id")
-                                                                 : djstr(v, "view_id");
+            const std::string vid = viewIdOf(v);
             for (const auto& ann : v["annotations"]) {
-                if (!ann.is_object()) continue;
-                bool sel = (tab.selAnnViewId == vid && tab.selAnnId == djstr(ann, "id"));
-                // Prefer the engine-compiled primitive block (covers dims + all GD&T); fall
-                // back to the legacy host renderer if an older drawing lacks `draw`.
-                if (ann.contains("draw") && ann["draw"].is_object())
-                    renderDrawPrimitives(dl, ann, toScreen, z, s, sel);
-                else
-                    renderDimension(dl, ann, st.ips(), toScreen, z, s, sel);
+                if (!ann.is_object() || !ann.contains("draw")) continue;
+                const std::string aid = djstr(ann, "id");
+                const bool sel = tab.selAnnViewId == vid && tab.selAnnId == aid && !aid.empty();
+                const bool hov = hovAnnView == vid && hovAnnId == aid && !aid.empty();
+                pen.block(ann["draw"], sel ? accent : hov ? sheetCol(pal.accent, 0.75f) : ink);
             }
         }
     }
 
-    // ---- W13: dimension tool interaction (snap + place) + annotation select/delete ----
-    {
-        // Esc cancels the in-progress action and disarms whatever tool is armed.
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape) && anyDrawToolActive(tab)) {
-            disarmDrawTools(tab);
+    // ---- view hover / selection: accent frame + caption chip above the view (UI, not ink) ----
+    if (hasViews && !tab.viewDragActive) {
+        for (const auto& v : (*sheet)["views"]) {
+            if (!v.is_object() || djstr(v, "type") == "table_overlay") continue;
+            const std::string vid = viewIdOf(v);
+            const bool sel = !tab.selViewId.empty() && tab.selViewId == vid && tab.selAnnId.empty();
+            const bool hov = !hovViewId.empty() && hovViewId == vid;
+            double bx0, by0, bx1, by1;
+            if ((!sel && !hov) || !viewBox(v, bx0, by0, bx1, by1)) continue;
+            const float g = ui::metrics::U(0.75f);
+            const ImVec2 h0 = toScreen(bx0, by1), h1 = toScreen(bx1, by0);
+            dl->AddRect(ImVec2(h0.x - g, h0.y - g), ImVec2(h1.x + g, h1.y + g),
+                        sheetCol(pal.accent, sel ? 0.90f : 0.45f), ui::metrics::rounding(2.0f), 0,
+                        ui::metrics::stroke(sel ? 1.5f : 1.0f));
+            const std::string cap = viewCaption(v);
+            const float chipW = ImGui::CalcTextSize(cap.c_str()).x + ui::metrics::U(3.0f);
+            const ImVec2 cp(h0.x - g, h0.y - g - hudChipH() - ui::metrics::U(1.0f));
+            if (cp.x >= clear.Min.x && cp.y >= clear.Min.y && cp.x + chipW <= clear.Max.x) {
+                ImGui::PushID(vid.c_str());
+                ImGui::SetCursorScreenPos(cp);
+                ui::kit::chip(cap.c_str(), ui::kit::Tone::Accent);
+                ImGui::PopID();
+            }
         }
-        ImVec2 mouse = ImGui::GetIO().MousePos;
-        bool overCanvas = canvasHovered;
-        // Convert the cursor to sheet-mm (inverse of toScreen).
-        double curMx = (mouse.x - canvasMin.x - panX) / z;
-        double curMy = -(mouse.y - canvasMin.y - panY) / z;
-        double snapRadiusMm = 9.0 / std::max(z, 1e-4f);   // ~9 px snap radius -> sheet mm
+    }
+
+    // ---- tool interaction (snap + place) + annotation/view select, drag, delete ----
+    {
+        const bool typing = ImGui::GetIO().WantTextInput;
+        // Esc cancels the in-progress action and disarms whatever tool is armed.
+        if (!typing && ImGui::IsKeyPressed(ImGuiKey_Escape) && anyDrawToolActive(tab))
+            disarmDrawTools(tab);
+        const bool overCanvas = overSheet;
 
         // ---- Section View tool: click a start on a parent view, click more points for a
         // jogged/offset cut line, then DOUBLE-CLICK (or Enter) to finish. Straight section =
@@ -1872,7 +1833,7 @@ void drawDrawingSheet(AppState& st) {
                                   4.0f * s);
             }
             bool dbl = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
-            bool finish = dbl || ImGui::IsKeyPressed(ImGuiKey_Enter);
+            bool finish = dbl || (!typing && ImGui::IsKeyPressed(ImGuiKey_Enter));
             if (finish && tab.sectionPts.size() >= 2) {
                 commitSection(st, tab, tab.sectionViewId, tab.sectionPts, tab.sectionMode,
                               tab.sectionReverse);
@@ -2024,11 +1985,8 @@ void drawDrawingSheet(AppState& st) {
                            snapToVertex(*sheet, curMx, curMy, snapRadiusMm, sx, sy, svid);
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
                 std::string overView = !svid.empty() ? svid : viewAtPoint(*sheet, curMx, curMy, 24.0);
-                if (overView.empty() && sheet->contains("views") && (*sheet)["views"].is_array() &&
-                    !(*sheet)["views"].empty()) {
-                    const auto& v0 = (*sheet)["views"][0];
-                    overView = djstr(v0, "view_id").empty() ? djstr(v0, "id") : djstr(v0, "view_id");
-                }
+                if (overView.empty() && hasViews && !(*sheet)["views"].empty())
+                    overView = viewIdOf((*sheet)["views"][0]);
                 if (!overView.empty()) {
                     if (tab.noteActive)
                         commitExtDim(st, tab, overView, "note",
@@ -2079,127 +2037,78 @@ void drawDrawingSheet(AppState& st) {
         }
         // ---- selection + double-click-to-edit + drag-to-reposition (no tool armed) ----
         else if (!anyDrawToolActive(tab) && overCanvas) {
-            // Nearest stored annotation's text position to the cursor (sheet-mm pick radius).
-            auto pickAnn = [&](double qx, double qy, std::string& hv, std::string& ha,
-                               double& hx, double& hy) {
-                double bestD2 = (14.0 / std::max(z, 1e-4f)) * (14.0 / std::max(z, 1e-4f));
-                if (!(sheet->contains("views") && (*sheet)["views"].is_array())) return;
-                for (const auto& v : (*sheet)["views"]) {
-                    if (!v.is_object() || !v.contains("annotations") ||
-                        !v["annotations"].is_array()) continue;
-                    const std::string vid = djstr(v, "view_id").empty() ? djstr(v, "id")
-                                                                        : djstr(v, "view_id");
-                    for (const auto& ann : v["annotations"]) {
-                        if (!ann.is_object()) continue;
-                        auto it = ann.find("pos");
-                        if (it == ann.end() || !it->is_array() || it->size() != 2) continue;
-                        double ppx = (*it)[0].get<double>(), ppy = (*it)[1].get<double>();
-                        double d2 = (ppx - qx) * (ppx - qx) + (ppy - qy) * (ppy - qy);
-                        if (d2 < bestD2) { bestD2 = d2; hv = vid; ha = djstr(ann, "id");
-                                           hx = ppx; hy = ppy; }
-                    }
-                }
-            };
             // Double-click opens the dimension editor for the annotation under the cursor.
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !spaceDown) {
-                std::string hv, ha; double hx = 0, hy = 0;
-                pickAnn(curMx, curMy, hv, ha, hx, hy);
-                if (!ha.empty()) {
-                    tab.selAnnViewId = hv; tab.selAnnId = ha;
+                if (!hovAnnId.empty()) {
+                    tab.selAnnViewId = hovAnnView; tab.selAnnId = hovAnnId;
                     s_annEditOpen = true; s_annEditLoaded = false;
                 }
             } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown && !panning) {
                 std::string hv, ha; double hx = 0, hy = 0;
-                pickAnn(curMx, curMy, hv, ha, hx, hy);
+                pickAnnotation(*sheet, curMx, curMy, pickRadiusMm, hv, ha, hx, hy);
                 tab.selAnnViewId = hv; tab.selAnnId = ha;   // empty clears the selection
                 // No annotation under the cursor -> select the VIEW for move/scale/delete.
                 if (ha.empty()) tab.selViewId = viewAtPoint(*sheet, curMx, curMy, 4.0);
             }
             // ---- view move: drag the selected view; ghost-rect preview, commit on release --
-            if (!tab.selViewId.empty() && tab.selAnnId.empty() && !s_annDragActive && !spaceDown) {
-                // find the selected view's position + bbox in the cache
+            if (!tab.selViewId.empty() && tab.selAnnId.empty() && !s_annDragActive && !spaceDown &&
+                hasViews) {
                 const nlohmann::json* sv = nullptr;
-                for (const auto& v : (*sheet)["views"]) {
-                    if (!v.is_object()) continue;
-                    std::string vid = djstr(v, "view_id").empty() ? djstr(v, "id")
-                                                                   : djstr(v, "view_id");
-                    if (vid == tab.selViewId) { sv = &v; break; }
-                }
-                if (sv && sv->contains("bbox") && (*sv)["bbox"].is_array() &&
-                    (*sv)["bbox"].size() == 4 && (*sv)["bbox"][0].is_number()) {
-                    double bx0 = (*sv)["bbox"][0].get<double>(), by0 = (*sv)["bbox"][1].get<double>();
-                    double bx1 = (*sv)["bbox"][2].get<double>(), by1 = (*sv)["bbox"][3].get<double>();
-                    // persistent selection highlight
-                    ImVec2 hl0 = toScreen(bx0, by1), hl1 = toScreen(bx1, by0);
-                    dl->AddRect(ImVec2(hl0.x - 3, hl0.y - 3), ImVec2(hl1.x + 3, hl1.y + 3),
-                                sheetCol(pal.sketchUnder, tab.viewDragActive ? 0.47f : 0.78f),
-                                2.0f, 0,
-                                1.4f * s);
+                for (const auto& v : (*sheet)["views"])
+                    if (v.is_object() && viewIdOf(v) == tab.selViewId) { sv = &v; break; }
+                double bx0, by0, bx1, by1;
+                if (sv && viewBox(*sv, bx0, by0, bx1, by1)) {
+                    const ImVec2 hl0 = toScreen(bx0, by1), hl1 = toScreen(bx1, by0);
                     if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                        const ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
                         if (!tab.viewDragActive) {
-                            ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
-                            ImVec2 press(mouse.x - dd.x, mouse.y - dd.y);
-                            if (press.x >= hl0.x - 4 && press.x <= hl1.x + 4 &&
-                                press.y >= hl0.y - 4 && press.y <= hl1.y + 4) {
+                            const ImVec2 press(mouse.x - dd.x, mouse.y - dd.y);
+                            const float g = ui::metrics::U(1.0f);
+                            if (press.x >= hl0.x - g && press.x <= hl1.x + g &&
+                                press.y >= hl0.y - g && press.y <= hl1.y + g)
                                 tab.viewDragActive = true;
-                            }
                         }
                         if (tab.viewDragActive) {
-                            ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
-                            // ghost rect at the dragged offset
-                            ImVec2 g0(hl0.x + dd.x, hl0.y + dd.y), g1(hl1.x + dd.x, hl1.y + dd.y);
-                            dl->AddRect(g0, g1, sheetCol(pal.sketchUnder, 0.90f), 2.0f * s, 0, 1.6f * s);
+                            // ghost frame at the dragged offset
+                            dl->AddRect(ImVec2(hl0.x + dd.x, hl0.y + dd.y),
+                                        ImVec2(hl1.x + dd.x, hl1.y + dd.y), accent,
+                                        ui::metrics::rounding(2.0f), 0, ui::metrics::stroke(1.6f));
                             tab.viewDragDX = dd.x / z;       // sheet-mm offset
                             tab.viewDragDY = -dd.y / z;
                         }
                     }
                     if (tab.viewDragActive && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-                        double px = djnum(*sv, "position", 0.0);  // (overwritten below)
-                        double cury = 0;
+                        double px = 0, py = 0;
                         if (sv->contains("position") && (*sv)["position"].is_array() &&
-                            (*sv)["position"].size() == 2) {
+                            (*sv)["position"].size() == 2 && (*sv)["position"][0].is_number() &&
+                            (*sv)["position"][1].is_number()) {
                             px = (*sv)["position"][0].get<double>();
-                            cury = (*sv)["position"][1].get<double>();
+                            py = (*sv)["position"][1].get<double>();
                         }
                         commitViewMove(st, tab, tab.selViewId, px + tab.viewDragDX,
-                                       cury + tab.viewDragDY);
+                                       py + tab.viewDragDY);
                         tab.viewDragActive = false; tab.viewDragDX = tab.viewDragDY = 0;
                     }
                 }
             }
             // Drag the selected annotation's text to reposition it (commit on release).
             if (!tab.selAnnId.empty() && !spaceDown) {
-                // current pos of the selected annotation
-                double selx = 0, sely = 0; bool haveSel = false;
-                for (const auto& v : (*sheet)["views"]) {
-                    if (!v.is_object() || !v.contains("annotations") ||
-                        !v["annotations"].is_array()) continue;
-                    const std::string vid = djstr(v, "view_id").empty() ? djstr(v, "id")
-                                                                        : djstr(v, "view_id");
-                    if (vid != tab.selAnnViewId) continue;
-                    for (const auto& ann : v["annotations"])
-                        if (ann.is_object() && djstr(ann, "id") == tab.selAnnId) {
-                            auto it = ann.find("pos");
-                            if (it != ann.end() && it->is_array() && it->size() == 2) {
-                                selx = (*it)[0].get<double>(); sely = (*it)[1].get<double>();
-                                haveSel = true;
-                            }
-                        }
-                }
+                const nlohmann::json* selAnn = findSelAnn(*sheet, tab.selAnnViewId, tab.selAnnId);
+                double selx = 0, sely = 0;
+                const bool haveSel = selAnn && annAnchor(*selAnn, selx, sely);
                 if (haveSel && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                    const ImVec2 selS = toScreen(selx, sely);
                     if (!s_annDragActive) {
                         // arm only if the drag began near the selected annotation
-                        ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
-                        ImVec2 press(mouse.x - dd.x, mouse.y - dd.y);
-                        ImVec2 selS = toScreen(selx, sely);
-                        float pr = 16.0f * s;
+                        const ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+                        const ImVec2 press(mouse.x - dd.x, mouse.y - dd.y);
+                        const float pr = ui::metrics::px(16.0f);
                         if (std::fabs(press.x - selS.x) < pr && std::fabs(press.y - selS.y) < pr)
                             s_annDragActive = true;
                     }
                     if (s_annDragActive) {
-                        ImVec2 selS = toScreen(selx, sely);
-                        dl->AddLine(selS, mouse, sheetCol(pal.statusWarn, 0.78f), 1.2f * s);
-                        dl->AddCircleFilled(mouse, 3.0f * s, sheetCol(pal.statusWarn, 0.86f));
+                        dl->AddLine(selS, mouse, sheetCol(pal.accent, 0.78f), ui::metrics::stroke(1.2f));
+                        dl->AddCircleFilled(mouse, ui::metrics::px(3.0f), sheetCol(pal.accent, 0.86f));
                     }
                 }
                 if (s_annDragActive && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
@@ -2210,8 +2119,8 @@ void drawDrawingSheet(AppState& st) {
             }
         }
 
-        // Delete the selected annotation, else the selected view.
-        if (!anyDrawToolActive(tab) &&
+        // Delete the selected annotation, else the selected view (never while typing in a field).
+        if (!typing && !anyDrawToolActive(tab) &&
             (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
             if (!tab.selAnnId.empty())
                 deleteAnnotation(st, tab, tab.selAnnViewId, tab.selAnnId);
@@ -2220,7 +2129,7 @@ void drawDrawingSheet(AppState& st) {
         }
     }
 
-    // ---- W13: BOM table overlay (top-right of the canvas) ----
+    // ---- W13: BOM table overlay (top-right of the clear rect) ----
     if (tab.bomVisible) {
         if (!tab.bomFetched) fetchBom(st, tab);   // (re)fetch after a Rebuild invalidated the cache
         const nlohmann::json& bom = tab.bomRows;
@@ -2233,17 +2142,16 @@ void drawDrawingSheet(AppState& st) {
         const float tableW = wItem + wName + wQty + pad * 2;
         int nRows = rows ? (int)rows->size() : 0;
         const float tableH = rowH * (nRows + 2) + pad * 2;   // header + title + rows
-        ImVec2 t0(canvasMax.x - tableW - 10 * s, canvasMin.y + 10 * s);
+        ImVec2 t0(clear.Max.x - tableW - 10 * s, clear.Min.y + 10 * s);
         ImVec2 t1(t0.x + tableW, t0.y + tableH);
         dl->AddRectFilled(t0, t1, sheetCol(pal.viewportTop, 0.94f), 3.0f);
         dl->AddRect(t0, t1, sheetCol(pal.sketchDimLine), 3.0f, 0, 1.2f * s);
-        const ImU32 ink = sheetCol(pal.sketchInk);
         float yy = t0.y + pad;
         dl->AddText(ImVec2(t0.x + pad, yy), ink, "Bill of Materials");
         yy += rowH;
         if (!isAsm || nRows == 0) {
             const char* msg = bom.is_object() && bom.contains("note") && bom["note"].is_string()
-                                  ? bom["note"].get<std::string>().c_str()
+                                  ? bom["note"].get_ptr<const std::string*>()->c_str()
                                   : (isAsm ? "no components" : "part drawing - no BOM");
             dl->AddText(ImVec2(t0.x + pad, yy), sheetCol(pal.sketchInk, 0.55f), msg);
         } else {
@@ -2258,13 +2166,7 @@ void drawDrawingSheet(AppState& st) {
                 if (!r.is_object()) continue;
                 char itemBuf[16];
                 std::snprintf(itemBuf, sizeof(itemBuf), "%d", (int)djnum(r, "item", 0));
-                std::string name = djstr(r, "name");
-                if ((float)ImGui::CalcTextSize(name.c_str()).x > wName - 4 * s) {
-                    while (name.size() > 3 &&
-                           (float)ImGui::CalcTextSize((name + "...").c_str()).x > wName - 4 * s)
-                        name.pop_back();
-                    name += "...";
-                }
+                const std::string name = ui::kit::elide(djstr(r, "name").c_str(), wName - 4 * s);
                 char qtyBuf[16];
                 std::snprintf(qtyBuf, sizeof(qtyBuf), "%d", (int)djnum(r, "quantity", 0));
                 dl->AddText(ImVec2(t0.x + pad, yy), ink, itemBuf);
@@ -2275,23 +2177,97 @@ void drawDrawingSheet(AppState& st) {
         }
     }
 
-    // ---- bottom-left HUD: zoom % + view count ----
-    {
-        int nViews = (sheet->contains("views") && (*sheet)["views"].is_array())
-                         ? (int)(*sheet)["views"].size() : 0;
-        char hud[96];
-        std::snprintf(hud, sizeof(hud), "%s   %d view%s   %.0f%%",
-                      djstr(*sheet, "id").c_str(), nViews, nViews == 1 ? "" : "s", z * 100.0f);
-        ImVec2 ts = ImGui::CalcTextSize(hud);
-        ImVec2 p0(canvasMin.x + 8 * s, canvasMax.y - ts.y - 8 * s);
-        ImVec2 p1(p0.x + ts.x + 12, p0.y + ts.y + 6);
-        ui::glassBackground(dl, p0, p1, 4.0f);
-        dl->AddText(ImVec2(p0.x + 6, p0.y + 3), ui::Palette::toU32(pal.overlayText), hud);
-    }
-
     dl->PopClipRect();
 
-    // ---- W17: editor popups (rendered last; they are separate ImGui windows) ----
+    // ---- HUD (inside the clear rect, never under the pinned columns) ----
+    ImGui::PushClipRect(clear.Min, clear.Max, true);
+    {
+        const float m = ui::metrics::U(2.0f);
+        const float chipH = hudChipH();
+        // Top: the armed tool's current step + Done, or a stale-source warning.
+        const char* stageMsg = nullptr;
+        if (tab.dimToolActive)
+            stageMsg = tab.dimStage == 0 ? "Smart Dimension: click vertex A"
+                     : tab.dimStage == 1 ? "Smart Dimension: click vertex B"
+                                         : "Smart Dimension: click to place text";
+        else if (tab.sectionToolActive)
+            stageMsg = tab.sectionStage == 0 ? "Section: click the cutting-line start across a view"
+                                             : "Section: click more points, double-click to finish";
+        else if (tab.detailToolActive)
+            stageMsg = tab.detailStage == 0 ? "Detail: click the circle center on a view"
+                                            : "Detail: move to set the radius, click to finish";
+        else if (tab.modelItemsActive)  stageMsg = "Model Items: click a view to auto-dimension it";
+        else if (tab.holeCalloutActive) stageMsg = "Hole Callout: click a circle";
+        else if (tab.centerMarkActive)  stageMsg = "Center Mark: click a circle";
+        else if (tab.centerLineActive)
+            stageMsg = tab.centerLineStage == 0 ? "Center Line: click the first point"
+                                                : "Center Line: click the second point";
+        else if (tab.noteActive)        stageMsg = "Note: click to place a note";
+        else if (tab.balloonActive)     stageMsg = "Balloon: click to drop an item bubble";
+        else if (tab.gdtToolActive)
+            stageMsg = tab.gdtStage == 0 ? "GD&T: click the feature" : "GD&T: click to place";
+        const bool stale = tab.drawingDoc.value("views_stale", false);
+        if (stageMsg || stale) {
+            hudRow(ImVec2(clear.Min.x + m, clear.Min.y + m), [&](float& x, float y, float rowH) {
+                if (stale) {
+                    const std::string w = djstr(tab.drawingDoc, "warning");
+                    ImGui::SetCursorScreenPos(ImVec2(x, y + (rowH - chipH) * 0.5f));
+                    ui::kit::chip(w.empty() ? "Source unavailable \xE2\x80\x94 views are stale"
+                                            : w.c_str(),
+                                  ui::kit::Tone::Warn, true);
+                    hudNext(x);
+                }
+                if (stageMsg) {
+                    ImGui::SetCursorScreenPos(ImVec2(x, y + (rowH - chipH) * 0.5f));
+                    ui::kit::chip(stageMsg, ui::kit::Tone::Accent, true);
+                    hudNext(x);
+                    ImGui::SetCursorScreenPos(ImVec2(x, y));
+                    if (ui::kit::secondaryButton("Done##drw_tool_done")) disarmDrawTools(tab);
+                    ui::kit::itemTooltip("Finish the tool (Esc)");
+                    hudNext(x);
+                }
+            });
+        }
+
+        // Bottom-left: sheet · scale · projection, view count, zoom, and the canvas hint.
+        int nViews = 0;
+        if (hasViews)
+            for (const auto& v : (*sheet)["views"])
+                if (v.is_object() && djstr(v, "type") != "table_overlay") ++nViews;
+        const std::string summary = sheetSummary(*sheet);
+        char viewsBuf[32], zoomBuf[32];
+        std::snprintf(viewsBuf, sizeof(viewsBuf), "%d view%s", nViews, nViews == 1 ? "" : "s");
+        std::snprintf(zoomBuf, sizeof(zoomBuf), "%.0f%%", z / std::max(1e-4f, ui::metrics::px(3.78f)) * 100.0f);
+        const ImVec2 hudOrigin(clear.Min.x + m, clear.Max.y - m - hudRowHeight());
+        hudRow(hudOrigin, [&](float& x, float y, float rowH) {
+            ImGui::SetCursorScreenPos(ImVec2(x, y + (rowH - chipH) * 0.5f));
+            ui::kit::chip(summary.c_str(), ui::kit::Tone::Neutral, false,
+                          "Paper size, drawing scale and projection method (Sheet Props to change)");
+            hudNext(x);
+            ImGui::SetCursorScreenPos(ImVec2(x, y + (rowH - chipH) * 0.5f));
+            ui::kit::chip(viewsBuf);
+            hudNext(x);
+            ImGui::SetCursorScreenPos(ImVec2(x, y + (rowH - chipH) * 0.5f));
+            ui::kit::chip(zoomBuf, ui::kit::Tone::Neutral, false,
+                          "Zoom relative to true paper size at 96 dpi");
+            hudNext(x);
+            const char* hint = "Double-click a dimension to edit  \xC2\xB7  drag to move  \xC2\xB7  "
+                               "wheel zoom  \xC2\xB7  middle-drag pan  \xC2\xB7  Del removes";
+            const float hintW = clear.Max.x - m - ui::metrics::U(3.0f) - x;
+            if (hintW > ui::metrics::U(16.0f)) {
+                const std::string h = ui::kit::elide(hint, hintW);
+                ImGui::SetCursorScreenPos(ImVec2(x, y + (rowH - ImGui::GetTextLineHeight()) * 0.5f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(pal.textDim[0], pal.textDim[1],
+                                                            pal.textDim[2], pal.textDim[3]));
+                ImGui::TextUnformatted(h.c_str());
+                ImGui::PopStyleColor();
+                hudNext(x);
+            }
+        });
+    }
+    ImGui::PopClipRect();
+
+    // ---- editor popups (rendered last; they are separate ImGui windows) ----
     renderDimEditorPopup(st, tab, *sheet);
     renderGdtEditorPopup(st, tab);
     renderTitleBlockPopup(st, tab, *sheet);

@@ -135,6 +135,7 @@
 #include "doc/selectors.h"
 #include "doc/sketch_geom.h"
 #include "doc/drawing_session.h"  // W12+ drawing embed/restore on save/open
+#include "doc/export2d.h"         // pool_drawing_sheet (drawing_render_png)
 #include "doc/stepplus.h"
 #include "doc/validate.h"
 #include "parts/parts.h"
@@ -9541,287 +9542,398 @@ json doc_render_contact_sheet(const std::string& doc_id, const std::string& out_
     }
 }
 
+namespace {
+
+// --- drawing_render_png: anti-aliased black-on-white rasterizer for an InkSheet --------
+
+// Single-stroke vector font for drawing text (ISO 3098-like proportions). Units: cap
+// height 10, x-height 7, descender -3; each glyph is strokes separated by ';' — either
+// "x y x y ..." polylines or "@cx cy rx ry a0 a1" elliptical arcs (degrees, a0 → a1).
+struct StrokeGlyph {
+    double w = 0.0;
+    std::vector<std::vector<std::array<double, 2>>> strokes;
+};
+
+const std::map<char32_t, StrokeGlyph>& stroke_font() {
+    static const std::map<char32_t, StrokeGlyph> font = [] {
+        struct Def { char32_t cp; double w; const char* s; };
+        static const Def defs[] = {
+            {' ', 3.6, ""},
+            {'!', 0, "0 10 0 3; 0 0.3 0 0"},
+            {'"', 2, "0 10 0 7; 2 10 2 7"},
+            {'#', 6.5, "1.5 0 2.5 10; 4 0 5 10; 0 3.3 6 3.3; 0.5 6.7 6.5 6.7"},
+            {'$', 6, "@3 7.5 2.8 2.5 30 270; @3 2.5 3 2.5 90 -150; 3 11 3 -1"},
+            {'%', 7, "0 0 7 10; @1.5 8 1.5 2 0 360; @5.5 2 1.5 2 0 360"},
+            {'&', 6.5, "@2.7 8.3 1.6 1.7 0 360; 1.6 7.1 6.5 0; 3.6 7 0.82 3.6; "
+                       "@2.9 2.4 2.4 2.4 150 330; 4.98 1.2 6.3 3.2"},
+            {'\'', 0, "0 10 0 7"},
+            {'(', 1.5, "@3.5 5 3.5 6.5 125 235"},
+            {')', 1.5, "@-2 5 3.5 6.5 55 -55"},
+            {'*', 4, "2 9.5 2 5.5; 0.3 8.5 3.7 6.5; 0.3 6.5 3.7 8.5"},
+            {'+', 6, "0 5 6 5; 3 2 3 8"},
+            {',', 0.6, "0.6 0.6 0 -1.6"},
+            {'-', 4, "0 4.5 4 4.5"},
+            {'.', 0, "0 0 0 0.3"},
+            {'/', 4, "0 -0.5 4 10.5"},
+            {'0', 5.5, "@2.75 5 2.75 5 0 360"},
+            {'1', 5.5, "1.25 8 3.25 10 3.25 0"},
+            {'2', 5.5, "@2.75 7.25 2.75 2.75 160 -40; 4.857 5.482 0 0 5.5 0"},
+            {'3', 5.5, "@2.75 7.6 2.4 2.4 150 -90; @2.75 2.6 2.75 2.6 90 -150"},
+            {'4', 5.5, "4 0 4 10 0 3 5.5 3"},
+            {'5', 5.5, "5 10 0.8 10 0.643 5.093; @2.75 3.1 2.75 3.1 140 -150"},
+            {'6', 5.5, "@2.75 2.9 2.75 2.9 0 360; 0 2.9 0 4.8; @3.4 4.8 3.4 5.2 180 70"},
+            {'7', 5.5, "0 10 5.5 10 1.8 0"},
+            {'8', 5.5, "@2.75 7.6 2.4 2.4 0 360; @2.75 2.6 2.75 2.6 0 360"},
+            {'9', 5.5, "@2.75 7.1 2.75 2.9 0 360; 5.5 7.1 5.5 5.2; @2.1 5.2 3.4 5.2 0 -110"},
+            {':', 0, "0 7 0 6.7; 0 0.3 0 0"},
+            {';', 0.6, "0.6 7 0.6 6.7; 0.6 0.6 0 -1.6"},
+            {'<', 6, "6 9 0 5 6 1"},
+            {'=', 6, "0 6.5 6 6.5; 0 3.5 6 3.5"},
+            {'>', 6, "0 9 6 5 0 1"},
+            {'?', 5.5, "@2.75 7.5 2.75 2.5 160 -60; 4.125 5.335 2.75 4 2.75 2.5; 2.75 0.3 2.75 0"},
+            {'@', 9, "@4.5 5 1.8 2.2 0 360; 6.3 7.2 6.3 3.6; @7.4 3.6 1.1 1.1 180 360; "
+                     "8.5 3.6 9 5; @4.5 5 4.5 5 0 300"},
+            {'A', 6, "0 0 3 10 6 0; 1.05 3.5 4.95 3.5"},
+            {'B', 6.5, "0 0 0 10 3.5 10; @3.5 7.5 2.5 2.5 90 -90; 0 5 4 5; "
+                       "@4 2.5 2.5 2.5 90 -90; 4 0 0 0"},
+            {'C', 6, "@3.2 5 3.2 5 40 320"},
+            {'D', 6, "0 0 0 10 2 10; @2 5 4 5 90 -90; 2 0 0 0"},
+            {'E', 5.5, "5.5 10 0 10 0 0 5.5 0; 0 5 4.5 5"},
+            {'F', 5.5, "5.5 10 0 10 0 0; 0 5 4.5 5"},
+            {'G', 6.4, "@3.2 5 3.2 5 40 360; 6.4 5 3.6 5"},
+            {'H', 6, "0 0 0 10; 6 0 6 10; 0 5 6 5"},
+            {'I', 0, "0 0 0 10"},
+            {'J', 5, "5 10 5 3; @2.5 3 2.5 3 0 -180"},
+            {'K', 6, "0 0 0 10; 6 10 0 4; 2.2 6.2 6 0"},
+            {'L', 5.5, "0 10 0 0 5.5 0"},
+            {'M', 8, "0 0 0 10 4 0 8 10 8 0"},
+            {'N', 6, "0 0 0 10 6 0 6 10"},
+            {'O', 7, "@3.5 5 3.5 5 0 360"},
+            {'P', 6.25, "0 0 0 10 3.5 10; @3.5 7.25 2.75 2.75 90 -90; 3.5 4.5 0 4.5"},
+            {'Q', 7, "@3.5 5 3.5 5 0 360; 4.2 2.5 7 -0.5"},
+            {'R', 6.25, "0 0 0 10 3.5 10; @3.5 7.25 2.75 2.75 90 -90; 3.5 4.5 0 4.5; "
+                        "3.5 4.5 6.25 0"},
+            {'S', 6, "@3 7.5 2.8 2.5 30 270; @3 2.5 3 2.5 90 -150"},
+            {'T', 6, "0 10 6 10; 3 10 3 0"},
+            {'U', 6, "0 10 0 3; @3 3 3 3 180 360; 6 3 6 10"},
+            {'V', 6, "0 10 3 0 6 10"},
+            {'W', 8, "0 10 2 0 4 10 6 0 8 10"},
+            {'X', 6, "0 10 6 0; 0 0 6 10"},
+            {'Y', 6, "0 10 3 5 6 10; 3 5 3 0"},
+            {'Z', 6, "0 10 6 10 0 0 6 0"},
+            {'[', 2, "2 10.5 0 10.5 0 -0.5 2 -0.5"},
+            {'\\', 4, "0 10.5 4 -0.5"},
+            {']', 2, "0 10.5 2 10.5 2 -0.5 0 -0.5"},
+            {'^', 5, "0 6 2.5 10 5 6"},
+            {'_', 6, "0 -1.5 6 -1.5"},
+            {'`', 1.5, "0 10 1.5 8.5"},
+            {'a', 5, "@2.5 3.5 2.5 3.5 0 360; 5 7 5 0"},
+            {'b', 5, "0 10 0 0; @2.5 3.5 2.5 3.5 0 360"},
+            {'c', 5, "@2.6 3.5 2.6 3.5 40 320"},
+            {'d', 5, "5 10 5 0; @2.5 3.5 2.5 3.5 0 360"},
+            {'e', 5, "0.05 3.5 5 3.5; @2.5 3.5 2.5 3.5 0 320"},
+            {'f', 4, "1.5 0 1.5 8; @3.25 8 1.75 2 180 60; 0 7 3.5 7"},
+            {'g', 5, "@2.5 3.5 2.5 3.5 0 360; 5 7 5 -1; @2.5 -1 2.5 2 0 -160"},
+            {'h', 5, "0 10 0 0; @2.5 4.5 2.5 2.5 180 0; 5 4.5 5 0"},
+            {'i', 0, "0 0 0 7; 0 9.2 0 9.5"},
+            {'j', 2, "2 7 2 -1.5; @0.5 -1.5 1.5 1.5 0 -160; 2 9.2 2 9.5"},
+            {'k', 4.8, "0 10 0 0; 4.5 7 0 2.5; 1.6 4 4.8 0"},
+            {'l', 0, "0 10 0 0"},
+            {'m', 7.6, "0 7 0 0; @1.9 5 1.9 2 180 0; 3.8 5 3.8 0; @5.7 5 1.9 2 180 0; "
+                       "7.6 5 7.6 0"},
+            {'n', 5, "0 7 0 0; @2.5 4.5 2.5 2.5 180 0; 5 4.5 5 0"},
+            {'o', 5.2, "@2.6 3.5 2.6 3.5 0 360"},
+            {'p', 5, "0 7 0 -3; @2.5 3.5 2.5 3.5 0 360"},
+            {'q', 5, "5 7 5 -3; @2.5 3.5 2.5 3.5 0 360"},
+            {'r', 4, "0 7 0 0; @2.75 4.5 2.75 2.5 180 60"},
+            {'s', 4.6, "@2.3 5.25 2.1 1.75 20 270; @2.3 1.75 2.3 1.75 90 -150"},
+            {'t', 3.5, "1.5 9.5 1.5 1 2 0.2 3.5 0; 0 7 3.5 7"},
+            {'u', 5, "0 7 0 2.5; @2.5 2.5 2.5 2.5 180 360; 5 7 5 0"},
+            {'v', 5, "0 7 2.5 0 5 7"},
+            {'w', 7, "0 7 1.75 0 3.5 7 5.25 0 7 7"},
+            {'x', 5, "0 7 5 0; 0 0 5 7"},
+            {'y', 5, "0 7 2.5 0.2; 5 7 1.6 -2.5 1 -3 0.3 -3"},
+            {'z', 5, "0 7 5 7 0 0 5 0"},
+            {'{', 2.5, "2.5 10.5 1.5 10 1.2 6 0 5 1.2 4 1.5 0 2.5 -0.5"},
+            {'|', 0, "0 10.5 0 -1.5"},
+            {'}', 2.5, "0 10.5 1 10 1.3 6 2.5 5 1.3 4 1 0 0 -0.5"},
+            {'~', 5.6, "0 4.4 0.8 5.2 1.8 5.4 3 4.8 4 4.4 5 4.6 5.6 5.2"},
+            {0x00B0, 3, "@1.5 8.5 1.5 1.5 0 360"},                     // °
+            {0x00B1, 6, "0 6 6 6; 3 3.5 3 8.5; 0 1 6 1"},              // ±
+            {0x00D7, 6, "0.5 2 5.5 7; 0.5 7 5.5 2"},                   // ×
+            {0x00D8, 7, "@3.5 5 3.5 5 0 360; 0 -0.5 7 10.5"},          // Ø
+            {0x2300, 7, "@3.5 5 3.5 3.5 0 360; 0 0.5 7 9.5"},          // ⌀
+        };
+        std::map<char32_t, StrokeGlyph> out;
+        for (const Def& d : defs) {
+            StrokeGlyph g;
+            g.w = d.w;
+            std::string spec(d.s);
+            std::size_t start = 0;
+            while (start <= spec.size()) {
+                std::size_t end = spec.find(';', start);
+                if (end == std::string::npos) end = spec.size();
+                std::string part = spec.substr(start, end - start);
+                start = end + 1;
+                const bool arc = part.find('@') != std::string::npos;
+                for (char& c : part)
+                    if (c == '@') c = ' ';
+                std::vector<double> v;
+                const char* p = part.c_str();
+                char* q = nullptr;
+                for (double x = std::strtod(p, &q); q != p; x = std::strtod(p, &q)) {
+                    v.push_back(x);
+                    p = q;
+                }
+                std::vector<std::array<double, 2>> pl;
+                if (arc && v.size() == 6) {
+                    const double a0 = v[4] * M_PI / 180.0, a1 = v[5] * M_PI / 180.0;
+                    const int n = std::max(2, (int)std::ceil(std::fabs(a1 - a0) / (M_PI / 18.0)));
+                    for (int i = 0; i <= n; ++i) {
+                        const double t = a0 + (a1 - a0) * i / n;
+                        pl.push_back({v[0] + v[2] * std::cos(t), v[1] + v[3] * std::sin(t)});
+                    }
+                } else {
+                    for (std::size_t i = 0; i + 1 < v.size(); i += 2) pl.push_back({v[i], v[i + 1]});
+                }
+                if (pl.size() >= 2) g.strokes.push_back(std::move(pl));
+            }
+            out[d.cp] = std::move(g);
+        }
+        return out;
+    }();
+    return font;
+}
+
+constexpr double kStrokeFontGap = 2.4;  // inter-glyph spacing, font units
+
+// Black-ink coverage canvas in sheet mm: overlapping strokes union via max coverage, so
+// joins never double-darken. Pixel (i,j) covers [i,i+1)x[j,j+1) in image space.
+struct InkCanvas {
+    int W = 0, H = 0;
+    double s = 1.0;            // px per mm
+    double ox = 0.0, oy = 0.0; // sheet-mm at the image bottom-left
+    std::vector<float> cov;
+
+    double px(double x) const { return (x - ox) * s; }
+    double py(double y) const { return H - (y - oy) * s; }
+    void put(int x, int y, double a) {
+        if (x < 0 || y < 0 || x >= W || y >= H || a <= 0.0) return;
+        float& c = cov[(std::size_t)y * W + x];
+        if (a > c) c = (float)std::min(1.0, a);
+    }
+    // Anti-aliased round-capped segment in pixel space, radius r px.
+    void seg_px(double x0, double y0, double x1, double y1, double r) {
+        const double len = std::hypot(x1 - x0, y1 - y0);
+        if (len > 48.0) {  // keep each bbox small for long diagonals
+            const int n = (int)std::ceil(len / 48.0);
+            for (int i = 0; i < n; ++i)
+                seg_px(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n,
+                       x0 + (x1 - x0) * (i + 1) / n, y0 + (y1 - y0) * (i + 1) / n, r);
+            return;
+        }
+        const int ix0 = std::max(0, (int)std::floor(std::min(x0, x1) - r - 1));
+        const int ix1 = std::min(W - 1, (int)std::ceil(std::max(x0, x1) + r + 1));
+        const int iy0 = std::max(0, (int)std::floor(std::min(y0, y1) - r - 1));
+        const int iy1 = std::min(H - 1, (int)std::ceil(std::max(y0, y1) + r + 1));
+        const double dx = x1 - x0, dy = y1 - y0, l2 = dx * dx + dy * dy;
+        for (int y = iy0; y <= iy1; ++y)
+            for (int x = ix0; x <= ix1; ++x) {
+                const double cx = x + 0.5, cy = y + 0.5;
+                double t = l2 > 0 ? ((cx - x0) * dx + (cy - y0) * dy) / l2 : 0.0;
+                t = std::clamp(t, 0.0, 1.0);
+                const double d = std::hypot(cx - (x0 + t * dx), cy - (y0 + t * dy));
+                put(x, y, std::clamp(r + 0.5 - d, 0.0, 1.0));
+            }
+    }
+    void seg(const InkPoint& a, const InkPoint& b, double r) {
+        seg_px(px(a[0]), py(a[1]), px(b[0]), py(b[1]), r);
+    }
+    // Stroke a polyline (sheet mm), optionally dashed with an on/off pattern in mm.
+    void stroke(const InkPolyline& pl, double width_px, const double* pat, int npat) {
+        const double r = 0.5 * width_px;
+        if (!pat) {
+            for (std::size_t i = 1; i < pl.size(); ++i) seg(pl[i - 1], pl[i], r);
+            return;
+        }
+        int k = 0;
+        double left = pat[0];
+        for (std::size_t i = 1; i < pl.size(); ++i) {
+            const InkPoint a = pl[i - 1], b = pl[i];
+            const double L = std::hypot(b[0] - a[0], b[1] - a[1]);
+            double t = 0.0;
+            while (t < L - 1e-12) {
+                const double step = std::min(left, L - t);
+                if (k % 2 == 0) {
+                    const double u0 = t / L, u1 = (t + step) / L;
+                    seg({a[0] + (b[0] - a[0]) * u0, a[1] + (b[1] - a[1]) * u0},
+                        {a[0] + (b[0] - a[0]) * u1, a[1] + (b[1] - a[1]) * u1}, r);
+                }
+                t += step;
+                left -= step;
+                if (left <= 1e-12) {
+                    k = (k + 1) % npat;
+                    left = pat[k];
+                }
+            }
+        }
+    }
+    void arc(const InkArc& a, double width_px) {
+        if (a.radius <= 0.0) return;
+        const double sweep = a.sweep();
+        // ≤ 0.1 px chord error.
+        const double rpx = a.radius * s;
+        const double step = rpx > 0.2 ? 2.0 * std::acos(std::max(-1.0, 1.0 - 0.1 / rpx)) : sweep;
+        const int n = std::clamp((int)std::ceil(sweep / std::max(step, 1e-3)), 8, 4096);
+        InkPolyline pl;
+        pl.reserve(n + 1);
+        for (int i = 0; i <= n; ++i) {
+            const double t = a.a0 + sweep * i / n;
+            pl.push_back({a.center[0] + a.radius * std::cos(t), a.center[1] + a.radius * std::sin(t)});
+        }
+        stroke(pl, width_px, nullptr, 0);
+    }
+    // Anti-aliased filled triangle (sheet mm).
+    void tri(const std::array<InkPoint, 3>& t) {
+        double X[3], Y[3];
+        for (int i = 0; i < 3; ++i) { X[i] = px(t[i][0]); Y[i] = py(t[i][1]); }
+        const double area = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
+        if (std::fabs(area) < 1e-9) return;
+        const double sign = area > 0 ? 1.0 : -1.0;
+        const int ix0 = std::max(0, (int)std::floor(std::min({X[0], X[1], X[2]})) - 1);
+        const int ix1 = std::min(W - 1, (int)std::ceil(std::max({X[0], X[1], X[2]})) + 1);
+        const int iy0 = std::max(0, (int)std::floor(std::min({Y[0], Y[1], Y[2]})) - 1);
+        const int iy1 = std::min(H - 1, (int)std::ceil(std::max({Y[0], Y[1], Y[2]})) + 1);
+        for (int y = iy0; y <= iy1; ++y)
+            for (int x = ix0; x <= ix1; ++x) {
+                const double cx = x + 0.5, cy = y + 0.5;
+                double sd = -1e9;  // signed distance, negative inside
+                for (int e = 0; e < 3; ++e) {
+                    const int f = (e + 1) % 3;
+                    const double ex = X[f] - X[e], ey = Y[f] - Y[e];
+                    const double el = std::hypot(ex, ey);
+                    if (el < 1e-12) continue;
+                    const double d = -sign * (ex * (cy - Y[e]) - ey * (cx - X[e])) / el;
+                    sd = std::max(sd, d);
+                }
+                put(x, y, std::clamp(0.5 - sd, 0.0, 1.0));
+            }
+    }
+    // Text in the single-stroke font, cap height t.h mm, aligned per the contract.
+    void text(const InkText& t) {
+        const auto& font = stroke_font();
+        const std::string in = ink_expand_callouts(t.text);
+        std::vector<const StrokeGlyph*> glyphs;
+        for (std::size_t i = 0; i < in.size();) {
+            const char32_t cp = ink_utf8_next(in, i);
+            auto it = font.find(cp);
+            if (it == font.end()) it = font.find(cp == '\t' ? U' ' : U'?');
+            glyphs.push_back(&it->second);
+        }
+        if (glyphs.empty()) return;
+        const double k = t.h / 10.0;  // mm per font unit
+        double width = 0.0;
+        for (const StrokeGlyph* g : glyphs) width += (g->w + kStrokeFontGap) * k;
+        width -= kStrokeFontGap * k;
+        double x = t.pos[0];
+        if (t.align == InkAlign::center) x -= 0.5 * width;
+        else if (t.align == InkAlign::right) x -= width;
+        const double base = t.baseline();
+        const double r = 0.5 * std::max(1.0, 0.1 * t.h * s);  // ISO 3098: d = h/10
+        for (const StrokeGlyph* g : glyphs) {
+            for (const auto& st : g->strokes)
+                for (std::size_t i = 1; i < st.size(); ++i)
+                    seg({x + st[i - 1][0] * k, base + st[i - 1][1] * k},
+                        {x + st[i][0] * k, base + st[i][1] * k}, r);
+            x += (g->w + kStrokeFontGap) * k;
+        }
+    }
+};
+
+}  // namespace
+
 // Rasterize a 2D DRAWING document to a PNG so the AI can SEE and self-review the drawing
-// it just made — the same feedback loop it has for 3D parts (Bug D-1; previously
-// render_part threw an opaque "render exception" because a drawing has no 3D bodies and
-// lives in a separate session registry). Visible edges draw black, hidden edges light
-// grey, on white paper, auto-fit to the canvas. Returns {ok, path, visible, hidden}.
+// it just made — the same feedback loop it has for 3D parts (Bug D-1). Renders the active
+// sheet (or the first sheet with view geometry) exactly as the vector exports do: the
+// whole fixed sheet at ~5 px/mm (long side capped at 2400 px), white paper, black ink,
+// ISO 128 line classes (thick 0.5 / thin 0.25 mm, dashed hidden, chain centre lines),
+// filled arrowheads, sheet["frame"] (border, zones, title block, projection symbol),
+// view["draw"] decorations and every annotation, with stroke-font text honouring
+// align/valign. Returns {ok, path, visible, hidden, annotations, title_block}.
 json drawing_render_png(const std::string& doc_id, const std::string& out_path) {
     try {
         // drawing_get works on the drawing-session registry (its own locking); it throws
         // unknown_doc if doc_id isn't an open drawing.
         json full = chudware::doc::drawing_get(doc_id);
-
-        std::vector<std::vector<std::array<double, 2>>> visible, hidden;
-        auto pool = [](const json& jpls,
-                       std::vector<std::vector<std::array<double, 2>>>& out) {
-            if (!jpls.is_array()) return;
-            for (const auto& jpl : jpls) {
-                if (!jpl.is_array() || jpl.size() < 2) continue;
-                std::vector<std::array<double, 2>> pl;
-                for (const auto& jp : jpl)
-                    if (jp.is_array() && jp.size() >= 2)
-                        pl.push_back({jp[0].get<double>(), jp[1].get<double>()});
-                if (pl.size() >= 2) out.push_back(std::move(pl));
-            }
+        const json& sheets = full.value("sheets", json::array());
+        if (!sheets.is_array() || sheets.empty())
+            return json{{"ok", false},
+                        {"reason", "drawing has no view geometry to render — add views, then Rebuild"}};
+        const std::string active = full.value("active_sheet_id", std::string());
+        auto has_geometry = [](const InkSheet& ink) {
+            return !ink.visible.thick.empty() || !ink.hidden.dashed.empty();
         };
-        // Annotation overlay: render the SHARED draw primitives (annot_draw) emitted per
-        // annotation by drawing_get — so GD&T frames, surface-finish/weld symbols, section
-        // hatch, dims + callouts all rasterize for the AI vision review, identical to the
-        // on-screen sheet and the DXF/PDF export.
-        std::vector<std::vector<std::array<double, 2>>> annSolid, annDash;  // sheet-mm strokes
-        struct Txt { std::array<double, 2> pos{}; std::string text; double h = 3.5; };
-        std::vector<Txt> texts;
-        // Bug D-8 — title block as label/value cells (not one crammed "key: value" line),
-        // so all standard fields fit a two-column grid without truncating or overlapping.
-        std::vector<std::pair<std::string, std::string>> title_cells;  // (LABEL, value)
-        double page_w = 0.0, page_h = 0.0;
-        auto poolDraw = [&](const json& d) {
-            if (!d.is_object()) return;
-            pool(d.value("segments", json::array()), annSolid);
-            pool(d.value("dashed", json::array()), annDash);
-            if (d.contains("tris") && d["tris"].is_array())
-                for (const auto& t : d["tris"]) {
-                    if (!t.is_array() || t.size() != 3) continue;
-                    std::vector<std::array<double, 2>> tri;
-                    for (const auto& p : t) tri.push_back({p[0].get<double>(), p[1].get<double>()});
-                    tri.push_back(tri.front());
-                    annSolid.push_back(std::move(tri));
-                }
-            if (d.contains("arcs") && d["arcs"].is_array())
-                for (const auto& a : d["arcs"]) {
-                    if (!a.is_object() || !a.contains("center")) continue;
-                    double cx = a["center"][0].get<double>(), cy = a["center"][1].get<double>();
-                    double r = a.value("radius", 0.0);
-                    double a0 = a.value("a0", 0.0), a1 = a.value("a1", 6.28318530718);
-                    if (r <= 0) continue;
-                    int n = std::max(10, (int)(std::fabs(a1 - a0) / 0.3));
-                    std::vector<std::array<double, 2>> pl;
-                    for (int i = 0; i <= n; ++i) {
-                        double tt = a0 + (a1 - a0) * (double)i / (double)n;
-                        pl.push_back({cx + r * std::cos(tt), cy + r * std::sin(tt)});
-                    }
-                    annSolid.push_back(std::move(pl));
-                }
-            if (d.contains("texts") && d["texts"].is_array())
-                for (const auto& t : d["texts"]) {
-                    if (!t.is_object() || !t.contains("pos")) continue;
-                    Txt T;
-                    T.pos = {t["pos"][0].get<double>(), t["pos"][1].get<double>()};
-                    T.text = sanitize_label(t.value("text", std::string()));
-                    T.h = t.value("h", 3.5);
-                    if (!T.text.empty()) texts.push_back(std::move(T));
-                }
-        };
-        if (full.contains("sheets") && full["sheets"].is_array())
-            for (const auto& sheet : full["sheets"]) {
-                if (page_w <= 0.0) {
-                    const json& mm = sheet.value("size_mm", json(nullptr));
-                    if (mm.is_array() && mm.size() == 2 && mm[0].is_number() &&
-                        mm[1].is_number()) {
-                        page_w = mm[0].get<double>();
-                        page_h = mm[1].get<double>();
-                        if (page_w > 20.0 && page_h > 20.0)
-                            annSolid.push_back({{10.0, 10.0}, {page_w - 10.0, 10.0},
-                                               {page_w - 10.0, page_h - 10.0},
-                                               {10.0, page_h - 10.0}, {10.0, 10.0}});
-                    }
-                }
-                if (sheet.contains("views") && sheet["views"].is_array())
-                    for (const auto& view : sheet["views"]) {
-                        pool(view.value("visible", json::array()), visible);
-                        pool(view.value("hidden", json::array()), hidden);
-                        pool(view.value("hatch", json::array()), annSolid);  // section hatch
-                        for (const auto& an : view.value("annotations", json::array()))
-                            if (an.is_object() && an.contains("draw")) poolDraw(an["draw"]);
-                        // R9 — cutting-plane line + "A-A" label on the PARENT view of a section.
-                        // attach_parent_markers puts {label,line} onto the parent view's
-                        // section_lines; draw each as a dashed cutting-plane line with the
-                        // section label at both endpoints (the SolidWorks "A ──┼── A" marker),
-                        // so the section view reads as derived from a real cut on the parent.
-                        for (const auto& sl : view.value("section_lines", json::array())) {
-                            if (!sl.is_object() || !sl.contains("line") || !sl["line"].is_array())
-                                continue;
-                            std::vector<std::array<double, 2>> ln;
-                            for (const auto& jp : sl["line"])
-                                if (jp.is_array() && jp.size() >= 2)
-                                    ln.push_back({jp[0].get<double>(), jp[1].get<double>()});
-                            if (ln.size() < 2) continue;
-                            annDash.push_back(ln);
-                            std::string lab = sl.value("label", std::string());
-                            if (lab.empty()) lab = "A";
-                            Txt t0; t0.pos = ln.front();   t0.text = sanitize_label(lab); t0.h = 4.5;
-                            Txt t1; t1.pos = ln.back();    t1.text = sanitize_label(lab); t1.h = 4.5;
-                            texts.push_back(std::move(t0));
-                            texts.push_back(std::move(t1));
-                        }
-                    }
-                // Title block: gather every non-empty standard field as a (LABEL, value) cell.
-                // The full ASME set is 10 fields (set_titleblock): title, drawn_by, date,
-                // material, finish, scale, rev, sheet, part_number, company. `rev`/`revision`
-                // are accepted interchangeably. Values are rendered in their own column so a
-                // long value never eats the label and nothing truncates (Bug D-8).
-                const json& tb = sheet.value("title_block", json::object());
-                if (tb.is_object()) {
-                    // {json key(s), display label}; first present key wins.
-                    struct Field { const char* keys[2]; const char* label; };
-                    static const Field kFields[] = {
-                        {{"title", nullptr}, "TITLE"},
-                        {{"part_number", "part_no"}, "PART NO"},
-                        {{"drawn_by", "drawn"}, "DRAWN"},
-                        {{"date", nullptr}, "DATE"},
-                        {{"material", nullptr}, "MATERIAL"},
-                        {{"finish", nullptr}, "FINISH"},
-                        {{"scale", nullptr}, "SCALE"},
-                        {{"rev", "revision"}, "REV"},
-                        {{"sheet", nullptr}, "SHEET"},
-                        {{"company", nullptr}, "COMPANY"},
-                    };
-                    for (const Field& fld : kFields) {
-                        std::string val;
-                        for (const char* k : fld.keys) {
-                            if (!k) break;
-                            auto it = tb.find(k);
-                            if (it != tb.end() && it->is_string() && !it->get<std::string>().empty()) {
-                                val = it->get<std::string>();
-                                break;
-                            }
-                        }
-                        if (!val.empty())
-                            title_cells.emplace_back(std::string(fld.label),
-                                                     sanitize_label(val));
-                    }
-                }
+        InkSheet ink;
+        bool found = false;
+        for (const json& sheet : sheets)
+            if (sheet.is_object() && sheet.value("id", std::string()) == active) {
+                ink = pool_drawing_sheet(sheet);
+                found = has_geometry(ink);
+                break;
             }
-        if (visible.empty() && hidden.empty())
+        for (std::size_t i = 0; !found && i < sheets.size(); ++i) {
+            ink = pool_drawing_sheet(sheets[i]);
+            found = has_geometry(ink);
+        }
+        if (!found)
             return json{{"ok", false},
                         {"reason", "drawing has no view geometry to render — add views, then Rebuild"}};
 
-        double minx = 1e30, miny = 1e30, maxx = -1e30, maxy = -1e30;
-        auto acc = [&](const std::vector<std::vector<std::array<double, 2>>>& src) {
-            for (const auto& pl : src)
-                for (const auto& p : pl) {
-                    minx = std::min(minx, p[0]); miny = std::min(miny, p[1]);
-                    maxx = std::max(maxx, p[0]); maxy = std::max(maxy, p[1]);
-                }
-        };
-        // Stateful drawings have a real paper size. Render that whole sheet rather than
-        // auto-cropping to the projected geometry: auto-crop made off-sheet views invisible,
-        // detached the title block from the paper, and showed the model a different composition
-        // from the fixed-size PDF it was supposed to review.
-        acc(visible); acc(hidden);
-        const bool fixed_sheet = page_w > 20.0 && page_h > 20.0;
-        if (fixed_sheet) {
-            minx = 0.0; miny = 0.0; maxx = page_w; maxy = page_h;
+        double minx = 0.0, miny = 0.0, maxx = ink.page_w, maxy = ink.page_h;
+        if (!ink.fixed_page) {
+            const InkBounds b = ink_bounds(ink);
+            minx = b.minx - 10.0; miny = b.miny - 10.0;
+            maxx = b.maxx + 10.0; maxy = b.maxy + 10.0;
         }
         if (!(maxx > minx) || !(maxy > miny))
             return json{{"ok", false}, {"reason", "degenerate drawing bounds"}};
 
-        const int W = 1100, H = 850, margin = 20;
-        std::vector<unsigned char> img(static_cast<std::size_t>(W) * H * 3, 255);  // white paper
-        const double sc = std::min(double(W - 2 * margin) / (maxx - minx),
-                                   double(H - 2 * margin) / (maxy - miny));
-        const double offx = margin + (W - 2 * margin - (maxx - minx) * sc) / 2.0;
-        const double offy = margin + (H - 2 * margin - (maxy - miny) * sc) / 2.0;
-        auto to_pix = [&](const std::array<double, 2>& p, int& ix, int& iy) {
-            ix = static_cast<int>(offx + (p[0] - minx) * sc);
-            iy = static_cast<int>(H - (offy + (p[1] - miny) * sc));  // flip Y: sheet-up = image-up
-        };
-        for (const auto& pl : hidden)
-            for (std::size_t i = 1; i < pl.size(); ++i) {
-                int x0, y0, x1, y1; to_pix(pl[i - 1], x0, y0); to_pix(pl[i], x1, y1);
-                draw_line(img, W, H, x0, y0, x1, y1, 150, 150, 150);
-            }
-        for (const auto& pl : visible)
-            for (std::size_t i = 1; i < pl.size(); ++i) {
-                int x0, y0, x1, y1; to_pix(pl[i - 1], x0, y0); to_pix(pl[i], x1, y1);
-                draw_line(img, W, H, x0, y0, x1, y1, 20, 20, 20);
-            }
-        // Annotations on top: the compiled draw primitives (dims, callouts, GD&T, hatch) in
-        // dim-blue, with text via the bitmap font sized from the paper-space text height.
-        const unsigned char DR = 30, DG = 70, DB = 170;  // dimension blue
-        for (const auto& pl : annDash)
-            for (std::size_t i = 1; i < pl.size(); ++i) {
-                int x0, y0, x1, y1; to_pix(pl[i - 1], x0, y0); to_pix(pl[i], x1, y1);
-                draw_line(img, W, H, x0, y0, x1, y1, DR, DG, DB);
-            }
-        for (const auto& pl : annSolid)
-            for (std::size_t i = 1; i < pl.size(); ++i) {
-                int x0, y0, x1, y1; to_pix(pl[i - 1], x0, y0); to_pix(pl[i], x1, y1);
-                draw_line(img, W, H, x0, y0, x1, y1, DR, DG, DB);
-            }
-        int n_anns_drawn = (int)texts.size();
-        for (const auto& T : texts) {
-            int tx, ty; to_pix(T.pos, tx, ty);
-            int fs = std::max(1, (int)std::lround(T.h * sc / 7.0));  // 5x7 bitmap font scale
-            blit_text(img, W, H, tx + 1, ty - fs * 7, T.text, fs, DR, DG, DB);
+        InkCanvas cv;
+        cv.s = std::min(5.0, 2400.0 / std::max(maxx - minx, maxy - miny));
+        cv.ox = minx;
+        cv.oy = miny;
+        cv.W = std::max(1, (int)std::ceil((maxx - minx) * cv.s));
+        cv.H = std::max(1, (int)std::ceil((maxy - miny) * cv.s));
+        cv.cov.assign((std::size_t)cv.W * cv.H, 0.0f);
+        const double thin = std::max(1.0, kInkThin * cv.s);
+        const double thick = std::max(1.8, kInkThick * cv.s);
+        ink.for_each_layer([&](const InkLayer& l) {
+            for (const auto& pl : l.thin) cv.stroke(pl, thin, nullptr, 0);
+            for (const auto& a : l.arcs) cv.arc(a, thin);
+            for (const auto& pl : l.dashed) cv.stroke(pl, thin, kInkDash, 2);
+            for (const auto& pl : l.chain) cv.stroke(pl, thin, kInkChain, 4);
+            for (const auto& pl : l.thick) cv.stroke(pl, thick, nullptr, 0);
+            for (const auto& pl : l.chain_thick) cv.stroke(pl, thick, kInkChain, 4);
+            for (const auto& t : l.tris) cv.tri(t);
+            for (const auto& t : l.texts) cv.text(t);
+        });
+
+        std::vector<unsigned char> img((std::size_t)cv.W * cv.H * 3);
+        for (std::size_t i = 0; i < cv.cov.size(); ++i) {
+            const auto v = (unsigned char)std::lround(255.0 * (1.0 - cv.cov[i]));
+            img[i * 3] = img[i * 3 + 1] = img[i * 3 + 2] = v;
         }
-        // Title block: a fixed two-column grid panel in the bottom-right corner (screen
-        // space, never clipped). One row per field; a LABEL column and a VALUE column with a
-        // divider between them, so a long value can never overrun a label and nothing
-        // truncates against another field (Bug D-8). Text is scale-1 (6px/char advance, 7px
-        // tall) so the full 10-field block fits; an over-long value is clipped to its cell
-        // with a trailing '.' so it degrades gracefully instead of bleeding past the frame.
-        if (!title_cells.empty()) {
-            const int ts = 1;            // bitmap-font scale
-            const int chW = 6 * ts;      // glyph advance
-            const int rowH = 7 * ts + 6; // text height + vertical padding
-            const int padX = 4;
-            // Label column: sized to the widest label (bounded so it can't dominate).
-            int labChars = 0;
-            for (const auto& c : title_cells) labChars = std::max(labChars, (int)c.first.size());
-            int labW = std::min(labChars * chW + 2 * padX, 90);
-            // Value column: sized to the widest value, but the whole panel is capped so it
-            // always fits the canvas; the value cell is clipped to whatever width remains.
-            int valChars = 0;
-            for (const auto& c : title_cells) valChars = std::max(valChars, (int)c.second.size());
-            int valW = valChars * chW + 2 * padX;
-            const int boxWmax = 360;     // panel width cap
-            int boxW = std::min(labW + valW, boxWmax);
-            boxW = std::min(boxW, W - 4);
-            boxW = std::max(boxW, 150);
-            valW = boxW - labW;          // value column gets the remainder
-            int boxH = (int)title_cells.size() * rowH;
-            // Keep the panel on-paper even if there are many rows.
-            boxH = std::min(boxH, H - 4);
-            int bx0 = W - boxW - 2, by0 = H - boxH - 2;
-            int labX = bx0 + labW;       // label|value divider x
-            // Outer frame.
-            draw_line(img, W, H, bx0, by0, bx0 + boxW, by0, 20, 20, 20);
-            draw_line(img, W, H, bx0, by0 + boxH, bx0 + boxW, by0 + boxH, 20, 20, 20);
-            draw_line(img, W, H, bx0, by0, bx0, by0 + boxH, 20, 20, 20);
-            draw_line(img, W, H, bx0 + boxW, by0, bx0 + boxW, by0 + boxH, 20, 20, 20);
-            // Label|value divider, full height.
-            draw_line(img, W, H, labX, by0, labX, by0 + boxH, 20, 20, 20);
-            // Clip a string to a pixel width (cells are fixed): keep what fits, mark a cut.
-            auto clip_to = [&](const std::string& s, int wpx) -> std::string {
-                int maxChars = std::max(0, (wpx - 2 * padX) / chW);
-                if ((int)s.size() <= maxChars) return s;
-                if (maxChars <= 1) return s.substr(0, std::max(0, maxChars));
-                return s.substr(0, maxChars - 1) + ".";
-            };
-            int ry = by0;
-            for (const auto& c : title_cells) {
-                if (ry + rowH > by0 + boxH) break;  // ran out of panel height
-                if (ry > by0)  // row divider (skip above the first row)
-                    draw_line(img, W, H, bx0, ry, bx0 + boxW, ry, 90, 90, 90);
-                int ty = ry + 3;
-                blit_text(img, W, H, bx0 + padX, ty, clip_to(c.first, labW), ts, 20, 20, 20);
-                blit_text(img, W, H, labX + padX, ty, clip_to(c.second, valW), ts, 20, 20, 20);
-                ry += rowH;
-            }
-        }
-        std::string png = encode_png_rgb(W, H, img);
+        std::string png = encode_png_rgb(cv.W, cv.H, img);
         if (png.empty()) return json{{"ok", false}, {"reason", "png encode failed"}};
         std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
         if (!f) return json{{"ok", false}, {"reason", "cannot open output path"}};
         f.write(png.data(), static_cast<std::streamsize>(png.size()));
         if (!f) return json{{"ok", false}, {"reason", "png write failed"}};
         return json{{"ok", true}, {"path", out_path},
-                    {"visible", static_cast<int>(visible.size())},
-                    {"hidden", static_cast<int>(hidden.size())},
-                    {"annotations", n_anns_drawn},
-                    {"title_block", !title_cells.empty()}};
+                    {"visible", static_cast<int>(ink.visible.thick.size())},
+                    {"hidden", static_cast<int>(ink.hidden.dashed.size())},
+                    {"annotations", ink.annotation_count},
+                    {"title_block", !ink.frame.texts.empty()}};
     } catch (const OpError& e) {
         // Bug D-3 — review after a detail/section view. drawing_get() re-projects EVERY view
         // on each render; if a derived view (e.g. a detail whose parent is a section with a

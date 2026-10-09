@@ -11,12 +11,23 @@
 #include <cstdio>
 #include <filesystem>
 #include <cstdlib>
+#include <ctime>
 #include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <BRepAdaptor_Surface.hxx>
+#include <BRepBndLib.hxx>
+#include <Bnd_Box.hxx>
+#include <GeomAbs_SurfaceType.hxx>
+#include <Standard_Failure.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopoDS.hxx>
+#include <TopoDS_Face.hxx>
+#include <gp_Cylinder.hxx>
 
 #include "doc/annot_draw.h"  // compile_annotation / compile_hatch (shared primitives)
 #include "doc/assembly.h"  // compile_assembly / placed_world_shape (multi-body / asm sourcing)
@@ -37,7 +48,8 @@ namespace {
 
 constexpr const char* kSchemaDrawing = "aicad.drawing/1";
 
-// ISO + ANSI sheet sizes in mm (drawing.py SHEET_DIMS_MM). Landscape (w >= h).
+// ISO 216 + ANSI Y14.1 sheet sizes in mm (drawing.py SHEET_DIMS_MM), landscape (w >= h).
+// A trailing "P" selects the portrait orientation of the same paper ("A4P" = 210 x 297).
 std::array<double, 2> sheet_dims(const std::string& size) {
     static const std::map<std::string, std::array<double, 2>> dims = {
         {"A4", {297.0, 210.0}},  {"A3", {420.0, 297.0}},  {"A2", {594.0, 420.0}},
@@ -46,7 +58,28 @@ std::array<double, 2> sheet_dims(const std::string& size) {
         {"E", {1117.6, 863.6}},
     };
     auto it = dims.find(size);
-    return it == dims.end() ? std::array<double, 2>{0.0, 0.0} : it->second;
+    if (it != dims.end()) return it->second;
+    if (size.size() >= 2 && size.back() == 'P') {
+        auto base = dims.find(size.substr(0, size.size() - 1));
+        if (base != dims.end()) return {base->second[1], base->second[0]};
+    }
+    return {0.0, 0.0};
+}
+
+// Canonical sheet key: "a4 portrait" / "A4-Portrait" / "a4p" -> "A4P"; "A3 landscape" -> "A3".
+std::string canon_sheet_size(const std::string& raw) {
+    std::string s;
+    for (char ch : raw)
+        if (!std::isspace(static_cast<unsigned char>(ch)) && ch != '-' && ch != '_')
+            s.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+    auto strip = [&](const char* suffix, const char* repl) {
+        const std::string suf = suffix;
+        if (s.size() > suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0)
+            s = s.substr(0, s.size() - suf.size()) + repl;
+    };
+    strip("PORTRAIT", "P");
+    strip("LANDSCAPE", "");
+    return s;
 }
 
 // ----------------------------------------------------------------- standard drawing scales
@@ -122,6 +155,13 @@ struct DrawingSession {
     bool source_missing = false;
     bool owns_source = false;
     json cached_views;
+    // Compiled source bodies keyed by the source revision, and orthographic/pictorial HLR
+    // results (at the view origin) keyed by orientation/scale/hidden. A drawing_get, an
+    // arrange or a title-block edit re-uses them, so only a source edit or a new scale pays
+    // for the expensive hidden-line removal again.
+    mutable std::string shapes_key;
+    mutable std::vector<TopoDS_Shape> shapes_cache;
+    mutable std::map<std::string, json> projection_cache;
 };
 
 std::mutex g_mtx;
@@ -199,17 +239,24 @@ std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s,
                                        std::vector<ComponentShape>* components = nullptr) {
     json tree = s.source_doc;
     json env = s.source_env;
+    long rev = s.source_revision;
+    std::string ref = "inline";
     if (!s.source_ref_id.empty()) {
         json live = doc_live_source(s.source_ref_id);
         if (live.is_object() && live.contains("tree")) {
             tree = live["tree"];
             env = live.value("env", json::object());
+            rev = live.value("revision", 0L);
+            ref = s.source_ref_id;
         }
     }
+    const std::string key = ref + ":" + std::to_string(rev) + ":" +
+                            std::to_string(std::hash<std::string>{}(tree.dump() + env.dump()));
+    if (!components && key == s.shapes_key) return s.shapes_cache;
+    std::vector<TopoDS_Shape> out;
     // Assembly source: resolve + mate-solve its components and return every world-placed
     // body so all of them superimpose in each view (one combined projection per orientation).
     if (tree.is_object() && tree.value("schema", std::string()) == "aicad.asm/1") {
-        std::vector<TopoDS_Shape> out;
         try {
             AssemblyResult ares = compile_assembly(tree);
             out.reserve(ares.bodies.size());
@@ -231,10 +278,16 @@ std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s,
                 }
             }
         } catch (...) { /* unresolved source projects as an empty view */ }
-        return out;
+    } else {
+        CompileResult res = compile_document(tree, env.is_null() ? json::object() : env);
+        out = res.shapes;
     }
-    CompileResult res = compile_document(tree, env.is_null() ? json::object() : env);
-    return res.shapes;
+    if (key != s.shapes_key) {
+        s.shapes_key = key;
+        s.projection_cache.clear();
+    }
+    s.shapes_cache = out;
+    return out;
 }
 
 // ----------------------------------------------------------------- view helpers
@@ -602,7 +655,19 @@ json project_one(DrawingSession& s, const json& view,
     } else {
         std::string orient = view.value("orientation", std::string("front"));
         // Project at origin then translate (mirrors the cache+_shift_to_position path).
-        proj = project_view(src_shapes, orient, scale, {0.0, 0.0}, show_hidden, vid, topology);
+        char key[160];
+        std::snprintf(key, sizeof(key), "%s|%.12g|%d|%d", orient.c_str(), scale,
+                      show_hidden ? 1 : 0, topology ? 1 : 0);
+        auto hit = s.projection_cache.find(key);
+        if (hit != s.projection_cache.end()) {
+            proj = hit->second;
+        } else {
+            proj = project_view(src_shapes, orient, scale, {0.0, 0.0}, show_hidden, vid, topology);
+            if (s.projection_cache.size() > 48) s.projection_cache.clear();
+            const json err = proj.value("error", json());
+            if (err.is_null() || (err.is_string() && err.get<std::string>().empty()))
+                s.projection_cache[key] = proj;
+        }
         proj = shift_to_position(proj, pos);
     }
 
@@ -629,6 +694,7 @@ json project_one(DrawingSession& s, const json& view,
                              ? view["annotations"]
                              : json::array();
     if (view.contains("label")) out["label"] = view["label"];
+    if (view.contains("caption")) out["caption"] = view["caption"];
     return out;
 }
 
@@ -646,6 +712,7 @@ void attach_parent_markers(json& views_out) {
                 (*it->second)["section_lines"].push_back(
                     json{{"label", g.value("label", json(nullptr))},
                          {"view_id", g.value("view_id", json(nullptr))},
+                         {"reverse", g.value("reverse", false)},
                          {"line", g["cut_line"]}});
         } else if (t == "detail") {
             auto it = by_id.find(g.value("parent", std::string()));
@@ -1014,8 +1081,8 @@ json default_table_columns(const std::string& kind) {
         return json{{"key", key}, {"title", title}, {"width", width}};
     };
     if (kind == "bom")
-        return json::array({col("item", "ITEM", 14), col("name", "PART", 52),
-                            col("quantity", "QTY", 16), col("source", "SOURCE", 48)});
+        return json::array({col("item", "ITEM", 14), col("name", "PART", 70),
+                            col("quantity", "QTY", 14), col("source", "SOURCE", 82)});
     if (kind == "holes")
         return json::array({col("item", "ID", 12), col("quantity", "QTY", 14),
                             col("description", "HOLE / THREAD", 64),
@@ -1051,7 +1118,7 @@ json resolved_table(const DrawingSession& s, const json& stored) {
 json compile_table_draw(const json& table) {
     const json columns = table.value("columns", json::array());
     const json rows = table.value("rows", json::array());
-    std::array<double, 2> anchor = get_pos(table.value("anchor", json::array({15.0, 270.0})));
+    std::array<double, 2> anchor = get_pos(table.value("anchor", json::array({25.0, 282.0})));
     const double row_h = table.value("row_height", 6.0);
     double total_w = 0.0;
     for (const json& c : columns) total_w += std::max(8.0, c.value("width", 30.0));
@@ -1103,55 +1170,6 @@ json compile_table_draw(const json& table) {
     }
     return json{{"segments", segs}, {"dashed", json::array()}, {"tris", json::array()},
                 {"arcs", json::array()}, {"texts", texts}};
-}
-
-json compile_title_extension_draw(const json& sheet) {
-    const json& tb = sheet.value("title_block", json::object());
-    static const std::array<const char*, 6> keys = {
-        "checked_by", "approved_by", "drawing_standard",
-        "projection", "general_tolerance", "mass"};
-    bool any = false;
-    for (const char* key : keys)
-        if (tb.contains(key) && !scalar_text(tb[key]).empty()) any = true;
-    if (!any) return json();
-    const json& mm = sheet.value("size_mm", json::array({420.0, 297.0}));
-    const double page_w = mm.is_array() && mm.size() == 2 ? mm[0].get<double>() : 420.0;
-    json rows = json::array();
-    for (int i = 0; i < 3; ++i) {
-        json row;
-        row["left"] = std::string(i == 0 ? "CHECKED BY: " :
-                                  i == 1 ? "STANDARD: " : "GENERAL TOL: ") +
-                      scalar_text(tb[keys[2 * i]]);
-        row["right"] = std::string(i == 0 ? "APPROVED BY: " :
-                                   i == 1 ? "PROJECTION: " : "MASS: ") +
-                       scalar_text(tb[keys[2 * i + 1]]);
-        rows.push_back(std::move(row));
-    }
-    json table = {{"anchor", json::array({page_w - 190.0, 101.0})},
-                  {"columns", json::array({
-                      json{{"key", "left"}, {"title", "DOCUMENT CONTROL"}, {"width", 95.0}},
-                      json{{"key", "right"}, {"title", "ENGINEERING DATA"}, {"width", 85.0}}})},
-                  {"rows", rows}, {"row_height", 7.0}};
-    json draw = compile_table_draw(table);
-    std::string projection = scalar_text(tb.value("projection", json()));
-    std::transform(projection.begin(), projection.end(), projection.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-    if (!projection.empty()) {
-        const bool first_angle = projection.find("FIRST") != std::string::npos;
-        const double cy = 83.5;
-        const double circle_x = first_angle ? page_w - 29.0 : page_w - 16.0;
-        const double cone_x = first_angle ? page_w - 19.0 : page_w - 31.0;
-        draw["arcs"].push_back(
-            json{{"center", json::array({circle_x, cy})}, {"radius", 2.4},
-                 {"a0", 0.0}, {"a1", 2.0 * CHUDWARE_PI}});
-        draw["segments"].push_back(
-            json::array({json::array({cone_x - 4.0, cy - 2.4}),
-                         json::array({cone_x + 4.0, cy - 1.4}),
-                         json::array({cone_x + 4.0, cy + 1.4}),
-                         json::array({cone_x - 4.0, cy + 2.4}),
-                         json::array({cone_x - 4.0, cy - 2.4})}));
-    }
-    return draw;
 }
 
 // Component-to-view mapping is computed against the same complete HLR projection.
@@ -1236,7 +1254,10 @@ json drawing_get_locked_unsafe(const std::string& doc_id,
         // Geometry stays frozen, but non-geometric drawing data remains editable:
         // overlay current title blocks and annotations onto the cached projection.
         const std::string units = doc_units(s.doc);
+        const int sheet_count = static_cast<int>(frozen["sheets"].size());
+        int sheet_index = 0;
         for (json& cached_sheet : frozen["sheets"]) {
+            ++sheet_index;
             const std::string sheet_id =
                 cached_sheet.value("id", std::string());
             const json* stored_sheet = nullptr;
@@ -1249,8 +1270,12 @@ json drawing_get_locked_unsafe(const std::string& doc_id,
             if (!stored_sheet) continue;
             cached_sheet["name"] = stored_sheet->value("name", json(nullptr));
             cached_sheet["size"] = stored_sheet->value("size", json(nullptr));
+            const auto paper = sheet_dims(stored_sheet->value("size", std::string()));
+            if (paper[0] > 0.0) cached_sheet["size_mm"] = json::array({paper[0], paper[1]});
             cached_sheet["title_block"] =
                 stored_sheet->value("title_block", json::object());
+            cached_sheet["frame"] =
+                compile_sheet_frame(cached_sheet, units, sheet_index, sheet_count);
             if (!cached_sheet.contains("views") || !cached_sheet["views"].is_array())
                 continue;
             for (json& cached_view : cached_sheet["views"]) {
@@ -1279,8 +1304,12 @@ json drawing_get_locked_unsafe(const std::string& doc_id,
     const auto topology = index_source_topology(shapes);
     json sheets_out = json::array();
     double total_ms = 0.0;
+    const int sheet_count =
+        s.doc.contains("sheets") && s.doc["sheets"].is_array() ? (int)s.doc["sheets"].size() : 0;
+    int sheet_index = 0;
     if (s.doc.contains("sheets") && s.doc["sheets"].is_array())
         for (const json& sh : s.doc["sheets"]) {
+            ++sheet_index;
             json views_out = json::array();
             if (sh.contains("views") && sh["views"].is_array())
                 for (const json& v : sh["views"]) {
@@ -1297,6 +1326,7 @@ json drawing_get_locked_unsafe(const std::string& doc_id,
                 if (g.contains("annotations") && g["annotations"].is_array())
                     for (json& an : g["annotations"])
                         if (an.is_object()) an["draw"] = compile_annotation(an, units);
+                g["draw"] = compile_view_decorations(g);
                 if (g.contains("section_faces") && g["section_faces"].is_array()) {
                     json hatch = json::array();
                     if (g.contains("section_bodies") && g["section_bodies"].is_array()) {
@@ -1325,6 +1355,7 @@ json drawing_get_locked_unsafe(const std::string& doc_id,
                            {"size", sh.value("size", json(nullptr))},
                            {"size_mm", json::array({sz[0], sz[1]})},
                            {"title_block", sh.value("title_block", json::object())}};
+            sh_out["frame"] = compile_sheet_frame(sh_out, units, sheet_index, sheet_count);
             json tables_out = json::array();
             json overlay_annotations = json::array();
             for (const json& stored : sh.value("tables", json::array())) {
@@ -1336,11 +1367,6 @@ json drawing_get_locked_unsafe(const std::string& doc_id,
                          {"type", "table"}, {"kind", table.value("kind", std::string())},
                          {"draw", table["draw"]}});
             }
-            json title_ext = compile_title_extension_draw(sh_out);
-            if (title_ext.is_object())
-                overlay_annotations.push_back(
-                    json{{"id", "__title_extension"}, {"type", "title_extension"},
-                         {"draw", title_ext}});
             if (!overlay_annotations.empty())
                 views_out.push_back(
                     json{{"view_id", "__tables_" + sh.value("id", std::string())},
@@ -1423,7 +1449,7 @@ json drawing_add_sheet(const std::string& doc_id, const std::string& size,
                        const std::string& name) {
     DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
-    const std::string paper = size.empty() ? "A3" : size;
+    const std::string paper = size.empty() ? "A3" : canon_sheet_size(size);
     if (sheet_dims(paper)[0] <= 0.0)
         throw OpError("invalid_op", "unknown sheet size '" + paper + "'",
                       {{"reason", "bad size"}});
@@ -1685,13 +1711,11 @@ void remap_annotation(json& ann, const std::array<double, 2>& before,
         ann["radius"] = ann["radius"].get<double>() * ratio;
 }
 
-json drawing_set_view(const std::string& doc_id, const std::string& view_id, const json& scale,
-                      const json& position, const json& orientation, const json& show_hidden) {
-    DrawingLock lk;
-    DrawingSession& s = require_session(doc_id);
-    json* view = find_view(s.doc, view_id);
-    if (!view)
-        throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
+// Apply a scale / position / orientation / hidden-line change to one stored view and carry
+// its annotations and its derived views' cut lines / detail circles along (no re-projection).
+void apply_view_transform(DrawingSession& s, const std::string& view_id, json* view,
+                          const json& scale, const json& position, const json& orientation,
+                          const json& show_hidden) {
     const double old_scale = view->value("scale", 1.0);
     const std::array<double, 2> old_pos =
         get_pos(view->value("position", json::array({0.0, 0.0})));
@@ -1744,6 +1768,16 @@ json drawing_set_view(const std::string& doc_id, const std::string& view_id, con
             }
         }
     }
+}
+
+json drawing_set_view(const std::string& doc_id, const std::string& view_id, const json& scale,
+                      const json& position, const json& orientation, const json& show_hidden) {
+    DrawingLock lk;
+    DrawingSession& s = require_session(doc_id);
+    json* view = find_view(s.doc, view_id);
+    if (!view)
+        throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
+    apply_view_transform(s, view_id, view, scale, position, orientation, show_hidden);
     s.revision += 1;
     auto shapes = source_shapes(s);
     const auto topology = index_source_topology(shapes);
@@ -2862,6 +2896,357 @@ json drawing_add_weld(const std::string& doc_id, const std::string& view_id, con
     return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
 }
 
+namespace {
+// ----------------------------------------------------------- professional auto-dimensioning
+// Shared state of one auto-dimension pass across the views of a sheet: which model axes
+// already carry an overall dimension and which diameter groups are already called out, so
+// a feature is dimensioned ONCE on the sheet (ISO 129-1: no redundant dimensions).
+struct DimLedger {
+    std::array<bool, 3> axes{false, false, false};
+    std::set<std::string> diameters;  // "d|count" keys in model mm
+};
+
+int dominant_axis(const Vec3& v) {
+    int best = 0;
+    for (int i = 1; i < 3; ++i)
+        if (std::fabs(v[i]) > std::fabs(v[best])) best = i;
+    return best;
+}
+
+bool bbox4(const json& g, std::array<double, 4>& bb) {
+    const json& b = g.value("bbox", json(nullptr));
+    if (!(b.is_array() && b.size() == 4 && b[0].is_number())) return false;
+    bb = {b[0].get<double>(), b[1].get<double>(), b[2].get<double>(), b[3].get<double>()};
+    return bb[2] > bb[0] - 1e-9 && bb[3] > bb[1] - 1e-9;
+}
+
+struct Circ { double cx, cy, r; };
+
+// Distinct closed circles of a projected view (coincident rims collapsed, slivers dropped).
+std::vector<Circ> view_circles(const json& geom) {
+    std::vector<Circ> out;
+    for (const json& ar : geom.value("arcs", json::array())) {
+        if (!ar.value("closed", false) || !ar.contains("center")) continue;
+        const double cx = ar["center"][0].get<double>(), cy = ar["center"][1].get<double>();
+        const double r = ar.value("radius", 0.0);
+        // D-B2: skip degenerate near-zero rings (chamfer-cone silhouettes) — never "⌀0".
+        if (r < 0.05) continue;
+        bool dup = false;
+        for (const Circ& c : out)
+            if (std::hypot(c.cx - cx, c.cy - cy) < 1e-4 && std::fabs(c.r - r) < 1e-4) {
+                dup = true;
+                break;
+            }
+        if (!dup) out.push_back({cx, cy, r});
+    }
+    return out;
+}
+
+// {width, height} of a view spanned by a circle concentric with its outline (a round part
+// seen along its axis): those extents are stated by the ⌀, not by linear dimensions.
+std::array<bool, 2> round_outline(const json& geom) {
+    std::array<bool, 2> out{false, false};
+    std::array<double, 4> bb{};
+    if (!bbox4(geom, bb)) return out;
+    const double w = bb[2] - bb[0], h = bb[3] - bb[1];
+    const double mx = (bb[0] + bb[2]) * 0.5, my = (bb[1] + bb[3]) * 0.5;
+    const double tol = 0.004 * std::max(w, h) + 0.02;
+    for (const Circ& c : view_circles(geom)) {
+        if (std::fabs(2 * c.r - w) < tol && std::fabs(c.cx - mx) < tol) out[0] = true;
+        if (std::fabs(2 * c.r - h) < tol && std::fabs(c.cy - my) < tol) out[1] = true;
+    }
+    return out;
+}
+
+// A world cylinder axis segment (holes, bosses, shafts) for centre lines in side views.
+struct AxisSeg { Vec3 p0, p1; double r; };
+
+std::vector<AxisSeg> cylinder_axes(const std::vector<TopoDS_Shape>& shapes) {
+    std::vector<AxisSeg> out;
+    for (const TopoDS_Shape& sh : shapes) {
+        if (sh.IsNull()) continue;
+        for (TopExp_Explorer ex(sh, TopAbs_FACE); ex.More(); ex.Next()) {
+            try {
+                BRepAdaptor_Surface surf(TopoDS::Face(ex.Current()));
+                if (surf.GetType() != GeomAbs_Cylinder) continue;
+                // Fillets / partial rounds (< 3/8 of a turn) carry no centre line.
+                if (surf.LastUParameter() - surf.FirstUParameter() < CHUDWARE_PI * 0.75) continue;
+                const gp_Cylinder cyl = surf.Cylinder();
+                const gp_Pnt o = cyl.Axis().Location();
+                const gp_Dir z = cyl.Axis().Direction();
+                const double v0 = surf.FirstVParameter(), v1 = surf.LastVParameter();
+                if (!std::isfinite(v0) || !std::isfinite(v1) || v1 - v0 < 1e-6) continue;
+                out.push_back({{o.X() + z.X() * v0, o.Y() + z.Y() * v0, o.Z() + z.Z() * v0},
+                               {o.X() + z.X() * v1, o.Y() + z.Y() * v1, o.Z() + z.Z() * v1},
+                               cyl.Radius()});
+            } catch (const Standard_Failure&) {
+            }
+        }
+    }
+    return out;
+}
+
+json new_ann(json& view, const char* type, const char* kind) {
+    json ann = {{"id", next_ann_id(view)}, {"type", type}, {"auto", true}};
+    if (kind) ann["kind"] = kind;
+    return ann;
+}
+
+// Auto-dimension one stored view from its projected geometry. `ledger` (sheet-level pass)
+// suppresses dimensions another view already carries, lets a round outline's diameter stand
+// in for the overall width/height, and adds centre marks + bolt circles; nullptr = the
+// single-view Model Items command (envelope + diameters only). `axes` (may be null) adds
+// centre lines for cylinder axes lying in the view plane. `envelope_only` skips circles.
+int add_model_items(json& view, const json& geom, const std::string& units, DimLedger* ledger,
+                    const std::vector<AxisSeg>* axes, bool envelope_only = false) {
+    double scale = view.value("scale", 1.0);
+    if (scale == 0.0) scale = 1.0;
+    if (!view.contains("annotations") || !view["annotations"].is_array())
+        view["annotations"] = json::array();
+    int added = 0;
+    const std::string orient = view.value("orientation", std::string());
+    Vec3 d{0, 1, 0}, sx{1, 0, 0}, sy{0, 0, 1};
+    bool framed = false;
+    try {
+        orient_frame(orient, d, sx, sy);
+        framed = true;
+    } catch (const OpError&) {
+    }
+    const std::array<double, 2> pos = get_pos(view.value("position", json::array({0.0, 0.0})));
+    const int ax_h = dominant_axis(sx), ax_v = dominant_axis(sy);
+
+    std::array<double, 4> bb{};
+    const bool has_bb = bbox4(geom, bb);
+    const std::vector<Circ> circles = envelope_only ? std::vector<Circ>{} : view_circles(geom);
+
+    // Round outline: a circle concentric with the view whose diameter spans the bbox stands in
+    // for that overall dimension (the ⌀ callout says it once, a linear dim would repeat it).
+    bool round_w = false, round_h = false;
+    if (ledger && !envelope_only) {
+        const auto r = round_outline(geom);
+        round_w = r[0];
+        round_h = r[1];
+        if (round_w) ledger->axes[ax_h] = true;
+        if (round_h) ledger->axes[ax_v] = true;
+    }
+
+    // Overall envelope: width below the view, height to its left (10 mm off the outline).
+    if (has_bb) {
+        const double minx = bb[0], miny = bb[1], maxx = bb[2], maxy = bb[3];
+        const double w = maxx - minx, h = maxy - miny;
+        const bool want_w = w > 1e-6 && !round_w && (!ledger || !framed || !ledger->axes[ax_h]);
+        const bool want_h = h > 1e-6 && !round_h && (!ledger || !framed || !ledger->axes[ax_v]);
+        if (want_w) {
+            json ann = new_ann(view, "linear_dim", nullptr);
+            ann["a"] = json::array({minx, miny});
+            ann["b"] = json::array({maxx, miny});
+            ann["pos"] = json::array({(minx + maxx) / 2.0, miny - 10.0});
+            ann["value"] = round6(w / scale);
+            ann["text"] = compose_disp(ann, units);
+            view["annotations"].push_back(ann);
+            ++added;
+            if (ledger) ledger->axes[ax_h] = true;
+        }
+        if (want_h) {
+            json ann = new_ann(view, "linear_dim", nullptr);
+            ann["a"] = json::array({minx, miny});
+            ann["b"] = json::array({minx, maxy});
+            ann["pos"] = json::array({minx - 10.0, (miny + maxy) / 2.0});
+            ann["value"] = round6(h / scale);
+            ann["text"] = compose_disp(ann, units);
+            view["annotations"].push_back(ann);
+            ++added;
+            if (ledger) ledger->axes[ax_v] = true;
+        }
+    }
+
+    // Centres of the view's circles (largest radius per centre) — leaders fan out around them.
+    struct Centre { double cx, cy, rmax; std::vector<double> used_angles; };
+    std::vector<Centre> centres;
+    auto centre_idx = [&](double cx, double cy) -> int {
+        for (size_t i = 0; i < centres.size(); ++i)
+            if (std::hypot(centres[i].cx - cx, centres[i].cy - cy) < 1e-3) return (int)i;
+        return -1;
+    };
+    for (const Circ& c : circles) {
+        const int hit = centre_idx(c.cx, c.cy);
+        if (hit >= 0) centres[hit].rmax = std::max(centres[hit].rmax, c.r);
+        else centres.push_back({c.cx, c.cy, c.r, {}});
+    }
+    if (ledger) {
+        for (const Centre& c : centres) {
+            json ann = new_ann(view, "note", "center_mark");
+            ann["center"] = json::array({c.cx, c.cy});
+            ann["a"] = json::array({c.cx, c.cy});
+            ann["radius"] = round6(c.rmax);
+            ann["value"] = 0.0;
+            ann["text"] = "";
+            view["annotations"].push_back(ann);
+        }
+    }
+
+    // ONE diameter callout per DISTINCT diameter — identical holes collapse to a single
+    // "N× ⌀d" callout (D4). Grouped by radius in first-seen order.
+    struct DiaGroup { std::vector<Circ> members; double r; };
+    std::vector<DiaGroup> groups;
+    for (const Circ& c : circles) {
+        bool merged = false;
+        for (DiaGroup& g : groups)
+            if (std::fabs(g.r - c.r) < 1e-4) {
+                g.members.push_back(c);
+                merged = true;
+                break;
+            }
+        if (!merged) groups.push_back({{c}, c.r});
+    }
+    // D-B4: leader directions fan out around each centre so concentric callouts never stack.
+    static const double kAngles[] = {45, 135, 25, 155, 65, 115, -35, -145, 5, 175};
+    auto place_leader = [&](double cx, double cy, double reach) -> json {
+        const int ci = centre_idx(cx, cy);
+        double ang = 45.0;
+        for (double cand : kAngles) {
+            bool taken = false;
+            if (ci >= 0)
+                for (double u : centres[ci].used_angles)
+                    if (std::fabs(u - cand) < 1.0) taken = true;
+            if (!taken) { ang = cand; break; }
+        }
+        if (ci >= 0) centres[ci].used_angles.push_back(ang);
+        const double rad = ang * CHUDWARE_PI / 180.0;
+        const double dist = reach + 7.0;
+        return json::array({cx + dist * std::cos(rad), cy + dist * std::sin(rad)});
+    };
+    for (const DiaGroup& g : groups) {
+        const int count = (int)g.members.size();
+        char key[64];
+        std::snprintf(key, sizeof(key), "%.4f|%d", 2.0 * g.r / scale, count);
+        if (ledger && !ledger->diameters.insert(key).second) continue;
+        // Anchor a pattern's leader on its upper-right-most hole.
+        Circ anchor = g.members.front();
+        for (const Circ& m : g.members)
+            if (m.cx + m.cy > anchor.cx + anchor.cy) anchor = m;
+        const int ci = centre_idx(anchor.cx, anchor.cy);
+        const double reach = ci >= 0 ? centres[ci].rmax : anchor.r;
+        json ann = new_ann(view, "note", "diameter_dim");
+        ann["a"] = json::array({anchor.cx, anchor.cy});
+        ann["b"] = json::array({anchor.cx, anchor.cy});
+        ann["center"] = json::array({anchor.cx, anchor.cy});
+        ann["radius"] = round6(anchor.r);
+        ann["model_radius"] = round6(anchor.r / scale);
+        ann["closed"] = true;
+        ann["value"] = round6(2.0 * anchor.r / scale);
+        ann["count"] = count > 1 ? count : 0;
+        ann["pos"] = place_leader(anchor.cx, anchor.cy, reach);
+        ann["text"] = compose_disp(ann, units);
+        view["annotations"].push_back(ann);
+        ++added;
+
+        // Bolt circle: >= 3 equal holes equidistant from a common centre -> a chain pitch
+        // circle through the hole centres plus its diameter.
+        if (ledger && count >= 3) {
+            double px = 0, py = 0;
+            for (const Circ& m : g.members) { px += m.cx; py += m.cy; }
+            px /= count;
+            py /= count;
+            const double R = std::hypot(g.members[0].cx - px, g.members[0].cy - py);
+            bool equal = R > 1e-3;
+            for (const Circ& m : g.members)
+                if (std::fabs(std::hypot(m.cx - px, m.cy - py) - R) > 0.002 * R + 1e-4)
+                    equal = false;
+            char pkey[64];
+            std::snprintf(pkey, sizeof(pkey), "pcd|%.4f", 2.0 * R / scale);
+            if (equal && ledger->diameters.insert(pkey).second) {
+                json pc = new_ann(view, "note", "pitch_circle");
+                pc["center"] = json::array({px, py});
+                pc["a"] = json::array({px, py});
+                pc["radius"] = round6(R);
+                pc["value"] = 0.0;
+                pc["text"] = "";
+                view["annotations"].push_back(pc);
+                if (centre_idx(px, py) < 0) centres.push_back({px, py, R, {}});
+                const int pci = centre_idx(px, py);
+                json pd = new_ann(view, "note", "diameter_dim");
+                pd["a"] = json::array({px + R, py});
+                pd["b"] = json::array({px, py});
+                pd["center"] = json::array({px, py});
+                pd["radius"] = round6(R);
+                pd["model_radius"] = round6(R / scale);
+                pd["closed"] = true;
+                pd["value"] = round6(2.0 * R / scale);
+                pd["count"] = 0;
+                pd["pos"] = place_leader(px, py, std::max(R, centres[pci].rmax));
+                pd["text"] = compose_disp(pd, units);
+                view["annotations"].push_back(pd);
+                ++added;
+            }
+        }
+    }
+
+    // Centre lines on cylinder axes lying in the view plane (holes and bosses seen side-on).
+    if (axes && framed && orient != "iso") {
+        struct Line { double nx, ny, off, t0, t1; };
+        std::vector<Line> lines;
+        auto same_line = [](const Line& A, const Line& B) {
+            return std::fabs(A.nx - B.nx) < 1e-6 && std::fabs(A.ny - B.ny) < 1e-6 &&
+                   std::fabs(A.off - B.off) < 0.05 && B.t0 <= A.t1 + 0.5 && B.t1 >= A.t0 - 0.5;
+        };
+        for (const AxisSeg& a : *axes) {
+            const Vec3 dir = v_norm({a.p1[0] - a.p0[0], a.p1[1] - a.p0[1], a.p1[2] - a.p0[2]});
+            if (std::fabs(v_dot(dir, d)) > 1e-6) continue;  // not side-on in this view
+            if (a.r * scale < 0.4) continue;
+            const double x0 = v_dot(a.p0, sx) * scale + pos[0], y0 = v_dot(a.p0, sy) * scale + pos[1];
+            const double x1 = v_dot(a.p1, sx) * scale + pos[0], y1 = v_dot(a.p1, sy) * scale + pos[1];
+            double ux = x1 - x0, uy = y1 - y0;
+            const double l = std::hypot(ux, uy);
+            if (l < 1.0) continue;
+            ux /= l;
+            uy /= l;
+            if (ux < -1e-9 || (std::fabs(ux) <= 1e-9 && uy < 0)) { ux = -ux; uy = -uy; }
+            const double nx = -uy, ny = ux;
+            double t0 = x0 * ux + y0 * uy, t1 = x1 * ux + y1 * uy;
+            if (t0 > t1) std::swap(t0, t1);
+            Line cand{nx, ny, x0 * nx + y0 * ny, t0, t1};
+            bool merged = false;
+            for (Line& L : lines)
+                if (same_line(L, cand)) {
+                    L.t0 = std::min(L.t0, cand.t0);
+                    L.t1 = std::max(L.t1, cand.t1);
+                    merged = true;
+                    break;
+                }
+            if (!merged) lines.push_back(cand);
+        }
+        // Intervals widened by later segments may now overlap — merge to a fixed point.
+        for (size_t i = 0; i < lines.size(); ++i)
+            for (size_t j = i + 1; j < lines.size();) {
+                if (same_line(lines[i], lines[j])) {
+                    lines[i].t0 = std::min(lines[i].t0, lines[j].t0);
+                    lines[i].t1 = std::max(lines[i].t1, lines[j].t1);
+                    lines.erase(lines.begin() + (long)j);
+                    j = i + 1;
+                } else {
+                    ++j;
+                }
+            }
+        std::sort(lines.begin(), lines.end(),
+                  [](const Line& a, const Line& b) { return a.t1 - a.t0 > b.t1 - b.t0; });
+        if (lines.size() > 40) lines.resize(40);
+        for (const Line& L : lines) {
+            const double ux = L.ny, uy = -L.nx;
+            const double bx = L.nx * L.off, by = L.ny * L.off;
+            json ann = new_ann(view, "note", "center_line");
+            ann["a"] = json::array({bx + ux * L.t0, by + uy * L.t0});
+            ann["b"] = json::array({bx + ux * L.t1, by + uy * L.t1});
+            ann["pos"] = json::array({bx + ux * (L.t0 + L.t1) * 0.5, by + uy * (L.t0 + L.t1) * 0.5});
+            ann["value"] = 0.0;
+            ann["text"] = "";
+            view["annotations"].push_back(ann);
+        }
+    }
+    return added;
+}
+}  // namespace
+
 json drawing_model_items(const std::string& doc_id, const std::string& view_id) {
     DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
@@ -2869,103 +3254,357 @@ json drawing_model_items(const std::string& doc_id, const std::string& view_id) 
     if (!view)
         throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
     std::string units = doc_units(s.doc);
-    double scale = view->value("scale", 1.0);
-    if (scale == 0.0) scale = 1.0;
     auto shapes = source_shapes(s);
     json geom = project_one(s, *view, shapes);
-    if (!(*view).contains("annotations") || !(*view)["annotations"].is_array())
-        (*view)["annotations"] = json::array();
-    json& anns = (*view)["annotations"];
-    int added = 0;
-
-    // Overall envelope: width below + height to the left (SW "auto-dimension" baseline).
-    if (geom.contains("bbox") && geom["bbox"].is_array() && geom["bbox"].size() == 4 &&
-        geom["bbox"][0].is_number()) {
-        double minx = geom["bbox"][0].get<double>(), miny = geom["bbox"][1].get<double>();
-        double maxx = geom["bbox"][2].get<double>(), maxy = geom["bbox"][3].get<double>();
-        double w = maxx - minx, h = maxy - miny;
-        if (w > 1e-6) {
-            json ann = {{"id", next_ann_id(*view)}, {"type", "linear_dim"}, {"auto", true},
-                        {"a", json::array({minx, miny})}, {"b", json::array({maxx, miny})},
-                        {"pos", json::array({(minx + maxx) / 2.0, miny - 12.0})},
-                        {"value", round6(w / scale)}};
-            ann["text"] = compose_disp(ann, units);
-            anns.push_back(ann);
-            ++added;
-        }
-        if (h > 1e-6) {
-            json ann = {{"id", next_ann_id(*view)}, {"type", "linear_dim"}, {"auto", true},
-                        {"a", json::array({minx, miny})}, {"b", json::array({minx, maxy})},
-                        {"pos", json::array({minx - 12.0, (miny + maxy) / 2.0})},
-                        {"value", round6(h / scale)}};
-            ann["text"] = compose_disp(ann, units);
-            anns.push_back(ann);
-            ++added;
-        }
-    }
-
-    // ONE diameter callout per DISTINCT diameter — identical holes collapse to a single
-    // "N× ⌀d" callout instead of one "⌀d" per hole (D4). First dedupe coincident inner/outer
-    // rims (a through hole projects its two rims to the same circle), then group the distinct
-    // hole centers by radius: each radius-group yields one callout anchored at its first hole
-    // with count = number of holes of that diameter (compose_disp prefixes "N× " when >1).
-    std::vector<std::array<double, 3>> distinct;  // (cx,cy,r) of each distinct projected circle
-    if (geom.contains("arcs") && geom["arcs"].is_array())
-        for (const json& ar : geom["arcs"]) {
-            if (!ar.value("closed", false)) continue;
-            double cx = ar["center"][0].get<double>(), cy = ar["center"][1].get<double>();
-            double r = ar.value("radius", 0.0);
-            // D-B2: skip degenerate / spurious near-zero-radius circles (a chamfer-cone silhouette
-            // or relief on a complex hole) so we don't emit a "⌀0" auto diameter callout for them.
-            if (r < 0.05) continue;
-            bool dup = false;
-            for (auto& sd : distinct)
-                if (std::hypot(sd[0] - cx, sd[1] - cy) < 1e-4 && std::fabs(sd[2] - r) < 1e-4) {
-                    dup = true;
-                    break;
-                }
-            if (!dup) distinct.push_back({cx, cy, r});
-        }
-    // Group by radius (preserve first-seen order for stable placement).
-    struct DiaGroup { double cx, cy, r; int count; };
-    std::vector<DiaGroup> groups;
-    for (const auto& c : distinct) {
-        bool merged = false;
-        for (auto& g : groups)
-            if (std::fabs(g.r - c[2]) < 1e-4) { ++g.count; merged = true; break; }
-        if (!merged) groups.push_back({c[0], c[1], c[2], 1});
-    }
-    // D-B4: concentric bores (e.g. ⌀40/⌀30/⌀16 on an impeller hub) share a centre, so the default
-    // leader pos (centre + r along the 45° diagonal) lands every callout on the same diagonal — they
-    // pile up and become unreadable. Fan stacked callouts out: for each group, count how many EARLIER
-    // groups share its centre and step that label down by a fixed pitch so the concentric set reads
-    // as a vertical stack of distinct leaders instead of one overlapping blob.
-    std::vector<std::array<double, 2>> placed_centers;  // centres already given a leader
-    const double kStackPitch = 12.0;                    // sheet-mm vertical step between stacked labels
-    for (const DiaGroup& g : groups) {
-        int same_center = 0;
-        for (const auto& pc : placed_centers)
-            if (std::hypot(pc[0] - g.cx, pc[1] - g.cy) < 1e-3) ++same_center;
-        placed_centers.push_back({g.cx, g.cy});
-        double px = g.cx + g.r + 10.0;
-        double py = g.cy + g.r + 10.0 - same_center * kStackPitch;  // step concentric labels down
-        json ann = {{"id", next_ann_id(*view)}, {"type", "note"}, {"kind", "diameter_dim"},
-                    {"auto", true}, {"a", json::array({g.cx, g.cy})},
-                    {"b", json::array({g.cx, g.cy})}, {"center", json::array({g.cx, g.cy})},
-                    {"radius", round6(g.r)}, {"model_radius", round6(g.r / scale)},
-                    {"closed", true}, {"value", round6(2.0 * g.r / scale)},
-                    {"count", g.count > 1 ? g.count : 0},
-                    {"pos", json::array({px, py})}};
-        ann["text"] = compose_disp(ann, units);
-        anns.push_back(ann);
-        ++added;
-    }
-
+    const int added = add_model_items(*view, geom, units, nullptr, nullptr);
     s.revision += 1;
     json out = drawing_get_locked_unsafe(doc_id);
     out["added"] = added;
     out["view_id"] = view_id;
     return out;
+}
+
+namespace {
+// ----------------------------------------------------------- professional auto layout
+// Standard-view lattice (col, row; row 0 at the top). Third-angle (ASME): top above front,
+// right to its right. First-angle (ISO E): top below front, right view to its left.
+bool standard_slot(const std::string& orient, bool first_angle, int& col, int& row) {
+    struct S { const char* name; int col, row; };
+    static const S third[] = {{"front", 1, 1}, {"top", 1, 0}, {"bottom", 1, 2},
+                              {"left", 0, 1},  {"right", 2, 1}, {"back", 3, 1}};
+    static const S first[] = {{"front", 1, 1}, {"top", 1, 2}, {"bottom", 1, 0},
+                              {"left", 2, 1},  {"right", 0, 1}, {"back", 3, 1}};
+    for (const S& s : first_angle ? first : third)
+        if (orient == s.name) { col = s.col; row = s.row; return true; }
+    return false;
+}
+
+bool is_first_angle(const std::string& projection) {
+    std::string p;
+    for (char c : projection) p.push_back((char)std::tolower((unsigned char)c));
+    return p.find("first") != std::string::npos || p.find("1st") != std::string::npos;
+}
+
+// Re-lay every view of one sheet: ONE standard scale for the whole sheet (largest that fits the
+// drawing area left free by the title block and tables), views on the projection lattice with
+// shared centre lines (top/front share x, front/right share y), derived views (sections,
+// details) in a column of their own, everything centred in the free area with room for the
+// dimensions between views. Annotations and derived cuts move with their views. Returns the
+// chosen {scale, projection}. Caller holds the lock.
+json arrange_sheet_locked(DrawingSession& s, const std::string& doc_id, const std::string& sheet_id,
+                          const std::string& projection_in, double fixed_scale) {
+    json& sheet = find_sheet(s.doc, sheet_id);
+    const std::string sid = sheet.value("id", std::string());
+    json tb = sheet.contains("title_block") && sheet["title_block"].is_object()
+                  ? sheet["title_block"] : json::object();
+    std::string projection = projection_in;
+    if (projection.empty()) projection = tb.value("projection", std::string("third"));
+    const bool first_angle = is_first_angle(projection);
+    projection = first_angle ? "first" : "third";
+
+    const json full = drawing_get_locked_unsafe(doc_id);
+    std::map<std::string, json> geom_by_id;
+    for (const json& sh : full.value("sheets", json::array()))
+        if (sh.value("id", std::string()) == sid)
+            for (const json& g : sh.value("views", json::array()))
+                geom_by_id[g.value("view_id", std::string())] = g;
+
+    struct Item {
+        std::string vid;
+        std::string type;
+        std::string parent;
+        double old_scale = 1.0, ratio = 1.0;
+        std::array<double, 2> old_pos{};
+        std::array<double, 4> mb{};  // bbox about the view origin at scale 1
+        bool has_bb = false;
+        int col = 0, row = 0;
+        bool placed = false;
+    };
+    std::vector<Item> items;
+    std::map<std::string, double> scale_of;
+    for (json& v : sheet["views"]) {
+        Item it;
+        it.vid = v.value("id", std::string());
+        it.type = v.value("type", std::string());
+        it.parent = v.value("parent", std::string());
+        it.old_scale = v.value("scale", 1.0);
+        if (!(it.old_scale > 0.0)) it.old_scale = 1.0;
+        it.old_pos = get_pos(v.value("position", json::array({0.0, 0.0})));
+        scale_of[it.vid] = it.old_scale;
+        auto g = geom_by_id.find(it.vid);
+        std::array<double, 4> bb{};
+        if (g != geom_by_id.end() && bbox4(g->second, bb)) {
+            it.has_bb = true;
+            it.mb = {(bb[0] - it.old_pos[0]) / it.old_scale, (bb[1] - it.old_pos[1]) / it.old_scale,
+                     (bb[2] - it.old_pos[0]) / it.old_scale, (bb[3] - it.old_pos[1]) / it.old_scale};
+        }
+        items.push_back(it);
+    }
+    if (items.empty())
+        return json{{"scale", fixed_scale > 0.0 ? fixed_scale : 1.0}, {"projection", projection}};
+    for (Item& it : items) {
+        if ((it.type == "section" || it.type == "detail") && scale_of.count(it.parent))
+            it.ratio = it.old_scale / scale_of[it.parent];
+    }
+
+    // Lattice slots: standard orthographic views first, then the pictorial view in the
+    // top-right corner, then derived views in their own column beside their parent's row.
+    std::set<std::pair<int, int>> used;
+    for (Item& it : items) {
+        if (it.type != "base" && it.type != "projected") continue;
+        const json* v = find_view_c(s.doc, it.vid);
+        int c = 0, r = 0;
+        if (!v || !standard_slot(v->value("orientation", std::string()), first_angle, c, r)) continue;
+        while (used.count({c, r})) ++c;
+        it.col = c; it.row = r; it.placed = true;
+        used.insert({c, r});
+    }
+    int max_col = -1, min_row = 99;
+    for (auto& u : used) { max_col = std::max(max_col, u.first); min_row = std::min(min_row, u.second); }
+    if (used.empty()) { max_col = 0; min_row = 0; }
+    for (Item& it : items) {
+        if (it.placed || (it.type == "section" || it.type == "detail")) continue;
+        int c = std::max(max_col, 1), r = min_row;
+        if (!used.count({max_col + 1, r}) && used.count({c, r})) c = max_col + 1;
+        while (used.count({c, r})) ++c;
+        it.col = c; it.row = r; it.placed = true;
+        used.insert({c, r});
+    }
+    for (auto& u : used) max_col = std::max(max_col, u.first);
+    for (Item& it : items) {
+        if (it.placed) continue;
+        int r = 1;
+        for (const Item& p : items)
+            if (p.vid == it.parent && p.placed) r = p.row;
+        int c = max_col + 1;
+        while (used.count({c, r})) ++r;
+        it.col = c; it.row = r; it.placed = true;
+        used.insert({c, r});
+    }
+
+    // Free drawing area: the frame minus the title-block band and any placed tables.
+    const std::array<double, 2> paper = sheet_dims(sheet.value("size", std::string("A3")));
+    const auto inner = sheet_frame_inner(paper[0], paper[1]);
+    const auto tbr = sheet_title_block_rect(paper[0], paper[1]);
+    double ax0 = inner[0] + 4.0, ax1 = inner[2] - 4.0;
+    double ay0 = tbr[3] + 4.0, ay1 = inner[3] - 4.0;
+    for (const json& stored : sheet.value("tables", json::array())) {
+        const json table = resolved_table(s, stored);
+        const std::array<double, 2> anc = get_pos(table.value("anchor", json::array({25.0, 282.0})));
+        double tw = 0.0;
+        for (const json& c : table.value("columns", json::array()))
+            tw += std::max(8.0, c.value("width", 30.0));
+        const double th = table.value("row_height", 6.0) *
+                          (1 + (table.value("title", std::string()).empty() ? 0 : 1) +
+                           (double)table.value("rows", json::array()).size());
+        const bool overlaps_y = anc[1] - th < ay1 && anc[1] > ay0;
+        if (!overlaps_y) continue;
+        if (anc[0] > (ax0 + ax1) * 0.5) ax1 = std::min(ax1, anc[0] - 5.0);
+        else ax0 = std::max(ax0, anc[0] + tw + 5.0);
+    }
+    const double gap = 26.0;  // room for dimensions + captions between views
+    const double pad_l = 22.0, pad_r = 6.0, pad_b = 20.0, pad_t = 6.0;
+
+    // One lattice solve. With `float_pictorial` the iso view does not size the lattice; it is
+    // placed afterwards in the largest free corner (the top-right cell in third angle), at the
+    // sheet scale or one standard step smaller — so a tall pictorial never shrinks the views
+    // that carry the dimensions.
+    struct Solved {
+        double scale = 1.0;
+        std::map<int, int> col_ix, row_ix;
+        std::vector<double> col_c, row_c;
+        std::map<std::string, std::array<double, 3>> floating;  // vid -> {cx, cy, scale}
+        bool ok = true;
+    };
+    auto solve = [&](bool float_pictorial) -> Solved {
+        Solved r;
+        auto floats = [&](const Item& it) { return float_pictorial && it.type == "iso"; };
+        std::set<std::pair<int, int>> occ;
+        for (const Item& it : items)
+            if (!floats(it)) occ.insert({it.col, it.row});
+        if (occ.empty()) {
+            r.ok = false;
+            return r;
+        }
+        for (auto& u : occ) { r.col_ix[u.first] = 0; r.row_ix[u.second] = 0; }
+        { int i = 0; for (auto& c : r.col_ix) c.second = i++; }
+        { int i = 0; for (auto& rr : r.row_ix) rr.second = i++; }
+        std::vector<double> colm(r.col_ix.size(), 0.0), rowm(r.row_ix.size(), 0.0);
+        for (const Item& it : items) {
+            if (!it.has_bb || floats(it)) continue;
+            const int ci = r.col_ix[it.col], ri = r.row_ix[it.row];
+            colm[ci] = std::max(colm[ci], (it.mb[2] - it.mb[0]) * it.ratio);
+            rowm[ri] = std::max(rowm[ri], (it.mb[3] - it.mb[1]) * it.ratio);
+        }
+        double sum_w = 0, sum_h = 0;
+        for (double w : colm) sum_w += w;
+        for (double h : rowm) sum_h += h;
+        const double fixed_w = pad_l + pad_r + gap * (double)(colm.size() - 1);
+        const double fixed_h = pad_b + pad_t + gap * (double)(rowm.size() - 1);
+        double sc = fixed_scale;
+        if (!(sc > 0.0)) {
+            double fit = 1e30;
+            if (sum_w > 1e-9) fit = std::min(fit, (ax1 - ax0 - fixed_w) / sum_w);
+            if (sum_h > 1e-9) fit = std::min(fit, (ay1 - ay0 - fixed_h) / sum_h);
+            sc = fit < 1e29 && fit > 0.0 ? snap_scale_down(fit)
+                                         : (fit >= 1e29 ? 1.0 : standard_scales().back());
+        }
+        r.scale = sc;
+        // Cell centres: columns left to right, rows top to bottom, arrangement centred.
+        const double used_w = sum_w * sc + fixed_w - pad_l - pad_r;
+        const double used_h = sum_h * sc + fixed_h - pad_b - pad_t;
+        double x = ax0 + pad_l + std::max(0.0, (ax1 - ax0 - pad_l - pad_r - used_w) * 0.5);
+        std::vector<double> col_l(colm.size()), row_t(rowm.size());
+        r.col_c.resize(colm.size());
+        r.row_c.resize(rowm.size());
+        for (size_t i = 0; i < colm.size(); ++i) {
+            col_l[i] = x;
+            r.col_c[i] = x + colm[i] * sc * 0.5;
+            x += colm[i] * sc + gap;
+        }
+        double y = ay1 - pad_t - std::max(0.0, (ay1 - ay0 - pad_t - pad_b - used_h) * 0.5);
+        for (size_t i = 0; i < rowm.size(); ++i) {
+            row_t[i] = y;
+            r.row_c[i] = y - rowm[i] * sc * 0.5;
+            y -= rowm[i] * sc + gap;
+        }
+        if (!float_pictorial) return r;
+        // Free corner beside the top row: right of its last occupied cell, above row 2.
+        const int top_row = r.row_ix.begin()->first;
+        int last_col = -1;
+        for (auto& u : occ)
+            if (u.second == top_row) last_col = std::max(last_col, r.col_ix[u.first]);
+        const double fx0 = last_col + 1 < (int)colm.size()
+                               ? col_l[last_col + 1]
+                               : col_l[last_col] + colm[last_col] * sc + gap;
+        const double fy0 = rowm.size() > 1 ? row_t[1] + gap * 0.5 : ay0 + pad_b;
+        const double fx1 = ax1 - pad_r, fy1 = ay1 - pad_t;
+        for (const Item& it : items) {
+            if (!floats(it)) continue;
+            if (!it.has_bb) continue;
+            const double w = it.mb[2] - it.mb[0], h = it.mb[3] - it.mb[1];
+            double isc = sc;
+            if (w * isc > fx1 - fx0 || h * isc > fy1 - fy0)
+                isc = snap_scale_down(std::min((fx1 - fx0) / std::max(w, 1e-9),
+                                               (fy1 - fy0) / std::max(h, 1e-9)));
+            if (isc < sc * 0.45 || fx1 - fx0 < 15.0 || fy1 - fy0 < 15.0) {
+                r.ok = false;
+                return r;
+            }
+            r.floating[it.vid] = {(fx0 + fx1) * 0.5, (fy0 + fy1) * 0.5, isc};
+        }
+        return r;
+    };
+    Solved sol = solve(true);
+    if (!sol.ok) sol = solve(false);
+    const double scale = sol.scale;
+
+    // Compute every target first (detail ratios read the parents' old scales), then apply.
+    struct Target { std::string vid; double scale; std::array<double, 2> pos; bool move; };
+    std::vector<Target> targets;
+    for (const Item& it : items) {
+        double ns = scale * it.ratio;
+        double cx = 0, cy = 0;
+        auto fl = sol.floating.find(it.vid);
+        if (fl != sol.floating.end()) {
+            ns = fl->second[2];
+            cx = fl->second[0];
+            cy = fl->second[1];
+        } else if (it.has_bb) {
+            cx = sol.col_c[sol.col_ix[it.col]];
+            cy = sol.row_c[sol.row_ix[it.row]];
+        }
+        Target t{it.vid, ns, it.old_pos, false};
+        if (it.has_bb) {
+            const double mcx = (it.mb[0] + it.mb[2]) * 0.5, mcy = (it.mb[1] + it.mb[3]) * 0.5;
+            t.pos = {cx - mcx * ns, cy - mcy * ns};
+            t.move = true;
+        }
+        targets.push_back(t);
+        // A pictorial drawn at its own scale says so under the view.
+        if (json* v = find_view(s.doc, it.vid); v && it.type == "iso") {
+            if (std::fabs(ns - scale) > 1e-12) (*v)["caption"] = "SCALE " + scale_text(ns);
+            else v->erase("caption");
+        }
+    }
+    for (const Target& t : targets) {
+        json* v = find_view(s.doc, t.vid);
+        if (!v) continue;
+        apply_view_transform(s, t.vid, v, json(t.scale),
+                             t.move ? json::array({t.pos[0], t.pos[1]}) : json(nullptr),
+                             json(nullptr), json(nullptr));
+    }
+    json& sheet_after = find_sheet(s.doc, sid);
+    if (!sheet_after.contains("title_block") || !sheet_after["title_block"].is_object())
+        sheet_after["title_block"] = json::object();
+    sheet_after["title_block"]["scale"] = scale_text(scale);
+    sheet_after["title_block"]["projection"] = projection;
+    s.revision += 1;
+    return json{{"scale", scale}, {"scale_text", scale_text(scale)}, {"projection", projection}};
+}
+
+// Sheet-level auto-dimensioning: each model extent and each diameter group once, round
+// outlines by their ⌀, centre marks / bolt circles / axis centre lines. Assemblies get the
+// overall envelope only (their parts are identified by balloons + the BOM).
+int auto_dimension_locked(DrawingSession& s, const std::string& doc_id, const std::string& sheet_id,
+                          bool assembly) {
+    json& sheet = find_sheet(s.doc, sheet_id);
+    const std::string sid = sheet.value("id", std::string());
+    const json full = drawing_get_locked_unsafe(doc_id);
+    std::map<std::string, json> geom_by_id;
+    for (const json& sh : full.value("sheets", json::array()))
+        if (sh.value("id", std::string()) == sid)
+            for (const json& g : sh.value("views", json::array()))
+                geom_by_id[g.value("view_id", std::string())] = g;
+    std::vector<AxisSeg> axes;
+    if (!assembly) axes = cylinder_axes(source_shapes(s));
+    const std::string units = doc_units(s.doc);
+    static const char* kPriority[] = {"front", "top", "right", "left", "bottom", "back"};
+    DimLedger ledger;
+    int added = 0;
+    json& sheet_ref = find_sheet(s.doc, sid);
+    // Pre-pass: a round outline in ANY view claims its axes for the ⌀ before any view gets a
+    // linear overall dimension along them.
+    if (!assembly)
+        for (json& v : sheet_ref["views"]) {
+            const std::string type = v.value("type", std::string());
+            if (type != "base" && type != "projected") continue;
+            auto g = geom_by_id.find(v.value("id", std::string()));
+            if (g == geom_by_id.end()) continue;
+            Vec3 d, sx, sy;
+            try { orient_frame(v.value("orientation", std::string()), d, sx, sy); }
+            catch (const OpError&) { continue; }
+            const auto r = round_outline(g->second);
+            if (r[0]) ledger.axes[dominant_axis(sx)] = true;
+            if (r[1]) ledger.axes[dominant_axis(sy)] = true;
+        }
+    for (const char* orient : kPriority)
+        for (json& v : sheet_ref["views"]) {
+            const std::string type = v.value("type", std::string());
+            if ((type != "base" && type != "projected") ||
+                v.value("orientation", std::string()) != orient)
+                continue;
+            auto g = geom_by_id.find(v.value("id", std::string()));
+            if (g == geom_by_id.end()) continue;
+            added += add_model_items(v, g->second, units, &ledger, assembly ? nullptr : &axes,
+                                     assembly);
+        }
+    s.revision += 1;
+    return added;
+}
+}  // namespace
+
+json drawing_arrange(const std::string& doc_id, const std::string& sheet_id,
+                     const std::string& projection, const nlohmann::json& scale) {
+    DrawingLock lk;
+    DrawingSession& s = require_session(doc_id);
+    if (scale.is_number() && !(scale.get<double>() > 0.0 && std::isfinite(scale.get<double>())))
+        throw OpError("invalid_op", "scale must be positive", {{"reason", "bad scale"}});
+    json r = arrange_sheet_locked(s, doc_id, sheet_id, projection,
+                                  scale.is_number() ? scale.get<double>() : 0.0);
+    r["doc_id"] = doc_id;
+    r["drawing"] = drawing_get_locked_unsafe(doc_id);
+    return r;
 }
 
 json drawing_set_titleblock(const std::string& doc_id, const std::string& sheet_id,
@@ -2990,12 +3629,13 @@ json drawing_set_sheet(const std::string& doc_id, const std::string& sheet_id,
     DrawingLock lk;
     DrawingSession& s = require_session(doc_id);
     json& sheet = find_sheet(s.doc, sheet_id);
-    if (sheet_dims(size)[0] <= 0.0)
+    const std::string paper = canon_sheet_size(size);
+    if (sheet_dims(paper)[0] <= 0.0)
         throw OpError("invalid_op", "unknown sheet size '" + size + "'", {{"reason", "bad size"}});
-    sheet["size"] = size;
+    sheet["size"] = paper;
     s.revision += 1;
     return json{{"doc_id", doc_id}, {"sheet_id", sheet.value("id", json(nullptr))},
-                {"size", size}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
+                {"size", paper}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
 }
 json drawing_add_table(const std::string& doc_id, const std::string& sheet_id,
                        const std::string& kind, const json& spec) {
@@ -3012,7 +3652,8 @@ json drawing_add_table(const std::string& doc_id, const std::string& sheet_id,
     const std::array<double, 2> mm = sheet_dims(sheet.value("size", std::string("A3")));
     json anchor = cfg.contains("anchor") ? cfg["anchor"] :
                   cfg.contains("position") ? cfg["position"] :
-                  json::array({15.0, std::max(30.0, mm[1] - 15.0)});
+                  json::array({sheet_frame_inner(mm[0], mm[1])[0] + 5.0,
+                               sheet_frame_inner(mm[0], mm[1])[3] - 5.0});
     if (!is_xy(anchor))
         throw OpError("invalid_op", "table position must be [x,y] sheet mm",
                       {{"reason", "bad position"}});
@@ -3054,244 +3695,110 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
     if (s.contains("sheet") && s["sheet"].is_string())
         try { drawing_set_sheet(doc_id, "s1", s["sheet"].get<std::string>()); }
         catch (const OpError&) { /* bad size -> keep default A3 */ }
+    const std::string projection =
+        is_first_angle(s.value("projection", std::string("third"))) ? "first" : "third";
 
-    // Requested views (default the SolidWorks standard set). Lay them out in a tidy grid so a
-    // fresh drawing reads well before the user/agent nudges anything.
     std::vector<std::string> views;
     if (s.contains("views") && s["views"].is_array())
         for (const auto& v : s["views"])
             if (v.is_string()) views.push_back(v.get<std::string>());
     if (views.empty()) views = {"front", "top", "right", "iso"};
 
-    // Relative grid cell (col,row) for each standard view — a SolidWorks 3rd-angle arrangement:
-    // front centre, top above it, right beside it, iso upper-right. Cells are sized by the
-    // (scaled) part footprint after auto-scale, so the absolute mm positions are computed below.
-    struct Slot { const char* name; const char* type; int col, row; };
-    static const Slot kSlots[] = {
-        {"front", "base", 1, 1},      {"top", "projected", 1, 0},
-        {"right", "projected", 2, 1}, {"bottom", "projected", 1, 2},
-        {"left", "projected", 0, 1},  {"back", "projected", 0, 0},
-        {"iso", "iso", 2, 0},
-    };
-    struct Placed { std::string vid; int col, row; };
-    std::vector<Placed> placed;
-    std::vector<std::string> ortho_view_ids;  // for model items / hole callouts (not the iso)
+    bool assembly = false;
+    bool general_arrangement = false;  // many bodies: no hidden lines, envelope dims only
+    double provisional = 1.0;          // first projection scale, from the bounding box
+    {
+        DrawingLock lk;
+        DrawingSession& ds = require_session(doc_id);
+        assembly = !bom_rows_locked(ds).empty();
+        const auto shapes = source_shapes(ds);
+        general_arrangement = assembly || shapes.size() > 4;
+        // Hidden-line removal is discretised in sheet mm, so projecting a 5 m model at 1:1
+        // costs orders of magnitude more than at its real scale. Estimate the layout's scale
+        // from the bounding box (front + right across, top + front down) so the first
+        // projection is usually already the final one and the layout pass re-uses it.
+        Bnd_Box box;
+        for (const TopoDS_Shape& sh : shapes)
+            if (!sh.IsNull()) BRepBndLib::Add(sh, box);
+        if (!box.IsVoid()) {
+            double x0, y0, z0, x1, y1, z1;
+            box.Get(x0, y0, z0, x1, y1, z1);
+            const double dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
+            const std::string size =
+                find_sheet(ds.doc, "s1").value("size", std::string("A3"));
+            const auto paper = sheet_dims(size);
+            const auto inner = sheet_frame_inner(paper[0], paper[1]);
+            const auto tbr = sheet_title_block_rect(paper[0], paper[1]);
+            const double aw = inner[2] - inner[0] - 8.0 - 28.0 - 26.0;
+            const double ah = inner[3] - tbr[3] - 8.0 - 26.0 - 26.0;
+            const double sw = dx + std::max(dy, 0.9 * (dx + dy) * 0.7071);
+            const double sh = dy + dz;
+            if (sw > 1e-9 && sh > 1e-9 && aw > 0.0 && ah > 0.0)
+                provisional = snap_scale_down(std::min(aw / sw, ah / sh));
+        }
+    }
+    if (s.contains("scale") && s["scale"].is_number() && s["scale"].get<double>() > 0.0)
+        provisional = s["scale"].get<double>();
+
+    // Create every view at the provisional scale (the layout pass picks the real scale and
+    // positions). The first orthographic view is the base; the pictorial view carries no
+    // hidden lines, and neither do the views of a many-body general arrangement (thousands
+    // of dashes of other bodies' edges hide the information instead of adding it).
+    static const std::set<std::string> kOrtho = {"front", "top", "right", "bottom", "left", "back"};
     bool used_base = false;
     for (const std::string& vn : views) {
-        const Slot* slot = nullptr;
-        for (const auto& k : kSlots)
-            if (vn == k.name) { slot = &k; break; }
-        if (!slot) continue;  // unknown view name -> skip (never throw)
-        std::string type = slot->type;
-        // The first orthographic view is the drawing's base; the rest project off it.
-        if (type == "base") { if (used_base) type = "projected"; else used_base = true; }
+        const bool iso = vn == "iso";
+        if (!iso && !kOrtho.count(vn)) continue;  // unknown view name -> skip (never throw)
+        std::string type = iso ? "iso" : (used_base ? "projected" : "base");
+        if (!iso) used_base = true;
         try {
-            // Create at scale 1.0 first so we can read the part's true projected footprint, then
-            // auto-scale + reposition all views below. Temporary position; overwritten by layout.
-            json added = drawing_add_view(doc_id, type, vn, "s1", 1.0,
-                                          json::array({0.0, 0.0}), json(nullptr));
-            std::string vid = added.value("view_id", std::string());
-            if (vid.empty()) continue;
-            placed.push_back({vid, slot->col, slot->row});
-            if (vn != "iso") ortho_view_ids.push_back(vid);
+            drawing_add_view(doc_id, type, vn, "s1", provisional, json::array({0.0, 0.0}),
+                             (iso || general_arrangement) ? json(false) : json(nullptr));
         } catch (const OpError&) { /* skip a view that fails to project */ }
     }
-
-    // ---------------------------------------------------------------- D5: auto-scale + layout
-    // Without this every view sat at a fixed 1:1, so a 1 mm part rendered as a few pixels and a
-    // 5000 mm part overflowed the sheet. Now: measure the part's worst-case projected footprint
-    // (from the scale-1.0 view bboxes we just produced), choose ONE standard drawing scale so the
-    // scaled part fills ~65% of its grid cell, then place every view on a grid sized to the scaled
-    // footprint (non-overlapping). The title-block SCALE text is set to match.
-    double chosen_scale = 1.0;
-    {
-        json probe = drawing_get(doc_id);
-        // Worst-case single-view model footprint (max width/height over the placed views). At
-        // scale 1.0 the view bbox extent IS the part's projected model extent in mm.
-        double fw = 0.0, fh = 0.0;
-        // Per-view scale-1.0 projected bbox CENTRE (model mm). project_view lands geometry at
-        // model_pt*scale + position, so a view's bbox centre on the sheet is
-        // centre_model*chosen_scale + position. To put that centre at the cell centre (R1/R2)
-        // we set position = cell_centre - centre_model*chosen_scale below. Without this a view
-        // is offset by its own bbox centre: a short/asymmetric view (e.g. a 15 mm-tall plate
-        // front view, or any body not modelled about the origin) sits at a cell EDGE instead of
-        // the middle, reading as a thin strip crammed against one side with dead space opposite.
-        std::map<std::string, std::array<double, 2>> view_center;  // vid -> (cx,cy) model mm
-        std::map<std::string, std::array<double, 2>> view_half;    // vid -> (halfw,halfh) model mm
-        if (probe.contains("sheets") && probe["sheets"].is_array())
-            for (const auto& sh : probe["sheets"])
-                for (const auto& v : sh.value("views", json::array())) {
-                    const json& bb = v.value("bbox", json(nullptr));
-                    if (bb.is_array() && bb.size() == 4 && bb[0].is_number()) {
-                        fw = std::max(fw, bb[2].get<double>() - bb[0].get<double>());
-                        fh = std::max(fh, bb[3].get<double>() - bb[1].get<double>());
-                        std::string vid = v.value("view_id", v.value("id", std::string()));
-                        if (!vid.empty()) {
-                            view_center[vid] = {(bb[0].get<double>() + bb[2].get<double>()) / 2.0,
-                                                (bb[1].get<double>() + bb[3].get<double>()) / 2.0};
-                            view_half[vid] = {(bb[2].get<double>() - bb[0].get<double>()) / 2.0,
-                                              (bb[3].get<double>() - bb[1].get<double>()) / 2.0};
-                        }
-                    }
-                }
-        // Sheet drawable area (the real sheet mm; default A3 if size_mm is missing).
-        std::array<double, 2> sz = sheet_dims("A3");
-        if (probe.contains("sheets") && probe["sheets"].is_array() && !probe["sheets"].empty()) {
-            const json& mm = probe["sheets"][0].value("size_mm", json(nullptr));
-            if (mm.is_array() && mm.size() == 2 && mm[0].is_number() && mm[0].get<double>() > 0.0)
-                sz = {mm[0].get<double>(), mm[1].get<double>()};
-        }
-        const double margin = 20.0;          // paper border + dimension breathing room
-        const double title_h = std::min(55.0, std::max(0.0, sz[1] * 0.30));
-        const double draw_y0 = margin + title_h;  // reserve the lower band for the title block
-        const double draw_w = std::max(40.0, sz[0] - 2 * margin);
-        const double draw_h = std::max(40.0, sz[1] - 2 * margin - title_h);
-        // Compress the standard-view lattice to the ACTUALLY occupied rows/columns. A
-        // front+top sheet uses standard column 1; treating max_col+1 as two columns left an
-        // entire blank half-sheet and shoved every view right.
-        int min_col = 99, min_row = 99, max_col = -1, max_row = -1;
-        bool any_placed = !placed.empty();
-        for (const auto& p : placed) {
-            min_col = std::min(min_col, p.col); min_row = std::min(min_row, p.row);
-            max_col = std::max(max_col, p.col); max_row = std::max(max_row, p.row);
-        }
-        const double cols = any_placed ? (double)(max_col - min_col + 1) : 1.0;
-        const double rows = any_placed ? (double)(max_row - min_row + 1) : 1.0;
-        const double gap = 12.0;             // gutter between view cells
-        const double cell_w = std::max(20.0, (draw_w - (cols - 1) * gap) / cols);
-        const double cell_h = std::max(20.0, (draw_h - (rows - 1) * gap) / rows);
-        const double target_fill = 0.65;     // the part should fill ~65% of its cell
-        if (fw > 1e-9 || fh > 1e-9) {
-            double sx = (fw > 1e-9) ? target_fill * cell_w / fw : 1e30;
-            double sy = (fh > 1e-9) ? target_fill * cell_h / fh : 1e30;
-            double ideal = std::min(sx, sy);
-            if (ideal > 1e-12 && std::isfinite(ideal)) chosen_scale = snap_scale_down(ideal);
-        }
-        // Re-place every view: assign its grid cell a mm centre and apply the chosen scale. The
-        // cell pitch is (cell + gap); the grid is centred on the drawable area. Y grows UP on the
-        // sheet, but rows count DOWN (row 0 = top), so flip the row when mapping to mm.
-        const double pitch_x = cell_w + gap, pitch_y = cell_h + gap;
-        const double grid_w = cols * cell_w + (cols - 1) * gap;
-        const double grid_h = rows * cell_h + (rows - 1) * gap;
-        const double x0 = margin + (draw_w - grid_w) / 2.0 + cell_w / 2.0;
-        const double y_top = draw_y0 + (draw_h - grid_h) / 2.0 + grid_h - cell_h / 2.0;
-        for (const auto& p : placed) {
-            // Cell CENTRE on the sheet (mm).
-            double cx_cell = x0 + (p.col - min_col) * pitch_x;
-            double cy_cell = y_top - (p.row - min_row) * pitch_y;  // top occupied row first
-            // Centre the view's projected bbox in its cell: position offsets the geometry, and
-            // geometry = model*chosen_scale + position, so to land the bbox centre on the cell
-            // centre, position = cell_centre - centre_model*chosen_scale (R1/R2). Falls back to
-            // the bare cell centre when we have no probe bbox for this view (degenerate/empty).
-            double px = cx_cell, py = cy_cell;
-            auto it = view_center.find(p.vid);
-            if (it != view_center.end()) {
-                px = cx_cell - it->second[0] * chosen_scale;
-                py = cy_cell - it->second[1] * chosen_scale;
-                // Keep the view's scaled projected bbox inside the sheet margins. Without this an
-                // off-origin part (built away from the origin, e.g. a base + a tall wall whose Z
-                // centre is well above 0) lands a view at negative / over-width sheet mm, drawn off
-                // the paper edge. Leave ~26 mm extra on the LEFT for the model-items overall-height
-                // dimension (placed at minx-12 plus its text/extension lines).
-                auto hf = view_half.find(p.vid);
-                if (hf != view_half.end()) {
-                    const double hw = hf->second[0] * chosen_scale;
-                    const double hh = hf->second[1] * chosen_scale;
-                    const double lo_x = margin + hw + 26.0, hi_x = sz[0] - margin - hw;
-                    const double lo_y = draw_y0 + hh,       hi_y = sz[1] - margin - hh;
-                    if (hi_x > lo_x) px = std::min(std::max(px, lo_x), hi_x);
-                    if (hi_y > lo_y) py = std::min(std::max(py, lo_y), hi_y);
-                }
-            }
-            try {
-                drawing_set_view(doc_id, p.vid, json(chosen_scale), json::array({px, py}),
-                                 json(nullptr), json(nullptr));
-            } catch (const OpError&) { /* keep the view at scale 1.0 if reposition fails */ }
-        }
+    // Assemblies: the parts list sits on the title block (ISO 7573), so the layout avoids it.
+    if (assembly) {
+        try {
+            const json listed = drawing_bom(doc_id);
+            const std::size_t n = listed.value("rows", json::array()).size();
+            json probe = drawing_list_sheets(doc_id);
+            std::string size = "A3";
+            for (const json& sh : probe.value("sheets", json::array()))
+                if (sh.value("id", std::string()) == "s1") size = sh.value("size", std::string("A3"));
+            const auto paper = sheet_dims(size);
+            const auto tbr = sheet_title_block_rect(paper[0], paper[1]);
+            const double top = tbr[3] + 6.0 * (double)(n + 1) + 0.5;
+            drawing_add_table(doc_id, "s1", "bom",
+                              json{{"anchor", json::array({tbr[0], top})}});
+        } catch (const OpError&) {}
     }
 
-    bool model_items = s.value("model_items", true);
-    bool hole_callouts = s.value("hole_callouts", false);
-    if (model_items)
-        for (const std::string& vid : ortho_view_ids)
-            try { drawing_model_items(doc_id, vid); } catch (const OpError&) {}
+    // An explicit numeric spec scale fixes the sheet scale; otherwise the layout fits one.
+    const json fixed_scale = s.contains("scale") && s["scale"].is_number() &&
+                                     s["scale"].get<double>() > 0.0
+                                 ? s["scale"] : json(nullptr);
+    auto arrange = [&]() {
+        try { drawing_arrange(doc_id, "s1", projection, fixed_scale); }
+        catch (const OpError&) {}
+    };
+    arrange();
 
-    if (hole_callouts) {
-        // Re-fetch geometry, then drop ONE ⌀ callout per DISTINCT hole DIAMETER per view.
-        // Identical holes (same diameter) must collapse to a single "N× ⌀d" callout with one
-        // leader — NOT one callout each (D4). drawing_add_callout already counts every
-        // same-diameter circle in the view and emits "N× ⌀d", so we anchor it on the FIRST
-        // hole of each radius and dedupe by radius (not by center). Dedupe by center too so a
-        // through hole (whose two rims project to coincident circles) seeds the radius once.
-        //
-        // D-B1 (no DOUBLE callout): when `model_items` ALSO ran above, it already emitted a
-        // diameter_dim "N× ⌀d" per distinct hole diameter on every ortho view — anchored at the
-        // SAME hole centre this pass would re-annotate. Adding a hole_callout for the same
-        // diameter stacked a second identical "N× ⌀d" leader on top of the model-items one (the
-        // duplicated pair). So when model_items owns the plain-hole diameter callouts, seed each
-        // view's `radii_done` with the radii those auto diameter_dim annotations already cover,
-        // making this pass a no-op for already-annotated diameters. With model_items OFF, the
-        // seed is empty and this pass remains the sole hole-callout emitter (unchanged).
-        json full = drawing_get(doc_id);
-        if (full.contains("sheets") && full["sheets"].is_array())
-            for (const auto& sh : full["sheets"])
-                for (const auto& v : sh.value("views", json::array())) {
-                    std::string vid = v.value("view_id", v.value("id", std::string()));
-                    if (vid.empty() || v.value("type", std::string()) == "iso") continue;
-                    std::vector<double> radii_done;  // one callout per distinct radius
-                    std::vector<std::array<double, 2>> seen_centers;
-                    // D-B1: pre-seed with radii model_items already called out on this view so we
-                    // don't emit a second, identical hole_callout over the existing diameter_dim.
-                    if (model_items)
-                        for (const auto& an : v.value("annotations", json::array())) {
-                            if (!an.value("auto", false)) continue;
-                            std::string k = an.value("kind", an.value("type", std::string()));
-                            if (k != "diameter_dim") continue;
-                            double rr = an.value("radius", 0.0);
-                            if (rr > 0.0) radii_done.push_back(rr);
-                        }
-                    for (const auto& ar : v.value("arcs", json::array())) {
-                        if (!ar.value("closed", false)) continue;
-                        double cx = ar["center"][0].get<double>(), cy = ar["center"][1].get<double>();
-                        double r = ar.value("radius", 0.0);
-                        bool dup_center = false;
-                        for (auto& c : seen_centers)
-                            if (std::hypot(c[0] - cx, c[1] - cy) < 1e-3) { dup_center = true; break; }
-                        if (dup_center) continue;
-                        seen_centers.push_back({cx, cy});
-                        bool dup_radius = false;
-                        for (double rd : radii_done)
-                            if (std::fabs(rd - r) < 1e-3) { dup_radius = true; break; }
-                        if (dup_radius) continue;  // a callout for this diameter already exists
-                        radii_done.push_back(r);
-                        try {
-                            drawing_add_callout(doc_id, vid, "hole",
-                                                json::array({cx, cy}), json::object());
-                        } catch (const OpError&) {}
-                    }
-                }
-    }
-
-    // Auto-sections: each spec entry cuts a parent view through its center along an axis, so an
+    // Auto-sections: each spec entry cuts a parent view through its centre along an axis, so an
     // LLM can request a section WITHOUT knowing sheet-mm coordinates. Entry:
     //   {"parent":"front"|<view_id>, "axis":"vertical"|"horizontal", "mode":"full"|"half",
     //    "reverse":bool, "label":"A"}
     if (s.contains("sections") && s["sections"].is_array() && !s["sections"].empty()) {
         json full = drawing_get(doc_id);
-        // Map orientation + view_id -> bbox for the current ortho views.
         auto find_parent = [&](const std::string& want, json& bbox, std::string& vid) -> bool {
-            if (!full.contains("sheets") || !full["sheets"].is_array()) return false;
-            for (const auto& sh : full["sheets"])
+            for (const auto& sh : full.value("sheets", json::array()))
                 for (const auto& v : sh.value("views", json::array())) {
-                    if (v.value("type", std::string()) == "section" ||
-                        v.value("type", std::string()) == "detail")
-                        continue;
+                    const std::string t = v.value("type", std::string());
+                    if (t != "base" && t != "projected") continue;
                     std::string id = v.value("view_id", v.value("id", std::string()));
-                    std::string orient = v.value("orientation", std::string());
-                    if (want == id || want == orient) {
-                        if (v.contains("bbox") && v["bbox"].is_array() && v["bbox"].size() == 4 &&
-                            v["bbox"][0].is_number()) {
-                            bbox = v["bbox"];
+                    if (want == id || want == v.value("orientation", std::string())) {
+                        const json& bb = v.value("bbox", json(nullptr));
+                        if (bb.is_array() && bb.size() == 4 && bb[0].is_number()) {
+                            bbox = bb;
                             vid = id;
                             return true;
                         }
@@ -3299,6 +3806,7 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
                 }
             return false;
         };
+        bool any = false;
         for (const auto& sec : s["sections"]) {
             if (!sec.is_object()) continue;
             std::string parent = sec.value("parent", std::string("front"));
@@ -3309,7 +3817,7 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
             double x0 = bbox[0].get<double>(), y0 = bbox[1].get<double>();
             double x1 = bbox[2].get<double>(), y1 = bbox[3].get<double>();
             double cx = (x0 + x1) / 2.0, cy = (y0 + y1) / 2.0;
-            double pad = 0.1 * std::max(x1 - x0, y1 - y0) + 2.0;
+            double pad = 0.08 * std::max(x1 - x0, y1 - y0) + 4.0;
             json cut = (axis == "horizontal")
                            ? json::array({json::array({x0 - pad, cy}), json::array({x1 + pad, cy})})
                            : json::array({json::array({cx, y0 - pad}), json::array({cx, y1 + pad})});
@@ -3319,17 +3827,91 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
                 drawing_add_section(doc_id, vid, json(nullptr), cut,
                                     sec.contains("label") ? sec["label"] : json(nullptr),
                                     json(nullptr), json(nullptr), "s1", json(false), opts);
+                any = true;
             } catch (const OpError&) { /* skip a section that fails to cut */ }
         }
+        if (any) arrange();
     }
 
-    // Title block: merge the caller's fields with the auto-chosen drawing SCALE (D5). The scale
-    // is no longer cosmetic — it reflects the actual view scale the auto-layout picked. An
-    // explicit `scale` in the caller's title spec still wins (the user named the scale).
+    const bool model_items = s.value("model_items", true);
+    const bool hole_callouts = s.value("hole_callouts", false);
+    if (model_items) {
+        DrawingLock lk;
+        DrawingSession& ds = require_session(doc_id);
+        try { auto_dimension_locked(ds, doc_id, "s1", general_arrangement); } catch (const OpError&) {}
+    }
+    if (assembly)
+        try { drawing_auto_balloon(doc_id); } catch (const OpError&) {}
+
+    if (hole_callouts && !general_arrangement) {
+        // ONE "N× ⌀d" callout per DISTINCT hole diameter on the sheet (D4). D-B1: diameters
+        // the sheet-level model items already called out (in ANY view) are never repeated.
+        json full = drawing_get(doc_id);
+        std::vector<double> done;  // model diameters already called out
+        for (const auto& sh : full.value("sheets", json::array()))
+            for (const auto& v : sh.value("views", json::array()))
+                for (const auto& an : v.value("annotations", json::array())) {
+                    const std::string k = an.value("kind", an.value("type", std::string()));
+                    if (k == "diameter_dim" || k == "hole_callout")
+                        done.push_back(an.value("value", 0.0));
+                }
+        for (const auto& sh : full.value("sheets", json::array()))
+            for (const auto& v : sh.value("views", json::array())) {
+                std::string vid = v.value("view_id", v.value("id", std::string()));
+                const std::string t = v.value("type", std::string());
+                if (vid.empty() || (t != "base" && t != "projected")) continue;
+                double vscale = v.value("scale", 1.0);
+                if (!(vscale > 0.0)) vscale = 1.0;
+                for (const Circ& c : view_circles(v)) {
+                    const double dia = 2.0 * c.r / vscale;
+                    bool dup = false;
+                    for (double dd : done)
+                        if (std::fabs(dd - dia) < 1e-3) { dup = true; break; }
+                    if (dup) continue;
+                    done.push_back(dia);
+                    try {
+                        drawing_add_callout(doc_id, vid, "hole", json::array({c.cx, c.cy}),
+                                            json::object());
+                    } catch (const OpError&) {}
+                }
+            }
+    }
+
+    // Title block: the caller's fields over sensible defaults — part name, material from the
+    // source, today's date, units, the projection method. SCALE always reflects the layout's
+    // real view scale (set by the arrange pass); an explicit caller scale still wins.
     json title = (s.contains("title") && s["title"].is_object()) ? s["title"] : json::object();
-    if (!(title.contains("scale") && title["scale"].is_string() &&
-          !title["scale"].get<std::string>().empty()))
-        title["scale"] = scale_text(chosen_scale);
+    {
+        DrawingLock lk;
+        DrawingSession& ds = require_session(doc_id);
+        const json src = live_source_tree(ds);
+        if (!title.contains("title") && src.is_object() && src.contains("name") &&
+            src["name"].is_string())
+            title["title"] = src["name"];
+        if (!title.contains("material") && src.is_object() && src.contains("material")) {
+            const json& m = src["material"];
+            std::string mat = m.is_string() ? m.get<std::string>()
+                              : m.is_object() ? m.value("name", m.value("key", std::string()))
+                                              : std::string();
+            if (!mat.empty()) title["material"] = mat;
+        }
+    }
+    if (!title.contains("date")) {
+        std::time_t now = std::time(nullptr);
+        std::tm tmv{};
+#ifdef _WIN32
+        gmtime_s(&tmv, &now);
+#else
+        gmtime_r(&now, &tmv);
+#endif
+        char buf[16];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tmv);
+        title["date"] = buf;
+    }
+    title["projection"] = projection;
+    if (title.contains("scale") && !(title["scale"].is_string() &&
+                                     !title["scale"].get<std::string>().empty()))
+        title.erase("scale");
     try { drawing_set_titleblock(doc_id, "s1", title); } catch (const OpError&) {}
 
     return json{{"doc_id", doc_id}, {"drawing", drawing_get(doc_id)}};

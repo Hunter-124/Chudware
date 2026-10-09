@@ -66,7 +66,7 @@ jobs:
           # gate anyway, but it fails 20 minutes in with a stage label; here it
           # fails in two seconds with the tool name.
           missing=()
-          for tool in python3 cmake ninja ctest git gh tar xvfb-run; do
+          for tool in python3 cmake ninja ctest git tar xvfb-run; do
             command -v "${tool}" >/dev/null 2>&1 || missing+=("${tool}")
           done
           if [ "${#missing[@]}" -ne 0 ]; then
@@ -156,8 +156,15 @@ jobs:
           read -r release source_commit <<< "$(python3 -c 'import json; p=json.load(open("vendor/chudcode/CHUDCODE_ARTIFACT.lock")); print("chudcode-runtime-v" + p["version"], p["repository_commit"])')"
           source_dir="$(mktemp -d "${RUNNER_TEMP}/gate-rpc.XXXXXX")"
           archive="chudcode-source-${source_commit}.tar.gz"
-          gh release download "${release}" --repo "${GITHUB_REPOSITORY}" \
-            --pattern "${archive}" --dir "${source_dir}"
+          python3 - "${source_dir}/${archive}" "${release}" <<'PY'
+          import os, shutil, sys
+          from pathlib import Path
+          from scripts.pin_chudcode import _github_asset_response
+          destination = Path(sys.argv[1])
+          url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{sys.argv[2]}/{destination.name}"
+          with _github_asset_response(url, os.environ["GH_TOKEN"]) as response, destination.open("wb") as output:
+              shutil.copyfileobj(response, output)
+          PY
           mkdir "${source_dir}/sdk"
           tar -xzf "${source_dir}/${archive}" -C "${source_dir}/sdk" \
             --strip-components=3 --wildcards '*/python/chudcode-rpc/*'
